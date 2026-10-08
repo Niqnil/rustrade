@@ -16,7 +16,7 @@
 # cannot land while leaving this record behind. CI cannot verify that the re-verification a
 # pinned entry mandates was actually performed — only that this file was not left untouched.
 
-ibapi=4.2.0  # 2026-09-14 | Financial protocol, community-maintained, no official SDK. Reviewed 3.2.0->3.3.0, all four properties recorded at 3.2.0 re-verified and still hold: zero unsafe (also no transmute/from_raw/extern "C"/asm!; holds by inspection, not by lint — upstream has no #![forbid(unsafe_code)]), no build.rs, dependency tree byte-identical vs 3.2.0 (both Cargo.toml and Cargo.lock differ by the version line alone; 9 direct deps under our `default-features = false, features = ["sync"]` selection, unchanged), still only a caller-supplied TWS socket (reconnect reuses the caller's address — no fallback host, no telemetry) + the opt-in local recorder dir (IBAPI_RECORDING_DIR; recorder.rs byte-identical). Env set unchanged (IBAPI_RECORDING_DIR, IBAPI_TIMEZONE_ALIASES); no process spawn, no obfuscation; published from git b140b312d1136d240f3b5651a89f4778e01aa222.
+ibapi=5.0.0  # 2026-10-06 | Financial protocol, community-maintained, no official SDK. Reviewed 3.2.0->3.3.0, all four properties recorded at 3.2.0 re-verified and still hold: zero unsafe (also no transmute/from_raw/extern "C"/asm!; holds by inspection, not by lint — upstream has no #![forbid(unsafe_code)]), no build.rs, dependency tree byte-identical vs 3.2.0 (both Cargo.toml and Cargo.lock differ by the version line alone; 9 direct deps under our `default-features = false, features = ["sync"]` selection, unchanged), still only a caller-supplied TWS socket (reconnect reuses the caller's address — no fallback host, no telemetry) + the opt-in local recorder dir (IBAPI_RECORDING_DIR; recorder.rs byte-identical). Env set unchanged (IBAPI_RECORDING_DIR, IBAPI_TIMEZONE_ALIASES); no process spawn, no obfuscation; published from git b140b312d1136d240f3b5651a89f4778e01aa222.
 #   New in 3.3.0, reviewed: `src/config` — despite the name it reads NO local files and NO env vars. It wraps two TWS wire messages (ReqConfig=108/UpdateConfig=109) over the already-open socket, whose protobuf types already existed in 3.2.0. Version-gated, #[must_use] builder, not reachable during connect/handshake.
 #   NOTE (capability, not vulnerability): `update_config()` can write the gateway's own safety settings — read_only_api, the bypass_* order precautions, trusted_ips, allow_localhost_only, socket_port, master_client_id. rustrade does not call it and does not re-export it; keep it out of the wrapper surface unless there is a deliberate reason.
 #   Upstream BREAKING in a minor release: the `fundamental` module was removed (IBKR retired reqFundamentalData in TWS API 10.47). rustrade never used it — verified no reference to fundamental_data / FundamentalData / FundamentalReportType / TickType::FundamentalRatios.
@@ -270,7 +270,60 @@ ibapi=4.2.0  # 2026-09-14 | Financial protocol, community-maintained, no officia
 # NOT VERIFIABLE OFF-GATEWAY, unchanged in force: the ibkr integration tests are all #[ignore]d and CI
 # does not run them. Nothing has exercised 4.2.0's connection-state gate, early reset or strict decode
 # against a real gateway. Do that before relying on 4.2.0 in production.
-binance-sdk=70.2.0  # 2026-09-14 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
+#
+# Re-verified against the =5.0.0 crates.io source on 2026-10-06 (4.2.0 -> 5.0.0). A MAJOR bump, so every
+# standing property was re-checked. Published from git f43c64682ab24b822dcd2892ff4208eac81813dc;
+# crate sha256 ea07cb0b82d0cfa1388cdcbcd15803a29a7b41d7cf572b46a94eae6404acca33 (= Cargo.lock).
+#
+# Standing properties, all hold:
+#   1. ZERO unsafe -- no unsafe / transmute / extern "C" / asm! / #[no_mangle] / #[link] / dlopen in src/.
+#      The only `from_raw` is the safe `RequestId::from_raw(i32)` (client/ids.rs:35). Still by inspection.
+#   2. NO build.rs (`build = false`), no proc macros, no include_bytes!/include_str!. prost output is checked in.
+#   3. DEPENDENCY TREE -- under our `default-features = false, features = ["sync"]` the same 9 direct deps,
+#      and a throwaway resolve of 4.2.0 vs 5.0.0 gives identical crate sets (68 locked packages each). The
+#      `utoipa` feature moved to an optional `utoipa6` (utoipa 6) behind `utoipa-6`; we enable neither.
+#      `serde_yaml` left upstream's own lock. New `rust-version = "1.88"`, below our 1.95.
+#   4. NETWORK SURFACE -- still only the caller's TWS socket (transport/sync.rs:1187, reconnect :1211 reuses
+#      the stored address). URL changes in src/ are doc links only. No process spawn, no telemetry, no
+#      obfuscation. Thread spawns unchanged (sync.rs:577,838).
+#   5. ENV SURFACE unchanged: IBAPI_RAW_CAPTURE_DIR (transport/raw_capture.rs:90), IBAPI_RECORDING_DIR
+#      (transport/recorder.rs:34), IBAPI_TIMEZONE_ALIASES (common/timezone/mod.rs:166). raw_capture.rs differs
+#      by comments only.
+#   `update_config()` is still reachable only through an explicit builder `.submit()`; nothing calls it on
+#   connect. Still not wrapped or re-exported.
+#
+# ORDER WIRE FORMAT: unchanged for every order rustrade builds. The whole `orders/common/encoders.rs` delta
+# is `attached_orders: None` -> `encode_attached_orders(order)`, which is `None` unless
+# `preset_stop_loss_order_id` / `preset_profit_taker_order_id` is set; both default to `None`. The
+# `order_builder` functions removed in 5.0 (`stop_limit`, `trailing_stop_limit`) are replaced in
+# rustrade-execution/src/client/ibkr/order.rs by literals with the same fields, including the old
+# `trail_stop_price: Some(0.0)`. `bracket_order` now validates prices (finite, TP/SL on the correct side)
+# and returns a Result; the orders it builds are otherwise identical.
+#
+# REQUEST IDS now start at 1,500,000,000 (client/ids.rs:17); order ids must stay below it, else
+# `Error::OrderIdInRequestRange`. Ours are seeded from TWS's nextValidId and are small. Error frames are
+# routed by which range their id falls in. `recovery.rs`'s `request_id > 0` test for replayed executions
+# still holds (live fills are -1).
+#
+# BEHAVIOUR CHANGES ON PATHS WE COMPILE, all adopted in the same PR:
+#   - Each shared subscription (positions, open orders) gets its own queue (rust-ibapi #836/#848), so the
+#     4.2.0 shared-queue caveats are gone. Every `positions()` call still sends a fresh reqPositions, and
+#     TWS's replies carry no request id and reach every live positions subscriber -- so `account_snapshot`
+#     now reads positions-multi (request-id scoped) once per managed account (IB documents the account
+#     as optional only for a single-account login) and stops at each end marker. Verified on a paper
+#     gateway (server 225, single-account login, read with the account given explicitly): positions-multi
+#     lists exactly what positions() does, and two concurrent reads each get the full listing.
+#   - `order_update_stream` ends with `Error::Shutdown` on shutdown (#871) and is refused on a shut-down
+#     client; the account stream now ends on that signal.
+#   - Depth reset 317 arrives as `MarketDepths::Reset` data, not a notice.
+#   - `OptionComputation` values TWS has not computed are `None`, not the -1/-2 sentinels.
+#   - Notice categories: 316/354/366 move to a new `RequestError`; our 399 handling is unaffected
+#     (`is_warning_message` unchanged; 399 still routes to its order).
+#   - Position frames without a contract are `Error::Parse`, ending the subscription; we surface it.
+#
+# Exercised against the paper gateway (positions, account_snapshot, EUR.USD paper orders). The #[ignore]d
+# ibkr integration tests still do not run in CI.
+binance-sdk=74.0.0  # 2026-10-08 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
 #   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
 #   3. common::utils::send_request                        — signature + HMAC signing + X-MBX-APIKEY header (hand-rolled `userListenToken` POST; SDK binds no endpoint for it)
@@ -481,6 +534,89 @@ binance-sdk=70.2.0  # 2026-09-14 | Exchange SDK, signing/IO. PINNED: margin user
 # zero packages added or removed. The vendored Cargo.lock's syn/thiserror/etc. drift is irrelevant.
 # CONSUMER-SIDE API CHURN: NONE -- the new field is builder-defaulted and we construct both configs via
 # the builder, so the crate type-checks unchanged (CI `cargo check --all-features` passed on the bump).
+#
+# Re-verified against the =73.0.0 crates.io source on 2026-10-06 (70.2.0 -> 73.0.0, three majors; PR #492).
+# Published from git 5ff71b43abcbfc1a22530547fa95b97e331c2443 (70.2.0 = 01eaf08eefe7fc99046d5ff2a90b04a7b7c6eed5).
+# THE ENTIRE `src/common/` DIRECTORY IS BYTE-IDENTICAL (all 8 files, `diff -r` empty; websocket.rs md5
+# 367bbb4fe76c40d401ba23bcaba8c08a, utils.rs md5 1541c46b7c5ba4f5f7ef57286c99695d, both unchanged), so all 3
+# internals hold BY CONSTRUCTION. Quoted from 73.0.0 anyway:
+#   1. `send_message(&self, method: &str, payload: BTreeMap<String, Value>,
+#      options: WebsocketMessageSendOptions) -> Result<SendWebsocketMessageResult<R>, WebsocketError>`
+#      (websocket.rs:1667); WebsocketMessageSendOptions (websocket.rs:1439-1444) still carries exactly
+#      with_api_key / is_signed / is_session_logon / is_session_logout. Both margin call sites
+#      (margin.rs:1595, :1635) still pass `WebsocketMessageSendOptions::new()`, i.e. unsigned, no API key.
+#   2. `WebsocketEventEmitter::subscribe` (websocket.rs:128) still spawns ONE task draining one unbounded
+#      channel via a sequential `while let Some(event) = rx.recv().await` (:141). The contract the
+#      non-atomic `Option::take()` calls in the margin `account_stream` callback (registered at
+#      margin.rs:1979) rely on holds.
+#   3. `send_request(configuration, endpoint, method, query_params, body_params, time_unit, is_signed)`
+#      -- 7-arg shape unchanged (utils.rs:951-959). `is_signed` still injects `timestamp` (:967-968), signs
+#      via `configuration.signature_gen.get_signature(...)` (:979-980), appends `signature` to the query
+#      string (:997) and sets `X-MBX-APIKEY` (:1034). The hand-rolled `POST /sapi/v1/userListenToken`
+#      (margin.rs:1510) is still signed as intended.
+# (margin.rs line numbers are as of the PR's base, develop at the time of review; they drift.)
+#
+# What changed outside common/ (108 files differ under src/ + examples/; 20 files added/removed):
+# regenerated spot WS-API models (per-endpoint `rate_limits` inner types, `TickerTradingDayResponse` is now
+# an enum, new tax/special commission models), one new margin REST endpoint
+# (`query_margin_accounts_open_otootoco_order_lists`), and doc rewording. Of the types rustrade reads, ONE
+# field changed type: `spot::websocket_api::ExecutionReport::n_uppercase` (the `N` commission-asset field)
+# went `Option<String>` -> `Option<Option<String>>` with `#[serde(default, with =
+# "::serde_with::rust::double_option")]` (absent -> None, JSON null -> Some(None), "BNB" -> Some(Some)).
+# The same change hit `spot::websocket_streams::ExecutionReport`, which we do not use.
+# `margin_trading::websocket_streams::ExecutionReport` is UNCHANGED (still `Option<String>`), so the shared
+# accessor macro in binance/shared.rs cannot read both with one expression; the fix flattens per type
+# (null and absent both map to None, exactly what the old `Option<String>` deserialisation produced, so
+# behaviour is preserved). All other fields the macro reads (x, X, s, S, i, c, T, t, L, l, n, z, r, o, p, q, f)
+# are identical in type in both versions. The REST models we read (GetOrderResponse,
+# GetOpenOrdersResponseInner, AllOrdersResponseInner, MyTradesResponseInner, GetAccountResponseBalancesInner,
+# the margin REST responses), OutboundAccountPosition(+BInner) and BalanceUpdate are byte-identical.
+#
+# Security: PASS. Real `unsafe`: 10 in BOTH, all `env::set_var`/`remove_var` below the `#[cfg(test)]` at
+# utils.rs:1353 (bare grep 17 -> 17, same over-count caveat as before). Zero `unsafe` outside common/.
+# build.rs identical (md5 32353f57fa3d951fe6be1ce5c5edb33c, 6 lines). NETWORK: zero new hosts; the URL set
+# only LOSES entries (doc links, and `wss://fstream.binance.com/{market,public}/stream`, which are
+# derivatives modules we do not compile). Env reads, filesystem sites, credential handling, process spawn
+# (none) and obfuscation (none) are all in byte-identical files. Both standing caveats carry forward
+# unchanged: the `BINANCE_CONNECTOR_RUST_USER_AGENT` crafted-value panic (utils.rs:437, :1032) and the DEBUG
+# log of the signed WS request (now websocket.rs:1702; same line, file unchanged -- the 1665 recorded
+# earlier was the 69.x line number).
+#
+# Dependency surface: Cargo.toml differs by the version line ALONE (`[dependencies]`, `[dev-dependencies]`,
+# `[build-dependencies]`, `[features]` identical). The PR's Cargo.lock delta is the binance-sdk version +
+# checksum plus 12 one-line re-pointings of EXISTING packages' dependency edges (windows-sys ->0.61.2,
+# socket2 0.5.10 -> 0.6.3, getrandom 0.3.4 -> 0.4.2 for tempfile): zero `[[package]]` entries added or
+# removed, no net-new crates. CONSUMER-SIDE API CHURN: one line, the `commission_asset` accessor above.
+#
+# Re-verified against the =74.0.0 crates.io source on 2026-10-08 (73.0.0 -> 74.0.0). .crate sha256
+# 3bf2c8c50455875559da8c03427f7ce741b0e7528f4508d73e0e6c7fb319eba8 matches the index; publisher unchanged
+# (solutionsGH); published from git 2771d295e46e0fdc8f5aca6296765fe43c46c3ee.
+# THE ENTIRE `src/` DELTA IS ONE MODULE WE DO NOT COMPILE: `diff -rq` over src/ returns 12 entries, all under
+# dual_investment/rest_api/ (the `change_auto_compound_status` endpoint and its response model removed --
+# what made it MAJOR -- plus reshaped dual-investment response models), behind the `dual_investment`
+# feature (lib.rs:35-36), not in our `spot` + `margin_trading` selection. `src/common/`, `src/spot/`,
+# `src/margin_trading/` and `src/lib.rs` are ALL BYTE-IDENTICAL (websocket.rs md5
+# 367bbb4fe76c40d401ba23bcaba8c08a, utils.rs md5 1541c46b7c5ba4f5f7ef57286c99695d, lib.rs md5
+# 971a687c42268b035b75255d898b8c18 -- all unchanged), so all 3 internals hold BY CONSTRUCTION:
+#   1. `send_message` (websocket.rs:1667), WebsocketMessageSendOptions (:1439-1443) still exactly
+#      with_api_key / is_signed / is_session_logon / is_session_logout; both margin call sites
+#      (margin.rs:1594, :1634) still pass `WebsocketMessageSendOptions::new()` (:1597, :1637).
+#   2. `WebsocketEventEmitter::subscribe` (websocket.rs:128-146): one task, one unbounded channel, sequential
+#      `while let Some(event) = rx.recv().await { callback(event) }`; registered at margin.rs:1978.
+#   3. `send_request` (utils.rs:951-959), 7 args; timestamp (:967-968), `get_signature` (:971-980),
+#      `signature` appended (:996-997), `X-MBX-APIKEY` (:1034); hand-rolled `userListenToken` POST at
+#      margin.rs:1509.
+# (margin.rs line numbers are as of this PR's head; they drift.)
+# Still no `userListenToken` / `userDataStream.subscribe.listenToken` binding in margin_trading (#109 stays
+# blocked). `MarginAccountNewOrderParams` has carried `trailing_delta: Option<i64>` since 69.x (still there,
+# trade_api.rs:2723), so the margin trailing-stop gap (#106) is ours, not the SDK's.
+#
+# Security: PASS, unchanged rather than equivalent -- real `unsafe` is the same 10 test-only sites in the
+# byte-identical utils.rs; build.rs identical; constants.rs identical (no new hosts); no new env reads,
+# filesystem, process or encoded-blob sites in the delta. Both standing caveats carry forward unchanged.
+# Dependency surface: Cargo.toml.orig differs by the version line and one removed dual_investment
+# `[[example]]` only; `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]` and `[features]`
+# identical. Our Cargo.lock delta is binance-sdk's version + checksum alone. CONSUMER-SIDE API CHURN: NONE.
 quick-xml  # 2026-07-08 | New direct dep (XML parsing of broker Flex statements). Reviewed @ 0.41.0: #![forbid(unsafe_code)] crate-wide, zero net-new transitive deps (serde+memchr only, both already in tree), no RUSTSEC advisories, de-facto-standard parser. Not pinned — any version bump still needs review.
 #   Re-reviewed @ 0.42.0 (2026-09-16), the review this entry's "any version bump still needs
 #   review" mandates. All four properties recorded at 0.41.0 re-verified and still hold:
@@ -616,6 +752,19 @@ databento  # 2026-09-13 | Direct dep (historical + live market data). Meets the 
 #   async-compression 0.4.43 -> 0.4.44 and the lockstep dbn-macros pin; neither crate has a build.rs, and
 #   neither reads env, spawns processes or opens network connections. The PR changes the databento, dbn and
 #   dbn-macros entries in Cargo.lock and nothing else: zero packages added or removed.
+#   Re-verified @ 0.63.0 on 2026-10-06 (databento 0.62.0 -> 0.63.0, dbn + dbn-macros 0.70.0 -> 0.71.0,
+#   databento's zstd requirement 0.13 -> 0.14), against the crates.io sources.
+#   databento: the src/ delta is live/client.rs only. `next_record()`/`try_next_record()` now decode in batches
+#   through `DbnFsm::process_batch()`/`next_buffered_record()` -- the path reviewed at 0.70.0 above, so our
+#   live.rs `next_record()` loop now reaches it too. Same Ok(Some)/Ok(None)/Err contract; the heartbeat timeout
+#   is still applied per socket read. Still zero `unsafe`, no build.rs, the same 16 direct deps, the same
+#   endpoints, and the only env read is still `DATABENTO_API_KEY`.
+#   dbn: the src/ delta is one `#[deprecated]` on `async_decode_record_ref_with_fsm` (unused by us) plus test
+#   edits; fsm.rs is unchanged from 0.70.0. `unsafe` count unchanged (135; 114 excluding python/). No soundness
+#   fixes in this release's changelog.
+#   Cargo.lock adds zero packages. It drops zstd 0.13.3 + zstd-safe 7.2.4 (parquet already uses zstd 0.14),
+#   bumps async-compression 0.4.50 and compression-codecs 0.4.45, and re-points some edges at the
+#   already-present windows-sys 0.61.2, socket2 0.6.3 and getrandom 0.4.2.
 
 # Net-new lockfile entries NOT attributable to a tier-2 crate above, recorded so the
 # "measured by diffing Cargo.lock" claim in the parquet entry stays true of the whole file:

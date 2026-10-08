@@ -7,24 +7,20 @@
 //!
 //! # Spot Market Subscriptions
 //!
-//! Hyperliquid spot uses `@{index}` format for WebSocket subscriptions.
-//! Use [`resolve_spot_pair`] to convert pair names to the required format:
-//!
-//! ```ignore
-//! let coin = resolve_spot_pair("hype", "usdc").await?; // "@107"
-//! ```
+//! Hyperliquid names every spot pair but PURR/USDC by its index (`@107` is HYPE/USDC).
+//! [`HyperliquidMeta::spot_pair`] finds a pair's coin from its tokens.
 
 // Example binary: panics are acceptable for demonstration code.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use futures_util::StreamExt;
 use rustrade_data::{
-    exchange::hyperliquid::{HyperliquidSpot, resolve_spot_pair},
+    exchange::hyperliquid::{HyperliquidMeta, HyperliquidSpot, Network},
+    instrument::MarketInstrumentData,
     streams::{Streams, reconnect::stream::ReconnectingStream},
     subscriber::WebSocketSubscriber,
-    subscription::{book::OrderBooksL2, trade::PublicTrades},
+    subscription::{Subscription, book::OrderBooksL2, trade::PublicTrades},
 };
-use rustrade_instrument::instrument::market_data::kind::MarketDataInstrumentKind;
 use tracing::{info, warn};
 
 const MAX_EVENTS: usize = 10;
@@ -35,23 +31,25 @@ async fn main() {
 
     info!("Subscribing to Hyperliquid SPOT market data...");
 
-    // Resolve pair name to @index format (fetches spotMeta on first call)
-    let hype_usdc = resolve_spot_pair("hype", "usdc")
+    // Read the spot pairs and find HYPE/USDC by its tokens
+    let meta = HyperliquidMeta::fetch(Network::Mainnet, &[])
         .await
-        .expect("Failed to resolve HYPE/USDC spot pair");
-    info!("Resolved HYPE/USDC -> {}", hype_usdc);
+        .expect("Failed to read Hyperliquid market metadata");
+    let pair = meta
+        .spot_pair("HYPE", "USDC")
+        .expect("Hyperliquid lists no HYPE/USDC pair");
+    info!("HYPE/USDC is subscribed as {}", pair.coin());
+    let hype_usdc = MarketInstrumentData::hyperliquid_spot("hype_usdc", pair);
 
     // Subscribe to HYPE/USDC spot trades
     let trades = Streams::<PublicTrades>::builder()
         .subscribe(
             WebSocketSubscriber,
-            [(
-                HyperliquidSpot,
-                hype_usdc.as_str(),
-                "usdc",
-                MarketDataInstrumentKind::Spot,
-                PublicTrades,
-            )],
+            [Subscription {
+                exchange: HyperliquidSpot,
+                instrument: hype_usdc.clone(),
+                kind: PublicTrades,
+            }],
         )
         .init()
         .await
@@ -61,13 +59,11 @@ async fn main() {
     let books = Streams::<OrderBooksL2>::builder()
         .subscribe(
             WebSocketSubscriber,
-            [(
-                HyperliquidSpot,
-                hype_usdc.as_str(),
-                "usdc",
-                MarketDataInstrumentKind::Spot,
-                OrderBooksL2,
-            )],
+            [Subscription {
+                exchange: HyperliquidSpot,
+                instrument: hype_usdc.clone(),
+                kind: OrderBooksL2,
+            }],
         )
         .init()
         .await
@@ -84,7 +80,7 @@ async fn main() {
 
     info!(
         "Subscribed to Hyperliquid {} (HYPE/USDC) spot trades + L2 books",
-        hype_usdc
+        pair.coin()
     );
     info!("Receiving {} events then exiting...", MAX_EVENTS);
 

@@ -1,5 +1,6 @@
-use rustrade_integration::{Validator, error::SocketError};
+use rustrade_integration::{Validator, error::SocketError, subscription::SubscriptionId};
 use serde::{Deserialize, Serialize};
+use smol_str::format_smolstr;
 
 /// Hyperliquid WebSocket subscription response.
 ///
@@ -36,6 +37,23 @@ pub enum HyperliquidSubResponse {
 pub struct HyperliquidSubResponseData {
     pub method: String,
     pub subscription: serde_json::Value,
+}
+
+impl HyperliquidSubResponse {
+    /// The subscription a confirmation acknowledges, as `{type}|{coin}` — the identifier the
+    /// subscription was keyed under.
+    ///
+    /// The venue echoes the subscription it accepted, with any optional fields filled in
+    /// (`l2Book` adds `nSigFigs`, `mantissa` and `fast`), so only `type` and `coin` are read.
+    /// `None` for anything but a confirmation carrying both.
+    pub fn subscription_id(&self) -> Option<SubscriptionId> {
+        let Self::SubscriptionResponse { data } = self else {
+            return None;
+        };
+        let kind = data.subscription.get("type")?.as_str()?;
+        let coin = data.subscription.get("coin")?.as_str()?;
+        Some(SubscriptionId(format_smolstr!("{kind}|{coin}")))
+    }
 }
 
 impl Validator for HyperliquidSubResponse {
@@ -85,6 +103,70 @@ mod tests {
                 HyperliquidSubResponse::SubscriptionResponse { .. }
             ));
             assert!(response.validate().is_ok());
+        }
+
+        #[test]
+        fn a_confirmation_names_its_subscription_by_type_and_coin() {
+            // Payload as served by mainnet: `l2Book` echoes its optional fields.
+            let input = r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"l2Book","coin":"xyz:TSLA","nSigFigs":null,"mantissa":null,"fast":false}}}"#;
+
+            let response: HyperliquidSubResponse = serde_json::from_str(input).unwrap();
+            assert_eq!(
+                response.subscription_id(),
+                Some(SubscriptionId::from("l2Book|xyz:TSLA"))
+            );
+        }
+
+        #[test]
+        fn anything_but_a_complete_confirmation_names_no_subscription() {
+            for input in [
+                r#"{"channel":"pong"}"#,
+                r#"{"channel":"error","data":"invalid subscription"}"#,
+                r#"{"channel":"subscriptionResponse","data":{"method":"subscribe","subscription":{"type":"allMids"}}}"#,
+            ] {
+                let response: HyperliquidSubResponse = serde_json::from_str(input).unwrap();
+                assert_eq!(response.subscription_id(), None, "{input}");
+            }
+        }
+
+        #[test]
+        fn an_echoed_subscription_names_the_id_it_was_keyed_under() {
+            use crate::{
+                Identifier,
+                exchange::{
+                    Connector, ExchangeSub,
+                    hyperliquid::{
+                        Hyperliquid, channel::HyperliquidChannel, market::HyperliquidMarket,
+                    },
+                },
+                subscription::{Subscription, book::OrderBooksL2, trade::PublicTrades},
+            };
+            use rustrade_instrument::instrument::market_data::{
+                MarketDataInstrument, kind::MarketDataInstrumentKind::Perpetual,
+            };
+
+            /// Echo the subscription the request carries back as the venue's confirmation, and
+            /// check it names the id the mapper keyed the subscription under.
+            fn round_trip(exchange_sub: ExchangeSub<HyperliquidChannel, HyperliquidMarket>) {
+                let keyed = exchange_sub.id();
+                let request = Hyperliquid::requests(vec![exchange_sub]).remove(0);
+                let request: serde_json::Value =
+                    serde_json::from_str(request.to_text().unwrap()).unwrap();
+                let echoed = serde_json::json!({
+                    "channel": "subscriptionResponse",
+                    "data": {"method": "subscribe", "subscription": request["subscription"]},
+                });
+
+                let response: HyperliquidSubResponse = serde_json::from_value(echoed).unwrap();
+                assert_eq!(response.subscription_id(), Some(keyed));
+            }
+
+            let trades: Subscription<Hyperliquid, MarketDataInstrument, PublicTrades> =
+                (Hyperliquid, "btc", "usdc", Perpetual, PublicTrades).into();
+            let books: Subscription<Hyperliquid, MarketDataInstrument, OrderBooksL2> =
+                (Hyperliquid, "eth", "usdc", Perpetual, OrderBooksL2).into();
+            round_trip(ExchangeSub::new(&trades));
+            round_trip(ExchangeSub::new(&books));
         }
 
         #[test]

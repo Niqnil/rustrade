@@ -20,6 +20,10 @@
 // documentation-bearing alias bounds kept intentionally. Denying these adds churn without improving
 // the API.
 #![allow(clippy::type_complexity, clippy::too_many_arguments, type_alias_bounds)]
+// Clippy 1.99 checks each field's span rather than the whole expression's, so the
+// `Self { field: field }` that `derive_more::Constructor` expands to is reported at our own
+// field declarations. Remove once rust-lang/rust-clippy#17525 is fixed in a stable release.
+#![allow(clippy::redundant_field_names)]
 
 //! # Barter-Instrument
 //! Barter-Instrument contains core Exchange, Instrument and Asset data structures and associated utilities.
@@ -56,6 +60,11 @@ pub mod corporate_action;
 /// Interactive Brokers support types (behind `ibkr` feature).
 #[cfg(feature = "ibkr")]
 pub mod ibkr;
+
+// Documented in the module itself: an outer doc comment here would resolve its intra-doc links
+// from the crate root.
+#[cfg(feature = "hyperliquid")]
+pub mod hyperliquid;
 
 /// A keyed value.
 ///

@@ -11,13 +11,17 @@
 //! it over pattern matching on specific variants, as the internal taxonomy may
 //! evolve while `is_transient()` semantics remain stable.
 
+use derive_more::Constructor;
+use rust_decimal::Decimal;
 use rustrade_instrument::{
     asset::{AssetIndex, name::AssetNameExchange},
     exchange::ExchangeId,
+    index::error::IndexError,
     instrument::{InstrumentIndex, name::InstrumentNameExchange},
 };
 use rustrade_integration::error::SocketError;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use thiserror::Error;
 
 /// Type alias for a [`ClientError`] that is keyed on [`AssetNameExchange`] and
@@ -68,21 +72,23 @@ pub enum ClientError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     #[error("internal error: {0}")]
     Internal(String),
 
-    /// Activity pagination was truncated at the page limit.
+    /// A bounded read of fills could not advance past its start: more fills share the span's
+    /// first moment than one call can read, so a read from the same start would stop at the same
+    /// place.
     ///
-    /// The returned data from the underlying call is a partial result. This error
-    /// indicates that more activities exist beyond the safety limit, typically due
-    /// to a very long outage (>5000 fills). Callers should alert operators and
-    /// consider manual reconciliation.
-    #[error("activity pagination truncated at {limit} pages — data may be incomplete")]
+    /// [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades) returns it
+    /// rather than a [`TradesRead`](crate::trade::TradesRead) whose `resume` could only loop. The
+    /// fills it read are not returned. Callers should alert operators and reconcile the span
+    /// another way.
+    #[error("trade read stopped after {fills_read} fills without advancing past its start")]
     Truncated {
-        /// Maximum number of pages that were fetched before truncation.
-        limit: usize,
+        /// How many fills the read returned before it stopped.
+        fills_read: usize,
     },
 
     /// Open orders snapshot was truncated at the API's row limit.
     ///
-    /// Unlike [`Self::Truncated`] (which applies to paginated activity fetches), this
+    /// Unlike [`Self::Truncated`] (which applies to paginated fill reads), this
     /// error indicates a single-request endpoint hit its maximum row count.
     /// Alpaca's `/v2/orders` endpoint caps results at 500; accounts with more
     /// concurrent open orders will have an incomplete snapshot.
@@ -144,7 +150,7 @@ pub enum ConnectivityError {
     /// Transient — retry with backoff. May indicate network congestion, server
     /// overload, or an overly aggressive timeout. Consider increasing timeout
     /// on subsequent attempts.
-    #[error("ExecutionRequest timed out")]
+    #[error("request timed out")]
     Timeout,
 
     /// Network-level socket error (connection refused, reset, DNS failure, etc.).
@@ -189,6 +195,15 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// - The [`AssetNameExchange`] was an invalid format.
     ///
     /// Not transient — do not retry. The asset identifier must be corrected.
+    ///
+    /// Indexed only when the [`ExecutionInstrumentMap`] holds the asset. Otherwise there is no
+    /// index to carry, and [`AccountEventIndexer`] reports it as
+    /// [`OrderRejected`](Self::OrderRejected) (from an order request) or
+    /// [`RequestRejected`](Self::RequestRejected) (from any other request), holding this error's
+    /// own message.
+    ///
+    /// [`ExecutionInstrumentMap`]: crate::map::ExecutionInstrumentMap
+    /// [`AccountEventIndexer`]: crate::indexer::AccountEventIndexer
     #[error("asset {0} invalid: {1}")]
     AssetInvalid(AssetKey, String),
 
@@ -199,6 +214,11 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// - The [`InstrumentNameExchange`] was an invalid format.
     ///
     /// Not transient — do not retry. The instrument identifier must be corrected.
+    ///
+    /// Indexed only when the [`ExecutionInstrumentMap`] holds the instrument; otherwise reported
+    /// as [`AssetInvalid`](Self::AssetInvalid) describes.
+    ///
+    /// [`ExecutionInstrumentMap`]: crate::map::ExecutionInstrumentMap
     #[error("instrument {0} invalid: {1}")]
     InstrumentInvalid(InstrumentKey, String),
 
@@ -225,20 +245,24 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
 
     /// Balance of an asset is insufficient to execute the requested operation.
     ///
-    /// # Warning: `AssetKey` field may hold an instrument name, not an asset name
+    /// The asset is `None` when it is not known which asset ran short:
+    /// - the venue's rejection does not name it (e.g. Binance's "Account has insufficient
+    ///   balance for requested action"), and a client does not guess it from the order;
+    /// - the venue named an asset that the [`ExecutionInstrumentMap`] does not hold, so it has no
+    ///   index. [`AccountEventIndexer::api_error`] logs the name it dropped.
     ///
-    /// Some `ExecutionClient` implementations (e.g. `BinanceSpot`) populate the
-    /// `AssetKey` field with the **instrument name** (e.g. `"BTCUSDT"`) rather than
-    /// the specific low-balance asset (e.g. `"BTC"` or `"USDT"`), because splitting
-    /// a symbol into base/quote requires exchange symbol-info metadata not available
-    /// at error-parse time. Do **not** pattern-match on the `AssetKey` value to
-    /// identify the specific low-balance asset — use the `String` field for
-    /// diagnostics only.
+    /// The `String` carries the venue's message.
     ///
     /// Not transient — do not retry the same request. Reduce order size or
     /// deposit additional funds.
-    #[error("asset {0} balance insufficient: {1}")]
-    BalanceInsufficient(AssetKey, String),
+    ///
+    /// [`ExecutionInstrumentMap`]: crate::map::ExecutionInstrumentMap
+    /// [`AccountEventIndexer::api_error`]: crate::indexer::AccountEventIndexer::api_error
+    #[error(
+        "balance insufficient{asset}: {1}",
+        asset = .0.as_ref().map(|asset| format!(" for asset {asset}")).unwrap_or_default()
+    )]
+    BalanceInsufficient(Option<AssetKey>, String),
 
     /// Order was rejected by the exchange for a business rule violation.
     ///
@@ -278,6 +302,28 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// Not transient — do not retry. The order no longer exists to cancel.
     #[error("order already expired")]
     OrderAlreadyExpired,
+
+    /// Open request refused because its [`ClientOrderId`] is already in use at the venue.
+    ///
+    /// The refusal concerns this request alone: the order already under the id is **unaffected**,
+    /// and is not reported ended by it. What "in use" means is the venue's rule. On the
+    /// [`SimulatedVenue`] and the IBKR client it is an order still working under the id, and an id
+    /// is free again once its order has ended. Binance documents an id as unique among open
+    /// orders. The `String` carries the venue's message, or the client's own where it refused the
+    /// request before sending it.
+    ///
+    /// Reported by the [`SimulatedVenue`], by the IBKR client, which refuses the request before it
+    /// reaches TWS, since TWS never sees a client order id, and by the Binance spot and margin
+    /// clients, from Binance's `"Duplicate order sent."`. Other clients report a venue's duplicate
+    /// rejection as [`OrderRejected`](Self::OrderRejected) until its message has been confirmed.
+    ///
+    /// Not transient — the same request fails identically while the order under the id works.
+    /// Use another id, or wait for that order to end.
+    ///
+    /// [`ClientOrderId`]: crate::order::id::ClientOrderId
+    /// [`SimulatedVenue`]: crate::exchange::mock::SimulatedVenue
+    #[error("client order id in use: {0}")]
+    DuplicateClientOrderId(String),
 
     /// The exchange refused the request itself, rather than an order it carried.
     ///
@@ -321,6 +367,110 @@ pub enum OrderError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// trailing stop orders on a connector that only supports market/limit).
     #[error("unsupported order type: {0}")]
     UnsupportedOrderType(String),
+
+    /// A quantity or price in the request has more precision than the venue accepts, so the
+    /// client refused it without sending it.
+    ///
+    /// Non-transient — change the request. A client that refuses this way never rounds a value
+    /// itself, because rounding would place a different order than the one requested; it
+    /// documents how to read the venue's precision so the caller can round first.
+    #[error("invalid precision: {0}")]
+    InvalidPrecision(PrecisionViolation),
+}
+
+/// A value in an order request with more precision than the venue accepts, or that is not
+/// positive.
+///
+/// Carried by [`OrderError::InvalidPrecision`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub struct PrecisionViolation {
+    /// Which value of the request broke the rule.
+    pub field: OrderField,
+    /// The value as requested.
+    pub value: Decimal,
+    /// The rule it broke.
+    pub limit: PrecisionLimit,
+}
+
+impl PrecisionViolation {
+    /// The request's `field`, of `value`, breaks `limit`.
+    pub fn new(field: OrderField, value: Decimal, limit: PrecisionLimit) -> Self {
+        Self {
+            field,
+            value,
+            limit,
+        }
+    }
+}
+
+impl fmt::Display for PrecisionViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            field,
+            value,
+            limit,
+        } = self;
+        write!(f, "{field} {value} ")?;
+        match limit {
+            PrecisionLimit::DecimalPlaces { max } => {
+                write!(f, "has more than {max} decimal places")
+            }
+            PrecisionLimit::SignificantFigures { max } => {
+                write!(
+                    f,
+                    "is not an integer and has more than {max} significant figures"
+                )
+            }
+            PrecisionLimit::NotRepresentable => {
+                write!(f, "cannot be sent exactly in the venue's number format")
+            }
+            PrecisionLimit::NotPositive => write!(f, "is not positive"),
+        }
+    }
+}
+
+/// A value of an order request, as named by a [`PrecisionViolation`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub enum OrderField {
+    /// The order's quantity.
+    Quantity,
+    /// The order's limit price.
+    Price,
+    /// The price that triggers a stop or take-profit order.
+    TriggerPrice,
+}
+
+impl fmt::Display for OrderField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Quantity => "quantity",
+            Self::Price => "price",
+            Self::TriggerPrice => "trigger price",
+        })
+    }
+}
+
+/// A venue's precision rule, as broken by a [`PrecisionViolation`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub enum PrecisionLimit {
+    /// The value may have at most `max` decimal places.
+    DecimalPlaces {
+        /// The most decimal places allowed.
+        max: u32,
+    },
+    /// The value may have at most `max` significant figures, unless it is an integer.
+    SignificantFigures {
+        /// The most significant figures allowed.
+        max: u32,
+    },
+    /// The value cannot be sent exactly: the venue's client library converts it to a number
+    /// format that would change it.
+    NotRepresentable,
+    /// The value is zero or negative. A quantity or price must be positive.
+    NotPositive,
 }
 
 impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
@@ -333,12 +483,14 @@ impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
     ///
     /// # Non-transient errors
     /// - Other [`Rejected`](Self::Rejected) errors (invalid instrument, insufficient balance, etc.)
+    /// - [`UnsupportedOrderType`](Self::UnsupportedOrderType) and
+    ///   [`InvalidPrecision`](Self::InvalidPrecision)
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Connectivity(e) => e.is_transient(),
             Self::Rejected(ApiError::RateLimit) => true,
             Self::Rejected(_) => false,
-            Self::UnsupportedOrderType(_) => false,
+            Self::UnsupportedOrderType(_) | Self::InvalidPrecision(_) => false,
         }
     }
 }
@@ -386,6 +538,40 @@ pub enum StreamTerminationReason {
     /// lagged past the buffer). The consumer is responsible for any re-establishment.
     #[error("unrecoverable stream error: {0}")]
     Error(String),
+}
+
+/// Type alias for an [`AccountStreamInitError`] that is keyed on [`AssetNameExchange`] and
+/// [`InstrumentNameExchange`] (yet to be indexed).
+pub type UnindexedAccountStreamInitError =
+    AccountStreamInitError<AssetNameExchange, InstrumentNameExchange>;
+
+/// Why an attempt to initialise an account stream, its snapshot and its updates, failed.
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
+pub enum AccountStreamInitError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
+    /// The [`ExecutionClient`](crate::client::ExecutionClient) failed to fetch the account
+    /// snapshot or to open the account stream. See [`ClientError::is_transient`].
+    #[error("{0}")]
+    Client(#[from] ClientError<AssetKey, InstrumentKey>),
+
+    /// The account snapshot named an exchange, asset or instrument that is not indexed. This does
+    /// not resolve on retry while the venue keeps reporting it.
+    #[error("IndexError: {0}")]
+    Index(#[from] IndexError),
+}
+
+/// A failed attempt to re-initialise an account stream after it ended.
+///
+/// Delivered in-band as the payload of
+/// [`AccountEventKind::ReinitFailed`](crate::AccountEventKind::ReinitFailed), once per failed
+/// attempt. Attempts continue with backoff; giving up is the consumer's decision.
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Constructor)]
+pub struct AccountReinitFailure<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
+    /// Consecutive failed attempts since the stream last initialised, starting at 1.
+    pub attempt: u32,
+    /// Why this attempt failed.
+    pub error: AccountStreamInitError<AssetKey, InstrumentKey>,
 }
 
 /// Represents errors related to exchange, asset and instrument identifier key lookups.
@@ -439,8 +625,10 @@ mod tests {
             ClientError::Api(ApiError::AssetInvalid(AssetIndex(0), "bad".into()));
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
 
-        let err: ClientError =
-            ClientError::Api(ApiError::BalanceInsufficient(AssetIndex(0), "low".into()));
+        let err: ClientError = ClientError::Api(ApiError::BalanceInsufficient(
+            Some(AssetIndex(0)),
+            "low".into(),
+        ));
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
 
         let err: ClientError = ClientError::Api(ApiError::InstrumentInvalid(
@@ -468,6 +656,16 @@ mod tests {
     }
 
     #[test]
+    fn balance_insufficient_names_its_asset_only_when_known() {
+        let named: UnindexedApiError =
+            ApiError::BalanceInsufficient(Some(AssetNameExchange::new("BTC")), "low".to_string());
+        assert_eq!(named.to_string(), "balance insufficient for asset BTC: low");
+
+        let unnamed: UnindexedApiError = ApiError::BalanceInsufficient(None, "low".to_string());
+        assert_eq!(unnamed.to_string(), "balance insufficient: low");
+    }
+
+    #[test]
     fn test_client_error_not_transient_task_failed() {
         let err: ClientError = ClientError::TaskFailed("task panicked".into());
         assert!(!err.is_transient());
@@ -481,7 +679,7 @@ mod tests {
 
     #[test]
     fn test_client_error_not_transient_truncated() {
-        let err: ClientError = ClientError::Truncated { limit: 100 };
+        let err: ClientError = ClientError::Truncated { fills_read: 5_000 };
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
 
         let err: ClientError = ClientError::TruncatedSnapshot { limit: 500 };
@@ -525,7 +723,7 @@ mod tests {
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
 
         let err: UnindexedOrderError = OrderError::Rejected(ApiError::BalanceInsufficient(
-            AssetNameExchange::from("BTC"),
+            Some(AssetNameExchange::from("BTC")),
             "insufficient".into(),
         ));
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);

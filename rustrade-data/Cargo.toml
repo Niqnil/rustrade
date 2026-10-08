@@ -1,6 +1,6 @@
 [package]
 name = "rustrade-data"
-version = "0.8.0"
+version = "0.9.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -11,10 +11,15 @@ documentation = "https://docs.rs/rustrade-data"
 readme = "README.md"
 description = "High performance & normalised WebSocket intergration for leading cryptocurrency exchanges - batteries included."
 
+# Every provider module (alpaca/databento/hyperliquid/ibkr/lse/massive) is feature-gated and
+# `default = []`, so a default-feature docs.rs build would document none of them.
+[package.metadata.docs.rs]
+all-features = true
+
 [features]
 default = []
 ibkr = ["dep:ibapi", "dep:time", "dep:quick-xml", "rustrade-instrument/ibkr"]
-hyperliquid = ["dep:hyperliquid_rust_sdk"]
+hyperliquid = ["dep:hyperliquid_rust_sdk", "rustrade-instrument/hyperliquid"]
 # `serde-with-float` provides the field-level `rust_decimal::serde::float` / `float_option`
 # helpers the clients use to deserialize `new_rate`/`old_rate` (and Massive's price/size) JSON
 # numbers into `Decimal`. It deliberately does NOT enable the global `serde-float` feature, whose
@@ -124,7 +129,7 @@ vecmap-rs = { workspace = true }
 fnv = { workspace = true }
 
 # IBKR (optional, behind "ibkr" feature)
-ibapi = { version = "=4.2.0", optional = true, default-features = false, features = ["sync"] }
+ibapi = { version = "=5.0.0", optional = true, default-features = false, features = ["sync"] }
 time = { version = "0.3", optional = true, features = ["macros"] }
 # XML parser for IBKR Flex Web Service statements (corporate-action reconciliation). New normal dep
 # (serde-xml-rs/xml-rs are only a build-dep of time-tz via ibapi, not reusable). Note for tier-2 review.
@@ -138,7 +143,7 @@ hyperliquid_rust_sdk = { version = "0.6", optional = true }
 # `chrono` enables `DateTimeRange: From<(DateTime<Utc>, DateTime<Utc>)>`, so the
 # candle historical path can build `GetRangeParams` from a chrono range without a
 # manual chrono->time conversion (chrono is already a core dependency).
-databento = { version = "0.62", optional = true, features = ["chrono"] }
+databento = { version = "0.63", optional = true, features = ["chrono"] }
 
 # Massive (optional, behind "massive" feature)
 urlencoding = { version = "2.1", optional = true }

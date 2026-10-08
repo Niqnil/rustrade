@@ -76,10 +76,17 @@ async fn main() {
 
     info!("Connected!");
 
-    // Register AAPL contract
+    // Resolve the AAPL contract through IB, then register it. IB reports fills and positions
+    // by contract id, which a locally built contract lacks until it is resolved. A contract
+    // listed in `IbkrConfig::contracts` is resolved and registered when the client connects.
     let aapl_name: InstrumentNameExchange = "AAPL".into();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
+    let aapl_contract = client
+        .resolve_contract(&stock_contract("AAPL", "SMART", "USD"))
+        .await
+        .expect("AAPL must resolve to one IB contract");
+    client
+        .register_contract(aapl_name.clone(), aapl_contract)
+        .expect("a resolved contract registers");
 
     info!("Registered AAPL contract");
 
@@ -149,61 +156,50 @@ async fn main() {
 
     info!("Placing BUY 1 AAPL @ $1.00 (won't fill - too far from market)");
 
-    match client.open_order(open_request).await {
-        Some(response) => {
-            match &response.state {
-                OrderState::Active(ActiveOrderState::Open(open_state)) => {
-                    info!("Order placed successfully!");
-                    info!("  Client Order ID: {}", response.key.cid);
-                    info!("  Exchange Order ID: {:?}", open_state.id);
+    let response = client.open_order(open_request).await;
+    match &response.state {
+        OrderState::Active(ActiveOrderState::Open(open_state)) => {
+            info!("Order placed successfully!");
+            info!("  Client Order ID: {}", response.key.cid);
+            info!("  Exchange Order ID: {:?}", open_state.id);
 
-                    // Wait a moment then cancel
-                    info!("");
-                    info!("=== Canceling Order ===");
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            // Wait a moment then cancel
+            info!("");
+            info!("=== Canceling Order ===");
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-                    let cancel_key = OrderKey {
-                        exchange: ExchangeId::Ibkr,
-                        instrument: &aapl_name,
-                        strategy: response.key.strategy.clone(),
-                        cid: response.key.cid.clone(),
-                    };
+            let cancel_key = OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &aapl_name,
+                strategy: response.key.strategy.clone(),
+                cid: response.key.cid.clone(),
+            };
 
-                    let cancel_request = OrderEvent {
-                        key: cancel_key,
-                        state: RequestCancel {
-                            id: Some(open_state.id.clone()),
-                        },
-                    };
+            let cancel_request = OrderEvent {
+                key: cancel_key,
+                state: RequestCancel {
+                    id: Some(open_state.id.clone()),
+                },
+            };
 
-                    match client.cancel_order(cancel_request).await {
-                        Some(cancel_response) => match &cancel_response.state {
-                            Ok(_cancelled) => {
-                                info!("Order canceled successfully!");
-                            }
-                            Err(e) => {
-                                warn!("Cancel rejected: {e:?}");
-                            }
-                        },
-                        None => {
-                            info!("Cancel request sent (no immediate response)");
-                        }
-                    }
+            match client.cancel_order(cancel_request).await.state {
+                Ok(_cancelled) => {
+                    info!("Order canceled successfully!");
                 }
-                OrderState::Inactive(inactive) => {
-                    warn!("Order rejected: {inactive:?}");
-                    warn!("This may be due to:");
-                    warn!("  - 'Read-Only API' is checked in TWS settings");
-                    warn!("  - Account not authorized for AAPL trading");
-                    warn!("  - Invalid order parameters");
-                }
-                other => {
-                    info!("Unexpected order state: {other:?}");
+                Err(e) => {
+                    warn!("Cancel rejected: {e:?}");
                 }
             }
         }
-        None => {
-            info!("Order request sent (no immediate response)");
+        OrderState::Inactive(inactive) => {
+            warn!("Order rejected: {inactive:?}");
+            warn!("This may be due to:");
+            warn!("  - 'Read-Only API' is checked in TWS settings");
+            warn!("  - Account not authorized for AAPL trading");
+            warn!("  - Invalid order parameters");
+        }
+        other => {
+            info!("Unexpected order state: {other:?}");
         }
     }
 

@@ -23,6 +23,14 @@ impl Display for SubscriptionId {
     }
 }
 
+/// Join [`SubscriptionId`]s with `", "` for an error message or a log line.
+pub fn display_subscription_ids(ids: &[SubscriptionId]) -> String {
+    ids.iter()
+        .map(SubscriptionId::as_ref)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 impl AsRef<str> for SubscriptionId {
     fn as_ref(&self) -> &str {
         &self.0

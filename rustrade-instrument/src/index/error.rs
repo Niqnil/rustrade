@@ -43,6 +43,24 @@ pub enum IndexError {
     #[error("duplicate InstrumentNameInternal: {0}")]
     DuplicateInstrumentNameInternal(String),
 
+    /// Two or more [`Instrument`](crate::instrument::Instrument)s on one exchange share an
+    /// [`InstrumentNameExchange`](crate::instrument::name::InstrumentNameExchange), ignoring ASCII
+    /// case.
+    ///
+    /// The exchange-side name is how a venue reports an instrument, so every order, fill and
+    /// position it sends is resolved back to an instrument by `(exchange, name_exchange)`. With two
+    /// candidates, each lookup would pick one arbitrarily: a fill for a spot `AAPL` could land on a
+    /// CFD named `AAPL` on the same venue, with that CFD's contract size and settlement asset.
+    ///
+    /// Names that differ only in case count as one, because the lookup that resolves a venue's
+    /// name ignores case: a venue and its client do not always spell a name the way it was
+    /// registered.
+    ///
+    /// Contains a description naming the duplicated name, the exchange, and the instruments that
+    /// share it.
+    #[error("duplicate InstrumentNameExchange: {0}")]
+    DuplicateInstrumentNameExchange(String),
+
     /// An [`Instrument`](crate::instrument::Instrument)'s `contract_size` is not a positive
     /// multiplier.
     ///
@@ -74,4 +92,18 @@ pub enum IndexError {
     /// Contains a description naming the exchange, the shared name, and both `name_exchange`s.
     #[error("duplicate AssetNameInternal: {0}")]
     DuplicateAssetNameInternal(String),
+
+    /// Two distinct [`Asset`](crate::asset::Asset)s on one exchange share an
+    /// [`AssetNameExchange`](crate::asset::name::AssetNameExchange), ignoring ASCII case, while
+    /// differing in `name_internal`.
+    ///
+    /// The exchange-side name is how a venue reports an asset, so every balance and fee it sends is
+    /// resolved back to an asset by `(exchange, name_exchange)`. With two candidates, a lookup
+    /// would pick one arbitrarily. Names that differ only in case count as one, because that lookup
+    /// ignores case.
+    ///
+    /// Contains a description naming the exchange, both `name_exchange`s, and both
+    /// `name_internal`s.
+    #[error("duplicate AssetNameExchange: {0}")]
+    DuplicateAssetNameExchange(String),
 }

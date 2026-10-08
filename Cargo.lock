@@ -115,9 +115,9 @@ dependencies = [
 
 [[package]]
 name = "async-compression"
-version = "0.4.46"
+version = "0.4.50"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f10dafd0c8d2e51ae9a748805777613ed0bbe17bf586b76c8311f45c020a32f"
+checksum = "ee19bd99b43e3691acbad4e840420a4881cea6c0b66a208125a824f8fd53f5a1"
 dependencies = [
  "compression-codecs",
  "compression-core",
@@ -259,9 +259,9 @@ checksum = "d86b93f97252c47b41663388e6d155714a9d0c398b99f1005cbc5f978b29f445"
 
 [[package]]
 name = "binance-sdk"
-version = "70.2.0"
+version = "74.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3de985fce9bc743281dd571dfab76018793db135a9eb5a98743333eaa5a85734"
+checksum = "3bf2c8c50455875559da8c03427f7ce741b0e7528f4508d73e0e6c7fb319eba8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -699,9 +699,9 @@ dependencies = [
 
 [[package]]
 name = "compression-codecs"
-version = "0.4.41"
+version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58a6d0db8759036a783bc7c3f7a07f8cef3bf9470eb1db3bc86e8bcd1c5d0fe8"
+checksum = "98fc98460ba0ad5317075d3632b8dfc45d0be8c4a49347c2a38272019717614a"
 dependencies = [
  "compression-core",
  "flate2",
@@ -1129,9 +1129,9 @@ checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
 name = "databento"
-version = "0.62.0"
+version = "0.63.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd94dc74b6f9da6c9f10f8743b1075880440a380ca7389d22626ac7fe5529b6d"
+checksum = "051a91d6950dd24d084f3374a94f295415bd30710836b7077813e01f16a26ff4"
 dependencies = [
  "async-compression",
  "bon",
@@ -1148,14 +1148,14 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
- "zstd 0.13.3",
+ "zstd 0.14.0",
 ]
 
 [[package]]
 name = "dbn"
-version = "0.70.0"
+version = "0.71.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b08982f668e35af7a91f6a2ac1af86b828b45d2cdaffab38d0e11711d8d595c3"
+checksum = "4cd13d45f15b0178b517293b48d62b059fbb2b44712f5943a9bd87063b63369a"
 dependencies = [
  "async-compression",
  "async-stream",
@@ -1170,14 +1170,14 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tokio",
- "zstd 0.13.3",
+ "zstd 0.14.0",
 ]
 
 [[package]]
 name = "dbn-macros"
-version = "0.70.0"
+version = "0.71.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f65050b0331364e5e7188a2dd9e5851492573b6c14ef88a8ba44f555aec6cd8"
+checksum = "c5aef6f95f9623e8d8697a55a557d1238cc014927cbf93fb9320de09d26b8504"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1516,7 +1516,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2503,7 +2503,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "system-configuration 0.7.0",
  "tokio",
  "tower-service",
@@ -2562,9 +2562,9 @@ dependencies = [
 
 [[package]]
 name = "ibapi"
-version = "4.2.0"
+version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58d6ef89a08cbe8139430b66c167c2cbc432faaab77fcdbffc17315c6583d6eb"
+checksum = "ea07cb0b82d0cfa1388cdcbcd15803a29a7b41d7cf572b46a94eae6404acca33"
 dependencies = [
  "byteorder",
  "crossbeam",
@@ -2801,7 +2801,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3166,7 +3166,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3791,7 +3791,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.45",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -3830,7 +3830,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -4336,7 +4336,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4414,7 +4414,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4447,7 +4447,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -4477,7 +4477,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-data"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "async-stream",
  "chrono",
@@ -4522,7 +4522,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-execution"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "binance-sdk",
@@ -4562,7 +4562,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-instrument"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "chrono",
  "derive_more 2.1.1",
@@ -4579,7 +4579,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-integration"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -4613,7 +4613,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-macro"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",
@@ -5125,7 +5125,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5374,10 +5374,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6323,7 +6323,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6949,15 +6949,6 @@ dependencies = [
 
 [[package]]
 name = "zstd"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
-dependencies = [
- "zstd-safe 7.2.4",
-]
-
-[[package]]
-name = "zstd"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf06bd8162af0734b344780deb55b42a2429ae430870d13fcc12f238e880fe6e"
@@ -6972,15 +6963,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d2a5585e04f9eea4b2a3d1eca508c4dee9592a89ef6f450c11719da0726f4db"
 dependencies = [
  "libc",
- "zstd-sys",
-]
-
-[[package]]
-name = "zstd-safe"
-version = "7.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
-dependencies = [
  "zstd-sys",
 ]
 

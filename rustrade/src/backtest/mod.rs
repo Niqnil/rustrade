@@ -31,7 +31,7 @@ use crate::{
     system::config::ExecutionConfig,
 };
 use crate::{
-    engine::Engine,
+    engine::{Engine, in_flight::InFlightDeadlines},
     execution::sim::{
         SimExecutionBuild, SimExecutionBuilder, SimRunner, VenueMarketUpdate, log_venue_summary,
     },
@@ -116,11 +116,11 @@ pub struct BacktestArgsDynamic<Strategy, Risk> {
 ///
 /// # A failing run cancels its siblings
 /// The first run to fail short-circuits the batch: the others are cancelled rather than allowed to
-/// finish, and their task trees are torn down with them (see `AbortOnDrop`). Nothing partial is
-/// returned for a cancelled run, and no summary is produced for it — a sweep either yields one
-/// [`BacktestSummary`] per configuration or fails as a whole. A cancelled run's market source stops
-/// being read at its next await point, which for a metered provider bounds what a doomed sweep
-/// spends.
+/// finish. Each run executes inline in its own future and spawns no task, so cancelling it drops
+/// everything it owns. Nothing partial is returned for a cancelled run, and no summary is produced
+/// for it — a sweep either yields one [`BacktestSummary`] per configuration or fails as a whole. A
+/// cancelled run's market source stops being read at its next await point, which for a metered
+/// provider bounds what a doomed sweep spends.
 pub async fn run_backtests<
     MarketData,
     SummaryInterval,
@@ -414,10 +414,13 @@ where
         &execution_venues,
     );
 
+    // No in-flight deadlines: simulated venues have no `request_timeout` to derive one from (see
+    // `InFlightDeadlines`).
     let mut engine = Engine::new(
         clock.clone(),
         engine_state,
         execution_tx_map,
+        InFlightDeadlines::default(),
         args_dynamic.strategy,
         args_dynamic.risk,
     );

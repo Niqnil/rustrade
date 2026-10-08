@@ -2,10 +2,11 @@ use crate::{
     engine::{
         Engine,
         action::send_requests::{SendCancelsAndOpensOutput, SendRequestsOutput},
+        clock::EngineClock,
         error::UnrecoverableEngineError,
         execution_tx::ExecutionTxMap,
         state::{
-            MarketSnapshotSource, TracksInstrument,
+            MarketSnapshotSource, TracksInstrument, TracksOrder,
             order::in_flight_recorder::InFlightRequestRecorder,
         },
     },
@@ -39,14 +40,16 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk, ExchangeKey, InstrumentKey>
     GenerateAlgoOrders<ExchangeKey, InstrumentKey>
     for Engine<Clock, State, ExecutionTxs, Strategy, Risk>
 where
+    Clock: EngineClock,
     State: InFlightRequestRecorder<ExchangeKey, InstrumentKey>
         + MarketSnapshotSource<InstrumentKey>
-        + TracksInstrument<InstrumentKey>,
+        + TracksInstrument<InstrumentKey>
+        + TracksOrder<InstrumentKey>,
     ExecutionTxs: ExecutionTxMap<ExchangeKey, InstrumentKey>,
     Strategy: AlgoStrategy<ExchangeKey, InstrumentKey, State = State>,
     Risk: RiskManager<ExchangeKey, InstrumentKey, State = State>,
     ExchangeKey: Debug + Clone,
-    InstrumentKey: Debug + Clone,
+    InstrumentKey: Debug + Clone + PartialEq,
 {
     fn generate_algo_orders(&mut self) -> GenerateAlgoOrdersOutput<ExchangeKey, InstrumentKey> {
         // Generate orders

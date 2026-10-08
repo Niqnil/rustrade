@@ -12,7 +12,8 @@ use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, exchange::ExchangeId,
     instrument::name::InstrumentNameExchange,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, hash_map::Entry};
+use thiserror::Error;
 
 /// An open order held by a simulated venue.
 pub type OpenOrder = Order<ExchangeId, InstrumentNameExchange, Open>;
@@ -21,12 +22,16 @@ pub type OpenOrder = Order<ExchangeId, InstrumentNameExchange, Open>;
 ///
 /// Recorded so the venue settles on a fill, and releases on a cancel, **exactly** what it took when
 /// the order rested — rather than recomputing an amount that a changed fee model or contract size
-/// could make disagree with the one the client was told about.
+/// could make disagree with the one the client was told about. A CFD fill is the exception: what
+/// it costs depends on the position it trades against, which can move while the order rests, so
+/// its hold is released and the fill costed afresh (see `SimulatedVenue`'s reserved balances).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reservation {
     /// The asset the order pays with: quote for a buy or a CFD, base for a spot sell.
     pub asset: AssetNameExchange,
-    /// How much of it is held, inclusive of the fee the fill will charge.
+    /// How much of it is held, inclusive of the fee the fill will charge. For a CFD, net of what
+    /// the fill will pay back by closing a position, so an order that only reduces one holds
+    /// nothing.
     ///
     /// Held against the order's **unfilled** quantity alone — its whole quantity for an order that
     /// rested without trading, and the remainder alone for one the book filled in part before it
@@ -48,6 +53,15 @@ pub struct RestingOrder {
     /// take that balance and has nothing of its own to give back. See [`OpenOrders`].
     pub reservation: Option<Reservation>,
 }
+
+/// An order [`OpenOrders::insert`] refused, because another is already resting under its
+/// [`ClientOrderId`].
+///
+/// Holds the refused order and its reservation, untouched. Boxed because an order is large and the
+/// refusal is the rare path.
+#[derive(Debug, Clone, Error)]
+#[error("an order is already resting under {}", .0.order.key.cid)]
+pub struct AlreadyResting(pub Box<RestingOrder>);
 
 /// One order's place in one side of one instrument's queue.
 ///
@@ -152,46 +166,37 @@ fn deadline_of(order: &OpenOrder) -> Option<DateTime<Utc>> {
 }
 
 impl OpenOrders {
-    /// Inserts `order` holding `reservation` against it, replacing any order already held under
+    /// Inserts `order` holding `reservation` against it, unless an order is already resting under
     /// its [`ClientOrderId`].
     ///
-    /// A replacement keeps the new order's price and arrival, so amending an order loses its queue
-    /// position — which is what a venue does when the amendment changes price. The replaced order's
-    /// own reservation is returned rather than dropped, because it is still held against the
-    /// account and only its caller knows the ledger to give it back to.
+    /// # Errors
+    /// [`AlreadyResting`], carrying `order` and `reservation` back untouched, if an order is already
+    /// held under its id. The book is left exactly as it was: the order already resting keeps its
+    /// queue position, its deadline and its own reservation. `reservation` is handed back rather
+    /// than dropped because it may already be held against the account, and only the caller knows
+    /// the ledger to give it back to.
     ///
     /// `reservation` is `None` only for an order the venue did not book itself — see the type's
     /// note on reservations. It is a parameter rather than a later setter so that an order cannot
     /// reach the book in a state where what is held against it has not yet been decided.
-    ///
-    /// `#[must_use]` because dropping a displaced reservation leaks it: nothing else knows the
-    /// order it belonged to is gone, so `free` stays down for the rest of the run and
-    /// [`Balance::used`](crate::balance::Balance::used) overstates by the same amount, silently.
-    #[must_use = "a displaced order's reservation is still held against the account, and dropping \
-                  it leaks the hold for the rest of the run"]
     pub fn insert(
         &mut self,
         order: OpenOrder,
         reservation: Option<Reservation>,
-    ) -> Option<Reservation> {
-        let resting = RestingOrder {
-            order: order.clone(),
-            reservation,
-        };
-
-        let released = match self.by_id.insert(order.key.cid.clone(), resting) {
-            Some(RestingOrder {
-                order: replaced,
-                reservation,
-            }) => {
-                self.unindex(&replaced);
-                reservation
+    ) -> Result<(), AlreadyResting> {
+        let cid = order.key.cid.clone();
+        let vacant = match self.by_id.entry(cid.clone()) {
+            Entry::Occupied(_) => {
+                return Err(AlreadyResting(Box::new(RestingOrder {
+                    order,
+                    reservation,
+                })));
             }
-            None => None,
+            Entry::Vacant(vacant) => vacant,
         };
 
         if let Some(expiry) = deadline_of(&order) {
-            self.expiries.insert((expiry, order.key.cid.clone()));
+            self.expiries.insert((expiry, cid.clone()));
         }
 
         if let Some(price) = order.price {
@@ -201,11 +206,17 @@ impl OpenOrders {
                 .or_default()
                 .insert(
                     QueuePosition::new(order.side, price, order.state.time_exchange, self.seq),
-                    order.key.cid,
+                    cid,
                 );
         }
 
-        released
+        vacant.insert(RestingOrder { order, reservation });
+        Ok(())
+    }
+
+    /// Whether an order is resting under `cid`.
+    pub fn contains(&self, cid: &ClientOrderId) -> bool {
+        self.by_id.contains_key(cid)
     }
 
     /// Removes and returns the order held under `cid`, with whatever is held against it.
@@ -325,22 +336,6 @@ impl OpenOrders {
     }
 }
 
-/// Collects orders the venue did not book itself, so none of them carries a [`Reservation`].
-///
-/// This is the `initial_state` path — see [`OpenOrders`]'s note on reservations.
-impl FromIterator<OpenOrder> for OpenOrders {
-    fn from_iter<T: IntoIterator<Item = OpenOrder>>(orders: T) -> Self {
-        let mut open = Self::default();
-        for order in orders {
-            // Nothing is held against a seeded order, so a displaced one leaks nothing -- see
-            // `AccountState::from`, which makes the same argument where the duplicate would come
-            // from.
-            let _displaced = open.insert(order, None);
-        }
-        open
-    }
-}
-
 /// Narrows an order's state to `Open`, or `None` if it is in any other state.
 pub(super) fn as_open(order: UnindexedOrder) -> Option<OpenOrder> {
     match order.state {
@@ -404,6 +399,15 @@ mod tests {
         }
     }
 
+    /// A book holding `orders`, none of them with a reservation.
+    fn book(orders: impl IntoIterator<Item = OpenOrder>) -> OpenOrders {
+        let mut open = OpenOrders::default();
+        for order in orders {
+            open.insert(order, None).unwrap();
+        }
+        open
+    }
+
     fn cids(orders: impl Iterator<Item = &'static OpenOrder>) -> Vec<String> {
         orders.map(|order| order.key.cid.0.to_string()).collect()
     }
@@ -417,14 +421,12 @@ mod tests {
     /// The best bid is the highest one, and the earliest of those at the same price.
     #[test]
     fn buys_rest_highest_price_then_earliest_first() {
-        let open: OpenOrders = [
+        let open = book([
             order("low", Side::Buy, Some(dec!(99)), 1_000),
             order("high_late", Side::Buy, Some(dec!(101)), 3_000),
             order("high_early", Side::Buy, Some(dec!(101)), 2_000),
             order("mid", Side::Buy, Some(dec!(100)), 500),
-        ]
-        .into_iter()
-        .collect();
+        ]);
 
         assert_eq!(
             resting_cids(&open, Side::Buy),
@@ -436,13 +438,11 @@ mod tests {
     /// The best offer is the lowest one. Same rule, opposite price direction.
     #[test]
     fn sells_rest_lowest_price_then_earliest_first() {
-        let open: OpenOrders = [
+        let open = book([
             order("high", Side::Sell, Some(dec!(101)), 1_000),
             order("low_late", Side::Sell, Some(dec!(99)), 3_000),
             order("low_early", Side::Sell, Some(dec!(99)), 2_000),
-        ]
-        .into_iter()
-        .collect();
+        ]);
 
         assert_eq!(
             resting_cids(&open, Side::Sell),
@@ -456,12 +456,10 @@ mod tests {
     /// an order silently vanishing from the book rather than merely being mis-ranked.
     #[test]
     fn orders_at_the_same_price_and_instant_both_rest() {
-        let open: OpenOrders = [
+        let open = book([
             order("first", Side::Buy, Some(dec!(100)), 1_000),
             order("second", Side::Buy, Some(dec!(100)), 1_000),
-        ]
-        .into_iter()
-        .collect();
+        ]);
 
         assert_eq!(open.len(), 2);
         assert_eq!(
@@ -473,12 +471,10 @@ mod tests {
 
     #[test]
     fn the_two_sides_are_separate_queues() {
-        let open: OpenOrders = [
+        let open = book([
             order("bid", Side::Buy, Some(dec!(99)), 1_000),
             order("ask", Side::Sell, Some(dec!(101)), 1_000),
-        ]
-        .into_iter()
-        .collect();
+        ]);
 
         assert_eq!(resting_cids(&open, Side::Buy), ["bid"]);
         assert_eq!(resting_cids(&open, Side::Sell), ["ask"]);
@@ -486,12 +482,10 @@ mod tests {
 
     #[test]
     fn a_removed_order_leaves_the_queue() {
-        let mut open: OpenOrders = [
+        let mut open = book([
             order("a", Side::Buy, Some(dec!(100)), 1_000),
             order("b", Side::Buy, Some(dec!(99)), 1_000),
-        ]
-        .into_iter()
-        .collect();
+        ]);
 
         let removed = open.remove(&ClientOrderId::new("a")).expect("a is open");
         assert_eq!(removed.order.key.cid, ClientOrderId::new("a"));
@@ -505,12 +499,10 @@ mod tests {
     /// Removing every order must leave nothing behind for the next one to trip over.
     #[test]
     fn emptying_the_book_empties_the_queues() {
-        let mut open: OpenOrders = [
+        let mut open = book([
             order("a", Side::Buy, Some(dec!(100)), 1_000),
             order("b", Side::Buy, Some(dec!(99)), 2_000),
-        ]
-        .into_iter()
-        .collect();
+        ]);
 
         open.remove(&ClientOrderId::new("a"));
         open.remove(&ClientOrderId::new("b"));
@@ -518,49 +510,62 @@ mod tests {
         assert!(open.is_empty());
         assert!(resting_cids(&open, Side::Buy).is_empty());
 
-        assert!(
-            open.insert(order("c", Side::Buy, Some(dec!(98)), 3_000), None)
-                .is_none(),
-            "a fresh id displaces nothing"
-        );
+        open.insert(order("c", Side::Buy, Some(dec!(98)), 3_000), None)
+            .unwrap();
         assert_eq!(resting_cids(&open, Side::Buy), ["c"]);
     }
 
-    /// Re-inserting under one id replaces the order and its queue position, rather than leaving the
-    /// old position pointing at the new order.
+    /// A second order under a resting id is refused, handed back whole with its reservation, and
+    /// the order already resting keeps its place.
     #[test]
-    fn reinserting_one_id_replaces_its_queue_position() {
-        let mut open: OpenOrders = [
-            order("amended", Side::Buy, Some(dec!(100)), 1_000),
+    fn a_second_order_under_a_resting_id_is_refused_and_the_first_keeps_its_place() {
+        let mut open = book([
+            order("taken", Side::Buy, Some(dec!(100)), 1_000),
             order("other", Side::Buy, Some(dec!(99)), 1_000),
-        ]
-        .into_iter()
-        .collect();
+        ]);
+        let held = Reservation {
+            asset: AssetNameExchange::new("usdt"),
+            amount: dec!(98),
+        };
 
-        // Amended down to behind `other`. Nothing is held against a seeded order, so the
-        // displaced one returns no reservation.
-        assert!(
-            open.insert(order("amended", Side::Buy, Some(dec!(98)), 2_000), None)
-                .is_none()
+        let Err(AlreadyResting(refused)) = open.insert(
+            order("taken", Side::Buy, Some(dec!(98)), 2_000),
+            Some(held.clone()),
+        ) else {
+            panic!("an id already resting is refused");
+        };
+
+        assert_eq!(
+            refused.order.price,
+            Some(dec!(98)),
+            "the refused order comes back"
         );
-
-        assert_eq!(open.len(), 2, "a replacement is not a second order");
+        assert_eq!(
+            refused.reservation,
+            Some(held),
+            "and so does what the caller may already hold against it"
+        );
+        assert_eq!(open.len(), 2, "nothing was added");
+        assert_eq!(
+            open.get(&ClientOrderId::new("taken"))
+                .map(|order| order.price),
+            Some(Some(dec!(100))),
+            "the resting order is the one still held"
+        );
         assert_eq!(
             resting_cids(&open, Side::Buy),
-            ["other", "amended"],
-            "the amended order takes its new price's place, and appears exactly once"
+            ["taken", "other"],
+            "at its own price and place, appearing exactly once"
         );
     }
 
     /// An order with no limit price is held but cannot be matched.
     #[test]
     fn an_order_without_a_price_is_held_but_never_rests() {
-        let open: OpenOrders = [
+        let open = book([
             order("priceless", Side::Buy, None, 1_000),
             order("priced", Side::Buy, Some(dec!(100)), 1_000),
-        ]
-        .into_iter()
-        .collect();
+        ]);
 
         assert_eq!(open.len(), 2, "a snapshot must still report it");
         assert!(open.get(&ClientOrderId::new("priceless")).is_some());
@@ -574,13 +579,11 @@ mod tests {
     /// Only orders that carry a deadline are indexed for the sweep, and only once reached.
     #[test]
     fn only_orders_past_their_deadline_are_swept() {
-        let open: OpenOrders = [
+        let open = book([
             order("no_deadline", Side::Buy, Some(dec!(100)), 1_000),
             gtd("due", 5_000),
             gtd("later", 9_000),
-        ]
-        .into_iter()
-        .collect();
+        ]);
 
         assert!(
             open.expired_as_of(at(4_999)).is_empty(),
@@ -604,7 +607,7 @@ mod tests {
     /// outliving its own deadline.
     #[test]
     fn orders_sharing_a_deadline_are_both_swept_in_id_order() {
-        let open: OpenOrders = [gtd("b", 5_000), gtd("a", 5_000)].into_iter().collect();
+        let open = book([gtd("b", 5_000), gtd("a", 5_000)]);
 
         assert_eq!(
             open.expired_as_of(at(5_000)),
@@ -616,9 +619,7 @@ mod tests {
     /// An order that leaves the book takes its deadline with it, whichever way it left.
     #[test]
     fn a_removed_order_is_no_longer_swept() {
-        let mut open: OpenOrders = [gtd("gone", 5_000), gtd("stays", 5_000)]
-            .into_iter()
-            .collect();
+        let mut open = book([gtd("gone", 5_000), gtd("stays", 5_000)]);
 
         open.remove(&ClientOrderId::new("gone"));
 
@@ -629,50 +630,45 @@ mod tests {
         );
     }
 
-    /// Replacing an order replaces its deadline, rather than leaving the old one behind.
+    /// A refused order brings no deadline of its own, and the resting order keeps its own.
     #[test]
-    fn reinserting_one_id_replaces_its_deadline() {
-        let mut open: OpenOrders = [gtd("amended", 5_000)].into_iter().collect();
+    fn a_refused_order_leaves_the_resting_ones_deadline() {
+        let mut open = book([gtd("taken", 5_000)]);
 
-        assert!(
-            open.insert(gtd("amended", 9_000), None).is_none(),
-            "nothing is held against a seeded order"
-        );
+        assert!(open.insert(gtd("taken", 9_000), None).is_err());
 
-        assert!(
-            open.expired_as_of(at(5_000)).is_empty(),
-            "the superseded deadline must not survive the amendment"
-        );
         assert_eq!(
             open.expired_as_of(at(9_000)),
-            [ClientOrderId::new("amended")]
+            [ClientOrderId::new("taken")],
+            "the resting order's deadline, once: the refused one's never reached the index"
         );
+        assert_eq!(open.expired_as_of(at(5_000)), [ClientOrderId::new("taken")]);
     }
 
-    /// Amending a deadline away leaves nothing to sweep.
+    /// An id is free again once its order has left the book, and the next order under it brings
+    /// its own deadline.
     #[test]
-    fn replacing_a_deadline_with_good_until_cancelled_clears_it() {
-        let mut open: OpenOrders = [gtd("amended", 5_000)].into_iter().collect();
+    fn an_id_is_free_again_once_its_order_leaves_the_book() {
+        let mut open = book([gtd("reused", 5_000)]);
+        open.remove(&ClientOrderId::new("reused")).unwrap();
+
+        open.insert(order("reused", Side::Buy, Some(dec!(100)), 6_000), None)
+            .unwrap();
 
         assert!(
-            open.insert(order("amended", Side::Buy, Some(dec!(100)), 1_000), None)
-                .is_none(),
-            "nothing is held against a seeded order"
+            open.expired_as_of(at(9_000)).is_empty(),
+            "the first order's deadline left with it"
         );
-
-        assert!(open.expired_as_of(at(9_000)).is_empty());
-        assert_eq!(open.len(), 1, "the order itself is still open");
+        assert_eq!(resting_cids(&open, Side::Buy), ["reused"]);
     }
 
     #[test]
     fn iter_reports_every_open_order() {
-        let open: OpenOrders = [
+        let open = book([
             order("a", Side::Buy, Some(dec!(100)), 1_000),
             order("b", Side::Sell, Some(dec!(101)), 1_000),
             order("c", Side::Buy, None, 1_000),
-        ]
-        .into_iter()
-        .collect();
+        ]);
 
         let mut all = cids(Vec::leak(open.iter().cloned().collect::<Vec<_>>()).iter());
         all.sort();

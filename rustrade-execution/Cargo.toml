@@ -1,6 +1,6 @@
 [package]
 name = "rustrade-execution"
-version = "0.8.0"
+version = "0.9.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -51,6 +51,7 @@ ibkr = [
 ]
 hyperliquid = [
     "dep:hyperliquid_rust_sdk",
+    "rustrade-instrument/hyperliquid",
     "dep:ethers",
     "dep:tokio-util",
     "dep:uuid",
@@ -111,7 +112,7 @@ reqwest = { workspace = true, optional = true } # HTTP client for Alpaca REST AP
 # `margin_trading` is bundled with `spot` under the single `binance` feature (one feature per
 # exchange, matching alpaca/ibkr/hyperliquid). It ships ahead of the BinanceMargin client being
 # fully wired so spot + margin compile together; spot-only users pay the margin module's build cost.
-binance-sdk = { version = "=70.2.0", features = ["spot", "margin_trading"], optional = true }
+binance-sdk = { version = "=74.0.0", features = ["spot", "margin_trading"], optional = true }
 anyhow = { workspace = true, optional = true }                              # Required: binance-sdk's public API returns anyhow::Result
 
 # Shared between "alpaca" and "binance" features
@@ -120,7 +121,7 @@ lru = { workspace = true, optional = true }         # Event deduplication cache 
 parking_lot = { workspace = true, optional = true } # Lighter mutex for dedup cache (no poisoning, no OS thread park)
 
 # IBKR (optional, behind "ibkr" feature)
-ibapi = { version = "=4.2.0", optional = true, default-features = false, features = [
+ibapi = { version = "=5.0.0", optional = true, default-features = false, features = [
     "sync",
 ] }
 chrono-tz = { workspace = true, optional = true }

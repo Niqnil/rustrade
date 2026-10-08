@@ -19,6 +19,7 @@ use rustrade::{
         command::Command,
         error::{EngineError, RecoverableEngineError},
         execution_tx::MultiExchangeTxMap,
+        in_flight::{InFlightDeadlines, InFlightOverdue, InFlightRequest},
         process_with_audit,
         state::{
             EngineState, MarketSnapshotSource,
@@ -85,9 +86,10 @@ use rustrade_instrument::{
     },
 };
 use rustrade_integration::{
-    channel::{UnboundedTx, mpsc_unbounded},
+    channel::{UnboundedRx, UnboundedTx, mpsc_unbounded},
     collection::{none_one_or_many::NoneOneOrMany, one_or_many::OneOrMany, snapshot::Snapshot},
 };
+use std::time::Duration;
 
 const STARTING_TIMESTAMP: DateTime<Utc> = DateTime::<Utc>::MIN_UTC;
 const RISK_FREE_RETURN: Decimal = dec!(0.05);
@@ -119,11 +121,11 @@ fn asset_fees(instrument: usize, amount: Decimal) -> AssetFees<AssetIndex> {
 }
 
 // Type alias to avoid clippy::type_complexity warnings in test helper functions
-type TestEngine = Engine<
+type TestEngine<Strategy = TestBuyAndHoldStrategy> = Engine<
     HistoricalClock,
     EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
     MultiExchangeTxMap<UnboundedTx<ExecutionRequest>>,
-    TestBuyAndHoldStrategy,
+    Strategy,
     DefaultRiskManager<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>,
 >;
 
@@ -1059,6 +1061,20 @@ fn build_engine_with_oms(
     execution_tx: UnboundedTx<ExecutionRequest>,
     oms_mode: OmsMode,
 ) -> TestEngine {
+    build_engine_with_deadlines(
+        trading_state,
+        execution_tx,
+        oms_mode,
+        InFlightDeadlines::default(),
+    )
+}
+
+fn build_engine_with_deadlines(
+    trading_state: TradingState,
+    execution_tx: UnboundedTx<ExecutionRequest>,
+    oms_mode: OmsMode,
+    in_flight_deadlines: InFlightDeadlines,
+) -> TestEngine {
     let instruments = IndexedInstruments::builder()
         .add_instrument(Instrument::spot(
             ExchangeId::BinanceSpot,
@@ -1113,6 +1129,7 @@ fn build_engine_with_oms(
         clock,
         state,
         execution_txs,
+        in_flight_deadlines,
         TestBuyAndHoldStrategy { id: strategy_id() },
         DefaultRiskManager::default(),
     )
@@ -1307,6 +1324,20 @@ fn build_option_engine_with_oms(
     execution_tx: UnboundedTx<ExecutionRequest>,
     oms_mode: OmsMode,
 ) -> TestEngine {
+    build_option_engine_with_strategy(
+        trading_state,
+        execution_tx,
+        oms_mode,
+        TestBuyAndHoldStrategy { id: strategy_id() },
+    )
+}
+
+fn build_option_engine_with_strategy<Strategy>(
+    trading_state: TradingState,
+    execution_tx: UnboundedTx<ExecutionRequest>,
+    oms_mode: OmsMode,
+    strategy: Strategy,
+) -> TestEngine<Strategy> {
     let expiry = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
         .unwrap()
         .with_timezone(&Utc);
@@ -1373,7 +1404,8 @@ fn build_option_engine_with_oms(
         clock,
         state,
         execution_txs,
-        TestBuyAndHoldStrategy { id: strategy_id() },
+        InFlightDeadlines::default(),
+        strategy,
         DefaultRiskManager::default(),
     )
 }
@@ -1640,6 +1672,68 @@ fn test_contract_expiry_missing_spot_price() {
     );
 }
 
+/// An option whose underlying matches two `Spot` listings on its `(base, quote, exchange)` is not
+/// settled: nothing says which listing's price is the settlement reference, so either would be a
+/// guess. It is rejected as `AmbiguousUnderlying`, as a split on that identity is rejected as
+/// `AmbiguousSplitTarget`, and re-injecting the event is rejected the same way.
+#[test]
+fn test_contract_expiry_ambiguous_underlying_not_settled() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_ambiguous_underlying_engine(TradingState::Disabled, execution_tx);
+
+    // The two listings disagree, so settling against either would change the result.
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    engine.process(market_event_trade(1, 2, dec!(55_000)));
+    open_position_on(&mut engine, 0, Side::Buy, dec!(1_000), dec!(2), "opt-open");
+
+    for attempt in 1..=2 {
+        let outputs: Vec<EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>> =
+            engine.process_contract_expiry(&InstrumentIndex(0));
+        assert_eq!(
+            outputs,
+            vec![EngineOutput::ContractExpiryNotSettled {
+                instrument: InstrumentIndex(0),
+                reason: ContractExpiryNotSettledReason::AmbiguousUnderlying,
+            }],
+            "attempt {attempt}"
+        );
+
+        let option_state = engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0));
+        assert_eq!(
+            option_state.position.positions.len(),
+            1,
+            "attempt {attempt}"
+        );
+        assert!(!option_state.expiration_processed, "attempt {attempt}");
+    }
+}
+
+/// The ambiguity only matters when there is a position to settle: an option expiring with none
+/// open needs no price, so its expiry completes even on an ambiguous underlying.
+#[test]
+fn test_contract_expiry_ambiguous_underlying_without_position_completes() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_ambiguous_underlying_engine(TradingState::Disabled, execution_tx);
+
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    engine.process(market_event_trade(1, 2, dec!(55_000)));
+
+    let outputs: Vec<EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>> =
+        engine.process_contract_expiry(&InstrumentIndex(0));
+    assert!(outputs.is_empty(), "{outputs:?}");
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .expiration_processed
+    );
+}
+
 #[test]
 fn test_contract_expiry_replica_state_cleared() {
     use rustrade::{
@@ -1752,6 +1846,7 @@ fn build_single_kind_engine(
         HistoricalClock::new(STARTING_TIMESTAMP),
         state,
         MultiExchangeTxMap::from_iter([(ExchangeId::BinanceSpot, Some(execution_tx))]),
+        InFlightDeadlines::default(),
         TestBuyAndHoldStrategy { id: strategy_id() },
         DefaultRiskManager::default(),
     )
@@ -2234,6 +2329,120 @@ fn test_command_send_requests_unknown_instrument_rejected_before_send() {
     }
 }
 
+fn duplicate_cid_error(cid: &str) -> EngineError {
+    EngineError::Recoverable(RecoverableEngineError::DuplicateClientOrderId(
+        cid.to_string(),
+    ))
+}
+
+/// An open under a client order id the engine already tracks an order under, for that instrument,
+/// is rejected before it is sent, and the tracked order is kept: whether the order holding the id
+/// was recorded by an earlier action or by an earlier open in the same batch. The same id on
+/// another instrument is a different order.
+#[test]
+fn test_command_send_open_requests_duplicate_cid_rejected_before_send() {
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    send_spot_price(&mut engine, 1, dec!(45_000));
+    let (known, other) = (InstrumentIndex(1), InstrumentIndex(0));
+    let open_sized = |instrument, quantity| {
+        let mut open = open_request(instrument, "dup");
+        open.state.quantity = quantity;
+        open
+    };
+    let opens_output = |engine: &mut TestEngine, opens: Vec<OrderRequestOpen>| {
+        let audit = process_with_audit(
+            engine,
+            EngineEvent::Command(Command::SendOpenRequests(OneOrMany::Many(opens))),
+        );
+        let EngineAudit::Process(audit) = audit.event else {
+            panic!("expected EngineAudit::Process");
+        };
+        assert!(
+            audit.errors.is_empty(),
+            "a duplicate must not stop the engine"
+        );
+        let NoneOneOrMany::One(EngineOutput::Commanded(ActionOutput::OpenOrders(output))) =
+            audit.outputs
+        else {
+            panic!("expected one OpenOrders output, got {:?}", audit.outputs);
+        };
+        output
+    };
+    let tracked_quantity = |engine: &TestEngine| {
+        engine.state.instruments.instrument_index(&known).orders.0[&ClientOrderId::new("dup")]
+            .quantity
+    };
+
+    // In one batch: the second open under the id is rejected, the same id elsewhere is sent.
+    let first = open_sized(known, dec!(1));
+    let in_batch = open_sized(known, dec!(2));
+    let elsewhere = open_sized(other, dec!(3));
+    let output = opens_output(
+        &mut engine,
+        vec![first.clone(), in_batch.clone(), elsewhere.clone()],
+    );
+    assert_eq!(
+        output.errors,
+        NoneOneOrMany::One(Box::new((in_batch, duplicate_cid_error("dup"))))
+    );
+    let sent: Vec<_> = output.sent_iter().map(|open| open.key.clone()).collect();
+    assert_eq!(sent, [first.key.clone(), elsewhere.key.clone()]);
+    for expected in [&first, &elsewhere] {
+        match execution_rx.rx.try_recv() {
+            Ok(ExecutionRequest::Open(request)) => assert_eq!(request.key, expected.key),
+            other => panic!("expected {:?} to be sent, got {other:?}", expected.key),
+        }
+    }
+    assert!(
+        execution_rx.rx.try_recv().is_err(),
+        "the duplicate must not be sent"
+    );
+    assert_eq!(
+        tracked_quantity(&engine),
+        dec!(1),
+        "the first open is the one tracked"
+    );
+
+    // In a later action: the id is tracked, so an open under it is rejected.
+    let later = open_sized(known, dec!(4));
+    let output = opens_output(&mut engine, vec![later.clone()]);
+    assert_eq!(
+        output.errors,
+        NoneOneOrMany::One(Box::new((later, duplicate_cid_error("dup"))))
+    );
+    assert!(output.sent.is_none());
+    assert!(
+        execution_rx.rx.try_recv().is_err(),
+        "the duplicate must not be sent"
+    );
+    assert_eq!(
+        tracked_quantity(&engine),
+        dec!(1),
+        "and the tracked order is kept"
+    );
+
+    use rustrade::engine::state::order::in_flight_recorder::InFlightRequestRecorder;
+
+    // Recorded directly, as a caller of the state's recorder could: none of the instrument's
+    // parts takes it, so the tracked order keeps its routing as well as its state.
+    let mut recorded = open_sized(known, dec!(5));
+    recorded.state.position_id = Some(PositionId::new("other-position"));
+    engine
+        .state
+        .record_in_flight_open(&recorded, DateTime::<Utc>::MIN_UTC);
+    assert_eq!(tracked_quantity(&engine), dec!(1));
+    assert!(
+        !engine
+            .state
+            .instruments
+            .instrument_index(&known)
+            .position_ids
+            .contains_key(&ClientOrderId::new("dup")),
+        "the refused request's position routing is not recorded"
+    );
+}
+
 /// Emits one cancel and one open for a fixed instrument, from both the algo and the
 /// close-positions hooks, regardless of state — standing in for user strategy code that holds an
 /// index the engine was not built with.
@@ -2290,18 +2499,17 @@ fn test_strategy_requests_unknown_instrument_rejected_before_send() {
     };
 
     let (execution_tx, mut execution_rx) = mpsc_unbounded();
-    let built = build_option_engine(TradingState::Enabled, execution_tx);
-    let unknown = InstrumentIndex(built.state.instruments.0.len());
-    let mut engine = Engine {
-        clock: built.clock,
-        meta: built.meta,
-        state: built.state,
-        execution_txs: built.execution_txs,
-        strategy: FixedInstrumentStrategy {
+    // The fixture has three instruments (indices 0..=2), so index 3 is unknown.
+    let unknown = InstrumentIndex(3);
+    let mut engine = build_option_engine_with_strategy(
+        TradingState::Enabled,
+        execution_tx,
+        OmsMode::Netting,
+        FixedInstrumentStrategy {
             instrument: unknown,
         },
-        risk: built.risk,
-    };
+    );
+    assert_eq!(engine.state.instruments.0.len(), 3);
     let pre_instruments = engine.state.instruments.clone();
 
     let output = engine.generate_algo_orders();
@@ -3989,6 +4197,7 @@ fn build_two_option_engine(
         clock,
         state,
         MultiExchangeTxMap::from_iter([(ExchangeId::BinanceSpot, Some(execution_tx))]),
+        InFlightDeadlines::default(),
         TestBuyAndHoldStrategy { id: strategy_id() },
         DefaultRiskManager::default(),
     )
@@ -4267,6 +4476,7 @@ fn build_put_option_engine(
         clock,
         state,
         MultiExchangeTxMap::from_iter([(ExchangeId::BinanceSpot, Some(execution_tx))]),
+        InFlightDeadlines::default(),
         TestBuyAndHoldStrategy { id: strategy_id() },
         DefaultRiskManager::default(),
     )
@@ -4457,6 +4667,7 @@ fn build_option_spot_engine_with_oms(
         clock,
         state,
         MultiExchangeTxMap::from_iter([(ExchangeId::BinanceSpot, Some(execution_tx))]),
+        InFlightDeadlines::default(),
         TestBuyAndHoldStrategy { id: strategy_id() },
         DefaultRiskManager::default(),
     )
@@ -5315,7 +5526,7 @@ fn send_cancel_ack(engine: &mut TestEngine, cid: ClientOrderId, exchange_order_i
             state: Ok(Cancelled {
                 id: exchange_order_id,
                 time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
-                filled_quantity: dec!(0),
+                filled_quantity: Some(dec!(0)),
             }),
         }),
     }));
@@ -6029,6 +6240,7 @@ fn build_ambiguous_underlying_engine(
         clock,
         state,
         execution_txs,
+        InFlightDeadlines::default(),
         TestBuyAndHoldStrategy { id: strategy_id() },
         DefaultRiskManager::default(),
     )
@@ -6379,14 +6591,18 @@ fn test_corporate_action_option_already_carrying_the_id_is_not_readjusted() {
     assert_eq!(position.quantity_abs, dec!(4));
     assert_eq!(position.price_entry_average, dec!(500));
 
-    // The suppression is observable, not silent — per skipped option.
-    assert!(
-        outputs.iter().any(|o| matches!(
-            o,
-            EngineOutput::CorporateActionAlreadyProcessed { instrument, .. }
-                if *instrument == InstrumentIndex(0)
-        )),
-        "a suppressed option re-adjust must be surfaced, not silently dropped"
+    // The suppression is observable, not silent — once per skipped option, not once per pass.
+    assert_eq!(
+        outputs
+            .iter()
+            .filter(|o| matches!(
+                o,
+                EngineOutput::CorporateActionAlreadyProcessed { instrument, .. }
+                    if *instrument == InstrumentIndex(0)
+            ))
+            .count(),
+        1,
+        "a suppressed option re-adjust must be surfaced exactly once, not silently dropped"
     );
     assert!(
         !outputs
@@ -6724,6 +6940,136 @@ fn test_corporate_action_option_replica_parity_suppressed_readjust() {
         panic!("instrument 0 must be an option");
     };
     assert_eq!(contract.strike, dec!(25_000));
+}
+
+/// Pins the contract that each `corporate_actions_processed` record guards only its own instrument:
+/// with the **target's** record lost, a re-delivered standard split applies to the equity leg
+/// again, while an option still carrying the `id` is skipped. The live engine and the audit
+/// replica agree on that outcome. A change to either half of this behaviour must be deliberate and
+/// fail here first.
+#[test]
+fn test_corporate_action_equity_leg_depends_solely_on_the_targets_record() {
+    use rustrade::engine::audit::{
+        AuditTick, EngineAudit, context::EngineContext, state_replica::StateReplicaManager,
+    };
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx); // Netting
+
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+    open_position_via_trade(
+        &mut engine,
+        1,
+        1,
+        Side::Buy,
+        dec!(60_000),
+        dec!(2),
+        "equity-open",
+    );
+
+    let pre_split_state = engine.state.clone();
+
+    let effective_time = time_plus_days(STARTING_TIMESTAMP, 10);
+    let ca_event = EngineEvent::CorporateAction {
+        id: "BTCUSD-2-1-split".into(),
+        instrument: InstrumentIndex(1),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Floor,
+        effective_time,
+    };
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: pre_split_state,
+        context: EngineContext {
+            time: effective_time,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
+
+    let first_tick = process_with_audit(&mut engine, ca_event.clone());
+    let first_outputs = match &first_tick.event {
+        EngineAudit::Process(audit) => audit.outputs.clone(),
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    replica_manager.update_from_event(ca_event.clone(), &first_outputs);
+
+    let equity_position = |state: &EngineState<DefaultGlobalData, DefaultInstrumentMarketData>| {
+        let position = state
+            .instruments
+            .instrument_index(&InstrumentIndex(1))
+            .position
+            .positions
+            .values()
+            .next()
+            .cloned();
+        let Some(position) = position else {
+            panic!("the equity position must stay open");
+        };
+        (position.quantity_abs, position.price_entry_average)
+    };
+    assert_eq!(equity_position(&engine.state), (dec!(4), dec!(30_000)));
+
+    // Lose the TARGET's record only, on both sides, as a snapshot taken before the field existed
+    // would. Every option keeps its own record.
+    engine
+        .state
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(1))
+        .corporate_actions_processed
+        .clear();
+    replica_manager
+        .state_replica
+        .event
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(1))
+        .corporate_actions_processed
+        .clear();
+
+    let second_tick = process_with_audit(&mut engine, ca_event.clone());
+    let second_outputs = match &second_tick.event {
+        EngineAudit::Process(audit) => audit.outputs.clone(),
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    replica_manager.update_from_event(ca_event, &second_outputs);
+
+    // The equity leg applied again: quantity multiplied and basis divided a second time.
+    assert_eq!(equity_position(&engine.state), (dec!(8), dec!(15_000)));
+
+    // The option was skipped, and the skip was reported for it alone.
+    let InstrumentKind::Option(contract) = &engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0))
+        .instrument
+        .kind
+    else {
+        panic!("instrument 0 must be an option");
+    };
+    assert_eq!(contract.strike, dec!(25_000));
+    let skipped: Vec<_> = second_outputs
+        .iter()
+        .filter_map(|output| match output {
+            EngineOutput::CorporateActionAlreadyProcessed { instrument, .. } => Some(*instrument),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(skipped, vec![InstrumentIndex(0)]);
+
+    // The replica reaches the same, asymmetric, state.
+    for idx in [InstrumentIndex(0), InstrumentIndex(1)] {
+        let live = engine.state.instruments.instrument_index(&idx);
+        let replica = replica_manager
+            .replica_engine_state()
+            .instruments
+            .instrument_index(&idx);
+        assert_eq!(replica, live, "replica/live divergence at {idx:?}");
+    }
 }
 
 /// A market `Item` from an exchange the engine was never built against is **reported**, and its
@@ -7250,4 +7596,216 @@ fn test_account_snapshot_position_drift() {
             .quantity_net(),
         dec!(1)
     );
+}
+
+/// The in-flight deadline outputs among `audit`'s outputs.
+fn in_flight_overdue(
+    audit: AuditTick<
+        EngineAudit<
+            EngineEvent<DataKind>,
+            EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>,
+        >,
+    >,
+) -> Vec<InFlightOverdue> {
+    let EngineAudit::Process(audit) = audit.event else {
+        panic!("expected EngineAudit::Process");
+    };
+    audit
+        .outputs
+        .into_iter()
+        .filter_map(|output| match output {
+            EngineOutput::InFlightOverdue(overdue) => Some(overdue),
+            _ => None,
+        })
+        .collect()
+}
+
+const TWO_DAYS: Duration = Duration::from_secs(2 * 24 * 60 * 60);
+
+/// The receiver is returned so the engine's requests are sent, and so recorded in flight.
+fn engine_with_two_day_deadline() -> (TestEngine, UnboundedRx<ExecutionRequest>) {
+    let (execution_tx, execution_rx) = mpsc_unbounded();
+    let engine = build_engine_with_deadlines(
+        TradingState::Disabled,
+        execution_tx,
+        OmsMode::Netting,
+        InFlightDeadlines::default().with(ExchangeIndex(0), TWO_DAYS),
+    );
+    (engine, execution_rx)
+}
+
+/// An order left in flight is flagged once its deadline passes, and once only per request: the
+/// open is flagged after its deadline, and the cancel sent later after the cancel's own deadline.
+/// The engine leaves the order in flight throughout.
+#[test]
+fn test_in_flight_deadline_flags_each_request_once() {
+    let (mut engine, _execution_rx) = engine_with_two_day_deadline();
+    let instrument = InstrumentIndex(0);
+    let cid = ClientOrderId::new("stranded");
+
+    // Sent at day 0, the clock's time when the command is processed.
+    let audit = process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(open_request(
+            instrument, "stranded",
+        )))),
+    );
+    assert!(in_flight_overdue(audit).is_empty());
+
+    let audit = process_with_audit(&mut engine, market_event_trade(1, 0, dec!(50_000)));
+    assert!(
+        in_flight_overdue(audit).is_empty(),
+        "day 1 is before the deadline"
+    );
+
+    let audit = process_with_audit(&mut engine, market_event_trade(2, 0, dec!(50_000)));
+    let overdue = in_flight_overdue(audit);
+    assert_eq!(overdue.len(), 1, "{overdue:?}");
+    assert_eq!(overdue[0].key.cid, cid);
+    assert_eq!(overdue[0].request, InFlightRequest::Open);
+    assert_eq!(overdue[0].time_sent, STARTING_TIMESTAMP);
+    assert_eq!(overdue[0].deadline, TWO_DAYS);
+    assert_eq!(overdue[0].elapsed, TWO_DAYS);
+
+    let audit = process_with_audit(&mut engine, market_event_trade(3, 0, dec!(50_000)));
+    assert!(
+        in_flight_overdue(audit).is_empty(),
+        "the open was already flagged"
+    );
+
+    // A cancel sent at day 3 is a new request, with its own deadline at day 5.
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendCancelRequests(OneOrMany::One(cancel_request(
+            instrument, "stranded",
+        )))),
+    );
+    let audit = process_with_audit(&mut engine, market_event_trade(4, 0, dec!(50_000)));
+    assert!(
+        in_flight_overdue(audit).is_empty(),
+        "day 4 is before the cancel's deadline"
+    );
+
+    let audit = process_with_audit(&mut engine, market_event_trade(5, 0, dec!(50_000)));
+    let overdue = in_flight_overdue(audit);
+    assert_eq!(overdue.len(), 1, "{overdue:?}");
+    assert_eq!(overdue[0].request, InFlightRequest::Cancel);
+    assert_eq!(overdue[0].time_sent, time_plus_days(STARTING_TIMESTAMP, 3));
+
+    let audit = process_with_audit(&mut engine, market_event_trade(9, 0, dec!(50_000)));
+    assert!(
+        in_flight_overdue(audit).is_empty(),
+        "the cancel was already flagged"
+    );
+
+    // Flagging settles nothing.
+    let order = engine
+        .state
+        .instruments
+        .instrument_index(&instrument)
+        .orders
+        .0
+        .get(&cid)
+        .expect("the order is still tracked");
+    assert!(
+        matches!(order.state, ActiveOrderState::CancelInFlight(_)),
+        "{order:?}"
+    );
+}
+
+/// An order the venue answers before its deadline is never flagged.
+#[test]
+fn test_in_flight_deadline_ignores_an_answered_order() {
+    let (mut engine, _execution_rx) = engine_with_two_day_deadline();
+    let mut request = open_request(InstrumentIndex(0), "answered");
+    request.key.cid = gen_cid(0);
+
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(request))),
+    );
+    process_with_audit(
+        &mut engine,
+        account_event_order_response(0, 1, Side::Buy, 1.0, 0.0),
+    );
+
+    for day in [2, 5, 30] {
+        let audit = process_with_audit(&mut engine, market_event_trade(day, 0, dec!(50_000)));
+        assert!(in_flight_overdue(audit).is_empty(), "day {day}");
+    }
+}
+
+/// An answer arriving in the event that also reaches the deadline settles the order before the
+/// check, so it is not flagged.
+#[test]
+fn test_in_flight_deadline_ignores_an_order_answered_at_its_deadline() {
+    let (mut engine, _execution_rx) = engine_with_two_day_deadline();
+    let mut request = open_request(InstrumentIndex(0), "answered");
+    request.key.cid = gen_cid(0);
+
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(request))),
+    );
+    let audit = process_with_audit(
+        &mut engine,
+        account_event_order_response(0, 2, Side::Buy, 1.0, 0.0),
+    );
+    assert_eq!(
+        engine.time(),
+        time_plus_days(STARTING_TIMESTAMP, 2),
+        "the answer moved the clock to the deadline"
+    );
+    assert!(in_flight_overdue(audit).is_empty());
+
+    let audit = process_with_audit(&mut engine, market_event_trade(30, 0, dec!(50_000)));
+    assert!(in_flight_overdue(audit).is_empty());
+}
+
+/// With no deadline for the exchange, nothing is ever flagged.
+#[test]
+fn test_in_flight_deadline_absent_flags_nothing() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(open_request(
+            InstrumentIndex(0),
+            "stranded",
+        )))),
+    );
+    let audit = process_with_audit(&mut engine, market_event_trade(365, 0, dec!(50_000)));
+    assert!(in_flight_overdue(audit).is_empty());
+}
+
+/// A restored engine keeps no record of earlier checks, so it flags an order its state restores
+/// already overdue once more, then not again.
+#[test]
+fn test_in_flight_deadline_reflags_once_after_restore() {
+    let (mut engine, _execution_rx) = engine_with_two_day_deadline();
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(open_request(
+            InstrumentIndex(0),
+            "stranded",
+        )))),
+    );
+    let audit = process_with_audit(&mut engine, market_event_trade(2, 0, dec!(50_000)));
+    assert_eq!(in_flight_overdue(audit).len(), 1);
+
+    let (execution_tx, _restored_execution_rx) = mpsc_unbounded();
+    let mut restored: TestEngine = Engine::new(
+        engine.clock.clone(),
+        engine.state.clone(),
+        MultiExchangeTxMap::from_iter([(ExchangeId::BinanceSpot, Some(execution_tx))]),
+        InFlightDeadlines::default().with(ExchangeIndex(0), TWO_DAYS),
+        TestBuyAndHoldStrategy { id: strategy_id() },
+        DefaultRiskManager::default(),
+    );
+
+    let audit = process_with_audit(&mut restored, market_event_trade(3, 0, dec!(50_000)));
+    assert_eq!(in_flight_overdue(audit).len(), 1, "flagged once more");
+    let audit = process_with_audit(&mut restored, market_event_trade(4, 0, dec!(50_000)));
+    assert!(in_flight_overdue(audit).is_empty(), "and only once");
 }

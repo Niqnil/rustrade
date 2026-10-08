@@ -4,6 +4,42 @@ use crate::error::{
     ApiError, ConnectivityError, UnindexedApiError, UnindexedClientError, UnindexedOrderError,
 };
 use rustrade_instrument::instrument::name::InstrumentNameExchange;
+use smol_str::SmolStr;
+
+/// Why [`HyperliquidClient::connect`](super::HyperliquidClient::connect) failed.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum HyperliquidConnectError {
+    /// Hyperliquid could not be reached, or did not answer as it should. Transient: retry with
+    /// backoff.
+    #[error("{0}")]
+    Connectivity(#[from] ConnectivityError),
+
+    /// A DEX in [`HyperliquidConfig::dexes`](super::HyperliquidConfig::dexes) is not one
+    /// Hyperliquid lists on the configured network. Retrying does not help: fix the config.
+    #[error("Hyperliquid lists no perpetual DEX named {0:?} on this network")]
+    UnknownDex(SmolStr),
+
+    /// Hyperliquid's description of a configured DEX could not be read or makes no sense, such
+    /// as a response that does not parse or a collateral token it does not list. Not transient:
+    /// a retry is unlikely to read anything different.
+    #[error("Hyperliquid perpetual DEX metadata: {0}")]
+    Metadata(String),
+}
+
+impl From<UnindexedClientError> for HyperliquidConnectError {
+    /// A connectivity error stays one, and a rate limit becomes one, since both pass; anything
+    /// else means the response could not be used.
+    fn from(error: UnindexedClientError) -> Self {
+        match error {
+            UnindexedClientError::Connectivity(error) => Self::Connectivity(error),
+            UnindexedClientError::Api(UnindexedApiError::RateLimit) => {
+                Self::Connectivity(ConnectivityError::Socket(error.to_string()))
+            }
+            other => Self::Metadata(other.to_string()),
+        }
+    }
+}
 
 /// Maps Hyperliquid SDK errors to `UnindexedClientError`.
 ///
@@ -170,7 +206,7 @@ mod tests {
 
     #[test]
     fn test_map_order_error_instrument_invalid() {
-        let instrument = InstrumentNameExchange::from("INVALID-USD-PERP");
+        let instrument = InstrumentNameExchange::from("INVALID-USDC-PERP");
 
         let err = map_order_error(make_sdk_error("unknown asset"), &instrument);
         assert!(matches!(
@@ -187,7 +223,7 @@ mod tests {
 
     #[test]
     fn test_map_order_error_rejected() {
-        let instrument = InstrumentNameExchange::from("BTC-USD-PERP");
+        let instrument = InstrumentNameExchange::from("BTC-USDC-PERP");
 
         let err = map_order_error(make_sdk_error("insufficient margin"), &instrument);
         assert!(matches!(
@@ -199,6 +235,23 @@ mod tests {
         assert!(matches!(
             err,
             UnindexedOrderError::Rejected(ApiError::OrderRejected(_))
+        ));
+    }
+
+    #[test]
+    fn a_connect_error_is_transient_only_when_the_request_was() {
+        let socket = ConnectivityError::Socket("reset".to_owned());
+        assert_eq!(
+            HyperliquidConnectError::from(UnindexedClientError::Connectivity(socket.clone())),
+            HyperliquidConnectError::Connectivity(socket)
+        );
+        assert!(matches!(
+            HyperliquidConnectError::from(UnindexedClientError::Api(UnindexedApiError::RateLimit)),
+            HyperliquidConnectError::Connectivity(ConnectivityError::Socket(_))
+        ));
+        assert!(matches!(
+            HyperliquidConnectError::from(UnindexedClientError::Internal("bad json".to_owned())),
+            HyperliquidConnectError::Metadata(reason) if reason.contains("bad json")
         ));
     }
 }

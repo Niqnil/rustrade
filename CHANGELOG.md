@@ -7,6 +7,1020 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-08
+
+### Added
+
+- **The engine flags an order whose request stays in flight past a deadline** (`rustrade`,
+  `rustrade-execution`). `ExecutionManager` answers every request within its `request_timeout`, so
+  an order still `OpenInFlight` or `CancelInFlight` well after that was stranded some other way, by
+  the manager task dying or a bug, and nothing noticed. While it stays, `has_requests_in_flight`
+  stays true, and in Hedging mode fills that match no order are held back. Closes #494.
+  - The engine records when it sends each open and cancel, by its `EngineClock`, and checks after
+    each event it processes, except a `Shutdown` and a `Command` whose action hit an unrecoverable
+    error, for an order whose request has passed its exchange's deadline. With nothing in flight
+    it does not read the clock. It logs an `error!` and emits the new `EngineOutput::InFlightOverdue`, naming the order key, which
+    request, when it was sent and how long it has been in flight. It does not settle the order:
+    the venue may hold it live, and settling and reconciling are the caller's decision.
+  - Each request is flagged once: an order flagged while `OpenInFlight` is flagged again only for a
+    later cancel, from that cancel's own send. A cancel resent while one is in flight keeps the
+    first one's send time, so re-cancelling on every event cannot keep an order from being
+    flagged. A restored engine flags an already-overdue order
+    once more. An order sent during a backward step of the live clock larger than its deadline
+    can be missed.
+  - Deadlines are per exchange (`InFlightDeadlines`, keyed by `ExchangeIndex`, with `insert`,
+    `with`, `get` and `remove`). `ExecutionBuilder::add_live` derives one from the
+    `request_timeout` plus `InFlightDeadlines::REQUEST_TIMEOUT_MARGIN` (5 s), exposed as
+    `ExecutionBuild::in_flight_deadlines` and `Execution::in_flight_deadlines`, and
+    `Engine::in_flight_deadlines` reads the ones in use. Mock and simulated venues get none by
+    default: the engine measures a deadline on its own clock, which in a backtest is simulated
+    time. A deadline must be non-zero: `InFlightDeadlines::insert` and `with` panic on zero, which
+    could never be flagged.
+  - `SystemBuilder::in_flight_deadline(ExchangeId, Option<Duration>)` overrides one exchange's
+    deadline over the derived ones: `Some` sets it, for example to check a mock paper-trading on a
+    live clock, and `None` removes it. `build` returns the new
+    `BarterError::InFlightDeadline(InFlightDeadlineError)` for an exchange without an execution
+    client or a zero deadline, rather than letting the override do nothing.
+  - **Breaking:**
+    - `Engine::new` takes the `InFlightDeadlines` after the execution transmitters. Pass
+      `Execution::in_flight_deadlines`, or `InFlightDeadlines::default()` to check nothing.
+    - `OpenInFlight` and `CancelInFlight` carry a `time_sent`, so their serialised form changes,
+      in audit streams and `EngineState` snapshots alike. `CancelInFlight` no longer implements
+      `Default`, and `ActiveOrderState::time_sent` reads either.
+    - `Order::from(&OrderRequestOpen)` is replaced by `Order::open_in_flight(request, time_sent)`.
+    - Every `InFlightRequestRecorder` method takes the `time_sent`, so a custom
+      `InstrumentDataState` implementation must add the parameter.
+    - `Engine` no longer implements `Copy`.
+    - `BarterError` gains `InFlightDeadline`, so an exhaustive match needs the arm.
+- **`ExecutionClient::validate_config`** (`rustrade-execution`). A client can now check its config
+  against the instruments it is about to trade before it is constructed. `ExecutionBuilder` calls
+  it after `SUPPORTED_KINDS`, with the instruments executed on the client's exchange, as
+  `ClientInstrument`s carrying each one's `name_exchange` and kind, and fails the build with
+  `BarterError::ExecutionBuilder` on an `Err`. The default accepts every config, so existing
+  implementations are unaffected. A client constructed by calling `new` directly is not checked.
+- **`System::feed_depth`: how many events wait in the engine's feed** (`rustrade`). The feed is
+  unbounded, so a live venue's read loop never waits on the engine, but an engine slower than its
+  inputs fell behind with no signal. `feed_depth` returns a cloneable `FeedDepth` handle whose
+  `current()` counts the events sent by the market and account forwarders and through `feed_tx`
+  that the engine has not yet taken. It can be polled from another task and outlives the `System`.
+  What depth calls for action is left to the caller. For the lag in time, compare an audit tick's
+  `EngineContext::time` with the event's `time_received`. Closes #220.
+  - `UnboundedRx::len` and `is_empty` (`rustrade-integration`), approximate while senders run.
+    For a receiver the caller holds itself, such as the audit updates `System::take_audit` hands
+    out, these read the backlog directly.
+- **`OrderStatusClient`: how an order ended at the venue** (`rustrade-execution`). A new
+  supertrait of `ExecutionClient`, implemented only by clients that can do the lookup.
+  `fetch_ended_orders(&[UnindexedOrderKey])` returns how each order that has ended did end
+  (filled, cancelled with what filled before, expired, or rejected after acceptance), under the
+  key it was asked for. It omits an order still live or unknown to the venue, and returns `Err`
+  rather than a partial list. An empty slice returns nothing, not every order. It is the lookup
+  that recovering order lifecycle events after a reconnect needs (#370). It is by order rather
+  than by time because Binance's `allOrders` and Alpaca's closed-order list both filter on
+  creation time, so a window opening at a disconnect cannot see an order placed before it and
+  cancelled during it. `MockExecution` implements it from the simulated venue's ledger, and
+  `BinanceSpot` and `BinanceMargin` by client order id (below).
+  - `Order::map_state`, which replaces an order's state and keeps every other field, and the
+    `UnindexedInactiveOrder` and `UnindexedInactiveOrderState` aliases.
+- **Binance Spot reports how orders ended while its account stream was disconnected**
+  (`rustrade-execution`). Until now a reconnect recovered the missed fills only, so an order
+  cancelled, expired or rejected meanwhile stayed live in engine state until a complete snapshot
+  dropped it, and even then nobody learned how it ended. `BinanceSpot` now holds the orders it has
+  seen live: from placing them, from `account_snapshot` and `fetch_open_orders`, and from the
+  stream, until it sees them end. It holds up to 4,096. After a reconnect, for each instrument the
+  stream was opened with, and once that instrument's missed fills are recovered, it lists the
+  instrument's open orders. It then looks
+  up each held order the listing no longer shows with `GET /api/v3/order` by client order id, and
+  sends each that ended as an `OrderSnapshot` of its inactive state, under `StrategyId::unknown()`.
+  Each instrument is settled as its check ends, and one that fails is retried on the fill gaps'
+  schedule. An order Binance does not know stops being held. `BinanceSpot` also implements
+  `OrderStatusClient` with the same lookup: `FILLED` with its average price (none where Binance
+  reports the quote traded as negative, its sign for "not available"), `CANCELED` and
+  `EXPIRED`/`EXPIRED_IN_MATCH` with what filled before, `REJECTED` as `OpenFailed`, and an order
+  unknown under the key's symbol (`-2013`, `-1121`) omitted. Refs #370. Binance Margin and Alpaca
+  do the same (below).
+- **Binance Margin reports how orders ended while its account stream was disconnected**
+  (`rustrade-execution`), as Binance Spot does (above), on both the cross and the isolated
+  stream. `BinanceMargin` holds the orders it has seen live: from placing them, from
+  `account_snapshot` and `fetch_open_orders`, from a successful cancel, which ends one, and from
+  the stream. After a reconnect, for each of the stream's instruments (`instruments` on cross,
+  `isolated_symbols` on isolated) and once its missed fills are recovered, it lists the
+  instrument's open orders with `GET /sapi/v1/margin/openOrders` and looks up each held order the
+  listing no longer shows with `GET /sapi/v1/margin/order` by client order id, both weight 10 and
+  in the configured account. Each that ended is sent as an `OrderSnapshot` of its inactive state,
+  under `StrategyId::unknown()`, and a failed check is retried on the fill gaps' schedule.
+  `BinanceMargin` also implements `OrderStatusClient` with the same lookup, read as on spot.
+  `account_stream` no longer tells callers they must call `fetch_open_orders` after each
+  reconnect; that stays the way to reconcile orders placed outside the client. Refs #370.
+- **Alpaca reports how orders ended while its account stream was disconnected**
+  (`rustrade-execution`), as Binance does (above). `AlpacaClient` holds the orders it has seen
+  live: from placing them (bracket parents included), from `account_snapshot` and
+  `fetch_open_orders`, and from the stream. A cancel Alpaca has only accepted (its 204) does not
+  end one. After a reconnect, once fill recovery has finished or given up, it lists the open
+  orders of every instrument it holds one on, among the stream's `instruments` (all of them when
+  that list is empty), in one `GET /v2/orders?status=open&symbols=…`. It then looks up each held
+  order the listing no longer shows with `GET /v2/orders:by_client_order_id`, and sends each that
+  ended as an `OrderSnapshot` of its inactive state, under `StrategyId::unknown()`. A failed check
+  is retried while connected 1, 2, 4, 8 and 16 minutes later, then given up with an `error!`.
+  `AlpacaClient` also implements `OrderStatusClient` with the same lookup: `filled` with
+  `filled_avg_price`, `canceled` and `replaced` as cancelled with what filled before, `expired`,
+  `rejected` as `OpenFailed`, and a 404 or an order on another symbol than the key's omitted.
+  `done_for_day` and the other working statuses are not ended. Refs #370.
+- **Hyperliquid reports how orders ended while its account stream was disconnected**
+  (`rustrade-execution`), as Binance and Alpaca do (above), for perpetuals and spot. The SDK
+  reconnects the socket itself and resubscribes, and `orderUpdates` opens with no snapshot, so an
+  order cancelled or rejected meanwhile was never reported. `HyperliquidClient` and
+  `HyperliquidSpotClient` now hold the orders they have seen live: from placing them, from
+  `account_snapshot` and `fetch_open_orders`, from a successful cancel, which ends one, and from
+  the stream. The stream reads the SDK's drop notice followed by the resubscribed `userFills`
+  snapshot as a reconnect. Once that snapshot's fills are sent on, it lists every open order with
+  one `openOrders` request and looks up each held order the listing no longer shows with
+  `orderStatus`, by its cloid. Each order that ended is sent as an `OrderSnapshot` of its inactive
+  state, under `StrategyId::unknown()`. A failed check is retried while the stream is open 1, 2,
+  4, 8 and 16 minutes later, then given up with an `error!`. The snapshot is the only fill
+  recovery, and Hyperliquid does not say how far back it reaches, so after a long outage an order
+  can be reported filled before, or without, its older fills; `fetch_trades` reads those. Both
+  clients also implement `OrderStatusClient` with the same lookup. `filled` is fully filled, with
+  no average price, since the record carries none. Every `…Canceled` status and `scheduledCancel`
+  is cancelled, with what filled before. Every `…Rejected` status is `OpenFailed`. Omitted: an
+  order the venue does not know (`unknownOid`), one on another instrument than the key's, and an
+  id that is neither a canonical UUID nor an oid. An order placed without a cloid, which the
+  clients report under its oid, is looked up by that oid. Refs #370.
+- **IBKR reports how orders ended while its account stream was disconnected, implements
+  `OrderStatusClient`, and lists open orders in its account snapshot** (`rustrade-execution`,
+  feature `ibkr`), as the other venues do (above). Closes #370 and #371. The **Breaking** changes
+  that came with it (client order id limits, and an account stream that no longer ends when fill
+  recovery keeps failing) are listed under Changed.
+  - Every order, bracket legs included, now carries its client order id as its IB order
+    reference, which IB lists with the order, its executions and its completion. So
+    `fetch_open_orders` and `account_snapshot` list an order this client does not track, such
+    as one placed before a restart, under the id it was placed with, and track it from then on:
+    its fills and status reach the account stream, and it can be cancelled. An order without a
+    reference, such as one placed by an earlier version, is still listed under its IB order id,
+    and so is one whose reference names another order this client tracks.
+  - `account_snapshot` returns each instrument's open orders of this API client, from one
+    listing of the account's open orders. An instrument's `orders_complete` is `true` when IB
+    listed every open order and each of the instrument's was read back under the id it was
+    placed with and with its status. An instrument with an open order is reported even with no
+    position. If the listing cannot be read, the snapshot is still returned, with no
+    instrument's orders complete and a warning.
+  - `IbkrClient` holds the orders it has seen live: from placing them, from `account_snapshot`
+    and `fetch_open_orders`, and from the stream. After a gap in event delivery, once fill
+    recovery has finished or given up, the stream lists the open orders once and looks up each
+    held order the listing no longer shows in IB's completed orders. Each that ended is sent as
+    an `OrderSnapshot` of its inactive state, under `StrategyId::unknown()`, and its client
+    order id is freed. A failed check is retried while connected 1, 2, 4, 8 and 16 minutes
+    later, then given up with an `error!`.
+  - `IbkrClient` implements `OrderStatusClient` with the same lookup, by order reference, so it
+    finds orders placed before a restart too. `Filled` is fully filled, with no average price. A
+    `Cancelled` order is cancelled or expired by the rule the stream applies, with the fill its
+    executions over the last seven days show: nothing when they show none and this client placed
+    the order under six days ago, otherwise unknown (`None`). IB lists a placement it accepted
+    and then rejected as `Cancelled`, saying so in its completion text; it is `OpenFailed`, and
+    so is an `Inactive` order. An order on another instrument than the key's, or none under the
+    id, is omitted. IB lists orders completed before a Gateway restart under API client id 0, so
+    those count as this client's: client order ids must be unique across the API clients on an
+    account. When several completed orders carry one id, the one that completed last is
+    reported, and one that completed more than 5 seconds before this client began tracking the
+    order now under the id is taken as an earlier order's, with a warning.
+  - IB answers every open-orders and completed-orders request with every listing in flight, so
+    the client and its clones now read these listings one at a time. Two `fetch_open_orders`
+    calls at once could each stop at the other's end of the listing.
+- **The Hyperliquid perpetuals client trades builder-deployed (HIP-3) perpetuals**
+  (`rustrade-execution`, `hyperliquid` feature). **Breaking.** It placed and cancelled only on the
+  default DEX: the SDK knows no HIP-3 asset ids, and a HIP-3 DEX's positions and open orders are
+  listed only when asked for that DEX.
+  - New `HyperliquidConfig::dexes` names the HIP-3 DEXs to trade besides the default one (`xyz`,
+    `flx`), set with `with_dexes` or the `HYPERLIQUID_DEXES` environment variable
+    (comma-separated). `HyperliquidClient::connect` reads each one's markets and collateral token
+    from `perpDexs`, `spotMeta` and its `meta`, and adds their asset ids to the SDK's.
+  - `account_snapshot`, `fetch_open_orders` and the reconnect check read each DEX traded, with one
+    `clearinghouseState` and one `openOrders` request per DEX, the default one included. Fills
+    need no extra request.
+  - **Breaking:** every perpetual is named after its DEX's collateral token,
+    `{coin}-{collateral}-PERP`: `BTC-USDC-PERP` (was `BTC-USD-PERP`), `xyz:TSLA-USDC-PERP`,
+    `flx:TSLA-USDH-PERP`. An order, cancel or filtered read on any other name, a perpetual on an
+    unconfigured DEX included, is refused with `ApiError::InstrumentInvalid`. Fills and orders on
+    an unconfigured DEX are left out, logged once per DEX. A fill's `fees_quote` is now set
+    whenever the fee is in the DEX's collateral, not only for USDC.
+  - **Breaking:** `HyperliquidConfig.testnet: bool` is replaced by
+    `network: rustrade_instrument::hyperliquid::Network` (re-exported as
+    `client::hyperliquid::Network`), and `from_private_key` and `new` take a `Network`.
+    `HYPERLIQUID_TESTNET` is read as before. `HyperliquidConfigFile.testnet` is likewise replaced
+    by `network` (`"mainnet"` or `"testnet"`, absent ⇒ testnet), and the file gains `dexes`. An
+    unknown field, such as the old `testnet`, now fails to load rather than being ignored.
+  - **Breaking:** `HyperliquidClient::connect` returns the new `HyperliquidConnectError`:
+    `Connectivity`, `UnknownDex` for a DEX Hyperliquid does not list, or `Metadata` for one whose
+    markets cannot be read. `HyperliquidSpotClient::connect` is unchanged and ignores `dexes`.
+  - **Breaking:** `client::hyperliquid::common::perp_coin_to_instrument` and
+    `instrument_to_perp_coin` are removed: a perpetual's name now depends on its DEX's metadata.
+
+  A perpetual listed after the client connects cannot be ordered until it connects again, as the
+  SDK's asset ids are read once. Closes #503.
+- **A given-up fill recovery is reported on the account stream, not only in the log**
+  (`rustrade-execution`). Before, when fill recovery gave up on a span of fills, those fills never
+  reached the consumer and the only trace was an `error!` line. The new
+  `AccountEventKind::FillRecoveryGaveUp(FillRecoveryGap)` is sent once per failed read and the
+  stream carries on. The event carries:
+  - `scope`: a `FillRecoveryScope`, either `Instruments(..)` or `AllInstruments`;
+  - `start` and `end`, both inclusive;
+  - `attempts`;
+  - `reason`: a `FillRecoveryFailure`, which is `Request`, `TimedOut` or `Truncated`.
+
+  Binance Spot and Margin send it for each instrument's gap once its first read and five
+  retries have failed. Alpaca sends one per failed recovery read, since its read covers the
+  whole account. It names the stream's instruments, or `AllInstruments` when the stream was
+  opened without a list. A read truncated at 5,000 fills delivers what it read first and
+  reports only the span from the millisecond of the last fill read. The engine logs the event at
+  `error!` and changes no state. Reconcile with
+  `fetch_trades(start, end, scope.instrument_filter())`, reading on from each call's `resume`
+  until it is `None`, and match the result against fills already seen by instrument and
+  `TradeId`. Closes #470.
+
+- **A busted or corrected trade is reported on the account stream** (`rustrade-execution`,
+  `rustrade`). Before, Alpaca's `trade_bust` and `trade_correct` events were dropped at `trace!`,
+  so a busted fill stayed on the stream as a `Trade` and a corrected one stayed at its first price
+  and quantity. The new `AccountEventKind::TradeAmended(TradeAmendment)` carries:
+  - `instrument`, `order_id` and `time_exchange`;
+  - `original`: the `TradeId` of the trade amended, or `None` when the venue did not name it;
+  - `kind`: a `TradeAmendmentKind`, which is `Busted { quantity }`, `Corrected { replacement }`
+    (a full replacement `Trade` with its own `TradeId`), or `CorrectedUnresolved` when the
+    venue's notice lacked what a replacement needs.
+
+  The earlier `Trade` is not withdrawn: find it by instrument and `original`, reverse it, and
+  apply any replacement, idempotently, as the library does not deduplicate Alpaca's amendments.
+  The engine logs the event at `error!` and changes no state. IBKR reports its corrected
+  executions with this event too (see Fixed). Alpaca's
+  frames are read per its Broker API schema (`previous_execution_id` names the fill amended),
+  since the Trading API documents neither event; each is also logged whole at `warn!`. Known
+  limitations: an order's cumulative fill is not lowered by a bust, and an Alpaca amendment sent
+  while the stream was disconnected is not reported, as its fill recovery reads fills only. Alpaca also
+  no longer drops a fill that, after a bust, takes its order back to a cumulative an earlier
+  fill reached: the stream and recovery now recognise a fill by its execution id. Closes #483.
+
+### Changed
+
+- **`IbkrClient::connect_sync` fails when a configured contract cannot be registered, and the
+  new `connect_sync_lenient` reports the ones it skips** (`rustrade-execution`, feature `ibkr`).
+  **Breaking.**
+  - A contract in `IbkrConfig::contracts` that could not be built, resolved or registered was
+    skipped with only a `warn!`, and the client connected without it. Orders for it were then
+    refused as unregistered, possibly long after startup.
+  - `connect_sync` now returns `Result<IbkrClient, IbkrConnectError>`. `IbkrConnectError` is
+    `Connect(UnindexedClientError)` when TWS/Gateway cannot be reached, or
+    `Contracts(Vec<SkippedContract>)`, listing every contract that failed, not just the first.
+    On `Contracts`, the connection is dropped, so its client ID is free again.
+  - New `connect_sync_lenient` returns `ConnectOutcome { client, skipped }`: it connects without
+    each contract that fails, and returns those in `skipped`.
+  - `SkippedContract { name, reason }` carries a `ContractSkipReason` of `Config`, `Resolve` or
+    `Register`, wrapping the error of the step that failed. `SkippedContract::new` builds one, for
+    testing code that handles skips without IB. `is_transient()` is true only for a
+    transient `Resolve` failure, such as a dropped connection. The library does not retry. To
+    retry one contract, call `resolve_contract` and `register_contract` on the connected client.
+  - `ExecutionClient::new`, which `ExecutionBuilder` calls, uses `connect_sync`, so it now panics
+    on a configured contract that cannot be registered, as it already did on a failed
+    connection.
+
+- **`ConnectivityError::Timeout` displays as "request timed out"** (`rustrade-execution`). It said
+  "ExecutionRequest timed out", which read wrongly for the requests besides order placement that
+  report it, such as IBKR contract resolution.
+
+- **IBKR client order ids are at most 128 ASCII characters, and a failing fill recovery no longer
+  ends the account stream** (`rustrade-execution`, feature `ibkr`). **Breaking.**
+  - An order's client order id is sent as its IB order reference, which IB rejects when it is
+    not ASCII (error 10363) and echoes back whole only up to 128 characters. An open, or a
+    bracket any of whose leg ids (the parent's plus `_tp` and `_sl`) is empty, longer, or not
+    ASCII, is refused before anything is sent, with the new
+    `OrderMappingError::InvalidClientOrderId`. `OrderMappingError` is now `#[non_exhaustive]`,
+    so a match on it needs a wildcard arm.
+  - When reading a gap's fills fails three times, the account stream sends
+    `AccountEventKind::FillRecoveryGaveUp` covering every instrument, from the start of the gap
+    to when it gave up, and stays open. It ended with `StreamTerminated`, leaving its reader
+    thread blocked and `account_stream` failing until TWS sent another event. Read the span with
+    `fetch_trades`.
+
+- **A client order id names one live order at a time: an open under one in use is rejected**
+  (`rustrade-execution`, `rustrade`). **Breaking:** the simulated venue's behaviour changes. A
+  venue refuses a second order under an id its live order holds, but `SimulatedVenue` replaced the
+  resting order, the IBKR client overwrote its id mapping, and the engine overwrote its record of
+  the order before the venue's answer arrived. The new `ApiError::DuplicateClientOrderId(String)`
+  reports the refusal, which concerns the request alone: the order holding the id is unaffected.
+  - `SimulatedVenue` rejects an open, of any kind, whose id names a resting order. The check runs
+    after the kind, time-in-force and instrument checks and before the ledger moves. Once an order
+    has ended its id is free, and the venue reports the latest order under each id
+    (`orders_ended`, a cancel's rejection, `account_snapshot`).
+  - The IBKR client refuses such an open, or a bracket any of whose three ids is in use, before
+    anything reaches TWS, which never sees a client order id. An order holds its id until the
+    account stream reports it `Filled`, `Cancelled` or `Inactive`, or `clear_stale_order_ids`
+    reaps it. A `Filled` order frees its id at once and keeps its IB-id entry, so late executions
+    still resolve, and a status IB re-sends for it after its id names a later order is dropped
+    rather than read as that order's. So cancelling a filled order's id is now refused locally as
+    not found, rather than at TWS. Without a running account stream, an id is held until reaped,
+    and so is the id of an `open_order` whose future was dropped mid-flight: retry under a fresh
+    id.
+  - Binance spot and margin report Binance's `"Duplicate order sent."` as the new variant, rather
+    than `OrderRejected`. Alpaca and Hyperliquid still report a duplicate as `OrderRejected`
+    until their messages are confirmed.
+  - The engine rejects an open under an id an order it tracks for that instrument holds, or that
+    an earlier open in the same batch names, before sending it, as the new
+    `RecoverableEngineError::DuplicateClientOrderId` in the action output's `errors`. A
+    `DuplicateClientOrderId` refusal no longer retires the tracked order holding the id, unless
+    that order is the refused request's own, still in flight. `Orders` and `EngineState` keep an
+    order already tracked when an open is recorded under its id, rather than replacing it.
+  - **Breaking:**
+    - `OpenOrders::insert` returns `Result<(), AlreadyResting>`, handing a refused order and its
+      reservation back, instead of replacing the resting order and returning its reservation.
+      `OpenOrders` no longer implements `FromIterator`; `OpenOrders::contains` is new.
+    - `AccountState::orders_mut` is removed, so an order cannot reach the book past the id rule:
+      `AccountState::book` books one and `AccountState::remove_order` takes one off.
+    - `AccountState` converts from an `UnindexedAccountSnapshot` with `TryFrom`, failing with the
+      new `DuplicateSeededOrder` on an id listed twice among the open and cancelled orders it
+      seeds, instead of `From`, where the last such order won in a release build. The
+      `SimulatedVenue` constructors panic on it, as they do on other invalid `initial_state`.
+    - `ibkr::order::OrderIdMap::register` returns `Result<(), ClientOrderIdInUse>`. The new
+      `register_all` registers several orders, all or none, `release_client_id` frees a filled
+      order's id, and `names_other_order` tells whether an id has since been reused. `len` counts
+      live orders only.
+    - The engine's `send_open_requests` callers, `GenerateAlgoOrders` and `ClosePositions`,
+      require the state to implement the new `TracksOrder` and the instrument key `PartialEq`.
+    - `ApiError` and `RecoverableEngineError` gain a variant each; both are `#[non_exhaustive]`.
+
+- **`ibapi` 4.2.0 → 5.0.0** (`rustrade-execution`, `rustrade-data`, `rustrade-instrument`,
+  feature `ibkr`). **Breaking.** A caller using `ibapi` types directly meets its own breaking
+  changes; see its [migration guide](https://github.com/wboayue/rust-ibapi/blob/main/docs/migration-5.0.md).
+  In rustrade:
+  - `ibkr::order::build_ib_bracket_with_oca` returns a `Result`. `ibapi` 5 rejects a non-finite
+    price, or a take profit or stop loss on the wrong side of the entry, as the new
+    `OrderMappingError::InvalidBracketPrices`, and the client rejects such a bracket before
+    sending anything to IB.
+  - `IB_MARKET_DEPTH_RESET_CODE` is removed. `ibapi` 5 delivers IB's depth reset (317) as
+    `MarketDepths::Reset` data, which `DepthAggregator::update` turns into the emptied book. A
+    caller driving its own depth loop no longer matches the notice.
+  - The orders rustrade sends are unchanged: stop-limit and trailing-stop-limit orders, whose
+    `ibapi` builders were removed, are built with the same fields.
+
+- **IBKR `account_snapshot` returns once IB has listed every position** (`rustrade-execution`,
+  feature `ibkr`). It waited for 5 s without a position update, so every call took at least
+  5 s; it now stops at IB's end-of-listing marker, which took about 130 ms against a paper
+  gateway. It reads each account the login manages with IB's positions-multi request, whose
+  replies carry their request's ID, so concurrent calls never read each other's listing; IB
+  documents the account as optional only for a single-account login. 5 s without a report before
+  an account's marker still ends that read, without reporting unlisted instruments flat.
+  Closes #408.
+
+- **`binance-sdk` 70.2.0 → 74.0.0** (`rustrade-execution`, `binance` feature). The three
+  `binance_sdk::common` internals the margin user-data stream couples to were re-verified before
+  merge, and hold by construction: `common/` is byte-identical to 70.2.0. The one change that
+  reaches us is that the spot WebSocket API's execution report now declares the commission asset
+  (`N`) nullable, distinguishing an absent key from `null`. Both still read as no commission asset,
+  as before. The margin stream's report is unchanged. 74.0.0 changes only the dual-investment
+  module, which the `binance` feature does not compile.
+
+- **`databento` 0.62.0 → 0.63.0** (`rustrade-data`, `databento` feature). Its live client decodes
+  records in batches, and it moves to DBN 0.71.0 and zstd 0.14. No change to this crate's API.
+
+- **A reconnect's check of the orders it holds reads each instrument's own orders**
+  (`rustrade-execution`). The known-live orders are indexed by instrument, so the check no longer
+  scans every held order for each instrument it covers. No API change. Closes #468.
+
+- **An Alpaca fill's `TradeId` is Alpaca's execution id on every path** (`rustrade-execution`).
+  **Breaking.** The account stream and reconnect recovery gave a fill the id
+  `"{order_id}:{cumulative filled}"`, while `fetch_trades` gave it the FILL activity's `id`, so a
+  consumer reconciling with `fetch_trades` could not match fills by `TradeId`. Every path now uses
+  the execution id: the stream's `execution_id`, and the part of the activity `id` after `::`,
+  which is the same id. A stream fill whose `execution_id` is missing, null or empty keeps the
+  old form and logs a warning. Anyone who stored Alpaca `TradeId`s must re-key them. Closes #479.
+
+- **`ExecutionClient::fetch_trades` reads a span, in bounded calls the caller resumes**
+  (`rustrade-execution`). **Breaking.** It took `time_since` and returned `Vec<Trade>`. It now
+  takes `start` and `end`, both inclusive, and returns `TradesRead { trades, resume }`:
+  - `resume: None` means the span was read to its end.
+  - `Some(t)` means the call stopped at the venue's bound. Read on with `start = t`, and match
+    the fills read again by instrument and `TradeId`.
+
+  Alpaca's `fetch_trades` failed with `ClientError::Truncated` and returned no fills when more
+  than 5,000 lay after `time_since`, so a busy span could not be read at all. It now returns up
+  to 5,000 per call with a `resume`. `ClientError::Truncated { limit }`, which counted pages,
+  becomes `Truncated { fills_read }`, returned only when a read cannot get past its start.
+  Binance, IBKR, Hyperliquid and the mock client read a span whole, so they always return
+  `resume: None`. The mock client now honours `instruments`, and
+  `MockExchangeRequestKind::FetchTrades` and `MockExchangeRequest::fetch_trades` carry `start` and
+  `end` instead of `time_since`. `hyperliquid::common::user_fills` is replaced by
+  `user_fills_by_time`. To migrate, pass an `end` such as `Utc::now()`, and call again while
+  `resume` is `Some`. Closes #481.
+
+- **`SimulatedVenue` keeps each filled order whole** (`rustrade-execution`). **Breaking.**
+  `AccountState::ack_filled` takes the filled `Order` instead of its client order id, so that
+  `AccountState::order_ended` and `SimulatedVenue::orders_ended` can report a fill's total and
+  average price. `MockExchangeRequestKind` gains `FetchOrdersEnded` and is now
+  `#[non_exhaustive]`, since only the venue's own driver matches on it, so a later request kind is
+  not another break.
+
+- **`System::feed_tx` is now a `FeedTx`** (`rustrade`, new module `system::feed`). **Breaking**
+  for code that named its type `UnboundedTx` or reached its inner sender through the public `tx`
+  field. That field is gone, so that no send bypasses the count in `feed_depth`. `FeedTx`
+  implements `Tx` and `Sink` as `UnboundedTx` did, both counted, so `send` and `forward` are
+  unchanged.
+
+- **`Engine::execution_txs` is private** (`rustrade`). **Breaking.** The public field let a caller
+  send an order request straight to an exchange, for example
+  `engine.execution_txs.find(..)?.send(..)`, without the engine rejecting an untracked instrument,
+  stamping an open with the current market, or recording the request as in flight. The engine's
+  state then did not know the order existed. Construct an `Engine` with `Engine::new`, which
+  already takes the transmitters, and send orders through the engine's actions such as
+  `Command::SendOpenRequests` and `Command::SendCancelRequests`. Code that built an `Engine` with
+  a struct literal must switch to `Engine::new`.
+- **`ConnectivityStates::global()` is computed instead of cached** (`rustrade`). It was a stored
+  aggregate over the per-venue states, kept in step by every update path, and each new path was a
+  chance for the two to disagree. It is now computed on each call, with the same rule: `Healthy`
+  iff at least one venue is tracked and every venue is healthy on the dimensions its role
+  declares. The serialised form is unchanged, `global` and then `exchanges`, in self-describing
+  and positional formats alike. Deserialising reads the payload's `global` and discards it,
+  computing it from `exchanges`, so a payload whose `global` disagrees with its venues now reads as
+  its venues say. `update_from_account_event` no longer returns early while `global` is `Healthy`,
+  so an out-of-range `ExchangeIndex` now panics on every call rather than only while some venue is
+  unhealthy.
+- **`stream_blocking_iter` decodes in chunks and needs a `Send + 'static` iterator**
+  (`rustrade-data`). **Breaking.** Each chunk of up to `chunk_size` items is decoded on its own
+  `spawn_blocking` task, which returns and gives its thread back. The stream starts the next chunk
+  when one arrives, and no further chunk until it is drained, so the decoder runs at most two chunks
+  ahead of its consumer (it was one channel's capacity); a merge of N streams holds up to N times
+  that. Nothing starts until the first poll, so `init`, and an error opening the source, now happen
+  then rather than at the call, and the first poll needs a Tokio runtime where the call used to. The
+  iterator moves between tasks, so it must be
+  `Send + 'static`, and a decoder with `!Send` internals is no longer accepted.
+  `DEFAULT_BLOCKING_CHANNEL_CAPACITY` is renamed `DEFAULT_BLOCKING_CHUNK_SIZE`, keeping its value of
+  1024. A dropped stream finishes the chunk in progress, rather than stopping at the next item.
+
+### Removed
+
+- **The public `SendRequests` trait** (`rustrade`). **Breaking.** Its two methods,
+  `send_requests` and `send_request`, sent order requests exactly as given: without the engine's
+  rejection of a request for an instrument it does not track, without stamping an open with the
+  current market, and without recording the request as in flight, so the engine's own state did
+  not know the order existed. The engine no longer used either internally. Send orders through the
+  engine's actions instead, such as `Command::SendOpenRequests` and `Command::SendCancelRequests`,
+  which reject an untracked instrument, stamp each open with the current market, and record each
+  request they send as in flight. `SendRequestsOutput` and `SendCancelsAndOpensOutput` are unchanged.
+
+### Fixed
+
+- **Hyperliquid orders were rounded to 5 significant figures before sending, which could change
+  the order or get it rejected** (`rustrade-execution`, `rustrade-instrument`). Closes #528.
+  **Breaking.**
+  - Both Hyperliquid clients passed quantity, limit price and trigger price through 5-significant-
+    figure rounding. A size Hyperliquid caps at the asset's `szDecimals` decimal places, not at
+    significant figures, so a quantity such as `123456` went out as `123460`, and `1.234` on an
+    asset with `szDecimals` 2 was rejected by the venue. Prices also ignored the venue's decimal-
+    place cap (`6 - szDecimals` for perpetuals, `8 - szDecimals` for spot), and an integer price,
+    which Hyperliquid always accepts, was rounded too.
+  - The clients now never round. An order whose quantity, price or trigger price breaks
+    Hyperliquid's rules is refused before anything is sent, with the new
+    `OrderError::InvalidPrecision(PrecisionViolation { field, value, limit })`. `OrderField` names
+    the value, and `PrecisionLimit` the rule it broke: `DecimalPlaces`, `SignificantFigures`,
+    `NotRepresentable` for a value the SDK's `f64` wire format would change, or `NotPositive` for
+    a zero or negative value. The error is not transient. Valid values are sent exactly as
+    requested.
+  - Read the rules with the new `HyperliquidClient::order_precision` and
+    `HyperliquidSpotClient::order_precision` (async: it reads `spotMeta` again for a pair listed
+    since), which return the new `OrderPrecision`. It checks values with `check_quantity`,
+    `check_price` and `check_trigger_price`, and rounds them with `round_quantity` and `round_price` in the direction you
+    pass, so the rounding policy stays with the caller.
+  - `SpotPair` gains `base_sz_decimals()`, read from `spotMeta`, and the HIP-3 DEXs' `meta` now
+    supplies each perpetual's `szDecimals`. Both responses must now carry `szDecimals`, which
+    Hyperliquid always sends: a `spotMeta` deserialized into `SpotPairs` without it fails, as it
+    already did in the SDK. An order on a perpetual listed after the client
+    connected is refused with `ApiError::InstrumentInvalid`, as the client has no `szDecimals`
+    for it. Reconnect to trade it.
+  - The public `hyperliquid::common::round_to_5_sig_figs` is removed.
+
+- **IBKR rejected every trailing stop-limit order: `OrderKind::TrailingStopLimit` had no initial
+  stop** (`rustrade-execution`). Closes #518. **Breaking:** the kind has a new required field,
+  `stop_price: Decimal`.
+  - IB requires a TRAIL LIMIT order's initial stop price. The kind had no field for it, so the
+    IBKR client sent a stop of 0 for an absolute trail, which IB acknowledges and then rejects
+    with `Inactive` ("Invalid Price"), and none for a percentage trail, which IB refuses outright
+    (error 321). No IBKR trailing stop-limit order could work.
+  - `stop_price` is the stop at submission, which then trails the market by `offset`. It must be
+    positive. On IBKR paper, a stop within `offset` of the market was kept as placed, and one
+    further away moved to `offset` from the market within seconds of IB accepting the order. So
+    an order read back from a venue listing may report the stop after it has trailed, not the one
+    it was placed with. The limit price follows from the stop and `limit_offset`. The kind's
+    `Display` now includes the stop: `TrailingStopLimit(offset, offset_type, stop_price,
+    limit_offset)`.
+  - The IBKR client sends `stop_price` as IB's `trail_stop_price` for both absolute and
+    percentage trails. It refuses a zero or negative stop with the new
+    `OrderMappingError::NonPositiveStopPrice`, and a `RequestOpen::price` given for this kind
+    with the new `OrderMappingError::UnexpectedLimitPrice`, before anything is sent. An order it
+    did not place, or no longer tracks, is read back with its stop from IB's `trail_stop_price`.
+  - The rustdoc of `RequestOpen::price` and of the IBKR order mapping said `TrailingStopLimit`
+    requires a limit price. It takes none.
+  - Binance, Alpaca and Hyperliquid still reject the kind, as before.
+  - An `OrderKind::TrailingStopLimit` serialised without `stop_price` no longer deserialises.
+
+- **A failing account-stream re-initialisation was retried forever in silence, and the engine
+  marked an account link up on events that showed it down** (`rustrade`, `rustrade-execution`,
+  `rustrade-data`). Closes #515.
+  - After the account stream ends, `ExecutionManager` re-initialises it with backoff. Each failed
+    attempt was logged with `warn!` and discarded, so the consumer received one
+    `Event::Reconnecting` and then nothing, and a reconnect that would never succeed, for example
+    after credentials were revoked, looked like one still in its backoff. Each failed attempt is
+    now sent in-band, in order with the account events, as the new
+    `AccountEventKind::ReinitFailed(AccountReinitFailure { attempt, error })`, where `attempt`
+    counts consecutive failures from 1. No further `Reconnecting` follows it. The manager keeps
+    retrying: when to give up is the caller's decision.
+  - `error` is the new `AccountStreamInitError`: `Client(ClientError)` when the client failed to
+    fetch the snapshot or open the stream (see `ClientError::is_transient`), or `Index(IndexError)`
+    when the snapshot named something not indexed. `AccountEventIndexer` indexes it with the new
+    `account_stream_init_error` and `reinit_failure`.
+  - The engine logs `ReinitFailed` at `error!` and changes no state. It no longer marks the
+    account link `Healthy` on a `ReinitFailed` or a `StreamTerminated`, both of which arrive while
+    the link is down.
+  - The new `ReconnectingStream::with_reconnection_events_reporting` turns the attempts from
+    `with_reconnect_backoff_reporting` into reconnect events, making one item of each failure.
+    Market streams and the account stream both use it.
+  - **Breaking:** `ExecutionError::Client` and `ExecutionError::Index`, which only account-stream
+    initialisation produced, are replaced by `ExecutionError::AccountStreamInit(AccountStreamInitError)`.
+    `ExecutionManager::init` returns it when the first attempt fails.
+
+- **An IBKR contract registered without its IB contract id lost every fill, order listing and
+  position for it** (`rustrade-execution`, feature `ibkr`; `rustrade-instrument`, feature `ibkr`).
+  **Breaking:** registration is fallible. `IbkrClient::register_contract` accepted a contract IB
+  had not resolved, such as `stock_contract("AAPL", "SMART", "USD")`, which has contract id 0.
+  Orders on it were placed, because placement looks contracts up by name. But IB reports
+  everything by contract id, so the client dropped the contract's stream and recovered fills, its
+  `fetch_trades` and `fetch_open_orders` entries and its `account_snapshot` positions, logging
+  only at `debug!`.
+  - `IbkrClient::register_contract` and `ContractRegistry::register` return
+    `Result<(), ContractRegistryError>`. They refuse a contract with no IB contract id
+    (`Unresolved`), and one whose id is already registered under another name
+    (`ContractIdTaken`), which used to move the id's reports to the new name. Either refusal
+    leaves the registry unchanged.
+  - New `IbkrClient::resolve_contract` resolves a contract description on the client's own
+    connection. Its error, the new `contract::ResolveContractError`, says whether a retry can
+    help (`is_transient`):
+    - `NoMatch` when no IB contract matches the description;
+    - `Ambiguous` when several do, carrying the matches;
+    - `Refused { code, message }` when IB answers with another error;
+    - `Connectivity(ConnectivityError)`, the transient case, when the connection drops or IB
+      sends nothing for 10 seconds;
+    - `Failed` otherwise, as for a client that has shut down or given up reconnecting.
+  - `IbkrClient::connect_sync` resolves `IbkrConfig::contracts` the same way. It used to register
+    the first of several matching contracts, which could be the wrong one, and skipped one with
+    no match without a warning. Both now count as a contract that failed to resolve, which fails
+    the connection: see the `connect_sync` entry under Changed.
+  - New `ContractRegistry::register_by_name_only` keeps the old behaviour for uses that only look
+    contracts up by name. `rustrade-data`'s `IbkrMarketStream` is one: IB resolves each market
+    data request's contract itself. A contract registered this way is never found by contract id.
+
+- **`IbkrClient::disconnect`'s rustdoc said it released the API client ID** (`rustrade-execution`,
+  feature `ibkr`). It does not: `ibapi` keeps the connection open until the last clone of the
+  client is dropped, and until then TWS/Gateway refuses a reconnect under the same ID with error
+  326. The rustdoc now says so: drop every clone before reconnecting under the same ID.
+
+- **IBKR warned at every lookup of a client order id reused after its order ended**
+  (`rustrade-execution`, feature `ibkr`). IB keeps the earlier order's completion in its listing,
+  so each `fetch_ended_orders` call and each reconnect check repeated the warning that the
+  completion predates the order now under the id. It is now warned about once per completion,
+  and logged at `debug!` after that. The warning names the usual cause, a reused client order id,
+  ahead of the rare one, IB's clock lagging this host's.
+
+- **Hyperliquid reported a cancel it had not applied as cancelled** (`rustrade-execution`, feature
+  `hyperliquid`). Hyperliquid answers such a cancel with a top-level `ok` and puts the error in the
+  order's own status, for example "Order was never placed, already canceled, or filled.".
+  `HyperliquidClient` and `HyperliquidSpotClient` read only the top level. So a cancel of an order
+  that had already filled was reported as `Ok(Cancelled)`, and the reconnect check then stopped
+  asking about that order. `cancel_order` now reports `Cancelled` only for a `success` status. An
+  error status, or an answer with no status for the order, is an `ApiError::OrderRejected` carrying
+  the reason, and the order stays tracked until the account stream or a lookup says how it ended.
+  The rejection is not reported as `OrderAlreadyCancelled` or `OrderAlreadyFullyFilled`: Hyperliquid's
+  message does not say which of "never placed, already canceled, or filled" happened, so the order
+  may already have ended either way.
+
+- **IBKR fills never advanced the engine's orders, and IBKR order reads misreported orders, fees
+  and other API clients' activity** (`rustrade-execution`, feature `ibkr`). **Breaking:** what
+  these methods return changes.
+  - A `Trade`, and a `TradeAmended`, now carry the IB order id in `order_id`, the id the order's
+    `Open` state carries. They carried the client order id, so the engine never matched an IBKR fill
+    to its order: neither its strategy routing nor its fill progress came from the fill.
+  - `fetch_trades` pairs each execution with the commission report IB sends with it, so trades
+    carry their real fees. They were always zero in an `"UNKNOWN"` asset. An execution IB sends no
+    report for keeps that placeholder, now `execution::UNKNOWN_FEE_ASSET`, with a warning.
+  - `fetch_open_orders` reports each order's kind, limit price and time in force. It reported every
+    order that was not a plain limit as `Market`, with time in force `GoodUntilCancelled`, and a
+    filled quantity of zero. An order this client tracks keeps what it was placed with; any other
+    is read back from IB's listing, and one whose type or time in force this client never sends is
+    left out with a warning. The filled quantity is the one IB lists with the order.
+  - IB numbers orders per API client, so `fetch_open_orders`, `fetch_trades`, the account stream
+    and fill recovery now keep only this API client's orders and executions. Another client's, or
+    an order entered in TWS, could carry an order id this client also uses, and be reported as
+    this client's order.
+  - IB reports orders entered in TWS under API client id 0, so a client connected as 0 still
+    sees them.
+  - A good-till-date order IB cancels at its expiry is reported `Expired`, not `Cancelled`. One
+    cancelled outside this client, as in TWS, within 5 seconds of its expiry reads as expired too.
+  - `fetch_balances`, `fetch_open_orders` and `fetch_trades` fail if IB sends nothing for 10
+    seconds before the end of a listing, or the connection drops during it. They blocked until IB
+    answered, or returned what they had read as if complete. `fetch_trades` returns trades in time
+    order.
+  - `ExecutionBuffer::add_execution` no longer takes a client order id.
+
+- **A market stream's failed re-initialisation reached only the logs, and a failed subscription
+  batch did not say which subscription failed** (`rustrade-data`, `rustrade-integration`). Closes
+  #506.
+  - When a venue does not acknowledge every subscription in a batch, for example Hyperliquid
+    dropping the connection on a coin it does not know, the error now names the subscriptions left
+    unacknowledged: the new `SocketError::Unacknowledged { reason, unacknowledged }`, carried into
+    `DataError::SubscriptionsUnacknowledged` instead of being flattened to `DataError::Socket`.
+    These are candidates, not proof of rejection: a venue that drops the connection also leaves
+    the subscriptions sent after the bad one unanswered. A venue names its acknowledgements through
+    the new `Connector::acknowledged_subscription`, which defaults to `None`, and Hyperliquid
+    (perpetuals and spot) implements it. Every other venue, and a response that names no
+    subscription in the batch, reports the whole batch.
+  - After a stream has started, each failed re-initialisation now yields
+    `Event::Item(Err(DataError::ReinitFailed { attempt, error }))`, where `attempt` counts
+    consecutive failures from 1. Before, the consumer received one `Event::Reconnecting` and then
+    nothing while the stream retried forever. A failed attempt is yielded at once, then the backoff
+    runs; no further `Reconnecting` follows it. The stream keeps retrying: when to give up, or to
+    rebuild without a subscription the venue no longer accepts, is the caller's decision.
+  - The new `ReconnectingStream::with_reconnect_backoff_reporting` yields each failure as a
+    `ReinitFailure { attempt, error }`; `with_reconnect_backoff` still logs and discards them.
+  - Subscription validation's timeout was re-armed by every message it read, so it never fired
+    while an acknowledged subscription kept streaming events. It now runs from the start of
+    validation.
+  - **Breaking:** `SocketError` is not `#[non_exhaustive]`, so an exhaustive match on it needs an
+    arm for `Unacknowledged`. A consumer's `with_error_handler` now also receives `ReinitFailed`.
+
+- **An IBKR order whose id was reused lost its mapping** (`rustrade-execution`, feature `ibkr`).
+  When an earlier order under the id ended, or was reaped by `clear_stale_order_ids`, it removed
+  the id's mapping even though it named the later order, so that order's cancel and status
+  updates no longer resolved. A removal now only removes a mapping that still names the order
+  removed.
+
+- **The IBKR account stream did not end when the client shut down** (`rustrade-execution`,
+  feature `ibkr`). Its reader thread stayed blocked until the process exited, holding `ibapi`'s
+  only order-update slot, and `account_stream` on a client that had already shut down returned a
+  stream that never ended. With `ibapi` 5 the stream ends with `StreamTerminated` as soon as the
+  client shuts down, its thread exits, and `account_stream` on a shut-down client fails. Closes
+  #409.
+
+- **IBKR `fetch_open_orders` could return stale orders, and calls failed after a reconnect**
+  (`rustrade-execution`, feature `ibkr`). `ibapi` 4.2.0 shared one reply queue per request type
+  across calls; `ibapi` 5 gives each call its own.
+
+- **IBKR option greeks IB had not computed came through as `-1` or `-2`** (`rustrade-data`,
+  feature `ibkr`). They are now `None`.
+
+- **`rustrade-integration`'s `channel` feature did not build on its own.** It now enables
+  `futures`, which the module imports.
+
+- **`UnboundedRx`'s `Iterator` spun a CPU core while its channel was empty**
+  (`rustrade-integration`, `channel` feature). `next` retried `try_recv` in a loop, so an engine run
+  in `EngineFeedMode::Iterator` kept a core busy whenever no event was waiting. `next` now returns
+  a waiting message at once and otherwise blocks the thread until one arrives. Like Tokio's
+  `blocking_recv`, it panics if it has to wait inside an asynchronous context; the system builder
+  already runs the iterator engine on a `spawn_blocking` thread.
+- **docs.rs documented none of `rustrade-data`'s providers, nor `rustrade-integration`'s
+  `channel` and `metric` modules**, which are behind non-default features. Both crates now build
+  their docs with all features, as `rustrade-execution` already did.
+- **An order request could go unanswered, leaving the order in flight forever** (`rustrade`,
+  `rustrade-execution`). `ExecutionManager` indexed each response by the order key the client put
+  in it, and discarded a response whose key it could not resolve. An `ExecutionClient` could also
+  answer `None`, after which the manager reported nothing. Either way the engine kept the order
+  `OpenInFlight` or `CancelInFlight` for good, and in Hedging mode held back fills on that
+  instrument that matched no order. Now every request gets exactly one answer within
+  `request_timeout`, unless the manager is stopped with `ExecutionRequest::Shutdown`:
+  - `ExecutionManager` delivers each response under the key of the request it answers. A response
+    whose own key differs, or cannot be resolved, is a client bug: it is logged at `error!` and
+    still delivered.
+  - **Breaking:** `ExecutionClient::open_order` and `cancel_order` return their answer instead of
+    an `Option`, as do the `open_orders` and `cancel_orders` defaults and Alpaca's
+    `open_order_with_intent`. No client in the workspace returned `None`. An implementation must
+    report a failure to send a request, or to read the venue's answer, as `OpenFailed` or as an
+    `Err` cancel, never by staying silent.
+
+- **A name a venue spelled in another case failed to index** (`rustrade-execution`,
+  `rustrade-instrument`, `rustrade`). `ExecutionInstrumentMap` matched asset and instrument names
+  exactly, case included, but venues and clients do not always spell a name the way it was
+  registered. An event naming one in another case was dropped or degraded. Alpaca reported a
+  crypto balance as `btc`, the USD balance as `usd` unless the caller's filter spelled it
+  otherwise, and every USD fee as `USD`, so no registered spelling resolved all three. A registered
+  `spy` failed against Alpaca's `SPY`, and IBKR reports currencies as `USD`. Now:
+  - `find_asset_index` and `find_instrument_index` match the registered spelling first, then
+    ignore ASCII case, logging such a match at `debug!` with both spellings. The lookups from an
+    index to a name still return the registered spelling.
+  - `VenuePositionSeeds::from_account_snapshot` matches a venue's instrument name the same way.
+  - Alpaca names the USD balance `USD`, and a crypto balance by its base as Alpaca spells it
+    (`BTC`), however the caller's filter spelled them.
+  - **Breaking:**
+    - `IndexedInstruments` rejects two instruments on one exchange whose `name_exchange`s differ
+      only in case (`IndexError::DuplicateInstrumentNameExchange`), and two distinct assets on one
+      exchange whose `name_exchange`s match ignoring case (the new
+      `IndexError::DuplicateAssetNameExchange`). The asset check also rejects two assets sharing a
+      `name_exchange` exactly under different `name_internal`s, which built before and left one
+      of them unreachable by name.
+    - `ExecutionInstrumentMap::asset_names` and `instrument_names` are private, since the
+      case-insensitive index is derived from them, and the map can no longer be built with a struct
+      literal: use `ExecutionInstrumentMap::new`. `exchange_assets()` and `exchange_instruments()`
+      still list the registered names.
+    - Alpaca's balance asset names change spelling: `usd` becomes `USD`, `btc` becomes `BTC`.
+
+- **IBKR delivered a corrected execution as a second fill** (`rustrade-execution`, feature
+  `ibkr`). IB reports a correction as a further execution whose id differs only in the digits
+  after the final period (`….01.02` corrects `….01.01`). The account stream and fill recovery
+  sent it as another `Trade`, so a consumer building positions from fills counted the execution
+  twice, and `fetch_trades` returned both. Now:
+  - the account stream sends a correction as `AccountEventKind::TradeAmended`, `Corrected`, with
+    the correction as the replacement `Trade`, once its commission report arrives. Its `original`
+    is the revision the stream delivered before, or, for an execution from before the stream,
+    the revision the correction's id says it corrects. A correction is logged at `warn!` when it
+    arrives, so one that never gets a commission report is still seen;
+  - a revision older than one already delivered is dropped, and fill recovery delivers an
+    execution ahead of its corrections;
+  - `fetch_trades` returns each execution once, at its latest revision.
+
+  A revision above `01` is read as a correction: IB's documentation gives `.02` correcting `.01`
+  as an example, and every execution IB first reports ends in `01`. IB documents no busts.
+  Known limitation: a correction that arrives live after a reconnect, before recovery has
+  delivered its original from the gap, is sent as an amendment, and recovery then drops the
+  original, so that trade reaches the stream only as the amendment. Closes #487.
+- **Hyperliquid's `fetch_trades` returned at most the 2,000 most recent fills**
+  (`rustrade-execution`). Perp and spot read `userFills`, which holds only a wallet's 2,000 most
+  recent fills, and filtered it by time. So a span with more fills than that came back short, with
+  no error. Both now read the span with `userFillsByTime`, paging past its 2,000-fill responses.
+  Hyperliquid keeps only a wallet's 10,000 most recent fills, so older fills still cannot be read.
+  Closes #484.
+- **Hyperliquid spot dropped every pair but PURR/USDC, and perpetuals reported spot pairs**
+  (`rustrade-execution` and `rustrade-instrument`, `hyperliquid` features). **Breaking.**
+  Hyperliquid names every spot pair but PURR/USDC by its index (`@107` is HYPE/USDC), but the spot
+  client recognised a spot coin only by a `/` in its name. So for every other pair it silently
+  dropped fills and order updates on the account stream, and rows from `fetch_open_orders`,
+  `fetch_trades` and the account snapshot. The perpetuals client took every coin for a perpetual,
+  so it reported those spot fills and orders, and PURR/USDC's, under instruments such as
+  `@107-USD-PERP`.
+  - The spot client reads Hyperliquid's `spotMeta` when it is created, and names each pair
+    `BASE-QUOTE-SPOT` from its tokens: `@107` is `HYPE-USDC-SPOT`, and `@207`, HYPE quoted in
+    USDT0, is `HYPE-USDT0-SPOT`. `connect` now fails, and `new` panics, if `spotMeta` cannot be
+    read.
+  - A spot coin missing from `spotMeta`, such as a pair listed since, makes the client read it
+    again, at most once every 10 seconds, each read abandoned after 5. A coin still missing fails
+    `account_snapshot`, `fetch_open_orders` and `fetch_trades`, whose lists would otherwise be
+    short with nothing to say so. It is left out of the account stream, logged once per stream
+    and coin, with `error!` for fills and `warn!` for order updates.
+  - Orders are still placed through the SDK's `ExchangeClient`, which reads `spotMeta` only when
+    it is created. So a pair listed after the client was created is reported but cannot be traded
+    until the client is created again.
+  - Each client keeps only its own coins, judged by their shape with the new
+    `rustrade_instrument::hyperliquid::CoinKind`: perpetuals (`BTC`, `kPEPE`, and HIP-3
+    perpetuals such as `xyz:TSLA`) or spot pairs (`@107`, `PURR/USDC`). A coin of neither shape,
+    such as an outcome coin, is left out by both. The perpetuals client logs it with `warn!`, once
+    per read or once per stream.
+  - New in `rustrade-instrument`, behind a new `hyperliquid` feature: `hyperliquid::CoinKind`
+    (non-exhaustive), `SpotPairs` and `SpotPair`. `SpotPairs` deserializes from the `spotMeta`
+    response. docs.rs now documents the crate's `ibkr` and `hyperliquid` modules.
+  - **Breaking:** `client::hyperliquid::common::is_spot_coin` is removed in favour of
+    `CoinKind::of`, and `spot_coin_to_instrument(&str)` is replaced by
+    `spot_pair_to_instrument(&SpotPair)`.
+
+  Closes #496.
+- **Hyperliquid perpetuals reported a zero balance for a unified or portfolio-margin account**
+  (`rustrade-execution`). `account_snapshot` and `fetch_balances` read USDC from the default DEX's
+  margin summary, which Hyperliquid documents as not meaningful in those modes, where every
+  balance is held in the spot clearinghouse. They now read the account's mode with
+  `userAbstraction` each time. Under unified account or portfolio margin they report one balance
+  per collateral token of the DEXs traded, from `spotClearinghouseState`, free of what is on hold.
+  Under standard mode they report one balance per DEX, from its margin summary: `USDC` for the
+  default DEX and `{dex}:{collateral}` (`xyz:USDC`, `flx:USDH`) for each HIP-3 DEX, since each
+  margins separately. A mode the client does not know fails the read.
+- **Hyperliquid perpetual fills reported every fee as USDC** (`rustrade-execution`). The
+  perpetuals client hard-coded the fee asset of fills on the account stream and from
+  `fetch_trades`. A builder-deployed (HIP-3) perpetual settles in its deployer's collateral, so a
+  fee charged in USDH, USDE or USDT0 was reported as USDC. The fee asset now comes from the fill's
+  `feeToken`, falling back to USDC only if it is absent.
+- **Hyperliquid data subscriptions upper-cased mixed-case perpetuals (`kPEPE` became `KPEPE`),
+  and had no way to find a builder-deployed (HIP-3) perpetual** (`rustrade-data` and
+  `rustrade-instrument`, `hyperliquid` features). **Breaking.** A subscription built from a
+  `MarketDataInstrument` derives the coin from asset names, which are stored lower-cased, so it
+  asked for `KPEPE`. Hyperliquid sends no data for a wrong coin and then closes the connection,
+  ending the other subscriptions on it too.
+  - New `exchange::hyperliquid::HyperliquidMeta` reads the coins from Hyperliquid's info endpoint:
+    `HyperliquidMeta::fetch(network, deployers)` reads the default perpetuals, the spot pairs, and
+    the perpetuals of each HIP-3 deployer named (such as `xyz`). An unlisted deployer fails with
+    `HyperliquidMetaError::UnknownDeployer`.
+  - `perp_coin(name)` finds a perpetual whatever its ASCII case and returns the venue's spelling
+    (`KPEPE` finds `kPEPE`; `xyz:TSLA`). `spot_pair(base, quote)` finds a pair by its tokens
+    (`HYPE`, `USDC` finds `@107`). An exact match wins; a name that matches several once case is
+    ignored matches none.
+  - New `MarketInstrumentData::hyperliquid_perp(key, &PerpCoin)` and
+    `hyperliquid_spot(key, &SpotPair)` build the instruments to subscribe with, named as the
+    venue spells them.
+  - The `MarketDataInstrument` path is unchanged, and its limits are now documented: it gets a
+    mixed-case or HIP-3 perpetual wrong, and names only PURR/USDC among spot pairs unless given an
+    `@{index}` base.
+  - New in `rustrade-instrument`: `hyperliquid::Perps` (deserializes from a `meta` response) and
+    `PerpCoin`, `SpotPairs::find(base, quote)`, and `hyperliquid::Network` (serialized as
+    `"mainnet"`/`"testnet"`). The `rustrade-data`
+    `hyperliquid` feature now enables `rustrade-instrument`'s.
+  - **Breaking:** `exchange::hyperliquid::SpotMetaResolver`, `resolve_spot_pair`,
+    `spot_meta::mainnet_resolver` and `SpotMetaError` are removed in favour of `HyperliquidMeta`.
+    The resolver named PURR/USDC `@0`, which is not its coin.
+  - **Breaking:** `HyperliquidHistoricalData::new` takes a `Network` instead of `testnet: bool`.
+
+  Closes #495.
+- **Alpaca fill recovery and `fetch_trades` could miss fills in the millisecond they read from**
+  (`rustrade-execution`). Alpaca's account-activities `after` filter compares at millisecond
+  precision, so a read from a time inside a millisecond skipped every later fill in it. Recovery
+  reads from the disconnect, so a fill up to 1 ms after a disconnect could be lost. Reads now start
+  at the beginning of their first millisecond, and the dedup cache absorbs the fills read twice.
+  A read that stops at its page cap resumes from the millisecond of its last fill, since Alpaca
+  orders a millisecond's fills by id rather than by time. Closes #485.
+- **Alpaca reported a crypto balance under its position symbol, `BTCUSD`** (`rustrade-execution`).
+  Alpaca's positions list names a crypto holding by its asset followed by `USD`, not by the pair
+  (`BTC/USD`) that orders and fills use. The asset was read as the part before a `/`, so a BTC
+  holding was reported as asset `BTCUSD`: an unfiltered `fetch_balances` or `account_snapshot`
+  failed to index it, and one filtered by `BTC` left it out. The asset is now read from either
+  form, and a symbol in neither form is reported whole with a warning. Closes #497.
+- **An ended order reported an unknown fill quantity as zero** (`rustrade-execution`).
+  **Breaking:** `Cancelled::filled_quantity` and `Expired::filled_quantity` are now
+  `Option<Decimal>`. `None` means the venue did not report how much filled, and it is not zero:
+  the order may have partly filled. Until now these cases read as `0`, which a consumer could not
+  tell from an order that filled nothing:
+  - every Alpaca cancel, whose `DELETE` returns no body;
+  - Hyperliquid cancels (perp and spot), whose response carries no fill;
+  - an IBKR cancel request's response;
+  - a Binance cancel, placement, order listing, or execution report missing or garbling its
+    cumulative filled quantity (`executedQty`, `z`), and the same in Alpaca's `filled_qty` and
+    IBKR's order status.
+
+  These now report `None`, with a warning where the venue normally sends the figure. A Binance
+  `ACK` placement response, which never carries it, still reads as `Open`. To learn an unknown
+  fill, read the order's fills from the account stream, or ask the venue with
+  `OrderStatusClient::fetch_ended_orders`; the client does not look it up itself. `Filled` is
+  unchanged: a filled order filled its whole quantity, which is used when the venue's figure is
+  missing. `Open` is unchanged too: a live order's fill only grows, so an unknown one still reads
+  as `0`, now with a warning, until the venue reports more. Serialised, an unknown fill is
+  `null`; a state serialised before this change still deserialises, its fill as `Some`.
+  Closes #475.
+- **A late order snapshot re-opened an order the engine had retired** (`rustrade`). **Breaking**
+  for code that builds `Orders` as a tuple, `Orders(map)`, or matches it with that pattern: use
+  `Orders::new`, which keeps its signature, and `.0`, which is unchanged. The serialised form is
+  unchanged. The account stream and an open request's response travel on different connections,
+  so the stream can report how an order ended before the response, which carries the order's
+  state at placement, arrives. That response, or a stale listing of an order that had just
+  ended, found the order untracked and tracked it again as a live order the venue no longer had,
+  until a complete account snapshot dropped it. `Orders` now remembers the client order ids of
+  the last `MAX_RECENTLY_RETIRED_ORDERS` (64) orders it retired or saw reported ended, per
+  instrument, including those `clear()` drops at contract expiry. It ignores an active snapshot
+  for one with a `debug!`. A repeated terminal report for one is also logged at `debug!` rather
+  than `warn!`, since a venue that reports the end in both the response and the stream sends
+  two. A new open request under a remembered id forgets it. The memory is not serialised, and
+  `Orders` equality compares the tracked orders only. So a restored engine, or an audit replica
+  seeded from a snapshot, starts with no memory. The replica also sees no open requests, so it
+  ignores an order under an id reused within the window, where the engine tracks it.
+  Closes #471.
+- **Binance reported an order that ended in its placement response as open** (`rustrade-execution`).
+  `BinanceSpot::open_order` and `BinanceMargin::open_order` read the returned state from
+  `executedQty` alone, so an IOC or FOK order that found no liquidity, or partly filled and
+  expired the rest (`EXPIRED`), or was expired by self-trade prevention (`EXPIRED_IN_MATCH`), came
+  back `Active(Open)` and was held as live for a reconnect to ask about. Both now read the
+  response's `status`: `EXPIRED`/`EXPIRED_IN_MATCH` return `Inactive(Expired)` and `CANCELED`
+  `Inactive(Cancelled)`, each with what filled, and `REJECTED` returns `OpenFailed`. Neither is
+  held as live. A live status, or none (an `ACK` response), reads as before. Binance Spot's
+  `FullyFilled` now carries the average price from `cummulativeQuoteQty`, as Margin's did. The
+  status mapping is shared with the lookup of how an order ended. Closes #467.
+- **Alpaca reported an order that ended in its placement response as open** (`rustrade-execution`).
+  `AlpacaClient::open_order` and `open_bracket_order` read the returned state from `filled_qty`
+  alone, never from the response's `status`, so an IOC or FOK order that found no liquidity, or
+  partly filled and had the rest cancelled (`canceled`, `expired`), or that Alpaca rejected after
+  accepting it (`rejected`), came back `Active(Open)` and was held as live for a reconnect to ask
+  about. Both now return `Inactive(Cancelled)` or `Inactive(Expired)`, each with what filled
+  (`None` when unknown), and `OpenFailed` for `rejected`. Neither is held as live. A live status,
+  including `done_for_day`, reads as before, and so does a missing or unknown one, with a warning.
+  `FullyFilled` from a placement now carries the response's `filled_avg_price`. The status mapping
+  is shared with the lookup of how an order ended. Closes #477.
+- **Alpaca retired an order that was only done for the day** (`rustrade-execution`). A
+  `done_for_day` event on the account stream was delivered as `OrderCancelled`, so the engine
+  dropped an order that Alpaca keeps and works again the next trading day ("will not receive
+  further updates until the next trading day"), and any later fill on it matched no order. It is
+  now delivered as an `OrderSnapshot` of the order as open, with what it has filled.
+- **An order rejected for insufficient balance on Binance stayed in flight forever**
+  (`rustrade-execution`, `rustrade`). Binance's error mapping put the *instrument* name where
+  `ApiError::BalanceInsufficient` expects an asset. The indexer could not resolve it, so
+  `ExecutionManager` discarded the whole open or cancel response ("filtering … response due to
+  unrecognised index"). The engine never learned that the request failed, and kept the order
+  `OpenInFlight` or `CancelInFlight` for good. In Hedging mode, fills on that instrument that
+  matched no order were also held back while it stayed. Binance Spot and Margin opens and cancels
+  were affected, and Alpaca's error mapping named `"usd"` whatever the map called it.
+  - The indexer no longer fails on what an error names. A response always reaches the engine, and
+    each degrade below logs a `warn!` naming what was dropped:
+    - `BalanceInsufficient` with an asset the map does not hold keeps its variant, with no asset.
+    - `AssetInvalid` and `InstrumentInvalid` with a name it does not hold have no index to carry.
+      They become `OrderRejected` (from an order request) or `RequestRejected` (from any other
+      request), keeping their own message.
+  - Binance reads `-2010` by its message. It is the generic NEW_ORDER_REJECTED code, shared by
+    reasons such as "Order would trigger immediately.", and all of them were reported as
+    `BalanceInsufficient`. Only a balance message is now; the rest are `OrderRejected`.
+  - A response whose own order key the indexer cannot resolve is no longer discarded either: see
+    the entry on `ExecutionManager` answering every request.
+  - **Breaking:**
+    - `ApiError::BalanceInsufficient` is `(Option<AssetKey>, String)`. Binance and Alpaca leave
+      the asset `None`, since their rejections do not name it.
+    - `AccountEventIndexer::api_error`, `order_error`, `order_state` and `client_error` return
+      their value instead of a `Result`.
+    - `BalanceInsufficient` displays as "balance insufficient for asset {asset}: {message}", or
+      "balance insufficient: {message}" with no asset, instead of "asset {asset} balance
+      insufficient: {message}".
+- **A market event for an `ExecutionOnly` venue was dropped once every venue was healthy**
+  (`rustrade`). `update_from_market_event` returned early while the cached `global` was `Healthy`,
+  so a misrouted market event, or a venue with the wrong role, left
+  `ConnectivityState::market_data` at `Reconnecting` after convergence and the mistake went
+  unseen. It is now recorded as `Healthy` whatever `global()` reads.
+- **A simulated CFD round trip needed twice its notional funded** (`rustrade-execution`).
+  `SimulatedVenue` debited a CFD fill's full notional in both directions, with no credit path, so a
+  strategy that opened a position with its balance could not close it: the close was refused for
+  insufficient balance and the run ended holding the position, with no error. The venue now keeps
+  a net position per CFD instrument and splits each fill against it. The part that closes the
+  position is credited the margin back plus the realised PnL, the rest posts its notional as margin
+  (leverage 1, as before), and the fee is charged on the whole quantity. A round trip therefore
+  moves the balance by the realised PnL less fees, as the engine's own `Position` books it.
+  - A resting CFD order holds only its fill's cost net of what the fill pays back, so an order
+    that only reduces holds nothing. It is costed again when it fills, and is **cancelled** if the
+    position has moved so far that the account can no longer afford it.
+  - `account_snapshot` reports each CFD's position, `Flat` when it holds none, instead of
+    `Unreported`, and a CFD position in `initial_state` is where the venue starts. It panics if
+    that position has no entry price.
+  - Not modelled: funding, financing and liquidation. A short that loses more than its margin pays
+    the shortfall.
+  - **Breaking:** `AccountState::commit` takes the fill's `credit: Decimal`, paid into the debit's
+    asset and zero for spot. A fixture or assertion that relied on a CFD close debiting the
+    notional again now sees a credit.
+- **Merging more `stream_blocking_iter` streams than Tokio has blocking threads deadlocked**
+  (`rustrade-data`). Each stream held a blocking-pool thread for its whole decode, parked while its
+  consumer had not drained it. `merge_time_sorted` cannot emit until every input has buffered an
+  event, so past `max_blocking_threads` (512 by default) the inputs left without a thread held the
+  merge, and so the running decodes, forever, with no error or log. A thread is now held only while
+  a chunk is decoded, so any number of these streams can be merged (#231).
+
+- **An option expiring with two possible underlyings settled against whichever came first**
+  (`rustrade`). When more than one `Spot` instrument matched an option's underlying base, quote
+  and exchange, `process_contract_expiry` logged a warning and settled the open position against
+  the first in the instrument map, that is, in declaration order. If the two listings carried
+  different last prices, the option settled at the wrong intrinsic value. It now emits
+  `ContractExpiryNotSettled` with the new reason
+  `ContractExpiryNotSettledReason::AmbiguousUnderlying`, closes no position and leaves
+  `expiration_processed` unset; the open orders are still cancelled, as for
+  `SettlementPriceUnavailable`. An expiry with no position open needs no price and completes as
+  before. A stock split on the same ambiguous identity was already rejected
+  (`AmbiguousSplitTarget`). The reason enum is `#[non_exhaustive]`.
+
+- **Mock exchanges kept running after an execution build failed** (`rustrade`).
+  `ExecutionBuildFutures::init` spawns the mock exchanges before awaiting the execution managers'
+  build futures. When one of those failed, the error was returned and the mock exchanges' tasks
+  were left running detached, with nothing able to stop them. They are now aborted first.
+
+- **Two instruments on one exchange could share an exchange-side name** (`rustrade-instrument`).
+  Every order, fill and position a venue reports is resolved back to an instrument by its exchange
+  and `name_exchange`, but only `name_internal` was checked for uniqueness. A spot and a CFD both
+  named `AAPL` on one venue, with distinct internal names, therefore built, and each venue-sourced
+  fill went to whichever of the two a lookup reached first, with that instrument's contract size
+  and settlement asset. `IndexedInstrumentsBuilder::try_build` and `IndexedInstruments::try_new`
+  now return the new `IndexError::DuplicateInstrumentNameExchange` (`build` and `new` panic with
+  it). **Breaking:** a programmatic instrument set that shares a `name_exchange` on one exchange
+  built before and is now rejected; register each instrument under the name its venue tells it
+  apart by (IBKR's `AAPL` and `AAPL.CFD`, say). Instruments built from a `SystemConfig` were not
+  affected, since their `name_internal` is derived from `name_exchange`. `IndexError` is
+  `#[non_exhaustive]`. Names that differ only in case count as one, since the execution lookup
+  ignores case.
+  - A collision error now names every field on which the two instruments differ, so two that
+    differ only in, say, their underlying no longer read as `BTCUSD (Spot) and BTCUSD (Spot)`.
+
+- **An LSE candle source could not resolve an instrument priced on LSE through a `DataVenue`**
+  (`rustrade-data`, feature `lse`). `LseCandleSource::resolve` and `instrument_index_for` matched
+  the symbol against each instrument's execution venue and name, so an instrument executed on IBKR
+  as `BP` and priced on LSE as `BP.L` failed with `LseError::UnknownInstrument`. They now match the
+  data venue and its symbol, falling back to the execution venue's for an instrument with no
+  `DataVenue`, which keeps every single-venue setup resolving as before. Two instruments priced
+  under one LSE symbol, such as one listing executed on two brokers, now fail with the new
+  `LseError::AmbiguousInstrument`, since a candle source feeds a single instrument. `LseError` is
+  `#[non_exhaustive]`. The LSE data terms still apply to anything a source retrieves: see
+  <https://londonstrategicedge.com/terms>; redistribution is prohibited.
+- **An IBKR contract config could contradict the instrument it was keyed to** (`rustrade-execution`,
+  feature `ibkr`). Nothing compared a `ContractConfig`'s `security_type` with the kind of the
+  instrument named by its `name`, so a contract registered as `STK` for an instrument modelled as
+  an option routed that instrument's orders as stock orders. Built through `ExecutionBuilder`,
+  `IbkrClient` now fails the build when an entry's `security_type` contradicts its instrument's
+  kind (`STK` or `CASH` for spot, `FUT` for a future, `OPT` for an option), and when an entry is
+  invalid, such as a `FUT` with no `last_trade_date`, which `connect_sync` finds only once connected.
+  Every problem is reported at once. An entry naming no configured instrument is still accepted.
+- **A simulated venue could mint an `OrderId` its seeded account state already used**
+  (`rustrade-execution`). `SimulatedVenue` counted its order ids from zero whatever its
+  `initial_state` held, so an order seeded with id `3` shared it with the fourth order the venue
+  minted, and anything keyed on the id alone, such as a position under `OmsMode::Hedging`, merged
+  the two. Minted ids now start one past the highest decimal id among the seeded open and
+  cancelled orders. A venue seeded with no decimal id counts from zero as before, and
+  `order_sequence` still counts the orders booked. `OrderId`'s rustdoc now states that ids are
+  unique per venue, not across the venues of a multi-exchange backtest, so the key is
+  `(exchange, OrderId)`.
+
 ## [0.8.0] - 2026-10-01
 
 ### Added

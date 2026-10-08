@@ -43,7 +43,9 @@
 //! | Test | Description |
 //! |------|-------------|
 //! | `test_connection` | Connect to IB Gateway |
-//! | `test_contract_registration` | Register contracts in local registry |
+//! | `test_contract_registration` | Resolve contracts, and refuse unresolved or duplicate ones |
+//! | `test_connect_refuses_a_configured_contract_it_cannot_register` | Strict connect fails, listing every bad contract, and frees the client ID |
+//! | `test_lenient_connect_reports_the_contracts_it_skips` | Lenient connect registers the rest and returns the skips |
 //! | `test_fetch_balances` | Fetch account balances |
 //! | `test_account_snapshot` | Fetch full account snapshot |
 //! | `test_fetch_open_orders` | Fetch currently open orders |
@@ -58,21 +60,28 @@
 //! | `test_place_and_cancel_stop_limit_order` | Stop-limit order lifecycle |
 //! | `test_place_and_cancel_trailing_stop_percentage` | Trailing stop (%) lifecycle |
 //! | `test_place_and_cancel_trailing_stop_limit_absolute` | Trailing stop-limit ($) lifecycle |
+//! | `test_place_and_cancel_trailing_stop_limit_percentage` | Trailing stop-limit (%) lifecycle |
 //! | `test_place_and_cancel_bracket_order` | Bracket order with OCA |
 //! | `test_bracket_order_oca_group_linkage` | Verify OCA group linkage |
 //! | `test_place_and_cancel_gtd_order` | Good-Till-Date order |
 //! | `test_place_moo_order_premarket` | Market-on-Open (timing-sensitive) |
 //! | `test_place_loo_order_premarket` | Limit-on-Open (timing-sensitive) |
+//! | `test_orders_found_by_client_order_id_across_a_restart` | Snapshot orders, adoption after a restart, ended-order lookup |
 
 #![cfg(feature = "ibkr")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Integration tests: panics are the correct failure mode
 
+use ibapi::contracts::{Contract, Currency, Exchange, SecurityType, Symbol};
 use rust_decimal_macros::dec;
 use rustrade_execution::{
     AccountEventKind,
     client::{
-        ExecutionClient,
-        ibkr::{IbkrClient, IbkrConfig, contract::stock_contract},
+        ExecutionClient, OrderStatusClient,
+        ibkr::{
+            ContractConfig, ContractSkipReason, IbkrClient, IbkrConfig, IbkrConnectError,
+            SkippedContract,
+            contract::{ContractConfigError, ResolveContractError, stock_contract},
+        },
     },
     order::{
         OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
@@ -82,7 +91,7 @@ use rustrade_execution::{
     },
 };
 use rustrade_instrument::{
-    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
+    Side, asset::name::AssetNameExchange, exchange::ExchangeId, ibkr::ContractRegistryError,
     instrument::name::InstrumentNameExchange,
 };
 use serial_test::serial;
@@ -120,8 +129,67 @@ fn test_config(client_id_offset: i32) -> IbkrConfig {
     }
 }
 
+/// AAPL resolved through `IbkrConfig::contracts`, so IB's listings, which name contracts by id,
+/// can be attributed to it.
+fn resolved_aapl_config(client_id_offset: i32) -> IbkrConfig {
+    IbkrConfig {
+        contracts: vec![ContractConfig {
+            name: "AAPL".to_string(),
+            symbol: "AAPL".to_string(),
+            security_type: "STK".to_string(),
+            exchange: "SMART".to_string(),
+            currency: "USD".to_string(),
+            last_trade_date: None,
+            strike: None,
+            right: None,
+        }],
+        ..test_config(client_id_offset)
+    }
+}
+
 fn aapl_instrument() -> InstrumentNameExchange {
     "AAPL".into()
+}
+
+/// AAPL, which registers, then a stock IB has no contract for and a future with no expiry, which
+/// do not.
+fn partly_registrable_config(client_id_offset: i32) -> IbkrConfig {
+    let mut config = resolved_aapl_config(client_id_offset);
+    let aapl = config.contracts[0].clone();
+    config.contracts.extend([
+        ContractConfig {
+            name: "NOSUCH".to_string(),
+            symbol: "NOSUCHSYMBOLXQZ".to_string(),
+            ..aapl.clone()
+        },
+        ContractConfig {
+            name: "ES-NODATE".to_string(),
+            symbol: "ES".to_string(),
+            security_type: "FUT".to_string(),
+            exchange: "CME".to_string(),
+            ..aapl
+        },
+    ]);
+    config
+}
+
+/// Check `skipped` lists the two contracts [`partly_registrable_config`] cannot register, in
+/// config order, and that neither failure is transient.
+fn assert_partly_registrable_skips(skipped: &[SkippedContract]) {
+    let names: Vec<_> = skipped
+        .iter()
+        .map(|skip| skip.name.name().as_str())
+        .collect();
+    assert_eq!(names, ["NOSUCH", "ES-NODATE"], "{skipped:?}");
+    assert_eq!(
+        skipped[0].reason,
+        ContractSkipReason::Resolve(ResolveContractError::NoMatch)
+    );
+    assert_eq!(
+        skipped[1].reason,
+        ContractSkipReason::Config(ContractConfigError::MissingLastTradeDate)
+    );
+    assert!(skipped.iter().all(|skip| !skip.reason.is_transient()));
 }
 
 /// Connect to IB, wrapping the blocking call in spawn_blocking.
@@ -159,19 +227,106 @@ async fn test_contract_registration() {
 
     let config = test_config(1);
     let client = connect_client(config).await.expect("connection failed");
-
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
+    let description = stock_contract("AAPL", "SMART", "USD");
 
-    client.register_contract(aapl_name.clone(), aapl_contract);
+    // A contract IB has not resolved is refused: IB would report its fills by an id it lacks.
+    assert_eq!(
+        client.register_contract(aapl_name.clone(), description.clone()),
+        Err(ContractRegistryError::Unresolved {
+            name: aapl_name.clone()
+        })
+    );
+    assert!(client.contract_registry().is_empty());
 
-    assert_eq!(client.contract_registry().len(), 1);
+    let aapl = client
+        .resolve_contract(&description)
+        .await
+        .expect("AAPL must resolve");
     assert!(
+        aapl.contract_id > 0,
+        "resolved contract has no id: {aapl:?}"
+    );
+    client
+        .register_contract(aapl_name.clone(), aapl.clone())
+        .expect("a resolved contract registers");
+    assert_eq!(client.contract_registry().len(), 1);
+    assert_eq!(
         client
             .contract_registry()
-            .get_contract(&aapl_name)
-            .is_some()
+            .get_name_by_con_id(aapl.contract_id),
+        Some(aapl_name.clone())
     );
+
+    // The same IB contract cannot be registered under a second name.
+    assert!(matches!(
+        client.register_contract("AAPL-2".into(), aapl.clone()),
+        Err(ContractRegistryError::ContractIdTaken { .. })
+    ));
+
+    let unknown = stock_contract("NOSUCHSYMBOLXQZ", "SMART", "USD");
+    assert_eq!(
+        client.resolve_contract(&unknown).await,
+        Err(ResolveContractError::NoMatch)
+    );
+
+    // A future with no expiry matches every listed contract month.
+    let every_es_month = Contract {
+        symbol: Symbol::from("ES"),
+        security_type: SecurityType::Future,
+        exchange: Exchange::from("CME"),
+        currency: Currency::from("USD"),
+        ..Contract::default()
+    };
+    match client.resolve_contract(&every_es_month).await {
+        Err(ResolveContractError::Ambiguous { matches }) => {
+            println!("ES months: {}", matches.len());
+            assert!(matches.len() > 1);
+        }
+        other => panic!("expected an ambiguous description, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_connect_refuses_a_configured_contract_it_cannot_register() {
+    init_logging();
+
+    let refused = tokio::task::spawn_blocking(|| {
+        IbkrClient::connect_sync(partly_registrable_config(23)).map(|_| ())
+    })
+    .await
+    .unwrap();
+    match refused {
+        Err(IbkrConnectError::Contracts(skipped)) => assert_partly_registrable_skips(&skipped),
+        other => panic!("expected the bad contracts to fail the connect, got {other:?}"),
+    }
+
+    // The refused connect dropped its connection, so the same client ID connects again.
+    let client = connect_client(resolved_aapl_config(23))
+        .await
+        .expect("the client ID was freed");
+    assert_eq!(client.contract_registry().len(), 1);
+}
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_lenient_connect_reports_the_contracts_it_skips() {
+    init_logging();
+
+    let outcome = tokio::task::spawn_blocking(|| {
+        IbkrClient::connect_sync_lenient(partly_registrable_config(24))
+    })
+    .await
+    .unwrap()
+    .expect("connection failed");
+
+    assert_partly_registrable_skips(&outcome.skipped);
+    let registry = outcome.client.contract_registry();
+    assert_eq!(registry.len(), 1);
+    assert!(registry.contains(&aapl_instrument()));
 }
 
 // ============================================================================
@@ -241,12 +396,8 @@ async fn test_account_snapshot() {
 async fn test_fetch_open_orders() {
     init_logging();
 
-    let config = test_config(4);
+    let config = resolved_aapl_config(4);
     let client = connect_client(config).await.expect("connection failed");
-
-    let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let instruments: Vec<InstrumentNameExchange> = vec![];
     let result = client.fetch_open_orders(&instruments).await;
@@ -277,12 +428,10 @@ async fn test_fetch_open_orders() {
 async fn test_place_and_cancel_limit_order() {
     init_logging();
 
-    let config = test_config(5);
+    let config = resolved_aapl_config(5);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-strategy");
     let order_cid = ClientOrderId::new(format!(
@@ -317,9 +466,6 @@ async fn test_place_and_cancel_limit_order() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("Order placed successfully!");
@@ -346,9 +492,6 @@ async fn test_place_and_cancel_limit_order() {
 
             println!("Canceling order...");
             let cancel_response = client.cancel_order(cancel_request).await;
-
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            let cancel_response = cancel_response.unwrap();
 
             match &cancel_response.state {
                 Ok(_cancelled) => {
@@ -425,21 +568,21 @@ async fn test_account_stream() {
 async fn test_fetch_trades() {
     init_logging();
 
-    let config = test_config(7);
+    let config = resolved_aapl_config(7);
     let client = connect_client(config).await.expect("connection failed");
-
-    let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let since = chrono::Utc::now() - chrono::Duration::hours(24);
     let instruments: Vec<InstrumentNameExchange> = vec![];
 
-    let result = client.fetch_trades(since, &instruments).await;
+    let result = client
+        .fetch_trades(since, chrono::Utc::now(), &instruments)
+        .await;
 
     assert!(result.is_ok(), "fetch_trades failed: {:?}", result.err());
 
-    let trades = result.unwrap();
+    let read = result.unwrap();
+    assert_eq!(read.resume, None, "the venue reads a span whole");
+    let trades = read.trades;
     println!("Trades in last 24h: {}", trades.len());
     for trade in trades.iter().take(5) {
         println!(
@@ -517,9 +660,6 @@ async fn test_order_without_registered_contract() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some());
-    let response = response.unwrap();
-
     assert!(
         response.state.is_failed(),
         "Expected rejection for unregistered contract"
@@ -554,9 +694,6 @@ async fn test_cancel_nonexistent_order() {
 
     let response = client.cancel_order(cancel_request).await;
 
-    assert!(response.is_some());
-    let response = response.unwrap();
-
     assert!(
         response.state.is_err(),
         "Expected rejection for nonexistent order"
@@ -579,12 +716,10 @@ async fn test_cancel_nonexistent_order() {
 async fn test_cancel_produces_cancelled_not_expired() {
     init_logging();
 
-    let config = test_config(11);
+    let config = resolved_aapl_config(11);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let assets: Vec<AssetNameExchange> = vec![];
     let instruments: Vec<InstrumentNameExchange> = vec![];
@@ -627,8 +762,6 @@ async fn test_cancel_produces_cancelled_not_expired() {
 
     println!("Placing DAY limit order: BUY 1 AAPL @ $1.00");
     let response = client.open_order(open_request).await;
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
 
     let exchange_order_id = match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
@@ -658,7 +791,7 @@ async fn test_cancel_produces_cancelled_not_expired() {
 
     println!("Cancelling order...");
     let cancel_response = client.cancel_order(cancel_request).await;
-    assert!(cancel_response.is_some(), "Expected cancel response");
+    println!("Cancel response: {:?}", cancel_response.state);
 
     // Collect stream events and find the final order state
     println!("Waiting for stream to emit Cancelled state...");
@@ -717,12 +850,10 @@ async fn test_cancel_produces_cancelled_not_expired() {
 async fn test_place_and_cancel_stop_order() {
     init_logging();
 
-    let config = test_config(12);
+    let config = resolved_aapl_config(12);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-stop-order");
     let order_cid = ClientOrderId::new(format!(
@@ -760,9 +891,6 @@ async fn test_place_and_cancel_stop_order() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("Stop order placed successfully!");
@@ -787,9 +915,6 @@ async fn test_place_and_cancel_stop_order() {
 
             println!("Canceling Stop order...");
             let cancel_response = client.cancel_order(cancel_request).await;
-
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            let cancel_response = cancel_response.unwrap();
 
             match &cancel_response.state {
                 Ok(_cancelled) => {
@@ -819,12 +944,10 @@ async fn test_place_and_cancel_stop_order() {
 async fn test_place_and_cancel_stop_limit_order() {
     init_logging();
 
-    let config = test_config(13);
+    let config = resolved_aapl_config(13);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-stop-limit-order");
     let order_cid = ClientOrderId::new(format!(
@@ -862,9 +985,6 @@ async fn test_place_and_cancel_stop_limit_order() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("StopLimit order placed successfully!");
@@ -889,9 +1009,6 @@ async fn test_place_and_cancel_stop_limit_order() {
 
             println!("Canceling StopLimit order...");
             let cancel_response = client.cancel_order(cancel_request).await;
-
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            let cancel_response = cancel_response.unwrap();
 
             match &cancel_response.state {
                 Ok(_cancelled) => {
@@ -922,12 +1039,10 @@ async fn test_place_and_cancel_stop_limit_order() {
 async fn test_place_and_cancel_trailing_stop_percentage() {
     init_logging();
 
-    let config = test_config(14);
+    let config = resolved_aapl_config(14);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-trailing-stop-pct");
     let order_cid = ClientOrderId::new(format!(
@@ -966,9 +1081,6 @@ async fn test_place_and_cancel_trailing_stop_percentage() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("TrailingStop (percentage) order placed successfully!");
@@ -994,9 +1106,6 @@ async fn test_place_and_cancel_trailing_stop_percentage() {
             println!("Canceling TrailingStop order...");
             let cancel_response = client.cancel_order(cancel_request).await;
 
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            let cancel_response = cancel_response.unwrap();
-
             match &cancel_response.state {
                 Ok(_cancelled) => {
                     println!("TrailingStop (percentage) order canceled successfully!");
@@ -1015,26 +1124,26 @@ async fn test_place_and_cancel_trailing_stop_percentage() {
     }
 }
 
-/// Test placing and cancelling a TrailingStopLimit order with absolute offset.
+/// Place a Sell TrailingStopLimit on AAPL with a $200 initial stop and a $1 limit offset, check
+/// IB keeps it working, then cancel it.
 ///
-/// Uses a Sell TrailingStopLimit with $500 absolute trail and $1 limit offset -
-/// the stop price trails $500 below the highest price seen. A $500 trailing
-/// distance is far wider than typical intraday AAPL moves, so the stop won't
-/// trigger and the order remains open for cancellation.
-#[tokio::test]
-#[ignore]
-#[serial]
-async fn test_place_and_cancel_trailing_stop_limit_absolute() {
+/// The stop starts at $200, far below the market, and the trail (`offset`) is wider than the
+/// price, so the stop stays put and the order neither triggers nor fills. IB answers a stop it
+/// will not take with `Inactive` a moment after the order is acknowledged, so the order is left
+/// working for a few seconds before the cancel, and must then end `Cancelled`.
+async fn place_and_cancel_trailing_stop_limit(
+    client_id_offset: i32,
+    offset: rust_decimal::Decimal,
+    offset_type: TrailingOffsetType,
+) {
     init_logging();
 
-    let config = test_config(15);
+    let config = resolved_aapl_config(client_id_offset);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
-    let strategy = StrategyId::new("test-trailing-stop-limit-abs");
+    let strategy = StrategyId::new("test-trailing-stop-limit");
     let order_cid = ClientOrderId::new(format!(
         "trail-stop-limit-{}",
         chrono::Utc::now().timestamp_millis()
@@ -1047,16 +1156,17 @@ async fn test_place_and_cancel_trailing_stop_limit_absolute() {
         cid: order_cid.clone(),
     };
 
-    // Sell TrailingStopLimit: $500 absolute trail, $1 limit offset from stop
+    let kind = OrderKind::TrailingStopLimit {
+        offset,
+        offset_type,
+        stop_price: dec!(200),
+        limit_offset: dec!(1), // Limit price = stop price - $1
+    };
     let request_open = RequestOpen {
         side: Side::Sell,
-        price: None, // Trailing stop limit uses limit_offset, not a fixed price
+        price: None, // The limit follows from the stop and limit_offset
         quantity: dec!(1),
-        kind: OrderKind::TrailingStopLimit {
-            offset: dec!(500), // $500 trailing amount
-            offset_type: TrailingOffsetType::Absolute,
-            limit_offset: dec!(1), // Limit price = stop price - $1
-        },
+        kind,
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
@@ -1068,59 +1178,64 @@ async fn test_place_and_cancel_trailing_stop_limit_absolute() {
         state: request_open,
     };
 
-    println!(
-        "Placing TrailingStopLimit order: SELL 1 AAPL @ $500 trail, $1 limit offset (won't trigger)"
-    );
+    println!("Placing TrailingStopLimit order: SELL 1 AAPL, {kind} (won't trigger)");
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
+    let OrderState::Active(ActiveOrderState::Open(open_state)) = &response.state else {
+        panic!("TrailingStopLimit order not open: {:?}", response.state);
+    };
+    println!("TrailingStopLimit order placed: {:?}", open_state.id);
 
-    match &response.state {
-        OrderState::Active(ActiveOrderState::Open(open_state)) => {
-            println!("TrailingStopLimit (absolute) order placed successfully!");
-            println!("  Client Order ID: {}", response.key.cid);
-            println!("  Exchange Order ID: {:?}", open_state.id);
+    // Long enough for IB to reject a stop it will not take.
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
-            tokio::time::sleep(Duration::from_millis(100)).await;
+    let cancel_request = rustrade_execution::order::OrderEvent {
+        key: OrderKey {
+            exchange: ExchangeId::Ibkr,
+            instrument: &aapl_name,
+            strategy: strategy.clone(),
+            cid: order_cid.clone(),
+        },
+        state: rustrade_execution::order::request::RequestCancel {
+            id: Some(open_state.id.clone()),
+        },
+    };
+    println!("Canceling TrailingStopLimit order...");
+    let cancel_response = client.cancel_order(cancel_request).await;
+    assert!(cancel_response.state.is_ok(), "{cancel_response:?}");
 
-            let cancel_key = OrderKey {
-                exchange: ExchangeId::Ibkr,
-                instrument: &aapl_name,
-                strategy: response.key.strategy.clone(),
-                cid: response.key.cid.clone(),
-            };
+    let ended = ended_eventually(
+        &client,
+        OrderKey {
+            exchange: ExchangeId::Ibkr,
+            instrument: aapl_name.clone(),
+            strategy,
+            cid: order_cid,
+        },
+    )
+    .await;
+    assert!(
+        matches!(ended.state, InactiveOrderState::Cancelled(_)),
+        "not cancelled: {:?}",
+        ended.state
+    );
+}
 
-            let cancel_request = rustrade_execution::order::OrderEvent {
-                key: cancel_key,
-                state: rustrade_execution::order::request::RequestCancel {
-                    id: Some(open_state.id.clone()),
-                },
-            };
+/// Test placing and cancelling a TrailingStopLimit order with an absolute ($500) trail.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_place_and_cancel_trailing_stop_limit_absolute() {
+    place_and_cancel_trailing_stop_limit(15, dec!(500), TrailingOffsetType::Absolute).await;
+}
 
-            println!("Canceling TrailingStopLimit order...");
-            let cancel_response = client.cancel_order(cancel_request).await;
-
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            let cancel_response = cancel_response.unwrap();
-
-            match &cancel_response.state {
-                Ok(_cancelled) => {
-                    println!("TrailingStopLimit (absolute) order canceled successfully!");
-                }
-                Err(e) => {
-                    panic!("Cancel rejected: {:?}", e);
-                }
-            }
-        }
-        OrderState::Inactive(e) => {
-            panic!("TrailingStopLimit order rejected: {:?}", e);
-        }
-        other => {
-            panic!("Unexpected order state: {:?}", other);
-        }
-    }
+/// Test placing and cancelling a TrailingStopLimit order with a percentage (50%) trail.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_place_and_cancel_trailing_stop_limit_percentage() {
+    place_and_cancel_trailing_stop_limit(22, dec!(50), TrailingOffsetType::Percentage).await;
 }
 
 // ============================================================================
@@ -1144,12 +1259,10 @@ async fn test_place_and_cancel_bracket_order() {
 
     init_logging();
 
-    let config = test_config(16);
+    let config = resolved_aapl_config(16);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-bracket-order");
     let parent_cid =
@@ -1238,9 +1351,6 @@ async fn test_place_and_cancel_bracket_order() {
         println!("Canceling bracket order (parent)...");
         let cancel_response = client.cancel_order(cancel_request).await;
 
-        assert!(cancel_response.is_some(), "Expected cancel response");
-        let cancel_response = cancel_response.unwrap();
-
         match &cancel_response.state {
             Ok(_cancelled) => {
                 println!("Bracket order canceled successfully!");
@@ -1265,12 +1375,10 @@ async fn test_bracket_order_oca_group_linkage() {
 
     init_logging();
 
-    let config = test_config(17);
+    let config = resolved_aapl_config(17);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-bracket-oca");
     let parent_cid = ClientOrderId::new(format!(
@@ -1366,12 +1474,10 @@ async fn test_bracket_order_oca_group_linkage() {
 async fn test_place_and_cancel_gtd_order() {
     init_logging();
 
-    let config = test_config(18);
+    let config = resolved_aapl_config(18);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-gtd-order");
     let order_cid = ClientOrderId::new(format!(
@@ -1411,9 +1517,6 @@ async fn test_place_and_cancel_gtd_order() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("GTD order placed successfully!");
@@ -1438,9 +1541,6 @@ async fn test_place_and_cancel_gtd_order() {
 
             println!("Canceling GTD order...");
             let cancel_response = client.cancel_order(cancel_request).await;
-
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            let cancel_response = cancel_response.unwrap();
 
             match &cancel_response.state {
                 Ok(_cancelled) => {
@@ -1471,12 +1571,10 @@ async fn test_place_and_cancel_gtd_order() {
 async fn test_place_moo_order_premarket() {
     init_logging();
 
-    let config = test_config(19);
+    let config = resolved_aapl_config(19);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-moo-order");
     let order_cid = ClientOrderId::new(format!(
@@ -1513,9 +1611,6 @@ async fn test_place_moo_order_premarket() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("MOO order placed successfully (pre-market)!");
@@ -1542,8 +1637,7 @@ async fn test_place_moo_order_premarket() {
             println!("Canceling MOO order...");
             let cancel_response = client.cancel_order(cancel_request).await;
 
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            match &cancel_response.unwrap().state {
+            match &cancel_response.state {
                 Ok(_) => println!("MOO order canceled successfully!"),
                 Err(e) => panic!("Cancel rejected: {:?}", e),
             }
@@ -1569,12 +1663,10 @@ async fn test_place_moo_order_premarket() {
 async fn test_place_loo_order_premarket() {
     init_logging();
 
-    let config = test_config(20);
+    let config = resolved_aapl_config(20);
     let client = connect_client(config).await.expect("connection failed");
 
     let aapl_name = aapl_instrument();
-    let aapl_contract = stock_contract("AAPL", "SMART", "USD");
-    client.register_contract(aapl_name.clone(), aapl_contract);
 
     let strategy = StrategyId::new("test-loo-order");
     let order_cid = ClientOrderId::new(format!(
@@ -1610,9 +1702,6 @@ async fn test_place_loo_order_premarket() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("LOO order placed successfully!");
@@ -1638,8 +1727,7 @@ async fn test_place_loo_order_premarket() {
             println!("Canceling LOO order...");
             let cancel_response = client.cancel_order(cancel_request).await;
 
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            match &cancel_response.unwrap().state {
+            match &cancel_response.state {
                 Ok(_) => println!("LOO order canceled successfully!"),
                 Err(e) => panic!("Cancel rejected: {:?}", e),
             }
@@ -1651,4 +1739,260 @@ async fn test_place_loo_order_premarket() {
             panic!("Unexpected order state: {:?}", other);
         }
     }
+}
+
+// ============================================================================
+// Orders by client order id — Tier 0: Paper Account Only (FREE)
+// ============================================================================
+
+/// How the order under `key` ended, once IB lists it completed.
+async fn ended_eventually(
+    client: &IbkrClient,
+    key: rustrade_execution::order::UnindexedOrderKey,
+) -> rustrade_execution::order::UnindexedInactiveOrder {
+    for _ in 0..20 {
+        let mut ended = client
+            .fetch_ended_orders(std::slice::from_ref(&key))
+            .await
+            .expect("fetch_ended_orders failed");
+        if let Some(order) = ended.pop() {
+            println!("Ended: {order:?}");
+            assert!(ended.is_empty());
+            return order;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("{} never listed completed", key.cid);
+}
+
+/// An order carries its client order id to IB, so the account snapshot lists it under that id, a
+/// new client under the same API client id finds it after a restart and can cancel it, and
+/// `fetch_ended_orders` reports how it ended. A client order id IB would reject is refused before
+/// anything is sent.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_orders_found_by_client_order_id_across_a_restart() {
+    init_logging();
+
+    let aapl = aapl_instrument();
+    let strategy = StrategyId::new("test-strategy");
+    let client = connect_client(resolved_aapl_config(21))
+        .await
+        .expect("connection failed");
+
+    let refused = client
+        .open_order(rustrade_execution::order::OrderEvent {
+            key: OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &aapl,
+                strategy: strategy.clone(),
+                cid: ClientOrderId::new("ordre-\u{e9}"),
+            },
+            state: RequestOpen {
+                side: Side::Buy,
+                price: Some(dec!(1.00)),
+                quantity: dec!(1),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                position_id: None,
+                reduce_only: false,
+                market: None,
+            },
+        })
+        .await;
+    assert!(
+        matches!(
+            refused.state,
+            OrderState::Inactive(InactiveOrderState::OpenFailed(_))
+        ),
+        "{refused:?}"
+    );
+
+    let cid = ClientOrderId::new(format!("restart-{}", chrono::Utc::now().timestamp_millis()));
+    let placed = client
+        .open_order(rustrade_execution::order::OrderEvent {
+            key: OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &aapl,
+                strategy: strategy.clone(),
+                cid: cid.clone(),
+            },
+            state: RequestOpen {
+                side: Side::Buy,
+                price: Some(dec!(1.00)),
+                quantity: dec!(1),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                position_id: None,
+                reduce_only: false,
+                market: None,
+            },
+        })
+        .await;
+    assert!(
+        matches!(placed.state, OrderState::Active(ActiveOrderState::Open(_))),
+        "{placed:?}"
+    );
+
+    let snapshot = client
+        .account_snapshot(&[], std::slice::from_ref(&aapl))
+        .await
+        .expect("account_snapshot failed");
+    let entry = snapshot
+        .instruments
+        .iter()
+        .find(|entry| entry.instrument == aapl)
+        .expect("AAPL has an open order");
+    println!(
+        "AAPL: {} order(s), complete: {}",
+        entry.orders.len(),
+        entry.orders_complete
+    );
+    assert!(
+        entry.orders.iter().any(|order| order.key.cid == cid),
+        "{entry:?}"
+    );
+    assert!(entry.orders_complete, "{entry:?}");
+
+    // An order this client placed and cancelled ended with nothing filled: no execution of it in
+    // a read that covers its whole life.
+    let placed_here = ClientOrderId::new(format!(
+        "restart-here-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    let order = client
+        .open_order(rustrade_execution::order::OrderEvent {
+            key: OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &aapl,
+                strategy: strategy.clone(),
+                cid: placed_here.clone(),
+            },
+            state: RequestOpen {
+                side: Side::Buy,
+                price: Some(dec!(1.00)),
+                quantity: dec!(1),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                position_id: None,
+                reduce_only: false,
+                market: None,
+            },
+        })
+        .await;
+    assert!(
+        matches!(order.state, OrderState::Active(ActiveOrderState::Open(_))),
+        "{order:?}"
+    );
+    let cancelled = client
+        .cancel_order(rustrade_execution::order::OrderEvent {
+            key: OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &aapl,
+                strategy: strategy.clone(),
+                cid: placed_here.clone(),
+            },
+            state: rustrade_execution::order::request::RequestCancel { id: None },
+        })
+        .await;
+    assert!(cancelled.state.is_ok(), "{cancelled:?}");
+    let ended = ended_eventually(
+        &client,
+        OrderKey {
+            exchange: ExchangeId::Ibkr,
+            instrument: aapl.clone(),
+            strategy: strategy.clone(),
+            cid: placed_here,
+        },
+    )
+    .await;
+    let InactiveOrderState::Cancelled(cancelled) = &ended.state else {
+        panic!("not cancelled: {:?}", ended.state);
+    };
+    assert_eq!(cancelled.filled_quantity, Some(rust_decimal::Decimal::ZERO));
+
+    // A restart: a new client under the same API client id, which has never seen the order. The
+    // socket closes only when the last handle to the client goes, and IB then takes a moment to
+    // release the id.
+    client.disconnect();
+    drop(client);
+    let mut restarted = Err(String::new());
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        restarted = connect_client(resolved_aapl_config(21)).await;
+        if restarted.is_ok() {
+            break;
+        }
+    }
+    let restarted = restarted.expect("reconnection failed");
+
+    let open = restarted
+        .fetch_open_orders(std::slice::from_ref(&aapl))
+        .await
+        .expect("fetch_open_orders failed");
+    let listed = open
+        .iter()
+        .find(|order| order.key.cid == cid)
+        .expect("the order is listed under its client order id");
+    assert_eq!(listed.kind, OrderKind::Limit);
+    assert_eq!(listed.price, Some(dec!(1.00)));
+
+    // Orders an earlier, failed run left open.
+    for leftover in open
+        .iter()
+        .filter(|order| order.key.cid != cid && order.key.cid.0.starts_with("restart-"))
+    {
+        let _ = restarted
+            .cancel_order(rustrade_execution::order::OrderEvent {
+                key: OrderKey {
+                    exchange: ExchangeId::Ibkr,
+                    instrument: &aapl,
+                    strategy: strategy.clone(),
+                    cid: leftover.key.cid.clone(),
+                },
+                state: rustrade_execution::order::request::RequestCancel { id: None },
+            })
+            .await;
+    }
+
+    let cancelled = restarted
+        .cancel_order(rustrade_execution::order::OrderEvent {
+            key: OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &aapl,
+                strategy: strategy.clone(),
+                cid: cid.clone(),
+            },
+            state: rustrade_execution::order::request::RequestCancel { id: None },
+        })
+        .await;
+    assert!(cancelled.state.is_ok(), "{cancelled:?}");
+
+    let key = OrderKey {
+        exchange: ExchangeId::Ibkr,
+        instrument: aapl.clone(),
+        strategy,
+        cid: cid.clone(),
+    };
+    let ended = ended_eventually(&restarted, key.clone()).await;
+    assert_eq!(ended.key, key);
+    let InactiveOrderState::Cancelled(cancelled) = &ended.state else {
+        panic!("not cancelled: {:?}", ended.state);
+    };
+    // Adopted, so when it was placed, and so whether the executions read covers its life, is
+    // unknown.
+    assert_eq!(cancelled.filled_quantity, None);
+
+    let unknown = OrderKey {
+        cid: ClientOrderId::new("never-placed"),
+        ..key
+    };
+    assert!(
+        restarted
+            .fetch_ended_orders(&[unknown])
+            .await
+            .expect("fetch_ended_orders failed")
+            .is_empty()
+    );
 }

@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 /// and [`InstrumentNameExchange`].
 pub type UnindexedOrderState = OrderState<AssetNameExchange, InstrumentNameExchange>;
 
+/// Convenient type alias for an [`InactiveOrderState`] keyed with [`AssetNameExchange`] and
+/// [`InstrumentNameExchange`].
+pub type UnindexedInactiveOrderState =
+    InactiveOrderState<AssetNameExchange, InstrumentNameExchange>;
+
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, From)]
 pub enum OrderState<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     Active(ActiveOrderState),
@@ -89,6 +94,17 @@ pub enum ActiveOrderState {
 }
 
 impl ActiveOrderState {
+    /// When the request this order awaits an answer to was sent: `Some` for
+    /// [`OpenInFlight`](Self::OpenInFlight) and [`CancelInFlight`](Self::CancelInFlight), `None`
+    /// for [`Open`](Self::Open).
+    pub fn time_sent(&self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::OpenInFlight(open) => Some(open.time_sent),
+            Self::Open(_) => None,
+            Self::CancelInFlight(cancel) => Some(cancel.time_sent),
+        }
+    }
+
     pub fn open_meta(&self) -> Option<&Open> {
         match self {
             Self::OpenInFlight(_) => None,
@@ -98,8 +114,15 @@ impl ActiveOrderState {
     }
 }
 
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
-pub struct OpenInFlight;
+/// An open request sent to the exchange that it has not yet answered.
+#[derive(
+    Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
+)]
+pub struct OpenInFlight {
+    /// When the request was sent, by the sender's clock: the engine's `EngineClock`, so a
+    /// backtest stamps the simulated time.
+    pub time_sent: DateTime<Utc>,
+}
 
 /// An order the exchange reports as working, in the state the exchange last reported it.
 ///
@@ -181,7 +204,9 @@ impl Open {
     ///
     /// A venue that *reduces* a reported cumulative -- busting or correcting an execution -- has
     /// its correction refused, since a decrease is indistinguishable from out-of-sequence
-    /// delivery. The order is left on the higher cumulative until a later snapshot moves it.
+    /// delivery. The order is left on the higher cumulative until a later snapshot moves it. A
+    /// venue that reports the bust or correction itself does so as
+    /// [`AccountEventKind::TradeAmended`](crate::AccountEventKind::TradeAmended).
     ///
     /// A caller replacing `self` with `update` wholesale adopts `update`'s `time_exchange` too,
     /// which may be the earlier of the two. That is deliberate: an `Open` is one state the venue
@@ -214,11 +239,15 @@ pub struct Filled {
     pub avg_price: Option<Decimal>,
 }
 
+/// A cancel request sent to the exchange that it has not yet answered.
 #[derive(
-    Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Default, Deserialize, Serialize, Constructor,
+    Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
 )]
 pub struct CancelInFlight {
+    /// The order as last reported working, if it was before the cancel was sent.
     pub order: Option<Open>,
+    /// When the cancel was sent, by the sender's clock, as [`OpenInFlight::time_sent`].
+    pub time_sent: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, From)]
@@ -245,11 +274,19 @@ pub struct Cancelled {
     /// back to the local receive time, which can differ from the true venue cancel time by network
     /// latency. Consumers building fill ledgers or P&L should not assume sub-second venue accuracy.
     pub time_exchange: DateTime<Utc>,
-    /// Quantity filled before the order was cancelled.
+    /// Quantity filled before the order was cancelled, or `None` when the venue did not report
+    /// it.
     ///
-    /// Zero for orders cancelled with no fills (e.g., GTC limit order cancelled by user).
+    /// `Some(0)` for an order cancelled with no fills (e.g., GTC limit order cancelled by user).
     /// Non-zero for IOC orders that partially filled before cancellation.
-    pub filled_quantity: Decimal,
+    ///
+    /// `None` is not zero: it means the fill is unknown, so the order may have partly filled.
+    /// Some venues never report it in the response to a cancel request (Alpaca, Hyperliquid,
+    /// IBKR), though their account streams may, and others omit it rarely.
+    /// To learn it, read the order's fills from the account stream, or ask the venue through
+    /// [`OrderStatusClient::fetch_ended_orders`](crate::client::OrderStatusClient::fetch_ended_orders)
+    /// where the client implements it.
+    pub filled_quantity: Option<Decimal>,
 }
 
 /// Metadata for an expired order.
@@ -262,8 +299,10 @@ pub struct Cancelled {
 pub struct Expired {
     pub id: OrderId,
     pub time_exchange: DateTime<Utc>,
-    /// Quantity filled before the order expired.
-    pub filled_quantity: Decimal,
+    /// Quantity filled before the order expired, or `None` when the venue did not report it.
+    ///
+    /// `None` is not zero: see [`Cancelled::filled_quantity`].
+    pub filled_quantity: Option<Decimal>,
 }
 
 #[cfg(test)]

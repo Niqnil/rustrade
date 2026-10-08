@@ -10,7 +10,9 @@
 //! [`BinanceMarginConfig`], [`MarginSideEffect`]) and a full [`ExecutionClient`] implementation:
 //! order submission/cancel and account snapshot / balance / open-order / trade queries over REST,
 //! plus a live account event stream ([`ExecutionClient::account_stream`]) over the hand-rolled
-//! `userListenToken` user-data WebSocket (the SDK's retired listen-key path is not used). Both
+//! `userListenToken` user-data WebSocket (the SDK's retired listen-key path is not used), which
+//! after a reconnect recovers missed fills and reports how orders ended meanwhile. It also
+//! implements [`OrderStatusClient`], looking orders up by client order id. Both
 //! **cross** (`isIsolated = "FALSE"`, account-wide collateral) and **isolated** (`isIsolated =
 //! "TRUE"`, per-pair sub-accounts) margin are supported, selected by
 //! [`BinanceMarginConfig::is_isolated`].
@@ -50,31 +52,39 @@
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS,
-    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, RateLimitTracker, RequestKind,
-    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnrecoveredFills, UserDataFrame, WeightPool,
-    classify_order_kind_tif, classify_rest_order_error, classify_rest_query_error,
-    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
-    dedup_key_from_event, drop_after, gap_failed, gap_time, is_duplicate, log_unrecognised_frame,
-    new_dedup_cache, parse_user_data_frame, recovered_order_totals, response_decode_error,
+    MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing, PlacementResponse, RateLimitTracker,
+    RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnrecoveredFills, UserDataFrame,
+    WeightPool, binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
+    classify_rest_query_error, convert_ended_order, convert_execution_report,
+    convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event, drop_after,
+    gap_failed, gap_time, is_duplicate, is_unknown_order, log_unrecognised_frame, new_dedup_cache,
+    parse_user_data_frame, placed_order_state, recovered_order_totals, response_decode_error,
     rest_call_with_retry,
 };
 use crate::{
-    AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, InstrumentBalanceUpdate,
-    IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent, UnindexedAccountSnapshot,
+    AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
+    InstrumentBalanceUpdate, IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent,
+    UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
-    client::ExecutionClient,
+    client::{
+        ExecutionClient, OrderStatusClient,
+        order_recovery::{
+            KnownLiveOrders, OpenListing, OrderLookup, SharedKnownLiveOrders, UncheckedOrders,
+            fetch_ended_by_key, recover_ended_orders,
+        },
+    },
     emit_stream_terminated,
     error::{
         ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
     },
     order::{
-        Order, OrderKey, OrderKind, TimeInForce,
+        Order, OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
+        state::{Cancelled, Open, OrderState, UnindexedOrderState},
     },
     position::PositionReport,
-    trade::{AssetFees, Trade, TradeId},
+    trade::{AssetFees, Trade, TradeId, TradesRead},
 };
 use binance_sdk::{
     common::{
@@ -98,6 +108,7 @@ use binance_sdk::{
             QueryIsolatedMarginAccountInfoParams,
             QueryIsolatedMarginAccountInfoResponseAssetsInner,
             QueryMarginAccountsOpenOrdersIsIsolatedEnum, QueryMarginAccountsOpenOrdersParams,
+            QueryMarginAccountsOrderIsIsolatedEnum, QueryMarginAccountsOrderParams,
             QueryMarginAccountsTradeListIsIsolatedEnum, QueryMarginAccountsTradeListParams,
             QueryMarginAccountsTradeListResponseInner, RestApi,
         },
@@ -107,6 +118,7 @@ use binance_sdk::{
     },
 };
 use chrono::{DateTime, TimeZone, Utc};
+use fnv::FnvHashSet;
 use futures::stream::BoxStream;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
@@ -354,8 +366,9 @@ impl BinanceMarginConfig {
 ///   [`account_snapshot`](Self::account_snapshot) for the full per-method semantics.
 ///
 /// # Trailing stops unsupported
-/// `TrailingStop` / `TrailingStopLimit` return [`OrderError::UnsupportedOrderType`]: the binance-sdk
-/// margin new-order binding omits `trailingDelta`. See [`open_order`](Self::open_order).
+/// `TrailingStop` / `TrailingStopLimit` return [`OrderError::UnsupportedOrderType`]: this client does
+/// not map them yet. Binance margin accepts `trailingDelta`, and the SDK binds it, but margin has no
+/// testnet to verify the mapping on. See [`open_order`](Self::open_order).
 ///
 /// # User-data stream (`userListenToken`)
 /// [`account_stream`](Self::account_stream) is hand-rolled over the `userListenToken` model — the
@@ -405,6 +418,9 @@ pub struct BinanceMargin {
     ws_config: ConfigurationWebsocketApi,
     // shared rate-limit tracker across all REST calls
     rate_limiter: Arc<RateLimitTracker>,
+    // The orders seen live and not yet seen end, which a reconnect asks about. Shared by every
+    // clone and every account stream, since an order placed through one ends on any of them.
+    known_live: SharedKnownLiveOrders,
 }
 
 impl std::fmt::Debug for BinanceMargin {
@@ -418,6 +434,17 @@ impl std::fmt::Debug for BinanceMargin {
 }
 
 impl BinanceMargin {
+    /// Hold each of `orders` as live, for a reconnect to ask about if the stream misses its end.
+    fn remember_live<'a>(
+        &self,
+        orders: impl IntoIterator<Item = &'a Order<ExchangeId, InstrumentNameExchange, Open>>,
+    ) {
+        let mut known = self.known_live.lock();
+        for order in orders {
+            known.live(&order.key, order.quantity, &order.state);
+        }
+    }
+
     /// Build the production-configured margin REST configuration (credentials + base path).
     ///
     /// The base path is pinned to production (`https://api.binance.com`): margin/SAPI has no
@@ -532,11 +559,13 @@ impl BinanceMargin {
                     self.rate_limiter.clone(),
                     instrument,
                     true,
+                    RequestKind::Query,
                 )
             }))
             .buffer_unordered(8)
             .map(|result| {
                 let (inst, listing) = result?;
+                self.remember_live(&listing.orders);
                 let wrapped = listing
                     .orders
                     .into_iter()
@@ -620,6 +649,7 @@ impl ExecutionClient for BinanceMargin {
             rest_config,
             ws_config,
             rate_limiter: Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
+            known_live: KnownLiveOrders::shared(ExchangeId::BinanceMargin),
         }
     }
 
@@ -634,12 +664,12 @@ impl ExecutionClient for BinanceMargin {
     /// - `isIsolated` is config-driven (`"TRUE"` for isolated, `"FALSE"` for cross).
     /// - `autoRepayAtCancel` is set only under [`MarginSideEffect::AutoBorrowRepay`]: a `NoBorrow`
     ///   client takes no loan, so requesting repay-on-cancel would be incoherent.
-    /// - Trailing-stop kinds return [`OrderError::UnsupportedOrderType`] (the SDK omits
-    ///   `trailingDelta` on the margin binding).
+    /// - Trailing-stop kinds return [`OrderError::UnsupportedOrderType`]: not mapped yet (see the
+    ///   type-level docs).
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
+    ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
         let instrument = request.key.instrument.clone();
         let side = request.state.side;
         let price = request.state.price;
@@ -657,16 +687,14 @@ impl ExecutionClient for BinanceMargin {
 
         // Build the returned Order with a given inactive (failure) state, preserving the request
         // fields — keeps the many early-return error paths to one line each.
-        let inactive = |state: UnindexedOrderState| {
-            Some(Order {
-                key: order_key.clone(),
-                side,
-                price,
-                quantity,
-                kind,
-                time_in_force,
-                state,
-            })
+        let inactive = |state: UnindexedOrderState| Order {
+            key: order_key.clone(),
+            side,
+            price,
+            quantity,
+            kind,
+            time_in_force,
+            state,
         };
 
         let params = match build_new_order_params(
@@ -738,44 +766,23 @@ impl ExecutionClient for BinanceMargin {
             }
         };
 
-        let filled_qty = match data.executed_qty.as_deref() {
-            Some(q) => Decimal::from_str(q).unwrap_or_else(|_| {
-                // Present-but-unparseable executedQty is corrupt data, not an expected
-                // absence: silently defaulting to zero could misreport a filled order as
-                // Open. Surface it (mirrors margin_avg_price).
-                warn!(
-                    executed_qty = q,
-                    "BinanceMargin: failed to parse executedQty; treating as zero"
-                );
-                Decimal::ZERO
-            }),
-            None => {
-                // executedQty is expected on margin's REST order/cancel responses; its absence is
-                // anomalous (not the expected-empty case), so surface it rather than silently zero.
-                warn!("BinanceMargin: executedQty missing in response; treating as zero");
-                Decimal::ZERO
-            }
-        };
-
-        let state = if filled_qty >= quantity {
-            // Fully filled on placement — derive avg price from cumulative quote qty (margin's
-            // REST response exposes this; spot's WS response does not, hence spot passes None).
-            let avg_price = margin_avg_price(data.cummulative_quote_qty.as_deref(), filled_qty);
-            OrderState::fully_filled(Filled::new(
-                exchange_order_id,
+        // Read from the response's status, so an order that ended in it (an IOC or FOK order
+        // that expired) is not reported, or held, as live.
+        let state = placed_order_state(
+            ExchangeId::BinanceMargin,
+            &instrument,
+            quantity,
+            PlacementResponse {
+                status: data.status.as_deref(),
+                order_id: exchange_order_id,
                 time_exchange,
-                filled_qty,
-                avg_price,
-            ))
-        } else {
-            OrderState::active(Open::new(
-                VenueOrderId::Assigned(exchange_order_id),
-                time_exchange,
-                filled_qty,
-            ))
-        };
+                executed_qty: data.executed_qty.as_deref(),
+                cumulative_quote_qty: data.cummulative_quote_qty.as_deref(),
+            },
+        );
+        self.known_live.lock().placed(&order_key, quantity, &state);
 
-        Some(Order {
+        Order {
             key: order_key,
             side,
             price,
@@ -783,7 +790,7 @@ impl ExecutionClient for BinanceMargin {
             kind,
             time_in_force,
             state,
-        })
+        }
     }
 
     /// Cancel a resting margin order via `DELETE /sapi/v1/margin/order`.
@@ -798,7 +805,7 @@ impl ExecutionClient for BinanceMargin {
     async fn cancel_order(
         &self,
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<UnindexedOrderResponseCancel> {
+    ) -> UnindexedOrderResponseCancel {
         let instrument = request.key.instrument.clone();
         let key = OrderKey {
             exchange: request.key.exchange,
@@ -816,10 +823,10 @@ impl ExecutionClient for BinanceMargin {
             Ok(p) => p,
             Err(e) => {
                 error!(%e, "BinanceMargin failed to build cancel order params");
-                return Some(UnindexedOrderResponseCancel {
+                return UnindexedOrderResponseCancel {
                     key,
                     state: Err(OrderError::Rejected(ApiError::OrderRejected(e))),
-                });
+                };
             }
         };
 
@@ -832,10 +839,10 @@ impl ExecutionClient for BinanceMargin {
             {
                 Ok(response) => response,
                 Err(e) => {
-                    return Some(UnindexedOrderResponseCancel {
+                    return UnindexedOrderResponseCancel {
                         key,
                         state: Err(classify_rest_order_error(&e, &instrument)),
-                    });
+                    };
                 }
             };
 
@@ -844,10 +851,10 @@ impl ExecutionClient for BinanceMargin {
             Err(e) => {
                 // Deserialization failure on a 2xx response — surface as a rejection, not a
                 // transport error (the cancel request did reach the venue), mirroring open_order.
-                return Some(UnindexedOrderResponseCancel {
+                return UnindexedOrderResponseCancel {
                     key,
                     state: Err(OrderError::Rejected(ApiError::OrderRejected(e.to_string()))),
-                });
+                };
             }
         };
 
@@ -860,38 +867,26 @@ impl ExecutionClient for BinanceMargin {
             Some(id) => OrderId(SmolStr::new(id)),
             None => {
                 error!("BinanceMargin cancel response missing orderId");
-                return Some(UnindexedOrderResponseCancel {
+                return UnindexedOrderResponseCancel {
                     key,
                     state: Err(OrderError::Rejected(ApiError::OrderRejected(
                         "cancel response missing orderId".into(),
                     ))),
-                });
+                };
             }
         };
 
-        let filled_qty = match data.executed_qty.as_deref() {
-            Some(q) => Decimal::from_str(q).unwrap_or_else(|_| {
-                // Present-but-unparseable executedQty is corrupt data, not an expected
-                // absence: silently defaulting to zero could misreport a filled order as
-                // Open. Surface it (mirrors margin_avg_price).
-                warn!(
-                    executed_qty = q,
-                    "BinanceMargin: failed to parse executedQty; treating as zero"
-                );
-                Decimal::ZERO
-            }),
-            None => {
-                // executedQty is expected on margin's REST order/cancel responses; its absence is
-                // anomalous (not the expected-empty case), so surface it rather than silently zero.
-                warn!("BinanceMargin: executedQty missing in response; treating as zero");
-                Decimal::ZERO
-            }
-        };
+        let filled_qty = binance_filled_qty(
+            ExchangeId::BinanceMargin,
+            &exchange_order_id,
+            data.executed_qty.as_deref(),
+        );
 
-        Some(UnindexedOrderResponseCancel {
+        self.known_live.lock().ended(&key.cid);
+        UnindexedOrderResponseCancel {
             key,
             state: Ok(Cancelled::new(exchange_order_id, time_exchange, filled_qty)),
-        })
+        }
     }
 
     /// Fetch a full margin account snapshot: balances plus open orders per instrument.
@@ -944,11 +939,13 @@ impl ExecutionClient for BinanceMargin {
                     instrument,
                     // Cross path only: isolated returns early via `isolated_account_snapshot`.
                     false,
+                    RequestKind::Query,
                 )
             }))
             .buffer_unordered(8)
             .map(|result| {
                 let (inst, listing) = result?;
+                self.remember_live(&listing.orders);
                 let wrapped = listing
                     .orders
                     .into_iter()
@@ -1034,6 +1031,7 @@ impl ExecutionClient for BinanceMargin {
                     self.rate_limiter.clone(),
                     instrument,
                     true,
+                    RequestKind::Query,
                 )
             }))
             .buffer_unordered(8)
@@ -1045,18 +1043,18 @@ impl ExecutionClient for BinanceMargin {
                     Ok(acc)
                 },
             )
-            .await;
+            .await
+            .inspect(|orders| self.remember_live(orders));
         }
 
         // Cross: empty slice = "return all" sentinel — a single no-symbol query is both correct
         // (the contract requires all instruments) and far cheaper than enumerating every symbol.
         if instruments.is_empty() {
-            return fetch_margin_all_open_orders(
-                self.rest.clone(),
-                self.rate_limiter.clone(),
-                false,
-            )
-            .await;
+            let orders =
+                fetch_margin_all_open_orders(self.rest.clone(), self.rate_limiter.clone(), false)
+                    .await?;
+            self.remember_live(&orders);
+            return Ok(orders);
         }
         futures::stream::iter(instruments.iter().cloned().map(|instrument| {
             fetch_margin_open_orders_for_instrument(
@@ -1064,6 +1062,7 @@ impl ExecutionClient for BinanceMargin {
                 self.rate_limiter.clone(),
                 instrument,
                 false,
+                RequestKind::Query,
             )
         }))
         .buffer_unordered(8)
@@ -1075,38 +1074,48 @@ impl ExecutionClient for BinanceMargin {
             },
         )
         .await
+        .inspect(|orders| self.remember_live(orders))
     }
 
-    /// Fetch margin trades (fills) since `time_since`, optionally filtered by instrument.
+    /// Read margin trades (fills) from `start` to `end`, optionally filtered by instrument.
     ///
     /// **Documented deviation from the `ExecutionClient::fetch_trades` "return all" contract:**
     /// Binance's margin trade-list endpoint (`myTrades`) requires a symbol — there is no no-symbol
     /// "all trades" query (unlike open orders).
     ///
-    /// **Cross**: an empty `instruments` slice has nothing to query and returns an empty `Vec`;
-    /// callers wanting all trades must enumerate instruments explicitly.
+    /// **Cross**: an empty `instruments` slice has nothing to query and reads nothing; callers
+    /// wanting all trades must enumerate instruments explicitly.
     ///
     /// **Isolated**: the empty sentinel resolves to the configured `isolated_symbols` (the effective
     /// isolated set; out-of-set instruments skipped with a warning), iterated per-symbol (Design
     /// decision #4).
     ///
+    /// **Complete:** each instrument is read to the span's end within the call, with no page cap,
+    /// so the read is always complete (`resume: None`).
+    ///
     /// **Lookback cost:** Binance serves margin trades by time only in spans under 24 hours, so
-    /// each instrument is read in 23-hour windows from `time_since` until its first trade, one
+    /// each instrument is read in 23-hour windows from `start` until its first trade, one
     /// request (weight 10) per window, then by trade id. The cost grows with the lookback and
-    /// has no cap: a `time_since` 30 days back with no trades costs about 32 requests per
-    /// instrument, and one at the Unix epoch about 21,000. Pass the most recent `time_since` that
+    /// has no cap: a `start` 30 days back with no trades costs about 32 requests per
+    /// instrument, and one at the Unix epoch about 21,000. Pass the most recent `start` that
     /// covers what you need.
     ///
-    /// **Upper bound:** trades are read up to the local clock at the call. A trade stamped later,
-    /// including one inside any skew between the local clock and Binance's, is left to the next
-    /// read, unless a window before the last one held a trade (or the last one read a full page)
-    /// and the walk went on to page by id, which has no time bound.
+    /// **Upper bound:** trades are read up to `end`, or up to the local clock at the call if that
+    /// is earlier. A trade stamped after the local clock, as one inside any skew between it and
+    /// Binance's can be, is left to the next read, unless a window before the last one held a
+    /// trade (or the last one read a full page) and the walk went on to page by id, which reads
+    /// on to `end`.
     async fn fetch_trades(
         &self,
-        time_since: DateTime<Utc>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
-    ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
+    ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError> {
         use futures::StreamExt as _;
+
+        if start > end {
+            return Ok(TradesRead::complete(Vec::new()));
+        }
 
         // Resolve the effective instrument set. Isolated resolves the empty sentinel to the
         // configured isolated_symbols; cross keeps the slice verbatim (no no-symbol "all" form).
@@ -1122,9 +1131,13 @@ impl ExecutionClient for BinanceMargin {
                 is_isolated = self.config.is_isolated,
                 "BinanceMargin fetch_trades: empty effective instrument set — returning empty result"
             );
-            return Ok(Vec::new());
+            return Ok(TradesRead::complete(Vec::new()));
         }
-        let start_time_ms = time_since.timestamp_millis();
+        // Binance stamps trades in whole milliseconds; the exact span is applied after the read.
+        let span = MyTradesFrom::Span {
+            start: start.timestamp_millis(),
+            end: end.timestamp_millis(),
+        };
         let is_isolated = self.config.is_isolated;
         let mut all_trades = Vec::new();
 
@@ -1138,7 +1151,7 @@ impl ExecutionClient for BinanceMargin {
                     &rest,
                     &rate_limiter,
                     &inst,
-                    MyTradesFrom::Time(start_time_ms),
+                    span,
                     is_isolated,
                     RequestKind::Query,
                 )
@@ -1150,13 +1163,15 @@ impl ExecutionClient for BinanceMargin {
         while let Some(result) = stream.next().await {
             let (instrument, trades_data) = result?;
             for t in trades_data {
-                if let Some(trade) = convert_margin_trade(&t, &instrument) {
+                if let Some(trade) = convert_margin_trade(&t, &instrument)
+                    && (start..=end).contains(&trade.time_exchange)
+                {
                     all_trades.push(trade);
                 }
             }
         }
 
-        Ok(all_trades)
+        Ok(TradesRead::complete(all_trades))
     }
 
     /// Live stream of account events (fills, order updates, balance changes) over the hand-rolled
@@ -1172,7 +1187,8 @@ impl ExecutionClient for BinanceMargin {
     /// As on spot, each instrument's gap after a reconnect is kept until its fills are forwarded:
     /// a gap whose read failed or timed out is retried after 1, 2, 4, 8 and 16 minutes, connected
     /// or not in between, reading only the gap. After five failed retries it is given up, logged
-    /// at `error`; [`ExecutionClient::fetch_trades`] can still read its fills.
+    /// at `error` and reported as an [`AccountEventKind::FillRecoveryGaveUp`];
+    /// [`ExecutionClient::fetch_trades`] can still read its fills.
     ///
     /// # Debt cold-start
     /// This method does **not** seed balances. Margin debt (`borrowed`/`interest`) is correct only
@@ -1184,9 +1200,7 @@ impl ExecutionClient for BinanceMargin {
     /// # Startup race window
     /// Like spot, fills arriving between subscribe and the listener being registered may be missed;
     /// callers requiring startup fill completeness must call [`ExecutionClient::fetch_trades`] with
-    /// a ~1s lookback after this returns. Callers must also call
-    /// [`ExecutionClient::fetch_open_orders`] after each reconnect to reconcile order state — only
-    /// TRADE fills are recovered, not order-lifecycle events.
+    /// a ~1s lookback after this returns.
     ///
     /// A recovered fill advances the order too. A live fill carries the order's cumulative filled
     /// quantity in [`Trade::order_filled_quantity`] (`executionReport`'s `z`); REST `myTrades`
@@ -1196,6 +1210,39 @@ impl ExecutionClient for BinanceMargin {
     /// time budget inside the recovery timeout, so they can never cost a fill: a fill whose order
     /// was not looked up in time, or whose lookup failed, goes out with `order_filled_quantity:
     /// None`, logged at `warn`, and advances the position but not the order.
+    ///
+    /// # Orders that ended while disconnected
+    ///
+    /// A reconnect also reports how each order the client holds as live on one of the stream's
+    /// instruments ended, where it did, as an [`AccountEventKind::OrderSnapshot`] of its inactive
+    /// state: filled, cancelled with what filled before, expired, or rejected. The stream's
+    /// instruments are `instruments` on cross and
+    /// [`isolated_symbols`](BinanceMarginConfig::isolated_symbols) on isolated, as for fill
+    /// recovery. Binance's order history filters on when an order was created, so such an order is
+    /// found by asking about it, not by time.
+    ///
+    /// - **Which orders.** The client holds an order as live from the response to placing it,
+    ///   from a listing of open orders ([`account_snapshot`](ExecutionClient::account_snapshot),
+    ///   [`fetch_open_orders`](ExecutionClient::fetch_open_orders)), and from its live reports on
+    ///   any of its account streams, until it sees the order end. It holds up to 4,096 orders and
+    ///   forgets the oldest past that, logged at `warn`. An order placed outside this client and
+    ///   never listed or reported to it is not covered.
+    /// - **Cost.** One `GET /sapi/v1/margin/openOrders` per instrument with an order held (weight
+    ///   10), then one `GET /sapi/v1/margin/order` (weight 10) for each held order the listing no
+    ///   longer shows, all in the configured cross or isolated account.
+    /// - **Fills first.** An instrument is checked only once its fill gap is recovered or given up,
+    ///   so an order's recovered fills arrive before how it ended. A fill that brings an order to
+    ///   its full quantity ends it, and that order is not reported again.
+    /// - **Keys.** Each snapshot carries [`StrategyId::unknown`], since Binance records no
+    ///   strategy. The engine matches it to the order it tracks by client order id.
+    /// - **Failures.** Each order's lookup is settled as it ends, and each instrument as soon as its
+    ///   check ends. One whose listing or any lookup fails, or whose check is still running when a
+    ///   pass reaches 30 s, is retried on the fill gaps' schedule (1, 2, 4, 8 and 16 minutes),
+    ///   asking only about the orders still held, then given up, logged at `error`. Its orders are
+    ///   asked about again at the next reconnect. An order Binance does not know (`-2013`) stops being held, logged
+    ///   at `warn`; one it still reports live, or in a state this version cannot read, stays held.
+    ///
+    /// The same lookup is public as [`OrderStatusClient::fetch_ended_orders`].
     ///
     /// # Isolated mode (multiplexed `userListenToken`)
     /// Under `is_isolated = true` a **separate** manager drives the stream (the cross path above is
@@ -1246,6 +1293,7 @@ impl ExecutionClient for BinanceMargin {
         let rest_config = self.rest_config.clone();
         let ws_config = self.ws_config.clone();
         let rate_limiter = self.rate_limiter.clone();
+        let known_live = self.known_live.clone();
 
         let cm_handle = if self.config.is_isolated {
             // --- Isolated: separate multiplexed manager over the configured isolated_symbols ---
@@ -1287,12 +1335,18 @@ impl ExecutionClient for BinanceMargin {
             // all before returning so connect-or-any-subscribe failure → Err (nothing spawned),
             // preserving cross's "can't-start vs started-then-dropped" distinction.
             let tokens = acquire_all_isolated_tokens(&rest_config, &rate_limiter, &symbols).await?;
-            let live =
-                isolated_connect_and_subscribe(&ws_config, &tx, &dedup, &base_quote, &tokens)
-                    .await
-                    .map_err(|e| {
-                        UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
-                    })?;
+            let live = isolated_connect_and_subscribe(
+                &ws_config,
+                &tx,
+                &dedup,
+                &known_live,
+                &base_quote,
+                &tokens,
+            )
+            .await
+            .map_err(|e| {
+                UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
+            })?;
 
             tokio::spawn(isolated_connection_manager(
                 tx,
@@ -1301,6 +1355,7 @@ impl ExecutionClient for BinanceMargin {
                 rest_config,
                 rest,
                 rate_limiter,
+                known_live,
                 symbols,
                 base_quote,
                 Some(live),
@@ -1335,6 +1390,7 @@ impl ExecutionClient for BinanceMargin {
                 rest_config,
                 rest,
                 rate_limiter,
+                known_live,
                 instruments,
                 Some((initial_ws, initial_token)),
             ))
@@ -1343,6 +1399,40 @@ impl ExecutionClient for BinanceMargin {
         let rx_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
         let guarded_stream = AbortOnDropStream::new(rx_stream, cm_handle);
         Ok(futures::StreamExt::boxed(guarded_stream))
+    }
+}
+
+/// Looks each order up with `GET /sapi/v1/margin/order` by symbol and client order id, in the
+/// cross or isolated account as [`BinanceMarginConfig::is_isolated`] says, weight 10 each, up to
+/// eight at a time. Binance's `FILLED` is reported with its average price, `CANCELED` with what
+/// filled before it, `EXPIRED` and `EXPIRED_IN_MATCH` (self-trade prevention) as expired, and
+/// `REJECTED` as [`OpenFailed`](crate::order::state::InactiveOrderState::OpenFailed). An order
+/// Binance does not know under the key's symbol (`-2013`, or `-1121` for a symbol that does not
+/// exist) is omitted. A row whose status this version does not know is omitted too, with a
+/// warning, as is a `PENDING_CANCEL` one.
+///
+/// In isolated mode a key's symbol is asked about whether or not it is one of
+/// [`isolated_symbols`](BinanceMarginConfig::isolated_symbols), since an order can be placed on any
+/// pair. Any error other than those two codes fails the call, including one Binance gives for a
+/// pair with no isolated account.
+///
+/// The account stream runs the same lookup itself after a reconnect; see
+/// [`account_stream`](ExecutionClient::account_stream).
+impl OrderStatusClient for BinanceMargin {
+    async fn fetch_ended_orders(
+        &self,
+        orders: &[UnindexedOrderKey],
+    ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
+        fetch_ended_by_key(orders, |key| {
+            fetch_margin_order_lookup(
+                self.rest.clone(),
+                self.rate_limiter.clone(),
+                key,
+                self.config.is_isolated,
+                RequestKind::Query,
+            )
+        })
+        .await
     }
 }
 
@@ -1859,11 +1949,13 @@ fn route_isolated_account_position(
 /// [`route_isolated_account_position`]). Returns the [`Subscription`] handle; the caller must
 /// `unsubscribe()` it on disconnect. `heartbeat_flag` is shared with the caller's monitor loop
 /// (set on every inbound frame/ping); `signal_tx` fires once on a terminal condition
-/// (consumer-drop, socket error/close, or exchange `eventStreamTerminated`).
+/// (consumer-drop, socket error/close, or exchange `eventStreamTerminated`). Each event `known`
+/// learns from updates it before it is sent.
 fn register_user_data_listener(
     ws: &Arc<WsApiBase>,
     tx: mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: SharedDedupCache,
+    known: SharedKnownLiveOrders,
     heartbeat_flag: Arc<AtomicBool>,
     signal_tx: oneshot::Sender<()>,
     mut handle_position: impl FnMut(
@@ -1902,7 +1994,16 @@ fn register_user_data_listener(
                         trace!("BinanceMargin dedup: skipping duplicate event");
                         continue;
                     }
+                    // Held across the send, so an order this reports ending and a reconnect's
+                    // check of it reach the stream in the order they were decided, and the check
+                    // reports only an order not already reported.
+                    let held = KnownLiveOrders::observes(&ev.kind).then(|| {
+                        let mut held = known.lock();
+                        held.observe(&ev);
+                        held
+                    });
                     if sender.send(ev).is_err() {
+                        drop(held);
                         warn!("BinanceMargin account_stream receiver dropped, suppressing sends");
                         event_tx.take();
                         if let Some(s) = signal_tx_opt.take() {
@@ -1946,8 +2047,8 @@ fn register_user_data_listener(
 /// through the dedup cache. Mirrors `BinanceSpot::recover_fills`, which documents how gaps are
 /// settled and retried.
 ///
-/// Only TRADE fills are recovered — order-lifecycle events (NEW/CANCELED) require a
-/// `fetch_open_orders` reconciliation by the caller.
+/// Only fills are recovered here; how the orders held as live ended is checked afterwards by
+/// [`recover_margin_ended_orders`]. A recovered fill that completes its order ends it in `known`.
 ///
 /// `myTrades` reports executions only, with no cumulative, so each recovered trade's
 /// `order_filled_quantity` is rebuilt from its order's executions by
@@ -1967,6 +2068,7 @@ async fn recover_margin_fills(
     unrecovered: &mut UnrecoveredFills,
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: &SharedDedupCache,
+    known: &SharedKnownLiveOrders,
     is_isolated: bool,
 ) {
     use futures::StreamExt as _;
@@ -2055,10 +2157,11 @@ async fn recover_margin_fills(
                 Err(e) => {
                     gap_failed(
                         unrecovered,
+                        tx,
                         ExchangeId::BinanceMargin,
                         inst,
                         gap,
-                        &e.to_string(),
+                        FillRecoveryFailure::Request(e.to_string()),
                     );
                     continue;
                 }
@@ -2074,7 +2177,14 @@ async fn recover_margin_fills(
                     duplicates += 1;
                     continue;
                 }
-                if tx.send(event).is_err() {
+                // A recovered fill that completes its order ends it, so a later check of how the
+                // orders held as live ended does not report it again.
+                let sent = {
+                    let mut known = known.lock();
+                    known.observe(&event);
+                    tx.send(event)
+                };
+                if sent.is_err() {
                     debug!("BinanceMargin fill recovery: consumer dropped during recovery");
                     return;
                 }
@@ -2102,13 +2212,32 @@ async fn recover_margin_fills(
         {
             gap_failed(
                 unrecovered,
+                tx,
                 ExchangeId::BinanceMargin,
                 inst,
                 gap,
-                "fill recovery timed out",
+                FillRecoveryFailure::TimedOut {
+                    timeout_secs: FILL_RECOVERY_TIMEOUT_SECS,
+                },
             );
         }
     }
+}
+
+/// Open what a reconnect after a disconnect at `disconnected` recovers: a fill gap on each of the
+/// stream's `instruments`, and a check of how the orders held as live ended on each of them that
+/// has one. Only the stream's instruments are checked, since only their fills are recovered, and
+/// an instrument is checked once its fills are.
+fn open_reconnect_recovery(
+    unrecovered: &mut UnrecoveredFills,
+    unchecked: &mut UncheckedOrders,
+    known: &SharedKnownLiveOrders,
+    instruments: &[InstrumentNameExchange],
+    disconnected: DateTime<Utc>,
+) {
+    unrecovered.open(instruments, disconnected, Utc::now());
+    let held = known.lock().instruments_among(instruments);
+    unchecked.open(held);
 }
 
 /// Long-running task driving the `account_stream` WebSocket lifecycle.
@@ -2129,6 +2258,7 @@ async fn margin_connection_manager(
     rest_config: Arc<ConfigurationRestApi>,
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
+    known: SharedKnownLiveOrders,
     instruments: Vec<InstrumentNameExchange>,
     initial: Option<(Arc<WsApiBase>, UserListenToken)>,
 ) {
@@ -2143,6 +2273,8 @@ async fn margin_connection_manager(
     let mut disconnect_time: Option<DateTime<Utc>> = None;
     // Gaps not yet recovered: read at reconnect, and retried on a timer while connected, once due.
     let mut unrecovered = UnrecoveredFills::default();
+    // Instruments whose known-live orders a reconnect has yet to check, likewise.
+    let mut unchecked = UncheckedOrders::default();
     let (mut current_ws, mut current_token) = match initial {
         Some((ws, token)) => (Some(ws), Some(token)),
         None => (None, None),
@@ -2207,6 +2339,7 @@ async fn margin_connection_manager(
             &ws,
             tx.clone(),
             dedup.clone(),
+            known.clone(),
             heartbeat_flag.clone(),
             signal_tx,
             cross_account_position_handler,
@@ -2245,24 +2378,48 @@ async fn margin_connection_manager(
         let token_deadline =
             tokio::time::Instant::now() + token_renew_after(token.expiration_time_ms);
 
-        // --- Fill recovery after a reconnect (bounded) ---
-        // The gap is opened before it is read, so a recovery that fails or times out keeps it.
+        // --- Recovery after a reconnect (each bounded) ---
+        // Fills first, then how the orders held as live ended: an order whose fills are not all
+        // recovered is not checked yet. Each gap and check is opened before it is read, so one that
+        // fails or times out is kept for a retry.
         if let Some(dt) = disconnect_time.take() {
-            unrecovered.open(&instruments, dt, Utc::now());
+            open_reconnect_recovery(&mut unrecovered, &mut unchecked, &known, &instruments, dt);
         }
-        // This is the cross manager (account-wide); fill recovery is always cross-scoped.
-        // The isolated manager (a separate path) passes `true`.
-        recover_margin_fills(&rest, &rate_limiter, &mut unrecovered, &tx, &dedup, false).await;
+        // This is the cross manager (account-wide); recovery is always cross-scoped. The isolated
+        // manager (a separate path) passes `true`.
+        recover_margin_fills(
+            &rest,
+            &rate_limiter,
+            &mut unrecovered,
+            &tx,
+            &dedup,
+            &known,
+            false,
+        )
+        .await;
+        recover_margin_ended_orders(
+            &rest,
+            &rate_limiter,
+            &known,
+            &mut unchecked,
+            &unrecovered,
+            &tx,
+            false,
+        )
+        .await;
 
         // --- Monitor: disconnect signal, heartbeat timeout, token refresh, or consumer drop ---
         let reason = {
             let mut signal_rx = signal_rx;
-            // Gaps a recovery did not read are retried as they fall due, alongside the monitor, so
-            // a disconnect is still seen at once. It never completes; dropping it when the monitor
-            // ends loses nothing, since each gap is settled as soon as its read ends.
+            // Gaps and order checks a recovery did not finish are retried as they fall due,
+            // alongside the monitor, so a disconnect is still seen at once. An order check waiting
+            // on a gap runs right after the gap's retry. It never completes; dropping it when the
+            // monitor ends loses nothing, since each gap, and each instrument's order check, is
+            // settled in one step as soon as its read ends.
             let retry_gaps = async {
                 loop {
-                    match unrecovered.next_due() {
+                    let next_check = unchecked.next_due(&unrecovered);
+                    match unrecovered.next_due().into_iter().chain(next_check).min() {
                         Some(due) => tokio::time::sleep_until(due).await,
                         None => std::future::pending::<()>().await,
                     }
@@ -2272,6 +2429,17 @@ async fn margin_connection_manager(
                         &mut unrecovered,
                         &tx,
                         &dedup,
+                        &known,
+                        false,
+                    )
+                    .await;
+                    recover_margin_ended_orders(
+                        &rest,
+                        &rate_limiter,
+                        &known,
+                        &mut unchecked,
+                        &unrecovered,
+                        &tx,
                         false,
                     )
                     .await;
@@ -2476,6 +2644,7 @@ async fn isolated_connect_and_subscribe(
     ws_config: &ConfigurationWebsocketApi,
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: &SharedDedupCache,
+    known: &SharedKnownLiveOrders,
     base_quote: &Arc<HashMap<InstrumentNameExchange, (AssetNameExchange, AssetNameExchange)>>,
     tokens: &[(InstrumentNameExchange, UserListenToken)],
 ) -> anyhow::Result<IsolatedLiveConn> {
@@ -2504,6 +2673,7 @@ async fn isolated_connect_and_subscribe(
         &ws,
         tx.clone(),
         dedup.clone(),
+        known.clone(),
         heartbeat_flag.clone(),
         signal_tx,
         handle_position,
@@ -2565,6 +2735,7 @@ async fn isolated_connection_manager(
     rest_config: Arc<ConfigurationRestApi>,
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
+    known: SharedKnownLiveOrders,
     symbols: Vec<InstrumentNameExchange>,
     base_quote: Arc<HashMap<InstrumentNameExchange, (AssetNameExchange, AssetNameExchange)>>,
     initial: Option<IsolatedLiveConn>,
@@ -2580,6 +2751,8 @@ async fn isolated_connection_manager(
     let mut disconnect_time: Option<DateTime<Utc>> = None;
     // Gaps not yet recovered: read at reconnect, and retried on a timer while connected, once due.
     let mut unrecovered = UnrecoveredFills::default();
+    // Instruments whose known-live orders a reconnect has yet to check, likewise.
+    let mut unchecked = UncheckedOrders::default();
     let mut current = initial;
 
     loop {
@@ -2621,8 +2794,15 @@ async fn isolated_connection_manager(
                         continue;
                     }
                 };
-                match isolated_connect_and_subscribe(&ws_config, &tx, &dedup, &base_quote, &tokens)
-                    .await
+                match isolated_connect_and_subscribe(
+                    &ws_config,
+                    &tx,
+                    &dedup,
+                    &known,
+                    &base_quote,
+                    &tokens,
+                )
+                .await
                 {
                     Ok(live) => live,
                     Err(e) => {
@@ -2657,29 +2837,66 @@ async fn isolated_connection_manager(
         // the monitor loop don't keep restarting the renewal timer. Earliest token expiry drives it.
         let token_deadline = tokio::time::Instant::now() + token_renew_after(earliest_expiry_ms);
 
-        // --- Fill recovery after a reconnect (isolated-scoped over the full symbol set) ---
-        // The gap is opened before it is read, so a recovery that fails or times out keeps it.
+        // --- Recovery after a reconnect (isolated-scoped over the full symbol set) ---
+        // Fills first, then how the orders held as live ended, as on cross.
         if let Some(dt) = disconnect_time.take() {
-            unrecovered.open(&symbols, dt, Utc::now());
+            open_reconnect_recovery(&mut unrecovered, &mut unchecked, &known, &symbols, dt);
         }
-        // is_isolated = true: paginate_margin_my_trades must query isolated trades.
-        recover_margin_fills(&rest, &rate_limiter, &mut unrecovered, &tx, &dedup, true).await;
+        // is_isolated = true: every margin read must query the isolated accounts.
+        recover_margin_fills(
+            &rest,
+            &rate_limiter,
+            &mut unrecovered,
+            &tx,
+            &dedup,
+            &known,
+            true,
+        )
+        .await;
+        recover_margin_ended_orders(
+            &rest,
+            &rate_limiter,
+            &known,
+            &mut unchecked,
+            &unrecovered,
+            &tx,
+            true,
+        )
+        .await;
 
         // --- Monitor: disconnect signal, heartbeat timeout, token refresh, or consumer drop ---
         // One socket regardless of N, so the conditions are identical to cross.
         let reason = {
             let mut signal_rx = signal_rx;
-            // Gaps a recovery did not read are retried as they fall due, alongside the monitor, so
-            // a disconnect is still seen at once. It never completes; dropping it when the monitor
-            // ends loses nothing, since each gap is settled as soon as its read ends.
+            // Gaps and order checks a recovery did not finish are retried as they fall due,
+            // alongside the monitor, as on cross.
             let retry_gaps = async {
                 loop {
-                    match unrecovered.next_due() {
+                    let next_check = unchecked.next_due(&unrecovered);
+                    match unrecovered.next_due().into_iter().chain(next_check).min() {
                         Some(due) => tokio::time::sleep_until(due).await,
                         None => std::future::pending::<()>().await,
                     }
-                    recover_margin_fills(&rest, &rate_limiter, &mut unrecovered, &tx, &dedup, true)
-                        .await;
+                    recover_margin_fills(
+                        &rest,
+                        &rate_limiter,
+                        &mut unrecovered,
+                        &tx,
+                        &dedup,
+                        &known,
+                        true,
+                    )
+                    .await;
+                    recover_margin_ended_orders(
+                        &rest,
+                        &rate_limiter,
+                        &known,
+                        &mut unchecked,
+                        &unrecovered,
+                        &tx,
+                        true,
+                    )
+                    .await;
                 }
             };
             tokio::pin!(retry_gaps);
@@ -2779,11 +2996,12 @@ async fn fetch_margin_open_orders_for_instrument(
     rate_limiter: Arc<RateLimitTracker>,
     instrument: InstrumentNameExchange,
     is_isolated: bool,
+    kind: RequestKind,
 ) -> Result<(InstrumentNameExchange, OpenOrderListing), UnindexedClientError> {
     // Convert once before the retry closure to avoid a String allocation on every retry.
     let symbol_str = instrument.name().to_string();
     let isolated = QueryMarginAccountsOpenOrdersIsIsolatedEnum::from_flag(is_isolated);
-    let response = rest_call_with_retry(&rest, &rate_limiter, RequestKind::Query, |rest| {
+    let response = rest_call_with_retry(&rest, &rate_limiter, kind, |rest| {
         let sym = symbol_str.clone();
         let isolated = isolated.clone();
         Box::pin(async move {
@@ -2838,6 +3056,104 @@ async fn fetch_margin_all_open_orders(
     Ok(orders)
 }
 
+/// Look the order under `key` up with `GET /sapi/v1/margin/order` by its client order id
+/// (weight 10), in the cross or isolated account as `is_isolated` says.
+async fn fetch_margin_order_lookup(
+    rest: Arc<RestApi>,
+    rate_limiter: Arc<RateLimitTracker>,
+    key: UnindexedOrderKey,
+    is_isolated: bool,
+    kind: RequestKind,
+) -> Result<OrderLookup, UnindexedClientError> {
+    // Convert once before the retry closure to avoid a String allocation on every retry.
+    let symbol = key.instrument.name().to_string();
+    let cid = key.cid.0.to_string();
+    let isolated = QueryMarginAccountsOrderIsIsolatedEnum::from_flag(is_isolated);
+    let response = match rest_call_with_retry(&rest, &rate_limiter, kind, |rest| {
+        let (symbol, cid, isolated) = (symbol.clone(), cid.clone(), isolated.clone());
+        Box::pin(async move {
+            let params = QueryMarginAccountsOrderParams::builder(symbol)
+                .orig_client_order_id(cid)
+                .is_isolated(isolated)
+                .build()?;
+            rest.query_margin_accounts_order(params).await
+        })
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(e) if is_unknown_order(&e) => {
+            debug!(instrument = %key.instrument, cid = %key.cid, error = %e, "BinanceMargin does not know this order");
+            return Ok(OrderLookup::Unknown);
+        }
+        Err(e) => return Err(classify_rest_query_error(&e, Some(&key.instrument))),
+    };
+
+    let row = response.data().await.map_err(response_decode_error)?;
+
+    Ok(convert_ended_order(&row, ExchangeId::BinanceMargin, &key)
+        .map_or(OrderLookup::NotEnded, |order| {
+            OrderLookup::Ended(Box::new(order))
+        }))
+}
+
+/// The client order ids `GET /sapi/v1/margin/openOrders` lists on `instruments` (weight 10 each,
+/// one at a time), for a reconnect's check of the orders held as live.
+async fn listed_margin_open_cids(
+    rest: Arc<RestApi>,
+    rate_limiter: Arc<RateLimitTracker>,
+    instruments: Vec<InstrumentNameExchange>,
+    is_isolated: bool,
+) -> Result<FnvHashSet<ClientOrderId>, UnindexedClientError> {
+    let mut listed = FnvHashSet::default();
+    for instrument in instruments {
+        let (_, listing) = fetch_margin_open_orders_for_instrument(
+            rest.clone(),
+            rate_limiter.clone(),
+            instrument,
+            is_isolated,
+            RequestKind::Essential,
+        )
+        .await?;
+        listed.extend(listing.orders.into_iter().map(|order| order.key.cid));
+    }
+    Ok(listed)
+}
+
+/// [`recover_ended_orders`] on Binance Margin: listings by [`listed_margin_open_cids`] and lookups
+/// by [`fetch_margin_order_lookup`], both [`RequestKind::Essential`], as fill recovery's reads are.
+async fn recover_margin_ended_orders(
+    rest: &Arc<RestApi>,
+    rate_limiter: &Arc<RateLimitTracker>,
+    known: &SharedKnownLiveOrders,
+    unchecked: &mut UncheckedOrders,
+    unrecovered: &UnrecoveredFills,
+    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
+    is_isolated: bool,
+) {
+    recover_ended_orders(
+        ExchangeId::BinanceMargin,
+        known,
+        unchecked,
+        unrecovered,
+        tx,
+        OpenListing::PerInstrument,
+        |instruments| {
+            listed_margin_open_cids(rest.clone(), rate_limiter.clone(), instruments, is_isolated)
+        },
+        |key| {
+            fetch_margin_order_lookup(
+                rest.clone(),
+                rate_limiter.clone(),
+                key,
+                is_isolated,
+                RequestKind::Essential,
+            )
+        },
+    )
+    .await;
+}
+
 /// Length of each time window [`paginate_margin_my_trades`] walks before it finds a trade.
 ///
 /// Binance requires "less than 24 hours between startTime and endTime" on margin `myTrades`,
@@ -2865,7 +3181,7 @@ impl MarginTradesQuery {
     /// window: the call's start, or a span's end if earlier.
     fn first(from: MyTradesFrom, now_ms: i64) -> Option<Self> {
         match from {
-            MyTradesFrom::Time(start) | MyTradesFrom::Span { start, .. } => {
+            MyTradesFrom::Span { start, .. } => {
                 (start <= now_ms).then(|| Self::window(start, now_ms))
             }
             MyTradesFrom::Order(order_id) => Some(Self::Order(order_id)),
@@ -2908,19 +3224,18 @@ impl MarginTradesQuery {
 }
 
 /// Paginate the margin trade list for a single instrument from `from` (`isIsolated`
-/// config-driven), returning every trade from `from` to the call's start with no gap.
+/// config-driven), returning every trade it covers with no gap.
 ///
 /// - [`MyTradesFrom::Order`]: first page by `order_id`, then `from_id = last_id + 1` alongside it,
 ///   as `BinanceSpot::paginate_my_trades` does.
-/// - [`MyTradesFrom::Span`]: as `Time`, stepping by window only up to the span's end, and
-///   stopping at the first page by id that reaches past it, without the executions after it.
-/// - [`MyTradesFrom::Time`]: unlike spot, margin `myTrades` does not return every trade since a
+/// - [`MyTradesFrom::Span`]: unlike spot, margin `myTrades` does not return every trade since a
 ///   bare `startTime` — without `fromId` it returns only 24 hours of trades, and it rejects a
 ///   `startTime`..`endTime` span of 24 hours or more. So the walk first steps forward in windows
-///   of [`MARGIN_MY_TRADES_WINDOW_MS`], each bounded by `startTime` and `endTime`, from `from` to
-///   the call's start by the local clock. At the first window holding a trade it switches to
-///   `from_id = last_id + 1` and reads on until a short page, unless that window was the last
-///   and read a short page.
+///   of [`MARGIN_MY_TRADES_WINDOW_MS`], each bounded by `startTime` and `endTime`, from the span's
+///   start to its end or the call's start by the local clock, whichever is earlier. At the first
+///   window holding a trade it switches to `from_id = last_id + 1` and reads on until a short
+///   page, unless that window was the last and read a short page, and stops at the first page
+///   reaching past the span's end, without the executions after it.
 ///
 /// **Cost:** each window before the first trade is one request (weight 10), so the cost grows
 /// with the lookback: about one request per day, and about 21,000 from the Unix epoch. An
@@ -2950,7 +3265,7 @@ async fn paginate_margin_my_trades(
     // reconnect, to the stream), unless the walk is already paging by id.
     let now_ms = match from {
         MyTradesFrom::Span { end, .. } => end.min(Utc::now().timestamp_millis()),
-        MyTradesFrom::Time(_) | MyTradesFrom::Order(_) => Utc::now().timestamp_millis(),
+        MyTradesFrom::Order(_) => Utc::now().timestamp_millis(),
     };
     let mut all_pages = Vec::new();
     let mut requests = 0u32;
@@ -2988,7 +3303,7 @@ async fn paginate_margin_my_trades(
         // A span ends once a page reaches past it; paging by id would otherwise read on.
         let past_end = match from {
             MyTradesFrom::Span { end, .. } => drop_after(&mut page, end),
-            MyTradesFrom::Time(_) | MyTradesFrom::Order(_) => false,
+            MyTradesFrom::Order(_) => false,
         };
         all_pages.extend(page);
         if past_end {
@@ -3434,6 +3749,7 @@ impl_isolated_flag!(
     MarginAccountNewOrderIsIsolatedEnum,
     MarginAccountCancelOrderIsIsolatedEnum,
     QueryMarginAccountsOpenOrdersIsIsolatedEnum,
+    QueryMarginAccountsOrderIsIsolatedEnum,
     QueryMarginAccountsTradeListIsIsolatedEnum,
 );
 
@@ -3546,9 +3862,9 @@ fn build_new_order_params(
 /// result onto margin's SDK output types — a [`MarginAccountNewOrderTypeEnum`] and a
 /// [`MarginAccountNewOrderTimeInForceEnum`]. Mirrors spot's own `convert_order_kind_tif` adapter.
 ///
-/// Returns `None` for unsupported combinations. Trailing-stop kinds are rejected here (the margin
-/// SDK has no `trailingDelta` binding), unlike spot which maps them to a `STOP_LOSS` with
-/// `trailingDelta`.
+/// Returns `None` for unsupported combinations. Trailing-stop kinds are rejected here (not mapped
+/// yet: margin has no testnet to verify `trailingDelta` on), unlike spot which maps them to a
+/// `STOP_LOSS` with `trailingDelta`.
 fn convert_order_kind_tif_margin(
     kind: OrderKind,
     tif: TimeInForce,
@@ -3562,7 +3878,7 @@ fn convert_order_kind_tif_margin(
     ) {
         warn!(
             ?kind,
-            "BinanceMargin does not support trailing-stop orders (SDK trailingDelta binding gap)"
+            "BinanceMargin does not support trailing-stop orders yet"
         );
         return None;
     }
@@ -3583,30 +3899,6 @@ fn convert_order_kind_tif_margin(
         BinanceTimeInForce::Fok => MarginAccountNewOrderTimeInForceEnum::Fok,
     });
     Some((margin_type, margin_tif))
-}
-
-/// Volume-weighted average fill price from a margin order response's cumulative quote quantity.
-///
-/// `avg_price = cummulative_quote_qty / executed_qty`. Returns `None` when `filled_qty` is zero
-/// (no fills, or division would be undefined) or the quote quantity is missing/unparseable.
-// `cummulative_quote_qty` keeps Binance's own field-name typo (sic, double-m) to mirror the SDK.
-fn margin_avg_price(cummulative_quote_qty: Option<&str>, filled_qty: Decimal) -> Option<Decimal> {
-    if filled_qty.is_zero() {
-        return None;
-    }
-    let s = cummulative_quote_qty?;
-    match Decimal::from_str(s) {
-        Ok(cumulative) => cumulative.checked_div(filled_qty),
-        Err(_) => {
-            // A filled order with an unparseable cumulative quote qty is corrupt data, not an
-            // expected absence — log it rather than silently returning a price-less Filled.
-            warn!(
-                cummulative_quote_qty = s,
-                "BinanceMargin: failed to parse cummulativeQuoteQty; avg price unavailable"
-            );
-            None
-        }
-    }
 }
 
 #[cfg(test)]
@@ -4082,6 +4374,7 @@ mod tests {
             OrderKind::TrailingStopLimit {
                 offset: Decimal::from(100),
                 offset_type: TrailingOffsetType::BasisPoints,
+                stop_price: Decimal::from(95),
                 limit_offset: Decimal::from(10),
             },
             gtc(),
@@ -4110,23 +4403,6 @@ mod tests {
             .expect("build");
             assert_eq!(p.time_in_force.as_ref().map(|t| t.as_str()), Some(expected));
         }
-    }
-
-    #[test]
-    fn avg_price_from_cumulative_quote_qty() {
-        // 100 quote / 4 base = 25.
-        assert_eq!(
-            margin_avg_price(Some("100"), Decimal::from(4)),
-            Some(Decimal::from(25))
-        );
-        // Zero fill → no average (avoids division by zero).
-        assert_eq!(margin_avg_price(Some("100"), Decimal::ZERO), None);
-        // Missing / unparseable quote qty → None.
-        assert_eq!(margin_avg_price(None, Decimal::from(4)), None);
-        assert_eq!(
-            margin_avg_price(Some("not-a-number"), Decimal::from(4)),
-            None
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -5341,6 +5617,14 @@ mod tests {
         }
     }
 
+    /// A walk by time from `start` with no end: every trade from `start` on.
+    fn since(start: i64) -> MyTradesFrom {
+        MyTradesFrom::Span {
+            start,
+            end: i64::MAX,
+        }
+    }
+
     /// Run `paginate_margin_my_trades` from `from` against `venue`, returning the ids read and the
     /// query parameters of each request sent.
     async fn read_margin_trades(
@@ -5403,7 +5687,7 @@ mod tests {
         let now = Utc::now().timestamp_millis();
         let (ids, _) = read_margin_trades(
             venue(vec![(7, now - 72 * HOUR_MS)]),
-            MyTradesFrom::Time(now - 120 * HOUR_MS),
+            since(now - 120 * HOUR_MS),
         )
         .await;
 
@@ -5420,8 +5704,7 @@ mod tests {
             (2, now - 72 * HOUR_MS),
             (3, now - HOUR_MS),
         ];
-        let (ids, _) =
-            read_margin_trades(venue(trades), MyTradesFrom::Time(now - 144 * HOUR_MS)).await;
+        let (ids, _) = read_margin_trades(venue(trades), since(now - 144 * HOUR_MS)).await;
 
         assert_eq!(ids, vec![1, 2, 3]);
     }
@@ -5437,7 +5720,7 @@ mod tests {
                 end_exclusive,
                 ..venue(vec![(5, from + MARGIN_MY_TRADES_WINDOW_MS)])
             };
-            let (ids, _) = read_margin_trades(venue, MyTradesFrom::Time(from)).await;
+            let (ids, _) = read_margin_trades(venue, since(from)).await;
 
             assert_eq!(ids, vec![5], "end_exclusive: {end_exclusive}");
         }
@@ -5451,8 +5734,7 @@ mod tests {
         let trades = (1..=count)
             .map(|id| (id, now - 48 * HOUR_MS + id))
             .collect();
-        let (ids, _) =
-            read_margin_trades(venue(trades), MyTradesFrom::Time(now - 50 * HOUR_MS)).await;
+        let (ids, _) = read_margin_trades(venue(trades), since(now - 50 * HOUR_MS)).await;
 
         assert_eq!(ids, (1..=count).collect::<Vec<_>>());
     }
@@ -5464,8 +5746,7 @@ mod tests {
         let now = Utc::now().timestamp_millis();
         let count = i64::try_from(BINANCE_MAX_TRADES).unwrap() + 1;
         let trades = (1..=count).map(|id| (id, now - HOUR_MS + id)).collect();
-        let (ids, requests) =
-            read_margin_trades(venue(trades), MyTradesFrom::Time(now - 2 * HOUR_MS)).await;
+        let (ids, requests) = read_margin_trades(venue(trades), since(now - 2 * HOUR_MS)).await;
 
         assert_eq!(ids, (1..=count).collect::<Vec<_>>());
         assert_eq!(requests.len(), 2);
@@ -5477,7 +5758,7 @@ mod tests {
     async fn margin_trades_quiet_lookback_sends_one_request_per_window() {
         let now = Utc::now().timestamp_millis();
         let (ids, requests) =
-            read_margin_trades(venue(Vec::new()), MyTradesFrom::Time(now - 72 * HOUR_MS)).await;
+            read_margin_trades(venue(Vec::new()), since(now - 72 * HOUR_MS)).await;
 
         assert!(ids.is_empty());
         // Windows start at 0, 23, 46 and 69 hours into the 72-hour lookback.
@@ -5489,11 +5770,8 @@ mod tests {
     #[tokio::test]
     async fn margin_trades_read_a_short_gap_in_one_request() {
         let now = Utc::now().timestamp_millis();
-        let (ids, requests) = read_margin_trades(
-            venue(vec![(9, now - HOUR_MS)]),
-            MyTradesFrom::Time(now - 2 * HOUR_MS),
-        )
-        .await;
+        let (ids, requests) =
+            read_margin_trades(venue(vec![(9, now - HOUR_MS)]), since(now - 2 * HOUR_MS)).await;
 
         assert_eq!(ids, vec![9]);
         assert_eq!(requests.len(), 1);
@@ -5503,8 +5781,7 @@ mod tests {
     #[tokio::test]
     async fn margin_trades_from_the_future_send_no_request() {
         let now = Utc::now().timestamp_millis();
-        let (ids, requests) =
-            read_margin_trades(venue(Vec::new()), MyTradesFrom::Time(now + HOUR_MS)).await;
+        let (ids, requests) = read_margin_trades(venue(Vec::new()), since(now + HOUR_MS)).await;
 
         assert!(ids.is_empty());
         assert!(requests.is_empty());
@@ -5565,7 +5842,7 @@ mod tests {
             &rest,
             &Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
             &InstrumentNameExchange::new("BTCUSDT"),
-            MyTradesFrom::Time(Utc::now().timestamp_millis() - HOUR_MS),
+            since(Utc::now().timestamp_millis() - HOUR_MS),
             true,
             RequestKind::Query,
         )
@@ -5701,6 +5978,7 @@ mod tests {
                 &mut unrecovered,
                 &tx,
                 &new_dedup_cache(),
+                &KnownLiveOrders::shared(ExchangeId::BinanceMargin),
                 false,
             ),
         )
@@ -5728,6 +6006,78 @@ mod tests {
         .await;
 
         assert_eq!(ids, vec![1, 2]);
+    }
+
+    /// A margin gap whose every read fails is given up, and reported on the stream with the last read's
+    /// error.
+    #[tokio::test]
+    async fn a_margin_gap_whose_every_read_fails_is_reported_when_given_up() {
+        let disconnect = Utc::now() - chrono::Duration::minutes(10);
+        let reconnect = Utc::now() - chrono::Duration::minutes(5);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/myTrades"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"code": -1100, "msg": "rejected"})),
+            )
+            .mount(&server)
+            .await;
+        let rest = Arc::new(MarginTradingRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .expect("valid config"),
+        ));
+        let tracker = Arc::new(RateLimitTracker::new(WeightPool::Sapi));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let dedup = new_dedup_cache();
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        let mut unrecovered = UnrecoveredFills::default();
+        unrecovered.open(std::slice::from_ref(&btc), disconnect, reconnect);
+
+        for _ in 0..=crate::client::order_recovery::MAX_GAP_RETRIES {
+            recover_margin_fills(
+                &rest,
+                &tracker,
+                &mut unrecovered,
+                &tx,
+                &dedup,
+                &KnownLiveOrders::shared(ExchangeId::BinanceMargin),
+                false,
+            )
+            .await;
+            unrecovered.make_due();
+        }
+
+        assert!(unrecovered.is_empty(), "the gap is given up");
+        let forwarded: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let [event] = forwarded.as_slice() else {
+            panic!("only the give-up is sent: {forwarded:?}");
+        };
+        let AccountEventKind::FillRecoveryGaveUp(gave_up) = &event.kind else {
+            panic!("expected FillRecoveryGaveUp, got {event:?}");
+        };
+        assert_eq!(event.exchange, ExchangeId::BinanceMargin);
+        assert_eq!(
+            gave_up.scope,
+            crate::FillRecoveryScope::Instruments(vec![btc])
+        );
+        assert_eq!(
+            gave_up.start.timestamp_millis(),
+            disconnect.timestamp_millis()
+        );
+        assert_eq!(
+            gave_up.attempts,
+            crate::client::order_recovery::MAX_GAP_RETRIES + 1
+        );
+        assert!(
+            matches!(&gave_up.reason, FillRecoveryFailure::Request(reason) if reason.contains("rejected")),
+            "the last read's error: {:?}",
+            gave_up.reason
+        );
     }
 
     /// A margin recovery that fails keeps its gap, closed at its own start; the retry reads only
@@ -5779,12 +6129,30 @@ mod tests {
             reconnect,
         );
 
-        recover_margin_fills(&rest, &tracker, &mut unrecovered, &tx, &dedup, false).await;
+        recover_margin_fills(
+            &rest,
+            &tracker,
+            &mut unrecovered,
+            &tx,
+            &dedup,
+            &KnownLiveOrders::shared(ExchangeId::BinanceMargin),
+            false,
+        )
+        .await;
         assert!(!unrecovered.is_empty(), "the failed gap is kept");
         assert!(rx.try_recv().is_err(), "nothing forwarded");
 
         unrecovered.make_due();
-        recover_margin_fills(&rest, &tracker, &mut unrecovered, &tx, &dedup, false).await;
+        recover_margin_fills(
+            &rest,
+            &tracker,
+            &mut unrecovered,
+            &tx,
+            &dedup,
+            &KnownLiveOrders::shared(ExchangeId::BinanceMargin),
+            false,
+        )
+        .await;
         assert!(unrecovered.is_empty(), "the retry recovered it");
         let forwarded: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert_eq!(
@@ -5837,6 +6205,7 @@ mod tests {
             &mut unrecovered,
             &tx,
             &new_dedup_cache(),
+            &KnownLiveOrders::shared(ExchangeId::BinanceMargin),
             false,
         )
         .await;
@@ -5849,10 +6218,567 @@ mod tests {
         );
         assert_eq!(
             unrecovered
-                .due(now + Duration::from_secs(crate::client::binance::shared::GAP_RETRY_BASE_SECS))
+                .due(now + Duration::from_secs(crate::client::order_recovery::GAP_RETRY_BASE_SECS))
                 .len(),
             9,
             "the eight started wait for their first retry"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // How orders ended: fetch_ended_orders, recover_margin_ended_orders, the known-live feed
+    // -----------------------------------------------------------------------
+
+    /// A margin order row for client order id `cid` in `status`: 1 of 2 filled, for 105 quote.
+    fn margin_order_row(cid: &str, status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "symbol": "BTCUSDT", "orderId": 7, "clientOrderId": cid, "price": "100",
+            "origQty": "2", "executedQty": "1", "cummulativeQuoteQty": "105", "status": status,
+            "timeInForce": "GTC", "type": "LIMIT", "side": "BUY", "isIsolated": false,
+            "time": 1_700_000_000_000_i64, "updateTime": 1_700_000_060_000_i64,
+        })
+    }
+
+    fn margin_key(instrument: &str, cid: &str) -> UnindexedOrderKey {
+        OrderKey::new(
+            ExchangeId::BinanceMargin,
+            InstrumentNameExchange::new(instrument),
+            StrategyId::new("strategy"),
+            ClientOrderId::new(cid),
+        )
+    }
+
+    #[test]
+    fn a_margin_order_row_says_how_the_order_ended() {
+        use crate::order::state::InactiveOrderState;
+        use binance_sdk::margin_trading::rest_api::QueryMarginAccountsOrderResponse;
+        let key = margin_key("BTCUSDT", "a");
+        let ended = |row: serde_json::Value| {
+            let row: QueryMarginAccountsOrderResponse = serde_json::from_value(row).unwrap();
+            convert_ended_order(&row, ExchangeId::BinanceMargin, &key).map(|order| order.state)
+        };
+
+        let mut filled = margin_order_row("a", "FILLED");
+        filled["executedQty"] = "2".into();
+        filled["cummulativeQuoteQty"] = "210".into();
+        let Some(InactiveOrderState::FullyFilled(filled)) = ended(filled) else {
+            panic!("FILLED is fully filled");
+        };
+        assert_eq!(filled.avg_price, Some(Decimal::from(105)));
+        assert!(matches!(
+            ended(margin_order_row("a", "CANCELED")),
+            Some(InactiveOrderState::Cancelled(cancelled)) if cancelled.filled_quantity == Some(Decimal::ONE)
+        ));
+        assert_eq!(ended(margin_order_row("a", "NEW")), None);
+
+        // Binance's sign that it does not have the quote traded for a historical order.
+        let mut unknown_quote = margin_order_row("a", "FILLED");
+        unknown_quote["executedQty"] = "2".into();
+        unknown_quote["cummulativeQuoteQty"] = "-1".into();
+        let Some(InactiveOrderState::FullyFilled(filled)) = ended(unknown_quote) else {
+            panic!("still fully filled");
+        };
+        assert_eq!(filled.avg_price, None, "no negative average price");
+    }
+
+    fn margin_rest_at(server: &wiremock::MockServer) -> Arc<RestApi> {
+        Arc::new(MarginTradingRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .unwrap(),
+        ))
+    }
+
+    /// A client of the cross account, or of the isolated BTCUSDT one, talking to `server`.
+    fn margin_client_at(server: &wiremock::MockServer, is_isolated: bool) -> BinanceMargin {
+        let config = if is_isolated {
+            BinanceMarginConfig::isolated(
+                "key".into(),
+                "secret".into(),
+                vec![InstrumentNameExchange::new("BTCUSDT")],
+            )
+        } else {
+            BinanceMarginConfig::cross_margin("key".into(), "secret".into())
+        };
+        let mut client = <BinanceMargin as ExecutionClient>::new(config);
+        client.rest = margin_rest_at(server);
+        client
+    }
+
+    /// Answer `GET /sapi/v1/margin/order` for client order id `cid` with `response`.
+    async fn mount_margin_order(
+        server: &wiremock::MockServer,
+        cid: &str,
+        response: wiremock::ResponseTemplate,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+            .and(wiremock::matchers::query_param("origClientOrderId", cid))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+
+    fn margin_venue_error(code: i64) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(400)
+            .set_body_json(serde_json::json!({"code": code, "msg": "refused"}))
+    }
+
+    fn margin_row_response(cid: &str, status: &str) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(margin_order_row(cid, status))
+    }
+
+    /// The path and `isIsolated` of every request `server` received.
+    async fn margin_requests(server: &wiremock::MockServer) -> Vec<(String, Option<String>)> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| {
+                let isolated = request
+                    .url
+                    .query_pairs()
+                    .find(|(key, _)| key == "isIsolated")
+                    .map(|(_, value)| value.into_owned());
+                (request.url.path().to_owned(), isolated)
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn margin_fetch_ended_orders_asks_the_configured_account_and_omits_the_rest() {
+        use crate::order::state::InactiveOrderState;
+        for (is_isolated, flag) in [(false, "FALSE"), (true, "TRUE")] {
+            let server = wiremock::MockServer::start().await;
+            mount_margin_order(&server, "filled", margin_row_response("filled", "FILLED")).await;
+            mount_margin_order(&server, "live", margin_row_response("live", "NEW")).await;
+            mount_margin_order(&server, "unknown", margin_venue_error(-2013)).await;
+            mount_margin_order(&server, "no-symbol", margin_venue_error(-1121)).await;
+            let client = margin_client_at(&server, is_isolated);
+            let keys = ["filled", "live", "unknown"].map(|cid| margin_key("BTCUSDT", cid));
+
+            let ended = client
+                .fetch_ended_orders(
+                    &[keys.to_vec(), vec![margin_key("NOSUCH", "no-symbol")]].concat(),
+                )
+                .await
+                .unwrap();
+
+            let [order] = ended.as_slice() else {
+                panic!("one order ended: {ended:?}");
+            };
+            assert_eq!(order.key, keys[0], "the strategy asked survives");
+            assert!(matches!(order.state, InactiveOrderState::FullyFilled(_)));
+            let requests = margin_requests(&server).await;
+            assert_eq!(requests.len(), 4);
+            for (path, isolated) in requests {
+                assert_eq!(path, "/sapi/v1/margin/order");
+                assert_eq!(
+                    isolated.as_deref(),
+                    Some(flag),
+                    "is_isolated = {is_isolated}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn margin_fetch_ended_orders_fails_when_any_lookup_fails() {
+        let server = wiremock::MockServer::start().await;
+        mount_margin_order(
+            &server,
+            "cancelled",
+            margin_row_response("cancelled", "CANCELED"),
+        )
+        .await;
+        mount_margin_order(&server, "refused", margin_venue_error(-1100)).await;
+        let client = margin_client_at(&server, false);
+
+        let result = client
+            .fetch_ended_orders(&[
+                margin_key("BTCUSDT", "cancelled"),
+                margin_key("BTCUSDT", "refused"),
+            ])
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(UnindexedClientError::Api(ApiError::RequestRejected(_)))
+            ),
+            "{result:?}"
+        );
+    }
+
+    /// `live`, `gone` and `unknown`, all held as live on BTCUSDT.
+    fn held_margin_orders() -> SharedKnownLiveOrders {
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceMargin);
+        for (n, cid) in ["live", "gone", "unknown"].into_iter().enumerate() {
+            known.lock().live(
+                &margin_key("BTCUSDT", cid),
+                Decimal::TWO,
+                &Open::new(
+                    VenueOrderId::Assigned(OrderId::new(n.to_string())),
+                    Utc::now(),
+                    Decimal::ZERO,
+                ),
+            );
+        }
+        known
+    }
+
+    #[tokio::test]
+    async fn a_margin_reconnect_reports_how_an_unlisted_order_ended_in_the_configured_account() {
+        for (is_isolated, flag) in [(false, "FALSE"), (true, "TRUE")] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/sapi/v1/margin/openOrders"))
+                .and(wiremock::matchers::query_param("symbol", "BTCUSDT"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([margin_order_row("live", "NEW")])),
+                )
+                .mount(&server)
+                .await;
+            mount_margin_order(&server, "gone", margin_row_response("gone", "CANCELED")).await;
+            mount_margin_order(&server, "unknown", margin_venue_error(-2013)).await;
+            let known = held_margin_orders();
+            let mut unchecked = UncheckedOrders::default();
+            unchecked.open([InstrumentNameExchange::new("BTCUSDT")]);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            recover_margin_ended_orders(
+                &margin_rest_at(&server),
+                &Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
+                &known,
+                &mut unchecked,
+                &UnrecoveredFills::default(),
+                &tx,
+                is_isolated,
+            )
+            .await;
+
+            let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let [event] = sent.as_slice() else {
+                panic!("one order ended: {sent:?}");
+            };
+            assert_eq!(event.exchange, ExchangeId::BinanceMargin);
+            let AccountEventKind::OrderSnapshot(snapshot) = &event.kind else {
+                panic!("an order snapshot: {event:?}");
+            };
+            assert_eq!(snapshot.0.key.cid, ClientOrderId::new("gone"));
+            assert_eq!(snapshot.0.key.strategy, StrategyId::unknown());
+            assert!(matches!(
+                snapshot.0.state,
+                OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(_))
+            ));
+            let mut requests = margin_requests(&server).await;
+            requests.sort();
+            let expected = |path: &str| (path.to_owned(), Some(flag.to_owned()));
+            assert_eq!(
+                requests,
+                [
+                    expected("/sapi/v1/margin/openOrders"),
+                    expected("/sapi/v1/margin/order"),
+                    expected("/sapi/v1/margin/order"),
+                ],
+                "one listing, and a lookup of each unlisted order only"
+            );
+            let known = known.lock();
+            assert!(known.contains(&ClientOrderId::new("live")));
+            assert!(!known.contains(&ClientOrderId::new("gone")));
+            assert!(
+                !known.contains(&ClientOrderId::new("unknown")),
+                "asking again cannot help"
+            );
+            assert!(unchecked.is_empty());
+        }
+    }
+
+    fn margin_open_request<'a>(
+        instrument: &'a InstrumentNameExchange,
+        cid: &str,
+    ) -> OrderRequestOpen<ExchangeId, &'a InstrumentNameExchange> {
+        OrderRequestOpen {
+            key: OrderKey::new(
+                ExchangeId::BinanceMargin,
+                instrument,
+                StrategyId::new("strategy"),
+                ClientOrderId::new(cid),
+            ),
+            state: crate::order::request::RequestOpen {
+                side: Side::Buy,
+                price: Some(Decimal::from(100)),
+                quantity: Decimal::TWO,
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                position_id: None,
+                reduce_only: false,
+                market: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn placing_listing_and_cancelling_margin_orders_feed_the_known_live_set() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "symbol": "BTCUSDT", "orderId": 7, "clientOrderId": "placed",
+                    "transactTime": 1_700_000_000_000_i64, "price": "100", "origQty": "2",
+                    "executedQty": "0", "cummulativeQuoteQty": "0", "status": "NEW",
+                    "timeInForce": "GTC", "type": "LIMIT", "side": "BUY",
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "symbol": "BTCUSDT", "orderId": "7", "origClientOrderId": "placed",
+                    "clientOrderId": "cancel", "price": "100", "origQty": "2", "executedQty": "0",
+                    "cummulativeQuoteQty": "0", "status": "CANCELED", "timeInForce": "GTC",
+                    "type": "LIMIT", "side": "BUY",
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/openOrders"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([margin_order_row("listed", "NEW")])),
+            )
+            .mount(&server)
+            .await;
+        let client = margin_client_at(&server, false);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+
+        let placed = client
+            .open_order(margin_open_request(&btcusdt, "placed"))
+            .await;
+        assert!(
+            matches!(placed.state, OrderState::Active(ActiveOrderState::Open(_))),
+            "{placed:?}"
+        );
+        assert!(
+            client
+                .known_live
+                .lock()
+                .contains(&ClientOrderId::new("placed"))
+        );
+
+        client.fetch_open_orders(&[]).await.unwrap();
+        assert!(
+            client
+                .known_live
+                .lock()
+                .contains(&ClientOrderId::new("listed"))
+        );
+
+        let cancelled = client
+            .cancel_order(OrderRequestCancel {
+                key: OrderKey::new(
+                    ExchangeId::BinanceMargin,
+                    &btcusdt,
+                    StrategyId::new("strategy"),
+                    ClientOrderId::new("placed"),
+                ),
+                state: crate::order::request::RequestCancel {
+                    id: Some(VenueOrderId::Assigned(OrderId::new("7"))),
+                },
+            })
+            .await;
+        assert!(cancelled.state.is_ok(), "{cancelled:?}");
+        assert!(
+            !client
+                .known_live
+                .lock()
+                .contains(&ClientOrderId::new("placed"))
+        );
+    }
+
+    /// A cancel response that does not say what filled reports the fill unknown, not zero.
+    #[tokio::test]
+    async fn a_cancel_response_without_executed_qty_reports_the_fill_unknown() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "symbol": "BTCUSDT", "orderId": "7", "origClientOrderId": "placed",
+                    "clientOrderId": "cancel", "price": "100", "origQty": "2",
+                    "status": "CANCELED", "timeInForce": "GTC", "type": "LIMIT", "side": "BUY",
+                })),
+            )
+            .mount(&server)
+            .await;
+        let client = margin_client_at(&server, false);
+
+        let cancelled = client
+            .cancel_order(OrderRequestCancel {
+                key: OrderKey::new(
+                    ExchangeId::BinanceMargin,
+                    &InstrumentNameExchange::new("BTCUSDT"),
+                    StrategyId::new("strategy"),
+                    ClientOrderId::new("placed"),
+                ),
+                state: crate::order::request::RequestCancel {
+                    id: Some(VenueOrderId::Assigned(OrderId::new("7"))),
+                },
+            })
+            .await;
+        let Ok(cancelled) = cancelled.state else {
+            panic!("expected Ok, got {cancelled:?}");
+        };
+        assert_eq!(cancelled.filled_quantity, None);
+    }
+
+    #[test]
+    fn a_reconnect_opens_a_gap_on_each_stream_instrument_and_checks_those_with_orders_held() {
+        let [btc, eth, xrp] = ["BTCUSDT", "ETHUSDT", "XRPUSDT"].map(InstrumentNameExchange::new);
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceMargin);
+        for (instrument, cid) in [(&btc, "btc"), (&xrp, "xrp")] {
+            known.lock().live(
+                &margin_key(instrument.name(), cid),
+                Decimal::TWO,
+                &Open::new(
+                    VenueOrderId::Assigned(OrderId::new(cid)),
+                    Utc::now(),
+                    Decimal::ZERO,
+                ),
+            );
+        }
+        let mut unrecovered = UnrecoveredFills::default();
+        let mut unchecked = UncheckedOrders::default();
+
+        open_reconnect_recovery(
+            &mut unrecovered,
+            &mut unchecked,
+            &known,
+            &[btc.clone(), eth.clone()],
+            Utc::now() - chrono::Duration::minutes(1),
+        );
+
+        assert!(unrecovered.covers(&btc) && unrecovered.covers(&eth));
+        assert!(!unrecovered.covers(&xrp), "not the stream's");
+        assert!(unchecked.contains(&btc));
+        assert!(!unchecked.contains(&eth), "no order held");
+        assert!(!unchecked.contains(&xrp), "its fills are not recovered");
+    }
+
+    /// Margin fill recovery ends a held order that a recovered fill completes, and keeps one it
+    /// only part-fills, so a later check does not report the completed one again.
+    #[tokio::test]
+    async fn a_recovered_margin_fill_that_completes_a_held_order_ends_it() {
+        let disconnect = Utc::now() - chrono::Duration::minutes(10);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/myTrades"))
+            .respond_with(venue(vec![
+                (
+                    1,
+                    (disconnect + chrono::Duration::minutes(1)).timestamp_millis(),
+                ),
+                (
+                    2,
+                    (disconnect + chrono::Duration::minutes(2)).timestamp_millis(),
+                ),
+            ]))
+            .mount(&server)
+            .await;
+        // Each venue trade is 0.01 of an order of its own id: order 1 is complete at 0.01, order 2
+        // is of 0.02 and part-filled.
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceMargin);
+        for (cid, order_id, quantity) in [("one", "1", "0.01"), ("two", "2", "0.02")] {
+            known.lock().live(
+                &margin_key("BTCUSDT", cid),
+                Decimal::from_str(quantity).unwrap(),
+                &Open::new(
+                    VenueOrderId::Assigned(OrderId::new(order_id)),
+                    Utc::now(),
+                    Decimal::ZERO,
+                ),
+            );
+        }
+        let mut unrecovered = UnrecoveredFills::default();
+        unrecovered.open(
+            &[InstrumentNameExchange::new("BTCUSDT")],
+            disconnect,
+            Utc::now(),
+        );
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        recover_margin_fills(
+            &margin_rest_at(&server),
+            &Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
+            &mut unrecovered,
+            &tx,
+            &new_dedup_cache(),
+            &known,
+            false,
+        )
+        .await;
+
+        assert_eq!(
+            std::iter::from_fn(|| rx.try_recv().ok()).count(),
+            2,
+            "both fills"
+        );
+        let known = known.lock();
+        assert!(!known.contains(&ClientOrderId::new("one")), "completed");
+        assert!(known.contains(&ClientOrderId::new("two")), "part-filled");
+    }
+
+    /// An IOC order that ended in its placement response is reported as expired with what
+    /// filled, and is not held as live, so a late report of it as live cannot bring it back.
+    #[tokio::test]
+    async fn a_margin_order_that_expired_on_placement_is_not_reported_or_held_open() {
+        use rust_decimal_macros::dec;
+
+        for (cid, filled, quote) in [("unfilled", "0", "0"), ("partly", "1", "100")] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "symbol": "BTCUSDT", "orderId": 7, "clientOrderId": cid,
+                        "transactTime": 1_700_000_000_000_i64, "price": "100", "origQty": "2",
+                        "executedQty": filled, "cummulativeQuoteQty": quote,
+                        "status": "EXPIRED", "timeInForce": "IOC", "type": "LIMIT", "side": "BUY",
+                    }),
+                ))
+                .mount(&server)
+                .await;
+            let client = margin_client_at(&server, false);
+            let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+
+            let placed = client.open_order(margin_open_request(&btcusdt, cid)).await;
+
+            let OrderState::Inactive(crate::order::state::InactiveOrderState::Expired(expired)) =
+                &placed.state
+            else {
+                panic!("{cid}: expired, not open: {placed:?}");
+            };
+            assert_eq!(expired.filled_quantity, Decimal::from_str(filled).ok());
+            let late = Open::new(
+                VenueOrderId::Assigned(OrderId::new("7")),
+                Utc::now(),
+                Decimal::ZERO,
+            );
+            let mut known = client.known_live.lock();
+            known.live(&placed.key, dec!(2), &late);
+            assert!(
+                !known.contains(&ClientOrderId::new(cid)),
+                "{cid}: not held, even after a late live report"
+            );
+        }
     }
 }

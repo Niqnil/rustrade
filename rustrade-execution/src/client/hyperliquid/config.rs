@@ -1,7 +1,10 @@
 //! Configuration for the Hyperliquid execution client.
 
 use ethers::signers::{LocalWallet, Signer};
+use hyperliquid_rust_sdk::BaseUrl;
+pub use rustrade_instrument::hyperliquid::Network;
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 
 /// Configuration for the Hyperliquid execution client.
 ///
@@ -17,15 +20,40 @@ use serde::{Deserialize, Serialize};
 pub struct HyperliquidConfig {
     /// The wallet containing the private key for signing (ethers LocalWallet).
     pub wallet: LocalWallet,
-    /// Whether to use testnet (true) or mainnet (false).
-    pub testnet: bool,
+    /// The network to trade on. [`Network::Mainnet`] trades **real funds**.
+    pub network: Network,
+    /// The builder-deployed (HIP-3) perpetual DEXs the perpetuals client trades besides
+    /// Hyperliquid's default one, by the name Hyperliquid lists them under (`xyz`, `flx`), exactly
+    /// as spelled there. Empty by default: only the default DEX.
+    ///
+    /// The perpetuals client reads each one's markets when it connects, and refuses to connect
+    /// if Hyperliquid does not list one. A name given twice counts once. See
+    /// [`HyperliquidClient`](super::HyperliquidClient)'s HIP-3 docs. The spot client ignores
+    /// this.
+    ///
+    /// Each DEX adds a `clearinghouseState` (weight 2) and an `openOrders` (weight 20) request to
+    /// every account snapshot, and an `openOrders` to every listing of open orders, against
+    /// Hyperliquid's REST limit of 1,200 a minute per IP address.
+    pub dexes: Vec<SmolStr>,
 }
 
 impl HyperliquidConfig {
-    /// Create a new config with the given wallet and network selection (`testnet = true` ⇒ testnet,
-    /// `false` ⇒ mainnet with **real funds**).
-    pub fn new(wallet: LocalWallet, testnet: bool) -> Self {
-        Self { wallet, testnet }
+    /// Create a new config with the given wallet on `network` ([`Network::Mainnet`] trades **real
+    /// funds**), trading only Hyperliquid's default perpetual DEX.
+    pub fn new(wallet: LocalWallet, network: Network) -> Self {
+        Self {
+            wallet,
+            network,
+            dexes: Vec::new(),
+        }
+    }
+
+    /// Trade the builder-deployed (HIP-3) perpetual DEXs `dexes` as well, replacing any named
+    /// before. See [`dexes`](Self::dexes).
+    #[must_use]
+    pub fn with_dexes<Dex: Into<SmolStr>>(mut self, dexes: impl IntoIterator<Item = Dex>) -> Self {
+        self.dexes = dexes.into_iter().map(Into::into).collect();
+        self
     }
 
     /// Build a config from environment variables.
@@ -34,6 +62,8 @@ impl HyperliquidConfig {
     /// - `HYPERLIQUID_PRIVATE_KEY` (required) — hex-encoded private key (with or without `0x` prefix).
     /// - `HYPERLIQUID_TESTNET` (optional) — `"true"`/`"false"` (case-insensitive). **Absent ⇒ the
     ///   safe testnet environment.** Set `HYPERLIQUID_TESTNET=false` to target mainnet (real funds).
+    /// - `HYPERLIQUID_DEXES` (optional) — the HIP-3 DEXs to trade, comma-separated (`xyz,flx`).
+    ///   Spaces around a name and empty entries are ignored. Absent ⇒ none.
     ///
     /// # Errors
     ///
@@ -42,7 +72,8 @@ impl HyperliquidConfig {
     ///   non-UTF-8 ([`InvalidPrivateKeyVar`](HyperliquidConfigError::InvalidPrivateKeyVar)), or not a valid key
     ///   ([`InvalidPrivateKey`](HyperliquidConfigError::InvalidPrivateKey));
     /// - `HYPERLIQUID_TESTNET` is neither `true` nor `false`, or holds non-UTF-8
-    ///   ([`InvalidTestnet`](HyperliquidConfigError::InvalidTestnet)).
+    ///   ([`InvalidTestnet`](HyperliquidConfigError::InvalidTestnet));
+    /// - `HYPERLIQUID_DEXES` holds non-UTF-8 ([`InvalidDexes`](HyperliquidConfigError::InvalidDexes)).
     pub fn from_env() -> Result<Self, HyperliquidConfigError> {
         let private_key = match std::env::var("HYPERLIQUID_PRIVATE_KEY") {
             Ok(value) => value,
@@ -54,10 +85,13 @@ impl HyperliquidConfig {
             }
         };
 
-        let testnet = match std::env::var("HYPERLIQUID_TESTNET") {
-            Ok(value) => crate::parse_env_bool(&value)
-                .ok_or(HyperliquidConfigError::InvalidTestnet(value))?,
-            Err(std::env::VarError::NotPresent) => true,
+        let network = match std::env::var("HYPERLIQUID_TESTNET") {
+            Ok(value) => match crate::parse_env_bool(&value) {
+                Some(true) => Network::Testnet,
+                Some(false) => Network::Mainnet,
+                None => return Err(HyperliquidConfigError::InvalidTestnet(value)),
+            },
+            Err(std::env::VarError::NotPresent) => Network::Testnet,
             // The toggle value is not secret, so echo it (lossily) like the parse-failure arm above —
             // an actionable "got X" beats a hardcoded sentinel.
             Err(std::env::VarError::NotUnicode(value)) => {
@@ -67,15 +101,31 @@ impl HyperliquidConfig {
             }
         };
 
-        Self::from_private_key(&private_key, testnet)
+        let dexes = match std::env::var("HYPERLIQUID_DEXES") {
+            Ok(value) => value
+                .split(',')
+                .map(str::trim)
+                .filter(|dex| !dex.is_empty())
+                .map(SmolStr::from)
+                .collect(),
+            Err(std::env::VarError::NotPresent) => Vec::new(),
+            Err(std::env::VarError::NotUnicode(value)) => {
+                return Err(HyperliquidConfigError::InvalidDexes(
+                    value.to_string_lossy().into_owned(),
+                ));
+            }
+        };
+
+        Ok(Self::from_private_key(&private_key, network)?.with_dexes(dexes))
     }
 
     /// Create a config from a hex-encoded private key string.
     ///
-    /// The private key can have an optional "0x" prefix.
+    /// The private key can have an optional "0x" prefix. Trades only Hyperliquid's default
+    /// perpetual DEX; add HIP-3 ones with [`with_dexes`](Self::with_dexes).
     pub fn from_private_key(
         private_key: &str,
-        testnet: bool,
+        network: Network,
     ) -> Result<Self, HyperliquidConfigError> {
         let key = private_key.strip_prefix("0x").unwrap_or(private_key);
 
@@ -83,12 +133,20 @@ impl HyperliquidConfig {
             .parse()
             .map_err(|e| HyperliquidConfigError::InvalidPrivateKey(format!("{e}")))?;
 
-        Ok(Self { wallet, testnet })
+        Ok(Self::new(wallet, network))
     }
 
     /// Returns the wallet address as a hex string (0x-prefixed).
     pub fn wallet_address_hex(&self) -> String {
         format!("{:#x}", self.wallet.address())
+    }
+
+    /// The SDK's base URL for [`network`](Self::network).
+    pub(super) fn base_url(&self) -> BaseUrl {
+        match self.network {
+            Network::Mainnet => BaseUrl::Mainnet,
+            Network::Testnet => BaseUrl::Testnet,
+        }
     }
 }
 
@@ -96,23 +154,31 @@ impl HyperliquidConfig {
 ///
 /// Does NOT include the private key for security reasons.
 /// Use [`HyperliquidConfig::from_env`] to load credentials.
+///
+/// An unknown field is an error, so a file written for an earlier version, whose `testnet` field
+/// `network` replaced, fails to load rather than fall back to testnet without a word.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HyperliquidConfigFile {
-    /// Whether to use testnet (true) or mainnet (false).
+    /// The network to trade on, `"mainnet"` or `"testnet"`.
     ///
-    /// An absent `testnet` field defaults to the **safe** testnet environment (`true`), matching
+    /// An absent `network` field defaults to the **safe** testnet, matching
     /// [`HyperliquidConfig::from_env`] and the Alpaca/Binance config files.
-    #[serde(default = "default_testnet")]
-    pub testnet: bool,
+    #[serde(default = "default_network")]
+    pub network: Network,
+
+    /// The HIP-3 DEXs to trade; see [`HyperliquidConfig::dexes`]. Absent ⇒ none.
+    #[serde(default)]
+    pub dexes: Vec<SmolStr>,
 }
 
-/// Serde default for [`HyperliquidConfigFile::testnet`]: an absent `testnet` field deserializes to
-/// the **safe** testnet environment (`true`).
+/// Serde default for [`HyperliquidConfigFile::network`]: an absent `network` field deserializes to
+/// the **safe** testnet.
 ///
 /// `#[serde(default = "…")]` requires a named function (it cannot take a literal), so this exists
 /// purely to supply that default to the derive.
-fn default_testnet() -> bool {
-    true
+fn default_network() -> Network {
+    Network::Testnet
 }
 
 /// Errors that can occur when creating a HyperliquidConfig.
@@ -132,6 +198,9 @@ pub enum HyperliquidConfigError {
 
     #[error("HYPERLIQUID_TESTNET must be true or false, got {0}")]
     InvalidTestnet(String),
+
+    #[error("HYPERLIQUID_DEXES environment variable is not valid UTF-8: {0}")]
+    InvalidDexes(String),
 }
 
 #[cfg(test)]
@@ -142,21 +211,22 @@ mod tests {
     #[test]
     fn test_from_private_key_with_prefix() {
         let key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-        let config = HyperliquidConfig::from_private_key(key, false).unwrap();
-        assert!(!config.testnet);
+        let config = HyperliquidConfig::from_private_key(key, Network::Mainnet).unwrap();
+        assert_eq!(config.network, Network::Mainnet);
+        assert!(config.dexes.is_empty());
         assert!(config.wallet_address_hex().starts_with("0x"));
     }
 
     #[test]
     fn test_from_private_key_without_prefix() {
         let key = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-        let config = HyperliquidConfig::from_private_key(key, true).unwrap();
-        assert!(config.testnet);
+        let config = HyperliquidConfig::from_private_key(key, Network::Testnet).unwrap();
+        assert_eq!(config.network, Network::Testnet);
     }
 
     #[test]
     fn test_invalid_private_key() {
-        let result = HyperliquidConfig::from_private_key("invalid", false);
+        let result = HyperliquidConfig::from_private_key("invalid", Network::Mainnet);
         assert!(result.is_err());
     }
 
@@ -173,8 +243,9 @@ mod tests {
             ],
             || {
                 let cfg = HyperliquidConfig::from_env().unwrap();
-                assert!(
-                    cfg.testnet,
+                assert_eq!(
+                    cfg.network,
+                    Network::Testnet,
                     "absent toggle must default to the safe testnet"
                 );
             },
@@ -191,7 +262,7 @@ mod tests {
             ],
             || {
                 let cfg = HyperliquidConfig::from_env().unwrap();
-                assert!(!cfg.testnet);
+                assert_eq!(cfg.network, Network::Mainnet);
             },
         );
     }
@@ -248,11 +319,85 @@ mod tests {
     }
 
     #[test]
-    fn test_config_file_absent_testnet_defaults_to_testnet() {
-        let file: HyperliquidConfigFile = serde_json::from_str("{}").unwrap();
-        assert!(
-            file.testnet,
-            "absent `testnet` field must default to safe testnet"
+    #[serial_test::serial]
+    fn from_env_reads_the_dexes_to_trade() {
+        temp_env::with_vars(
+            [
+                ("HYPERLIQUID_PRIVATE_KEY", Some(TEST_KEY)),
+                ("HYPERLIQUID_TESTNET", None),
+                ("HYPERLIQUID_DEXES", Some(" xyz, ,flx ,")),
+            ],
+            || {
+                let cfg = HyperliquidConfig::from_env().unwrap();
+                assert_eq!(cfg.dexes, ["xyz", "flx"]);
+            },
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn from_env_rejects_non_utf8_dexes() {
+        use std::os::unix::ffi::OsStringExt;
+        let dexes = std::ffi::OsString::from_vec(vec![b'x', 0xff]);
+        temp_env::with_vars(
+            [
+                (
+                    "HYPERLIQUID_PRIVATE_KEY",
+                    Some(std::ffi::OsString::from(TEST_KEY)),
+                ),
+                ("HYPERLIQUID_DEXES", Some(dexes)),
+            ],
+            || {
+                let err = HyperliquidConfig::from_env().unwrap_err();
+                assert!(matches!(err, HyperliquidConfigError::InvalidDexes(_)));
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn from_env_trades_no_dex_when_none_is_named() {
+        temp_env::with_vars(
+            [
+                ("HYPERLIQUID_PRIVATE_KEY", Some(TEST_KEY)),
+                ("HYPERLIQUID_DEXES", None),
+            ],
+            || assert!(HyperliquidConfig::from_env().unwrap().dexes.is_empty()),
+        );
+    }
+
+    #[test]
+    fn with_dexes_replaces_the_dexes_named_before() {
+        let config = HyperliquidConfig::from_private_key(TEST_KEY, Network::Testnet)
+            .unwrap()
+            .with_dexes(["xyz"])
+            .with_dexes(["flx", "km"]);
+        assert_eq!(config.dexes, ["flx", "km"]);
+    }
+
+    #[test]
+    fn test_config_file_absent_network_defaults_to_testnet() {
+        let file: HyperliquidConfigFile = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            file.network,
+            Network::Testnet,
+            "absent `network` field must default to safe testnet"
+        );
+        assert!(file.dexes.is_empty());
+    }
+
+    #[test]
+    fn a_config_file_from_before_network_fails_to_load() {
+        let file = serde_json::from_str::<HyperliquidConfigFile>(r#"{"testnet": false}"#);
+        assert!(file.unwrap_err().to_string().contains("testnet"));
+    }
+
+    #[test]
+    fn a_config_file_names_its_network_and_dexes() {
+        let file: HyperliquidConfigFile =
+            serde_json::from_str(r#"{"network": "mainnet", "dexes": ["xyz", "flx"]}"#).unwrap();
+        assert_eq!(file.network, Network::Mainnet);
+        assert_eq!(file.dexes, ["xyz", "flx"]);
     }
 }

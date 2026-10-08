@@ -530,6 +530,7 @@ async fn backtest_market_only(
 
     let ExecutionBuild {
         execution_tx_map,
+        in_flight_deadlines,
         account_channel,
         futures,
     } = args_constant
@@ -548,6 +549,7 @@ async fn backtest_market_only(
         clock,
         args_constant.engine_state.clone(),
         execution_tx_map,
+        in_flight_deadlines,
         args_dynamic.strategy,
         args_dynamic.risk,
     );
@@ -880,9 +882,19 @@ impl Processor<&AccountEvent> for LoseMoneyInstrumentData {
 }
 
 impl InFlightRequestRecorder for LoseMoneyInstrumentData {
-    fn record_in_flight_cancel(&mut self, _: &OrderRequestCancel<ExchangeIndex, InstrumentIndex>) {}
+    fn record_in_flight_cancel(
+        &mut self,
+        _: &OrderRequestCancel<ExchangeIndex, InstrumentIndex>,
+        _: DateTime<Utc>,
+    ) {
+    }
 
-    fn record_in_flight_open(&mut self, _: &OrderRequestOpen<ExchangeIndex, InstrumentIndex>) {}
+    fn record_in_flight_open(
+        &mut self,
+        _: &OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
+        _: DateTime<Utc>,
+    ) {
+    }
 }
 
 fn args_constant(

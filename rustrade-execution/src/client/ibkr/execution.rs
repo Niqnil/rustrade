@@ -1,5 +1,5 @@
 use crate::{
-    order::id::{ClientOrderId, StrategyId},
+    order::id::{OrderId, StrategyId},
     trade::{AssetFees, Trade, TradeId},
 };
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -11,9 +11,9 @@ use rust_decimal::Decimal;
 use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, instrument::name::InstrumentNameExchange,
 };
-use smol_str::SmolStr;
-use std::{cell::RefCell, sync::Arc};
-use tracing::warn;
+use smol_str::{SmolStr, format_smolstr};
+use std::{cell::RefCell, collections::hash_map::Entry, sync::Arc};
+use tracing::{debug, warn};
 
 // Thread-local cache for parsed IANA timezones. IB uses per-exchange timezones,
 // but most portfolios only see a handful (US/Eastern, Europe/London, etc.).
@@ -46,7 +46,6 @@ struct ExecutionBufferInner {
 struct PendingExecution {
     execution: ExecutionData,
     instrument: InstrumentNameExchange,
-    client_order_id: ClientOrderId,
 }
 
 impl ExecutionBuffer {
@@ -57,12 +56,7 @@ impl ExecutionBuffer {
     }
 
     /// Buffer an execution, waiting for its commission report.
-    pub fn add_execution(
-        &self,
-        execution: ExecutionData,
-        instrument: InstrumentNameExchange,
-        client_order_id: ClientOrderId,
-    ) {
+    pub fn add_execution(&self, execution: ExecutionData, instrument: InstrumentNameExchange) {
         let exec_id = execution.execution.execution_id.clone();
         let mut inner = self.inner.lock();
         inner.pending.insert(
@@ -70,7 +64,6 @@ impl ExecutionBuffer {
             PendingExecution {
                 execution,
                 instrument,
-                client_order_id,
             },
         );
 
@@ -96,6 +89,27 @@ impl ExecutionBuffer {
         };
 
         Some(build_trade(pending, report))
+    }
+
+    /// Take every pending execution out of the buffer as a trade whose fee is unknown: zero, in
+    /// [`UNKNOWN_FEE_ASSET`].
+    ///
+    /// For a read that has ended, such as one executions request, whose commission reports will
+    /// not arrive in it any more.
+    pub(super) fn take_without_commission(
+        &self,
+    ) -> Vec<Trade<AssetNameExchange, InstrumentNameExchange>> {
+        std::mem::take(&mut self.inner.lock().pending)
+            .into_values()
+            .map(|pending| {
+                let fees = AssetFees::new(
+                    AssetNameExchange::from(UNKNOWN_FEE_ASSET),
+                    Decimal::ZERO,
+                    None,
+                );
+                trade_with_fees(pending, fees)
+            })
+            .collect()
     }
 
     /// Move every pending execution into `target`, returning how many moved.
@@ -155,10 +169,137 @@ impl Default for ExecutionBuffer {
     }
 }
 
+/// An IB execution id, read as the execution it reports and that execution's revision.
+///
+/// IB reports a correction as a further execution whose id differs from the one it corrects only
+/// in the digits after the final period: `0000e0d5.5f8b1c2a.01.02` corrects
+/// `0000e0d5.5f8b1c2a.01.01`. IB's documentation gives that example rather than a rule, but every
+/// execution IB first reports ends in `01`, so a higher revision is read as a correction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ExecutionRevision<'a> {
+    /// The id up to its final period, which every revision of the execution shares.
+    pub(super) execution: &'a str,
+    /// The digits after the final period, kept to write the previous revision's id at the same
+    /// width.
+    digits: &'a str,
+    pub(super) revision: u32,
+}
+
+impl<'a> ExecutionRevision<'a> {
+    /// `None` when `execution_id` does not end in a period followed by digits. Such an id is read
+    /// as an execution that has not been corrected.
+    pub(super) fn parse(execution_id: &'a str) -> Option<Self> {
+        let (execution, digits) = execution_id.rsplit_once('.')?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some(Self {
+            execution,
+            digits,
+            revision: digits.parse().ok()?,
+        })
+    }
+
+    /// Whether this revision corrects an earlier one.
+    pub(super) fn is_correction(&self) -> bool {
+        self.revision > 1
+    }
+
+    /// The id of the revision this one corrects, or `None` if it is not a correction.
+    pub(super) fn previous_id(&self) -> Option<TradeId> {
+        self.is_correction().then(|| {
+            TradeId(format_smolstr!(
+                "{}.{:0width$}",
+                self.execution,
+                self.revision - 1,
+                width = self.digits.len()
+            ))
+        })
+    }
+}
+
+/// The revision of the execution `id` names, `0` when it names none. Sorting by it puts each
+/// execution ahead of its corrections.
+pub(super) fn revision_of(id: &TradeId) -> u32 {
+    ExecutionRevision::parse(&id.0).map_or(0, |revision| revision.revision)
+}
+
+/// `trades` with each execution only at its latest revision, in the order the executions first
+/// appear, so that a corrected execution is read as corrected rather than twice. An execution
+/// read twice at one revision is kept once.
+pub(super) fn keep_latest_revisions(
+    trades: Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
+) -> Vec<Trade<AssetNameExchange, InstrumentNameExchange>> {
+    // The kept position and revision of each execution with a revision.
+    let mut latest = FnvHashMap::<SmolStr, (usize, u32)>::with_capacity_and_hasher(
+        trades.len(),
+        Default::default(),
+    );
+    let mut kept = Vec::with_capacity(trades.len());
+    for trade in trades {
+        let Some(revision) = ExecutionRevision::parse(&trade.id.0) else {
+            kept.push(trade);
+            continue;
+        };
+        let (execution, revision) = (SmolStr::new(revision.execution), revision.revision);
+        match latest.entry(execution) {
+            Entry::Vacant(entry) => {
+                entry.insert((kept.len(), revision));
+                kept.push(trade);
+            }
+            Entry::Occupied(mut entry) => {
+                let (position, kept_revision) = *entry.get();
+                if revision == kept_revision {
+                    debug!(exec_id = %trade.id, "IBKR execution read twice; keeping one");
+                    continue;
+                }
+                let (older, newer) = if revision > kept_revision {
+                    entry.insert((position, revision));
+                    (
+                        std::mem::replace(&mut kept[position], trade),
+                        &kept[position],
+                    )
+                } else {
+                    (trade, &kept[position])
+                };
+                debug!(
+                    corrected = %older.id,
+                    correction = %newer.id,
+                    "IBKR execution corrected; keeping the correction"
+                );
+            }
+        }
+    }
+    kept
+}
+
+/// The fee asset of a trade whose commission report IB did not send.
+pub const UNKNOWN_FEE_ASSET: &str = "UNKNOWN";
+
+/// The venue order id of IB order `ib_order_id`, as [`Open`](crate::order::state::Open) and every
+/// [`Trade`] of this client carry it.
+pub(super) fn ib_order_id(ib_order_id: i32) -> OrderId {
+    OrderId::new(format_smolstr!("{ib_order_id}"))
+}
+
 /// Build a rustrade Trade from IB execution + commission data.
 fn build_trade(
     pending: PendingExecution,
     commission: &CommissionReport,
+) -> Trade<AssetNameExchange, InstrumentNameExchange> {
+    let commission_amount = parse_decimal_or_warn(commission.commission, "commission");
+    let fees = AssetFees {
+        asset: AssetNameExchange::from(commission.currency.as_str()),
+        fees: commission_amount,
+        fees_quote: None, // Indexer computes based on fee asset vs instrument quote
+    };
+    trade_with_fees(pending, fees)
+}
+
+/// Build a rustrade Trade from an IB execution and its fees.
+fn trade_with_fees(
+    pending: PendingExecution,
+    fees: AssetFees<AssetNameExchange>,
 ) -> Trade<AssetNameExchange, InstrumentNameExchange> {
     let exec = &pending.execution.execution;
 
@@ -171,13 +312,13 @@ fn build_trade(
 
     let price = parse_decimal_or_warn(exec.price, "exec.price");
     let quantity = parse_decimal_or_warn(exec.shares, "exec.shares");
-    let commission_amount = parse_decimal_or_warn(commission.commission, "commission");
 
     let time_exchange = parse_ib_timestamp(&exec.time).unwrap_or_else(Utc::now);
 
     Trade {
         id: TradeId::new(&exec.execution_id),
-        order_id: crate::order::id::OrderId::new(&pending.client_order_id.0),
+        // The id the order's `Open` state carries, which is what a fill is matched against.
+        order_id: ib_order_id(exec.order_id),
         instrument: pending.instrument,
         strategy: StrategyId::unknown(),
         time_exchange,
@@ -190,11 +331,7 @@ fn build_trade(
             exec.cumulative_quantity,
             "exec.cumulative_quantity",
         )),
-        fees: AssetFees {
-            asset: AssetNameExchange::from(commission.currency.as_str()),
-            fees: commission_amount,
-            fees_quote: None, // Indexer computes based on fee asset vs instrument quote
-        },
+        fees,
     }
 }
 
@@ -205,12 +342,23 @@ fn build_trade(
 /// - If it does, something is fundamentally broken and the warning log surfaces it
 /// - Callers processing trades in bulk shouldn't abort on one corrupted record
 ///
-/// For stricter handling, callers can check for zero in critical fields.
-pub fn parse_decimal_or_warn(value: f64, field_name: &str) -> Decimal {
-    Decimal::try_from(value).unwrap_or_else(|e| {
-        warn!(field = %field_name, value = %value, error = %e, "Invalid f64 for Decimal, using zero");
-        Decimal::ZERO
-    })
+/// Where zero would be read as a real value, such as an ended order's fill, use
+/// [`try_decimal_or_warn`] and keep it unknown instead.
+pub fn parse_decimal_or_warn(value: f64, field_name: impl std::fmt::Display) -> Decimal {
+    try_decimal_or_warn(value, field_name).unwrap_or(Decimal::ZERO)
+}
+
+/// Convert an IB `f64` to a `Decimal`: `None`, with a warning, when it is not a finite number
+/// that fits, so that a caller can keep it unknown rather than read it as zero.
+///
+/// `field_name` names the value in the warning; a `format_args!` can add context, such as the
+/// order, without formatting it unless the warning fires.
+pub fn try_decimal_or_warn(value: f64, field_name: impl std::fmt::Display) -> Option<Decimal> {
+    Decimal::try_from(value)
+        .map_err(
+            |e| warn!(field = %field_name, value = %value, error = %e, "Invalid f64 for Decimal"),
+        )
+        .ok()
 }
 
 /// Parse IB timestamp format (YYYYMMDD HH:MM:SS timezone).
@@ -303,11 +451,7 @@ mod tests {
             ..Default::default()
         };
         let add = |buffer: &ExecutionBuffer, exec_id: &str| {
-            buffer.add_execution(
-                execution(exec_id),
-                InstrumentNameExchange::new("AAPL"),
-                ClientOrderId::new("cid"),
-            );
+            buffer.add_execution(execution(exec_id), InstrumentNameExchange::new("AAPL"));
         };
         let source = ExecutionBuffer::new();
         let target = ExecutionBuffer::new();
@@ -318,6 +462,83 @@ mod tests {
         assert_eq!(source.drain_into(&target), 2);
         assert_eq!(source.pending_count(), 0);
         assert_eq!(target.pending_count(), 3);
+    }
+
+    #[test]
+    fn execution_revision_reads_the_digits_after_the_final_period() {
+        let original = ExecutionRevision::parse("0000e0d5.5f8b1c2a.01.01").unwrap();
+        assert_eq!(original.execution, "0000e0d5.5f8b1c2a.01");
+        assert_eq!(original.revision, 1);
+        assert!(!original.is_correction());
+        assert_eq!(original.previous_id(), None);
+
+        let correction = ExecutionRevision::parse("0000e0d5.5f8b1c2a.01.02").unwrap();
+        assert_eq!(correction.execution, "0000e0d5.5f8b1c2a.01");
+        assert!(correction.is_correction());
+        assert_eq!(
+            correction.previous_id(),
+            Some(TradeId::new("0000e0d5.5f8b1c2a.01.01"))
+        );
+
+        // The previous revision keeps the width of the digits.
+        assert_eq!(
+            ExecutionRevision::parse("x.10").unwrap().previous_id(),
+            Some(TradeId::new("x.09"))
+        );
+        assert_eq!(
+            ExecutionRevision::parse("x.3").unwrap().previous_id(),
+            Some(TradeId::new("x.2"))
+        );
+    }
+
+    #[test]
+    fn execution_id_without_a_revision_is_never_a_correction() {
+        for id in ["e1", "abc.", "abc.0x", "abc.1a", "", ".", "abc.99999999999"] {
+            assert_eq!(ExecutionRevision::parse(id), None, "{id:?}");
+        }
+        assert_eq!(revision_of(&TradeId::new("e1")), 0);
+        assert_eq!(revision_of(&TradeId::new("a.b.02")), 2);
+    }
+
+    fn trade(id: &str, price: i64) -> Trade<AssetNameExchange, InstrumentNameExchange> {
+        Trade {
+            id: TradeId::new(id),
+            order_id: crate::order::id::OrderId::new("cid"),
+            instrument: InstrumentNameExchange::new("AAPL"),
+            strategy: StrategyId::unknown(),
+            time_exchange: DateTime::<Utc>::MIN_UTC,
+            side: Side::Buy,
+            price: Decimal::from(price),
+            quantity: Decimal::ONE,
+            order_filled_quantity: Some(Decimal::ONE),
+            fees: AssetFees::new(AssetNameExchange::from("USD"), Decimal::ZERO, None),
+        }
+    }
+
+    #[test]
+    fn keep_latest_revisions_reads_a_corrected_execution_once() {
+        let kept = keep_latest_revisions(vec![
+            trade("a.01.01", 100),
+            trade("b.01.01", 200),
+            trade("a.01.02", 101),
+            trade("a.01.02", 101),
+            trade("plain", 300),
+            // An earlier revision after a later one is still the earlier one.
+            trade("b.01.03", 202),
+            trade("b.01.02", 201),
+        ]);
+        let read: Vec<_> = kept
+            .iter()
+            .map(|trade| (trade.id.0.as_str(), trade.price))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("a.01.02", Decimal::from(101)),
+                ("b.01.03", Decimal::from(202)),
+                ("plain", Decimal::from(300)),
+            ]
+        );
     }
 
     #[test]

@@ -3,12 +3,15 @@ use crate::order::{
     id::{ClientOrderId, StrategyId},
     state::UnindexedOrderState,
 };
-use fnv::FnvHashMap;
-use ibapi::orders::{Action, OcaType, Order, TimeInForce as IbTimeInForce, order_builder};
+use fnv::{FnvHashMap, FnvHashSet};
+use ibapi::orders::{
+    Action, OcaType, Order, TimeInForce as IbTimeInForce, builder::BracketPrices, order_builder,
+};
 use parking_lot::{Mutex, RwLock};
 use rust_decimal::Decimal;
 use rustrade_instrument::{Side, exchange::ExchangeId, instrument::name::InstrumentNameExchange};
 use std::{sync::Arc, time::Instant};
+use thiserror::Error;
 
 // ============================================================================
 // Bracket Order Types
@@ -99,17 +102,104 @@ pub struct OrderContext {
 /// IB uses `i32` order IDs from a sequence. Barter uses `ClientOrderId` (SmolStr).
 /// This map maintains the bidirectional relationship and stores order context
 /// for reconstructing full `Order` structs from `OrderStatus` callbacks.
+///
+/// # A client order id names one live order at a time
+///
+/// TWS receives a [`ClientOrderId`] only as the order's reference ([`order_ref`]), whose uniqueness
+/// it does not check, so this map is the only place it can be kept.
+/// An id is held from [`register`](Self::register) until its order ends, and registering an id
+/// already held is refused with [`ClientOrderIdInUse`]. Once its order has ended the id may name a
+/// new order.
+///
+/// An order ends here when the account stream reports it `Filled`, `Cancelled` or `Inactive`, or
+/// when [`clear_stale`](Self::clear_stale) reaps it. A `Filled` order releases its id
+/// ([`release_client_id`](Self::release_client_id)) but keeps its IB-id entry, so the executions
+/// and commissions IB may still send for it resolve to the id it was placed under. That entry is
+/// reaped by `clear_stale`.
+///
+/// Every removal is conditional on the id still naming the order removed, so an earlier order
+/// under a reused id cannot take the mapping of the order now under it. Its late executions and
+/// commissions still resolve to the id, carrying its own IB order ID, while a status IB re-sends
+/// for it is dropped by the account stream ([`names_other_order`](Self::names_other_order)).
 #[derive(Debug, Clone)]
 pub struct OrderIdMap {
     inner: Arc<RwLock<OrderIdMapInner>>,
 }
 
+/// When and how an order came to be tracked by an [`OrderIdMap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Registration {
+    /// How long ago it was registered or adopted.
+    pub(crate) age: std::time::Duration,
+    /// Whether it was adopted from a listing rather than placed through this client.
+    pub(crate) adopted: bool,
+}
+
+/// Why [`OrderIdMap::adopt`] refused to track a listed order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub(crate) enum AdoptionRefused {
+    #[error("its client order id names another live order")]
+    ClientOrderIdInUse,
+    #[error("its IB order id names another tracked order")]
+    IbOrderIdTracked,
+}
+
+/// [`OrderIdMap::register`] refused an id because a live order already holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("client order id {0} already names a live IBKR order")]
+pub struct ClientOrderIdInUse(pub ClientOrderId);
+
 #[derive(Debug, Default)]
 struct OrderIdMapInner {
+    /// The live orders: each id held by an order that has not ended.
     cid_to_ib: FnvHashMap<ClientOrderId, i32>,
     /// Merged map: IB order ID → (ClientOrderId, OrderContext, registration time) for single-lookup on hot path.
     /// The Instant tracks when the order was registered, enabling age-based cleanup.
+    ///
+    /// Holds the live orders and the filled ones not yet reaped, which no longer hold their id.
     ib_to_entry: FnvHashMap<i32, (ClientOrderId, OrderContext, Instant)>,
+    /// The IB order ids of the entries adopted from a listing ([`OrderIdMap::adopt`]) rather than
+    /// placed through this client, whose registration time says nothing of when they were placed.
+    adopted: FnvHashSet<i32>,
+}
+
+impl OrderIdMapInner {
+    /// Removes `ib_id`'s entry, and its id's mapping if that still names `ib_id`.
+    fn remove(&mut self, ib_id: i32) -> Option<(ClientOrderId, OrderContext)> {
+        let (client_id, ctx, _) = self.ib_to_entry.remove(&ib_id)?;
+        self.adopted.remove(&ib_id);
+        self.release(&client_id, ib_id);
+        Some((client_id, ctx))
+    }
+
+    /// Whether `client_id` is held by a live order, or named twice among `orders`: the refusal
+    /// [`OrderIdMap::register_all`] and [`OrderIdMap::adopt`] make.
+    fn in_use<'a>(
+        &self,
+        mut orders: impl Iterator<Item = &'a ClientOrderId>,
+        client_id: &ClientOrderId,
+    ) -> bool {
+        orders.any(|earlier| earlier == client_id) || self.cid_to_ib.contains_key(client_id)
+    }
+
+    fn insert(
+        &mut self,
+        client_id: ClientOrderId,
+        ib_id: i32,
+        context: OrderContext,
+        now: Instant,
+    ) {
+        self.adopted.remove(&ib_id);
+        self.cid_to_ib.insert(client_id.clone(), ib_id);
+        self.ib_to_entry.insert(ib_id, (client_id, context, now));
+    }
+
+    /// Frees `client_id` if it still names `ib_id`, rather than a later order under the same id.
+    fn release(&mut self, client_id: &ClientOrderId, ib_id: i32) {
+        if self.cid_to_ib.get(client_id) == Some(&ib_id) {
+            self.cid_to_ib.remove(client_id);
+        }
+    }
 }
 
 impl OrderIdMap {
@@ -120,17 +210,92 @@ impl OrderIdMap {
     }
 
     /// Register a mapping between ClientOrderId and IB order ID with order context.
-    pub fn register(&self, client_id: ClientOrderId, ib_id: i32, context: OrderContext) {
-        let mut inner = self.inner.write();
-        inner.cid_to_ib.insert(client_id.clone(), ib_id);
-        inner
-            .ib_to_entry
-            .insert(ib_id, (client_id, context, Instant::now()));
+    ///
+    /// # Errors
+    /// [`ClientOrderIdInUse`] if a live order already holds `client_id`. Nothing is registered.
+    pub fn register(
+        &self,
+        client_id: ClientOrderId,
+        ib_id: i32,
+        context: OrderContext,
+    ) -> Result<(), ClientOrderIdInUse> {
+        self.register_all([(client_id, ib_id, context)])
     }
 
-    /// Look up IB order ID by ClientOrderId.
+    /// Register several orders at once, such as the legs of a bracket: all of them or none.
+    ///
+    /// # Errors
+    /// [`ClientOrderIdInUse`], naming the first id at fault, if a live order already holds one of
+    /// the ids or two of `orders` share one. Nothing is registered.
+    pub fn register_all<const N: usize>(
+        &self,
+        orders: [(ClientOrderId, i32, OrderContext); N],
+    ) -> Result<(), ClientOrderIdInUse> {
+        let mut inner = self.inner.write();
+        for (index, (client_id, _, _)) in orders.iter().enumerate() {
+            if inner.in_use(
+                orders[..index].iter().map(|(earlier, _, _)| earlier),
+                client_id,
+            ) {
+                return Err(ClientOrderIdInUse(client_id.clone()));
+            }
+        }
+        let now = Instant::now();
+        for (client_id, ib_id, context) in orders {
+            inner.insert(client_id, ib_id, context, now);
+        }
+        Ok(())
+    }
+
+    /// Track an order this client did not place, found in IB's listing under `client_id`, the id
+    /// its order reference carries: one placed before a restart, say. Its
+    /// [`registration`](Self::registration) says it was adopted.
+    ///
+    /// # Errors
+    /// [`AdoptionRefused`] if a live order already holds `client_id`, or `ib_id` already names
+    /// an order here. Nothing is tracked.
+    pub(crate) fn adopt(
+        &self,
+        client_id: ClientOrderId,
+        ib_id: i32,
+        context: OrderContext,
+    ) -> Result<(), AdoptionRefused> {
+        let mut inner = self.inner.write();
+        if inner.ib_to_entry.contains_key(&ib_id) {
+            return Err(AdoptionRefused::IbOrderIdTracked);
+        }
+        if inner.in_use(std::iter::empty(), &client_id) {
+            return Err(AdoptionRefused::ClientOrderIdInUse);
+        }
+        inner.insert(client_id, ib_id, context, Instant::now());
+        inner.adopted.insert(ib_id);
+        Ok(())
+    }
+
+    /// Look up the IB order ID of the live order under `client_id`.
     pub fn get_ib_id(&self, client_id: &ClientOrderId) -> Option<i32> {
         self.inner.read().cid_to_ib.get(client_id).copied()
+    }
+
+    /// How long ago the live order under `client_id` came to be tracked here, and whether it was
+    /// [adopted](Self::adopt) from a listing rather than placed through this client. A placed
+    /// order is registered just before it is sent, so its age is how long ago it was placed; an
+    /// adopted one's says only that it was open by then.
+    ///
+    /// `None` when no live order holds `client_id`.
+    pub(crate) fn registration(&self, client_id: &ClientOrderId) -> Option<Registration> {
+        let inner = self.inner.read();
+        let ib_id = inner.cid_to_ib.get(client_id)?;
+        let (_, _, registered_at) = inner.ib_to_entry.get(ib_id)?;
+        Some(Registration {
+            age: registered_at.elapsed(),
+            adopted: inner.adopted.contains(ib_id),
+        })
+    }
+
+    /// Whether IB order `ib_id` has an entry: a live order, or a filled one not yet reaped.
+    pub fn contains(&self, ib_id: i32) -> bool {
+        self.inner.read().ib_to_entry.contains_key(&ib_id)
     }
 
     /// Look up ClientOrderId by IB order ID.
@@ -151,29 +316,46 @@ impl OrderIdMap {
             .map(|(cid, ctx, _)| (cid.clone(), ctx.clone()))
     }
 
+    /// Whether `client_id` now names a live order other than `ib_id`: the id was freed when `ib_id`
+    /// ended and has since been registered again.
+    pub fn names_other_order(&self, client_id: &ClientOrderId, ib_id: i32) -> bool {
+        self.inner
+            .read()
+            .cid_to_ib
+            .get(client_id)
+            .is_some_and(|live| *live != ib_id)
+    }
+
+    /// Free the id of the filled order `ib_id`, keeping its entry, and return both, in a single
+    /// write lock acquisition.
+    ///
+    /// Use this for a `Filled` status: the id may then name a new order, while the executions and
+    /// commissions IB may still send for this one resolve to it by IB id.
+    pub fn release_client_id(&self, ib_id: i32) -> Option<(ClientOrderId, OrderContext)> {
+        let mut inner = self.inner.write();
+        let (client_id, ctx, _) = inner.ib_to_entry.get(&ib_id)?;
+        let (client_id, ctx) = (client_id.clone(), ctx.clone());
+        inner.release(&client_id, ib_id);
+        Some((client_id, ctx))
+    }
+
     /// Remove mapping and return context in a single write lock acquisition.
     ///
     /// Use this for terminal status events (Cancelled/Inactive) to avoid the
     /// read-then-write pattern of `get_client_id_and_context` + `remove_by_ib_id`.
+    /// The id's mapping is removed only if it still names `ib_id`.
     pub fn remove_and_get_context(&self, ib_id: i32) -> Option<(ClientOrderId, OrderContext)> {
-        let mut inner = self.inner.write();
-        if let Some((client_id, ctx, _)) = inner.ib_to_entry.remove(&ib_id) {
-            inner.cid_to_ib.remove(&client_id);
-            Some((client_id, ctx))
-        } else {
-            None
-        }
+        self.inner.write().remove(ib_id)
     }
 
-    /// Remove a mapping by IB order ID (used when order is fully filled/cancelled).
+    /// Remove a mapping by IB order ID (used when an order failed or was rolled back).
+    ///
+    /// The id's mapping is removed only if it still names `ib_id`.
     pub fn remove_by_ib_id(&self, ib_id: i32) -> Option<ClientOrderId> {
-        let mut inner = self.inner.write();
-        if let Some((client_id, _, _)) = inner.ib_to_entry.remove(&ib_id) {
-            inner.cid_to_ib.remove(&client_id);
-            Some(client_id)
-        } else {
-            None
-        }
+        self.inner
+            .write()
+            .remove(ib_id)
+            .map(|(client_id, _)| client_id)
     }
 
     /// Clear order ID mappings older than the given duration.
@@ -185,11 +367,13 @@ impl OrderIdMap {
     /// IB does not guarantee event ordering between `OrderStatus("Filled")` and
     /// `ExecutionData`/`CommissionReport`. For fast-filling orders (especially
     /// market orders), execution data may arrive AFTER the filled status — or
-    /// the filled status may not arrive at all. Removing mappings on terminal
-    /// status would cause data loss.
+    /// the filled status may not arrive at all. So a `Filled` status frees the
+    /// order's client id but keeps its IB-id entry, and an order whose terminal
+    /// status never arrives keeps both.
     ///
-    /// Instead, call this method periodically to clean up old mappings. A
-    /// reasonable interval is 5-10 minutes with a max_age of 1 hour.
+    /// Call this method periodically to clean up old mappings. A
+    /// reasonable interval is 5-10 minutes with a max_age of 1 hour. An order
+    /// still working past `max_age` is cleared too, freeing its id.
     pub fn clear_stale(&self, max_age: std::time::Duration) -> usize {
         let mut inner = self.inner.write();
         let before = inner.ib_to_entry.len();
@@ -203,20 +387,18 @@ impl OrderIdMap {
             .collect();
 
         for ib_id in stale_ids {
-            if let Some((client_id, _, _)) = inner.ib_to_entry.remove(&ib_id) {
-                inner.cid_to_ib.remove(&client_id);
-            }
+            inner.remove(ib_id);
         }
 
         before - inner.ib_to_entry.len()
     }
 
-    /// Number of active mappings.
+    /// Number of live orders: those holding a client id.
     pub fn len(&self) -> usize {
         self.inner.read().cid_to_ib.len()
     }
 
-    /// Check if map is empty.
+    /// Check if no order is live.
     pub fn is_empty(&self) -> bool {
         self.inner.read().cid_to_ib.is_empty()
     }
@@ -261,6 +443,12 @@ impl PendingCancels {
         self.inner.lock().remove(&ib_id).is_some()
     }
 
+    /// Whether a cancel of IB order `ib_id` was requested through this client and is still
+    /// tracked: not yet seen to end the order, nor cleared as stale.
+    pub(crate) fn contains(&self, ib_id: i32) -> bool {
+        self.inner.lock().contains_key(&ib_id)
+    }
+
     /// Clear entries older than the given duration.
     ///
     /// Returns the number of cleared entries. Call periodically to prevent
@@ -300,7 +488,150 @@ pub(crate) fn side_to_action(side: rustrade_instrument::Side) -> Action {
     }
 }
 
+/// Convert an IB Action to a rustrade Side. A short sale is a sell.
+pub(crate) fn action_to_side(action: &Action) -> rustrade_instrument::Side {
+    match action {
+        Action::Buy => rustrade_instrument::Side::Buy,
+        Action::Sell | Action::SellShort | Action::SellLong => rustrade_instrument::Side::Sell,
+    }
+}
+
+/// What kind of order an IB order is, as [`build_ib_order`] would have built it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OrderShape {
+    pub(crate) kind: OrderKind,
+    /// The limit price, for the kinds that have one.
+    pub(crate) price: Option<Decimal>,
+    pub(crate) time_in_force: TimeInForce,
+}
+
+/// Read back the shape of an order IB lists, the inverse of [`build_ib_order`].
+///
+/// For an order this client did not place, or no longer tracks, such as one placed before a
+/// restart. A tracked order's shape is the one it was placed with.
+///
+/// # Errors
+/// A description of what does not map: an order type or time in force [`build_ib_order`] never
+/// sends, a price the type needs that IB did not list, or a good-till-date time that does not
+/// parse.
+pub(crate) fn order_shape_from_ib(order: &Order) -> Result<OrderShape, String> {
+    let order_type = order.order_type.as_str();
+    let decimal = |value: Option<f64>, field: &str| -> Result<Decimal, String> {
+        let value = value.ok_or_else(|| format!("{order_type} order without {field}"))?;
+        Decimal::try_from(value).map_err(|e| format!("{order_type} order's {field} {value}: {e}"))
+    };
+
+    let time_in_force = match &order.tif {
+        IbTimeInForce::Day => TimeInForce::GoodUntilEndOfDay,
+        IbTimeInForce::GoodTillCanceled => TimeInForce::GoodUntilCancelled { post_only: false },
+        IbTimeInForce::ImmediateOrCancel => TimeInForce::ImmediateOrCancel,
+        IbTimeInForce::FillOrKill => TimeInForce::FillOrKill,
+        IbTimeInForce::OnOpen => TimeInForce::AtOpen,
+        IbTimeInForce::GoodTillDate => TimeInForce::GoodTillDate {
+            expiry: parse_gtd_datetime(&order.good_till_date).ok_or_else(|| {
+                format!(
+                    "good-till-date time {:?} does not parse",
+                    order.good_till_date
+                )
+            })?,
+        },
+        other => return Err(format!("time in force {other:?}")),
+    };
+
+    // A trailing order is by percentage when IB lists a percentage, else by an amount in
+    // `aux_price`, as `build_ib_order` sends them.
+    let trailing = || -> Result<(Decimal, TrailingOffsetType), String> {
+        match order.trailing_percent {
+            Some(_) => Ok((
+                decimal(order.trailing_percent, "trailing_percent")?,
+                TrailingOffsetType::Percentage,
+            )),
+            None => Ok((
+                decimal(order.aux_price, "aux_price")?,
+                TrailingOffsetType::Absolute,
+            )),
+        }
+    };
+
+    let (kind, price, time_in_force) = match order_type {
+        "MKT" => (OrderKind::Market, None, time_in_force),
+        "LMT" => (
+            OrderKind::Limit,
+            Some(decimal(order.limit_price, "limit_price")?),
+            time_in_force,
+        ),
+        // At-close orders are typed, not timed, at IB (see `build_at_close_order`).
+        "MOC" => (OrderKind::Market, None, TimeInForce::AtClose),
+        "LOC" => (
+            OrderKind::Limit,
+            Some(decimal(order.limit_price, "limit_price")?),
+            TimeInForce::AtClose,
+        ),
+        "STP" => (
+            OrderKind::Stop {
+                trigger_price: decimal(order.aux_price, "aux_price")?,
+            },
+            None,
+            time_in_force,
+        ),
+        "STP LMT" => (
+            OrderKind::StopLimit {
+                trigger_price: decimal(order.aux_price, "aux_price")?,
+            },
+            Some(decimal(order.limit_price, "limit_price")?),
+            time_in_force,
+        ),
+        "TRAIL" => {
+            let (offset, offset_type) = trailing()?;
+            (
+                OrderKind::TrailingStop {
+                    offset,
+                    offset_type,
+                },
+                None,
+                time_in_force,
+            )
+        }
+        "TRAIL LIMIT" => {
+            let (offset, offset_type) = trailing()?;
+            let stop_price = decimal(order.trail_stop_price, "trail_stop_price")?;
+            if stop_price <= Decimal::ZERO {
+                return Err(format!(
+                    "{order_type} order's trail_stop_price {stop_price} is not positive"
+                ));
+            }
+            (
+                OrderKind::TrailingStopLimit {
+                    offset,
+                    offset_type,
+                    stop_price,
+                    limit_offset: decimal(order.limit_price_offset, "limit_price_offset")?,
+                },
+                None,
+                time_in_force,
+            )
+        }
+        other => return Err(format!("order type {other:?}")),
+    };
+
+    Ok(OrderShape {
+        kind,
+        price,
+        time_in_force,
+    })
+}
+
+/// Parse IB's good-till-date field: the form [`format_gtd_datetime`] sends, in UTC, or IB's
+/// `yyyyMMdd HH:mm:ss` with an optional zone.
+fn parse_gtd_datetime(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::NaiveDateTime::parse_from_str(value, GTD_FORMAT)
+        .map(|naive| naive.and_utc())
+        .ok()
+        .or_else(|| super::execution::parse_ib_timestamp(value))
+}
+
 /// Error when mapping rustrade order types to IB.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrderMappingError {
     PostOnlyNotSupported,
@@ -308,6 +639,11 @@ pub enum OrderMappingError {
     InvalidPrice(String),
     /// Limit price required for this order type but was None.
     MissingLimitPrice(OrderKind),
+    /// A limit price was given for a kind that derives its own, such as `TrailingStopLimit`,
+    /// whose limit follows from its stop and `limit_offset`.
+    UnexpectedLimitPrice(OrderKind),
+    /// The kind's stop price is zero or negative; IB rejects such an order.
+    NonPositiveStopPrice(OrderKind),
     /// Trailing offset type not supported by IBKR.
     UnsupportedOffsetType(TrailingOffsetType),
     /// Order kind not supported by IBKR (e.g., TakeProfit).
@@ -319,6 +655,13 @@ pub enum OrderMappingError {
     /// order TYPE (MOC/LOC), not just the TIF; callers must route through
     /// `build_ib_order` which handles the type promotion.
     AtCloseRequiresOrderTypeChange,
+    /// `ibapi` rejected a bracket's prices: one is not finite, or the take profit or stop loss is
+    /// on the wrong side of the entry (for a buy, the take profit must be above the entry and the
+    /// stop loss below; a sell the reverse).
+    InvalidBracketPrices(String),
+    /// The client order id cannot be sent as the order's IB order reference, which carries it:
+    /// IB takes at most [`MAX_ORDER_REF_LEN`] ASCII characters there.
+    InvalidClientOrderId(ClientOrderId),
 }
 
 impl std::fmt::Display for OrderMappingError {
@@ -328,6 +671,13 @@ impl std::fmt::Display for OrderMappingError {
             Self::InvalidPrice(p) => write!(f, "invalid price for f64 conversion: {p}"),
             Self::MissingLimitPrice(k) => {
                 write!(f, "limit price required for {k} but was None")
+            }
+            Self::UnexpectedLimitPrice(k) => write!(
+                f,
+                "{k} takes no limit price: it follows from the stop price and limit offset"
+            ),
+            Self::NonPositiveStopPrice(k) => {
+                write!(f, "stop price must be positive for {k}")
             }
             Self::UnsupportedOffsetType(t) => {
                 write!(f, "trailing offset type {t:?} not supported by IBKR")
@@ -346,8 +696,34 @@ impl std::fmt::Display for OrderMappingError {
                 "AtClose TIF must be routed through build_ib_order, which promotes \
                  the order to MOC/LOC; time_in_force_to_ib cannot map it directly"
             ),
+            Self::InvalidBracketPrices(e) => write!(f, "invalid bracket prices: {e}"),
+            Self::InvalidClientOrderId(cid) => write!(
+                f,
+                "client order id {cid} is not an IB order reference: at most \
+                 {MAX_ORDER_REF_LEN} ASCII characters"
+            ),
         }
     }
+}
+
+/// The longest order reference IB echoes back whole, verified on paper. The client order id
+/// travels there, so it is limited to this.
+pub const MAX_ORDER_REF_LEN: usize = 128;
+
+/// The IB order reference that carries `cid`: the id itself.
+///
+/// IB echoes the reference on every open-order, completed-order and execution report, so an order
+/// can be named by the id it was placed with even by a client that did not place it.
+///
+/// # Errors
+/// [`OrderMappingError::InvalidClientOrderId`] for an id IB would reject (error 10363 for
+/// non-ASCII text) or not echo whole: empty, longer than [`MAX_ORDER_REF_LEN`], or not ASCII.
+pub fn order_ref(cid: &ClientOrderId) -> Result<String, OrderMappingError> {
+    let id = cid.0.as_str();
+    if id.is_empty() || id.len() > MAX_ORDER_REF_LEN || !id.is_ascii() {
+        return Err(OrderMappingError::InvalidClientOrderId(cid.clone()));
+    }
+    Ok(id.to_owned())
 }
 
 impl std::error::Error for OrderMappingError {}
@@ -411,8 +787,10 @@ fn require_limit_price(
 /// - `StopLimit` → IB "STP LMT" with `aux_price` as trigger, `limit_price` from Order.price
 /// - `TrailingStop` (Percentage) → IB "TRAIL" with `trailing_percent`
 /// - `TrailingStop` (Absolute) → IB "TRAIL" with `aux_price`
-/// - `TrailingStopLimit` (Absolute) → IB "TRAIL LIMIT" with `aux_price`, `limit_price_offset`
-/// - `TrailingStopLimit` (Percentage) → IB "TRAIL LIMIT" with `trailing_percent`, `limit_price_offset`
+/// - `TrailingStopLimit` (Absolute) → IB "TRAIL LIMIT" with `aux_price`, `trail_stop_price`,
+///   `limit_price_offset`
+/// - `TrailingStopLimit` (Percentage) → IB "TRAIL LIMIT" with `trailing_percent`,
+///   `trail_stop_price`, `limit_price_offset`
 /// - `TakeProfit` → `Err(UnsupportedOrderKind)` (IBKR has no native TP; use bracket orders)
 /// - `TakeProfitLimit` → `Err(UnsupportedOrderKind)` (IBKR has no native TP; use bracket orders)
 /// - `BasisPoints` offset type → Error (not supported by IBKR)
@@ -420,7 +798,10 @@ fn require_limit_price(
 /// # Price Requirements
 ///
 /// - `Market`, `Stop`, `TrailingStop`: `price` should be `None` (ignored if provided)
-/// - `Limit`, `StopLimit`, `TrailingStopLimit`: `price` must be `Some(limit_price)`
+/// - `Limit`, `StopLimit`: `price` must be `Some(limit_price)`
+/// - `TrailingStopLimit`: `price` must be `None` (IB derives the limit from the stop and
+///   `limit_offset`), else `Err(UnexpectedLimitPrice)`; `stop_price` must be positive, else
+///   `Err(NonPositiveStopPrice)`. IB requires the initial stop and rejects a zero one.
 ///
 /// # Time-in-Force Special Cases
 ///
@@ -460,7 +841,16 @@ pub fn build_ib_order(
         OrderKind::StopLimit { trigger_price } => {
             let limit_f64 = require_limit_price(price, *kind)?;
             let trigger_f64 = decimal_to_f64(*trigger_price)?;
-            order_builder::stop_limit(action, quantity, limit_f64, trigger_f64)
+            // Built by hand: `ibapi` 5 removed `order_builder::stop_limit`, and its fluent
+            // replacement adds nothing our checks above have not done. Same fields as before.
+            Order {
+                action,
+                order_type: "STP LMT".to_owned(),
+                total_quantity: quantity,
+                limit_price: Some(limit_f64),
+                aux_price: Some(trigger_f64),
+                ..Order::default()
+            }
         }
 
         OrderKind::TrailingStop {
@@ -504,39 +894,41 @@ pub fn build_ib_order(
         OrderKind::TrailingStopLimit {
             offset,
             offset_type,
+            stop_price,
             limit_offset,
         } => {
+            // IB sets the limit from the stop and `limit_price_offset`, so a limit price here
+            // would be ignored; refuse it rather than place something other than was asked.
+            if price.is_some() {
+                return Err(OrderMappingError::UnexpectedLimitPrice(*kind));
+            }
+            // IB refuses a TRAIL LIMIT without an initial stop (error 321), and rejects a zero
+            // one as an invalid price once the order reaches the exchange.
+            if *stop_price <= Decimal::ZERO {
+                return Err(OrderMappingError::NonPositiveStopPrice(*kind));
+            }
             let offset_f64 = decimal_to_f64(*offset)?;
+            let stop_price_f64 = decimal_to_f64(*stop_price)?;
             let limit_offset_f64 = decimal_to_f64(*limit_offset)?;
-            match offset_type {
-                TrailingOffsetType::Absolute => {
-                    // Use builder for absolute trailing stop-limit.
-                    // aux_price = trailing_amount, limit_price_offset = limit offset from stop.
-                    order_builder::trailing_stop_limit(
-                        action,
-                        quantity,
-                        limit_offset_f64,
-                        offset_f64,
-                        0.0, // trail_stop_price: let IB derive from market
-                    )
-                }
-                TrailingOffsetType::Percentage => {
-                    // Manual construction for percentage-based trailing stop-limit.
-                    Order {
-                        action,
-                        order_type: "TRAIL LIMIT".to_owned(),
-                        total_quantity: quantity,
-                        trailing_percent: Some(offset_f64),
-                        limit_price_offset: Some(limit_offset_f64),
-                        trail_stop_price: None,
-                        ..Order::default()
-                    }
-                }
+            // The trail goes in `aux_price` as an amount, or in `trailing_percent`.
+            let (aux_price, trailing_percent) = match offset_type {
+                TrailingOffsetType::Absolute => (Some(offset_f64), None),
+                TrailingOffsetType::Percentage => (None, Some(offset_f64)),
                 TrailingOffsetType::BasisPoints => {
                     return Err(OrderMappingError::UnsupportedOffsetType(
                         TrailingOffsetType::BasisPoints,
                     ));
                 }
+            };
+            Order {
+                action,
+                order_type: "TRAIL LIMIT".to_owned(),
+                total_quantity: quantity,
+                aux_price,
+                trailing_percent,
+                trail_stop_price: Some(stop_price_f64),
+                limit_price_offset: Some(limit_offset_f64),
+                ..Order::default()
             }
         }
 
@@ -562,8 +954,11 @@ pub fn build_ib_order(
 /// IB accepts format: "yyyyMMdd HH:mm:ss" with optional timezone suffix.
 /// We use UTC format "yyyyMMdd-HH:mm:ss" which IB interprets as UTC.
 fn format_gtd_datetime(dt: &chrono::DateTime<chrono::Utc>) -> String {
-    dt.format("%Y%m%d-%H:%M:%S").to_string()
+    dt.format(GTD_FORMAT).to_string()
 }
+
+/// The good-till-date form this client sends, in UTC.
+const GTD_FORMAT: &str = "%Y%m%d-%H:%M:%S";
 
 /// Build an at-close order (MOC or LOC).
 ///
@@ -606,6 +1001,8 @@ fn build_at_close_order(
 ///
 /// # Returns
 ///
+/// [`OrderMappingError::InvalidBracketPrices`] if `ibapi` rejects the prices: one is not finite,
+/// or the take profit or stop loss is on the wrong side of the entry. Otherwise a
 /// Vec of 3 orders: `[parent, take_profit, stop_loss]` with:
 /// - `parent_id` set on children (IB's bracket linkage)
 /// - `oca_group` set on children (OCA linkage between TP and SL)
@@ -624,15 +1021,14 @@ pub fn build_ib_bracket_with_oca(
     take_profit_price: f64,
     stop_loss_price: f64,
     tif: IbTimeInForce,
-) -> Vec<Order> {
-    let mut orders = order_builder::bracket_order(
-        parent_order_id,
-        action,
-        quantity,
-        limit_price,
-        take_profit_price,
-        stop_loss_price,
-    );
+) -> Result<Vec<Order>, OrderMappingError> {
+    let prices = BracketPrices {
+        entry: limit_price,
+        take_profit: take_profit_price,
+        stop_loss: stop_loss_price,
+    };
+    let mut orders = order_builder::bracket_order(parent_order_id, action, quantity, prices)
+        .map_err(|e| OrderMappingError::InvalidBracketPrices(e.to_string()))?;
     assert_eq!(
         orders.len(),
         3,
@@ -653,7 +1049,7 @@ pub fn build_ib_bracket_with_oca(
     orders[2].oca_group = oca_group;
     orders[2].oca_type = OcaType::CancelWithBlock;
 
-    orders
+    Ok(orders)
 }
 
 #[cfg(test)]
@@ -679,7 +1075,7 @@ mod tests {
         let cid = ClientOrderId::new("order-123");
         let ctx = test_context();
 
-        map.register(cid.clone(), 42, ctx.clone());
+        map.register(cid.clone(), 42, ctx.clone()).unwrap();
 
         assert_eq!(map.get_ib_id(&cid), Some(42));
         assert_eq!(map.get_client_id(42), Some(cid.clone()));
@@ -696,7 +1092,7 @@ mod tests {
         let map = OrderIdMap::new();
         let cid = ClientOrderId::new("order-456");
 
-        map.register(cid.clone(), 100, test_context());
+        map.register(cid.clone(), 100, test_context()).unwrap();
         assert_eq!(map.len(), 1);
 
         let removed = map.remove_by_ib_id(100);
@@ -813,7 +1209,7 @@ mod tests {
         let cid = ClientOrderId::new("order-789");
         let ctx = test_context();
 
-        map.register(cid.clone(), 50, ctx);
+        map.register(cid.clone(), 50, ctx).unwrap();
         assert_eq!(map.len(), 1);
 
         // Remove and get context in single operation
@@ -839,8 +1235,10 @@ mod tests {
         let map = OrderIdMap::new();
 
         // Register orders
-        map.register(ClientOrderId::new("old-1"), 1, test_context());
-        map.register(ClientOrderId::new("old-2"), 2, test_context());
+        map.register(ClientOrderId::new("old-1"), 1, test_context())
+            .unwrap();
+        map.register(ClientOrderId::new("old-2"), 2, test_context())
+            .unwrap();
 
         // With zero max_age, all entries are stale
         let cleared = map.clear_stale(Duration::ZERO);
@@ -848,13 +1246,242 @@ mod tests {
         assert!(map.is_empty());
 
         // Register new orders
-        map.register(ClientOrderId::new("new-1"), 10, test_context());
-        map.register(ClientOrderId::new("new-2"), 20, test_context());
+        map.register(ClientOrderId::new("new-1"), 10, test_context())
+            .unwrap();
+        map.register(ClientOrderId::new("new-2"), 20, test_context())
+            .unwrap();
 
         // With large max_age, nothing is stale
         let cleared = map.clear_stale(Duration::from_secs(3600));
         assert_eq!(cleared, 0);
         assert_eq!(map.len(), 2);
+    }
+
+    /// A live order's id is refused to a second order, and the first keeps its mapping.
+    #[test]
+    fn a_live_orders_id_is_refused_to_a_second_order() {
+        let map = OrderIdMap::new();
+        let cid = ClientOrderId::new("taken");
+        map.register(cid.clone(), 1, test_context()).unwrap();
+
+        assert_eq!(
+            map.register(cid.clone(), 2, test_context()),
+            Err(ClientOrderIdInUse(cid.clone()))
+        );
+        assert_eq!(
+            map.get_ib_id(&cid),
+            Some(1),
+            "a cancel by id still reaches the first"
+        );
+        assert!(
+            map.get_client_id(2).is_none(),
+            "nothing of the second was registered"
+        );
+    }
+
+    /// A filled order frees its id at once, while its late executions still resolve to it.
+    #[test]
+    fn a_filled_order_frees_its_id_and_keeps_resolving_by_ib_id() {
+        let map = OrderIdMap::new();
+        let cid = ClientOrderId::new("reused");
+        map.register(cid.clone(), 1, test_context()).unwrap();
+
+        assert_eq!(
+            map.release_client_id(1).map(|(id, _)| id),
+            Some(cid.clone())
+        );
+        assert!(map.is_empty(), "no order is live");
+        assert_eq!(
+            map.get_client_id(1),
+            Some(cid.clone()),
+            "a late execution resolves"
+        );
+
+        // The id is free again.
+        map.register(cid.clone(), 2, test_context()).unwrap();
+        assert_eq!(map.get_ib_id(&cid), Some(2));
+        assert_eq!(map.get_client_id(1), Some(cid.clone()), "and still does");
+    }
+
+    /// An earlier order under a reused id ending, or being reaped, leaves the order now under the
+    /// id mapped.
+    #[test]
+    fn an_earlier_order_ending_leaves_a_reused_ids_mapping() {
+        let map = OrderIdMap::new();
+        let cid = ClientOrderId::new("reused");
+        map.register(cid.clone(), 1, test_context()).unwrap();
+        let _ = map.release_client_id(1);
+        map.register(cid.clone(), 2, test_context()).unwrap();
+
+        assert!(
+            map.remove_and_get_context(1).is_some(),
+            "the first order's entry goes"
+        );
+        assert_eq!(map.get_ib_id(&cid), Some(2), "the second keeps the id");
+        assert!(map.remove_by_ib_id(1).is_none());
+        assert_eq!(map.get_ib_id(&cid), Some(2));
+    }
+
+    /// Reaping a filled order's entry leaves a reused id's mapping too.
+    #[test]
+    fn reaping_a_filled_order_leaves_a_reused_ids_mapping() {
+        use std::time::Duration;
+
+        let map = OrderIdMap::new();
+        let cid = ClientOrderId::new("reused");
+        map.register(cid.clone(), 1, test_context()).unwrap();
+        let _ = map.release_client_id(1);
+        std::thread::sleep(Duration::from_millis(5));
+        map.register(cid.clone(), 2, test_context()).unwrap();
+
+        assert_eq!(
+            map.clear_stale(Duration::from_millis(5)),
+            1,
+            "only the filled one"
+        );
+        assert_eq!(map.get_ib_id(&cid), Some(2));
+    }
+
+    /// Several orders register all or none: an id already live, or one repeated among them,
+    /// registers none of them.
+    #[test]
+    fn register_all_registers_every_order_or_none() {
+        let map = OrderIdMap::new();
+        map.register(ClientOrderId::new("live"), 1, test_context())
+            .unwrap();
+
+        let clash = map.register_all([
+            (ClientOrderId::new("a"), 10, test_context()),
+            (ClientOrderId::new("live"), 11, test_context()),
+        ]);
+        assert_eq!(clash, Err(ClientOrderIdInUse(ClientOrderId::new("live"))));
+
+        let repeated = map.register_all([
+            (ClientOrderId::new("b"), 20, test_context()),
+            (ClientOrderId::new("b"), 21, test_context()),
+        ]);
+        assert_eq!(repeated, Err(ClientOrderIdInUse(ClientOrderId::new("b"))));
+
+        assert_eq!(map.len(), 1, "neither registered anything");
+        assert!(
+            [10, 11, 20, 21]
+                .iter()
+                .all(|ib_id| map.get_client_id(*ib_id).is_none())
+        );
+
+        map.register_all([
+            (ClientOrderId::new("a"), 10, test_context()),
+            (ClientOrderId::new("b"), 20, test_context()),
+        ])
+        .unwrap();
+        assert_eq!(map.len(), 3);
+    }
+
+    /// A listed order is adopted under its client order id: tracked, and marked adopted.
+    #[test]
+    fn an_adopted_order_is_tracked_and_marked_adopted() {
+        let map = OrderIdMap::new();
+        let cid = ClientOrderId::new("listed");
+
+        map.adopt(cid.clone(), 7, test_context()).unwrap();
+
+        assert_eq!(map.get_ib_id(&cid), Some(7));
+        assert_eq!(map.get_client_id(7), Some(cid.clone()));
+        assert!(map.registration(&cid).is_some_and(|r| r.adopted));
+    }
+
+    /// An IB order id that already names a tracked order, live or filled and not yet reaped, is
+    /// not adopted under another id, and the tracked order is left as it was.
+    #[test]
+    fn adopting_an_ib_order_id_already_tracked_is_refused_and_changes_nothing() {
+        let map = OrderIdMap::new();
+        let placed = ClientOrderId::new("placed");
+        let adopted = ClientOrderId::new("adopted");
+        let filled = ClientOrderId::new("filled");
+        map.register(placed.clone(), 1, test_context()).unwrap();
+        map.adopt(adopted.clone(), 2, test_context()).unwrap();
+        map.register(filled.clone(), 3, test_context()).unwrap();
+        let _ = map.release_client_id(3);
+
+        for ib_id in [1, 2, 3] {
+            let other = ClientOrderId::new(smol_str::format_smolstr!("other-{ib_id}"));
+            assert_eq!(
+                map.adopt(other.clone(), ib_id, test_context()),
+                Err(AdoptionRefused::IbOrderIdTracked)
+            );
+            assert!(map.get_ib_id(&other).is_none(), "{other} was not tracked");
+        }
+
+        assert_eq!(map.get_client_id(1), Some(placed.clone()));
+        assert_eq!(map.get_client_id(2), Some(adopted.clone()));
+        assert_eq!(map.get_client_id(3), Some(filled.clone()));
+        assert!(map.registration(&placed).is_some_and(|r| !r.adopted));
+        assert!(map.registration(&adopted).is_some_and(|r| r.adopted));
+        assert!(
+            map.registration(&filled).is_none(),
+            "the filled order's id stays free"
+        );
+        assert_eq!(map.len(), 2);
+    }
+
+    /// A client order id a live order holds is not adopted for another IB order, and the live
+    /// order is left as it was.
+    #[test]
+    fn adopting_a_client_order_id_a_live_order_holds_is_refused_and_changes_nothing() {
+        let map = OrderIdMap::new();
+        let placed = ClientOrderId::new("placed");
+        let adopted = ClientOrderId::new("adopted");
+        map.register(placed.clone(), 1, test_context()).unwrap();
+        map.adopt(adopted.clone(), 2, test_context()).unwrap();
+        let before = [
+            map.registration(&placed).map(|r| r.adopted),
+            map.registration(&adopted).map(|r| r.adopted),
+        ];
+
+        for (cid, ib_id) in [(&placed, 10), (&adopted, 20)] {
+            assert_eq!(
+                map.adopt(cid.clone(), ib_id, test_context()),
+                Err(AdoptionRefused::ClientOrderIdInUse)
+            );
+            assert!(!map.contains(ib_id), "IB order {ib_id} was not tracked");
+        }
+
+        assert_eq!(map.get_ib_id(&placed), Some(1));
+        assert_eq!(map.get_ib_id(&adopted), Some(2));
+        assert_eq!(
+            [
+                map.registration(&placed).map(|r| r.adopted),
+                map.registration(&adopted).map(|r| r.adopted),
+            ],
+            before
+        );
+        assert_eq!(map.len(), 2);
+    }
+
+    /// A client order id whose earlier order ended, cancelled or filled, may name an adopted
+    /// order. A filled order keeps its entry, so its late executions still resolve.
+    #[test]
+    fn an_order_is_adopted_under_an_id_whose_earlier_order_ended() {
+        let map = OrderIdMap::new();
+        let cancelled = ClientOrderId::new("cancelled");
+        let filled = ClientOrderId::new("filled");
+        map.register(cancelled.clone(), 1, test_context()).unwrap();
+        map.register(filled.clone(), 2, test_context()).unwrap();
+        let _ = map.remove_and_get_context(1);
+        let _ = map.release_client_id(2);
+
+        map.adopt(cancelled.clone(), 11, test_context()).unwrap();
+        map.adopt(filled.clone(), 12, test_context()).unwrap();
+
+        assert_eq!(map.get_ib_id(&cancelled), Some(11));
+        assert_eq!(map.get_ib_id(&filled), Some(12));
+        assert!(map.registration(&cancelled).is_some_and(|r| r.adopted));
+        assert!(map.registration(&filled).is_some_and(|r| r.adopted));
+        assert_eq!(
+            map.get_client_id(2),
+            Some(filled),
+            "the filled order's executions resolve"
+        );
     }
 
     #[test]
@@ -1024,6 +1651,7 @@ mod tests {
             &OrderKind::TrailingStopLimit {
                 offset: Decimal::from(2),
                 offset_type: TrailingOffsetType::Absolute,
+                stop_price: Decimal::from(95),
                 limit_offset: Decimal::try_from(0.5).unwrap(),
             },
             None, // Trailing stop limit uses limit_offset, not a fixed price
@@ -1037,6 +1665,8 @@ mod tests {
         assert_eq!(order.aux_price, Some(2.0)); // trailing amount
         assert_eq!(order.limit_price_offset, Some(0.5)); // limit offset from stop
         assert_eq!(order.trailing_percent, None);
+        assert_eq!(order.trail_stop_price, Some(95.0)); // initial stop
+        assert_eq!(order.limit_price, None); // IB derives it from the stop
     }
 
     #[test]
@@ -1047,6 +1677,7 @@ mod tests {
             &OrderKind::TrailingStopLimit {
                 offset: Decimal::from(5),
                 offset_type: TrailingOffsetType::Percentage,
+                stop_price: Decimal::from(95),
                 limit_offset: Decimal::try_from(0.5).unwrap(),
             },
             None, // Trailing stop limit uses limit_offset, not a fixed price
@@ -1060,6 +1691,59 @@ mod tests {
         assert_eq!(order.trailing_percent, Some(5.0));
         assert_eq!(order.limit_price_offset, Some(0.5));
         assert_eq!(order.aux_price, None); // percentage doesn't use aux_price
+        assert_eq!(order.trail_stop_price, Some(95.0)); // initial stop
+        assert_eq!(order.limit_price, None); // IB derives it from the stop
+    }
+
+    /// IB refuses a TRAIL LIMIT without a stop, and rejects a zero one; neither is sent.
+    #[test]
+    fn test_build_trailing_stop_limit_rejects_non_positive_stop_price() {
+        for offset_type in [TrailingOffsetType::Absolute, TrailingOffsetType::Percentage] {
+            for stop_price in [Decimal::ZERO, Decimal::from(-1)] {
+                let kind = OrderKind::TrailingStopLimit {
+                    offset: Decimal::from(2),
+                    offset_type,
+                    stop_price,
+                    limit_offset: Decimal::from(1),
+                };
+                assert_eq!(
+                    build_ib_order(
+                        rustrade_instrument::Side::Sell,
+                        1.0,
+                        &kind,
+                        None,
+                        &TimeInForce::GoodUntilCancelled { post_only: false },
+                    ),
+                    Err(OrderMappingError::NonPositiveStopPrice(kind)),
+                    "{kind}"
+                );
+            }
+        }
+    }
+
+    /// The limit follows from the stop and limit offset, so a limit price is refused, not
+    /// silently dropped.
+    #[test]
+    fn test_build_trailing_stop_limit_rejects_limit_price() {
+        for offset_type in [TrailingOffsetType::Absolute, TrailingOffsetType::Percentage] {
+            let kind = OrderKind::TrailingStopLimit {
+                offset: Decimal::from(2),
+                offset_type,
+                stop_price: Decimal::from(95),
+                limit_offset: Decimal::from(1),
+            };
+            assert_eq!(
+                build_ib_order(
+                    rustrade_instrument::Side::Sell,
+                    1.0,
+                    &kind,
+                    Some(Decimal::from(94)),
+                    &TimeInForce::GoodUntilCancelled { post_only: false },
+                ),
+                Err(OrderMappingError::UnexpectedLimitPrice(kind)),
+                "{kind}"
+            );
+        }
     }
 
     #[test]
@@ -1091,6 +1775,7 @@ mod tests {
             &OrderKind::TrailingStopLimit {
                 offset: Decimal::from(50),
                 offset_type: TrailingOffsetType::BasisPoints,
+                stop_price: Decimal::from(95),
                 limit_offset: Decimal::try_from(0.5).unwrap(),
             },
             None, // Trailing stop limit uses limit_offset, not a fixed price
@@ -1305,6 +1990,7 @@ mod tests {
             &OrderKind::TrailingStopLimit {
                 offset: Decimal::from(5),
                 offset_type: TrailingOffsetType::Absolute,
+                stop_price: Decimal::from(95),
                 limit_offset: Decimal::from(1),
             },
             None, // Trailing stop limit uses limit_offset, not a fixed price
@@ -1365,7 +2051,8 @@ mod tests {
             160.0,
             140.0,
             IbTimeInForce::Day,
-        );
+        )
+        .unwrap();
 
         assert_eq!(orders.len(), 3);
 
@@ -1392,7 +2079,8 @@ mod tests {
             160.0,
             140.0,
             IbTimeInForce::Day,
-        );
+        )
+        .unwrap();
 
         // Children must reference parent via parent_id
         assert_eq!(orders[1].parent_id, 1000); // TP waits for parent fill
@@ -1412,7 +2100,8 @@ mod tests {
             160.0,
             140.0,
             IbTimeInForce::Day,
-        );
+        )
+        .unwrap();
 
         // Only the last order triggers transmission of all three
         assert!(!orders[0].transmit); // Parent: don't transmit yet
@@ -1430,7 +2119,8 @@ mod tests {
             90.0,
             110.0,
             IbTimeInForce::Day,
-        );
+        )
+        .unwrap();
 
         assert_eq!(orders[0].order_id, 500); // Parent
         assert_eq!(orders[1].order_id, 501); // Take profit
@@ -1438,9 +2128,29 @@ mod tests {
     }
 
     #[test]
+    fn test_build_ib_bracket_with_oca_rejects_prices_on_the_wrong_side_of_the_entry() {
+        // A buy's take profit below its entry.
+        let result =
+            build_ib_bracket_with_oca(7, Action::Buy, 1.0, 10.0, 9.0, 8.0, IbTimeInForce::Day);
+        assert!(matches!(
+            result,
+            Err(OrderMappingError::InvalidBracketPrices(_))
+        ));
+
+        // A sell's stop loss below its entry.
+        let result =
+            build_ib_bracket_with_oca(7, Action::Sell, 1.0, 10.0, 8.0, 9.0, IbTimeInForce::Day);
+        assert!(matches!(
+            result,
+            Err(OrderMappingError::InvalidBracketPrices(_))
+        ));
+    }
+
+    #[test]
     fn test_build_ib_bracket_with_oca_group_name_contains_parent_id() {
         let orders =
-            build_ib_bracket_with_oca(42, Action::Buy, 1.0, 10.0, 12.0, 8.0, IbTimeInForce::Day);
+            build_ib_bracket_with_oca(42, Action::Buy, 1.0, 10.0, 12.0, 8.0, IbTimeInForce::Day)
+                .unwrap();
 
         assert!(orders[1].oca_group.contains("42"));
         assert!(orders[2].oca_group.contains("42"));
@@ -1456,7 +2166,8 @@ mod tests {
             160.0,
             140.0,
             IbTimeInForce::Day,
-        );
+        )
+        .unwrap();
 
         // Parent is limit order
         assert_eq!(orders[0].order_type, "LMT");
@@ -1475,7 +2186,8 @@ mod tests {
     fn test_build_ib_bracket_with_oca_actions_reversed_for_children() {
         // Buy bracket: entry=Buy, exits=Sell
         let buy_orders =
-            build_ib_bracket_with_oca(100, Action::Buy, 10.0, 50.0, 55.0, 45.0, IbTimeInForce::Day);
+            build_ib_bracket_with_oca(100, Action::Buy, 10.0, 50.0, 55.0, 45.0, IbTimeInForce::Day)
+                .unwrap();
         assert_eq!(buy_orders[0].action, Action::Buy);
         assert_eq!(buy_orders[1].action, Action::Sell);
         assert_eq!(buy_orders[2].action, Action::Sell);
@@ -1489,7 +2201,8 @@ mod tests {
             45.0,
             55.0,
             IbTimeInForce::Day,
-        );
+        )
+        .unwrap();
         assert_eq!(sell_orders[0].action, Action::Sell);
         assert_eq!(sell_orders[1].action, Action::Buy);
         assert_eq!(sell_orders[2].action, Action::Buy);
@@ -1505,10 +2218,215 @@ mod tests {
             160.0,
             140.0,
             IbTimeInForce::GoodTillCanceled,
-        );
+        )
+        .unwrap();
 
         assert_eq!(orders[0].tif, IbTimeInForce::GoodTillCanceled);
         assert_eq!(orders[1].tif, IbTimeInForce::GoodTillCanceled);
         assert_eq!(orders[2].tif, IbTimeInForce::GoodTillCanceled);
+    }
+
+    /// A client order id travels as the order reference whole, so one IB would reject or cut is
+    /// refused: empty, longer than IB echoes back, or not ASCII (IB error 10363).
+    #[test]
+    fn order_ref_is_the_client_order_id_when_ib_echoes_it_whole() {
+        let longest = "a".repeat(MAX_ORDER_REF_LEN);
+        assert_eq!(
+            order_ref(&ClientOrderId::new(longest.as_str())).unwrap(),
+            longest
+        );
+        assert_eq!(
+            order_ref(&ClientOrderId::new("cid-1_tp")).unwrap(),
+            "cid-1_tp"
+        );
+
+        let too_long = "a".repeat(MAX_ORDER_REF_LEN + 1);
+        for refused in ["", too_long.as_str(), "ordre-é"] {
+            let cid = ClientOrderId::new(refused);
+            assert_eq!(
+                order_ref(&cid),
+                Err(OrderMappingError::InvalidClientOrderId(cid.clone()))
+            );
+        }
+    }
+
+    /// Every order this client builds reads back as what it was built from, so an open order it no
+    /// longer tracks is reported as placed.
+    #[test]
+    fn order_shape_from_ib_reads_back_what_build_ib_order_sends() {
+        use chrono::TimeZone;
+        use rust_decimal_macros::dec;
+
+        let expiry = chrono::Utc.with_ymd_and_hms(2026, 10, 9, 20, 0, 0).unwrap();
+        let kinds = [
+            (OrderKind::Market, None),
+            (OrderKind::Limit, Some(dec!(150.25))),
+            (
+                OrderKind::Stop {
+                    trigger_price: dec!(140.5),
+                },
+                None,
+            ),
+            (
+                OrderKind::StopLimit {
+                    trigger_price: dec!(140.5),
+                },
+                Some(dec!(140)),
+            ),
+            (
+                OrderKind::TrailingStop {
+                    offset: dec!(2.5),
+                    offset_type: TrailingOffsetType::Percentage,
+                },
+                None,
+            ),
+            (
+                OrderKind::TrailingStop {
+                    offset: dec!(1.75),
+                    offset_type: TrailingOffsetType::Absolute,
+                },
+                None,
+            ),
+            (
+                OrderKind::TrailingStopLimit {
+                    offset: dec!(2),
+                    offset_type: TrailingOffsetType::Percentage,
+                    stop_price: dec!(130.5),
+                    limit_offset: dec!(0.5),
+                },
+                None,
+            ),
+            (
+                OrderKind::TrailingStopLimit {
+                    offset: dec!(1.5),
+                    offset_type: TrailingOffsetType::Absolute,
+                    stop_price: dec!(139.75),
+                    limit_offset: dec!(0.25),
+                },
+                None,
+            ),
+        ];
+        let tifs = [
+            TimeInForce::GoodUntilCancelled { post_only: false },
+            TimeInForce::GoodUntilEndOfDay,
+            TimeInForce::ImmediateOrCancel,
+            TimeInForce::FillOrKill,
+            TimeInForce::AtOpen,
+            TimeInForce::GoodTillDate { expiry },
+        ];
+
+        for (kind, price) in kinds {
+            for time_in_force in tifs {
+                let order = build_ib_order(Side::Buy, 1.0, &kind, price, &time_in_force).unwrap();
+                assert_eq!(
+                    order_shape_from_ib(&order),
+                    Ok(OrderShape {
+                        kind,
+                        price,
+                        time_in_force
+                    }),
+                    "{kind} {time_in_force}"
+                );
+            }
+        }
+
+        // At-close orders are typed MOC/LOC at IB.
+        for (kind, price) in [
+            (OrderKind::Market, None),
+            (OrderKind::Limit, Some(dec!(99))),
+        ] {
+            let order =
+                build_ib_order(Side::Sell, 1.0, &kind, price, &TimeInForce::AtClose).unwrap();
+            assert_eq!(
+                order_shape_from_ib(&order),
+                Ok(OrderShape {
+                    kind,
+                    price,
+                    time_in_force: TimeInForce::AtClose
+                }),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn order_shape_from_ib_reads_ibs_own_good_till_date_form() {
+        use chrono::TimeZone;
+
+        let order = Order {
+            order_type: "MKT".to_owned(),
+            tif: IbTimeInForce::GoodTillDate,
+            good_till_date: "20261009 16:00:00 US/Eastern".to_owned(),
+            ..Order::default()
+        };
+        assert_eq!(
+            order_shape_from_ib(&order).unwrap().time_in_force,
+            TimeInForce::GoodTillDate {
+                expiry: chrono::Utc.with_ymd_and_hms(2026, 10, 9, 20, 0, 0).unwrap()
+            }
+        );
+    }
+
+    #[test]
+    fn order_shape_from_ib_refuses_what_this_client_never_sends() {
+        let order = |order_type: &str, tif: IbTimeInForce| Order {
+            order_type: order_type.to_owned(),
+            tif,
+            limit_price: Some(1.0),
+            ..Order::default()
+        };
+        for (order, reason) in [
+            (order("REL", IbTimeInForce::Day), "order type"),
+            (
+                order("LMT", IbTimeInForce::DayTillCanceled),
+                "time in force",
+            ),
+            (
+                Order {
+                    limit_price: None,
+                    ..order("LMT", IbTimeInForce::Day)
+                },
+                "without limit_price",
+            ),
+            (order("STP", IbTimeInForce::Day), "without aux_price"),
+            (order("MKT", IbTimeInForce::GoodTillDate), "good-till-date"),
+            (
+                Order {
+                    aux_price: Some(2.0),
+                    limit_price_offset: Some(0.5),
+                    ..order("TRAIL LIMIT", IbTimeInForce::Day)
+                },
+                "without trail_stop_price",
+            ),
+            (
+                Order {
+                    aux_price: Some(2.0),
+                    trail_stop_price: Some(0.0),
+                    limit_price_offset: Some(0.5),
+                    ..order("TRAIL LIMIT", IbTimeInForce::Day)
+                },
+                "not positive",
+            ),
+            (
+                Order {
+                    trailing_percent: Some(5.0),
+                    trail_stop_price: Some(-1.0),
+                    limit_price_offset: Some(0.5),
+                    ..order("TRAIL LIMIT", IbTimeInForce::Day)
+                },
+                "not positive",
+            ),
+        ] {
+            let error = order_shape_from_ib(&order).unwrap_err();
+            assert!(error.contains(reason), "{error:?} should name {reason:?}");
+        }
+    }
+
+    #[test]
+    fn action_to_side_reads_a_short_sale_as_a_sell() {
+        assert_eq!(action_to_side(&Action::Buy), Side::Buy);
+        for action in [Action::Sell, Action::SellShort, Action::SellLong] {
+            assert_eq!(action_to_side(&action), Side::Sell, "{action:?}");
+        }
     }
 }

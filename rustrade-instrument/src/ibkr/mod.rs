@@ -5,4 +5,4 @@
 
 pub mod contract;
 
-pub use contract::ContractRegistry;
+pub use contract::{ContractRegistry, ContractRegistryError};

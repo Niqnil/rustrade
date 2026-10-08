@@ -50,9 +50,10 @@ async fn main() {
     // Build contract registry with instruments we want to subscribe to
     let registry = ContractRegistry::new();
 
-    // Register AAPL stock contract
+    // Register AAPL stock contract. Market data looks contracts up by name only, and IB
+    // resolves the description on each request, so it need not be resolved first.
     let aapl_contract = Contract::stock("AAPL").build();
-    registry.register("AAPL".into(), aapl_contract.clone());
+    registry.register_by_name_only("AAPL".into(), aapl_contract.clone());
 
     let registry = Arc::new(registry);
 

@@ -131,7 +131,6 @@ mod tests {
 
     fn make_trade(unix_time: i64, price: f64, size: f64) -> Trade {
         Trade {
-            tick_type: "Last".to_string(),
             time: make_offset_datetime(unix_time),
             price,
             size,

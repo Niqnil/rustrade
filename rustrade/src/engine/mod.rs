@@ -11,10 +11,11 @@ use crate::{
         clock::EngineClock,
         command::Command,
         execution_tx::ExecutionTxMap,
+        in_flight::{InFlightDeadlines, InFlightOverdue, InFlightWatch},
         state::{
             EngineState,
             connectivity::UntrackedExchange,
-            instrument::{OptionSplitPlan, data::InstrumentDataState},
+            instrument::{OptionSplitPlan, data::InstrumentDataState, filter::InstrumentFilter},
             order::{Orders, in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
             position::{Position, PositionDrift, PositionExited, PositionId, SplitRoundingPolicy},
             trading::TradingState,
@@ -79,6 +80,9 @@ pub mod error;
 /// can `ExecutionRequest` to the appropriate `ExecutionManagers`.
 pub mod execution_tx;
 
+// Documented by its own inner doc comment, which rustdoc would merge with an outer one here.
+pub mod in_flight;
+
 /// Defines all state used by the`Engine` to algorithmically trade.
 ///
 /// eg/ `ConnectivityStates`, `AssetStates`, `InstrumentStates`, `Position`, etc.
@@ -120,12 +124,19 @@ where
 /// * `ExecutionTxs` - [`ExecutionTxMap`] implementation for sending execution requests.
 /// * `Strategy` - Trading Strategy implementation (see [`super::strategy`]).
 /// * `Risk` - [`RiskManager`] implementation.
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+///
+/// The execution transmitters are private: every order request reaches an exchange through the
+/// engine's own actions, which validate it and record it as in flight. Construct an `Engine`
+/// with [`Engine::new`].
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct Engine<Clock, State, ExecutionTxs, Strategy, Risk> {
     pub clock: Clock,
     pub meta: EngineMeta,
     pub state: State,
-    pub execution_txs: ExecutionTxs,
+    /// Private so that no order request can be sent without the engine's in-flight tracking.
+    execution_txs: ExecutionTxs,
+    /// Flags orders in flight past their exchange's deadline (see [`InFlightDeadlines`]).
+    in_flight: InFlightWatch,
     pub strategy: Strategy,
     pub risk: Risk,
 }
@@ -246,6 +257,14 @@ where
             }
         };
 
+        // After the event, so an order the event answered is not flagged; before the drain check,
+        // which returns early, so an order stranded during a drain is still flagged. The arms
+        // that return early above skip the check until the next event.
+        let mut process_audit = process_audit;
+        for overdue in self.flag_overdue_in_flight() {
+            process_audit = process_audit.add_output(EngineOutput::InFlightOverdue(overdue));
+        }
+
         // A drain in progress outranks everything below: no new orders. The run is *not* ended
         // here — see the `Shutdown::AfterDrain` arm above for why the execution side owns that
         // decision.
@@ -286,6 +305,18 @@ where
 impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     Engine<Clock, EngineState<GlobalData, InstrumentData>, ExecutionTxs, Strategy, Risk>
 {
+    /// Flag the orders whose request has newly passed its exchange's in-flight deadline.
+    fn flag_overdue_in_flight(&mut self) -> Vec<InFlightOverdue>
+    where
+        Clock: EngineClock,
+    {
+        let clock = &self.clock;
+        self.in_flight.check(
+            || clock.time(),
+            self.state.instruments.instruments(&InstrumentFilter::None),
+        )
+    }
+
     /// Tell every `ExecutionManager` to finish what it has in flight and then stop.
     ///
     /// Sends [`ExecutionRequest::Drain`], the graceful counterpart to the
@@ -309,6 +340,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     /// Action an `Engine` [`Command`], producing an [`ActionOutput`] of work done.
     pub fn action(&mut self, command: &Command) -> ActionOutput
     where
+        Clock: EngineClock,
         InstrumentData: InstrumentDataState + InFlightRequestRecorder,
         ExecutionTxs: ExecutionTxMap,
         Strategy: ClosePositionsStrategy<State = EngineState<GlobalData, InstrumentData>>,
@@ -494,6 +526,12 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     /// `expiration_processed` is **not** set, so the event is **retryable**: re-inject
     /// `ContractExpiry` once that price has arrived.
     ///
+    /// If a position is open and more than one `Spot` instrument matches the option's underlying,
+    /// the method emits an [`EngineOutput::ContractExpiryNotSettled`] carrying
+    /// [`ContractExpiryNotSettledReason::AmbiguousUnderlying`] and synthesises no fill, with the
+    /// same effects as above. Re-injecting the event is rejected the same way. With no position
+    /// open, no price is needed, so the expiry completes as usual.
+    ///
     /// # Not modelled (deferred)
     ///
     /// - **Assignment for short writers:** short positions at expiry are closed at intrinsic
@@ -600,9 +638,6 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 // the option's underlying base AND quote. Both are required: without the
                 // quote filter, BTC/USDT and BTC/USDC options on the same exchange would
                 // silently share the same spot price (M3).
-                // Single-pass: collect all matching spot instruments so we can both
-                // warn on ambiguity (visible in production) and use the first match,
-                // without scanning the instrument list twice.
                 //
                 // The rule here is "the settlement reference is the DELIVERABLE underlying" —
                 // `InstrumentKind::Spot` is only its current spelling. An option settles into, or
@@ -617,26 +652,32 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 // deliverable an option settles against" versus "can split arithmetic be applied
                 // to this" — so folding them would tie each one's future to the other's. Widen
                 // either on its own rule, not on the fact that they currently match.
-                let spot_matches: Vec<_> = self
-                    .state
-                    .instruments
-                    .0
-                    .values()
-                    .filter(|s| {
-                        matches!(&s.instrument.kind, InstrumentKind::Spot)
-                            && s.instrument.underlying.base == base_key
-                            && s.instrument.underlying.quote == quote_key
-                            && s.instrument.exchange == exchange
-                    })
-                    .collect();
-                if spot_matches.len() > 1 {
+                let mut spot_matches = self.state.instruments.0.values().filter(|s| {
+                    matches!(&s.instrument.kind, InstrumentKind::Spot)
+                        && s.instrument.underlying.base == base_key
+                        && s.instrument.underlying.quote == quote_key
+                        && s.instrument.exchange == exchange
+                });
+                let first = spot_matches.next();
+                // A second match leaves nothing to say which one the option is written on, so
+                // settling against either would be a guess the caller never learns of. Reject it,
+                // as a split on the same ambiguous identity is rejected (`AmbiguousSplitTarget`).
+                if spot_matches.next().is_some() {
                     warn!(
-                        count = spot_matches.len(),
-                        "process_contract_expiry: multiple Spot instruments match the option \
-                         underlying — using the first. Deduplicate your instrument config."
+                        instrument = ?key,
+                        // The two matches already taken, plus any left.
+                        count = 2 + spot_matches.count(),
+                        "ContractExpiry: more than one Spot instrument matches the option's \
+                         underlying (base, quote, exchange), so its settlement reference is \
+                         ambiguous — not settled. Construct the engine with one Spot instrument \
+                         per underlying. Emitting ContractExpiryNotSettled."
                     );
+                    return vec![EngineOutput::ContractExpiryNotSettled {
+                        instrument: *key,
+                        reason: ContractExpiryNotSettledReason::AmbiguousUnderlying,
+                    }];
                 }
-                spot_matches.into_iter().next().and_then(|s| s.data.price())
+                first.and_then(|s| s.data.price())
             }
             ExpirySettlement::OwnLastPrice => {
                 self.state.instruments.instrument_index(key).data.price()
@@ -798,10 +839,14 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     /// 0. Rejects a `key` this engine was not built with, mutating nothing and recording no `id`,
     ///    with [`UnsupportedCorporateActionReason::UnknownInstrument`].
     /// 1. Idempotency guard on `id` (per-instrument `corporate_actions_processed` set). A
-    ///    duplicate `id` is skipped with a warning. This holds within a live session but does **not**
-    ///    survive a snapshot taken before the set existed; see the `corporate_actions_processed`
-    ///    field on [`InstrumentState`](crate::engine::state::instrument::InstrumentState) for the
-    ///    migration caveat.
+    ///    duplicate `id` is skipped with a warning. The target's set is the only guard on the equity
+    ///    leg; on a standard split, each option's own set guards that option (step 5). This holds
+    ///    within a live session but does **not** survive a snapshot taken before the set existed:
+    ///    with the target's record missing, its positions are split again while options a standard
+    ///    split already adjusted are skipped.
+    ///    See the `corporate_actions_processed` field on
+    ///    [`InstrumentState`](crate::engine::state::instrument::InstrumentState) for the migration
+    ///    caveat.
     /// 2. **Unsupported guards (no silent no-op, `id` not recorded ⇒ retryable).** The
     ///    instrument-kind check runs **first** so a split on an option is attributed to the
     ///    instrument, not the (supported) kind:
@@ -1507,11 +1552,22 @@ where
 {
     /// Construct a new `Engine`.
     ///
-    /// An initial [`EngineMeta`] is constructed form the provided `clock` and `Sequence(0)`.
+    /// An initial [`EngineMeta`] is constructed from the provided `clock` and `Sequence(0)`.
+    ///
+    /// This is the only way to construct an `Engine` outside this crate, as the execution
+    /// transmitters are private.
+    ///
+    /// `in_flight_deadlines` says how long an order's request may stay in flight on each exchange
+    /// before the engine flags it with [`EngineOutput::InFlightOverdue`]. Pass the deadlines
+    /// [`ExecutionBuild`](crate::execution::builder::ExecutionBuild) derived from each
+    /// `ExecutionManager`'s `request_timeout`, or [`InFlightDeadlines::default`] to check nothing.
+    /// The engine checks after each event it processes, except a `Shutdown` and a `Command` whose
+    /// action hit an unrecoverable error.
     pub fn new(
         clock: Clock,
         state: State,
         execution_txs: ExecutionTxs,
+        in_flight_deadlines: InFlightDeadlines,
         strategy: Strategy,
         risk: Risk,
     ) -> Self {
@@ -1524,9 +1580,15 @@ where
             clock,
             state,
             execution_txs,
+            in_flight: InFlightWatch::new(in_flight_deadlines),
             strategy,
             risk,
         }
+    }
+
+    /// The deadlines the engine flags orders in flight by (see [`EngineOutput::InFlightOverdue`]).
+    pub fn in_flight_deadlines(&self) -> &InFlightDeadlines {
+        self.in_flight.deadlines()
     }
 
     /// Return `Engine` clock time.
@@ -1581,6 +1643,10 @@ pub enum EngineOutput<
     /// format is unchanged (a newtype variant serializes its payload identically whether boxed or
     /// not).
     AlgoOrders(GenerateAlgoOrdersOutput<ExchangeKey, InstrumentKey>),
+
+    /// An order whose request has been in flight past its exchange's deadline. The engine leaves
+    /// the order in flight; see [`in_flight`] for why, and [`InFlightOverdue`] for when it fires.
+    InFlightOverdue(InFlightOverdue<ExchangeKey, InstrumentKey>),
 
     /// Cash-in-lieu observable: a corporate-action split disposed a fractional share quantity
     /// (under [`SplitRoundingPolicy::Floor`]) from one open position. Emitted **per position**
@@ -1840,6 +1906,20 @@ pub enum ContractExpiryNotSettledReason {
     /// its positions are untouched. **Retryable**: re-inject the `ContractExpiry` once that price
     /// has arrived.
     SettlementPriceUnavailable,
+    /// More than one `Spot` instrument matches the option's underlying `(base, quote, exchange)`,
+    /// so nothing says which one's last price settlement should be computed from. Settling
+    /// against either would be a guess; a [`CorporateAction`](crate::EngineEvent::CorporateAction)
+    /// split on the same identity is rejected for the same reason
+    /// ([`UnsupportedCorporateActionReason::AmbiguousSplitTarget`]).
+    ///
+    /// As for `SettlementPriceUnavailable`, the instrument's open orders **were** cancelled, but
+    /// its positions are untouched and `expiration_processed` stays unset. **Not** retryable: the
+    /// instrument set is fixed at construction, so the same event is rejected every time until
+    /// the engine is constructed with one `Spot` instrument per underlying.
+    ///
+    /// Raised only when a position needs settling. An option expiring with no position open needs
+    /// no price, so its expiry completes whatever the underlying.
+    AmbiguousUnderlying,
     /// The event's `InstrumentIndex` is not an instrument this engine was built with: for
     /// example one taken from another `IndexedInstruments`. It was rejected before anything was
     /// touched. **Not** retryable — the same event is rejected every time.

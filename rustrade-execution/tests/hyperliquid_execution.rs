@@ -35,8 +35,8 @@
 use rust_decimal_macros::dec;
 use rustrade_execution::{
     client::{
-        ExecutionClient,
-        hyperliquid::{HyperliquidClient, config::HyperliquidConfig},
+        ExecutionClient, OrderStatusClient,
+        hyperliquid::{HyperliquidClient, Network, config::HyperliquidConfig},
     },
     order::{
         OrderKey, OrderKind, TimeInForce,
@@ -70,11 +70,11 @@ fn test_config() -> HyperliquidConfig {
 }
 
 fn btc_instrument() -> InstrumentNameExchange {
-    "BTC-USD-PERP".into()
+    "BTC-USDC-PERP".into()
 }
 
 fn eth_instrument() -> InstrumentNameExchange {
-    "ETH-USD-PERP".into()
+    "ETH-USDC-PERP".into()
 }
 
 // ============================================================================
@@ -87,7 +87,11 @@ async fn test_connection() {
     init_logging();
 
     let config = test_config();
-    assert!(config.testnet, "Integration tests must run on testnet");
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "Integration tests must run on testnet"
+    );
 
     println!("Wallet address: {}", config.wallet_address_hex());
 
@@ -111,10 +115,14 @@ async fn test_mainnet_authentication() {
     // Create mainnet config (override testnet setting)
     let private_key =
         std::env::var("HYPERLIQUID_PRIVATE_KEY").expect("HYPERLIQUID_PRIVATE_KEY env var required");
-    let config =
-        HyperliquidConfig::from_private_key(&private_key, false).expect("Invalid private key");
+    let config = HyperliquidConfig::from_private_key(&private_key, Network::Mainnet)
+        .expect("Invalid private key");
 
-    assert!(!config.testnet, "This test must run on mainnet");
+    assert_eq!(
+        config.network,
+        Network::Mainnet,
+        "This test must run on mainnet"
+    );
     println!("Mainnet wallet address: {}", config.wallet_address_hex());
 
     let client = HyperliquidClient::connect(config)
@@ -294,11 +302,15 @@ async fn test_fetch_trades() {
     let since = chrono::Utc::now() - chrono::Duration::days(7);
     let instruments: Vec<InstrumentNameExchange> = vec![];
 
-    let result = client.fetch_trades(since, &instruments).await;
+    let result = client
+        .fetch_trades(since, chrono::Utc::now(), &instruments)
+        .await;
 
     assert!(result.is_ok(), "fetch_trades failed: {:?}", result.err());
 
-    let trades = result.unwrap();
+    let read = result.unwrap();
+    assert_eq!(read.resume, None, "the venue reads a span whole");
+    let trades = read.trades;
     println!("Trades in last 7 days: {}", trades.len());
     for trade in trades.iter().take(10) {
         println!(
@@ -323,7 +335,11 @@ async fn test_place_and_cancel_limit_order() {
     init_logging();
 
     let config = test_config();
-    assert!(config.testnet, "This test MUST run on testnet only!");
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "This test MUST run on testnet only!"
+    );
 
     let client = HyperliquidClient::connect(config)
         .await
@@ -358,12 +374,9 @@ async fn test_place_and_cancel_limit_order() {
         state: request_open,
     };
 
-    println!("Placing limit order: BUY 0.001 BTC-USD-PERP @ $50,000 (won't fill)");
+    println!("Placing limit order: BUY 0.001 BTC-USDC-PERP @ $50,000 (won't fill)");
 
     let response = client.open_order(open_request).await;
-
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
 
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
@@ -392,9 +405,6 @@ async fn test_place_and_cancel_limit_order() {
             println!("Canceling order...");
             let cancel_response = client.cancel_order(cancel_request).await;
 
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            let cancel_response = cancel_response.unwrap();
-
             match &cancel_response.state {
                 Ok(cancelled) => {
                     println!("Order canceled successfully!");
@@ -414,6 +424,210 @@ async fn test_place_and_cancel_limit_order() {
     }
 }
 
+/// `fetch_ended_orders` omits a live order and an id the venue does not know, and reports a
+/// cancelled order as cancelled, with nothing filled, under the key it was asked about.
+#[tokio::test]
+#[ignore]
+async fn test_fetch_ended_orders_reports_a_cancelled_order() {
+    init_logging();
+
+    let config = test_config();
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "This test MUST run on testnet only!"
+    );
+
+    let client = HyperliquidClient::connect(config)
+        .await
+        .expect("Failed to connect");
+
+    let instrument = btc_instrument();
+    let strategy = StrategyId::new("test-strategy");
+    let key = OrderKey {
+        exchange: ExchangeId::HyperliquidPerp,
+        instrument: &instrument,
+        strategy: strategy.clone(),
+        cid: ClientOrderId::uuid(),
+    };
+    let owned_key = OrderKey {
+        exchange: key.exchange,
+        instrument: instrument.clone(),
+        strategy: strategy.clone(),
+        cid: key.cid.clone(),
+    };
+    let unknown_key = OrderKey {
+        cid: ClientOrderId::uuid(),
+        ..owned_key.clone()
+    };
+
+    // Far below the market, so it rests.
+    let response = client
+        .open_order(rustrade_execution::order::OrderEvent {
+            key: key.clone(),
+            state: RequestOpen {
+                side: Side::Buy,
+                price: Some(dec!(50000.0)),
+                quantity: dec!(0.001),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                position_id: None,
+                reduce_only: false,
+                market: None,
+            },
+        })
+        .await;
+    let OrderState::Active(ActiveOrderState::Open(open)) = &response.state else {
+        panic!("Order not resting: {:?}", response.state);
+    };
+
+    let live = client
+        .fetch_ended_orders(&[owned_key.clone(), unknown_key.clone()])
+        .await
+        .expect("lookup failed");
+    assert!(
+        live.is_empty(),
+        "a live order and an unknown id are omitted: {live:?}"
+    );
+
+    let cancelled = client
+        .cancel_order(rustrade_execution::order::OrderEvent {
+            key,
+            state: rustrade_execution::order::request::RequestCancel {
+                id: Some(open.id.clone()),
+            },
+        })
+        .await;
+    assert!(
+        cancelled.state.is_ok(),
+        "Cancel rejected: {:?}",
+        cancelled.state
+    );
+
+    let ended = client
+        .fetch_ended_orders(&[unknown_key, owned_key.clone()])
+        .await
+        .expect("lookup failed");
+    println!("Ended: {ended:?}");
+    assert_eq!(ended.len(), 1);
+    assert_eq!(
+        ended[0].key, owned_key,
+        "reported under the key asked about"
+    );
+    let InactiveOrderState::Cancelled(cancelled) = &ended[0].state else {
+        panic!("expected cancelled, got {:?}", ended[0].state);
+    };
+    assert_eq!(cancelled.filled_quantity, Some(dec!(0)));
+}
+
+/// Trade a builder-deployed (HIP-3) perpetual on testnet's `test` DEX, which settles in USDC:
+/// place a resting order on `test:ABC-USDC-PERP`, find it under its client id in the open orders
+/// and the snapshot, then cancel it. A perpetual on a DEX the client is not configured with is
+/// refused before anything is sent.
+#[tokio::test]
+#[ignore]
+async fn test_hip3_order_round_trip() {
+    init_logging();
+
+    let config = test_config().with_dexes(["test"]);
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "This test MUST run on testnet only!"
+    );
+
+    let client = HyperliquidClient::connect(config)
+        .await
+        .expect("Failed to connect");
+
+    let instrument = InstrumentNameExchange::from("test:ABC-USDC-PERP");
+    let key = OrderKey {
+        exchange: ExchangeId::HyperliquidPerp,
+        instrument: &instrument,
+        strategy: StrategyId::new("test-strategy"),
+        cid: ClientOrderId::uuid(),
+    };
+
+    // `test:ABC` has an oracle price of 1.0 and an empty book, so 12 at 0.9 rests, and clears the
+    // venue's $10 minimum order value.
+    let response = client
+        .open_order(rustrade_execution::order::OrderEvent {
+            key: key.clone(),
+            state: RequestOpen {
+                side: Side::Buy,
+                price: Some(dec!(0.9)),
+                quantity: dec!(12),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                position_id: None,
+                reduce_only: false,
+                market: None,
+            },
+        })
+        .await;
+    let OrderState::Active(ActiveOrderState::Open(open)) = &response.state else {
+        panic!("Order not resting: {:?}", response.state);
+    };
+
+    let listed = client
+        .fetch_open_orders(std::slice::from_ref(&instrument))
+        .await
+        .expect("listing failed");
+    assert!(
+        listed.iter().any(|order| order.key.cid == key.cid),
+        "the order is listed under its client id: {listed:?}"
+    );
+
+    let snapshot = client
+        .account_snapshot(&[], std::slice::from_ref(&instrument))
+        .await
+        .expect("snapshot failed");
+    println!("Balances: {:?}", snapshot.balances);
+    let entry = snapshot
+        .instruments
+        .iter()
+        .find(|entry| entry.instrument == instrument)
+        .expect("the requested instrument is listed");
+    assert!(entry.orders_complete);
+    assert!(entry.orders.iter().any(|order| order.key.cid == key.cid));
+    assert!(
+        snapshot
+            .balances
+            .iter()
+            .any(|balance| balance.asset.as_ref() == "USDC" && balance.balance.total > dec!(0)),
+        "the default DEX's collateral is reported, wherever the account's mode holds it"
+    );
+
+    let cancelled = client
+        .cancel_order(rustrade_execution::order::OrderEvent {
+            key,
+            state: rustrade_execution::order::request::RequestCancel {
+                id: Some(open.id.clone()),
+            },
+        })
+        .await;
+    assert!(
+        cancelled.state.is_ok(),
+        "Cancel rejected: {:?}",
+        cancelled.state
+    );
+
+    let unconfigured = InstrumentNameExchange::from("unit:ABC-USDC-PERP");
+    let error = client
+        .fetch_open_orders(std::slice::from_ref(&unconfigured))
+        .await
+        .expect_err("a DEX not configured is refused");
+    assert!(
+        matches!(
+            error,
+            rustrade_execution::error::ClientError::Api(
+                rustrade_execution::error::ApiError::InstrumentInvalid(..)
+            )
+        ),
+        "{error:?}"
+    );
+}
+
 // ============================================================================
 // Conditional Order Tests
 // ============================================================================
@@ -425,7 +639,11 @@ async fn test_stop_order_requires_uuid_cid() {
     init_logging();
 
     let config = test_config();
-    assert!(config.testnet, "This test MUST run on testnet only!");
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "This test MUST run on testnet only!"
+    );
 
     let client = HyperliquidClient::connect(config)
         .await
@@ -467,8 +685,6 @@ async fn test_stop_order_requires_uuid_cid() {
     println!("Placing Stop order with non-UUID cid (should be rejected)...");
 
     let response = client.open_order(open_request).await;
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
 
     match &response.state {
         OrderState::Inactive(rustrade_execution::order::state::InactiveOrderState::OpenFailed(
@@ -493,7 +709,11 @@ async fn test_place_and_cancel_stop_order() {
     init_logging();
 
     let config = test_config();
-    assert!(config.testnet, "This test MUST run on testnet only!");
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "This test MUST run on testnet only!"
+    );
 
     let client = HyperliquidClient::connect(config)
         .await
@@ -533,11 +753,9 @@ async fn test_place_and_cancel_stop_order() {
         state: request_open,
     };
 
-    println!("Placing Stop order: SELL 0.001 BTC-USD-PERP @ stop $50,000");
+    println!("Placing Stop order: SELL 0.001 BTC-USDC-PERP @ stop $50,000");
 
     let response = client.open_order(open_request).await;
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
 
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
@@ -577,9 +795,6 @@ async fn test_place_and_cancel_stop_order() {
             println!("Canceling Stop order...");
             let cancel_response = client.cancel_order(cancel_request).await;
 
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            let cancel_response = cancel_response.unwrap();
-
             match &cancel_response.state {
                 Ok(cancelled) => {
                     println!("Stop order canceled successfully!");
@@ -606,7 +821,11 @@ async fn test_place_and_cancel_take_profit_order() {
     init_logging();
 
     let config = test_config();
-    assert!(config.testnet, "This test MUST run on testnet only!");
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "This test MUST run on testnet only!"
+    );
 
     let client = HyperliquidClient::connect(config)
         .await
@@ -643,11 +862,9 @@ async fn test_place_and_cancel_take_profit_order() {
         state: request_open,
     };
 
-    println!("Placing TakeProfit order: SELL 0.001 BTC-USD-PERP @ TP $150,000");
+    println!("Placing TakeProfit order: SELL 0.001 BTC-USDC-PERP @ TP $150,000");
 
     let response = client.open_order(open_request).await;
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
 
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
@@ -673,9 +890,8 @@ async fn test_place_and_cancel_take_profit_order() {
 
             println!("Canceling TakeProfit order...");
             let cancel_response = client.cancel_order(cancel_request).await;
-            assert!(cancel_response.is_some());
 
-            match &cancel_response.unwrap().state {
+            match &cancel_response.state {
                 Ok(_) => println!("TakeProfit order canceled successfully!"),
                 Err(e) => panic!("Cancel rejected: {:?}", e),
             }
@@ -696,7 +912,11 @@ async fn test_trailing_stop_unsupported() {
     init_logging();
 
     let config = test_config();
-    assert!(config.testnet, "This test MUST run on testnet only!");
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "This test MUST run on testnet only!"
+    );
 
     let client = HyperliquidClient::connect(config)
         .await
@@ -732,9 +952,8 @@ async fn test_trailing_stop_unsupported() {
     println!("Placing TrailingStop order (should be rejected as unsupported)...");
 
     let response = client.open_order(open_request).await;
-    assert!(response.is_some());
 
-    match &response.unwrap().state {
+    match &response.state {
         OrderState::Inactive(rustrade_execution::order::state::InactiveOrderState::OpenFailed(
             rustrade_execution::error::OrderError::UnsupportedOrderType(msg),
         )) => {
@@ -804,7 +1023,11 @@ async fn test_account_stream_with_order() {
     init_logging();
 
     let config = test_config();
-    assert!(config.testnet, "This test MUST run on testnet only!");
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "This test MUST run on testnet only!"
+    );
 
     let client = HyperliquidClient::connect(config)
         .await
@@ -857,8 +1080,6 @@ async fn test_account_stream_with_order() {
     };
 
     let response = client.open_order(open_request).await;
-    assert!(response.is_some());
-    let response = response.unwrap();
 
     let order_id = match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
@@ -919,7 +1140,11 @@ async fn test_order_is_reported_under_its_client_id() {
     init_logging();
 
     let config = test_config();
-    assert!(config.testnet, "This test MUST run on testnet only!");
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "This test MUST run on testnet only!"
+    );
 
     let client = HyperliquidClient::connect(config)
         .await
@@ -955,8 +1180,7 @@ async fn test_order_is_reported_under_its_client_id() {
                 market: None,
             },
         })
-        .await
-        .expect("Expected order response");
+        .await;
     let venue_id = match &response.state {
         OrderState::Active(ActiveOrderState::Open(open)) => open.id.clone(),
         other => panic!("Order did not rest: {other:?}"),
@@ -1000,8 +1224,7 @@ async fn test_order_is_reported_under_its_client_id() {
             key: key.clone(),
             state: rustrade_execution::order::request::RequestCancel { id: Some(venue_id) },
         })
-        .await
-        .expect("Expected cancel response");
+        .await;
     assert!(cancel.state.is_ok(), "cancel failed: {:?}", cancel.state);
 
     // Both updates -- resting, then cancelled -- must name the order by its client id.
@@ -1054,6 +1277,11 @@ async fn test_cancel_nonexistent_order() {
     init_logging();
 
     let config = test_config();
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "This test MUST run on testnet only!"
+    );
     let client = HyperliquidClient::connect(config)
         .await
         .expect("Failed to connect");
@@ -1080,11 +1308,19 @@ async fn test_cancel_nonexistent_order() {
 
     let response = client.cancel_order(cancel_request).await;
 
-    assert!(response.is_some());
-    let response = response.unwrap();
-
-    // Hyperliquid may return success or error for nonexistent orders
+    // Hyperliquid answers with a top-level `ok` and the error in the order's own status, which
+    // must not read as a cancel.
     println!("Cancel nonexistent order result: {:?}", response.state);
+    assert!(
+        matches!(
+            response.state,
+            Err(rustrade_execution::error::OrderError::Rejected(
+                rustrade_execution::error::ApiError::OrderRejected(_)
+            ))
+        ),
+        "a cancel of an order Hyperliquid does not hold must be rejected, got {:?}",
+        response.state
+    );
 }
 
 #[tokio::test]
@@ -1115,12 +1351,116 @@ async fn test_cancel_without_order_id() {
 
     let response = client.cancel_order(cancel_request).await;
 
-    assert!(response.is_some());
-    let response = response.unwrap();
-
     assert!(
         response.state.is_err(),
         "Expected rejection when order ID is missing"
     );
     println!("Cancel correctly rejected: {:?}", response.state.err());
+}
+
+/// The precision check accepts what Hyperliquid accepts at its boundaries: a BTC sell at an
+/// integer price past 5 significant figures, and a size at the asset's full `szDecimals`, both of
+/// which the client once rounded. Each order rests away from the market, then is cancelled.
+#[tokio::test]
+#[ignore] // Requires a Hyperliquid testnet account
+async fn test_boundary_precision_orders_rest() {
+    use rust_decimal::{Decimal, RoundingStrategy};
+
+    init_logging();
+    let config = test_config();
+    assert_eq!(
+        config.network,
+        Network::Testnet,
+        "This test MUST run on testnet only!"
+    );
+    let client = HyperliquidClient::connect(config)
+        .await
+        .expect("Failed to connect");
+
+    let info =
+        hyperliquid_rust_sdk::InfoClient::new(None, Some(hyperliquid_rust_sdk::BaseUrl::Testnet))
+            .await
+            .expect("Failed to create InfoClient");
+    let mids = info.all_mids().await.expect("Failed to read allMids");
+    let mid = |coin: &str| -> Decimal {
+        mids.get(coin)
+            .unwrap_or_else(|| panic!("allMids has no {coin} mid"))
+            .parse()
+            .expect("mid is a decimal")
+    };
+
+    // A sell 20% above the market, at an integer of at least 6 digits ending in 1, so it keeps 6
+    // significant figures.
+    let btc_price = (mid("BTC") * dec!(1.2))
+        .max(dec!(100000))
+        .trunc()
+        .checked_div(dec!(10))
+        .expect("divides")
+        .trunc()
+        * dec!(10)
+        + dec!(1);
+    // A buy 30% below the market, rounded down to the rules.
+    let eth = eth_instrument();
+    let eth_precision = client.order_precision(&eth).expect("ETH is listed");
+    let eth_price = eth_precision.round_price(mid("ETH") * dec!(0.7), RoundingStrategy::ToZero);
+
+    let btc = btc_instrument();
+    let btc_precision = client.order_precision(&btc).expect("BTC is listed");
+    for (instrument, precision, side, price) in [
+        (&btc, btc_precision, Side::Sell, btc_price),
+        (&eth, eth_precision, Side::Buy, eth_price),
+    ] {
+        // About $12, above the $10 minimum, at the asset's full size decimals.
+        let quantity = precision.round_quantity(dec!(12) / price, RoundingStrategy::AwayFromZero);
+        precision
+            .check_price(price)
+            .expect("the price meets the rules");
+        precision
+            .check_quantity(quantity)
+            .expect("the quantity meets the rules");
+        println!("Placing {side:?} {quantity} {instrument} @ {price}");
+
+        let key = OrderKey {
+            exchange: ExchangeId::HyperliquidPerp,
+            instrument,
+            strategy: StrategyId::new("test-precision"),
+            cid: ClientOrderId::uuid(),
+        };
+        let response = client
+            .open_order(rustrade_execution::order::OrderEvent {
+                key: key.clone(),
+                state: RequestOpen {
+                    side,
+                    price: Some(price),
+                    quantity,
+                    kind: OrderKind::Limit,
+                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                    position_id: None,
+                    reduce_only: false,
+                    market: None,
+                },
+            })
+            .await;
+        let OrderState::Active(ActiveOrderState::Open(open)) = &response.state else {
+            panic!(
+                "{instrument} @ {price} x {quantity} was not resting: {:?}",
+                response.state
+            );
+        };
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let cancelled = client
+            .cancel_order(rustrade_execution::order::OrderEvent {
+                key,
+                state: rustrade_execution::order::request::RequestCancel {
+                    id: Some(open.id.clone()),
+                },
+            })
+            .await;
+        assert!(
+            cancelled.state.is_ok(),
+            "cancel of {instrument}: {:?}",
+            cancelled.state
+        );
+    }
 }

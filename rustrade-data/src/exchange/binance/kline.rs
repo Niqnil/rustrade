@@ -1,5 +1,5 @@
 //! Live Binance kline (candle) WebSocket payloads and their normalisation to
-//! [`Candle`](crate::subscription::candle::Candle).
+//! [`Candle`].
 //!
 //! Covers both the [`BinanceSpot`](crate::exchange::binance::spot::BinanceSpot) `@kline_<interval>`
 //! stream and the
@@ -9,9 +9,9 @@
 //! # Closed candles only (no repaint)
 //!
 //! rustrade emits **closed candles only** — an in-progress kline (`k.x == false`) yields an empty
-//! [`MarketIter`](crate::event::MarketIter), so consumers never see a repainting/lookahead value.
+//! [`MarketIter`], so consumers never see a repainting/lookahead value.
 //! The exclusive `close_time` boundary is recomputed library-side as `open + interval` (see
-//! [`close_time_from_open`](crate::subscription::candle::close_time_from_open)), **not** taken from
+//! [`close_time_from_open`]), **not** taken from
 //! Binance's wire `T` (its `period-end − 1ms` convention) — consumers comparing against the raw `T`
 //! will see a 1ms difference by design.
 //!

@@ -41,6 +41,11 @@ pub type UnindexedOrder = Order<ExchangeId, InstrumentNameExchange, UnindexedOrd
 /// and [`InstrumentNameExchange`].
 pub type UnindexedOrderKey = OrderKey<ExchangeId, InstrumentNameExchange>;
 
+/// Convenient type alias for an [`Order`] that has ended, keyed with [`ExchangeId`] and
+/// [`InstrumentNameExchange`].
+pub type UnindexedInactiveOrder =
+    Order<ExchangeId, InstrumentNameExchange, state::UnindexedInactiveOrderState>;
+
 /// Convenient type alias for an [`OrderSnapshot`] keyed with [`ExchangeId`], [`AssetNameExchange`],
 /// and [`InstrumentNameExchange`].
 pub type UnindexedOrderSnapshot = Order<
@@ -131,6 +136,34 @@ pub struct Order<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex, S
     pub kind: OrderKind,
     pub time_in_force: TimeInForce,
     pub state: State,
+}
+
+impl<ExchangeKey, InstrumentKey, State> Order<ExchangeKey, InstrumentKey, State> {
+    /// This order with its state replaced by `f` of it, every other field unchanged.
+    pub fn map_state<NewState>(
+        self,
+        f: impl FnOnce(State) -> NewState,
+    ) -> Order<ExchangeKey, InstrumentKey, NewState> {
+        let Order {
+            key,
+            side,
+            price,
+            quantity,
+            kind,
+            time_in_force,
+            state,
+        } = self;
+
+        Order {
+            key,
+            side,
+            price,
+            quantity,
+            kind,
+            time_in_force,
+            state: f(state),
+        }
+    }
 }
 
 impl<ExchangeKey, AssetKey, InstrumentKey>
@@ -256,10 +289,20 @@ pub enum OrderKind {
         offset_type: TrailingOffsetType,
     },
     /// Trailing stop-limit order - when triggered, submits a limit order offset from the stop.
-    #[display("TrailingStopLimit({offset}, {offset_type}, {limit_offset})")]
+    ///
+    /// The limit price follows from the stop and `limit_offset`, so the order takes no `price`.
+    #[display("TrailingStopLimit({offset}, {offset_type}, {stop_price}, {limit_offset})")]
     TrailingStopLimit {
         offset: Decimal,
         offset_type: TrailingOffsetType,
+        /// The stop price at submission; it then trails the market by `offset`. Must be positive.
+        ///
+        /// The venue may trail it straight away. On IBKR paper, a stop within `offset` of the
+        /// market was kept as placed, and one further away moved to `offset` from the market
+        /// within seconds of IB accepting the order, for buys and sells, absolute and percentage
+        /// trails. So an order read back from a venue listing may report the stop after it has
+        /// trailed, not the one it was placed with.
+        stop_price: Decimal,
         /// Offset from the triggered stop price to set the limit price.
         limit_offset: Decimal,
     },
@@ -286,13 +329,16 @@ pub enum TimeInForce {
     AtClose,
 }
 
-impl<ExchangeKey, InstrumentKey> From<&OrderRequestOpen<ExchangeKey, InstrumentKey>>
-    for Order<ExchangeKey, InstrumentKey, ActiveOrderState>
+impl<ExchangeKey, InstrumentKey> Order<ExchangeKey, InstrumentKey, ActiveOrderState>
 where
     ExchangeKey: Clone,
     InstrumentKey: Clone,
 {
-    fn from(value: &OrderRequestOpen<ExchangeKey, InstrumentKey>) -> Self {
+    /// The order an open request describes, [`OpenInFlight`] since `time_sent`.
+    pub fn open_in_flight(
+        request: &OrderRequestOpen<ExchangeKey, InstrumentKey>,
+        time_sent: DateTime<Utc>,
+    ) -> Self {
         let OrderRequestOpen {
             key,
             state:
@@ -306,7 +352,7 @@ where
                     reduce_only: _, // used by adapters (e.g., Alpaca) to derive position_intent
                     market: _,      // decision-time provenance; not part of the resulting Order
                 },
-        } = value;
+        } = request;
 
         Self {
             key: key.clone(),
@@ -315,7 +361,7 @@ where
             quantity: *quantity,
             kind: *kind,
             time_in_force: *time_in_force,
-            state: ActiveOrderState::OpenInFlight(OpenInFlight),
+            state: ActiveOrderState::OpenInFlight(OpenInFlight::new(time_sent)),
         }
     }
 }
@@ -324,25 +370,7 @@ impl<ExchangeKey, InstrumentKey> From<Order<ExchangeKey, InstrumentKey, Open>>
     for Order<ExchangeKey, InstrumentKey, ActiveOrderState>
 {
     fn from(value: Order<ExchangeKey, InstrumentKey, Open>) -> Self {
-        let Order {
-            key,
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            state,
-        } = value;
-
-        Self {
-            key,
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            state: ActiveOrderState::Open(state),
-        }
+        value.map_state(ActiveOrderState::Open)
     }
 }
 
@@ -350,25 +378,7 @@ impl<ExchangeKey, AssetKey, InstrumentKey> From<Order<ExchangeKey, InstrumentKey
     for Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>
 {
     fn from(value: Order<ExchangeKey, InstrumentKey, Open>) -> Self {
-        let Order {
-            key,
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            state,
-        } = value;
-
-        Self {
-            key,
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            state: OrderState::Active(ActiveOrderState::Open(state)),
-        }
+        value.map_state(|state| OrderState::Active(ActiveOrderState::Open(state)))
     }
 }
 
@@ -376,25 +386,7 @@ impl<ExchangeKey, AssetKey, InstrumentKey> From<Order<ExchangeKey, InstrumentKey
     for Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>
 {
     fn from(value: Order<ExchangeKey, InstrumentKey, Cancelled>) -> Self {
-        let Order {
-            key,
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            state,
-        } = value;
-
-        Self {
-            key,
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            state: OrderState::Inactive(InactiveOrderState::Cancelled(state)),
-        }
+        value.map_state(|state| OrderState::Inactive(InactiveOrderState::Cancelled(state)))
     }
 }
 
@@ -402,25 +394,7 @@ impl<ExchangeKey, AssetKey, InstrumentKey> From<Order<ExchangeKey, InstrumentKey
     for Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>
 {
     fn from(value: Order<ExchangeKey, InstrumentKey, Expired>) -> Self {
-        let Order {
-            key,
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            state,
-        } = value;
-
-        Self {
-            key,
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            state: OrderState::Inactive(InactiveOrderState::Expired(state)),
-        }
+        value.map_state(|state| OrderState::Inactive(InactiveOrderState::Expired(state)))
     }
 }
 

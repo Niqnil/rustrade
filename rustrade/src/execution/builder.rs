@@ -1,5 +1,5 @@
 use crate::{
-    engine::{clock::EngineClock, execution_tx::MultiExchangeTxMap},
+    engine::{clock::EngineClock, execution_tx::MultiExchangeTxMap, in_flight::InFlightDeadlines},
     error::BarterError,
     execution::{
         AccountStreamEvent, Execution, error::ExecutionError, manager::ExecutionManager,
@@ -15,7 +15,7 @@ use rustrade_data::streams::{
 use rustrade_execution::{
     UnindexedAccountEvent,
     client::{
-        ExecutionClient,
+        ClientInstrument, ExecutionClient,
         mock::{MockExecution, MockExecutionClientConfig, MockExecutionConfig},
     },
     exchange::mock::{MockExchange, request::MockExchangeRequest},
@@ -69,6 +69,7 @@ pub struct ExecutionBuilder<'a> {
     merged_channel: Channel<AccountStreamEvent<ExchangeIndex, AssetIndex, InstrumentIndex>>,
     mock_exchange_futures: Vec<RunFuture>,
     execution_init_futures: Vec<ExecutionInitFuture>,
+    in_flight_deadlines: InFlightDeadlines,
 }
 
 impl<'a> ExecutionBuilder<'a> {
@@ -80,6 +81,7 @@ impl<'a> ExecutionBuilder<'a> {
             merged_channel: Channel::default(),
             mock_exchange_futures: Vec::default(),
             execution_init_futures: Vec::default(),
+            in_flight_deadlines: InFlightDeadlines::default(),
         }
     }
 
@@ -88,6 +90,13 @@ impl<'a> ExecutionBuilder<'a> {
     ///
     /// The provided [`MockExecutionConfig`] is used to configure the [`MockExchange`] and provide
     /// the initial account state.
+    ///
+    /// The exchange gets no in-flight deadline (see [`ExecutionBuild::in_flight_deadlines`]): the
+    /// engine measures one on its own clock, which in a backtest is simulated time, while the
+    /// mock's `latency_ms` is real time. To check a mock run on a live clock, as in paper trading,
+    /// set one with
+    /// [`SystemBuilder::in_flight_deadline`](crate::system::builder::SystemBuilder::in_flight_deadline),
+    /// or with [`InFlightDeadlines::insert`] before [`Engine::new`](crate::engine::Engine::new).
     ///
     /// # Errors
     /// Returns [`BarterError::ExecutionBuilder`] if any indexed instrument executed on
@@ -134,6 +143,7 @@ impl<'a> ExecutionBuilder<'a> {
             mock_execution_client_config.mocked_exchange,
             mock_execution_client_config,
             DUMMY_EXECUTION_REQUEST_TIMEOUT,
+            None,
         )?;
 
         // Register MockExchange init Future
@@ -155,6 +165,9 @@ impl<'a> ExecutionBuilder<'a> {
     }
 
     /// Adds an [`ExecutionManager`] for a live exchange.
+    ///
+    /// The exchange's in-flight deadline (see [`ExecutionBuild::in_flight_deadlines`]) is derived
+    /// from `request_timeout` by [`InFlightDeadlines::deadline_for_request_timeout`].
     pub fn add_live<Client>(
         self,
         config: Client::Config,
@@ -165,14 +178,23 @@ impl<'a> ExecutionBuilder<'a> {
         Client::AccountStream: Send,
         Client::Config: Send,
     {
-        self.add_execution::<Client>(Client::EXCHANGE, config, request_timeout)
+        self.add_execution::<Client>(
+            Client::EXCHANGE,
+            config,
+            request_timeout,
+            Some(InFlightDeadlines::deadline_for_request_timeout(
+                request_timeout,
+            )),
+        )
     }
 
+    /// Register an [`ExecutionManager`] for `exchange`, and its in-flight deadline if it has one.
     fn add_execution<Client>(
         mut self,
         exchange: ExchangeId,
         config: Client::Config,
         request_timeout: Duration,
+        in_flight_deadline: Option<Duration>,
     ) -> Result<Self, BarterError>
     where
         Client: ExecutionClient + Send + Sync + 'static,
@@ -180,6 +202,9 @@ impl<'a> ExecutionBuilder<'a> {
         Client::Config: Send,
     {
         validate_supported_instrument_kinds(self.instruments, exchange, Client::SUPPORTED_KINDS)?;
+        validate_client_config(self.instruments, exchange, |instruments| {
+            Client::validate_config(&config, instruments)
+        })?;
 
         let instrument_map = generate_execution_instrument_map(self.instruments, exchange)?;
 
@@ -193,6 +218,11 @@ impl<'a> ExecutionBuilder<'a> {
             return Err(BarterError::ExecutionBuilder(format!(
                 "ExecutionBuilder does not support duplicate mocked ExecutionManagers: {exchange}"
             )));
+        }
+
+        if let Some(deadline) = in_flight_deadline {
+            self.in_flight_deadlines
+                .insert(instrument_map.exchange.key, deadline);
         }
 
         let merged_tx = self.merged_channel.tx.clone();
@@ -253,6 +283,7 @@ impl<'a> ExecutionBuilder<'a> {
 
         ExecutionBuild {
             execution_tx_map,
+            in_flight_deadlines: self.in_flight_deadlines,
             account_channel: self.merged_channel,
             futures: ExecutionBuildFutures {
                 mock_exchange_run_futures: self.mock_exchange_futures,
@@ -270,6 +301,10 @@ impl<'a> ExecutionBuilder<'a> {
 #[allow(missing_debug_implementations)]
 pub struct ExecutionBuild {
     pub execution_tx_map: MultiExchangeTxMap,
+    /// An in-flight deadline for each live exchange, derived from its `request_timeout`, for
+    /// [`Engine::new`](crate::engine::Engine::new). Mock exchanges have none; see
+    /// [`ExecutionBuilder::add_mock`].
+    pub in_flight_deadlines: InFlightDeadlines,
     pub account_channel: Channel<AccountStreamEvent>,
     pub futures: ExecutionBuildFutures,
 }
@@ -309,6 +344,7 @@ impl ExecutionBuild {
 
         Ok(Execution {
             execution_txs: self.execution_tx_map,
+            in_flight_deadlines: self.in_flight_deadlines,
             account_channel: self.account_channel,
             handles,
         })
@@ -353,24 +389,33 @@ impl ExecutionBuildFutures {
         self,
         runtime: tokio::runtime::Handle,
     ) -> Result<ExecutionHandles, BarterError> {
-        let mock_exchanges = self
+        // Spawned first: the ExecutionManager build futures below connect to them.
+        let mock_exchanges: Vec<_> = self
             .mock_exchange_run_futures
             .into_iter()
             .map(|mock_exchange_run_future| runtime.spawn(mock_exchange_run_future))
             .collect();
 
-        // Await ExecutionManager build futures and ensure success
-        let (managers, account_to_engines) =
-            futures::future::try_join_all(self.execution_init_futures)
-                .await?
-                .into_iter()
-                .map(|(manager_run_future, account_event_forward_future)| {
-                    (
-                        runtime.spawn(manager_run_future),
-                        runtime.spawn(account_event_forward_future),
-                    )
-                })
-                .unzip();
+        // Await ExecutionManager build futures and ensure success. On failure, abort the mock
+        // exchanges spawned above: dropping a `JoinHandle` only detaches its task, which would
+        // leave each one running with nothing able to stop it.
+        let execution_inits = match try_join_all(self.execution_init_futures).await {
+            Ok(execution_inits) => execution_inits,
+            Err(error) => {
+                mock_exchanges.iter().for_each(JoinHandle::abort);
+                return Err(error.into());
+            }
+        };
+
+        let (managers, account_to_engines) = execution_inits
+            .into_iter()
+            .map(|(manager_run_future, account_event_forward_future)| {
+                (
+                    runtime.spawn(manager_run_future),
+                    runtime.spawn(account_event_forward_future),
+                )
+            })
+            .unzip();
 
         Ok(ExecutionHandles {
             mock_exchanges,
@@ -609,6 +654,29 @@ pub(crate) fn validate_supported_instrument_kinds(
         join_kinds(unsupported.iter().copied()),
         join_kinds(supported.iter().copied()),
     )))
+}
+
+/// Runs a client's own check of its config (see [`ExecutionClient::validate_config`]) against the
+/// instruments registered on `exchange`.
+fn validate_client_config(
+    instruments: &IndexedInstruments,
+    exchange: ExchangeId,
+    validate: impl FnOnce(&[ClientInstrument<'_>]) -> Result<(), String>,
+) -> Result<(), BarterError> {
+    let instruments = instruments
+        .instruments()
+        .iter()
+        .filter(|keyed| keyed.value.exchange.value == exchange)
+        .map(|keyed| {
+            ClientInstrument::new(&keyed.value.name_exchange, keyed.value.kind.discriminant())
+        })
+        .collect::<Vec<_>>();
+
+    validate(&instruments).map_err(|error| {
+        BarterError::ExecutionBuilder(format!(
+            "{exchange} execution client config is invalid: {error}"
+        ))
+    })
 }
 
 fn join_kinds(kinds: impl Iterator<Item = InstrumentKindDiscriminant>) -> String {
@@ -892,5 +960,92 @@ mod tests {
             1,
             "the offending kind must be deduplicated, got: {message}"
         );
+    }
+
+    /// A client's config check sees the instruments it executes, with their kinds, and not one
+    /// that is merely priced on its venue.
+    #[test]
+    fn client_config_validation_sees_the_instruments_executed_on_its_exchange() {
+        let instruments = instruments_priced_on_another_venue(future());
+
+        let mut seen = Vec::new();
+        validate_client_config(&instruments, EXCHANGE, |instruments| {
+            seen.extend(
+                instruments
+                    .iter()
+                    .map(|instrument| (instrument.name_exchange.clone(), instrument.kind)),
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            seen,
+            [(
+                InstrumentNameExchange::new("spx500_usd"),
+                InstrumentKindDiscriminant::Future
+            )]
+        );
+
+        validate_client_config(&instruments, DATA_VENUE, |instruments| {
+            assert!(instruments.is_empty(), "{instruments:?}");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_rejected_client_config_fails_the_build_naming_the_exchange() {
+        let error = validate_client_config(&instruments(InstrumentKind::Spot), EXCHANGE, |_| {
+            Err("contract \"X\" is wrong".to_owned())
+        })
+        .unwrap_err();
+
+        let BarterError::ExecutionBuilder(message) = error else {
+            panic!("expected an ExecutionBuilder error, got {error:?}")
+        };
+        assert!(message.contains(EXCHANGE.as_str()), "{message}");
+        assert!(message.contains("contract \"X\" is wrong"), "{message}");
+    }
+
+    /// A failed `ExecutionManager` build aborts the mock exchanges spawned before it, rather than
+    /// leaving them running detached.
+    #[tokio::test]
+    async fn init_aborts_spawned_mock_exchanges_when_an_execution_build_fails() {
+        /// Sets its flag when dropped, which an aborted task does to the future it was running.
+        struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = SetOnDrop(Arc::clone(&dropped));
+        let mock_exchange: RunFuture = Box::pin(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let failing_init: ExecutionInitFuture =
+            Box::pin(async { Err(ExecutionError::Config("fixture".to_owned())) });
+
+        let result = ExecutionBuildFutures {
+            mock_exchange_run_futures: vec![mock_exchange],
+            execution_init_futures: vec![failing_init],
+        }
+        .init()
+        .await;
+        assert!(matches!(
+            result,
+            Err(BarterError::Execution(ExecutionError::Config(_)))
+        ));
+
+        // An abort takes effect when the runtime next reaches the task, so let it run.
+        for _ in 0..100 {
+            if dropped.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("the mock exchange task was left running after the build failed");
     }
 }

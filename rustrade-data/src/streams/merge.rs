@@ -44,16 +44,14 @@ use std::{
 ///
 /// # ⚠️ Inputs must be able to progress independently
 /// The corollary of the pace rule is that **an input which cannot make progress stalls the whole
-/// merge, permanently and silently**. The inputs are also collected eagerly here, so every one of
-/// them starts as soon as this function is called rather than when it is first polled.
+/// merge, permanently and silently**. The inputs are also collected eagerly here, though a stream
+/// that starts its work on first poll still starts it only when the merge is first polled.
 ///
-/// The reachable case is
-/// [`stream_blocking_iter`](super::blocking::stream_blocking_iter), which takes a blocking-pool
-/// thread per input at construction and holds it for the whole decode. Tokio's pool defaults to
-/// `max_blocking_threads: 512`, so beyond 512 inputs the surplus decoders never get a thread, stay
-/// `Pending`, and hold the merge `Pending` — which stops the running decodes being drained, so none
-/// of them releases a thread either. Nothing errors and nothing logs. See that function's
-/// `# ⚠️ One blocking thread per call` section for the ways out.
+/// An input that holds a shared, bounded resource while it waits to be drained is the case to
+/// avoid: once the resource runs out, the inputs left without it stay `Pending`, the merge stays
+/// `Pending`, and the inputs holding it are never drained and never release it.
+/// [`stream_blocking_iter`](super::blocking::stream_blocking_iter) holds a blocking-pool thread only
+/// while decoding a chunk, not while waiting, so any number of its streams can be merged.
 ///
 /// # Errors
 /// The item type is a `Result` so that fallible sources (file decoders, paginated fetches) compose
@@ -228,6 +226,7 @@ where
 #[allow(clippy::unwrap_used)] // Test code: panicking on a bad fixture is acceptable
 mod tests {
     use super::*;
+    use crate::streams::blocking::stream_blocking_iter;
     use crate::{event::DataKind, subscription::trade::PublicTrade};
     use rust_decimal_macros::dec;
     use rustrade_instrument::{Side, instrument::InstrumentIndex};
@@ -278,6 +277,46 @@ mod tests {
         merge_time_sorted(inputs.into_iter().map(futures::stream::iter))
             .collect::<Vec<_>>()
             .await
+    }
+
+    /// The composition `stream_blocking_iter`'s rustdoc describes: more blocking inputs than the
+    /// pool has threads. A merge cannot emit until every input has buffered an event, so if each
+    /// input held a thread while waiting to be drained, the inputs left without one would hold the
+    /// merge, and so the running ones, forever. Each holds a thread only while decoding a chunk, so
+    /// the merge completes.
+    #[test]
+    fn a_merge_of_more_blocking_inputs_than_blocking_threads_completes() {
+        const THREADS: usize = 4;
+        const INPUTS: usize = 3 * THREADS + 1;
+        const EVENTS: usize = 20;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(THREADS)
+            .enable_time()
+            .build()
+            .unwrap();
+
+        let merged = runtime.block_on(async {
+            let inputs = (0..INPUTS).map(|instrument| {
+                // Chunks of 2 over 20 events, so every input needs several chunks.
+                stream_blocking_iter(2, move || {
+                    Ok::<_, TestError>(
+                        (0..EVENTS).map(move |secs| item(instrument, i64::try_from(secs).unwrap())),
+                    )
+                })
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                merge_time_sorted(inputs).collect::<Vec<_>>(),
+            )
+            .await
+        });
+
+        let Ok(merged) = merged else {
+            panic!("the merge deadlocked");
+        };
+        assert_eq!(observed(&merged).len(), INPUTS * EVENTS);
     }
 
     #[tokio::test]

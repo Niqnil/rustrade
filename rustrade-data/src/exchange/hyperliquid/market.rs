@@ -1,3 +1,23 @@
+//! The coin a Hyperliquid subscription names its market by.
+//!
+//! # Which instrument to subscribe with
+//!
+//! A [`MarketInstrumentData`] is subscribed by its `name_exchange` verbatim, so it works for every
+//! market. Build it with [`MarketInstrumentData::hyperliquid_perp`] or
+//! [`MarketInstrumentData::hyperliquid_spot`] from a
+//! [`HyperliquidMeta`](super::HyperliquidMeta) lookup.
+//!
+//! A [`MarketDataInstrument`] (or one [`Keyed`] over it) derives the coin from its asset names,
+//! which are stored lower-cased, so the venue's case is lost before the coin is built:
+//! - A perpetual's coin is the base asset upper-cased. That is right for most perpetuals (`BTC`),
+//!   but wrong for a mixed-case one (`kPEPE` becomes `KPEPE`) and for a builder-deployed (HIP-3)
+//!   one, whose deployer is lower-case (`xyz:TSLA` becomes `XYZ:TSLA`).
+//! - A spot pair's coin is `BASE/QUOTE` upper-cased, which names only PURR/USDC. Every other pair
+//!   is named `@{index}`; pass that as the base asset (`@107`) to subscribe to it.
+//!
+//! A wrong coin gets no data, and Hyperliquid then closes the connection, ending the other
+//! subscriptions on it too.
+
 use super::{Hyperliquid, HyperliquidSpot};
 use crate::{Identifier, instrument::MarketInstrumentData, subscription::Subscription};
 use rustrade_instrument::{
@@ -6,10 +26,8 @@ use rustrade_instrument::{
 use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, StrExt, format_smolstr};
 
-/// Hyperliquid market identifier.
-///
-/// For perpetuals, this is just the base asset in uppercase (e.g., "BTC", "ETH").
-/// For spot, this is the pair format (e.g., "PURR/USDC", "HYPE/USDC").
+/// The coin a Hyperliquid subscription names its market by (`BTC`, `kPEPE`, `xyz:TSLA`, `@107`,
+/// `PURR/USDC`).
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize, Serialize)]
 pub struct HyperliquidMarket(pub SmolStr);
 
@@ -46,6 +64,8 @@ impl<InstrumentKey> HyperliquidInstrument for Keyed<InstrumentKey, MarketDataIns
     }
 }
 
+/// The perpetual coin a [`MarketDataInstrument`] names: its base asset, upper-cased. See the
+/// [module docs](self) for the coins this gets wrong.
 fn hyperliquid_market(base: &AssetNameInternal) -> HyperliquidMarket {
     HyperliquidMarket(base.name().to_uppercase_smolstr())
 }
@@ -80,22 +100,17 @@ impl<InstrumentKey, Kind> Identifier<HyperliquidMarket>
     }
 }
 
+/// The spot coin a [`MarketDataInstrument`] names: its base asset if that is an `@{index}`
+/// coin, otherwise `BASE/QUOTE` upper-cased, which names only PURR/USDC. See the
+/// [module docs](self).
 fn hyperliquid_spot_market(
     base: &AssetNameInternal,
     quote: &AssetNameInternal,
 ) -> HyperliquidMarket {
     let base_name = base.name();
-    // Hyperliquid spot WebSocket uses "@index" format for all spot markets
-    // (e.g., "@0" for PURR, "@107" for HYPE). Use SpotMetaResolver to map
-    // token names to indices. If base already starts with "@", use it directly.
     if base_name.starts_with('@') {
         HyperliquidMarket(SmolStr::new(base_name))
     } else {
-        // WARNING: This fallback produces "BASE/QUOTE" literal strings, which only
-        // work for PURR/USDC (the sole exception that uses literal pair name).
-        // All other spot pairs must be resolved via SpotMetaResolver to "@{index}"
-        // format before calling — otherwise the subscription will silently receive
-        // no data.
         HyperliquidMarket(format_smolstr!(
             "{}/{}",
             base_name.to_uppercase_smolstr(),
@@ -109,5 +124,64 @@ impl<InstrumentKey, Kind> Identifier<HyperliquidMarket>
 {
     fn id(&self) -> HyperliquidMarket {
         HyperliquidMarket(self.instrument.name_exchange.name().clone())
+    }
+}
+
+#[cfg(test)]
+// Test code: panics on bad input are acceptable
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use crate::subscription::trade::PublicTrades;
+    use rustrade_instrument::{
+        hyperliquid::{Perps, SpotPairs},
+        instrument::market_data::kind::MarketDataInstrumentKind,
+    };
+
+    fn market<Exchange, Instrument>(exchange: Exchange, instrument: Instrument) -> String
+    where
+        Subscription<Exchange, Instrument, PublicTrades>: Identifier<HyperliquidMarket>,
+    {
+        Subscription::new(exchange, instrument, PublicTrades)
+            .id()
+            .0
+            .to_string()
+    }
+
+    #[test]
+    fn a_market_instrument_data_subscribes_by_the_venue_spelling() {
+        let perps: Perps =
+            serde_json::from_str(r#"{"universe": [{"name": "kPEPE"}, {"name": "xyz:TSLA"}]}"#)
+                .unwrap();
+        let spot_pairs: SpotPairs = serde_json::from_str(
+            r#"{
+                "universe": [{"name": "@107", "tokens": [150, 0], "index": 107}],
+                "tokens": [{"name": "USDC", "szDecimals": 8, "index": 0}, {"name": "HYPE", "szDecimals": 2, "index": 150}]
+            }"#,
+        )
+        .unwrap();
+
+        for (name, coin) in [("KPEPE", "kPEPE"), ("XYZ:TSLA", "xyz:TSLA")] {
+            let perp = MarketInstrumentData::hyperliquid_perp(0, perps.get(name).unwrap());
+            assert_eq!(perp.kind, MarketDataInstrumentKind::Perpetual);
+            assert_eq!(market(Hyperliquid, perp), coin);
+        }
+        let hype =
+            MarketInstrumentData::hyperliquid_spot(0, spot_pairs.find("hype", "usdc").unwrap());
+        assert_eq!(hype.kind, MarketDataInstrumentKind::Spot);
+        assert_eq!(market(HyperliquidSpot, hype), "@107");
+    }
+
+    #[test]
+    fn a_market_data_instrument_loses_the_venue_case() {
+        // Documented limitation: asset names are stored lower-cased.
+        let perp =
+            |base| MarketDataInstrument::new(base, "usdc", MarketDataInstrumentKind::Perpetual);
+        assert_eq!(market(Hyperliquid, perp("btc")), "BTC");
+        assert_eq!(market(Hyperliquid, perp("kPEPE")), "KPEPE");
+
+        let spot = |base| MarketDataInstrument::new(base, "usdc", MarketDataInstrumentKind::Spot);
+        assert_eq!(market(HyperliquidSpot, spot("purr")), "PURR/USDC");
+        assert_eq!(market(HyperliquidSpot, spot("@107")), "@107");
     }
 }

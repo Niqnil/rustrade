@@ -12,17 +12,25 @@ use crate::order::{
     id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
     state::{Cancelled, Filled, Open, OrderState},
 };
-use crate::{InstrumentAccountSnapshot, UnindexedAccountEvent, position::PositionReport};
+use crate::{
+    InstrumentAccountSnapshot, UnindexedAccountEvent,
+    balance::{AssetBalance, Balance},
+    position::PositionReport,
+};
 use chrono::{DateTime, TimeZone, Utc};
 use futures::Stream;
+use hyperliquid_rust_sdk::{ExchangeDataStatus, ExchangeResponseStatus};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
-    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
+    Side,
+    asset::name::AssetNameExchange,
+    exchange::ExchangeId,
+    hyperliquid::{CoinKind, SpotPair},
     instrument::name::InstrumentNameExchange,
 };
 use serde::de::DeserializeOwned;
 use smol_str::format_smolstr;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::task::{Context, Poll};
@@ -111,21 +119,83 @@ pub struct UserFill {
     pub fee_token: Option<String>,
 }
 
-/// Fetch `userFills` for `address`, parsing it into [`UserFill`] rather than the SDK's lossy type.
+/// The span `start..=end` in epoch milliseconds, as `userFillsByTime` takes it, or `None` when it
+/// is empty or ends before the epoch. Fill times are whole milliseconds, read from the
+/// millisecond holding `start`; the caller applies the exact span to the fills it reads.
+pub(super) fn span_millis(start: DateTime<Utc>, end: DateTime<Utc>) -> Option<(u64, u64)> {
+    if start > end {
+        return None;
+    }
+    let end_ms = u64::try_from(end.timestamp_millis()).ok()?;
+    let start_ms = u64::try_from(start.timestamp_millis()).unwrap_or(0);
+    Some((start_ms, end_ms))
+}
+
+/// The most fills one `userFillsByTime` response holds.
+const USER_FILLS_PER_RESPONSE: usize = 2_000;
+
+/// Read every fill `address` made from `start_ms` to `end_ms`, both inclusive, in epoch
+/// milliseconds, parsed into [`UserFill`] rather than the SDK's lossy type.
 ///
-/// Issued through the SDK's own [`HttpClient`](hyperliquid_rust_sdk::InfoClient::http_client), so
-/// base URL, TLS configuration and error type are exactly those of every other info request this
-/// client makes — only the response type differs.
+/// `userFillsByTime` returns at most 2,000 fills per response, oldest
+/// first, with both bounds inclusive (observed on mainnet, 2026-10-05). A full response is
+/// followed by a read from its last fill's time, which returns again the fills at that
+/// millisecond already read; those are dropped by coin and `tid`. Hyperliquid keeps only each
+/// wallet's 10,000 most recent fills, so the whole read is a handful of requests, and it cannot
+/// reach a fill older than those.
+///
+/// `userFills`, which takes no span, is not used: it returns only the 2,000 most recent fills, so
+/// a span holding more would come back short without saying so.
 ///
 /// # Errors
 ///
-/// Returns a transport error if the POST fails, or a parse error if the response does not match
+/// Returns a transport error if a POST fails, or a parse error if a response does not match
 /// [`UserFill`] — which includes the case where `tid` has stopped being sent.
-pub async fn user_fills(
+/// [`Truncated`](UnindexedClientError::Truncated) when a full response holds only fills at the
+/// millisecond it was read from, so the read cannot advance.
+pub async fn user_fills_by_time(
     info_client: &hyperliquid_rust_sdk::InfoClient,
     address: ethers::types::H160,
+    start_ms: u64,
+    end_ms: u64,
 ) -> Result<Vec<UserFill>, UnindexedClientError> {
-    user_info(info_client, "userFills", address).await
+    let mut fills: Vec<UserFill> = Vec::new();
+    let mut from = start_ms;
+    loop {
+        // `{:?}` on H160 renders the full checksummed form; see `user_info`.
+        let body = format!(
+            r#"{{"type":"userFillsByTime","user":"{address:?}","startTime":{from},"endTime":{end_ms}}}"#
+        );
+        let page: Vec<UserFill> = info(info_client, "userFillsByTime", body).await?;
+        let full = page.len() >= USER_FILLS_PER_RESPONSE;
+        let Some(last_time) = page.last().map(|fill| fill.time) else {
+            break;
+        };
+        // The fills at `from` that the previous response already returned: a few at most, since
+        // they share one millisecond.
+        let seen: Vec<(String, u64)> = fills
+            .iter()
+            .rev()
+            .take_while(|fill| fill.time == from)
+            .map(|fill| (fill.coin.clone(), fill.tid))
+            .collect();
+        fills.extend(page.into_iter().filter(|fill| {
+            fill.time != from
+                || !seen
+                    .iter()
+                    .any(|(coin, tid)| *tid == fill.tid && *coin == fill.coin)
+        }));
+        if !full {
+            break;
+        }
+        if last_time <= from {
+            return Err(UnindexedClientError::Truncated {
+                fills_read: fills.len(),
+            });
+        }
+        from = last_time;
+    }
+    Ok(fills)
 }
 
 /// One order from the `openOrders` info endpoint, as the venue actually returns it.
@@ -173,23 +243,36 @@ pub async fn open_orders(
     info_client: &hyperliquid_rust_sdk::InfoClient,
     address: ethers::types::H160,
 ) -> Result<Vec<OpenOrder>, UnindexedClientError> {
-    user_info(info_client, "openOrders", address).await
+    user_info(info_client, "openOrders", address, None).await
 }
 
-/// POST the info request `{"type": kind, "user": address}` and parse the response as `T`.
+/// POST the info request `{"type": kind, "user": address}`, with `"dex": dex` when `dex` names a
+/// builder-deployed (HIP-3) perpetual DEX, and parse the response as `T`.
 ///
 /// Issued through the SDK's own [`HttpClient`](hyperliquid_rust_sdk::InfoClient::http_client), so
 /// base URL, TLS configuration and error type are exactly those of every other info request this
 /// client makes — only the response type differs.
-async fn user_info<T: DeserializeOwned>(
+pub(super) async fn user_info<T: DeserializeOwned>(
     info_client: &hyperliquid_rust_sdk::InfoClient,
     kind: &str,
     address: ethers::types::H160,
+    dex: Option<&str>,
 ) -> Result<T, UnindexedClientError> {
     // `{:?}` on H160 renders the checksummed 0x-prefixed form the endpoint expects. `Display`
     // abbreviates the middle of the address ("0x1234…5678"), so it must not be used here.
-    let body = format!(r#"{{"type":"{kind}","user":"{address:?}"}}"#);
+    let mut body = serde_json::json!({"type": kind, "user": format!("{address:?}")});
+    if let Some(dex) = dex {
+        body["dex"] = dex.into();
+    }
+    info(info_client, kind, body.to_string()).await
+}
 
+/// POST the info request `body`, of type `kind`, and parse the response as `T`.
+pub(super) async fn info<T: DeserializeOwned>(
+    info_client: &hyperliquid_rust_sdk::InfoClient,
+    kind: &str,
+    body: String,
+) -> Result<T, UnindexedClientError> {
     let raw = info_client
         .http_client
         .post("/info", body)
@@ -200,6 +283,23 @@ async fn user_info<T: DeserializeOwned>(
     // change or a venue-side regression, not a transient fault, and retrying will not fix it.
     serde_json::from_str(&raw).map_err(|e| {
         UnindexedClientError::Internal(format!("Hyperliquid {kind} response did not parse: {e}"))
+    })
+}
+
+/// Each spot token balance in `balances` (`spotClearinghouseState`), free of what is on hold.
+pub(super) fn spot_balances<'a>(
+    balances: impl IntoIterator<Item = &'a hyperliquid_rust_sdk::UserTokenBalance>,
+    now: DateTime<Utc>,
+) -> impl Iterator<Item = AssetBalance<AssetNameExchange>> {
+    balances.into_iter().map(move |balance| {
+        let total = parse_decimal(&balance.total, "total").unwrap_or(Decimal::ZERO);
+        let hold = parse_decimal(&balance.hold, "hold").unwrap_or(Decimal::ZERO);
+        let free = (total - hold).max(Decimal::ZERO);
+        AssetBalance::new(
+            AssetNameExchange::from(balance.coin.as_str()),
+            Balance::new(total, free),
+            now,
+        )
     })
 }
 
@@ -382,6 +482,25 @@ pub(super) fn order_update_to_account_event(
     exchange: ExchangeId,
     instrument: InstrumentNameExchange,
 ) -> Option<UnindexedAccountEvent> {
+    let snapshot = order_update_to_order(update, exchange, instrument)?;
+    Some(crate::AccountEvent::new(
+        exchange,
+        crate::AccountEventKind::OrderSnapshot(
+            rustrade_integration::collection::snapshot::Snapshot(snapshot),
+        ),
+    ))
+}
+
+/// Convert an order record, as `orderUpdates` sends it and `orderStatus` answers with it, into the
+/// order it describes on `instrument`, keyed as [`record_cid`] says.
+///
+/// `None`, with a `warn!` naming the cause where the parse helpers do not, when a field does not
+/// parse or the status is not one [`OrderStatus::classify`] recognises.
+pub(super) fn order_update_to_order(
+    update: &hyperliquid_rust_sdk::OrderUpdate,
+    exchange: ExchangeId,
+    instrument: InstrumentNameExchange,
+) -> Option<UnindexedOrderSnapshot> {
     let order = &update.order;
     let Some(status) = OrderStatus::classify(&update.status) else {
         warn!(%exchange, status = %update.status, oid = order.oid, "Unknown Hyperliquid order status - ignoring the update");
@@ -413,8 +532,9 @@ pub(super) fn order_update_to_account_event(
             orig_sz,
             None, // The update does not carry the average price.
         )),
+        // An unparseable remaining size leaves the fill unknown, not the cancel.
         OrderStatus::Cancelled => {
-            OrderState::inactive(Cancelled::new(order_id, time_exchange, filled_quantity()?))
+            OrderState::inactive(Cancelled::new(order_id, time_exchange, filled_quantity()))
         }
         OrderStatus::Rejected => OrderState::inactive(OrderError::Rejected(
             ApiError::OrderRejected(update.status.clone()),
@@ -422,7 +542,7 @@ pub(super) fn order_update_to_account_event(
     };
 
     // The update carries neither the order's kind nor its time in force.
-    let snapshot: UnindexedOrderSnapshot = Order {
+    Some(Order {
         key: OrderKey {
             exchange,
             instrument,
@@ -435,14 +555,7 @@ pub(super) fn order_update_to_account_event(
         kind: OrderKind::Limit,
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         state,
-    };
-
-    Some(crate::AccountEvent::new(
-        exchange,
-        crate::AccountEventKind::OrderSnapshot(
-            rustrade_integration::collection::snapshot::Snapshot(snapshot),
-        ),
-    ))
+    })
 }
 
 pub fn parse_decimal(value: &str, field: &str) -> Option<Decimal> {
@@ -472,46 +585,6 @@ pub fn parse_side(side: &str) -> Option<Side> {
 pub fn millis_to_datetime(millis: u64) -> Option<DateTime<Utc>> {
     Utc.timestamp_millis_opt(i64::try_from(millis).ok()?)
         .single()
-}
-
-/// Round a price to 5 significant figures (Hyperliquid requirement).
-///
-/// Performs rounding using `Decimal` arithmetic to avoid floating-point precision
-/// errors. The final `f64` conversion happens only at the SDK interface boundary.
-pub fn round_to_5_sig_figs(value: Decimal) -> f64 {
-    use rust_decimal::prelude::ToPrimitive;
-
-    if value.is_zero() {
-        return 0.0;
-    }
-
-    // Use f64 only for computing magnitude (acceptable precision for this purpose;
-    // we only need to know which power of 10 the number is close to).
-    let abs_f = value.abs().to_f64().unwrap_or(0.0);
-    if abs_f == 0.0 {
-        return 0.0;
-    }
-
-    // Clamp magnitude to prevent overflow when computing scale factor
-    #[allow(clippy::cast_possible_truncation)]
-    let magnitude = abs_f.log10().floor().clamp(-30.0, 30.0) as i32;
-
-    // Round using Decimal arithmetic to preserve precision
-    let rounded = if magnitude >= 4 {
-        // Large numbers (e.g., 123456): scale down, round integer, scale back up
-        // Safety: magnitude >= 4 guarantees (magnitude - 4) is non-negative
-        #[allow(clippy::cast_sign_loss)]
-        let factor = Decimal::from(10i64.pow((magnitude - 4) as u32));
-        (value / factor).round() * factor
-    } else {
-        // Small/medium numbers: round to appropriate decimal places
-        #[allow(clippy::cast_sign_loss)]
-        let dp = (4 - magnitude) as u32;
-        value.round_dp(dp)
-    };
-
-    // SDK requires f64 — convert only at the interface boundary
-    rounded.to_f64().unwrap_or(0.0)
 }
 
 /// Map rustrade TimeInForce to Hyperliquid TIF string.
@@ -563,6 +636,34 @@ pub fn cloid_to_cid(cloid: &str) -> Option<ClientOrderId> {
     Some(ClientOrderId::new(format_smolstr!("{}", uuid.hyphenated())))
 }
 
+/// Whether Hyperliquid applied a cancel of one order, read from its answer: `Err` with the reason
+/// when it did not.
+///
+/// Hyperliquid answers a cancel it could not apply with a top-level `ok`, and puts the error in
+/// the order's own status ("Order was never placed, already canceled, or filled.", for one), so
+/// the top level alone does not say. Only a `success` status is a cancel. An answer carrying no
+/// status, or another kind of status, is not taken as one either: the order may still be working.
+/// A cancel names one order, so only the first status is read.
+///
+/// The reason is not classified. Hyperliquid's message says the order was never placed, already
+/// cancelled, or filled, without saying which, so naming it already cancelled or already filled
+/// would be a guess. A caller learns how the order ended from the account stream or a lookup.
+pub(super) fn cancel_outcome(response: ExchangeResponseStatus) -> Result<(), String> {
+    let response = match response {
+        ExchangeResponseStatus::Ok(response) => response,
+        ExchangeResponseStatus::Err(reason) => return Err(reason),
+    };
+    match response
+        .data
+        .and_then(|data| data.statuses.into_iter().next())
+    {
+        Some(ExchangeDataStatus::Success) => Ok(()),
+        Some(ExchangeDataStatus::Error(reason)) => Err(reason),
+        Some(status) => Err(format!("cancel answered with status {status:?}")),
+        None => Err("cancel answered without a status for the order".to_owned()),
+    }
+}
+
 /// The client id to report a venue order record under, given the record's `cloid` and `oid`.
 ///
 /// Every order this client places carries a cloid ([`cid_to_cloid`]), so a record with one is
@@ -585,42 +686,49 @@ pub(super) fn record_cid(cloid: Option<&str>, oid: u64) -> Option<ClientOrderId>
     }
 }
 
-/// Build perp instrument name from Hyperliquid coin name (e.g., "BTC" -> "BTC-USD-PERP").
-pub fn perp_coin_to_instrument(coin: &str) -> InstrumentNameExchange {
-    InstrumentNameExchange::from(format_smolstr!("{}-USD-PERP", coin))
+/// Whether `coin` names a market of a kind [`CoinKind::of`] does not recognise.
+fn is_unknown_coin(coin: &str) -> bool {
+    !matches!(CoinKind::of(coin), CoinKind::Perp | CoinKind::Spot)
 }
 
-/// Extract coin name from perp instrument (e.g., "BTC-USD-PERP" -> "BTC").
-///
-/// Returns `String` because Hyperliquid SDK requires `String` for asset fields.
-pub fn instrument_to_perp_coin(instrument: &InstrumentNameExchange) -> String {
-    let s = instrument.as_ref();
-    // Expected format: "COIN-USD-PERP" or just "COIN"
-    match s.split_once('-') {
-        Some((coin, _)) => coin.to_string(),
-        None => s.to_string(),
+/// Log with one `warn!` the distinct coins among `coins` of a kind [`CoinKind::of`] does not
+/// recognise, which neither client reports. For a read that lists many rows at once.
+pub(super) fn warn_unknown_coins<'a>(coins: impl IntoIterator<Item = &'a str>) {
+    let unknown: BTreeSet<&str> = coins
+        .into_iter()
+        .filter(|coin| is_unknown_coin(coin))
+        .collect();
+    if !unknown.is_empty() {
+        warn!(
+            ?unknown,
+            "Hyperliquid coins name markets of an unrecognised kind; leaving them out"
+        );
     }
 }
 
-/// Build spot instrument name from Hyperliquid coin pair (e.g., "PURR/USDC" -> "PURR-USDC-SPOT").
-///
-/// # Panics (debug builds only)
-///
-/// Debug-asserts if `coin` does not contain '/' — callers must verify `is_spot_coin()`
-/// before calling. The fallback path produces a malformed instrument name.
-pub fn spot_coin_to_instrument(coin: &str) -> InstrumentNameExchange {
-    match coin.split_once('/') {
-        Some((base, quote)) => {
-            InstrumentNameExchange::from(format_smolstr!("{}-{}-SPOT", base, quote))
-        }
-        None => {
-            debug_assert!(
-                false,
-                "spot_coin_to_instrument called with non-spot coin: {coin}"
+/// The coins of a kind [`CoinKind::of`] does not recognise that an account stream has logged, so
+/// it logs each once rather than on every event.
+#[derive(Debug, Default)]
+pub(super) struct UnknownCoins(HashSet<String>);
+
+impl UnknownCoins {
+    /// Log `coin` with `warn!` if it is of an unrecognised kind and not logged before.
+    pub(super) fn warn_once(&mut self, coin: &str) {
+        if is_unknown_coin(coin) && !self.0.contains(coin) {
+            warn!(
+                %coin,
+                "Hyperliquid coin names a market of an unrecognised kind; leaving it out \
+                 (logged once per stream)"
             );
-            InstrumentNameExchange::from(format_smolstr!("{}-SPOT", coin))
+            self.0.insert(coin.to_owned());
         }
     }
+}
+
+/// Build the spot instrument name for `pair`, from its tokens: `BASE-QUOTE-SPOT` (e.g.
+/// `HYPE-USDC-SPOT` for the pair Hyperliquid names `@107`).
+pub fn spot_pair_to_instrument(pair: &SpotPair) -> InstrumentNameExchange {
+    InstrumentNameExchange::from(format_smolstr!("{}-{}-SPOT", pair.base(), pair.quote()))
 }
 
 /// Extract coin pair from spot instrument (e.g., "PURR-USDC-SPOT" -> "PURR/USDC").
@@ -628,22 +736,18 @@ pub fn spot_coin_to_instrument(coin: &str) -> InstrumentNameExchange {
 /// Returns `Option<String>` — `None` if the instrument doesn't match expected
 /// `BASE-QUOTE-SPOT` format. Callers should fail fast on `None` rather than
 /// send a malformed asset to the exchange.
+///
+/// The SDK's `ExchangeClient` addresses every spot pair by this `BASE/QUOTE` form as well as by
+/// the coin Hyperliquid names it (`@107`), so orders can be placed with it.
 pub fn instrument_to_spot_coin(instrument: &InstrumentNameExchange) -> Option<String> {
-    let s = instrument.as_ref();
-    // Expected format: "BASE-QUOTE-SPOT" -> "BASE/QUOTE"
-    let without_suffix = s.strip_suffix("-SPOT")?;
-    let (base, quote) = without_suffix.split_once('-')?;
-    Some(format!("{}/{}", base, quote))
+    let (base, quote) = spot_base_quote(instrument)?;
+    Some(format!("{base}/{quote}"))
 }
 
-/// Check if a Hyperliquid coin name is a spot pair (contains '/').
-///
-/// Hyperliquid API uses pair format `"BASE/QUOTE"` (e.g., `"PURR/USDC"`) for spot coins
-/// and single symbols (e.g., `"BTC"`) for perpetuals. This naming convention is observed
-/// across all SDK examples and test fixtures. The invariant is validated by our spot
-/// fixture tests in `hyperliquid_spot_execution.rs`.
-pub fn is_spot_coin(coin: &str) -> bool {
-    coin.contains('/')
+/// The base and quote tokens of a spot instrument named `BASE-QUOTE-SPOT`, `None` for a name of
+/// another form.
+pub(super) fn spot_base_quote(instrument: &InstrumentNameExchange) -> Option<(&str, &str)> {
+    instrument.as_ref().strip_suffix("-SPOT")?.split_once('-')
 }
 
 #[cfg(test)]
@@ -681,34 +785,81 @@ mod tests {
     }
 
     #[test]
-    fn test_perp_coin_to_instrument() {
-        let inst = perp_coin_to_instrument("BTC");
-        assert_eq!(inst.as_ref(), "BTC-USD-PERP");
+    fn test_spot_pair_to_instrument() {
+        let pairs = super::super::spot_coins::test_spot_pairs();
+        let instrument = |coin| spot_pair_to_instrument(pairs.get(coin).unwrap());
 
-        let inst = perp_coin_to_instrument("ETH");
-        assert_eq!(inst.as_ref(), "ETH-USD-PERP");
+        assert_eq!(instrument("PURR/USDC").as_ref(), "PURR-USDC-SPOT");
+        assert_eq!(instrument("@107").as_ref(), "HYPE-USDC-SPOT");
+        assert_eq!(instrument("@207").as_ref(), "HYPE-USDT0-SPOT");
     }
 
     #[test]
-    fn test_instrument_to_perp_coin() {
-        let coin = instrument_to_perp_coin(&InstrumentNameExchange::from("BTC-USD-PERP"));
-        assert_eq!(coin, "BTC");
+    fn unknown_coins_are_recorded_once_and_known_ones_never() {
+        let mut unknown = UnknownCoins::default();
+        for coin in ["#12", "#12", "BTC", "@107", "PURR/USDC", "+3"] {
+            unknown.warn_once(coin);
+        }
+        assert_eq!(
+            unknown.0,
+            HashSet::from(["#12".to_owned(), "+3".to_owned()])
+        );
+    }
 
-        let coin = instrument_to_perp_coin(&InstrumentNameExchange::from("ETH-USD-PERP"));
-        assert_eq!(coin, "ETH");
-
-        // Just coin name without suffix
-        let coin = instrument_to_perp_coin(&InstrumentNameExchange::from("SOL"));
-        assert_eq!(coin, "SOL");
+    /// [`info_tests::cancel_answer`] as the SDK reads it.
+    fn cancel_answer(statuses: serde_json::Value) -> ExchangeResponseStatus {
+        serde_json::from_value(info_tests::cancel_answer(statuses)).unwrap()
     }
 
     #[test]
-    fn test_spot_coin_to_instrument() {
-        let inst = spot_coin_to_instrument("PURR/USDC");
-        assert_eq!(inst.as_ref(), "PURR-USDC-SPOT");
+    fn only_a_success_status_is_a_cancel() {
+        assert_eq!(
+            cancel_outcome(cancel_answer(serde_json::json!(["success"]))),
+            Ok(())
+        );
+    }
 
-        let inst = spot_coin_to_instrument("HYPE/USDC");
-        assert_eq!(inst.as_ref(), "HYPE-USDC-SPOT");
+    /// The exchange endpoint documentation's own example of a cancel that was not applied.
+    #[test]
+    fn an_error_status_under_a_top_level_ok_is_not_a_cancel() {
+        let answer = cancel_answer(serde_json::json!([
+            {"error": info_tests::CANCEL_NOT_APPLIED}
+        ]));
+        assert_eq!(
+            cancel_outcome(answer),
+            Err(info_tests::CANCEL_NOT_APPLIED.to_owned())
+        );
+    }
+
+    #[test]
+    fn an_answer_without_a_success_status_is_not_a_cancel() {
+        let no_data: ExchangeResponseStatus = serde_json::from_value(serde_json::json!({
+            "status": "ok",
+            "response": {"type": "cancel"},
+        }))
+        .unwrap();
+        let answers = [
+            no_data,
+            cancel_answer(serde_json::json!([])),
+            cancel_answer(serde_json::json!([{"resting": {"oid": 1}}])),
+        ];
+        for answer in answers {
+            let outcome = cancel_outcome(answer.clone());
+            assert!(outcome.is_err(), "{answer:?} read as {outcome:?}");
+        }
+    }
+
+    #[test]
+    fn a_top_level_error_is_not_a_cancel() {
+        let answer: ExchangeResponseStatus = serde_json::from_value(serde_json::json!({
+            "status": "err",
+            "response": "User or API Wallet does not exist.",
+        }))
+        .unwrap();
+        assert_eq!(
+            cancel_outcome(answer),
+            Err("User or API Wallet does not exist.".to_owned())
+        );
     }
 
     #[test]
@@ -721,31 +872,13 @@ mod tests {
 
         // Malformed instruments return None
         assert_eq!(
-            instrument_to_spot_coin(&InstrumentNameExchange::from("BTC-USD-PERP")),
+            instrument_to_spot_coin(&InstrumentNameExchange::from("BTC-USDC-PERP")),
             None
         );
         assert_eq!(
             instrument_to_spot_coin(&InstrumentNameExchange::from("INVALID")),
             None
         );
-    }
-
-    #[test]
-    fn test_is_spot_coin() {
-        assert!(is_spot_coin("PURR/USDC"));
-        assert!(is_spot_coin("HYPE/USDC"));
-        assert!(!is_spot_coin("BTC"));
-        assert!(!is_spot_coin("ETH"));
-    }
-
-    #[test]
-    fn test_round_to_5_sig_figs() {
-        assert_eq!(round_to_5_sig_figs(dec!(0)), 0.0);
-        assert_eq!(round_to_5_sig_figs(dec!(12345)), 12345.0);
-        assert_eq!(round_to_5_sig_figs(dec!(123456)), 123460.0);
-        assert_eq!(round_to_5_sig_figs(dec!(0.00012345)), 0.00012345);
-        assert_eq!(round_to_5_sig_figs(dec!(0.000123456)), 0.00012346);
-        assert_eq!(round_to_5_sig_figs(dec!(1.23456789)), 1.2346);
     }
 
     #[test]
@@ -776,7 +909,7 @@ mod tests {
 #[cfg(test)]
 // Test code: panics on bad input are acceptable
 #[allow(clippy::unwrap_used)]
-mod info_tests {
+pub(super) mod info_tests {
     use super::*;
     use rust_decimal_macros::dec;
     use wiremock::matchers::{method, path};
@@ -804,7 +937,9 @@ mod info_tests {
 
     /// Build an `InfoClient` pointed at `uri`. `InfoClient::new` opens no connection -- it only
     /// fills in the struct -- so this costs nothing and touches no network.
-    async fn info_client_against(uri: String) -> hyperliquid_rust_sdk::InfoClient {
+    pub(in crate::client::hyperliquid) async fn info_client_against(
+        uri: String,
+    ) -> hyperliquid_rust_sdk::InfoClient {
         let mut client = hyperliquid_rust_sdk::InfoClient::new(
             None,
             Some(hyperliquid_rust_sdk::BaseUrl::Localhost),
@@ -814,6 +949,44 @@ mod info_tests {
         client.http_client.base_url = uri;
         client
     }
+
+    /// The wallet clients built in tests sign with. No real server sees what it signs.
+    pub(in crate::client::hyperliquid) fn test_wallet() -> ethers::signers::LocalWallet {
+        "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+            .parse()
+            .unwrap()
+    }
+
+    /// Build an `ExchangeClient` pointed at `uri` that knows the assets in `coin_to_asset`.
+    /// `ExchangeClient::new` would read them over the network instead.
+    pub(in crate::client::hyperliquid) async fn exchange_client_against(
+        uri: String,
+        coin_to_asset: HashMap<String, u32>,
+    ) -> hyperliquid_rust_sdk::ExchangeClient {
+        hyperliquid_rust_sdk::ExchangeClient {
+            http_client: info_client_against(uri).await.http_client,
+            wallet: test_wallet(),
+            meta: hyperliquid_rust_sdk::Meta {
+                universe: Vec::new(),
+            },
+            vault_address: None,
+            coin_to_asset,
+        }
+    }
+
+    /// Hyperliquid's answer to a cancel, as its exchange endpoint sends it, carrying `statuses`.
+    pub(in crate::client::hyperliquid) fn cancel_answer(
+        statuses: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "status": "ok",
+            "response": {"type": "cancel", "data": {"statuses": statuses}},
+        })
+    }
+
+    /// The documentation's example of a cancel Hyperliquid did not apply, under a top-level `ok`.
+    pub(in crate::client::hyperliquid) const CANCEL_NOT_APPLIED: &str =
+        "Order was never placed, already canceled, or filled.";
 
     async fn serve(body: String) -> (MockServer, hyperliquid_rust_sdk::InfoClient) {
         let server = MockServer::start().await;
@@ -830,7 +1003,7 @@ mod info_tests {
     async fn a_fill_carries_the_tid_and_fee_token_the_sdk_type_drops() {
         let (_server, client) = serve(format!("[{DOCUMENTED_FILL}]")).await;
 
-        let fills = user_fills(&client, ethers::types::H160::zero())
+        let fills = user_fills_by_time(&client, ethers::types::H160::zero(), 0, u64::MAX)
             .await
             .unwrap();
 
@@ -858,7 +1031,7 @@ mod info_tests {
         ]"#;
         let (_server, client) = serve(sweep.to_string()).await;
 
-        let fills = user_fills(&client, ethers::types::H160::zero())
+        let fills = user_fills_by_time(&client, ethers::types::H160::zero(), 0, u64::MAX)
             .await
             .unwrap();
 
@@ -873,7 +1046,7 @@ mod info_tests {
         let without = DOCUMENTED_FILL.replace(r#""feeToken": "USDC","#, "");
         let (_server, client) = serve(format!("[{without}]")).await;
 
-        let fills = user_fills(&client, ethers::types::H160::zero())
+        let fills = user_fills_by_time(&client, ethers::types::H160::zero(), 0, u64::MAX)
             .await
             .unwrap();
 
@@ -888,7 +1061,7 @@ mod info_tests {
         let without = DOCUMENTED_FILL.replace(r#""tid": 118906512037719"#, r#""unused": 0"#);
         let (_server, client) = serve(format!("[{without}]")).await;
 
-        let error = user_fills(&client, ethers::types::H160::zero())
+        let error = user_fills_by_time(&client, ethers::types::H160::zero(), 0, u64::MAX)
             .await
             .unwrap_err();
 
@@ -920,7 +1093,119 @@ mod info_tests {
 
         // The mock only answers a body carrying the full address, so reaching `Ok` is the
         // assertion.
-        assert!(user_fills(&client, address).await.unwrap().is_empty());
+        assert!(
+            user_fills_by_time(&client, address, 0, u64::MAX)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// `userFillsByTime` over `fills`, which are sorted by time, as observed on mainnet: both
+    /// bounds inclusive, oldest first, at most [`USER_FILLS_PER_RESPONSE`] per response.
+    struct FillsByTime {
+        fills: Vec<serde_json::Value>,
+    }
+
+    impl wiremock::Respond for FillsByTime {
+        fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["type"], "userFillsByTime");
+            let bound = |name: &str| body[name].as_u64().unwrap();
+            let (start, end) = (bound("startTime"), bound("endTime"));
+            let page: Vec<_> = self
+                .fills
+                .iter()
+                .filter(|fill| (start..=end).contains(&fill["time"].as_u64().unwrap()))
+                .take(USER_FILLS_PER_RESPONSE)
+                .cloned()
+                .collect();
+            ResponseTemplate::new(200).set_body_json(page)
+        }
+    }
+
+    /// `DOCUMENTED_FILL` with `tid` at `time`.
+    fn fill(tid: u64, time: u64) -> serde_json::Value {
+        let mut fill: serde_json::Value = serde_json::from_str(DOCUMENTED_FILL).unwrap();
+        fill["tid"] = tid.into();
+        fill["time"] = time.into();
+        fill
+    }
+
+    async fn serve_fills_by_time(
+        fills: Vec<serde_json::Value>,
+    ) -> (MockServer, hyperliquid_rust_sdk::InfoClient) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/info"))
+            .respond_with(FillsByTime { fills })
+            .mount(&server)
+            .await;
+        let client = info_client_against(server.uri()).await;
+        (server, client)
+    }
+
+    /// A span holding more fills than one response is read completely, each fill once. Three
+    /// fills share each millisecond, so a response ends inside one, and the next, read from that
+    /// millisecond, returns again the fills of it already read.
+    #[tokio::test]
+    async fn a_span_with_more_fills_than_one_response_is_read_whole() {
+        let fills = (0..4_500).map(|tid| fill(tid, 1_000 + tid / 3)).collect();
+        let (server, client) = serve_fills_by_time(fills).await;
+
+        let read = user_fills_by_time(&client, ethers::types::H160::zero(), 0, u64::MAX)
+            .await
+            .unwrap();
+        let tids: Vec<u64> = read.iter().map(|fill| fill.tid).collect();
+        assert_eq!(tids, (0..4_500).collect::<Vec<_>>());
+        assert_eq!(server.received_requests().await.map(|r| r.len()), Some(3));
+
+        // Both bounds are inclusive.
+        let read = user_fills_by_time(&client, ethers::types::H160::zero(), 1_010, 1_019)
+            .await
+            .unwrap();
+        assert_eq!(read.len(), 30);
+    }
+
+    /// A full response of fills all at the millisecond it was read from cannot be read past.
+    #[tokio::test]
+    async fn a_read_that_cannot_advance_is_truncated() {
+        let fills = (0..USER_FILLS_PER_RESPONSE as u64)
+            .map(|tid| fill(tid, 5))
+            .collect();
+        let (_server, client) = serve_fills_by_time(fills).await;
+
+        let error = user_fills_by_time(&client, ethers::types::H160::zero(), 0, u64::MAX)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, UnindexedClientError::Truncated { fills_read: 2_000 }),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_span_is_read_in_whole_milliseconds_and_an_empty_one_not_at_all() {
+        let at = |s: &str| s.parse::<DateTime<Utc>>().unwrap();
+        assert_eq!(
+            span_millis(
+                at("1970-01-01T00:00:01.000900Z"),
+                at("1970-01-01T00:00:02.000900Z")
+            ),
+            Some((1_000, 2_000))
+        );
+        assert_eq!(
+            span_millis(at("1969-12-31T23:59:59Z"), at("1970-01-01T00:00:01Z")),
+            Some((0, 1_000))
+        );
+        assert_eq!(
+            span_millis(at("1970-01-01T00:00:02Z"), at("1970-01-01T00:00:01Z")),
+            None
+        );
+        assert_eq!(
+            span_millis(at("1969-01-01T00:00:00Z"), at("1969-12-31T23:59:59Z")),
+            None
+        );
     }
 
     // ---- client order ids -------------------------------------------------------------------
@@ -1045,7 +1330,7 @@ mod info_tests {
     }
 
     fn eth() -> InstrumentNameExchange {
-        InstrumentNameExchange::from("ETH-USD-PERP")
+        InstrumentNameExchange::from("ETH-USDC-PERP")
     }
 
     #[test]
@@ -1091,7 +1376,23 @@ mod info_tests {
         );
         match order.state {
             OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(cancelled)) => {
-                assert_eq!(cancelled.filled_quantity, dec!(0.0025));
+                assert_eq!(cancelled.filled_quantity, Some(dec!(0.0025)));
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    /// A cancellation whose remaining size does not parse still ends the order, with its fill
+    /// unknown rather than the update dropped.
+    #[test]
+    fn a_cancellation_with_an_unparseable_size_ends_the_order_with_its_fill_unknown() {
+        let update = order_update("canceled", &format!(r#""{CLOID}""#), "not a number");
+        let order = snapshot_of(
+            order_update_to_account_event(&update, ExchangeId::HyperliquidPerp, eth()).unwrap(),
+        );
+        match order.state {
+            OrderState::Inactive(crate::order::state::InactiveOrderState::Cancelled(cancelled)) => {
+                assert_eq!(cancelled.filled_quantity, None);
             }
             other => panic!("expected Cancelled, got {other:?}"),
         }
@@ -1144,7 +1445,7 @@ mod info_tests {
     }
 
     fn perp(coin: &str) -> Option<InstrumentNameExchange> {
-        Some(perp_coin_to_instrument(coin))
+        Some(InstrumentNameExchange::from(format!("{coin}-USDC-PERP")))
     }
 
     #[test]
@@ -1160,7 +1461,7 @@ mod info_tests {
     #[test]
     fn an_open_order_without_its_original_size_is_its_remainder_with_nothing_filled() {
         let row = &rows()[2];
-        let btc = InstrumentNameExchange::from("BTC-USD-PERP");
+        let btc = InstrumentNameExchange::from("BTC-USDC-PERP");
         let order = open_order_to_order(row, ExchangeId::HyperliquidPerp, btc).unwrap();
 
         assert_eq!(order.key.cid, ClientOrderId::new("7003"));
@@ -1170,7 +1471,7 @@ mod info_tests {
 
     #[test]
     fn every_requested_instrument_is_listed_complete_even_with_nothing_open() {
-        let sol = InstrumentNameExchange::from("SOL-USD-PERP");
+        let sol = InstrumentNameExchange::from("SOL-USDC-PERP");
         let mut listing = OpenOrderListing::new(
             &rows(),
             ExchangeId::HyperliquidPerp,
@@ -1199,14 +1500,14 @@ mod info_tests {
             .map(|entry| entry.instrument.to_string())
             .collect::<Vec<_>>();
         instruments.sort();
-        assert_eq!(instruments, ["BTC-USD-PERP", "ETH-USD-PERP"]);
+        assert_eq!(instruments, ["BTC-USDC-PERP", "ETH-USDC-PERP"]);
     }
 
     #[test]
     fn an_order_that_does_not_convert_leaves_only_its_instrument_incomplete() {
         let mut rows = rows();
         rows[1].side = "?".to_string();
-        let btc = InstrumentNameExchange::from("BTC-USD-PERP");
+        let btc = InstrumentNameExchange::from("BTC-USDC-PERP");
         let mut listing = OpenOrderListing::new(
             &rows,
             ExchangeId::HyperliquidPerp,
@@ -1233,8 +1534,9 @@ mod info_tests {
 
     #[test]
     fn coins_the_client_does_not_trade_are_left_out() {
+        let pairs = super::super::spot_coins::test_spot_pairs();
         let listing = OpenOrderListing::new(&rows(), ExchangeId::HyperliquidSpot, &[], |coin| {
-            is_spot_coin(coin).then(|| spot_coin_to_instrument(coin))
+            pairs.get(coin).map(spot_pair_to_instrument)
         });
         assert_eq!(listing.into_snapshots().count(), 0);
     }

@@ -17,7 +17,7 @@ use fnv::FnvHashMap;
 use rustrade_data::event::MarketEvent;
 use rustrade_execution::{
     AccountEvent, AccountEventKind, AccountSnapshot, UnindexedAccountSnapshot,
-    balance::AssetBalance, market::MarketSnapshot,
+    balance::AssetBalance, market::MarketSnapshot, order::id::ClientOrderId,
 };
 use rustrade_instrument::{
     Keyed,
@@ -29,7 +29,7 @@ use rustrade_instrument::{
 use rustrade_integration::collection::{one_or_many::OneOrMany, snapshot::Snapshot};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
-use tracing::warn;
+use tracing::{error, warn};
 
 /// Asset-centric state and associated state management logic.
 pub mod asset;
@@ -141,6 +141,44 @@ impl<GlobalData, InstrumentData> TracksInstrument<InstrumentIndex>
     /// which no lookup can detect.
     fn tracks_instrument(&self, key: &InstrumentIndex) -> bool {
         self.instruments.get_index(key).is_some()
+    }
+}
+
+/// Reports whether a `State` tracks an order under a client order id.
+///
+/// A [`ClientOrderId`] names one order at a time, and the `Engine` keys the orders it tracks for an
+/// instrument on it. An open request under an id an order it tracks already holds would make the
+/// engine's record of that order ambiguous, and a venue refuses one anyway (see
+/// [`ApiError::DuplicateClientOrderId`]). So the `Engine` checks each open request against this,
+/// after [`TracksInstrument`], and rejects one under a tracked id as
+/// [`RecoverableEngineError::DuplicateClientOrderId`](crate::engine::error::RecoverableEngineError::DuplicateClientOrderId)
+/// in the action output's `errors`, unsent and unrecorded. It rejects a second open in one batch
+/// under the same instrument and id in the same way.
+///
+/// An id is free again once the `Engine` stops tracking its order, which is when the order ends.
+/// The check is per instrument, as the tracking is: an id in use on another instrument is left to
+/// the venue, which rejects it if it keys ids across instruments.
+///
+/// # Implementing this
+/// Return `true` for every id under which the state's
+/// [`InFlightRequestRecorder`](order::in_flight_recorder::InFlightRequestRecorder) already holds an
+/// order for `instrument`. The `Engine` asks only about an instrument [`TracksInstrument`] reported
+/// as tracked.
+///
+/// [`ApiError::DuplicateClientOrderId`]: rustrade_execution::error::ApiError::DuplicateClientOrderId
+pub trait TracksOrder<InstrumentKey = InstrumentIndex> {
+    /// Whether this state tracks an order for `instrument` under `cid`.
+    fn tracks_order(&self, instrument: &InstrumentKey, cid: &ClientOrderId) -> bool;
+}
+
+impl<GlobalData, InstrumentData> TracksOrder<InstrumentIndex>
+    for EngineState<GlobalData, InstrumentData>
+{
+    /// Whether the instrument's [`Orders`](order::Orders) track an order under `cid`.
+    fn tracks_order(&self, instrument: &InstrumentIndex, cid: &ClientOrderId) -> bool {
+        self.instruments
+            .get_index(instrument)
+            .is_some_and(|state| state.orders.0.contains_key(cid))
     }
 }
 
@@ -285,7 +323,10 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     ///
     /// This method:
     /// - Sets the account [`ConnectivityState`](connectivity::ConnectivityState) to
-    ///   [`Health::Healthy`](connectivity::Health::Healthy) if it was not previously.
+    ///   [`Health::Healthy`](connectivity::Health::Healthy) if it was not previously, unless the
+    ///   event is [`ReinitFailed`](AccountEventKind::ReinitFailed) or
+    ///   [`StreamTerminated`](AccountEventKind::StreamTerminated), which report on the account link
+    ///   without showing it is up.
     /// - Updates the `GlobalData` with the `AccountEvent`.
     /// - Updates the associated `AssetStates` and `InstrumentStates` with the `AccountEvent`.
     pub fn update_from_account(
@@ -296,8 +337,14 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
         GlobalData: for<'a> Processor<&'a AccountEvent>,
         InstrumentData: for<'a> Processor<&'a AccountEvent>,
     {
-        // Set exchange account connectivity to Healthy if it was Reconnecting
-        self.connectivity.update_from_account_event(&event.exchange);
+        // Set exchange account connectivity to Healthy if it was Reconnecting. A failed re-init
+        // or an ended stream reports on the link without showing it is up, so neither counts.
+        if !matches!(
+            event.kind,
+            AccountEventKind::ReinitFailed(_) | AccountEventKind::StreamTerminated(_)
+        ) {
+            self.connectivity.update_from_account_event(&event.exchange);
+        }
 
         let output = match &event.kind {
             AccountEventKind::Snapshot(snapshot) => {
@@ -364,6 +411,47 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                     exchange = ?event.exchange,
                     %reason,
                     "account event stream terminated — no further account events will arrive on it",
+                );
+                None
+            }
+            AccountEventKind::FillRecoveryGaveUp(gap) => {
+                // Fills in the span may never arrive, so positions and orders may be stale. What to
+                // do (reconcile with fetch_trades, alert, halt) is the consumer's policy; the engine
+                // only makes it loud.
+                error!(
+                    exchange = ?event.exchange,
+                    scope = ?gap.scope,
+                    start = %gap.start,
+                    end = %gap.end,
+                    attempts = gap.attempts,
+                    reason = %gap.reason,
+                    "account stream fill recovery gave up — fills in this span may be missing",
+                );
+                None
+            }
+            AccountEventKind::ReinitFailed(failure) => {
+                // The account link is still down, so state may be going stale. Whether to keep
+                // waiting, alert or halt is the consumer's policy; the engine only makes it loud.
+                error!(
+                    exchange = ?event.exchange,
+                    attempt = failure.attempt,
+                    error = %failure.error,
+                    "account stream re-initialisation failed — retrying with backoff",
+                );
+                None
+            }
+            AccountEventKind::TradeAmended(amendment) => {
+                // The amended trade was applied as first reported, so positions and PnL built on
+                // it are wrong until it is reversed. Reversing it is the consumer's policy (the
+                // engine holds no ledger of trades by id to reverse); the engine only makes it
+                // loud.
+                error!(
+                    exchange = ?event.exchange,
+                    instrument = ?amendment.instrument,
+                    order_id = %amendment.order_id,
+                    original = ?amendment.original,
+                    kind = ?amendment.kind,
+                    "venue amended a trade it reported earlier — state built on that trade is stale",
                 );
                 None
             }
@@ -524,5 +612,145 @@ mod tests {
         let execution = snapshots.get(&EXECUTION).unwrap();
         assert_eq!(execution.exchange, EXECUTION);
         assert_eq!(execution.instruments.len(), 1);
+    }
+    /// A given-up fill recovery is reported, not acted on: no position exits and the account
+    /// state is unchanged. What to do about the missing fills is the consumer's policy.
+    #[test]
+    fn a_fill_recovery_give_up_changes_no_account_state() {
+        use crate::engine::state::{
+            global::DefaultGlobalData, instrument::data::DefaultInstrumentMarketData,
+        };
+        use chrono::{DateTime, Utc};
+        use rustrade_execution::{FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope};
+
+        let instruments = IndexedInstruments::new([test_instrument(EXECUTION, "btc", "usdt")]);
+        let mut state: EngineState<DefaultGlobalData, DefaultInstrumentMarketData> =
+            EngineState::builder(&instruments, DefaultGlobalData, |_| {
+                DefaultInstrumentMarketData::default()
+            })
+            .build();
+        let before = state.clone();
+        let event = AccountEvent::new(
+            ExchangeIndex::new(0),
+            AccountEventKind::FillRecoveryGaveUp(FillRecoveryGap::new(
+                FillRecoveryScope::Instruments(vec![InstrumentIndex::new(0)]),
+                DateTime::<Utc>::MIN_UTC,
+                DateTime::<Utc>::MAX_UTC,
+                6,
+                FillRecoveryFailure::TimedOut { timeout_secs: 30 },
+            )),
+        );
+
+        assert_eq!(state.update_from_account(&event), None);
+        assert_eq!(state.assets, before.assets);
+        assert_eq!(state.instruments, before.instruments);
+        assert_eq!(state.trading, before.trading);
+    }
+
+    /// A failed re-init and an ended stream report on the account link without showing it is
+    /// up, so neither marks it Healthy or changes account state. The next event from a live
+    /// stream marks it Healthy.
+    #[test]
+    fn only_events_from_a_live_account_stream_mark_the_account_healthy() {
+        use crate::engine::state::{
+            connectivity::Health, global::DefaultGlobalData,
+            instrument::data::DefaultInstrumentMarketData,
+        };
+        use chrono::{DateTime, Utc};
+        use rustrade_execution::{
+            FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope,
+            error::{
+                AccountReinitFailure, AccountStreamInitError, ClientError, ConnectivityError,
+                StreamTerminationReason,
+            },
+        };
+
+        let instruments = IndexedInstruments::new([test_instrument(EXECUTION, "btc", "usdt")]);
+        let mut state: EngineState<DefaultGlobalData, DefaultInstrumentMarketData> =
+            EngineState::builder(&instruments, DefaultGlobalData, |_| {
+                DefaultInstrumentMarketData::default()
+            })
+            .build();
+        let exchange = ExchangeIndex::new(0);
+        let account_health =
+            |state: &EngineState<_, _>| state.connectivity.connectivity_index(&exchange).account();
+        assert_eq!(account_health(&state), Health::Reconnecting);
+        let before = state.clone();
+
+        let reinit_failed = AccountEvent::new(
+            exchange,
+            AccountEventKind::ReinitFailed(AccountReinitFailure::new(
+                1,
+                AccountStreamInitError::Client(ClientError::Connectivity(
+                    ConnectivityError::Timeout,
+                )),
+            )),
+        );
+        let terminated = AccountEvent::new(
+            exchange,
+            AccountEventKind::StreamTerminated(StreamTerminationReason::Error(
+                "socket closed".to_owned(),
+            )),
+        );
+        for event in [&reinit_failed, &terminated] {
+            assert_eq!(state.update_from_account(event), None);
+            assert_eq!(account_health(&state), Health::Reconnecting, "{event:?}");
+        }
+        assert_eq!(state.assets, before.assets);
+        assert_eq!(state.instruments, before.instruments);
+        assert_eq!(state.trading, before.trading);
+
+        let from_live_stream = AccountEvent::new(
+            exchange,
+            AccountEventKind::FillRecoveryGaveUp(FillRecoveryGap::new(
+                FillRecoveryScope::AllInstruments,
+                DateTime::<Utc>::MIN_UTC,
+                DateTime::<Utc>::MAX_UTC,
+                1,
+                FillRecoveryFailure::TimedOut { timeout_secs: 30 },
+            )),
+        );
+        assert_eq!(state.update_from_account(&from_live_stream), None);
+        assert_eq!(account_health(&state), Health::Healthy);
+    }
+
+    /// A trade amendment is reported, not acted on: no position exits and the account state is
+    /// unchanged. Reversing the trade is the consumer's policy.
+    #[test]
+    fn a_trade_amendment_changes_no_account_state() {
+        use crate::engine::state::{
+            global::DefaultGlobalData, instrument::data::DefaultInstrumentMarketData,
+        };
+        use chrono::{DateTime, Utc};
+        use rust_decimal::Decimal;
+        use rustrade_execution::{
+            order::id::OrderId,
+            trade::{TradeAmendment, TradeAmendmentKind, TradeId},
+        };
+
+        let instruments = IndexedInstruments::new([test_instrument(EXECUTION, "btc", "usdt")]);
+        let mut state: EngineState<DefaultGlobalData, DefaultInstrumentMarketData> =
+            EngineState::builder(&instruments, DefaultGlobalData, |_| {
+                DefaultInstrumentMarketData::default()
+            })
+            .build();
+        let before = state.clone();
+        let event = AccountEvent::new(
+            ExchangeIndex::new(0),
+            AccountEventKind::TradeAmended(TradeAmendment::new(
+                InstrumentIndex::new(0),
+                OrderId::new("ord-1"),
+                DateTime::<Utc>::MIN_UTC,
+                Some(TradeId::new("t-1")),
+                TradeAmendmentKind::Busted {
+                    quantity: Some(Decimal::ONE),
+                },
+            )),
+        );
+
+        assert_eq!(state.update_from_account(&event), None);
+        assert_eq!(state.assets, before.assets);
+        assert_eq!(state.instruments, before.instruments);
+        assert_eq!(state.trading, before.trading);
     }
 }

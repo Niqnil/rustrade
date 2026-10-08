@@ -2,9 +2,11 @@ use crate::{
     engine::{
         Engine,
         action::send_requests::SendCancelsAndOpensOutput,
+        clock::EngineClock,
         execution_tx::ExecutionTxMap,
         state::{
-            MarketSnapshotSource, TracksInstrument, instrument::filter::InstrumentFilter,
+            MarketSnapshotSource, TracksInstrument, TracksOrder,
+            instrument::filter::InstrumentFilter,
             order::in_flight_recorder::InFlightRequestRecorder,
         },
     },
@@ -41,13 +43,15 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk, ExchangeKey, AssetKey, Instrume
     ClosePositions<ExchangeKey, AssetKey, InstrumentKey>
     for Engine<Clock, State, ExecutionTxs, Strategy, Risk>
 where
+    Clock: EngineClock,
     State: InFlightRequestRecorder<ExchangeKey, InstrumentKey>
         + MarketSnapshotSource<InstrumentKey>
-        + TracksInstrument<InstrumentKey>,
+        + TracksInstrument<InstrumentKey>
+        + TracksOrder<InstrumentKey>,
     ExecutionTxs: ExecutionTxMap<ExchangeKey, InstrumentKey>,
     Strategy: ClosePositionsStrategy<ExchangeKey, AssetKey, InstrumentKey, State = State>,
     ExchangeKey: Debug + Clone,
-    InstrumentKey: Debug + Clone,
+    InstrumentKey: Debug + Clone + PartialEq,
 {
     fn close_positions(
         &mut self,

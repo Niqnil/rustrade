@@ -105,6 +105,39 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
     }
 }
 
+/// What one [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades) call
+/// read of the span it was asked for.
+///
+/// A venue reads a span in bounded calls, so one call may stop before the span's end. `resume`
+/// says whether this one did:
+/// - `None`: every fill in the span the venue still holds is in `trades`.
+/// - `Some(t)`: the call stopped at its bound, and fills from `t` on may be missing from
+///   `trades`. Read on from `start = t` with the same end. That read can return again fills this
+///   one returned at or after `t`, so match them by instrument and [`TradeId`].
+///
+/// `trades` can be empty while `resume` is `Some`: a venue that reads every instrument's fills
+/// and filters them afterwards can spend a whole call on other instruments'. A caller that takes
+/// `trades` without reading on from `resume` can miss fills.
+#[non_exhaustive]
+#[must_use = "`resume` says whether the span was read to its end"]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Constructor)]
+pub struct TradesRead<AssetKey, InstrumentKey> {
+    /// The fills read, in the span and for the requested instruments.
+    pub trades: Vec<Trade<AssetKey, InstrumentKey>>,
+    /// Where to read on from, or `None` when the read reached the span's end.
+    pub resume: Option<DateTime<Utc>>,
+}
+
+impl<AssetKey, InstrumentKey> TradesRead<AssetKey, InstrumentKey> {
+    /// A read that reached the span's end.
+    pub fn complete(trades: Vec<Trade<AssetKey, InstrumentKey>>) -> Self {
+        Self {
+            trades,
+            resume: None,
+        }
+    }
+}
+
 impl<AssetKey, InstrumentKey> Display for Trade<AssetKey, InstrumentKey>
 where
     AssetKey: Display,
@@ -117,6 +150,84 @@ where
             self.instrument, self.side, self.price, self.quantity, self.time_exchange
         )
     }
+}
+
+/// A venue's notice that a trade it reported earlier was busted or corrected.
+///
+/// Sent as [`AccountEventKind::TradeAmended`](crate::AccountEventKind::TradeAmended). The
+/// [`Trade`] it amends was delivered as reported and is not withdrawn: positions, PnL and fees
+/// built on it stay wrong until the consumer applies this. Find it by instrument and
+/// [`original`](Self::original), reverse it, and apply the [`kind`](Self::kind)'s replacement, if
+/// any. The library does not act on it beyond reporting it, and the engine only logs it.
+///
+/// A replacement can itself be amended later. That amendment names the replacement's id as its
+/// `original`, so follow amendments by id, one at a time.
+///
+/// # Known limitations
+///
+/// - An order's cumulative filled quantity is not lowered by a bust:
+///   [`Open::is_superseded_by`](crate::order::state::Open::is_superseded_by) refuses a lower
+///   cumulative, so the order stays on what it reported before.
+/// - Alpaca's fill recovery after a reconnect reads fills only, so an Alpaca amendment sent while
+///   the stream was disconnected is not reported. IBKR's recovery reads corrections too.
+///
+/// # Delivery
+///
+/// Apply an amendment idempotently: reverse a given `original` once, and apply a replacement
+/// once by its [`TradeId`]. Whether a venue can send one amendment twice, such as around a
+/// reconnect, is not known for every producer. The library delivers each IBKR correction once
+/// per account stream, but does not deduplicate Alpaca's amendments.
+///
+/// Known producers, as of writing:
+/// - Alpaca's `trade_updates` `trade_bust` and `trade_correct`;
+/// - IBKR's corrected executions, as [`Corrected`](TradeAmendmentKind::Corrected) only. IB
+///   documents no busts.
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Constructor)]
+pub struct TradeAmendment<AssetKey, InstrumentKey> {
+    /// The instrument of the trade amended.
+    pub instrument: InstrumentKey,
+    /// The order whose trade was amended.
+    pub order_id: OrderId,
+    /// When the venue amended the trade, or when it was received where the venue does not say.
+    pub time_exchange: DateTime<Utc>,
+    /// The [`TradeId`] of the trade amended, as the venue named it. `None` when the venue's notice
+    /// did not name it: match it to a trade of [`order_id`](Self::order_id) yourself, or
+    /// reconcile with
+    /// [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades).
+    pub original: Option<TradeId>,
+    /// What the venue did to the trade.
+    pub kind: TradeAmendmentKind<AssetKey, InstrumentKey>,
+}
+
+/// What a [`TradeAmendment`] did to the trade.
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize)]
+pub enum TradeAmendmentKind<AssetKey, InstrumentKey> {
+    /// The trade was cancelled: it did not happen.
+    Busted {
+        /// The quantity busted, as a magnitude, when the venue said. A venue that reports it as
+        /// a negative reversal is read as its absolute value.
+        quantity: Option<Decimal>,
+    },
+    /// The trade was replaced, in full.
+    Corrected {
+        /// The trade as corrected: its price and quantity are the corrected values, not
+        /// differences from the original's. It has its own [`TradeId`], which a later amendment
+        /// of it names.
+        replacement: Trade<AssetKey, InstrumentKey>,
+    },
+    /// The trade was corrected, but the venue's notice lacked what a replacement [`Trade`] needs.
+    /// What it did carry is here. Reconcile the trade with
+    /// [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades).
+    CorrectedUnresolved {
+        /// The id of the replacement, which a later amendment of it names.
+        id: Option<TradeId>,
+        /// The corrected price, if the notice had one.
+        price: Option<Decimal>,
+        /// The corrected quantity, if the notice had one.
+        quantity: Option<Decimal>,
+    },
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]

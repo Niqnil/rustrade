@@ -4,6 +4,7 @@ use crate::{
         audit::{Auditor, context::EngineContext},
         clock::EngineClock,
         execution_tx::MultiExchangeTxMap,
+        in_flight::{InFlightDeadlineError, InFlightDeadlines},
         run::{async_run, async_run_with_audit, sync_run, sync_run_with_audit},
         state::{
             EngineState, builder::EngineStateBuilder, position::PositionSeed, trading::TradingState,
@@ -35,7 +36,7 @@ use rustrade_integration::{
     collection::snapshot::SnapUpdates,
 };
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, marker::PhantomData};
+use std::{fmt::Debug, marker::PhantomData, time::Duration};
 
 /// Defines how the `Engine` processes input events.
 ///
@@ -105,6 +106,7 @@ pub struct SystemBuilder<'a, Clock, Strategy, Risk, MarketStream, GlobalData, Fn
     engine_feed_mode: Option<EngineFeedMode>,
     audit_mode: Option<AuditMode>,
     trading_state: Option<TradingState>,
+    in_flight_deadline_overrides: Vec<(ExchangeId, Option<Duration>)>,
     balances: FnvHashMap<ExchangeAsset<AssetNameInternal>, Balance>,
     positions: Vec<PositionSeed>,
 }
@@ -123,6 +125,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             engine_feed_mode: None,
             audit_mode: None,
             trading_state: None,
+            in_flight_deadline_overrides: Vec::new(),
             balances: FnvHashMap::default(),
             positions: Vec::new(),
         }
@@ -156,6 +159,27 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             trading_state: Some(value),
             ..self
         }
+    }
+
+    /// Override the in-flight deadline the engine flags `exchange`'s overdue orders by (see
+    /// [`InFlightDeadlines`]).
+    ///
+    /// `Some` sets the deadline and `None` removes it, so the exchange is never checked. Exchanges
+    /// not overridden keep the deadline
+    /// [`ExecutionBuild`](crate::execution::builder::ExecutionBuild) derives for them, and for the
+    /// same exchange the last override wins.
+    ///
+    /// Mock exchanges get no deadline by default (see
+    /// [`ExecutionBuilder::add_mock`]). Set one here to check a mock run on a live clock, as in
+    /// paper trading. The deadline is measured on the engine's clock, so on a simulated clock it
+    /// is in simulated time.
+    ///
+    /// # Errors
+    /// [`build`](Self::build) returns [`BarterError::InFlightDeadline`] if `exchange` has no
+    /// execution client in the system, or the deadline is zero.
+    pub fn in_flight_deadline(mut self, exchange: ExchangeId, deadline: Option<Duration>) -> Self {
+        self.in_flight_deadline_overrides.push((exchange, deadline));
+        self
     }
 
     /// Optionally provide initial exchange asset `Balance`s.
@@ -235,6 +259,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             engine_feed_mode,
             audit_mode,
             trading_state,
+            in_flight_deadline_overrides,
             balances,
             positions,
         } = self;
@@ -263,6 +288,13 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             .execution_venues()
             .collect::<Vec<_>>();
 
+        let in_flight_deadlines = override_in_flight_deadlines(
+            execution.in_flight_deadlines,
+            in_flight_deadline_overrides,
+            instruments,
+            &execution_venues,
+        )?;
+
         // Build EngineState
         let state = EngineStateBuilder::new(instruments, global_data, instrument_data_init)
             .time_engine_start(clock.time())
@@ -277,7 +309,14 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             .try_build()?;
 
         // Construct Engine
-        let engine = Engine::new(clock, state, execution.execution_tx_map, strategy, risk);
+        let engine = Engine::new(
+            clock,
+            state,
+            execution.execution_tx_map,
+            in_flight_deadlines,
+            strategy,
+            risk,
+        );
 
         Ok(SystemBuild {
             engine,
@@ -289,6 +328,34 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             phantom_event: PhantomData,
         })
     }
+}
+
+/// Apply [`SystemBuilder::in_flight_deadline`] overrides, in order, over the derived `deadlines`.
+fn override_in_flight_deadlines(
+    mut deadlines: InFlightDeadlines,
+    overrides: Vec<(ExchangeId, Option<Duration>)>,
+    instruments: &IndexedInstruments,
+    execution_venues: &[ExchangeId],
+) -> Result<InFlightDeadlines, InFlightDeadlineError> {
+    for (exchange, deadline) in overrides {
+        // A venue with an execution client is always indexed, so a failed lookup is the same case.
+        let index = instruments
+            .find_exchange_index(exchange)
+            .ok()
+            .filter(|_| execution_venues.contains(&exchange))
+            .ok_or(InFlightDeadlineError::NoExecution(exchange))?;
+
+        match deadline {
+            Some(deadline) if deadline.is_zero() => {
+                return Err(InFlightDeadlineError::Zero(exchange));
+            }
+            Some(deadline) => deadlines.insert(index, deadline),
+            None => {
+                deadlines.remove(index);
+            }
+        }
+    }
+    Ok(deadlines)
 }
 
 /// Fully constructed `SystemBuild` ready to be initialised.
@@ -385,7 +452,7 @@ where
             .await?;
 
         // Initialise central Engine channel
-        let (feed_tx, mut feed_rx) = mpsc_unbounded();
+        let (feed_tx, mut feed_rx) = super::feed::feed();
 
         // Forward MarketStreamEvents to Engine feed
         let market_to_engine = runtime
@@ -633,6 +700,98 @@ mod tests {
         );
     }
 
+    /// Overrides apply in order over the derived deadlines: `Some` sets one, `None` removes one, the
+    /// last for an exchange wins, and exchanges not named keep theirs.
+    #[test]
+    fn in_flight_deadline_overrides_merge_over_the_derived_deadlines() {
+        const OTHER: ExchangeId = ExchangeId::Kraken;
+        let instruments = IndexedInstruments::new([
+            instrument(DATA, "xau", "usd"),
+            instrument(EXECUTION, "btc", "usdt"),
+            instrument(OTHER, "eth", "usd"),
+        ]);
+        let index = |exchange| instruments.find_exchange_index(exchange).unwrap();
+        let secs = Duration::from_secs;
+        let derived =
+            InFlightDeadlines::from_iter([(index(EXECUTION), secs(10)), (index(OTHER), secs(20))]);
+        let venues = [EXECUTION, OTHER];
+
+        let deadlines = override_in_flight_deadlines(
+            derived.clone(),
+            vec![(EXECUTION, Some(secs(30))), (EXECUTION, Some(secs(40)))],
+            &instruments,
+            &venues,
+        )
+        .unwrap();
+        assert_eq!(deadlines.get(index(EXECUTION)), Some(secs(40)), "last wins");
+        assert_eq!(deadlines.get(index(OTHER)), Some(secs(20)), "kept");
+        assert_eq!(deadlines.get(index(DATA)), None);
+
+        let deadlines = override_in_flight_deadlines(
+            derived.clone(),
+            vec![(OTHER, None)],
+            &instruments,
+            &venues,
+        )
+        .unwrap();
+        assert_eq!(deadlines.get(index(OTHER)), None, "removed");
+        assert_eq!(deadlines.get(index(EXECUTION)), Some(secs(10)), "kept");
+
+        let rejected = |overrides| {
+            override_in_flight_deadlines(derived.clone(), overrides, &instruments, &venues)
+                .unwrap_err()
+        };
+        assert_eq!(
+            rejected(vec![(DATA, Some(secs(1)))]),
+            InFlightDeadlineError::NoExecution(DATA),
+            "indexed, but only prices instruments"
+        );
+        assert_eq!(
+            rejected(vec![(ExchangeId::Bitfinex, None)]),
+            InFlightDeadlineError::NoExecution(ExchangeId::Bitfinex),
+            "not indexed at all"
+        );
+        assert_eq!(
+            rejected(vec![(EXECUTION, Some(Duration::ZERO))]),
+            InFlightDeadlineError::Zero(EXECUTION)
+        );
+    }
+
+    /// A mock exchange has no in-flight deadline unless one is set, and an override for an exchange
+    /// without an execution client fails the build.
+    #[test]
+    fn a_mock_exchange_is_checked_only_with_an_in_flight_deadline_override() {
+        let instruments = IndexedInstruments::new([
+            instrument(DATA, "xau", "usd"),
+            instrument(EXECUTION, "btc", "usdt"),
+        ]);
+        let execution = instruments.find_exchange_index(EXECUTION).unwrap();
+
+        let system = SystemBuilder::new(system_args(&instruments))
+            .build::<EngineEvent, _>()
+            .unwrap();
+        assert!(system.engine.in_flight_deadlines().is_empty());
+
+        let system = SystemBuilder::new(system_args(&instruments))
+            .in_flight_deadline(EXECUTION, Some(Duration::from_secs(30)))
+            .build::<EngineEvent, _>()
+            .unwrap();
+        assert_eq!(
+            system.engine.in_flight_deadlines().get(execution),
+            Some(Duration::from_secs(30))
+        );
+
+        let error = SystemBuilder::new(system_args(&instruments))
+            .in_flight_deadline(DATA, Some(Duration::from_secs(30)))
+            .build::<EngineEvent, _>()
+            .err()
+            .expect("an exchange without an execution client must fail the build");
+        assert_eq!(
+            error,
+            BarterError::InFlightDeadline(InFlightDeadlineError::NoExecution(DATA))
+        );
+    }
+
     /// `SystemBuilder` derives the account dimension from the execution clients it registers, so a
     /// venue that prices instruments without being traded on is not given an account connection to
     /// wait on.
@@ -666,5 +825,61 @@ mod tests {
             connectivity.connectivity(&EXECUTION).role(),
             VenueRole::Both
         );
+    }
+
+    /// [`System::feed_depth`] counts what the market forwarder and `feed_tx` put in the feed, and
+    /// what the `Engine` takes out of it.
+    ///
+    /// Relies on `EngineFeedMode::Stream` on `#[tokio::test]`'s current-thread runtime: the spawned
+    /// forwarder and `Engine` tasks cannot run until this test yields, so the two direct sends are
+    /// the only events queued when it first reads the depth. (`EngineFeedMode::Iterator` would run
+    /// the `Engine` on a blocking thread at once.) A send that bypassed the count would make the
+    /// `Engine`'s take wrap the count below zero, so it could never settle at zero.
+    #[tokio::test]
+    async fn feed_depth_counts_queued_events_until_the_engine_takes_them() {
+        use crate::engine::state::trading::TradingState;
+
+        const MARKET_EVENTS: usize = 3;
+
+        let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
+        let args = system_args(&instruments);
+        let args = SystemArgs::new(
+            args.instruments,
+            args.executions,
+            args.clock,
+            args.strategy,
+            args.risk,
+            futures::stream::iter(vec![
+                EngineEvent::from(TradingState::Disabled);
+                MARKET_EVENTS
+            ]),
+            args.global_data,
+            args.instrument_data_init,
+        );
+        let system = SystemBuilder::new(args)
+            .engine_feed_mode(EngineFeedMode::Stream)
+            .build::<EngineEvent, _>()
+            .unwrap()
+            .init()
+            .await
+            .unwrap();
+
+        let depth = system.feed_depth();
+        system.trading_state(TradingState::Disabled);
+        system.trading_state(TradingState::Disabled);
+        assert_eq!(depth.current(), 2);
+
+        // Settles once the forwarder has sent every market event and the `Engine` has taken them.
+        let mut drained = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if system.handles.market_to_engine.is_finished() && depth.current() == 0 {
+                drained = true;
+                break;
+            }
+        }
+        assert!(drained, "{} events were never taken", depth.current());
+
+        system.abort().await.unwrap();
     }
 }

@@ -48,8 +48,8 @@ use std::{marker::PhantomData, sync::Arc};
 /// `Pending` rather than running to exhaustion. A network-paced source (a paginated fetch) does so
 /// incidentally, because awaiting a response yields. A local decoder does not, and must be bridged:
 /// [`stream_blocking_iter`](rustrade_data::streams::blocking::stream_blocking_iter) moves the decode
-/// to a blocking thread and parks it whenever it gets a fixed number of events ahead of *that
-/// channel's reader*.
+/// to the blocking pool and stops it whenever it gets a fixed number of events ahead of *that
+/// stream's reader*.
 ///
 /// That reader is the time-merge, **not the engine**, so this is not an end-to-end memory bound. The
 /// harness forwards the merged stream into the unbounded feed channel with a synchronous send that

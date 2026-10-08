@@ -311,9 +311,6 @@ async fn test_place_and_cancel_limit_order() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("Order placed successfully!");
@@ -341,9 +338,6 @@ async fn test_place_and_cancel_limit_order() {
 
             println!("Canceling order...");
             let cancel_response = client.cancel_order(cancel_request).await;
-
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            let cancel_response = cancel_response.unwrap();
 
             match &cancel_response.state {
                 Ok(cancelled) => {
@@ -396,8 +390,7 @@ async fn assert_snapshot_lists_the_order_then_drops_it(
             key: key.clone(),
             state: request,
         })
-        .await
-        .expect("Expected order response");
+        .await;
     let OrderState::Active(ActiveOrderState::Open(open)) = &response.state else {
         panic!(
             "{instrument} limit order did not rest: {:?}",
@@ -431,8 +424,7 @@ async fn assert_snapshot_lists_the_order_then_drops_it(
                 id: Some(open.id.clone()),
             },
         })
-        .await
-        .expect("Expected cancel response");
+        .await;
     assert!(
         cancelled.state.is_ok(),
         "Cancel rejected: {:?}",
@@ -440,24 +432,38 @@ async fn assert_snapshot_lists_the_order_then_drops_it(
     );
     await_no_open_orders(&client, &instrument).await;
 
-    let listed = client
-        .account_snapshot(&[], &instruments)
-        .await
-        .expect("account_snapshot failed");
-    let snapshot = listed
-        .instruments
-        .iter()
-        .find(|snapshot| snapshot.instrument == instrument)
-        .expect("a requested instrument always has an entry");
-    assert!(
-        snapshot.orders_complete,
-        "{instrument}'s order list is not declared complete"
-    );
-    assert!(
-        snapshot.orders.iter().all(|order| order.key.cid != cid),
-        "the cancelled {instrument} order is still listed: {:?}",
-        snapshot.orders
-    );
+    // Alpaca's order listing is eventually consistent: one empty read does not stop the next
+    // from still returning the cancelled order, so poll the snapshot itself. Like
+    // `await_no_open_orders`, a failed read is retried until the deadline.
+    const POLL: Duration = Duration::from_millis(250);
+    const DEADLINE: Duration = Duration::from_secs(15);
+    let started = tokio::time::Instant::now();
+    loop {
+        let last = match client.account_snapshot(&[], &instruments).await {
+            Ok(listed) => {
+                let snapshot = listed
+                    .instruments
+                    .iter()
+                    .find(|snapshot| snapshot.instrument == instrument)
+                    .expect("a requested instrument always has an entry");
+                assert!(
+                    snapshot.orders_complete,
+                    "{instrument}'s order list is not declared complete"
+                );
+                if snapshot.orders.iter().all(|order| order.key.cid != cid) {
+                    return;
+                }
+                format!("still listed: {:?}", snapshot.orders)
+            }
+            Err(error) => format!("account_snapshot failed: {error:?}"),
+        };
+        let waited = started.elapsed();
+        assert!(
+            waited < DEADLINE,
+            "the cancelled {instrument} order did not drop out {waited:?} after the cancel; {last}"
+        );
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 #[tokio::test]
@@ -546,9 +552,6 @@ async fn test_place_crypto_limit_order() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("Crypto order placed successfully!");
@@ -573,8 +576,7 @@ async fn test_place_crypto_limit_order() {
             println!("Canceling crypto order...");
             let cancel_response = client.cancel_order(cancel_request).await;
 
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            match &cancel_response.unwrap().state {
+            match &cancel_response.state {
                 Ok(_) => println!("Crypto order canceled successfully!"),
                 Err(e) => panic!("Cancel rejected: {:?}", e),
             }
@@ -702,12 +704,9 @@ async fn test_account_stream_with_order() {
         })
         .await;
 
-    let order_id = match response {
-        Some(ref r) => match &r.state {
-            OrderState::Active(ActiveOrderState::Open(o)) => Some(o.id.clone()),
-            _ => None,
-        },
-        None => None,
+    let order_id = match &response.state {
+        OrderState::Active(ActiveOrderState::Open(o)) => Some(o.id.clone()),
+        _ => None,
     };
 
     println!("Waiting for order events on stream (5s timeout)...");
@@ -825,9 +824,6 @@ async fn test_place_and_cancel_stop_order() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("Stop order placed successfully!");
@@ -853,9 +849,6 @@ async fn test_place_and_cancel_stop_order() {
 
             println!("Canceling stop order...");
             let cancel_response = client.cancel_order(cancel_request).await;
-
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            let cancel_response = cancel_response.unwrap();
 
             match &cancel_response.state {
                 Ok(cancelled) => {
@@ -925,9 +918,6 @@ async fn test_place_and_cancel_trailing_stop_order() {
 
     let response = client.open_order(open_request).await;
 
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
-
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
             println!("Trailing stop order placed successfully!");
@@ -953,9 +943,6 @@ async fn test_place_and_cancel_trailing_stop_order() {
 
             println!("Canceling trailing stop order...");
             let cancel_response = client.cancel_order(cancel_request).await;
-
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            let cancel_response = cancel_response.unwrap();
 
             match &cancel_response.state {
                 Ok(cancelled) => {
@@ -1074,8 +1061,7 @@ async fn test_place_and_cancel_bracket_order_with_stop() {
             println!("Canceling bracket order...");
             let cancel_response = client.cancel_order(cancel_request).await;
 
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            match &cancel_response.unwrap().state {
+            match &cancel_response.state {
                 Ok(cancelled) => {
                     println!("Bracket order canceled successfully!");
                     println!("  Exchange Order ID: {:?}", cancelled.id);
@@ -1160,8 +1146,7 @@ async fn test_place_and_cancel_bracket_order_with_stop_limit() {
             println!("Canceling bracket order (stop-limit)...");
             let cancel_response = client.cancel_order(cancel_request).await;
 
-            assert!(cancel_response.is_some(), "Expected cancel response");
-            match &cancel_response.unwrap().state {
+            match &cancel_response.state {
                 Ok(cancelled) => {
                     println!("Bracket order (stop-limit) canceled successfully!");
                     println!("  Exchange Order ID: {:?}", cancelled.id);

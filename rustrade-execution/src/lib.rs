@@ -20,6 +20,10 @@
 // documentation-bearing alias bounds kept intentionally. Denying these adds churn without improving
 // the API.
 #![allow(clippy::type_complexity, clippy::too_many_arguments, type_alias_bounds)]
+// Clippy 1.99 checks each field's span rather than the whole expression's, so the
+// `Self { field: field }` that `derive_more::Constructor` expands to is reported at our own
+// field declarations. Remove once rust-lang/rust-clippy#17525 is fixed in a stable release.
+#![allow(clippy::redundant_field_names)]
 
 //! # Barter-Execution
 //! Stream private account data from financial venues, and execute (live or mock) orders. Also provides
@@ -82,6 +86,8 @@ pub mod fill;
 pub use fill::{
     BidAskFillModel, FillContext, FillModel, LastPriceFillModel, MidpointFillModel, SimFillConfig,
 };
+pub mod fill_recovery;
+pub use fill_recovery::{FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope};
 pub mod indexer;
 pub mod map;
 pub mod market;
@@ -250,6 +256,31 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// consumer-initiated drop closes the receiver, so there is no one left to deliver to (see
     /// [`StreamTerminationReason`] for the deliverable-only rationale).
     StreamTerminated(StreamTerminationReason),
+
+    /// Fill recovery gave up on a span of fills: fills in it may not have been delivered.
+    ///
+    /// Sent by venues that recover missed fills after a reconnect (Binance Spot and Margin,
+    /// Alpaca) when a recovery read fails for good, once per failed read. The stream carries on.
+    /// The engine logs it and changes no state; reconciling is the consumer's policy. See
+    /// [`FillRecoveryGap`] for what the span covers and how to read it again.
+    FillRecoveryGaveUp(FillRecoveryGap<InstrumentKey>),
+
+    /// A trade delivered earlier was busted or corrected by the venue.
+    ///
+    /// The earlier [`Trade`](Self::Trade) is not withdrawn, so state built on it is wrong until
+    /// the consumer applies this. The engine logs it and changes no state; reversing the trade is
+    /// the consumer's policy. See [`TradeAmendment`](trade::TradeAmendment).
+    TradeAmended(trade::TradeAmendment<AssetKey, InstrumentKey>),
+
+    /// An attempt to re-initialise the account stream after it ended failed. Attempts continue
+    /// with backoff.
+    ///
+    /// Sent by a consumer that re-initialises the account stream itself, such as the `rustrade`
+    /// crate's `ExecutionManager`, once per failed attempt and in order with the other account
+    /// events. It reports that the account link is still down, so it is not evidence the link is
+    /// up. The engine logs it and changes no state. How long to keep waiting, and whether to halt
+    /// or alert, is the consumer's policy. See [`AccountReinitFailure`](error::AccountReinitFailure).
+    ReinitFailed(error::AccountReinitFailure<AssetKey, InstrumentKey>),
 }
 
 impl<ExchangeKey, AssetKey, InstrumentKey> AccountEvent<ExchangeKey, AssetKey, InstrumentKey>
@@ -476,6 +507,29 @@ mod tests {
             matches!(event.kind, AccountEventKind::StreamTerminated(r) if r == reason),
             "expected StreamTerminated carrying the supplied reason",
         );
+    }
+
+    /// A failed re-init survives a serde round trip, so audit and replay keep it, error and all.
+    #[test]
+    fn a_reinit_failure_round_trips_through_serde() {
+        use crate::error::{
+            AccountReinitFailure, AccountStreamInitError, ClientError, ConnectivityError,
+        };
+
+        let event = AccountEvent::new(
+            ExchangeIndex::new(0),
+            AccountEventKind::ReinitFailed(AccountReinitFailure::new(
+                3,
+                AccountStreamInitError::Client(ClientError::Connectivity(
+                    ConnectivityError::Timeout,
+                )),
+            )),
+        );
+
+        let json = serde_json::to_string(&event).unwrap();
+        let decoded: AccountEvent = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded, event);
     }
 
     /// Per the D6 consumer-drop decision, emitting after the consumer dropped the receiver is a

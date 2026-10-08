@@ -147,3 +147,46 @@ impl From<InstrumentConfig> for Instrument<ExchangeId, Asset> {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panicking on a bad fixture is acceptable
+mod tests {
+    use super::*;
+
+    fn instrument_config(data_venue: &str) -> InstrumentConfig {
+        serde_json::from_str(&format!(
+            r#"{{
+                "exchange": "coinbase",
+                "name_exchange": "BTC-USD",
+                "underlying": {{ "base": "btc", "quote": "usd" }},
+                "quote": "underlying_quote",
+                "kind": "spot"
+                {data_venue}
+            }}"#
+        ))
+        .unwrap()
+    }
+
+    /// A config written before `data_venue` existed has no such key, and must still deserialise,
+    /// to an instrument priced where it is executed.
+    #[test]
+    fn an_instrument_config_without_data_venue_deserialises_to_none() {
+        let config = instrument_config("");
+        assert_eq!(config.data_venue, None);
+
+        let instrument = Instrument::from(config);
+        assert_eq!(instrument.data_venue, None);
+        assert_eq!(instrument.data_exchange(), &ExchangeId::Coinbase);
+    }
+
+    #[test]
+    fn an_instrument_config_data_venue_reaches_the_instrument() {
+        let config = instrument_config(
+            r#", "data_venue": { "exchange": "lse_crypto", "name_exchange": "BTC/USD" }"#,
+        );
+
+        let instrument = Instrument::from(config);
+        assert_eq!(instrument.data_exchange(), &ExchangeId::LseCrypto);
+        assert_eq!(instrument.data_name_exchange().as_ref(), "BTC/USD");
+    }
+}

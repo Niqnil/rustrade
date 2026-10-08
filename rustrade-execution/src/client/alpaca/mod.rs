@@ -22,46 +22,62 @@
 //   backoff (1 s → 30 s, max 10 attempts)
 // - Heartbeat monitoring: reconnects if no WS message for HEARTBEAT_TIMEOUT_SECS
 // - Fill recovery: after reconnect, fetches missed fills via GET /v2/account/activities
-//   since disconnect_time; sent through the dedup cache to filter duplicates
-// - Dedup cache: LRU keyed on "{order_id}:{cumulative_filled_qty}" prevents
-//   duplicate fills arising from the overlap between WS events before disconnect
-//   and the fill-recovery REST window
+//   since disconnect_time; sent through the dedup cache to filter duplicates. A read that fails,
+//   times out or truncates is reported as AccountEventKind::FillRecoveryGaveUp
+// - Dedup cache: LRU keyed on each fill's execution id (with "{order_id}:{cumulative_filled_qty}"
+//   for a fill without one) prevents duplicate fills arising from the overlap between WS events
+//   before disconnect and the fill-recovery REST window
+// - Ended-order recovery: after the fills, each order held as live that one listing of the open
+//   orders no longer shows is looked up by client order id (GET /v2/orders:by_client_order_id),
+//   and how it ended is reported; a failed check is retried on a backoff while connected
 //
 // Known limitations:
-// - Only FILL activities are recovered after reconnect; order lifecycle events
-//   (new, cancelled, expired) are not — callers must call fetch_open_orders after
-//   each reconnect to reconcile open-order state.
+// - Order lifecycle events missed while disconnected are recovered only for orders the client
+//   holds as live (placed through it, listed by it, or seen on its stream); an order placed
+//   elsewhere and ended during the outage is not reported.
 // - A fill frame whose order status is neither partially_filled nor filled emits the
 //   execution but no order snapshot, so a fill arriving after its order's terminal frame
 //   cannot resurrect a retired order as a resting one. That order's filled quantity is
 //   settled instead by the terminal frame's own filled_qty, or by fetch_open_orders.
+// - A trade_bust or trade_correct sent while disconnected is not recovered: fill recovery reads
+//   FILL activities only.
 
 use crate::{
-    AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, UnindexedAccountEvent,
-    UnindexedAccountSnapshot,
+    AccountEventKind, AccountSnapshot, FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope,
+    InstrumentAccountSnapshot, UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
-    client::{BracketOrderClient, ExecutionClient},
+    client::{
+        BracketOrderClient, ExecutionClient, OrderStatusClient,
+        order_recovery::{
+            KnownLiveOrders, NoPendingFills, OpenListing, OrderLookup, SharedKnownLiveOrders,
+            UncheckedOrders, fetch_ended_by_key, recover_ended_orders,
+        },
+    },
     emit_stream_terminated,
     error::{
         ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
         UnindexedOrderError,
     },
     order::{
-        Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType, UnindexedOrderSnapshot,
+        Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType, UnindexedInactiveOrder,
+        UnindexedOrderKey, UnindexedOrderSnapshot,
         bracket::{
             BracketOrderRequest as UnifiedBracketOrderRequest,
             BracketOrderResult as UnifiedBracketOrderResult,
         },
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
-        state::{Cancelled, Filled, Open, OrderState, UnindexedOrderState},
+        state::{
+            ActiveOrderState, Cancelled, Expired, Filled, InactiveOrderState, Open, OrderState,
+            UnindexedOrderState,
+        },
     },
     parse_env_bool,
     position::{Position, PositionReport},
-    trade::{AssetFees, Trade, TradeId},
+    trade::{AssetFees, Trade, TradeAmendmentKind, TradeId, TradesRead},
 };
-use chrono::{DateTime, Utc};
-use fnv::FnvHashMap;
+use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
+use fnv::{FnvHashMap, FnvHashSet};
 use futures::{SinkExt as _, StreamExt as _, stream::BoxStream};
 use indexmap::IndexMap;
 use itertools::Itertools as _;
@@ -101,9 +117,14 @@ const DEFAULT_RATE_LIMIT_DELAY_SECS: u64 = 60;
 /// Total REST attempts (1 initial + retries) before giving up on rate-limit errors.
 /// The loop runs `0..MAX_RATE_LIMIT_ATTEMPTS`, retrying while `attempt + 1 < MAX`.
 const MAX_RATE_LIMIT_ATTEMPTS: u32 = 4;
-/// Dedup LRU cache size. Each entry is a ~50–70 byte String (UUID + decimal).
-/// 2_000 entries ≈ 120–140 KB — ample for options trading fill rates.
-const DEDUP_CACHE_SIZE: usize = 2_000;
+/// Dedup LRU cache size, in keys. Each fill records two (see [`is_duplicate_fill`]), so this holds
+/// the last 2,000 fills. Each key is a ~40–70 byte string (a UUID, or a UUID and a decimal):
+/// 4_000 keys ≈ 250 KB — ample for options trading fill rates.
+const DEDUP_CACHE_SIZE: usize = 4_000;
+
+/// The account currency, named as Alpaca spells it. Every USD balance and fee is reported under
+/// it.
+const USD: &str = "USD";
 /// Timeout for the initial WS auth+subscribe handshake.
 const WS_HANDSHAKE_TIMEOUT_SECS: u64 = 15;
 /// Timeout for a graceful WS close. Prevents indefinite blocking when the
@@ -324,27 +345,25 @@ impl ExponentialBackoff {
 // Dedup cache
 // ---------------------------------------------------------------------------
 
-/// LRU cache keyed on `trade.id`, which both paths synthesise as
-/// `"{order_id}:{cumulative_filled_qty}"`.
+/// LRU cache of the fills the account stream has delivered, so that a fill both the WebSocket
+/// and fill recovery deliver, in the overlap around a reconnect, is sent once. See
+/// [`is_duplicate_fill`] for how a fill is recognised.
+type SharedDedupCache = Arc<parking_lot::Mutex<LruCache<FillKey, ()>>>;
+
+/// One key under which [`SharedDedupCache`] records a fill.
 ///
-/// WS fills: `convert_trade_update` sets `trade_id = order.id + ":" + order.filled_qty`
-/// (cumulative from the order update payload).
-///
-/// REST fills: `recover_fills` reads the activity's own `cum_qty` -- the same figure the WS path
-/// reads -- and overrides `trade.id` to the same format before inserting into the cache. Where
-/// Alpaca omits `cum_qty` it falls back to accumulating per-execution qty within the batch, which
-/// is correct only for an order whose fills lie wholly inside the recovery window.
-///
-/// Using cumulative qty (not per-execution qty) means two equal-size partial fills
-/// on the same order produce distinct keys (`order:1` and `order:2`), preventing
-/// silent fill drops.
-///
-/// [`SmolStr`] keys avoid heap allocation for IDs ≤22 bytes. UUID-length keys
-/// (36 chars) always heap-allocate in `SmolStr`; `format_smolstr!` uses an
-/// internal `String` buffer for long keys, identical in allocation cost to
-/// `format!(…).into::<SmolStr>()`. The type is kept for API consistency with
-/// other key types in this codebase.
-type SharedDedupCache = Arc<parking_lot::Mutex<LruCache<SmolStr, ()>>>;
+/// [`SmolStr`] keys avoid heap allocation for ids ≤22 bytes. UUID-length keys (36 chars) always
+/// heap-allocate.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum FillKey {
+    /// The fill's execution id: the WS frame's `execution_id`, or the UUID after `::` in its FILL
+    /// activity's id ([`activity_execution_id_part`]).
+    Execution(SmolStr),
+    /// The fill's [`fill_dedup_key`], recorded for every fill.
+    Cumulative(SmolStr),
+    /// The fill's [`fill_dedup_key`], recorded only for a fill without a usable execution id.
+    CumulativeWithoutId(SmolStr),
+}
 
 fn new_dedup_cache() -> SharedDedupCache {
     // allow(clippy::unwrap_used) — NonZeroUsize::new on a non-zero constant
@@ -355,18 +374,65 @@ fn new_dedup_cache() -> SharedDedupCache {
     )))
 }
 
-/// Returns `true` if this key was already seen (duplicate). Inserts if new.
-fn is_duplicate(cache: &SharedDedupCache, key: &SmolStr) -> bool {
+/// Returns `true` if this fill was already delivered (duplicate). Records it if not.
+///
+/// `execution_id` is the fill's execution id, `None` when it has no usable one; `cumulative` is
+/// its [`fill_dedup_key`].
+///
+/// A fill is identified by its execution id, which both paths carry and which Alpaca's activity
+/// docs name as the dedup key. The cumulative key alone would not do: a bust lowers an order's
+/// cumulative, after which a new fill can take it back to a cumulative an earlier fill reached,
+/// and that fill would be taken for the earlier one and dropped.
+///
+/// A fill without an execution id is recognised by its cumulative key instead. So that it still
+/// matches the same fill delivered *with* an id by the other path, every fill records its
+/// cumulative key, and a fill with an id is also checked against the cumulative keys of fills
+/// recorded without one.
+///
+/// So after a bust, a new fill can still be taken for an earlier one at the same cumulative when
+/// either lacks an execution id: a fill without one matches any earlier fill's cumulative key,
+/// and a fill with one matches an earlier id-less fill's. An id-less WS fill is logged at `warn!`
+/// by [`convert_trade_update`].
+fn is_duplicate_fill(
+    cache: &SharedDedupCache,
+    execution_id: Option<&str>,
+    cumulative: SmolStr,
+) -> bool {
+    // Built before locking, so the lock is not held across the allocation.
+    let execution = execution_id.map(|id| FillKey::Execution(SmolStr::new(id)));
     let mut guard = cache.lock();
     // peek avoids promoting to MRU on the duplicate (discard) path
-    if guard.peek(key).is_some() {
-        return true;
+    match execution {
+        Some(execution) => {
+            if guard.peek(&execution).is_some()
+                || guard
+                    .peek(&FillKey::CumulativeWithoutId(cumulative.clone()))
+                    .is_some()
+            {
+                return true;
+            }
+            guard.put(execution, ());
+            guard.put(FillKey::Cumulative(cumulative), ());
+        }
+        None => {
+            if guard
+                .peek(&FillKey::Cumulative(cumulative.clone()))
+                .is_some()
+            {
+                return true;
+            }
+            guard.put(FillKey::Cumulative(cumulative.clone()), ());
+            guard.put(FillKey::CumulativeWithoutId(cumulative), ());
+        }
     }
-    // Clone on the insert (non-duplicate) path only. UUID-length SmolStr keys
-    // heap-allocate, but the WS path is single-threaded — there is no mutex
-    // contention to justify cloning before the lock on the duplicate fast-path.
-    guard.put(key.clone(), ());
     false
+}
+
+/// Record an execution delivered other than as a fill, so that fill recovery does not deliver it
+/// again as one.
+fn record_execution(cache: &SharedDedupCache, execution_id: &str) {
+    let execution = FillKey::Execution(SmolStr::new(execution_id));
+    cache.lock().put(execution, ());
 }
 
 // ---------------------------------------------------------------------------
@@ -581,7 +647,7 @@ struct AlpacaAccount {
 /// zero or as a flat position.
 #[derive(Debug, Deserialize)]
 struct AlpacaPosition {
-    /// Exchange symbol (e.g., "BTC/USD" for crypto, "AAPL" for equity, an OCC symbol for an
+    /// Exchange symbol (e.g., "BTCUSD" for crypto, "AAPL" for equity, an OCC symbol for an
     /// option).
     symbol: String,
     /// Asset class: "us_equity", "crypto", "us_option".
@@ -626,6 +692,14 @@ struct AlpacaOrderResponse {
     symbol: String,
     qty: Option<String>,
     filled_qty: String,
+    /// The average price of the order's fills, when any filled.
+    #[serde(default)]
+    filled_avg_price: Option<String>,
+    /// The order's status: `new`, `filled`, `canceled`, and so on. Read by the lookup of how an
+    /// order ended and from the response to placing one. Optional so that a response without it
+    /// still decodes.
+    #[serde(default)]
+    status: Option<String>,
     side: String,
     #[serde(rename = "type")]
     order_type: String,
@@ -880,7 +954,8 @@ struct AlpacaStreamMessage<'a> {
 /// Numeric and timestamp fields borrow directly from the `RawValue` input buffer
 /// (`#[serde(borrow)]`), propagating the zero-copy design of `AlpacaStreamMessage`.
 /// This eliminates 4–6 heap allocations per fill event. The borrow is valid because
-/// Alpaca's numeric and timestamp strings contain no JSON escape sequences.
+/// Alpaca's numeric and timestamp strings, and its execution ids (UUIDs), contain no JSON escape
+/// sequences.
 #[derive(Debug, Deserialize)]
 struct AlpacaTradeUpdate<'a> {
     // Short event tag ("fill", "partial_fill", "new", ...) — fits inline.
@@ -895,6 +970,16 @@ struct AlpacaTradeUpdate<'a> {
     qty: Option<&'a str>,
     #[serde(borrow)]
     timestamp: Option<&'a str>,
+    /// Alpaca's id for this event. On a fill it is the execution's id, the same as the UUID after
+    /// `::` in that fill's FILL activity id (see [`activity_execution_id`]), so it is the fill's
+    /// [`TradeId`] on every path. On a `trade_correct` it is taken as the corrected execution's id.
+    #[serde(borrow)]
+    execution_id: Option<&'a str>,
+    /// On `trade_bust` and `trade_correct` only: the `execution_id` of the fill busted or
+    /// corrected, per Alpaca's Broker API schema (`TradeUpdateEventV2`). The Trading API's docs do
+    /// not list either event, so this is unverified against a real frame.
+    #[serde(borrow)]
+    previous_execution_id: Option<&'a str>,
 }
 
 /// Order state embedded in a `trade_updates` WebSocket event.
@@ -912,7 +997,9 @@ struct AlpacaOrderWs<'a> {
     // Alpaca guarantees `filled_qty` for fill/partial_fill and most lifecycle
     // events, but some event types (e.g. `rejected`) may omit the field.
     // Using Option avoids a deserialization failure that would silently drop
-    // the event. Call sites use `.unwrap_or("0")`.
+    // the event. A snapshot of a live order reads its absence as nothing filled
+    // yet; a cancel reads it as unknown; the dedup key, and a fill's fallback trade id, read it
+    // as "0".
     #[serde(borrow)]
     filled_qty: Option<&'a str>,
     // Short enums ("buy"/"sell", "market"/"limit"/..., "day"/"gtc"/..., status)
@@ -961,6 +1048,9 @@ pub struct AlpacaClient {
     rate_limiter: Arc<RateLimitTracker>,
     /// Pre-allocated `/v2/orders` endpoint URL to avoid allocation per request.
     orders_url: String,
+    /// The orders seen live and not yet seen end, which a reconnect asks about. Shared by every
+    /// clone and every account stream, since an order placed through one ends on any of them.
+    known_live: SharedKnownLiveOrders,
 }
 
 impl std::fmt::Debug for AlpacaClient {
@@ -1001,6 +1091,17 @@ impl AlpacaClient {
 
     fn base_url(&self) -> &str {
         self.config.rest_base_url()
+    }
+
+    /// Hold each of `orders` as live, for a reconnect to ask about if the stream misses its end.
+    fn remember_live<'a>(
+        &self,
+        orders: impl IntoIterator<Item = &'a Order<ExchangeId, InstrumentNameExchange, Open>>,
+    ) {
+        let mut known = self.known_live.lock();
+        for order in orders {
+            known.live(&order.key, order.quantity, &order.state);
+        }
     }
 }
 
@@ -1077,8 +1178,49 @@ fn observe_rate_limit_remaining(
 ///   call that expects a body. Retrying returns the same answer.
 async fn rest_with_retry<T>(
     rate_limiter: &RateLimitTracker,
-    mut build_request: impl FnMut() -> reqwest::RequestBuilder,
+    build_request: impl FnMut() -> reqwest::RequestBuilder,
 ) -> Result<T, UnindexedClientError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    match rest_request(rate_limiter, build_request).await? {
+        Fetched::Found(value) => Ok(value),
+        Fetched::NotFound(message) => Err(UnindexedClientError::Api(parse_api_error(
+            reqwest::StatusCode::NOT_FOUND,
+            &message,
+        ))),
+    }
+}
+
+/// [`rest_with_retry`] for a lookup by id: a 404 is `Ok(None)`, Alpaca knowing nothing under the
+/// id asked for, rather than an error.
+async fn rest_lookup_with_retry<T>(
+    rate_limiter: &RateLimitTracker,
+    build_request: impl FnMut() -> reqwest::RequestBuilder,
+) -> Result<Option<T>, UnindexedClientError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    match rest_request(rate_limiter, build_request).await? {
+        Fetched::Found(value) => Ok(Some(value)),
+        Fetched::NotFound(_) => Ok(None),
+    }
+}
+
+/// What [`rest_request`] got back from a request that did not fail.
+#[derive(Debug)]
+enum Fetched<T> {
+    /// A 2xx body, decoded.
+    Found(T),
+    /// A 404, with Alpaca's message.
+    NotFound(String),
+}
+
+/// [`rest_with_retry`] and [`rest_lookup_with_retry`], which differ only in how they read a 404.
+async fn rest_request<T>(
+    rate_limiter: &RateLimitTracker,
+    mut build_request: impl FnMut() -> reqwest::RequestBuilder,
+) -> Result<Fetched<T>, UnindexedClientError>
 where
     T: for<'de> Deserialize<'de>,
 {
@@ -1132,21 +1274,27 @@ where
         // A 2xx body that does not fit the model is not transient: retrying returns the same
         // body. An order path must still treat it as status unknown; see `order_post_error`.
         if status.is_success() {
-            return serde_json::from_slice::<T>(&bytes).map_err(|e| {
-                UnindexedClientError::Internal(format!(
-                    "Alpaca REST JSON parse error ({status}): {e} | body: {}",
-                    String::from_utf8_lossy(&bytes)
-                        .chars()
-                        .take(200)
-                        .collect::<String>()
-                ))
-            });
+            return serde_json::from_slice::<T>(&bytes)
+                .map(Fetched::Found)
+                .map_err(|e| {
+                    UnindexedClientError::Internal(format!(
+                        "Alpaca REST JSON parse error ({status}): {e} | body: {}",
+                        String::from_utf8_lossy(&bytes)
+                            .chars()
+                            .take(200)
+                            .collect::<String>()
+                    ))
+                });
         }
 
         // Parse API error body for a better error message.
         let api_err = serde_json::from_slice::<AlpacaApiError>(&bytes)
             .map(|e| e.message)
             .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Fetched::NotFound(api_err));
+        }
 
         // 4xx = API-level rejection (wrong parameters, auth failure, insufficient funds).
         // 5xx / other = server-side failure treated as connectivity error.
@@ -1260,6 +1408,7 @@ impl ExecutionClient for AlpacaClient {
             http,
             rate_limiter: Arc::new(RateLimitTracker::new()),
             orders_url,
+            known_live: KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
         }
     }
 
@@ -1280,9 +1429,10 @@ impl ExecutionClient for AlpacaClient {
     ///   entry price is the premium per share of the underlying, as quoted and as orders are
     ///   priced, not per contract. Margin, liquidation price and leverage are `None`, and
     ///   `time_exchange` is the time of the call, since Alpaca does not timestamp positions.
-    /// - **Crypto**: each holding is an asset balance of its base asset (e.g. `btc` for
-    ///   `BTC/USD`), in base units. Alpaca crypto is spot-only and cannot be sold short, so there
-    ///   is no position to report: its instruments are [`PositionReport::Unreported`].
+    /// - **Crypto**: each holding is an asset balance of the asset it holds (e.g. `BTC` for the
+    ///   position Alpaca lists as `BTCUSD`), in base units. Alpaca crypto is spot-only and cannot
+    ///   be sold short, so there is no position to report: its instruments are
+    ///   [`PositionReport::Unreported`].
     ///
     /// # Limitations
     ///
@@ -1317,14 +1467,8 @@ impl ExecutionClient for AlpacaClient {
         let http = self.http.clone();
         let rl = &self.rate_limiter;
 
-        let wants_usd = assets.is_empty()
-            || assets
-                .iter()
-                .any(|a| a.name().as_str().eq_ignore_ascii_case("usd"));
-        let wants_non_usd = assets.is_empty()
-            || assets
-                .iter()
-                .any(|a| !a.name().as_str().eq_ignore_ascii_case("usd"));
+        let wants_usd = assets.is_empty() || assets.iter().any(is_usd);
+        let wants_non_usd = assets.is_empty() || assets.iter().any(|a| !is_usd(a));
 
         // URLs are extracted before the closures to avoid re-allocating on each retry attempt.
         let account_url = format!("{base}/v2/account");
@@ -1357,6 +1501,17 @@ impl ExecutionClient for AlpacaClient {
         // Group open orders and positions by instrument symbol.
         let instrument_snapshots =
             build_instrument_snapshots(open_orders, converted_positions, instruments);
+        {
+            let mut known = self.known_live.lock();
+            for order in instrument_snapshots
+                .iter()
+                .flat_map(|snapshot| &snapshot.orders)
+            {
+                if let OrderState::Active(ActiveOrderState::Open(open)) = &order.state {
+                    known.live(&order.key, order.quantity, open);
+                }
+            }
+        }
 
         Ok(AccountSnapshot::new(
             ExchangeId::AlpacaBroker,
@@ -1379,25 +1534,45 @@ impl ExecutionClient for AlpacaClient {
     /// This gap also applies on every **reconnect**: during the auth+subscribe handshake
     /// (`connect_and_subscribe`), any `trade_updates` messages that arrive are consumed
     /// by the handshake loop and not forwarded. Fill events in this window are recovered
-    /// via the REST activities endpoint (anchored to `disconnect_time`). Lifecycle events
-    /// (`new`, `canceled`, `rejected`) consumed during the handshake are **not** recovered
-    /// — callers must call `fetch_open_orders` after each reconnect to reconcile order state.
+    /// via the REST activities endpoint (anchored to `disconnect_time`). How an order held as live
+    /// ended in this window is recovered too (see below); a lifecycle event of any other order,
+    /// such as `new` for one placed elsewhere, is not.
     ///
     /// # Fill recovery ordering
     ///
     /// After a reconnect, missed fills are recovered from the REST activities endpoint
     /// using `direction=asc` to match the chronological order in which the WS stream
-    /// advanced `filled_qty`. The dedup key `"{order_id}:{cum_qty}"` is taken from the
-    /// activity's own `cum_qty`, so it matches the WS path by construction and does not
-    /// depend on the order in which activities arrive.
+    /// advanced `filled_qty`. A fill both paths deliver is sent once: it is recognised by its
+    /// execution id, which the WS frame and the FILL activity both carry.
     ///
-    /// Only where Alpaca omits `cum_qty` does the key fall back to accumulating per-execution
-    /// qty within the batch. That fallback counts from zero per order, so it is correct only for
-    /// an order whose fills lie wholly inside the recovery window, and it is sensitive to
-    /// activities arriving out of chronological order (e.g. at pagination boundaries).
+    /// A fill lacking that id on either path is recognised instead by `"{order_id}:{cum_qty}"`,
+    /// taken from the activity's own `cum_qty`, so it matches the WS path's `filled_qty` by
+    /// construction. Only where Alpaca omits `cum_qty` too does that key fall back to
+    /// accumulating per-execution qty within the batch. That fallback counts from zero per order,
+    /// so it is correct only for an order whose fills lie wholly inside the recovery window, and
+    /// it is sensitive to activities arriving out of chronological order (e.g. at pagination
+    /// boundaries).
     ///
     /// A recovered fill also carries the order's cumulative filled quantity, so it advances the
     /// order's `filled_quantity` without waiting for a `fetch_open_orders` reconciliation.
+    ///
+    /// Every fill's [`TradeId`] is Alpaca's execution id, whether the stream, recovery, or
+    /// [`ExecutionClient::fetch_trades`] delivers it, so a fill read again by `fetch_trades`
+    /// matches the one the stream delivered. A stream fill whose `execution_id` is missing, null
+    /// or empty is logged and identified by `"{order_id}:{filled_qty}"` instead.
+    ///
+    /// The read is made once, with no retry. When it fails, times out, or stops at 5,000 fills,
+    /// the stream sends one [`AccountEventKind::FillRecoveryGaveUp`] covering the stream's
+    /// `instruments`, or every instrument when that list is empty. A truncated read delivers the
+    /// fills it read first, and the event's span starts just before the last of them.
+    ///
+    /// # Busted and corrected fills
+    ///
+    /// A `trade_bust` or `trade_correct` is sent as [`AccountEventKind::TradeAmended`], naming
+    /// the fill amended by its [`TradeId`]; the fill itself was delivered as first reported and
+    /// is not withdrawn. The Trading API documents neither event, so their frames are read per
+    /// Alpaca's Broker API schema, and each is also logged whole at `warn!`. One sent while the
+    /// stream was disconnected is not recovered.
     ///
     /// # Lifecycle event deduplication
     ///
@@ -1410,11 +1585,57 @@ impl ExecutionClient for AlpacaClient {
     /// [`AccountEventKind::OrderCancelled`] processing idempotent, or call
     /// [`ExecutionClient::fetch_open_orders`] after each reconnect to reconcile state.
     ///
+    /// # Orders that ended while disconnected
+    ///
+    /// A reconnect also reports how each order the client holds as live ended, where it did, as an
+    /// [`AccountEventKind::OrderSnapshot`] of its inactive state: filled (with the average fill
+    /// price), cancelled or replaced (as cancelled, with what filled before), expired, or rejected.
+    /// Like fill recovery, it covers only the instruments the stream was opened with, or every
+    /// instrument when that list is empty. Alpaca's closed-order list filters on when an order was
+    /// submitted, so such an order is found by asking about it, not by time.
+    ///
+    /// - **Which orders.** The client holds an order as live from the response to placing it,
+    ///   from a listing of open orders ([`account_snapshot`](ExecutionClient::account_snapshot),
+    ///   [`fetch_open_orders`](ExecutionClient::fetch_open_orders)), and from its live reports on
+    ///   any of its account streams, until it sees the order end; a cancel Alpaca has only
+    ///   accepted does not end it. A bracket's take-profit and stop-loss legs carry client order
+    ///   ids Alpaca assigns, so they are held only once a listing or the stream reports them. It
+    ///   holds up to 4,096 orders and forgets the oldest past that, logged at `warn`. An order
+    ///   placed outside this client and never listed or reported to it is not covered.
+    /// - **Cost.** One `GET /v2/orders?status=open` request listing every instrument with an
+    ///   order held, then one `GET /v2/orders:by_client_order_id` for each held order the listing
+    ///   no longer shows, 8 at a time. These share the account's rate limit with orders, so after
+    ///   an outage in which many held orders ended, the check can hold orders back until the
+    ///   window resets (see [Rate limits](AlpacaClient#rate-limits)).
+    /// - **Fills first.** The check starts once fill recovery has finished or given up, so an
+    ///   order's recovered fills arrive before how it ended. It runs alongside the stream, which
+    ///   is read from the start. A fill that brings an order to its full quantity ends it, and
+    ///   that order is not reported again.
+    /// - **Keys.** Each snapshot carries [`StrategyId::unknown`], since Alpaca records no
+    ///   strategy. The engine matches it to the order it tracks by client order id.
+    /// - **Failures.** Each order's lookup is settled as it ends. An instrument whose listing or
+    ///   lookup fails, or whose check is still running after 30 s, is retried while connected 1,
+    ///   2, 4, 8 and 16 minutes later, asking only about the orders still held, then given up,
+    ///   logged at `error`; its orders are asked about again at the next reconnect. A listing that
+    ///   fails charges every instrument in it. Alpaca lists at most 500 open orders and has no
+    ///   pagination for them, so a listing of 500 may be truncated and fails: an account with 500
+    ///   or more open orders on the held instruments is not covered. An order Alpaca does not know
+    ///   (404) stops being held, logged at `warn`; one still live, `done_for_day`, or in a state
+    ///   this version cannot read stays held.
+    ///
+    /// The same lookup is public as [`OrderStatusClient::fetch_ended_orders`].
+    ///
     /// # Rejected orders
     ///
     /// Alpaca `rejected` events are delivered as `AccountEventKind::OrderCancelled` with
     /// `state: Err(OrderRejected(...))`. Match on `response.state.is_err()` to distinguish
     /// rejections from true cancels — do not call `.unwrap()` on `OrderCancelled.state`.
+    ///
+    /// # Orders done for the day
+    ///
+    /// A `done_for_day` event is delivered as an [`AccountEventKind::OrderSnapshot`] of the order
+    /// as open, with what it has filled: Alpaca stops working the order until the next trading
+    /// day but has not ended it.
     ///
     /// # Stream drop behaviour
     ///
@@ -1445,6 +1666,7 @@ impl ExecutionClient for AlpacaClient {
         let config = self.config.clone();
         let http = self.http.clone();
         let rate_limiter = self.rate_limiter.clone();
+        let known = self.known_live.clone();
         let instruments = instruments.to_vec();
 
         let cm_handle = tokio::spawn(connection_manager(
@@ -1453,6 +1675,7 @@ impl ExecutionClient for AlpacaClient {
             config,
             http,
             rate_limiter,
+            known,
             instruments,
             Some(initial_ws),
         ));
@@ -1474,12 +1697,16 @@ impl ExecutionClient for AlpacaClient {
     /// The 204 has no body, so `filled_quantity` is zero whatever the order filled, and
     /// `time_exchange` is the local time the answer arrived.
     ///
+    /// The client keeps holding the order as live until the stream reports how it ended, so if the
+    /// stream is down when it does, a reconnect still finds out (see
+    /// [`account_stream`](ExecutionClient::account_stream)).
+    ///
     /// Needs the venue order id. A request without one is refused, since Alpaca cancels by that
     /// id only; resolve it through [`ExecutionClient::fetch_open_orders`].
     async fn cancel_order(
         &self,
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<UnindexedOrderResponseCancel> {
+    ) -> UnindexedOrderResponseCancel {
         let key = crate::order::OrderKey {
             exchange: request.key.exchange,
             instrument: request.key.instrument.clone(),
@@ -1497,13 +1724,13 @@ impl ExecutionClient for AlpacaClient {
                     instrument = %key.instrument,
                     "Alpaca cancel_order: no exchange order ID available (clientOrderId-only cancel not supported)"
                 );
-                return Some(crate::order::request::OrderResponseCancel {
+                return crate::order::request::OrderResponseCancel {
                     key,
                     state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
                         "exchange order ID required for cancel (fetch_open_orders to resolve)"
                             .into(),
                     ))),
-                });
+                };
             }
         };
 
@@ -1514,14 +1741,14 @@ impl ExecutionClient for AlpacaClient {
         match rest_delete_with_retry(&self.rate_limiter, || http.delete(&url)).await {
             Ok(()) => {
                 let exchange_order_id = OrderId(order_id);
-                // REST DELETE returns no response body, so filled_qty unavailable.
-                // Use ZERO; downstream can reconcile via WS events or fetch_open_orders.
-                Some(crate::order::request::OrderResponseCancel {
+                // REST DELETE returns no response body, so the filled quantity is unknown
+                // here; the account stream's `canceled` update reports it.
+                crate::order::request::OrderResponseCancel {
                     key,
-                    state: Ok(Cancelled::new(exchange_order_id, Utc::now(), Decimal::ZERO)),
-                })
+                    state: Ok(Cancelled::new(exchange_order_id, Utc::now(), None)),
+                }
             }
-            Err(e) => Some(crate::order::request::OrderResponseCancel { key, state: Err(e) }),
+            Err(e) => crate::order::request::OrderResponseCancel { key, state: Err(e) },
         }
     }
 
@@ -1548,7 +1775,7 @@ impl ExecutionClient for AlpacaClient {
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
+    ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
         let side = request.state.side;
         let reduce_only = request.state.reduce_only;
         self.open_order_inner(request, map_position_intent(side, reduce_only))
@@ -1572,10 +1799,7 @@ impl ExecutionClient for AlpacaClient {
 
         // Only fetch the account (USD balance) when USD is among the requested assets.
         // Crypto-only requests skip this call to conserve rate-limit budget.
-        let wants_usd = assets.is_empty()
-            || assets
-                .iter()
-                .any(|a| a.name().as_str().eq_ignore_ascii_case("usd"));
+        let wants_usd = assets.is_empty() || assets.iter().any(is_usd);
         if wants_usd {
             // Pre-allocate URL to avoid re-allocation on each retry attempt.
             let account_url = format!("{base}/v2/account");
@@ -1585,10 +1809,7 @@ impl ExecutionClient for AlpacaClient {
         }
 
         // Fetch positions for non-USD asset balances (e.g., BTC, ETH from crypto holdings).
-        let wants_non_usd = assets.is_empty()
-            || assets
-                .iter()
-                .any(|a| !a.name().as_str().eq_ignore_ascii_case("usd"));
+        let wants_non_usd = assets.is_empty() || assets.iter().any(|a| !is_usd(a));
         if wants_non_usd {
             // Pre-allocate URL to avoid re-allocation on each retry attempt.
             let positions_url = format!("{base}/v2/positions");
@@ -1610,50 +1831,79 @@ impl ExecutionClient for AlpacaClient {
         let open_orders =
             fetch_raw_open_orders(&http, &self.rate_limiter, base, instruments).await?;
 
-        let result = open_orders
+        let result: Vec<_> = open_orders
             .into_iter()
             .filter_map(|o| convert_open_order(&o))
             .collect();
+        self.remember_live(&result);
         Ok(result)
     }
 
+    /// # Cost
+    ///
+    /// One call sends up to 50 requests, reading at most 5,000 FILL activities, and returns
+    /// `resume` when it stops there. The limit counts every activity on the account, before the
+    /// instrument filter, so a call for one instrument can spend all 50 requests and return no
+    /// trades with `resume: Some`.
+    ///
+    /// # Times
+    ///
+    /// An activity whose `transaction_time` does not parse is still returned, since Alpaca placed
+    /// it in the span. Its `time_exchange` is then the local clock at the read, which can lie
+    /// outside the span, and a warning names it.
     async fn fetch_trades(
         &self,
-        time_since: DateTime<Utc>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
-    ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
-        let after_str = time_since.to_rfc3339();
-        let base = self.base_url();
-        let http = self.http.clone();
+    ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError> {
+        // An empty span, or one ending before the epoch, holds nothing Alpaca has.
+        if start > end || end < DateTime::UNIX_EPOCH {
+            return Ok(TradesRead::complete(Vec::new()));
+        }
+        let page = paginate_activities(
+            &self.http,
+            &self.rate_limiter,
+            self.base_url(),
+            start,
+            Some(end),
+        )
+        .await?;
 
-        let page = paginate_activities(&http, &self.rate_limiter, base, &after_str).await?;
-
-        // Propagate truncation as an error so callers can detect incomplete results.
-        // A caller can match on `Truncated` and alert rather than act on a partial page.
-        if page.truncated {
+        // Alpaca's `until` is not exact, and is not sent for an `end` not yet reached, so the
+        // read can run past `end`. Activities are ascending by millisecond, so a resume past `end`
+        // means every activity in the span was read.
+        let resume = page.resume.filter(|resume| *resume <= end);
+        // A read from `resume` would stop where this one did, so it cannot advance.
+        if resume.is_some_and(|resume| resume <= floor_millis(start)) {
+            error!(
+                %start,
+                fills_read = page.activities.len(),
+                "Alpaca fetch_trades: a full read did not advance past the span's first millisecond"
+            );
             return Err(UnindexedClientError::Truncated {
-                limit: MAX_ACTIVITY_PAGES,
+                fills_read: page.activities.len(),
             });
         }
 
         // Empty instruments slice means "all instruments" — same convention as
-        // fetch_open_orders. Build a set only when filtering is needed.
-        let trades = if instruments.is_empty() {
-            page.activities
-                .into_iter()
-                .filter_map(|a| convert_activity_to_trade(&a))
-                .collect()
-        } else {
-            let instrument_set: fnv::FnvHashSet<&str> =
-                instruments.iter().map(|i| i.name().as_str()).collect();
-            page.activities
-                .into_iter()
-                .filter(|a| instrument_set.contains(a.symbol.as_str()))
-                .filter_map(|a| convert_activity_to_trade(&a))
-                .collect()
-        };
+        // fetch_open_orders.
+        let instrument_set: fnv::FnvHashSet<&str> =
+            instruments.iter().map(|i| i.name().as_str()).collect();
+        let trades = page
+            .activities
+            .iter()
+            .filter(|a| instrument_set.is_empty() || instrument_set.contains(a.symbol.as_str()))
+            // Alpaca's bounds are not exact (see `paginate_activities`), so the span is applied
+            // here. An activity whose time does not parse is kept: Alpaca placed it in the span.
+            .filter(|a| {
+                parse_timestamp(&a.transaction_time)
+                    .is_none_or(|time| (start..=end).contains(&time))
+            })
+            .filter_map(convert_activity_to_trade)
+            .collect();
 
-        Ok(trades)
+        Ok(TradesRead::new(trades, resume))
     }
 }
 
@@ -1678,7 +1928,7 @@ impl AlpacaClient {
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
         intent: AlpacaPositionIntent,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
+    ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
         self.open_order_inner(request, intent).await
     }
 
@@ -1867,24 +2117,10 @@ impl AlpacaClient {
 
         match result {
             Ok(resp) => {
-                let exchange_order_id = OrderId(SmolStr::new(&resp.id));
-                let time_exchange = order_state_time(&resp);
-                let filled_qty = Decimal::from_str(&resp.filled_qty).unwrap_or(Decimal::ZERO);
-
-                let state = if filled_qty >= request.quantity {
-                    OrderState::fully_filled(Filled::new(
-                        exchange_order_id,
-                        time_exchange,
-                        filled_qty,
-                        None,
-                    ))
-                } else {
-                    OrderState::active(Open::new(
-                        VenueOrderId::Assigned(exchange_order_id),
-                        time_exchange,
-                        filled_qty,
-                    ))
-                };
+                let state = placed_order_state(&resp, &order_key.instrument, request.quantity);
+                self.known_live
+                    .lock()
+                    .placed(&order_key, request.quantity, &state);
 
                 AlpacaBracketOrderResult {
                     parent: Order {
@@ -1919,7 +2155,7 @@ impl AlpacaClient {
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
         intent: AlpacaPositionIntent,
-    ) -> Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> {
+    ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
         let instrument = request.key.instrument.clone();
         let side = request.state.side;
         let price = request.state.price;
@@ -1939,7 +2175,7 @@ impl AlpacaClient {
         let tif_str = match map_time_in_force(time_in_force) {
             Ok(s) => s,
             Err(msg) => {
-                return Some(Order {
+                return Order {
                     key: order_key,
                     side,
                     price,
@@ -1949,7 +2185,7 @@ impl AlpacaClient {
                     state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                         msg.to_string(),
                     ))),
-                });
+                };
             }
         };
 
@@ -1957,7 +2193,7 @@ impl AlpacaClient {
         let order_type_str = match map_order_kind(kind) {
             Some(s) => s,
             None => {
-                return Some(Order {
+                return Order {
                     key: order_key,
                     side,
                     price,
@@ -1967,7 +2203,7 @@ impl AlpacaClient {
                     state: OrderState::inactive(OrderError::UnsupportedOrderType(format!(
                         "Alpaca connector does not yet support OrderKind::{kind:?}"
                     ))),
-                });
+                };
             }
         };
 
@@ -1977,7 +2213,7 @@ impl AlpacaClient {
             ..
         } = kind
         {
-            return Some(Order {
+            return Order {
                 key: order_key,
                 side,
                 price,
@@ -1989,13 +2225,13 @@ impl AlpacaClient {
                      use Percentage or Absolute"
                         .to_string(),
                 )),
-            });
+            };
         }
 
         // StopLimit requires Order.price (the limit price applied once trigger fires).
         // Guard locally to avoid a wire round-trip producing a generic 422.
         if matches!(kind, OrderKind::StopLimit { .. }) && price.is_none() {
-            return Some(Order {
+            return Order {
                 key: order_key,
                 side,
                 price,
@@ -2005,7 +2241,7 @@ impl AlpacaClient {
                 state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
                     "StopLimit order requires Order.price (the limit price) to be set".to_string(),
                 ))),
-            });
+            };
         }
 
         // Extract stop/trailing parameters based on order kind.
@@ -2067,28 +2303,10 @@ impl AlpacaClient {
 
         match result {
             Ok(resp) => {
-                let exchange_order_id = OrderId(SmolStr::new(&resp.id));
-                let time_exchange = order_state_time(&resp);
-                let filled_qty = Decimal::from_str(&resp.filled_qty).unwrap_or(Decimal::ZERO);
+                let state = placed_order_state(&resp, &order_key.instrument, quantity);
+                self.known_live.lock().placed(&order_key, quantity, &state);
 
-                let state = if filled_qty >= quantity {
-                    // Order was fully filled immediately (market order or aggressive limit)
-                    OrderState::fully_filled(Filled::new(
-                        exchange_order_id,
-                        time_exchange,
-                        filled_qty,
-                        None, // Alpaca order response doesn't include avg_price
-                    ))
-                } else {
-                    // Order is resting on the order book (partially filled or unfilled)
-                    OrderState::active(Open::new(
-                        VenueOrderId::Assigned(exchange_order_id),
-                        time_exchange,
-                        filled_qty,
-                    ))
-                };
-
-                Some(Order {
+                Order {
                     key: order_key,
                     side,
                     price,
@@ -2096,11 +2314,11 @@ impl AlpacaClient {
                     kind,
                     time_in_force,
                     state,
-                })
+                }
             }
             Err(e) => {
                 let order_err = order_post_error(e);
-                Some(Order {
+                Order {
                     key: order_key,
                     side,
                     price,
@@ -2108,7 +2326,7 @@ impl AlpacaClient {
                     kind,
                     time_in_force,
                     state: OrderState::inactive(order_err),
-                })
+                }
             }
         }
     }
@@ -2170,31 +2388,53 @@ async fn fetch_raw_open_orders(
 // Activity pagination
 // ---------------------------------------------------------------------------
 
-/// Maximum number of pages fetched by [`paginate_activities`].
+/// Maximum number of pages fetched by one [`paginate_activities`] call.
 ///
-/// 50 pages × 100 items = 5 000 fills. Exceeding this during recovery indicates
-/// an unusually long outage; we warn and truncate rather than looping forever.
+/// 50 pages × 100 items = 5 000 fills. It bounds how long one read, such as a reconnect's
+/// recovery, can take; a read that reaches it says where to read on from.
 const MAX_ACTIVITY_PAGES: usize = 50;
 
-/// Result of [`paginate_activities`] including truncation status.
-///
-/// When `truncated` is true, the `activities` vector contains a partial result
-/// capped at [`MAX_ACTIVITY_PAGES`] pages. Callers should handle this case
-/// appropriately — typically by alerting operators about potential data loss.
+/// What one [`paginate_activities`] call read.
 struct ActivityPage {
+    /// Every FILL activity read, in Alpaca's ascending order.
     activities: Vec<AlpacaActivity>,
-    truncated: bool,
+    /// Set when the read stopped at [`MAX_ACTIVITY_PAGES`]: every activity before this time was
+    /// read, and some from it on may not have been.
+    resume: Option<DateTime<Utc>>,
 }
 
-/// Fetch all FILL activities since `after` using token-based pagination.
+/// `time` rounded down to the millisecond.
+fn floor_millis(time: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(time.timestamp_millis()).unwrap_or(time)
+}
+
+/// Fetch the FILL activities from `start`, and up to `end` if given, using token-based
+/// pagination.
 ///
 /// Alpaca returns up to `ALPACA_MAX_ACTIVITIES` per page. If a full page is
 /// returned, the next request uses the last item's `id` as the `page_token`.
 /// Pagination terminates when a page has fewer items than `page_size`, or after
 /// [`MAX_ACTIVITY_PAGES`] pages (whichever comes first).
 ///
-/// Returns [`ActivityPage`] with `truncated = true` if the page limit was reached,
-/// allowing callers to detect and handle partial results.
+/// # Bounds
+///
+/// Alpaca's `after` and `until` are not exact. Observed on paper (2026-10-05):
+/// - `after` matches an activity whose time, rounded down to the millisecond, is at or after it.
+///   So a microsecond `after` drops the rest of its own millisecond. It is sent rounded down to
+///   the millisecond, which reads the whole of `start`'s.
+/// - `until` matched no single rule: exact to the microsecond for one fill, yet including a fill
+///   15 µs past it for two that shared a millisecond. It is sent as the millisecond after
+///   `end`'s, or not at all for an `end` not yet reached, and callers apply `end` to what is
+///   read.
+///
+/// So the activities read can begin before `start` and end after `end`, within their
+/// milliseconds.
+///
+/// # Resuming
+///
+/// Within one millisecond Alpaca orders activities by id, not by time, so a read cut inside a
+/// millisecond may not have reached an earlier fill in it. [`ActivityPage::resume`] is therefore
+/// the millisecond of the last activity read, and a read from it reads that millisecond again.
 // Compile-time string form of ALPACA_MAX_ACTIVITIES (avoids runtime to_string() allocation).
 const PAGE_SIZE_STR: &str = "100"; // must match ALPACA_MAX_ACTIVITIES
 const _: () = assert!(
@@ -2206,8 +2446,17 @@ async fn paginate_activities(
     http: &reqwest::Client,
     rate_limiter: &RateLimitTracker,
     base: &str,
-    after: &str,
+    start: DateTime<Utc>,
+    end: Option<DateTime<Utc>>,
 ) -> Result<ActivityPage, UnindexedClientError> {
+    // Clamped to the epoch so a far-past `start` still formats as RFC 3339; Alpaca holds nothing
+    // older. An `end` not yet reached sends no `until`, so a far-future one cannot overflow.
+    let after =
+        floor_millis(start.max(DateTime::UNIX_EPOCH)).to_rfc3339_opts(SecondsFormat::Millis, true);
+    let until = end.filter(|end| *end < Utc::now()).map(|end| {
+        (floor_millis(end) + TimeDelta::milliseconds(1))
+            .to_rfc3339_opts(SecondsFormat::Millis, true)
+    });
     let mut all = Vec::with_capacity(ALPACA_MAX_ACTIVITIES);
     let mut page_token: Option<String> = None;
     let mut pages = 0usize;
@@ -2224,10 +2473,13 @@ async fn paginate_activities(
         let activities: Vec<AlpacaActivity> = rest_with_retry(rate_limiter, || {
             let mut req = http.get(format!("{base}/v2/account/activities")).query(&[
                 ("activity_type", "FILL"),
-                ("after", after),
+                ("after", after.as_str()),
                 ("page_size", PAGE_SIZE_STR),
                 ("direction", "asc"),
             ]);
+            if let Some(until) = until.as_deref() {
+                req = req.query(&[("until", until)]);
+            }
             if let Some(token) = page_token_ref {
                 req = req.query(&[("page_token", token)]);
             }
@@ -2263,9 +2515,19 @@ async fn paginate_activities(
         }
     }
 
+    // Activities are ascending by millisecond, so the last one whose time parses bounds what is
+    // left. None parsing leaves everything from `start`.
+    let resume = truncated.then(|| {
+        floor_millis(
+            all.iter()
+                .rev()
+                .find_map(|activity| parse_timestamp(&activity.transaction_time))
+                .unwrap_or(start),
+        )
+    });
     Ok(ActivityPage {
         activities: all,
-        truncated,
+        resume,
     })
 }
 
@@ -2275,9 +2537,9 @@ async fn paginate_activities(
 
 /// Long-running task managing the WebSocket lifecycle for account_stream.
 ///
-/// Loop: connect → auth → subscribe → stream events → on disconnect → backoff
-/// → fill recovery → reconnect. The `tx` channel persists across reconnections
-/// so the consumer sees a seamless event stream.
+/// Loop: connect → auth → subscribe → fill recovery → ended-order check → stream events → on
+/// disconnect → backoff → reconnect. The `tx` channel persists across reconnections so the
+/// consumer sees a seamless event stream.
 ///
 /// Terminates when the consumer drops the stream or max reconnect attempts are
 /// exhausted.
@@ -2290,11 +2552,15 @@ async fn connection_manager(
     config: Arc<AlpacaConfig>,
     http: reqwest::Client,
     rate_limiter: Arc<RateLimitTracker>,
+    known: SharedKnownLiveOrders,
     instruments: Vec<InstrumentNameExchange>,
     initial_ws: Option<WebSocket>,
 ) {
     let mut backoff = ExponentialBackoff::new();
     let mut disconnect_time: Option<DateTime<Utc>> = None;
+    // Instruments whose known-live orders a reconnect has yet to check: checked after the fills,
+    // and retried on a timer while connected, once due.
+    let mut unchecked = UncheckedOrders::default();
     let mut current_ws = initial_ws;
 
     'outer: loop {
@@ -2340,35 +2606,28 @@ async fn connection_manager(
         // captured by the already-connected WS session. The dedup cache prevents
         // duplicates between recovered REST fills and live WS events.
         if let Some(dt) = disconnect_time.take() {
-            let base = config.rest_base_url();
-            let after_str = dt.to_rfc3339();
-            match tokio::time::timeout(
+            recover_fills_or_report(
+                &http,
+                &rate_limiter,
+                &instruments,
+                config.rest_base_url(),
+                dt,
                 Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS),
-                recover_fills(
-                    &http,
-                    &rate_limiter,
-                    &instruments,
-                    base,
-                    &after_str,
-                    &tx,
-                    &dedup,
-                ),
+                &tx,
+                &dedup,
+                &known,
             )
-            .await
-            {
-                Ok(()) => {}
-                // One account-wide activities query serves every instrument, so a timeout can
-                // have missed fills in any of them: name the requested set.
-                Err(_) => warn!(
-                    timeout_secs = FILL_RECOVERY_TIMEOUT_SECS,
-                    instruments = ?instruments
-                        .iter()
-                        .map(|instrument| instrument.name().as_str())
-                        .collect::<Vec<_>>(),
-                    "Alpaca fill recovery timed out — fills since the disconnect may be missing \
-                     for any of the instruments (every instrument when the list is empty)"
-                ),
-            }
+            .await;
+            // Only the instruments this stream recovers fills for, every one when none is named.
+            let held = {
+                let known = known.lock();
+                if instruments.is_empty() {
+                    known.instruments()
+                } else {
+                    known.instruments_among(&instruments)
+                }
+            };
+            unchecked.open(held);
         }
 
         // --- Stream events ---
@@ -2386,6 +2645,14 @@ async fn connection_manager(
         let mut last_message_time = Utc::now();
         let heartbeat = tokio::time::sleep(Duration::from_secs(HEARTBEAT_TIMEOUT_SECS));
         tokio::pin!(heartbeat);
+
+        // How the orders held as live ended: checked alongside the stream, so it is read, and a
+        // disconnect seen, from the start. Fill recovery has finished or given up above, so the
+        // fills come first. Dropping this when the stream loop ends loses nothing, since each
+        // lookup and each check is settled in one step as soon as it ends.
+        let order_checks =
+            run_order_checks(&http, &rate_limiter, &config, &known, &mut unchecked, &tx);
+        tokio::pin!(order_checks);
 
         // Resets the rolling heartbeat deadline and records the wall-clock receive time.
         // Pin<&mut Sleep> cannot be passed to a regular function, so a macro avoids
@@ -2417,14 +2684,14 @@ async fn connection_manager(
                             reset_heartbeat!();
                         }
                         Some(Ok(WsMessage::Text(text))) => {
-                            process_ws_text(text.as_str(), &tx, &dedup, &mut backoff);
+                            process_ws_text(text.as_str(), &tx, &dedup, &known, &mut backoff);
                             reset_heartbeat!();
                         }
                         Some(Ok(WsMessage::Binary(bytes))) => {
                             // Alpaca paper trading sends binary-framed JSON.
                             match std::str::from_utf8(&bytes) {
                                 Ok(text) => {
-                                    process_ws_text(text, &tx, &dedup, &mut backoff);
+                                    process_ws_text(text, &tx, &dedup, &known, &mut backoff);
                                     // Only reset heartbeat for valid UTF-8 frames that may carry
                                     // real events. A corrupt binary frame (e.g. from a proxy)
                                     // must not keep the watchdog from firing.
@@ -2448,6 +2715,7 @@ async fn connection_manager(
                         }
                     }
                 }
+                () = &mut order_checks => {}
                 _ = &mut heartbeat => {
                     warn!(
                         timeout_secs = HEARTBEAT_TIMEOUT_SECS,
@@ -2638,13 +2906,14 @@ async fn ws_handshake(ws: &mut WebSocket, config: &AlpacaConfig) -> Result<(), H
                     break;
                 }
                 // Other messages in this window are NOT buffered and are permanently
-                // dropped — callers must reconcile order state via fetch_open_orders
-                // after each (re)connect, as documented in account_stream's doc comment.
+                // dropped. On a reconnect, REST recovers the fills and how each order held
+                // as live ended; any other lifecycle event is lost, as documented in
+                // account_stream's doc comment.
                 // Log at warn! for trade_updates (fill/lifecycle events) to ensure
                 // production operators see dropped events; trace! for other streams.
                 if let Ok(msg) = serde_json::from_str::<AlpacaStreamMessage<'_>>(text.as_str()) {
                     if msg.stream == "trade_updates" {
-                        warn!(stream = %msg.stream, "WS trade_updates event dropped during listen-ack handshake — will be recovered via REST for fills, but lifecycle events (new/canceled) are lost");
+                        warn!(stream = %msg.stream, "WS trade_updates event dropped during listen-ack handshake — on a reconnect, fills and how orders held as live ended are recovered via REST; other lifecycle events are lost");
                     } else {
                         trace!(stream = %msg.stream, "WS message dropped during listen-ack handshake");
                     }
@@ -2735,10 +3004,15 @@ fn check_listen_ack(text: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Parse a raw WS text message and forward relevant account events to `tx`.
+///
+/// Each event is applied to `known` before it is sent, under the lock, so an order this reports
+/// ending and a reconnect's check of it reach the consumer in the order they were decided, and the
+/// check reports only an order not already reported.
 fn process_ws_text(
     text: &str,
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: &SharedDedupCache,
+    known: &SharedKnownLiveOrders,
     backoff: &mut ExponentialBackoff,
 ) {
     let msg: AlpacaStreamMessage<'_> = match serde_json::from_str(text) {
@@ -2778,18 +3052,41 @@ fn process_ws_text(
             // PERF: Check dedup BEFORE constructing the full event for fill events.
             // This avoids heap allocations (Trade, InstrumentNameExchange, TradeId) on
             // duplicate fills, which occur on every reconnect during recovery overlap.
-            if is_fill_event(&update) {
-                let key = early_dedup_key(&update);
-                if is_duplicate(dedup, &key) {
-                    trace!("Alpaca WS: skipping duplicate fill event (early check)");
-                    return;
-                }
+            if is_fill_event(&update)
+                && is_duplicate_fill(dedup, ws_execution_id(&update), early_dedup_key(&update))
+            {
+                trace!("Alpaca WS: skipping duplicate fill event (early check)");
+                return;
+            }
+
+            // Neither amendment is in the Trading API's docs, and no real frame has been seen, so
+            // log it whole: the first one shows what Alpaca sends.
+            if is_trade_amendment(&update) {
+                warn!(
+                    event = %update.event,
+                    raw = %msg.data.get(),
+                    "Alpaca WS: a fill reported earlier was amended — reporting it as TradeAmended"
+                );
             }
 
             for event in convert_trade_update(update).into_iter().flatten() {
+                // A resolved correction delivers its execution as the replacement trade. Should
+                // Alpaca also list it as a FILL activity, recovery must not deliver it again. An
+                // unresolved one delivered no trade, so recovery may.
+                if let AccountEventKind::TradeAmended(amendment) = &event.kind
+                    && let TradeAmendmentKind::Corrected { replacement } = &amendment.kind
+                {
+                    record_execution(dedup, &replacement.id.0);
+                }
+                let known = KnownLiveOrders::observes(&event.kind).then(|| {
+                    let mut known = known.lock();
+                    known.observe(&event);
+                    known
+                });
                 // Consumer dropped errors are benign; connection_manager will detect
                 // tx.closed() on the next select! poll and exit cleanly.
                 let _ = tx.send(event);
+                drop(known);
             }
         }
         "authorization" | "listening" => {
@@ -2803,18 +3100,23 @@ fn process_ws_text(
     }
 }
 
-/// Extract a dedup key from an account event, if applicable.
+/// The cumulative dedup key for a fill that took order `order_id` to `cumulative` filled: what
+/// [`is_duplicate_fill`] recognises a fill by when it has no execution id.
 ///
-/// Uses `trade.id` as the key. Both the WS path (`convert_trade_update`) and the
-/// REST recovery path (`recover_fills`) synthesise `TradeId` as
-/// `"{order_id}:{cumulative_filled_qty}"`, ensuring the same fill produces the
-/// same key regardless of which path delivered it.
-fn fill_dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<&SmolStr> {
-    match &event.kind {
-        // Return a reference to avoid cloning the SmolStr; is_duplicate takes &SmolStr.
-        AccountEventKind::Trade(trade) => Some(&trade.id.0),
-        _ => None,
-    }
+/// The account stream and fill recovery both build it, from the cumulative each reports for the
+/// order (the WS frame's `order.filled_qty`, the FILL activity's `cum_qty`), so one fill
+/// delivered by both is recognised. `normalize` strips trailing zeros, so `"1.00"` and `"1"` give
+/// one key. A WS fill whose `filled_qty` does not parse is keyed at zero.
+///
+/// The `format_smolstr!` call heap-allocates for UUID-length order ids (36 chars exceeds
+/// SmolStr's inline limit), which is unavoidable given the key length.
+fn fill_dedup_key(order_id: &str, cumulative: Decimal) -> SmolStr {
+    format_smolstr!("{}:{}", order_id, cumulative.normalize())
+}
+
+/// Returns `true` if this event busts or corrects a fill reported earlier.
+fn is_trade_amendment(update: &AlpacaTradeUpdate<'_>) -> bool {
+    matches!(update.event.as_str(), "trade_bust" | "trade_correct")
 }
 
 /// Returns `true` if this event type produces a fill (Trade) event.
@@ -2825,37 +3127,160 @@ fn is_fill_event(update: &AlpacaTradeUpdate<'_>) -> bool {
     matches!(update.event.as_str(), "fill" | "partial_fill")
 }
 
-/// Construct the dedup key from raw WS update fields without allocating the full event.
+/// A WS event's `execution_id`, or `None` when it is missing, null or empty.
+fn ws_execution_id<'a>(update: &AlpacaTradeUpdate<'a>) -> Option<&'a str> {
+    update.execution_id.filter(|id| !id.is_empty())
+}
+
+/// The [`fill_dedup_key`] of a WS fill, from its raw fields, before the full event is built.
 ///
-/// Key format: `"{order_id}:{cumulative_filled_qty}"` — same as `convert_trade_update`
-/// and `recover_fills` produce, ensuring cross-source dedup works correctly.
-///
-/// Note: The `format_smolstr!` call heap-allocates for UUID-length order IDs (36 chars
-/// exceeds SmolStr's 22-byte inline limit). This is unavoidable given the key length.
-/// Passing the Decimal directly to format_smolstr! (rather than via intermediate String)
-/// lets Decimal's Display impl write directly into the buffer, eliminating one allocation.
+/// An unparseable `filled_qty` reads as zero, as `convert_trade_update` reports it.
 fn early_dedup_key(update: &AlpacaTradeUpdate<'_>) -> SmolStr {
     let filled_qty = update.order.filled_qty.unwrap_or("0");
-    // Parse and normalize to match convert_trade_update's key format exactly.
-    // Decimal::from_str + normalize() are stack-only; no heap allocation until format_smolstr!.
     let qty = Decimal::from_str(filled_qty).unwrap_or(Decimal::ZERO);
-    format_smolstr!("{}:{}", update.order.id, qty.normalize())
+    fill_dedup_key(&update.order.id, qty)
+}
+
+/// The execution id in a FILL activity's `id`, `"{time}::{execution id}"`: the same id the WS
+/// fill carries as `execution_id`. The time prefix is US Eastern local time, so it is never read.
+/// An id without `::`, or with nothing after it, is taken whole, so it stays unique.
+fn activity_execution_id(activity_id: &str) -> &str {
+    activity_execution_id_part(activity_id).unwrap_or(activity_id)
+}
+
+/// The execution id after `::` in a FILL activity's `id`, or `None` when there is none: an id
+/// taken whole by [`activity_execution_id`] is not one the WS fill carries, so dedup does not
+/// key on it.
+fn activity_execution_id_part(activity_id: &str) -> Option<&str> {
+    activity_id
+        .split_once("::")
+        .map(|(_, execution_id)| execution_id)
+        .filter(|execution_id| !execution_id.is_empty())
 }
 
 // ---------------------------------------------------------------------------
 // Fill recovery
 // ---------------------------------------------------------------------------
 
-/// Fetch fills missed during a WS disconnect and forward through the dedup cache.
+/// Fills a recovery read did not deliver: those from `start` until the recovery began.
+#[derive(Debug, PartialEq)]
+struct UnreadFills {
+    start: DateTime<Utc>,
+    reason: FillRecoveryFailure,
+}
+
+/// Recover the fills missed since `disconnect` ([`recover_fills`]) within `timeout`, and send an
+/// [`AccountEventKind::FillRecoveryGaveUp`] for those the read did not deliver, after the fills
+/// it did.
+async fn recover_fills_or_report(
+    http: &reqwest::Client,
+    rate_limiter: &RateLimitTracker,
+    instruments: &[InstrumentNameExchange],
+    base: &str,
+    disconnect: DateTime<Utc>,
+    timeout: Duration,
+    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
+    dedup: &SharedDedupCache,
+    known: &SharedKnownLiveOrders,
+) {
+    // The live stream is already subscribed, so every fill after this arrives live.
+    let recovery_start = Utc::now();
+    let outcome = match tokio::time::timeout(
+        timeout,
+        recover_fills(
+            http,
+            rate_limiter,
+            instruments,
+            base,
+            disconnect,
+            tx,
+            dedup,
+            known,
+        ),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        // One account-wide activities query serves every instrument, so a timeout can have missed
+        // fills in any of them: name the requested set. Nothing was forwarded, since recovery
+        // sends its fills only after the read has finished.
+        Err(_) => {
+            warn!(
+                timeout_secs = timeout.as_secs(),
+                instruments = ?instruments
+                    .iter()
+                    .map(|instrument| instrument.name().as_str())
+                    .collect::<Vec<_>>(),
+                "Alpaca fill recovery timed out — fills since the disconnect may be missing for \
+                 any of the instruments (every instrument when the list is empty)"
+            );
+            Err(UnreadFills {
+                start: disconnect,
+                reason: FillRecoveryFailure::TimedOut {
+                    timeout_secs: timeout.as_secs(),
+                },
+            })
+        }
+    };
+    if let Err(unread) = outcome
+        && tx
+            .send(fill_recovery_gave_up(instruments, unread, recovery_start))
+            .is_err()
+    {
+        debug!("Alpaca fill recovery: consumer dropped before the give-up was sent");
+    }
+}
+
+/// The [`AccountEventKind::FillRecoveryGaveUp`] for `unread`, whose recovery began at `end`,
+/// on a stream opened with `instruments`, every instrument when empty. Alpaca does not retry the
+/// read, so it was read once.
+///
+/// A truncated read can return fills stamped after `end`, by Alpaca's clock, which may run ahead
+/// of this host's. The span then ends at its start rather than before it: the event is still
+/// sent, since a report with nothing left to read costs the consumer one read, while a report
+/// withheld on a clock comparison would be a silent loss.
+fn fill_recovery_gave_up(
+    instruments: &[InstrumentNameExchange],
+    unread: UnreadFills,
+    end: DateTime<Utc>,
+) -> UnindexedAccountEvent {
+    let UnreadFills { start, reason } = unread;
+    // One account-wide read serves every instrument, so one event covers them all.
+    let scope = if instruments.is_empty() {
+        FillRecoveryScope::AllInstruments
+    } else {
+        FillRecoveryScope::Instruments(instruments.to_vec())
+    };
+    UnindexedAccountEvent::new(
+        ExchangeId::AlpacaBroker,
+        AccountEventKind::FillRecoveryGaveUp(FillRecoveryGap::new(
+            scope,
+            start,
+            end.max(start),
+            1,
+            reason,
+        )),
+    )
+}
+
+/// Fetch fills missed during a WS disconnect, since `after`, and forward through the dedup cache.
+///
+/// A fill that brings an order to its full quantity ends it in `known`, so a reconnect's check
+/// does not report it again.
+///
+/// Returns the fills it did not deliver: all of them when the read fails, and those from the
+/// millisecond of the last one read when the read stops at [`MAX_ACTIVITY_PAGES`]. The fills it read are sent
+/// first. A consumer that drops the stream part-way gets `Ok`, as there is no one to report to.
 async fn recover_fills(
     http: &reqwest::Client,
     rate_limiter: &RateLimitTracker,
     instruments: &[InstrumentNameExchange],
     base: &str,
-    after: &str,
+    after: DateTime<Utc>,
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: &SharedDedupCache,
-) {
+    known: &SharedKnownLiveOrders,
+) -> Result<(), UnreadFills> {
     // Empty `instruments` means "recover for all subscribed symbols" (same convention as
     // `fetch_trades` / `fetch_open_orders`). Skip the set allocation when not filtering.
     info!(%after, instruments = instruments.len(), "Alpaca recovering fills after reconnect");
@@ -2865,37 +3290,48 @@ async fn recover_fills(
         instruments.iter().map(|i| i.name().as_str()).collect()
     };
 
-    let page = match paginate_activities(http, rate_limiter, base, after).await {
+    let page = match paginate_activities(http, rate_limiter, base, after, None).await {
         Ok(p) => p,
         Err(e) => {
             error!(%e, "Alpaca fill recovery: REST request failed");
-            return;
+            return Err(UnreadFills {
+                start: after,
+                reason: FillRecoveryFailure::Request(e.to_string()),
+            });
         }
     };
 
-    // Log truncation as error — the returned data is partial and some fills are
-    // permanently lost. Callers cannot propagate this error (recover_fills returns ()),
-    // but the log ensures operators are alerted.
-    if page.truncated {
+    let activities = page.activities;
+
+    // The read is account-wide, so one that stopped at the page cap has every fill before its
+    // resume point, whatever the instrument: the millisecond of its last fill, which a read from
+    // there reads again. The dedup cache absorbs the fills read twice.
+    let unread = page.resume.map(|start| {
         error!(
             max_pages = MAX_ACTIVITY_PAGES,
-            "Alpaca fill recovery: max page limit reached, truncating — \
-             fills from this outage are permanently lost. Manual reconciliation required."
+            fills_read = activities.len(),
+            %start,
+            "Alpaca fill recovery: max page limit reached, truncating — fills from this time on \
+             are not delivered; read them with fetch_trades"
         );
-    }
-
-    let activities = page.activities;
+        UnreadFills {
+            start,
+            reason: FillRecoveryFailure::Truncated {
+                fills_read: activities.len(),
+            },
+        }
+    });
 
     let mut recovered = 0u32;
     let mut duplicates = 0u32;
 
-    // Fallback only. The dedup key is "{order_id}:{cumulative_filled_qty}" on both paths, and the
-    // cumulative is now taken from the activity's own `cum_qty` -- the same figure the WS path
-    // reads from `order.filled_qty` -- so the two agree by construction rather than by
-    // reconstruction.
+    // Fallback only. A fill is recognised by its execution id, and by its cumulative key
+    // "{order_id}:{cumulative_filled_qty}" where either path lacks the id (see
+    // `is_duplicate_fill`). The cumulative is taken from the activity's own `cum_qty` -- the same
+    // figure the WS path reads from `order.filled_qty` -- so the two agree by construction rather
+    // than by reconstruction.
     //
-    // This counter is what the key falls back to when `cum_qty` is absent, which reproduces the
-    // previous behaviour exactly. That behaviour is correct only for an order whose fills lie
+    // This counter is what the cumulative key falls back to when `cum_qty` is absent. That behaviour is correct only for an order whose fills lie
     // entirely inside the recovery window: it counts from zero per order within the batch, so an
     // order that had already partly filled before the window yields keys offset by the amount it
     // filled earlier, and those keys match nothing the WS path ever emitted. Preferring `cum_qty`
@@ -2936,7 +3372,7 @@ async fn recover_fills(
         *cum += exec_qty;
         let cumulative = *cum;
 
-        let mut trade = match convert_activity_to_trade(activity) {
+        let trade = match convert_activity_to_trade(activity) {
             Some(t) => t,
             None => {
                 warn!(id = %activity.id, symbol = %activity.symbol, "Alpaca: skipping activity with unparseable fields");
@@ -2944,11 +3380,7 @@ async fn recover_fills(
             }
         };
 
-        // Override trade.id to match the WS synthesised format so that
-        // fill_dedup_key_from_event produces the same key for both sources.
-        // Normalise the cumulative Decimal to strip trailing zeros so the string
-        // representation matches the WS path (e.g. "1" == "1.00" after normalize).
-        //
+        // The cumulative key, which matches the WS path's for the same fill.
         // `order_filled_quantity` holds the venue's own cumulative, parsed by
         // `convert_activity_to_trade`; `cumulative` is the intra-batch fallback described above.
         //
@@ -2957,34 +3389,320 @@ async fn recover_fills(
         // on the same order that omits the field. A batch mixing both therefore interleaves two
         // key schemes, and the fallback keys in it remain offset by whatever the order filled
         // before the window -- the field's presence rescues an activity, not an order.
-        let key_cumulative = trade.order_filled_quantity.unwrap_or(cumulative);
-        trade.id = TradeId(format_smolstr!(
-            "{}:{}",
-            activity.order_id,
-            key_cumulative.normalize()
-        ));
-
-        let event =
-            UnindexedAccountEvent::new(ExchangeId::AlpacaBroker, AccountEventKind::Trade(trade));
-
-        // Re-use fill_dedup_key_from_event so the key logic is in one place.
-        if fill_dedup_key_from_event(&event).is_some_and(|k| is_duplicate(dedup, k)) {
+        let key = fill_dedup_key(
+            &activity.order_id,
+            trade.order_filled_quantity.unwrap_or(cumulative),
+        );
+        if is_duplicate_fill(dedup, activity_execution_id_part(&activity.id), key) {
             duplicates += 1;
             continue;
         }
-        if tx.send(event).is_err() {
+
+        let event =
+            UnindexedAccountEvent::new(ExchangeId::AlpacaBroker, AccountEventKind::Trade(trade));
+        let mut held = known.lock();
+        held.observe(&event);
+        let sent = tx.send(event);
+        drop(held);
+        if sent.is_err() {
             debug!("Alpaca fill recovery: consumer dropped during recovery");
-            return;
+            return Ok(());
         }
         recovered += 1;
     }
 
     info!(recovered, duplicates, "Alpaca fill recovery complete");
+    unread.map_or(Ok(()), Err)
+}
+
+// ---------------------------------------------------------------------------
+// Ended-order recovery
+// ---------------------------------------------------------------------------
+
+/// Look the order under `key` up with `GET /v2/orders:by_client_order_id`.
+///
+/// A 404 is [`OrderLookup::Unknown`], and so is an order on another symbol than the key's (ignoring
+/// case, as Alpaca's symbols are upper case).
+async fn fetch_order_lookup(
+    http: reqwest::Client,
+    rate_limiter: Arc<RateLimitTracker>,
+    config: Arc<AlpacaConfig>,
+    key: UnindexedOrderKey,
+) -> Result<OrderLookup, UnindexedClientError> {
+    let url = format!("{}/v2/orders:by_client_order_id", config.rest_base_url());
+    let cid = key.cid.0.as_str();
+    let found: Option<AlpacaOrderResponse> = rest_lookup_with_retry(&rate_limiter, || {
+        http.get(&url).query(&[("client_order_id", cid)])
+    })
+    .await?;
+    let Some(order) = found else {
+        debug!(instrument = %key.instrument, cid = %key.cid, "Alpaca does not know this order");
+        return Ok(OrderLookup::Unknown);
+    };
+    if !order
+        .symbol
+        .eq_ignore_ascii_case(key.instrument.name().as_str())
+    {
+        debug!(
+            instrument = %key.instrument,
+            cid = %key.cid,
+            symbol = %order.symbol,
+            "Alpaca knows this client order id on another symbol"
+        );
+        return Ok(OrderLookup::Unknown);
+    }
+    Ok(
+        convert_ended_order(&order, &key).map_or(OrderLookup::NotEnded, |order| {
+            OrderLookup::Ended(Box::new(order))
+        }),
+    )
+}
+
+/// The client order ids one `GET /v2/orders?status=open` lists on `instruments`, for a
+/// reconnect's check of the orders held as live. A listing of 500 may be truncated, so it fails.
+async fn listed_open_cids(
+    http: reqwest::Client,
+    rate_limiter: Arc<RateLimitTracker>,
+    config: Arc<AlpacaConfig>,
+    instruments: Vec<InstrumentNameExchange>,
+) -> Result<FnvHashSet<ClientOrderId>, UnindexedClientError> {
+    let orders =
+        fetch_raw_open_orders(&http, &rate_limiter, config.rest_base_url(), &instruments).await?;
+    Ok(orders
+        .iter()
+        .map(|order| alpaca_cid(order.client_order_id.as_deref(), &order.id))
+        .collect())
+}
+
+/// [`recover_ended_orders`] on Alpaca: one listing of every instrument due by
+/// [`listed_open_cids`], and lookups by [`fetch_order_lookup`]. Fill recovery has finished or been
+/// given up before it runs, so no fills are pending.
+async fn recover_alpaca_ended_orders(
+    http: &reqwest::Client,
+    rate_limiter: &Arc<RateLimitTracker>,
+    config: &Arc<AlpacaConfig>,
+    known: &SharedKnownLiveOrders,
+    unchecked: &mut UncheckedOrders,
+    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
+) {
+    recover_ended_orders(
+        ExchangeId::AlpacaBroker,
+        known,
+        unchecked,
+        &NoPendingFills,
+        tx,
+        OpenListing::Batched,
+        |instruments| {
+            listed_open_cids(
+                http.clone(),
+                rate_limiter.clone(),
+                config.clone(),
+                instruments,
+            )
+        },
+        |key| fetch_order_lookup(http.clone(), rate_limiter.clone(), config.clone(), key),
+    )
+    .await;
+}
+
+/// Run every order check as it falls due, the first at once and a failed one after its backoff,
+/// for as long as it is polled. It never completes, and once the consumer has gone it only waits.
+///
+/// Fill recovery has finished or been given up before this starts, so no fills are pending.
+async fn run_order_checks(
+    http: &reqwest::Client,
+    rate_limiter: &Arc<RateLimitTracker>,
+    config: &Arc<AlpacaConfig>,
+    known: &SharedKnownLiveOrders,
+    unchecked: &mut UncheckedOrders,
+    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
+) {
+    loop {
+        // A check stops at a gone consumer before settling, so its instruments stay due.
+        if tx.is_closed() {
+            return std::future::pending().await;
+        }
+        match unchecked.next_due(&NoPendingFills) {
+            Some(due) => tokio::time::sleep_until(due).await,
+            None => return std::future::pending().await,
+        }
+        recover_alpaca_ended_orders(http, rate_limiter, config, known, unchecked, tx).await;
+    }
+}
+
+/// How an order that has ended did end, from its REST order under `key`, the key it was asked for
+/// (see [`ended_order_state`]).
+///
+/// Returns `None` for an order still live (see [`order_status_is_live`]), including
+/// `done_for_day`, and, with a warning, for an order whose status is missing or unknown or that
+/// cannot be converted. A caller reads `None` as "not ended", so such an order is asked about again
+/// later rather than retired on a guess.
+fn convert_ended_order(
+    o: &AlpacaOrderResponse,
+    key: &UnindexedOrderKey,
+) -> Option<UnindexedInactiveOrder> {
+    let instrument = &key.instrument;
+    let Some(status) = o.status.as_deref() else {
+        warn!(%instrument, cid = %key.cid, order_id = %o.id, "Alpaca order missing status");
+        return None;
+    };
+    if order_status_is_live(status) {
+        return None;
+    }
+    let Some(order) = convert_representable_open_order(o) else {
+        warn!(%instrument, cid = %key.cid, order_id = %o.id, status, "Alpaca order cannot be represented, treating it as not ended");
+        return None;
+    };
+    // Read again rather than from the open order, which reads an unknown fill as zero; that
+    // conversion has already warned of it.
+    let filled_qty = Decimal::from_str(&o.filled_qty).ok();
+    let Some(state) = ended_order_state(
+        status,
+        OrderId(SmolStr::new(&o.id)),
+        order.state.time_exchange,
+        order.quantity,
+        filled_qty,
+        o.filled_avg_price.as_deref(),
+    ) else {
+        warn!(%instrument, cid = %key.cid, order_id = %o.id, status, "Alpaca order has a status this version does not know, treating it as not ended");
+        return None;
+    };
+    let mut order = order.map_state(|_| state);
+    order.key = key.clone();
+    Some(order)
+}
+
+/// Whether an Alpaca order in `status` is still live, so may yet fill or be cancelled.
+///
+/// `done_for_day` is live: Alpaca works the order again the next trading day. The rest are
+/// Alpaca's working and pending statuses. Every other status has ended the order (see
+/// [`ended_order_state`]) or is unknown to this version.
+fn order_status_is_live(status: &str) -> bool {
+    matches!(
+        status,
+        "new"
+            | "partially_filled"
+            | "done_for_day"
+            | "pending_cancel"
+            | "pending_replace"
+            | "accepted"
+            | "pending_new"
+            | "accepted_for_bidding"
+            | "stopped"
+            | "suspended"
+            | "calculated"
+            | "held"
+    )
+}
+
+/// How an order ended, from its Alpaca `status`, or `None` for a status that does not end it.
+///
+/// `filled` becomes [`InactiveOrderState::FullyFilled`] with the reported fill, or the whole
+/// `quantity` when that is unknown, and `filled_avg_price`; `canceled` becomes
+/// [`InactiveOrderState::Cancelled`], and so does `replaced`, since the order replacing it has an
+/// id and client order id of its own; `expired` becomes [`InactiveOrderState::Expired`], each with
+/// what filled before, `None` when that is unknown; and `rejected` becomes
+/// [`InactiveOrderState::OpenFailed`]. Shared by the lookup of an order that ended
+/// ([`convert_ended_order`]) and the response to placing one ([`placed_order_state`]).
+fn ended_order_state<AssetKey, InstrumentKey>(
+    status: &str,
+    order_id: OrderId,
+    time_exchange: DateTime<Utc>,
+    quantity: Decimal,
+    filled_qty: Option<Decimal>,
+    filled_avg_price: Option<&str>,
+) -> Option<InactiveOrderState<AssetKey, InstrumentKey>> {
+    Some(match status {
+        // A filled order filled its whole quantity, whether or not `filled_qty` said so.
+        "filled" => InactiveOrderState::FullyFilled(Filled::new(
+            order_id,
+            time_exchange,
+            filled_qty.unwrap_or(quantity),
+            alpaca_avg_price(filled_avg_price),
+        )),
+        "canceled" | "replaced" => {
+            InactiveOrderState::Cancelled(Cancelled::new(order_id, time_exchange, filled_qty))
+        }
+        "expired" => InactiveOrderState::Expired(Expired::new(order_id, time_exchange, filled_qty)),
+        "rejected" => {
+            InactiveOrderState::OpenFailed(OrderError::Rejected(ApiError::OrderRejected(format!(
+                "Alpaca rejected order {order_id} after accepting it"
+            ))))
+        }
+        _ => return None,
+    })
+}
+
+/// The state that `resp`, Alpaca's response to placing an order of `quantity`, reports.
+///
+/// An order that ended in the response itself is reported as it ended (see
+/// [`ended_order_state`]): an IOC or FOK order that found no liquidity, or partly filled and had
+/// the rest cancelled, is `Cancelled` or `Expired` with what filled, not `Open`, and one Alpaca
+/// rejected after accepting it is `OpenFailed`. A live status (see [`order_status_is_live`]) reads
+/// from what filled: `FullyFilled`, with `filled_avg_price`, once it covers `quantity`, otherwise
+/// `Open`. So does a status that is missing or that this version does not know, with a warning,
+/// since the account stream reports the order's next state either way.
+fn placed_order_state(
+    resp: &AlpacaOrderResponse,
+    instrument: &InstrumentNameExchange,
+    quantity: Decimal,
+) -> UnindexedOrderState {
+    let order_id = OrderId(SmolStr::new(&resp.id));
+    let time_exchange = order_state_time(resp);
+    let filled_qty = alpaca_filled_qty(&resp.id, Some(&resp.filled_qty));
+    let filled_avg_price = resp.filled_avg_price.as_deref();
+    match resp.status.as_deref() {
+        Some(status) => {
+            if let Some(ended) = ended_order_state(
+                status,
+                order_id.clone(),
+                time_exchange,
+                quantity,
+                filled_qty,
+                filled_avg_price,
+            ) {
+                return OrderState::Inactive(ended);
+            }
+            if !order_status_is_live(status) {
+                warn!(%instrument, %order_id, status, "Alpaca placed an order with a status this version does not know, reading it from what filled");
+            }
+        }
+        None => {
+            warn!(%instrument, %order_id, "Alpaca placed an order without a status, reading it from what filled");
+        }
+    }
+    match filled_qty {
+        Some(filled_qty) if filled_qty >= quantity => OrderState::fully_filled(Filled::new(
+            order_id,
+            time_exchange,
+            filled_qty,
+            alpaca_avg_price(filled_avg_price),
+        )),
+        // A live order's fill only grows, so an unknown one reads as nothing filled until the
+        // account stream reports more.
+        _ => OrderState::active(Open::new(
+            VenueOrderId::Assigned(order_id),
+            time_exchange,
+            filled_qty.unwrap_or(Decimal::ZERO),
+        )),
+    }
+}
+
+/// The average price of an Alpaca order's fills, from its `filled_avg_price`: `None` when no
+/// price is reported or it does not parse.
+fn alpaca_avg_price(filled_avg_price: Option<&str>) -> Option<Decimal> {
+    filled_avg_price.and_then(|price| Decimal::from_str(price).ok())
 }
 
 // ---------------------------------------------------------------------------
 // Type conversion helpers
 // ---------------------------------------------------------------------------
+
+/// Whether a caller's `asset` names the account currency. A name a caller passes is matched
+/// ignoring case, as the execution map matches the names this client reports.
+fn is_usd(asset: &AssetNameExchange) -> bool {
+    asset.name().as_str().eq_ignore_ascii_case(USD)
+}
 
 /// Convert an Alpaca account response to rustrade balance entries.
 ///
@@ -3000,29 +3718,19 @@ async fn recover_fills(
 /// Account equity is not the total: equity and option holdings are reported as positions, and
 /// counting them again here would double them.
 ///
-/// If `assets` is non-empty, only returns the balance if "usd" (case-insensitive)
-/// is in the requested set. An empty `assets` slice returns the USD balance unconditionally.
+/// The balance is named [`USD`], however the caller spelled it. If `assets` is non-empty, it is
+/// returned only when USD is among them, matched ignoring case. An empty `assets` slice returns it
+/// unconditionally.
 fn convert_account_to_balances(
     account: &AlpacaAccount,
     assets: &[AssetNameExchange],
 ) -> Vec<AssetBalance<AssetNameExchange>> {
-    // Preserve the caller's casing for the USD asset name (e.g. "USD" vs "usd").
-    // When no filter is given, fall back to lowercase "usd" as the canonical form.
-    let usd_entry = assets
-        .iter()
-        .find(|a| a.name().as_str().eq_ignore_ascii_case("usd"));
-
-    // Filter check: if assets is specified, only return USD balance if requested.
-    if !assets.is_empty() && usd_entry.is_none() {
+    if !assets.is_empty() && !assets.iter().any(is_usd) {
         return Vec::new();
     }
 
-    let usd_name = usd_entry
-        .cloned()
-        .unwrap_or_else(|| AssetNameExchange::new("usd"));
-
     vec![AssetBalance::new(
-        usd_name,
+        AssetNameExchange::new(USD),
         Balance::new(
             account.cash,
             account.cash.min(account.non_marginable_buying_power),
@@ -3034,7 +3742,8 @@ fn convert_account_to_balances(
 /// Convert Alpaca positions to crypto asset balance entries.
 ///
 /// Only positions with `asset_class == "crypto"` are included; [`convert_positions`] reports the
-/// rest. The base asset is extracted from the symbol (e.g., `"BTC/USD"` → `"btc"`).
+/// rest. Each is named by the asset it holds, read from its symbol by
+/// [`crypto_position_asset`] as Alpaca spells it (e.g., `"BTCUSD"` → `"BTC"`).
 ///
 /// - `total` = quantity of the holding in base currency units (e.g. 0.5 BTC)
 /// - `free`  = qty_available (base currency units not locked in open orders)
@@ -3050,20 +3759,13 @@ fn convert_positions_to_balances(
         .iter()
         .filter(|p| is_crypto_position(p))
         .filter_map(|p| {
-            // Alpaca crypto symbols are "BASE/QUOTE" (e.g., "BTC/USD").
-            // Extract the base currency as the asset name.
-            let base = p
-                .symbol
-                .split('/')
-                .next()
-                .map(|s| s.to_ascii_lowercase())
-                .unwrap_or_else(|| p.symbol.to_ascii_lowercase());
+            let base = crypto_position_asset(&p.symbol);
 
             // Apply assets filter if specified.
             if !assets.is_empty()
                 && !assets
                     .iter()
-                    .any(|a| a.name().as_str().eq_ignore_ascii_case(&base))
+                    .any(|a| a.name().as_str().eq_ignore_ascii_case(base))
             {
                 return None;
             }
@@ -3078,6 +3780,36 @@ fn convert_positions_to_balances(
             ))
         })
         .collect()
+}
+
+/// The asset a crypto position holds, read from its symbol.
+///
+/// Alpaca documents that its positions list names a crypto holding by its asset followed by `USD`
+/// (`BTCUSD` holds BTC), while orders and fills name the pair (`BTC/USD`). Both forms are read,
+/// the `USD` suffix ignoring case. A symbol in neither form, or with an empty asset, is returned
+/// whole, with a warning, so its balance is still reported, under a name that fails to index
+/// rather than not at all.
+fn crypto_position_asset(symbol: &str) -> &str {
+    let base = match symbol.split_once('/') {
+        Some((base, _)) => Some(base),
+        None => {
+            let base_len = symbol.len().saturating_sub(USD.len());
+            symbol
+                .get(base_len..)
+                .filter(|suffix| suffix.eq_ignore_ascii_case(USD))
+                .and_then(|_| symbol.get(..base_len))
+        }
+    };
+    match base {
+        Some(base) if !base.is_empty() => base,
+        _ => {
+            warn!(
+                %symbol,
+                "Alpaca crypto position symbol is neither ASSETUSD nor BASE/QUOTE; using it whole"
+            );
+            symbol
+        }
+    }
 }
 
 /// Whether an Alpaca position is a crypto holding, which is reported as an asset balance rather
@@ -3307,7 +4039,7 @@ fn convert_representable_open_order(
         .limit_price
         .as_deref()
         .and_then(|s| Decimal::from_str(s).ok());
-    let filled_qty = Decimal::from_str(&o.filled_qty).unwrap_or(Decimal::ZERO);
+    let filled_qty = alpaca_filled_qty(&o.id, Some(&o.filled_qty)).unwrap_or(Decimal::ZERO);
     let kind = parse_order_kind(
         &o.order_type,
         o.stop_price.as_deref(),
@@ -3338,7 +4070,7 @@ fn convert_representable_open_order(
 fn convert_activity_to_trade(
     a: &AlpacaActivity,
 ) -> Option<Trade<AssetNameExchange, InstrumentNameExchange>> {
-    let trade_id = TradeId::new(&a.id);
+    let trade_id = TradeId::new(activity_execution_id(&a.id));
     let order_id = OrderId(SmolStr::new(&a.order_id));
     let instrument = InstrumentNameExchange::new(&a.symbol);
     let side = parse_side(&a.side)?;
@@ -3367,7 +4099,7 @@ fn convert_activity_to_trade(
         quantity,
         order_filled_quantity,
         AssetFees::new(
-            AssetNameExchange::from("USD"),
+            AssetNameExchange::from(USD),
             Decimal::ZERO,
             Some(Decimal::ZERO),
         ),
@@ -3397,7 +4129,12 @@ fn ws_order_snapshot(
         return None;
     }
     let price = order.limit_price.and_then(|s| Decimal::from_str(s).ok());
-    let filled_qty = Decimal::from_str(order.filled_qty.unwrap_or("0")).unwrap_or(Decimal::ZERO);
+    // A live order's fill only grows, so a frame that omits it (some lifecycle events may) reads
+    // as nothing filled yet, without a warning; one that garbles it is still reported.
+    let filled_qty = order
+        .filled_qty
+        .and_then(|_| alpaca_filled_qty(&order.id, order.filled_qty))
+        .unwrap_or(Decimal::ZERO);
     let kind = parse_order_kind(
         &order.order_type,
         order.stop_price,
@@ -3445,6 +4182,84 @@ fn ws_fill_order_is_live(status: &str) -> bool {
     matches!(status, "partially_filled" | "filled")
 }
 
+/// The [`AccountEventKind::TradeAmended`] for a `trade_bust` or `trade_correct` frame.
+///
+/// Neither event is in the Trading API's docs. The fields read are those of the Broker API's
+/// `TradeUpdateEventV2`: `previous_execution_id` names the fill amended, `execution_id` is taken
+/// as the corrected execution's id, `qty` is the busted or corrected quantity (negative on some
+/// busts), and `price` the corrected price, which that schema does not promise on a correction. A
+/// correction lacking anything a replacement trade needs is reported as
+/// [`TradeAmendmentKind::CorrectedUnresolved`] with what it did carry, never dropped.
+///
+/// No order snapshot is emitted: a bust's lower cumulative would be refused, as
+/// [`TradeAmendment`](crate::trade::TradeAmendment) documents.
+fn trade_amendment_event(
+    update: &AlpacaTradeUpdate<'_>,
+    instrument: InstrumentNameExchange,
+    order_id: OrderId,
+) -> UnindexedAccountEvent {
+    let order = &update.order;
+    let time_exchange = update
+        .timestamp
+        .and_then(parse_timestamp)
+        .unwrap_or_else(Utc::now);
+    let original = update
+        .previous_execution_id
+        .filter(|id| !id.is_empty())
+        .map(TradeId::new);
+    let quantity = update.qty.and_then(|s| Decimal::from_str(s).ok());
+
+    let kind = if update.event == "trade_bust" {
+        TradeAmendmentKind::Busted {
+            quantity: quantity.map(|quantity| quantity.abs()),
+        }
+    } else {
+        let id = ws_execution_id(update).map(TradeId::new);
+        let price = update.price.and_then(|s| Decimal::from_str(s).ok());
+        match (id, price, quantity, parse_side(&order.side)) {
+            (Some(id), Some(price), Some(quantity), Some(side)) if quantity > Decimal::ZERO => {
+                TradeAmendmentKind::Corrected {
+                    replacement: Trade::new(
+                        id,
+                        order_id.clone(),
+                        instrument.clone(),
+                        StrategyId::unknown(),
+                        time_exchange,
+                        side,
+                        price,
+                        quantity,
+                        // What `order.filled_qty` means on a correction is undocumented, so the
+                        // replacement does not claim a cumulative.
+                        None,
+                        // As on a fill: no fee info in WebSocket updates.
+                        AssetFees::new(
+                            AssetNameExchange::from(USD),
+                            Decimal::ZERO,
+                            Some(Decimal::ZERO),
+                        ),
+                    ),
+                }
+            }
+            (id, price, quantity, _) => TradeAmendmentKind::CorrectedUnresolved {
+                id,
+                price,
+                quantity,
+            },
+        }
+    };
+
+    UnindexedAccountEvent::new(
+        ExchangeId::AlpacaBroker,
+        AccountEventKind::TradeAmended(crate::trade::TradeAmendment::new(
+            instrument,
+            order_id,
+            time_exchange,
+            original,
+            kind,
+        )),
+    )
+}
+
 /// Convert a WebSocket trade_update event into rustrade AccountEvents.
 ///
 /// Returns up to two events, in the order they must be applied. A fill frame genuinely carries
@@ -3470,6 +4285,8 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
             | "replaced"
             | "done_for_day"
             | "rejected"
+            | "trade_bust"
+            | "trade_correct"
     ) {
         trace!(event = %event_str, "Alpaca WS: ignoring trade_updates event type");
         return [None, None];
@@ -3495,14 +4312,9 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
                 .and_then(parse_timestamp)
                 .unwrap_or_else(Utc::now);
 
-            // Trade ID: synthesise from order_id + cumulative filled qty since
-            // Alpaca WS trade_updates don't include an activity ID.
-            // Normalise via Decimal to strip trailing zeros so the key matches the
-            // REST recovery path (e.g. "1.00" and "1" both normalise to "1").
-            //
-            // If filled_qty is unparseable (API regression), cum_qty falls back to
-            // zero. Two consecutive bad fills on the same order would produce the same
-            // dedup key ("order_id:0"), causing the second fill to be silently dropped.
+            // If filled_qty is unparseable (API regression), cum_qty falls back to zero: the
+            // trade reports a cumulative of 0, and a fill without an execution id is deduplicated
+            // on "order_id:0", so a second such fill on the same order would be silently dropped.
             // Warn loudly so API regressions are surfaced immediately.
             let cum_qty = Decimal::from_str(order.filled_qty.unwrap_or("0"))
                 .inspect_err(|e| {
@@ -3510,12 +4322,26 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
                         order_id = %order.id,
                         filled_qty = ?order.filled_qty,
                         %e,
-                        "Alpaca WS: failed to parse filled_qty — dedup key will use 0, \
-                         a second malformed fill on the same order would be deduplicated away"
+                        "Alpaca WS: failed to parse filled_qty — the fill reports a cumulative \
+                         of 0, and without an execution id a second such fill on the same order \
+                         would be deduplicated away"
                     );
                 })
                 .unwrap_or(Decimal::ZERO);
-            let trade_id = TradeId(format_smolstr!("{}:{}", order.id, cum_qty.normalize()));
+            // The execution id, which the FILL activity for this fill carries too, so the fill has
+            // one TradeId however it is delivered. Without it, fall back to the dedup key, which
+            // is unique per fill but matches nothing a REST read returns.
+            let trade_id = match ws_execution_id(&update) {
+                Some(execution_id) => TradeId::new(execution_id),
+                None => {
+                    warn!(
+                        order_id = %order.id,
+                        "Alpaca WS: fill without a usable execution_id — its TradeId is \
+                         \"{{order_id}}:{{filled_qty}}\", which fetch_trades will not match"
+                    );
+                    TradeId(fill_dedup_key(&order.id, cum_qty))
+                }
+            };
 
             // Alpaca equities and options are commission-free. Crypto trades incur
             // maker/taker fees (currently 0.15–0.25%) in the credited asset, but
@@ -3532,7 +4358,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
                 // The venue's own cumulative for this order, as of this execution.
                 Some(cum_qty),
                 AssetFees::new(
-                    AssetNameExchange::from("USD"),
+                    AssetNameExchange::from(USD),
                     Decimal::ZERO,
                     Some(Decimal::ZERO),
                 ),
@@ -3560,8 +4386,10 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
             [Some(trade_event), snapshot_event]
         }
 
-        "new" | "accepted" | "pending_new" => {
-            // Order acknowledged by Alpaca — emit an OrderSnapshot.
+        "new" | "accepted" | "pending_new" | "done_for_day" => {
+            // Order acknowledged by Alpaca, or done for the day: Alpaca stops working a
+            // `done_for_day` order until the next trading day but has not ended it, so it is
+            // reported open with what it has filled, never retired.
             let time_exchange = update
                 .timestamp
                 .and_then(parse_timestamp)
@@ -3573,7 +4401,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
             ]
         }
 
-        "canceled" | "expired" | "replaced" | "done_for_day" => {
+        "canceled" | "expired" | "replaced" => {
             // Order no longer active.
             //
             // NOTE on "replaced": Alpaca's replace operation cancels the original order
@@ -3585,8 +4413,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
                 .timestamp
                 .and_then(parse_timestamp)
                 .unwrap_or_else(Utc::now);
-            let filled_qty =
-                Decimal::from_str(order.filled_qty.unwrap_or("0")).unwrap_or(Decimal::ZERO);
+            let filled_qty = alpaca_filled_qty(&order.id, order.filled_qty);
             let cancelled = Cancelled::new(order_id, time_exchange, filled_qty);
             let response = crate::order::request::OrderResponseCancel {
                 key: OrderKey::new(
@@ -3605,6 +4432,11 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
                 None,
             ]
         }
+
+        "trade_bust" | "trade_correct" => [
+            Some(trade_amendment_event(&update, instrument, order_id)),
+            None,
+        ],
 
         "rejected" => {
             let response = crate::order::request::OrderResponseCancel {
@@ -3720,6 +4552,22 @@ fn order_state_time(order: &AlpacaOrderResponse) -> DateTime<Utc> {
         .unwrap_or_else(Utc::now)
 }
 
+/// The quantity Alpaca order `order_id` has filled, from its `filled_qty`: `None`, with a
+/// warning, when it is missing or does not parse, so that an unknown fill is not read as zero.
+fn alpaca_filled_qty(order_id: &str, filled_qty: Option<&str>) -> Option<Decimal> {
+    let Some(raw) = filled_qty else {
+        warn!(%order_id, "Alpaca did not report how much the order filled");
+        return None;
+    };
+    match Decimal::from_str(raw) {
+        Ok(filled_qty) => Some(filled_qty),
+        Err(_) => {
+            warn!(%order_id, filled_qty = raw, "Alpaca reported an unparseable filled_qty, treating it as unknown");
+            None
+        }
+    }
+}
+
 fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .ok()
@@ -3829,8 +4677,10 @@ fn parse_api_error(status: reqwest::StatusCode, message: &str) -> crate::error::
         // funds. 403 is *Forbidden* — auth/permission failure — and must NOT be
         // mapped to BalanceInsufficient even if the body happens to contain the
         // substring "insufficient".
+        // The body says what ran short ("insufficient buying power", or "insufficient qty
+        // available" on a sell) but names no asset, so none is guessed.
         422 if lower.contains("insufficient") => {
-            ApiError::BalanceInsufficient(AssetNameExchange::new("usd"), message.to_owned())
+            ApiError::BalanceInsufficient(None, message.to_owned())
         }
         401 => ApiError::Unauthenticated(format!("unauthorized: {message}")),
         403 => ApiError::Unauthenticated(format!("forbidden: {message}")),
@@ -3869,6 +4719,34 @@ fn order_post_error(error: UnindexedClientError) -> UnindexedOrderError {
         | UnindexedClientError::TruncatedSnapshot { .. }) => OrderError::Connectivity(
             ConnectivityError::Socket(format!("Alpaca order status unknown: {other}")),
         ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OrderStatusClient implementation
+// ---------------------------------------------------------------------------
+
+impl OrderStatusClient for AlpacaClient {
+    /// Looks each order up with `GET /v2/orders:by_client_order_id`, up to 8 at a time.
+    ///
+    /// `filled` is reported as fully filled with `filled_avg_price`, `canceled` and `replaced` as
+    /// cancelled (the order replacing one has its own client order id, which the caller must
+    /// learn from [`ExecutionClient::fetch_open_orders`]), `expired` as expired and `rejected` as
+    /// open failed. `done_for_day` is not ended: Alpaca works the order again the next trading day.
+    /// A 404, or an order on another symbol than the key's (ignoring case), is unknown.
+    async fn fetch_ended_orders(
+        &self,
+        orders: &[UnindexedOrderKey],
+    ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
+        fetch_ended_by_key(orders, |key| {
+            fetch_order_lookup(
+                self.http.clone(),
+                self.rate_limiter.clone(),
+                self.config.clone(),
+                key,
+            )
+        })
+        .await
     }
 }
 
@@ -4147,6 +5025,7 @@ mod tests {
             map_order_kind(OrderKind::TrailingStopLimit {
                 offset: Decimal::from_str("5.0").unwrap(),
                 offset_type: TrailingOffsetType::Percentage,
+                stop_price: Decimal::from_str("95.0").unwrap(),
                 limit_offset: Decimal::from_str("1.0").unwrap(),
             }),
             None
@@ -4449,14 +5328,54 @@ mod tests {
     #[test]
     fn test_dedup_cache() {
         let cache = new_dedup_cache();
-        let key = SmolStr::new("order-1:1");
+        let key = || SmolStr::new("order-1:1");
         assert!(
-            !is_duplicate(&cache, &key),
+            !is_duplicate_fill(&cache, Some("exec-1"), key()),
             "first time should not be duplicate"
         );
         assert!(
-            is_duplicate(&cache, &key),
+            is_duplicate_fill(&cache, Some("exec-1"), key()),
             "second time should be duplicate"
+        );
+    }
+
+    /// A fill is told apart by its execution id, so after a bust lowers an order's cumulative, a
+    /// new fill that takes it back to a cumulative an earlier fill reached is not dropped.
+    #[test]
+    fn dedup_tells_fills_apart_by_execution_id_not_cumulative() {
+        let cache = new_dedup_cache();
+        assert!(!is_duplicate_fill(
+            &cache,
+            Some("exec-a"),
+            SmolStr::new("ord-1:5")
+        ));
+        // A bust took the order back to 3, and a new fill takes it to 5 again.
+        assert!(
+            !is_duplicate_fill(&cache, Some("exec-b"), SmolStr::new("ord-1:5")),
+            "a different execution at a cumulative seen before is a new fill"
+        );
+    }
+
+    /// A fill one path delivers without an execution id still matches the same fill the other
+    /// path delivers with one, whichever comes first.
+    #[test]
+    fn dedup_matches_a_fill_with_an_execution_id_to_the_same_fill_without_one() {
+        let cache = new_dedup_cache();
+
+        assert!(!is_duplicate_fill(&cache, None, SmolStr::new("ord-1:2")));
+        assert!(
+            is_duplicate_fill(&cache, Some("exec-a"), SmolStr::new("ord-1:2")),
+            "without an id first, then with one"
+        );
+
+        assert!(!is_duplicate_fill(
+            &cache,
+            Some("exec-b"),
+            SmolStr::new("ord-1:4")
+        ));
+        assert!(
+            is_duplicate_fill(&cache, None, SmolStr::new("ord-1:4")),
+            "with an id first, then without one"
         );
     }
 
@@ -4503,7 +5422,7 @@ mod tests {
         .unwrap();
         let balances = convert_account_to_balances(&account, &[]);
         assert_eq!(balances.len(), 1);
-        assert_eq!(balances[0].asset, AssetNameExchange::new("usd"));
+        assert_eq!(balances[0].asset, AssetNameExchange::new("USD"));
         assert_eq!(balances[0].balance.total, dec!(9000.50), "total is cash");
         assert_eq!(
             balances[0].balance.free,
@@ -4587,6 +5506,19 @@ mod tests {
         let non_usd = vec![AssetNameExchange::new("BTC")];
         let balances = convert_account_to_balances(&account, &non_usd);
         assert!(balances.is_empty());
+    }
+
+    /// A caller's filter is matched ignoring case, but the balance keeps Alpaca's spelling, the
+    /// one every USD fee is reported under too.
+    #[test]
+    fn a_usd_balance_is_named_usd_however_the_filter_spells_it() {
+        let account = AlpacaAccount {
+            cash: dec!(12000.00),
+            non_marginable_buying_power: dec!(10000.00),
+        };
+        let balances = convert_account_to_balances(&account, &[AssetNameExchange::new("usd")]);
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].asset, AssetNameExchange::new("USD"));
     }
 
     #[test]
@@ -4698,17 +5630,19 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_trade_update_fill_produces_trade_with_dedup_key() {
+    fn test_convert_trade_update_fill_produces_trade_with_execution_id() {
         let update = AlpacaTradeUpdate {
             event: SmolStr::new("fill"),
+            execution_id: Some("exec-1"),
+            previous_execution_id: None,
             order: make_order_ws("ord-1", "SPY", "buy", "1"),
             price: Some("150.00"),
             qty: Some("1"),
             timestamp: Some("2025-04-18T14:30:00Z"),
         };
         let (trade, order) = fill_events(convert_trade_update(update));
-        // Trade ID must be "{order_id}:{cumulative_filled_qty}" for dedup to match REST path.
-        assert_eq!(trade.id.0.as_str(), "ord-1:1");
+        // The venue's execution id, which the fill's FILL activity carries too.
+        assert_eq!(trade.id.0.as_str(), "exec-1");
         assert_eq!(trade.price, Decimal::from_str("150.00").unwrap());
         assert_eq!(trade.quantity, Decimal::from_str("1").unwrap());
 
@@ -4726,6 +5660,8 @@ mod tests {
     fn test_convert_trade_update_partial_fill() {
         let update = AlpacaTradeUpdate {
             event: SmolStr::new("partial_fill"),
+            execution_id: None,
+            previous_execution_id: None,
             order: make_order_ws("ord-2", "AAPL", "sell", "0.5"),
             price: Some("200.00"),
             qty: Some("0.5"),
@@ -4754,6 +5690,8 @@ mod tests {
     fn a_full_fill_snapshot_reports_nothing_left_to_fill() {
         let update = AlpacaTradeUpdate {
             event: SmolStr::new("fill"),
+            execution_id: None,
+            previous_execution_id: None,
             // make_order_ws reports qty=2; a cumulative filled of 2 completes it.
             order: AlpacaOrderWs {
                 status: SmolStr::new("filled"),
@@ -4789,6 +5727,8 @@ mod tests {
         ] {
             let update = AlpacaTradeUpdate {
                 event: SmolStr::new("partial_fill"),
+                execution_id: None,
+                previous_execution_id: None,
                 order: AlpacaOrderWs {
                     status: SmolStr::new(status),
                     ..make_order_ws("ord-late", "SPY", "buy", "1")
@@ -4815,6 +5755,8 @@ mod tests {
     fn a_notional_order_fill_emits_the_execution_without_a_snapshot() {
         let update = AlpacaTradeUpdate {
             event: SmolStr::new("partial_fill"),
+            execution_id: None,
+            previous_execution_id: None,
             order: AlpacaOrderWs {
                 qty: None,
                 ..make_order_ws("ord-notional-ws", "SPY", "buy", "1")
@@ -4838,6 +5780,8 @@ mod tests {
     fn test_convert_trade_update_new_order_produces_snapshot() {
         let update = AlpacaTradeUpdate {
             event: SmolStr::new("new"),
+            execution_id: None,
+            previous_execution_id: None,
             order: AlpacaOrderWs {
                 id: SmolStr::new("ord-new"),
                 client_order_id: Some(SmolStr::new("cid-1")),
@@ -4866,6 +5810,8 @@ mod tests {
     fn test_convert_trade_update_canceled_produces_cancel() {
         let update = AlpacaTradeUpdate {
             event: SmolStr::new("canceled"),
+            execution_id: None,
+            previous_execution_id: None,
             order: make_order_ws("ord-3", "AAPL", "sell", "0"),
             price: None,
             qty: None,
@@ -4879,10 +5825,82 @@ mod tests {
         assert!(response.state.is_ok());
     }
 
+    /// A `canceled` update carries what filled, and an unknown fill stays unknown, not zero.
+    #[test]
+    fn a_canceled_update_carries_its_fill_or_none() {
+        let cancelled = |filled_qty: Option<&'static str>| {
+            let mut order = make_order_ws("ord-3", "AAPL", "sell", "0");
+            order.filled_qty = filled_qty;
+            let update = AlpacaTradeUpdate {
+                event: SmolStr::new("canceled"),
+                execution_id: None,
+                previous_execution_id: None,
+                order,
+                price: None,
+                qty: None,
+                timestamp: Some("2025-04-18T14:30:00Z"),
+            };
+            let event =
+                sole_event(convert_trade_update(update)).expect("canceled should produce an event");
+            let AccountEventKind::OrderCancelled(response) = event.kind else {
+                panic!("expected OrderCancelled, got {:?}", event.kind);
+            };
+            let Ok(cancelled) = response.state else {
+                panic!("expected Ok, got {:?}", response.state);
+            };
+            cancelled.filled_quantity
+        };
+
+        assert_eq!(cancelled(Some("1")), Some(Decimal::ONE));
+        assert_eq!(cancelled(Some("0")), Some(Decimal::ZERO));
+        assert_eq!(cancelled(None), None);
+        assert_eq!(cancelled(Some("not a number")), None);
+    }
+
+    /// An ended order whose `filled_qty` does not parse reports its fill unknown, not zero; a
+    /// filled one filled its whole quantity regardless.
+    #[test]
+    fn an_ended_order_with_an_unparseable_fill_reports_it_unknown() {
+        let key = OrderKey::new(
+            ExchangeId::AlpacaBroker,
+            InstrumentNameExchange::new("AAPL"),
+            StrategyId::new("strategy"),
+            ClientOrderId::new("c"),
+        );
+        let ended = |status: &str| {
+            let mut order = make_order_response("o1", "AAPL");
+            order.status = Some(status.to_string());
+            order.filled_qty = "not a number".to_string();
+            convert_ended_order(&order, &key).map(|order| order.state)
+        };
+
+        assert!(matches!(
+            ended("canceled"),
+            Some(InactiveOrderState::Cancelled(Cancelled {
+                filled_quantity: None,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            ended("expired"),
+            Some(InactiveOrderState::Expired(Expired {
+                filled_quantity: None,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            ended("filled"),
+            Some(InactiveOrderState::FullyFilled(Filled { filled_quantity, .. }))
+                if filled_quantity == Decimal::ONE
+        ));
+    }
+
     #[test]
     fn test_convert_trade_update_rejected_produces_error() {
         let update = AlpacaTradeUpdate {
             event: SmolStr::new("rejected"),
+            execution_id: None,
+            previous_execution_id: None,
             order: make_order_ws("ord-4", "SPY", "buy", "0"),
             price: None,
             qty: None,
@@ -4906,6 +5924,8 @@ mod tests {
             symbol: "SPY".to_string(),
             qty: None,
             filled_qty: "0".to_string(),
+            filled_avg_price: None,
+            status: None,
             side: "buy".to_string(),
             order_type: "market".to_string(),
             time_in_force: "day".to_string(),
@@ -4940,10 +5960,12 @@ mod tests {
     #[test]
     fn test_convert_positions_to_balances_crypto() {
         let positions = vec![
+            // The positions list's form: the asset followed by USD.
             AlpacaPosition {
                 qty_available: dec!(0.4),
-                ..alpaca_position("BTC/USD", "crypto", AlpacaPositionSide::Long, dec!(0.5))
+                ..alpaca_position("BTCUSD", "crypto", AlpacaPositionSide::Long, dec!(0.5))
             },
+            // The pair form orders use, read too.
             alpaca_position("ETH/USD", "crypto", AlpacaPositionSide::Long, dec!(2.0)),
             // Equity positions should be filtered out
             alpaca_position("AAPL", "us_equity", AlpacaPositionSide::Long, dec!(10)),
@@ -4952,16 +5974,45 @@ mod tests {
         // All crypto assets
         let balances = convert_positions_to_balances(&positions, &[]);
         assert_eq!(balances.len(), 2, "only crypto positions returned");
-        assert_eq!(balances[0].asset.name().as_str(), "btc");
+        assert_eq!(balances[0].asset.name().as_str(), "BTC");
+        assert_eq!(balances[1].asset.name().as_str(), "ETH");
         // total = qty (0.5 BTC), free = qty_available (0.4 BTC)
         assert_eq!(balances[0].balance.total, dec!(0.5));
         assert_eq!(balances[0].balance.free, dec!(0.4));
 
-        // Filter to BTC only
-        let btc_only = vec![AssetNameExchange::new("BTC")];
+        // Filter to BTC only: matches the `BTCUSD` position
+        let btc_only = vec![AssetNameExchange::new("btc")];
         let balances = convert_positions_to_balances(&positions, &btc_only);
         assert_eq!(balances.len(), 1);
-        assert_eq!(balances[0].asset.name().as_str(), "btc");
+        assert_eq!(balances[0].asset.name().as_str(), "BTC");
+    }
+
+    #[test]
+    fn test_crypto_position_asset() {
+        assert_eq!(crypto_position_asset("BTCUSD"), "BTC");
+        assert_eq!(
+            crypto_position_asset("btcusd"),
+            "btc",
+            "suffix matched ignoring case"
+        );
+        assert_eq!(
+            crypto_position_asset("USDTUSD"),
+            "USDT",
+            "only one USD is stripped"
+        );
+        assert_eq!(crypto_position_asset("BTC/USD"), "BTC");
+        assert_eq!(crypto_position_asset("BTC/USDT"), "BTC");
+        assert_eq!(crypto_position_asset("€USD"), "€");
+        // Neither form, or an empty asset: used whole rather than dropped.
+        assert_eq!(crypto_position_asset("USD"), "USD");
+        assert_eq!(crypto_position_asset("/USD"), "/USD");
+        assert_eq!(crypto_position_asset("BTCUSDT"), "BTCUSDT");
+        assert_eq!(
+            crypto_position_asset("BTC€é"),
+            "BTC€é",
+            "no char boundary at the suffix"
+        );
+        assert_eq!(crypto_position_asset(""), "");
     }
 
     /// A position as `/v2/positions` reports it, with `qty_available` equal to `qty`.
@@ -5145,6 +6196,30 @@ mod tests {
         );
     }
 
+    /// A placement response without a status reads from what filled, as one with a live status
+    /// does.
+    #[test]
+    fn a_placement_response_without_a_status_reads_from_what_filled() {
+        let instrument = InstrumentNameExchange::new("SPY");
+        let mut resp = make_order_response("ord-1", "SPY");
+        resp.filled_qty = "0.4".to_string();
+        let OrderState::Active(ActiveOrderState::Open(open)) =
+            placed_order_state(&resp, &instrument, Decimal::ONE)
+        else {
+            panic!("expected Open");
+        };
+        assert_eq!(open.filled_quantity, Decimal::new(4, 1));
+
+        resp.filled_qty = "1".to_string();
+        resp.filled_avg_price = Some("100.5".to_string());
+        let state = placed_order_state(&resp, &instrument, Decimal::ONE);
+        let OrderState::Inactive(InactiveOrderState::FullyFilled(filled)) = state else {
+            panic!("expected FullyFilled, got {state:?}");
+        };
+        assert_eq!(filled.filled_quantity, Decimal::ONE);
+        assert_eq!(filled.avg_price, Some(Decimal::new(1005, 1)));
+    }
+
     fn make_order_response(id: &str, symbol: &str) -> AlpacaOrderResponse {
         AlpacaOrderResponse {
             id: id.to_string(),
@@ -5152,6 +6227,8 @@ mod tests {
             symbol: symbol.to_string(),
             qty: Some("1".to_string()),
             filled_qty: "0".to_string(),
+            filled_avg_price: None,
+            status: None,
             side: "buy".to_string(),
             order_type: "limit".to_string(),
             time_in_force: "day".to_string(),
@@ -5373,17 +6450,16 @@ mod tests {
         // Two partial fills of 1 lot each → filled_qty "1" then "2".
         let ws_keys: Vec<SmolStr> = ["1", "2"]
             .iter()
-            .filter_map(|filled_qty| {
-                let update = AlpacaTradeUpdate {
+            .map(|filled_qty| {
+                early_dedup_key(&AlpacaTradeUpdate {
                     event: SmolStr::new("partial_fill"),
+                    execution_id: None,
+                    previous_execution_id: None,
                     order: make_order_ws(order_id, "SPY", "buy", filled_qty),
                     price: Some("150.00"),
                     qty: Some("1"),
                     timestamp: None,
-                };
-                let [event, _snapshot] = convert_trade_update(update);
-                let event = event?;
-                fill_dedup_key_from_event(&event).cloned()
+                })
             })
             .collect();
 
@@ -5394,7 +6470,7 @@ mod tests {
             .iter()
             .map(|exec_qty| {
                 cumulative += Decimal::from_str(exec_qty).unwrap();
-                format_smolstr!("{}:{}", order_id, cumulative.normalize())
+                fill_dedup_key(order_id, cumulative)
             })
             .collect();
 
@@ -5408,13 +6484,14 @@ mod tests {
 
     /// Verifies that `early_dedup_key` produces the same key as the full event path.
     ///
-    /// The early dedup check (M-1 optimization) extracts the key from raw WS fields
-    /// before constructing the full event. This test ensures both paths produce
-    /// identical keys, otherwise duplicate detection would fail.
+    /// A fill without an `execution_id` falls back to its dedup key for its `TradeId`, the key the
+    /// early dedup check reads from the raw WS fields before the event is built.
     #[test]
-    fn early_dedup_key_matches_full_event_path() {
+    fn a_ws_fill_without_an_execution_id_is_identified_by_its_dedup_key() {
         let update = AlpacaTradeUpdate {
             event: SmolStr::new("fill"),
+            execution_id: None,
+            previous_execution_id: None,
             order: make_order_ws("ord-abc", "SPY", "buy", "5"),
             price: Some("150.00"),
             qty: Some("5"),
@@ -5424,17 +6501,20 @@ mod tests {
         // Early path: extract key before full event construction
         let early_key = early_dedup_key(&update);
 
-        // Full path: construct event then extract key. A fill frame also carries the order
-        // snapshot; the dedup key lives on the execution, which is always the first slot.
+        // A fill frame also carries the order snapshot; the execution is always the first slot.
         let [event, _snapshot] = convert_trade_update(update);
-        let event = event.expect("fill should produce an execution");
-        let full_key =
-            fill_dedup_key_from_event(&event).expect("fill event should have a dedup key");
+        let Some(UnindexedAccountEvent {
+            kind: AccountEventKind::Trade(trade),
+            ..
+        }) = event
+        else {
+            panic!("fill should produce an execution");
+        };
 
         assert_eq!(
+            trade.id.0.as_str(),
             early_key.as_str(),
-            full_key.as_str(),
-            "early_dedup_key must produce the same key as the full event path"
+            "without an execution_id the TradeId is the dedup key"
         );
         assert_eq!(early_key.as_str(), "ord-abc:5");
     }
@@ -5448,6 +6528,8 @@ mod tests {
         // Test with trailing zeros: "1.00" should normalize to "1"
         let update1 = AlpacaTradeUpdate {
             event: SmolStr::new("fill"),
+            execution_id: None,
+            previous_execution_id: None,
             order: AlpacaOrderWs {
                 id: SmolStr::new("ord-x"),
                 client_order_id: Some(SmolStr::new("cid")),
@@ -5472,6 +6554,8 @@ mod tests {
         // Test already normalized: "1" stays "1"
         let update2 = AlpacaTradeUpdate {
             event: SmolStr::new("fill"),
+            execution_id: None,
+            previous_execution_id: None,
             order: AlpacaOrderWs {
                 id: SmolStr::new("ord-x"),
                 client_order_id: Some(SmolStr::new("cid")),
@@ -5496,6 +6580,8 @@ mod tests {
         // Test single trailing zero: "1.0" normalizes to "1"
         let update3 = AlpacaTradeUpdate {
             event: SmolStr::new("fill"),
+            execution_id: None,
+            previous_execution_id: None,
             order: AlpacaOrderWs {
                 id: SmolStr::new("ord-x"),
                 client_order_id: Some(SmolStr::new("cid")),
@@ -5531,7 +6617,8 @@ mod tests {
         // Minimal rejected-event JSON — no `filled_qty` field in the order object.
         let json = r#"{"stream":"trade_updates","data":{"event":"rejected","order":{"id":"test-rej-id","client_order_id":"test-cid","symbol":"AAPL","qty":"10","side":"buy","type":"limit","time_in_force":"day","limit_price":"100.00","status":"rejected"}}}"#;
 
-        process_ws_text(json, &tx, &dedup, &mut backoff);
+        let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+        process_ws_text(json, &tx, &dedup, &known, &mut backoff);
 
         // The event must NOT be silently dropped — an OrderCancelled must be emitted.
         let event = rx.try_recv()
@@ -5540,6 +6627,214 @@ mod tests {
             matches!(event.kind, AccountEventKind::OrderCancelled(_)),
             "rejected event must map to OrderCancelled, got: {:?}",
             event.kind
+        );
+    }
+
+    /// A `trade_updates` fill frame as Alpaca sends it: its `execution_id` is the trade's id. One
+    /// that is null, empty or absent falls back to the dedup key.
+    #[test]
+    fn process_ws_text_identifies_a_fill_by_its_execution_id() {
+        let frame = |execution_id: &str| {
+            format!(
+                r#"{{"stream":"trade_updates","data":{{"event":"fill",{execution_id}"order":{{"id":"ord-1","client_order_id":"cid-1","symbol":"SPY","qty":"2","filled_qty":"2","side":"buy","type":"market","time_in_force":"day","status":"filled"}},"price":"100.00","qty":"2","timestamp":"2025-04-18T14:30:00Z"}}}}"#
+            )
+        };
+        let cases = [
+            (
+                r#""execution_id":"524b1902-817e-446c-825b-a9fcfebbc17e","#,
+                "524b1902-817e-446c-825b-a9fcfebbc17e",
+            ),
+            (r#""execution_id":null,"#, "ord-1:2"),
+            (r#""execution_id":"","#, "ord-1:2"),
+            ("", "ord-1:2"),
+        ];
+        for (field, expected) in cases {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            process_ws_text(
+                &frame(field),
+                &tx,
+                &new_dedup_cache(),
+                &known,
+                &mut ExponentialBackoff::new(),
+            );
+            let Ok(UnindexedAccountEvent {
+                kind: AccountEventKind::Trade(trade),
+                ..
+            }) = rx.try_recv()
+            else {
+                panic!("the fill frame {field:?} produces a Trade");
+            };
+            assert_eq!(trade.id.0.as_str(), expected, "frame {field:?}");
+        }
+    }
+
+    /// A `trade_bust` or `trade_correct` frame for `ord-1` (a buy of SPY), with `fields` spliced
+    /// in. Its shape follows the Broker API's `TradeUpdateEventV2`; no real frame has been seen.
+    fn amendment_frame(event: &str, fields: &str) -> String {
+        format!(
+            r#"{{"stream":"trade_updates","data":{{"event":"{event}",{fields}"order":{{"id":"ord-1","client_order_id":"cid-1","symbol":"SPY","qty":"2","filled_qty":"0","side":"buy","type":"market","time_in_force":"day","status":"filled"}},"timestamp":"2025-04-18T14:31:00Z"}}}}"#
+        )
+    }
+
+    /// The events the stream sends for `frames`, in order.
+    fn stream_events(frames: &[String]) -> Vec<UnindexedAccountEvent> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let dedup = new_dedup_cache();
+        let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+        let mut backoff = ExponentialBackoff::new();
+        for frame in frames {
+            process_ws_text(frame, &tx, &dedup, &known, &mut backoff);
+        }
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// The one event the stream sends for an amendment frame, as a `TradeAmendment`.
+    fn amendment_of(
+        frame: String,
+    ) -> crate::trade::TradeAmendment<AssetNameExchange, InstrumentNameExchange> {
+        let events = stream_events(&[frame]);
+        let [
+            UnindexedAccountEvent {
+                kind: AccountEventKind::TradeAmended(amendment),
+                ..
+            },
+        ] = <[_; 1]>::try_from(events).unwrap_or_else(|events| {
+            panic!("one TradeAmended, got {events:?}");
+        })
+        else {
+            panic!("expected TradeAmended");
+        };
+        amendment
+    }
+
+    /// A bust names the fill it cancels, and its quantity, which Alpaca may send as a negative
+    /// reversal, is read as a magnitude.
+    #[test]
+    fn process_ws_text_reports_a_trade_bust() {
+        let amendment = amendment_of(amendment_frame(
+            "trade_bust",
+            r#""execution_id":"exec-x","previous_execution_id":"exec-a","qty":"-2","#,
+        ));
+        assert_eq!(amendment.original, Some(TradeId::new("exec-a")));
+        assert_eq!(amendment.order_id, OrderId::new("ord-1"));
+        assert_eq!(amendment.instrument, InstrumentNameExchange::new("SPY"));
+        assert_eq!(
+            Some(amendment.time_exchange),
+            parse_timestamp("2025-04-18T14:31:00Z")
+        );
+        assert_eq!(
+            amendment.kind,
+            TradeAmendmentKind::Busted {
+                quantity: Some(Decimal::TWO)
+            }
+        );
+    }
+
+    /// A bust is reported even when it names neither the fill nor a quantity.
+    #[test]
+    fn process_ws_text_reports_a_bust_that_names_no_fill() {
+        let amendment = amendment_of(amendment_frame("trade_bust", ""));
+        assert_eq!(amendment.original, None);
+        assert_eq!(
+            amendment.kind,
+            TradeAmendmentKind::Busted { quantity: None }
+        );
+    }
+
+    /// A correction carrying a price and a quantity replaces the fill with a trade under its own
+    /// execution id, which claims no cumulative.
+    #[test]
+    fn process_ws_text_reports_a_trade_correct_with_its_replacement() {
+        let amendment = amendment_of(amendment_frame(
+            "trade_correct",
+            r#""execution_id":"exec-c","previous_execution_id":"exec-a","price":"101.50","qty":"2","#,
+        ));
+        assert_eq!(amendment.original, Some(TradeId::new("exec-a")));
+        let TradeAmendmentKind::Corrected { replacement } = amendment.kind else {
+            panic!("a full replacement: {:?}", amendment.kind);
+        };
+        assert_eq!(replacement.id, TradeId::new("exec-c"));
+        assert_eq!(replacement.order_id, OrderId::new("ord-1"));
+        assert_eq!(replacement.side, Side::Buy);
+        assert_eq!(replacement.price, Decimal::new(10150, 2));
+        assert_eq!(replacement.quantity, Decimal::TWO);
+        assert_eq!(replacement.order_filled_quantity, None);
+        assert_eq!(replacement.time_exchange, amendment.time_exchange);
+    }
+
+    /// A correction lacking anything a replacement trade needs is still reported, with what it
+    /// carried.
+    #[test]
+    fn process_ws_text_reports_a_correction_it_cannot_resolve() {
+        let price = Some(Decimal::new(10150, 2));
+        let cases = [
+            (
+                r#""execution_id":"exec-c","qty":"2","#,
+                (Some("exec-c"), None, Some(Decimal::TWO)),
+            ),
+            (
+                r#""price":"101.50","qty":"2","#,
+                (None, price, Some(Decimal::TWO)),
+            ),
+            (
+                r#""execution_id":"exec-c","price":"101.50","qty":"0","#,
+                (Some("exec-c"), price, Some(Decimal::ZERO)),
+            ),
+            (
+                r#""execution_id":"exec-c","price":"101.50","#,
+                (Some("exec-c"), price, None),
+            ),
+        ];
+        for (fields, (id, price, quantity)) in cases {
+            let amendment = amendment_of(amendment_frame("trade_correct", fields));
+            assert_eq!(
+                amendment.kind,
+                TradeAmendmentKind::CorrectedUnresolved {
+                    id: id.map(TradeId::new),
+                    price,
+                    quantity,
+                },
+                "{fields}"
+            );
+        }
+    }
+
+    /// After a bust takes an order back, a new fill that returns it to a cumulative an earlier
+    /// fill reached is delivered, not taken for that fill.
+    #[test]
+    fn a_fill_after_a_bust_is_delivered_at_a_cumulative_seen_before() {
+        let fill = |execution_id: &str| {
+            format!(
+                r#"{{"stream":"trade_updates","data":{{"event":"partial_fill","execution_id":"{execution_id}","order":{{"id":"ord-1","client_order_id":"cid-1","symbol":"SPY","qty":"4","filled_qty":"2","side":"buy","type":"market","time_in_force":"day","status":"partially_filled"}},"price":"100.00","qty":"2","timestamp":"2025-04-18T14:30:00Z"}}}}"#
+            )
+        };
+        let events = stream_events(&[
+            fill("exec-a"),
+            amendment_frame(
+                "trade_bust",
+                r#""execution_id":"exec-x","previous_execution_id":"exec-a","qty":"-2","#,
+            ),
+            fill("exec-b"),
+        ]);
+
+        let kinds: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                AccountEventKind::Trade(trade) => Some(format!("trade {}", trade.id)),
+                AccountEventKind::TradeAmended(amendment) => {
+                    Some(format!("amended {:?}", amendment.original))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "trade exec-a",
+                "amended Some(TradeId(\"exec-a\"))",
+                "trade exec-b"
+            ]
         );
     }
 
@@ -5652,7 +6947,7 @@ mod tests {
                 reqwest::StatusCode::UNPROCESSABLE_ENTITY,
                 "insufficient funds for this order"
             ),
-            UnindexedOrderError::Rejected(ApiError::BalanceInsufficient(_, _))
+            UnindexedOrderError::Rejected(ApiError::BalanceInsufficient(None, _))
         ));
     }
 
@@ -5808,12 +7103,12 @@ mod tests {
 
             let http = reqwest::Client::new();
             let rl = RateLimitTracker::new();
-            let result = paginate_activities(&http, &rl, &server.uri(), "2025-01-01T00:00:00Z")
+            let result = paginate_activities(&http, &rl, &server.uri(), recovery_after(), None)
                 .await
                 .unwrap();
 
             assert_eq!(result.activities.len(), 5);
-            assert!(!result.truncated);
+            assert_eq!(result.resume, None);
             assert_eq!(server.received_requests().await.unwrap().len(), 1);
         }
 
@@ -5833,12 +7128,12 @@ mod tests {
 
             let http = reqwest::Client::new();
             let rl = RateLimitTracker::new();
-            let result = paginate_activities(&http, &rl, &server.uri(), "2025-01-01T00:00:00Z")
+            let result = paginate_activities(&http, &rl, &server.uri(), recovery_after(), None)
                 .await
                 .unwrap();
 
             assert_eq!(result.activities.len(), ALPACA_MAX_ACTIVITIES);
-            assert!(!result.truncated);
+            assert_eq!(result.resume, None);
             assert_eq!(
                 server.received_requests().await.unwrap().len(),
                 2,
@@ -5862,12 +7157,12 @@ mod tests {
 
             let http = reqwest::Client::new();
             let rl = RateLimitTracker::new();
-            let result = paginate_activities(&http, &rl, &server.uri(), "2025-01-01T00:00:00Z")
+            let result = paginate_activities(&http, &rl, &server.uri(), recovery_after(), None)
                 .await
                 .unwrap();
 
             assert_eq!(result.activities.len(), ALPACA_MAX_ACTIVITIES + 37);
-            assert!(!result.truncated);
+            assert_eq!(result.resume, None);
             assert_eq!(server.received_requests().await.unwrap().len(), 2);
         }
 
@@ -5890,13 +7185,13 @@ mod tests {
 
             let http = reqwest::Client::new();
             let rl = RateLimitTracker::new();
-            let result = paginate_activities(&http, &rl, &server.uri(), "2025-01-01T00:00:00Z")
+            let result = paginate_activities(&http, &rl, &server.uri(), recovery_after(), None)
                 .await
                 .unwrap();
 
             assert!(
-                result.truncated,
-                "must be truncated after MAX_ACTIVITY_PAGES pages"
+                result.resume.is_some(),
+                "must say where to read on after MAX_ACTIVITY_PAGES pages"
             );
             assert_eq!(
                 result.activities.len(),
@@ -6013,7 +7308,7 @@ mod tests {
                         "unrealized_pl": "1.25",
                     },
                     {
-                        "symbol": "BTC/USD",
+                        "symbol": "BTCUSD",
                         "asset_class": "crypto",
                         "side": "long",
                         "qty": "0.75",
@@ -6061,8 +7356,8 @@ mod tests {
             assert_eq!(
                 balances,
                 vec![
-                    ("usd", dec!(-1500.50), dec!(-1500.50)),
-                    ("btc", dec!(0.75), dec!(0.5)),
+                    ("USD", dec!(-1500.50), dec!(-1500.50)),
+                    ("BTC", dec!(0.75), dec!(0.5)),
                 ],
                 "crypto stays a balance; equities and options do not appear as balances"
             );
@@ -6136,7 +7431,7 @@ mod tests {
                 .unwrap();
 
             assert_eq!(snapshot.balances.len(), 1);
-            assert_eq!(snapshot.balances[0].asset, AssetNameExchange::new("btc"));
+            assert_eq!(snapshot.balances[0].asset, AssetNameExchange::new("BTC"));
             let requests = server.received_requests().await.unwrap();
             assert!(
                 requests.iter().all(|r| r.url.path() != "/v2/account"),
@@ -6221,7 +7516,7 @@ mod tests {
             };
 
             // Call open_order (borrows instrument)
-            let result = client
+            let order = client
                 .open_order(OrderRequestOpen {
                     key: OrderKey {
                         exchange: request.key.exchange,
@@ -6234,8 +7529,6 @@ mod tests {
                 .await;
 
             // Verify the order was accepted
-            assert!(result.is_some(), "open_order should return a result");
-            let order = result.unwrap();
             assert!(
                 order.state.is_accepted(),
                 "order should be accepted: {:?}",
@@ -6319,10 +7612,8 @@ mod tests {
                 },
             };
 
-            let result = client.open_order(request).await;
+            let order = client.open_order(request).await;
 
-            assert!(result.is_some(), "open_order should return a result");
-            let order = result.unwrap();
             assert!(
                 order.state.is_accepted(),
                 "order should be accepted: {:?}",
@@ -6502,8 +7793,7 @@ mod tests {
                         market: None,
                     },
                 })
-                .await
-                .expect("open_order should return a result");
+                .await;
 
             assert!(
                 matches!(
@@ -6567,6 +7857,11 @@ mod tests {
         // These drive `recover_fills` itself rather than re-deriving its arithmetic in the test.
         // A key that is correct in isolation is worth nothing if the function does not produce it.
 
+        /// The disconnect anchor the recovery tests read from.
+        fn recovery_after() -> DateTime<Utc> {
+            "2025-01-01T00:00:00Z".parse().expect("valid time")
+        }
+
         /// One FILL activity as Alpaca serves it. `cum_qty` is omitted entirely when `None`, which
         /// is how the pre-existing fallback path is reached.
         fn activity_json(
@@ -6595,6 +7890,7 @@ mod tests {
         async fn drive_recover_fills_with(
             activities: Vec<serde_json::Value>,
             dedup: SharedDedupCache,
+            known: &SharedKnownLiveOrders,
         ) -> Vec<UnindexedAccountEvent> {
             let server = MockServer::start().await;
             Mock::given(method("GET"))
@@ -6608,16 +7904,18 @@ mod tests {
             let http = reqwest::Client::new();
             let rl = RateLimitTracker::new();
             let (tx, mut rx) = mpsc::unbounded_channel();
-            recover_fills(
+            let outcome = recover_fills(
                 &http,
                 &rl,
                 &[],
                 &server.uri(),
-                "2025-01-01T00:00:00Z",
+                recovery_after(),
                 &tx,
                 &dedup,
+                known,
             )
             .await;
+            assert_eq!(outcome, Ok(()), "a full read leaves nothing unrecovered");
             drop(tx);
 
             let mut out = Vec::new();
@@ -6630,7 +7928,689 @@ mod tests {
         async fn drive_recover_fills(
             activities: Vec<serde_json::Value>,
         ) -> Vec<UnindexedAccountEvent> {
-            drive_recover_fills_with(activities, new_dedup_cache()).await
+            drive_recover_fills_with(
+                activities,
+                new_dedup_cache(),
+                &KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
+            )
+            .await
+        }
+
+        /// Run `recover_fills` for every instrument against `server`, returning what it left
+        /// unread and every event it forwarded.
+        async fn recover_fills_from(
+            server: &MockServer,
+        ) -> (Result<(), UnreadFills>, Vec<UnindexedAccountEvent>) {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let outcome = recover_fills(
+                &reqwest::Client::new(),
+                &RateLimitTracker::new(),
+                &[],
+                &server.uri(),
+                recovery_after(),
+                &tx,
+                &new_dedup_cache(),
+                &KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
+            )
+            .await;
+            drop(tx);
+            (outcome, std::iter::from_fn(|| rx.try_recv().ok()).collect())
+        }
+
+        /// A recovery read that fails delivers nothing and leaves every fill since the disconnect
+        /// unread, with the request's error.
+        #[tokio::test]
+        async fn a_failed_recovery_read_leaves_every_fill_since_the_disconnect_unread() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(ResponseTemplate::new(500).set_body_string("unavailable"))
+                .mount(&server)
+                .await;
+
+            let (outcome, events) = recover_fills_from(&server).await;
+
+            let Err(UnreadFills {
+                start,
+                reason: FillRecoveryFailure::Request(_),
+            }) = outcome
+            else {
+                panic!("expected the request's failure, got {outcome:?}");
+            };
+            assert_eq!(start, recovery_after(), "from the disconnect");
+            assert!(events.is_empty(), "nothing forwarded: {events:?}");
+        }
+
+        /// A recovery read that stops at the page cap delivers the fills it read, then leaves
+        /// those from the millisecond of the last one on unread: Alpaca orders a millisecond's
+        /// fills by id, so the cut may have passed over an earlier one in it. A last time that
+        /// does not parse falls back to the latest that does, and none parsing to the disconnect.
+        #[tokio::test]
+        async fn a_truncated_recovery_read_delivers_what_it_read_and_leaves_the_rest_unread() {
+            let time = |s: &str| s.parse::<DateTime<Utc>>().expect("valid time");
+            // The page's other activities are at 14:30:00.
+            let cases = [
+                (
+                    Some("2025-04-18T14:30:01.234567Z"),
+                    time("2025-04-18T14:30:01.234Z"),
+                ),
+                (Some("not a time"), time("2025-04-18T14:30:00Z")),
+                (None, recovery_after()),
+            ];
+            for (last_time, expected_start) in cases {
+                let mut page = make_activities_json(ALPACA_MAX_ACTIVITIES, "act");
+                let Some(activities) = page.as_array_mut() else {
+                    panic!("an array of activities");
+                };
+                match last_time {
+                    Some(last_time) => {
+                        if let Some(last) = activities.last_mut() {
+                            last["transaction_time"] =
+                                serde_json::Value::String(last_time.to_string());
+                        }
+                    }
+                    None => {
+                        for activity in activities.iter_mut() {
+                            activity["transaction_time"] =
+                                serde_json::Value::String("not a time".to_string());
+                        }
+                    }
+                }
+                let server = MockServer::start().await;
+                Mock::given(method("GET"))
+                    .and(path("/v2/account/activities"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(page))
+                    .mount(&server)
+                    .await;
+
+                let (outcome, events) = recover_fills_from(&server).await;
+
+                let fills_read = MAX_ACTIVITY_PAGES * ALPACA_MAX_ACTIVITIES;
+                assert_eq!(
+                    outcome,
+                    Err(UnreadFills {
+                        start: expected_start,
+                        reason: FillRecoveryFailure::Truncated { fills_read },
+                    }),
+                    "last time {last_time:?}"
+                );
+                assert_eq!(events.len(), fills_read, "every fill read is forwarded");
+            }
+        }
+
+        /// One account-wide read serves every instrument the stream covers, so one give-up names
+        /// them all: the stream's list, or every instrument when it has none. It was read once.
+        #[test]
+        fn a_fill_recovery_give_up_covers_every_instrument_the_stream_does() {
+            let start = recovery_after();
+            let end = start + chrono::Duration::minutes(5);
+            let spy = InstrumentNameExchange::new("SPY");
+            let qqq = InstrumentNameExchange::new("QQQ");
+            let cases = [
+                (vec![], FillRecoveryScope::AllInstruments),
+                (
+                    vec![spy.clone(), qqq.clone()],
+                    FillRecoveryScope::Instruments(vec![spy, qqq]),
+                ),
+            ];
+            for (instruments, scope) in cases {
+                let reason = FillRecoveryFailure::TimedOut { timeout_secs: 30 };
+                let unread = UnreadFills {
+                    start,
+                    reason: reason.clone(),
+                };
+                assert_eq!(
+                    fill_recovery_gave_up(&instruments, unread, end),
+                    UnindexedAccountEvent::new(
+                        ExchangeId::AlpacaBroker,
+                        AccountEventKind::FillRecoveryGaveUp(FillRecoveryGap::new(
+                            scope, start, end, 1, reason,
+                        )),
+                    )
+                );
+            }
+        }
+
+        /// A truncated read can return fills stamped after the moment recovery began, by a venue
+        /// clock ahead of this host's. The give-up is still sent, its span ending at its start
+        /// rather than before it.
+        #[test]
+        fn a_read_that_reached_past_the_recovery_start_still_reports() {
+            let end = recovery_after();
+            let start = end + chrono::Duration::seconds(1);
+            let unread = UnreadFills {
+                start,
+                reason: FillRecoveryFailure::Truncated { fills_read: 5_000 },
+            };
+            let event = fill_recovery_gave_up(&[], unread, end);
+            let AccountEventKind::FillRecoveryGaveUp(gave_up) = event.kind else {
+                panic!("expected FillRecoveryGaveUp, got {event:?}");
+            };
+            assert_eq!((gave_up.start, gave_up.end), (start, start));
+        }
+
+        /// Run `recover_fills_or_report` for `instruments` against `server` within `timeout`,
+        /// returning every event it sent.
+        async fn recover_fills_or_report_from(
+            server: &MockServer,
+            instruments: &[InstrumentNameExchange],
+            timeout: Duration,
+        ) -> Vec<UnindexedAccountEvent> {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            recover_fills_or_report(
+                &reqwest::Client::new(),
+                &RateLimitTracker::new(),
+                instruments,
+                &server.uri(),
+                recovery_after(),
+                timeout,
+                &tx,
+                &new_dedup_cache(),
+                &KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
+            )
+            .await;
+            drop(tx);
+            std::iter::from_fn(|| rx.try_recv().ok()).collect()
+        }
+
+        /// A recovery that times out forwards nothing and reports every fill since the disconnect,
+        /// for the stream's instruments.
+        #[tokio::test]
+        async fn a_timed_out_recovery_reports_every_fill_since_the_disconnect() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([]))
+                        .set_delay(Duration::from_secs(3_600)),
+                )
+                .mount(&server)
+                .await;
+            let spy = InstrumentNameExchange::new("SPY");
+
+            let events = recover_fills_or_report_from(
+                &server,
+                std::slice::from_ref(&spy),
+                Duration::from_millis(50),
+            )
+            .await;
+
+            let [event] = events.as_slice() else {
+                panic!("only the give-up is sent: {events:?}");
+            };
+            let AccountEventKind::FillRecoveryGaveUp(gave_up) = &event.kind else {
+                panic!("expected FillRecoveryGaveUp, got {event:?}");
+            };
+            assert_eq!(gave_up.scope, FillRecoveryScope::Instruments(vec![spy]));
+            assert_eq!(gave_up.start, recovery_after(), "from the disconnect");
+            assert!(gave_up.end >= gave_up.start);
+            assert_eq!(gave_up.attempts, 1);
+            assert!(
+                matches!(gave_up.reason, FillRecoveryFailure::TimedOut { .. }),
+                "{:?}",
+                gave_up.reason
+            );
+        }
+
+        /// A truncated recovery sends every fill it read before the give-up, so a consumer sees the
+        /// report after what was delivered.
+        #[tokio::test]
+        async fn a_truncated_recovery_reports_after_the_fills_it_read() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(make_activities_json(ALPACA_MAX_ACTIVITIES, "act")),
+                )
+                .mount(&server)
+                .await;
+
+            let events = recover_fills_or_report_from(&server, &[], Duration::from_secs(30)).await;
+
+            let Some((last, fills)) = events.split_last() else {
+                panic!("events are sent");
+            };
+            assert_eq!(fills.len(), MAX_ACTIVITY_PAGES * ALPACA_MAX_ACTIVITIES);
+            assert!(
+                fills
+                    .iter()
+                    .all(|event| matches!(event.kind, AccountEventKind::Trade(_))),
+                "every fill comes first"
+            );
+            let AccountEventKind::FillRecoveryGaveUp(gave_up) = &last.kind else {
+                panic!("the give-up comes last, got {last:?}");
+            };
+            assert_eq!(gave_up.scope, FillRecoveryScope::AllInstruments);
+            assert!(matches!(
+                gave_up.reason,
+                FillRecoveryFailure::Truncated { .. }
+            ));
+        }
+
+        /// A FILL activity's execution id is the part of its `id` after `::`; an id without one is
+        /// taken whole.
+        #[test]
+        fn an_activity_id_names_its_execution_after_the_separator() {
+            assert_eq!(
+                activity_execution_id("20261005041849348::524b1902-817e-446c-825b-a9fcfebbc17e"),
+                "524b1902-817e-446c-825b-a9fcfebbc17e"
+            );
+            assert_eq!(activity_execution_id("act-1"), "act-1");
+            assert_eq!(
+                activity_execution_id("20261005041849348::"),
+                "20261005041849348::"
+            );
+        }
+
+        /// One fill carries one `TradeId` however it is delivered: over the account stream, by
+        /// reconnect recovery, and by `fetch_trades`. So a consumer reconciling with `fetch_trades`
+        /// matches what the stream already delivered.
+        #[tokio::test]
+        async fn a_fill_has_one_trade_id_on_the_stream_in_recovery_and_from_fetch_trades() {
+            use crate::client::ExecutionClient;
+
+            let execution_id = "524b1902-817e-446c-825b-a9fcfebbc17e";
+            let activity = activity_json(
+                &format!("20250418103000000::{execution_id}"),
+                "ord-1",
+                "2",
+                Some("2"),
+            );
+
+            let [streamed, _snapshot] = convert_trade_update(AlpacaTradeUpdate {
+                event: SmolStr::new("fill"),
+                execution_id: Some(execution_id),
+                previous_execution_id: None,
+                order: super::make_order_ws("ord-1", "SPY", "buy", "2"),
+                price: Some("100.00"),
+                qty: Some("2"),
+                timestamp: Some("2025-04-18T14:30:00Z"),
+            });
+            let Some(streamed) = streamed else {
+                panic!("a fill converts to a Trade");
+            };
+
+            let recovered = drive_recover_fills(vec![activity.clone()]).await;
+            let [recovered] = recovered.as_slice() else {
+                panic!("one fill recovered: {recovered:?}");
+            };
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::Value::Array(vec![activity])),
+                )
+                .mount(&server)
+                .await;
+            let Ok(fetched) = client_for(&server)
+                .fetch_trades(recovery_after(), Utc::now(), &[])
+                .await
+            else {
+                panic!("fetch_trades reads the activity");
+            };
+            let [fetched] = fetched.trades.as_slice() else {
+                panic!("one fill fetched: {fetched:?}");
+            };
+
+            assert_eq!(trade_of(&streamed).id.0.as_str(), execution_id);
+            assert_eq!(trade_of(recovered).id.0.as_str(), execution_id);
+            assert_eq!(fetched.id.0.as_str(), execution_id);
+        }
+
+        // -----------------------------------------------------------------------
+        // fetch_trades — bounded reads of a span, resumed by the caller
+        // -----------------------------------------------------------------------
+
+        fn time(s: &str) -> DateTime<Utc> {
+            s.parse().expect("valid time")
+        }
+
+        /// Alpaca's activities endpoint over `activities`, which are sorted by id, as observed on
+        /// paper: `after` matches an activity whose time, rounded down to the millisecond, is at
+        /// or after it, `until` one whose rounded time is before it, and `page_token` resumes
+        /// after the activity it names.
+        struct ActivitiesVenue {
+            activities: Vec<serde_json::Value>,
+        }
+
+        impl Respond for ActivitiesVenue {
+            fn respond(&self, request: &Request) -> ResponseTemplate {
+                let query: std::collections::HashMap<String, String> =
+                    request.url.query_pairs().into_owned().collect();
+                let bound = |name: &str| query.get(name).map(|s| time(s));
+                let (after, until) = (bound("after"), bound("until"));
+                let size: usize = query
+                    .get("page_size")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(ALPACA_MAX_ACTIVITIES);
+                let in_bounds = self.activities.iter().filter(|activity| {
+                    let at =
+                        floor_millis(time(activity["transaction_time"].as_str().expect("a time")));
+                    after.is_none_or(|after| at >= after) && until.is_none_or(|until| at < until)
+                });
+                let page: Vec<_> = match query.get("page_token") {
+                    Some(token) => in_bounds
+                        .skip_while(|activity| activity["id"] != token.as_str())
+                        .skip(1)
+                        .take(size)
+                        .cloned()
+                        .collect(),
+                    None => in_bounds.take(size).cloned().collect(),
+                };
+                ResponseTemplate::new(200).set_body_json(page)
+            }
+        }
+
+        /// A FILL activity on `symbol` with id `id` at `transaction_time`.
+        fn fill_at(id: &str, symbol: &str, transaction_time: DateTime<Utc>) -> serde_json::Value {
+            serde_json::json!({
+                "id": id,
+                "order_id": format!("ord-{id}"),
+                "symbol": symbol,
+                "side": "buy",
+                "price": "100.00",
+                "qty": "1",
+                "cum_qty": "1",
+                "transaction_time": transaction_time.to_rfc3339_opts(SecondsFormat::Micros, true),
+            })
+        }
+
+        async fn serve_activities(activities: Vec<serde_json::Value>) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(ActivitiesVenue { activities })
+                .mount(&server)
+                .await;
+            server
+        }
+
+        /// Read `start..=end` to its end, from each call's `resume`, returning the trade ids
+        /// read and how many calls it took.
+        async fn read_span(
+            client: &AlpacaClient,
+            start: DateTime<Utc>,
+            end: DateTime<Utc>,
+            instruments: &[InstrumentNameExchange],
+        ) -> (std::collections::HashSet<String>, usize) {
+            use crate::client::ExecutionClient;
+
+            let mut ids = std::collections::HashSet::new();
+            let mut from = start;
+            for calls in 1..=10 {
+                let read = match client.fetch_trades(from, end, instruments).await {
+                    Ok(read) => read,
+                    Err(error) => panic!("call {calls} failed: {error:?}"),
+                };
+                ids.extend(read.trades.iter().map(|trade| trade.id.0.to_string()));
+                match read.resume {
+                    Some(resume) => from = resume,
+                    None => return (ids, calls),
+                }
+            }
+            panic!("the reads did not reach the span's end");
+        }
+
+        /// A span holding more fills than one call reads is read completely across calls, each
+        /// resumed from the last. Three fills share each millisecond, ordered by id against
+        /// their times, so a call's cut falls inside one: its last fill read is later than an
+        /// unread one in the same millisecond, which a resume from the last fill's exact time
+        /// would lose.
+        #[tokio::test]
+        async fn fetch_trades_reads_a_busy_span_completely_across_calls() {
+            let base = time("2025-04-18T14:30:00Z");
+            let mut activities = Vec::new();
+            for ms in 0..4_000_i64 {
+                let symbol = if ms % 2 == 0 { "SPY" } else { "QQQ" };
+                for (k, micros) in [("a", 900), ("b", 500), ("c", 100)] {
+                    let at = base + TimeDelta::milliseconds(ms) + TimeDelta::microseconds(micros);
+                    activities.push(fill_at(&format!("{ms:017}::{ms}-{k}"), symbol, at));
+                }
+            }
+            let server = serve_activities(activities).await;
+            let client = client_for(&server);
+            let end = time("2025-04-18T15:00:00Z");
+
+            let (ids, calls) = read_span(&client, recovery_after(), end, &[]).await;
+            assert_eq!(ids.len(), 12_000, "every fill is read once or more");
+            assert_eq!(calls, 3, "5,000 activities per call");
+
+            let spy = [InstrumentNameExchange::new("SPY")];
+            let (ids, _) = read_span(&client, recovery_after(), end, &spy).await;
+            assert_eq!(ids.len(), 6_000, "every SPY fill, and only those");
+
+            let Some(requests) = server.received_requests().await else {
+                panic!("requests are recorded");
+            };
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.url.query_pairs().any(
+                        |(name, value)| name == "until" && value == "2025-04-18T15:00:00.001Z"
+                    )),
+                "every request is bounded by the span's end"
+            );
+        }
+
+        /// A call can spend its whole bound on other instruments' fills: it returns none, and
+        /// says where to read on from.
+        #[tokio::test]
+        async fn fetch_trades_says_where_to_read_on_after_a_call_without_matches() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(make_activities_json(ALPACA_MAX_ACTIVITIES, "act")),
+                )
+                .mount(&server)
+                .await;
+
+            let qqq = [InstrumentNameExchange::new("QQQ")];
+            let Ok(read) = client_for(&server)
+                .fetch_trades(recovery_after(), Utc::now(), &qqq)
+                .await
+            else {
+                panic!("the read succeeds");
+            };
+            assert!(read.trades.is_empty(), "every fill read is SPY's");
+            assert_eq!(read.resume, Some(time("2025-04-18T14:30:00Z")));
+        }
+
+        /// A full read that does not get past the span's first millisecond cannot advance, so it
+        /// is an error rather than a resume that would loop.
+        #[tokio::test]
+        async fn fetch_trades_that_cannot_advance_is_truncated() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(make_activities_json(ALPACA_MAX_ACTIVITIES, "act")),
+                )
+                .mount(&server)
+                .await;
+
+            let result = client_for(&server)
+                .fetch_trades(time("2025-04-18T14:30:00.000500Z"), Utc::now(), &[])
+                .await;
+            assert!(
+                matches!(
+                    result,
+                    Err(UnindexedClientError::Truncated { fills_read: 5_000 })
+                ),
+                "got {result:?}"
+            );
+        }
+
+        /// The span is applied exactly, although Alpaca's bounds reach the whole of the
+        /// milliseconds holding `start` and `end`.
+        #[tokio::test]
+        async fn fetch_trades_returns_only_the_span() {
+            let (start, end) = (
+                time("2025-04-18T14:30:00.123456Z"),
+                time("2025-04-18T14:30:05.678901Z"),
+            );
+            let micro = TimeDelta::microseconds(1);
+            let server = serve_activities(vec![
+                fill_at("1::before", "SPY", start - micro),
+                fill_at("2::start", "SPY", start),
+                fill_at("3::end", "SPY", end),
+                fill_at("4::after", "SPY", end + micro),
+            ])
+            .await;
+
+            let (ids, calls) = read_span(&client_for(&server), start, end, &[]).await;
+            assert_eq!(calls, 1);
+            let mut ids: Vec<_> = ids.into_iter().collect();
+            ids.sort();
+            assert_eq!(ids, ["end", "start"]);
+        }
+
+        /// Alpaca's `until` is not exact, so a capped read can return activities past `end`. Every
+        /// activity before them was read, so the span is complete.
+        #[tokio::test]
+        async fn fetch_trades_that_read_past_the_end_is_complete() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            // Full pages at 14:30:00, whatever `until` asks for.
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(make_activities_json(ALPACA_MAX_ACTIVITIES, "act")),
+                )
+                .mount(&server)
+                .await;
+
+            let Ok(read) = client_for(&server)
+                .fetch_trades(recovery_after(), time("2025-04-18T14:29:00Z"), &[])
+                .await
+            else {
+                panic!("the read succeeds");
+            };
+            assert_eq!(read, TradesRead::complete(Vec::new()));
+        }
+
+        /// The extreme times are valid bounds: a start before the epoch asks from the epoch, an
+        /// end not yet reached sends no `until` rather than overflowing, and a span ending before
+        /// the epoch reads nothing.
+        #[tokio::test]
+        async fn fetch_trades_accepts_the_extreme_times() {
+            use crate::client::ExecutionClient;
+
+            let server = serve_activities(vec![fill_at(
+                "1::fill",
+                "SPY",
+                time("2025-04-18T14:30:00Z"),
+            )])
+            .await;
+            let Ok(read) = client_for(&server)
+                .fetch_trades(DateTime::<Utc>::MIN_UTC, DateTime::<Utc>::MAX_UTC, &[])
+                .await
+            else {
+                panic!("the read succeeds");
+            };
+            assert_eq!(read.trades.len(), 1);
+            assert_eq!(read.resume, None);
+
+            let Some(requests) = server.received_requests().await else {
+                panic!("requests are recorded");
+            };
+            let [request] = requests.as_slice() else {
+                panic!("one request: {requests:?}");
+            };
+            let query: std::collections::HashMap<_, _> =
+                request.url.query_pairs().into_owned().collect();
+            assert_eq!(
+                query.get("after").map(String::as_str),
+                Some("1970-01-01T00:00:00.000Z")
+            );
+            assert!(!query.contains_key("until"), "{query:?}");
+
+            // A span ending before the epoch holds nothing, and is not requested.
+            let before_epoch = DateTime::UNIX_EPOCH - TimeDelta::days(1);
+            let Ok(read) = client_for(&server)
+                .fetch_trades(DateTime::<Utc>::MIN_UTC, before_epoch, &[])
+                .await
+            else {
+                panic!("the read succeeds");
+            };
+            assert_eq!(read, TradesRead::complete(Vec::new()));
+            assert_eq!(server.received_requests().await.map(|r| r.len()), Some(1));
+        }
+
+        /// A span whose start is after its end is empty: nothing is requested.
+        #[tokio::test]
+        async fn fetch_trades_reads_nothing_for_an_empty_span() {
+            use crate::client::ExecutionClient;
+
+            let server = MockServer::start().await;
+            let start = recovery_after();
+            let Ok(read) = client_for(&server)
+                .fetch_trades(start, start - TimeDelta::seconds(1), &[])
+                .await
+            else {
+                panic!("an empty span reads");
+            };
+            assert_eq!(read, TradesRead::complete(Vec::new()));
+            assert_eq!(server.received_requests().await.map(|r| r.len()), Some(0));
+        }
+
+        /// Alpaca's `after` compares at millisecond precision, so a recovery from mid-millisecond
+        /// asks from that millisecond's start, or it would miss a fill later in it.
+        #[tokio::test]
+        async fn recovery_reads_from_the_start_of_the_disconnects_millisecond() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .and(wiremock::matchers::query_param(
+                    "after",
+                    "2025-01-01T00:00:00.123Z",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let outcome = recover_fills(
+                &reqwest::Client::new(),
+                &RateLimitTracker::new(),
+                &[],
+                &server.uri(),
+                time("2025-01-01T00:00:00.123456Z"),
+                &tx,
+                &new_dedup_cache(),
+                &KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
+            )
+            .await;
+            assert_eq!(outcome, Ok(()));
+            server.verify().await;
+        }
+
+        /// The cumulative dedup keys `dedup` holds, oldest first.
+        fn dedup_keys(dedup: &SharedDedupCache) -> Vec<String> {
+            let mut keys: Vec<_> = dedup
+                .lock()
+                .iter()
+                .filter_map(|(key, _)| match key {
+                    FillKey::Cumulative(key) => Some(key.to_string()),
+                    FillKey::Execution(_) | FillKey::CumulativeWithoutId(_) => None,
+                })
+                .collect();
+            // The LRU iterates most recent first.
+            keys.reverse();
+            keys
         }
 
         fn trade_of(
@@ -6674,75 +8654,920 @@ mod tests {
         #[tokio::test]
         async fn the_dedup_key_uses_the_venue_cumulative_not_an_intra_batch_count() {
             // Three lots filled before the window; the recovered 2-lot fill takes the order to 5.
-            let events =
-                drive_recover_fills(vec![activity_json("act-1", "ord-1", "2", Some("5"))]).await;
+            let dedup = new_dedup_cache();
+            drive_recover_fills_with(
+                vec![activity_json("act-1", "ord-1", "2", Some("5"))],
+                dedup.clone(),
+                &KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
+            )
+            .await;
 
             assert_eq!(
-                trade_of(&events[0]).id.0.as_str(),
-                "ord-1:5",
+                dedup_keys(&dedup),
+                vec!["ord-1:5"],
                 "counting executions within the batch would key this as ord-1:2"
             );
         }
 
-        /// The property the key exists for: one fill delivered twice, by two different paths, is
-        /// one fill. Before the cumulative was carried this held only for an order whose fills lay
-        /// wholly inside the recovery window -- precisely the orders least in need of recovery.
-        #[tokio::test]
-        async fn a_fill_already_delivered_over_websocket_is_not_recovered_twice() {
+        /// Delivers a WS fill of 2 lots on `ord-1`, leaving it at 5, with `execution_id`, then
+        /// recovers one activity `activity_id` of the same size and cumulative through the same
+        /// dedup cache.
+        async fn recover_after_ws_fill(
+            execution_id: Option<&str>,
+            activity_id: &str,
+        ) -> Vec<UnindexedAccountEvent> {
             let dedup = new_dedup_cache();
-
-            // The same execution as it arrived over WebSocket: 2 lots, leaving the order at 5.
             let update = AlpacaTradeUpdate {
                 event: SmolStr::new("partial_fill"),
+                execution_id,
+                previous_execution_id: None,
                 order: super::make_order_ws("ord-1", "SPY", "buy", "5"),
                 price: Some("100.00"),
                 qty: Some("2"),
                 timestamp: None,
             };
-            let [ws_event, _snapshot] = convert_trade_update(update);
-            let ws_event = ws_event.expect("a partial_fill converts to a Trade");
-            let ws_key = fill_dedup_key_from_event(&ws_event)
-                .expect("a Trade carries a dedup key")
-                .clone();
             assert!(
-                !is_duplicate(&dedup, &ws_key),
+                !is_duplicate_fill(&dedup, ws_execution_id(&update), early_dedup_key(&update)),
                 "precondition: first sighting"
             );
 
-            let events = drive_recover_fills_with(
-                vec![activity_json("act-1", "ord-1", "2", Some("5"))],
+            drive_recover_fills_with(
+                vec![activity_json(activity_id, "ord-1", "2", Some("5"))],
                 dedup,
+                &KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
+            )
+            .await
+        }
+
+        /// The property the cache exists for: one fill delivered by both paths is one fill. It is
+        /// recognised by its execution id, or by its cumulative where either path lacks the id.
+        #[tokio::test]
+        async fn a_fill_already_delivered_over_websocket_is_not_recovered_twice() {
+            for (ws_execution_id, activity_id) in [
+                (Some("exec-a"), "20250418103000000::exec-a"),
+                (None, "20250418103000000::exec-a"),
+                (Some("exec-a"), "act-1"),
+            ] {
+                let events = recover_after_ws_fill(ws_execution_id, activity_id).await;
+                assert!(
+                    events.is_empty(),
+                    "a fill already delivered over WebSocket ({ws_execution_id:?}) must not be \
+                     re-delivered by recovery ({activity_id}), got {events:?}"
+                );
+            }
+        }
+
+        /// Streams a `trade_correct` with `fields` (its execution id `exec-c`), then recovers the
+        /// FILL activity of `exec-c` through the same dedup cache.
+        async fn recover_after_correction(fields: &str) -> Vec<UnindexedAccountEvent> {
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let dedup = new_dedup_cache();
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            process_ws_text(
+                &super::amendment_frame("trade_correct", fields),
+                &tx,
+                &dedup,
+                &known,
+                &mut ExponentialBackoff::new(),
+            );
+
+            drive_recover_fills_with(
+                vec![activity_json(
+                    "20250418103100000::exec-c",
+                    "ord-1",
+                    "2",
+                    Some("2"),
+                )],
+                dedup,
+                &known,
+            )
+            .await
+        }
+
+        /// A correction's execution was delivered as the replacement trade, so recovery does not
+        /// deliver it again should Alpaca list it as a FILL activity.
+        #[tokio::test]
+        async fn a_corrected_execution_is_not_recovered_again() {
+            let events = recover_after_correction(
+                r#""execution_id":"exec-c","previous_execution_id":"exec-a","price":"101.50","qty":"2","#,
             )
             .await;
-
             assert!(
                 events.is_empty(),
-                "a fill already delivered over WebSocket must not be re-delivered by recovery, \
-                 got {events:?}"
+                "the corrected execution was delivered as the replacement, got {events:?}"
             );
+        }
+
+        /// An unresolved correction delivered no trade, so recovery still delivers its execution.
+        #[tokio::test]
+        async fn an_unresolved_correction_does_not_keep_its_execution_from_recovery() {
+            let events = recover_after_correction(
+                r#""execution_id":"exec-c","previous_execution_id":"exec-a","qty":"2","#,
+            )
+            .await;
+            let ids: Vec<_> = events.iter().map(|e| trade_of(e).id.0.as_str()).collect();
+            assert_eq!(ids, vec!["exec-c"]);
+        }
+
+        /// A different execution that takes the order to a cumulative already seen, as after a
+        /// bust, is a new fill and is recovered.
+        #[tokio::test]
+        async fn a_different_execution_at_a_cumulative_already_seen_is_recovered() {
+            let events = recover_after_ws_fill(Some("exec-a"), "20250418103000000::exec-b").await;
+            let ids: Vec<_> = events.iter().map(|e| trade_of(e).id.0.as_str()).collect();
+            assert_eq!(ids, vec!["exec-b"]);
         }
 
         /// With `cum_qty` absent the key falls back to counting within the batch -- exactly what
         /// shipped before -- and the fill reports no cumulative rather than a fabricated one.
         #[tokio::test]
         async fn without_a_reported_cumulative_the_previous_behaviour_is_preserved() {
-            let events = drive_recover_fills(vec![
-                activity_json("act-1", "ord-1", "2", None),
-                activity_json("act-2", "ord-1", "3", None),
-            ])
+            let dedup = new_dedup_cache();
+            let events = drive_recover_fills_with(
+                vec![
+                    activity_json("act-1", "ord-1", "2", None),
+                    activity_json("act-2", "ord-1", "3", None),
+                ],
+                dedup.clone(),
+                &KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
+            )
             .await;
 
-            let keys: Vec<_> = events
-                .iter()
-                .map(|e| trade_of(e).id.0.as_str().to_owned())
-                .collect();
-            assert_eq!(keys, vec!["ord-1:2", "ord-1:5"], "intra-batch accumulation");
+            assert_eq!(
+                dedup_keys(&dedup),
+                vec!["ord-1:2", "ord-1:5"],
+                "intra-batch accumulation"
+            );
+            let ids: Vec<_> = events.iter().map(|e| trade_of(e).id.0.as_str()).collect();
+            assert_eq!(ids, vec!["act-1", "act-2"], "each keeps its activity's id");
 
             assert!(
                 events
                     .iter()
                     .all(|e| trade_of(e).order_filled_quantity.is_none()),
                 "a venue that reported no cumulative must not have one invented for it"
+            );
+        }
+
+        // --- How orders ended: fetch_ended_orders, the reconnect check, and what is held ---
+
+        /// An order as `GET /v2/orders` and `GET /v2/orders:by_client_order_id` serve it, of
+        /// quantity 2.
+        fn order_json(cid: &str, symbol: &str, status: &str, filled: &str) -> serde_json::Value {
+            serde_json::json!({
+                "id": format!("id-{cid}"),
+                "client_order_id": cid,
+                "symbol": symbol,
+                "qty": "2",
+                "filled_qty": filled,
+                "filled_avg_price": if filled == "0" { None } else { Some("101.5") },
+                "status": status,
+                "side": "buy",
+                "type": "limit",
+                "time_in_force": "gtc",
+                "limit_price": "100",
+                "created_at": "2026-10-01T14:30:00Z",
+                "updated_at": "2026-10-01T15:00:00Z"
+            })
+        }
+
+        /// Serve `order` as the lookup of client order id `cid`, expecting `calls` lookups.
+        async fn mount_lookup(server: &MockServer, cid: &str, order: ResponseTemplate, calls: u64) {
+            use wiremock::matchers::query_param;
+            Mock::given(method("GET"))
+                .and(path("/v2/orders:by_client_order_id"))
+                .and(query_param("client_order_id", cid))
+                .respond_with(order)
+                .expect(calls)
+                .mount(server)
+                .await;
+        }
+
+        fn ok(body: serde_json::Value) -> ResponseTemplate {
+            ResponseTemplate::new(200).set_body_json(body)
+        }
+
+        fn alpaca_key(instrument: &str, cid: &str) -> UnindexedOrderKey {
+            OrderKey::new(
+                ExchangeId::AlpacaBroker,
+                InstrumentNameExchange::new(instrument),
+                StrategyId::new("strategy"),
+                ClientOrderId::new(cid),
+            )
+        }
+
+        fn hold(known: &SharedKnownLiveOrders, key: &UnindexedOrderKey) {
+            let open = Open::new(
+                VenueOrderId::Assigned(OrderId::new(format!("id-{}", key.cid))),
+                Utc::now(),
+                Decimal::ZERO,
+            );
+            known.lock().live(key, Decimal::TWO, &open);
+        }
+
+        #[tokio::test]
+        async fn fetch_ended_orders_reads_each_end_alpaca_reports() {
+            use rust_decimal_macros::dec;
+
+            let server = MockServer::start().await;
+            for (cid, status, filled) in [
+                ("filled", "filled", "2"),
+                ("canceled", "canceled", "1"),
+                ("replaced", "replaced", "0"),
+                ("expired", "expired", "1"),
+                ("rejected", "rejected", "0"),
+                ("done", "done_for_day", "1"),
+                ("live", "new", "0"),
+                ("unknown-status", "frozen", "0"),
+            ] {
+                mount_lookup(&server, cid, ok(order_json(cid, "SPY", status, filled)), 1).await;
+            }
+            mount_lookup(
+                &server,
+                "elsewhere",
+                ok(order_json("elsewhere", "QQQ", "canceled", "0")),
+                1,
+            )
+            .await;
+            mount_lookup(
+                &server,
+                "gone",
+                ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "code": 40410000,
+                    "message": "order not found for gone"
+                })),
+                1,
+            )
+            .await;
+
+            let keys: Vec<_> = [
+                "filled",
+                "canceled",
+                "replaced",
+                "expired",
+                "rejected",
+                "done",
+                "live",
+                "unknown-status",
+                "elsewhere",
+                "gone",
+            ]
+            .into_iter()
+            .map(|cid| alpaca_key("spy", cid))
+            .collect();
+            let ended = client_for(&server).fetch_ended_orders(&keys).await.unwrap();
+
+            let mut found: Vec<_> = ended
+                .iter()
+                .map(|order| (order.key.cid.0.as_str(), &order.state))
+                .collect();
+            found.sort_by_key(|(cid, _)| *cid);
+            let [
+                (canceled, InactiveOrderState::Cancelled(cancelled)),
+                (expired, InactiveOrderState::Expired(expiry)),
+                (filled, InactiveOrderState::FullyFilled(fill)),
+                (rejected, InactiveOrderState::OpenFailed(failed)),
+                (replaced, InactiveOrderState::Cancelled(replacement)),
+            ] = found.as_slice()
+            else {
+                panic!("filled, canceled, replaced, expired and rejected: {found:?}");
+            };
+            assert_eq!(
+                [*canceled, *expired, *filled, *rejected, *replaced],
+                ["canceled", "expired", "filled", "rejected", "replaced"]
+            );
+            assert_eq!(
+                (fill.filled_quantity, fill.avg_price),
+                (dec!(2), Some(dec!(101.5)))
+            );
+            assert_eq!(
+                cancelled.filled_quantity,
+                Some(dec!(1)),
+                "what filled before"
+            );
+            assert_eq!(expiry.filled_quantity, Some(dec!(1)));
+            assert_eq!(replacement.filled_quantity, Some(Decimal::ZERO));
+            assert_eq!(
+                cancelled.time_exchange,
+                parse_timestamp("2026-10-01T15:00:00Z").unwrap(),
+                "stamped when the order last changed"
+            );
+            assert!(matches!(
+                failed,
+                OrderError::Rejected(ApiError::OrderRejected(message))
+                    if message.contains("id-rejected")
+            ));
+            assert!(
+                ended
+                    .iter()
+                    .all(|order| order.key.strategy == StrategyId::new("strategy")
+                        && order.key.instrument == InstrumentNameExchange::new("spy")),
+                "each carries the key it was asked for"
+            );
+        }
+
+        #[tokio::test]
+        async fn fetch_ended_orders_fails_when_a_lookup_fails() {
+            let server = MockServer::start().await;
+            mount_lookup(&server, "a", ok(order_json("a", "SPY", "canceled", "0")), 1).await;
+            mount_lookup(&server, "b", ResponseTemplate::new(500), 1).await;
+
+            let result = client_for(&server)
+                .fetch_ended_orders(&[alpaca_key("SPY", "a"), alpaca_key("SPY", "b")])
+                .await;
+
+            assert!(
+                matches!(result, Err(UnindexedClientError::Connectivity(_))),
+                "{result:?}"
+            );
+        }
+
+        /// One listing covers every instrument due; only the held orders it no longer shows are
+        /// looked up, and only those that ended are reported and stop being held.
+        #[tokio::test]
+        async fn a_reconnect_check_lists_once_and_reports_the_orders_that_ended() {
+            use wiremock::matchers::query_param;
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/orders"))
+                .and(query_param("status", "open"))
+                .and(query_param("symbols", "QQQ,SPY"))
+                .respond_with(ok(serde_json::json!([order_json(
+                    "spy-listed",
+                    "SPY",
+                    "new",
+                    "0"
+                )])))
+                .expect(1)
+                .mount(&server)
+                .await;
+            mount_lookup(&server, "spy-listed", ResponseTemplate::new(500), 0).await;
+            mount_lookup(
+                &server,
+                "spy-cancelled",
+                ok(order_json("spy-cancelled", "SPY", "canceled", "1")),
+                1,
+            )
+            .await;
+            mount_lookup(
+                &server,
+                "spy-done",
+                ok(order_json("spy-done", "SPY", "done_for_day", "1")),
+                1,
+            )
+            .await;
+            mount_lookup(
+                &server,
+                "qqq-filled",
+                ok(order_json("qqq-filled", "QQQ", "filled", "2")),
+                1,
+            )
+            .await;
+
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            let [listed, cancelled, done, filled] = [
+                ("SPY", "spy-listed"),
+                ("SPY", "spy-cancelled"),
+                ("SPY", "spy-done"),
+                ("QQQ", "qqq-filled"),
+            ]
+            .map(|(instrument, cid)| alpaca_key(instrument, cid));
+            for key in [&listed, &cancelled, &done, &filled] {
+                hold(&known, key);
+            }
+            let mut unchecked = UncheckedOrders::default();
+            unchecked.open(known.lock().instruments());
+            let config = Arc::new(AlpacaConfig::with_base_url(
+                "test-key".into(),
+                "test-secret".into(),
+                server.uri(),
+            ));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            recover_alpaca_ended_orders(
+                &reqwest::Client::new(),
+                &Arc::new(RateLimitTracker::new()),
+                &config,
+                &known,
+                &mut unchecked,
+                &tx,
+            )
+            .await;
+
+            let mut reported: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|event| {
+                    let AccountEventKind::OrderSnapshot(
+                        rustrade_integration::collection::snapshot::Snapshot(order),
+                    ) = event.kind
+                    else {
+                        panic!("an order snapshot: {event:?}");
+                    };
+                    assert!(matches!(order.state, OrderState::Inactive(_)), "{order:?}");
+                    order.key.cid
+                })
+                .collect();
+            reported.sort();
+            assert_eq!(reported, [filled.cid.clone(), cancelled.cid.clone()]);
+            let known = known.lock();
+            assert!(known.contains(&listed.cid) && known.contains(&done.cid));
+            assert!(!known.contains(&cancelled.cid) && !known.contains(&filled.cid));
+            assert!(unchecked.is_empty(), "both instruments checked");
+        }
+
+        /// A listing that fails charges every instrument in it, which then waits for a retry.
+        #[tokio::test]
+        async fn a_failed_listing_is_retried_for_every_instrument_in_it() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/orders"))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            hold(&known, &alpaca_key("SPY", "a"));
+            hold(&known, &alpaca_key("QQQ", "b"));
+            let mut unchecked = UncheckedOrders::default();
+            unchecked.open(known.lock().instruments());
+            let config = Arc::new(AlpacaConfig::with_base_url(
+                "test-key".into(),
+                "test-secret".into(),
+                server.uri(),
+            ));
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            recover_alpaca_ended_orders(
+                &reqwest::Client::new(),
+                &Arc::new(RateLimitTracker::new()),
+                &config,
+                &known,
+                &mut unchecked,
+                &tx,
+            )
+            .await;
+
+            assert!(rx.try_recv().is_err(), "nothing reported");
+            let now = tokio::time::Instant::now();
+            assert!(
+                unchecked.ready(&NoPendingFills, now).is_empty(),
+                "both wait"
+            );
+            for instrument in ["QQQ", "SPY"] {
+                assert_eq!(
+                    unchecked.failed(&InstrumentNameExchange::new(instrument), now),
+                    Some(crate::client::order_recovery::GapFailure::Retry(
+                        Duration::from_secs(crate::client::order_recovery::GAP_RETRY_BASE_SECS * 2)
+                    )),
+                    "{instrument} has failed once already"
+                );
+            }
+            assert_eq!(known.lock().instruments().len(), 2, "both still held");
+        }
+
+        #[tokio::test]
+        async fn placing_listing_and_cancelling_keep_the_held_orders_in_step() {
+            use crate::order::request::{OrderRequestCancel, RequestCancel, RequestOpen};
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/v2/orders"))
+                .respond_with(ok(order_json("resting", "SPY", "new", "0")))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/v2/orders"))
+                .respond_with(ok(order_json("filled", "SPY", "filled", "2")))
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/v2/orders"))
+                .respond_with(ok(serde_json::json!([order_json(
+                    "listed", "QQQ", "new", "0"
+                )])))
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path("/v2/orders/id-resting"))
+                .respond_with(ResponseTemplate::new(204))
+                .mount(&server)
+                .await;
+            let client = client_for(&server);
+            let spy = InstrumentNameExchange::new("SPY");
+
+            for cid in ["resting", "filled"] {
+                let request = OrderRequestOpen {
+                    key: OrderKey::new(
+                        ExchangeId::AlpacaBroker,
+                        &spy,
+                        StrategyId::new("strategy"),
+                        ClientOrderId::new(cid),
+                    ),
+                    state: RequestOpen {
+                        side: Side::Buy,
+                        price: Some(Decimal::ONE_HUNDRED),
+                        quantity: Decimal::TWO,
+                        kind: OrderKind::Limit,
+                        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                        position_id: None,
+                        reduce_only: false,
+                        market: None,
+                    },
+                };
+                client.open_order(request).await;
+            }
+            client.fetch_open_orders(&[]).await.unwrap();
+            {
+                let known = client.known_live.lock();
+                assert!(known.contains(&ClientOrderId::new("resting")));
+                assert!(
+                    !known.contains(&ClientOrderId::new("filled")),
+                    "filled in its placement response"
+                );
+                assert!(known.contains(&ClientOrderId::new("listed")));
+            }
+
+            let cancel = client
+                .cancel_order(OrderRequestCancel {
+                    key: OrderKey::new(
+                        ExchangeId::AlpacaBroker,
+                        &spy,
+                        StrategyId::new("strategy"),
+                        ClientOrderId::new("resting"),
+                    ),
+                    state: RequestCancel {
+                        id: Some(VenueOrderId::Assigned(OrderId::new("id-resting"))),
+                    },
+                })
+                .await;
+            let Ok(cancelled) = &cancel.state else {
+                panic!("expected Ok, got {cancel:?}");
+            };
+            assert_eq!(
+                cancelled.filled_quantity, None,
+                "the DELETE response has no body, so what filled is unknown"
+            );
+            assert!(
+                client
+                    .known_live
+                    .lock()
+                    .contains(&ClientOrderId::new("resting")),
+                "a cancel Alpaca has only accepted has not ended the order"
+            );
+        }
+
+        /// An order that ended in its placement response is reported as it ended, on both
+        /// placement paths, and is not held as live: an IOC that found no liquidity or partly
+        /// filled and expired the rest, one cancelled or replaced, one rejected after Alpaca
+        /// accepted it, and one filled. A live status is reported open, with what filled (zero
+        /// when that is unknown), and held, as is one this version does not know; one whose fill
+        /// covers the quantity is reported filled.
+        #[tokio::test]
+        async fn an_order_that_ended_in_its_placement_response_is_reported_as_it_ended() {
+            use crate::order::request::RequestOpen;
+
+            let Some(time) = parse_timestamp("2026-10-01T15:00:00Z") else {
+                panic!("order_json's updated_at parses");
+            };
+            let id = |cid: &str| OrderId::new(format!("id-{cid}"));
+            let open = |cid: &str, filled| {
+                OrderState::active(Open::new(VenueOrderId::Assigned(id(cid)), time, filled))
+            };
+            let cases: [(&str, &str, &str, UnindexedOrderState, bool); 13] = [
+                (
+                    "ioc-unfilled",
+                    "expired",
+                    "0",
+                    OrderState::expired(Expired::new(
+                        id("ioc-unfilled"),
+                        time,
+                        Some(Decimal::ZERO),
+                    )),
+                    false,
+                ),
+                (
+                    "ioc-partial",
+                    "expired",
+                    "1",
+                    OrderState::expired(Expired::new(id("ioc-partial"), time, Some(Decimal::ONE))),
+                    false,
+                ),
+                (
+                    "fill-unknown",
+                    "expired",
+                    "not-a-number",
+                    OrderState::expired(Expired::new(id("fill-unknown"), time, None)),
+                    false,
+                ),
+                (
+                    "cancelled",
+                    "canceled",
+                    "1",
+                    OrderState::inactive(Cancelled::new(id("cancelled"), time, Some(Decimal::ONE))),
+                    false,
+                ),
+                (
+                    "rejected",
+                    "rejected",
+                    "0",
+                    OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
+                        "Alpaca rejected order id-rejected after accepting it".to_string(),
+                    ))),
+                    false,
+                ),
+                (
+                    "filled",
+                    "filled",
+                    "2",
+                    OrderState::fully_filled(Filled::new(
+                        id("filled"),
+                        time,
+                        Decimal::TWO,
+                        Some(Decimal::new(1015, 1)),
+                    )),
+                    false,
+                ),
+                (
+                    "replaced",
+                    "replaced",
+                    "0",
+                    OrderState::inactive(Cancelled::new(id("replaced"), time, Some(Decimal::ZERO))),
+                    false,
+                ),
+                (
+                    "live-covered",
+                    "partially_filled",
+                    "2",
+                    OrderState::fully_filled(Filled::new(
+                        id("live-covered"),
+                        time,
+                        Decimal::TWO,
+                        Some(Decimal::new(1015, 1)),
+                    )),
+                    false,
+                ),
+                ("new", "new", "0", open("new", Decimal::ZERO), true),
+                (
+                    "live-fill-unknown",
+                    "new",
+                    "not-a-number",
+                    open("live-fill-unknown", Decimal::ZERO),
+                    true,
+                ),
+                (
+                    "partial",
+                    "partially_filled",
+                    "1",
+                    open("partial", Decimal::ONE),
+                    true,
+                ),
+                (
+                    "for-the-day",
+                    "done_for_day",
+                    "1",
+                    open("for-the-day", Decimal::ONE),
+                    true,
+                ),
+                (
+                    "unknown",
+                    "a_status_not_yet_documented",
+                    "0",
+                    open("unknown", Decimal::ZERO),
+                    true,
+                ),
+            ];
+
+            for (cid, status, filled, expected, held) in cases {
+                for bracket in [false, true] {
+                    let server = MockServer::start().await;
+                    Mock::given(method("POST"))
+                        .and(path("/v2/orders"))
+                        .respond_with(ok(order_json(cid, "SPY", status, filled)))
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                    let client = client_for(&server);
+                    let spy = InstrumentNameExchange::new("SPY");
+                    let time_in_force = TimeInForce::GoodUntilCancelled { post_only: false };
+
+                    let state = if bracket {
+                        client
+                            .open_bracket_order(AlpacaBracketOrderRequest::new(
+                                spy,
+                                StrategyId::new("strategy"),
+                                ClientOrderId::new(cid),
+                                Side::Buy,
+                                Decimal::TWO,
+                                Decimal::ONE_HUNDRED,
+                                Decimal::new(120, 0),
+                                Decimal::new(90, 0),
+                                time_in_force,
+                            ))
+                            .await
+                            .parent
+                            .state
+                    } else {
+                        let request = OrderRequestOpen {
+                            key: OrderKey::new(
+                                ExchangeId::AlpacaBroker,
+                                &spy,
+                                StrategyId::new("strategy"),
+                                ClientOrderId::new(cid),
+                            ),
+                            state: RequestOpen {
+                                side: Side::Buy,
+                                price: Some(Decimal::ONE_HUNDRED),
+                                quantity: Decimal::TWO,
+                                kind: OrderKind::Limit,
+                                time_in_force,
+                                position_id: None,
+                                reduce_only: false,
+                                market: None,
+                            },
+                        };
+                        client.open_order(request).await.state
+                    };
+
+                    assert_eq!(state, expected, "{status} {filled}, bracket: {bracket}");
+                    assert_eq!(
+                        client.known_live.lock().contains(&ClientOrderId::new(cid)),
+                        held,
+                        "{status} {filled}, bracket: {bracket}"
+                    );
+                }
+            }
+        }
+
+        /// The stream holds an acknowledged order, keeps holding one done for the day (reported
+        /// open, not retired), and drops one cancelled.
+        #[test]
+        fn the_stream_keeps_the_held_orders_in_step() {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let dedup = new_dedup_cache();
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            let mut backoff = ExponentialBackoff::new();
+            let frame = |event: &str, filled: &str| {
+                format!(
+                    r#"{{"stream":"trade_updates","data":{{"event":"{event}","order":{{"id":"id-a","client_order_id":"a","symbol":"SPY","qty":"2","filled_qty":"{filled}","side":"buy","type":"limit","time_in_force":"gtc","limit_price":"100","status":"{event}"}}}}}}"#
+                )
+            };
+            let cid = ClientOrderId::new("a");
+
+            process_ws_text(&frame("new", "0"), &tx, &dedup, &known, &mut backoff);
+            assert!(known.lock().contains(&cid), "acknowledged");
+
+            process_ws_text(
+                &frame("done_for_day", "1"),
+                &tx,
+                &dedup,
+                &known,
+                &mut backoff,
+            );
+            assert!(known.lock().contains(&cid), "done for the day is not ended");
+
+            process_ws_text(&frame("canceled", "1"), &tx, &dedup, &known, &mut backoff);
+            assert!(!known.lock().contains(&cid), "cancelled");
+
+            let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+            let [_, done, cancelled] = events.as_slice() else {
+                panic!("three events: {events:?}");
+            };
+            let AccountEventKind::OrderSnapshot(
+                rustrade_integration::collection::snapshot::Snapshot(order),
+            ) = &done.kind
+            else {
+                panic!("done_for_day reports an order snapshot: {done:?}");
+            };
+            let OrderState::Active(ActiveOrderState::Open(open)) = &order.state else {
+                panic!("open: {order:?}");
+            };
+            assert_eq!(open.filled_quantity, Decimal::ONE, "with what it filled");
+            assert!(matches!(
+                cancelled.kind,
+                AccountEventKind::OrderCancelled(_)
+            ));
+        }
+
+        /// A recovered fill that brings an order to its full quantity ends it, so a reconnect's
+        /// check does not ask about it.
+        #[tokio::test]
+        async fn a_recovered_fill_that_completes_an_order_stops_it_being_held() {
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            let key = alpaca_key("SPY", "a");
+            known.lock().live(
+                &key,
+                Decimal::TWO,
+                &Open::new(
+                    VenueOrderId::Assigned(OrderId::new("ord-1")),
+                    Utc::now(),
+                    Decimal::ZERO,
+                ),
+            );
+
+            drive_recover_fills_with(
+                vec![activity_json("act-1", "ord-1", "1", Some("1"))],
+                new_dedup_cache(),
+                &known,
+            )
+            .await;
+            assert!(known.lock().contains(&key.cid), "half filled");
+
+            drive_recover_fills_with(
+                vec![activity_json("act-2", "ord-1", "1", Some("2"))],
+                new_dedup_cache(),
+                &known,
+            )
+            .await;
+            assert!(!known.lock().contains(&key.cid), "filled");
+        }
+
+        /// The first check runs as soon as the loop is polled, and a failed one waits for its
+        /// backoff rather than running again at once.
+        #[tokio::test]
+        async fn the_check_loop_runs_at_once_then_waits_out_a_failure() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/orders"))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            hold(&known, &alpaca_key("SPY", "a"));
+            let mut unchecked = UncheckedOrders::default();
+            unchecked.open(known.lock().instruments());
+            let config = Arc::new(AlpacaConfig::with_base_url(
+                "test-key".into(),
+                "test-secret".into(),
+                server.uri(),
+            ));
+            let (tx, _rx) = mpsc::unbounded_channel();
+
+            let ran = tokio::time::timeout(
+                Duration::from_secs(1),
+                run_order_checks(
+                    &reqwest::Client::new(),
+                    &Arc::new(RateLimitTracker::new()),
+                    &config,
+                    &known,
+                    &mut unchecked,
+                    &tx,
+                ),
+            )
+            .await;
+
+            assert!(ran.is_err(), "the loop never completes");
+            assert!(
+                unchecked.contains(&InstrumentNameExchange::new("SPY")),
+                "SPY waits for its retry"
+            );
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                1,
+                "the failed check is not run again at once"
+            );
+        }
+
+        /// Once the consumer has gone, the loop asks nothing.
+        #[tokio::test]
+        async fn the_check_loop_waits_once_the_consumer_has_gone() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(0)
+                .mount(&server)
+                .await;
+            let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+            hold(&known, &alpaca_key("SPY", "a"));
+            let mut unchecked = UncheckedOrders::default();
+            unchecked.open(known.lock().instruments());
+            let config = Arc::new(AlpacaConfig::with_base_url(
+                "test-key".into(),
+                "test-secret".into(),
+                server.uri(),
+            ));
+            let (tx, rx) = mpsc::unbounded_channel();
+            drop(rx);
+
+            let ran = tokio::time::timeout(
+                Duration::from_millis(200),
+                run_order_checks(
+                    &reqwest::Client::new(),
+                    &Arc::new(RateLimitTracker::new()),
+                    &config,
+                    &known,
+                    &mut unchecked,
+                    &tx,
+                ),
+            )
+            .await;
+
+            assert!(ran.is_err(), "the loop never completes");
+            assert!(
+                server.received_requests().await.unwrap().is_empty(),
+                "nothing asked once the consumer has gone"
             );
         }
     }

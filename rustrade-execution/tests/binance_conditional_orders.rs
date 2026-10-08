@@ -150,8 +150,6 @@ async fn test_stop_order() {
     println!("Placing Stop order: SELL 0.001 BTC @ market when price <= $50,000");
 
     let response = client.open_order(open_request).await;
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
 
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
@@ -178,9 +176,8 @@ async fn test_stop_order() {
 
             println!("Canceling order...");
             let cancel_response = client.cancel_order(cancel_request).await;
-            assert!(cancel_response.is_some(), "Expected cancel response");
 
-            match &cancel_response.unwrap().state {
+            match &cancel_response.state {
                 Ok(cancelled) => println!("Order canceled at: {}", cancelled.time_exchange),
                 Err(e) => panic!("Cancel rejected: {:?}", e),
             }
@@ -243,8 +240,6 @@ async fn test_stop_limit_order() {
     println!("Placing StopLimit order: SELL 0.001 BTC @ $49,900 when price <= $50,000");
 
     let response = client.open_order(open_request).await;
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
 
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
@@ -265,10 +260,7 @@ async fn test_stop_limit_order() {
             };
 
             let cancel_response = client.cancel_order(cancel_request).await;
-            assert!(matches!(
-                cancel_response.as_ref().map(|r| &r.state),
-                Some(Ok(_))
-            ));
+            assert!(cancel_response.state.is_ok());
             println!("Order canceled");
         }
         OrderState::Inactive(e) => panic!("StopLimit order rejected: {:?}", e),
@@ -323,8 +315,6 @@ async fn test_take_profit_order() {
     println!("Placing TakeProfit order: SELL 0.001 BTC @ market when price >= $110,000");
 
     let response = client.open_order(open_request).await;
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
 
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
@@ -345,10 +335,7 @@ async fn test_take_profit_order() {
             };
 
             let cancel_response = client.cancel_order(cancel_request).await;
-            assert!(matches!(
-                cancel_response.as_ref().map(|r| &r.state),
-                Some(Ok(_))
-            ));
+            assert!(cancel_response.state.is_ok());
             println!("Order canceled");
         }
         OrderState::Inactive(e) => panic!("TakeProfit order rejected: {:?}", e),
@@ -403,8 +390,6 @@ async fn test_take_profit_limit_order() {
     println!("Placing TakeProfitLimit order: SELL 0.001 BTC @ $109,000 when price >= $110,000");
 
     let response = client.open_order(open_request).await;
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
 
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
@@ -425,10 +410,7 @@ async fn test_take_profit_limit_order() {
             };
 
             let cancel_response = client.cancel_order(cancel_request).await;
-            assert!(matches!(
-                cancel_response.as_ref().map(|r| &r.state),
-                Some(Ok(_))
-            ));
+            assert!(cancel_response.state.is_ok());
             println!("Order canceled");
         }
         OrderState::Inactive(e) => panic!("TakeProfitLimit order rejected: {:?}", e),
@@ -483,8 +465,6 @@ async fn test_trailing_stop_basis_points() {
     println!("Placing TrailingStop order: SELL 0.001 BTC with 1% (100 bps) trailing delta");
 
     let response = client.open_order(open_request).await;
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
 
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
@@ -505,10 +485,7 @@ async fn test_trailing_stop_basis_points() {
             };
 
             let cancel_response = client.cancel_order(cancel_request).await;
-            assert!(matches!(
-                cancel_response.as_ref().map(|r| &r.state),
-                Some(Ok(_))
-            ));
+            assert!(cancel_response.state.is_ok());
             println!("Order canceled");
         }
         OrderState::Inactive(e) => panic!("TrailingStop order rejected: {:?}", e),
@@ -562,8 +539,6 @@ async fn test_trailing_stop_percentage() {
     println!("Placing TrailingStop order: SELL 0.001 BTC with 2% trailing delta");
 
     let response = client.open_order(open_request).await;
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
 
     match &response.state {
         OrderState::Active(ActiveOrderState::Open(open_state)) => {
@@ -584,10 +559,7 @@ async fn test_trailing_stop_percentage() {
             };
 
             let cancel_response = client.cancel_order(cancel_request).await;
-            assert!(matches!(
-                cancel_response.as_ref().map(|r| &r.state),
-                Some(Ok(_))
-            ));
+            assert!(cancel_response.state.is_ok());
             println!("Order canceled");
         }
         OrderState::Inactive(e) => panic!("TrailingStop order rejected: {:?}", e),
@@ -644,8 +616,6 @@ async fn test_trailing_stop_absolute_rejected() {
     println!("Placing TrailingStop with Absolute offset (should be rejected)");
 
     let response = client.open_order(open_request).await;
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
 
     match &response.state {
         OrderState::Inactive(e) => {
@@ -690,6 +660,7 @@ async fn test_trailing_stop_limit_rejected() {
         kind: OrderKind::TrailingStopLimit {
             offset: dec!(100),
             offset_type: TrailingOffsetType::BasisPoints,
+            stop_price: dec!(98000),
             limit_offset: dec!(50),
         },
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
@@ -706,8 +677,6 @@ async fn test_trailing_stop_limit_rejected() {
     println!("Placing TrailingStopLimit order (should be rejected)");
 
     let response = client.open_order(open_request).await;
-    assert!(response.is_some(), "Expected order response");
-    let response = response.unwrap();
 
     match &response.state {
         OrderState::Inactive(e) => {

@@ -11,16 +11,18 @@ use futures::{
 };
 use rustrade_data::streams::{
     consumer::StreamKey,
-    reconnect::stream::{ReconnectingStream, ReconnectionBackoffPolicy, init_reconnecting_stream},
+    reconnect::stream::{
+        ReconnectingStream, ReconnectionBackoffPolicy, ReinitFailure, init_reconnecting_stream,
+    },
 };
 use rustrade_execution::{
     AccountEvent, AccountEventKind,
     client::ExecutionClient,
-    error::{ConnectivityError, OrderError},
+    error::{AccountReinitFailure, AccountStreamInitError, ConnectivityError, OrderError},
     indexer::{AccountEventIndexer, IndexedAccountStream},
     map::ExecutionInstrumentMap,
     order::{
-        Order,
+        Order, OrderKey, UnindexedOrderKey,
         request::{
             OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, UnindexedOrderResponseCancel,
         },
@@ -30,7 +32,6 @@ use rustrade_execution::{
 use rustrade_instrument::{
     asset::{AssetIndex, name::AssetNameExchange},
     exchange::{ExchangeId, ExchangeIndex},
-    index::error::IndexError,
     instrument::{InstrumentIndex, name::InstrumentNameExchange},
 };
 use rustrade_integration::{
@@ -38,7 +39,7 @@ use rustrade_integration::{
     collection::snapshot::Snapshot,
 };
 use std::{fmt::Debug, sync::Arc};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Per-exchange execution manager that actions order requests from the Engine and forwards back
 /// responses.
@@ -46,7 +47,9 @@ use tracing::{error, info, warn};
 /// Processes indexed Engine [`ExecutionRequest`]s by:
 /// - Transforming the requests to use the associated exchange's asset and instrument names.
 /// - Issues the request via it's associated exchange [`ExecutionClient`],
-/// - Tracks requests and returns timeouts to the Engine where necessary.
+/// - Answers every request exactly once, keyed by the request: with the client's response, or with
+///   a timeout once `request_timeout` elapses. Only [`ExecutionRequest::Shutdown`] abandons
+///   requests in flight.
 #[derive(Constructor)]
 pub struct ExecutionManager<RequestStream, Client> {
     /// `Stream` of incoming Engine [`ExecutionRequest`]s.
@@ -117,6 +120,18 @@ where
     /// A response resolving the last in-flight request could then tear the run down while the trade
     /// that opens the position was still unread on the account side, truncating both the trade and
     /// the balance ledger non-deterministically.
+    ///
+    /// # Re-initialisation
+    /// When the AccountStream ends, the returned `Stream` yields one
+    /// [`Reconnecting`](rustrade_data::streams::reconnect::Event::Reconnecting), and the manager
+    /// re-initialises it with `reconnect_policy`'s backoff, for as long as it runs. Each failed
+    /// attempt is yielded as an [`AccountEventKind::ReinitFailed`], with no further
+    /// `Reconnecting`. Whether to stop waiting is the caller's decision.
+    ///
+    /// # Errors
+    /// [`ExecutionError::Config`] if `client` and `indexer` are for different exchanges, and
+    /// [`ExecutionError::AccountStreamInit`] if the first attempt to initialise the AccountStream
+    /// fails.
     pub async fn init(
         request_stream: RequestStream,
         request_timeout: std::time::Duration,
@@ -174,10 +189,21 @@ where
         let (response_tx, response_rx) = mpsc_unbounded();
 
         // Boxed so the manager can poll it inline in `run`'s `select!` -- see `account_stream`.
+        // A failed re-init is sent in-band, in order with the account events, so the consumer can
+        // tell a reconnect that keeps failing from one still in its backoff.
+        let exchange = indexer.map.exchange.key;
         let account_stream = Box::pin(
             account_stream
-                .with_reconnect_backoff::<_, ExecutionError>(reconnect_policy, stream_key)
-                .with_reconnection_events(indexer.map.exchange.value),
+                .with_reconnect_backoff_reporting(reconnect_policy, stream_key)
+                .with_reconnection_events_reporting(
+                    indexer.map.exchange.value,
+                    move |ReinitFailure { attempt, error }| AccountEvent {
+                        exchange,
+                        kind: AccountEventKind::ReinitFailed(AccountReinitFailure::new(
+                            attempt, error,
+                        )),
+                    },
+                ),
         );
 
         Ok((
@@ -220,7 +246,7 @@ where
         indexer: &AccountEventIndexer,
         assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
-    ) -> Result<AccountEvent, ExecutionError> {
+    ) -> Result<AccountEvent, AccountStreamInitError> {
         match client.account_snapshot(assets, instruments).await {
             Ok(snapshot) => {
                 let indexed_snapshot = indexer.snapshot(snapshot)?;
@@ -229,7 +255,7 @@ where
                     kind: AccountEventKind::Snapshot(indexed_snapshot),
                 })
             }
-            Err(error) => Err(ExecutionError::Client(indexer.client_error(error)?)),
+            Err(error) => Err(AccountStreamInitError::Client(indexer.client_error(error))),
         }
     }
 
@@ -238,10 +264,13 @@ where
         indexer: AccountEventIndexer,
         assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
-    ) -> Result<impl Stream<Item = AccountEvent> + use<RequestStream, Client>, ExecutionError> {
+    ) -> Result<impl Stream<Item = AccountEvent> + use<RequestStream, Client>, AccountStreamInitError>
+    {
         let stream = match client.account_stream(assets, instruments).await {
             Ok(stream) => stream,
-            Err(error) => return Err(ExecutionError::Client(indexer.client_error(error)?)),
+            Err(error) => {
+                return Err(AccountStreamInitError::Client(indexer.client_error(error)));
+            }
         };
 
         Ok(
@@ -378,68 +407,26 @@ where
                 },
 
                 // Process next ExecutionRequest::Cancel response
-                response_cancel = next_cancel_response => {
-                    match response_cancel {
-                        Ok(Some(response)) => {
-                            let event = match self.process_cancel_response(response) {
-                                Ok(indexed_event) => indexed_event,
-                                Err(error) => {
-                                    warn!(
-                                        exchange = %self.indexer.map.exchange.value,
-                                        ?error,
-                                        "ExecutionManager filtering cancel response due to unrecognised index"
-                                    );
-                                    continue
-                                }
-                            };
-
-                            if self.response_tx.send(event).is_err() {
-                                break;
-                            }
-                        }
-                        Err(request) => {
-                            let event = Self::process_cancel_timeout(request);
-
-                            if self.response_tx.send(event).is_err() {
-                                break;
-                            }
-                        }
-                        Ok(None) => {
-                            // Do nothing
-                        }
+                (request, response) = next_cancel_response => {
+                    let event = match response {
+                        Ok(response) => self.process_cancel_response(request, response),
+                        Err(_elapsed) => Self::process_cancel_timeout(request),
                     };
+
+                    if self.response_tx.send(event).is_err() {
+                        break;
+                    }
                 },
 
                 // Process next ExecutionRequest::Open response
-                response_open = next_open_response => {
-                    match response_open {
-                        Ok(Some(response)) => {
-                            let event = match self.process_open_response(response) {
-                                Ok(indexed_event) => indexed_event,
-                                Err(error) => {
-                                    warn!(
-                                        exchange = %self.indexer.map.exchange.value,
-                                        ?error,
-                                        "ExecutionManager filtering open response due to unrecognised index"
-                                    );
-                                    continue
-                                }
-                            };
+                (request, response) = next_open_response => {
+                    let event = match response {
+                        Ok(response) => self.process_open_response(request, response),
+                        Err(_elapsed) => Self::process_open_timeout(request),
+                    };
 
-                            if self.response_tx.send(event).is_err() {
-                                break;
-                            }
-                        }
-                        Err(request) => {
-                            let event = Self::process_open_timeout(request);
-
-                            if self.response_tx.send(event).is_err() {
-                                break;
-                            }
-                        }
-                        Ok(None) => {
-                            // Do nothing
-                        }
+                    if self.response_tx.send(event).is_err() {
+                        break;
                     }
                 }
             }
@@ -503,16 +490,45 @@ where
         drained
     }
 
+    /// Index a cancel response under the key of the request it answers.
+    ///
+    /// The response's own key should echo the request's. When it does not, or cannot be indexed,
+    /// that is a client bug: it is logged, and the response is still delivered under the request's
+    /// key, since nothing else would ever settle the request.
     fn process_cancel_response(
         &self,
-        order: UnindexedOrderResponseCancel,
-    ) -> Result<AccountStreamEvent, IndexError> {
-        let order = self.indexer.order_response_cancel(order)?;
+        request: OrderRequestCancel<ExchangeIndex, InstrumentIndex>,
+        response: UnindexedOrderResponseCancel,
+    ) -> AccountStreamEvent {
+        let OrderResponseCancel { key, state } = response;
+        self.check_response_key(&request.key, key, "cancel");
 
-        Ok(AccountStreamEvent::Item(AccountEvent {
-            exchange: order.key.exchange,
-            kind: AccountEventKind::OrderCancelled(order),
-        }))
+        AccountStreamEvent::Item(AccountEvent {
+            exchange: request.key.exchange,
+            kind: AccountEventKind::OrderCancelled(OrderResponseCancel {
+                key: request.key,
+                state: state.map_err(|error| self.indexer.order_error(error)),
+            }),
+        })
+    }
+
+    /// Log an `error!` if a response's key does not index to the key of the request it answers.
+    fn check_response_key(
+        &self,
+        request_key: &OrderKey<ExchangeIndex, InstrumentIndex>,
+        response_key: UnindexedOrderKey,
+        kind: &'static str,
+    ) {
+        match self.indexer.order_key(response_key) {
+            Ok(response_key) if response_key == *request_key => {}
+            response_key => error!(
+                exchange = %self.indexer.map.exchange.value,
+                kind,
+                ?request_key,
+                ?response_key,
+                "ExecutionManager received a response whose order key differs from its request's - delivering it under the request's key"
+            ),
+        }
     }
 
     fn process_cancel_timeout(
@@ -529,10 +545,14 @@ where
         })
     }
 
+    /// Index an open response under the key of the request it answers, as
+    /// [`process_cancel_response`](Self::process_cancel_response) does. The rest of the order is
+    /// the venue's answer, taken from the response.
     fn process_open_response(
         &self,
-        order: Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
-    ) -> Result<AccountStreamEvent, IndexError> {
+        request: OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
+        response: Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
+    ) -> AccountStreamEvent {
         let Order {
             key,
             side,
@@ -541,23 +561,21 @@ where
             kind,
             time_in_force,
             state,
-        } = order;
+        } = response;
+        self.check_response_key(&request.key, key, "open");
 
-        let key = self.indexer.order_key(key)?;
-        let state = self.indexer.order_state(state)?;
-
-        Ok(AccountStreamEvent::Item(AccountEvent {
-            exchange: key.exchange,
+        AccountStreamEvent::Item(AccountEvent {
+            exchange: request.key.exchange,
             kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
-                key,
+                key: request.key,
                 side,
                 price,
                 quantity,
                 kind,
                 time_in_force,
-                state,
+                state: self.indexer.order_state(state),
             })),
-        }))
+        })
     }
 
     fn process_open_timeout(
@@ -577,5 +595,460 @@ where
                 state: OrderState::inactive(OrderError::Connectivity(ConnectivityError::Timeout)),
             })),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::request::ExecutionRequest;
+    use chrono::{DateTime, Utc};
+    use rust_decimal_macros::dec;
+    use rustrade_execution::{
+        AccountSnapshot, UnindexedAccountEvent, UnindexedAccountSnapshot,
+        balance::AssetBalance,
+        error::{ApiError, ClientError, UnindexedClientError, UnindexedOrderError},
+        map::generate_execution_instrument_map,
+        order::{
+            OrderKey, OrderKind, TimeInForce,
+            id::{ClientOrderId, StrategyId},
+            request::{RequestCancel, RequestOpen},
+            state::Open,
+        },
+        trade::TradesRead,
+    };
+    use rustrade_instrument::{
+        Side, index::IndexedInstruments, instrument::kind::InstrumentKindDiscriminant,
+        test_utils::instrument,
+    };
+
+    const EXCHANGE: ExchangeId = ExchangeId::BinanceSpot;
+
+    /// A venue rejection naming an asset the instrument map does not hold — an instrument name,
+    /// as Binance's error mapping once put there.
+    fn unresolvable_rejection() -> UnindexedOrderError {
+        OrderError::Rejected(ApiError::BalanceInsufficient(
+            Some(AssetNameExchange::new("ETH_USDT")),
+            "insufficient balance".to_string(),
+        ))
+    }
+
+    /// Answers every open and cancel with [`unresolvable_rejection`]. [`ExecutionManager::run`]
+    /// calls nothing else.
+    #[derive(Debug, Clone, Default)]
+    struct RejectingClient {
+        /// When set, every response names this instrument instead of echoing the request's.
+        answer_instrument: Option<InstrumentNameExchange>,
+        /// When set, every response names this client order id instead of echoing the request's.
+        answer_cid: Option<ClientOrderId>,
+    }
+
+    impl RejectingClient {
+        fn answer_key(
+            &self,
+            key: OrderKey<ExchangeId, &InstrumentNameExchange>,
+        ) -> OrderKey<ExchangeId, InstrumentNameExchange> {
+            OrderKey {
+                exchange: key.exchange,
+                instrument: self
+                    .answer_instrument
+                    .clone()
+                    .unwrap_or_else(|| key.instrument.clone()),
+                strategy: key.strategy,
+                cid: self.answer_cid.clone().unwrap_or(key.cid),
+            }
+        }
+    }
+
+    impl ExecutionClient for RejectingClient {
+        const EXCHANGE: ExchangeId = EXCHANGE;
+        const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] = &[];
+        type Config = ();
+        type AccountStream = futures::stream::Empty<UnindexedAccountEvent>;
+
+        fn new(_: Self::Config) -> Self {
+            Self::default()
+        }
+
+        async fn account_snapshot(
+            &self,
+            _: &[AssetNameExchange],
+            _: &[InstrumentNameExchange],
+        ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
+            unreachable!("ExecutionManager::run does not fetch account snapshots")
+        }
+
+        async fn account_stream(
+            &self,
+            _: &[AssetNameExchange],
+            _: &[InstrumentNameExchange],
+        ) -> Result<Self::AccountStream, UnindexedClientError> {
+            unreachable!("ExecutionManager::run does not open account streams")
+        }
+
+        async fn cancel_order(
+            &self,
+            request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
+        ) -> UnindexedOrderResponseCancel {
+            OrderResponseCancel {
+                key: self.answer_key(request.key),
+                state: Err(unresolvable_rejection()),
+            }
+        }
+
+        async fn open_order(
+            &self,
+            request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
+        ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+            let OrderRequestOpen { key, state } = request;
+            Order {
+                key: self.answer_key(key),
+                side: state.side,
+                price: state.price,
+                quantity: state.quantity,
+                kind: state.kind,
+                time_in_force: state.time_in_force,
+                state: OrderState::inactive(unresolvable_rejection()),
+            }
+        }
+
+        async fn fetch_balances(
+            &self,
+            _: &[AssetNameExchange],
+        ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
+            unreachable!("ExecutionManager::run does not fetch balances")
+        }
+
+        async fn fetch_open_orders(
+            &self,
+            _: &[InstrumentNameExchange],
+        ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError>
+        {
+            unreachable!("ExecutionManager::run does not fetch open orders")
+        }
+
+        async fn fetch_trades(
+            &self,
+            _: DateTime<Utc>,
+            _: DateTime<Utc>,
+            _: &[InstrumentNameExchange],
+        ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError>
+        {
+            unreachable!("ExecutionManager::run does not fetch trades")
+        }
+    }
+
+    /// Send one open and one cancel for the same order through a manager over `client`, and
+    /// collect everything it forwards once the request stream ends and it drains.
+    async fn run_open_and_cancel(
+        client: RejectingClient,
+    ) -> (
+        OrderKey,
+        Vec<AccountStreamEvent<ExchangeIndex, AssetIndex, InstrumentIndex>>,
+    ) {
+        let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
+        let Ok(map) = generate_execution_instrument_map(&instruments, EXCHANGE) else {
+            panic!("the instrument map should build");
+        };
+        let indexer = AccountEventIndexer::new(Arc::new(map));
+        let key = OrderKey {
+            exchange: indexer.map.exchange.key,
+            instrument: InstrumentIndex(0),
+            strategy: StrategyId::new("test"),
+            cid: ClientOrderId::random(),
+        };
+        let requests = futures::stream::iter([
+            ExecutionRequest::Open(OrderRequestOpen {
+                key: key.clone(),
+                state: RequestOpen {
+                    side: Side::Sell,
+                    price: None,
+                    quantity: dec!(1),
+                    kind: OrderKind::Market,
+                    time_in_force: TimeInForce::ImmediateOrCancel,
+                    position_id: None,
+                    reduce_only: false,
+                    market: None,
+                },
+            }),
+            ExecutionRequest::Cancel(OrderRequestCancel {
+                key: key.clone(),
+                state: RequestCancel { id: None },
+            }),
+        ]);
+        let (response_tx, response_rx) = mpsc_unbounded();
+
+        // The request stream ends after the two requests, so the manager drains and returns.
+        ExecutionManager {
+            request_stream: requests,
+            request_timeout: std::time::Duration::from_secs(5),
+            response_tx,
+            client: Arc::new(client),
+            indexer,
+            account_stream: futures::stream::empty().boxed(),
+        }
+        .run()
+        .await;
+
+        (key, response_rx.into_stream().collect::<Vec<_>>().await)
+    }
+
+    /// Assert `events` holds exactly one open snapshot and one cancel response, both under `key`
+    /// and both carrying `rejection`.
+    fn assert_both_answered(
+        key: &OrderKey,
+        events: &[AccountStreamEvent<ExchangeIndex, AssetIndex, InstrumentIndex>],
+        rejection: &OrderError<AssetIndex, InstrumentIndex>,
+    ) {
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AccountStreamEvent::Item(AccountEvent {
+                    kind: AccountEventKind::OrderSnapshot(Snapshot(order)),
+                    ..
+                }) if order.key == *key && order.state == OrderState::inactive(rejection.clone())
+            )),
+            "the open's answer must reach the Engine under the request's key: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                AccountStreamEvent::Item(AccountEvent {
+                    kind: AccountEventKind::OrderCancelled(response),
+                    ..
+                }) if response.key == *key && response.state == Err(rejection.clone())
+            )),
+            "the cancel's answer must reach the Engine under the request's key: {events:?}"
+        );
+    }
+
+    /// A rejection whose error names something the instrument map does not hold must still reach
+    /// the Engine, settling the order, rather than be discarded and leave it in flight for good.
+    #[tokio::test]
+    async fn a_rejection_naming_an_unresolvable_asset_still_reaches_the_engine() {
+        let (key, events) = run_open_and_cancel(RejectingClient::default()).await;
+
+        // The asset is dropped, the rejection kept.
+        let rejection = OrderError::Rejected(ApiError::BalanceInsufficient(
+            None,
+            "insufficient balance".to_string(),
+        ));
+        assert_both_answered(&key, &events, &rejection);
+    }
+
+    /// A response whose own key names an instrument the map does not hold is a client bug, but it
+    /// still answers the request: it must reach the Engine under the request's key, rather than be
+    /// discarded and leave the order in flight for good.
+    #[tokio::test]
+    async fn a_response_keyed_to_an_unknown_instrument_still_answers_its_request() {
+        let client = RejectingClient {
+            answer_instrument: Some(InstrumentNameExchange::new("not_in_the_map")),
+            ..RejectingClient::default()
+        };
+        let (key, events) = run_open_and_cancel(client).await;
+
+        let rejection = OrderError::Rejected(ApiError::BalanceInsufficient(
+            None,
+            "insufficient balance".to_string(),
+        ));
+        assert_both_answered(&key, &events, &rejection);
+    }
+
+    /// Opens an account stream that fails on the attempts in `fail_on`, counted from 0. A stream
+    /// opened before attempt `open_from` ends at once; one opened from it on stays open.
+    #[derive(Debug, Clone, Default)]
+    struct FlakyAccountClient {
+        fail_on: &'static [usize],
+        open_from: usize,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ExecutionClient for FlakyAccountClient {
+        const EXCHANGE: ExchangeId = EXCHANGE;
+        const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] = &[];
+        type Config = ();
+        type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
+
+        fn new(_: Self::Config) -> Self {
+            Self::default()
+        }
+
+        async fn account_snapshot(
+            &self,
+            _: &[AssetNameExchange],
+            _: &[InstrumentNameExchange],
+        ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
+            Ok(UnindexedAccountSnapshot::new(EXCHANGE, vec![], vec![]))
+        }
+
+        async fn account_stream(
+            &self,
+            _: &[AssetNameExchange],
+            _: &[InstrumentNameExchange],
+        ) -> Result<Self::AccountStream, UnindexedClientError> {
+            let attempt = self
+                .attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.fail_on.contains(&attempt) {
+                Err(UnindexedClientError::Connectivity(
+                    ConnectivityError::Timeout,
+                ))
+            } else if attempt < self.open_from {
+                Ok(futures::stream::empty().boxed())
+            } else {
+                Ok(futures::stream::pending().boxed())
+            }
+        }
+
+        async fn cancel_order(
+            &self,
+            _: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
+        ) -> UnindexedOrderResponseCancel {
+            unreachable!("the account stream does not cancel orders")
+        }
+
+        async fn open_order(
+            &self,
+            _: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
+        ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+            unreachable!("the account stream does not open orders")
+        }
+
+        async fn fetch_balances(
+            &self,
+            _: &[AssetNameExchange],
+        ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
+            unreachable!("the account stream does not fetch balances")
+        }
+
+        async fn fetch_open_orders(
+            &self,
+            _: &[InstrumentNameExchange],
+        ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError>
+        {
+            unreachable!("the account stream does not fetch open orders")
+        }
+
+        async fn fetch_trades(
+            &self,
+            _: DateTime<Utc>,
+            _: DateTime<Utc>,
+            _: &[InstrumentNameExchange],
+        ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError>
+        {
+            unreachable!("the account stream does not fetch trades")
+        }
+    }
+
+    /// Initialise a manager over `client`, with a 1 ms backoff.
+    async fn init_flaky(
+        client: FlakyAccountClient,
+    ) -> Result<
+        ExecutionManager<
+            futures::stream::Pending<ExecutionRequest<ExchangeIndex, InstrumentIndex>>,
+            FlakyAccountClient,
+        >,
+        ExecutionError,
+    > {
+        let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
+        let Ok(map) = generate_execution_instrument_map(&instruments, EXCHANGE) else {
+            panic!("the instrument map should build");
+        };
+        ExecutionManager::init(
+            futures::stream::pending(),
+            std::time::Duration::from_secs(5),
+            Arc::new(client),
+            AccountEventIndexer::new(Arc::new(map)),
+            ReconnectionBackoffPolicy::new(1, 1, 1),
+        )
+        .await
+        .map(|(manager, _events)| manager)
+    }
+
+    /// Each failed re-init reaches the consumer in order, as a `ReinitFailed` counting
+    /// consecutive failures, with no `Reconnecting` beyond the one that marked the disconnect.
+    /// The count restarts after a stream initialises.
+    #[tokio::test]
+    async fn each_failed_account_stream_reinit_is_sent_in_order() {
+        let Ok(manager) = init_flaky(FlakyAccountClient {
+            fail_on: &[1, 2, 4],
+            open_from: 5,
+            ..FlakyAccountClient::default()
+        })
+        .await
+        else {
+            panic!("the first attempt succeeds, so init should too");
+        };
+        let exchange = manager.indexer.map.exchange.key;
+
+        let events = manager.account_stream.take(8).collect::<Vec<_>>().await;
+
+        let snapshot = || {
+            AccountStreamEvent::Item(AccountEvent {
+                exchange,
+                kind: AccountEventKind::Snapshot(AccountSnapshot::new(exchange, vec![], vec![])),
+            })
+        };
+        let reinit_failed = |attempt| {
+            AccountStreamEvent::Item(AccountEvent {
+                exchange,
+                kind: AccountEventKind::ReinitFailed(AccountReinitFailure::new(
+                    attempt,
+                    AccountStreamInitError::Client(ClientError::Connectivity(
+                        ConnectivityError::Timeout,
+                    )),
+                )),
+            })
+        };
+        assert_eq!(
+            events,
+            [
+                snapshot(),
+                AccountStreamEvent::Reconnecting(EXCHANGE),
+                reinit_failed(1),
+                reinit_failed(2),
+                snapshot(),
+                AccountStreamEvent::Reconnecting(EXCHANGE),
+                reinit_failed(1),
+                snapshot(),
+            ]
+        );
+    }
+
+    /// A failure of the first attempt is returned from `init`, not sent on the stream.
+    #[tokio::test]
+    async fn a_failed_first_account_stream_init_fails_init() {
+        let result = init_flaky(FlakyAccountClient {
+            fail_on: &[0],
+            ..FlakyAccountClient::default()
+        })
+        .await;
+
+        assert_eq!(
+            result.err(),
+            Some(ExecutionError::AccountStreamInit(
+                AccountStreamInitError::Client(ClientError::Connectivity(
+                    ConnectivityError::Timeout
+                ))
+            ))
+        );
+    }
+
+    /// A response whose own key resolves, but to a different order, is a client bug too: it must
+    /// reach the Engine under the request's key, not settle the order it names.
+    #[tokio::test]
+    async fn a_response_keyed_to_another_order_still_answers_its_request() {
+        let client = RejectingClient {
+            answer_cid: Some(ClientOrderId::random()),
+            ..RejectingClient::default()
+        };
+        let (key, events) = run_open_and_cancel(client).await;
+
+        let rejection = OrderError::Rejected(ApiError::BalanceInsufficient(
+            None,
+            "insufficient balance".to_string(),
+        ));
+        assert_both_answered(&key, &events, &rejection);
     }
 }

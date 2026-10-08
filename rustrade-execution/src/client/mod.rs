@@ -2,15 +2,17 @@
 //!
 //! # Connector Comparison
 //!
-//! | Connector | Reconnect | Dedup | Fill Recovery | Heartbeat | Cancel answers once |
-//! |-----------|-----------|-------|---------------|-----------|---------------------|
-//! | [`binance`] | Auto (1s→30s backoff) | 10k LRU | REST after reconnect | 30s | cancelled |
-//! | [`alpaca`] | Auto (1s→30s backoff) | 2k LRU | REST after reconnect | 35s | accepted |
-//! | [`ibkr`] | ibapi-managed | 10k LRU, fills only | Executions request after reconnect | N/A | submitted |
-//! | [`hyperliquid`] | SDK-managed | 10k LRU, fills only | Caller responsibility | SDK-managed | cancelled |
+//! | Connector | Reconnect | Dedup | Fill Recovery | Ended-order Recovery | Heartbeat | Cancel answers once |
+//! |-----------|-----------|-------|---------------|----------------------|-----------|---------------------|
+//! | [`binance`] | Auto (1s→30s backoff) | 10k LRU | REST after reconnect | REST after reconnect | 30s | cancelled |
+//! | [`alpaca`] | Auto (1s→30s backoff) | 2k LRU | REST after reconnect | REST after reconnect | 35s | accepted |
+//! | [`ibkr`] | ibapi-managed | 10k LRU, fills only | Executions request after reconnect | None | N/A | submitted |
+//! | [`hyperliquid`] | SDK-managed | 10k LRU, fills only | Venue snapshot on resubscribe | REST after reconnect | SDK-managed | cancelled |
 //!
-//! The last column is when [`ExecutionClient::cancel_order`] answers `Ok`. Only for "cancelled" has
-//! the order ended by then; see that method.
+//! "Ended-order Recovery" is whether a reconnect reports how an order the client held as live
+//! ended while the stream was down, and only those clients implement [`OrderStatusClient`]. The
+//! last column is when [`ExecutionClient::cancel_order`] answers `Ok`. Only for "cancelled" has the
+//! order ended by then; see that method.
 //!
 //! # Resilience Philosophy
 //!
@@ -26,14 +28,20 @@
 //!
 //! **Hyperliquid** delegates reconnection to the official SDK's `with_reconnect()` mechanism, but
 //! deduplicates fills itself: the SDK resubscribes on reconnect and the venue opens a `userFills`
-//! subscription with a snapshot, so every reconnect redelivers fills already seen. It does not
-//! recover fills missed while disconnected — callers needing that call
-//! [`ExecutionClient::fetch_trades`], whose results are not deduplicated against the stream.
+//! subscription with a snapshot, so every reconnect redelivers fills already seen. That snapshot
+//! is the only fill recovery: it holds recent fills, how many Hyperliquid does not say, so callers
+//! needing older ones call [`ExecutionClient::fetch_trades`], whose results are not deduplicated
+//! against the stream. Once the snapshot has been sent on, a reconnect checks how the orders the
+//! client holds as live ended, like Binance's and Alpaca's.
 //!
 //! # Known Limitations
 //!
-//! No connector recovers the **order lifecycle events** (NEW, CANCELED, EXPIRED) it missed while
-//! disconnected; only fills are recovered (#370).
+//! Only Binance (Spot and Margin), Alpaca and Hyperliquid (perpetuals and spot) recover the **order
+//! lifecycle events** (cancelled, expired, rejected, a fill that completes an order) they missed
+//! while disconnected, and only for the orders the client holds as live; IBKR recovers fills only
+//! (#370). [`OrderStatusClient`] is the lookup that recovery is built on: given the orders a caller
+//! still holds as live, it says how each that has ended did end. Binance Spot, Binance Margin,
+//! Alpaca, both Hyperliquid clients and the mock client implement it.
 //!
 //! The engine closes part of that gap from the account snapshot each reconnect produces: an order a
 //! complete list no longer shows is retired (see [`ExecutionClient::account_snapshot`]). That covers
@@ -47,12 +55,12 @@ use crate::{
     balance::AssetBalance,
     error::UnindexedClientError,
     order::{
-        Order,
+        Order, UnindexedInactiveOrder, UnindexedOrderKey,
         bracket::{BracketOrderRequest, BracketOrderResult},
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Open, UnindexedOrderState},
     },
-    trade::Trade,
+    trade::TradesRead,
 };
 use chrono::{DateTime, Utc};
 use futures::Stream;
@@ -68,6 +76,16 @@ use std::future::Future;
 // against a raw `SmolStr` fill key rather than this cache, so it is deliberately not in this list.
 #[cfg(any(feature = "binance", feature = "hyperliquid", feature = "ibkr"))]
 pub(crate) mod dedup;
+
+// What a client knows of its live orders, and the reconnect check of how those orders ended while
+// its account stream was down. Gated on the clients that use it, like `dedup`.
+#[cfg(any(
+    feature = "alpaca",
+    feature = "binance",
+    feature = "hyperliquid",
+    feature = "ibkr"
+))]
+pub(crate) mod order_recovery;
 
 // Alpaca ExecutionClient implementation (options, equities, crypto — single unified API)
 #[cfg(feature = "alpaca")]
@@ -86,6 +104,33 @@ pub mod hyperliquid;
 pub mod ibkr;
 
 pub mod mock;
+
+/// An instrument an [`ExecutionClient`] is about to be built to trade, as
+/// [`ExecutionClient::validate_config`] sees it.
+///
+/// `#[non_exhaustive]`, so further detail can be added without breaking an implementation that
+/// reads these fields; construct one with [`Self::new`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct ClientInstrument<'a> {
+    /// The name the venue knows the instrument by, which is what a client's requests carry.
+    pub name_exchange: &'a InstrumentNameExchange,
+    /// The instrument's kind.
+    pub kind: InstrumentKindDiscriminant,
+}
+
+impl<'a> ClientInstrument<'a> {
+    /// The view of an instrument named `name_exchange`, of kind `kind`.
+    pub fn new(
+        name_exchange: &'a InstrumentNameExchange,
+        kind: InstrumentKindDiscriminant,
+    ) -> Self {
+        Self {
+            name_exchange,
+            kind,
+        }
+    }
+}
 
 // `+ Send` bounds on async method return types required for multi-threaded
 // Tokio runtime. This is a breaking change vs upstream — any `!Send` executor
@@ -122,6 +167,32 @@ where
     const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant];
 
     type Config: Clone;
+
+    /// Checks `config` against the instruments this client is about to be built to trade, before
+    /// [`Self::new`] is called. `Err` names what is wrong.
+    ///
+    /// [`SUPPORTED_KINDS`](Self::SUPPORTED_KINDS) rejects a kind the client cannot route at all.
+    /// This catches what only the config knows: a per-instrument entry that is invalid, or that
+    /// disagrees with the instrument it is keyed to, such as a contract registered as a stock for
+    /// an instrument modelled as an option. Each such entry would otherwise be skipped or acted on
+    /// silently once the client runs.
+    ///
+    /// The default accepts every config. Override it when `Self::Config` carries per-instrument
+    /// detail.
+    ///
+    /// [`ExecutionBuilder`] calls it, after checking `SUPPORTED_KINDS`, with the instruments
+    /// registered on this client's exchange. A client constructed by calling `new` directly is not
+    /// checked; call this first to get the same check.
+    ///
+    /// [`ExecutionBuilder`]: https://docs.rs/rustrade/latest/rustrade/execution/builder/struct.ExecutionBuilder.html
+    fn validate_config(
+        config: &Self::Config,
+        instruments: &[ClientInstrument<'_>],
+    ) -> Result<(), String> {
+        let _ = (config, instruments);
+        Ok(())
+    }
+
     // `+ Send` required so generic code (e.g. ExecutionManager) can pass
     // the stream to tokio::spawn, which requires Send.
     type AccountStream: Stream<Item = UnindexedAccountEvent> + Send;
@@ -176,13 +247,15 @@ where
     ///
     /// # Return value
     ///
-    /// - `Some` with `Ok(Cancelled)`: the venue took the cancel. Whether the order has *ended* by
-    ///   then depends on the venue; see below.
-    /// - `Some` with `Err`: the venue refused the cancel, or it could not be sent or answered. The
-    ///   order may still be open, or may have ended some other way, such as by filling. The account
-    ///   stream reports which.
-    /// - `None`: nothing to report, so the engine's `ExecutionManager` emits nothing for the
-    ///   request. No client in this crate returns it.
+    /// Every request gets exactly one answer, which the engine's `ExecutionManager` forwards as the
+    /// order's response. An implementation must not swallow a request: a failure to send it, or to
+    /// read the venue's answer, is an `Err`.
+    ///
+    /// - `Ok(Cancelled)`: the venue took the cancel. Whether the order has *ended* by then depends
+    ///   on the venue; see below.
+    /// - `Err`: the venue refused the cancel, or it could not be sent or answered. The order may
+    ///   still be open, or may have ended some other way, such as by filling. The account stream
+    ///   reports which.
     ///
     /// # A taken cancel is not always an ended order
     ///
@@ -206,13 +279,13 @@ where
     fn cancel_order(
         &self,
         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
-    ) -> impl Future<Output = Option<UnindexedOrderResponseCancel>> + Send;
+    ) -> impl Future<Output = UnindexedOrderResponseCancel> + Send;
 
     // `+ Send` on default method return types for multi-threaded Tokio runtime
     fn cancel_orders<'a>(
         &self,
         requests: impl IntoIterator<Item = OrderRequestCancel<ExchangeId, &'a InstrumentNameExchange>>,
-    ) -> impl Stream<Item = Option<UnindexedOrderResponseCancel>> + Send {
+    ) -> impl Stream<Item = UnindexedOrderResponseCancel> + Send {
         futures::stream::FuturesUnordered::from_iter(
             requests
                 .into_iter()
@@ -224,24 +297,37 @@ where
     ///
     /// # Return value
     ///
+    /// Every request gets exactly one answer, which the engine's `ExecutionManager` forwards as the
+    /// order's response. An implementation must not swallow a request: a failure to send it, or to
+    /// read the venue's answer, is `OpenFailed`.
+    ///
     /// Returns `OrderState` directly rather than `Result<Open, OrderError>`:
     /// - `OrderState::Active(Open)` - order is resting on the order book
     /// - `OrderState::Inactive(FullyFilled)` - order was immediately filled (includes `avg_price` when available)
-    /// - `OrderState::Inactive(OpenFailed)` - order placement failed (API error, connectivity, etc.)
+    /// - `OrderState::Inactive(Expired)` - order ended in the response itself without filling
+    ///   completely, carrying what filled: an IOC or FOK order that found too little liquidity,
+    ///   or one expired by self-trade prevention
+    /// - `OrderState::Inactive(Cancelled)` - order the venue reports cancelled in the response
+    ///   itself, carrying what filled
+    /// - `OrderState::Inactive(OpenFailed)` - order placement failed (API error, connectivity, a
+    ///   rejection the venue reports in the response, etc.)
+    ///
+    /// An implementation returns `Expired` or `Cancelled` only when its venue reports the order's
+    /// status in the placement response (currently Binance Spot and Margin). The others return
+    /// `Open` for such an order, and their account stream reports how it ended.
     ///
     /// This design allows immediate fills to carry metadata (e.g., `avg_price`) that
     /// would be lost if we had to infer terminal state from `Open::filled_quantity`.
     fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
-    ) -> impl Future<Output = Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>>>
-    + Send;
+    ) -> impl Future<Output = Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> + Send;
 
     // `+ Send` on default method return types for multi-threaded Tokio runtime
     fn open_orders<'a>(
         &self,
         requests: impl IntoIterator<Item = OrderRequestOpen<ExchangeId, &'a InstrumentNameExchange>>,
-    ) -> impl Stream<Item = Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>>> + Send
+    ) -> impl Stream<Item = Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> + Send
     {
         futures::stream::FuturesUnordered::from_iter(
             requests.into_iter().map(|request| self.open_order(request)),
@@ -269,23 +355,48 @@ where
         Output = Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError>,
     > + Send;
 
-    /// Fetch trades (fills) since `time_since`, optionally filtered by instrument.
+    /// Read the trades (fills) from `start` to `end`, both inclusive, optionally filtered by
+    /// instrument.
     ///
     /// An empty `instruments` slice is the "return all" sentinel: implementations must
     /// return trades across all instruments. When non-empty, only trades for the listed
     /// instruments are returned.
     ///
+    /// # Bounded, resumable reads
+    ///
+    /// One call is bounded by the venue's limits, so it may stop before `end`.
+    /// [`TradesRead::resume`] says whether it did:
+    /// - `None`: every fill in the span the venue still holds was read.
+    /// - `Some(t)`: call again with `start = t` and the same `end` to read on. That read can
+    ///   return again fills the previous one returned, so match them by instrument and
+    ///   [`TradeId`](crate::trade::TradeId).
+    ///
+    /// The caller owns the loop, and with it how many calls, and how long, it spends on a span.
+    /// A `start` after `end` is an empty span, read as no trades and `resume: None`.
+    ///
+    /// # Venue limits
+    ///
+    /// `resume: None` covers what the venue still holds, which can be less than the span:
+    /// - IBKR returns the current trading day's executions only.
+    /// - Hyperliquid keeps only each wallet's 10,000 most recent fills.
+    ///
+    /// Binance needs instruments: an empty slice reads nothing. Each client documents its limits.
+    ///
+    /// # Errors
+    ///
+    /// [`Truncated`](crate::error::ClientError::Truncated) when a read cannot advance, because
+    /// more fills share the span's first moment than one call can read past.
+    ///
     /// The fee asset (`AssetNameExchange`) may be quote, base, or third-party (e.g., BNB).
     /// Use `fees.fees_quote` for quote-equivalent value when available.
-    ///
-    /// Note: `MockExecution` currently ignores `instruments` and always returns all trades.
     fn fetch_trades(
         &self,
-        time_since: DateTime<Utc>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
         instruments: &[InstrumentNameExchange],
     ) -> impl Future<
         Output = Result<
-            Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
+            TradesRead<AssetNameExchange, InstrumentNameExchange>,
             UnindexedClientError,
         >,
     > + Send;
@@ -380,6 +491,63 @@ pub trait BracketOrderClient: ExecutionClient {
         &self,
         request: BracketOrderRequest<ExchangeId, &InstrumentNameExchange>,
     ) -> impl Future<Output = BracketOrderResult> + Send;
+}
+
+/// Extension trait for clients that can say how an order ended at the venue.
+///
+/// A client that loses its account stream recovers the fills it missed when it reconnects, but not
+/// an order that was cancelled, expired or rejected in the meantime: the event that said so went
+/// out while nothing was listening. The engine then keeps such an order as live until a complete
+/// account snapshot no longer lists it, and even then cannot tell how it ended. This trait is the
+/// lookup that answers that: given the orders a caller still holds as live, it returns how each one
+/// that has ended did end.
+///
+/// # By order, not by time
+///
+/// The obvious alternative, asking the venue for every order closed since the disconnect, does not
+/// work. Binance's `allOrders` and Alpaca's `GET /v2/orders?status=closed` both filter their time
+/// window on when an order was **created**, so a window opening at the disconnect cannot see an
+/// order placed before it and cancelled during it — which is the order that matters, because the
+/// caller is tracking it. Looking each order up by its client order id finds it whenever it was
+/// placed.
+///
+/// # Type-Level Capability
+///
+/// A supertrait of [`ExecutionClient`], for the reason [`BracketOrderClient`] is one: a client that
+/// cannot look orders up does not implement it, rather than carrying a method that fails at run
+/// time. A caller that needs the lookup bounds on `ExecutionClient + OrderStatusClient`.
+pub trait OrderStatusClient: ExecutionClient {
+    /// How each of `orders` ended, for those that have.
+    ///
+    /// # Contract
+    ///
+    /// - One entry per order that has ended, in no particular order:
+    ///   [`FullyFilled`](crate::order::state::InactiveOrderState::FullyFilled),
+    ///   [`Cancelled`](crate::order::state::InactiveOrderState::Cancelled) carrying what filled
+    ///   before it, [`Expired`](crate::order::state::InactiveOrderState::Expired), or
+    ///   [`OpenFailed`](crate::order::state::InactiveOrderState::OpenFailed) for an order the venue
+    ///   accepted for processing and later rejected (Binance `REJECTED`, Alpaca `rejected`). An
+    ///   order rejected in the response to its open request was answered there and is not expected
+    ///   here.
+    /// - An order still live is **omitted**, and so is one the venue does not know. Neither is an
+    ///   error. A caller compares the result with what it asked for.
+    /// - An empty `orders` returns an empty list. Unlike
+    ///   [`ExecutionClient::fetch_open_orders`]'s empty slice, it does not mean "all".
+    /// - An order is found by its [`cid`](crate::order::OrderKey::cid), and each returned order
+    ///   carries the key it was asked for, so a `strategy` the venue does not record survives.
+    /// - A key whose `instrument` is not the one the order traded is treated as unknown. The
+    ///   `exchange` is not checked: a client answers for its own venue.
+    /// - A `cid` asked about more than once is reported at most once, under the first key that
+    ///   finds it.
+    ///
+    /// # Errors
+    ///
+    /// `Err` if the venue could not answer for every order. A partial list is never returned,
+    /// because an order missing from it would read as still live.
+    fn fetch_ended_orders(
+        &self,
+        orders: &[UnindexedOrderKey],
+    ) -> impl Future<Output = Result<Vec<UnindexedInactiveOrder>, UnindexedClientError>> + Send;
 }
 
 /// The capability table, pinned.
