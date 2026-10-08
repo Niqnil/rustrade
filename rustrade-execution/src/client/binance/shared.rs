@@ -1984,7 +1984,8 @@ impl<'de> Visitor<'de> for WireIntVisitor {
     }
 }
 
-// Tests build stream frames from reports, so a value serializes back to the JSON it was read from.
+// Tests build stream frames from reports. An `Int` serializes as the number it was read from, and
+// an `Unreadable` as a string of its text, which reads back as `Unreadable` unless it is an integer.
 #[cfg(test)]
 impl serde::Serialize for WireInt {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -2276,7 +2277,14 @@ fn convert_order_snapshot(
         None => TrailingDelta::Absent,
         Some(WireInt::Int(delta)) => TrailingDelta::from_reported(Some(*delta)),
         Some(WireInt::Unreadable(raw)) => {
-            warn!(%exchange, %symbol, %order_id, raw, "Binance order report has an unreadable trailing delta (d)");
+            // A shape Binance sends one way recurs on every report of the order, so sample it.
+            static SEEN: AtomicU64 = AtomicU64::new(0);
+            let (count, warns) = sampled(&SEEN);
+            if warns {
+                warn!(%exchange, %symbol, %order_id, raw, count, "Binance order report has an unreadable trailing delta (d); further ones are logged at debug, with a warning every 1000th");
+            } else {
+                debug!(%exchange, %symbol, %order_id, raw, count, "Binance order report has an unreadable trailing delta (d)");
+            }
             TrailingDelta::Unknown
         }
     };
