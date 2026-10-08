@@ -38,13 +38,13 @@ use super::shared::{
     CONNECT_TIMEOUT_SECS, ExecutionReport, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS,
     HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
     PlacementResponse, RateLimitTracker, RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS,
-    SharedDedupCache, UnrecoveredFills, UserDataFrame, WeightPool, binance_filled_qty,
-    classify_order_kind_tif, classify_rest_query_error, classify_ws_order_error,
-    convert_ended_order, convert_execution_report, convert_open_order_listing,
-    convert_open_order_owned_symbol, dedup_key_from_event, drop_after, frame_excerpt, gap_failed,
-    gap_time, is_duplicate, is_handshake_rate_limit, is_unknown_order, log_unhandled_event,
-    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
-    recovered_order_totals, response_decode_error, rest_call_with_retry,
+    SharedDedupCache, UnhandledEvents, UnrecoveredFills, UserDataFrame, WeightPool,
+    binance_filled_qty, classify_order_kind_tif, classify_rest_query_error,
+    classify_ws_order_error, convert_ended_order, convert_execution_report,
+    convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event, drop_after,
+    frame_excerpt, gap_failed, gap_time, is_duplicate, is_handshake_rate_limit, is_unknown_order,
+    log_unhandled_event, log_unrecognised_frame, new_dedup_cache, parse_user_data_frame,
+    placed_order_state, recovered_order_totals, response_decode_error, rest_call_with_retry,
     trailing_delta_basis_points, unix_ms,
 };
 use crate::{
@@ -2302,7 +2302,7 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
             false
         }
         _ => {
-            static SEEN: AtomicU64 = AtomicU64::new(0);
+            static SEEN: UnhandledEvents = UnhandledEvents::new();
             log_unhandled_event("BinanceSpot", &SEEN, event_type, event);
             false
         }

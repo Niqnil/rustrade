@@ -16,9 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Both spellings are now accepted until a live frame confirms which one the `userListenToken`
     stream sends. The events are still logged only, never applied to balance state (#108).
 - **`BinanceSpot` and `BinanceMargin` warn about user-data event types they do not handle**
-  (`rustrade-execution`). Before, any such event was dropped at trace level. Now the first one,
-  and every 1,000th after it, is logged at WARN. Event types the clients ignore on purpose
-  (`listStatus`, and `externalLockUpdate` on spot) are still logged at trace.
+  (`rustrade-execution`). Before, any such event was dropped at trace level. Now the first event of
+  each unhandled type is logged at WARN, so a frequent one cannot hide a rarer one, as is every
+  1,000th unhandled event per venue. Event types the clients ignore on purpose (`listStatus`, and
+  `externalLockUpdate` on spot) are still logged at trace.
 
 ## [0.10.0] - 2026-10-08
 

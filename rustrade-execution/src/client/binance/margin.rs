@@ -40,9 +40,9 @@
 //! - `balanceUpdate` events (deposits/withdrawals) are not forwarded. Callers reconcile balances
 //!   after external transfers via [`ExecutionClient::fetch_balances`] or
 //!   [`ExecutionClient::account_snapshot`].
-//! - `USER_LIABILITY_CHANGE` (borrow/repay) is surfaced at INFO but never folded into balance state: borrow/repay
-//!   is a delta, and accumulating it would be the position tracking this library leaves to its
-//!   consumers.
+//! - `USER_LIABILITY_CHANGE` (borrow/repay) is surfaced at INFO but never folded into balance
+//!   state: it is a delta, and accumulating it would be the position tracking this library leaves
+//!   to its consumers.
 //! - A `TRADE` report whose order status (`X`) is neither `PARTIALLY_FILLED` nor `FILLED` emits
 //!   the execution but no order snapshot, so a fill arriving after its order's terminal report
 //!   cannot resurrect a retired order as a resting one. That order's filled quantity is settled
@@ -54,8 +54,8 @@ use super::shared::{
     CONNECT_TIMEOUT_SECS, ExecutionReport, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS,
     HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
     PlacementResponse, RateLimitTracker, RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS,
-    SharedDedupCache, TrailingDeltaError, UnrecoveredFills, UserDataFrame, WeightPool,
-    binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
+    SharedDedupCache, TrailingDeltaError, UnhandledEvents, UnrecoveredFills, UserDataFrame,
+    WeightPool, binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
     classify_rest_query_error, convert_ended_order, convert_execution_report,
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event, drop_after,
     frame_excerpt, gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
@@ -1715,8 +1715,8 @@ fn convert_margin_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEv
 /// Returns `true` if the exchange signalled stream termination (a reconnect trigger). Unrecognised
 /// frames are ignored and logged by [`log_unrecognised_frame`] (throttled `warn`); event types with
 /// no arm are ignored and logged by [`log_unhandled_event`] (throttled `warn`), so a renamed event
-/// is seen rather than dropped silently. Deserialization of a known event type is defensive: a mismatch is logged and the
-/// event dropped (observable), never silently mis-parsed.
+/// is seen rather than dropped silently. Deserialization of a known event type is defensive: a
+/// mismatch is logged and the event dropped (observable), never silently mis-parsed.
 ///
 /// The `outboundAccountPosition` (balance) arm is delegated to `handle_position` — the **only** arm
 /// that differs between cross (account-wide `BalanceStreamUpdate`) and isolated (per-instrument
@@ -1836,7 +1836,7 @@ fn convert_margin_user_data_events_with(
             false
         }
         other => {
-            static SEEN: AtomicU64 = AtomicU64::new(0);
+            static SEEN: UnhandledEvents = UnhandledEvents::new();
             log_unhandled_event("BinanceMargin", &SEEN, other, event_raw);
             false
         }
@@ -5407,7 +5407,8 @@ mod tests {
         // pushes events or signals a reconnect.
         for (e, expected) in [
             ("listStatus", "ignoring listStatus"),
-            ("someFutureEvent", "user-data event"),
+            // First of its type, so the loud path: a warning naming the unhandled type.
+            ("someFutureEvent", "of a type this client does not handle"),
         ] {
             let mut buf = Vec::new();
             let frame = push(serde_json::json!({ "e": e, "E": 1_700_000_000_000_i64 }));
