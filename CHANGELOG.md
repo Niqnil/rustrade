@@ -14,7 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `Position`'s PnL is computed from fills and fees alone. It excludes perpetual funding, margin
     interest and stock borrow fees, so it overstates a position that pays carry.
   - Each client now says what its balances include and how fresh they are. Hyperliquid's
-    collateral balances include funding, but position PnL does not. Binance margin debt and
+    standard-mode balances include funding, but position PnL does not. Binance margin debt and
     accrued interest are only as fresh as the last REST read. IBKR's `TotalCashValue`, as IB
     documents it, leaves out interest and borrow fees accrued during the month until they are
     posted. Alpaca reads only fill activities, and its trades report zero fees.

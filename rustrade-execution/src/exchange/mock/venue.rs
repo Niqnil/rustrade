@@ -138,8 +138,8 @@ pub enum VenueRegime {
 /// The position is reported by [`account_snapshot`](Self::account_snapshot), and a position that
 /// a configured `initial_state` reports for a CFD is where this venue starts.
 ///
-/// Not modelled: funding, financing and liquidation. A short closed at more than twice its entry
-/// has lost more than its margin, and pays the shortfall as a debit.
+/// Not modelled: liquidation, nor any carry (see below). A short closed at more than twice its
+/// entry has lost more than its margin, and pays the shortfall as a debit.
 ///
 /// [`Perpetual`](InstrumentKind::Perpetual), [`Future`](InstrumentKind::Future) and
 /// [`Option`](InstrumentKind::Option) need funding, margin and expiry settlement, none of which this

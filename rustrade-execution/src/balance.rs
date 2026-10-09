@@ -71,9 +71,9 @@ pub struct Balance {
     /// the client's `account_snapshot`.
     ///
     /// A carrying cost (funding, margin interest, a borrow fee) reaches `total` only once the venue
-    /// posts it. Until then no figure here carries it, except the accrued
-    /// [`MarginDetails::interest`] of a venue that reports one. Each client's rustdoc says what
-    /// its venue posts and when.
+    /// posts it to the account, hourly at some venues and monthly at others. Until then no figure
+    /// here carries it, except the accrued [`MarginDetails::interest`] of a venue that reports
+    /// one. Each client's rustdoc says what its venue posts and when.
     pub total: Decimal,
     /// Portion of `total` available to trade (not reserved against resting orders).
     pub free: Decimal,
