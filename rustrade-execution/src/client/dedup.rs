@@ -72,6 +72,8 @@ pub(crate) enum DedupEventKind {
 /// - For order snapshots: instrument + order_id + `DedupEventKind::OrderState`, which carries the
 ///   cumulative filled quantity so that an acknowledgement and the fills after it stay distinct
 /// - For CANCELED/EXPIRED: instrument + order_id + `DedupEventKind::Cancelled`
+/// - For Hyperliquid funding payments: coin + funding time in milliseconds +
+///   `DedupEventKind::Funding`, since a payment has no id
 #[derive(Debug, Hash, Eq, PartialEq)]
 pub(crate) struct DedupKey {
     pub(crate) instrument: SmolStr,

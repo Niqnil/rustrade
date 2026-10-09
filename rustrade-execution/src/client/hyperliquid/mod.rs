@@ -585,6 +585,12 @@ impl ExecutionClient for HyperliquidClient {
     ///   that fails charges every instrument in it. An order Hyperliquid does not know stops being
     ///   held, logged at `warn`; one still live, or in a state this version cannot read, stays
     ///   held.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectivityError::Socket`] if the WebSocket cannot be opened, or if any of the
+    /// `userFills`, `orderUpdates` and `userFundings` subscriptions fails: the stream is not
+    /// opened with only some of them.
     async fn account_stream(
         &self,
         _assets: &[AssetNameExchange],

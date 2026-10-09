@@ -288,9 +288,8 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// fee or a rebate, as the venue posted it.
     ///
     /// A flow is a delta, signed positive when the account received it. The engine logs it and
-    /// changes no state: position PnL is computed from fills alone (see
-    /// [`CashFlow`]), and the venue's balances already include what it has
-    /// posted. See [`CashFlow`] for which venues send it.
+    /// changes no state: position PnL is computed from fills alone, and the venue's balances
+    /// already include what it has posted. See [`CashFlow`] for which venues send it.
     CashFlow(cash_flow::CashFlow<AssetKey, InstrumentKey>),
 }
 
