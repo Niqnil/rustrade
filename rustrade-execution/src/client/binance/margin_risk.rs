@@ -27,13 +27,14 @@ use binance_sdk::margin_trading::{
     websocket_streams::{MarginLevelStatusChange, UserLiabilityChange},
 };
 use chrono::{TimeZone, Utc};
-use futures::{FutureExt as _, SinkExt as _, StreamExt as _};
+use futures::{FutureExt as _, Sink, SinkExt as _, StreamExt as _};
 use rust_decimal::Decimal;
 use rustrade_instrument::{exchange::ExchangeId, instrument::name::InstrumentNameExchange};
 use rustrade_integration::protocol::websocket::{WebSocket, WsMessage, connect};
 use serde::Deserialize as _;
 use smol_str::SmolStr;
 use std::{
+    fmt::Display,
     future::Future,
     panic::AssertUnwindSafe,
     str::FromStr,
@@ -66,7 +67,7 @@ const HEALTHY_SESSION: Duration = RETRY_MAX;
 /// The longest a listen-key request may take, rate-limit waits included.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// The longest a session waits to send a ping or close its socket.
-const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The listen-key requests the Risk Data Stream needs, so a test can stand in for the venue.
 pub(super) trait RiskListenKeys: Send + Sync + 'static {
@@ -135,8 +136,14 @@ impl RiskStreamTask {
     ) -> Self {
         Self(tokio::spawn(async move {
             let run = AssertUnwindSafe(run_risk_stream(keys, base_url, tx, dedup));
-            if run.catch_unwind().await.is_err() {
+            if let Err(payload) = run.catch_unwind().await {
+                let panic = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("(not a string)");
                 error!(
+                    panic,
                     "BinanceMargin risk data stream panicked and has stopped: margin notices now \
                      arrive only if the user-data stream carries them"
                 );
@@ -251,7 +258,7 @@ async fn risk_session(
     let stop = forward_session(keys, &listen_key, &mut ws, early, tx, dedup).await;
     // Best effort, and bounded: the session is over either way, and a half-open socket would
     // otherwise hold the close.
-    let _ = tokio::time::timeout(CLOSE_TIMEOUT, ws.close(None)).await;
+    let _ = tokio::time::timeout(SOCKET_WRITE_TIMEOUT, ws.close(None)).await;
     match stop {
         Stop::ConsumerDropped => SessionEnd::ConsumerDropped,
         Stop::Retry(error) => SessionEnd::Retry {
@@ -339,20 +346,33 @@ async fn forward_session(
                         IDLE_TIMEOUT.as_secs()
                     ));
                 }
-                // Bounded: a half-open socket with a full send buffer would otherwise hold the
-                // session here, past the idle check above.
-                match tokio::time::timeout(
-                    CLOSE_TIMEOUT,
-                    ws.send(WsMessage::Ping(Default::default())),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => return Stop::Retry(format!("ping failed: {e}")),
-                    Err(_) => return Stop::Retry("ping could not be sent".to_owned()),
+                if let Err(e) = send_ping(ws).await {
+                    return Stop::Retry(e);
                 }
             }
         }
+    }
+}
+
+/// Send a ping, bounded by [`SOCKET_WRITE_TIMEOUT`]: a half-open socket with a full send buffer
+/// would otherwise hold the session in the send, past its idle check.
+async fn send_ping<S>(sink: &mut S) -> Result<(), String>
+where
+    S: Sink<WsMessage> + Unpin,
+    S::Error: Display,
+{
+    match tokio::time::timeout(
+        SOCKET_WRITE_TIMEOUT,
+        sink.send(WsMessage::Ping(Default::default())),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("ping failed: {e}")),
+        Err(_) => Err(format!(
+            "ping not sent within {}s",
+            SOCKET_WRITE_TIMEOUT.as_secs()
+        )),
     }
 }
 
@@ -855,11 +875,22 @@ mod tests {
             .unwrap();
     }
 
-    /// A listen-key request that never answers.
-    struct HangingKeys;
+    /// A listen-key request that never answers, counting how often it is made.
+    #[derive(Default)]
+    struct HangingKeys {
+        starts: std::sync::atomic::AtomicU32,
+    }
 
-    impl RiskListenKeys for HangingKeys {
+    impl HangingKeys {
+        fn starts(&self) -> u32 {
+            self.starts.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    impl RiskListenKeys for Arc<HangingKeys> {
         async fn start(&self) -> Result<String, String> {
+            self.starts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             std::future::pending().await
         }
 
@@ -873,7 +904,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_hanging_listen_key_request_times_out_and_does_not_outlive_the_consumer() {
         let (tx, rx) = mpsc::unbounded_channel();
-        let keys = HangingKeys;
+        let keys = Arc::new(HangingKeys::default());
         let dedup = new_dedup_cache();
 
         // One session alone ends at the request timeout, as a failure to retry.
@@ -885,9 +916,19 @@ mod tests {
         }
         assert_eq!(started.elapsed(), REQUEST_TIMEOUT);
 
-        // The stream, mid-request, stops once the consumer drops.
-        let task = tokio::spawn(run_risk_stream(keys, "ws://unused".to_owned(), tx, dedup));
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // The stream retries a timed-out request after the backoff, and stops, mid-request, once
+        // the consumer drops.
+        let keys = Arc::new(HangingKeys::default());
+        let task = tokio::spawn(run_risk_stream(
+            Arc::clone(&keys),
+            "ws://unused".to_owned(),
+            tx,
+            dedup,
+        ));
+        tokio::time::sleep(REQUEST_TIMEOUT - Duration::from_millis(1)).await;
+        assert_eq!(keys.starts(), 1, "still waiting on the first request");
+        tokio::time::sleep(RETRY_INITIAL + Duration::from_millis(2)).await;
+        assert_eq!(keys.starts(), 2, "retried after the first backoff");
         drop(rx);
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
@@ -899,8 +940,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn dropping_the_task_handle_stops_the_stream() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let task =
-            RiskStreamTask::spawn(HangingKeys, "ws://unused".to_owned(), tx, new_dedup_cache());
+        let task = RiskStreamTask::spawn(
+            Arc::new(HangingKeys::default()),
+            "ws://unused".to_owned(),
+            tx,
+            new_dedup_cache(),
+        );
         tokio::time::sleep(Duration::from_secs(1)).await;
         drop(task);
         let ended = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -929,5 +974,138 @@ mod tests {
             }
             SessionEnd::ConsumerDropped => panic!("the consumer is still there"),
         }
+    }
+
+    /// A sink that never accepts a frame, as a socket whose send buffer stays full.
+    struct StuckSink;
+
+    impl Sink<WsMessage> for StuckSink {
+        type Error = std::convert::Infallible;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn start_send(self: std::pin::Pin<&mut Self>, _: WsMessage) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    /// A ping a stuck socket never takes fails after the write timeout, rather than holding the
+    /// session.
+    #[tokio::test(start_paused = true)]
+    async fn a_ping_a_stuck_socket_never_takes_fails_after_the_write_timeout() {
+        let started = Instant::now();
+        let result = send_ping(&mut StuckSink).await;
+        assert_eq!(started.elapsed(), SOCKET_WRITE_TIMEOUT);
+        assert_eq!(result, Err("ping not sent within 5s".to_owned()));
+    }
+
+    /// Listen keys whose request panics.
+    struct PanickingKeys;
+
+    impl RiskListenKeys for PanickingKeys {
+        async fn start(&self) -> Result<String, String> {
+            panic!("listen-key bug")
+        }
+
+        async fn keepalive(&self, _listen_key: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// Every event logged on this thread while the guard lives, as its fields rendered
+    /// `name=value`, space-separated.
+    fn capture_logs() -> (Arc<Mutex<Vec<String>>>, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Fields<'a>(&'a mut String);
+
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{}={value:?} ", field.name()));
+            }
+        }
+
+        struct Capture(Arc<Mutex<Vec<String>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut fields = String::new();
+                event.record(&mut Fields(&mut fields));
+                self.0.lock().unwrap().push(fields);
+            }
+        }
+
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(Capture(Arc::clone(&logs))),
+        );
+        (logs, guard)
+    }
+
+    /// A panic in the stream is caught, logged with its message, and drops the stream's sender;
+    /// an abort is not logged as a panic.
+    #[tokio::test]
+    async fn a_panic_in_the_stream_is_logged_and_stops_it() {
+        // The test runtime runs on this thread, so the thread's default subscriber sees the
+        // spawned task's events.
+        let (logs, _guard) = capture_logs();
+        let panicked = |logs: &Mutex<Vec<String>>| {
+            logs.lock()
+                .unwrap()
+                .iter()
+                .any(|fields| fields.contains("panicked"))
+        };
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let _task = RiskStreamTask::spawn(
+            PanickingKeys,
+            "ws://unused".to_owned(),
+            tx,
+            new_dedup_cache(),
+        );
+        assert!(rx.recv().await.is_none(), "the panic drops the sender");
+        let logged = logs.lock().unwrap().clone();
+        assert!(
+            logged
+                .iter()
+                .any(|fields| fields.contains("panicked") && fields.contains("listen-key bug")),
+            "{logged:?}"
+        );
+
+        logs.lock().unwrap().clear();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let task = RiskStreamTask::spawn(
+            Arc::new(HangingKeys::default()),
+            "ws://unused".to_owned(),
+            tx,
+            new_dedup_cache(),
+        );
+        tokio::task::yield_now().await;
+        drop(task);
+        assert!(rx.recv().await.is_none(), "the abort drops the sender");
+        assert!(!panicked(&logs), "an abort is not a panic");
     }
 }
