@@ -4697,7 +4697,10 @@ fn map_position_intent(side: Side, reduce_only: bool) -> AlpacaPositionIntent {
 /// (for cancel operations) to ensure consistent error classification across all REST paths.
 ///
 /// `code` is the body's Alpaca error code, where it has one. It is prefixed to the message of a
-/// rejection, so a caller can see it.
+/// refusal, so a caller can see it.
+///
+/// The mapping knows nothing of the request, so a query (account, positions, activities) refused
+/// on a business rule gets an order's variant too, as any other 4xx on a query already does.
 fn parse_api_error(
     status: reqwest::StatusCode,
     code: Option<i64>,
@@ -4736,7 +4739,7 @@ fn parse_api_error(
             }
             Some(_) => ApiError::OrderRejected(coded()),
         },
-        404 => ApiError::OrderRejected(format!("order not found: {message}")),
+        404 => ApiError::OrderRejected(format!("order not found: {}", coded())),
         _ => ApiError::OrderRejected(coded()),
     }
 }

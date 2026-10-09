@@ -116,8 +116,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `BalanceInsufficient` when its message says "insufficient", otherwise `OrderRejected`. A 403
     without one, Alpaca's `{"message": "forbidden."}` to a wrong key, secret or host, is still
     `Unauthenticated`.
-  - Where a body carries a code, rejection messages now start with it, e.g.
-    `40310000 insufficient buying power`.
+  - The messages of `BalanceInsufficient` and `OrderRejected` now start with the body's code
+    when it has one, e.g. `40310000 insufficient buying power`. That includes 422 refusals, whose
+    text changes accordingly.
 
 ## [0.10.1] - 2026-10-09
 
