@@ -218,7 +218,7 @@ pub struct IbkrConfig {
     /// under API client id 0, so a client connected as 0 takes their fills for its own too, under
     /// their IB order id as [`fetch_open_orders`](ExecutionClient::fetch_open_orders) lists the
     /// orders, and reports them as [`Order`](crate::trade::TradeOrigin::Order) whatever this is
-    /// set to.
+    /// set to. To keep manual trading apart from this client's, connect under a non-zero id.
     ///
     /// Either way, a fill IB flags as an IB-initiated liquidation is reported, as
     /// [`Liquidation`](crate::trade::TradeOrigin::Liquidation), since it moves the account's
@@ -3064,10 +3064,11 @@ impl ExecutionClient for IbkrClient {
     ///   before today. For historical executions beyond today, use IB's Flex Query or
     ///   Activity Statements.
     /// - Only the executions of orders this API client placed are returned, and those IB
-    ///   flags as an IB-initiated liquidation, unless [`IbkrConfig::other_clients_fills`] is
-    ///   set: then every client's IB sends are, each other client's as an
-    ///   [`External`](crate::trade::TradeOrigin::External) trade under IB's permanent id for
-    ///   its order. An execution in a contract this client has not registered is skipped
+    ///   flags as an IB-initiated liquidation, as
+    ///   [`Liquidation`](crate::trade::TradeOrigin::Liquidation) trades. With
+    ///   [`IbkrConfig::other_clients_fills`] set, every other client's execution IB sends is
+    ///   returned too, as an [`External`](crate::trade::TradeOrigin::External) trade under
+    ///   IB's permanent id for its order. An execution in a contract this client has not registered is skipped
     ///   either way.
     /// - Each trade's fees come from the commission report IB sends with its
     ///   execution. An execution whose report IB did not send is returned with a zero
