@@ -103,6 +103,16 @@ pub struct TearSheet<Interval> {
     #[serde(default)]
     pub fills_unmatched: usize,
 
+    /// Fills the venue forced on this instrument's positions: liquidations, auto-deleveraging
+    /// and option assignments, as
+    /// [`TradeOrigin::is_forced`](rustrade_execution::trade::TradeOrigin::is_forced) defines them.
+    ///
+    /// Counted as the venues reported them, and most mark no forced fill at all, so zero is not
+    /// proof that none happened.
+    /// [`TradeOrigin`](rustrade_execution::trade::TradeOrigin) says what each venue reports.
+    #[serde(default)]
+    pub fills_forced: usize,
+
     /// Why the first fill of either kind above could not be routed.
     ///
     /// Shared by both counters, for the same reason [`Self::first_rejection_reason`] exists: the
@@ -159,6 +169,10 @@ pub struct TearSheetGenerator {
     #[serde(default)]
     pub fills_unmatched: usize,
 
+    /// Fills the venue forced. See [`TearSheet::fills_forced`].
+    #[serde(default)]
+    pub fills_forced: usize,
+
     /// First unroutable-fill detail seen. See [`TearSheet::first_fallback_detail`].
     #[serde(default)]
     pub first_fallback_detail: Option<String>,
@@ -183,6 +197,7 @@ impl TearSheetGenerator {
             first_rejection_reason: None,
             fills_routed_by_fallback: 0,
             fills_unmatched: 0,
+            fills_forced: 0,
             first_fallback_detail: None,
             fallback_positions: Vec::new(),
         }
@@ -227,6 +242,11 @@ impl TearSheetGenerator {
     ) {
         self.fills_unmatched = self.fills_unmatched.saturating_add(1);
         self.record_fallback_position(position_id, detail);
+    }
+
+    /// Record a fill the venue forced. See [`TearSheet::fills_forced`].
+    pub fn record_fill_forced(&mut self) {
+        self.fills_forced = self.fills_forced.saturating_add(1);
     }
 
     /// Note the position a fallback routing opened, and the reason if it is the first one.
@@ -350,6 +370,7 @@ impl TearSheetGenerator {
             first_rejection_reason: self.first_rejection_reason.clone(),
             fills_routed_by_fallback: self.fills_routed_by_fallback,
             fills_unmatched: self.fills_unmatched,
+            fills_forced: self.fills_forced,
             first_fallback_detail: self.first_fallback_detail.clone(),
             fallback_positions: self.fallback_positions.clone(),
         }

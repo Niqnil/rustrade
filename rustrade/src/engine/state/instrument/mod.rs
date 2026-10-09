@@ -27,7 +27,7 @@ use rustrade_execution::{
         state::{ActiveOrderState, InactiveOrderState, OrderState},
     },
     position::PositionReport,
-    trade::Trade,
+    trade::{Trade, TradeOrigin},
 };
 use rustrade_instrument::{
     Keyed,
@@ -45,7 +45,7 @@ use rustrade_integration::collection::{FnvIndexMap, snapshot::Snapshot};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::fmt::Debug;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Defines the state interface [`InstrumentDataState`] that can be implemented for custom
 /// instrument level data state.
@@ -1496,6 +1496,17 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// [`TearSheet::fallback_positions`](crate::statistic::summary::instrument::TearSheet::fallback_positions),
     /// and both counters are summed onto
     /// [`TradingSummary`](crate::statistic::summary::TradingSummary) for the session.
+    ///
+    /// # Forced fills
+    ///
+    /// A fill of any [`TradeOrigin`] is applied the same way: the position really changed. One the
+    /// venue forced ([`TradeOrigin::is_forced`]) is also logged at `warn!` and counted on
+    /// [`TearSheet::fills_forced`](crate::statistic::summary::instrument::TearSheet::fills_forced).
+    ///
+    /// In `OmsMode::Hedging`, a forced fill matches none of this engine's orders, so it is routed
+    /// like any unmatched fill: it opens a position of its own under its order id rather than
+    /// reducing the position it closed at the venue. Which of several hedged positions a
+    /// liquidation closed is not something the fill says. Reconcile positions after one.
     pub fn update_from_trade(
         &mut self,
         trade: &Trade<AssetKey, InstrumentKey>,
@@ -1604,9 +1615,14 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                                 //
                                 // Check for OpenInFlight only in this no-match case (avoids
                                 // unnecessary scan when match is found in the common case).
-                                let has_in_flight = self.orders.0.values().any(|order| {
-                                    matches!(order.state, ActiveOrderState::OpenInFlight(_))
-                                });
+                                //
+                                // A fill the venue reports as anything but an order fill, such as
+                                // a liquidation, is not for an order of this engine's, so it is
+                                // never (a). Queued, it would wait for an ack that cannot come.
+                                let has_in_flight = trade.origin == TradeOrigin::Order
+                                    && self.orders.0.values().any(|order| {
+                                        matches!(order.state, ActiveOrderState::OpenInFlight(_))
+                                    });
                                 if has_in_flight {
                                     debug!(
                                         order_id = %trade.order_id,
@@ -1639,6 +1655,28 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             }
         };
 
+        // Recorded here, past the fill-before-ack queue above, so a queued fill is counted once:
+        // when it is replayed.
+        if trade.origin.is_forced() {
+            warn!(
+                instrument = ?trade.instrument,
+                order_id = %trade.order_id,
+                origin = %trade.origin,
+                side = %trade.side,
+                price = %trade.price,
+                quantity = %trade.quantity,
+                "venue forced a fill on this instrument's position"
+            );
+            self.tear_sheet.record_fill_forced();
+        } else if trade.origin != TradeOrigin::Order {
+            info!(
+                instrument = ?trade.instrument,
+                order_id = %trade.order_id,
+                origin = %trade.origin,
+                "fill of origin other than this engine's orders"
+            );
+        }
+
         // Step 2: Extract contract_size and apply fee model to the trade.
         //
         // contract_size is the multiplier for derivatives (options, futures, perpetuals).
@@ -1661,15 +1699,11 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         let effective_trade = if computed_fee.is_zero() {
             trade
         } else {
-            augmented = Trade {
-                fees: rustrade_execution::trade::AssetFees {
-                    asset: trade.fees.asset.clone(),
-                    fees: trade.fees.fees + computed_fee,
-                    // computed_fee is in quote terms; add to fees_quote if available
-                    fees_quote: trade.fees.fees_quote.map(|fq| fq + computed_fee),
-                },
-                ..trade.clone()
-            };
+            let mut with_fee = trade.clone();
+            with_fee.fees.fees += computed_fee;
+            // computed_fee is in quote terms; add to fees_quote if available
+            with_fee.fees.fees_quote = trade.fees.fees_quote.map(|fq| fq + computed_fee);
+            augmented = with_fee;
             &augmented
         };
 
@@ -2162,22 +2196,22 @@ mod tests {
         quantity: Decimal,
         order_filled_quantity: Option<Decimal>,
     ) -> Trade<AssetIndex, InstrumentIndex> {
-        Trade {
-            order_filled_quantity,
-            id: TradeId::new("trade"),
+        Trade::new(
+            TradeId::new("trade"),
             order_id,
-            instrument: InstrumentIndex(0),
-            strategy: StrategyId::new("strategy"),
-            time_exchange: TIME,
+            InstrumentIndex(0),
+            StrategyId::new("strategy"),
+            TIME,
             side,
-            price: dec!(100),
+            dec!(100),
             quantity,
-            fees: AssetFees {
+            order_filled_quantity,
+            AssetFees {
                 asset: AssetIndex(0),
                 fees: Decimal::ZERO,
                 fees_quote: Some(Decimal::ZERO),
             },
-        }
+        )
     }
 
     /// Drive an order from submission to resting `Open` at the exchange, learning the
@@ -2416,6 +2450,60 @@ mod tests {
             open_position_ids(&state),
             vec![position_id],
             "the replayed fill lands in the strategy's position, not under the raw OrderId"
+        );
+    }
+
+    /// A liquidation or an external fill is not for any order of this engine's, so an order of
+    /// its own awaiting its ack must not hold it: that ack would never release it.
+    #[test]
+    fn a_fill_of_another_origin_is_not_queued_behind_an_order_awaiting_its_ack() {
+        for origin in [TradeOrigin::Liquidation, TradeOrigin::External] {
+            let mut state = instrument_state(OmsMode::Hedging);
+            state.update_from_order_snapshot(Snapshot(&order(
+                ClientOrderId::new("cid-1"),
+                OrderState::active(OpenInFlight::new(TIME_SENT)),
+            )));
+
+            state.update_from_trade(
+                &fill(OrderId::new("venue-order"), Side::Sell, dec!(4)).with_origin(origin),
+            );
+
+            assert!(state.pending_fills.is_empty(), "{origin}");
+            assert_eq!(
+                open_position_ids(&state),
+                vec![PositionId::new("venue-order")],
+                "{origin}: applied, as an unmatched fill"
+            );
+            assert_eq!(state.tear_sheet.fills_unmatched, 1, "{origin}");
+        }
+    }
+
+    /// A forced fill moves the position like any other, and is counted; a fill of another
+    /// origin that the venue did not force is not.
+    #[test]
+    fn forced_fills_are_applied_and_counted() {
+        let mut state = instrument_state(OmsMode::Netting);
+
+        state.update_from_trade(&fill(OrderId::new("own"), Side::Buy, dec!(4)));
+        state.update_from_trade(
+            &fill(OrderId::new("other"), Side::Buy, dec!(1)).with_origin(TradeOrigin::External),
+        );
+        assert_eq!(state.tear_sheet.fills_forced, 0);
+
+        let exited = state.update_from_trade(
+            &fill(OrderId::new("liquidation"), Side::Sell, dec!(5))
+                .with_origin(TradeOrigin::Liquidation),
+        );
+
+        assert!(exited.is_some(), "the liquidation closed the position");
+        assert!(open_position_ids(&state).is_empty());
+        assert_eq!(state.tear_sheet.fills_forced, 1);
+        assert_eq!(
+            state
+                .tear_sheet
+                .generate(Decimal::ZERO, crate::statistic::time::Daily)
+                .fills_forced,
+            1
         );
     }
 

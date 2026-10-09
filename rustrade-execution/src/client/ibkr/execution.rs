@@ -1,11 +1,11 @@
 use crate::{
     order::id::{OrderId, StrategyId},
-    trade::{AssetFees, Trade, TradeId},
+    trade::{AssetFees, Trade, TradeId, TradeOrigin},
 };
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use fnv::FnvHashMap;
-use ibapi::orders::{CommissionReport, ExecutionData, ExecutionSide};
+use ibapi::orders::{CommissionReport, Execution, ExecutionData, ExecutionFilter, ExecutionSide};
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
@@ -45,7 +45,62 @@ struct ExecutionBufferInner {
 #[derive(Debug, Clone)]
 struct PendingExecution {
     execution: ExecutionData,
-    instrument: InstrumentNameExchange,
+    resolved: ResolvedExecution,
+}
+
+/// Which API clients' executions this client reports, and how it tells its own from theirs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ExecutionScope {
+    /// This API client's id, which an execution of one of its orders carries.
+    pub(super) api_client_id: i32,
+    /// Whether other clients' executions are reported too:
+    /// [`IbkrConfig::other_clients_fills`](super::IbkrConfig::other_clients_fills).
+    pub(super) other_clients: bool,
+}
+
+impl ExecutionScope {
+    /// The filter for an executions request: this client's alone, unless other clients' are
+    /// reported too.
+    pub(super) fn filter(self) -> ExecutionFilter {
+        ExecutionFilter {
+            client_id: (!self.other_clients).then_some(self.api_client_id),
+            ..ExecutionFilter::default()
+        }
+    }
+
+    /// The order id and origin `execution`'s trade is reported with, or `None` when it is another
+    /// client's and other clients' are not reported.
+    ///
+    /// An execution IB flags as an IB-initiated liquidation is reported whoever's order it was,
+    /// as [`TradeOrigin::Liquidation`]: it moves the account's position, which no client chose.
+    pub(super) fn classify(self, execution: &Execution) -> Option<(OrderId, TradeOrigin)> {
+        let own = execution.client_id == self.api_client_id;
+        let liquidation = execution.liquidation != 0;
+        if !own && !liquidation && !self.other_clients {
+            return None;
+        }
+        let origin = if liquidation {
+            TradeOrigin::Liquidation
+        } else if own {
+            TradeOrigin::Order
+        } else {
+            TradeOrigin::External
+        };
+        let order_id = if own {
+            ib_order_id(execution.order_id)
+        } else {
+            foreign_order_id(execution)
+        };
+        Some((order_id, origin))
+    }
+}
+
+/// What an execution's trade is reported with, besides what the execution itself carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ResolvedExecution {
+    pub(super) instrument: InstrumentNameExchange,
+    pub(super) order_id: OrderId,
+    pub(super) origin: TradeOrigin,
 }
 
 impl ExecutionBuffer {
@@ -56,14 +111,14 @@ impl ExecutionBuffer {
     }
 
     /// Buffer an execution, waiting for its commission report.
-    pub fn add_execution(&self, execution: ExecutionData, instrument: InstrumentNameExchange) {
+    pub(super) fn add_execution(&self, execution: ExecutionData, resolved: ResolvedExecution) {
         let exec_id = execution.execution.execution_id.clone();
         let mut inner = self.inner.lock();
         inner.pending.insert(
             exec_id,
             PendingExecution {
                 execution,
-                instrument,
+                resolved,
             },
         );
 
@@ -282,6 +337,24 @@ pub(super) fn ib_order_id(ib_order_id: i32) -> OrderId {
     OrderId::new(format_smolstr!("{ib_order_id}"))
 }
 
+/// The venue order id of `execution`, an execution of another client's order.
+///
+/// IB numbers orders per API client, so that client's order id could name one of this client's.
+/// The permanent id IB gives an order does not, and is used where there is one: `perm:` and the
+/// id. An order from outside IB can have none (`0`), and is named by its client and order id
+/// instead: `client:`, the client id, `:` and the order id.
+pub(super) fn foreign_order_id(execution: &Execution) -> OrderId {
+    if execution.perm_id != 0 {
+        OrderId::new(format_smolstr!("perm:{}", execution.perm_id))
+    } else {
+        OrderId::new(format_smolstr!(
+            "client:{}:{}",
+            execution.client_id,
+            execution.order_id
+        ))
+    }
+}
+
 /// Build a rustrade Trade from IB execution + commission data.
 fn build_trade(
     pending: PendingExecution,
@@ -315,11 +388,17 @@ fn trade_with_fees(
 
     let time_exchange = parse_ib_timestamp(&exec.time).unwrap_or_else(Utc::now);
 
+    let ResolvedExecution {
+        instrument,
+        order_id,
+        origin,
+    } = pending.resolved;
     Trade {
         id: TradeId::new(&exec.execution_id),
-        // The id the order's `Open` state carries, which is what a fill is matched against.
-        order_id: ib_order_id(exec.order_id),
-        instrument: pending.instrument,
+        // For this client's order, the id its `Open` state carries, which is what a fill is
+        // matched against.
+        order_id,
+        instrument,
         strategy: StrategyId::unknown(),
         time_exchange,
         side,
@@ -332,6 +411,7 @@ fn trade_with_fees(
             "exec.cumulative_quantity",
         )),
         fees,
+        origin,
     }
 }
 
@@ -451,7 +531,14 @@ mod tests {
             ..Default::default()
         };
         let add = |buffer: &ExecutionBuffer, exec_id: &str| {
-            buffer.add_execution(execution(exec_id), InstrumentNameExchange::new("AAPL"));
+            buffer.add_execution(
+                execution(exec_id),
+                ResolvedExecution {
+                    instrument: InstrumentNameExchange::new("AAPL"),
+                    order_id: ib_order_id(1),
+                    origin: TradeOrigin::Order,
+                },
+            );
         };
         let source = ExecutionBuffer::new();
         let target = ExecutionBuffer::new();
@@ -512,6 +599,7 @@ mod tests {
             quantity: Decimal::ONE,
             order_filled_quantity: Some(Decimal::ONE),
             fees: AssetFees::new(AssetNameExchange::from("USD"), Decimal::ZERO, None),
+            origin: TradeOrigin::Order,
         }
     }
 

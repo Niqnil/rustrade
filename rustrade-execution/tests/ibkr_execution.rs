@@ -126,6 +126,7 @@ fn test_config(client_id_offset: i32) -> IbkrConfig {
         client_id: test_client_id_base() + client_id_offset,
         account: std::env::var("IBKR_PAPER_ACCOUNT").expect("IBKR_PAPER_ACCOUNT env var required"),
         contracts: vec![],
+        other_clients_fills: false,
     }
 }
 

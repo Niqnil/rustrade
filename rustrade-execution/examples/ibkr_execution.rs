@@ -60,6 +60,7 @@ async fn main() {
         account: std::env::var("IBKR_PAPER_ACCOUNT")
             .unwrap_or_else(|_| "YOUR_PAPER_ACCOUNT_ID".to_string()),
         contracts: vec![], // We'll register contracts manually
+        other_clients_fills: false,
     };
 
     info!("Connecting to IB Gateway...");

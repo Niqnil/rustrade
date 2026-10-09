@@ -45,6 +45,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and drawdown are computed from realised PnL plus carry. The new `TearSheet::carry` and
     `PnLReturns::carry` report the total, and the summary table shows it. Without cash flows,
     which the simulated venue does not produce, carry is zero and nothing changes.
+- **Why a fill happened: `Trade::origin`** (`rustrade-execution`, part of #552).
+  - **Breaking:** `Trade` is `#[non_exhaustive]` and gains `origin: TradeOrigin`, with
+    `#[serde(default)]` so stored trades still load, as `Order`. Outside `rustrade-execution`, build
+    one with `Trade::new`, which keeps its arguments and gives `Order`, then `with_origin`, and
+    change a copy by assigning its fields: struct literals and `..trade` updates no longer compile.
+  - `TradeOrigin` (`#[non_exhaustive]`): `Order`, `Liquidation`, `Adl`, `Assignment`, `Exercise`,
+    `Expiry` and `External`. `Order` means no other origin was reported, not that the client placed
+    the order; its rustdoc lists what each venue reports. Binance, Hyperliquid, Alpaca and the
+    simulated venue report `Order` only for now. `is_forced()` is true for `Liquidation`, `Adl`
+    and `Assignment`. A `Trade`'s `Display` shows its origin when it is not `Order`.
+  - `IbkrClient` reports a fill IB flags as an IB-initiated liquidation as `Liquidation`, whichever
+    API client placed the order; it was dropped when another client had. A fill of the client's
+    own order is reported even when the client no longer tracks the order, such as after a
+    restart; it was dropped. An execution in a contract the client has not registered is still
+    dropped, now with a WARN on the account stream.
+  - **Breaking:** `IbkrConfig` gains `other_clients_fills: bool`, `#[serde(default)]` and off. Set,
+    fill recovery and `fetch_trades` read every API client's executions, and the account stream
+    reports another client's execution when IB sends one, each as `External`, under the order id
+    `perm:` and IB's permanent id for the order (`client:<client id>:<order id>` when it has none).
+    Leave it off when several API clients each feed an engine from one account: each would apply
+    the others' fills.
+  - **Breaking:** `ibkr::execution::ExecutionBuffer::add_execution` is no longer public.
+  - The engine's expiry settlement trade is `Expiry`. The engine applies a fill of any origin, logs
+    a forced one at WARN and counts it in the new `TearSheet::fills_forced` and
+    `TradingSummary::fills_forced`, and logs other non-`Order` fills at INFO. In `OmsMode::Hedging`
+    a fill whose origin is not `Order` is no longer queued behind an order awaiting its ack, where
+    it waited for an ack that could not come; it is routed as an unmatched fill. Hedging mode still
+    opens a forced fill's own position rather than reducing the one it closed, as
+    `InstrumentState::update_from_trade` documents.
 
 ## [0.10.1] - 2026-10-09
 

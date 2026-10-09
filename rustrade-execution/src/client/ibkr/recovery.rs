@@ -32,7 +32,7 @@
 use super::{
     ListingLock,
     ended_orders::{EarlierCompletions, EndedOrderReader, release_ended},
-    execution::{ExecutionBuffer, ExecutionRevision, revision_of},
+    execution::{ExecutionBuffer, ExecutionRevision, ExecutionScope, revision_of},
     listed_cids,
     order::{OrderIdMap, PendingCancels},
     resolve_execution,
@@ -57,7 +57,7 @@ use fnv::FnvHashSet;
 use ibapi::{
     TRANSPORT_RECONNECT_CODE,
     client::blocking::{Client, NoticeStream},
-    orders::{ExecutionData, ExecutionFilter, Executions},
+    orders::{ExecutionData, Executions},
     subscriptions::SubscriptionItem,
 };
 use lru::LruCache;
@@ -422,14 +422,12 @@ impl RecoveryError {
 
 /// Turns what one executions request returns into the trades of a gap.
 ///
-/// Keeps executions from `floor` on, for orders and contracts this client tracks, and pairs each
-/// with its commission report as the stream worker does.
+/// Keeps executions from `floor` on, that `scope` reports, in contracts this client registered,
+/// and pairs each with its commission report as the stream worker does.
 pub(super) struct RecoveredFills<'a> {
     floor: DateTime<Utc>,
-    /// This API client's id, which an execution of one of its orders carries.
-    api_client_id: i32,
+    scope: ExecutionScope,
     contracts: &'a ContractRegistry,
-    order_ids: &'a OrderIdMap,
     awaiting_commission: ExecutionBuffer,
     trades: Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
     /// Executions kept although their timestamp did not parse.
@@ -439,15 +437,13 @@ pub(super) struct RecoveredFills<'a> {
 impl<'a> RecoveredFills<'a> {
     pub(super) fn new(
         floor: DateTime<Utc>,
-        api_client_id: i32,
+        scope: ExecutionScope,
         contracts: &'a ContractRegistry,
-        order_ids: &'a OrderIdMap,
     ) -> Self {
         Self {
             floor,
-            api_client_id,
+            scope,
             contracts,
-            order_ids,
             awaiting_commission: ExecutionBuffer::new(),
             trades: Vec::new(),
             unparseable: 0,
@@ -472,14 +468,8 @@ impl<'a> RecoveredFills<'a> {
                         self.unparseable += 1;
                     }
                 }
-                if let Some(instrument) = resolve_execution(
-                    &execution,
-                    self.api_client_id,
-                    self.contracts,
-                    self.order_ids,
-                ) {
-                    self.awaiting_commission
-                        .add_execution(execution, instrument);
+                if let Some(resolved) = resolve_execution(&execution, self.scope, self.contracts) {
+                    self.awaiting_commission.add_execution(execution, resolved);
                 }
             }
             Executions::CommissionReport(report) => {
@@ -527,23 +517,19 @@ impl<'a> RecoveredFills<'a> {
 fn recover_fills(
     client: &Client,
     floor: DateTime<Utc>,
+    scope: ExecutionScope,
     contracts: &ContractRegistry,
-    order_ids: &OrderIdMap,
     pending: &ExecutionBuffer,
     sink: &EventSink,
 ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, RecoveryError> {
     // No server-side time filter: TWS reads `ExecutionFilter::time` in a zone of its own choosing.
-    // A day's executions are few, and `RecoveredFills` applies the window. Only this API client's:
-    // IB numbers orders per client, so another's could name an order id this client also uses.
-    let api_client_id = client.client_id();
+    // A day's executions are few, and `RecoveredFills` applies the window. Other API clients'
+    // only when `scope` reports them.
     let subscription = client
-        .executions(ExecutionFilter {
-            client_id: Some(api_client_id),
-            ..ExecutionFilter::default()
-        })
+        .executions(scope.filter())
         .map_err(RecoveryError::Ibapi)?;
     let deadline = Instant::now() + RECOVERY_TIMEOUT;
-    let mut fills = RecoveredFills::new(floor, api_client_id, contracts, order_ids);
+    let mut fills = RecoveredFills::new(floor, scope, contracts);
 
     loop {
         if !sink.is_open() {
@@ -592,6 +578,8 @@ pub(super) struct RecoveryWatcher {
     pub(super) sink: EventSink,
     /// The runtime the order check, which is shared with the other venues, runs its timers on.
     pub(super) runtime: tokio::runtime::Handle,
+    /// Which API clients' executions recovery reports.
+    pub(super) scope: ExecutionScope,
 }
 
 /// What became of one attempt at recovering a gap's fills.
@@ -660,8 +648,8 @@ impl RecoveryWatcher {
         match recover_fills(
             &self.client,
             floor,
+            self.scope,
             &self.contracts,
-            &self.order_ids,
             &self.pending,
             &self.sink,
         ) {
@@ -777,10 +765,7 @@ fn observe_notice(tracker: &mut GapTracker, notice: &ibapi::Notice) {
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics are the correct failure mode
 mod tests {
     use super::*;
-    use crate::{
-        client::dedup::new_dedup_cache,
-        order::{OrderKind, TimeInForce, id::ClientOrderId},
-    };
+    use crate::{client::dedup::new_dedup_cache, trade::TradeOrigin};
     use ibapi::{
         contracts::Contract,
         orders::{CommissionReport, Execution},
@@ -974,6 +959,7 @@ mod tests {
             quantity: Decimal::ONE,
             order_filled_quantity: Some(Decimal::ONE),
             fees: AssetFees::new(AssetNameExchange::from("USD"), Decimal::ONE, None),
+            origin: TradeOrigin::Order,
         }
     }
 
@@ -1210,7 +1196,7 @@ mod tests {
     const CON_ID: i32 = 265598;
     const IB_ORDER_ID: i32 = 7;
 
-    fn tracked() -> (ContractRegistry, OrderIdMap) {
+    fn registered() -> ContractRegistry {
         let contracts = ContractRegistry::new();
         contracts
             .register(
@@ -1221,23 +1207,14 @@ mod tests {
                 },
             )
             .unwrap();
-        let order_ids = OrderIdMap::new();
-        order_ids
-            .register(
-                ClientOrderId::new("cid-7"),
-                IB_ORDER_ID,
-                super::super::order::OrderContext {
-                    instrument: InstrumentNameExchange::new("AAPL"),
-                    side: Side::Buy,
-                    price: Some(Decimal::from(100)),
-                    quantity: Decimal::from(2),
-                    kind: OrderKind::Limit,
-                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                },
-            )
-            .unwrap();
-        (contracts, order_ids)
+        contracts
     }
+
+    /// This client's executions alone, as API client 0.
+    const OWN: ExecutionScope = ExecutionScope {
+        api_client_id: 0,
+        other_clients: false,
+    };
 
     fn execution(exec_id: &str, order_id: i32, time: &str) -> Executions {
         Executions::ExecutionData(ExecutionData {
@@ -1277,10 +1254,10 @@ mod tests {
     }
 
     #[test]
-    fn recovered_fills_keep_the_window_and_tracked_orders() {
-        let (contracts, order_ids) = tracked();
+    fn recovered_fills_keep_the_window_and_this_clients_orders() {
+        let contracts = registered();
         let pending = ExecutionBuffer::new();
-        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), 0, &contracts, &order_ids);
+        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts);
 
         for item in [
             // Before the window: the stream delivered it, or it predates the stream.
@@ -1289,9 +1266,10 @@ mod tests {
             // In the window.
             execution("gap", IB_ORDER_ID, "20260929 14:00:00 UTC"),
             commission("gap"),
-            // In the window, but for an order this client does not track.
-            execution("foreign", 99, "20260929 14:00:01 UTC"),
-            commission("foreign"),
+            // In the window, for an order of this client's that it no longer tracks, such as one
+            // placed before a restart: still this client's fill.
+            execution("untracked", 99, "20260929 14:00:01 UTC"),
+            commission("untracked"),
             // In the window, under the tracked order's id, but another API client's order: IB
             // numbers orders per client.
             from_api_client(
@@ -1304,21 +1282,103 @@ mod tests {
         }
 
         let trades = fills.finish(&pending);
-        assert_eq!(trades.len(), 1, "{trades:?}");
-        assert_eq!(trades[0].id.0.as_str(), "gap");
+        let ids: Vec<_> = trades.iter().map(|trade| trade.id.0.as_str()).collect();
+        assert_eq!(ids, ["gap", "untracked"]);
         // The IB order id, which the order's `Open` state carries.
         assert_eq!(trades[0].order_id.0, IB_ORDER_ID.to_string());
+        assert_eq!(trades[1].order_id.0, "99");
+        assert!(
+            trades
+                .iter()
+                .all(|trade| trade.origin == TradeOrigin::Order)
+        );
         assert_eq!(trades[0].fees.fees, Decimal::ONE);
         assert_eq!(pending.pending_count(), 0);
+    }
+
+    /// Another client's fill is reported only when the scope asks for it, and under IB's permanent
+    /// id for the order, since its client's order id could name one of this client's. A
+    /// liquidation is reported whatever the scope.
+    #[test]
+    fn recovered_fills_report_other_clients_by_scope_and_liquidations_always() {
+        let other = |exec_id: &str, perm_id: i64, liquidation: i32| {
+            let Executions::ExecutionData(mut data) = from_api_client(
+                905,
+                execution(exec_id, IB_ORDER_ID, "20260929 14:00:00 UTC"),
+            ) else {
+                unreachable!("an execution")
+            };
+            data.execution.perm_id = perm_id;
+            data.execution.liquidation = liquidation;
+            Executions::ExecutionData(data)
+        };
+        let read = |scope: ExecutionScope| {
+            let contracts = registered();
+            let pending = ExecutionBuffer::new();
+            let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), scope, &contracts);
+            for item in [
+                other("external", 4242, 0),
+                commission("external"),
+                other("outside-ib", 0, 0),
+                commission("outside-ib"),
+                other("liquidated", 4343, 1),
+                commission("liquidated"),
+            ] {
+                fills.push(item);
+            }
+            fills
+                .finish(&pending)
+                .into_iter()
+                .map(|trade| {
+                    (
+                        trade.id.0.to_string(),
+                        trade.order_id.0.to_string(),
+                        trade.origin,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            read(OWN),
+            [(
+                "liquidated".to_string(),
+                "perm:4343".to_string(),
+                TradeOrigin::Liquidation
+            )]
+        );
+        assert_eq!(
+            read(ExecutionScope {
+                other_clients: true,
+                ..OWN
+            }),
+            [
+                (
+                    "external".to_string(),
+                    "perm:4242".to_string(),
+                    TradeOrigin::External
+                ),
+                (
+                    "outside-ib".to_string(),
+                    format!("client:905:{IB_ORDER_ID}"),
+                    TradeOrigin::External
+                ),
+                (
+                    "liquidated".to_string(),
+                    "perm:4343".to_string(),
+                    TradeOrigin::Liquidation
+                ),
+            ]
+        );
     }
 
     /// A time that does not parse cannot be placed against the window, and dropping the execution
     /// could lose a fill from the gap, so it is kept.
     #[test]
     fn recovered_execution_with_unparseable_time_is_kept() {
-        let (contracts, order_ids) = tracked();
+        let contracts = registered();
         let pending = ExecutionBuffer::new();
-        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), 0, &contracts, &order_ids);
+        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts);
         fills.push(execution("garbled", IB_ORDER_ID, "not a time"));
         fills.push(commission("garbled"));
 
@@ -1332,9 +1392,9 @@ mod tests {
     /// correction of an execution the consumer never saw and then drop that execution as older.
     #[test]
     fn recovered_fills_put_an_execution_ahead_of_its_corrections() {
-        let (contracts, order_ids) = tracked();
+        let contracts = registered();
         let pending = ExecutionBuffer::new();
-        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), 0, &contracts, &order_ids);
+        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts);
         for item in [
             execution("x.01.02", IB_ORDER_ID, "20260929 14:00:00 UTC"),
             commission("x.01.02"),
@@ -1358,9 +1418,9 @@ mod tests {
 
     #[test]
     fn recovered_execution_without_commission_moves_to_the_stream_buffer() {
-        let (contracts, order_ids) = tracked();
+        let contracts = registered();
         let pending = ExecutionBuffer::new();
-        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), 0, &contracts, &order_ids);
+        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts);
         fills.push(execution("late", IB_ORDER_ID, "20260929 14:00:30 UTC"));
 
         assert!(fills.finish(&pending).is_empty());
