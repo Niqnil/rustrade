@@ -29,6 +29,9 @@ impl PositionSeed {
     ///   `entryPx` includes fees.
     /// - No entry fees: the venue does not report them separately. Add them with
     ///   [`Self::with_fees_enter`] only for a venue whose entry price excludes them.
+    /// - The venue's [`carry`](VenuePosition::carry) when it reports one (Hyperliquid's funding
+    ///   since open), and zero otherwise. It is taken to be in the instrument's quote asset, as a
+    ///   perpetual's margin asset usually is; override it with [`Self::with_carry`] where not.
     /// - The position's `time_exchange`, when it was read, as its `time_enter`. The venues do not
     ///   report an entry time (the Alpaca, IBKR and Hyperliquid clients stamp their own clock),
     ///   so this is later than the true entry.
@@ -46,13 +49,16 @@ impl PositionSeed {
         } else {
             Side::Sell
         };
-        Some(Self::new(
-            instrument,
-            side,
-            position.abs_quantity(),
-            position.entry_price?,
-            position.time_exchange,
-        ))
+        Some(
+            Self::new(
+                instrument,
+                side,
+                position.abs_quantity(),
+                position.entry_price?,
+                position.time_exchange,
+            )
+            .with_carry(position.carry.unwrap_or_default()),
+        )
     }
 }
 
@@ -192,7 +198,7 @@ mod tests {
     }
 
     fn venue_position(quantity: Decimal, entry_price: Option<Decimal>) -> VenuePosition {
-        VenuePosition::new(quantity, entry_price, None, None, None, None, time())
+        VenuePosition::new(quantity, entry_price, None, None, None, None, None, time())
     }
 
     fn instrument_snapshot(
@@ -221,6 +227,19 @@ mod tests {
         assert_eq!(
             seed,
             PositionSeed::new("x", Side::Sell, dec!(3), dec!(7), time())
+        );
+    }
+
+    #[test]
+    fn venue_carry_seeds_carry() {
+        let position = VenuePosition {
+            carry: Some(dec!(-1.25)),
+            ..venue_position(dec!(-3), Some(dec!(7)))
+        };
+        let seed = PositionSeed::from_venue_position("x", &position).unwrap();
+        assert_eq!(
+            seed,
+            PositionSeed::new("x", Side::Sell, dec!(3), dec!(7), time()).with_carry(dec!(-1.25))
         );
     }
 

@@ -235,6 +235,7 @@ fn convert_position(
         None,
         None,
         None,
+        None,
         now,
     )))
 }
@@ -355,7 +356,16 @@ mod tests {
                 .unwrap();
         assert_eq!(
             position,
-            Position::new(dec!(10), Some(dec!(150.25)), None, None, None, None, now())
+            Position::new(
+                dec!(10),
+                Some(dec!(150.25)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                now()
+            )
         );
     }
 

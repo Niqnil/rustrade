@@ -16,9 +16,10 @@ use std::fmt::{Display, Formatter};
 /// One movement of cash into or out of an account that is not a trade, as the venue posted it.
 ///
 /// Sent as [`AccountEventKind::CashFlow`](crate::AccountEventKind::CashFlow). A flow is a delta:
-/// apply each one once. The library does not act on it beyond reporting it, and the engine does
-/// not apply it to positions or balances. A venue's balances already include the flows it has
-/// posted, so adding a flow to a balance read after it counts the flow twice.
+/// apply each one once. The engine adds a flow attributed to an instrument to the `carry` of that
+/// instrument's open position (see `Position::carry` in `rustrade`), and applies none to
+/// balances. A venue's balances already include the flows it has posted, so adding a flow to a
+/// balance read after it counts the flow twice.
 ///
 /// # Delivery
 ///

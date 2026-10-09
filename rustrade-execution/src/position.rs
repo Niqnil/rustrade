@@ -34,6 +34,13 @@ pub struct Position {
 
     /// Leverage setting. `None` if not applicable (e.g., spot-margin).
     pub leverage: Option<Decimal>,
+    /// Carry the venue has charged or paid on this position since it opened, such as perpetual
+    /// funding, signed: positive = received, negative = paid. It is in the asset the venue settles
+    /// it in, which for a perpetual is its margin asset. `None` if the venue does not report it.
+    ///
+    /// Of the built-in clients only Hyperliquid reports it, from its `cumFunding.sinceOpen` with
+    /// the sign flipped (Hyperliquid counts funding paid as positive).
+    pub carry: Option<Decimal>,
 
     /// Exchange timestamp when this position state was reported.
     pub time_exchange: DateTime<Utc>,
@@ -136,7 +143,16 @@ mod tests {
         type Snapshot =
             InstrumentAccountSnapshot<ExchangeId, AssetNameExchange, InstrumentNameExchange>;
 
-        let open = Position::new(dec!(-2), Some(dec!(10)), None, None, None, None, Utc::now());
+        let open = Position::new(
+            dec!(-2),
+            Some(dec!(10)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Utc::now(),
+        );
         for (position, expected) in [
             (PositionReport::Unreported, None),
             (PositionReport::Flat, Some(serde_json::json!("Flat"))),
@@ -155,13 +171,13 @@ mod tests {
     #[test]
     fn position_report_from_position_reports_zero_as_flat() {
         let now = Utc::now();
-        let open = Position::new(dec!(-2), None, None, None, None, None, now);
+        let open = Position::new(dec!(-2), None, None, None, None, None, None, now);
         assert_eq!(
             PositionReport::from_position(open.clone()),
             PositionReport::Open(open.clone())
         );
         for zero in [dec!(0), -dec!(0)] {
-            let flat = Position::new(zero, None, None, None, None, None, now);
+            let flat = Position::new(zero, None, None, None, None, None, None, now);
             assert_eq!(PositionReport::from_position(flat), PositionReport::Flat);
         }
         assert_eq!(PositionReport::Open(open).quantity(), Some(dec!(-2)));
@@ -173,19 +189,19 @@ mod tests {
     fn test_position_side_detection() {
         let now = Utc::now();
 
-        let long = Position::new(dec!(1.5), None, None, None, None, None, now);
+        let long = Position::new(dec!(1.5), None, None, None, None, None, None, now);
         assert!(long.is_long());
         assert!(!long.is_short());
         assert!(!long.is_flat());
 
-        let short = Position::new(dec!(-1.5), None, None, None, None, None, now);
+        let short = Position::new(dec!(-1.5), None, None, None, None, None, None, now);
         assert!(!short.is_long());
         assert!(short.is_short());
         assert!(!short.is_flat());
 
         // Negative zero, as `Decimal` can produce from arithmetic or parsing "-0", is flat too.
         for zero in [dec!(0), -dec!(0)] {
-            let flat = Position::new(zero, None, None, None, None, None, now);
+            let flat = Position::new(zero, None, None, None, None, None, None, now);
             assert!(!flat.is_long(), "{zero:?}");
             assert!(!flat.is_short(), "{zero:?}");
             assert!(flat.is_flat(), "{zero:?}");
@@ -195,7 +211,7 @@ mod tests {
     #[test]
     fn test_abs_quantity() {
         let now = Utc::now();
-        let short = Position::new(dec!(-2.5), None, None, None, None, None, now);
+        let short = Position::new(dec!(-2.5), None, None, None, None, None, None, now);
         assert_eq!(short.abs_quantity(), dec!(2.5));
     }
 }

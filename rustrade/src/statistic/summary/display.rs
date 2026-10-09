@@ -179,6 +179,7 @@ where
             ts.orders_rejected.to_string()
         });
         self.add_instrument_metric_row(&mut table, "PnL", |ts| format!("{:.2}", ts.pnl));
+        self.add_instrument_metric_row(&mut table, "Carry", |ts| format!("{:.2}", ts.carry));
         self.add_instrument_metric_row(&mut table, &format!("Return {interval}"), |ts| {
             format_percentage(ts.pnl_return.value, 2)
         });

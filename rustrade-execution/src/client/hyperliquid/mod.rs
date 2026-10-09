@@ -163,10 +163,12 @@
 //! [`account_snapshot`](HyperliquidClient#method.account_snapshot) and
 //! [`fetch_balances`](ExecutionClient::fetch_balances).
 //!
-//! Positions exclude funding:
+//! Positions report funding apart from their PnL:
 //! - A position's [`unrealized_pnl`](crate::position::Position::unrealized_pnl) is Hyperliquid's
-//!   `unrealizedPnl`, which comes from price alone. The `cumFunding` Hyperliquid lists beside it
-//!   is not read.
+//!   `unrealizedPnl`, which comes from price alone.
+//! - Its [`carry`](crate::position::Position::carry) is the funding since the position opened,
+//!   from Hyperliquid's `cumFunding.sinceOpen` with the sign flipped: Hyperliquid counts funding
+//!   paid as positive, and `carry` counts it as negative, as a payment's `amount` does.
 //! - Fills carry no funding, so PnL computed from them excludes it too.
 //!
 //! # Limitations
@@ -1457,6 +1459,8 @@ fn perp_position_report(
             .as_ref()
             .and_then(|p| parse_decimal(p, "liquidation_px")),
         Some(Decimal::from(position.leverage.value)),
+        // Hyperliquid counts funding paid as positive; carry counts it as negative.
+        parse_decimal(&position.cum_funding.since_open, "cum_funding.since_open").map(|paid| -paid),
         now,
     ))
 }
@@ -2158,7 +2162,7 @@ mod tests {
             "szi": szi,
             "unrealizedPnl": "1.5",
             "maxLeverage": 50,
-            "cumFunding": {"allTime": "0", "sinceOpen": "0", "sinceChange": "0"}
+            "cumFunding": {"allTime": "3.5", "sinceOpen": "1.25", "sinceChange": "0"}
         }))
         .unwrap()
     }
@@ -2168,9 +2172,20 @@ mod tests {
         let now = Utc::now();
         let open = perp_position_report(&perp_position("-0.01"), now);
         let position = open.open().unwrap();
+        // Funding paid since open is positive on Hyperliquid and negative as carry.
         assert_eq!(
-            (position.quantity, position.entry_price, position.leverage),
-            (dec!(-0.01), Some(dec!(50000.0)), Some(dec!(5)))
+            (
+                position.quantity,
+                position.entry_price,
+                position.leverage,
+                position.carry
+            ),
+            (
+                dec!(-0.01),
+                Some(dec!(50000.0)),
+                Some(dec!(5)),
+                Some(dec!(-1.25))
+            )
         );
         assert_eq!(
             perp_position_report(&perp_position("0.0"), now),
