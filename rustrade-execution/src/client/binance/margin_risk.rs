@@ -27,7 +27,7 @@ use binance_sdk::margin_trading::{
     websocket_streams::{MarginLevelStatusChange, UserLiabilityChange},
 };
 use chrono::{TimeZone, Utc};
-use futures::{SinkExt as _, StreamExt as _};
+use futures::{FutureExt as _, SinkExt as _, StreamExt as _};
 use rust_decimal::Decimal;
 use rustrade_instrument::{exchange::ExchangeId, instrument::name::InstrumentNameExchange};
 use rustrade_integration::protocol::websocket::{WebSocket, WsMessage, connect};
@@ -35,6 +35,7 @@ use serde::Deserialize as _;
 use smol_str::SmolStr;
 use std::{
     future::Future,
+    panic::AssertUnwindSafe,
     str::FromStr,
     sync::{Arc, atomic::AtomicU64},
     time::Duration,
@@ -43,7 +44,7 @@ use tokio::{
     sync::mpsc,
     time::{Instant, MissedTickBehavior},
 };
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 /// Base URL of Binance's margin Risk Data Stream, as binance-sdk names it
 /// (`MARGIN_TRADING_RISK_WS_STREAMS_PROD_URL`).
@@ -64,7 +65,7 @@ const RETRY_MAX: Duration = Duration::from_secs(5 * 60);
 const HEALTHY_SESSION: Duration = RETRY_MAX;
 /// The longest a listen-key request may take, rate-limit waits included.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-/// The longest a session waits to close its socket.
+/// The longest a session waits to send a ping or close its socket.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The listen-key requests the Risk Data Stream needs, so a test can stand in for the venue.
@@ -120,7 +121,8 @@ impl RiskListenKeys for SapiRiskListenKeys {
 ///
 /// It runs in a task of its own, apart from the user-data manager, so that nothing in it, a panic
 /// included, can end the account stream: the account stream's task holds this and drops it when
-/// it ends, or when it is aborted because the consumer dropped the stream.
+/// it ends, or when it is aborted because the consumer dropped the stream. A panic stops the Risk
+/// Data Stream for the rest of the account stream's life, logged at `error`; it is not restarted.
 pub(super) struct RiskStreamTask(tokio::task::JoinHandle<()>);
 
 impl RiskStreamTask {
@@ -131,7 +133,15 @@ impl RiskStreamTask {
         tx: mpsc::UnboundedSender<UnindexedAccountEvent>,
         dedup: SharedDedupCache,
     ) -> Self {
-        Self(tokio::spawn(run_risk_stream(keys, base_url, tx, dedup)))
+        Self(tokio::spawn(async move {
+            let run = AssertUnwindSafe(run_risk_stream(keys, base_url, tx, dedup));
+            if run.catch_unwind().await.is_err() {
+                error!(
+                    "BinanceMargin risk data stream panicked and has stopped: margin notices now \
+                     arrive only if the user-data stream carries them"
+                );
+            }
+        }))
     }
 }
 
@@ -329,8 +339,17 @@ async fn forward_session(
                         IDLE_TIMEOUT.as_secs()
                     ));
                 }
-                if let Err(e) = ws.send(WsMessage::Ping(Default::default())).await {
-                    return Stop::Retry(format!("ping failed: {e}"));
+                // Bounded: a half-open socket with a full send buffer would otherwise hold the
+                // session here, past the idle check above.
+                match tokio::time::timeout(
+                    CLOSE_TIMEOUT,
+                    ws.send(WsMessage::Ping(Default::default())),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Stop::Retry(format!("ping failed: {e}")),
+                    Err(_) => return Stop::Retry("ping could not be sent".to_owned()),
                 }
             }
         }
@@ -834,5 +853,81 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    /// A listen-key request that never answers.
+    struct HangingKeys;
+
+    impl RiskListenKeys for HangingKeys {
+        async fn start(&self) -> Result<String, String> {
+            std::future::pending().await
+        }
+
+        async fn keepalive(&self, _listen_key: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// A listen-key request that hangs times out and is retried with backoff, and the stream still
+    /// stops as soon as the consumer goes, mid-request.
+    #[tokio::test(start_paused = true)]
+    async fn a_hanging_listen_key_request_times_out_and_does_not_outlive_the_consumer() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let keys = HangingKeys;
+        let dedup = new_dedup_cache();
+
+        // One session alone ends at the request timeout, as a failure to retry.
+        let session = risk_session(&keys, "ws://unused", &tx, &dedup);
+        let started = Instant::now();
+        match session.await {
+            SessionEnd::Retry { healthy, .. } => assert!(!healthy),
+            SessionEnd::ConsumerDropped => panic!("the consumer is still there"),
+        }
+        assert_eq!(started.elapsed(), REQUEST_TIMEOUT);
+
+        // The stream, mid-request, stops once the consumer drops.
+        let task = tokio::spawn(run_risk_stream(keys, "ws://unused".to_owned(), tx, dedup));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(rx);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("the stream stops once the consumer is gone")
+            .unwrap();
+    }
+
+    /// Dropping the task handle stops the stream, which drops its sender.
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_task_handle_stops_the_stream() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let task =
+            RiskStreamTask::spawn(HangingKeys, "ws://unused".to_owned(), tx, new_dedup_cache());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        drop(task);
+        let ended = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("the aborted task drops its sender");
+        assert!(ended.is_none());
+    }
+
+    /// A session the venue ends straight after the subscribe is not healthy, so the backoff keeps
+    /// growing rather than reconnecting every second.
+    #[tokio::test]
+    async fn a_session_ended_at_once_is_not_healthy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("ws://{}", listener.local_addr().unwrap());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let expired = wrapped(serde_json::json!({ "e": "listenKeyExpired", "E": 1 }));
+        let keys = Arc::new(FakeKeys::default());
+        let dedup = new_dedup_cache();
+        let session = risk_session(&keys, &base_url, &tx, &dedup);
+        let server = serve(&listener, "key-1", vec![], vec![expired]);
+        let (end, ()) = tokio::join!(session, server);
+        match end {
+            SessionEnd::Retry { healthy, error } => {
+                assert!(!healthy);
+                assert_eq!(error, "listen key expired");
+            }
+            SessionEnd::ConsumerDropped => panic!("the consumer is still there"),
+        }
     }
 }
