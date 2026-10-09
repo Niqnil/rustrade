@@ -2287,6 +2287,8 @@ pub(crate) fn convert_execution_report(
             // discovered post-validation). Mapped to OrderCancelled with an error state so the
             // engine removes this order. The reason (`r`) goes through the same classifier as a
             // synchronous rejection, so one refusal is reported alike whichever path brings it.
+            // `r` is a name such as `INSUFFICIENT_FUNDS`, never a numeric code, so only the
+            // classifier's text heuristics can match it: a refused borrow never arrives this way.
             let reject_reason = report.reject_reason.as_deref().unwrap_or("unknown");
             warn!(
                 %exchange, %symbol, %order_id, reason = reject_reason,
@@ -2555,12 +2557,13 @@ const BORROW_REJECT_CODES: [(&str, BorrowRejectReason); 5] = [
     ("-3045", BorrowRejectReason::InventoryUnavailable),
 ];
 
-/// The borrow refusal a Binance error message carries, by its code ([`BORROW_REJECT_CODES`]).
-fn borrow_reject(msg: &str) -> Option<BorrowReject> {
+/// The code and [`BorrowRejectReason`] of the borrow refusal a Binance error message carries,
+/// by its code ([`BORROW_REJECT_CODES`]).
+fn borrow_reject_code(msg: &str) -> Option<(&'static str, BorrowRejectReason)> {
     BORROW_REJECT_CODES
         .iter()
+        .copied()
         .find(|(code, _)| contains_error_code(msg, code))
-        .map(|&(code, reason)| BorrowReject::new(reason, Some(code.to_owned()), msg.to_owned()))
 }
 
 /// Parse Binance error strings to rustrade ApiError, in an order's context.
@@ -2595,8 +2598,12 @@ pub(crate) fn parse_binance_api_error(
     if contains_error_code(&error_msg, "-1121") {
         return ApiError::InstrumentInvalid(instrument.clone(), error_msg);
     }
-    if let Some(reject) = borrow_reject(&error_msg) {
-        return ApiError::BorrowRejected(reject);
+    if let Some((code, reason)) = borrow_reject_code(&error_msg) {
+        return ApiError::BorrowRejected(BorrowReject::new(
+            reason,
+            Some(code.to_owned()),
+            error_msg,
+        ));
     }
     // -3041 ("Balance is not enough") and -3023 ("You can't transfer out/place order under
     // current margin level.") are the margin account's own collateral running short, not a

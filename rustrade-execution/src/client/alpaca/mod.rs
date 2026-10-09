@@ -4736,7 +4736,8 @@ fn parse_api_error(
 }
 
 /// Classifies a refusal on a business rule (a 422, or a 403 with a code) by its text, since
-/// Alpaca's codes are generic. `lower` is `message` in lowercase.
+/// Alpaca's codes are generic. `lower` is `message` in lowercase. The first match below wins, so
+/// a refused short is reported as such even if its text also says "insufficient".
 ///
 /// - "account is not allowed to short" → [`ApiError::BorrowRejected`] with
 ///   [`BorrowRejectReason::BorrowDisabled`].
@@ -7078,16 +7079,28 @@ mod tests {
 
         // The asset may be shortable in whole shares: the order's shape was refused, not a
         // borrow.
-        assert_eq!(
+        for (status, code) in [
+            (reqwest::StatusCode::UNPROCESSABLE_ENTITY, 42210000),
+            (reqwest::StatusCode::FORBIDDEN, 40310000),
+        ] {
+            assert_eq!(
+                parse_order_error(status, Some(code), "fractional orders cannot be sold short"),
+                UnindexedOrderError::Rejected(ApiError::OrderRejected(format!(
+                    "{code} fractional orders cannot be sold short"
+                ))),
+                "{status}"
+            );
+        }
+
+        // A refused short wins over "insufficient" in the same text.
+        assert!(matches!(
             parse_order_error(
-                reqwest::StatusCode::UNPROCESSABLE_ENTITY,
-                Some(42210000),
-                "fractional orders cannot be sold short",
+                reqwest::StatusCode::FORBIDDEN,
+                Some(40310000),
+                "insufficient qty: account is not allowed to short",
             ),
-            UnindexedOrderError::Rejected(ApiError::OrderRejected(
-                "42210000 fractional orders cannot be sold short".into()
-            ))
-        );
+            UnindexedOrderError::Rejected(ApiError::BorrowRejected(_))
+        ));
 
         // Without a code a 403 is a wrong key, whatever its text.
         assert!(matches!(
@@ -8015,8 +8028,8 @@ mod tests {
             );
         }
 
-        /// A 403 refusal reaches the order's state as the refusal it is, with Alpaca's code, and a
-        /// 403 without a code (a wrong key) as an authentication failure.
+        /// A 403 refusal, or a 422 refused short, reaches the order's state as the refusal it is,
+        /// with Alpaca's code, and a 403 without a code (a wrong key) as an authentication failure.
         #[tokio::test]
         async fn open_order_reports_a_403_by_its_code() {
             use crate::client::ExecutionClient;
@@ -8032,12 +8045,13 @@ mod tests {
             use rustrade_instrument::instrument::name::InstrumentNameExchange;
 
             async fn open_against(
+                status: u16,
                 body: serde_json::Value,
             ) -> OrderState<AssetNameExchange, InstrumentNameExchange> {
                 let server = MockServer::start().await;
                 Mock::given(method("POST"))
                     .and(path("/v2/orders"))
-                    .respond_with(ResponseTemplate::new(403).set_body_json(body))
+                    .respond_with(ResponseTemplate::new(status).set_body_json(body))
                     .mount(&server)
                     .await;
                 let instrument = InstrumentNameExchange::new("AAPL");
@@ -8072,20 +8086,26 @@ mod tests {
                     other => panic!("expected a rejection, got {other:?}"),
                 };
 
-            let state = open_against(serde_json::json!({
-                "code": 40310000,
-                "message": "insufficient buying power"
-            }))
+            let state = open_against(
+                403,
+                serde_json::json!({
+                    "code": 40310000,
+                    "message": "insufficient buying power"
+                }),
+            )
             .await;
             assert_eq!(
                 rejected(&state),
                 ApiError::BalanceInsufficient(None, "40310000 insufficient buying power".into())
             );
 
-            let state = open_against(serde_json::json!({
-                "code": 40310000,
-                "message": "account is not allowed to short"
-            }))
+            let state = open_against(
+                403,
+                serde_json::json!({
+                    "code": 40310000,
+                    "message": "account is not allowed to short"
+                }),
+            )
             .await;
             assert_eq!(
                 rejected(&state),
@@ -8096,7 +8116,25 @@ mod tests {
                 ))
             );
 
-            let state = open_against(serde_json::json!({ "message": "forbidden." })).await;
+            // Which status Alpaca gives a non-shortable asset is unconfirmed; a 422 is read too.
+            let state = open_against(
+                422,
+                serde_json::json!({
+                    "code": 42210000,
+                    "message": "asset XYZ cannot be sold short"
+                }),
+            )
+            .await;
+            assert_eq!(
+                rejected(&state),
+                ApiError::BorrowRejected(BorrowReject::new(
+                    BorrowRejectReason::NotShortable,
+                    Some("42210000".into()),
+                    "asset XYZ cannot be sold short".into(),
+                ))
+            );
+
+            let state = open_against(403, serde_json::json!({ "message": "forbidden." })).await;
             assert!(
                 matches!(rejected(&state), ApiError::Unauthenticated(_)),
                 "{state:?}"
