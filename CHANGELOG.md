@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-09
+
 ### Changed
 
 - **Position PnL and the execution clients' balances now document what carrying costs they leave
