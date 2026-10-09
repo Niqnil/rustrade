@@ -336,6 +336,97 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// Not transient — the same request fails identically on retry. Change the request.
     #[error("request rejected: {0}")]
     RequestRejected(String),
+
+    /// Order refused because the venue would not lend what it needed: a short sale, or a margin
+    /// order that borrows to cover itself.
+    ///
+    /// Distinct from [`OrderRejected`](Self::OrderRejected) so a caller can tell a refused borrow
+    /// apart from a malformed order, and from [`BalanceInsufficient`](Self::BalanceInsufficient),
+    /// which is the account's own funds running short. A borrow can be refused for a long too: on
+    /// Binance margin, an order that borrows to buy is refused when the venue has too little of
+    /// the asset to lend or the borrow would exceed the account's limit. [`BorrowReject`] says
+    /// why.
+    ///
+    /// Reported by the Binance margin client, by Binance's code, and by the Alpaca client, by the
+    /// text of a 403 or 422. Other clients report such refusals as
+    /// [`OrderRejected`](Self::OrderRejected) until their venue's wording is confirmed.
+    ///
+    /// Not transient — the same request fails identically until the venue's lending changes.
+    #[error("borrow rejected: {0}")]
+    BorrowRejected(BorrowReject),
+}
+
+/// Why a venue refused to lend for an order, as carried by [`ApiError::BorrowRejected`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub struct BorrowReject {
+    /// The kind of refusal.
+    pub reason: BorrowRejectReason,
+    /// The venue's own code for the refusal, where it gave one (e.g. `-3045` on Binance,
+    /// `40310000` on Alpaca).
+    ///
+    /// For diagnostics only, not a stable contract: match on [`reason`](Self::reason) instead. A
+    /// venue may reuse a code for several refusals, as Alpaca's generic `40310000` is.
+    pub venue_code: Option<String>,
+    /// The venue's message. It may itself carry the code, as Binance's does.
+    pub message: String,
+}
+
+impl BorrowReject {
+    /// A refusal for `reason`, with the venue's code where it gave one, and its message.
+    pub fn new(reason: BorrowRejectReason, venue_code: Option<String>, message: String) -> Self {
+        Self {
+            reason,
+            venue_code,
+            message,
+        }
+    }
+}
+
+impl fmt::Display for BorrowReject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            reason,
+            venue_code,
+            message,
+        } = self;
+        write!(f, "{reason}")?;
+        if let Some(code) = venue_code {
+            write!(f, " (code {code})")?;
+        }
+        write!(f, ": {message}")
+    }
+}
+
+/// The kind of borrow refusal carried by a [`BorrowReject`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub enum BorrowRejectReason {
+    /// The instrument cannot be sold short at all, whoever asks (e.g. Alpaca's "asset X cannot be
+    /// sold short").
+    NotShortable,
+    /// Borrowing is barred for this account, or for this asset on this account (e.g. Binance
+    /// `-3008`, `-3012` and `-3014`, Alpaca's "account is not allowed to short").
+    BorrowDisabled,
+    /// The venue has too little of the asset to lend right now (e.g. Binance `-3045`). It may
+    /// lend again later.
+    InventoryUnavailable,
+    /// The borrow would exceed what the account may borrow (e.g. Binance `-3006`).
+    BorrowLimitExceeded,
+    /// A borrow refusal of a kind not listed here. The [`BorrowReject`] message says which.
+    Other,
+}
+
+impl fmt::Display for BorrowRejectReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotShortable => "not shortable",
+            Self::BorrowDisabled => "borrow disabled",
+            Self::InventoryUnavailable => "inventory unavailable",
+            Self::BorrowLimitExceeded => "borrow limit exceeded",
+            Self::Other => "other",
+        })
+    }
 }
 
 /// Represents all errors that can be generated when cancelling or opening orders.
@@ -485,7 +576,8 @@ impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
     /// - [`Rejected(ApiError::RateLimit)`](ApiError::RateLimit)
     ///
     /// # Non-transient errors
-    /// - Other [`Rejected`](Self::Rejected) errors (invalid instrument, insufficient balance, etc.)
+    /// - Other [`Rejected`](Self::Rejected) errors (invalid instrument, insufficient balance,
+    ///   refused borrow, etc.)
     /// - [`UnsupportedOrderType`](Self::UnsupportedOrderType) and
     ///   [`InvalidPrecision`](Self::InvalidPrecision)
     pub fn is_transient(&self) -> bool {
@@ -656,6 +748,33 @@ mod tests {
         let err: ClientError =
             ClientError::Api(ApiError::RequestRejected("-1127 More than 24 hours".into()));
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
+
+        let err: ClientError = ClientError::Api(ApiError::BorrowRejected(BorrowReject::new(
+            BorrowRejectReason::InventoryUnavailable,
+            Some("-3045".into()),
+            "-3045 The system doesn't have enough asset now.".into(),
+        )));
+        assert!(!err.is_transient(), "expected non-transient for {:?}", err);
+    }
+
+    #[test]
+    fn borrow_rejected_shows_its_reason_and_code() {
+        let coded: UnindexedApiError = ApiError::BorrowRejected(BorrowReject::new(
+            BorrowRejectReason::BorrowDisabled,
+            Some("40310000".into()),
+            "account is not allowed to short".into(),
+        ));
+        assert_eq!(
+            coded.to_string(),
+            "borrow rejected: borrow disabled (code 40310000): account is not allowed to short"
+        );
+
+        let uncoded: UnindexedApiError = ApiError::BorrowRejected(BorrowReject::new(
+            BorrowRejectReason::Other,
+            None,
+            "no borrow".into(),
+        ));
+        assert_eq!(uncoded.to_string(), "borrow rejected: other: no borrow");
     }
 
     #[test]
@@ -723,6 +842,14 @@ mod tests {
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
 
         let err: UnindexedOrderError = OrderError::Rejected(ApiError::OrderAlreadyCancelled);
+        assert!(!err.is_transient(), "expected non-transient for {:?}", err);
+
+        let err: UnindexedOrderError =
+            OrderError::Rejected(ApiError::BorrowRejected(BorrowReject::new(
+                BorrowRejectReason::NotShortable,
+                None,
+                "asset XYZ cannot be sold short".into(),
+            )));
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
 
         let err: UnindexedOrderError = OrderError::Rejected(ApiError::BalanceInsufficient(

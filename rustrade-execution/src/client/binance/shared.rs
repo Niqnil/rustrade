@@ -20,8 +20,8 @@
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
     error::{
-        ApiError, ConnectivityError, OrderError, OrderField, PrecisionLimit, PrecisionViolation,
-        UnindexedClientError, UnindexedOrderError,
+        ApiError, BorrowReject, BorrowRejectReason, ConnectivityError, OrderError, OrderField,
+        PrecisionLimit, PrecisionViolation, UnindexedClientError, UnindexedOrderError,
     },
     fill_recovery::{FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope},
     order::{
@@ -523,7 +523,7 @@ impl UnhandledEvents {
     pub(crate) const fn new() -> Self {
         Self {
             count: AtomicU64::new(0),
-            types: parking_lot::const_mutex(Vec::new()),
+            types: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -2285,17 +2285,19 @@ pub(crate) fn convert_execution_report(
         "REJECTED" => {
             // Rejected by the matching engine after initial acceptance (e.g. insufficient funds
             // discovered post-validation). Mapped to OrderCancelled with an error state so the
-            // engine removes this order.
+            // engine removes this order. The reason (`r`) goes through the same classifier as a
+            // synchronous rejection, so one refusal is reported alike whichever path brings it.
+            // `r` is a name such as `INSUFFICIENT_FUNDS`, never a numeric code, so only the
+            // classifier's text heuristics can match it: a refused borrow never arrives this way.
             let reject_reason = report.reject_reason.as_deref().unwrap_or("unknown");
             warn!(
                 %exchange, %symbol, %order_id, reason = reject_reason,
                 "Binance order REJECTED by matching engine"
             );
+            let error = parse_binance_api_error(reject_reason.to_string(), &symbol);
             let response = UnindexedOrderResponseCancel {
                 key: OrderKey::new(exchange, symbol, StrategyId::unknown(), cid),
-                state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
-                    reject_reason.to_string(),
-                ))),
+                state: Err(UnindexedOrderError::Rejected(error)),
             };
             buf.push(UnindexedAccountEvent::new(
                 exchange,
@@ -2537,6 +2539,33 @@ fn has_rate_limit_error_code(msg: &str) -> bool {
     contains_error_code(msg, "-1003") || contains_error_code(msg, "-1015")
 }
 
+/// Binance margin codes for a refused borrow, and the [`BorrowRejectReason`] each means.
+///
+/// The margin client always sends `sideEffectType`, so an order that needs a borrow is refused
+/// with one of these. `-3013` (below the minimum borrow) is a malformed order, not a refusal to
+/// lend, so it stays [`ApiError::OrderRejected`].
+const BORROW_REJECT_CODES: [(&str, BorrowRejectReason); 5] = [
+    // EXCEED_MAX_BORROWABLE: "Your borrow amount has exceed maximum borrow amount."
+    ("-3006", BorrowRejectReason::BorrowLimitExceeded),
+    // "Borrow not allowed."
+    ("-3008", BorrowRejectReason::BorrowDisabled),
+    // "Borrow is banned for this asset."
+    ("-3012", BorrowRejectReason::BorrowDisabled),
+    // "Borrow is banned for this account."
+    ("-3014", BorrowRejectReason::BorrowDisabled),
+    // INSUFFICIENT_INVENTORY: "The system doesn't have enough asset now."
+    ("-3045", BorrowRejectReason::InventoryUnavailable),
+];
+
+/// The code and [`BorrowRejectReason`] of the borrow refusal a Binance error message carries,
+/// by its code ([`BORROW_REJECT_CODES`]).
+fn borrow_reject_code(msg: &str) -> Option<(&'static str, BorrowRejectReason)> {
+    BORROW_REJECT_CODES
+        .iter()
+        .copied()
+        .find(|(code, _)| contains_error_code(msg, code))
+}
+
 /// Parse Binance error strings to rustrade ApiError, in an order's context.
 ///
 /// Order and cancel paths call it through [`parse_binance_order_rejection`], which first catches
@@ -2568,6 +2597,19 @@ pub(crate) fn parse_binance_api_error(
     }
     if contains_error_code(&error_msg, "-1121") {
         return ApiError::InstrumentInvalid(instrument.clone(), error_msg);
+    }
+    if let Some((code, reason)) = borrow_reject_code(&error_msg) {
+        return ApiError::BorrowRejected(BorrowReject::new(
+            reason,
+            Some(code.to_owned()),
+            error_msg,
+        ));
+    }
+    // -3041 ("Balance is not enough") and -3023 ("You can't transfer out/place order under
+    // current margin level.") are the margin account's own collateral running short, not a
+    // refused borrow. The wording of -3023 escapes the text heuristic below, so both go by code.
+    if contains_error_code(&error_msg, "-3041") || contains_error_code(&error_msg, "-3023") {
+        return ApiError::BalanceInsufficient(None, error_msg);
     }
     // -2010 (NEW_ORDER_REJECTED) is deliberately not matched by code: Binance gives it for dozens
     // of reasons ("Account has insufficient balance for requested action.", "Order would trigger
@@ -4528,6 +4570,92 @@ mod tests {
             assert!(
                 ws.as_ref().is_some_and(expected),
                 "WS API {msg:?}: got {ws:?}"
+            );
+        }
+    }
+
+    /// A margin order that needs a borrow is refused by a `-3xxx` code. A refused borrow is
+    /// [`ApiError::BorrowRejected`] by its code, over REST (the code spliced into the message) and
+    /// over the WS API (the code in the error's text) alike, whatever the wording says.
+    #[test]
+    fn a_borrow_refusal_is_read_by_its_code() {
+        for (code, msg, reason) in [
+            (
+                -3006,
+                "Your borrow amount has exceed maximum borrow amount.",
+                BorrowRejectReason::BorrowLimitExceeded,
+            ),
+            (
+                -3008,
+                "Borrow not allowed.",
+                BorrowRejectReason::BorrowDisabled,
+            ),
+            (
+                -3012,
+                "Borrow is banned for this asset.",
+                BorrowRejectReason::BorrowDisabled,
+            ),
+            (
+                -3014,
+                "Borrow is banned for this account.",
+                BorrowRejectReason::BorrowDisabled,
+            ),
+            (
+                -3045,
+                "The system doesn't have enough asset now.",
+                BorrowRejectReason::InventoryUnavailable,
+            ),
+        ] {
+            let rest = classify_err(ConnectorError::BadRequestError {
+                msg: msg.to_string(),
+                code: Some(code),
+            });
+            let expected =
+                BorrowReject::new(reason, Some(code.to_string()), format!("{code} {msg}"));
+            assert_eq!(
+                rest,
+                OrderError::Rejected(ApiError::BorrowRejected(expected)),
+                "REST {code}"
+            );
+
+            let ws = classify_ws(code, msg);
+            assert!(
+                matches!(
+                    &ws,
+                    Some(OrderError::Rejected(ApiError::BorrowRejected(reject)))
+                        if reject.reason == reason
+                            && reject.venue_code.as_deref() == Some(code.to_string().as_str())
+                ),
+                "WS API {code}: got {ws:?}"
+            );
+        }
+    }
+
+    /// The margin account's own collateral running short is a shortfall, not a refused borrow,
+    /// and goes by code. A borrow below the minimum, or a pair or account barred from trading, is
+    /// a plain rejection.
+    #[test]
+    fn other_margin_codes_are_not_borrow_refusals() {
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        for msg in [
+            "-3041 Balance is not enough",
+            "-3023 You can't transfer out/place order under current margin level.",
+        ] {
+            assert_eq!(
+                parse_binance_api_error(msg.to_string(), &instrument),
+                ApiError::BalanceInsufficient(None, msg.to_string()),
+                "{msg:?}"
+            );
+        }
+        for msg in [
+            "-3013 Borrow amount less than minimum borrow amount.",
+            "-3021 Margin account are not allowed to trade this trading pair.",
+            "-3022 You account's trading is banned.",
+        ] {
+            assert_eq!(
+                parse_binance_api_error(msg.to_string(), &instrument),
+                ApiError::OrderRejected(msg.to_string()),
+                "{msg:?}"
             );
         }
     }

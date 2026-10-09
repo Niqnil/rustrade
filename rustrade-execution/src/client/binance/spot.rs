@@ -3673,8 +3673,39 @@ mod tests {
 
         let event = sole_event(convert(report)).expect("REJECTED should produce Some");
         assert!(
-            matches!(event.kind, AccountEventKind::OrderCancelled(ref r) if r.state.is_err()),
-            "REJECTED should yield OrderCancelled with Err state"
+            matches!(
+                event.kind,
+                AccountEventKind::OrderCancelled(ref r) if matches!(
+                    &r.state,
+                    Err(OrderError::Rejected(ApiError::BalanceInsufficient(None, reason)))
+                        if reason == "INSUFFICIENT_FUNDS"
+                )
+            ),
+            "a REJECTED shortfall should go through the classifier, got {:?}",
+            event.kind
+        );
+    }
+
+    #[test]
+    fn test_convert_execution_report_rejected_for_another_reason() {
+        let report = ExecutionReport {
+            execution_type: Some("REJECTED".to_string()),
+            reject_reason: Some("WOULD_MATCH_IMMEDIATELY".to_string()),
+            ..make_base_report()
+        };
+
+        let event = sole_event(convert(report)).expect("REJECTED should produce Some");
+        assert!(
+            matches!(
+                event.kind,
+                AccountEventKind::OrderCancelled(ref r) if matches!(
+                    &r.state,
+                    Err(OrderError::Rejected(ApiError::OrderRejected(reason)))
+                        if reason == "WOULD_MATCH_IMMEDIATELY"
+                )
+            ),
+            "an unrecognised REJECTED reason should stay OrderRejected, got {:?}",
+            event.kind
         );
     }
 
