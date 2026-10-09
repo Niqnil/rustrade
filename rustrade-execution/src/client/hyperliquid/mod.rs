@@ -212,7 +212,7 @@ use crate::{
         state::{Filled, Open, OrderState, UnindexedOrderState},
     },
     position::{Position, PositionReport},
-    trade::{AssetFees, Trade, TradeId, TradesRead},
+    trade::{AssetFees, Trade, TradeId, TradeOrigin, TradesRead},
 };
 use chrono::{DateTime, Utc};
 use common::{
@@ -1372,6 +1372,8 @@ impl ExecutionClient for HyperliquidClient {
                 // state as its own `OrderUpdate` message.
                 order_filled_quantity: None,
                 fees: perp_fill_fees(fill.fee_token.as_deref(), fee, collateral),
+                // As on the stream, whose copy of a fill usually arrives first; see `TradeOrigin`.
+                origin: TradeOrigin::Order,
             });
         }
 
@@ -1511,6 +1513,9 @@ fn fill_to_account_event(
         // from an `OrderUpdate` -- which Hyperliquid sends as its own message.
         order_filled_quantity: None,
         fees: perp_fill_fees(Some(&fill.fee_token), fee, collateral),
+        // The SDK's `TradeInfo` drops the fill's liquidation marker, so every fill is reported
+        // as `Order`; see `TradeOrigin`.
+        origin: TradeOrigin::Order,
     };
 
     Some(AccountEvent::new(

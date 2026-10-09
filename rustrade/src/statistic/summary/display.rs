@@ -371,6 +371,7 @@ mod tests {
             orders_rejected: 0,
             fills_routed_by_fallback: 0,
             fills_unmatched: 0,
+            fills_forced: 0,
         }
     }
 
@@ -429,6 +430,7 @@ mod tests {
             orders_rejected: 0,
             fills_routed_by_fallback,
             fills_unmatched,
+            fills_forced: 0,
         }
     }
 

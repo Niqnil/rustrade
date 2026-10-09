@@ -70,6 +70,13 @@
 //! [`ExecutionClient::fetch_open_orders`] list them under it and track them again, and
 //! [`OrderStatusClient`] finds how they ended.
 //!
+//! Fills of orders that other API clients or TWS placed on the account are reported only when
+//! [`IbkrConfig::other_clients_fills`] is set, as trades of origin
+//! [`External`](crate::trade::TradeOrigin::External). A fill IB flags as an IB-initiated
+//! liquidation is reported either way, as a
+//! [`Liquidation`](crate::trade::TradeOrigin::Liquidation), on the stream, by fill recovery and by
+//! `fetch_trades`, whenever IB sends it to this connection.
+//!
 //! # Caller Responsibilities
 //!
 //! 1. **Fill reconciliation**: when fill recovery fails repeatedly, the stream reports the
@@ -130,13 +137,16 @@ use crate::{
         state::{Cancelled, Expired, Filled, Open, OrderState, UnindexedOrderState},
     },
     position::PositionReport,
-    trade::{Trade, TradesRead},
+    trade::{Trade, TradeOrigin, TradesRead},
 };
 use account::{BalanceAggregator, PositionAggregator};
 use chrono::{DateTime, Utc};
 pub use connect::{ConnectOutcome, ContractSkipReason, IbkrConnectError, SkippedContract};
 use contract::ResolveContractError;
-use execution::{ExecutionBuffer, ExecutionRevision, parse_decimal_or_warn, try_decimal_or_warn};
+use execution::{
+    ExecutionBuffer, ExecutionRevision, ExecutionScope, ResolvedExecution, parse_decimal_or_warn,
+    try_decimal_or_warn,
+};
 use futures::stream::BoxStream;
 use ibapi::{
     accounts::{
@@ -172,6 +182,11 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
 /// Configuration for the IBKR execution client.
+///
+/// `#[non_exhaustive]`, so a setting can be added without breaking a caller. Build one with
+/// [`IbkrConfig::new`] and the `with_*` methods, or deserialise one: every setting `new` does not
+/// take has a serde default.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IbkrConfig {
     /// TWS/Gateway host (e.g., "127.0.0.1")
@@ -190,6 +205,68 @@ pub struct IbkrConfig {
     /// and reports it.
     #[serde(default)]
     pub contracts: Vec<ContractConfig>,
+    /// Also report fills of orders that other API clients, or TWS itself, placed on the account,
+    /// as trades of origin [`External`](crate::trade::TradeOrigin::External). Off by default.
+    ///
+    /// Off, this client reports its own orders' fills only. Leave it off when several API clients
+    /// each feed an engine from one account: each would otherwise apply the others' fills too.
+    ///
+    /// On, another client's execution is reported wherever this client reads it. Fill recovery
+    /// and [`fetch_trades`](ExecutionClient::fetch_trades) ask IB for every client's executions,
+    /// and IB answers with them. IB does not send another API client's execution to a connection
+    /// live, client id 0 included, so the account stream reports one only when its recovery reads
+    /// it after a disconnect: read the rest with `fetch_trades`. IB numbers orders per API
+    /// client, so such a trade's
+    /// [`order_id`](crate::trade::Trade::order_id) is IB's permanent id for the order (`perm:`
+    /// and the id) rather than the client's order id, which could name one of this client's.
+    ///
+    /// A fill of an order this client's id placed is its own, even when the client does not
+    /// track the order, such as one placed before a restart. IB reports orders entered in TWS
+    /// under API client id 0, so a client connected as 0 takes their fills for its own too, under
+    /// their IB order id as [`fetch_open_orders`](ExecutionClient::fetch_open_orders) lists the
+    /// orders, and reports them as [`Order`](crate::trade::TradeOrigin::Order) whatever this is
+    /// set to. To keep manual trading apart from this client's, connect under a non-zero id.
+    ///
+    /// Either way, a fill IB flags as an IB-initiated liquidation is reported, as
+    /// [`Liquidation`](crate::trade::TradeOrigin::Liquidation), since it moves the account's
+    /// position whoever placed the order.
+    #[serde(default)]
+    pub other_clients_fills: bool,
+}
+
+impl IbkrConfig {
+    /// A config connecting to TWS or Gateway at `host`:`port` as API client `client_id`, with no
+    /// contracts to register and only this client's fills reported.
+    pub fn new(
+        host: impl Into<String>,
+        port: u16,
+        client_id: i32,
+        account: impl Into<String>,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            client_id,
+            account: account.into(),
+            contracts: Vec::new(),
+            other_clients_fills: false,
+        }
+    }
+
+    /// This config with [`contracts`](Self::contracts) to register on connect.
+    #[must_use]
+    pub fn with_contracts(self, contracts: Vec<ContractConfig>) -> Self {
+        Self { contracts, ..self }
+    }
+
+    /// This config with [`other_clients_fills`](Self::other_clients_fills) set.
+    #[must_use]
+    pub fn with_other_clients_fills(self, other_clients_fills: bool) -> Self {
+        Self {
+            other_clients_fills,
+            ..self
+        }
+    }
 }
 
 /// Pre-configured contract for startup registration.
@@ -395,44 +472,58 @@ fn is_transport_loss(e: &ibapi::Error) -> bool {
     )
 }
 
-/// The instrument `execution` is in, or `None` when another API client placed its order, or this
-/// client does not track its order or its contract.
+/// What `execution`'s trade is reported with, or `None` when it is not reported: another API
+/// client's execution that `scope` leaves out, or one in a contract this client has not
+/// registered.
 ///
-/// IB numbers orders per API client, so an order id names this client's order only together with
-/// this client's id.
+/// An execution of this client's own order is reported even if the client no longer tracks the
+/// order: after a restart, or once its id was reaped, it is still this client's fill.
 fn resolve_execution(
     execution: &ibapi::orders::ExecutionData,
-    api_client_id: i32,
+    scope: ExecutionScope,
     contracts: &ContractRegistry,
-    order_ids: &OrderIdMap,
-) -> Option<InstrumentNameExchange> {
-    let order_id = execution.execution.order_id;
+) -> Option<ResolvedExecution> {
+    let ib_order_id = execution.execution.order_id;
     let con_id = execution.contract.contract_id;
 
-    if execution.execution.client_id != api_client_id {
+    let Some((order_id, origin)) = scope.classify(&execution.execution) else {
         trace!(
-            ib_order_id = order_id,
+            ib_order_id,
             api_client_id = execution.execution.client_id,
-            "ExecutionData for another API client's order, dropping"
-        );
-        return None;
-    }
-    // Fail-fast: skip second lookup if first fails
-    if !order_ids.contains(order_id) {
-        debug!(
-            ib_order_id = order_id,
-            con_id, "ExecutionData for unknown order ID, dropping"
-        );
-        return None;
-    }
-    let Some(instrument) = contracts.get_name_by_con_id(con_id) else {
-        debug!(
-            ib_order_id = order_id,
-            con_id, "ExecutionData for unknown contract ID, dropping"
+            "ExecutionData for another API client's order, dropping \
+             (IbkrConfig::other_clients_fills is off)"
         );
         return None;
     };
-    Some(instrument)
+    let Some(instrument) = contracts.get_name_by_con_id(con_id) else {
+        if origin == TradeOrigin::External {
+            // Another client's trading in a contract this one does not follow: expected, and on
+            // a busy account frequent.
+            debug!(
+                ib_order_id,
+                con_id,
+                exec_id = %execution.execution.execution_id,
+                "Another API client's ExecutionData in a contract this client has not \
+                 registered, dropping"
+            );
+        } else {
+            // A fill of this client's order, or a liquidation, moved the account's position, and
+            // no trade will report it. One line per such execution, so no louder than the fills.
+            warn!(
+                ib_order_id,
+                con_id,
+                exec_id = %execution.execution.execution_id,
+                %origin,
+                "ExecutionData in a contract this client has not registered, dropping"
+            );
+        }
+        return None;
+    };
+    Some(ResolvedExecution {
+        instrument,
+        order_id,
+        origin,
+    })
 }
 
 /// How long a listing read waits for IB's next message before giving up on the read.
@@ -751,7 +842,7 @@ fn read_account_positions(
 fn forward_order_updates(
     updates: impl IntoIterator<Item = Result<ibapi::orders::OrderUpdate, ibapi::Error>>,
     sink: &recovery::EventSink,
-    api_client_id: i32,
+    scope: ExecutionScope,
     contracts: &ContractRegistry,
     order_ids: &OrderIdMap,
     pending_cancels: &PendingCancels,
@@ -788,7 +879,7 @@ fn forward_order_updates(
         let event = match update {
             // IB numbers orders per API client, and `ibapi` copies here every order status an
             // open-orders listing carries, other clients' included.
-            OrderUpdate::OrderStatus(status) if status.client_id != api_client_id => {
+            OrderUpdate::OrderStatus(status) if status.client_id != scope.api_client_id => {
                 trace!(
                     ib_order_id = status.order_id,
                     api_client_id = status.client_id,
@@ -847,9 +938,7 @@ fn forward_order_updates(
                     );
                     continue;
                 }
-                let Some(instrument) =
-                    resolve_execution(&exec, api_client_id, contracts, order_ids)
-                else {
+                let Some(resolved) = resolve_execution(&exec, scope, contracts) else {
                     continue;
                 };
                 // Logged on arrival, so the correction is seen even if no commission report
@@ -859,7 +948,7 @@ fn forward_order_updates(
                 {
                     warn!(
                         exec_id = %exec.execution.execution_id,
-                        %instrument,
+                        instrument = %resolved.instrument,
                         price = exec.execution.price,
                         shares = exec.execution.shares,
                         "IBKR corrected an execution; it will be reported as TradeAmended if its \
@@ -867,7 +956,7 @@ fn forward_order_updates(
                     );
                 }
 
-                exec_buffer.add_execution(exec, instrument);
+                exec_buffer.add_execution(exec, resolved);
                 None
             }
             OrderUpdate::CommissionReport(report) => {
@@ -1188,6 +1277,14 @@ impl IbkrClient {
             earlier_completions: ended_orders::EarlierCompletions::new(),
         };
         Ok(ConnectOutcome { client, skipped })
+    }
+
+    /// Which API clients' executions this client reports.
+    fn execution_scope(&self) -> ExecutionScope {
+        ExecutionScope {
+            api_client_id: self.client.client_id(),
+            other_clients: self.config.other_clients_fills,
+        }
     }
 
     /// Get the next order ID and increment the counter.
@@ -2469,7 +2566,7 @@ impl ExecutionClient for IbkrClient {
         .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))?
         .map_err(|e| UnindexedClientError::Internal(format!("order updates: {e}")))?;
 
-        let api_client_id = self.client.client_id();
+        let scope = self.execution_scope();
         let contracts_clone = self.contracts.clone();
         let order_ids_clone = self.order_ids.clone();
         let pending_cancels_clone = self.pending_cancels.clone();
@@ -2492,6 +2589,7 @@ impl ExecutionClient for IbkrClient {
             earlier_completions: self.earlier_completions.clone(),
             sink: sink.clone(),
             runtime: tokio::runtime::Handle::current(),
+            scope,
         };
         let watcher_sink = sink.clone();
         std::thread::Builder::new()
@@ -2521,7 +2619,7 @@ impl ExecutionClient for IbkrClient {
                     forward_order_updates(
                         order_sub.iter_data(),
                         &sink,
-                        api_client_id,
+                        scope,
                         &contracts_clone,
                         &order_ids_clone,
                         &pending_cancels_clone,
@@ -3007,9 +3105,13 @@ impl ExecutionClient for IbkrClient {
     ///   (`resume: None`) for what IB returned: a span reaching before today is not read
     ///   before today. For historical executions beyond today, use IB's Flex Query or
     ///   Activity Statements.
-    /// - Only the executions of orders this API client placed are read. IB numbers
-    ///   orders per API client, so another client's execution could name an order id
-    ///   of this client's.
+    /// - Only the executions of orders this API client placed are returned, plus any
+    ///   execution IB flags as an IB-initiated liquidation, whoever placed its order, as a
+    ///   [`Liquidation`](crate::trade::TradeOrigin::Liquidation) trade. With
+    ///   [`IbkrConfig::other_clients_fills`] set, every other client's execution IB sends is
+    ///   returned too, as an [`External`](crate::trade::TradeOrigin::External) trade under
+    ///   IB's permanent id for its order. An execution in a contract this client has not
+    ///   registered is skipped either way.
     /// - Each trade's fees come from the commission report IB sends with its
     ///   execution. An execution whose report IB did not send is returned with a zero
     ///   fee in [`UNKNOWN_FEE_ASSET`](execution::UNKNOWN_FEE_ASSET), with a warning.
@@ -3039,6 +3141,7 @@ impl ExecutionClient for IbkrClient {
         }
         let client = self.client.clone();
         let contracts = self.contracts.clone();
+        let scope = self.execution_scope();
         let instruments_filter: Option<HashSet<_>> = if instruments.is_empty() {
             None
         } else {
@@ -3046,14 +3149,11 @@ impl ExecutionClient for IbkrClient {
         };
 
         tokio::task::spawn_blocking(move || {
-            let api_client_id = client.client_id();
-            let exec_filter = ibapi::orders::ExecutionFilter {
-                client_id: Some(api_client_id),
-                ..ibapi::orders::ExecutionFilter::default()
-            };
+            // Every client's executions: `scope` decides which are reported (see
+            // `ExecutionScope::classify`).
             // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
             let sub = client
-                .executions(exec_filter)
+                .executions(ibapi::orders::ExecutionFilter::default())
                 .map_err(|e| UnindexedClientError::Internal(format!("executions: {e}")))?;
 
             let mut listing = Vec::new();
@@ -3070,7 +3170,7 @@ impl ExecutionClient for IbkrClient {
 
             let trades = trades_from_executions(
                 listing,
-                api_client_id,
+                scope,
                 &contracts,
                 start..=end,
                 instruments_filter.as_ref(),
@@ -3085,15 +3185,14 @@ impl ExecutionClient for IbkrClient {
 }
 
 /// The trades [`ExecutionClient::fetch_trades`] returns from what one executions request
-/// listed: the executions of this API client's orders, in registered contracts, at a time in
-/// `span`, in `instruments` when that is given. Each is paired with the commission report IB lists
-/// after it.
+/// listed: the executions `scope` reports, in registered contracts, at a time in `span`, in
+/// `instruments` when that is given. Each is paired with the commission report IB lists after it.
 ///
 /// An execution IB listed no commission report for is a trade with an unknown fee, warned about.
 /// The trades are in time order, then by id.
 fn trades_from_executions(
     listing: impl IntoIterator<Item = ibapi::orders::Executions>,
-    api_client_id: i32,
+    scope: ExecutionScope,
     contracts: &ContractRegistry,
     span: std::ops::RangeInclusive<DateTime<Utc>>,
     instruments: Option<&HashSet<InstrumentNameExchange>>,
@@ -3106,15 +3205,17 @@ fn trades_from_executions(
         match item {
             Executions::ExecutionData(data) => {
                 let exec = &data.execution;
-                if exec.client_id != api_client_id {
-                    // The request asked IB for this client's alone.
+                let Some((order_id, origin)) = scope.classify(exec) else {
                     debug!(
                         exec_id = %exec.execution_id,
                         api_client_id = exec.client_id,
                         "Execution of another API client's order, skipping"
                     );
                     continue;
-                }
+                };
+                // Unlike the account stream, not warned about: a read of a span lists whatever
+                // the account traded, and a contract never registered is not one this client
+                // follows.
                 let Some(instrument) = contracts.get_name_by_con_id(data.contract.contract_id)
                 else {
                     continue;
@@ -3124,7 +3225,14 @@ fn trades_from_executions(
                 }
                 match execution::parse_ib_timestamp(&exec.time) {
                     Some(time) if span.contains(&time) => {
-                        awaiting_commission.add_execution(data, instrument);
+                        awaiting_commission.add_execution(
+                            data,
+                            ResolvedExecution {
+                                instrument,
+                                order_id,
+                                origin,
+                            },
+                        );
                     }
                     Some(_) => {}
                     None => warn!(
@@ -3793,13 +3901,7 @@ mod contract_config_tests {
     }
 
     fn ibkr_config(contracts: Vec<ContractConfig>) -> IbkrConfig {
-        IbkrConfig {
-            host: "127.0.0.1".to_string(),
-            port: 4002,
-            client_id: 1,
-            account: String::new(),
-            contracts,
-        }
+        IbkrConfig::new("127.0.0.1", 4002, 1, "").with_contracts(contracts)
     }
 
     fn named(name: &str, security_type: &str) -> ContractConfig {
@@ -4392,6 +4494,14 @@ mod order_reader_tests {
     use ibapi::orders::{OrderStatus, OrderUpdate};
     use std::cell::Cell;
 
+    /// API client `api_client_id`'s own executions alone.
+    fn scope(api_client_id: i32) -> ExecutionScope {
+        ExecutionScope {
+            api_client_id,
+            other_clients: false,
+        }
+    }
+
     /// Status updates for an order this client did not place, so none is forwarded.
     fn unforwarded(n: usize) -> Vec<Result<OrderUpdate, ibapi::Error>> {
         (0..n)
@@ -4412,7 +4522,7 @@ mod order_reader_tests {
                 .into_iter()
                 .inspect(|_| pulled.set(pulled.get() + 1)),
             sink,
-            0,
+            scope(0),
             &ContractRegistry::new(),
             &OrderIdMap::new(),
             &PendingCancels::new(),
@@ -4490,7 +4600,7 @@ mod order_reader_tests {
                     ..OrderStatus::default()
                 }))],
                 &sink,
-                0,
+                scope(0),
                 &ContractRegistry::new(),
                 &order_ids,
                 &PendingCancels::new(),
@@ -4544,7 +4654,7 @@ mod order_reader_tests {
                 ..OrderStatus::default()
             }))],
             &sink,
-            903,
+            scope(903),
             &ContractRegistry::new(),
             &order_ids,
             &PendingCancels::new(),
@@ -4605,7 +4715,7 @@ mod order_reader_tests {
         forward_order_updates(
             updates,
             &sink,
-            0,
+            scope(0),
             &ContractRegistry::new(),
             &order_ids,
             &PendingCancels::new(),
@@ -4716,7 +4826,7 @@ mod order_reader_tests {
                 commission("0000e0d5.5f8b1c2a.01.02"),
             ],
             &sink,
-            0,
+            scope(0),
             &contracts,
             &order_ids,
             &PendingCancels::new(),
@@ -5426,7 +5536,7 @@ mod order_reader_tests {
                     executed(905, 7, "other-client", "20261007 10:00:03 UTC"),
                     commission("other-client"),
                 ],
-                API_CLIENT,
+                scope(API_CLIENT),
                 &contracts(),
                 at("2026-10-07T10:00:00Z")..=at("2026-10-07T11:00:00Z"),
                 None,
@@ -5456,12 +5566,41 @@ mod order_reader_tests {
                     executed(API_CLIENT, 7, "paired", "20261007 10:00:00 UTC"),
                     commission("paired"),
                 ],
-                API_CLIENT,
+                scope(API_CLIENT),
                 &contracts(),
                 at("2026-10-07T10:00:00Z")..=at("2026-10-07T11:00:00Z"),
                 Some(&HashSet::from([InstrumentNameExchange::new("MSFT")])),
             );
             assert!(filtered.is_empty(), "{filtered:?}");
+
+            // Opted in to other clients' fills, another client's is read too, as external and
+            // under a name its client's order id cannot share with this client's.
+            let all_clients = trades_from_executions(
+                [
+                    executed(API_CLIENT, 7, "own", "20261007 10:00:00 UTC"),
+                    commission("own"),
+                    executed(905, 7, "other-client", "20261007 10:00:01 UTC"),
+                    commission("other-client"),
+                ],
+                ExecutionScope {
+                    api_client_id: API_CLIENT,
+                    other_clients: true,
+                },
+                &contracts(),
+                at("2026-10-07T10:00:00Z")..=at("2026-10-07T11:00:00Z"),
+                None,
+            );
+            let read: Vec<_> = all_clients
+                .iter()
+                .map(|trade| (trade.order_id.0.as_str(), trade.origin))
+                .collect();
+            assert_eq!(
+                read,
+                [
+                    ("7", crate::trade::TradeOrigin::Order),
+                    ("client:905:7", crate::trade::TradeOrigin::External)
+                ]
+            );
         }
     }
 }

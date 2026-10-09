@@ -1279,21 +1279,21 @@ fn account_event_trade(
 ) -> EngineEvent<DataKind> {
     EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::Trade(Trade {
-            id: gen_trade_id(instrument),
-            order_id: gen_order_id(instrument),
-            instrument: InstrumentIndex(instrument),
-            strategy: strategy_id(),
-            time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
+        kind: AccountEventKind::Trade(Trade::new(
+            gen_trade_id(instrument),
+            gen_order_id(instrument),
+            InstrumentIndex(instrument),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, time_plus),
             side,
-            price: Decimal::try_from(price).unwrap(),
-            quantity: Decimal::try_from(quantity).unwrap(),
-            order_filled_quantity: None,
-            fees: asset_fees(
+            Decimal::try_from(price).unwrap(),
+            Decimal::try_from(quantity).unwrap(),
+            None,
+            asset_fees(
                 instrument,
                 Decimal::try_from(price * quantity * QUOTE_FEES_PERCENT).unwrap(),
             ),
-        }),
+        )),
     }))
 }
 
@@ -1436,19 +1436,19 @@ fn expiry_exits(
 fn open_option_position(engine: &mut TestEngine, quantity: Decimal, price: Decimal) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::Trade(Trade {
-            id: TradeId::new("opt-trade-open"),
-            order_id: gen_order_id(0),
-            instrument: InstrumentIndex(0),
-            strategy: strategy_id(),
-            time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
-            side: Side::Buy,
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new("opt-trade-open"),
+            gen_order_id(0),
+            InstrumentIndex(0),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, 1),
+            Side::Buy,
             price,
             quantity,
             // Option instrument quote is USD = AssetIndex(1) in option engine
-            order_filled_quantity: None,
-            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
-        }),
+            None,
+            AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
+        )),
     }));
     engine.process(event);
 }
@@ -2614,18 +2614,18 @@ fn open_position_via_trade(
 ) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::Trade(Trade {
-            id: TradeId::new(tag),
-            order_id: OrderId::new(tag),
-            instrument: InstrumentIndex(instrument),
-            strategy: strategy_id(),
-            time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new(tag),
+            OrderId::new(tag),
+            InstrumentIndex(instrument),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, time_plus),
             side,
             price,
             quantity,
-            order_filled_quantity: None,
-            fees: asset_fees(instrument, dec!(0)),
-        }),
+            None,
+            asset_fees(instrument, dec!(0)),
+        )),
     }));
     engine.process(event);
 }
@@ -3196,18 +3196,18 @@ fn open_option_position_via_trade(
 ) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::Trade(Trade {
-            id: TradeId::new(tag),
-            order_id: OrderId::new(tag),
-            instrument: InstrumentIndex(0),
-            strategy: strategy_id(),
-            time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new(tag),
+            OrderId::new(tag),
+            InstrumentIndex(0),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, time_plus),
             side,
             price,
             quantity,
-            order_filled_quantity: None,
-            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
-        }),
+            None,
+            AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
+        )),
     }));
     engine.process(event);
 }
@@ -4218,18 +4218,18 @@ fn option_trade_event(
 ) -> EngineEvent<DataKind> {
     EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::Trade(Trade {
-            id: TradeId::new(tag),
-            order_id: OrderId::new(tag),
-            instrument: InstrumentIndex(instrument),
-            strategy: strategy_id(),
-            time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new(tag),
+            OrderId::new(tag),
+            InstrumentIndex(instrument),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, time_plus),
             side,
             price,
             quantity,
-            order_filled_quantity: None,
-            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
-        }),
+            None,
+            AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
+        )),
     }))
 }
 
@@ -4497,19 +4497,19 @@ fn open_option_position_side(
     };
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::Trade(Trade {
-            id: trade_id,
-            order_id: gen_order_id(0),
-            instrument: InstrumentIndex(0),
-            strategy: strategy_id(),
-            time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
+        kind: AccountEventKind::Trade(Trade::new(
+            trade_id,
+            gen_order_id(0),
+            InstrumentIndex(0),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, 1),
             side,
             price,
             quantity,
             // Put option instrument quote is USD = AssetIndex(1)
-            order_filled_quantity: None,
-            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
-        }),
+            None,
+            AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
+        )),
     }));
     engine.process(event);
 }
@@ -4742,20 +4742,20 @@ fn send_order_ack(
 fn send_fill(engine: &mut TestEngine, exchange_order_id: OrderId, side: Side, price: Decimal) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::Trade(Trade {
-            id: TradeId::new(format!("fill-{}", exchange_order_id.0.as_str())),
-            order_id: exchange_order_id,
-            instrument: InstrumentIndex(0),
-            strategy: strategy_id(),
-            time_exchange: time_plus_days(STARTING_TIMESTAMP, 2),
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new(format!("fill-{}", exchange_order_id.0.as_str())),
+            exchange_order_id,
+            InstrumentIndex(0),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, 2),
             side,
             price,
-            quantity: dec!(1),
+            dec!(1),
             // BTCUSDT (instrument 0) quote = usdt = AssetIndex(2). Fee is zero here regardless, but
             // use the correct quote asset for the instrument this helper always fills (index 0).
-            order_filled_quantity: None,
-            fees: asset_fees(0, Decimal::ZERO),
-        }),
+            None,
+            asset_fees(0, Decimal::ZERO),
+        )),
     }));
     engine.process(event);
 }
@@ -5459,19 +5459,19 @@ fn test_fee_model_per_contract_augments_trade_fees() {
     // should augment it with 1 contract × $0.65 = $0.65.
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::Trade(Trade {
-            id: TradeId::new("fee-test-trade"),
-            order_id: gen_order_id(0),
-            instrument: InstrumentIndex(0),
-            strategy: strategy_id(),
-            time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
-            side: Side::Buy,
-            price: dec!(1_000),
-            quantity: dec!(1),
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new("fee-test-trade"),
+            gen_order_id(0),
+            InstrumentIndex(0),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, 1),
+            Side::Buy,
+            dec!(1_000),
+            dec!(1),
             // Option engine: quote is USD = AssetIndex(1). Exchange reports zero commission.
-            order_filled_quantity: None,
-            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
-        }),
+            None,
+            AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
+        )),
     }));
     engine.process(event);
 
@@ -6259,19 +6259,19 @@ fn open_position_on(
 ) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::Trade(Trade {
-            id: TradeId::new(tag),
-            order_id: OrderId::new(tag),
-            instrument: InstrumentIndex(instrument),
-            strategy: strategy_id(),
-            time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new(tag),
+            OrderId::new(tag),
+            InstrumentIndex(instrument),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, 1),
             side,
             price,
             quantity,
             // Quote asset of every instrument in the ambiguous fixture is usd = AssetIndex(1).
-            order_filled_quantity: None,
-            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
-        }),
+            None,
+            AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
+        )),
     }));
     engine.process(event);
 }

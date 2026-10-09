@@ -620,6 +620,7 @@ impl AccountEventIndexer {
             quantity,
             order_filled_quantity,
             fees,
+            origin,
         } = trade;
 
         let instrument_index = self.map.find_instrument_index(&instrument)?;
@@ -658,6 +659,7 @@ impl AccountEventIndexer {
                 fees: fees.fees,
                 fees_quote,
             },
+            origin,
         })
     }
 }

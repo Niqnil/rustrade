@@ -631,34 +631,34 @@ pub enum PositionSeedError {
 /// use rust_decimal_macros::dec;
 ///
 /// // Create a new LONG Position from an initial Buy trade
-/// let position = Position::from(&Trade {
-///     id: TradeId::new("trade_1"),
-///     order_id: OrderId::new("order_1"),
-///     instrument: InstrumentNameInternal::new("BTC-USD"),
-///     strategy: StrategyId::new("strategy_1"),
-///     time_exchange: DateTime::from_str("2024-01-01T00:00:00Z").unwrap(),
-///     side: Side::Buy,
-///     price: dec!(50_000.0),
-///     quantity: dec!(0.1),
-///     order_filled_quantity: None,
-///     fees: AssetFees::quote_fees(dec!(5.0))
-/// });
+/// let position = Position::from(&Trade::new(
+///     TradeId::new("trade_1"),
+///     OrderId::new("order_1"),
+///     InstrumentNameInternal::new("BTC-USD"),
+///     StrategyId::new("strategy_1"),
+///     DateTime::from_str("2024-01-01T00:00:00Z").unwrap(),
+///     Side::Buy,
+///     dec!(50_000.0),
+///     dec!(0.1),
+///     None,
+///     AssetFees::quote_fees(dec!(5.0)),
+/// ));
 /// assert_eq!(position.side, Side::Buy);
 /// assert_eq!(position.quantity_abs, dec!(0.1));
 ///
 /// // Partially reduce LONG Position from a new Sell Trade
-/// let (updated_position, closed_position) = position.update_from_trade(&Trade {
-///     id: TradeId::new("trade_2"),
-///     order_id: OrderId::new("order_2"),
-///     instrument: InstrumentNameInternal::new("BTC-USD"),
-///     strategy: StrategyId::new("strategy_1"),
-///     time_exchange: DateTime::from_str("2024-01-01T01:00:00Z").unwrap(),
-///     side: Side::Sell,
-///     price: dec!(60_000.0),
-///     quantity: dec!(0.05),
-///     order_filled_quantity: None,
-///     fees: AssetFees::quote_fees(dec!(2.5))
-/// });
+/// let (updated_position, closed_position) = position.update_from_trade(&Trade::new(
+///     TradeId::new("trade_2"),
+///     OrderId::new("order_2"),
+///     InstrumentNameInternal::new("BTC-USD"),
+///     StrategyId::new("strategy_1"),
+///     DateTime::from_str("2024-01-01T01:00:00Z").unwrap(),
+///     Side::Sell,
+///     dec!(60_000.0),
+///     dec!(0.05),
+///     None,
+///     AssetFees::quote_fees(dec!(2.5)),
+/// ));
 ///
 /// // LONG Position is still open, but with reduced size
 /// let updated_position = updated_position.unwrap();
@@ -681,34 +681,34 @@ pub enum PositionSeedError {
 /// use rust_decimal_macros::dec;
 ///
 /// // Create a new SHORT Position from an initial Sell trade
-/// let position = Position::from(&Trade {
-///     id: TradeId::new("trade_1"),
-///     order_id: OrderId::new("order_1"),
-///     instrument: InstrumentNameInternal::new("BTC-USD"),
-///     strategy: StrategyId::new("strategy_1"),
-///     time_exchange: DateTime::from_str("2024-01-01T00:00:00Z").unwrap(),
-///     side: Side::Sell,
-///     price: dec!(50_000.0),
-///     quantity: dec!(0.1),
-///     order_filled_quantity: None,
-///     fees: AssetFees::quote_fees(dec!(5.0))
-/// });
+/// let position = Position::from(&Trade::new(
+///     TradeId::new("trade_1"),
+///     OrderId::new("order_1"),
+///     InstrumentNameInternal::new("BTC-USD"),
+///     StrategyId::new("strategy_1"),
+///     DateTime::from_str("2024-01-01T00:00:00Z").unwrap(),
+///     Side::Sell,
+///     dec!(50_000.0),
+///     dec!(0.1),
+///     None,
+///     AssetFees::quote_fees(dec!(5.0)),
+/// ));
 /// assert_eq!(position.side, Side::Sell);
 /// assert_eq!(position.quantity_abs, dec!(0.1));
 ///
 /// // Close SHORT from a new Buy trade with larger quantity, flipping into a new LONG Position
-/// let (new_position, closed_position) = position.update_from_trade(&Trade {
-///     id: TradeId::new("trade_2"),
-///     order_id: OrderId::new("order_2"),
-///     instrument: InstrumentNameInternal::new("BTC-USD"),
-///     strategy: StrategyId::new("strategy_1"),
-///     time_exchange: DateTime::from_str("2024-01-01T01:00:00Z").unwrap(),
-///     side: Side::Buy,
-///     price: dec!(40_000.0),
-///     quantity: dec!(0.2),
-///     order_filled_quantity: None,
-///     fees: AssetFees::quote_fees(dec!(10.0))
-/// });
+/// let (new_position, closed_position) = position.update_from_trade(&Trade::new(
+///     TradeId::new("trade_2"),
+///     OrderId::new("order_2"),
+///     InstrumentNameInternal::new("BTC-USD"),
+///     StrategyId::new("strategy_1"),
+///     DateTime::from_str("2024-01-01T01:00:00Z").unwrap(),
+///     Side::Buy,
+///     dec!(40_000.0),
+///     dec!(0.2),
+///     None,
+///     AssetFees::quote_fees(dec!(10.0)),
+/// ));
 ///
 /// // Original SHORT Position closed with profit
 /// let closed = closed_position.unwrap();
@@ -929,28 +929,20 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                 let next_position_quantity = trade.quantity.abs() - self.quantity_abs;
                 let next_position_fee_enter =
                     trade.fees.fees * (next_position_quantity / trade.quantity.abs());
-                let next_position_trade = Trade {
-                    id: trade.id.clone(),
-                    order_id: trade.order_id.clone(),
-                    instrument: trade.instrument.clone(),
-                    strategy: trade.strategy.clone(),
-                    time_exchange: trade.time_exchange,
-                    side: trade.side,
-                    price: trade.price,
-                    quantity: next_position_quantity,
-                    // Synthetic: this is a slice of `trade` opening the next position, not a
-                    // second execution the venue reported. Carrying the cumulative forward would
-                    // apply the same order advance twice.
-                    order_filled_quantity: None,
-                    fees: AssetFees {
-                        asset: trade.fees.asset.clone(),
-                        fees: next_position_fee_enter,
-                        fees_quote: trade
-                            .fees
-                            .fees_quote
-                            .map(|fq| fq * (next_position_quantity / trade.quantity.abs())),
-                    },
-                };
+                // A copy of `trade`, so the slice keeps everything else it carries, its origin
+                // included: a liquidation that flips a position opens the next one as a
+                // liquidation too.
+                let mut next_position_trade = trade.clone();
+                next_position_trade.quantity = next_position_quantity;
+                // Synthetic: this is a slice of `trade` opening the next position, not a second
+                // execution the venue reported. Carrying the cumulative forward would apply the
+                // same order advance twice.
+                next_position_trade.order_filled_quantity = None;
+                next_position_trade.fees.fees = next_position_fee_enter;
+                next_position_trade.fees.fees_quote = trade
+                    .fees
+                    .fees_quote
+                    .map(|fq| fq * (next_position_quantity / trade.quantity.abs()));
 
                 // Update closing Position with appropriate ratio of fees for theoretical quantity
                 let fee_exit = trade.fees.fees * (self.quantity_abs / trade.quantity.abs());

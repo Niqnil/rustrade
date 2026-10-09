@@ -37,7 +37,7 @@ use rustrade_data::{event::MarketEvent, streams::consumer::MarketStreamEvent};
 use rustrade_execution::{
     AccountEvent, AccountEventKind,
     order::{Order, id::ClientOrderId},
-    trade::{AssetFees, Trade, TradeId},
+    trade::{AssetFees, Trade, TradeId, TradeOrigin},
 };
 use rustrade_instrument::{
     Side,
@@ -752,24 +752,25 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             );
             // Use the instrument's quote asset for fee tracking (amount is zero)
             let quote_asset = instrument_state.instrument.underlying.quote;
-            let settlement_trade = Trade {
-                id: TradeId::new(&trade_tag),
-                order_id: rustrade_execution::order::id::OrderId::new(&trade_tag),
-                instrument: *key,
-                strategy: rustrade_execution::order::id::StrategyId::ENGINE_EXPIRY,
-                time_exchange: engine_time,
-                side: closing_side,
+            let settlement_trade = Trade::new(
+                TradeId::new(&trade_tag),
+                rustrade_execution::order::id::OrderId::new(&trade_tag),
+                *key,
+                rustrade_execution::order::id::StrategyId::ENGINE_EXPIRY,
+                engine_time,
+                closing_side,
+                settlement_price,
+                closing_quantity,
                 // Engine-generated settlement, not a venue execution: there is no order for it
                 // to advance.
-                order_filled_quantity: None,
-                price: settlement_price,
-                quantity: closing_quantity,
-                fees: AssetFees {
+                None,
+                AssetFees {
                     asset: quote_asset,
                     fees: Decimal::ZERO,
                     fees_quote: Some(Decimal::ZERO),
                 },
-            };
+            )
+            .with_origin(TradeOrigin::Expiry);
 
             // Route settlement directly to the correct position by ID.
             // We bypass InstrumentState::update_from_trade (which calls update_from_trade

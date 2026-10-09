@@ -19,7 +19,7 @@ use crate::{
         state::{Cancelled, Expired, Filled, Open, OrderState, UnindexedOrderState},
     },
     position::{Position, PositionReport},
-    trade::{AssetFees, Trade, TradeId},
+    trade::{AssetFees, Trade, TradeId, TradeOrigin},
 };
 use chrono::{DateTime, Utc};
 use fnv::{FnvHashMap, FnvHashSet};
@@ -764,6 +764,7 @@ impl SimulatedVenue {
                 // already done plus what is settled here.
                 order_filled_quantity: Some(order.state.filled_quantity + remaining),
                 fees: settlement.fees,
+                origin: TradeOrigin::Order,
             };
 
             self.account.ack_trade(trade.clone());
@@ -1668,6 +1669,7 @@ impl SimulatedVenue {
             // whole cumulative.
             order_filled_quantity: Some(filled_quantity),
             fees: fill.fees,
+            origin: TradeOrigin::Order,
         };
 
         // Booked here rather than by the caller, so that whatever this order became is decided in

@@ -538,18 +538,18 @@ mod tests {
             .instrument_mut(&InstrumentNameInternal::new(SPOT));
         let quote = spot.instrument.underlying.quote;
         let exited = spot
-            .update_from_trade(&Trade {
-                id: TradeId::new("close"),
-                order_id: OrderId::new("close"),
-                instrument: spot.key,
-                strategy: StrategyId::new("strategy"),
-                time_exchange: time(3_000),
-                side: Side::Sell,
-                price: dec!(52_000),
-                quantity: dec!(0.5),
-                order_filled_quantity: None,
-                fees: AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
-            })
+            .update_from_trade(&Trade::new(
+                TradeId::new("close"),
+                OrderId::new("close"),
+                spot.key,
+                StrategyId::new("strategy"),
+                time(3_000),
+                Side::Sell,
+                dec!(52_000),
+                dec!(0.5),
+                None,
+                AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
+            ))
             .expect("a fill for the whole quantity exits the seeded position");
 
         assert_eq!(exited.position_id, PositionId::NETTING);
@@ -666,18 +666,18 @@ mod tests {
         );
 
         let exited = spot
-            .update_from_trade(&Trade {
-                id: TradeId::new("close"),
-                order_id: OrderId::new("close"),
-                instrument: spot.key,
-                strategy: StrategyId::new("strategy"),
-                time_exchange: time(3_000),
-                side: Side::Sell,
-                price: dec!(52_000),
-                quantity: dec!(0.5),
-                order_filled_quantity: None,
-                fees: AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
-            })
+            .update_from_trade(&Trade::new(
+                TradeId::new("close"),
+                OrderId::new("close"),
+                spot.key,
+                StrategyId::new("strategy"),
+                time(3_000),
+                Side::Sell,
+                dec!(52_000),
+                dec!(0.5),
+                None,
+                AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
+            ))
             .expect("a fill for the whole quantity exits the seeded position");
 
         assert_eq!(exited.pnl_realised, dec!(1_000));
@@ -702,18 +702,18 @@ mod tests {
             .instrument_mut(&InstrumentNameInternal::new(SPOT));
         let quote = spot.instrument.underlying.quote;
         let exited = spot
-            .update_from_trade(&Trade {
-                id: TradeId::new("close"),
-                order_id: OrderId::new("close"),
-                instrument: spot.key,
-                strategy: StrategyId::new("strategy"),
-                time_exchange: time(3_000),
-                side: Side::Sell,
-                price: dec!(52_000),
-                quantity: dec!(0.5),
-                order_filled_quantity: None,
-                fees: AssetFees::new(quote, dec!(3), Some(dec!(3))),
-            })
+            .update_from_trade(&Trade::new(
+                TradeId::new("close"),
+                OrderId::new("close"),
+                spot.key,
+                StrategyId::new("strategy"),
+                time(3_000),
+                Side::Sell,
+                dec!(52_000),
+                dec!(0.5),
+                None,
+                AssetFees::new(quote, dec!(3), Some(dec!(3))),
+            ))
             .expect("a fill for the whole quantity exits the seeded position");
 
         // 0.5 * (52_000 - 50_000) = 1_000, less 5 entry and 3 exit fees.
@@ -778,17 +778,19 @@ mod tests {
         spot.position_ids.insert(cid.clone(), PositionId::new("a"));
         spot.exchange_id_to_cid.insert(OrderId::new("close_a"), cid);
 
-        let sell = |id: &str, quantity| Trade {
-            id: TradeId::new(id),
-            order_id: OrderId::new("close_a"),
-            instrument: key,
-            strategy: StrategyId::new("strategy"),
-            time_exchange: time(3_000),
-            side: Side::Sell,
-            price: dec!(52_000),
-            quantity,
-            order_filled_quantity: None,
-            fees: AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
+        let sell = |id: &str, quantity| {
+            Trade::new(
+                TradeId::new(id),
+                OrderId::new("close_a"),
+                key,
+                StrategyId::new("strategy"),
+                time(3_000),
+                Side::Sell,
+                dec!(52_000),
+                quantity,
+                None,
+                AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
+            )
         };
 
         let first = sell("fill_1", dec!(1));

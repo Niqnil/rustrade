@@ -109,7 +109,7 @@ use crate::{
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Filled, Open, OrderState, UnindexedOrderState},
     },
-    trade::{AssetFees, Trade, TradeId, TradesRead},
+    trade::{AssetFees, Trade, TradeId, TradeOrigin, TradesRead},
 };
 use chrono::{DateTime, Utc};
 use ethers::signers::Signer;
@@ -1303,6 +1303,8 @@ fn spot_trades(
                     None
                 },
             },
+            // As on the stream, whose copy of a fill usually arrives first; see `TradeOrigin`.
+            origin: TradeOrigin::Order,
         });
     }
 
@@ -1351,6 +1353,9 @@ fn fill_to_account_event(
                 None
             },
         },
+        // The SDK's `TradeInfo` drops the fill's liquidation marker, so every fill is reported
+        // as `Order`; see `TradeOrigin`.
+        origin: TradeOrigin::Order,
     };
 
     Some(AccountEvent::new(

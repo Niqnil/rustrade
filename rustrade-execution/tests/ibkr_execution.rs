@@ -117,34 +117,30 @@ fn test_client_id_base() -> i32 {
 }
 
 fn test_config(client_id_offset: i32) -> IbkrConfig {
-    IbkrConfig {
-        host: "127.0.0.1".to_string(),
-        port: std::env::var("IBKR_PORT")
+    IbkrConfig::new(
+        "127.0.0.1",
+        std::env::var("IBKR_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(4002),
-        client_id: test_client_id_base() + client_id_offset,
-        account: std::env::var("IBKR_PAPER_ACCOUNT").expect("IBKR_PAPER_ACCOUNT env var required"),
-        contracts: vec![],
-    }
+        test_client_id_base() + client_id_offset,
+        std::env::var("IBKR_PAPER_ACCOUNT").expect("IBKR_PAPER_ACCOUNT env var required"),
+    )
 }
 
 /// AAPL resolved through `IbkrConfig::contracts`, so IB's listings, which name contracts by id,
 /// can be attributed to it.
 fn resolved_aapl_config(client_id_offset: i32) -> IbkrConfig {
-    IbkrConfig {
-        contracts: vec![ContractConfig {
-            name: "AAPL".to_string(),
-            symbol: "AAPL".to_string(),
-            security_type: "STK".to_string(),
-            exchange: "SMART".to_string(),
-            currency: "USD".to_string(),
-            last_trade_date: None,
-            strike: None,
-            right: None,
-        }],
-        ..test_config(client_id_offset)
-    }
+    test_config(client_id_offset).with_contracts(vec![ContractConfig {
+        name: "AAPL".to_string(),
+        symbol: "AAPL".to_string(),
+        security_type: "STK".to_string(),
+        exchange: "SMART".to_string(),
+        currency: "USD".to_string(),
+        last_trade_date: None,
+        strike: None,
+        right: None,
+    }])
 }
 
 fn aapl_instrument() -> InstrumentNameExchange {
