@@ -733,9 +733,24 @@ struct AlpacaActivity {
     cum_qty: Option<String>,
 }
 
+/// The body of an Alpaca error response: `{"code": 40310000, "message": "..."}`.
+///
+/// `code` is absent from some responses, notably the bare `{"message": "forbidden."}` that a
+/// wrong key, secret or host gets.
 #[derive(Debug, Deserialize)]
 struct AlpacaApiError {
+    code: Option<i64>,
     message: String,
+}
+
+impl AlpacaApiError {
+    /// Decode an error body, keeping the raw text as the message when it is not Alpaca's JSON.
+    fn from_body(bytes: &[u8]) -> Self {
+        serde_json::from_slice(bytes).unwrap_or_else(|_| Self {
+            code: None,
+            message: String::from_utf8_lossy(bytes).into_owned(),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1198,6 +1213,7 @@ where
         Fetched::Found(value) => Ok(value),
         Fetched::NotFound(message) => Err(UnindexedClientError::Api(parse_api_error(
             reqwest::StatusCode::NOT_FOUND,
+            None,
             &message,
         ))),
     }
@@ -1299,12 +1315,10 @@ where
         }
 
         // Parse API error body for a better error message.
-        let api_err = serde_json::from_slice::<AlpacaApiError>(&bytes)
-            .map(|e| e.message)
-            .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
+        let api_err = AlpacaApiError::from_body(&bytes);
 
         if status == reqwest::StatusCode::NOT_FOUND {
-            return Ok(Fetched::NotFound(api_err));
+            return Ok(Fetched::NotFound(api_err.message));
         }
 
         // 4xx = API-level rejection (wrong parameters, auth failure, insufficient funds).
@@ -1316,10 +1330,15 @@ where
         // maps to BalanceInsufficient (not generic OrderRejected), enabling callers to
         // trigger balance refresh on insufficient-funds rejections.
         if status.is_client_error() {
-            return Err(UnindexedClientError::Api(parse_api_error(status, &api_err)));
+            return Err(UnindexedClientError::Api(parse_api_error(
+                status,
+                api_err.code,
+                &api_err.message,
+            )));
         }
         return Err(connectivity_err(format!(
-            "Alpaca REST error {status}: {api_err}"
+            "Alpaca REST error {status}: {}",
+            api_err.message
         )));
     }
     unreachable!("Alpaca REST retry loop exited without returning")
@@ -1327,8 +1346,9 @@ where
 
 /// Execute a DELETE request, returning an order error on rejection.
 ///
-/// Handles 204 No Content (success), 422 / 403 (API rejection), and 429 (rate limit). Any other
-/// response reporting `X-Ratelimit-Remaining: 0` pauses later requests, as in [`rest_with_retry`].
+/// Handles 204 No Content (success), other 4xx (API rejection, see [`parse_api_error`]), and 429
+/// (rate limit). Any other response reporting `X-Ratelimit-Remaining: 0` pauses later requests,
+/// as in [`rest_with_retry`].
 async fn rest_delete_with_retry(
     rate_limiter: &RateLimitTracker,
     mut build_request: impl FnMut() -> reqwest::RequestBuilder,
@@ -1378,11 +1398,9 @@ async fn rest_delete_with_retry(
                 |e| warn!(%e, %status, "Alpaca cancel_order: failed to read error response body"),
             )
             .unwrap_or_default();
-        let msg = serde_json::from_slice::<AlpacaApiError>(&bytes)
-            .map(|e| e.message)
-            .unwrap_or_else(|_| String::from_utf8_lossy(&bytes).into_owned());
+        let api_err = AlpacaApiError::from_body(&bytes);
 
-        return Err(parse_order_error(status, &msg));
+        return Err(parse_order_error(status, api_err.code, &api_err.message));
     }
     unreachable!("Alpaca cancel retry loop exited without returning")
 }
@@ -4677,7 +4695,14 @@ fn map_position_intent(side: Side, reduce_only: bool) -> AlpacaPositionIntent {
 ///
 /// Used by both `rest_with_retry` (for general REST calls) and `rest_delete_with_retry`
 /// (for cancel operations) to ensure consistent error classification across all REST paths.
-fn parse_api_error(status: reqwest::StatusCode, message: &str) -> crate::error::UnindexedApiError {
+///
+/// `code` is the body's Alpaca error code, where it has one. It is prefixed to the message of a
+/// rejection, so a caller can see it.
+fn parse_api_error(
+    status: reqwest::StatusCode,
+    code: Option<i64>,
+    message: &str,
+) -> crate::error::UnindexedApiError {
     // Fast path: 429 doesn't need message parsing.
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return ApiError::RateLimit;
@@ -4685,30 +4710,44 @@ fn parse_api_error(status: reqwest::StatusCode, message: &str) -> crate::error::
 
     // Compute lowercase once for all match guards that inspect the message body.
     let lower = message.to_ascii_lowercase();
+    let coded = || match code {
+        Some(code) => format!("{code} {message}"),
+        None => message.to_owned(),
+    };
     match status.as_u16() {
         // Match "already" before "insufficient": if Alpaca ever sends a 422 body
         // containing both substrings, this arm wins and maps to OrderAlreadyCancelled,
         // which is more specific than BalanceInsufficient.
         422 if lower.contains("already") => ApiError::OrderAlreadyCancelled,
-        // Alpaca returns 422 for business-rule rejections including insufficient
-        // funds. 403 is *Forbidden* — auth/permission failure — and must NOT be
-        // mapped to BalanceInsufficient even if the body happens to contain the
-        // substring "insufficient".
         // The body says what ran short ("insufficient buying power", or "insufficient qty
         // available" on a sell) but names no asset, so none is guessed.
-        422 if lower.contains("insufficient") => {
-            ApiError::BalanceInsufficient(None, message.to_owned())
-        }
+        422 if lower.contains("insufficient") => ApiError::BalanceInsufficient(None, coded()),
         401 => ApiError::Unauthenticated(format!("unauthorized: {message}")),
-        403 => ApiError::Unauthenticated(format!("forbidden: {message}")),
+        // A 403 means one of two things, told apart by the code. Without one, it is Alpaca's
+        // `{"message": "forbidden."}` to a wrong key, secret or host. With one, the account is
+        // fine and Alpaca refused the request on a business rule: `40310000` is generic
+        // ("insufficient buying power", "insufficient qty available for order", "account is
+        // not allowed to short", "account is restricted to liquidation only", ...), and
+        // `40310100` is pattern-day-trader protection. Only the text tells a shortfall apart.
+        403 => match code {
+            None => ApiError::Unauthenticated(format!("forbidden: {message}")),
+            Some(_) if lower.contains("insufficient") => {
+                ApiError::BalanceInsufficient(None, coded())
+            }
+            Some(_) => ApiError::OrderRejected(coded()),
+        },
         404 => ApiError::OrderRejected(format!("order not found: {message}")),
-        _ => ApiError::OrderRejected(message.to_owned()),
+        _ => ApiError::OrderRejected(coded()),
     }
 }
 
 /// Wraps [`parse_api_error`] for order-specific error handling (e.g., cancel_order).
-fn parse_order_error(status: reqwest::StatusCode, message: &str) -> UnindexedOrderError {
-    UnindexedOrderError::Rejected(parse_api_error(status, message))
+fn parse_order_error(
+    status: reqwest::StatusCode,
+    code: Option<i64>,
+    message: &str,
+) -> UnindexedOrderError {
+    UnindexedOrderError::Rejected(parse_api_error(status, code, message))
 }
 
 fn connectivity_err(msg: impl Into<String>) -> UnindexedClientError {
@@ -5562,6 +5601,7 @@ mod tests {
         assert!(matches!(
             parse_order_error(
                 reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+                None,
                 "order is already cancelled"
             ),
             UnindexedOrderError::Rejected(ApiError::OrderAlreadyCancelled)
@@ -5575,6 +5615,7 @@ mod tests {
         assert!(matches!(
             parse_order_error(
                 reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+                None,
                 "order already cancelled due to insufficient margin"
             ),
             UnindexedOrderError::Rejected(ApiError::OrderAlreadyCancelled)
@@ -6930,24 +6971,74 @@ mod tests {
     fn parse_order_error_401_maps_to_unauthenticated() {
         // 401 Unauthorized: invalid/expired API credentials.
         assert!(matches!(
-            parse_order_error(reqwest::StatusCode::UNAUTHORIZED, "bad credentials"),
+            parse_order_error(reqwest::StatusCode::UNAUTHORIZED, None, "bad credentials"),
             UnindexedOrderError::Rejected(ApiError::Unauthenticated(_))
         ));
     }
 
     #[test]
-    fn parse_order_error_403_maps_to_unauthenticated() {
-        // 403 Forbidden indicates auth/permission failure — use Unauthenticated, not
-        // OrderRejected or BalanceInsufficient (which could trigger incorrect retry logic).
+    fn parse_order_error_403_without_code_maps_to_unauthenticated() {
+        // Alpaca's answer to a wrong key, secret or host: a bare `{"message": "forbidden."}`.
         assert!(matches!(
-            parse_order_error(reqwest::StatusCode::FORBIDDEN, "account suspended"),
+            parse_order_error(reqwest::StatusCode::FORBIDDEN, None, "forbidden."),
             UnindexedOrderError::Rejected(ApiError::Unauthenticated(_))
         ));
+    }
+
+    #[test]
+    fn parse_order_error_403_with_code_and_insufficient_maps_to_balance_insufficient() {
+        for message in [
+            "insufficient buying power",
+            "insufficient day trading buying power",
+            "insufficient qty available for order (requested: 10, available: 0)",
+        ] {
+            let err = parse_order_error(reqwest::StatusCode::FORBIDDEN, Some(40310000), message);
+            let UnindexedOrderError::Rejected(ApiError::BalanceInsufficient(None, text)) = err
+            else {
+                panic!("expected BalanceInsufficient for {message:?}, got {err:?}");
+            };
+            assert_eq!(text, format!("40310000 {message}"));
+        }
+    }
+
+    #[test]
+    fn parse_order_error_403_with_code_maps_to_order_rejected() {
+        for (code, message) in [
+            (40310000, "account is not allowed to short"),
+            (40310000, "account is restricted to liquidation only"),
+            (
+                40310100,
+                "trade denied due to pattern day trading protection",
+            ),
+        ] {
+            let err = parse_order_error(reqwest::StatusCode::FORBIDDEN, Some(code), message);
+            let UnindexedOrderError::Rejected(ApiError::OrderRejected(text)) = err else {
+                panic!("expected OrderRejected for {message:?}, got {err:?}");
+            };
+            assert_eq!(text, format!("{code} {message}"));
+        }
+    }
+
+    #[test]
+    fn alpaca_api_error_reads_code_and_falls_back_to_raw_text() {
+        let coded = AlpacaApiError::from_body(
+            br#"{"code": 40310000, "message": "insufficient buying power"}"#,
+        );
+        assert_eq!(coded.code, Some(40310000));
+        assert_eq!(coded.message, "insufficient buying power");
+
+        let bare = AlpacaApiError::from_body(br#"{"message": "forbidden."}"#);
+        assert_eq!(bare.code, None);
+        assert_eq!(bare.message, "forbidden.");
+
+        let raw = AlpacaApiError::from_body(b"upstream connect error");
+        assert_eq!(raw.code, None);
+        assert_eq!(raw.message, "upstream connect error");
     }
 
     #[test]
     fn parse_order_error_404_maps_to_order_rejected_with_not_found_prefix() {
-        let err = parse_order_error(reqwest::StatusCode::NOT_FOUND, "order not found");
+        let err = parse_order_error(reqwest::StatusCode::NOT_FOUND, None, "order not found");
         let UnindexedOrderError::Rejected(ApiError::OrderRejected(msg)) = err else {
             panic!("expected OrderRejected, got {err:?}");
         };
@@ -6963,6 +7054,7 @@ mod tests {
         assert!(matches!(
             parse_order_error(
                 reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+                None,
                 "insufficient funds for this order"
             ),
             UnindexedOrderError::Rejected(ApiError::BalanceInsufficient(None, _))
@@ -6972,7 +7064,7 @@ mod tests {
     #[test]
     fn parse_order_error_429_maps_to_rate_limit() {
         assert!(matches!(
-            parse_order_error(reqwest::StatusCode::TOO_MANY_REQUESTS, "rate limited"),
+            parse_order_error(reqwest::StatusCode::TOO_MANY_REQUESTS, None, "rate limited"),
             UnindexedOrderError::Rejected(ApiError::RateLimit)
         ));
     }
@@ -7822,6 +7914,90 @@ mod tests {
                 ),
                 "{:?}",
                 order.state
+            );
+        }
+
+        /// A 403 refusal reaches the order's state as the refusal it is, with Alpaca's code, and a
+        /// 403 without a code (a wrong key) as an authentication failure.
+        #[tokio::test]
+        async fn open_order_reports_a_403_by_its_code() {
+            use crate::client::ExecutionClient;
+            use crate::error::OrderError;
+            use crate::order::request::{OrderRequestOpen, RequestOpen};
+            use crate::order::state::{InactiveOrderState, OrderState};
+            use crate::order::{
+                OrderKey, OrderKind, TimeInForce,
+                id::{ClientOrderId, StrategyId},
+            };
+            use rustrade_instrument::Side;
+            use rustrade_instrument::exchange::ExchangeId;
+            use rustrade_instrument::instrument::name::InstrumentNameExchange;
+
+            async fn open_against(
+                body: serde_json::Value,
+            ) -> OrderState<AssetNameExchange, InstrumentNameExchange> {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/v2/orders"))
+                    .respond_with(ResponseTemplate::new(403).set_body_json(body))
+                    .mount(&server)
+                    .await;
+                let instrument = InstrumentNameExchange::new("AAPL");
+                client_for(&server)
+                    .open_order(OrderRequestOpen {
+                        key: OrderKey {
+                            exchange: ExchangeId::AlpacaBroker,
+                            instrument: &instrument,
+                            strategy: StrategyId::new("test-strategy"),
+                            cid: ClientOrderId::new("test-cid"),
+                        },
+                        state: RequestOpen {
+                            side: Side::Sell,
+                            price: None,
+                            quantity: Decimal::new(10, 0),
+                            kind: OrderKind::Market,
+                            time_in_force: TimeInForce::ImmediateOrCancel,
+                            position_id: None,
+                            reduce_only: false,
+                            market: None,
+                        },
+                    })
+                    .await
+                    .state
+            }
+
+            let rejected =
+                |state: &OrderState<AssetNameExchange, InstrumentNameExchange>| match state {
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                        e,
+                    ))) => e.clone(),
+                    other => panic!("expected a rejection, got {other:?}"),
+                };
+
+            let state = open_against(serde_json::json!({
+                "code": 40310000,
+                "message": "insufficient buying power"
+            }))
+            .await;
+            assert_eq!(
+                rejected(&state),
+                ApiError::BalanceInsufficient(None, "40310000 insufficient buying power".into())
+            );
+
+            let state = open_against(serde_json::json!({
+                "code": 40310000,
+                "message": "account is not allowed to short"
+            }))
+            .await;
+            assert_eq!(
+                rejected(&state),
+                ApiError::OrderRejected("40310000 account is not allowed to short".into())
+            );
+
+            let state = open_against(serde_json::json!({ "message": "forbidden." })).await;
+            assert!(
+                matches!(rejected(&state), ApiError::Unauthenticated(_)),
+                "{state:?}"
             );
         }
 

@@ -103,6 +103,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `BinanceMargin` logs each `executionReport`'s client order id, order type and execution type
     at DEBUG, as evidence for a future margin-liquidation marker, which Binance does not document.
 
+### Fixed
+
+- **`AlpacaClient` no longer reports Alpaca's business refusals as `Unauthenticated`**
+  (`rustrade-execution`). Fixes #570.
+  - Every HTTP 403 was mapped to `ApiError::Unauthenticated`, whose contract tells callers to stop
+    trading. Alpaca also uses 403, with code `40310000`, to refuse an order on a business rule:
+    "insufficient buying power", "insufficient qty available for order", "account is not allowed
+    to short", "account is restricted to liquidation only". `40310100` is pattern-day-trader
+    protection.
+  - The client now reads the error body's `code`. A 403 with a code is a refusal:
+    `BalanceInsufficient` when its message says "insufficient", otherwise `OrderRejected`. A 403
+    without one, Alpaca's `{"message": "forbidden."}` to a wrong key, secret or host, is still
+    `Unauthenticated`.
+  - Where a body carries a code, rejection messages now start with it, e.g.
+    `40310000 insufficient buying power`.
+
 ## [0.10.1] - 2026-10-09
 
 ### Changed
