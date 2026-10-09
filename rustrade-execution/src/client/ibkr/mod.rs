@@ -3063,13 +3063,13 @@ impl ExecutionClient for IbkrClient {
     ///   (`resume: None`) for what IB returned: a span reaching before today is not read
     ///   before today. For historical executions beyond today, use IB's Flex Query or
     ///   Activity Statements.
-    /// - Only the executions of orders this API client placed are returned, and those IB
-    ///   flags as an IB-initiated liquidation, as
-    ///   [`Liquidation`](crate::trade::TradeOrigin::Liquidation) trades. With
+    /// - Only the executions of orders this API client placed are returned, plus any
+    ///   execution IB flags as an IB-initiated liquidation, whoever placed its order, as a
+    ///   [`Liquidation`](crate::trade::TradeOrigin::Liquidation) trade. With
     ///   [`IbkrConfig::other_clients_fills`] set, every other client's execution IB sends is
     ///   returned too, as an [`External`](crate::trade::TradeOrigin::External) trade under
-    ///   IB's permanent id for its order. An execution in a contract this client has not registered is skipped
-    ///   either way.
+    ///   IB's permanent id for its order. An execution in a contract this client has not
+    ///   registered is skipped either way.
     /// - Each trade's fees come from the commission report IB sends with its
     ///   execution. An execution whose report IB did not send is returned with a zero
     ///   fee in [`UNKNOWN_FEE_ASSET`](execution::UNKNOWN_FEE_ASSET), with a warning.
