@@ -138,8 +138,8 @@ pub enum VenueRegime {
 /// The position is reported by [`account_snapshot`](Self::account_snapshot), and a position that
 /// a configured `initial_state` reports for a CFD is where this venue starts.
 ///
-/// Not modelled: funding, financing and liquidation. A short closed at more than twice its entry
-/// has lost more than its margin, and pays the shortfall as a debit.
+/// Not modelled: liquidation, or any carry (see below). A short closed at more than twice its
+/// entry has lost more than its margin, and pays the shortfall as a debit.
 ///
 /// [`Perpetual`](InstrumentKind::Perpetual), [`Future`](InstrumentKind::Future) and
 /// [`Option`](InstrumentKind::Option) need funding, margin and expiry settlement, none of which this
@@ -148,6 +148,14 @@ pub enum VenueRegime {
 /// `rustrade` builder, because this type and its [`instruments`](Self::instruments) map are public:
 /// a consumer that constructs one directly bypasses every upstream gate, and the alternative to
 /// rejecting is filling a derivative as if it were deliverable stock.
+///
+/// # Carry, locates and the short-sale restriction
+/// This venue charges no carrying cost: no funding, financing, margin interest or borrow fee ever
+/// reaches its ledger, so a CFD short is held for free, and the balances and PnL of a run leave
+/// carry out. It lends no stock either: a spot sell delivers base the account must hold, so a
+/// short sale of a spot instrument is refused with [`ApiError::BalanceInsufficient`]. Nor does it
+/// model the steps a short sale on a real venue can meet before it fills: no locate is required,
+/// and no hard-to-borrow list or short-sale restriction ever refuses a CFD short.
 ///
 /// # ⚠️ Caller obligations and known limitations
 /// - **Fund the quote asset of every instrument traded.** Every debit is quote-denominated except a

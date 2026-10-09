@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-09
+
+### Changed
+
+- **Position PnL and the execution clients' balances now document what carrying costs they leave
+  out** (`rustrade`, `rustrade-execution`; documentation only, no behaviour change). Fixes #548.
+  - `Position`'s PnL is computed from fills and fees alone. It excludes perpetual funding, margin
+    interest and stock borrow fees, so it overstates a position that pays carry.
+  - Each client now says what its balances include and how fresh they are. Hyperliquid's
+    standard-mode balances include funding, but position PnL does not. Binance margin debt and
+    accrued interest are only as fresh as the last REST read. IBKR's `TotalCashValue`, as IB
+    documents it, leaves out interest and borrow fees accrued during the month until they are
+    posted. Alpaca reads only fill activities, and its trades report zero fees.
+  - `SimulatedVenue` charges no carry, lends no stock, and models no locate or short-sale
+    restriction.
+
+### Fixed
+
+- **`BinanceMargin` logs its borrow/repay and margin-level stream events** (`rustrade-execution`). Fixes #547.
+  - The user-data stream matched `userLiabilityChange` and `marginLevelStatusChange`. Binance
+    documents these events as `USER_LIABILITY_CHANGE` and `MARGIN_LEVEL_STATUS_CHANGE`, so
+    documented frames were dropped at trace level, including the liquidation-risk warning.
+  - Both spellings are now accepted until a live frame confirms which one the `userListenToken`
+    stream sends. The events are still logged only, never applied to balance state (#108).
+- **`BinanceSpot` and `BinanceMargin` warn about user-data event types they do not handle**
+  (`rustrade-execution`). Before, any such event was dropped at trace level. Now the first event of
+  each unhandled type is logged at WARN, as is every 1,000th unhandled event per venue, so a
+  frequent type cannot hide a rarer one. Event types the clients ignore on purpose (`listStatus`,
+  and `externalLockUpdate` on spot) are still logged at trace.
+
 ## [0.10.0] - 2026-10-08
 
 ### Added

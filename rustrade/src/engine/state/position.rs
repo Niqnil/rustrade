@@ -533,6 +533,18 @@ pub enum PositionSeedError {
 
 /// Represents an open trading position for a specific instrument.
 ///
+/// # What the PnL covers
+/// `pnl_realised` and `pnl_unrealised` are computed from fills and their fees alone. They leave
+/// out the costs of *holding* a position, which arrive as no [`Trade`]: perpetual funding, margin
+/// interest and stock borrow fees. So they overstate the PnL of a position that pays carry (a
+/// short on borrowed stock, or a perpetual on the side that pays funding) and understate that of
+/// one that receives it.
+///
+/// A venue charges these to the account's cash or collateral, so its balances can include carry
+/// that no `Position` shows. Each execution client's rustdoc says what its balances include and
+/// how fresh they are. The simulated venue charges no carry at all (see
+/// [`SimulatedVenue`](rustrade_execution::exchange::mock::SimulatedVenue)).
+///
 /// # Type Parameters
 /// - `AssetKey`: The type representing the asset used for fees (e.g. AssetIndex, QuoteAsset, etc.)
 /// - `InstrumentKey`: The type identifying the traded instrument (e.g. InstrumentIndex, etc.)
@@ -662,12 +674,14 @@ pub struct Position<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
 
     /// Estimated unrealised PnL generated from closing the remaining [`Position`] `quantity_abs`.
     ///
-    /// Note this includes estimated exit fees.
+    /// Note this includes estimated exit fees, and excludes funding, interest and borrow fees (see
+    /// [What the PnL covers](Position#what-the-pnl-covers)).
     pub pnl_unrealised: Decimal,
 
     /// Cumulative realised PnL from any partially closed [`Position`] `quantity_abs_max`.
     ///
-    /// Note this includes fees.
+    /// Note this includes fees, and excludes funding, interest and borrow fees (see
+    /// [What the PnL covers](Position#what-the-pnl-covers)).
     pub pnl_realised: Decimal,
 
     /// Cumulative fees paid when entering/increasing [`Position`] quantity.
@@ -1325,7 +1339,8 @@ pub struct PositionExited<AssetKey, InstrumentKey = InstrumentIndex> {
 
     /// Cumulative realised PnL from closing the full [`Position`] `quantity_abs_max`.
     ///
-    /// Note this includes fees.
+    /// Note this includes fees, and excludes funding, interest and borrow fees (see
+    /// [What the PnL covers](Position#what-the-pnl-covers)).
     pub pnl_realised: Decimal,
 
     /// Cumulative fees paid when entering the [`Position`].
