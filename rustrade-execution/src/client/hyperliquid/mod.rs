@@ -134,6 +134,23 @@
 //! reported as `OrderKind::Limit`, `GoodUntilCancelled`. Track `OrderKind` from the placement
 //! request.
 //!
+//! # Funding
+//!
+//! Hyperliquid settles perpetual funding every hour, as a payment into or out of the collateral
+//! that margins the position. So the collateral balances this client reports include the funding
+//! paid and received: under the standard account mode a DEX's balance is its `accountValue`.
+//! Nothing else this client reports includes it:
+//! - The account stream subscribes to fills and order updates only. No funding payment arrives as
+//!   an event, and no balance does either: balances are read only by
+//!   [`account_snapshot`](HyperliquidClient#method.account_snapshot) and
+//!   [`fetch_balances`](ExecutionClient::fetch_balances).
+//! - A position's [`unrealized_pnl`](crate::position::Position::unrealized_pnl) is Hyperliquid's
+//!   `unrealizedPnl`, which comes from price alone. The `cumFunding` Hyperliquid lists beside it
+//!   is not read.
+//! - Fills carry no funding, so PnL computed from them excludes it too.
+//!
+//! A caller that needs a position's funding reads Hyperliquid's `userFunding` history itself.
+//!
 //! # Limitations
 //!
 //! - **Order precision**: Hyperliquid limits a size to the asset's `szDecimals` decimal places,

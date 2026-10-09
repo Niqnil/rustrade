@@ -29,6 +29,18 @@
 //! - Orders: Subscription-based events (OrderStatus, ExecutionData, CommissionReport)
 //! - Account: Subscription-based position and balance updates
 //!
+//! # Balances and carrying costs
+//!
+//! Balances are read from IB's account summary, one per currency: `total` is `TotalCashValue` and
+//! `free` is `AvailableFunds`. No other tag is read, and [`ExecutionClient::account_stream`]
+//! delivers no balances.
+//!
+//! As IB documents it, margin interest and stock borrow fees accrue through the month, reported
+//! under the `AccruedCash` tag, and are posted to cash monthly. Until they are posted,
+//! `TotalCashValue`, and so `total`, leaves them out: up to a month of charges. This client does
+//! not read `AccruedCash`. Fills carry none of these charges, so PnL computed from them excludes
+//! them too.
+//!
 //! # Limitations
 //!
 //! - **Order types**: Market, Limit, Stop, StopLimit, TrailingStop, TrailingStopLimit,

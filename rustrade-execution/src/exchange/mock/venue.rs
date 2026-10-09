@@ -149,6 +149,14 @@ pub enum VenueRegime {
 /// a consumer that constructs one directly bypasses every upstream gate, and the alternative to
 /// rejecting is filling a derivative as if it were deliverable stock.
 ///
+/// # Carry, locates and the short-sale restriction
+/// This venue charges no carrying cost: no funding, financing, margin interest or borrow fee ever
+/// reaches its ledger, so a CFD short is held for free, and the balances and PnL of a run leave
+/// carry out. It lends no stock either: a spot sell delivers base the account must hold, so a
+/// short sale of a spot instrument is refused with [`ApiError::BalanceInsufficient`]. Nor does it
+/// model the steps a short sale on a real venue can meet before it fills: no locate is required,
+/// and no hard-to-borrow list or short-sale restriction ever refuses a CFD short.
+///
 /// # ⚠️ Caller obligations and known limitations
 /// - **Fund the quote asset of every instrument traded.** Every debit is quote-denominated except a
 ///   spot sell, which debits base. A missing balance is a **panic**, not an error: the balances are
