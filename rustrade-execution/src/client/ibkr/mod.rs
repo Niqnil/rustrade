@@ -380,6 +380,15 @@ const PLACEMENT_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// live-but-pending ([`PlacementOutcome::HeldPending`]) rather than rejected
 /// when one of these codes arrives.
 ///
+/// # Code 404: held for a short-sale locate
+///
+/// *"Shares for this order are not immediately available for short sale. The order will be
+/// held while we attempt to locate the shares."* IBKR keeps the order working and transmits it
+/// once shares are found, or ends it when its time in force runs out. ibapi 5.0.0 classifies 404
+/// as `NoticeCategory::Error` (it is outside every range), so it arrives as `Err(Error::Notice)`
+/// and ends the placement subscription, like the second form of 399 below. Reporting it as a
+/// rejection would tell the caller a live order is dead while it can still fill.
+///
 /// # ibapi 4.0 splits code 399 by message text
 ///
 /// `is_warning_message` now classifies a 399 whose text carries a `Warning:`
@@ -410,7 +419,7 @@ const PLACEMENT_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// between ibapi's range heuristic and IBKR's actual protocol semantics; if
 /// IBKR adds further informational codes in the 200-399 range, an out-of-RTH
 /// placement test will surface them and they can be added here.
-const INFORMATIONAL_ORDER_CODES: &[i32] = &[399];
+const INFORMATIONAL_ORDER_CODES: &[i32] = &[399, 404];
 
 /// Outcome of awaiting the initial status on an order-placement subscription.
 ///
@@ -1032,10 +1041,10 @@ fn send_error<AssetKey, InstrumentKey>(
 /// # Why notices are not blanket rejections
 ///
 /// ibapi delivers a TWS error frame that it does not classify as a warning as
-/// `Err(Error::Notice)`, and then closes the subscription. IB emits
-/// informational order messages (e.g. code 399, order held until RTH) the same
-/// way, so treating every `Err` as a rejection would falsely reject orders that
-/// are actually live. We instead key off the notice code: known informational
+/// `Err(Error::Notice)`, and then closes the subscription. IB emits informational order
+/// messages (e.g. code 399, order held until RTH, or 404, held for a short-sale locate) the
+/// same way, so treating every `Err` as a rejection would falsely reject orders that are
+/// actually live. We instead key off the notice code: known informational
 /// codes yield [`PlacementOutcome::HeldPending`]; transport loss yields
 /// [`PlacementOutcome::NoStatus`], because the order may already be live; all
 /// other notices and errors yield [`PlacementOutcome::Rejected`]. The `OrderStatus`
@@ -1056,9 +1065,9 @@ where
     for event in events {
         let event = match event {
             Ok(event) => event,
-            // Informational order message (e.g. 399 held-until-RTH): the order
-            // is accepted; ibapi has closed the subscription, so stop here and
-            // let the update stream carry the real status.
+            // Informational order message (e.g. 399 held until RTH, 404 held for a
+            // short-sale locate): the order is accepted; ibapi has closed the
+            // subscription, so stop here and let the update stream carry the real status.
             Err(ibapi::Error::Notice(n)) if INFORMATIONAL_ORDER_CODES.contains(&n.code) => {
                 return PlacementOutcome::HeldPending(format!("[{}] {}", n.code, n.message));
             }
@@ -1781,8 +1790,8 @@ impl IbkrClient {
                 }
             };
 
-            // Await the first status from each subscription. A leg held until
-            // RTH (informational notice, e.g. 399) is treated as live with an
+            // Await the first status from each subscription. A held leg
+            // (informational notice, e.g. 399 or 404) is treated as live with an
             // unknown fill (0.0) — the order is working, not rejected. `None`
             // means the subscription closed/timed out without a terminal status.
             let leg_status = |outcome: PlacementOutcome, leg: &str| match outcome {
@@ -4148,6 +4157,55 @@ mod order_status_tests {
         assert!(matches!(
             await_order_placement(events),
             PlacementOutcome::Accepted { .. }
+        ));
+    }
+
+    fn order_notice(code: i32, message: &str) -> Result<PlaceOrder, ibapi::Error> {
+        Err(ibapi::Error::Notice(ibapi::Notice {
+            request_id: Some(42),
+            code,
+            message: message.to_string(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        }))
+    }
+
+    /// IBKR holds an order on 399 (until the session opens) and on 404 (while it locates shares
+    /// for a short sale). Either way the order is live, so placement must not report it rejected.
+    #[test]
+    fn held_order_notices_are_held_pending_not_rejected() {
+        for (code, message) in [
+            (
+                399,
+                "Order Message:\nSELL 100 AAPL NASDAQ.NMS\nYour order will not be placed at the \
+                 exchange until 2026-10-12 09:30:00 US/Eastern.",
+            ),
+            (
+                404,
+                "Shares for this order are not immediately available for short sale. The order \
+                 will be held while we attempt to locate the shares.",
+            ),
+        ] {
+            match await_order_placement(vec![order_notice(code, message)]) {
+                PlacementOutcome::HeldPending(reason) => assert!(
+                    reason.starts_with(&format!("[{code}] ")),
+                    "the code and text must reach the caller, got {reason:?}"
+                ),
+                other => panic!("expected HeldPending for {code}, got {other:?}"),
+            }
+        }
+    }
+
+    /// A notice that is not a known hold, such as a 201 rejection, still rejects the placement.
+    #[test]
+    fn other_order_notices_are_rejected() {
+        let events = vec![order_notice(
+            201,
+            "Order rejected - reason:YOUR ORDER IS NOT ACCEPTED.",
+        )];
+        assert!(matches!(
+            await_order_placement(events),
+            PlacementOutcome::Rejected(reason) if reason.contains("[201]")
         ));
     }
 

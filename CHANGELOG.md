@@ -103,6 +103,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `BinanceMargin` logs each `executionReport`'s client order id, order type and execution type
     at DEBUG, as evidence for a future margin-liquidation marker, which Binance does not document.
 
+### Fixed
+
+- **`IbkrClient` no longer reports an order held for a short-sale locate as rejected**
+  (`rustrade-execution`). Fixes #569.
+  - TWS code 404 ("Shares for this order are not immediately available for short sale. The order
+    will be held while we attempt to locate the shares.") means IBKR keeps the order working until
+    shares are found or its time in force ends. Placement reported it as `OrderRejected`, so a
+    caller treated a live order as dead while it could still fill.
+  - It is now handled like code 399 (held until the session opens): placement reports the order
+    open with nothing filled, logs the hold at WARN with the order id and TWS's text, and the
+    account stream carries its later status.
+
 ## [0.10.1] - 2026-10-09
 
 ### Changed
