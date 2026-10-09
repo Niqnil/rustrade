@@ -140,8 +140,8 @@
 //! that margins the position. Under the standard account mode a DEX's balance is its
 //! `accountValue`, which includes the funding paid and received, and the positions' unrealised
 //! PnL too. Under a unified account or portfolio margin a balance is the collateral token's spot
-//! balance; whether Hyperliquid books funding there at once has not been checked. Nothing else
-//! this client reports includes funding:
+//! balance; whether Hyperliquid books funding there at once has not been checked. Apart from
+//! the balances, nothing this client reports includes funding:
 //! - The account stream subscribes to fills and order updates only. No funding payment arrives as
 //!   an event, and no balance does either: balances are read only by
 //!   [`account_snapshot`](HyperliquidClient#method.account_snapshot) and
