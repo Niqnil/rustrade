@@ -409,6 +409,11 @@ impl BinanceMarginConfig {
 /// asset — call it at startup and refresh on demand (see [`account_stream`](Self::account_stream)'s
 /// cold-start note).
 ///
+/// As Binance documents it, margin interest is charged hourly on what is borrowed and accrues as
+/// the asset's unpaid `interest`, which comes out of `total` only when it is repaid. `net_asset`
+/// deducts `borrowed` alone, so until then `interest` is the only figure that holds it, as fresh
+/// as the rest of the debt. Fills carry no interest, so PnL computed from them excludes it.
+///
 /// # Rate limits
 /// Once a `/sapi` response reports at least 90% of the documented per-IP weight limit (12000 per
 /// minute) used, queries wait for the next minute, so the rest is left for orders and cancels,

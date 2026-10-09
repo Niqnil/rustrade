@@ -1038,6 +1038,17 @@ struct AlpacaOrderWs<'a> {
 /// every request, orders included, waits until the window resets (`X-Ratelimit-Reset`, at most a
 /// minute away), so it is not refused. A 429 waits the same way and is retried.
 ///
+/// # Fees, interest and borrow fees
+/// Every [`Trade`] this client reports carries zero fees. Equities and options trade without
+/// commission. Alpaca's fill events carry no fee for crypto either: it is taken from the asset
+/// the trade credits, so it shows only in that asset's balance.
+///
+/// Alpaca posts its other charges, such as margin interest and stock borrow fees, to the
+/// account's cash as account activities. A USD balance's `total` is that cash, so it includes a
+/// charge once Alpaca has posted it. This client reads only `FILL` activities, so the charges
+/// themselves are not reported, and [`ExecutionClient::account_stream`] delivers no balances.
+/// PnL computed from fills excludes all of them.
+///
 /// Cloning is cheap: all inner state is behind `Arc`.
 #[derive(Clone)]
 pub struct AlpacaClient {

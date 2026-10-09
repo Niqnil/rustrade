@@ -69,6 +69,11 @@ pub struct Balance {
     /// Exception: a venue whose margin is account-level (Alpaca, IBKR) reports only the account's
     /// cash here, which is negative while the account borrows, with `margin` left `None`. See
     /// the client's `account_snapshot`.
+    ///
+    /// A carrying cost (funding, margin interest, a borrow fee) reaches `total` only once the venue
+    /// posts it to the account, hourly at some venues and monthly at others. Until then no figure
+    /// here carries it, except the accrued [`MarginDetails::interest`] of a venue that reports
+    /// one. Each client's rustdoc says what its venue posts and when.
     pub total: Decimal,
     /// Portion of `total` available to trade (not reserved against resting orders).
     pub free: Decimal,
