@@ -151,6 +151,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     open with nothing filled, and the account stream carries its later status. When the notice is
     the first thing TWS sends about the order, the hold is logged at WARN with the order id and
     TWS's text.
+- **`HyperliquidClient` and `HyperliquidSpotClient` report a shortfall of funds as
+  `BalanceInsufficient`** (`rustrade-execution`). Fixes #571.
+  - Before, every Hyperliquid refusal was `OrderRejected`, so a caller could not handle a shortfall
+    the way it does on other venues.
+  - "Insufficient margin to place order." and the `perpMarginRejected` order status, and "Order has
+    insufficient spot balance to trade" and the `insufficientSpotBalanceRejected` status, are now
+    `BalanceInsufficient(None, <venue text>)`. Hyperliquid does not name the asset that ran short.
+    This covers the placement response, the account stream's order updates, and order-status
+    lookups.
+  - Other refusals (minimum notional, reduce-only, open-interest caps, oracle, margin-tier limit)
+    stay `OrderRejected`.
 
 ## [0.10.1] - 2026-10-09
 
