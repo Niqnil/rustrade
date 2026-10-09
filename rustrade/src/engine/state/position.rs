@@ -742,8 +742,8 @@ pub struct Position<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
 
     /// Estimated unrealised PnL generated from closing the remaining [`Position`] `quantity_abs`.
     ///
-    /// Note this includes estimated exit fees, and excludes funding, interest and borrow fees, which
-    /// accumulate in `carry` (see [What the PnL covers](Position#what-the-pnl-covers)).
+    /// Note this includes estimated exit fees, and excludes funding, interest and borrow fees,
+    /// which accumulate in `carry` (see [What the PnL covers](Position#what-the-pnl-covers)).
     pub pnl_unrealised: Decimal,
 
     /// Cumulative realised PnL from any partially closed [`Position`] `quantity_abs_max`.
