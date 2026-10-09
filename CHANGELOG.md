@@ -102,6 +102,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     no state. A notice sent while a stream is disconnected is not recovered.
   - `BinanceMargin` logs each `executionReport`'s client order id, order type and execution type
     at DEBUG, as evidence for a future margin-liquidation marker, which Binance does not document.
+- **Refused borrows get their own error: `ApiError::BorrowRejected`** (`rustrade-execution`,
+  #550).
+  - It carries a `BorrowReject`: why (`BorrowRejectReason`: `NotShortable`, `BorrowDisabled`,
+    `InventoryUnavailable`, `BorrowLimitExceeded` or `Other`), the venue's code where it gave one,
+    for diagnostics only, and the venue's message. `BorrowReject` and `BorrowRejectReason` are
+    `#[non_exhaustive]`. It is not transient. A borrow can be refused for a leveraged long too,
+    hence "borrow" rather than "short".
+  - **Breaking, in behaviour:** these refusals no longer arrive as `OrderRejected` or
+    `BalanceInsufficient`. Code matching on those for a refused short or borrow must match
+    `BorrowRejected` too. `ApiError` is `#[non_exhaustive]`, so the variant is additive at compile
+    time.
+  - `BinanceMargin` maps by code: `-3006` → `BorrowLimitExceeded`; `-3008`, `-3012` and `-3014` →
+    `BorrowDisabled`; `-3045` → `InventoryUnavailable`. All five were `OrderRejected` before.
+  - Binance's `-3041` and `-3023` are now `BalanceInsufficient` by code; `-3023`'s wording was
+    `OrderRejected` before. `-3013`, `-3021` and `-3022` stay `OrderRejected`.
+  - `BinanceSpot` and `BinanceMargin` now classify an `executionReport` with status `REJECTED`
+    the way they classify a synchronous rejection, so a balance shortfall arriving that way is
+    `BalanceInsufficient` rather than `OrderRejected`.
+  - `AlpacaClient` reads a 422, or a 403 with a code, by its text: "account is not allowed to
+    short" → `BorrowDisabled`, and "cannot be sold short" → `NotShortable`. Alpaca's "fractional
+    orders cannot be sold short" stays `OrderRejected`, since the asset may be shortable in whole
+    shares. Other clients still report such refusals as `OrderRejected`.
 
 ### Fixed
 

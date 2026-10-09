@@ -55,8 +55,8 @@ use crate::{
     },
     emit_stream_terminated,
     error::{
-        ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
-        UnindexedOrderError,
+        ApiError, BorrowReject, BorrowRejectReason, ConnectivityError, OrderError,
+        StreamTerminationReason, UnindexedApiError, UnindexedClientError, UnindexedOrderError,
     },
     order::{
         Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType, UnindexedInactiveOrder,
@@ -4713,34 +4713,66 @@ fn parse_api_error(
 
     // Compute lowercase once for all match guards that inspect the message body.
     let lower = message.to_ascii_lowercase();
-    let coded = || match code {
-        Some(code) => format!("{code} {message}"),
-        None => message.to_owned(),
-    };
     match status.as_u16() {
         // Match "already" before "insufficient": if Alpaca ever sends a 422 body
         // containing both substrings, this arm wins and maps to OrderAlreadyCancelled,
         // which is more specific than BalanceInsufficient.
         422 if lower.contains("already") => ApiError::OrderAlreadyCancelled,
-        // The body says what ran short ("insufficient buying power", or "insufficient qty
-        // available" on a sell) but names no asset, so none is guessed.
-        422 if lower.contains("insufficient") => ApiError::BalanceInsufficient(None, coded()),
+        422 => parse_business_refusal(code, message, &lower),
         401 => ApiError::Unauthenticated(format!("unauthorized: {message}")),
         // A 403 means one of two things, told apart by the code. Without one, it is Alpaca's
         // `{"message": "forbidden."}` to a wrong key, secret or host. With one, the account is
         // fine and Alpaca refused the request on a business rule: `40310000` is generic
         // ("insufficient buying power", "insufficient qty available for order", "account is
         // not allowed to short", "account is restricted to liquidation only", ...), and
-        // `40310100` is pattern-day-trader protection. Only the text tells a shortfall apart.
+        // `40310100` is pattern-day-trader protection.
         403 => match code {
             None => ApiError::Unauthenticated(format!("forbidden: {message}")),
-            Some(_) if lower.contains("insufficient") => {
-                ApiError::BalanceInsufficient(None, coded())
-            }
-            Some(_) => ApiError::OrderRejected(coded()),
+            Some(_) => parse_business_refusal(code, message, &lower),
         },
         404 => ApiError::OrderRejected(format!("order not found: {message}")),
-        _ => ApiError::OrderRejected(coded()),
+        _ => ApiError::OrderRejected(with_alpaca_code(code, message)),
+    }
+}
+
+/// Classifies a refusal on a business rule (a 422, or a 403 with a code) by its text, since
+/// Alpaca's codes are generic. `lower` is `message` in lowercase.
+///
+/// - "account is not allowed to short" → [`ApiError::BorrowRejected`] with
+///   [`BorrowRejectReason::BorrowDisabled`].
+/// - "cannot be sold short" → [`BorrowRejectReason::NotShortable`], except Alpaca's "fractional
+///   orders cannot be sold short": the asset may be shortable in whole shares, so that is the
+///   order's shape, an [`ApiError::OrderRejected`].
+/// - "insufficient" → [`ApiError::BalanceInsufficient`]. The body says what ran short
+///   ("insufficient buying power", or "insufficient qty available" on a sell) but names no
+///   asset, so none is guessed.
+/// - anything else → [`ApiError::OrderRejected`].
+fn parse_business_refusal(code: Option<i64>, message: &str, lower: &str) -> UnindexedApiError {
+    let borrow = if lower.contains("not allowed to short") {
+        Some(BorrowRejectReason::BorrowDisabled)
+    } else if lower.contains("cannot be sold short") && !lower.contains("fractional") {
+        Some(BorrowRejectReason::NotShortable)
+    } else {
+        None
+    };
+    if let Some(reason) = borrow {
+        ApiError::BorrowRejected(BorrowReject::new(
+            reason,
+            code.map(|code| code.to_string()),
+            message.to_owned(),
+        ))
+    } else if lower.contains("insufficient") {
+        ApiError::BalanceInsufficient(None, with_alpaca_code(code, message))
+    } else {
+        ApiError::OrderRejected(with_alpaca_code(code, message))
+    }
+}
+
+/// `message` prefixed with Alpaca's code where it has one, so a caller can see it.
+fn with_alpaca_code(code: Option<i64>, message: &str) -> String {
+    match code {
+        Some(code) => format!("{code} {message}"),
+        None => message.to_owned(),
     }
 }
 
@@ -7005,9 +7037,72 @@ mod tests {
     }
 
     #[test]
+    fn parse_order_error_reads_a_refused_short_by_its_text() {
+        for (status, code, message, reason) in [
+            (
+                reqwest::StatusCode::FORBIDDEN,
+                Some(40310000),
+                "account is not allowed to short",
+                BorrowRejectReason::BorrowDisabled,
+            ),
+            // Which status Alpaca gives a non-shortable asset is unconfirmed, so both are read.
+            (
+                reqwest::StatusCode::FORBIDDEN,
+                Some(40310000),
+                "asset XYZ cannot be sold short",
+                BorrowRejectReason::NotShortable,
+            ),
+            (
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+                Some(42210000),
+                "asset XYZ cannot be sold short",
+                BorrowRejectReason::NotShortable,
+            ),
+            (
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+                None,
+                "account is not allowed to short",
+                BorrowRejectReason::BorrowDisabled,
+            ),
+        ] {
+            assert_eq!(
+                parse_order_error(status, code, message),
+                UnindexedOrderError::Rejected(ApiError::BorrowRejected(BorrowReject::new(
+                    reason,
+                    code.map(|code| code.to_string()),
+                    message.to_owned(),
+                ))),
+                "{status} {message:?}"
+            );
+        }
+
+        // The asset may be shortable in whole shares: the order's shape was refused, not a
+        // borrow.
+        assert_eq!(
+            parse_order_error(
+                reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+                Some(42210000),
+                "fractional orders cannot be sold short",
+            ),
+            UnindexedOrderError::Rejected(ApiError::OrderRejected(
+                "42210000 fractional orders cannot be sold short".into()
+            ))
+        );
+
+        // Without a code a 403 is a wrong key, whatever its text.
+        assert!(matches!(
+            parse_order_error(
+                reqwest::StatusCode::FORBIDDEN,
+                None,
+                "account is not allowed to short"
+            ),
+            UnindexedOrderError::Rejected(ApiError::Unauthenticated(_))
+        ));
+    }
+
+    #[test]
     fn parse_order_error_403_with_code_maps_to_order_rejected() {
         for (code, message) in [
-            (40310000, "account is not allowed to short"),
             (40310000, "account is restricted to liquidation only"),
             (
                 40310100,
@@ -7994,7 +8089,11 @@ mod tests {
             .await;
             assert_eq!(
                 rejected(&state),
-                ApiError::OrderRejected("40310000 account is not allowed to short".into())
+                ApiError::BorrowRejected(BorrowReject::new(
+                    BorrowRejectReason::BorrowDisabled,
+                    Some("40310000".into()),
+                    "account is not allowed to short".into(),
+                ))
             );
 
             let state = open_against(serde_json::json!({ "message": "forbidden." })).await;

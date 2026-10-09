@@ -493,6 +493,7 @@ impl AccountEventIndexer {
                 ApiError::DuplicateClientOrderId(message)
             }
             UnindexedApiError::RequestRejected(reason) => ApiError::RequestRejected(reason),
+            UnindexedApiError::BorrowRejected(reject) => ApiError::BorrowRejected(reject),
         }
     }
 
