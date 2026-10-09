@@ -542,7 +542,9 @@ pub enum PositionSeedError {
 ///
 /// A venue charges these to the account's cash or collateral, so its balances can include carry
 /// that no `Position` shows. Each execution client's rustdoc says what its balances include and
-/// how fresh they are. The simulated venue charges no carry at all (see
+/// how fresh they are. Where a venue reports a payment as it posts it, it arrives on the account
+/// feed as an [`AccountEventKind::CashFlow`](rustrade_execution::AccountEventKind::CashFlow),
+/// which the engine logs without applying to any `Position`. The simulated venue charges no carry at all (see
 /// [`SimulatedVenue`](rustrade_execution::exchange::mock::SimulatedVenue)).
 ///
 /// # Type Parameters

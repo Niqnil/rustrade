@@ -20,7 +20,8 @@
 //!   the response into [`common::UserFill`] rather than the SDK's type, which drops `tid` and
 //!   `feeToken`.
 //! - REST (`ExchangeClient`): open_order, cancel_order
-//! - WebSocket (`InfoClient` with `with_reconnect`): account_stream via UserFills + OrderUpdates subscriptions
+//! - WebSocket (`InfoClient` with `with_reconnect`): account_stream via UserFills + OrderUpdates +
+//!   UserFundings subscriptions
 //! - REST (`InfoClient`), after each reconnect and through [`OrderStatusClient`]: how the orders
 //!   held as live ended, by `openOrders` and `orderStatus`
 //!
@@ -32,7 +33,7 @@
 //! |----------------|----------------|
 //! | **Reconnection** | `InfoClient::with_reconnect()` handles WebSocket reconnection automatically |
 //! | **Heartbeat** | SDK manages WebSocket ping/pong internally |
-//! | **Deduplication** | This client's own, on the fills stream. See below. |
+//! | **Deduplication** | This client's own, on the fills and funding payments. See below and [Funding](self#funding). |
 //! | **Fill recovery** | Only the recent fills the venue's `userFills` snapshot redelivers on each resubscription — use [`ExecutionClient::fetch_trades`] for older ones |
 //! | **Ended-order recovery** | This client's own, after each reconnect: see [`HyperliquidClient`]'s `account_stream` and [`OrderStatusClient`] |
 //!
@@ -137,21 +138,36 @@
 //! # Funding
 //!
 //! Hyperliquid settles perpetual funding every hour, as a payment into or out of the collateral
-//! that margins the position. Under the standard account mode a DEX's balance is its
-//! `accountValue`, which includes the funding paid and received, and the positions' unrealised
-//! PnL too. Under a unified account or portfolio margin a balance is the collateral token's spot
-//! balance; whether Hyperliquid books funding there at once has not been checked. Apart from
-//! the balances, nothing this client reports includes funding:
-//! - The account stream subscribes to fills and order updates only. No funding payment arrives as
-//!   an event, and no balance does either: balances are read only by
-//!   [`account_snapshot`](HyperliquidClient#method.account_snapshot) and
-//!   [`fetch_balances`](ExecutionClient::fetch_balances).
+//! that margins the position. The perpetuals account stream reports each payment, from the
+//! `userFundings` subscription, as an [`AccountEventKind::CashFlow`] of
+//! [`CashFlowKind::Funding`](crate::cash_flow::CashFlowKind::Funding):
+//! - `amount` is Hyperliquid's `usdc`, signed positive when the account received it. Its asset is
+//!   the collateral of the perpetual's DEX. Hyperliquid names the field `usdc` on every DEX, and
+//!   that it is in the collateral on a HIP-3 DEX settling in another token is this client's
+//!   reading, not documented. `rate` is `fundingRate` and `position_quantity` is the signed `szi`.
+//! - Hyperliquid gives a payment no id, so `id` is `None`. The instrument and `time_exchange`
+//!   identify it.
+//! - The subscription opens with a snapshot of recent payments, so a stream's first events can
+//!   predate it: filter on `time_exchange` to take only new ones. The SDK resubscribes on every
+//!   reconnect and the snapshot comes again, so this client sends each payment once per
+//!   [`ExecutionClient::account_stream`] call, as it does fills. Hyperliquid does not document
+//!   how far back the snapshot reaches, so payments made during a long outage can be missing;
+//!   Hyperliquid's `userFunding` history has them.
+//! - The spot client's stream carries none.
+//!
+//! Under the standard account mode a DEX's balance is its `accountValue`, which includes the
+//! funding paid and received, and the positions' unrealised PnL too, so adding payments to a
+//! balance read after them counts them twice. Under a unified account or portfolio margin a
+//! balance is the collateral token's spot balance; whether Hyperliquid books funding there at
+//! once has not been checked. The stream carries no balance: balances are read only by
+//! [`account_snapshot`](HyperliquidClient#method.account_snapshot) and
+//! [`fetch_balances`](ExecutionClient::fetch_balances).
+//!
+//! Positions exclude funding:
 //! - A position's [`unrealized_pnl`](crate::position::Position::unrealized_pnl) is Hyperliquid's
 //!   `unrealizedPnl`, which comes from price alone. The `cumFunding` Hyperliquid lists beside it
 //!   is not read.
 //! - Fills carry no funding, so PnL computed from them excludes it too.
-//!
-//! A caller that needs a position's funding reads Hyperliquid's `userFunding` history itself.
 //!
 //! # Limitations
 //!
@@ -165,6 +181,7 @@
 pub mod common;
 pub mod config;
 pub mod error;
+mod funding;
 mod order_recovery;
 mod perp_account;
 mod perp_dexes;
@@ -206,6 +223,7 @@ pub use error::HyperliquidConnectError;
 use error::map_order_error;
 use ethers::signers::Signer;
 use fnv::FnvHashSet;
+use funding::{funding_cash_flow, send_fundings};
 use futures::{StreamExt, stream::BoxStream};
 use hyperliquid_rust_sdk::{ExchangeClient, InfoClient, Message, Subscription};
 use order_recovery::{
@@ -508,20 +526,24 @@ impl ExecutionClient for HyperliquidClient {
         Ok(snapshot)
     }
 
-    /// Returns a live stream of account events (fills, order updates).
+    /// Returns a live stream of account events (fills, order updates, funding payments).
+    ///
+    /// Funding payments arrive as [`AccountEventKind::CashFlow`]; see the [module
+    /// docs](self#funding).
     ///
     /// # Instrument filtering
     ///
     /// The `instruments` parameter is **ignored** — Hyperliquid's WebSocket API does not
-    /// support per-instrument subscriptions for user events. All fills and order updates
-    /// across all instruments are delivered. Consumers requiring instrument filtering
-    /// must filter client-side.
+    /// support per-instrument subscriptions for user events. All fills, order updates and
+    /// funding payments across all instruments are delivered. Consumers requiring instrument
+    /// filtering must filter client-side.
     ///
     /// # Task lifecycle
     ///
-    /// Spawns three background tasks (fills, orders, and the reconnect's order check below) that
-    /// are automatically cancelled when the returned stream is dropped. The `ws_client` is held by
-    /// the orders task; when cancelled, the tasks exit and the WebSocket connection closes.
+    /// Spawns four background tasks (fills, orders, funding payments, and the reconnect's order
+    /// check below) that are automatically cancelled when the returned stream is dropped. The
+    /// `ws_client` is held by the orders task; when cancelled, the tasks exit and the WebSocket
+    /// connection closes.
     ///
     /// # Orders that ended while disconnected
     ///
@@ -580,6 +602,7 @@ impl ExecutionClient for HyperliquidClient {
         // Create channels for subscriptions
         let (fills_tx, mut fills_rx) = mpsc::unbounded_channel::<Message>();
         let (orders_tx, mut orders_rx) = mpsc::unbounded_channel::<Message>();
+        let (fundings_tx, mut fundings_rx) = mpsc::unbounded_channel::<Message>();
 
         // Subscribe to user fills
         ws_client
@@ -592,6 +615,12 @@ impl ExecutionClient for HyperliquidClient {
             .subscribe(Subscription::OrderUpdates { user }, orders_tx)
             .await
             .map_err(|e| ConnectivityError::Socket(format!("OrderUpdates subscribe: {e}")))?;
+
+        // Subscribe to funding payments
+        ws_client
+            .subscribe(Subscription::UserFundings { user }, fundings_tx)
+            .await
+            .map_err(|e| ConnectivityError::Socket(format!("UserFundings subscribe: {e}")))?;
 
         info!(%user, "Subscribed to Hyperliquid account stream");
 
@@ -694,6 +723,59 @@ impl ExecutionClient for HyperliquidClient {
                                 // Transient, non-terminal: the loop continues. Log only — no
                                 // in-band event (consumers took no action on the old StreamError).
                                 error!(%e, "UserFills WebSocket error");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+
+        // Spawn task to process funding payments. It sends no terminal event: the SDK closes every
+        // subscription's channel together, and the fills and orders tasks report that.
+        let fundings_event_tx = event_tx.clone();
+        let fundings_cancel = cancel_token.clone();
+        let fundings_dexes = self.dexes.clone();
+        // Like the fills cache, scoped to this stream and surviving reconnects within it.
+        let fundings_dedup = new_dedup_cache();
+        tokio::spawn(async move {
+            let mut unknown_coins = UnknownCoins::default();
+            let mut unconfigured = UnconfiguredDexes::default();
+            loop {
+                tokio::select! {
+                    biased;
+                    () = fundings_cancel.cancelled() => {
+                        debug!("Fundings task cancelled");
+                        return;
+                    }
+                    msg = fundings_rx.recv() => {
+                        let Some(msg) = msg else {
+                            debug!("Fundings receiver closed");
+                            return;
+                        };
+                        match msg {
+                            Message::UserFundings(fundings) => {
+                                let convert = |funding: &hyperliquid_rust_sdk::UserFunding| {
+                                    unknown_coins.warn_once(&funding.coin);
+                                    unconfigured.warn_once(&fundings_dexes, &funding.coin);
+                                    funding_cash_flow(funding, &fundings_dexes)
+                                };
+                                if !send_fundings(
+                                    &fundings.data,
+                                    convert,
+                                    &fundings_dedup,
+                                    &fundings_event_tx,
+                                ) {
+                                    debug!("Fundings event channel closed");
+                                    return;
+                                }
+                            }
+                            Message::NoData => {
+                                warn!("UserFundings WebSocket disconnected");
+                            }
+                            Message::HyperliquidError(e) => {
+                                // Transient, non-terminal: the loop continues.
+                                error!(%e, "UserFundings WebSocket error");
                             }
                             _ => {}
                         }

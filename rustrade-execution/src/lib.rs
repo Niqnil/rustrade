@@ -75,6 +75,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 pub mod balance;
+pub mod cash_flow;
+pub use cash_flow::{CashFlow, CashFlowId, CashFlowKind};
 pub mod client;
 pub mod error;
 pub mod exchange;
@@ -281,6 +283,15 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// up. The engine logs it and changes no state. How long to keep waiting, and whether to halt
     /// or alert, is the consumer's policy. See [`AccountReinitFailure`](error::AccountReinitFailure).
     ReinitFailed(error::AccountReinitFailure<AssetKey, InstrumentKey>),
+
+    /// Cash moved into or out of the account other than by a trade: funding, interest, a borrow
+    /// fee or a rebate, as the venue posted it.
+    ///
+    /// A flow is a delta, signed positive when the account received it. The engine logs it and
+    /// changes no state: position PnL is computed from fills alone (see
+    /// [`CashFlow`]), and the venue's balances already include what it has
+    /// posted. See [`CashFlow`] for which venues send it.
+    CashFlow(cash_flow::CashFlow<AssetKey, InstrumentKey>),
 }
 
 impl<ExchangeKey, AssetKey, InstrumentKey> AccountEvent<ExchangeKey, AssetKey, InstrumentKey>

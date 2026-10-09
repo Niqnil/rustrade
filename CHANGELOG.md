@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`AccountEventKind::CashFlow`: cash moved into or out of an account other than by a trade**
+  (`rustrade-execution`, #549).
+  - A `CashFlow` carries what it is for (`CashFlowKind`: `Funding`, `BorrowFee`,
+    `MarginInterest`, `Rebate` or `Other`), the asset, the amount signed positive when received,
+    the instrument when the venue attributes it to one, the venue's time, and the venue's id when
+    it gives one. `CashFlow` and `CashFlowKind` are `#[non_exhaustive]`.
+  - `HyperliquidClient`'s account stream now reports each hourly funding payment as one, from the
+    `userFundings` subscription, with the funding rate and the signed position it was charged on.
+    The subscription's snapshot of recent payments is sent too, and the repeat of it after each
+    reconnect is deduplicated, as fills are.
+  - The engine logs a cash flow and changes no state: position PnL is still computed from fills
+    alone, and the venue's balances already include what it has posted.
+
 ## [0.10.1] - 2026-10-09
 
 ### Changed

@@ -29,7 +29,7 @@ use rustrade_instrument::{
 use rustrade_integration::collection::{one_or_many::OneOrMany, snapshot::Snapshot};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 /// Asset-centric state and associated state management logic.
 pub mod asset;
@@ -452,6 +452,22 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                     original = ?amendment.original,
                     kind = ?amendment.kind,
                     "venue amended a trade it reported earlier — state built on that trade is stale",
+                );
+                None
+            }
+            AccountEventKind::CashFlow(flow) => {
+                // Position PnL is computed from fills alone, and the venue's balances already
+                // include what it has posted (adding a flow to them would count it twice), so
+                // the engine applies flows to neither. A consumer that tracks carry reads it off
+                // the account feed.
+                debug!(
+                    exchange = ?event.exchange,
+                    kind = ?flow.kind,
+                    asset = ?flow.asset,
+                    amount = %flow.amount,
+                    instrument = ?flow.instrument,
+                    time_exchange = %flow.time_exchange,
+                    "account cash flow received — not applied to positions or balances",
                 );
                 None
             }

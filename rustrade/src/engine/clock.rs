@@ -202,6 +202,7 @@ impl<MarketEventKind: Debug> TimeExchange for EngineEvent<MarketEventKind> {
                     .map(|cancelled| cancelled.time_exchange)
                     .ok(),
                 AccountEventKind::Trade(trade) => Some(trade.time_exchange),
+                AccountEventKind::CashFlow(flow) => Some(flow.time_exchange),
                 _ => None,
             },
             // The corporate action carries its own resolved effective instant, so the
@@ -447,5 +448,32 @@ mod tests {
         assert_eq!(clock.inner.read().time_exchange_last, later);
         clock.advance_to(later);
         assert_eq!(clock.inner.read().time_exchange_last, later);
+    }
+
+    /// A cash flow is stamped with the venue's time, so a historical clock advances on one as it
+    /// does on a trade.
+    #[test]
+    fn a_cash_flow_reports_its_time_exchange() {
+        use rustrade_execution::{
+            AccountEvent, AccountEventKind,
+            cash_flow::{CashFlow, CashFlowKind},
+        };
+        use rustrade_instrument::{asset::AssetIndex, exchange::ExchangeIndex};
+
+        let time = DateTime::<Utc>::MIN_UTC + TimeDelta::hours(1);
+        let event: EngineEvent<()> =
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent::new(
+                ExchangeIndex(0),
+                AccountEventKind::CashFlow(CashFlow::new(
+                    CashFlowKind::BorrowFee,
+                    AssetIndex(0),
+                    Decimal::NEGATIVE_ONE,
+                    Some(InstrumentIndex::new(0)),
+                    time,
+                    None,
+                )),
+            )));
+
+        assert_eq!(event.time_exchange(), Some(time));
     }
 }

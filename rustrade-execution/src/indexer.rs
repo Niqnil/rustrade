@@ -3,6 +3,7 @@ use crate::{
     InstrumentBalanceUpdate, IsolatedInstrumentState, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate},
+    cash_flow::CashFlow,
     error::{
         AccountReinitFailure, AccountStreamInitError, ApiError, ClientError, KeyError, OrderError,
         UnindexedAccountStreamInitError, UnindexedApiError, UnindexedClientError,
@@ -88,6 +89,7 @@ impl AccountEventIndexer {
             AccountEventKind::ReinitFailed(failure) => {
                 AccountEventKind::ReinitFailed(self.reinit_failure(failure))
             }
+            AccountEventKind::CashFlow(flow) => AccountEventKind::CashFlow(self.cash_flow(flow)?),
         };
 
         Ok(AccountEvent { exchange, kind })
@@ -241,6 +243,35 @@ impl AccountEventIndexer {
             end,
             attempts,
             reason,
+        })
+    }
+
+    /// Index a [`CashFlow`]'s asset and, when it names one, instrument.
+    ///
+    /// # Errors
+    /// Returns `IndexError` if the asset, or a named instrument, is not registered in the map.
+    pub fn cash_flow(
+        &self,
+        flow: CashFlow<AssetNameExchange, InstrumentNameExchange>,
+    ) -> Result<CashFlow<AssetIndex, InstrumentIndex>, IndexError> {
+        let CashFlow {
+            kind,
+            asset,
+            amount,
+            instrument,
+            time_exchange,
+            id,
+        } = flow;
+
+        Ok(CashFlow {
+            kind,
+            asset: self.map.find_asset_index(&asset)?,
+            amount,
+            instrument: instrument
+                .map(|instrument| self.map.find_instrument_index(&instrument))
+                .transpose()?,
+            time_exchange,
+            id,
         })
     }
 
@@ -1011,5 +1042,75 @@ mod tests {
             })
             .unwrap();
         assert_eq!(cancel.state, Err(indexed));
+    }
+
+    /// A cash flow indexes its asset and, when it names one, its instrument, and fails when
+    /// either is not in the map.
+    #[test]
+    fn account_event_indexes_a_cash_flow() {
+        use crate::cash_flow::{CashFlowId, CashFlowKind};
+        use rust_decimal_macros::dec;
+
+        let indexer = binance_indexer();
+        let time = DateTime::<Utc>::MIN_UTC;
+        let kind = CashFlowKind::Funding {
+            rate: Some(dec!(0.0001)),
+            position_quantity: Some(dec!(-2)),
+        };
+        let flow = |asset: &str, instrument: Option<&str>| {
+            UnindexedAccountEvent::new(
+                ExchangeId::BinanceSpot,
+                AccountEventKind::CashFlow(CashFlow::new(
+                    kind.clone(),
+                    AssetNameExchange::new(asset),
+                    dec!(1.5),
+                    instrument.map(InstrumentNameExchange::new),
+                    time,
+                    Some(CashFlowId::new("cf-1")),
+                )),
+            )
+        };
+        let index_of = |event| match indexer.account_event(event) {
+            Ok(AccountEvent {
+                kind: AccountEventKind::CashFlow(flow),
+                ..
+            }) => Ok(flow),
+            Ok(other) => panic!("expected CashFlow, got {other:?}"),
+            Err(error) => Err(error),
+        };
+        let (Ok(usdt), Ok(btc_usdt)) = (
+            indexer
+                .map
+                .find_asset_index(&AssetNameExchange::new("USDT")),
+            indexer
+                .map
+                .find_instrument_index(&InstrumentNameExchange::new("BTC_USDT")),
+        ) else {
+            panic!("USDT and BTC_USDT are mapped");
+        };
+
+        assert_eq!(
+            index_of(flow("USDT", Some("BTC_USDT"))),
+            Ok(CashFlow::new(
+                kind.clone(),
+                usdt,
+                dec!(1.5),
+                Some(btc_usdt),
+                time,
+                Some(CashFlowId::new("cf-1")),
+            ))
+        );
+        assert_eq!(
+            index_of(flow("USDT", None)).map(|flow| flow.instrument),
+            Ok(None)
+        );
+        assert!(
+            index_of(flow("ETH", None)).is_err(),
+            "an unmapped asset fails"
+        );
+        assert!(
+            index_of(flow("USDT", Some("ETHUSDT"))).is_err(),
+            "an unmapped instrument fails"
+        );
     }
 }

@@ -57,6 +57,9 @@ pub(crate) enum DedupEventKind {
         filled_quantity: Decimal,
     },
     Cancelled,
+    /// A funding payment, keyed on its instrument and funding time because the venue gives it no
+    /// id.
+    Funding,
 }
 
 /// Dedup cache key: (instrument, event ID, event kind).
@@ -140,7 +143,10 @@ pub(crate) fn dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<Dedu
         // one twice is unknown, and TradeAmendment tells the consumer to apply it idempotently.
         // IBKR's EventSink tracks each execution's revisions itself, which also keeps an
         // execution from going out after its correction.
-        _ => None, // BalanceSnapshot, BalanceStreamUpdate, InstrumentBalanceUpdate, Snapshot, StreamTerminated, FillRecoveryGaveUp, TradeAmended, ReinitFailed — no dedup needed
+        // CashFlow has none here: a venue may give a flow no id, and what identifies one then is
+        // the producer's to say, so each producer keys its own (Hyperliquid's funding on coin and
+        // time).
+        _ => None, // BalanceSnapshot, BalanceStreamUpdate, InstrumentBalanceUpdate, Snapshot, StreamTerminated, FillRecoveryGaveUp, TradeAmended, ReinitFailed, CashFlow — no dedup needed
     }
 }
 
