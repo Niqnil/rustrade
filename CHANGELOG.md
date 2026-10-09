@@ -63,9 +63,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     entered in TWS, which IB reports under client id 0. A correction keeps the origin of the
     execution it corrects. An execution in a contract the client has not registered is still
     dropped, now with a WARN on the account stream unless it is another client's.
+  - **Breaking:** `IbkrConfig` is `#[non_exhaustive]`, so a setting can be added later without
+    breaking callers. Build one with `IbkrConfig::new(host, port, client_id, account)` and
+    `with_contracts` / `with_other_clients_fills`; a deserialised config is unaffected.
   - **Breaking:** `IbkrConfig` gains `other_clients_fills: bool`, `#[serde(default)]` and off. Set,
-    the stream, fill recovery and `fetch_trades` report other API clients' executions too, each
-    as `External`, under the order id `perm:` and IB's permanent id for the order
+    fill recovery and `fetch_trades` report other API clients' executions too (IB does not send
+    them to a connection live, so the stream reports one only through its recovery), each as
+    `External`, under the order id `perm:` and IB's permanent id for the order
     (`client:<client id>:<order id>` when it has none). Leave it off when several API clients each
     feed an engine from one account: each would apply the others' fills.
   - **Breaking:** `ibkr::execution::ExecutionBuffer::add_execution` is no longer public.

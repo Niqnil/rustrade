@@ -182,6 +182,11 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 
 /// Configuration for the IBKR execution client.
+///
+/// `#[non_exhaustive]`, so a setting can be added without breaking a caller. Build one with
+/// [`IbkrConfig::new`] and the `with_*` methods, or deserialise one: every setting `new` does not
+/// take has a serde default.
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IbkrConfig {
     /// TWS/Gateway host (e.g., "127.0.0.1")
@@ -206,10 +211,12 @@ pub struct IbkrConfig {
     /// Off, this client reports its own orders' fills only. Leave it off when several API clients
     /// each feed an engine from one account: each would otherwise apply the others' fills too.
     ///
-    /// On, another client's execution is reported wherever this client reads it: the account
-    /// stream, fill recovery and [`fetch_trades`](ExecutionClient::fetch_trades). Recovery and
-    /// `fetch_trades` ask IB for every client's executions; which IB sends a given connection,
-    /// live or in answer, is IB's to decide. IB numbers orders per API client, so such a trade's
+    /// On, another client's execution is reported wherever this client reads it. Fill recovery
+    /// and [`fetch_trades`](ExecutionClient::fetch_trades) ask IB for every client's executions,
+    /// and IB answers with them. IB does not send another API client's execution to a connection
+    /// live, client id 0 included, so the account stream reports one only when its recovery reads
+    /// it after a disconnect: read the rest with `fetch_trades`. IB numbers orders per API
+    /// client, so such a trade's
     /// [`order_id`](crate::trade::Trade::order_id) is IB's permanent id for the order (`perm:`
     /// and the id) rather than the client's order id, which could name one of this client's.
     ///
@@ -225,6 +232,41 @@ pub struct IbkrConfig {
     /// position whoever placed the order.
     #[serde(default)]
     pub other_clients_fills: bool,
+}
+
+impl IbkrConfig {
+    /// A config connecting to TWS or Gateway at `host`:`port` as API client `client_id`, with no
+    /// contracts to register and only this client's fills reported.
+    pub fn new(
+        host: impl Into<String>,
+        port: u16,
+        client_id: i32,
+        account: impl Into<String>,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            client_id,
+            account: account.into(),
+            contracts: Vec::new(),
+            other_clients_fills: false,
+        }
+    }
+
+    /// This config with [`contracts`](Self::contracts) to register on connect.
+    #[must_use]
+    pub fn with_contracts(self, contracts: Vec<ContractConfig>) -> Self {
+        Self { contracts, ..self }
+    }
+
+    /// This config with [`other_clients_fills`](Self::other_clients_fills) set.
+    #[must_use]
+    pub fn with_other_clients_fills(self, other_clients_fills: bool) -> Self {
+        Self {
+            other_clients_fills,
+            ..self
+        }
+    }
 }
 
 /// Pre-configured contract for startup registration.
@@ -3859,14 +3901,7 @@ mod contract_config_tests {
     }
 
     fn ibkr_config(contracts: Vec<ContractConfig>) -> IbkrConfig {
-        IbkrConfig {
-            host: "127.0.0.1".to_string(),
-            port: 4002,
-            client_id: 1,
-            account: String::new(),
-            contracts,
-            other_clients_fills: false,
-        }
+        IbkrConfig::new("127.0.0.1", 4002, 1, "").with_contracts(contracts)
     }
 
     fn named(name: &str, security_type: &str) -> ContractConfig {
