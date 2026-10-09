@@ -105,6 +105,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`AlpacaClient` no longer reports Alpaca's business refusals as `Unauthenticated`**
+  (`rustrade-execution`). Fixes #570.
+  - Every HTTP 403 was mapped to `ApiError::Unauthenticated`, whose contract tells callers to stop
+    trading. Alpaca also uses 403, with code `40310000`, to refuse an order on a business rule:
+    "insufficient buying power", "insufficient qty available for order", "account is not allowed
+    to short", "account is restricted to liquidation only". `40310100` is pattern-day-trader
+    protection.
+  - The client now reads the error body's `code`. A 403 with a code is a refusal:
+    `BalanceInsufficient` when its message says "insufficient", otherwise `OrderRejected`. A 403
+    without one, Alpaca's `{"message": "forbidden."}` to a wrong key, secret or host, is still
+    `Unauthenticated`.
+  - A refusal's message now starts with the body's code when it has one, e.g.
+    `40310000 insufficient buying power`. That covers every 4xx except a 404 and the
+    `Unauthenticated` ones, and changes the text of 422 refusals too.
 - **`IbkrClient` no longer reports an order held for a short-sale locate as rejected**
   (`rustrade-execution`). Fixes #569.
   - TWS code 404 ("Shares for this order are not immediately available for short sale. The order
