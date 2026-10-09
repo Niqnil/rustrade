@@ -1351,7 +1351,9 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ///   close. Logged at WARN when the flow is no older than the session start
     ///   ([`TearSheetGenerator::time_engine_start`]), and at DEBUG when it is older: a venue whose
     ///   stream opens by replaying recent flows, as Hyperliquid's does, sends ones that predate the
-    ///   session.
+    ///   session. The session start is the `time_engine_start` given to the
+    ///   [`EngineStateBuilder`](crate::engine::state::builder::EngineStateBuilder), `Utc::now` by
+    ///   default; a run over historical flows should set it, or its flows all log at DEBUG.
     /// - [`SeveralOpen`](CarryUpdate::SeveralOpen) under [`OmsMode::Hedging`]: the venue charges
     ///   the instrument, not a slot, so which position a flow belongs to is unknown. WARN.
     /// - [`BeforeEntry`](CarryUpdate::BeforeEntry): the flow predates the position's
@@ -1360,10 +1362,19 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// - [`AssetMismatch`](CarryUpdate::AssetMismatch): the flow's asset is not the instrument's
     ///   quote asset, which carry is kept in. WARN.
     /// - Otherwise the flow is added, by
-    ///   [`Position::apply_carry`](super::position::Position::apply_carry).
+    ///   [`Position::apply_carry`](super::position::Position::apply_carry), which returns
+    ///   [`Applied`](CarryUpdate::Applied), or [`Overflowed`](CarryUpdate::Overflowed) if the sum
+    ///   does not fit a `Decimal`.
     ///
     /// The flow's own [`instrument`](CashFlow::instrument) is not checked; the caller routes it
     /// here.
+    ///
+    /// # Caller obligation: each flow once
+    /// A flow is a delta, and nothing here recognises one already applied. An execution client
+    /// deduplicates the flows of one account stream, including the replay each reconnect brings,
+    /// but a second stream opened while the engine runs replays recent flows again, as it replays
+    /// recent fills. Those that postdate an open position's entry would be added twice, so a
+    /// consumer that opens a new stream must drop the flows it has already passed on.
     pub fn update_from_cash_flow(&mut self, flow: &CashFlow<AssetKey, InstrumentKey>) -> CarryUpdate
     where
         AssetKey: Debug + PartialEq,

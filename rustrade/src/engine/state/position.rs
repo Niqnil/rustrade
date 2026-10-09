@@ -469,6 +469,13 @@ impl PositionSeed {
     /// received), in the instrument's quote asset. It starts the position's
     /// [`carry`](Position::carry), so net PnL at close covers the whole holding period, as the
     /// seeded entry price makes realised PnL do.
+    ///
+    /// The carry must cover every flow up to the seed's `time_enter`, and none after it. The
+    /// engine leaves out a flow older than `time_enter` as already counted, and adds any later
+    /// one, including a flow a venue's stream replays when it opens. So seed `time_enter` with
+    /// when the carry was read, not with an earlier true entry time. A venue position seeded by
+    /// [`Self::from_venue_position`] does this, with the time the client read it; a client clock
+    /// behind the venue's would let a replayed flow already in the carry be added again.
     pub fn with_carry(self, carry: Decimal) -> Self {
         Self { carry, ..self }
     }
@@ -735,8 +742,8 @@ pub struct Position<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
 
     /// Estimated unrealised PnL generated from closing the remaining [`Position`] `quantity_abs`.
     ///
-    /// Note this includes estimated exit fees, and excludes funding, interest and borrow fees (see
-    /// [What the PnL covers](Position#what-the-pnl-covers)).
+    /// Note this includes estimated exit fees, and excludes funding, interest and borrow fees, which
+    /// accumulate in `carry` (see [What the PnL covers](Position#what-the-pnl-covers)).
     pub pnl_unrealised: Decimal,
 
     /// Cumulative realised PnL from any partially closed [`Position`] `quantity_abs_max`.
@@ -2532,6 +2539,74 @@ mod tests {
             dec!(100.0), // 100 shares per contract
         );
         assert_eq!(pnl, Some(dec!(398.0)));
+    }
+
+    #[test]
+    fn test_carry_stays_with_the_closed_position_and_a_flip_starts_at_zero() {
+        let base_time = DateTime::<Utc>::MIN_UTC;
+        let open = || {
+            let mut position = Position::from(&trade(base_time, Side::Buy, 100.0, 2.0, 0.0));
+            assert_eq!(
+                position.apply_carry(dec!(-3), time_plus_days(base_time, 1)),
+                CarryUpdate::Applied
+            );
+            position
+        };
+
+        // A partial close keeps the carry on the remaining position.
+        let (reduced, exited) = open().update_from_trade(&trade(
+            time_plus_days(base_time, 2),
+            Side::Sell,
+            110.0,
+            1.0,
+            0.0,
+        ));
+        assert!(exited.is_none());
+        assert_eq!(reduced.map(|p| p.carry), Some(dec!(-3)));
+
+        // An exact close reports it on the exit.
+        let (closed, exited) = open().update_from_trade(&trade(
+            time_plus_days(base_time, 2),
+            Side::Sell,
+            110.0,
+            2.0,
+            0.0,
+        ));
+        assert!(closed.is_none());
+        let exited = exited.unwrap();
+        assert_eq!(exited.carry, dec!(-3));
+        assert_eq!(exited.pnl_realised, dec!(20));
+        assert_eq!(exited.pnl_realised_net(), Some(dec!(17)));
+
+        // A flip reports it on the exit and starts the new position at zero.
+        let (next, exited) = open().update_from_trade(&trade(
+            time_plus_days(base_time, 2),
+            Side::Sell,
+            110.0,
+            3.0,
+            0.0,
+        ));
+        assert_eq!(exited.map(|e| e.carry), Some(dec!(-3)));
+        let next = next.unwrap();
+        assert_eq!(next.side, Side::Sell);
+        assert_eq!(next.carry, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_apply_carry_holds_last_good_on_overflow() {
+        let base_time = DateTime::<Utc>::MIN_UTC;
+        let mut position = Position::from(&trade(base_time, Side::Buy, 100.0, 1.0, 0.0));
+        assert_eq!(
+            position.apply_carry(dec!(1), time_plus_days(base_time, 1)),
+            CarryUpdate::Applied
+        );
+
+        assert_eq!(
+            position.apply_carry(Decimal::MAX, time_plus_days(base_time, 2)),
+            CarryUpdate::Overflowed
+        );
+        assert_eq!(position.carry, dec!(1));
+        assert_eq!(position.time_exchange_update, time_plus_days(base_time, 1));
     }
 
     #[test]
