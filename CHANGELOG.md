@@ -112,8 +112,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     shares are found or its time in force ends. Placement reported it as `OrderRejected`, so a
     caller treated a live order as dead while it could still fill.
   - It is now handled like code 399 (held until the session opens): placement reports the order
-    open with nothing filled, logs the hold at WARN with the order id and TWS's text, and the
-    account stream carries its later status.
+    open with nothing filled, and the account stream carries its later status. When the notice is
+    the first thing TWS sends about the order, the hold is logged at WARN with the order id and
+    TWS's text.
 
 ## [0.10.1] - 2026-10-09
 

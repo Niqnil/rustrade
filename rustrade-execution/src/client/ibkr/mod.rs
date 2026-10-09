@@ -380,15 +380,6 @@ const PLACEMENT_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// live-but-pending ([`PlacementOutcome::HeldPending`]) rather than rejected
 /// when one of these codes arrives.
 ///
-/// # Code 404: held for a short-sale locate
-///
-/// *"Shares for this order are not immediately available for short sale. The order will be
-/// held while we attempt to locate the shares."* IBKR keeps the order working and transmits it
-/// once shares are found, or ends it when its time in force runs out. ibapi 5.0.0 classifies 404
-/// as `NoticeCategory::Error` (it is outside every range), so it arrives as `Err(Error::Notice)`
-/// and ends the placement subscription, like the second form of 399 below. Reporting it as a
-/// rejection would tell the caller a live order is dead while it can still fill.
-///
 /// # ibapi 4.0 splits code 399 by message text
 ///
 /// `is_warning_message` now classifies a 399 whose text carries a `Warning:`
@@ -417,8 +408,17 @@ const PLACEMENT_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_
 ///
 /// The list stays load-bearing for the second form. It documents the known gap
 /// between ibapi's range heuristic and IBKR's actual protocol semantics; if
-/// IBKR adds further informational codes in the 200-399 range, an out-of-RTH
-/// placement test will surface them and they can be added here.
+/// IBKR adds further informational codes, in the 200-399 range or outside it as
+/// 404 is, an out-of-RTH placement test will surface them and they can be added here.
+///
+/// # Code 404: held for a short-sale locate
+///
+/// *"Shares for this order are not immediately available for short sale. The order will be
+/// held while we attempt to locate the shares."* IBKR keeps the order working and transmits it
+/// once shares are found, or ends it when its time in force runs out. ibapi 5.0.0 classifies 404
+/// as `NoticeCategory::Error` (it is outside every range), so it arrives as `Err(Error::Notice)`
+/// and ends the placement subscription, like the second form of 399 above. Reporting it as a
+/// rejection would tell the caller a live order is dead while it can still fill.
 const INFORMATIONAL_ORDER_CODES: &[i32] = &[399, 404];
 
 /// Outcome of awaiting the initial status on an order-placement subscription.
@@ -2901,7 +2901,8 @@ impl ExecutionClient for IbkrClient {
                 PlacementOutcome::Rejected(reason) => {
                     Err(OrderError::Rejected(ApiError::OrderRejected(reason)))
                 }
-                // Held until RTH (informational notice): the order is live; its
+                // Held (informational notice, e.g. 399 until RTH or 404 for a short-sale
+                // locate, or a status ibapi does not model): the order is live; its
                 // authoritative status arrives via account_stream. Surface as
                 // "no terminal status yet" (Open with zero fill), same as below.
                 PlacementOutcome::HeldPending(notice) => {
@@ -4174,6 +4175,19 @@ mod order_status_tests {
     /// for a short sale). Either way the order is live, so placement must not report it rejected.
     #[test]
     fn held_order_notices_are_held_pending_not_rejected() {
+        // The notices below are built by hand, so pin the ibapi routing they stand for: a 404 is
+        // a plain error, which ends the placement subscription as `Err(Error::Notice)`. Should a
+        // later ibapi make it informational, it would be dropped before reaching this code, and
+        // `INFORMATIONAL_ORDER_CODES`' account of it would need revisiting.
+        let held_for_locate = ibapi::Notice {
+            request_id: Some(42),
+            code: 404,
+            message: String::new(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        };
+        assert_eq!(held_for_locate.category(), ibapi::NoticeCategory::Error);
+
         for (code, message) in [
             (
                 399,
