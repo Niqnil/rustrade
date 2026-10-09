@@ -24,7 +24,8 @@ use std::{num::NonZeroUsize, sync::Arc};
 
 /// Size of the LRU dedup cache. 10k entries covers ~hours of high-frequency
 /// trading at typical fill rates; each entry is ~100-104 bytes (`DedupKey` =
-/// `SmolStr` 24 + `SmolStr` 24 + `DedupEventKind` 20 + padding 4 = 72 bytes, plus
+/// `SmolStr` 24 + `SmolStr` 24 + `DedupEventKind` 24 (8-aligned by `Notice`'s `i64`) = 72
+/// bytes, plus
 /// `LruCache` node overhead: 2 linked-list pointers 16 + hashbrown slot ~12-16
 /// ≈ 28-32 bytes). At 10k: ~1.0 MB.
 /// At very high fill rates (>333 distinct fills/sec sustained during the 30s

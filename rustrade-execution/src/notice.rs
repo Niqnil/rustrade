@@ -55,7 +55,7 @@ pub struct AccountNotice<InstrumentKey> {
 /// is sent as [`Other`](Self::Other), with the venue's name for it in
 /// [`AccountNotice::status`].
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum NoticeKind {
     /// The account's margin has fallen to the venue's margin-call level.
     MarginCall,

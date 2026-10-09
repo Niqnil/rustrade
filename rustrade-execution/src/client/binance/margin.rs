@@ -51,8 +51,8 @@
 //!   [`ExecutionClient::fetch_open_orders`].
 
 use super::margin_risk::{
-    RISK_STREAM_URL, SapiRiskListenKeys, log_liability_change, log_margin_level_change,
-    margin_level_notice, run_risk_stream,
+    RISK_STREAM_URL, RiskStreamTask, SapiRiskListenKeys, log_liability_change,
+    log_margin_level_change, margin_level_notice,
 };
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
@@ -1262,8 +1262,9 @@ impl ExecutionClient for BinanceMargin {
     /// (`wss://margin-stream.binance.com`, keyed by `POST /sapi/v1/margin/listen-key`). Whether the
     /// `userListenToken` stream sends it too is not documented, so:
     /// - **Cross** reads both, and a notice sent on both is delivered once (matched on status and
-    ///   Binance's event time). Notices name no instrument. The Risk Data Stream is a side
-    ///   channel: if it cannot get a listen key or connect, that is logged at `warn` and retried
+    ///   Binance's event time; a frame with no time is stamped on arrival, so its two copies both
+    ///   arrive). Notices name no instrument. The Risk Data Stream is a side channel, in a task of
+    ///   its own: if it cannot get a listen key or connect, that is logged at `warn` and retried
     ///   with backoff up to 5 minutes, without limit, and the account stream carries on. Its key is
     ///   kept alive every 30 minutes (weight 1) and left to lapse when the stream ends.
     /// - **Isolated** reads only the `userListenToken` stream, so receives notices only if Binance
@@ -1461,9 +1462,10 @@ impl ExecutionClient for BinanceMargin {
                 UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
             })?;
 
-            // The risk data stream runs beside the manager, for the margin notices it carries, and
-            // ends with it: it never ends the account stream itself (see `margin_risk`).
-            let risk = run_risk_stream(
+            // The risk data stream runs beside the manager, for the margin notices it carries, in
+            // a task of its own so nothing in it can end the account stream, and is aborted when
+            // the manager's task ends or is aborted (see `margin_risk`).
+            let risk = RiskStreamTask::spawn(
                 SapiRiskListenKeys {
                     rest: rest.clone(),
                     rate_limiter: rate_limiter.clone(),
@@ -1484,12 +1486,8 @@ impl ExecutionClient for BinanceMargin {
                 Some((initial_ws, initial_token)),
             );
             tokio::spawn(async move {
-                // `risk` returns only once the consumer has dropped the stream, when the manager
-                // is ending too.
-                tokio::select! {
-                    () = manager => {}
-                    () = risk => {}
-                }
+                let _risk = risk;
+                manager.await;
             })
         };
 
@@ -5904,6 +5902,30 @@ mod tests {
         assert_eq!(notice_on(99), None);
         // No subscriptionId at all.
         assert_eq!(isolated_notice_instrument(None, &sub_map), None);
+    }
+
+    #[test]
+    fn the_two_streams_key_one_notice_alike() {
+        // The same change, as each stream frames it, must collide in the shared cache.
+        use crate::client::binance::margin_risk::{RiskFrame, convert_risk_frame};
+
+        let change = documented_margin_level_change("MARGIN_LEVEL_STATUS_CHANGE");
+        let mut from_user_data = Vec::new();
+        convert_margin_user_data_events(&push(change.clone()), &mut from_user_data);
+        let mut from_risk = Vec::new();
+        let risk_frame = serde_json::json!({ "stream": "listen-key", "data": change });
+        assert_eq!(
+            convert_risk_frame(&risk_frame.to_string(), &mut from_risk),
+            RiskFrame::Continue
+        );
+
+        let dedup = new_dedup_cache();
+        let key = |events: &[UnindexedAccountEvent]| dedup_key_from_event(&events[0]).unwrap();
+        assert!(!is_duplicate(&dedup, key(&from_user_data)));
+        assert!(
+            is_duplicate(&dedup, key(&from_risk)),
+            "the risk data stream's copy is dropped"
+        );
     }
 
     #[test]

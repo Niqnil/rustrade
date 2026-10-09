@@ -31,6 +31,7 @@ use futures::{SinkExt as _, StreamExt as _};
 use rust_decimal::Decimal;
 use rustrade_instrument::{exchange::ExchangeId, instrument::name::InstrumentNameExchange};
 use rustrade_integration::protocol::websocket::{WebSocket, WsMessage, connect};
+use serde::Deserialize as _;
 use smol_str::SmolStr;
 use std::{
     future::Future,
@@ -38,7 +39,10 @@ use std::{
     sync::{Arc, atomic::AtomicU64},
     time::Duration,
 };
-use tokio::{sync::mpsc, time::Instant};
+use tokio::{
+    sync::mpsc,
+    time::{Instant, MissedTickBehavior},
+};
 use tracing::{debug, info, trace, warn};
 
 /// Base URL of Binance's margin Risk Data Stream, as binance-sdk names it
@@ -56,6 +60,12 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(3 * 60);
 /// The first and the longest wait between attempts after a failure.
 const RETRY_INITIAL: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(5 * 60);
+/// How long a subscribed session must last for its end to restart the backoff.
+const HEALTHY_SESSION: Duration = RETRY_MAX;
+/// The longest a listen-key request may take, rate-limit waits included.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest a session waits to close its socket.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The listen-key requests the Risk Data Stream needs, so a test can stand in for the venue.
 pub(super) trait RiskListenKeys: Send + Sync + 'static {
@@ -106,11 +116,36 @@ impl RiskListenKeys for SapiRiskListenKeys {
     }
 }
 
+/// The Risk Data Stream's task, aborted when this is dropped.
+///
+/// It runs in a task of its own, apart from the user-data manager, so that nothing in it, a panic
+/// included, can end the account stream: the account stream's task holds this and drops it when
+/// it ends, or when it is aborted because the consumer dropped the stream.
+pub(super) struct RiskStreamTask(tokio::task::JoinHandle<()>);
+
+impl RiskStreamTask {
+    /// Spawn [`run_risk_stream`].
+    pub(super) fn spawn(
+        keys: impl RiskListenKeys,
+        base_url: String,
+        tx: mpsc::UnboundedSender<UnindexedAccountEvent>,
+        dedup: SharedDedupCache,
+    ) -> Self {
+        Self(tokio::spawn(run_risk_stream(keys, base_url, tx, dedup)))
+    }
+}
+
+impl Drop for RiskStreamTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Read the Risk Data Stream at `base_url` into `tx` until `tx` closes, reconnecting after any
 /// failure. Returns only once the consumer has dropped the stream.
 ///
 /// Each notice passes `dedup` before it is sent, as the user-data stream's do.
-pub(super) async fn run_risk_stream(
+async fn run_risk_stream(
     keys: impl RiskListenKeys,
     base_url: String,
     tx: mpsc::UnboundedSender<UnindexedAccountEvent>,
@@ -123,10 +158,11 @@ pub(super) async fn run_risk_stream(
                 debug!("BinanceMargin risk data stream: account stream dropped, stopping");
                 return;
             }
-            SessionEnd::Retry { error, connected } => {
-                // A session that connected was not a failure to connect, so it starts the
-                // backoff again.
-                if connected {
+            SessionEnd::Retry { error, healthy } => {
+                // Only a session that stayed up starts the backoff again: one that the venue
+                // ends straight after the subscribe keeps backing off, rather than reconnecting
+                // every second.
+                if healthy {
                     failures = 0;
                 }
                 error
@@ -156,11 +192,18 @@ fn retry_delay(failures: u32) -> Duration {
 
 enum SessionEnd {
     ConsumerDropped,
-    /// The session ended. `connected` says whether it got as far as a confirmed subscription.
+    /// The session ended. `healthy` says whether it stayed subscribed for at least
+    /// [`HEALTHY_SESSION`].
     Retry {
         error: String,
-        connected: bool,
+        healthy: bool,
     },
+}
+
+/// Why a subscribed session's loop stopped.
+enum Stop {
+    ConsumerDropped,
+    Retry(String),
 }
 
 /// One connection: get a listen key, connect, subscribe, then forward notices until the socket,
@@ -171,85 +214,127 @@ async fn risk_session(
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: &SharedDedupCache,
 ) -> SessionEnd {
-    let retry = |error: String, connected: bool| SessionEnd::Retry { error, connected };
+    let failed = |error: String| SessionEnd::Retry {
+        error,
+        healthy: false,
+    };
 
-    let listen_key = match keys.start().await {
-        Ok(key) => key,
-        Err(e) => return retry(format!("listen key request failed: {e}"), false),
+    // Raced against the consumer, since the request can wait out a rate limit.
+    let listen_key = tokio::select! {
+        () = tx.closed() => return SessionEnd::ConsumerDropped,
+        key = tokio::time::timeout(REQUEST_TIMEOUT, keys.start()) => match key {
+            Ok(Ok(key)) => key,
+            Ok(Err(e)) => return failed(format!("listen key request failed: {e}")),
+            Err(_) => return failed(format!(
+                "listen key request timed out after {}s",
+                REQUEST_TIMEOUT.as_secs()
+            )),
+        },
     };
     let (mut ws, early) = match connect_and_subscribe(base_url, &listen_key).await {
         Ok(subscribed) => subscribed,
-        Err(e) => return retry(e, false),
+        Err(e) => return failed(e),
     };
     info!("BinanceMargin risk data stream connected and subscribed");
+
+    let start = Instant::now();
+    let stop = forward_session(keys, &listen_key, &mut ws, early, tx, dedup).await;
+    // Best effort, and bounded: the session is over either way, and a half-open socket would
+    // otherwise hold the close.
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, ws.close(None)).await;
+    match stop {
+        Stop::ConsumerDropped => SessionEnd::ConsumerDropped,
+        Stop::Retry(error) => SessionEnd::Retry {
+            error,
+            healthy: start.elapsed() >= HEALTHY_SESSION,
+        },
+    }
+}
+
+/// Forward a subscribed session's notices, `early` frames first, keeping the key alive and the
+/// socket checked, until something ends it.
+async fn forward_session(
+    keys: &impl RiskListenKeys,
+    listen_key: &str,
+    ws: &mut WebSocket,
+    early: Vec<String>,
+    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
+    dedup: &SharedDedupCache,
+) -> Stop {
+    let mut buf = Vec::with_capacity(1);
+    for text in early {
+        if let RiskFrame::KeyExpired = convert_risk_frame(&text, &mut buf) {
+            return Stop::Retry("listen key expired".to_owned());
+        }
+        if !forward(&mut buf, tx, dedup) {
+            return Stop::ConsumerDropped;
+        }
+    }
 
     let start = Instant::now();
     let mut keepalive =
         tokio::time::interval_at(start + LISTEN_KEY_KEEPALIVE, LISTEN_KEY_KEEPALIVE);
     let mut ping = tokio::time::interval_at(start + PING_INTERVAL, PING_INTERVAL);
+    // After a stall, wait a full period rather than firing the missed ticks back to back.
+    keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    ping.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut last_frame = start;
-    let mut buf = Vec::with_capacity(1);
 
-    for text in early {
-        if let RiskFrame::KeyExpired = convert_risk_frame(&text, &mut buf) {
-            let _ = ws.close(None).await;
-            return retry("listen key expired".to_owned(), true);
-        }
-        if !forward(&mut buf, tx, dedup) {
-            let _ = ws.close(None).await;
-            return SessionEnd::ConsumerDropped;
-        }
-    }
-
-    let end = loop {
+    loop {
         tokio::select! {
             // A dropped consumer ends the session at once, whatever else is ready.
             biased;
-            () = tx.closed() => break SessionEnd::ConsumerDropped,
+            () = tx.closed() => return Stop::ConsumerDropped,
             message = ws.next() => {
                 last_frame = Instant::now();
                 match message {
                     Some(Ok(WsMessage::Text(text))) => {
                         if let RiskFrame::KeyExpired = convert_risk_frame(&text, &mut buf) {
-                            break retry("listen key expired".to_owned(), true);
+                            return Stop::Retry("listen key expired".to_owned());
                         }
                         if !forward(&mut buf, tx, dedup) {
-                            break SessionEnd::ConsumerDropped;
+                            return Stop::ConsumerDropped;
                         }
                     }
                     Some(Ok(WsMessage::Close(frame))) => {
-                        break retry(format!("closed by the venue: {frame:?}"), true);
+                        return Stop::Retry(format!("closed by the venue: {frame:?}"));
                     }
                     // tokio-tungstenite answers a ping itself; pongs and binary frames carry
                     // nothing here but show the socket is alive.
                     Some(Ok(_)) => {}
-                    Some(Err(e)) => break retry(format!("socket error: {e}"), true),
-                    None => break retry("socket ended".to_owned(), true),
+                    Some(Err(e)) => return Stop::Retry(format!("socket error: {e}")),
+                    None => return Stop::Retry("socket ended".to_owned()),
                 }
             }
             _ = keepalive.tick() => {
                 // A failed keepalive is not fatal yet: the key has 30 minutes left, and the venue
-                // sends listenKeyExpired if it lapses.
-                if let Err(e) = keys.keepalive(&listen_key).await {
-                    warn!(error = %e, "BinanceMargin risk data stream listen-key keepalive failed");
+                // sends listenKeyExpired if it lapses. Bounded, since the socket goes unread
+                // meanwhile.
+                match tokio::time::timeout(REQUEST_TIMEOUT, keys.keepalive(listen_key)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!(
+                        error = %e,
+                        "BinanceMargin risk data stream listen-key keepalive failed"
+                    ),
+                    Err(_) => warn!(
+                        timeout_secs = REQUEST_TIMEOUT.as_secs(),
+                        "BinanceMargin risk data stream listen-key keepalive timed out"
+                    ),
                 }
             }
             _ = ping.tick() => {
                 if last_frame.elapsed() > IDLE_TIMEOUT {
-                    break retry(
-                        format!("no frame for {}s, pongs included", IDLE_TIMEOUT.as_secs()),
-                        true,
-                    );
+                    return Stop::Retry(format!(
+                        "no frame for {}s, pongs included",
+                        IDLE_TIMEOUT.as_secs()
+                    ));
                 }
                 if let Err(e) = ws.send(WsMessage::Ping(Default::default())).await {
-                    break retry(format!("ping failed: {e}"), true);
+                    return Stop::Retry(format!("ping failed: {e}"));
                 }
             }
         }
-    };
-    // Best effort: the session is over either way.
-    let _ = ws.close(None).await;
-    end
+    }
 }
 
 /// Connect to the combined-stream endpoint and subscribe `listen_key`, as binance-sdk's
@@ -338,7 +423,7 @@ fn forward(
 
 /// What a Risk Data Stream frame asks of the session.
 #[derive(Debug, PartialEq, Eq)]
-enum RiskFrame {
+pub(super) enum RiskFrame {
     Continue,
     /// The listen key lapsed; the session must get a new one.
     KeyExpired,
@@ -348,7 +433,7 @@ enum RiskFrame {
 ///
 /// Frames come wrapped as `{ "stream": <listen key>, "data": { "e", … } }`; a bare event is read
 /// too. Event types with no arm are logged by [`log_unhandled_event`], so a renamed event is seen.
-fn convert_risk_frame(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> RiskFrame {
+pub(super) fn convert_risk_frame(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> RiskFrame {
     static UNRECOGNISED: AtomicU64 = AtomicU64::new(0);
     static UNHANDLED: UnhandledEvents = UnhandledEvents::new();
 
@@ -368,31 +453,27 @@ fn convert_risk_frame(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> Risk
     };
 
     match event_type {
-        "MARGIN_LEVEL_STATUS_CHANGE" => {
-            match serde_json::from_value::<MarginLevelStatusChange>(event.clone()) {
-                Ok(change) => {
-                    log_margin_level_change(&change, "risk data");
-                    buf.extend(margin_level_notice(change, None));
-                }
-                Err(e) => warn!(
-                    error = %e,
-                    frame = frame_excerpt(frame),
-                    "BinanceMargin: undeserializable MARGIN_LEVEL_STATUS_CHANGE on the risk data \
-                     stream, dropping"
-                ),
+        "MARGIN_LEVEL_STATUS_CHANGE" => match MarginLevelStatusChange::deserialize(event) {
+            Ok(change) => {
+                log_margin_level_change(&change, "risk data");
+                buf.extend(margin_level_notice(change, None));
             }
-        }
-        "USER_LIABILITY_CHANGE" => {
-            match serde_json::from_value::<UserLiabilityChange>(event.clone()) {
-                Ok(change) => log_liability_change(&change, "risk data"),
-                Err(e) => warn!(
-                    error = %e,
-                    frame = frame_excerpt(frame),
-                    "BinanceMargin: undeserializable USER_LIABILITY_CHANGE on the risk data \
-                     stream, dropping"
-                ),
-            }
-        }
+            Err(e) => warn!(
+                error = %e,
+                frame = frame_excerpt(frame),
+                "BinanceMargin: undeserializable MARGIN_LEVEL_STATUS_CHANGE on the risk data \
+                 stream, dropping"
+            ),
+        },
+        "USER_LIABILITY_CHANGE" => match UserLiabilityChange::deserialize(event) {
+            Ok(change) => log_liability_change(&change, "risk data"),
+            Err(e) => warn!(
+                error = %e,
+                frame = frame_excerpt(frame),
+                "BinanceMargin: undeserializable USER_LIABILITY_CHANGE on the risk data \
+                 stream, dropping"
+            ),
+        },
         "listenKeyExpired" => return RiskFrame::KeyExpired,
         other => log_unhandled_event("BinanceMargin risk", &UNHANDLED, other, frame),
     }
