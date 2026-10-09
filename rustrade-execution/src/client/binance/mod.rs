@@ -44,6 +44,7 @@
 //! an explicit request.
 
 mod margin;
+mod margin_risk;
 mod shared;
 mod spot;
 

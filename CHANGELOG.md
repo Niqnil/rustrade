@@ -80,6 +80,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     it waited for an ack that could not come; it is routed as an unmatched fill. Hedging mode still
     opens a forced fill's own position rather than reducing the one it closed, as
     `InstrumentState::update_from_trade` documents.
+- **Margin calls and liquidation warnings: `AccountEventKind::Notice`** (`rustrade-execution`,
+  part of #552).
+  - An `AccountNotice` carries what the venue reported (`NoticeKind`: `MarginCall`,
+    `LiquidationWarning`, `Liquidation`, `MarginRestored` or `Other`), the venue's status verbatim,
+    the instrument when the venue scopes the notice to one, the venue's time, and its margin level
+    when it reports one. `AccountNotice` and `NoticeKind` are `#[non_exhaustive]`;
+    `NoticeKind::is_escalation()` is true for the first three. The new variant is additive, since
+    `AccountEventKind` is `#[non_exhaustive]`.
+  - `BinanceMargin`'s account stream reports Binance's `MARGIN_LEVEL_STATUS_CHANGE` as one:
+    `MARGIN_CALL`, `PRE_LIQUIDATION` and `FORCE_LIQUIDATION` map to the first three kinds, `NORMAL`
+    and `EXCESSIVE` to `MarginRestored`. It was only logged.
+  - Binance's SDKs read that event from the margin Risk Data Stream, and whether the
+    `userListenToken` stream sends it too is undocumented. A cross-margin account stream now reads
+    both, through a second socket with its own listen key (`/sapi/v1/margin/listen-key`, kept alive
+    every 30 minutes), and delivers a notice sent on both once. The Risk Data Stream never ends the
+    account stream: a failure is logged at WARN and retried with backoff. An isolated stream reads
+    only the `userListenToken` stream, and attributes a notice to the pair whose subscription it
+    came on.
+  - The engine logs a notice, at WARN when it is an escalation and at INFO otherwise, and changes
+    no state. A notice sent while a stream is disconnected is not recovered.
+  - `BinanceMargin` logs each `executionReport`'s client order id, order type and execution type
+    at DEBUG, as evidence for a future margin-liquidation marker, which Binance does not document.
 
 ## [0.10.1] - 2026-10-09
 

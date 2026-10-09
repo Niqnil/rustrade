@@ -10,8 +10,9 @@
 //! [`BinanceMarginConfig`], [`MarginSideEffect`]) and a full [`ExecutionClient`] implementation:
 //! order submission/cancel and account snapshot / balance / open-order / trade queries over REST,
 //! plus a live account event stream ([`ExecutionClient::account_stream`]) over the hand-rolled
-//! `userListenToken` user-data WebSocket (the SDK's retired listen-key path is not used), which
-//! after a reconnect recovers missed fills and reports how orders ended meanwhile. It also
+//! `userListenToken` user-data WebSocket (the retired `/sapi/v1/userDataStream` listen-key path is
+//! not used), which after a reconnect recovers missed fills and reports how orders ended
+//! meanwhile, and on cross margin also reads the Risk Data Stream for margin notices. It also
 //! implements [`OrderStatusClient`], looking orders up by client order id. Both
 //! **cross** (`isIsolated = "FALSE"`, account-wide collateral) and **isolated** (`isIsolated =
 //! "TRUE"`, per-pair sub-accounts) margin are supported, selected by
@@ -49,6 +50,10 @@
 //!   instead by the terminal report's own `z`, or by
 //!   [`ExecutionClient::fetch_open_orders`].
 
+use super::margin_risk::{
+    RISK_STREAM_URL, RiskStreamTask, SapiRiskListenKeys, log_liability_change,
+    log_margin_level_change, margin_level_notice,
+};
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExecutionReport, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS,
@@ -345,7 +350,8 @@ impl BinanceMarginConfig {
 ///
 /// Places orders and queries account state over the margin REST API
 /// (`margin_trading::rest_api`), and streams live account events via a hand-rolled
-/// `userListenToken` flow over the WS API, not the SDK's retired listen-key path.
+/// `userListenToken` flow over the WS API, not the retired `/sapi/v1/userDataStream` listen-key
+/// path.
 ///
 /// See [`BinanceMarginConfig::testnet`] for the no-testnet caveat. The behaviour a caller most needs to know
 /// is summarised below, with links to the authoritative detail.
@@ -393,10 +399,15 @@ impl BinanceMarginConfig {
 ///
 /// # User-data stream (`userListenToken`)
 /// [`account_stream`](Self::account_stream) is hand-rolled over the `userListenToken` model — the
-/// legacy margin listen-key user-data API was retired by Binance on 2026-02-20 and the SDK binds
-/// only the dead endpoint. There is **no keepalive ping** (the retired listen-key `PUT` mechanism):
-/// instead the token (~24h validity) is re-acquired and re-subscribed before its `expirationTime`,
-/// transparently across reconnects.
+/// legacy margin listen-key user-data API (`/sapi/v1/userDataStream`) was retired by Binance on
+/// 2026-02-20, and binance-sdk has no binding for its replacement. There is **no keepalive ping**
+/// (the retired listen-key `PUT` mechanism): instead the token (~24h validity) is re-acquired and
+/// re-subscribed before its `expirationTime`, transparently across reconnects.
+///
+/// The Risk Data Stream a cross account stream also reads (see
+/// [`account_stream`](Self::account_stream)'s "Margin notices") is a different, current API: its
+/// listen key comes from `/sapi/v1/margin/listen-key`, which binance-sdk does bind, and is kept
+/// alive every 30 minutes.
 ///
 /// # Margin balances & debt-freshness
 /// Balances carry per-asset margin debt: [`Balance::net_asset`](crate::balance::Balance::net_asset)
@@ -1238,6 +1249,33 @@ impl ExecutionClient for BinanceMargin {
     /// but never re-establishes debt; `USER_LIABILITY_CHANGE` is logged observably, not applied to
     /// balance state.
     ///
+    /// # Margin notices
+    /// Binance's `MARGIN_LEVEL_STATUS_CHANGE` is delivered as an
+    /// [`AccountEventKind::Notice`]. Its status maps to a
+    /// [`NoticeKind`](crate::NoticeKind): `MARGIN_CALL` → `MarginCall`, `PRE_LIQUIDATION` →
+    /// `LiquidationWarning`, `FORCE_LIQUIDATION` → `Liquidation`, `NORMAL` and `EXCESSIVE` →
+    /// `MarginRestored`, anything else → `Other`, with Binance's status verbatim in
+    /// [`AccountNotice::status`](crate::AccountNotice::status) and its margin level (`l`) in
+    /// [`margin_level`](crate::AccountNotice::margin_level).
+    ///
+    /// Binance's own SDKs read the event from the **Risk Data Stream**
+    /// (`wss://margin-stream.binance.com`, keyed by `POST /sapi/v1/margin/listen-key`). Whether the
+    /// `userListenToken` stream sends it too is not documented, so:
+    /// - **Cross** reads both, and a notice sent on both is delivered once (matched on status and
+    ///   Binance's event time; a frame with no time is stamped on arrival, so its two copies both
+    ///   arrive). Notices name no instrument. The Risk Data Stream is a side channel, in a task of
+    ///   its own: if it cannot get a listen key or connect, that is logged at `warn` and retried
+    ///   with backoff up to 5 minutes, without limit, and the account stream carries on. Its key is
+    ///   kept alive every 30 minutes (weight 1) and left to lapse when the stream ends.
+    /// - **Isolated** reads only the `userListenToken` stream, so receives notices only if Binance
+    ///   sends them there (unconfirmed). A notice names the pair whose subscription it came on, or
+    ///   no instrument, with a `warn`, when the frame's `subscriptionId` is missing or unmapped.
+    ///
+    /// Each arrival is logged at `info`, naming the stream, before the duplicate is dropped. A
+    /// notice sent while a stream is disconnected is not recovered.
+    ///
+    /// `USER_LIABILITY_CHANGE`, on either stream, is logged at `info` and not forwarded.
+    ///
     /// # Startup race window
     /// Like spot, fills arriving between subscribe and the listener being registered may be missed;
     /// callers requiring startup fill completeness must call [`ExecutionClient::fetch_trades`] with
@@ -1424,7 +1462,19 @@ impl ExecutionClient for BinanceMargin {
                 UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
             })?;
 
-            tokio::spawn(margin_connection_manager(
+            // The risk data stream runs beside the manager, for the margin notices it carries, in
+            // a task of its own so nothing in it can end the account stream, and is aborted when
+            // the manager's task ends or is aborted (see `margin_risk`).
+            let risk = RiskStreamTask::spawn(
+                SapiRiskListenKeys {
+                    rest: rest.clone(),
+                    rate_limiter: rate_limiter.clone(),
+                },
+                RISK_STREAM_URL.to_owned(),
+                tx.clone(),
+                dedup.clone(),
+            );
+            let manager = margin_connection_manager(
                 tx,
                 dedup,
                 ws_config,
@@ -1434,7 +1484,11 @@ impl ExecutionClient for BinanceMargin {
                 known_live,
                 instruments,
                 Some((initial_ws, initial_token)),
-            ))
+            );
+            tokio::spawn(async move {
+                let _risk = risk;
+                manager.await;
+            })
         };
 
         let rx_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
@@ -1704,13 +1758,57 @@ fn cross_account_position_handler(
     convert_margin_account_position(position, buf);
 }
 
+/// Cross-margin notice attribution: a cross account's margin level is the whole account's, so a
+/// notice names no instrument. The `notice_instrument` passed to
+/// [`convert_margin_user_data_events_with`] / the cross manager.
+fn cross_notice_instrument(_subscription_id: Option<i64>) -> Option<InstrumentNameExchange> {
+    None
+}
+
+/// Isolated-margin notice attribution: the pair whose subscription the frame came on, recovered
+/// from `subscription_id` via `sub_map` as [`route_isolated_account_position`] recovers a balance
+/// frame's. A notice whose subscription is missing or unmapped is still delivered, naming no
+/// instrument, with a `warn`: losing a margin call costs more than losing its attribution, and
+/// unlike a balance there is no snapshot to repair it.
+fn isolated_notice_instrument(
+    subscription_id: Option<i64>,
+    sub_map: &Mutex<HashMap<i64, InstrumentNameExchange>>,
+) -> Option<InstrumentNameExchange> {
+    let Some(sub_id) = subscription_id else {
+        warn!(
+            "BinanceMargin isolated: MARGIN_LEVEL_STATUS_CHANGE without subscriptionId — \
+             delivering the notice without an instrument"
+        );
+        return None;
+    };
+    let instrument = sub_map
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&sub_id)
+        .cloned();
+    if instrument.is_none() {
+        warn!(
+            subscription_id = sub_id,
+            "BinanceMargin isolated: MARGIN_LEVEL_STATUS_CHANGE for unmapped subscriptionId — \
+             delivering the notice without an instrument"
+        );
+    }
+    instrument
+}
+
 /// Cross-margin convenience wrapper over [`convert_margin_user_data_events_with`] using
-/// [`cross_account_position_handler`] (account-wide `BalanceStreamUpdate`s). Test-only: the cross
-/// manager calls the listener helper with the handler directly, but the converter unit tests exercise
-/// frame discrimination through this two-arg form (they do not route balances per-instrument).
+/// [`cross_account_position_handler`] (account-wide `BalanceStreamUpdate`s) and
+/// [`cross_notice_instrument`]. Test-only: the cross manager calls the listener helper with the
+/// handlers directly, but the converter unit tests exercise frame discrimination through this
+/// two-arg form (they do not route balances per-instrument).
 #[cfg(test)]
 fn convert_margin_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> bool {
-    convert_margin_user_data_events_with(frame, buf, &mut cross_account_position_handler)
+    convert_margin_user_data_events_with(
+        frame,
+        buf,
+        &mut cross_account_position_handler,
+        &mut cross_notice_instrument,
+    )
 }
 
 /// Frame discrimination for the WS-API user-data delivery, as observed live.
@@ -1723,11 +1821,12 @@ fn convert_margin_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEv
 /// is seen rather than dropped silently. Deserialization of a known event type is defensive: a
 /// mismatch is logged and the event dropped (observable), never silently mis-parsed.
 ///
-/// The `outboundAccountPosition` (balance) arm is delegated to `handle_position` — the **only** arm
-/// that differs between cross (account-wide `BalanceStreamUpdate`) and isolated (per-instrument
-/// `InstrumentBalanceUpdate`, routed via the frame's `subscriptionId`). Everything else
-/// (`executionReport` routing by inner `s`, the observable-only margin events, termination
-/// signalling) is single-sourced here.
+/// Two arms differ between cross and isolated, and are delegated: the `outboundAccountPosition`
+/// (balance) arm to `handle_position` (cross: account-wide `BalanceStreamUpdate`; isolated:
+/// per-instrument `InstrumentBalanceUpdate`, routed via the frame's `subscriptionId`), and the
+/// instrument a `MARGIN_LEVEL_STATUS_CHANGE` notice names to `notice_instrument` (cross: none;
+/// isolated: the subscription's pair). Everything else (`executionReport` routing by inner `s`,
+/// the margin events, termination signalling) is single-sourced here.
 fn convert_margin_user_data_events_with(
     frame: &str,
     buf: &mut Vec<UnindexedAccountEvent>,
@@ -1736,6 +1835,7 @@ fn convert_margin_user_data_events_with(
         Option<i64>,
         &mut Vec<UnindexedAccountEvent>,
     ),
+    notice_instrument: &mut impl FnMut(Option<i64>) -> Option<InstrumentNameExchange>,
 ) -> bool {
     let (subscription_id, event_type, event_raw) = match parse_user_data_frame(frame) {
         // RPC responses (subscribe ack, errors): not a user-data event.
@@ -1756,7 +1856,21 @@ fn convert_margin_user_data_events_with(
             // Single typed pass straight from the raw inner slice — no intermediate DOM, and only
             // the matched branch deserializes its payload.
             match serde_json::from_str::<ExecutionReport>(event_raw) {
-                Ok(report) => convert_execution_report(&report, ExchangeId::BinanceMargin, buf),
+                Ok(report) => {
+                    // Evidence for a future margin-liquidation marker: Binance documents none for
+                    // margin, so a forced liquidation's report looks like any other. These fields
+                    // are where one would show.
+                    debug!(
+                        symbol = report.symbol.as_deref().unwrap_or("?"),
+                        order_id = ?report.order_id,
+                        client_order_id = report.client_order_id.as_deref().unwrap_or("?"),
+                        order_type = report.order_type.as_deref().unwrap_or("?"),
+                        execution_type = report.execution_type.as_deref().unwrap_or("?"),
+                        order_status = report.order_status.as_deref().unwrap_or("?"),
+                        "BinanceMargin executionReport"
+                    );
+                    convert_execution_report(&report, ExchangeId::BinanceMargin, buf);
+                }
                 Err(e) => {
                     warn!(error = %e, frame = frame_excerpt(event_raw), "BinanceMargin: undeserializable executionReport, dropping")
                 }
@@ -1785,22 +1899,12 @@ fn convert_margin_user_data_events_with(
         "USER_LIABILITY_CHANGE" | "userLiabilityChange" => {
             // Observable, NOT accumulated into balance state: borrow/repay is a
             // delta, and folding it in would be the position tracking the library refuses. Surfaced
-            // via logs; consumers needing exact live debt refresh via account_snapshot. Always
-            // deserialized (rare borrow/repay path, not per-frame) so a parse failure — exchange
-            // schema drift — is surfaced at WARN rather than silently dropped, even when INFO is
-            // filtered out (observable failures over silent ones). The success log itself is INFO-gated.
+            // via logs, naming this stream (the risk data stream logs its copy too); consumers
+            // needing exact live debt refresh via account_snapshot. Always deserialized (rare
+            // borrow/repay path, not per-frame) so a parse failure — exchange schema drift — is
+            // surfaced at WARN rather than silently dropped (observable failures over silent ones).
             match serde_json::from_str::<UserLiabilityChange>(event_raw) {
-                Ok(c) => {
-                    if tracing::enabled!(tracing::Level::INFO) {
-                        info!(
-                            asset = c.a.as_deref().unwrap_or("?"),
-                            kind = c.t.as_deref().unwrap_or("?"),
-                            principal = c.p.as_deref().unwrap_or("?"),
-                            interest = c.i.as_deref().unwrap_or("?"),
-                            "BinanceMargin USER_LIABILITY_CHANGE (observable; not applied to balance state)"
-                        );
-                    }
-                }
+                Ok(c) => log_liability_change(&c, "user data"),
                 Err(e) => warn!(
                     error = %e,
                     frame = frame_excerpt(event_raw),
@@ -1810,23 +1914,21 @@ fn convert_margin_user_data_events_with(
             false
         }
         "MARGIN_LEVEL_STATUS_CHANGE" | "marginLevelStatusChange" => {
-            // Liquidation-risk signal — observable, no policy (the library takes no defensive action).
-            // The level guard skips the deserialize allocation when WARN is filtered out, mirroring
-            // USER_LIABILITY_CHANGE above. A parse failure on a liquidation-risk frame is surfaced
-            // rather than dropped silently (observable failures over silent ones).
-            if tracing::enabled!(tracing::Level::WARN) {
-                match serde_json::from_str::<MarginLevelStatusChange>(event_raw) {
-                    Ok(c) => warn!(
-                        margin_level = c.l.as_deref().unwrap_or("?"),
-                        status = c.s.as_deref().unwrap_or("?"),
-                        "BinanceMargin MARGIN_LEVEL_STATUS_CHANGE (liquidation risk; observable, no policy)"
-                    ),
-                    Err(e) => warn!(
-                        error = %e,
-                        frame = frame_excerpt(event_raw),
-                        "BinanceMargin: undeserializable MARGIN_LEVEL_STATUS_CHANGE, dropping"
-                    ),
+            // Forwarded as a Notice; what to do about it is the consumer's policy. The risk data
+            // stream may send the same change, and the listener's dedup gate delivers it once.
+            match serde_json::from_str::<MarginLevelStatusChange>(event_raw) {
+                Ok(change) => {
+                    log_margin_level_change(&change, "user data");
+                    buf.extend(margin_level_notice(
+                        change,
+                        notice_instrument(subscription_id),
+                    ));
                 }
+                Err(e) => warn!(
+                    error = %e,
+                    frame = frame_excerpt(event_raw),
+                    "BinanceMargin: undeserializable MARGIN_LEVEL_STATUS_CHANGE, dropping"
+                ),
             }
             false
         }
@@ -1996,10 +2098,11 @@ fn route_isolated_account_position(
 /// Register the WS-API event-dispatch callback shared by both margin managers.
 ///
 /// Single-sources the demux/dedup/dispatch + heartbeat + terminal-signal logic the cross and
-/// isolated managers both need; only the `outboundAccountPosition` (balance) arm differs and is
-/// supplied as `handle_position` (cross → account-wide `BalanceStreamUpdate` via
-/// [`cross_account_position_handler`]; isolated → per-instrument `InstrumentBalanceUpdate` via
-/// [`route_isolated_account_position`]). Returns the [`Subscription`] handle; the caller must
+/// isolated managers both need; only the `outboundAccountPosition` (balance) arm and the
+/// instrument a margin notice names differ, supplied as `handle_position` (cross → account-wide
+/// `BalanceStreamUpdate` via [`cross_account_position_handler`]; isolated → per-instrument
+/// `InstrumentBalanceUpdate` via [`route_isolated_account_position`]) and `notice_instrument`
+/// ([`cross_notice_instrument`]; [`isolated_notice_instrument`]). Returns the [`Subscription`] handle; the caller must
 /// `unsubscribe()` it on disconnect. `heartbeat_flag` is shared with the caller's monitor loop
 /// (set on every inbound frame/ping); `signal_tx` fires once on a terminal condition
 /// (consumer-drop, socket error/close, or exchange `eventStreamTerminated`). Each event `known`
@@ -2017,6 +2120,7 @@ fn register_user_data_listener(
         &mut Vec<UnindexedAccountEvent>,
     ) + Send
     + 'static,
+    mut notice_instrument: impl FnMut(Option<i64>) -> Option<InstrumentNameExchange> + Send + 'static,
 ) -> Subscription {
     let mut signal_tx_opt = Some(signal_tx);
     let mut event_tx = Some(tx);
@@ -2039,6 +2143,7 @@ fn register_user_data_listener(
                     &json_str,
                     &mut event_buf,
                     &mut handle_position,
+                    &mut notice_instrument,
                 );
                 for ev in event_buf.drain(..) {
                     if let Some(key) = dedup_key_from_event(&ev)
@@ -2396,6 +2501,7 @@ async fn margin_connection_manager(
             heartbeat_flag.clone(),
             signal_tx,
             cross_account_position_handler,
+            cross_notice_instrument,
         );
 
         // --- Subscribe (token is the sole auth) ---
@@ -2721,6 +2827,10 @@ async fn isolated_connect_and_subscribe(
             route_isolated_account_position(position, subscription_id, &sub_map, &base_quote, buf);
         }
     };
+    let notice_instrument = {
+        let sub_map = sub_map.clone();
+        move |subscription_id| isolated_notice_instrument(subscription_id, &sub_map)
+    };
     // Register BEFORE subscribing so a pushed event arriving mid-fan-out is not missed.
     let subscription = register_user_data_listener(
         &ws,
@@ -2730,6 +2840,7 @@ async fn isolated_connect_and_subscribe(
         heartbeat_flag.clone(),
         signal_tx,
         handle_position,
+        notice_instrument,
     );
 
     let earliest_expiry_ms = earliest_token_expiry_ms(tokens);
@@ -3969,6 +4080,7 @@ fn convert_order_kind_tif_margin(
 mod tests {
     use super::*;
     use crate::client::binance::shared::convert_open_order;
+    use crate::notice::{AccountNotice, NoticeKind};
     use crate::order::state::ActiveOrderState;
     use binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner;
 
@@ -5288,18 +5400,104 @@ mod tests {
     }
 
     #[test]
-    fn margin_ws_margin_specific_events_are_observable_only() {
-        // USER_LIABILITY_CHANGE / MARGIN_LEVEL_STATUS_CHANGE are logged, NOT forwarded as account
-        // events and NOT signalled as reconnects: observable, not accumulated.
+    fn margin_ws_liability_change_is_observable_only() {
+        // USER_LIABILITY_CHANGE is logged, NOT forwarded as an account event and NOT signalled as
+        // a reconnect: observable, not accumulated.
         let mut buf = Vec::new();
         assert!(!convert_margin_user_data_events(
             &push(documented_liability_change("USER_LIABILITY_CHANGE")),
             &mut buf
         ));
+        assert!(buf.is_empty());
+    }
+
+    /// The notice a converter pushed, which must be its only event.
+    fn only_notice(buf: &[UnindexedAccountEvent]) -> &AccountNotice<InstrumentNameExchange> {
+        match buf {
+            [
+                UnindexedAccountEvent {
+                    exchange: ExchangeId::BinanceMargin,
+                    kind: AccountEventKind::Notice(notice),
+                },
+            ] => notice,
+            other => panic!("expected one BinanceMargin notice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn margin_ws_margin_level_change_is_forwarded_as_a_notice() {
+        let mut buf = Vec::new();
         assert!(!convert_margin_user_data_events(
             &push(documented_margin_level_change("MARGIN_LEVEL_STATUS_CHANGE")),
             &mut buf
         ));
+        assert_eq!(
+            only_notice(&buf),
+            &AccountNotice::new(
+                NoticeKind::MarginCall,
+                None,
+                Utc.timestamp_millis_opt(1_573_200_697_110).unwrap(),
+                Some(Decimal::new(125, 2)),
+                SmolStr::new("MARGIN_CALL"),
+            ),
+            "cross names no instrument"
+        );
+    }
+
+    #[test]
+    fn margin_level_statuses_map_to_notice_kinds() {
+        for (status, kind) in [
+            ("MARGIN_CALL", NoticeKind::MarginCall),
+            ("PRE_LIQUIDATION", NoticeKind::LiquidationWarning),
+            ("FORCE_LIQUIDATION", NoticeKind::Liquidation),
+            ("NORMAL", NoticeKind::MarginRestored),
+            ("EXCESSIVE", NoticeKind::MarginRestored),
+            ("SOME_FUTURE_STATUS", NoticeKind::Other),
+        ] {
+            let mut buf = Vec::new();
+            let frame = push(serde_json::json!({
+                "e": "MARGIN_LEVEL_STATUS_CHANGE", "E": 1_700_000_000_000_i64, "l": "1.5",
+                "s": status,
+            }));
+            convert_margin_user_data_events(&frame, &mut buf);
+            let notice = only_notice(&buf);
+            assert_eq!(notice.kind, kind, "{status}");
+            assert_eq!(notice.status, status, "the raw status is kept");
+        }
+    }
+
+    #[test]
+    fn a_margin_level_change_missing_parts_is_still_delivered_where_it_can_be() {
+        // No readable margin level: delivered without one.
+        let mut buf = Vec::new();
+        convert_margin_user_data_events(
+            &push(serde_json::json!({
+                "e": "MARGIN_LEVEL_STATUS_CHANGE", "E": 1_700_000_000_000_i64, "l": "n/a",
+                "s": "FORCE_LIQUIDATION",
+            })),
+            &mut buf,
+        );
+        let notice = only_notice(&buf);
+        assert_eq!(notice.kind, NoticeKind::Liquidation);
+        assert_eq!(notice.margin_level, None);
+
+        // No time: stamped now.
+        let before = Utc::now();
+        let mut buf = Vec::new();
+        convert_margin_user_data_events(
+            &push(serde_json::json!({ "e": "MARGIN_LEVEL_STATUS_CHANGE", "s": "MARGIN_CALL" })),
+            &mut buf,
+        );
+        assert!(only_notice(&buf).time_exchange >= before);
+
+        // No status: nothing to classify, dropped.
+        let mut buf = Vec::new();
+        convert_margin_user_data_events(
+            &push(serde_json::json!({
+                "e": "MARGIN_LEVEL_STATUS_CHANGE", "E": 1_700_000_000_000_i64, "l": "1.5",
+            })),
+            &mut buf,
+        );
         assert!(buf.is_empty());
     }
 
@@ -5333,7 +5531,7 @@ mod tests {
             (
                 "MARGIN_LEVEL_STATUS_CHANGE",
                 documented_margin_level_change("MARGIN_LEVEL_STATUS_CHANGE"),
-                "MARGIN_LEVEL_STATUS_CHANGE (liquidation risk",
+                "MARGIN_LEVEL_STATUS_CHANGE received",
             ),
             // Accepted until a live frame settles which spelling the userListenToken stream sends.
             (
@@ -5344,14 +5542,19 @@ mod tests {
             (
                 "marginLevelStatusChange",
                 documented_margin_level_change("marginLevelStatusChange"),
-                "MARGIN_LEVEL_STATUS_CHANGE (liquidation risk",
+                "MARGIN_LEVEL_STATUS_CHANGE received",
             ),
         ] {
             let mut buf = Vec::new();
             let (terminated, messages) =
                 log_messages(|| convert_margin_user_data_events(&push(frame), &mut buf));
             assert!(!terminated, "{e}");
-            assert!(buf.is_empty(), "{e}");
+            // Only the margin-level arm forwards anything: its notice.
+            assert_eq!(
+                buf.len(),
+                usize::from(expected.starts_with("MARGIN")),
+                "{e}"
+            );
             assert!(
                 messages.iter().any(|m| m.contains(expected)),
                 "{e}: expected its own arm's log, got {messages:?}"
@@ -5677,6 +5880,81 @@ mod tests {
     }
 
     #[test]
+    fn isolated_margin_level_change_names_its_subscriptions_pair_or_none() {
+        let sub_map = Arc::new(Mutex::new(HashMap::from([(7_i64, btcusdt())])));
+        let notice_on = |subscription_id: i64| {
+            let mut buf = Vec::new();
+            let frame = push_with_sub(
+                subscription_id,
+                documented_margin_level_change("MARGIN_LEVEL_STATUS_CHANGE"),
+            );
+            assert!(!convert_margin_user_data_events_with(
+                &frame,
+                &mut buf,
+                &mut cross_account_position_handler,
+                &mut |id| isolated_notice_instrument(id, &sub_map),
+            ));
+            only_notice(&buf).instrument.clone()
+        };
+
+        assert_eq!(notice_on(7), Some(btcusdt()));
+        // Unmapped: still delivered, unattributed, rather than dropped like a balance frame.
+        assert_eq!(notice_on(99), None);
+        // No subscriptionId at all.
+        assert_eq!(isolated_notice_instrument(None, &sub_map), None);
+    }
+
+    #[test]
+    fn the_two_streams_key_one_notice_alike() {
+        // The same change, as each stream frames it, must collide in the shared cache.
+        use crate::client::binance::margin_risk::{RiskFrame, convert_risk_frame};
+
+        let change = documented_margin_level_change("MARGIN_LEVEL_STATUS_CHANGE");
+        let mut from_user_data = Vec::new();
+        convert_margin_user_data_events(&push(change.clone()), &mut from_user_data);
+        let mut from_risk = Vec::new();
+        let risk_frame = serde_json::json!({ "stream": "listen-key", "data": change });
+        assert_eq!(
+            convert_risk_frame(&risk_frame.to_string(), &mut from_risk),
+            RiskFrame::Continue
+        );
+
+        let dedup = new_dedup_cache();
+        let key = |events: &[UnindexedAccountEvent]| dedup_key_from_event(&events[0]).unwrap();
+        assert!(!is_duplicate(&dedup, key(&from_user_data)));
+        assert!(
+            is_duplicate(&dedup, key(&from_risk)),
+            "the risk data stream's copy is dropped"
+        );
+    }
+
+    #[test]
+    fn a_notice_from_both_streams_is_delivered_once() {
+        // The user-data stream and the risk data stream key a notice alike (status + event time),
+        // so the shared cache drops the second copy whichever arrives first. A later change with
+        // the same status is a new notice.
+        let dedup = new_dedup_cache();
+        let notice = |time_ms: i64| {
+            let mut buf = Vec::new();
+            convert_margin_user_data_events(
+                &push(serde_json::json!({
+                    "e": "MARGIN_LEVEL_STATUS_CHANGE", "E": time_ms, "l": "1.1",
+                    "s": "MARGIN_CALL",
+                })),
+                &mut buf,
+            );
+            buf.pop().unwrap()
+        };
+        let is_new = |event: &UnindexedAccountEvent| {
+            !is_duplicate(&dedup, dedup_key_from_event(event).unwrap())
+        };
+
+        assert!(is_new(&notice(1_700_000_000_000)));
+        assert!(!is_new(&notice(1_700_000_000_000)), "second copy dropped");
+        assert!(is_new(&notice(1_700_000_060_000)), "a later notice is new");
+    }
+
+    #[test]
     fn isolated_outbound_position_routes_to_instrument_balance_update() {
         let sub_map = Arc::new(Mutex::new(HashMap::from([(7_i64, btcusdt())])));
         let base_quote = Arc::new(HashMap::from([(
@@ -5703,7 +5981,8 @@ mod tests {
         assert!(!convert_margin_user_data_events_with(
             &frame,
             &mut buf,
-            &mut handler
+            &mut handler,
+            &mut cross_notice_instrument,
         ));
         assert_eq!(buf.len(), 1, "one InstrumentBalanceUpdate for the pair");
         match &buf[0].kind {
@@ -5749,7 +6028,8 @@ mod tests {
         assert!(!convert_margin_user_data_events_with(
             &frame,
             &mut buf,
-            &mut handler
+            &mut handler,
+            &mut cross_notice_instrument,
         ));
         assert!(buf.is_empty(), "unmapped subscriptionId frame is dropped");
     }
@@ -5779,7 +6059,8 @@ mod tests {
         assert!(!convert_margin_user_data_events_with(
             &frame,
             &mut buf,
-            &mut handler
+            &mut handler,
+            &mut cross_notice_instrument,
         ));
         assert!(buf.is_empty(), "missing quote side → frame dropped");
     }
@@ -5806,7 +6087,8 @@ mod tests {
         assert!(!convert_margin_user_data_events_with(
             &frame,
             &mut buf,
-            &mut handler
+            &mut handler,
+            &mut cross_notice_instrument,
         ));
         assert_eq!(buf.len(), 2, "the execution and its order snapshot");
         match &buf[0].kind {

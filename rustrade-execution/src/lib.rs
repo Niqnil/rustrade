@@ -94,6 +94,8 @@ pub mod indexer;
 pub mod map;
 pub mod market;
 pub use market::{MarketDepth, MarketSnapshot};
+pub mod notice;
+pub use notice::{AccountNotice, NoticeKind};
 pub mod order;
 pub mod position;
 pub mod trade;
@@ -292,6 +294,15 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// `Position::carry` in `rustrade`), and applies none to balances: the venue's balances already
     /// include what it has posted. See [`CashFlow`] for which venues send it.
     CashFlow(cash_flow::CashFlow<AssetKey, InstrumentKey>),
+
+    /// The venue reported a change in the account's margin or liquidation state: a margin call, a
+    /// liquidation warning, a liquidation under way, or that one of those no longer holds.
+    ///
+    /// A notice changes no balance or position. The engine logs it, at `warn` when
+    /// [`NoticeKind::is_escalation`] and at `info` otherwise, and changes no state; what to do
+    /// about it is the consumer's policy. A notice sent while the stream was disconnected is not
+    /// recovered. See [`AccountNotice`] for which venues send it.
+    Notice(notice::AccountNotice<InstrumentKey>),
 }
 
 impl<ExchangeKey, AssetKey, InstrumentKey> AccountEvent<ExchangeKey, AssetKey, InstrumentKey>

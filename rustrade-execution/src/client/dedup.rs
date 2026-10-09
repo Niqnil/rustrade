@@ -24,7 +24,8 @@ use std::{num::NonZeroUsize, sync::Arc};
 
 /// Size of the LRU dedup cache. 10k entries covers ~hours of high-frequency
 /// trading at typical fill rates; each entry is ~100-104 bytes (`DedupKey` =
-/// `SmolStr` 24 + `SmolStr` 24 + `DedupEventKind` 20 + padding 4 = 72 bytes, plus
+/// `SmolStr` 24 + `SmolStr` 24 + `DedupEventKind` 24 (8-aligned by `Notice`'s `i64`) = 72
+/// bytes, plus
 /// `LruCache` node overhead: 2 linked-list pointers 16 + hashbrown slot ~12-16
 /// ≈ 28-32 bytes). At 10k: ~1.0 MB.
 /// At very high fill rates (>333 distinct fills/sec sustained during the 30s
@@ -60,6 +61,12 @@ pub(crate) enum DedupEventKind {
     /// A funding payment, keyed on its instrument and funding time because the venue gives it no
     /// id.
     Funding,
+    /// An account notice, keyed on its instrument (empty for the account as a whole), the venue's
+    /// status and the time the venue sent it, since a notice has no id. A venue that sends one
+    /// notice on two streams sends it with the same time, so the second is dropped.
+    Notice {
+        time_exchange_ms: i64,
+    },
 }
 
 /// Dedup cache key: (instrument, event ID, event kind).
@@ -74,6 +81,8 @@ pub(crate) enum DedupEventKind {
 /// - For CANCELED/EXPIRED: instrument + order_id + `DedupEventKind::Cancelled`
 /// - For Hyperliquid funding payments: coin + funding time in milliseconds +
 ///   `DedupEventKind::Funding`, since a payment has no id
+/// - For account notices: instrument (empty when the notice names none) + the venue's status +
+///   `DedupEventKind::Notice`, carrying the time the venue sent it
 #[derive(Debug, Hash, Eq, PartialEq)]
 pub(crate) struct DedupKey {
     pub(crate) instrument: SmolStr,
@@ -145,6 +154,17 @@ pub(crate) fn dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<Dedu
         // one twice is unknown, and TradeAmendment tells the consumer to apply it idempotently.
         // IBKR's EventSink tracks each execution's revisions itself, which also keeps an
         // execution from going out after its correction.
+        AccountEventKind::Notice(notice) => Some(DedupKey {
+            instrument: notice
+                .instrument
+                .as_ref()
+                .map(|instrument| instrument.name().clone())
+                .unwrap_or_default(),
+            id: notice.status.clone(),
+            kind: DedupEventKind::Notice {
+                time_exchange_ms: notice.time_exchange.timestamp_millis(),
+            },
+        }),
         // CashFlow has none here: a venue may give a flow no id, and what identifies one then is
         // the producer's to say, so each producer keys its own (Hyperliquid's funding on coin and
         // time).
