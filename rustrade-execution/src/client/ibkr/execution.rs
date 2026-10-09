@@ -5,7 +5,7 @@ use crate::{
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use fnv::FnvHashMap;
-use ibapi::orders::{CommissionReport, Execution, ExecutionData, ExecutionFilter, ExecutionSide};
+use ibapi::orders::{CommissionReport, Execution, ExecutionData, ExecutionSide};
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
@@ -59,20 +59,13 @@ pub(super) struct ExecutionScope {
 }
 
 impl ExecutionScope {
-    /// The filter for an executions request: this client's alone, unless other clients' are
-    /// reported too.
-    pub(super) fn filter(self) -> ExecutionFilter {
-        ExecutionFilter {
-            client_id: (!self.other_clients).then_some(self.api_client_id),
-            ..ExecutionFilter::default()
-        }
-    }
-
     /// The order id and origin `execution`'s trade is reported with, or `None` when it is another
     /// client's and other clients' are not reported.
     ///
     /// An execution IB flags as an IB-initiated liquidation is reported whoever's order it was,
     /// as [`TradeOrigin::Liquidation`]: it moves the account's position, which no client chose.
+    /// That is why an executions request asks IB for every client's, and this decides which are
+    /// reported.
     pub(super) fn classify(self, execution: &Execution) -> Option<(OrderId, TradeOrigin)> {
         let own = execution.client_id == self.api_client_id;
         let liquidation = execution.liquidation != 0;

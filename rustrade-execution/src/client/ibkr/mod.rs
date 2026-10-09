@@ -74,7 +74,8 @@
 //! [`IbkrConfig::other_clients_fills`] is set, as trades of origin
 //! [`External`](crate::trade::TradeOrigin::External). A fill IB flags as an IB-initiated
 //! liquidation is reported either way, as a
-//! [`Liquidation`](crate::trade::TradeOrigin::Liquidation).
+//! [`Liquidation`](crate::trade::TradeOrigin::Liquidation), on the stream, by fill recovery and by
+//! `fetch_trades`, whenever IB sends it to this connection.
 //!
 //! # Caller Responsibilities
 //!
@@ -136,7 +137,7 @@ use crate::{
         state::{Cancelled, Expired, Filled, Open, OrderState, UnindexedOrderState},
     },
     position::PositionReport,
-    trade::{Trade, TradesRead},
+    trade::{Trade, TradeOrigin, TradesRead},
 };
 use account::{BalanceAggregator, PositionAggregator};
 use chrono::{DateTime, Utc};
@@ -205,19 +206,23 @@ pub struct IbkrConfig {
     /// Off, this client reports its own orders' fills only. Leave it off when several API clients
     /// each feed an engine from one account: each would otherwise apply the others' fills too.
     ///
-    /// On, fill recovery and [`fetch_trades`](ExecutionClient::fetch_trades) ask IB for every
-    /// client's executions, and the account stream reports another client's execution whenever
-    /// IB sends one live. IB numbers orders per API client, so such a trade's
+    /// On, another client's execution is reported wherever this client reads it: the account
+    /// stream, fill recovery and [`fetch_trades`](ExecutionClient::fetch_trades). Recovery and
+    /// `fetch_trades` ask IB for every client's executions; which IB sends a given connection,
+    /// live or in answer, is IB's to decide. IB numbers orders per API client, so such a trade's
     /// [`order_id`](crate::trade::Trade::order_id) is IB's permanent id for the order (`perm:`
     /// and the id) rather than the client's order id, which could name one of this client's.
     ///
-    /// IB reports orders entered in TWS under API client id 0, so a client connected as 0 takes
-    /// their fills for its own and reports them as [`Order`](crate::trade::TradeOrigin::Order),
-    /// whatever this is set to.
+    /// A fill of an order this client's id placed is its own, even when the client does not
+    /// track the order, such as one placed before a restart. IB reports orders entered in TWS
+    /// under API client id 0, so a client connected as 0 takes their fills for its own too, under
+    /// their IB order id as [`fetch_open_orders`](ExecutionClient::fetch_open_orders) lists the
+    /// orders, and reports them as [`Order`](crate::trade::TradeOrigin::Order) whatever this is
+    /// set to.
     ///
-    /// Either way, a fill IB flags as an IB-initiated liquidation is reported whenever IB sends
-    /// it, as [`Liquidation`](crate::trade::TradeOrigin::Liquidation), since it moves the
-    /// account's position whoever placed the order.
+    /// Either way, a fill IB flags as an IB-initiated liquidation is reported, as
+    /// [`Liquidation`](crate::trade::TradeOrigin::Liquidation), since it moves the account's
+    /// position whoever placed the order.
     #[serde(default)]
     pub other_clients_fills: bool,
 }
@@ -449,15 +454,27 @@ fn resolve_execution(
         return None;
     };
     let Some(instrument) = contracts.get_name_by_con_id(con_id) else {
-        // A fill that moved the account's position, which no trade will report. Loud, but one
-        // line per execution, so no louder than the fills themselves.
-        warn!(
-            ib_order_id,
-            con_id,
-            exec_id = %execution.execution.execution_id,
-            %origin,
-            "ExecutionData in a contract this client has not registered, dropping"
-        );
+        if origin == TradeOrigin::External {
+            // Another client's trading in a contract this one does not follow: expected, and on
+            // a busy account frequent.
+            debug!(
+                ib_order_id,
+                con_id,
+                exec_id = %execution.execution.execution_id,
+                "Another API client's ExecutionData in a contract this client has not \
+                 registered, dropping"
+            );
+        } else {
+            // A fill of this client's order, or a liquidation, moved the account's position, and
+            // no trade will report it. One line per such execution, so no louder than the fills.
+            warn!(
+                ib_order_id,
+                con_id,
+                exec_id = %execution.execution.execution_id,
+                %origin,
+                "ExecutionData in a contract this client has not registered, dropping"
+            );
+        }
         return None;
     };
     Some(ResolvedExecution {
@@ -3046,11 +3063,12 @@ impl ExecutionClient for IbkrClient {
     ///   (`resume: None`) for what IB returned: a span reaching before today is not read
     ///   before today. For historical executions beyond today, use IB's Flex Query or
     ///   Activity Statements.
-    /// - Only the executions of orders this API client placed are read, unless
-    ///   [`IbkrConfig::other_clients_fills`] is set: then every client's are, each other
-    ///   client's as an [`External`](crate::trade::TradeOrigin::External) trade under IB's
-    ///   permanent id for its order. An execution in a contract this client has not
-    ///   registered is skipped either way.
+    /// - Only the executions of orders this API client placed are returned, and those IB
+    ///   flags as an IB-initiated liquidation, unless [`IbkrConfig::other_clients_fills`] is
+    ///   set: then every client's IB sends are, each other client's as an
+    ///   [`External`](crate::trade::TradeOrigin::External) trade under IB's permanent id for
+    ///   its order. An execution in a contract this client has not registered is skipped
+    ///   either way.
     /// - Each trade's fees come from the commission report IB sends with its
     ///   execution. An execution whose report IB did not send is returned with a zero
     ///   fee in [`UNKNOWN_FEE_ASSET`](execution::UNKNOWN_FEE_ASSET), with a warning.
@@ -3088,9 +3106,11 @@ impl ExecutionClient for IbkrClient {
         };
 
         tokio::task::spawn_blocking(move || {
+            // Every client's executions: `scope` decides which are reported (see
+            // `ExecutionScope::classify`).
             // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
             let sub = client
-                .executions(scope.filter())
+                .executions(ibapi::orders::ExecutionFilter::default())
                 .map_err(|e| UnindexedClientError::Internal(format!("executions: {e}")))?;
 
             let mut listing = Vec::new();
@@ -3143,7 +3163,6 @@ fn trades_from_executions(
             Executions::ExecutionData(data) => {
                 let exec = &data.execution;
                 let Some((order_id, origin)) = scope.classify(exec) else {
-                    // Unless it is a liquidation, the request asked IB for this client's alone.
                     debug!(
                         exec_id = %exec.execution_id,
                         api_client_id = exec.client_id,

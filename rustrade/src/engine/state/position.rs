@@ -938,14 +938,11 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                 // execution the venue reported. Carrying the cumulative forward would apply the
                 // same order advance twice.
                 next_position_trade.order_filled_quantity = None;
-                next_position_trade.fees = AssetFees {
-                    asset: trade.fees.asset.clone(),
-                    fees: next_position_fee_enter,
-                    fees_quote: trade
-                        .fees
-                        .fees_quote
-                        .map(|fq| fq * (next_position_quantity / trade.quantity.abs())),
-                };
+                next_position_trade.fees.fees = next_position_fee_enter;
+                next_position_trade.fees.fees_quote = trade
+                    .fees
+                    .fees_quote
+                    .map(|fq| fq * (next_position_quantity / trade.quantity.abs()));
 
                 // Update closing Position with appropriate ratio of fees for theoretical quantity
                 let fee_exit = trade.fees.fees * (self.quantity_abs / trade.quantity.abs());

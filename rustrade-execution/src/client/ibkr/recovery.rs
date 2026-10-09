@@ -50,14 +50,14 @@ use crate::{
     error::{StreamTerminationReason, UnindexedClientError},
     fill_recovery::{FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope},
     order::id::ClientOrderId,
-    trade::{Trade, TradeAmendment, TradeAmendmentKind, TradeId},
+    trade::{Trade, TradeAmendment, TradeAmendmentKind, TradeId, TradeOrigin},
 };
 use chrono::{DateTime, Utc};
 use fnv::FnvHashSet;
 use ibapi::{
     TRANSPORT_RECONNECT_CODE,
     client::blocking::{Client, NoticeStream},
-    orders::{ExecutionData, Executions},
+    orders::{ExecutionData, ExecutionFilter, Executions},
     subscriptions::SubscriptionItem,
 };
 use lru::LruCache;
@@ -258,6 +258,8 @@ pub(super) struct EventSink {
 struct DeliveredRevision {
     revision: u32,
     id: TradeId,
+    /// The origin it was delivered with, which a correction keeps.
+    origin: TradeOrigin,
 }
 
 impl EventSink {
@@ -297,9 +299,13 @@ impl EventSink {
     /// the execution predates the stream or has dropped out of what this sink remembers, it names
     /// the revision the correction's id says it corrects. Recovery passes an execution ahead of
     /// its corrections, so an original that fell in a gap is still delivered first.
+    ///
+    /// A correction this stream reports as an [`Order`](TradeOrigin::Order) fill takes the origin
+    /// the revision it corrects was delivered with: a corrected liquidation is still one, whether
+    /// or not IB repeats the flag on the correction.
     pub(super) fn send_execution(
         &self,
-        trade: Trade<AssetNameExchange, InstrumentNameExchange>,
+        mut trade: Trade<AssetNameExchange, InstrumentNameExchange>,
     ) -> bool {
         let Some(revision) = ExecutionRevision::parse(&trade.id.0) else {
             return self.send_trade(trade);
@@ -319,10 +325,16 @@ impl EventSink {
                 );
                 return true;
             }
-            Some(delivered) => Some(delivered.id.clone()),
+            Some(delivered) => {
+                if trade.origin == TradeOrigin::Order {
+                    trade.origin = delivered.origin;
+                }
+                Some(delivered.id.clone())
+            }
             None => revision.previous_id(),
         };
         let id = trade.id.clone();
+        let origin = trade.origin;
         let sent = match original {
             None => self.send_trade(trade),
             Some(original) => {
@@ -346,6 +358,7 @@ impl EventSink {
                 DeliveredRevision {
                     revision: number,
                     id,
+                    origin,
                 },
             );
         }
@@ -522,11 +535,12 @@ fn recover_fills(
     pending: &ExecutionBuffer,
     sink: &EventSink,
 ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, RecoveryError> {
-    // No server-side time filter: TWS reads `ExecutionFilter::time` in a zone of its own choosing.
-    // A day's executions are few, and `RecoveredFills` applies the window. Other API clients'
-    // only when `scope` reports them.
+    // No server-side filter. Not on time: TWS reads `ExecutionFilter::time` in a zone of its own
+    // choosing. A day's executions are few, and `RecoveredFills` applies the window. Not on the
+    // client either: `scope` reports a liquidation of another client's order whatever it is set
+    // to, so which executions are reported is decided by `ExecutionScope::classify`.
     let subscription = client
-        .executions(scope.filter())
+        .executions(ExecutionFilter::default())
         .map_err(RecoveryError::Ibapi)?;
     let deadline = Instant::now() + RECOVERY_TIMEOUT;
     let mut fills = RecoveredFills::new(floor, scope, contracts);
@@ -765,7 +779,7 @@ fn observe_notice(tracker: &mut GapTracker, notice: &ibapi::Notice) {
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics are the correct failure mode
 mod tests {
     use super::*;
-    use crate::{client::dedup::new_dedup_cache, trade::TradeOrigin};
+    use crate::client::dedup::new_dedup_cache;
     use ibapi::{
         contracts::Contract,
         orders::{CommissionReport, Execution},
@@ -1116,6 +1130,32 @@ mod tests {
         );
     }
 
+    /// A correction of a liquidation is one too, even when IB does not repeat the flag on it; one
+    /// that reports an origin of its own keeps it.
+    #[test]
+    fn a_correction_keeps_the_origin_it_corrects() {
+        let replacement = |events: &[UnindexedAccountEvent]| {
+            let AccountEventKind::TradeAmended(TradeAmendment {
+                kind: TradeAmendmentKind::Corrected { replacement },
+                ..
+            }) = &events[1].kind
+            else {
+                panic!("expected a correction, got {:?}", events[1]);
+            };
+            replacement.origin
+        };
+
+        let (unflagged, mut rx) = sink();
+        assert!(unflagged.send_execution(trade("x.01.01").with_origin(TradeOrigin::Liquidation)));
+        assert!(unflagged.send_execution(trade("x.01.02")));
+        assert_eq!(replacement(&drain(&mut rx)), TradeOrigin::Liquidation);
+
+        let (flagged, mut rx) = sink();
+        assert!(flagged.send_execution(trade("y.01.01")));
+        assert!(flagged.send_execution(trade("y.01.02").with_origin(TradeOrigin::Liquidation)));
+        assert_eq!(replacement(&drain(&mut rx)), TradeOrigin::Liquidation);
+    }
+
     /// The original predates the stream, so the snapshot the consumer started from counts it.
     /// Sent as a trade, the correction would count it twice.
     #[test]
@@ -1267,7 +1307,8 @@ mod tests {
             execution("gap", IB_ORDER_ID, "20260929 14:00:00 UTC"),
             commission("gap"),
             // In the window, for an order of this client's that it no longer tracks, such as one
-            // placed before a restart: still this client's fill.
+            // placed before a restart, or, this being client 0, one entered in TWS: still this
+            // client's fill.
             execution("untracked", 99, "20260929 14:00:01 UTC"),
             commission("untracked"),
             // In the window, under the tracked order's id, but another API client's order: IB

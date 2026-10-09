@@ -1655,8 +1655,8 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             }
         };
 
-        // Recorded here, past the fill-before-ack queue above, so a queued fill is counted once:
-        // when it is replayed.
+        // A forced fill is never queued above (its origin is not `Order`), so this counts each
+        // one once.
         if trade.origin.is_forced() {
             warn!(
                 instrument = ?trade.instrument,

@@ -234,7 +234,12 @@ where
 /// A forced variant takes precedence over [`External`](Self::External): a liquidation is
 /// reported as a liquidation whoever placed the order it closed.
 ///
-/// # Ordering
+/// # Serialised form and ordering
+///
+/// Serialised as the variant's name (`"Liquidation"`), as [`Side`] is, while `Display` writes it
+/// in lower case (`liquidation`). The names are a stored format: they are not renamed, and new
+/// variants are added after the existing ones. A trade with an origin a build does not know does
+/// not deserialise in that build.
 ///
 /// `Ord` follows declaration order. It exists so [`Trade`] can derive `Ord`, and carries no
 /// meaning beyond that.

@@ -56,16 +56,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     simulated venue report `Order` only for now. `is_forced()` is true for `Liquidation`, `Adl`
     and `Assignment`. A `Trade`'s `Display` shows its origin when it is not `Order`.
   - `IbkrClient` reports a fill IB flags as an IB-initiated liquidation as `Liquidation`, whichever
-    API client placed the order; it was dropped when another client had. A fill of the client's
-    own order is reported even when the client no longer tracks the order, such as after a
-    restart; it was dropped. An execution in a contract the client has not registered is still
-    dropped, now with a WARN on the account stream.
+    API client placed the order; it was dropped when another client had. Fill recovery and
+    `fetch_trades` now ask IB for every client's executions so that they can find one. A fill of
+    an order the client's id placed is reported even when the client no longer tracks the order,
+    such as after a restart; it was dropped. For a client connected as id 0 that includes orders
+    entered in TWS, which IB reports under client id 0. A correction keeps the origin of the
+    execution it corrects. An execution in a contract the client has not registered is still
+    dropped, now with a WARN on the account stream unless it is another client's.
   - **Breaking:** `IbkrConfig` gains `other_clients_fills: bool`, `#[serde(default)]` and off. Set,
-    fill recovery and `fetch_trades` read every API client's executions, and the account stream
-    reports another client's execution when IB sends one, each as `External`, under the order id
-    `perm:` and IB's permanent id for the order (`client:<client id>:<order id>` when it has none).
-    Leave it off when several API clients each feed an engine from one account: each would apply
-    the others' fills.
+    the stream, fill recovery and `fetch_trades` report other API clients' executions too, each
+    as `External`, under the order id `perm:` and IB's permanent id for the order
+    (`client:<client id>:<order id>` when it has none). Leave it off when several API clients each
+    feed an engine from one account: each would apply the others' fills.
   - **Breaking:** `ibkr::execution::ExecutionBuffer::add_execution` is no longer public.
   - The engine's expiry settlement trade is `Expiry`. The engine applies a fill of any origin, logs
     a forced one at WARN and counts it in the new `TearSheet::fills_forced` and
