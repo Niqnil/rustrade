@@ -29,7 +29,7 @@ use rustrade_instrument::{
 use rustrade_integration::collection::{one_or_many::OneOrMany, snapshot::Snapshot};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Asset-centric state and associated state management logic.
 pub mod asset;
@@ -477,6 +477,34 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                 }
                 None
             }
+            AccountEventKind::Notice(notice) => {
+                // Reported, not acted on: what to do about a margin call or liquidation is the
+                // consumer's policy. A consumer that wants the latest notice keeps it from the
+                // `GlobalData` update below, which every account event reaches. Not routed to an
+                // instrument's data state: a notice changes nothing there.
+                if notice.kind.is_escalation() {
+                    warn!(
+                        exchange = ?event.exchange,
+                        kind = %notice.kind,
+                        status = %notice.status,
+                        instrument = ?notice.instrument,
+                        margin_level = ?notice.margin_level,
+                        time_exchange = %notice.time_exchange,
+                        "venue reported rising margin risk on the account",
+                    );
+                } else {
+                    info!(
+                        exchange = ?event.exchange,
+                        kind = %notice.kind,
+                        status = %notice.status,
+                        instrument = ?notice.instrument,
+                        margin_level = ?notice.margin_level,
+                        time_exchange = %notice.time_exchange,
+                        "venue reported a change in the account's margin state",
+                    );
+                }
+                None
+            }
             _ => None,
         };
 
@@ -775,6 +803,48 @@ mod tests {
         assert_eq!(state.instruments, before.instruments);
         assert_eq!(state.trading, before.trading);
     }
+
+    /// A notice, rising risk or not, attributed or not, changes no engine state.
+    #[test]
+    fn a_notice_changes_no_state() {
+        use crate::engine::state::{
+            global::DefaultGlobalData, instrument::data::DefaultInstrumentMarketData,
+        };
+        use chrono::{DateTime, Utc};
+        use rust_decimal_macros::dec;
+        use rustrade_execution::notice::{AccountNotice, NoticeKind};
+        use smol_str::SmolStr;
+
+        let instruments = IndexedInstruments::new([test_instrument(EXECUTION, "btc", "usdt")]);
+        let mut state: EngineState<DefaultGlobalData, DefaultInstrumentMarketData> =
+            EngineState::builder(&instruments, DefaultGlobalData, |_| {
+                DefaultInstrumentMarketData::default()
+            })
+            .build();
+        let before = state.clone();
+
+        for (kind, instrument) in [
+            (NoticeKind::Liquidation, Some(InstrumentIndex::new(0))),
+            (NoticeKind::MarginCall, None),
+            (NoticeKind::MarginRestored, None),
+        ] {
+            let event = AccountEvent::new(
+                ExchangeIndex::new(0),
+                AccountEventKind::Notice(AccountNotice::new(
+                    kind,
+                    instrument,
+                    DateTime::<Utc>::MIN_UTC,
+                    Some(dec!(1.05)),
+                    SmolStr::new("STATUS"),
+                )),
+            );
+            assert_eq!(state.update_from_account(&event), None, "{kind}");
+        }
+        assert_eq!(state.assets, before.assets);
+        assert_eq!(state.instruments, before.instruments);
+        assert_eq!(state.trading, before.trading);
+    }
+
     /// A cash flow attributed to an instrument reaches its open position's carry and nothing
     /// else; an account-level one changes no state.
     #[test]

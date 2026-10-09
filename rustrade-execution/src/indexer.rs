@@ -11,6 +11,7 @@ use crate::{
     },
     fill_recovery::{FillRecoveryGap, FillRecoveryScope},
     map::ExecutionInstrumentMap,
+    notice::AccountNotice,
     order::{
         Order, OrderEvent, OrderKey, OrderSnapshot, UnindexedOrderKey, UnindexedOrderSnapshot,
         request::OrderResponseCancel,
@@ -90,6 +91,9 @@ impl AccountEventIndexer {
                 AccountEventKind::ReinitFailed(self.reinit_failure(failure))
             }
             AccountEventKind::CashFlow(flow) => AccountEventKind::CashFlow(self.cash_flow(flow)?),
+            AccountEventKind::Notice(notice) => {
+                AccountEventKind::Notice(self.notice(exchange, notice))
+            }
         };
 
         Ok(AccountEvent { exchange, kind })
@@ -273,6 +277,50 @@ impl AccountEventIndexer {
             time_exchange,
             id,
         })
+    }
+
+    /// Index an [`AccountNotice`]'s instrument, when it names one.
+    ///
+    /// Never fails. A notice naming an instrument that is not in the map is kept, with its
+    /// instrument set to `None` and a `warn`: a notice changes no state, so dropping one about a
+    /// margin call or liquidation would cost more than losing its attribution.
+    pub fn notice(
+        &self,
+        exchange: ExchangeIndex,
+        notice: AccountNotice<InstrumentNameExchange>,
+    ) -> AccountNotice<InstrumentIndex> {
+        let AccountNotice {
+            kind,
+            instrument,
+            time_exchange,
+            margin_level,
+            status,
+        } = notice;
+
+        let instrument = instrument.and_then(|instrument| {
+            self.map
+                .find_instrument_index(&instrument)
+                .inspect_err(|error| {
+                    warn!(
+                        ?exchange,
+                        %instrument,
+                        %kind,
+                        %status,
+                        %error,
+                        "account notice names an instrument that is not in the map, \
+                         delivering it unattributed",
+                    );
+                })
+                .ok()
+        });
+
+        AccountNotice {
+            kind,
+            instrument,
+            time_exchange,
+            margin_level,
+            status,
+        }
     }
 
     /// Index an [`InstrumentBalanceUpdate`]'s instrument and `base`/`quote` asset keys.
@@ -1113,6 +1161,60 @@ mod tests {
         assert!(
             index_of(flow("USDT", Some("ETHUSDT"))).is_err(),
             "an unmapped instrument fails"
+        );
+    }
+
+    /// A notice indexes its instrument when it names a mapped one, and is kept unattributed,
+    /// rather than dropped, when it names one that is not mapped.
+    #[test]
+    fn account_event_indexes_a_notice() {
+        use crate::notice::{AccountNotice, NoticeKind};
+        use rust_decimal_macros::dec;
+        use smol_str::SmolStr;
+
+        let indexer = binance_indexer();
+        let time = DateTime::<Utc>::MIN_UTC;
+        let notice = |instrument: Option<&str>| {
+            UnindexedAccountEvent::new(
+                ExchangeId::BinanceSpot,
+                AccountEventKind::Notice(AccountNotice::new(
+                    NoticeKind::MarginCall,
+                    instrument.map(InstrumentNameExchange::new),
+                    time,
+                    Some(dec!(1.1)),
+                    SmolStr::new("MARGIN_CALL"),
+                )),
+            )
+        };
+        let index_of = |event| match indexer.account_event(event) {
+            Ok(AccountEvent {
+                kind: AccountEventKind::Notice(notice),
+                ..
+            }) => notice,
+            other => panic!("expected Notice, got {other:?}"),
+        };
+        let Ok(btc_usdt) = indexer
+            .map
+            .find_instrument_index(&InstrumentNameExchange::new("BTC_USDT"))
+        else {
+            panic!("BTC_USDT is mapped");
+        };
+
+        assert_eq!(
+            index_of(notice(Some("BTC_USDT"))),
+            AccountNotice::new(
+                NoticeKind::MarginCall,
+                Some(btc_usdt),
+                time,
+                Some(dec!(1.1)),
+                SmolStr::new("MARGIN_CALL"),
+            )
+        );
+        assert_eq!(index_of(notice(None)).instrument, None);
+        assert_eq!(
+            index_of(notice(Some("ETHUSDT"))).instrument,
+            None,
+            "an unmapped instrument is dropped from the notice, not the notice itself"
         );
     }
 }
