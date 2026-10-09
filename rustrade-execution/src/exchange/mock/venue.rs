@@ -1216,6 +1216,7 @@ impl SimulatedVenue {
             None,
             None,
             None,
+            None,
             self.time_exchange(),
         ))
     }
@@ -3421,6 +3422,7 @@ mod tests {
                         None,
                         None,
                         None,
+                        None,
                         time(0),
                     )),
                     isolated: None,
@@ -3452,6 +3454,7 @@ mod tests {
                     orders_complete: true,
                     position: PositionReport::from_position(Position::new(
                         d("-1"),
+                        None,
                         None,
                         None,
                         None,

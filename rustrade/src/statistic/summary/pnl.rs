@@ -8,8 +8,11 @@ use tracing::warn;
 
 /// Records Profit and Loss (PnL) data.
 ///
+/// Every figure is net of carry: a closed position counts as its
+/// [`pnl_realised_net`](PositionExited::pnl_realised_net), realised PnL plus carry.
+///
 /// Includes tracking of:
-/// - Raw PnL.
+/// - Raw PnL, and the carry included in it.
 /// - Statistical summaries of returns for all closed positions (wins and losses combined)
 /// - Statistical summaries of returns for all losing closed positions (useful for downside risk analysis).
 ///
@@ -22,7 +25,7 @@ use tracing::warn;
 ///   - Can be denominated in any chosen asset for cross-instrument aggregation
 #[derive(Debug, Clone, PartialEq, PartialOrd, Default, Deserialize, Serialize)]
 pub struct PnLReturns {
-    /// Raw PnL.
+    /// Raw PnL, net of carry.
     ///
     /// For Instrument PnL, this is most likely denominated in "quote asset" units. For example,
     /// btc_usdt  spot PnL would be in usdt. However, in some derivative cases the
@@ -31,6 +34,13 @@ pub struct PnLReturns {
     /// For Portfolio and Strategy PnL, this could be denominated in any asset chosen to aggregate
     /// PnL across different instruments.
     pub pnl_raw: Decimal,
+
+    /// Carry included in `pnl_raw`: funding, interest and borrow fees, signed (positive =
+    /// received), in the same asset.
+    ///
+    /// `#[serde(default)]` so a summary serialised before this field existed still loads.
+    #[serde(default)]
+    pub carry: Decimal,
 
     /// PnL returns statistical summary for wins and losses.
     pub total: DataSetSummary,
@@ -42,10 +52,12 @@ pub struct PnLReturns {
 impl PnLReturns {
     /// Update the `PnLReturns` from the next [`PositionExited`].
     ///
-    /// Uses **checked** `Decimal` arithmetic on both accumulations so a corrupt or extreme
-    /// `pnl_realised` cannot panic this reporting path:
-    /// - The raw-PnL total holds its last-good value on overflow (consistent with
-    ///   `Position::update_pnl_realised`) and emits a `warn!`.
+    /// Uses **checked** `Decimal` arithmetic throughout so a corrupt or extreme `pnl_realised` or
+    /// `carry` cannot panic this reporting path:
+    /// - If the position's net PnL is not representable, the whole update is **skipped** with a
+    ///   `warn!`.
+    /// - The raw-PnL and carry totals each hold their last-good value on overflow (consistent with
+    ///   `Position::update_pnl_realised`) and emit a `warn!`.
     /// - If the per-position return is not representable (see [`calculate_pnl_return`]), that single
     ///   data point is **skipped** — `total` and `losses` are left untouched and a `warn!` is emitted
     ///   — rather than dropping the whole update.
@@ -53,25 +65,42 @@ impl PnLReturns {
         &mut self,
         position: &PositionExited<AssetKey, InstrumentKey>,
     ) {
+        let Some(pnl_net) = position.pnl_realised_net() else {
+            warn!(
+                position_pnl_realised = %position.pnl_realised,
+                position_carry = %position.carry,
+                "position net PnL overflowed Decimal; skipping this position"
+            );
+            return;
+        };
+
         // Checked, hold-last-good on overflow (consistent with `Position::update_pnl_realised`):
-        // a raw-PnL accumulation that can't be represented holds the prior total rather than
-        // panicking this reporting path.
-        match self.pnl_raw.checked_add(position.pnl_realised) {
+        // an accumulation that can't be represented holds the prior total rather than panicking
+        // this reporting path.
+        match self.pnl_raw.checked_add(pnl_net) {
             Some(new_total) => self.pnl_raw = new_total,
             None => warn!(
                 pnl_raw_held = %self.pnl_raw,
-                position_pnl_realised = %position.pnl_realised,
+                position_pnl_net = %pnl_net,
                 "pnl_raw accumulation overflowed Decimal; holding last-good value"
+            ),
+        }
+        match self.carry.checked_add(position.carry) {
+            Some(new_total) => self.carry = new_total,
+            None => warn!(
+                carry_held = %self.carry,
+                position_carry = %position.carry,
+                "carry accumulation overflowed Decimal; holding last-good value"
             ),
         }
 
         let Some(pnl_return) = calculate_pnl_return(
-            position.pnl_realised,
+            pnl_net,
             position.price_entry_average,
             position.quantity_abs_max,
         ) else {
             warn!(
-                position_pnl_realised = %position.pnl_realised,
+                position_pnl_net = %pnl_net,
                 "pnl_return computation overflowed Decimal; skipping this return data point"
             );
             return;
@@ -97,8 +126,9 @@ mod tests {
     };
     use rustrade_instrument::{Side, asset::QuoteAsset, instrument::name::InstrumentNameInternal};
 
-    /// Build a closed-position record carrying the three fields `PnLReturns::update` reads
-    /// (`pnl_realised`, `price_entry_average`, `quantity_abs_max`); the rest are inert filler.
+    /// Build a closed-position record carrying three of the fields `PnLReturns::update` reads
+    /// (`pnl_realised`, `price_entry_average`, `quantity_abs_max`), with zero `carry`; the rest are
+    /// inert filler.
     fn exited(
         pnl_realised: Decimal,
         price_entry_average: Decimal,
@@ -111,6 +141,7 @@ mod tests {
             price_entry_average,
             quantity_abs_max,
             pnl_realised,
+            carry: Decimal::ZERO,
             fees_enter: AssetFees {
                 asset: QuoteAsset,
                 fees: dec!(0.0),
@@ -125,6 +156,27 @@ mod tests {
             time_exit: DateTime::<Utc>::MIN_UTC,
             trades: vec![TradeId::new("t")],
         }
+    }
+
+    #[test]
+    fn test_update_is_net_of_carry() {
+        // A position that made 10 on price and paid 4 of funding counts as a 6 win; one that lost
+        // 1 on price and received 3 counts as a 2 win. Returns are on a 100 basis.
+        let mut returns = PnLReturns::default();
+        returns.update(&PositionExited {
+            carry: dec!(-4),
+            ..exited(dec!(10), dec!(100), dec!(1))
+        });
+        returns.update(&PositionExited {
+            carry: dec!(3),
+            ..exited(dec!(-1), dec!(100), dec!(1))
+        });
+
+        assert_eq!(returns.pnl_raw, dec!(8));
+        assert_eq!(returns.carry, dec!(-1));
+        assert_eq!(returns.total.count, dec!(2));
+        assert_eq!(returns.total.sum, dec!(0.08));
+        assert_eq!(returns.losses.count, Decimal::ZERO);
     }
 
     #[test]

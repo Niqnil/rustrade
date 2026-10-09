@@ -5,8 +5,8 @@ use crate::{
             instrument::{data::InstrumentDataState, filter::InstrumentFilter},
             order::{Orders, manager::OrderManager},
             position::{
-                OmsMode, PnlUnrealisedUpdate, PositionExited, PositionManager, PreparedSplit,
-                SplitError, SplitRoundingPolicy,
+                CarryUpdate, OmsMode, PnlUnrealisedUpdate, PositionExited, PositionManager,
+                PreparedSplit, SplitError, SplitRoundingPolicy,
             },
         },
     },
@@ -19,6 +19,7 @@ use rust_decimal::Decimal;
 use rustrade_data::event::MarketEvent;
 use rustrade_execution::{
     FeeModel, FeeModelConfig, InstrumentAccountSnapshot, Liquidity,
+    cash_flow::CashFlow,
     order::{
         Order, OrderKey,
         id::{ClientOrderId, OrderId, PositionId, VenueOrderId},
@@ -1338,6 +1339,109 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                 self.pending_fills.clear();
             }
         }
+    }
+
+    /// Add a cash flow the venue attributed to this instrument, such as a funding payment, to the
+    /// [`carry`](super::position::Position::carry) of its open position.
+    ///
+    /// The flow is applied only when it can be attributed without guessing. Otherwise it is
+    /// logged, the positions are unchanged, and the flow stays on the account feed for the
+    /// consumer. Checked in order, the returned [`CarryUpdate`] says which case applied:
+    /// - [`NoOpenPosition`](CarryUpdate::NoOpenPosition), as when funding posts just after a
+    ///   close. Logged at WARN when the flow is no older than the session start
+    ///   ([`TearSheetGenerator::time_engine_start`]), and at DEBUG when it is older: a venue whose
+    ///   stream opens by replaying recent flows, as Hyperliquid's does, sends ones that predate the
+    ///   session. The session start is the `time_engine_start` given to the
+    ///   [`EngineStateBuilder`](crate::engine::state::builder::EngineStateBuilder), `Utc::now` by
+    ///   default; a run over historical flows should set it, or its flows all log at DEBUG.
+    /// - [`SeveralOpen`](CarryUpdate::SeveralOpen) under [`OmsMode::Hedging`]: the venue charges
+    ///   the instrument, not a slot, so which position a flow belongs to is unknown. WARN.
+    /// - [`BeforeEntry`](CarryUpdate::BeforeEntry): the flow predates the position's
+    ///   `time_enter`, so it belongs to an earlier position, or to carry seeded with this one
+    ///   (see [`PositionSeed::with_carry`](super::position::PositionSeed::with_carry)). DEBUG.
+    /// - [`AssetMismatch`](CarryUpdate::AssetMismatch): the flow's asset is not the instrument's
+    ///   quote asset, which carry is kept in. WARN.
+    /// - Otherwise the flow is added, by
+    ///   [`Position::apply_carry`](super::position::Position::apply_carry), which returns
+    ///   [`Applied`](CarryUpdate::Applied), or [`Overflowed`](CarryUpdate::Overflowed) if the sum
+    ///   does not fit a `Decimal`.
+    ///
+    /// The flow's own [`instrument`](CashFlow::instrument) is not checked; the caller routes it
+    /// here.
+    ///
+    /// # Caller obligation: each flow once
+    /// A flow is a delta, and nothing here recognises one already applied. An execution client
+    /// deduplicates the flows of one account stream, including the replay each reconnect brings,
+    /// but a second stream opened while the engine runs replays recent flows again, as it replays
+    /// recent fills. Those that postdate an open position's entry would be added twice, so a
+    /// consumer that opens a new stream must drop the flows it has already passed on.
+    pub fn update_from_cash_flow(&mut self, flow: &CashFlow<AssetKey, InstrumentKey>) -> CarryUpdate
+    where
+        AssetKey: Debug + PartialEq,
+        InstrumentKey: Debug,
+    {
+        let mut open = self.position.positions.values_mut();
+        let (Some(position), None) = (open.next(), open.next()) else {
+            let open = self.position.positions.len();
+            if open == 0 {
+                if flow.time_exchange >= self.tear_sheet.time_engine_start {
+                    warn!(
+                        instrument = ?self.key,
+                        kind = ?flow.kind,
+                        amount = %flow.amount,
+                        time_exchange = %flow.time_exchange,
+                        "cash flow for an instrument with no open position — not applied to carry",
+                    );
+                } else {
+                    debug!(
+                        instrument = ?self.key,
+                        kind = ?flow.kind,
+                        amount = %flow.amount,
+                        time_exchange = %flow.time_exchange,
+                        "cash flow from before the session for an instrument with no open position \
+                         — not applied to carry",
+                    );
+                }
+                return CarryUpdate::NoOpenPosition;
+            }
+            warn!(
+                instrument = ?self.key,
+                open,
+                kind = ?flow.kind,
+                amount = %flow.amount,
+                time_exchange = %flow.time_exchange,
+                "cash flow for an instrument with several open positions — the venue does not say \
+                 which it belongs to, so it is not applied to carry",
+            );
+            return CarryUpdate::SeveralOpen;
+        };
+
+        if flow.time_exchange < position.time_enter {
+            debug!(
+                instrument = ?self.key,
+                kind = ?flow.kind,
+                amount = %flow.amount,
+                time_exchange = %flow.time_exchange,
+                time_enter = %position.time_enter,
+                "cash flow predates the open position — not applied to carry",
+            );
+            return CarryUpdate::BeforeEntry;
+        }
+
+        if flow.asset != self.instrument.underlying.quote {
+            warn!(
+                instrument = ?self.key,
+                kind = ?flow.kind,
+                asset = ?flow.asset,
+                quote = ?self.instrument.underlying.quote,
+                amount = %flow.amount,
+                time_exchange = %flow.time_exchange,
+                "cash flow is not in the instrument's quote asset — not applied to carry",
+            );
+            return CarryUpdate::AssetMismatch;
+        }
+
+        position.apply_carry(flow.amount, flow.time_exchange)
     }
 
     /// Updates the instrument state based on a new trade.
@@ -3048,5 +3152,171 @@ mod tests {
         };
         assert!(recorded(EXCHANGE));
         assert!(!recorded(OTHER));
+    }
+
+    /// Run `f`, returning its value and the number of `WARN` events it emitted on this thread.
+    /// Whether a flow left out of carry is a WARN or a DEBUG is the observable contract, so the
+    /// returned [`CarryUpdate`] alone cannot tell them apart.
+    fn count_warnings<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Default)]
+        struct CountWarnings(Arc<AtomicUsize>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountWarnings {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let layer = CountWarnings::default();
+        let count = Arc::clone(&layer.0);
+        // Thread-local, so other tests running in parallel are not counted.
+        let value =
+            tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), f);
+        (value, count.load(Ordering::Relaxed))
+    }
+
+    /// `seconds` after [`TIME`], the session start and the harness fills' time.
+    fn after(seconds: i64) -> DateTime<Utc> {
+        TIME + chrono::TimeDelta::seconds(seconds)
+    }
+
+    /// A funding payment for the harness instrument, in `asset`, posted at `time`.
+    fn funding(
+        asset: AssetIndex,
+        amount: Decimal,
+        time: DateTime<Utc>,
+    ) -> CashFlow<AssetIndex, InstrumentIndex> {
+        CashFlow::new(
+            rustrade_execution::cash_flow::CashFlowKind::Funding {
+                rate: None,
+                position_quantity: None,
+            },
+            asset,
+            amount,
+            Some(InstrumentIndex(0)),
+            time,
+            None,
+        )
+    }
+
+    #[test]
+    fn flows_after_entry_accumulate_in_carry_and_reach_the_exit() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        assert!(
+            state
+                .update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)))
+                .is_none()
+        );
+
+        let (updates, warnings) = count_warnings(|| {
+            [
+                state.update_from_cash_flow(&funding(quote, dec!(-2), after(2))),
+                // Out of order: still applied, and the update time does not move back.
+                state.update_from_cash_flow(&funding(quote, dec!(0.5), after(1))),
+            ]
+        });
+        assert_eq!(updates, [CarryUpdate::Applied, CarryUpdate::Applied]);
+        assert_eq!(warnings, 0);
+        let position = &state.position.positions[&PositionId::NETTING];
+        assert_eq!(position.carry, dec!(-1.5));
+        assert_eq!(position.pnl_realised, Decimal::ZERO);
+        assert_eq!(position.time_exchange_update, after(2));
+        assert_eq!(position.pnl_realised_net(), Some(dec!(-1.5)));
+
+        let exited = state
+            .update_from_trade(&fill(OrderId::new("close"), Side::Buy, dec!(1)))
+            .expect("a fill for the whole quantity exits the position");
+        assert_eq!(exited.carry, dec!(-1.5));
+        assert_eq!(exited.pnl_realised_net(), Some(dec!(-1.5)));
+    }
+
+    #[test]
+    fn a_flow_from_before_the_positions_entry_is_left_out_quietly() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
+        let position = state
+            .position
+            .positions
+            .get_mut(&PositionId::NETTING)
+            .unwrap();
+        position.time_enter = after(10);
+
+        let (update, warnings) =
+            count_warnings(|| state.update_from_cash_flow(&funding(quote, dec!(-2), after(5))));
+        assert_eq!(update, CarryUpdate::BeforeEntry);
+        assert_eq!(warnings, 0);
+        assert_eq!(
+            state.position.positions[&PositionId::NETTING].carry,
+            Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn a_flow_for_a_flat_instrument_warns_only_from_the_session_start() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        state.tear_sheet.time_engine_start = after(10);
+
+        let (replayed, warnings) =
+            count_warnings(|| state.update_from_cash_flow(&funding(quote, dec!(-2), after(9))));
+        assert_eq!(replayed, CarryUpdate::NoOpenPosition);
+        assert_eq!(warnings, 0);
+
+        let (live, warnings) =
+            count_warnings(|| state.update_from_cash_flow(&funding(quote, dec!(-2), after(10))));
+        assert_eq!(live, CarryUpdate::NoOpenPosition);
+        assert_eq!(warnings, 1);
+        assert!(state.position.positions.is_empty());
+    }
+
+    #[test]
+    fn a_flow_with_several_hedging_positions_open_is_left_out() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let quote = state.instrument.underlying.quote;
+        let _ = state.update_from_trade(&fill(OrderId::new("a"), Side::Buy, dec!(1)));
+
+        // One open slot: nothing to guess.
+        assert_eq!(
+            state.update_from_cash_flow(&funding(quote, dec!(-1), after(1))),
+            CarryUpdate::Applied
+        );
+
+        let _ = state.update_from_trade(&fill(OrderId::new("b"), Side::Sell, dec!(1)));
+        let (update, warnings) =
+            count_warnings(|| state.update_from_cash_flow(&funding(quote, dec!(-1), after(2))));
+        assert_eq!(update, CarryUpdate::SeveralOpen);
+        assert_eq!(warnings, 1);
+        let carry: Vec<Decimal> = state.position.positions.values().map(|p| p.carry).collect();
+        assert_eq!(carry, [dec!(-1), Decimal::ZERO]);
+    }
+
+    #[test]
+    fn a_flow_in_an_asset_other_than_the_quote_is_left_out() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let base = state.instrument.underlying.base;
+        let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
+
+        let (update, warnings) =
+            count_warnings(|| state.update_from_cash_flow(&funding(base, dec!(-2), after(1))));
+        assert_eq!(update, CarryUpdate::AssetMismatch);
+        assert_eq!(warnings, 1);
+        assert_eq!(
+            state.position.positions[&PositionId::NETTING].carry,
+            Decimal::ZERO
+        );
     }
 }

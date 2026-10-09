@@ -35,7 +35,18 @@ pub const MAX_FALLBACK_POSITIONS: usize = 16;
 /// TearSheet summarising the trading performance related to an instrument.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Deserialize, Serialize)]
 pub struct TearSheet<Interval> {
+    /// PnL of the closed positions, net of carry: each one's realised PnL plus its
+    /// [`carry`](PositionExited::carry). The returns, ratios and drawdowns below are computed from
+    /// the same net figures.
     pub pnl: Decimal,
+
+    /// Carry of the closed positions, already included in `pnl`: funding, interest and borrow
+    /// fees, signed (positive = received).
+    ///
+    /// `#[serde(default)]` so tear sheets serialised before this field existed still load.
+    #[serde(default)]
+    pub carry: Decimal,
+
     pub pnl_return: RateOfReturn<Interval>,
     pub sharpe_ratio: SharpeRatio<Interval>,
     pub sortino_ratio: SortinoRatio<Interval>,
@@ -327,6 +338,7 @@ impl TearSheetGenerator {
             sortino_ratio,
             calmar_ratio,
             pnl: self.pnl_returns.pnl_raw,
+            carry: self.pnl_returns.carry,
             pnl_return,
             pnl_drawdown: current_pnl_drawdown,
             pnl_drawdown_mean,

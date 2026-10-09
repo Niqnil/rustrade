@@ -1619,7 +1619,7 @@ pub enum EngineOutput<
     /// Output of an actioned [`Command`].
     ///
     /// **Inline.** [`ActionOutput`]'s inner order payloads are boxed at the root (#195), so
-    /// `ActionOutput` is only ~96 B — well under the ~232 B [`PositionExit`](Self::PositionExit)
+    /// `ActionOutput` is only ~96 B — well under the ~248 B [`PositionExit`](Self::PositionExit)
     /// variant that floors this enum's size. Carrying it inline therefore costs `EngineOutput`
     /// nothing in stack size (and thus in the per-tick [`ProcessAudit`] copy), while avoiding a
     /// heap allocation and pointer indirection on the command path that an outer `Box` would add.
@@ -1635,7 +1635,7 @@ pub enum EngineOutput<
     /// path).
     ///
     /// **Inline.** `GenerateAlgoOrdersOutput`'s inner order payloads are boxed at the root (#195),
-    /// so it is only ~144 B — under the ~232 B [`PositionExit`](Self::PositionExit) variant that
+    /// so it is only ~144 B — under the ~248 B [`PositionExit`](Self::PositionExit) variant that
     /// floors this enum's size. Carrying it inline therefore costs `EngineOutput` nothing in stack
     /// size (and thus in the per-tick [`ProcessAudit`] copy). The only allocation is the root
     /// boxing of the orders themselves, paid solely when the strategy actually emits some — the
@@ -2126,7 +2126,7 @@ mod size_guard {
     use super::*;
 
     /// Regression guard: `EngineOutput` stays small so the per-tick `ProcessAudit` copy is cheap. Its
-    /// floor is the largest variant `PositionExit(PositionExited)` (~232 B). The `AlgoOrders`/
+    /// floor is the largest variant `PositionExit(PositionExited)` (~248 B). The `AlgoOrders`/
     /// `Commanded` variants are carried inline, but their order payloads are boxed at the root (#195)
     /// — `GenerateAlgoOrdersOutput` ~144 B, `ActionOutput` ~96 B — so both sit under the
     /// `PositionExit` floor and neither dominates. This bound (<= 256 B) catches a large regression —
@@ -2134,13 +2134,13 @@ mod size_guard {
     /// above the floor — while leaving headroom for unrelated growth.
     #[test]
     fn engine_output_stays_small() {
-        // Measured 232 B, floored by the PositionExit variant.
+        // Measured 248 B, floored by the PositionExit variant (232 B before its `carry` field).
         let size = std::mem::size_of::<EngineOutput<(), (), ExchangeIndex, InstrumentIndex>>();
         assert!(
             size <= 256,
             "EngineOutput grew to {size} B (expected <= 256): a variant gained a large inline \
              payload. AlgoOrders/Commanded order payloads must stay root-boxed (#195) so those \
-             variants sit under the ~232 B PositionExit floor."
+             variants sit under the ~248 B PositionExit floor."
         );
     }
 }

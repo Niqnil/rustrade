@@ -3881,6 +3881,7 @@ fn convert_positions(
                 None,
                 None,
                 None,
+                None,
                 now,
             );
             Ok((p.symbol.as_str(), position))
@@ -6382,6 +6383,7 @@ mod tests {
         Position::new(
             quantity,
             Some(dec!(100)),
+            None,
             None,
             None,
             None,

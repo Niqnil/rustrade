@@ -19,8 +19,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `userFundings` subscription, with the funding rate and the signed position it was charged on.
     The subscription's snapshot of recent payments is sent too, and the repeat of it after each
     reconnect is deduplicated, as fills are.
-  - The engine logs a cash flow and changes no state: position PnL is still computed from fills
-    alone, and the venue's balances already include what it has posted.
+  - The engine adds a flow attributed to an instrument to its open position's carry (see the next
+    entry), and applies none to balances: the venue's balances already include what it has posted.
+- **Carry on positions, kept apart from realised PnL** (#551).
+  - **Breaking:** the engine's `Position` and `PositionExited` gain `carry: Decimal`: funding,
+    interest and borrow fees the venue posted while the position was open, signed positive when
+    received, in the instrument's quote asset. `pnl_realised` stays fill-based, and the new
+    `pnl_realised_net()` on both adds the two. Both types have public fields and a derived
+    constructor, so code that builds them needs the new field.
+  - The engine applies a `CashFlow` attributed to an instrument through the new
+    `InstrumentState::update_from_cash_flow`, which returns a `CarryUpdate`. It applies a flow
+    only when it can attribute it without guessing. It leaves a flow out when the instrument has no
+    open position, has several (`OmsMode::Hedging`), the flow predates the position's entry, or
+    the flow is not in the quote asset. Each case is logged at WARN, except a flow that predates
+    the position, or one for a flat instrument that predates the session start, which is logged at
+    DEBUG. Hyperliquid's stream opens by replaying recent payments, which would otherwise WARN at
+    every start. The instrument's `InstrumentData` now processes the flow event too, as it does a
+    trade.
+  - **Breaking:** the venue `Position` (`rustrade-execution`) gains `carry: Option<Decimal>`, the
+    carry the venue reports since the position opened. `HyperliquidClient` fills it from
+    `cumFunding.sinceOpen`, with the sign flipped to match. `PositionSeed` gains `carry` and
+    `with_carry`, and `PositionSeed::from_venue_position` copies the venue's carry, so a position
+    held across a restart keeps the funding it accrued before.
+  - **Breaking:** the trading summary is net of carry. `TearSheet::pnl` and every return, ratio
+    and drawdown are computed from realised PnL plus carry. The new `TearSheet::carry` and
+    `PnLReturns::carry` report the total, and the summary table shows it. Without cash flows,
+    which the simulated venue does not produce, carry is zero and nothing changes.
 
 ## [0.10.1] - 2026-10-09
 

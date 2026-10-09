@@ -510,6 +510,7 @@ fn test_engine_process_engine_event_with_audit() {
                 quantity_abs_max: dec!(1.0),
                 pnl_realised: dec!(7000.0), // (-10k entry - 1k fees)+(20k exit - 2k fees) = 7k
                 fees_enter: asset_fees(0, dec!(1_000.0)),
+                carry: Decimal::ZERO,
                 fees_exit: asset_fees(0, dec!(2_000.0)),
                 time_enter: time_plus_days(STARTING_TIMESTAMP, 2),
                 time_exit: time_plus_days(STARTING_TIMESTAMP, 3),
@@ -711,6 +712,7 @@ fn test_engine_process_engine_event_with_audit() {
                 fees_enter: asset_fees(1, dec!(0.01)), // 0.01 btc
                 fees_exit: asset_fees(1, dec!(0.005)), // 0.005 btc
                 time_enter: time_plus_days(STARTING_TIMESTAMP, 2),
+                carry: Decimal::ZERO,
                 time_exit: time_plus_days(STARTING_TIMESTAMP, 5),
                 trades: vec![gen_trade_id(1), gen_trade_id(1)],
             }
@@ -7532,6 +7534,7 @@ fn test_account_snapshot_position_drift() {
         PositionReport::from_position(Position::new(
             quantity,
             Some(entry_price),
+            None,
             None,
             None,
             None,

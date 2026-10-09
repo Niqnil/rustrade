@@ -287,9 +287,10 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// Cash moved into or out of the account other than by a trade: funding, interest, a borrow
     /// fee or a rebate, as the venue posted it.
     ///
-    /// A flow is a delta, signed positive when the account received it. The engine logs it and
-    /// changes no state: position PnL is computed from fills alone, and the venue's balances
-    /// already include what it has posted. See [`CashFlow`] for which venues send it.
+    /// A flow is a delta, signed positive when the account received it. The engine adds a flow
+    /// attributed to an instrument to the `carry` of that instrument's open position (see
+    /// `Position::carry` in `rustrade`), and applies none to balances: the venue's balances already
+    /// include what it has posted. See [`CashFlow`] for which venues send it.
     CashFlow(cash_flow::CashFlow<AssetKey, InstrumentKey>),
 }
 

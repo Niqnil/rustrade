@@ -456,19 +456,25 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                 None
             }
             AccountEventKind::CashFlow(flow) => {
-                // Position PnL is computed from fills alone, and the venue's balances already
-                // include what it has posted (adding a flow to them would count it twice), so
-                // the engine applies flows to neither. A consumer that tracks carry reads it off
-                // the account feed.
-                debug!(
-                    exchange = ?event.exchange,
-                    kind = ?flow.kind,
-                    asset = ?flow.asset,
-                    amount = %flow.amount,
-                    instrument = ?flow.instrument,
-                    time_exchange = %flow.time_exchange,
-                    "account cash flow received — not applied to positions or balances",
-                );
+                // The venue's balances already include what it has posted, so a flow is applied
+                // to no balance (that would count it twice). One attributed to an instrument goes
+                // to its open position's carry, when it can be attributed without guessing.
+                match &flow.instrument {
+                    Some(instrument) => {
+                        let instrument_state = self.instruments.instrument_index_mut(instrument);
+                        // Not applied: already logged, and the flow stays on the account feed.
+                        let _ = instrument_state.update_from_cash_flow(flow);
+                        instrument_state.data.process(event);
+                    }
+                    None => debug!(
+                        exchange = ?event.exchange,
+                        kind = ?flow.kind,
+                        asset = ?flow.asset,
+                        amount = %flow.amount,
+                        time_exchange = %flow.time_exchange,
+                        "account-level cash flow received — not applied to positions or balances",
+                    ),
+                }
                 None
             }
             _ => None,
@@ -768,5 +774,74 @@ mod tests {
         assert_eq!(state.assets, before.assets);
         assert_eq!(state.instruments, before.instruments);
         assert_eq!(state.trading, before.trading);
+    }
+    /// A cash flow attributed to an instrument reaches its open position's carry and nothing
+    /// else; an account-level one changes no state.
+    #[test]
+    fn a_cash_flow_reaches_only_its_instruments_open_position() {
+        use crate::engine::state::{
+            global::DefaultGlobalData, instrument::data::DefaultInstrumentMarketData,
+            position::PositionSeed,
+        };
+        use chrono::{DateTime, Utc};
+        use rust_decimal::Decimal;
+        use rust_decimal_macros::dec;
+        use rustrade_execution::cash_flow::{CashFlow, CashFlowKind};
+        use rustrade_instrument::Side;
+
+        let instruments = IndexedInstruments::new([test_instrument(EXECUTION, "btc", "usdt")]);
+        let name = instruments.instruments()[0].value.name_internal.clone();
+        let quote = instruments.instruments()[0].value.underlying.quote;
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut state: EngineState<DefaultGlobalData, DefaultInstrumentMarketData> =
+            EngineState::builder(&instruments, DefaultGlobalData, |_| {
+                DefaultInstrumentMarketData::default()
+            })
+            .time_engine_start(time)
+            .positions([PositionSeed::new(
+                name,
+                Side::Sell,
+                dec!(1),
+                dec!(100),
+                time,
+            )])
+            .try_build()
+            .unwrap();
+        let flow = |instrument| {
+            AccountEvent::new(
+                ExchangeIndex::new(0),
+                AccountEventKind::CashFlow(CashFlow::new(
+                    CashFlowKind::Funding {
+                        rate: None,
+                        position_quantity: None,
+                    },
+                    quote,
+                    dec!(0.75),
+                    instrument,
+                    time,
+                    None,
+                )),
+            )
+        };
+
+        let before = state.clone();
+        assert_eq!(state.update_from_account(&flow(None)), None);
+        assert_eq!(state.assets, before.assets);
+        assert_eq!(state.instruments, before.instruments);
+
+        assert_eq!(
+            state.update_from_account(&flow(Some(InstrumentIndex::new(0)))),
+            None
+        );
+        assert_eq!(state.assets, before.assets);
+        let positions = &state
+            .instruments
+            .instrument_index(&InstrumentIndex::new(0))
+            .position
+            .positions;
+        assert_eq!(positions.len(), 1);
+        let position = positions.values().next().unwrap();
+        assert_eq!(position.carry, dec!(0.75));
+        assert_eq!(position.pnl_realised, Decimal::ZERO);
     }
 }

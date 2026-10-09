@@ -150,6 +150,39 @@ pub enum PnlRealisedUpdate {
     Overflowed,
 }
 
+/// Outcome of applying a cash flow to a [`Position`]'s [`carry`](Position::carry), from
+/// [`InstrumentState::update_from_cash_flow`](super::instrument::InstrumentState::update_from_cash_flow).
+/// [`Position::apply_carry`] returns only [`Applied`](Self::Applied) or
+/// [`Overflowed`](Self::Overflowed).
+///
+/// Every outcome but `Applied` leaves the positions unchanged. The flow stays on the account feed
+/// either way, so a consumer can still attribute one the engine did not.
+///
+/// `#[must_use]` so a caller cannot silently ignore a flow that was not applied;
+/// `#[non_exhaustive]` so a future outcome can be added without breaking downstream exhaustive
+/// matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+#[non_exhaustive]
+pub enum CarryUpdate {
+    /// The flow was added to the open position's carry.
+    Applied,
+    /// Adding the flow overflowed `Decimal`, so carry **held** its previous value. Needs a value
+    /// near `Decimal::MAX` (~7.9e28), so effectively unreachable with real data.
+    Overflowed,
+    /// The instrument has no open position, as when funding posts just after a close.
+    NoOpenPosition,
+    /// The flow predates the open position's `time_enter`, so it belongs to an earlier position on
+    /// the instrument, or to the carry seeded with this one.
+    BeforeEntry,
+    /// Several positions are open on the instrument ([`OmsMode::Hedging`]) and the venue does not
+    /// say which one the flow belongs to.
+    SeveralOpen,
+    /// The flow is in an asset other than the instrument's quote asset, the asset carry is kept
+    /// in.
+    AssetMismatch,
+}
+
 /// The rescaled field values a split produces, pre-computed by [`Position::prepare_split`] without
 /// mutating the position, then written by [`Position::commit_split`].
 ///
@@ -340,14 +373,16 @@ impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, Instrumen
 /// - Entry fees from [`PositionSeed::with_fees_enter`], zero by default, in the instrument's
 ///   quote asset, and zero exit fees. As for a position opened by a fill, realised PnL starts at
 ///   minus the entry fees, and unrealised PnL deducts an exit-fee estimate scaled from them.
+/// - Carry from [`PositionSeed::with_carry`], zero by default, kept apart from realised PnL as
+///   for any position.
 /// - Zero unrealised PnL until the first market price for the instrument arrives.
 /// - `quantity_abs_max` equal to `quantity_abs`, and no [`TradeId`]s.
 ///
 /// No [`Trade`] is generated, so nothing reaches the audit stream or the trading summary until the
 /// position changes. When it closes, its realised PnL is measured from the seeded
 /// `price_entry_average`, net of the seeded entry fees, so a session summary includes any PnL
-/// accrued before the engine started. Seed the current price, and no fees, instead if the summary
-/// should cover only this session.
+/// accrued before the engine started, as it includes any seeded carry. Seed the current price, and
+/// no fees or carry, instead if the summary should cover only this session.
 ///
 /// A seed is not checked when it is constructed or deserialised. The checks listed on
 /// [`PositionSeedError`] run when the state is built, by
@@ -384,6 +419,10 @@ pub struct PositionSeed {
     /// rebate, as on a fill. Zero by default, including when absent from a deserialised seed.
     #[serde(default)]
     pub fees_enter: Decimal,
+    /// Carry the position has accrued since it opened, signed (positive = received), in the
+    /// instrument's quote asset. Zero by default, including when absent from a deserialised seed.
+    #[serde(default)]
+    pub carry: Decimal,
 }
 
 impl PositionSeed {
@@ -404,6 +443,7 @@ impl PositionSeed {
             time_enter,
             position_id: None,
             fees_enter: Decimal::ZERO,
+            carry: Decimal::ZERO,
         }
     }
 
@@ -423,6 +463,21 @@ impl PositionSeed {
     /// starts realised PnL above zero.
     pub fn with_fees_enter(self, fees_enter: Decimal) -> Self {
         Self { fees_enter, ..self }
+    }
+
+    /// Set the carry the position has accrued since it opened, such as funding, signed (positive =
+    /// received), in the instrument's quote asset. It starts the position's
+    /// [`carry`](Position::carry), so net PnL at close covers the whole holding period, as the
+    /// seeded entry price makes realised PnL do.
+    ///
+    /// The carry must cover every flow up to the seed's `time_enter`, and none after it. The
+    /// engine leaves out a flow older than `time_enter` as already counted, and adds any later
+    /// one, including a flow a venue's stream replays when it opens. So seed `time_enter` with
+    /// when the carry was read, not with an earlier true entry time. A venue position seeded by
+    /// [`Self::from_venue_position`] does this, with the time the client read it; a client clock
+    /// behind the venue's would let a replayed flow already in the carry be added again.
+    pub fn with_carry(self, carry: Decimal) -> Self {
+        Self { carry, ..self }
     }
 
     /// Validate this seed against `manager` and insert it as an open [`Position`].
@@ -476,6 +531,7 @@ impl PositionSeed {
             pnl_unrealised: Decimal::ZERO,
             // As `Position::from(&Trade)` sets it: the entry fees are realised when paid.
             pnl_realised: -self.fees_enter,
+            carry: self.carry,
             fees_enter: AssetFees::new(quote, self.fees_enter, Some(self.fees_enter)),
             fees_exit: AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
             time_enter: self.time_enter,
@@ -536,16 +592,26 @@ pub enum PositionSeedError {
 /// # What the PnL covers
 /// `pnl_realised` and `pnl_unrealised` are computed from fills and their fees alone. They leave
 /// out the costs of *holding* a position, which arrive as no [`Trade`]: perpetual funding, margin
-/// interest and stock borrow fees. So they overstate the PnL of a position that pays carry (a
-/// short on borrowed stock, or a perpetual on the side that pays funding) and understate that of
-/// one that receives it.
+/// interest and stock borrow fees. Those accumulate separately, in [`carry`](Position::carry), and
+/// [`pnl_realised_net`](Position::pnl_realised_net) adds it to realised PnL.
 ///
-/// A venue charges these to the account's cash or collateral, so its balances can include carry
-/// that no `Position` shows. Each execution client's rustdoc says what its balances include and
-/// how fresh they are. Where a venue reports a payment as it posts it, it arrives on the account
-/// feed as an [`AccountEventKind::CashFlow`](rustrade_execution::AccountEventKind::CashFlow),
-/// which the engine logs without applying to any `Position`. The simulated venue charges no
-/// carry at all (see [`SimulatedVenue`](rustrade_execution::exchange::mock::SimulatedVenue)).
+/// `carry` holds only what reaches the engine:
+/// - Payments a venue reports as it posts them, which arrive on the account feed as an
+///   [`AccountEventKind::CashFlow`](rustrade_execution::AccountEventKind::CashFlow) attributed to
+///   the instrument. The engine adds one to the open position's carry when it can attribute it
+///   without guessing; see
+///   [`InstrumentState::update_from_cash_flow`](super::instrument::InstrumentState::update_from_cash_flow)
+///   for the flows it leaves out. A flow for the account as a whole, such as margin interest, never
+///   reaches a position.
+/// - Carry seeded with the position (see [`PositionSeed::with_carry`]).
+///
+/// So `carry` stays zero on a venue that reports no such payments, and PnL then overstates the
+/// result of a position that pays carry (a short on borrowed stock, or a perpetual on the side
+/// that pays funding) and understates that of one that receives it. A venue charges carry to the
+/// account's cash or collateral, so its balances can include carry that no `Position` shows.
+/// Each execution client's rustdoc says what its balances include, how fresh they are, and which
+/// payments it reports. The simulated venue charges no carry at all (see
+/// [`SimulatedVenue`](rustrade_execution::exchange::mock::SimulatedVenue)).
 ///
 /// # Type Parameters
 /// - `AssetKey`: The type representing the asset used for fees (e.g. AssetIndex, QuoteAsset, etc.)
@@ -676,8 +742,8 @@ pub struct Position<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
 
     /// Estimated unrealised PnL generated from closing the remaining [`Position`] `quantity_abs`.
     ///
-    /// Note this includes estimated exit fees, and excludes funding, interest and borrow fees (see
-    /// [What the PnL covers](Position#what-the-pnl-covers)).
+    /// Note this includes estimated exit fees, and excludes funding, interest and borrow fees,
+    /// which accumulate in `carry` (see [What the PnL covers](Position#what-the-pnl-covers)).
     pub pnl_unrealised: Decimal,
 
     /// Cumulative realised PnL from any partially closed [`Position`] `quantity_abs_max`.
@@ -685,6 +751,17 @@ pub struct Position<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// Note this includes fees, and excludes funding, interest and borrow fees (see
     /// [What the PnL covers](Position#what-the-pnl-covers)).
     pub pnl_realised: Decimal,
+
+    /// Cumulative carry while the [`Position`] has been open: funding, interest and borrow fees
+    /// the venue posted for it, signed (positive = received, negative = paid), in the
+    /// instrument's quote asset.
+    ///
+    /// Kept apart from `pnl_realised`, which stays fill-based; [`Self::pnl_realised_net`] adds
+    /// the two. See [What the PnL covers](Position#what-the-pnl-covers) for what reaches it.
+    ///
+    /// `#[serde(default)]` so a position serialised before this field existed still loads.
+    #[serde(default)]
+    pub carry: Decimal,
 
     /// Cumulative fees paid when entering/increasing [`Position`] quantity.
     pub fees_enter: AssetFees<AssetKey>,
@@ -903,6 +980,41 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                 (Some(next_position), Some(PositionExited::from(self)))
             }
             _ => unreachable!("match expression guard statements cover all cases"),
+        }
+    }
+
+    /// Realised PnL net of carry: `pnl_realised + carry`. `None` if the sum overflows `Decimal`,
+    /// which needs a value near `Decimal::MAX` (~7.9e28).
+    pub fn pnl_realised_net(&self) -> Option<Decimal> {
+        self.pnl_realised.checked_add(self.carry)
+    }
+
+    /// Add a cash flow the venue posted for this [`Position`] to its [`carry`](Self::carry).
+    ///
+    /// `amount` is signed, positive when the account received it, and must be in the instrument's
+    /// quote asset. `time_exchange_update` moves forward to `time_exchange`, never back, since a
+    /// flow can arrive after later updates.
+    ///
+    /// Nothing else is checked: whether the flow belongs to this position is the caller's
+    /// decision, as
+    /// [`InstrumentState::update_from_cash_flow`](super::instrument::InstrumentState::update_from_cash_flow)
+    /// makes it. On `Decimal` overflow nothing is mutated, a `warn!` is emitted and
+    /// [`CarryUpdate::Overflowed`] is returned; otherwise [`CarryUpdate::Applied`].
+    pub fn apply_carry(&mut self, amount: Decimal, time_exchange: DateTime<Utc>) -> CarryUpdate {
+        match self.carry.checked_add(amount) {
+            Some(carry) => {
+                self.carry = carry;
+                self.time_exchange_update = self.time_exchange_update.max(time_exchange);
+                CarryUpdate::Applied
+            }
+            None => {
+                warn!(
+                    %amount,
+                    carry_held = %self.carry,
+                    "carry accumulation overflowed Decimal; holding last-good value"
+                );
+                CarryUpdate::Overflowed
+            }
         }
     }
 
@@ -1295,6 +1407,7 @@ where
             quantity_abs_max: trade.quantity.abs(),
             pnl_unrealised: Decimal::ZERO,
             pnl_realised: -trade.fees.fees_quote.unwrap_or(trade.fees.fees),
+            carry: Decimal::ZERO,
             fees_enter: trade.fees.clone(),
             fees_exit: AssetFees::new(trade.fees.asset.clone(), Decimal::ZERO, Some(Decimal::ZERO)),
             time_enter: trade.time_exchange,
@@ -1345,6 +1458,14 @@ pub struct PositionExited<AssetKey, InstrumentKey = InstrumentIndex> {
     /// [What the PnL covers](Position#what-the-pnl-covers)).
     pub pnl_realised: Decimal,
 
+    /// Cumulative carry while the [`Position`] was open, as [`Position::carry`]: signed
+    /// (positive = received), in the instrument's quote asset. [`Self::pnl_realised_net`] adds it
+    /// to `pnl_realised`.
+    ///
+    /// `#[serde(default)]` so a record serialised before this field existed still loads.
+    #[serde(default)]
+    pub carry: Decimal,
+
     /// Cumulative fees paid when entering the [`Position`].
     pub fees_enter: AssetFees<AssetKey>,
 
@@ -1372,12 +1493,21 @@ impl<AssetKey, InstrumentKey> From<Position<AssetKey, InstrumentKey>>
             price_entry_average: value.price_entry_average,
             quantity_abs_max: value.quantity_abs_max,
             pnl_realised: value.pnl_realised,
+            carry: value.carry,
             fees_enter: value.fees_enter,
             fees_exit: value.fees_exit,
             time_enter: value.time_enter,
             time_exit: value.time_exchange_update,
             trades: value.trades,
         }
+    }
+}
+
+impl<AssetKey, InstrumentKey> PositionExited<AssetKey, InstrumentKey> {
+    /// Realised PnL net of carry: `pnl_realised + carry`. `None` if the sum overflows `Decimal`,
+    /// which needs a value near `Decimal::MAX` (~7.9e28).
+    pub fn pnl_realised_net(&self) -> Option<Decimal> {
+        self.pnl_realised.checked_add(self.carry)
     }
 }
 
@@ -1584,6 +1714,7 @@ mod tests {
                     quantity_abs_max: dec!(2.0),
                     pnl_unrealised: dec!(0.0),
                     pnl_realised: dec!(-20.0), // Sum of fees
+                    carry: Decimal::ZERO,
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(20.0),
@@ -1613,6 +1744,7 @@ mod tests {
                     quantity_abs_max: dec!(2.0),
                     pnl_unrealised: dec!(67.5), // (150-100)*(2.0-0.5) - approx_exit_fees (1.5/2 * 10)
                     pnl_realised: dec!(10.0),   // (150-100)*0.5 - 15_fees
+                    carry: Decimal::ZERO,
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
@@ -1642,6 +1774,7 @@ mod tests {
                     price_entry_average: dec!(100.0),
                     quantity_abs_max: dec!(1.0),
                     pnl_realised: dec!(30.0), // (150-100)*1 - 20 (total fees)
+                    carry: Decimal::ZERO,
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
@@ -1669,6 +1802,7 @@ mod tests {
                     quantity_abs_max: dec!(1.0),
                     pnl_unrealised: dec!(0.0),
                     pnl_realised: dec!(-10.0), // Entry fees for new position (2-1)*(1/2)*20
+                    carry: Decimal::ZERO,
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
@@ -1691,6 +1825,7 @@ mod tests {
                     price_entry_average: dec!(100.0),
                     quantity_abs_max: dec!(1.0),
                     pnl_realised: dec!(30.0), // (150-100)*1 - 20 (total fees)
+                    carry: Decimal::ZERO,
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
@@ -1718,6 +1853,7 @@ mod tests {
                     quantity_abs_max: dec!(2.0),
                     pnl_unrealised: dec!(0.0), // (90-80)*2 - approx_exit_fees(2/2 * 20)
                     pnl_realised: dec!(-20.0), // Sum of entry fees
+                    carry: Decimal::ZERO,
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(20.0),
@@ -1747,6 +1883,7 @@ mod tests {
                     quantity_abs_max: dec!(2.0),
                     pnl_unrealised: dec!(22.5), // (100-80)*1.5 - approx_exit_fees(1.5/2 * 10)
                     pnl_realised: dec!(-5.0),   // 10_fee_entry - (100-80)*0.5 - 5_fee_exit
+                    carry: Decimal::ZERO,
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
@@ -1776,6 +1913,7 @@ mod tests {
                     price_entry_average: dec!(100.0),
                     quantity_abs_max: dec!(1.0),
                     pnl_realised: dec!(0.0), // (100-80)*1 - 20 (total fees)
+                    carry: Decimal::ZERO,
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
@@ -1803,6 +1941,7 @@ mod tests {
                     quantity_abs_max: dec!(1.0),
                     pnl_unrealised: dec!(0.0),
                     pnl_realised: dec!(-10.0), // Entry fees for new position
+                    carry: Decimal::ZERO,
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
@@ -1825,6 +1964,7 @@ mod tests {
                     price_entry_average: dec!(100.0),
                     quantity_abs_max: dec!(1.0),
                     pnl_realised: dec!(0.0), // (100-80)*1 - 20 (total fees)
+                    carry: Decimal::ZERO,
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
@@ -2065,6 +2205,7 @@ mod tests {
             quantity_abs_max: dec!(1.0),
             pnl_unrealised: dec!(0.0),
             pnl_realised: dec!(0.0),
+            carry: Decimal::ZERO,
             fees_enter: AssetFees {
                 asset: QuoteAsset,
                 fees: dec!(0.001),            // raw fee in BASE asset units (BTC)
@@ -2106,6 +2247,7 @@ mod tests {
             quantity_abs_max: dec!(1.0),
             pnl_unrealised: dec!(0.0),
             pnl_realised: dec!(0.0),
+            carry: Decimal::ZERO,
             fees_enter: AssetFees {
                 asset: QuoteAsset,
                 fees: dec!(2.0),
@@ -2150,6 +2292,7 @@ mod tests {
             quantity_abs_max: dec!(2.0),
             pnl_unrealised: sentinel,
             pnl_realised: dec!(0.0),
+            carry: Decimal::ZERO,
             fees_enter: AssetFees {
                 asset: QuoteAsset,
                 fees: dec!(0.0),
@@ -2399,6 +2542,74 @@ mod tests {
     }
 
     #[test]
+    fn test_carry_stays_with_the_closed_position_and_a_flip_starts_at_zero() {
+        let base_time = DateTime::<Utc>::MIN_UTC;
+        let open = || {
+            let mut position = Position::from(&trade(base_time, Side::Buy, 100.0, 2.0, 0.0));
+            assert_eq!(
+                position.apply_carry(dec!(-3), time_plus_days(base_time, 1)),
+                CarryUpdate::Applied
+            );
+            position
+        };
+
+        // A partial close keeps the carry on the remaining position.
+        let (reduced, exited) = open().update_from_trade(&trade(
+            time_plus_days(base_time, 2),
+            Side::Sell,
+            110.0,
+            1.0,
+            0.0,
+        ));
+        assert!(exited.is_none());
+        assert_eq!(reduced.map(|p| p.carry), Some(dec!(-3)));
+
+        // An exact close reports it on the exit.
+        let (closed, exited) = open().update_from_trade(&trade(
+            time_plus_days(base_time, 2),
+            Side::Sell,
+            110.0,
+            2.0,
+            0.0,
+        ));
+        assert!(closed.is_none());
+        let exited = exited.unwrap();
+        assert_eq!(exited.carry, dec!(-3));
+        assert_eq!(exited.pnl_realised, dec!(20));
+        assert_eq!(exited.pnl_realised_net(), Some(dec!(17)));
+
+        // A flip reports it on the exit and starts the new position at zero.
+        let (next, exited) = open().update_from_trade(&trade(
+            time_plus_days(base_time, 2),
+            Side::Sell,
+            110.0,
+            3.0,
+            0.0,
+        ));
+        assert_eq!(exited.map(|e| e.carry), Some(dec!(-3)));
+        let next = next.unwrap();
+        assert_eq!(next.side, Side::Sell);
+        assert_eq!(next.carry, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_apply_carry_holds_last_good_on_overflow() {
+        let base_time = DateTime::<Utc>::MIN_UTC;
+        let mut position = Position::from(&trade(base_time, Side::Buy, 100.0, 1.0, 0.0));
+        assert_eq!(
+            position.apply_carry(dec!(1), time_plus_days(base_time, 1)),
+            CarryUpdate::Applied
+        );
+
+        assert_eq!(
+            position.apply_carry(Decimal::MAX, time_plus_days(base_time, 2)),
+            CarryUpdate::Overflowed
+        );
+        assert_eq!(position.carry, dec!(1));
+        assert_eq!(position.time_exchange_update, time_plus_days(base_time, 1));
+    }
+
+    #[test]
     fn test_update_pnl_realised_holds_last_good_on_overflow() {
         // Regression for the realised overflow-safety contract: realised PnL is a booked,
         // cumulative ledger value, so on `Decimal` overflow of either the close-delta computation
@@ -2415,6 +2626,7 @@ mod tests {
             quantity_abs_max: dec!(5.0),
             pnl_unrealised: dec!(0.0),
             pnl_realised: sentinel,
+            carry: Decimal::ZERO,
             fees_enter: AssetFees {
                 asset: QuoteAsset,
                 fees: dec!(0.0),
@@ -2522,6 +2734,7 @@ mod tests {
             quantity_abs_max,
             pnl_unrealised: dec!(999.0), // sentinel: apply_split must overwrite this
             pnl_realised: dec!(-12.5),   // sentinel: apply_split must NOT touch this
+            carry: Decimal::ZERO,
             fees_enter: AssetFees {
                 asset: QuoteAsset,
                 fees: fees_enter,

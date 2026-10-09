@@ -666,6 +666,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             DateTime::<Utc>::MIN_UTC,
         );
         let snapshot = AccountSnapshot::new(

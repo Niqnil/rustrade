@@ -312,7 +312,7 @@ mod tests {
         engine::state::{
             EngineState,
             connectivity::VenueRole,
-            position::{PnlUnrealisedUpdate, PositionId},
+            position::{CarryUpdate, PnlUnrealisedUpdate, PositionId},
         },
         statistic::{summary::TradingSummaryGenerator, time::Annual365},
     };
@@ -502,6 +502,7 @@ mod tests {
         assert_eq!(position.quantity_abs_max, dec!(0.5));
         assert_eq!(position.pnl_unrealised, Decimal::ZERO);
         assert_eq!(position.pnl_realised, Decimal::ZERO);
+        assert_eq!(position.carry, Decimal::ZERO);
         assert_eq!(
             position.fees_enter,
             AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO))
@@ -617,20 +618,71 @@ mod tests {
         assert_eq!(position.pnl_realised, dec!(0.25));
     }
 
-    /// A seed serialised without `fees_enter` still deserialises, with zero entry fees.
+    /// A seed serialised without `fees_enter` or `carry` still deserialises, with both zero.
     #[test]
-    fn seed_without_fees_enter_deserialises_with_zero_fees() {
+    fn seed_without_fees_enter_or_carry_deserialises_with_zeros() {
         let seed = long_seed(SPOT, dec!(0.5));
         let mut json = serde_json::to_value(&seed).unwrap();
-        json.as_object_mut()
-            .unwrap()
-            .remove("fees_enter")
-            .expect("a serialised seed holds fees_enter");
+        let fields = json.as_object_mut().unwrap();
+        for field in ["fees_enter", "carry"] {
+            fields
+                .remove(field)
+                .unwrap_or_else(|| panic!("a serialised seed holds {field}"));
+        }
 
         let deserialised: PositionSeed = serde_json::from_value(json).unwrap();
 
         assert_eq!(deserialised.fees_enter, Decimal::ZERO);
+        assert_eq!(deserialised.carry, Decimal::ZERO);
         assert_eq!(deserialised, seed);
+    }
+
+    /// Seeded carry starts the position's carry, apart from realised PnL, and reaches the exit
+    /// with the carry posted while the engine held it.
+    #[test]
+    fn seeded_carry_is_kept_apart_from_realised_pnl_and_reaches_the_exit() {
+        let instruments = seed_instruments();
+        let mut state = try_build(
+            &instruments,
+            OmsMode::Netting,
+            vec![long_seed(SPOT, dec!(0.5)).with_carry(dec!(-4))],
+        )
+        .unwrap();
+
+        let spot = state
+            .instruments
+            .instrument_mut(&InstrumentNameInternal::new(SPOT));
+        let quote = spot.instrument.underlying.quote;
+        let position = spot
+            .position
+            .positions
+            .get_mut(&PositionId::NETTING)
+            .unwrap();
+        assert_eq!(position.carry, dec!(-4));
+        assert_eq!(position.pnl_realised, Decimal::ZERO);
+        assert_eq!(
+            position.apply_carry(dec!(1.5), time(2_000)),
+            CarryUpdate::Applied
+        );
+
+        let exited = spot
+            .update_from_trade(&Trade {
+                id: TradeId::new("close"),
+                order_id: OrderId::new("close"),
+                instrument: spot.key,
+                strategy: StrategyId::new("strategy"),
+                time_exchange: time(3_000),
+                side: Side::Sell,
+                price: dec!(52_000),
+                quantity: dec!(0.5),
+                order_filled_quantity: None,
+                fees: AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
+            })
+            .expect("a fill for the whole quantity exits the seeded position");
+
+        assert_eq!(exited.pnl_realised, dec!(1_000));
+        assert_eq!(exited.carry, dec!(-2.5));
+        assert_eq!(exited.pnl_realised_net(), Some(dec!(997.5)));
     }
 
     /// Closing a position seeded with entry fees nets them out of its realised PnL, together with

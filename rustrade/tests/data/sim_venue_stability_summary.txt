@@ -6,6 +6,7 @@ TradingSummary {
             "binance_spot-btcusdt",
         ): TearSheet {
             pnl: 0,
+            carry: 0,
             pnl_return: RateOfReturn {
                 value: 0,
                 interval: Daily,
@@ -39,6 +40,7 @@ TradingSummary {
             "binance_spot-ethusdt",
         ): TearSheet {
             pnl: 0,
+            carry: 0,
             pnl_return: RateOfReturn {
                 value: 0,
                 interval: Daily,
@@ -72,6 +74,7 @@ TradingSummary {
             "binance_spot-solusdt",
         ): TearSheet {
             pnl: 0,
+            carry: 0,
             pnl_return: RateOfReturn {
                 value: 0,
                 interval: Daily,
