@@ -91,9 +91,12 @@ pub fn map_sdk_error(error: hyperliquid_rust_sdk::Error) -> UnindexedClientError
     UnindexedClientError::Internal(msg)
 }
 
-/// Maps Hyperliquid order placement errors to `UnindexedOrderError`.
+/// Maps an SDK error from placing or cancelling an order to `UnindexedOrderError`.
 ///
-/// Hyperliquid returns specific error codes/messages for order rejections.
+/// An unknown instrument is [`ApiError::InstrumentInvalid`]; anything else is classified by its
+/// text, as a refusal in a placement response is, so a shortfall of funds is
+/// [`ApiError::BalanceInsufficient`].
+/// A cancel never fails for want of funds, so it shares the classifier harmlessly.
 pub fn map_order_error(
     error: hyperliquid_rust_sdk::Error,
     instrument: &InstrumentNameExchange,
