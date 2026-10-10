@@ -154,8 +154,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     instrument, both stamped at the boundary and in the quote asset, with an id from the venue's
     own sequence. The engine adds it to the position's carry, as it does a live venue's. A
     position is valued at the venue's mid, else its last price, else, with a WARN once per venue,
-    its entry price. A charge the account cannot cover is still made, and takes `free` below zero
-    with a WARN, since the venue models no liquidation.
+    its entry price. A charge the account cannot cover is still made, and takes `free` below zero,
+    with a WARN when it first does, since the venue models no liquidation.
   - `rustrade`'s `SimVenueOptions` carries a venue's models (shared, as `Arc`s, so one rate
     history can serve a whole sweep), through the new `SimExecutionBuilder::add_venue_with_options`.
   - **Breaking:** `BacktestArgsConstant` gains `venue_options`, the options for each simulated

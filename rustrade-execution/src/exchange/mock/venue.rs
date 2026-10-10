@@ -176,7 +176,8 @@ pub enum VenueRegime {
 ///   [`AccountEventKind::CashFlow`] attributed to the instrument, both stamped at the boundary,
 ///   with a [`CashFlowId`] from this venue's own sequence. The engine adds the flow to the
 ///   position's `carry`, as it does a live venue's. A charge the account cannot cover is still
-///   made, and takes `free` below zero with a WARN, since this venue models no liquidation.
+///   made, and takes `free` below zero, with a WARN on the charge that does so, since this venue
+///   models no liquidation.
 ///
 /// # Locates and the short-sale restriction
 /// This venue lends no stock: a spot sell delivers base the account must hold, so a short sale of
@@ -563,7 +564,7 @@ impl SimulatedVenue {
                 .flat_map(|instrument| {
                     self.holding_costs
                         .iter()
-                        .filter_map(move |model| model.next_boundary(instrument, after))
+                        .filter_map(move |model| next_boundary(model.as_ref(), instrument, after))
                 })
                 .min()
         });
@@ -658,12 +659,7 @@ impl SimulatedVenue {
         for instrument in self.positions.keys() {
             for (index, model) in self.holding_costs.iter().enumerate() {
                 let mut from = after;
-                while let Some(boundary) = model.next_boundary(instrument, from) {
-                    assert!(
-                        boundary > from,
-                        "HoldingCostModel {model:?} returned boundary {boundary} for \
-                         {instrument}, which is not after {from}"
-                    );
+                while let Some(boundary) = next_boundary(model.as_ref(), instrument, from) {
                     if boundary > now {
                         break;
                     }
@@ -678,25 +674,26 @@ impl SimulatedVenue {
 
         let mut events = Vec::with_capacity(due.len() * 2);
         for (boundary, instrument, index) in due {
-            events.extend(self.charge_holding_cost(boundary, &instrument, index));
+            self.charge_holding_cost(boundary, &instrument, index, &mut events);
         }
         self.refresh_next_charge();
         events
     }
 
-    /// Charges one model's cost of the position in `instrument` at `boundary`, returning
-    /// `[balance, cash flow]`, or nothing if the model charges nothing.
+    /// Charges one model's cost of the position in `instrument` at `boundary`, pushing
+    /// `[balance, cash flow]` onto `events`, or nothing if the model charges nothing.
     fn charge_holding_cost(
         &mut self,
         boundary: DateTime<Utc>,
         instrument: &InstrumentNameExchange,
         model: usize,
-    ) -> Vec<UnindexedAccountEvent> {
+        events: &mut Vec<UnindexedAccountEvent>,
+    ) {
         let (Some(position), Some(terms)) = (
             self.positions.get(instrument).copied(),
             self.instruments.get(instrument),
         ) else {
-            return Vec::new();
+            return;
         };
         let quote = terms.underlying.quote.clone();
         let contract_size = terms.kind.contract_size();
@@ -710,14 +707,18 @@ impl SimulatedVenue {
             price,
         );
         let Some(charge) = self.holding_costs[model].charge(&held, boundary) else {
-            return Vec::new();
+            return;
         };
         if charge.amount.is_zero() {
-            return Vec::new();
+            return;
         }
 
         let balance = self.account.charge(&quote, charge.amount, boundary);
-        if balance.balance.free.is_sign_negative() && charge.amount.is_sign_negative() {
+        // Warned when `free` goes negative, not at every charge while it stays there: an
+        // underwater account charged hourly would otherwise warn every simulated hour. Each charge
+        // is still reported as a cash flow.
+        let free = balance.balance.free;
+        if free.is_sign_negative() && !(free - charge.amount).is_sign_negative() {
             warn!(
                 exchange = %self.exchange,
                 %instrument,
@@ -733,8 +734,8 @@ impl SimulatedVenue {
         let id = CashFlowId::new(self.cash_flow_sequence.to_smolstr());
         self.cash_flow_sequence += 1;
 
-        vec![
-            self.build_account_event(Snapshot(balance)),
+        events.push(self.build_account_event(Snapshot(balance)));
+        events.push(
             self.build_account_event(AccountEventKind::CashFlow(CashFlow::new(
                 charge.kind,
                 quote,
@@ -743,7 +744,7 @@ impl SimulatedVenue {
                 boundary,
                 Some(id),
             ))),
-        ]
+        );
     }
 
     /// The price a holding cost values `position` in `instrument` at: the mid of this venue's
@@ -2251,23 +2252,28 @@ impl SimulatedVenue {
         }
 
         // One lookup for a position already held, and the name cloned only to open one.
-        match self.positions.get_mut(instrument) {
+        let opened_or_closed = match self.positions.get_mut(instrument) {
             Some(position) => {
                 *position = position.after(side, fill.quantity, fill.price);
-                if position.quantity.is_zero() {
+                let closed = position.quantity.is_zero();
+                if closed {
                     self.positions.remove(instrument);
                 }
+                closed
             }
             None => {
                 let position = NetPosition::default().after(side, fill.quantity, fill.price);
-                if !position.quantity.is_zero() {
+                let opened = !position.quantity.is_zero();
+                if opened {
                     self.positions.insert(instrument.clone(), position);
                 }
+                opened
             }
-        }
+        };
 
-        // A position opened or closed has boundaries of its own, or no longer has any.
-        if !self.holding_costs.is_empty() {
+        // A position opened or closed has boundaries of its own, or no longer has any. One that
+        // only changed size keeps its boundaries, which depend on the instrument alone.
+        if opened_or_closed && !self.holding_costs.is_empty() {
             self.refresh_next_charge();
         }
     }
@@ -2486,6 +2492,26 @@ impl SimulatedVenue {
             kind: kind.into(),
         }
     }
+}
+
+/// `model`'s first boundary for `instrument` after `after`, checked against its contract.
+///
+/// # Panics
+/// If the boundary is not after `after`. Charging it would charge one instant forever, and a
+/// driver waking the venue for it would wake it there forever, so it is refused at the first
+/// read, wherever that is.
+fn next_boundary(
+    model: &dyn HoldingCostModel,
+    instrument: &InstrumentNameExchange,
+    after: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let boundary = model.next_boundary(instrument, after)?;
+    assert!(
+        boundary > after,
+        "HoldingCostModel {model:?} returned boundary {boundary} for {instrument}, which is not \
+         after {after}"
+    );
+    Some(boundary)
 }
 
 /// The net positions an `initial_state` opens a venue with: one for each cash-settled instrument
@@ -2995,7 +3021,10 @@ mod tests {
         },
         fee::PercentageFeeModel,
         fill::BidAskFillModel,
-        holding_cost::{FundingModel, HoldingCharge, RateSeries},
+        holding_cost::{
+            AccrualDays, BorrowFeeModel, DailyAccrual, DayCount, FinancingModel, FinancingRates,
+            FundingModel, HoldingCharge, RateSeries, WeekendsOnly,
+        },
         order::{
             OrderEvent, OrderKey, TimeInForce,
             id::{ClientOrderId, StrategyId},
@@ -3003,7 +3032,7 @@ mod tests {
             state::{ActiveOrderState, InactiveOrderState},
         },
     };
-    use chrono::TimeDelta;
+    use chrono::{NaiveTime, TimeDelta};
     use rustrade_instrument::{
         Underlying,
         instrument::{
@@ -7274,6 +7303,135 @@ mod tests {
         assert_eq!(venue.next_deadline(), Some(boundary(0)));
     }
 
+    /// A borrow fee on settlement days and financing on calendar days, both at 21:00 UTC, on a
+    /// short. `time(1)` is Tuesday 2023-11-14 22:13:21Z, so the first cutoffs are Wednesday's
+    /// and Thursday's. With T+1, Wednesday's borrow fee covers one day and Thursday's three; the
+    /// short receives its negative financing rate once a day. At one boundary the models charge
+    /// in the order they were given.
+    #[test]
+    fn a_short_pays_its_borrow_by_settlement_day_and_receives_its_financing() {
+        let cutoff = NaiveTime::from_hms_opt(21, 0, 0).unwrap();
+        let borrow = BorrowFeeModel::new(DailyAccrual::new(
+            cutoff,
+            Utc,
+            AccrualDays::Settlement {
+                calendar: Arc::new(WeekendsOnly),
+                lag: 1,
+            },
+            DayCount::Act360,
+        ))
+        .with_rates(cfd_instrument_name(), RateSeries::constant(d("0.36")));
+        let financing = FinancingModel::new(DailyAccrual::new(
+            cutoff,
+            Utc,
+            AccrualDays::Calendar,
+            DayCount::Act365,
+        ))
+        .with_rates(
+            cfd_instrument_name(),
+            FinancingRates::new(
+                RateSeries::constant(d("0.073")),
+                RateSeries::constant(d("-0.0365")),
+            ),
+        );
+        let mut venue =
+            make_cfd_venue_charging("200000", vec![Arc::new(borrow), Arc::new(financing)]);
+        assert!(cfd_market(&mut venue, "5000", "5000", "5000").is_empty());
+        cfd_market_fill(&mut venue, Side::Sell, "1");
+
+        let friday = DateTime::parse_from_rfc3339("2023-11-17T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        let events = venue.advance_time(friday);
+        let charged: Vec<_> = charges(&events)
+            .iter()
+            .map(|(_, flow)| (flow.time_exchange, flow.kind.clone(), flow.amount))
+            .collect();
+
+        let wednesday = DateTime::parse_from_rfc3339("2023-11-15T21:00:00Z")
+            .unwrap()
+            .to_utc();
+        let thursday = wednesday + TimeDelta::days(1);
+        let borrow_fee = CashFlowKind::BorrowFee {
+            rate: Some(d("0.36")),
+            quantity: Some(d("25")),
+        };
+        let financed = CashFlowKind::Financing {
+            rate: Some(d("-0.0365")),
+            notional: Some(d("125000")),
+        };
+        // 125,000 notional: 36% / 360 a day is 125, and 3.65% / 365 a day is 12.5.
+        assert_eq!(
+            charged,
+            vec![
+                (wednesday, borrow_fee.clone(), d("-125")),
+                (wednesday, financed.clone(), d("12.5")),
+                (thursday, borrow_fee, d("-375")),
+                (thursday, financed, d("12.5")),
+            ]
+        );
+    }
+
+    /// Two instruments charged at one boundary are charged in instrument order, whichever order
+    /// the venue's positions happen to hash in.
+    #[test]
+    fn positions_charged_at_one_boundary_are_charged_in_instrument_order() {
+        let nas = InstrumentNameExchange::new("nas100_usd");
+        let mut instruments = instruments_of(cfd_instrument());
+        let mut second = cfd_instrument();
+        second.name_exchange = nas.clone();
+        instruments.insert(nas.clone(), second);
+
+        let funding = FundingModel::new(TimeDelta::hours(1))
+            .with_rates(cfd_instrument_name(), RateSeries::constant(d("0.0001")))
+            .with_rates(nas.clone(), RateSeries::constant(d("0.0001")));
+        let mut venue = SimulatedVenue::new_market_driven(
+            &config_from_balances(vec![funded(usd(), d("500000"))], FeeModelConfig::default()),
+            instruments,
+        )
+        .with_holding_costs(vec![Arc::new(funding)]);
+        advance(&mut venue, time(1));
+
+        for name in [cfd_instrument_name(), nas.clone()] {
+            let fills = venue.apply_market(
+                &name,
+                market_prices("5000").unwrap(),
+                MarketDepth::UNKNOWN,
+                time(1),
+            );
+            assert!(fills.is_empty());
+            let outcome = venue.open_order(request(name, Side::Buy, "1", None));
+            assert!(outcome.response.state.is_accepted());
+        }
+
+        let events = venue.advance_time(boundary(0));
+        let order: Vec<_> = charges(&events)
+            .iter()
+            .map(|(_, flow)| flow.instrument.clone().unwrap())
+            .collect();
+        assert_eq!(order, vec![nas, cfd_instrument_name()]);
+    }
+
+    /// A long flipped to a short before a boundary is charged there as the short it is.
+    #[test]
+    fn a_position_flipped_before_a_boundary_is_charged_as_what_it_became() {
+        let mut venue = make_cfd_venue_charging("400000", vec![hourly_funding("0.0001")]);
+        assert!(cfd_market(&mut venue, "5000", "5000", "5000").is_empty());
+        cfd_market_fill(&mut venue, Side::Buy, "1");
+        cfd_market_fill(&mut venue, Side::Sell, "2");
+
+        let events = venue.advance_time(boundary(0));
+        let charged = charges(&events);
+        assert_eq!(charged.len(), 1);
+        assert_eq!(
+            charged[0].1.amount,
+            d("12.5"),
+            "a short receives a positive rate"
+        );
+    }
+
+    /// A model breaking its contract is caught at the first read of its boundary, here the cache
+    /// refresh on opening a position, before any driver could wake the venue for it forever.
     #[test]
     #[should_panic(expected = "which is not after")]
     fn a_model_whose_boundary_does_not_advance_panics_rather_than_charging_forever() {
