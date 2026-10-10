@@ -185,6 +185,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     where known, shown by its `Display`. The simulated venue sets it on `InventoryUnavailable`.
     `BorrowReject::new` is unchanged.
   - `rustrade`'s `SimVenueOptions` gains `shortability` and `with_shortability`.
+- **Ask a live venue what it would lend for a short sale, and how much this account can borrow**
+  (`rustrade-execution`, #572).
+  - `ShortabilityClient::fetch_shortability(&instrument)` returns the `Shortability` a simulated
+    venue already reads. It is a capability trait, like `OrderStatusClient`: a client whose venue
+    does not report it does not implement it. The answer is advisory, so a short sale must still
+    handle `ApiError::BorrowRejected`, and each implementation states what its requests cost.
+  - `BorrowCapacityClient::fetch_borrow_capacity(&instrument, side)` returns a `BorrowCapacity`:
+    the asset an order on that side would borrow (the base for a sell, the quote for a buy), how
+    much more of it this account can borrow now, and the account's limit. It is a separate type
+    from `Shortability` because it is net of the account's collateral and borrows: replayed into a
+    simulated venue as the lender's total, it would count the account's own short twice.
+  - `AlpacaClient` implements `ShortabilityClient` from `GET /v2/assets/{symbol}`: shortable, easy
+    to borrow, and a zero fee for an easy-to-borrow stock, which Alpaca charges nothing to borrow.
+    Alpaca publishes no hard-to-borrow rate, so that fee is unknown, and its flags may be a day old.
+  - `BinanceMargin` implements both, for its cross or isolated margin. A pair is shortable when it
+    is traded on margin, may be sold and its base asset may be borrowed; the fee is the base
+    asset's next hourly interest rate times 24 × 365. A query costs 102 of Binance's per-IP request
+    weight on cross margin and 111 on isolated, almost all of it the interest rate; the borrow
+    capacity costs 51 and 60. Binance does not say how much it has to lend in total, so
+    `available` is unknown there.
+  - An option, and a symbol the venue does not know, is `ApiError::InstrumentInvalid`.
+  - `Shortability::fee_rate` now states its convention: simple, on the venue's own year basis.
 
 ### Changed
 
