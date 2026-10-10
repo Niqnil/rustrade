@@ -216,9 +216,9 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use common::{
-    CLOID_REQUIRED, CancelOnDropStream, OpenOrderListing, UnknownCoins, cancel_outcome,
-    cid_to_cloid, map_tif, millis_to_datetime, open_order_to_order, parse_decimal, parse_side,
-    span_millis, user_fills_by_time, warn_unknown_coins,
+    CLOID_REQUIRED, CancelOnDropStream, InstrumentFilter, OpenOrderListing, UnknownCoins,
+    cancel_outcome, cid_to_cloid, map_tif, millis_to_datetime, open_order_to_order, parse_decimal,
+    parse_side, span_millis, user_fills_by_time, warn_unknown_coins,
 };
 pub use config::{HyperliquidConfig, HyperliquidConfigError, Network};
 pub use error::HyperliquidConnectError;
@@ -244,12 +244,9 @@ use rustrade_instrument::{
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use smol_str::format_smolstr;
-use std::{
-    collections::HashSet,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -462,14 +459,7 @@ impl ExecutionClient for HyperliquidClient {
             perp_account::snapshot_balances(info_client, address, dexes, mode, &states, now)
                 .await?;
 
-        // Build instrument filter if provided
-        let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
-            None
-        } else {
-            let mut set = HashSet::with_capacity(instruments.len());
-            set.extend(instruments.iter().cloned());
-            Some(set)
-        };
+        let instrument_filter = InstrumentFilter::new(instruments);
 
         warn_unknown_coins(open_orders.iter().map(|order| order.coin.as_str()));
         let mut listing = OpenOrderListing::new(
@@ -487,10 +477,7 @@ impl ExecutionClient for HyperliquidClient {
                 continue;
             };
 
-            if instrument_filter
-                .as_ref()
-                .is_some_and(|f| !f.contains(&instrument))
-            {
+            if !instrument_filter.matches(&instrument) {
                 continue;
             }
 
@@ -1265,22 +1252,13 @@ impl ExecutionClient for HyperliquidClient {
             perp_account::open_orders(&self.info_client, address, &self.dexes).await?;
         warn_unknown_coins(open_orders.iter().map(|order| order.coin.as_str()));
 
-        let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
-            None
-        } else {
-            let mut set = HashSet::with_capacity(instruments.len());
-            set.extend(instruments.iter().cloned());
-            Some(set)
-        };
+        let instrument_filter = InstrumentFilter::new(instruments);
 
         let orders: Vec<_> = open_orders
             .iter()
             .filter_map(|order| {
                 let instrument = self.dexes.instrument(&order.coin)?;
-                if instrument_filter
-                    .as_ref()
-                    .is_some_and(|f| !f.contains(&instrument))
-                {
+                if !instrument_filter.matches(&instrument) {
                     return None;
                 }
                 open_order_to_order(order, ExchangeId::HyperliquidPerp, instrument)
@@ -1315,13 +1293,7 @@ impl ExecutionClient for HyperliquidClient {
         warn_unknown_coins(fills.iter().map(|fill| fill.coin.as_str()));
         warn_unconfigured_dexes(&self.dexes, fills.iter().map(|fill| fill.coin.as_str()));
 
-        let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
-            None
-        } else {
-            let mut set = HashSet::with_capacity(instruments.len());
-            set.extend(instruments.iter().cloned());
-            Some(set)
-        };
+        let instrument_filter = InstrumentFilter::new(instruments);
 
         let mut result = Vec::new();
         for fill in fills {
@@ -1329,10 +1301,7 @@ impl ExecutionClient for HyperliquidClient {
                 continue;
             };
 
-            if instrument_filter
-                .as_ref()
-                .is_some_and(|f| !f.contains(&instrument))
-            {
+            if !instrument_filter.matches(&instrument) {
                 continue;
             }
 

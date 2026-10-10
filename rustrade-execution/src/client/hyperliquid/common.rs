@@ -18,6 +18,7 @@ use crate::{
     position::PositionReport,
 };
 use chrono::{DateTime, TimeZone, Utc};
+use fnv::FnvHashSet;
 use futures::Stream;
 use hyperliquid_rust_sdk::{ExchangeDataStatus, ExchangeResponseStatus};
 use rust_decimal::Decimal;
@@ -358,6 +359,21 @@ pub(super) fn open_order_to_order(
     })
 }
 
+/// Which instruments a read keeps: those in the slice it was given, or every one when the slice is
+/// empty, the "return all" sentinel of [`ExecutionClient`](crate::client::ExecutionClient)'s reads.
+pub(super) struct InstrumentFilter<'a>(Option<FnvHashSet<&'a InstrumentNameExchange>>);
+
+impl<'a> InstrumentFilter<'a> {
+    pub(super) fn new(instruments: &'a [InstrumentNameExchange]) -> Self {
+        Self((!instruments.is_empty()).then(|| instruments.iter().collect()))
+    }
+
+    /// Whether the read keeps `instrument`.
+    pub(super) fn matches(&self, instrument: &InstrumentNameExchange) -> bool {
+        self.0.as_ref().is_none_or(|set| set.contains(instrument))
+    }
+}
+
 type UnindexedInstrumentAccountSnapshot =
     InstrumentAccountSnapshot<ExchangeId, AssetNameExchange, InstrumentNameExchange>;
 
@@ -400,7 +416,7 @@ impl OpenOrderListing {
                 })
         }
 
-        let requested_set = requested.iter().collect::<HashSet<_>>();
+        let filter = InstrumentFilter::new(requested);
         let mut listing = HashMap::with_capacity(requested.len());
 
         for instrument in requested {
@@ -411,7 +427,7 @@ impl OpenOrderListing {
             let Some(instrument) = to_instrument(&row.coin) else {
                 continue;
             };
-            if !requested_set.is_empty() && !requested_set.contains(&instrument) {
+            if !filter.matches(&instrument) {
                 continue;
             }
             let order = open_order_to_order(row, exchange, instrument.clone());
@@ -758,6 +774,22 @@ pub(super) fn spot_base_quote(instrument: &InstrumentNameExchange) -> Option<(&s
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn an_instrument_filter_keeps_what_it_was_given_or_everything_when_given_nothing() {
+        let (btc, eth) = (
+            InstrumentNameExchange::new("BTC"),
+            InstrumentNameExchange::new("ETH"),
+        );
+
+        let all = InstrumentFilter::new(&[]);
+        assert!(all.matches(&btc) && all.matches(&eth));
+
+        let given = [btc.clone()];
+        let one = InstrumentFilter::new(&given);
+        assert!(one.matches(&btc));
+        assert!(!one.matches(&eth));
+    }
 
     #[test]
     fn test_parse_decimal_valid() {
