@@ -806,7 +806,7 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
                     let mut checked = CheckedListing::default();
                     while let Some((key, found)) = lookups.next().await {
                         if let Some(left) = unsettled.get_mut(&key.instrument) {
-                            *left = left.saturating_sub(1);
+                            *left -= 1;
                         }
                         match found {
                             Ok(found) => match settle(exchange, known, key, found, tx) {
@@ -839,7 +839,6 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
             .buffer_unordered(LISTINGS_IN_FLIGHT);
         while let Some((index, checked)) = runs.next().await {
             settled[index] = true;
-            let quiet = throttled.load(Ordering::Relaxed);
             match checked {
                 Ok(checked) => {
                     if checked.consumer_gone {
@@ -850,8 +849,9 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
                     for instrument in &instruments[index] {
                         match checked.failed.get(instrument) {
                             Some(reason) => {
-                                deferred += usize::from(quiet);
-                                order_check_failed(exchange, unchecked, instrument, reason, quiet);
+                                deferred += usize::from(order_check_failed(
+                                    exchange, unchecked, instrument, reason,
+                                ));
                             }
                             None => unchecked.checked(instrument),
                         }
@@ -860,8 +860,9 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
                 Err(e) => {
                     let reason = failure_reason(&e);
                     for instrument in &instruments[index] {
-                        deferred += usize::from(quiet);
-                        order_check_failed(exchange, unchecked, instrument, &reason, quiet);
+                        deferred += usize::from(order_check_failed(
+                            exchange, unchecked, instrument, &reason,
+                        ));
                     }
                 }
             }
@@ -889,13 +890,7 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
             .filter(|(_, settled)| !**settled)
         {
             for instrument in check {
-                order_check_failed(
-                    exchange,
-                    unchecked,
-                    instrument,
-                    "order check timed out",
-                    false,
-                );
+                order_check_failed(exchange, unchecked, instrument, "order check timed out");
             }
         }
     }
@@ -981,40 +976,51 @@ fn settle(
 }
 
 /// Record that the check of how the orders held as live on `instrument` ended did not finish,
-/// because of `reason`, and log what follows: a retry, or giving the check up. A retry is logged at
-/// debug when `quiet`, as by a check stopped for the rate limit, which warns once for all.
+/// because of `reason`, and log what follows: a retry, or giving the check up.
+///
+/// Returns whether it is a retry for the venue's rate limit, which is logged at debug: the check
+/// stopped for it warns once for all of them.
 fn order_check_failed(
     exchange: ExchangeId,
     unchecked: &mut UncheckedOrders,
     instrument: &InstrumentNameExchange,
     reason: &str,
-    quiet: bool,
-) {
+) -> bool {
+    let rate_limited = reason == RATE_LIMITED;
     match unchecked.failed(instrument, tokio::time::Instant::now()) {
-        Some(GapFailure::Retry(delay)) if quiet => debug!(
-            %exchange,
-            %instrument,
-            retry_in_secs = delay.as_secs(),
-            reason,
-            "Could not check how the orders held as live ended, retrying later"
-        ),
-        Some(GapFailure::Retry(delay)) => warn!(
-            %exchange,
-            %instrument,
-            retry_in_secs = delay.as_secs(),
-            reason,
-            "Could not check how the orders held as live ended, retrying later"
-        ),
-        Some(GapFailure::GivenUp) => error!(
-            %exchange,
-            %instrument,
-            retries = MAX_GAP_RETRIES,
-            reason,
-            "Gave up checking how the orders held as live ended: an order that ended \
-             while disconnected stays live in engine state until the next reconnect checks it; \
-             reconcile with fetch_open_orders"
-        ),
-        None => {}
+        Some(GapFailure::Retry(delay)) => {
+            if rate_limited {
+                debug!(
+                    %exchange,
+                    %instrument,
+                    retry_in_secs = delay.as_secs(),
+                    reason,
+                    "Could not check how the orders held as live ended, retrying later"
+                );
+            } else {
+                warn!(
+                    %exchange,
+                    %instrument,
+                    retry_in_secs = delay.as_secs(),
+                    reason,
+                    "Could not check how the orders held as live ended, retrying later"
+                );
+            }
+            rate_limited
+        }
+        Some(GapFailure::GivenUp) => {
+            error!(
+                %exchange,
+                %instrument,
+                retries = MAX_GAP_RETRIES,
+                reason,
+                "Gave up checking how the orders held as live ended: an order that ended \
+                 while disconnected stays live in engine state until the next reconnect checks it; \
+                 reconcile with fetch_open_orders"
+            );
+            false
+        }
+        None => false,
     }
 }
 
@@ -1880,7 +1886,7 @@ mod tests {
         )
         .await;
 
-        assert!(lookups.load(Ordering::Relaxed) >= 1);
+        assert!(lookups.load(Ordering::Relaxed) <= 2);
         assert!(rx.try_recv().is_err(), "nothing reported");
         for instrument in ["AAA", "BBB"] {
             assert!(failed_once(&mut unchecked, instrument), "{instrument}");
@@ -1911,6 +1917,10 @@ mod tests {
             |key: UnindexedOrderKey| {
                 let first = lookups.fetch_add(1, Ordering::Relaxed) == 0;
                 async move {
+                    // Every lookup answers later, so all those started are sent before the
+                    // refusal is read, and the refusal first, so no answer frees a place for
+                    // another lookup before it.
+                    tokio::task::yield_now().await;
                     if first {
                         return Err(UnindexedClientError::Api(ApiError::RateLimit));
                     }
