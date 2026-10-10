@@ -34,6 +34,7 @@ use rustrade_integration::protocol::websocket::{WebSocket, WsMessage, connect};
 use serde::Deserialize as _;
 use smol_str::SmolStr;
 use std::{
+    borrow::Cow,
     fmt::Display,
     future::Future,
     panic::AssertUnwindSafe,
@@ -280,7 +281,7 @@ async fn forward_session(
 ) -> Stop {
     let mut buf = Vec::with_capacity(1);
     for text in early {
-        if let RiskFrame::KeyExpired = convert_risk_frame(&text, &mut buf) {
+        if let RiskFrame::KeyExpired = convert_risk_frame(&text, listen_key, &mut buf) {
             return Stop::Retry("listen key expired".to_owned());
         }
         if !forward(&mut buf, tx, dedup) {
@@ -306,7 +307,9 @@ async fn forward_session(
                 last_frame = Instant::now();
                 match message {
                     Some(Ok(WsMessage::Text(text))) => {
-                        if let RiskFrame::KeyExpired = convert_risk_frame(&text, &mut buf) {
+                        if let RiskFrame::KeyExpired =
+                            convert_risk_frame(&text, listen_key, &mut buf)
+                        {
                             return Stop::Retry("listen key expired".to_owned());
                         }
                         if !forward(&mut buf, tx, dedup) {
@@ -429,7 +432,10 @@ async fn connect_and_subscribe(
             };
             return match reply.get("error") {
                 None => Ok(()),
-                Some(error) => Err(format!("subscribe refused: {error}")),
+                Some(error) => Err(format!(
+                    "subscribe refused: {}",
+                    redact_listen_key(&error.to_string(), listen_key)
+                )),
             };
         }
         Err("socket ended while subscribing".to_owned())
@@ -472,12 +478,20 @@ pub(super) enum RiskFrame {
 ///
 /// Frames come wrapped as `{ "stream": <listen key>, "data": { "e", … } }`; a bare event is read
 /// too. Event types with no arm are logged by [`log_unhandled_event`], so a renamed event is seen.
-pub(super) fn convert_risk_frame(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> RiskFrame {
+///
+/// `listen_key` is the key the session subscribed with. A frame that is logged has it masked
+/// first, by [`redact_listen_key`].
+pub(super) fn convert_risk_frame(
+    frame: &str,
+    listen_key: &str,
+    buf: &mut Vec<UnindexedAccountEvent>,
+) -> RiskFrame {
     static UNRECOGNISED: AtomicU64 = AtomicU64::new(0);
     static UNHANDLED: UnhandledEvents = UnhandledEvents::new();
 
+    let logged = || redact_listen_key(frame, listen_key);
     let Ok(value) = serde_json::from_str::<serde_json::Value>(frame) else {
-        log_unrecognised_frame("BinanceMargin risk", &UNRECOGNISED, frame);
+        log_unrecognised_frame("BinanceMargin risk", &UNRECOGNISED, &logged());
         return RiskFrame::Continue;
     };
     let event = value.get("data").unwrap_or(&value);
@@ -486,7 +500,7 @@ pub(super) fn convert_risk_frame(frame: &str, buf: &mut Vec<UnindexedAccountEven
             // A reply to a request, such as a late subscribe ack.
             trace!("BinanceMargin risk data stream: ignoring a request reply");
         } else {
-            log_unrecognised_frame("BinanceMargin risk", &UNRECOGNISED, frame);
+            log_unrecognised_frame("BinanceMargin risk", &UNRECOGNISED, &logged());
         }
         return RiskFrame::Continue;
     };
@@ -499,7 +513,7 @@ pub(super) fn convert_risk_frame(frame: &str, buf: &mut Vec<UnindexedAccountEven
             }
             Err(e) => warn!(
                 error = %e,
-                frame = frame_excerpt(frame),
+                frame = frame_excerpt(&logged()),
                 "BinanceMargin: undeserializable MARGIN_LEVEL_STATUS_CHANGE on the risk data \
                  stream, dropping"
             ),
@@ -508,15 +522,28 @@ pub(super) fn convert_risk_frame(frame: &str, buf: &mut Vec<UnindexedAccountEven
             Ok(change) => log_liability_change(&change, "risk data"),
             Err(e) => warn!(
                 error = %e,
-                frame = frame_excerpt(frame),
+                frame = frame_excerpt(&logged()),
                 "BinanceMargin: undeserializable USER_LIABILITY_CHANGE on the risk data \
                  stream, dropping"
             ),
         },
         "listenKeyExpired" => return RiskFrame::KeyExpired,
-        other => log_unhandled_event("BinanceMargin risk", &UNHANDLED, other, frame),
+        other => log_unhandled_event("BinanceMargin risk", &UNHANDLED, other, &logged()),
     }
     RiskFrame::Continue
+}
+
+/// `text` with each occurrence of `listen_key` replaced by `<listen key>`, for a log line.
+///
+/// Anyone holding the key can read the account's Risk Data Stream until it lapses, and every frame
+/// names it in its `stream` field, so no frame or venue reply is logged unmasked. Masking runs
+/// before a log helper cuts the text short, so no prefix of the key survives either.
+fn redact_listen_key<'a>(text: &'a str, listen_key: &str) -> Cow<'a, str> {
+    if listen_key.is_empty() || !text.contains(listen_key) {
+        Cow::Borrowed(text)
+    } else {
+        Cow::Owned(text.replace(listen_key, "<listen key>"))
+    }
 }
 
 /// Log that a `MARGIN_LEVEL_STATUS_CHANGE` arrived, naming the stream it arrived on.
@@ -631,9 +658,89 @@ mod tests {
         })
     }
 
+    const LISTEN_KEY: &str = "synthetic-listen-key-0123456789";
+
     /// A frame as the combined-stream endpoint wraps it.
     fn wrapped(event: serde_json::Value) -> String {
-        serde_json::json!({ "stream": "listen-key", "data": event }).to_string()
+        serde_json::json!({ "stream": LISTEN_KEY, "data": event }).to_string()
+    }
+
+    /// Run `f`, returning every field of every log event it emitted on this thread, at any level.
+    fn logged_fields<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Default)]
+        struct Fields(Arc<Mutex<Vec<String>>>);
+
+        struct Visit<'a>(&'a mut Vec<String>);
+
+        impl tracing::field::Visit for Visit<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push(format!("{}={value:?}", field.name()));
+            }
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Fields {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut fields = Vec::new();
+                event.record(&mut Visit(&mut fields));
+                self.0.lock().unwrap().extend(fields);
+            }
+        }
+
+        let layer = Fields::default();
+        let fields = Arc::clone(&layer.0);
+        // Thread-local, so other tests running in parallel are not captured.
+        let value =
+            tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), f);
+        let fields = fields.lock().unwrap().clone();
+        (value, fields)
+    }
+
+    /// Every frame that is logged names the listen key, so each must be logged with it masked:
+    /// unrecognised frames, undeserializable events, and event types with no arm.
+    #[test]
+    fn a_logged_frame_never_shows_the_listen_key() {
+        for frame in [
+            // An event type no other test uses, so it takes the loud first-of-type path.
+            wrapped(serde_json::json!({ "e": "aFrameNamingTheKey", "E": 1 })),
+            wrapped(serde_json::json!({ "e": "MARGIN_LEVEL_STATUS_CHANGE", "s": 5 })),
+            wrapped(serde_json::json!({ "e": "USER_LIABILITY_CHANGE", "a": 5 })),
+            serde_json::json!({ "stream": LISTEN_KEY }).to_string(),
+            format!("{LISTEN_KEY} is not json"),
+        ] {
+            let mut buf = Vec::new();
+            let (_, fields) = logged_fields(|| convert_risk_frame(&frame, LISTEN_KEY, &mut buf));
+            assert!(
+                fields.iter().any(|field| field.contains("<listen key>")),
+                "{frame}: no masked frame logged in {fields:?}"
+            );
+            assert!(
+                fields.iter().all(|field| !field.contains(LISTEN_KEY)),
+                "{frame}: the key was logged in {fields:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_listen_key_is_masked_wherever_it_appears_and_text_without_it_is_untouched() {
+        let text = format!("{LISTEN_KEY} and {LISTEN_KEY}");
+        assert_eq!(
+            redact_listen_key(&text, LISTEN_KEY),
+            "<listen key> and <listen key>"
+        );
+        assert!(matches!(
+            redact_listen_key("no key here", LISTEN_KEY),
+            Cow::Borrowed("no key here")
+        ));
+        assert!(matches!(
+            redact_listen_key("no key here", ""),
+            Cow::Borrowed("no key here")
+        ));
     }
 
     fn notice_of(event: &UnindexedAccountEvent) -> &AccountNotice<InstrumentNameExchange> {
@@ -650,7 +757,10 @@ mod tests {
             margin_level("PRE_LIQUIDATION", 1_700_000_000_000).to_string(),
         ] {
             let mut buf = Vec::new();
-            assert_eq!(convert_risk_frame(&frame, &mut buf), RiskFrame::Continue);
+            assert_eq!(
+                convert_risk_frame(&frame, LISTEN_KEY, &mut buf),
+                RiskFrame::Continue
+            );
             let [event] = buf.as_slice() else {
                 panic!("expected one event, got {buf:?}")
             };
@@ -691,7 +801,11 @@ mod tests {
             ),
         ] {
             let mut buf = Vec::new();
-            assert_eq!(convert_risk_frame(&frame, &mut buf), expected, "{frame}");
+            assert_eq!(
+                convert_risk_frame(&frame, LISTEN_KEY, &mut buf),
+                expected,
+                "{frame}"
+            );
             assert!(buf.is_empty(), "{frame}");
         }
     }

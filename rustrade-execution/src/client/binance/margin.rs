@@ -5915,7 +5915,7 @@ mod tests {
         let mut from_risk = Vec::new();
         let risk_frame = serde_json::json!({ "stream": "listen-key", "data": change });
         assert_eq!(
-            convert_risk_frame(&risk_frame.to_string(), &mut from_risk),
+            convert_risk_frame(&risk_frame.to_string(), "listen-key", &mut from_risk),
             RiskFrame::Continue
         );
 
