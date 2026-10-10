@@ -205,6 +205,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     weight on cross margin and 111 on isolated, almost all of it the interest rate; the borrow
     capacity costs 51 and 60. Binance does not say how much it has to lend in total, so
     `available` is unknown there.
+  - `IbkrClient` implements `ShortabilityClient` from IB's shortable ticks, through a streaming
+    market data request for generic tick 236: tick 46's level gives shortable and easy to borrow,
+    and tick 89 the shares IB has to lend. IB reports no borrow fee to the API, so the fee is
+    unknown. The request holds one of the account's market data lines until both ticks arrive or
+    the new `IbkrConfig::shortability_timeout` runs out (10 s by default; set it with
+    `with_shortability_timeout`, or `shortability_timeout_ms` in a config file), and returns what
+    arrived. Nothing arriving is an error: `ConnectivityError::Timeout`, or
+    `ApiError::RequestRejected` carrying IB's notices, such as one saying the account lacks the
+    stock's market data subscription. A contract that is not a stock, or not registered, is
+    `ApiError::InstrumentInvalid`.
   - An option, and a symbol the venue does not know, is `ApiError::InstrumentInvalid`.
   - `Shortability::fee_rate` now states its convention: simple, on the venue's own year basis.
 

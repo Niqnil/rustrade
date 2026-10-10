@@ -9,7 +9,8 @@
 //! for CI, and requires IB Gateway/TWS running locally.
 //!
 //! **Tested locally:** All execution tests (connection, orders, account streaming)
-//! run on paper trading accounts — no market data subscriptions required.
+//! run on paper trading accounts — no market data subscriptions required, except for
+//! [shortability](#shortability).
 //!
 //! # Connection
 //!
@@ -40,6 +41,14 @@
 //! `TotalCashValue`, and so `total`, leaves them out: up to a month of charges. This client does
 //! not read `AccruedCash`. Fills carry none of these charges, so PnL computed from them excludes
 //! them too.
+//!
+//! # Shortability
+//!
+//! [`ShortabilityClient`](crate::client::ShortabilityClient) reads what IB says about lending a
+//! stock from its shortable market data ticks, so unlike the rest of this client it uses one of
+//! the account's market data lines while it runs, and IB answers it only for an account entitled
+//! to the stock's market data. See `fetch_shortability` under [`IbkrClient`]'s trait
+//! implementations, and [`IbkrConfig::shortability_timeout`].
 //!
 //! # Limitations
 //!
@@ -111,6 +120,7 @@ mod ended_orders;
 pub mod execution;
 pub mod order;
 mod recovery;
+mod shortability;
 
 use crate::{
     AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, Snapshot, UnindexedAccountEvent,
@@ -170,6 +180,7 @@ use rustrade_instrument::{
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use serde::{Deserialize, Serialize};
+pub use shortability::DEFAULT_SHORTABILITY_TIMEOUT;
 use smol_str::format_smolstr;
 use std::{
     collections::HashSet,
@@ -232,11 +243,50 @@ pub struct IbkrConfig {
     /// position whoever placed the order.
     #[serde(default)]
     pub other_clients_fills: bool,
+    /// How long [`fetch_shortability`](crate::client::ShortabilityClient::fetch_shortability)
+    /// waits for IB's shortability ticks before answering with what has arrived, or failing when
+    /// nothing has. [`DEFAULT_SHORTABILITY_TIMEOUT`] by default.
+    ///
+    /// The request holds one of the account's market data lines for up to this long.
+    /// Serialised as whole milliseconds, under `shortability_timeout_ms`.
+    #[serde(
+        rename = "shortability_timeout_ms",
+        default = "default_shortability_timeout",
+        with = "duration_millis"
+    )]
+    pub shortability_timeout: std::time::Duration,
+}
+
+/// `#[serde(default = "…")]` takes a function, not a constant.
+fn default_shortability_timeout() -> std::time::Duration {
+    DEFAULT_SHORTABILITY_TIMEOUT
+}
+
+/// A [`Duration`](std::time::Duration) as a whole number of milliseconds, so a config file
+/// writes `10000` rather than the `{ secs, nanos }` serde gives it by default.
+mod duration_millis {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::time::Duration;
+
+    pub(super) fn serialize<S: Serializer>(
+        duration: &Duration,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        // Saturates rather than fails: no timeout needs more than u64::MAX milliseconds.
+        serializer.serialize_u64(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Duration, D::Error> {
+        u64::deserialize(deserializer).map(Duration::from_millis)
+    }
 }
 
 impl IbkrConfig {
     /// A config connecting to TWS or Gateway at `host`:`port` as API client `client_id`, with no
-    /// contracts to register and only this client's fills reported.
+    /// contracts to register, only this client's fills reported, and the default
+    /// [`shortability_timeout`](Self::shortability_timeout).
     pub fn new(
         host: impl Into<String>,
         port: u16,
@@ -250,6 +300,7 @@ impl IbkrConfig {
             account: account.into(),
             contracts: Vec::new(),
             other_clients_fills: false,
+            shortability_timeout: DEFAULT_SHORTABILITY_TIMEOUT,
         }
     }
 
@@ -264,6 +315,15 @@ impl IbkrConfig {
     pub fn with_other_clients_fills(self, other_clients_fills: bool) -> Self {
         Self {
             other_clients_fills,
+            ..self
+        }
+    }
+
+    /// This config with [`shortability_timeout`](Self::shortability_timeout) set.
+    #[must_use]
+    pub fn with_shortability_timeout(self, shortability_timeout: std::time::Duration) -> Self {
+        Self {
+            shortability_timeout,
             ..self
         }
     }

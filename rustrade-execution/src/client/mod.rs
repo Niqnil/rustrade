@@ -578,14 +578,23 @@ pub trait ShortabilityClient: ExecutionClient {
     ///   lend, not what is left of it for this account; that is
     ///   [`BorrowCapacityClient::fetch_borrow_capacity`], where a venue reports it.
     /// - **May be expensive.** An implementation may make several requests, some of them heavy
-    ///   against the venue's rate limit; each says what it costs. Fetch it when deciding on a
-    ///   short, not on every tick.
+    ///   against the venue's rate limit, or hold a scarce resource such as a market data line;
+    ///   each says what it costs. Fetch it when deciding on a short, not on every tick.
+    /// - **May be slow.** Where the venue streams its answer rather than replying to a request,
+    ///   the call waits for it, up to a timeout the implementation documents: seconds, not
+    ///   milliseconds.
+    /// - **May outlive its future.** An implementation that reads on a blocking thread finishes
+    ///   that read, and releases what it holds, even when the returned future is dropped first;
+    ///   each says so.
     ///
     /// # Errors
     ///
-    /// [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid) for an instrument
-    /// the venue does not know, or one of a kind that is not sold short by borrowing it, such as an
-    /// option.
+    /// - [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid) for an
+    ///   instrument the venue does not know, or one of a kind that is not sold short by borrowing
+    ///   it, such as an option.
+    /// - An error, rather than a [`Shortability`] with nothing known, when the venue does not
+    ///   answer, including when the account is not entitled to the answer, such as one without the
+    ///   market data subscription a venue sends it through.
     fn fetch_shortability(
         &self,
         instrument: &InstrumentNameExchange,
