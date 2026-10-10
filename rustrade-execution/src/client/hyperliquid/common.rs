@@ -5,8 +5,8 @@
 //!
 //! Error mapping is in the `error` module.
 
-use crate::client::hyperliquid::error::map_sdk_error;
-use crate::error::{ApiError, OrderError, UnindexedClientError};
+use crate::client::hyperliquid::error::{map_sdk_error, order_rejection};
+use crate::error::{OrderError, UnindexedClientError};
 use crate::order::{
     Order, OrderKey, OrderKind, TimeInForce, UnindexedOrderSnapshot,
     id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
@@ -536,9 +536,9 @@ pub(super) fn order_update_to_order(
         OrderStatus::Cancelled => {
             OrderState::inactive(Cancelled::new(order_id, time_exchange, filled_quantity()))
         }
-        OrderStatus::Rejected => OrderState::inactive(OrderError::Rejected(
-            ApiError::OrderRejected(update.status.clone()),
-        )),
+        OrderStatus::Rejected => {
+            OrderState::inactive(OrderError::Rejected(order_rejection(update.status.clone())))
+        }
     };
 
     // The update carries neither the order's kind nor its time in force.
@@ -913,6 +913,7 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 pub(super) mod info_tests {
     use super::*;
+    use crate::error::ApiError;
     use rust_decimal_macros::dec;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1397,6 +1398,22 @@ pub(super) mod info_tests {
                 assert_eq!(cancelled.filled_quantity, None);
             }
             other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_status_saying_funds_ran_short_ends_the_order_as_balance_insufficient() {
+        for status in ["perpMarginRejected", "insufficientSpotBalanceRejected"] {
+            let update = order_update(status, &format!(r#""{CLOID}""#), "0.0075");
+            let order = snapshot_of(
+                order_update_to_account_event(&update, ExchangeId::HyperliquidPerp, eth()).unwrap(),
+            );
+            match order.state {
+                OrderState::Inactive(crate::order::state::InactiveOrderState::OpenFailed(
+                    OrderError::Rejected(ApiError::BalanceInsufficient(None, reason)),
+                )) => assert_eq!(reason, status),
+                other => panic!("{status}: expected BalanceInsufficient, got {other:?}"),
+            }
         }
     }
 

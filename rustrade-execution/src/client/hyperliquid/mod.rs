@@ -222,7 +222,7 @@ use common::{
 };
 pub use config::{HyperliquidConfig, HyperliquidConfigError, Network};
 pub use error::HyperliquidConnectError;
-use error::map_order_error;
+use error::{map_order_error, order_rejection};
 use ethers::signers::Signer;
 use fnv::FnvHashSet;
 use funding::{funding_cash_flow, send_fundings};
@@ -1186,9 +1186,7 @@ impl ExecutionClient for HyperliquidClient {
                     }
                     Some(ExchangeDataStatus::Error(msg)) => {
                         warn!(%msg, "Order rejected by exchange");
-                        OrderState::inactive(OrderError::Rejected(
-                            crate::error::ApiError::OrderRejected(msg),
-                        ))
+                        OrderState::inactive(OrderError::Rejected(order_rejection(msg)))
                     }
                     Some(
                         ExchangeDataStatus::WaitingForFill | ExchangeDataStatus::WaitingForTrigger,
@@ -1217,9 +1215,7 @@ impl ExecutionClient for HyperliquidClient {
             }
             ExchangeResponseStatus::Err(msg) => {
                 warn!(%msg, "Order rejected");
-                OrderState::inactive(OrderError::Rejected(crate::error::ApiError::OrderRejected(
-                    msg,
-                )))
+                OrderState::inactive(OrderError::Rejected(order_rejection(msg)))
             }
         };
         let order = Order {
@@ -1730,25 +1726,83 @@ mod tests {
         }
     }
 
-    mod precision {
+    mod open_order {
         use super::*;
-        use crate::error::{OrderField, PrecisionLimit, PrecisionViolation};
+        use crate::error::{ApiError, OrderField, PrecisionLimit, PrecisionViolation};
         use crate::order::{OrderEvent, request::RequestOpen, state::InactiveOrderState};
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         /// A server whose exchange endpoint rests every order it is sent.
         async fn resting_server() -> MockServer {
+            server_responding(serde_json::json!({
+                "status": "ok",
+                "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 77}}]}},
+            }))
+            .await
+        }
+
+        /// A server whose exchange endpoint answers every request with `body`.
+        async fn server_responding(body: serde_json::Value) -> MockServer {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/exchange"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "status": "ok",
-                    "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 77}}]}},
-                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
                 .mount(&server)
                 .await;
             server
+        }
+
+        /// A refusal for want of margin is a balance shortfall, as on other venues; any other
+        /// refusal stays a rejection. Hyperliquid names no asset. The refusal is read both as an
+        /// order's status and as the error of the whole response.
+        #[tokio::test]
+        async fn an_order_refused_for_margin_is_balance_insufficient() {
+            const MARGIN: &str = "Insufficient margin to place order. asset=0";
+            const MINIMUM: &str = "Order must have minimum value of $10. asset=0";
+            let in_status = |error: &str| {
+                serde_json::json!({
+                    "status": "ok",
+                    "response": {"type": "order", "data": {"statuses": [{"error": error}]}},
+                })
+            };
+            let in_response = |error: &str| serde_json::json!({"status": "err", "response": error});
+            for (body, expected) in [
+                (
+                    in_status(MARGIN),
+                    ApiError::BalanceInsufficient(None, MARGIN.to_owned()),
+                ),
+                (
+                    in_response(MARGIN),
+                    ApiError::BalanceInsufficient(None, MARGIN.to_owned()),
+                ),
+                (
+                    in_status(MINIMUM),
+                    ApiError::OrderRejected(MINIMUM.to_owned()),
+                ),
+                (
+                    in_response(MINIMUM),
+                    ApiError::OrderRejected(MINIMUM.to_owned()),
+                ),
+            ] {
+                let server = server_responding(body.clone()).await;
+                let client = client_against(&server, HashMap::from([("BTC".to_owned(), 0)])).await;
+                let order = place(
+                    &client,
+                    &InstrumentNameExchange::from("BTC-USDC-PERP"),
+                    OrderKind::Limit,
+                    Some(dec!(50000)),
+                    dec!(0.001),
+                )
+                .await;
+                let OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                    reported,
+                ))) = &order.state
+                else {
+                    panic!("{body}: expected a rejection, got {:?}", order.state);
+                };
+                assert_eq!(reported, &expected, "{body}");
+            }
         }
 
         async fn place(
