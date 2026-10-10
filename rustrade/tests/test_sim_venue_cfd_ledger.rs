@@ -405,7 +405,7 @@ impl
 }
 
 /// A round trip of 1 contract: opened at 5,000 at 22:00, through 5,100 at 22:30, closed at 5,200
-/// at 23:00, from an account funded with `margin` and charging what `venue_options` configure.
+/// at 23:10, from an account funded with `margin` and charging what `venue_options` configure.
 async fn round_trip(
     margin: Decimal,
     venue_options: FnvHashMap<ExchangeId, SimVenueOptions>,
@@ -421,7 +421,7 @@ async fn round_trip(
     let market_events = [
         ("2025-03-24T22:00:00Z", dec!(5000)),
         ("2025-03-24T22:30:00Z", dec!(5100)),
-        ("2025-03-24T23:00:00Z", dec!(5200)),
+        ("2025-03-24T23:10:00Z", dec!(5200)),
     ]
     .into_iter()
     .map(|(time, price)| {
@@ -506,9 +506,9 @@ async fn a_backtest_opens_and_closes_a_cfd_with_one_positions_margin() {
     assert_eq!(usd_end.free, usd_end.total, "nothing is left held");
 }
 
-/// Hourly funding charges the long once, at 23:00: the boundary falls between no two ticks the
-/// strategy acts on, so the runner wakes the venue for it, and it is charged before the tick at
-/// that instant closes the position. It is valued at the market as of the boundary, 5,100, so
+/// Hourly funding charges the long once, at 23:00. No market event falls on that boundary, between
+/// the ticks at 22:30 and 23:10, so the runner wakes the venue for it, and it is charged before
+/// the tick at 23:10 closes the position. It is valued at the market as of the boundary, 5,100, so
 /// the long pays 1 × 25 × 5,100 × 0.0001 = 12.75.
 ///
 /// The venue's balance and the engine's carry describe that one charge: the balance ends 12.75

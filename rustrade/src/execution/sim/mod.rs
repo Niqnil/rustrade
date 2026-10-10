@@ -100,18 +100,20 @@ enum Action {
     Wake,
 }
 
-/// The wake-up each venue has queued for its own next deadline.
+/// The wake-ups each venue has queued for its own next deadline.
 ///
-/// One per venue at a time. A venue's deadline moves whenever the venue does — an order rests
-/// with an earlier expiry, a position opens and has a boundary to be charged at — so it is
-/// re-read after every action and every market event routed to the venue, and a new wake-up is
-/// queued when it has changed. The one it replaces stays in the queue, since a [`BinaryHeap`]
-/// cannot remove an entry, and does nothing when it pops: only the wake-up at the instant
-/// recorded here is live.
+/// A venue's deadline moves whenever the venue does — an order rests with an earlier expiry, a
+/// position opens and has a boundary to be charged at, an order is cancelled — so it is re-read
+/// after every action and every market event routed to the venue. A wake-up is queued only when
+/// the deadline is earlier than the earliest one already queued. One queued for a deadline that has
+/// since moved later still pops, moves the venue's clock to an instant at which it has nothing to
+/// do, and queues the real one, which costs one empty step. Queuing on every change instead would
+/// grow the queue by one entry per change, for as long as the furthest deadline: a strategy
+/// re-placing a week-long good-till-date quote on every tick would hold one per tick for a week.
 #[derive(Debug)]
 struct Wakeups {
-    /// The instant each venue's live wake-up is due.
-    armed: FnvHashMap<ExchangeIndex, DateTime<Utc>>,
+    /// The earliest wake-up queued for each venue and not yet popped.
+    queued: FnvHashMap<ExchangeIndex, DateTime<Utc>>,
     /// The session start. A deadline before it — a seeded order that had already expired — is
     /// woken for at the session start instead, so nothing is stamped before the run began.
     floor: DateTime<Utc>,
@@ -123,13 +125,13 @@ struct Wakeups {
 impl Wakeups {
     fn new(floor: DateTime<Utc>) -> Self {
         Self {
-            armed: FnvHashMap::default(),
+            queued: FnvHashMap::default(),
             floor,
             stopped: false,
         }
     }
 
-    /// Queue a wake-up at `venue`'s next deadline, unless one is already queued for it.
+    /// Queue a wake-up at `venue`'s next deadline, unless one at or before it is already queued.
     fn arm(
         &mut self,
         pending: &mut BinaryHeap<Reverse<ScheduledEvent>>,
@@ -142,14 +144,18 @@ impl Wakeups {
         }
 
         let Some(deadline) = venue.next_deadline() else {
-            self.armed.remove(&exchange);
             return;
         };
         let deadline = deadline.max(self.floor);
 
-        if self.armed.insert(exchange, deadline) == Some(deadline) {
+        if self
+            .queued
+            .get(&exchange)
+            .is_some_and(|queued| *queued <= deadline)
+        {
             return;
         }
+        self.queued.insert(exchange, deadline);
 
         pending.push(Reverse(ScheduledEvent {
             time: deadline,
@@ -161,12 +167,13 @@ impl Wakeups {
         *seq += 1;
     }
 
-    /// Whether a wake-up for `exchange` popped at `time` is that venue's live one, consuming it if
-    /// so. One that is not has been superseded, and must do nothing.
+    /// Whether a wake-up for `exchange` popped at `time` is the earliest one queued for it,
+    /// consuming it if so. Any other has been overtaken by an earlier one that has already woken
+    /// the venue, and must do nothing.
     fn take(&mut self, exchange: ExchangeIndex, time: DateTime<Utc>) -> bool {
-        let live = self.armed.get(&exchange) == Some(&time);
+        let live = self.queued.get(&exchange) == Some(&time);
         if live {
-            self.armed.remove(&exchange);
+            self.queued.remove(&exchange);
         }
         live
     }
@@ -174,7 +181,7 @@ impl Wakeups {
     /// Stop waking venues: the source is exhausted. Every queued wake-up becomes a no-op.
     fn stop(&mut self) {
         self.stopped = true;
-        self.armed.clear();
+        self.queued.clear();
     }
 }
 
@@ -401,7 +408,8 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// - A deadline at a source event's instant is reached before that event, as every venue-bound
 ///   action at an instant is.
 /// - A wake-up the venue no longer needs, because its order was cancelled or filled or its
-///   position closed, stays in the queue and does nothing when it pops.
+///   position closed, stays in the queue. When it pops it moves the venue's clock to an instant
+///   with nothing due, which changes nothing, and the venue's real next deadline is queued.
 /// - Simulated time still ends with the source. Once the source is exhausted no venue is woken,
 ///   so a deadline after the last source event is never reached.
 /// - A deadline before the session start, such as that of a seeded order already past it, is
@@ -751,6 +759,13 @@ where
                     // A venue acted. Nothing to emit, and what it produced is now queued, so the
                     // next iteration weighs that against the source exactly as it did this one.
                     Step::Acted => continue,
+                    // A venue was woken at its own deadline, which moved simulated time forward
+                    // as a source event does, so what it produces starts a fresh budget. A gap in
+                    // the source spanning many charges is not a feedback cycle.
+                    Step::Woken => {
+                        *this.since_source = 0;
+                        continue;
+                    }
                     // Nothing left owed and no source to draw from: the run is over.
                     Step::Empty => {
                         *this.terminated = true;
@@ -872,9 +887,10 @@ fn route_market<MarketKind>(
 /// # An action at the head is not what the budget counts
 /// The budget counts what the `Engine` is *shown*, so a venue-bound action is let through: it
 /// emits nothing, and reporting against it would name a request rather than the deliverable the
-/// run stopped on. It cannot defer the guard indefinitely either — every action this runner
-/// queues produces at least a response, so the head becomes a deliverable within one step and the
-/// limit is reached on the same count it would have been.
+/// run stopped on. It cannot defer the guard indefinitely either. A request produces at least a
+/// response, so the head becomes a deliverable within one step. A wake-up produces no response,
+/// but each one that acts leaves the venue's next deadline strictly later, and only a deadline
+/// queues one, so a run of wake-ups at one instant ends.
 fn check_feedback(
     venues: &FnvIndexMap<ExchangeIndex, SimVenue>,
     pending: &BinaryHeap<Reverse<ScheduledEvent>>,
@@ -1010,8 +1026,10 @@ fn drain_requests(
 /// alone — the same one leg a tick-caused fill pays — and are scheduled ahead of this request's
 /// own response, which they precede in fact as well as in the queue.
 ///
-/// A [`Action::Wake`] moves the clock and does nothing else, and only if it is the venue's live
-/// wake-up — see [`Wakeups`]. Every action ends by re-reading the venue's next deadline.
+/// A [`Action::Wake`] moves the clock and does nothing else, and only if it is the venue's earliest
+/// queued wake-up — see [`Wakeups`]. Every action ends by re-reading the venue's next deadline.
+///
+/// Returns whether a wake-up moved the venue's clock.
 ///
 /// # Panics
 /// Panics if `exchange` is not registered, or if a simulated timestamp overflows — see
@@ -1026,13 +1044,14 @@ fn act(
     exchange: ExchangeIndex,
     time: DateTime<Utc>,
     action: Action,
-) {
+) -> bool {
     let slot = venues.get_mut(&exchange).unwrap_or_else(|| {
         panic!("SimRunner scheduled an action for an unregistered venue: {exchange}")
     });
 
-    if matches!(action, Action::Wake) && !wakeups.take(exchange, time) {
-        return;
+    let woken = matches!(action, Action::Wake);
+    if woken && !wakeups.take(exchange, time) {
+        return false;
     }
 
     let delivers = checked_offset(
@@ -1071,6 +1090,7 @@ fn act(
     }
 
     wakeups.arm(pending, seq, exchange, &slot.venue);
+    woken
 }
 
 /// Apply a simulated latency offset, refusing to schedule an event before its own cause.
@@ -1156,6 +1176,9 @@ enum Step<MarketKind> {
     Emitted(EngineEvent<MarketKind>),
     /// An action was popped and run against its venue. Nothing to emit; poll again.
     Acted,
+    /// A wake-up was popped and moved its venue's clock to the venue's own deadline. Nothing to
+    /// emit; poll again.
+    Woken,
     /// The queue is empty.
     Empty,
 }
@@ -1184,8 +1207,10 @@ fn step<MarketKind>(
 
     let payload = match payload {
         Payload::Act(action) => {
-            act(venues, pending, seq, wakeups, exchange, time, action);
-            return Step::Acted;
+            return match act(venues, pending, seq, wakeups, exchange, time, action) {
+                true => Step::Woken,
+                false => Step::Acted,
+            };
         }
         Payload::Deliver(payload) => payload,
     };
@@ -1430,6 +1455,14 @@ mod tests {
                 txs: execution_tx_map,
                 clock,
                 exchange,
+            }
+        }
+
+        /// The same harness, abandoning a run after `limit` deliverables with no source event.
+        fn with_feedback_limit(self, limit: usize) -> Self {
+            Self {
+                runner: self.runner.with_feedback_limit(limit),
+                ..self
             }
         }
 
@@ -2331,6 +2364,55 @@ mod tests {
             vec!["balance", "cancelled", "market", "after_drain"],
             "the cancel releases the hold, and nothing expires at 500"
         );
+    }
+
+    /// Re-placing an order with a far deadline, again and again, does not grow the queue: a
+    /// wake-up is queued only for a deadline earlier than the one already queued.
+    #[tokio::test]
+    async fn re_placing_an_expiring_order_does_not_grow_the_queue() {
+        let mut harness = Harness::new(0, vec![market(10, dec!(200)), market(900_000, dec!(200))]);
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+        harness.clock.advance_to(at(10));
+
+        for _ in 0..200 {
+            let cid = harness.send_limit_gtd(dec!(1), at(500_000));
+            assert_eq!(harness.next().await, Some("balance"));
+            assert_eq!(harness.next().await, Some("order"));
+            harness.send_cancel(cid);
+            assert_eq!(harness.next().await, Some("balance"));
+            assert_eq!(harness.next().await, Some("cancelled"));
+        }
+
+        assert!(
+            harness.runner.pending.len() <= 1,
+            "one wake-up at most, not one per order: {}",
+            harness.runner.pending.len()
+        );
+    }
+
+    /// A venue woken at its own deadline moves simulated time forward, so what it produces does
+    /// not count towards the zero-delay feedback budget: a quiet stretch of the source with many
+    /// deadlines in it is not a feedback cycle.
+    #[tokio::test]
+    async fn deadlines_between_source_events_do_not_spend_the_feedback_budget() {
+        // The five opens alone deliver ten events after the tick at 10; the five expiries would
+        // take that to twenty with no source event between them.
+        let mut harness = Harness::new(0, vec![market(10, dec!(200)), market(1_000, dec!(200))])
+            .with_feedback_limit(12);
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+        harness.clock.advance_to(at(10));
+        for deadline in [100, 200, 300, 400, 500] {
+            harness.send_limit_gtd(dec!(1), at(deadline));
+        }
+
+        let labels = harness.rest().await;
+        assert_eq!(harness.runner.error(), None);
+        assert_eq!(labels.len(), 22, "{labels:?}");
+        assert_eq!(labels[20..], ["market", "after_drain"]);
     }
 
     /// Simulated time ends with the last source event: a deadline after it is never reached, as
