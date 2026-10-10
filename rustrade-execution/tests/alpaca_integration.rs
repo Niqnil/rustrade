@@ -266,10 +266,10 @@ async fn test_fetch_shortability() {
         .await
         .expect("BTC/USD shortability");
     println!("BTC/USD: {btc:?}");
-    assert_eq!(
-        btc.easy_to_borrow, None,
-        "borrow status is for US equities only"
-    );
+    // Alpaca lends no crypto. Its `borrow_status` is for US equities only, but a crypto asset
+    // still carries the `easy_to_borrow` flag, false, which is reported as given.
+    assert_eq!(btc.shortable, Some(false), "Alpaca does not short crypto");
+    assert_eq!(btc.fee_rate, None);
 
     let unknown = client
         .fetch_shortability(&InstrumentNameExchange::new("NOSUCHSYMBOLXYZ"))
