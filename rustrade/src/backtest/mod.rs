@@ -33,17 +33,20 @@ use crate::{
 use crate::{
     engine::{Engine, in_flight::InFlightDeadlines},
     execution::sim::{
-        SimExecutionBuild, SimExecutionBuilder, SimRunner, VenueMarketUpdate, log_venue_summary,
+        SimExecutionBuild, SimExecutionBuilder, SimRunner, SimVenueOptions, VenueMarketUpdate,
+        log_venue_summary,
     },
 };
 use chrono::{DateTime, Utc};
-use fnv::FnvHashSet;
+use fnv::{FnvHashMap, FnvHashSet};
 use futures::{Stream, StreamExt, future::try_join_all, stream::FusedStream};
 use rust_decimal::Decimal;
 use rustrade_data::{event::MarketEvent, streams::consumer::MarketStreamEvent};
 use rustrade_execution::AccountEvent;
 use rustrade_instrument::{
-    asset::AssetIndex, exchange::ExchangeIndex, index::IndexedInstruments,
+    asset::AssetIndex,
+    exchange::{ExchangeId, ExchangeIndex},
+    index::IndexedInstruments,
     instrument::InstrumentIndex,
 };
 use smol_str::SmolStr;
@@ -76,6 +79,14 @@ pub struct BacktestArgsConstant<MarketData, SummaryInterval, State, AuxEvents = 
     pub instruments: IndexedInstruments,
     /// Exchange execution configurations.
     pub executions: Vec<ExecutionConfig>,
+    /// What each simulated venue models beyond its execution configuration, keyed by the exchange
+    /// it mocks: what holding a position there costs, for one — see [`SimVenueOptions`]. A venue
+    /// with no entry models nothing extra, so an empty map is every venue as configured.
+    ///
+    /// An entry for an exchange no execution configuration mocks is refused with
+    /// [`BarterError::ExecutionBuilder`]: options that nothing would apply are a misconfiguration,
+    /// and ignoring them would run a backtest without the costs its author configured.
+    pub venue_options: FnvHashMap<ExchangeId, SimVenueOptions>,
     /// Historical market data to use for simulation.
     pub market_data: MarketData,
     /// Time interval for aggregating and reporting summary statistics.
@@ -384,6 +395,23 @@ where
 
     // Build the simulated venues. Nothing is spawned, connected or awaited: `SimRunner` drives
     // them inline on the engine's own thread, which is what makes a run reproducible.
+    let mocked = args_constant
+        .executions
+        .iter()
+        .map(|config| match config {
+            ExecutionConfig::Mock(mock) => mock.mocked_exchange,
+        })
+        .collect::<FnvHashSet<_>>();
+    if let Some(exchange) = args_constant
+        .venue_options
+        .keys()
+        .find(|exchange| !mocked.contains(exchange))
+    {
+        return Err(BarterError::ExecutionBuilder(format!(
+            "BacktestArgsConstant::venue_options has options for {exchange}, which no execution \
+             configuration mocks"
+        )));
+    }
     let SimExecutionBuild {
         execution_tx_map,
         venues,
@@ -394,7 +422,14 @@ where
         .try_fold(
             SimExecutionBuilder::new(&args_constant.instruments),
             |builder, config| match config {
-                ExecutionConfig::Mock(mock_config) => builder.add_venue(mock_config),
+                ExecutionConfig::Mock(mock_config) => {
+                    let options = args_constant
+                        .venue_options
+                        .get(&mock_config.mocked_exchange)
+                        .cloned()
+                        .unwrap_or_default();
+                    builder.add_venue_with_options(mock_config, options)
+                }
             },
         )?
         .build();

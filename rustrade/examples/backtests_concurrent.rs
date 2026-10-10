@@ -70,6 +70,7 @@ async fn main() {
     // Construct constant backtest arguments
     let args_constant = Arc::new(BacktestArgsConstant {
         instruments,
+        venue_options: Default::default(),
         executions,
         market_data,
         summary_interval: Daily,

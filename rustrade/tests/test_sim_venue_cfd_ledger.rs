@@ -16,13 +16,14 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
+use fnv::FnvHashMap;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use rustrade::{
     backtest::{
         BacktestArgsConstant, BacktestArgsDynamic, aux_events::NoAuxEvents, backtest,
-        market_data::MarketDataInMemory,
+        market_data::MarketDataInMemory, summary::BacktestResult,
     },
     engine::{
         Engine,
@@ -39,7 +40,7 @@ use rustrade::{
             trading::TradingState,
         },
     },
-    execution::request::ExecutionRequest,
+    execution::{request::ExecutionRequest, sim::SimVenueOptions},
     risk::DefaultRiskManager,
     statistic::time::Daily,
     strategy::{
@@ -60,6 +61,7 @@ use rustrade_execution::{
     exchange::mock::SimulatedVenue,
     fee::{FeeModelConfig, PercentageFeeModel},
     fill::SimFillConfig,
+    holding_cost::{FundingModel, RateSeries},
     market::MarketSnapshot,
     order::{
         OrderEvent, OrderKey, OrderKind, TimeInForce,
@@ -402,11 +404,12 @@ impl
     }
 }
 
-/// Funded with exactly the margin one contract posts at 5,000 (1 × 25 × 5,000). Opening takes the
-/// whole balance, so the close only goes through because it is paid for by the position it closes,
-/// and the run ends flat with the realised PnL, 1 × 25 × (5,200 − 5,000), in the balance.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_backtest_opens_and_closes_a_cfd_with_one_positions_margin() {
+/// A round trip of 1 contract: opened at 5,000 at 22:00, through 5,100 at 22:30, closed at 5,200
+/// at 23:00, from an account funded with `margin` and charging what `venue_options` configure.
+async fn round_trip(
+    margin: Decimal,
+    venue_options: FnvHashMap<ExchangeId, SimVenueOptions>,
+) -> BacktestResult<Daily, BacktestState> {
     let mut cfd = instrument(EXCHANGE, "spx500", "usd");
     cfd.kind = InstrumentKind::Cfd(CfdContract {
         contract_size: contract_size(),
@@ -445,9 +448,9 @@ async fn a_backtest_opens_and_closes_a_cfd_with_one_positions_margin() {
     .trading_state(TradingState::Enabled)
     .build();
 
-    let margin = dec!(125_000);
     let args_constant = Arc::new(BacktestArgsConstant {
         instruments,
+        venue_options,
         executions: vec![ExecutionConfig::Mock(mock_config(
             margin,
             FeeModelConfig::default(),
@@ -458,7 +461,7 @@ async fn a_backtest_opens_and_closes_a_cfd_with_one_positions_margin() {
         aux_events: NoAuxEvents,
     });
 
-    let result = backtest(
+    backtest(
         args_constant,
         BacktestArgsDynamic {
             id: "cfd-round-trip".into(),
@@ -468,7 +471,27 @@ async fn a_backtest_opens_and_closes_a_cfd_with_one_positions_margin() {
         },
     )
     .await
-    .expect("a CFD round trip must complete");
+    .expect("a CFD round trip must complete")
+}
+
+fn usd_end(result: &BacktestResult<Daily, BacktestState>) -> Balance {
+    result
+        .summary
+        .trading_summary
+        .assets
+        .get(&ExchangeAsset::<AssetNameInternal>::new(EXCHANGE, "usd"))
+        .expect("the run is funded in usd, so it must be summarised")
+        .balance_end
+        .expect("a funded asset has a closing balance")
+}
+
+/// Funded with exactly the margin one contract posts at 5,000 (1 × 25 × 5,000). Opening takes the
+/// whole balance, so the close only goes through because it is paid for by the position it closes,
+/// and the run ends flat with the realised PnL, 1 × 25 × (5,200 − 5,000), in the balance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backtest_opens_and_closes_a_cfd_with_one_positions_margin() {
+    let margin = dec!(125_000);
+    let result = round_trip(margin, FnvHashMap::default()).await;
 
     let positions = result
         .engine_state
@@ -478,14 +501,102 @@ async fn a_backtest_opens_and_closes_a_cfd_with_one_positions_margin() {
         .count();
     assert_eq!(positions, 0, "the close filled, so the run ends flat");
 
-    let usd_end = result
-        .summary
-        .trading_summary
-        .assets
-        .get(&ExchangeAsset::<AssetNameInternal>::new(EXCHANGE, "usd"))
-        .expect("the run is funded in usd, so it must be summarised")
-        .balance_end
-        .expect("a funded asset has a closing balance");
+    let usd_end = usd_end(&result);
     assert_eq!(usd_end.total, margin + dec!(5_000));
     assert_eq!(usd_end.free, usd_end.total, "nothing is left held");
+}
+
+/// Hourly funding charges the long once, at 23:00: the boundary falls between no two ticks the
+/// strategy acts on, so the runner wakes the venue for it, and it is charged before the tick at
+/// that instant closes the position. It is valued at the market as of the boundary, 5,100, so
+/// the long pays 1 × 25 × 5,100 × 0.0001 = 12.75.
+///
+/// The venue's balance and the engine's carry describe that one charge: the balance ends 12.75
+/// short of the PnL, the tear sheet reports it as carry, and its PnL is net of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backtest_charges_a_held_cfd_its_funding_and_the_engine_carries_it() {
+    let funding = FundingModel::new(TimeDelta::hours(1)).with_rates(
+        InstrumentNameExchange::new("spx500_usd"),
+        RateSeries::constant(dec!(0.0001)),
+    );
+    let options = FnvHashMap::from_iter([(
+        EXCHANGE,
+        SimVenueOptions::default().with_holding_cost(Arc::new(funding)),
+    )]);
+
+    let margin = dec!(200_000);
+    let result = round_trip(margin, options).await;
+
+    assert_eq!(usd_end(&result).total, margin + dec!(5_000) - dec!(12.75));
+
+    let tear_sheet = result
+        .summary
+        .trading_summary
+        .instruments
+        .values()
+        .next()
+        .expect("one instrument traded");
+    assert_eq!(tear_sheet.carry, dec!(-12.75));
+    assert_eq!(tear_sheet.pnl, dec!(5_000) - dec!(12.75));
+}
+
+/// Options for an exchange no execution configuration mocks are a misconfiguration: refused
+/// rather than ignored, which would run the backtest without the costs its author configured.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn venue_options_for_an_exchange_with_no_simulated_venue_are_refused() {
+    let mut cfd = instrument(EXCHANGE, "spx500", "usd");
+    cfd.kind = InstrumentKind::Cfd(CfdContract {
+        contract_size: contract_size(),
+        settlement_asset: cfd.underlying.quote.clone(),
+    });
+    let instruments = IndexedInstruments::new([cfd]);
+    let engine_state = EngineStateBuilder::new(&instruments, DefaultGlobalData, |_| {
+        DefaultInstrumentMarketData::default()
+    })
+    .time_engine_start(ts("2025-03-24T22:00:00Z"))
+    .build();
+    let market_events = vec![MarketStreamEvent::Item(MarketEvent {
+        time_exchange: ts("2025-03-24T22:00:00Z"),
+        time_received: ts("2025-03-24T22:00:00Z"),
+        exchange: EXCHANGE,
+        instrument: instruments.instruments()[0].key,
+        kind: DataKind::Trade(PublicTrade {
+            id: "t".into(),
+            price: dec!(5000),
+            amount: dec!(1),
+            side: None,
+        }),
+    })];
+
+    let args_constant = Arc::new(BacktestArgsConstant {
+        instruments,
+        venue_options: FnvHashMap::from_iter([(ExchangeId::Kraken, SimVenueOptions::default())]),
+        executions: vec![ExecutionConfig::Mock(mock_config(
+            dec!(125_000),
+            FeeModelConfig::default(),
+        ))],
+        market_data: MarketDataInMemory::new(Arc::new(market_events)),
+        summary_interval: Daily,
+        engine_state,
+        aux_events: NoAuxEvents,
+    });
+
+    let error = backtest(
+        args_constant,
+        BacktestArgsDynamic {
+            id: "misconfigured".into(),
+            risk_free_return: Decimal::ZERO,
+            strategy: RoundTrip::default(),
+            risk: DefaultRiskManager::default(),
+        },
+    )
+    .await
+    .expect_err("options nothing would apply must be refused");
+
+    assert!(
+        error
+            .to_string()
+            .contains("no execution configuration mocks"),
+        "unexpected error: {error}"
+    );
 }
