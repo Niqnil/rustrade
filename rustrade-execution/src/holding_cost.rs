@@ -88,6 +88,8 @@ pub struct HeldPosition<'a> {
 }
 
 impl<'a> HeldPosition<'a> {
+    /// A position of signed `quantity` contracts in `instrument`, each of `contract_size` units of
+    /// the underlying, entered at `entry_price` and valued at `price`.
     pub fn new(
         instrument: &'a InstrumentNameExchange,
         quantity: Decimal,
@@ -129,6 +131,7 @@ pub struct HoldingCharge {
 }
 
 impl HoldingCharge {
+    /// A charge for `kind` of `amount`, signed positive when the account receives it.
     pub fn new(kind: CashFlowKind, amount: Decimal) -> Self {
         Self { kind, amount }
     }
@@ -140,9 +143,30 @@ impl HoldingCharge {
 /// One type for a constant rate ([`constant`](Self::constant)) and a replayed history
 /// ([`new`](Self::new)). Before its first point a series has no rate, and a model charges nothing
 /// there rather than inventing one.
+///
+/// Serialised as its list of points, and deserialised through [`new`](Self::new), so a history
+/// loaded from a file is refused out of order exactly as one built in code is.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(
+    try_from = "Vec<(DateTime<Utc>, Decimal)>",
+    into = "Vec<(DateTime<Utc>, Decimal)>"
+)]
 pub struct RateSeries {
     points: Vec<(DateTime<Utc>, Decimal)>,
+}
+
+impl TryFrom<Vec<(DateTime<Utc>, Decimal)>> for RateSeries {
+    type Error = RateSeriesUnsorted;
+
+    fn try_from(points: Vec<(DateTime<Utc>, Decimal)>) -> Result<Self, Self::Error> {
+        Self::new(points)
+    }
+}
+
+impl From<RateSeries> for Vec<(DateTime<Utc>, Decimal)> {
+    fn from(series: RateSeries) -> Self {
+        series.points
+    }
 }
 
 impl RateSeries {
@@ -251,6 +275,7 @@ pub struct HolidayCalendar {
 }
 
 impl HolidayCalendar {
+    /// A calendar closed on weekends and on each of `holidays`.
     pub fn new(holidays: impl IntoIterator<Item = NaiveDate>) -> Self {
         Self {
             holidays: holidays.into_iter().collect(),
@@ -305,6 +330,8 @@ pub struct DailyAccrual<Tz: TimeZone = Utc> {
 }
 
 impl<Tz: TimeZone> DailyAccrual<Tz> {
+    /// Cutoffs at local time `cutoff` in `zone`, on the dates `days` names, each charging its days
+    /// on the `day_count` basis.
     pub fn new(cutoff: NaiveTime, zone: Tz, days: AccrualDays, day_count: DayCount) -> Self {
         Self {
             cutoff,
@@ -493,6 +520,9 @@ impl HoldingCostModel for FundingModel {
 ///
 /// Charged as [`CashFlowKind::BorrowFee`], with the rate and the quantity borrowed in units of the
 /// underlying (`|quantity| × contract_size`).
+///
+/// Its boundaries do not depend on the position's side, so a long in an instrument it has rates
+/// for is still woken for at each cutoff, and charged nothing there.
 #[derive(Debug, Clone)]
 pub struct BorrowFeeModel<Tz: TimeZone = Utc> {
     accrual: DailyAccrual<Tz>,
@@ -558,13 +588,17 @@ where
 /// Each is what the position **pays**; a negative rate is received. A CFD provider typically
 /// charges a long a benchmark rate plus its markup, and a short the benchmark less its markup,
 /// which a short receives while it is positive.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct FinancingRates {
+    /// The annualised rate a long pays.
     pub long: RateSeries,
+    /// The annualised rate a short pays; negative when it receives.
     pub short: RateSeries,
 }
 
 impl FinancingRates {
+    /// The rates a long and a short pay.
     pub fn new(long: RateSeries, short: RateSeries) -> Self {
         Self { long, short }
     }
@@ -712,6 +746,24 @@ mod tests {
     }
 
     #[test]
+    fn a_rate_series_loaded_out_of_order_is_refused_as_one_built_out_of_order_is() {
+        let sorted = RateSeries::new(vec![
+            (utc("2026-01-01T00:00:00Z"), dec!(0.01)),
+            (utc("2026-01-02T00:00:00Z"), dec!(0.02)),
+        ])
+        .unwrap();
+        let json = serde_json::to_string(&sorted).unwrap();
+        assert_eq!(serde_json::from_str::<RateSeries>(&json).unwrap(), sorted);
+
+        let unsorted = r#"[["2026-01-02T00:00:00Z","0.02"],["2026-01-01T00:00:00Z","0.01"]]"#;
+        let error = serde_json::from_str::<RateSeries>(unsorted).unwrap_err();
+        assert!(
+            error.to_string().contains("strictly ascending"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn a_calendar_cutoff_falls_every_day_and_charges_one_day() {
         let accrual = DailyAccrual::new(cutoff(21), Utc, AccrualDays::Calendar, DayCount::Act360);
 
@@ -799,6 +851,23 @@ mod tests {
         assert_eq!(
             accrual.next_boundary(utc("2026-03-08T00:00:00Z")),
             utc("2026-03-08T07:00:00Z")
+        );
+    }
+
+    /// 01:30 happens twice in New York on 2026-11-01; the cutoff is the first, in daylight time.
+    #[test]
+    fn a_cutoff_that_falls_twice_is_taken_the_first_time() {
+        let accrual = DailyAccrual::new(
+            NaiveTime::from_hms_opt(1, 30, 0).unwrap(),
+            chrono_tz::America::New_York,
+            AccrualDays::Calendar,
+            DayCount::Act360,
+        );
+
+        // 01:30 EDT, not 01:30 EST an hour later.
+        assert_eq!(
+            accrual.next_boundary(utc("2026-11-01T00:00:00Z")),
+            utc("2026-11-01T05:30:00Z")
         );
     }
 
