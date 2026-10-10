@@ -115,56 +115,76 @@ pub(crate) const ORDER_CHECK_TIMEOUT_SECS: u64 = 30;
 pub(crate) struct SharedKnownLiveOrders(Arc<parking_lot::Mutex<KnownLiveOrders>>);
 
 impl SharedKnownLiveOrders {
+    /// Lock the set. What it has to say while locked is logged when the guard drops, so a guard
+    /// held long defers that logging with it.
     pub(crate) fn lock(&self) -> KnownLiveOrdersGuard<'_> {
-        KnownLiveOrdersGuard(self.0.lock())
+        KnownLiveOrdersGuard {
+            guard: self.0.lock(),
+            log: ForgottenLog::default(),
+        }
     }
 }
 
-/// The lock on a [`SharedKnownLiveOrders`]. On drop it logs what the set kept to say, with the
-/// lock released, then releases it again.
-#[derive(Debug)]
-pub(crate) struct KnownLiveOrdersGuard<'a>(parking_lot::MutexGuard<'a, KnownLiveOrders>);
+/// The lock on a [`SharedKnownLiveOrders`]. On drop it releases the lock, then logs what the set
+/// kept to say.
+pub(crate) struct KnownLiveOrdersGuard<'a> {
+    // Fields drop in declaration order: the lock is released before `log` logs.
+    guard: parking_lot::MutexGuard<'a, KnownLiveOrders>,
+    log: ForgottenLog,
+}
 
 impl Deref for KnownLiveOrdersGuard<'_> {
     type Target = KnownLiveOrders;
 
     fn deref(&self) -> &KnownLiveOrders {
-        &self.0
+        &self.guard
     }
 }
 
 impl DerefMut for KnownLiveOrdersGuard<'_> {
     fn deref_mut(&mut self) -> &mut KnownLiveOrders {
-        &mut self.0
+        &mut self.guard
     }
 }
 
 impl Drop for KnownLiveOrdersGuard<'_> {
     fn drop(&mut self) {
-        if self.0.forgotten.is_empty() {
-            return;
+        if !self.guard.forgotten.is_empty() {
+            self.log = ForgottenLog {
+                exchange: Some(self.guard.exchange),
+                forgotten: std::mem::take(&mut self.guard.forgotten),
+            };
         }
-        let exchange = self.0.exchange;
-        let forgotten = std::mem::take(&mut self.0.forgotten);
-        // Re-taken once the logging is done, only to be released when the guard is dropped: the
-        // price of releasing it while logging without `unsafe`, paid only when there is something
-        // to log.
-        parking_lot::MutexGuard::unlocked(&mut self.0, || {
-            for Forgotten { cid, first } in forgotten {
-                if first {
-                    warn!(
-                        %exchange,
-                        %cid,
-                        held = MAX_KNOWN_LIVE_ORDERS,
-                        "Holding the most orders as live the client can, and forgetting the oldest \
-                         as more arrive: if one ended while the stream was disconnected, a \
-                         reconnect will not report it. Further orders forgotten are logged at debug"
-                    );
-                } else {
-                    debug!(%exchange, %cid, "Forgetting the oldest order held as live");
-                }
+    }
+}
+
+/// The orders a [`KnownLiveOrdersGuard`] took from the set, logged when it is dropped, which is
+/// after the lock is released.
+#[derive(Default)]
+struct ForgottenLog {
+    exchange: Option<ExchangeId>,
+    forgotten: Vec<Forgotten>,
+}
+
+impl Drop for ForgottenLog {
+    fn drop(&mut self) {
+        let Some(exchange) = self.exchange else {
+            return;
+        };
+        for Forgotten { cid, first } in self.forgotten.drain(..) {
+            if first {
+                warn!(
+                    %exchange,
+                    %cid,
+                    held = MAX_KNOWN_LIVE_ORDERS,
+                    "Holding the most orders as live the client can, and forgetting the oldest as \
+                     more arrive: if one ended while the stream was disconnected, a reconnect will \
+                     not report it. Further orders forgotten are logged at debug"
+                );
+            } else {
+                debug!(%exchange, %cid, "Forgetting the oldest order held as live");
             }
-        });
+        }
     }
 }
 
@@ -213,8 +233,9 @@ pub(crate) struct KnownLiveOrders {
     next_seq: u64,
     /// Whether the set is forgetting orders, so that it warns once per episode, not per order.
     forgetting: bool,
-    /// The orders forgotten since the lock was taken, logged by [`KnownLiveOrdersGuard`] once it
-    /// is released.
+    /// The orders forgotten since the lock was taken, logged once it is released. Only a
+    /// [`KnownLiveOrdersGuard`] drains it, which is why clients take the set from
+    /// [`shared`](Self::shared).
     forgotten: Vec<Forgotten>,
 }
 
@@ -262,7 +283,8 @@ impl KnownLiveOrders {
             known.quantity = quantity;
             let moved = known.instrument != key.instrument;
             let new_id = order_id.filter(|id| known.order_id.as_ref() != Some(*id));
-            // The common case, such as a partial fill: nothing to re-index.
+            // The common case, such as a partial fill: nothing to re-index. The entry under its
+            // id is taken to be its own, as a venue names one order by one id.
             if !moved && new_id.is_none() {
                 return;
             }
@@ -1307,12 +1329,30 @@ mod tests {
         known.observe(&fill("7", Some(dec!(2))));
         assert!(known.contains(&order.cid), "no longer found by its old id");
 
+        let no_id = Open::new(VenueOrderId::ClientAssigned, Utc::now(), dec!(1));
+        known.live(&order, dec!(2), OrderKind::Limit, &no_id);
+        known.assert_consistent();
+
+        // Moved, with no id reported: the id known moves with it.
         let moved = key("ETHUSDT", "a");
-        known.live(&moved, dec!(2), OrderKind::Limit, &open("8", dec!(1)));
+        known.live(&moved, dec!(2), OrderKind::Limit, &no_id);
         known.assert_consistent();
         assert_eq!(
             known.instruments(),
             [InstrumentNameExchange::new("ETHUSDT")]
+        );
+
+        let back = key("BTCUSDT", "a");
+        known.live(&back, dec!(2), OrderKind::Limit, &open("8", dec!(1)));
+        known.assert_consistent();
+        assert_eq!(
+            known.instruments(),
+            [InstrumentNameExchange::new("BTCUSDT")]
+        );
+        known.observe(&fill("8", Some(dec!(2))));
+        assert!(
+            !known.contains(&order.cid),
+            "found by its id on its instrument"
         );
     }
 
