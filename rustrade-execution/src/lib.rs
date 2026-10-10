@@ -75,6 +75,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 pub mod balance;
+pub mod borrow_capacity;
+pub use borrow_capacity::BorrowCapacity;
 pub mod cash_flow;
 pub use cash_flow::{CashFlow, CashFlowId, CashFlowKind};
 pub mod client;

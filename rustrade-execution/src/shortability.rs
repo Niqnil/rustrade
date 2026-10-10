@@ -36,6 +36,11 @@ pub struct Shortability {
     /// total, not what is left after this account's own shorts.
     pub available: Option<Decimal>,
     /// The annualised fee for borrowing the instrument, as a fraction: `0.05` is 5% a year.
+    ///
+    /// Simple, not compounded, and on the venue's own year basis, which differs between venues:
+    /// Alpaca divides its borrow rate over a 360-day year, and Binance's hourly rate is annualised
+    /// over 365 days. A simulated venue's holding costs apply their own
+    /// [`DayCount`](crate::holding_cost::DayCount) to whatever rate they are given.
     pub fee_rate: Option<Decimal>,
 }
 

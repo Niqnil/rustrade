@@ -47,7 +47,7 @@ use crate::{
     InstrumentAccountSnapshot, UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
     client::{
-        BracketOrderClient, ExecutionClient, OrderStatusClient,
+        BracketOrderClient, ExecutionClient, OrderStatusClient, ShortabilityClient,
         order_recovery::{
             KnownLiveOrders, NoPendingFills, OpenListing, OrderLookup, SharedKnownLiveOrders,
             UncheckedOrders, fetch_ended_by_key, recover_ended_orders,
@@ -74,6 +74,7 @@ use crate::{
     },
     parse_env_bool,
     position::{Position, PositionReport},
+    shortability::Shortability,
     trade::{AssetFees, Trade, TradeAmendmentKind, TradeId, TradesRead},
 };
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
@@ -4840,6 +4841,133 @@ impl OrderStatusClient for AlpacaClient {
         })
         .await
     }
+}
+
+// ---------------------------------------------------------------------------
+// ShortabilityClient implementation
+// ---------------------------------------------------------------------------
+
+impl ShortabilityClient for AlpacaClient {
+    /// Reads the asset with `GET /v2/assets/{symbol}`, one request.
+    ///
+    /// - `shortable` is the asset's `shortable`.
+    /// - `easy_to_borrow` is its `borrow_status`, which Alpaca reports for US equities only, or
+    ///   failing that its `easy_to_borrow` flag; neither present leaves it unknown.
+    /// - `fee_rate` is zero for an easy-to-borrow stock, as Alpaca charges no borrow fee on one.
+    ///   That is Alpaca's charge, not the market's cost of borrowing. Alpaca publishes no rate for
+    ///   a hard-to-borrow stock, so its fee is unknown.
+    /// - `available` is unknown. Alpaca's locate quotes report what it can lend of a hard-to-borrow
+    ///   stock, but they are not on paper accounts and are not read here.
+    ///
+    /// Alpaca updates its borrow flags from a daily list, so they may be up to a day old.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::InstrumentInvalid`] for a symbol Alpaca knows no asset under, and for an
+    /// option, as writing one borrows nothing.
+    async fn fetch_shortability(
+        &self,
+        instrument: &InstrumentNameExchange,
+    ) -> Result<Shortability, UnindexedClientError> {
+        let url = asset_url(self.base_url(), instrument)?;
+        let found: Option<AlpacaAsset> =
+            rest_lookup_with_retry(&self.rate_limiter, || self.http.get(url.clone())).await?;
+        let Some(asset) = found else {
+            return Err(instrument_invalid(
+                instrument,
+                "Alpaca knows no asset under this symbol",
+            ));
+        };
+        shortability_from_asset(instrument, &asset)
+    }
+}
+
+/// `GET /v2/assets/{symbol}`, with the symbol as one path segment, so a crypto pair's `/` is
+/// escaped rather than read as a path separator.
+fn asset_url(
+    base_url: &str,
+    instrument: &InstrumentNameExchange,
+) -> Result<reqwest::Url, UnindexedClientError> {
+    let mut url = reqwest::Url::parse(base_url).map_err(|error| {
+        UnindexedClientError::Internal(format!("Alpaca base URL {base_url:?}: {error}"))
+    })?;
+    url.path_segments_mut()
+        .map_err(|()| {
+            UnindexedClientError::Internal(format!("Alpaca base URL {base_url:?} has no path"))
+        })?
+        .pop_if_empty()
+        .extend(["v2", "assets", instrument.name().as_str()]);
+    Ok(url)
+}
+
+fn instrument_invalid(instrument: &InstrumentNameExchange, reason: &str) -> UnindexedClientError {
+    UnindexedClientError::Api(ApiError::InstrumentInvalid(
+        instrument.clone(),
+        reason.to_owned(),
+    ))
+}
+
+/// What [`AlpacaClient::fetch_shortability`] reports of `asset`.
+fn shortability_from_asset(
+    instrument: &InstrumentNameExchange,
+    asset: &AlpacaAsset,
+) -> Result<Shortability, UnindexedClientError> {
+    if asset.class == AlpacaAssetClass::UsOption {
+        return Err(instrument_invalid(
+            instrument,
+            "shortability does not apply to an option: writing one borrows nothing",
+        ));
+    }
+    let easy_to_borrow = match asset.borrow_status {
+        Some(AlpacaBorrowStatus::EasyToBorrow) => Some(true),
+        Some(AlpacaBorrowStatus::HardToBorrow) => Some(false),
+        Some(AlpacaBorrowStatus::Other) | None => asset.easy_to_borrow,
+    };
+    let mut shortability = Shortability::new();
+    if let Some(shortable) = asset.shortable {
+        shortability = shortability.with_shortable(shortable);
+    }
+    if let Some(easy_to_borrow) = easy_to_borrow {
+        shortability = shortability.with_easy_to_borrow(easy_to_borrow);
+        if easy_to_borrow {
+            shortability = shortability.with_fee_rate(Decimal::ZERO);
+        }
+    }
+    Ok(shortability)
+}
+
+/// The fields of `GET /v2/assets/{symbol}` a [`Shortability`] is built from. Each is optional, so
+/// one Alpaca leaves out reads as unknown rather than failing the request.
+#[derive(Debug, Deserialize)]
+struct AlpacaAsset {
+    #[serde(default)]
+    class: AlpacaAssetClass,
+    #[serde(default)]
+    shortable: Option<bool>,
+    /// US equities only.
+    #[serde(default)]
+    borrow_status: Option<AlpacaBorrowStatus>,
+    /// In Alpaca's examples but not its schema, so read only when `borrow_status` is absent.
+    #[serde(default)]
+    easy_to_borrow: Option<bool>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AlpacaAssetClass {
+    UsOption,
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AlpacaBorrowStatus {
+    EasyToBorrow,
+    HardToBorrow,
+    #[serde(other)]
+    Other,
 }
 
 // ---------------------------------------------------------------------------
@@ -9905,6 +10033,156 @@ mod tests {
             assert!(
                 server.received_requests().await.unwrap().is_empty(),
                 "nothing asked once the consumer has gone"
+            );
+        }
+
+        async fn shortability_with_asset(
+            symbol: &str,
+            asset: serde_json::Value,
+        ) -> (Result<Shortability, UnindexedClientError>, Vec<String>) {
+            use crate::client::ShortabilityClient;
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(asset))
+                .mount(&server)
+                .await;
+            let result = client_for(&server)
+                .fetch_shortability(&InstrumentNameExchange::new(symbol))
+                .await;
+            let paths = server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .map(|request| request.url.path().to_owned())
+                .collect();
+            (result, paths)
+        }
+
+        #[tokio::test]
+        async fn an_easy_to_borrow_stock_is_shortable_at_no_fee() {
+            let (result, paths) = shortability_with_asset(
+                "AAPL",
+                serde_json::json!({
+                    "class": "us_equity",
+                    "symbol": "AAPL",
+                    "shortable": true,
+                    "easy_to_borrow": true,
+                    "borrow_status": "easy_to_borrow",
+                }),
+            )
+            .await;
+
+            assert_eq!(
+                result.unwrap(),
+                Shortability::new()
+                    .with_shortable(true)
+                    .with_easy_to_borrow(true)
+                    .with_fee_rate(Decimal::ZERO)
+            );
+            assert_eq!(paths, vec!["/v2/assets/AAPL"]);
+        }
+
+        #[tokio::test]
+        async fn a_hard_to_borrow_stock_has_no_known_fee() {
+            let (result, _) = shortability_with_asset(
+                "GME",
+                serde_json::json!({
+                    "class": "us_equity",
+                    "shortable": true,
+                    "easy_to_borrow": true,
+                    "borrow_status": "hard_to_borrow",
+                }),
+            )
+            .await;
+
+            assert_eq!(
+                result.unwrap(),
+                Shortability::new()
+                    .with_shortable(true)
+                    .with_easy_to_borrow(false),
+                "borrow_status wins over the easy_to_borrow flag, and a hard-to-borrow fee is unknown"
+            );
+        }
+
+        #[tokio::test]
+        async fn without_a_borrow_status_the_easy_to_borrow_flag_is_read() {
+            let (result, _) = shortability_with_asset(
+                "AAPL",
+                serde_json::json!({ "class": "us_equity", "shortable": false, "easy_to_borrow": false }),
+            )
+            .await;
+
+            assert_eq!(
+                result.unwrap(),
+                Shortability::new()
+                    .with_shortable(false)
+                    .with_easy_to_borrow(false)
+            );
+        }
+
+        #[tokio::test]
+        async fn an_asset_without_borrow_fields_is_unknown_but_for_shortable() {
+            let (result, paths) = shortability_with_asset(
+                "BTC/USD",
+                serde_json::json!({ "class": "crypto", "symbol": "BTC/USD", "shortable": false }),
+            )
+            .await;
+
+            assert_eq!(result.unwrap(), Shortability::new().with_shortable(false));
+            assert_eq!(
+                paths,
+                vec!["/v2/assets/BTC%2FUSD"],
+                "a crypto pair's slash is escaped, not read as a path separator"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_option_has_no_shortability() {
+            let (result, _) = shortability_with_asset(
+                "AAPL250117C00150000",
+                serde_json::json!({ "class": "us_option", "shortable": true }),
+            )
+            .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(ref instrument, ref reason)))
+                        if instrument.name().as_str() == "AAPL250117C00150000"
+                            && reason.contains("option")
+                ),
+                "{result:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unknown_symbol_is_an_invalid_instrument() {
+            use crate::client::ShortabilityClient;
+
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/assets/NOPE"))
+                .respond_with(
+                    ResponseTemplate::new(404).set_body_json(
+                        serde_json::json!({ "message": "asset not found for NOPE" }),
+                    ),
+                )
+                .mount(&server)
+                .await;
+
+            let result = client_for(&server)
+                .fetch_shortability(&InstrumentNameExchange::new("NOPE"))
+                .await;
+
+            assert!(
+                matches!(
+                    result,
+                    Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(ref instrument, _)))
+                        if instrument.name().as_str() == "NOPE"
+                ),
+                "{result:?}"
             );
         }
     }
