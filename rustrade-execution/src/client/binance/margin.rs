@@ -13,7 +13,9 @@
 //! `userListenToken` user-data WebSocket (the retired `/sapi/v1/userDataStream` listen-key path is
 //! not used), which after a reconnect recovers missed fills and reports how orders ended
 //! meanwhile, and on cross margin also reads the Risk Data Stream for margin notices. It also
-//! implements [`OrderStatusClient`], looking orders up by client order id. Both
+//! implements [`OrderStatusClient`], looking orders up by client order id, and reports a pair's
+//! borrow terms ([`ShortabilityClient`]) and how much this account can borrow for it
+//! ([`BorrowCapacityClient`]). Both
 //! **cross** (`isIsolated = "FALSE"`, account-wide collateral) and **isolated** (`isIsolated =
 //! "TRUE"`, per-pair sub-accounts) margin are supported, selected by
 //! [`BinanceMarginConfig::is_isolated`].
@@ -73,8 +75,9 @@ use crate::{
     InstrumentBalanceUpdate, IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
+    borrow_capacity::BorrowCapacity,
     client::{
-        ExecutionClient, OrderStatusClient,
+        BorrowCapacityClient, ExecutionClient, OrderStatusClient, ShortabilityClient,
         order_recovery::{
             KnownLiveOrders, OpenListing, OrderLookup, SharedKnownLiveOrders, UncheckedOrders,
             fetch_ended_by_key, recover_ended_orders,
@@ -91,6 +94,7 @@ use crate::{
         state::{Cancelled, Open, OrderState, UnindexedOrderState},
     },
     position::PositionReport,
+    shortability::Shortability,
     trade::{AssetFees, Trade, TradeId, TradesRead},
 };
 use binance_sdk::{
@@ -106,18 +110,21 @@ use binance_sdk::{
     margin_trading::{
         MarginTradingRestApi,
         rest_api::{
-            MarginAccountCancelOrderIsIsolatedEnum, MarginAccountCancelOrderParams,
-            MarginAccountNewOrderIsIsolatedEnum, MarginAccountNewOrderNewOrderRespTypeEnum,
-            MarginAccountNewOrderParams, MarginAccountNewOrderSideEffectTypeEnum,
-            MarginAccountNewOrderSideEnum, MarginAccountNewOrderTimeInForceEnum,
-            MarginAccountNewOrderTypeEnum, QueryCrossMarginAccountDetailsParams,
+            GetAllCrossMarginPairsParams, GetAllIsolatedMarginSymbolParams,
+            GetAllMarginAssetsParams, GetFutureHourlyInterestRateIsIsolatedEnum,
+            GetFutureHourlyInterestRateParams, MarginAccountCancelOrderIsIsolatedEnum,
+            MarginAccountCancelOrderParams, MarginAccountNewOrderIsIsolatedEnum,
+            MarginAccountNewOrderNewOrderRespTypeEnum, MarginAccountNewOrderParams,
+            MarginAccountNewOrderSideEffectTypeEnum, MarginAccountNewOrderSideEnum,
+            MarginAccountNewOrderTimeInForceEnum, MarginAccountNewOrderTypeEnum,
+            QueryCrossMarginAccountDetailsParams,
             QueryCrossMarginAccountDetailsResponseUserAssetsInner,
             QueryIsolatedMarginAccountInfoParams,
             QueryIsolatedMarginAccountInfoResponseAssetsInner,
             QueryMarginAccountsOpenOrdersIsIsolatedEnum, QueryMarginAccountsOpenOrdersParams,
             QueryMarginAccountsOrderIsIsolatedEnum, QueryMarginAccountsOrderParams,
             QueryMarginAccountsTradeListIsIsolatedEnum, QueryMarginAccountsTradeListParams,
-            QueryMarginAccountsTradeListResponseInner, RestApi,
+            QueryMarginAccountsTradeListResponseInner, QueryMaxBorrowParams, RestApi,
         },
         websocket_streams::{
             MarginLevelStatusChange, OutboundAccountPosition, UserLiabilityChange,
@@ -1531,6 +1538,286 @@ impl OrderStatusClient for BinanceMargin {
         })
         .await
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shortability and borrow capacity
+// ---------------------------------------------------------------------------
+
+/// Hours in the 365-day year a Binance hourly interest rate is annualised over.
+const HOURS_PER_YEAR: u32 = 24 * 365;
+
+impl ShortabilityClient for BinanceMargin {
+    /// Reads the pair, its base asset and the base asset's next hourly interest rate, which cost
+    /// 102 of Binance's per-IP request weight on cross margin and 111 on isolated, almost all of
+    /// it the interest rate.
+    ///
+    /// - `shortable` is whether the pair is traded on margin and may be sold
+    ///   (`/sapi/v1/margin/allPairs`, or `isolated/allPairs` on isolated margin), and its base
+    ///   asset may be borrowed (`/sapi/v1/margin/allAssets`). Any of them false makes it false.
+    /// - `fee_rate` is the base asset's next hourly interest rate
+    ///   (`/sapi/v1/margin/next-hourly-interest-rate`, for this client's cross or isolated margin)
+    ///   times 24 × 365. It is this account's rate, at its VIP level, for the coming hour only.
+    /// - `easy_to_borrow` is unknown: Binance has no such distinction.
+    /// - `available` is unknown: Binance does not say how much it has to lend in total, only how
+    ///   much this account can borrow, which
+    ///   [`fetch_borrow_capacity`](BorrowCapacityClient::fetch_borrow_capacity) reports.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::InstrumentInvalid`] for a pair Binance does not trade on this client's cross
+    /// or isolated margin.
+    async fn fetch_shortability(
+        &self,
+        instrument: &InstrumentNameExchange,
+    ) -> Result<Shortability, UnindexedClientError> {
+        let pair = self.fetch_margin_pair(instrument).await?;
+        let (borrowable, hourly_rate) = tokio::try_join!(
+            self.fetch_asset_borrowable(&pair.base),
+            self.fetch_next_hourly_interest_rate(&pair.base),
+        )?;
+
+        let mut shortability = Shortability::new();
+        // Any flag false is enough to forbid the short; all must be known true to allow it.
+        let flags = [pair.is_margin_trade, pair.is_sell_allowed, borrowable];
+        if flags.contains(&Some(false)) {
+            shortability = shortability.with_shortable(false);
+        } else if flags.iter().all(|flag| *flag == Some(true)) {
+            shortability = shortability.with_shortable(true);
+        }
+        if let Some(hourly_rate) = hourly_rate {
+            shortability = shortability.with_fee_rate(hourly_rate * Decimal::from(HOURS_PER_YEAR));
+        }
+        Ok(shortability)
+    }
+}
+
+impl BorrowCapacityClient for BinanceMargin {
+    /// Reads the pair, then `/sapi/v1/margin/maxBorrowable` for the asset an order on `side`
+    /// borrows, on this client's cross margin or on the pair's isolated account. They cost 51 of
+    /// Binance's per-IP request weight on cross margin and 60 on isolated.
+    ///
+    /// `borrowable_now` is Binance's `amount`, which it describes as the account's "max
+    /// borrowable amount with sufficient system availability", so it is also capped by what
+    /// Binance has to lend. `account_limit` is its `borrowLimit`, the most the account's VIP level
+    /// allows.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::InstrumentInvalid`] for a pair Binance does not trade on this client's cross
+    /// or isolated margin.
+    async fn fetch_borrow_capacity(
+        &self,
+        instrument: &InstrumentNameExchange,
+        side: Side,
+    ) -> Result<BorrowCapacity, UnindexedClientError> {
+        let pair = self.fetch_margin_pair(instrument).await?;
+        let asset = match side {
+            Side::Buy => pair.quote,
+            Side::Sell => pair.base,
+        };
+        let isolated_symbol = self
+            .config
+            .is_isolated
+            .then(|| instrument.name().to_string());
+        let response =
+            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                let asset = asset.name().to_string();
+                let isolated_symbol = isolated_symbol.clone();
+                Box::pin(async move {
+                    let params = QueryMaxBorrowParams::builder(asset)
+                        .isolated_symbol(isolated_symbol)
+                        .build()?;
+                    rest.query_max_borrow(params).await
+                })
+            })
+            .await
+            .map_err(|e| classify_rest_query_error(&e, Some(instrument)))?;
+        let max_borrow = response.data().await.map_err(response_decode_error)?;
+
+        let mut capacity = BorrowCapacity::new(asset);
+        if let Some(amount) = optional_decimal("amount", max_borrow.amount.as_deref())? {
+            capacity = capacity.with_borrowable_now(amount);
+        }
+        if let Some(limit) = optional_decimal("borrowLimit", max_borrow.borrow_limit.as_deref())? {
+            capacity = capacity.with_account_limit(limit);
+        }
+        Ok(capacity)
+    }
+}
+
+/// A margin pair as Binance lists it, for this client's cross or isolated margin.
+#[derive(Debug)]
+struct MarginPair {
+    base: AssetNameExchange,
+    quote: AssetNameExchange,
+    is_margin_trade: Option<bool>,
+    is_sell_allowed: Option<bool>,
+}
+
+impl BinanceMargin {
+    /// `instrument` as Binance lists it for this client's margin: `/sapi/v1/margin/allPairs`
+    /// (weight 1) on cross, `/sapi/v1/margin/isolated/allPairs` (weight 10) on isolated, both
+    /// filtered to the one symbol.
+    async fn fetch_margin_pair(
+        &self,
+        instrument: &InstrumentNameExchange,
+    ) -> Result<MarginPair, UnindexedClientError> {
+        let symbol = instrument.name().to_string();
+        let listed = if self.config.is_isolated {
+            let response =
+                rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                    let symbol = symbol.clone();
+                    Box::pin(async move {
+                        let params = GetAllIsolatedMarginSymbolParams::builder()
+                            .symbol(symbol)
+                            .build()?;
+                        rest.get_all_isolated_margin_symbol(params).await
+                    })
+                })
+                .await
+                .map_err(|e| classify_rest_query_error(&e, Some(instrument)))?;
+            response
+                .data()
+                .await
+                .map_err(response_decode_error)?
+                .into_iter()
+                .find(|pair| pair.symbol.as_deref() == Some(symbol.as_str()))
+                .map(|pair| {
+                    (
+                        pair.base,
+                        pair.quote,
+                        pair.is_margin_trade,
+                        pair.is_sell_allowed,
+                    )
+                })
+        } else {
+            let response =
+                rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                    let symbol = symbol.clone();
+                    Box::pin(async move {
+                        let params = GetAllCrossMarginPairsParams::builder()
+                            .symbol(symbol)
+                            .build()?;
+                        rest.get_all_cross_margin_pairs(params).await
+                    })
+                })
+                .await
+                .map_err(|e| classify_rest_query_error(&e, Some(instrument)))?;
+            response
+                .data()
+                .await
+                .map_err(response_decode_error)?
+                .into_iter()
+                .find(|pair| pair.symbol.as_deref() == Some(symbol.as_str()))
+                .map(|pair| {
+                    (
+                        pair.base,
+                        pair.quote,
+                        pair.is_margin_trade,
+                        pair.is_sell_allowed,
+                    )
+                })
+        };
+        let margin = if self.config.is_isolated {
+            "isolated"
+        } else {
+            "cross"
+        };
+        let Some((base, quote, is_margin_trade, is_sell_allowed)) = listed else {
+            return Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(
+                instrument.clone(),
+                format!("Binance lists no {margin} margin pair {symbol}"),
+            )));
+        };
+        let (Some(base), Some(quote)) = (base, quote) else {
+            return Err(UnindexedClientError::Internal(format!(
+                "Binance lists {margin} margin pair {symbol} without its base or quote asset"
+            )));
+        };
+        Ok(MarginPair {
+            base: AssetNameExchange::new(base),
+            quote: AssetNameExchange::new(quote),
+            is_margin_trade,
+            is_sell_allowed,
+        })
+    }
+
+    /// Whether Binance lends `asset` on margin: its `isBorrowable` in `/sapi/v1/margin/allAssets`
+    /// (weight 1). Unknown if Binance does not list it.
+    async fn fetch_asset_borrowable(
+        &self,
+        asset: &AssetNameExchange,
+    ) -> Result<Option<bool>, UnindexedClientError> {
+        let name = asset.name().to_string();
+        let response =
+            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                let name = name.clone();
+                Box::pin(async move {
+                    let params = GetAllMarginAssetsParams::builder().asset(name).build()?;
+                    rest.get_all_margin_assets(params).await
+                })
+            })
+            .await
+            .map_err(|e| classify_rest_query_error(&e, None))?;
+        Ok(response
+            .data()
+            .await
+            .map_err(response_decode_error)?
+            .into_iter()
+            .find(|listed| listed.asset_name.as_deref() == Some(name.as_str()))
+            .and_then(|listed| listed.is_borrowable))
+    }
+
+    /// `asset`'s next hourly interest rate on this client's cross or isolated margin, a fraction
+    /// per hour: `/sapi/v1/margin/next-hourly-interest-rate` (weight 100). Unknown if Binance does
+    /// not answer for it.
+    async fn fetch_next_hourly_interest_rate(
+        &self,
+        asset: &AssetNameExchange,
+    ) -> Result<Option<Decimal>, UnindexedClientError> {
+        let name = asset.name().to_string();
+        let is_isolated = self.config.is_isolated;
+        let response =
+            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                let name = name.clone();
+                Box::pin(async move {
+                    let params = GetFutureHourlyInterestRateParams::builder(
+                        name,
+                        IsolatedFlag::from_flag(is_isolated),
+                    )
+                    .build()?;
+                    rest.get_future_hourly_interest_rate(params).await
+                })
+            })
+            .await
+            .map_err(|e| classify_rest_query_error(&e, None))?;
+        let rate = response
+            .data()
+            .await
+            .map_err(response_decode_error)?
+            .into_iter()
+            .find(|listed| listed.asset.as_deref() == Some(name.as_str()))
+            .and_then(|listed| listed.next_hourly_interest_rate);
+        optional_decimal("nextHourlyInterestRate", rate.as_deref())
+    }
+}
+
+/// A decimal Binance may leave out: absent is `None`, but present and unreadable is an error, so a
+/// malformed amount is not mistaken for an unreported one.
+fn optional_decimal(
+    field: &str,
+    value: Option<&str>,
+) -> Result<Option<Decimal>, UnindexedClientError> {
+    value
+        .map(|value| {
+            Decimal::from_str(value).map_err(|error| {
+                UnindexedClientError::Internal(format!(
+                    "decoding Binance response: {field} {value:?}: {error}"
+                ))
+            })
+        })
+        .transpose()
 }
 
 // ---------------------------------------------------------------------------
@@ -3927,6 +4214,7 @@ impl_isolated_flag!(
     QueryMarginAccountsOpenOrdersIsIsolatedEnum,
     QueryMarginAccountsOrderIsIsolatedEnum,
     QueryMarginAccountsTradeListIsIsolatedEnum,
+    GetFutureHourlyInterestRateIsIsolatedEnum,
 );
 
 /// Build the margin cancel-order params (pure; no I/O).
@@ -7483,5 +7771,268 @@ mod tests {
                 "{cid}: not held, even after a late live report"
             );
         }
+    }
+
+    /// Answer the requests behind `fetch_shortability` and `fetch_borrow_capacity`: the BTCUSDT
+    /// pair on cross and isolated margin, the base asset, its hourly rate and its max borrow.
+    async fn mount_borrow_terms(
+        server: &wiremock::MockServer,
+        pair: serde_json::Value,
+        asset: serde_json::Value,
+        rate: serde_json::Value,
+        max_borrow: serde_json::Value,
+    ) {
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path},
+        };
+        for (route, body) in [
+            ("/sapi/v1/margin/allPairs", pair.clone()),
+            ("/sapi/v1/margin/isolated/allPairs", pair),
+            ("/sapi/v1/margin/allAssets", asset),
+            ("/sapi/v1/margin/next-hourly-interest-rate", rate),
+            ("/sapi/v1/margin/maxBorrowable", max_borrow),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(server)
+                .await;
+        }
+    }
+
+    fn btcusdt_pair(is_margin_trade: bool, is_sell_allowed: bool) -> serde_json::Value {
+        serde_json::json!([{
+            "base": "BTC", "quote": "USDT", "symbol": "BTCUSDT",
+            "isMarginTrade": is_margin_trade, "isSellAllowed": is_sell_allowed, "isBuyAllowed": true,
+        }])
+    }
+
+    fn btc_asset(is_borrowable: bool) -> serde_json::Value {
+        serde_json::json!([{ "assetName": "BTC", "isBorrowable": is_borrowable }])
+    }
+
+    fn btc_rate(rate: &str) -> serde_json::Value {
+        serde_json::json!([{ "asset": "BTC", "nextHourlyInterestRate": rate }])
+    }
+
+    /// The value of `key` in the query of the request `server` received on `route`.
+    async fn query_value(server: &wiremock::MockServer, route: &str, key: &str) -> Option<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .find(|request| request.url.path() == route)
+            .and_then(|request| {
+                request
+                    .url
+                    .query_pairs()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.into_owned())
+            })
+    }
+
+    #[tokio::test]
+    async fn margin_shortability_reads_the_pair_the_asset_and_the_annualised_rate() {
+        use crate::client::ShortabilityClient;
+        use rust_decimal_macros::dec;
+        for (is_isolated, pairs_route, flag) in [
+            (false, "/sapi/v1/margin/allPairs", "FALSE"),
+            (true, "/sapi/v1/margin/isolated/allPairs", "TRUE"),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            mount_borrow_terms(
+                &server,
+                btcusdt_pair(true, true),
+                btc_asset(true),
+                btc_rate("0.00000571"),
+                serde_json::json!({}),
+            )
+            .await;
+
+            let shortability = margin_client_at(&server, is_isolated)
+                .fetch_shortability(&InstrumentNameExchange::new("BTCUSDT"))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                shortability,
+                Shortability::new()
+                    .with_shortable(true)
+                    .with_fee_rate(dec!(0.00000571) * dec!(8760)),
+                "isolated: {is_isolated}"
+            );
+            assert_eq!(
+                query_value(&server, pairs_route, "symbol").await.as_deref(),
+                Some("BTCUSDT"),
+                "the pair list is asked for the one symbol"
+            );
+            assert_eq!(
+                query_value(&server, "/sapi/v1/margin/allAssets", "asset")
+                    .await
+                    .as_deref(),
+                Some("BTC"),
+                "the base asset is the one borrowed"
+            );
+            let rate = "/sapi/v1/margin/next-hourly-interest-rate";
+            assert_eq!(
+                query_value(&server, rate, "assets").await.as_deref(),
+                Some("BTC")
+            );
+            assert_eq!(
+                query_value(&server, rate, "isIsolated").await.as_deref(),
+                Some(flag)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn margin_shortability_is_refused_by_any_flag_and_unknown_without_them() {
+        use crate::client::ShortabilityClient;
+        let cases = [
+            (btcusdt_pair(false, true), btc_asset(true), Some(false)),
+            (btcusdt_pair(true, false), btc_asset(true), Some(false)),
+            (btcusdt_pair(true, true), btc_asset(false), Some(false)),
+            // Binance does not list the asset, so whether it lends it is unknown.
+            (btcusdt_pair(true, true), serde_json::json!([]), None),
+        ];
+        for (pair, asset, shortable) in cases {
+            let server = wiremock::MockServer::start().await;
+            mount_borrow_terms(
+                &server,
+                pair.clone(),
+                asset.clone(),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            )
+            .await;
+
+            let shortability = margin_client_at(&server, false)
+                .fetch_shortability(&InstrumentNameExchange::new("BTCUSDT"))
+                .await
+                .unwrap();
+
+            assert_eq!(shortability.shortable, shortable, "{pair} {asset}");
+            assert_eq!(
+                shortability.fee_rate, None,
+                "no rate returned is an unknown fee"
+            );
+            assert_eq!(shortability.easy_to_borrow, None);
+            assert_eq!(shortability.available, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn margin_shortability_of_an_unlisted_pair_is_an_invalid_instrument() {
+        use crate::client::ShortabilityClient;
+        let server = wiremock::MockServer::start().await;
+        mount_borrow_terms(
+            &server,
+            serde_json::json!([]),
+            btc_asset(true),
+            btc_rate("0.00000571"),
+            serde_json::json!({}),
+        )
+        .await;
+
+        let result = margin_client_at(&server, false)
+            .fetch_shortability(&InstrumentNameExchange::new("BTCUSDT"))
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(ref instrument, _)))
+                    if instrument.name().as_str() == "BTCUSDT"
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn margin_borrow_capacity_asks_for_the_asset_the_side_borrows() {
+        use crate::client::BorrowCapacityClient;
+        use rust_decimal_macros::dec;
+        for (is_isolated, side, asset, isolated_symbol) in [
+            (false, Side::Sell, "BTC", None),
+            (false, Side::Buy, "USDT", None),
+            (true, Side::Sell, "BTC", Some("BTCUSDT")),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            mount_borrow_terms(
+                &server,
+                btcusdt_pair(true, true),
+                btc_asset(true),
+                btc_rate("0.00000571"),
+                serde_json::json!({ "amount": "1.69248805", "borrowLimit": "60" }),
+            )
+            .await;
+
+            let capacity = margin_client_at(&server, is_isolated)
+                .fetch_borrow_capacity(&InstrumentNameExchange::new("BTCUSDT"), side)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                capacity,
+                BorrowCapacity::new(AssetNameExchange::new(asset))
+                    .with_borrowable_now(dec!(1.69248805))
+                    .with_account_limit(dec!(60)),
+                "{side:?} isolated: {is_isolated}"
+            );
+            let max_borrow = "/sapi/v1/margin/maxBorrowable";
+            assert_eq!(
+                query_value(&server, max_borrow, "asset").await.as_deref(),
+                Some(asset)
+            );
+            assert_eq!(
+                query_value(&server, max_borrow, "isolatedSymbol")
+                    .await
+                    .as_deref(),
+                isolated_symbol,
+                "only isolated margin names the pair's account"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn margin_borrow_capacity_keeps_an_omitted_amount_unknown_and_fails_a_malformed_one() {
+        use crate::client::BorrowCapacityClient;
+        use rust_decimal_macros::dec;
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+
+        let server = wiremock::MockServer::start().await;
+        mount_borrow_terms(
+            &server,
+            btcusdt_pair(true, true),
+            btc_asset(true),
+            btc_rate("0"),
+            serde_json::json!({ "borrowLimit": "60" }),
+        )
+        .await;
+        let capacity = margin_client_at(&server, false)
+            .fetch_borrow_capacity(&instrument, Side::Sell)
+            .await
+            .unwrap();
+        assert_eq!(capacity.borrowable_now, None);
+        assert_eq!(capacity.account_limit, Some(dec!(60)));
+
+        let server = wiremock::MockServer::start().await;
+        mount_borrow_terms(
+            &server,
+            btcusdt_pair(true, true),
+            btc_asset(true),
+            btc_rate("0"),
+            serde_json::json!({ "amount": "lots", "borrowLimit": "60" }),
+        )
+        .await;
+        let result = margin_client_at(&server, false)
+            .fetch_borrow_capacity(&instrument, Side::Sell)
+            .await;
+        assert!(
+            matches!(result, Err(UnindexedClientError::Internal(ref message)) if message.contains("amount")),
+            "{result:?}"
+        );
     }
 }

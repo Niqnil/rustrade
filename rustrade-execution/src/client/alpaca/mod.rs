@@ -6,7 +6,7 @@
 //
 // Architecture:
 // - REST (reqwest): account_snapshot, fetch_balances, fetch_open_orders,
-//   fetch_trades, open_order, cancel_order
+//   fetch_trades, open_order, cancel_order, fetch_shortability (GET /v2/assets/{symbol})
 // - WebSocket (tungstenite): account_stream via Alpaca's trade_updates stream
 //   at wss://[paper-]api.alpaca.markets/stream
 //
