@@ -196,8 +196,9 @@ pub enum VenueRegime {
 ///   what is left in [`BorrowReject::available`].
 /// - [`ShortSaleRestricted`](BorrowRejectReason::ShortSaleRestricted): a short-sale restriction
 ///   is in effect and the order is marketable: a market order, or a sell limit at or below the
-///   best bid (the last price, on a feed with no book). A limit above the bid rests. With no
-///   market to price it, an order is refused as unpriceable instead, as it would be unrestricted.
+///   best bid (the last price, on a feed with no book). A limit above the bid rests. With neither
+///   a bid nor a last price, a market order is refused as unpriceable, as it would be
+///   unrestricted, and a sell limit rests.
 ///
 /// Only the short part of an order is gated: a flip from a long is measured by the short it
 /// opens, and a buy, or a sell that only reduces a long once every resting sell has filled, is
@@ -1758,15 +1759,16 @@ impl SimulatedVenue {
             ));
         }
 
-        // With no market, nothing is marketable: an order that would take from the book is
-        // instead refused as unpriceable, naming the absent snapshot, which is the real cause.
+        // Judged against what a sell trades against, the bid, else the last price, as `crosses`
+        // judges it. Without either, a restriction has nothing to judge: an order that would take
+        // from the book is refused as unpriceable instead, which names the real cause.
         let marketable = market.is_some_and(|market| match request.state.kind {
             OrderKind::Limit => request
                 .state
                 .price
                 .is_some_and(|limit| crosses(Side::Sell, limit, market)),
             // Every other kind this venue accepts takes whatever the book offers.
-            _ => true,
+            _ => market.best_bid.or(market.last_price).is_some(),
         });
         if marketable && provider.short_sale_restricted(instrument, now) {
             return Err(ApiError::BorrowRejected(BorrowReject::new(
@@ -7901,35 +7903,37 @@ mod tests {
         }
     }
 
-    /// With no market for the instrument, a restricted market sell is refused for what it is,
-    /// unpriceable, rather than for a restriction that judges a bid there is none of.
+    /// With no price to judge a restriction against, a restricted market sell is refused for what
+    /// it is, unpriceable, naming which of the two unpriceable causes occurred, rather than for a
+    /// restriction that judges a bid there is none of.
     #[test]
-    fn a_restricted_short_with_no_market_is_refused_as_unpriceable() {
-        let mut venue = SimulatedVenue::new_market_driven(
-            &config_from_balances(
-                vec![funded(self::usd(), d("10000000"))],
-                FeeModelConfig::default(),
-            ),
-            instruments_of(cfd_instrument()),
-        )
-        .with_shortability(Arc::new(
-            ShortabilityTable::new().with_short_sale_restriction(
-                cfd_instrument_name(),
-                time(0),
-                time(10),
-            ),
-        ));
-        advance(&mut venue, time(1));
+    fn a_restricted_short_with_no_price_is_refused_as_unpriceable() {
+        let reason_of = |market| {
+            let mut venue = make_cfd_venue("10000000", FeeModelConfig::default())
+                .with_shortability(Arc::new(
+                    ShortabilityTable::new().with_short_sale_restriction(
+                        cfd_instrument_name(),
+                        time(0),
+                        time(10),
+                    ),
+                ));
+            advance(&mut venue, time(1));
+            match venue
+                .open_order(cfd_request(Side::Sell, "1", market))
+                .response
+                .state
+            {
+                OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                    ApiError::OrderRejected(reason),
+                ))) => reason,
+                other => panic!("expected the unpriceable OrderRejected, got: {other:?}"),
+            }
+        };
 
-        let outcome = open_cfd(&mut venue, Side::Sell, "1");
-
-        match outcome.response.state {
-            OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
-                ApiError::BorrowRejected(reject),
-            ))) => panic!("expected the unpriceable rejection, got: {reject:?}"),
-            OrderState::Inactive(InactiveOrderState::OpenFailed(_)) => {}
-            other => panic!("an unpriceable order must not open, got: {other:?}"),
-        }
+        let absent = reason_of(None);
+        assert!(absent.contains("no market snapshot"), "{absent}");
+        let empty = reason_of(Some(MarketSnapshot::default()));
+        assert!(empty.contains("no market price available yet"), "{empty}");
     }
 
     /// The checks apply in their documented order: not shortable before too little to lend,
