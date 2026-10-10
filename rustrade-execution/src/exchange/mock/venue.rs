@@ -3,6 +3,7 @@
 use crate::{
     AccountEventKind, InstrumentAccountSnapshot, UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::AssetBalance,
+    cash_flow::{CashFlow, CashFlowId},
     client::mock::MockExecutionConfig,
     error::{ApiError, UnindexedApiError, UnindexedOrderError},
     exchange::mock::{
@@ -11,6 +12,7 @@ use crate::{
     },
     fee::{FeeModel, FeeModelConfig, Liquidity},
     fill::{FillContext, FillModel, SimFillConfig},
+    holding_cost::{HeldPosition, HoldingCostModel},
     market::{MarketDepth, MarketSnapshot},
     order::{
         Order, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrder, UnindexedOrderKey,
@@ -33,6 +35,7 @@ use rustrade_instrument::{
 };
 use rustrade_integration::collection::snapshot::Snapshot;
 use smol_str::ToSmolStr;
+use tracing::warn;
 
 /// Everything one request obliges a driver to deliver, in the order it must deliver it.
 ///
@@ -138,8 +141,9 @@ pub enum VenueRegime {
 /// The position is reported by [`account_snapshot`](Self::account_snapshot), and a position that
 /// a configured `initial_state` reports for a CFD is where this venue starts.
 ///
-/// Not modelled: liquidation, or any carry (see below). A short closed at more than twice its
-/// entry has lost more than its margin, and pays the shortfall as a debit.
+/// Not modelled: liquidation. A short closed at more than twice its entry has lost more than its
+/// margin, and pays the shortfall as a debit. Carry is charged only when configured: see
+/// `# Holding costs`.
 ///
 /// [`Perpetual`](InstrumentKind::Perpetual), [`Future`](InstrumentKind::Future) and
 /// [`Option`](InstrumentKind::Option) need funding, margin and expiry settlement, none of which this
@@ -149,13 +153,35 @@ pub enum VenueRegime {
 /// a consumer that constructs one directly bypasses every upstream gate, and the alternative to
 /// rejecting is filling a derivative as if it were deliverable stock.
 ///
-/// # Carry, locates and the short-sale restriction
-/// This venue charges no carrying cost: no funding, financing, margin interest or borrow fee ever
-/// reaches its ledger, so a CFD short is held for free, and the balances and PnL of a run leave
-/// carry out. It lends no stock either: a spot sell delivers base the account must hold, so a
-/// short sale of a spot instrument is refused with [`ApiError::BalanceInsufficient`]. Nor does it
-/// model the steps a short sale on a real venue can meet before it fills: no locate is required,
-/// and no hard-to-borrow list or short-sale restriction ever refuses a CFD short.
+/// # Holding costs
+/// By default this venue charges no carrying cost, so a CFD position is held for free and the
+/// balances and PnL of a run leave carry out. Configured with
+/// [`with_holding_costs`](Self::with_holding_costs), it charges each CFD position what its
+/// [`HoldingCostModel`]s say holding it costs: funding, a borrow fee, overnight financing.
+/// - **When.** At each model's boundaries, as the clock reaches them. This venue has no timer, so
+///   a boundary is charged when a driver next moves the clock to or past it, through
+///   [`advance_time`](Self::advance_time) or [`apply_market`](Self::apply_market). Several
+///   boundaries passed at once are each charged, in time order. A driver that moves the clock to
+///   [`next_deadline`](Self::next_deadline) charges each one when it falls, as `SimRunner` does.
+///   Charging starts at the instant the clock first moves, so a position a configured
+///   `initial_state` seeds is charged from there, and never for the time before the run.
+/// - **What.** The position held across the boundary, valued at the mid of this venue's market,
+///   else its last price, else its entry price where there is no market, which is warned of
+///   once. A position opened at a boundary's instant is not charged for it; one closed at that
+///   instant is. Nothing is charged for part of a period: a position opened and closed between
+///   two boundaries pays nothing, as one held past no venue cutoff would.
+/// - **How.** Each charge moves the instrument's quote asset and is reported as
+///   `[balance, cash flow]`: the restated balance, then an
+///   [`AccountEventKind::CashFlow`] attributed to the instrument, both stamped at the boundary,
+///   with a [`CashFlowId`] from this venue's own sequence. The engine adds the flow to the
+///   position's `carry`, as it does a live venue's. A charge the account cannot cover is still
+///   made, and takes `free` below zero with a WARN, since this venue models no liquidation.
+///
+/// # Locates and the short-sale restriction
+/// This venue lends no stock: a spot sell delivers base the account must hold, so a short sale of
+/// a spot instrument is refused with [`ApiError::BalanceInsufficient`]. Nor does it model the steps
+/// a short sale on a real venue can meet before it fills: no locate is required, and no
+/// hard-to-borrow list or short-sale restriction ever refuses a CFD short.
 ///
 /// # ⚠️ Caller obligations and known limitations
 /// - **Fund the quote asset of every instrument traded.** Every debit is quote-denominated except a
@@ -396,6 +422,23 @@ pub struct SimulatedVenue {
     /// flipping it on a venue already holding resting orders would leave them unmatchable with no
     /// way to find out. Read through [`regime`](Self::regime).
     regime: VenueRegime,
+    /// What holding a position costs over time. Empty unless set by
+    /// [`with_holding_costs`](Self::with_holding_costs), and then fixed: swapping a model under
+    /// a position mid-run would leave its charges to date priced by one and the rest by another.
+    holding_costs: Vec<Box<dyn HoldingCostModel>>,
+    /// The instant up to which every holding-cost boundary has been charged, or `None` before
+    /// this venue's clock first moved.
+    ///
+    /// A boundary is charged when the clock first reaches it and never again, which is what makes
+    /// a charge idempotent however often the clock is moved to one instant. It starts unset
+    /// rather than at the epoch, so a venue charges from the first instant it is driven to, not
+    /// for every boundary since 1970.
+    accrued_through: Option<DateTime<Utc>>,
+    /// Monotone [`CashFlowId`] source for the charges this venue posts.
+    cash_flow_sequence: u64,
+    /// Whether a holding cost has already been valued at a position's entry price for want of a
+    /// market, which is warned of once per venue rather than at every boundary.
+    valued_at_entry: bool,
 }
 
 impl SimulatedVenue {
@@ -463,7 +506,50 @@ impl SimulatedVenue {
             trade_sequence: 0,
             time_exchange_latest: Default::default(),
             regime,
+            holding_costs: Vec::new(),
+            accrued_through: None,
+            cash_flow_sequence: 0,
+            valued_at_entry: false,
         }
+    }
+
+    /// This venue, charging each open position what `models` say holding it costs.
+    ///
+    /// Each model is asked for its boundaries on every instrument this venue holds a position in,
+    /// and charges the position held across each one, as described on [`HoldingCostModel`]. Only
+    /// a cash-settled position is charged: a spot holding is a balance on this venue, not a
+    /// position. See the type's `# Holding costs` for when a charge is made and how it is
+    /// reported.
+    #[must_use]
+    pub fn with_holding_costs(mut self, models: Vec<Box<dyn HoldingCostModel>>) -> Self {
+        self.holding_costs = models;
+        self
+    }
+
+    /// The next instant at which this venue has something to do of its own accord: an open order
+    /// reaching its deadline, or a holding-cost boundary of a position it holds.
+    ///
+    /// For a driver with a timeline of its own, such as `SimRunner`, which moves the clock to this
+    /// instant so that an expiry or a charge happens when it is due rather than when the next
+    /// market event or request happens to arrive. `None` when nothing is due.
+    ///
+    /// Recompute it after anything that moves this venue: an order, a fill, or the clock. A
+    /// holding-cost boundary is reported only once the venue's clock has first moved, since that is
+    /// where charging starts.
+    pub fn next_deadline(&self) -> Option<DateTime<Utc>> {
+        let expiry = self.account.orders().next_expiry();
+        let boundary = self.accrued_through.and_then(|after| {
+            self.positions
+                .keys()
+                .flat_map(|instrument| {
+                    self.holding_costs
+                        .iter()
+                        .filter_map(move |model| model.next_boundary(instrument, after))
+                })
+                .min()
+        });
+
+        expiry.into_iter().chain(boundary).min()
     }
 
     /// Which price source this venue has, and so which order kinds it accepts.
@@ -502,11 +588,167 @@ impl SimulatedVenue {
     /// `#[must_use]` because a driver that advances the clock and drops the result has silently
     /// eaten the expiries, leaving its client holding orders the venue no longer has and a balance
     /// it has already released.
+    ///
+    /// # And the holding costs it reached
+    /// Every holding-cost boundary between the previous instant and this one is charged first, in
+    /// time order, each as `[balance, cash flow]` stamped at its boundary — see the type's
+    /// `# Holding costs`. They precede the expiries, which are stamped at `time_exchange`.
     #[must_use]
     pub fn advance_time(&mut self, time_exchange: DateTime<Utc>) -> Vec<UnindexedAccountEvent> {
+        // Charged before the balances are restamped, so each restatement it emits keeps its own
+        // boundary's stamp and the ledger still ends stamped at `time_exchange`.
+        let mut events = self.accrue(time_exchange);
         self.time_exchange_latest = time_exchange;
         self.account.update_time_exchange(time_exchange);
-        self.sweep_expired(time_exchange)
+        events.append(&mut self.sweep_expired(time_exchange));
+        events
+    }
+
+    /// Charges every holding-cost boundary in `(accrued_through, now]` against the position held
+    /// across it, returning `[balance, cash flow]` per charge, in boundary then instrument then
+    /// model order.
+    ///
+    /// The positions cannot have changed since `accrued_through`: this venue's state moves only on
+    /// its inputs, and each input charges what is due before it fills anything. So the position
+    /// held now is the one held across every boundary being charged, and a gap of several
+    /// boundaries is caught up exactly.
+    ///
+    /// # Panics
+    /// If a model returns a boundary that is not after the instant it was asked from — see
+    /// [`HoldingCostModel`]'s contract.
+    fn accrue(&mut self, now: DateTime<Utc>) -> Vec<UnindexedAccountEvent> {
+        let after = match self.accrued_through {
+            // The clock's first move: charging starts here.
+            None => {
+                self.accrued_through = Some(now);
+                return Vec::new();
+            }
+            Some(after) if now <= after => return Vec::new(),
+            Some(after) => after,
+        };
+        self.accrued_through = Some(now);
+
+        if self.holding_costs.is_empty() || self.positions.is_empty() {
+            return Vec::new();
+        }
+
+        let mut due = Vec::new();
+        for instrument in self.positions.keys() {
+            for (index, model) in self.holding_costs.iter().enumerate() {
+                let mut from = after;
+                while let Some(boundary) = model.next_boundary(instrument, from) {
+                    assert!(
+                        boundary > from,
+                        "HoldingCostModel {model:?} returned boundary {boundary} for \
+                         {instrument}, which is not after {from}"
+                    );
+                    if boundary > now {
+                        break;
+                    }
+                    due.push((boundary, instrument.clone(), index));
+                    from = boundary;
+                }
+            }
+        }
+        // Positions are hashed, so their iteration order is arbitrary: sorted, so one run's
+        // charges arrive in the same order as another's.
+        due.sort_unstable();
+
+        let mut events = Vec::with_capacity(due.len() * 2);
+        for (boundary, instrument, index) in due {
+            events.extend(self.charge_holding_cost(boundary, &instrument, index));
+        }
+        events
+    }
+
+    /// Charges one model's cost of the position in `instrument` at `boundary`, returning
+    /// `[balance, cash flow]`, or nothing if the model charges nothing.
+    fn charge_holding_cost(
+        &mut self,
+        boundary: DateTime<Utc>,
+        instrument: &InstrumentNameExchange,
+        model: usize,
+    ) -> Vec<UnindexedAccountEvent> {
+        let (Some(position), Some(terms)) = (
+            self.positions.get(instrument).copied(),
+            self.instruments.get(instrument),
+        ) else {
+            return Vec::new();
+        };
+        let quote = terms.underlying.quote.clone();
+        let contract_size = terms.kind.contract_size();
+        let price = self.valuation(instrument, position);
+
+        let held = HeldPosition::new(
+            instrument,
+            position.quantity,
+            contract_size,
+            position.entry,
+            price,
+        );
+        let Some(charge) = self.holding_costs[model].charge(&held, boundary) else {
+            return Vec::new();
+        };
+        if charge.amount.is_zero() {
+            return Vec::new();
+        }
+
+        let balance = self.account.charge(&quote, charge.amount, boundary);
+        if balance.balance.free.is_sign_negative() && charge.amount.is_sign_negative() {
+            warn!(
+                exchange = %self.exchange,
+                %instrument,
+                asset = %quote,
+                amount = %charge.amount,
+                free = %balance.balance.free,
+                %boundary,
+                "SimulatedVenue charged a holding cost the account could not cover: free balance \
+                 is negative, and this venue models no liquidation"
+            );
+        }
+
+        let id = CashFlowId::new(self.cash_flow_sequence.to_smolstr());
+        self.cash_flow_sequence += 1;
+
+        vec![
+            self.build_account_event(Snapshot(balance)),
+            self.build_account_event(AccountEventKind::CashFlow(CashFlow::new(
+                charge.kind,
+                quote,
+                charge.amount,
+                Some(instrument.clone()),
+                boundary,
+                Some(id),
+            ))),
+        ]
+    }
+
+    /// The price a holding cost values `position` in `instrument` at: the mid of this venue's
+    /// market, else its last price, else the position's entry price.
+    ///
+    /// The entry price is a degraded valuation, used only where this venue has no market for the
+    /// instrument, as on a [`RequestPriced`](VenueRegime::RequestPriced) venue. It is warned of
+    /// once.
+    fn valuation(&mut self, instrument: &InstrumentNameExchange, position: NetPosition) -> Decimal {
+        let snapshot = self.market(instrument).map(|market| market.snapshot);
+        let price = snapshot.and_then(|snapshot| match (snapshot.best_bid, snapshot.best_ask) {
+            (Some(bid), Some(ask)) => Some((bid + ask) / Decimal::TWO),
+            _ => snapshot.last_price,
+        });
+
+        price.unwrap_or_else(|| {
+            if !self.valued_at_entry {
+                self.valued_at_entry = true;
+                warn!(
+                    exchange = %self.exchange,
+                    %instrument,
+                    entry = %position.entry,
+                    "SimulatedVenue has no market price to value a holding cost at, so values it \
+                     at the position's entry price; warned once per venue"
+                );
+            }
+            position.entry
+        })
     }
 
     /// Retires every order whose deadline `time_exchange` has reached, releasing what it held.
@@ -615,6 +857,10 @@ impl SimulatedVenue {
     /// consumer routing a fill to a position needs the order still to be live when the trade
     /// arrives.
     ///
+    /// They are preceded by the holding costs of every boundary since the clock last moved and the
+    /// expiries this tick reached, exactly as [`advance_time`](Self::advance_time) reports them.
+    /// The costs are valued at the market as it stood before this tick replaced it.
+    ///
     /// `#[must_use]` because a driver that applies the market and drops the result has silently
     /// eaten the fills, leaving its client holding an order the venue no longer has.
     #[must_use]
@@ -625,6 +871,10 @@ impl SimulatedVenue {
         depth: MarketDepth,
         time_exchange: DateTime<Utc>,
     ) -> Vec<UnindexedAccountEvent> {
+        // Charged before the snapshot is replaced, so a boundary this tick passed is valued at the
+        // market as of that boundary rather than at a price observed after it.
+        let mut events = self.accrue(time_exchange);
+
         let entry = self.market.entry(instrument.clone()).or_default();
         entry.snapshot = snapshot;
         entry.depth = depth;
@@ -632,7 +882,7 @@ impl SimulatedVenue {
 
         // Swept before matching, so an order whose deadline this tick has reached cannot trade on
         // the very tick that retires it -- see `advance_time`.
-        let mut events = self.sweep_expired(time_exchange);
+        events.append(&mut self.sweep_expired(time_exchange));
         events.append(&mut self.match_resting(instrument, snapshot, time_exchange));
         events
     }
@@ -2708,6 +2958,8 @@ fn first_unseeded_order_id(account: &AccountState) -> u128 {
 mod tests {
     use super::*;
     use crate::{
+        balance::Balance,
+        cash_flow::CashFlowKind,
         error::OrderError,
         exchange::mock::{
             fixtures::*,
@@ -2715,6 +2967,7 @@ mod tests {
         },
         fee::PercentageFeeModel,
         fill::BidAskFillModel,
+        holding_cost::{FundingModel, HoldingCharge, RateSeries},
         order::{
             OrderEvent, OrderKey, TimeInForce,
             id::{ClientOrderId, StrategyId},
@@ -2722,6 +2975,7 @@ mod tests {
             state::{ActiveOrderState, InactiveOrderState},
         },
     };
+    use chrono::TimeDelta;
     use rustrade_instrument::{
         Underlying,
         instrument::{
@@ -6746,5 +7000,273 @@ mod tests {
             venue.orders_ended(&[other_instrument]).is_empty(),
             "a key for another instrument does not find it"
         );
+    }
+
+    // --- Holding costs: charged at each boundary the clock reaches -----------------------------
+
+    /// Hourly funding on the CFD at `rate` per hour, so a boundary falls on every whole hour.
+    fn hourly_funding(rate: &str) -> Box<dyn HoldingCostModel> {
+        Box::new(
+            FundingModel::new(TimeDelta::hours(1))
+                .with_rates(cfd_instrument_name(), RateSeries::constant(d(rate))),
+        )
+    }
+
+    /// The `n`th whole hour after `time(0)`: `time(0)` is 2023-11-14T22:13:20Z.
+    fn boundary(n: i64) -> DateTime<Utc> {
+        time(2800 + 3600 * n)
+    }
+
+    /// A market-driven CFD venue charging `models`, its clock first moved to `time(1)`.
+    fn make_cfd_venue_charging(
+        usd: &str,
+        models: Vec<Box<dyn HoldingCostModel>>,
+    ) -> SimulatedVenue {
+        let mut venue = SimulatedVenue::new_market_driven(
+            &config_from_balances(vec![funded(self::usd(), d(usd))], FeeModelConfig::default()),
+            instruments_of(cfd_instrument()),
+        )
+        .with_holding_costs(models);
+        advance(&mut venue, time(1));
+        venue
+    }
+
+    /// The cash flows among `events`, each with the balance restated just before it.
+    fn charges(
+        events: &[UnindexedAccountEvent],
+    ) -> Vec<(
+        &AssetBalance<AssetNameExchange>,
+        &CashFlow<AssetNameExchange, InstrumentNameExchange>,
+    )> {
+        events
+            .chunks(2)
+            .map(
+                |pair| match (&pair[0].kind, pair.get(1).map(|event| &event.kind)) {
+                    (
+                        AccountEventKind::BalanceSnapshot(balance),
+                        Some(AccountEventKind::CashFlow(flow)),
+                    ) => (&balance.0, flow),
+                    other => panic!("a charge is [balance, cash flow], got: {other:?}"),
+                },
+            )
+            .collect()
+    }
+
+    /// The position is valued at the mid (5000), not the last trade (4000) it filled at: a long
+    /// of 1 contract × 25 × 5000 pays 0.0001 of it, 12.5, as one restatement and one cash flow,
+    /// both stamped at the boundary.
+    #[test]
+    fn a_position_held_across_a_boundary_is_charged_there_as_balance_then_cash_flow() {
+        let mut venue = make_cfd_venue_charging("200000", vec![hourly_funding("0.0001")]);
+        assert!(cfd_market(&mut venue, "4990", "5010", "4000").is_empty());
+        cfd_market_fill(&mut venue, Side::Buy, "1");
+        assert_eq!(free_usd(&venue), d("100000"));
+
+        let events = venue.advance_time(boundary(0));
+        let charged = charges(&events);
+
+        assert_eq!(charged.len(), 1);
+        let (balance, flow) = charged[0];
+        assert_eq!(balance.asset, usd());
+        assert_eq!(balance.balance, Balance::new(d("99987.5"), d("99987.5")));
+        assert_eq!(balance.time_exchange, boundary(0));
+        assert_eq!(
+            *flow,
+            CashFlow::new(
+                CashFlowKind::Funding {
+                    rate: Some(d("0.0001")),
+                    position_quantity: Some(d("1")),
+                },
+                usd(),
+                d("-12.5"),
+                Some(cfd_instrument_name()),
+                boundary(0),
+                Some(CashFlowId::new("0")),
+            )
+        );
+        assert_eq!(total_usd(&venue), d("99987.5"));
+    }
+
+    /// A clock that jumps over several boundaries charges each one, in time order and at its own
+    /// stamp, and a clock moved to an instant already charged charges nothing again.
+    #[test]
+    fn a_gap_of_several_boundaries_is_caught_up_once_each() {
+        let mut venue = make_cfd_venue_charging("200000", vec![hourly_funding("0.0001")]);
+        assert!(cfd_market(&mut venue, "5000", "5000", "5000").is_empty());
+        cfd_market_fill(&mut venue, Side::Sell, "1");
+
+        let events = venue.advance_time(boundary(2) + TimeDelta::seconds(1));
+        let charged = charges(&events);
+
+        let stamps: Vec<_> = charged.iter().map(|(_, flow)| flow.time_exchange).collect();
+        assert_eq!(stamps, vec![boundary(0), boundary(1), boundary(2)]);
+        let ids: Vec<_> = charged.iter().map(|(_, flow)| flow.id.clone()).collect();
+        assert_eq!(
+            ids,
+            ["0", "1", "2"].map(|id| Some(CashFlowId::new(id))).to_vec()
+        );
+        assert!(
+            charged.iter().all(|(_, flow)| flow.amount == d("12.5")),
+            "a short receives a positive funding rate"
+        );
+        assert_eq!(free_usd(&venue), d("75000") + d("37.5"));
+
+        assert!(
+            venue
+                .advance_time(boundary(2) + TimeDelta::seconds(1))
+                .is_empty()
+        );
+        assert!(
+            venue.advance_time(boundary(1)).is_empty(),
+            "the clock moving back"
+        );
+        assert_eq!(free_usd(&venue), d("75000") + d("37.5"));
+    }
+
+    /// Charging starts where the clock first moves, not at the epoch the clock starts at. A venue
+    /// with no market values the position at its entry price.
+    #[test]
+    fn charging_starts_at_the_first_clock_move_and_values_at_entry_without_a_market() {
+        let mut venue = make_cfd_venue("200000", FeeModelConfig::default())
+            .with_holding_costs(vec![hourly_funding("0.0001")]);
+        cfd_fill(&mut venue, Side::Buy, "1", "4000");
+
+        assert!(
+            venue
+                .advance_time(boundary(0) + TimeDelta::seconds(1))
+                .is_empty(),
+            "the first move charges nothing before it"
+        );
+
+        let events = venue.advance_time(boundary(1));
+        let charged = charges(&events);
+        assert_eq!(charged.len(), 1);
+        // 1 × 25 × 4000 × 0.0001, at the entry price.
+        assert_eq!(charged[0].1.amount, d("-10"));
+    }
+
+    /// At a boundary's instant the venue charges before it fills: a position opened there is not
+    /// charged for it, and one closed there is.
+    #[test]
+    fn a_position_opened_at_a_boundary_is_not_charged_for_it_and_one_closed_there_is() {
+        let mut venue = make_cfd_venue_charging("200000", vec![hourly_funding("0.0001")]);
+        assert!(cfd_market(&mut venue, "5000", "5000", "5000").is_empty());
+
+        assert!(venue.advance_time(boundary(0)).is_empty());
+        cfd_market_fill(&mut venue, Side::Buy, "1");
+
+        let events = venue.advance_time(boundary(1));
+        let stamps: Vec<_> = charges(&events)
+            .iter()
+            .map(|(_, flow)| flow.time_exchange)
+            .collect();
+        assert_eq!(stamps, vec![boundary(1)]);
+
+        cfd_market_fill(&mut venue, Side::Sell, "1");
+        assert!(venue.advance_time(boundary(3)).is_empty(), "flat");
+    }
+
+    /// A tick that passes a boundary charges it at the market as it stood before the tick.
+    #[test]
+    fn a_market_tick_past_a_boundary_charges_it_at_the_market_before_the_tick() {
+        let mut venue = make_cfd_venue_charging("200000", vec![hourly_funding("0.0001")]);
+        assert!(cfd_market(&mut venue, "5000", "5000", "5000").is_empty());
+        cfd_market_fill(&mut venue, Side::Buy, "1");
+
+        let six_thousand = MarketSnapshot {
+            best_bid: Some(d("6000")),
+            best_ask: Some(d("6000")),
+            last_price: Some(d("6000")),
+        };
+        let events = venue.apply_market(
+            &cfd_instrument_name(),
+            six_thousand,
+            MarketDepth::UNKNOWN,
+            boundary(0) + TimeDelta::seconds(1),
+        );
+
+        let charged = charges(&events);
+        assert_eq!(charged.len(), 1);
+        assert_eq!(charged[0].1.amount, d("-12.5"), "valued at 5000, not 6000");
+    }
+
+    /// A charge the account cannot cover is still made: this venue models no liquidation to stop
+    /// it, and leaving it out would understate the cost.
+    #[test]
+    fn a_charge_the_account_cannot_cover_takes_free_below_zero() {
+        let mut venue = make_cfd_venue_charging("125000", vec![hourly_funding("0.0001")]);
+        assert!(cfd_market(&mut venue, "5000", "5000", "5000").is_empty());
+        cfd_market_fill(&mut venue, Side::Buy, "1");
+        assert_eq!(free_usd(&venue), Decimal::ZERO);
+
+        let events = venue.advance_time(boundary(0));
+
+        assert_eq!(
+            charges(&events)[0].0.balance,
+            Balance::new(d("-12.5"), d("-12.5"))
+        );
+    }
+
+    /// A charge of zero is not reported: there is nothing to apply.
+    #[test]
+    fn a_zero_charge_is_not_reported() {
+        let mut venue = make_cfd_venue_charging("200000", vec![hourly_funding("0")]);
+        assert!(cfd_market(&mut venue, "5000", "5000", "5000").is_empty());
+        cfd_market_fill(&mut venue, Side::Buy, "1");
+
+        assert!(venue.advance_time(boundary(1)).is_empty());
+    }
+
+    /// The next deadline is the earlier of an order's expiry and a held position's boundary, and
+    /// a flat venue with no expiring order has none.
+    #[test]
+    fn the_next_deadline_is_the_earliest_expiry_or_boundary() {
+        let mut venue = make_cfd_venue_charging("200000", vec![hourly_funding("0.0001")]);
+        assert!(cfd_market(&mut venue, "5000", "5000", "5000").is_empty());
+        assert_eq!(venue.next_deadline(), None, "flat, no orders");
+
+        cfd_market_fill(&mut venue, Side::Buy, "1");
+        assert_eq!(venue.next_deadline(), Some(boundary(0)));
+
+        // Rests without crossing, and holds nothing, since it only reduces the long.
+        let expiry = boundary(0) - TimeDelta::seconds(60);
+        let mut gtd = limit_request(
+            "gtd",
+            Side::Sell,
+            "1",
+            "6000",
+            TimeInForce::GoodTillDate { expiry },
+        );
+        gtd.key.instrument = cfd_instrument_name();
+        assert!(venue.open_order(gtd).response.state.is_accepted());
+        assert_eq!(venue.next_deadline(), Some(expiry));
+
+        let events = venue.advance_time(expiry);
+        assert!(!events.is_empty(), "the order expired");
+        assert_eq!(venue.next_deadline(), Some(boundary(0)));
+    }
+
+    #[test]
+    #[should_panic(expected = "which is not after")]
+    fn a_model_whose_boundary_does_not_advance_panics_rather_than_charging_forever() {
+        #[derive(Debug)]
+        struct Stuck;
+        impl HoldingCostModel for Stuck {
+            fn next_boundary(
+                &self,
+                _: &InstrumentNameExchange,
+                after: DateTime<Utc>,
+            ) -> Option<DateTime<Utc>> {
+                Some(after)
+            }
+            fn charge(&self, _: &HeldPosition<'_>, _: DateTime<Utc>) -> Option<HoldingCharge> {
+                None
+            }
+        }
+
+        let mut venue = make_cfd_venue_charging("200000", vec![Box::new(Stuck)]);
+        assert!(cfd_market(&mut venue, "5000", "5000", "5000").is_empty());
+        cfd_market_fill(&mut venue, Side::Buy, "1");
+        let _ = venue.advance_time(time(2));
     }
 }
