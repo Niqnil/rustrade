@@ -245,7 +245,7 @@ impl Ord for ScheduledEvent {
 }
 
 /// Default [`SimRunner::with_feedback_limit`]: account deliverables emitted with no intervening
-/// source event before a run is abandoned as a zero-delay feedback cycle.
+/// source event or venue deadline before a run is abandoned as a zero-delay feedback cycle.
 ///
 /// Generous enough that no realistic strategy reaches it — it allows roughly three thousand orders
 /// opened simultaneously against one market event — and small enough that a runaway is reported in
