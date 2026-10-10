@@ -249,9 +249,12 @@ async fn risk_session(
             )),
         },
     };
+    // Every error from here on may quote the venue (a subscribe refusal, a close reason) and so
+    // the key, and each one is logged when the stream retries.
+    let masked = |error: String| redact_listen_key(&error, &listen_key).into_owned();
     let (mut ws, early) = match connect_and_subscribe(base_url, &listen_key).await {
         Ok(subscribed) => subscribed,
-        Err(e) => return failed(e),
+        Err(e) => return failed(masked(e)),
     };
     info!("BinanceMargin risk data stream connected and subscribed");
 
@@ -263,7 +266,7 @@ async fn risk_session(
     match stop {
         Stop::ConsumerDropped => SessionEnd::ConsumerDropped,
         Stop::Retry(error) => SessionEnd::Retry {
-            error,
+            error: masked(error),
             healthy: start.elapsed() >= HEALTHY_SESSION,
         },
     }
@@ -333,7 +336,7 @@ async fn forward_session(
                 match tokio::time::timeout(REQUEST_TIMEOUT, keys.keepalive(listen_key)).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => warn!(
-                        error = %e,
+                        error = %redact_listen_key(&e, listen_key),
                         "BinanceMargin risk data stream listen-key keepalive failed"
                     ),
                     Err(_) => warn!(
@@ -432,10 +435,7 @@ async fn connect_and_subscribe(
             };
             return match reply.get("error") {
                 None => Ok(()),
-                Some(error) => Err(format!(
-                    "subscribe refused: {}",
-                    redact_listen_key(&error.to_string(), listen_key)
-                )),
+                Some(error) => Err(format!("subscribe refused: {error}")),
             };
         }
         Err("socket ended while subscribing".to_owned())
@@ -536,8 +536,10 @@ pub(super) fn convert_risk_frame(
 /// `text` with each occurrence of `listen_key` replaced by `<listen key>`, for a log line.
 ///
 /// Anyone holding the key can read the account's Risk Data Stream until it lapses, and every frame
-/// names it in its `stream` field, so no frame or venue reply is logged unmasked. Masking runs
-/// before a log helper cuts the text short, so no prefix of the key survives either.
+/// names it in its `stream` field, so no frame, venue reply or error that may quote one is logged
+/// unmasked. Masking runs before a log helper cuts the text short, so no prefix of the key
+/// survives either. It matches the key literally: Binance's keys are alphanumeric, so JSON or URL
+/// encoding leaves them unchanged.
 fn redact_listen_key<'a>(text: &'a str, listen_key: &str) -> Cow<'a, str> {
     if listen_key.is_empty() || !text.contains(listen_key) {
         Cow::Borrowed(text)
@@ -832,6 +834,65 @@ mod tests {
 
         async fn keepalive(&self, _listen_key: &str) -> Result<(), String> {
             Ok(())
+        }
+    }
+
+    /// A session's error, logged when the stream retries, has the key masked whether the venue
+    /// quotes it refusing the subscribe or closing the socket.
+    #[tokio::test]
+    async fn a_session_error_quoting_the_key_is_masked() {
+        use tokio_tungstenite::tungstenite::protocol::{CloseFrame, frame::coding::CloseCode};
+
+        for refuse in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base_url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let Some(Ok(Message::Text(subscribe))) = ws.next().await else {
+                    panic!("expected a SUBSCRIBE frame")
+                };
+                let subscribe: serde_json::Value = serde_json::from_str(&subscribe).unwrap();
+                let key = subscribe["params"][0].as_str().unwrap().to_owned();
+                if refuse {
+                    let refusal = serde_json::json!({
+                        "id": subscribe["id"], "error": { "code": 2, "msg": format!("bad {key}") },
+                    });
+                    ws.send(Message::Text(refusal.to_string().into()))
+                        .await
+                        .unwrap();
+                } else {
+                    let ack = serde_json::json!({ "result": null, "id": subscribe["id"] });
+                    ws.send(Message::Text(ack.to_string().into()))
+                        .await
+                        .unwrap();
+                    let close = CloseFrame {
+                        code: CloseCode::Policy,
+                        reason: format!("bad {key}").into(),
+                    };
+                    ws.send(Message::Close(Some(close))).await.unwrap();
+                }
+                while let Some(Ok(_)) = ws.next().await {}
+                key
+            });
+
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let end = risk_session(
+                &Arc::new(FakeKeys::default()),
+                &base_url,
+                &tx,
+                &new_dedup_cache(),
+            )
+            .await;
+            let SessionEnd::Retry { error, .. } = end else {
+                panic!("refuse={refuse}: expected a retry")
+            };
+            let key = server.await.unwrap();
+            assert!(
+                error.contains("bad <listen key>"),
+                "refuse={refuse}: {error}"
+            );
+            assert!(!error.contains(&key), "refuse={refuse}: {error}");
         }
     }
 
