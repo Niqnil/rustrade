@@ -160,6 +160,7 @@ fn args_constant_with_market_data(
 
     Arc::new(BacktestArgsConstant {
         instruments,
+        venue_options: Default::default(),
         executions,
         market_data,
         summary_interval: Daily,

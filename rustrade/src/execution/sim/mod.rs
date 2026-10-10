@@ -39,7 +39,7 @@ use tracing::info;
 pub mod builder;
 pub mod market;
 
-pub use builder::{SimExecutionBuild, SimExecutionBuilder};
+pub use builder::{SimExecutionBuild, SimExecutionBuilder, SimVenueOptions};
 pub use market::VenueMarketUpdate;
 
 /// One simulated venue and everything needed to drive it deterministically.
@@ -86,15 +86,103 @@ enum Deliverable {
     CancelResponse(UnindexedOrderResponseCancel),
 }
 
-/// A request the `Engine` has issued and its venue has not yet acted on.
+/// Something a venue has yet to do: a request the `Engine` has issued, or a deadline of its own.
 ///
-/// Indexed and owned at the moment it was drained rather than when it is acted on, so a
-/// misconfigured key is reported against the request that carried it — see [`SimRunner`]'s
+/// A request is indexed and owned at the moment it was drained rather than when it is acted on,
+/// so a misconfigured key is reported against the request that carried it — see [`SimRunner`]'s
 /// `# Panics`.
 #[derive(Debug)]
 enum Action {
     Open(OrderRequestOpen<ExchangeId, InstrumentNameExchange>),
     Cancel(OrderRequestCancel<ExchangeId, InstrumentNameExchange>),
+    /// Move the venue's clock to its own next deadline, an order's expiry or a holding-cost
+    /// boundary. See [`SimRunner`]'s `# A venue's own deadlines`.
+    Wake,
+}
+
+/// The wake-ups each venue has queued for its own next deadline.
+///
+/// A venue's deadline moves whenever the venue does — an order rests with an earlier expiry, a
+/// position opens and has a boundary to be charged at, an order is cancelled — so it is re-read
+/// after every action and every market event routed to the venue. A wake-up is queued only when
+/// the deadline is earlier than the earliest one already queued. One queued for a deadline that has
+/// since moved later still pops, moves the venue's clock to an instant at which it has nothing to
+/// do, and queues the real one, which costs one empty step. Queuing on every change instead would
+/// grow the queue by one entry per change, for as long as the furthest deadline: a strategy
+/// re-placing a week-long good-till-date quote on every tick would hold one per tick for a week.
+#[derive(Debug)]
+struct Wakeups {
+    /// The earliest wake-up queued for each venue and not yet popped.
+    queued: FnvHashMap<ExchangeIndex, DateTime<Utc>>,
+    /// The session start. A deadline before it — a seeded order that had already expired — is
+    /// woken for at the session start instead, so nothing is stamped before the run began.
+    floor: DateTime<Utc>,
+    /// Set once the source is exhausted: simulated time then ends with the last source event, as
+    /// it always has, so no deadline after it is woken for. See [`SimRunner`]'s `# Termination`.
+    stopped: bool,
+}
+
+impl Wakeups {
+    fn new(floor: DateTime<Utc>) -> Self {
+        Self {
+            queued: FnvHashMap::default(),
+            floor,
+            stopped: false,
+        }
+    }
+
+    /// Queue a wake-up at `venue`'s next deadline, unless one at or before it is already queued.
+    fn arm(
+        &mut self,
+        pending: &mut BinaryHeap<Reverse<ScheduledEvent>>,
+        seq: &mut u64,
+        exchange: ExchangeIndex,
+        venue: &SimulatedVenue,
+    ) {
+        if self.stopped {
+            return;
+        }
+
+        let Some(deadline) = venue.next_deadline() else {
+            return;
+        };
+        let deadline = deadline.max(self.floor);
+
+        if self
+            .queued
+            .get(&exchange)
+            .is_some_and(|queued| *queued <= deadline)
+        {
+            return;
+        }
+        self.queued.insert(exchange, deadline);
+
+        pending.push(Reverse(ScheduledEvent {
+            time: deadline,
+            class: CLASS_ACTION,
+            seq: *seq,
+            exchange,
+            payload: Payload::Act(Action::Wake),
+        }));
+        *seq += 1;
+    }
+
+    /// Whether a wake-up for `exchange` popped at `time` is the earliest one queued for it,
+    /// consuming it if so. Any other has been overtaken by an earlier one that has already woken
+    /// the venue, and must do nothing.
+    fn take(&mut self, exchange: ExchangeIndex, time: DateTime<Utc>) -> bool {
+        let live = self.queued.get(&exchange) == Some(&time);
+        if live {
+            self.queued.remove(&exchange);
+        }
+        live
+    }
+
+    /// Stop waking venues: the source is exhausted. Every queued wake-up becomes a no-op.
+    fn stop(&mut self) {
+        self.stopped = true;
+        self.queued.clear();
+    }
 }
 
 /// What one queue entry holds: something owed to the `Engine`, or something owed to a venue.
@@ -167,7 +255,7 @@ impl Ord for ScheduledEvent {
 /// A tick that crosses many resting orders at once emits three deliverables per fill, so around
 /// three thousand simultaneous fills reach this limit too. The budget is per source event —
 /// `since_source` is reset when a source event is returned, *before* that event is routed to the
-/// venues — so the accounting is right, but a run abandoned this way is reporting a wide book
+/// venues, and when a venue is woken at its own deadline — so the accounting is right, but a run abandoned this way is reporting a wide book
 /// rather than the feedback cycle [`BarterError::SimFeedbackLoop`] names. Raise the limit with
 /// [`SimRunner::with_feedback_limit`] if that is the case.
 ///
@@ -255,7 +343,7 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 ///
 /// | class | entries |
 /// |---|---|
-/// | 0 | venue-bound actions — the requests this runner has yet to book |
+/// | 0 | venue-bound actions — requests this runner has yet to book, venues' own deadlines |
 /// | 1 | auxiliary and control — corporate actions, contract expiries |
 /// | 2 | account — balances, trades, order responses |
 /// | 3 | market data |
@@ -307,6 +395,26 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// Claims 3 and 4 together are the contract for a tick-caused fill: booked at `T`, marked at `T`,
 /// and never delivered before its own cause.
 ///
+/// # A venue's own deadlines
+/// A venue has things to do at instants nobody requested: an order reaching its
+/// [`TimeInForce::GoodTillDate`](rustrade_execution::order::TimeInForce::GoodTillDate) deadline,
+/// and a held position reaching a holding-cost boundary (see [`SimVenueOptions`]). This runner
+/// reads each venue's [`SimulatedVenue::next_deadline`] after anything that can move it — an
+/// action, or a market event routed to the venue — and queues one venue-bound action at that
+/// instant, which moves the venue's clock there. So an expiry or a charge happens at its own
+/// instant, between source events if that is where it falls, and nothing requested it, so it is
+/// delivered one `from_venue` leg later, as a tick-caused fill is.
+///
+/// - A deadline at a source event's instant is reached before that event, as every venue-bound
+///   action at an instant is.
+/// - A wake-up the venue no longer needs, because its order was cancelled or filled or its
+///   position closed, stays in the queue. When it pops it moves the venue's clock to an instant
+///   with nothing due, which changes nothing, and the venue's real next deadline is queued.
+/// - Simulated time still ends with the source. Once the source is exhausted no venue is woken,
+///   so a deadline after the last source event is never reached.
+/// - A deadline before the session start, such as that of a seeded order already past it, is
+///   reached at the session start, so nothing is stamped before the run began.
+///
 /// # Latency is simulated, never slept
 /// A request issued at `T` reaches its venue at `T + to_venue` and its result becomes visible at
 /// `T + to_venue + from_venue`. Both are simulated offsets applied to the queue key, so a run's
@@ -355,8 +463,8 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// round trip is zero, schedules that fill at the instant of the request that provoked it. The
 /// account event then outranks every later source event forever: simulated time never advances and
 /// the source is never drawn again. At most [`with_feedback_limit`](Self::with_feedback_limit)
-/// account deliverables are therefore emitted with no intervening source event, after which the
-/// run is abandoned with [`BarterError::SimFeedbackLoop`], readable via [`error`](Self::error).
+/// account deliverables are therefore emitted with no intervening source event or venue deadline,
+/// after which the run is abandoned with [`BarterError::SimFeedbackLoop`], readable via [`error`](Self::error).
 ///
 /// # Panics
 /// Panics if a venue reports an account event or response whose exchange, asset or instrument is
@@ -383,7 +491,8 @@ where
     seeding: VecDeque<EngineEvent<MarketKind>>,
     /// Ceiling on `since_source`. See [`SimRunner::with_feedback_limit`].
     feedback_limit: usize,
-    /// Account deliverables emitted since the last source event, or since the source was exhausted.
+    /// Account deliverables emitted since the last source event or venue wake-up, or since the
+    /// source was exhausted.
     ///
     /// The seeding snapshots are not charged against it: they are bounded by the venue count and
     /// precede any feedback there could be.
@@ -400,6 +509,8 @@ where
     /// two venues trading it see one market, and folding the stream once is both cheaper and the
     /// only way they cannot disagree.
     market: FnvHashMap<InstrumentIndex, MarketKind::State>,
+    /// Each venue's queued wake-up for its own next deadline.
+    wakeups: Wakeups,
 }
 
 /// Manual because [`futures::stream::Peekable`] is [`Debug`] only when its `Source` is, and
@@ -500,11 +611,18 @@ where
             })
             .collect();
 
+        let mut pending = BinaryHeap::new();
+        let mut seq = 0;
+        let mut wakeups = Wakeups::new(time_engine_start);
+        for (exchange, slot) in &venues {
+            wakeups.arm(&mut pending, &mut seq, *exchange, &slot.venue);
+        }
+
         Self {
             source: futures::StreamExt::peekable(source),
             venues,
-            pending: BinaryHeap::new(),
-            seq: 0,
+            pending,
+            seq,
             clock,
             seeding,
             feedback_limit: DEFAULT_FEEDBACK_LIMIT,
@@ -514,11 +632,17 @@ where
             drain_signalled: false,
             terminated: false,
             market: FnvHashMap::default(),
+            wakeups,
         }
     }
 
-    /// Set how many account deliverables may be emitted with no intervening source event before the
-    /// run is abandoned as a zero-delay feedback cycle. Defaults to [`DEFAULT_FEEDBACK_LIMIT`].
+    /// Set how many account deliverables may be emitted with no intervening source event or venue
+    /// deadline before the run is abandoned as a zero-delay feedback cycle. Defaults to
+    /// [`DEFAULT_FEEDBACK_LIMIT`].
+    ///
+    /// A cycle that moves simulated time forward is not zero-delay and is not reported: a strategy
+    /// that re-places an order with a short deadline each time one expires advances through those
+    /// deadlines until the next source event, or until the source is exhausted.
     ///
     /// Raise it for a strategy that legitimately opens more than a few thousand orders against a
     /// single market event, or for a book deep enough that one tick fills that many resting orders
@@ -607,6 +731,7 @@ where
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(None) => {
                         *this.source_done = true;
+                        this.wakeups.stop();
                         continue;
                     }
                     Poll::Ready(Some(timed)) => (timed.time, source_class(&timed.value)),
@@ -632,7 +757,7 @@ where
                     return Poll::Ready(None);
                 }
 
-                match step(this.venues, this.pending, this.seq) {
+                match step(this.venues, this.pending, this.seq, this.wakeups) {
                     Step::Emitted(event) => {
                         *this.since_source += 1;
                         return Poll::Ready(Some(event));
@@ -640,6 +765,13 @@ where
                     // A venue acted. Nothing to emit, and what it produced is now queued, so the
                     // next iteration weighs that against the source exactly as it did this one.
                     Step::Acted => continue,
+                    // A venue was woken at its own deadline, which moved simulated time forward
+                    // as a source event does, so what it produces starts a fresh budget. A gap in
+                    // the source spanning many charges is not a feedback cycle.
+                    Step::Woken => {
+                        *this.since_source = 0;
+                        continue;
+                    }
                     // Nothing left owed and no source to draw from: the run is over.
                     Step::Empty => {
                         *this.terminated = true;
@@ -663,6 +795,7 @@ where
                         this.market,
                         this.pending,
                         this.seq,
+                        this.wakeups,
                         &timed.value,
                     );
 
@@ -670,6 +803,7 @@ where
                 }
                 Poll::Ready(None) => {
                     *this.source_done = true;
+                    this.wakeups.stop();
                     continue;
                 }
                 Poll::Pending => Poll::Pending,
@@ -701,6 +835,7 @@ fn route_market<MarketKind>(
     market: &mut FnvHashMap<InstrumentIndex, MarketKind::State>,
     pending: &mut BinaryHeap<Reverse<ScheduledEvent>>,
     seq: &mut u64,
+    wakeups: &mut Wakeups,
     event: &EngineEvent<MarketKind>,
 ) where
     MarketKind: VenueMarketUpdate,
@@ -731,6 +866,10 @@ fn route_market<MarketKind>(
             .venue
             .apply_market(&name, snapshot, depth, event.time_exchange);
 
+        // A fill can open or close a position, and the venue's first market starts its clock, so
+        // either can move its next deadline.
+        wakeups.arm(pending, seq, *exchange, &slot.venue);
+
         if fills.is_empty() {
             continue;
         }
@@ -754,9 +893,10 @@ fn route_market<MarketKind>(
 /// # An action at the head is not what the budget counts
 /// The budget counts what the `Engine` is *shown*, so a venue-bound action is let through: it
 /// emits nothing, and reporting against it would name a request rather than the deliverable the
-/// run stopped on. It cannot defer the guard indefinitely either — every action this runner
-/// queues produces at least a response, so the head becomes a deliverable within one step and the
-/// limit is reached on the same count it would have been.
+/// run stopped on. It cannot defer the guard indefinitely either. A request produces at least a
+/// response, so the head becomes a deliverable within one step. A wake-up produces no response,
+/// but each one that acts leaves the venue's next deadline strictly later, and only a deadline
+/// queues one, so a run of wake-ups at one instant ends.
 fn check_feedback(
     venues: &FnvIndexMap<ExchangeIndex, SimVenue>,
     pending: &BinaryHeap<Reverse<ScheduledEvent>>,
@@ -884,11 +1024,18 @@ fn drain_requests(
 /// venue's book is the one this request actually arrives to.
 ///
 /// The venue's clock is advanced first, which is what makes a deadline an unconditional cutoff: an
-/// order whose [`TimeInForce::GoodTillDate`] deadline fell between this request being sent and it
-/// arriving is retired before the request is served, so a cancel for it is answered
-/// `OrderAlreadyExpired` rather than succeeding. Nothing requested those expiries, so they pay
-/// `from_venue` alone — the same one leg a tick-caused fill pays — and are scheduled ahead of this
-/// request's own response, which they precede in fact as well as in the queue.
+/// order whose [`TimeInForce::GoodTillDate`] deadline has been reached is retired before the
+/// request is served, so a cancel for it is answered `OrderAlreadyExpired` rather than succeeding.
+/// A venue is normally woken at each deadline already (see [`SimRunner`]'s
+/// `# A venue's own deadlines`), so this catches only one reached at this very instant. Nothing
+/// requested those expiries, or the holding costs the advance charges, so they pay `from_venue`
+/// alone — the same one leg a tick-caused fill pays — and are scheduled ahead of this request's
+/// own response, which they precede in fact as well as in the queue.
+///
+/// A [`Action::Wake`] moves the clock and does nothing else, and only if it is the venue's earliest
+/// queued wake-up — see [`Wakeups`]. Every action ends by re-reading the venue's next deadline.
+///
+/// Returns whether a wake-up moved the venue's clock.
 ///
 /// # Panics
 /// Panics if `exchange` is not registered, or if a simulated timestamp overflows — see
@@ -899,13 +1046,19 @@ fn act(
     venues: &mut FnvIndexMap<ExchangeIndex, SimVenue>,
     pending: &mut BinaryHeap<Reverse<ScheduledEvent>>,
     seq: &mut u64,
+    wakeups: &mut Wakeups,
     exchange: ExchangeIndex,
     time: DateTime<Utc>,
     action: Action,
-) {
+) -> bool {
     let slot = venues.get_mut(&exchange).unwrap_or_else(|| {
         panic!("SimRunner scheduled an action for an unregistered venue: {exchange}")
     });
+
+    let woken = matches!(action, Action::Wake);
+    if woken && !wakeups.take(exchange, time) {
+        return false;
+    }
 
     let delivers = checked_offset(
         time,
@@ -938,7 +1091,12 @@ fn act(
             slot.venue.cancel_order(request),
             Deliverable::CancelResponse,
         ),
+        // The clock is all a wake-up moves, and it has moved.
+        Action::Wake => {}
     }
+
+    wakeups.arm(pending, seq, exchange, &slot.venue);
+    woken
 }
 
 /// Apply a simulated latency offset, refusing to schedule an event before its own cause.
@@ -1024,6 +1182,9 @@ enum Step<MarketKind> {
     Emitted(EngineEvent<MarketKind>),
     /// An action was popped and run against its venue. Nothing to emit; poll again.
     Acted,
+    /// A wake-up was popped and moved its venue's clock to the venue's own deadline. Nothing to
+    /// emit; poll again.
+    Woken,
     /// The queue is empty.
     Empty,
 }
@@ -1037,6 +1198,7 @@ fn step<MarketKind>(
     venues: &mut FnvIndexMap<ExchangeIndex, SimVenue>,
     pending: &mut BinaryHeap<Reverse<ScheduledEvent>>,
     seq: &mut u64,
+    wakeups: &mut Wakeups,
 ) -> Step<MarketKind> {
     let Some(Reverse(ScheduledEvent {
         time,
@@ -1051,8 +1213,10 @@ fn step<MarketKind>(
 
     let payload = match payload {
         Payload::Act(action) => {
-            act(venues, pending, seq, exchange, time, action);
-            return Step::Acted;
+            return match act(venues, pending, seq, wakeups, exchange, time, action) {
+                true => Step::Woken,
+                false => Step::Acted,
+            };
         }
         Payload::Deliver(payload) => payload,
     };
@@ -1297,6 +1461,14 @@ mod tests {
                 txs: execution_tx_map,
                 clock,
                 exchange,
+            }
+        }
+
+        /// The same harness, abandoning a run after `limit` deliverables with no source event.
+        fn with_feedback_limit(self, limit: usize) -> Self {
+            Self {
+                runner: self.runner.with_feedback_limit(limit),
+                ..self
             }
         }
 
@@ -2085,12 +2257,13 @@ mod tests {
         );
     }
 
-    /// A deadline reached by a market tick reaches the `Engine`, rather than being eaten.
+    /// A deadline is reached at its own instant, between ticks, rather than at whichever tick or
+    /// request next moves the venue's clock.
     ///
     /// The order rests below the market and is never crossed, so nothing but its deadline can
-    /// retire it.
+    /// retire it, and no tick falls on the deadline.
     #[tokio::test]
-    async fn a_deadline_reached_by_a_tick_is_delivered() {
+    async fn a_deadline_is_reached_at_its_own_instant_between_ticks() {
         let mut harness = Harness::new(
             0,
             vec![
@@ -2104,29 +2277,172 @@ mod tests {
         assert_eq!(harness.next().await, Some("market"));
 
         harness.clock.advance_to(at(10));
-        // Far below the market, so only the deadline at 500 can retire it.
+        // Far below the market, so only the deadline at 300 can retire it.
+        harness.send_limit_gtd(dec!(1), at(300));
+
+        let events = harness.rest_events().await;
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec![
+                "balance",
+                "order", // the open rests
+                "balance",
+                "order", // retired at 300: release, then the terminal snapshot
+                "market",
+                "market",
+                "after_drain"
+            ],
+            "the expiry precedes the tick at 500, which no longer has to reach it"
+        );
+        let EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+            kind: AccountEventKind::OrderSnapshot(Snapshot(expired)),
+            ..
+        })) = &events[3]
+        else {
+            panic!(
+                "the fourth event is the expired order, got: {:?}",
+                events[3]
+            );
+        };
+        assert_eq!(expired.state.time_exchange(), Some(at(300)));
+    }
+
+    /// A deadline that falls on a tick's instant is reached before the tick, as any venue-bound
+    /// action at an instant precedes the market at it.
+    #[tokio::test]
+    async fn a_deadline_on_a_ticks_instant_is_reached_before_the_tick() {
+        let mut harness = Harness::new(
+            0,
+            vec![
+                market(10, dec!(200)),
+                market(500, dec!(200)),
+                market(700, dec!(200)),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
         harness.send_limit_gtd(dec!(1), at(500));
 
         assert_eq!(
             harness.rest().await,
             vec![
                 "balance",
-                "order",  // the open rests
-                "market", // the tick at 500, which reaches the deadline as it is applied
+                "order", // the open rests
                 "balance",
-                "order", // and so retires it: release, then the terminal snapshot
+                "order", // retired at 500
+                "market",
                 "market",
                 "after_drain"
             ],
-            "an expiry follows the tick that reached it, exactly as a resting fill does — a \
-             market is applied on emit, so anything it retires is drawn on a later poll"
         );
     }
 
-    /// A deadline reached while advancing the clock for an unrelated request is delivered too.
+    /// An order cancelled before its deadline leaves a wake-up behind in the queue, which does
+    /// nothing when it pops.
+    #[tokio::test]
+    async fn a_wake_up_superseded_by_a_cancel_does_nothing() {
+        let mut harness = Harness::new(
+            0,
+            vec![
+                market(10, dec!(200)),
+                market(100, dec!(200)),
+                market(700, dec!(200)),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        let cid = harness.send_limit_gtd(dec!(1), at(500));
+        assert_eq!(harness.next().await, Some("balance"));
+        assert_eq!(harness.next().await, Some("order"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(100));
+        harness.send_cancel(cid);
+
+        assert_eq!(
+            harness.rest().await,
+            vec!["balance", "cancelled", "market", "after_drain"],
+            "the cancel releases the hold, and nothing expires at 500"
+        );
+    }
+
+    /// Re-placing an order with a far deadline, again and again, does not grow the queue: a
+    /// wake-up is queued only for a deadline earlier than the one already queued.
+    #[tokio::test]
+    async fn re_placing_an_expiring_order_does_not_grow_the_queue() {
+        let mut harness = Harness::new(0, vec![market(10, dec!(200)), market(900_000, dec!(200))]);
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+        harness.clock.advance_to(at(10));
+
+        for _ in 0..200 {
+            let cid = harness.send_limit_gtd(dec!(1), at(500_000));
+            assert_eq!(harness.next().await, Some("balance"));
+            assert_eq!(harness.next().await, Some("order"));
+            harness.send_cancel(cid);
+            assert_eq!(harness.next().await, Some("balance"));
+            assert_eq!(harness.next().await, Some("cancelled"));
+        }
+
+        assert!(
+            harness.runner.pending.len() <= 1,
+            "one wake-up at most, not one per order: {}",
+            harness.runner.pending.len()
+        );
+    }
+
+    /// A venue woken at its own deadline moves simulated time forward, so what it produces does
+    /// not count towards the zero-delay feedback budget: a quiet stretch of the source with many
+    /// deadlines in it is not a feedback cycle.
+    #[tokio::test]
+    async fn deadlines_between_source_events_do_not_spend_the_feedback_budget() {
+        // The five opens alone deliver ten events after the tick at 10; the five expiries would
+        // take that to twenty with no source event between them.
+        let mut harness = Harness::new(0, vec![market(10, dec!(200)), market(1_000, dec!(200))])
+            .with_feedback_limit(12);
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+        harness.clock.advance_to(at(10));
+        for deadline in [100, 200, 300, 400, 500] {
+            harness.send_limit_gtd(dec!(1), at(deadline));
+        }
+
+        let labels = harness.rest().await;
+        assert_eq!(harness.runner.error(), None);
+        assert_eq!(labels.len(), 22, "{labels:?}");
+        assert_eq!(labels[20..], ["market", "after_drain"]);
+    }
+
+    /// Simulated time ends with the last source event: a deadline after it is never reached, as
+    /// before deadlines were woken for.
+    #[tokio::test]
+    async fn a_deadline_after_the_last_source_event_is_not_reached() {
+        let mut harness = Harness::new(0, vec![market(10, dec!(200)), market(100, dec!(200))]);
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        harness.send_limit_gtd(dec!(1), at(500));
+
+        assert_eq!(
+            harness.rest().await,
+            vec!["balance", "order", "market", "after_drain"],
+        );
+    }
+
+    /// A deadline that passed before a cancel arrives is delivered ahead of the cancel's response,
+    /// and the cancel is told the order expired.
     ///
-    /// Nothing ticks between the open and the cancel, so only `advance_time`'s sweep can find it —
-    /// this is the entry point a tick-driven sweep alone would miss.
+    /// Nothing ticks between the open and the cancel; the venue is woken for the deadline itself.
     #[tokio::test]
     async fn a_deadline_reached_by_a_request_is_delivered_and_the_cancel_is_told_why() {
         let mut harness = Harness::new(0, vec![market(10, dec!(200)), market(900, dec!(200))]);
@@ -2148,7 +2464,7 @@ mod tests {
             harness.rest().await,
             vec![
                 "balance",
-                "order",     // swept by the advance the cancel provoked
+                "order",     // retired at its deadline, before the cancel arrives
                 "cancelled", // the cancel itself, answered `OrderAlreadyExpired`
                 "market",
                 "after_drain"

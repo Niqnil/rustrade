@@ -244,6 +244,11 @@ impl OpenOrders {
             .collect()
     }
 
+    /// The earliest deadline of any open order, or `None` if none has one.
+    pub fn next_expiry(&self) -> Option<DateTime<Utc>> {
+        self.expiries.first().map(|(expiry, _)| *expiry)
+    }
+
     /// Takes `order` out of every index that ranks it, leaving [`by_id`](Self::by_id) to its caller.
     fn unindex(&mut self, order: &OpenOrder) {
         self.dequeue(order);

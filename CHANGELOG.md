@@ -12,9 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`AccountEventKind::CashFlow`: cash moved into or out of an account other than by a trade**
   (`rustrade-execution`, #549).
   - A `CashFlow` carries what it is for (`CashFlowKind`: `Funding`, `BorrowFee`,
-    `MarginInterest`, `Rebate` or `Other`), the asset, the amount signed positive when received,
-    the instrument when the venue attributes it to one, the venue's time, and the venue's id when
-    it gives one. `CashFlow` and `CashFlowKind` are `#[non_exhaustive]`.
+    `MarginInterest`, `Financing`, `Rebate` or `Other`, each with the venue's figures where it
+    reports them), the asset, the amount signed positive when received, the instrument when the
+    venue attributes it to one, the venue's time, and the venue's id when it gives one. `CashFlow`
+    and `CashFlowKind` are `#[non_exhaustive]`. `Financing` is a leveraged position's overnight
+    financing, such as a CFD's, charged on the position rather than on a loan.
   - `HyperliquidClient`'s account stream now reports each hourly funding payment as one, from the
     `userFundings` subscription, with the funding rate and the signed position it was charged on.
     The subscription's snapshot of recent payments is sent too, and the repeat of it after each
@@ -44,7 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Breaking:** the trading summary is net of carry. `TearSheet::pnl` and every return, ratio
     and drawdown are computed from realised PnL plus carry. The new `TearSheet::carry` and
     `PnLReturns::carry` report the total, and the summary table shows it. Without cash flows,
-    which the simulated venue does not produce, carry is zero and nothing changes.
+    which the simulated venue produces only when given holding costs (see below), carry is zero
+    and nothing changes.
 - **Why a fill happened: `Trade::origin`** (`rustrade-execution`, part of #552).
   - **Breaking:** `Trade` is `#[non_exhaustive]` and gains `origin: TradeOrigin`, with
     `#[serde(default)]` so stored trades still load, as `Order`. Outside `rustrade-execution`, build
@@ -124,6 +127,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     short" → `BorrowDisabled`, and "cannot be sold short" → `NotShortable`. Alpaca's "fractional
     orders cannot be sold short" stays `OrderRejected`, since the asset may be shortable in whole
     shares. Other clients still report such refusals as `OrderRejected`.
+- **The simulator charges what holding a position costs: funding, borrow fees and overnight
+  financing** (part of #553).
+  - `HoldingCostModel` (`rustrade-execution`) prices holding a position over time, as `FeeModel`
+    prices a fill: it names its next boundary in time for an instrument, and what the position
+    held across that boundary is charged there. Built in:
+    - `FundingModel`: a perpetual's funding at a fixed interval, on whole intervals since the
+      epoch (hourly on the hour, 8-hourly at 00:00, 08:00 and 16:00 UTC).
+    - `BorrowFeeModel`: a short's borrow fee at a daily cutoff, from an annualised rate.
+    - `FinancingModel`: a CFD's overnight financing at a daily cutoff, at separate long and short
+      rates.
+  - Rates are a `RateSeries`, a step function of time that refuses unsorted points, so one type
+    holds a constant rate or a replayed history. A daily charge is timed by a `DailyAccrual`:
+    a local cutoff in any `chrono` time zone, a cutoff every calendar day or on business days
+    only (`AccrualDays`), and an Act/360 or Act/365 basis (`DayCount`). On business days, a
+    charge covers the calendar days until the next one settles, with a settlement lag, so a T+1
+    short held over Thursday's cutoff pays three days, and four before a Monday holiday. Business
+    days come from a `SettlementCalendar`: `WeekendsOnly`, or a `HolidayCalendar` of the caller's
+    holidays. No market's holidays are bundled.
+  - `SimulatedVenue::with_holding_costs` charges each open CFD position at every boundary its
+    clock reaches, before anything else at that instant, so a position opened at a boundary is
+    not charged for it and one closed there is. Nothing is charged for part of a period. A clock
+    move over several boundaries charges each once, in time order. Charging starts where the
+    clock first moves, so a seeded position is never charged for time before the run.
+  - Each charge is reported as the restated balance, then a `CashFlow` attributed to the
+    instrument, both stamped at the boundary and in the quote asset, with an id from the venue's
+    own sequence. The engine adds it to the position's carry, as it does a live venue's. A
+    position is valued at the venue's mid, else its last price, else, with a WARN once per venue,
+    its entry price. A charge the account cannot cover is still made, and takes `free` below zero,
+    with a WARN when it first does, since the venue models no liquidation.
+  - `rustrade`'s `SimVenueOptions` carries a venue's models (shared, as `Arc`s, so one rate
+    history can serve a whole sweep), through the new `SimExecutionBuilder::add_venue_with_options`.
+  - **Breaking:** `BacktestArgsConstant` gains `venue_options`, the options for each simulated
+    venue by the exchange it mocks; `Default::default()` is every venue as configured. Options for
+    an exchange that no execution configuration mocks are refused with
+    `BarterError::ExecutionBuilder`.
+
+### Changed
+
+- **`SimRunner` reaches a simulated venue's deadlines at their own instants** (`rustrade`, part of
+  #553).
+  - A good-till-date order was retired at the first market event or request to reach its venue
+    after its deadline; it is now retired at the deadline itself, between market events if that
+    is where it falls, and before a market event at the same instant. The same wake-up charges
+    holding costs when they fall. A backtest with good-till-date orders can therefore give a
+    different result: an expiry is stamped, and its released hold is free, earlier.
+  - A deadline after the last market event is still never reached, and a seeded order already
+    past its deadline is retired at the session start.
+  - `SimulatedVenue::next_deadline` reports the earliest open order's deadline or held position's
+    holding-cost boundary, for any driver that wants the same.
 
 ### Fixed
 

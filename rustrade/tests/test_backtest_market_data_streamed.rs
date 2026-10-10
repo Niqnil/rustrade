@@ -224,6 +224,7 @@ where
 
     Arc::new(BacktestArgsConstant {
         instruments,
+        venue_options: Default::default(),
         executions,
         market_data,
         summary_interval: Daily,

@@ -90,7 +90,8 @@ pub enum BarterError {
     /// [`SimRunner::with_feedback_limit`]: crate::execution::sim::SimRunner::with_feedback_limit
     #[error(
         "simulated feedback loop on {exchange} at {time}: {limit} account events were delivered \
-         with no intervening source event, so simulated time is not advancing. A strategy trading \
+         with no intervening source event or venue deadline, so simulated time is not advancing. \
+         A strategy trading \
          on its own fills at zero simulated latency is a zero-delay cycle; give the venue a \
          non-zero latency_ms, or stop generating orders from its own account events"
     )]

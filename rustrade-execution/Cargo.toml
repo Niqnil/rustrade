@@ -150,6 +150,8 @@ serde_json = { workspace = true }
 temp-env = { workspace = true }
 # Serial test execution for integration tests that share exchange state
 serial_test = { workspace = true }
+# Daylight-saving zones for the holding-cost cutoff tests (already an optional dependency)
+chrono-tz = { workspace = true }
 
 # Integration tests whose contents are entirely feature-gated. Without `required-features`, the
 # target still builds with the feature off and libtest reports "0 passed" -- a green run that

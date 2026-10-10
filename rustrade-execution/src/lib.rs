@@ -90,6 +90,12 @@ pub use fill::{
 };
 pub mod fill_recovery;
 pub use fill_recovery::{FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope};
+pub mod holding_cost;
+pub use holding_cost::{
+    AccrualDays, BorrowFeeModel, DailyAccrual, DayCount, FinancingModel, FinancingRates,
+    FundingModel, HeldPosition, HoldingCharge, HoldingCostModel, HolidayCalendar, RateSeries,
+    RateSeriesUnsorted, SettlementCalendar, WeekendsOnly,
+};
 pub mod indexer;
 pub mod map;
 pub mod market;

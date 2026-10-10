@@ -26,6 +26,9 @@ use std::fmt::{Display, Formatter};
 /// Each producer says how it avoids sending one flow twice, and what identifies a flow when the
 /// venue gives it no [`id`](Self::id). Known producers, as of writing:
 /// - Hyperliquid perpetuals: funding, as [`CashFlowKind::Funding`]. See the client's rustdoc.
+/// - The simulated venue: whatever its configured
+///   [`HoldingCostModel`](crate::holding_cost::HoldingCostModel)s charge, each flow once, with an
+///   id from its own sequence.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, Constructor)]
 pub struct CashFlow<AssetKey, InstrumentKey> {
@@ -60,13 +63,30 @@ pub enum CashFlowKind {
         position_quantity: Option<Decimal>,
     },
     /// A fee for borrowing a security to sell it short.
-    BorrowFee,
+    BorrowFee {
+        /// The fee rate charged, as the venue quotes it: usually annualised.
+        rate: Option<Decimal>,
+        /// The quantity borrowed that the fee was charged on.
+        quantity: Option<Decimal>,
+    },
     /// Interest on borrowed cash or assets.
     MarginInterest {
         /// The interest rate charged, per the venue's own period.
         rate: Option<Decimal>,
         /// The amount borrowed that the interest was charged on.
         principal: Option<Decimal>,
+    },
+    /// The financing of a leveraged position held past a venue's daily cutoff, such as a CFD's
+    /// overnight financing.
+    ///
+    /// Charged on the position rather than on a loan: a long and a short in one instrument are
+    /// charged at different rates, and a short may receive rather than pay. Interest on a loan of
+    /// cash or assets is [`MarginInterest`](Self::MarginInterest).
+    Financing {
+        /// The financing rate charged, as the venue quotes it: usually annualised.
+        rate: Option<Decimal>,
+        /// The notional value of the position the financing was charged on.
+        notional: Option<Decimal>,
     },
     /// A rebate paid to the account, such as on cash collateral for a short sale.
     Rebate,

@@ -466,7 +466,10 @@ mod tests {
             EngineEvent::Account(AccountStreamEvent::Item(AccountEvent::new(
                 ExchangeIndex(0),
                 AccountEventKind::CashFlow(CashFlow::new(
-                    CashFlowKind::BorrowFee,
+                    CashFlowKind::BorrowFee {
+                        rate: None,
+                        quantity: None,
+                    },
                     AssetIndex(0),
                     Decimal::NEGATIVE_ONE,
                     Some(InstrumentIndex::new(0)),

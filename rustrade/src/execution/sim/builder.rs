@@ -15,6 +15,7 @@ use rustrade_execution::{
         mock::{MockExecution, MockExecutionConfig},
     },
     exchange::mock::SimulatedVenue,
+    holding_cost::HoldingCostModel,
     indexer::AccountEventIndexer,
     map::generate_execution_instrument_map,
 };
@@ -27,6 +28,32 @@ use rustrade_integration::{
     collection::FnvIndexMap,
 };
 use std::sync::Arc;
+
+/// What a simulated venue models beyond its [`MockExecutionConfig`]: the parts that are behaviour
+/// or data rather than settings, and so cannot live in a serialisable configuration.
+///
+/// Passed to [`SimExecutionBuilder::add_venue_with_options`]. The default models nothing extra,
+/// which is what [`SimExecutionBuilder::add_venue`] uses.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default)]
+pub struct SimVenueOptions {
+    /// What holding a position on the venue costs over time — see
+    /// [`SimulatedVenue::with_holding_costs`]. Charged at each model's boundaries as they fall,
+    /// since [`SimRunner`](crate::execution::sim::SimRunner) wakes the venue for each one.
+    ///
+    /// Shared rather than owned, so the models, and the rate histories they carry, can be built
+    /// once for a whole sweep of backtests.
+    pub holding_costs: Vec<Arc<dyn HoldingCostModel>>,
+}
+
+impl SimVenueOptions {
+    /// These options, also charging what `model` says holding a position costs.
+    #[must_use]
+    pub fn with_holding_cost(mut self, model: Arc<dyn HoldingCostModel>) -> Self {
+        self.holding_costs.push(model);
+        self
+    }
+}
 
 /// Builds the execution half of a deterministic simulation: one [`SimulatedVenue`] per configured
 /// exchange, plus the [`MultiExchangeTxMap`] the `Engine` routes requests through.
@@ -82,7 +109,21 @@ impl<'a> SimExecutionBuilder<'a> {
     /// [`InstrumentKind`]: rustrade_instrument::instrument::kind::InstrumentKind
     /// [`MockExecution::SUPPORTED_KINDS`]: rustrade_execution::client::ExecutionClient::SUPPORTED_KINDS
     /// [`SimRunner`]: crate::execution::sim::SimRunner
-    pub fn add_venue(mut self, config: MockExecutionConfig) -> Result<Self, BarterError> {
+    pub fn add_venue(self, config: MockExecutionConfig) -> Result<Self, BarterError> {
+        self.add_venue_with_options(config, SimVenueOptions::default())
+    }
+
+    /// Adds a [`SimulatedVenue`] for the exchange `config` mocks, modelling what `options` add
+    /// to it — see [`SimVenueOptions`].
+    ///
+    /// Otherwise exactly [`add_venue`](Self::add_venue), whose latency, errors and panics apply.
+    pub fn add_venue_with_options(
+        mut self,
+        config: MockExecutionConfig,
+        options: SimVenueOptions,
+    ) -> Result<Self, BarterError> {
+        let SimVenueOptions { holding_costs } = options;
+
         let exchange = config.mocked_exchange;
 
         validate_supported_instrument_kinds(
@@ -117,7 +158,8 @@ impl<'a> SimExecutionBuilder<'a> {
             venue: SimulatedVenue::new_market_driven(
                 &config,
                 generate_mock_exchange_instruments(self.instruments, exchange),
-            ),
+            )
+            .with_holding_costs(holding_costs),
             indexer: AccountEventIndexer::new(Arc::new(instrument_map)),
             request_rx: execution_rx,
             to_venue: leg,
