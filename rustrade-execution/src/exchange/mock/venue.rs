@@ -7264,6 +7264,71 @@ mod tests {
         );
     }
 
+    /// Run `f`, returning its value and the message of every WARN it logged on this thread.
+    fn warnings<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        use std::sync::Mutex;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Warnings(Arc<Mutex<Vec<String>>>);
+
+        struct Message<'a>(&'a mut String);
+
+        impl tracing::field::Visit for Message<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    *self.0 = format!("{value:?}");
+                }
+            }
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() == tracing::Level::WARN {
+                    let mut message = String::new();
+                    event.record(&mut Message(&mut message));
+                    self.0.lock().unwrap().push(message);
+                }
+            }
+        }
+
+        let warnings = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Warnings(Arc::clone(&warnings)));
+        let value = tracing::subscriber::with_default(subscriber, f);
+        let warnings = warnings.lock().unwrap().clone();
+        (value, warnings)
+    }
+
+    /// An account charged into a negative balance is warned once, on the charge that took it
+    /// there, not again for each charge while it stays negative, nor for a credit.
+    #[test]
+    fn a_negative_balance_is_warned_of_on_the_charge_that_crosses_zero() {
+        // Paid for three hours, then received while the balance is still below zero.
+        let rates = RateSeries::new(vec![
+            (DateTime::<Utc>::MIN_UTC, d("0.0001")),
+            (boundary(3), d("-0.00001")),
+        ])
+        .unwrap();
+        let funding =
+            FundingModel::new(TimeDelta::hours(1)).with_rates(cfd_instrument_name(), rates);
+        let mut venue = make_cfd_venue_charging("125000", vec![Arc::new(funding)]);
+        assert!(cfd_market(&mut venue, "5000", "5000", "5000").is_empty());
+        cfd_market_fill(&mut venue, Side::Buy, "1");
+
+        let (events, logged) = warnings(|| venue.advance_time(boundary(2)));
+        assert_eq!(charges(&events).len(), 3, "three charges, all below zero");
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        assert!(logged[0].contains("could not cover"), "{logged:?}");
+
+        let (events, logged) = warnings(|| venue.advance_time(boundary(3)));
+        assert_eq!(charges(&events)[0].1.amount, d("1.25"), "the long receives");
+        assert_eq!(free_usd(&venue), d("-36.25"));
+        assert!(logged.is_empty(), "a credit is not warned of: {logged:?}");
+    }
+
     /// A charge of zero is not reported: there is nothing to apply.
     #[test]
     fn a_zero_charge_is_not_reported() {
@@ -7372,27 +7437,29 @@ mod tests {
         );
     }
 
-    /// Two instruments charged at one boundary are charged in instrument order, whichever order
-    /// the venue's positions happen to hash in.
+    /// Instruments charged at one boundary are charged in instrument order, whichever order the
+    /// venue's positions happen to hash in.
     #[test]
     fn positions_charged_at_one_boundary_are_charged_in_instrument_order() {
         let nas = InstrumentNameExchange::new("nas100_usd");
+        let dax = InstrumentNameExchange::new("dax40_usd");
         let mut instruments = instruments_of(cfd_instrument());
-        let mut second = cfd_instrument();
-        second.name_exchange = nas.clone();
-        instruments.insert(nas.clone(), second);
-
-        let funding = FundingModel::new(TimeDelta::hours(1))
-            .with_rates(cfd_instrument_name(), RateSeries::constant(d("0.0001")))
-            .with_rates(nas.clone(), RateSeries::constant(d("0.0001")));
+        let mut funding = FundingModel::new(TimeDelta::hours(1))
+            .with_rates(cfd_instrument_name(), RateSeries::constant(d("0.0001")));
+        for name in [&nas, &dax] {
+            let mut other = cfd_instrument();
+            other.name_exchange = name.clone();
+            instruments.insert(name.clone(), other);
+            funding = funding.with_rates(name.clone(), RateSeries::constant(d("0.0001")));
+        }
         let mut venue = SimulatedVenue::new_market_driven(
-            &config_from_balances(vec![funded(usd(), d("500000"))], FeeModelConfig::default()),
+            &config_from_balances(vec![funded(usd(), d("1000000"))], FeeModelConfig::default()),
             instruments,
         )
         .with_holding_costs(vec![Arc::new(funding)]);
         advance(&mut venue, time(1));
 
-        for name in [cfd_instrument_name(), nas.clone()] {
+        for name in [cfd_instrument_name(), nas.clone(), dax.clone()] {
             let fills = venue.apply_market(
                 &name,
                 market_prices("5000").unwrap(),
@@ -7409,7 +7476,7 @@ mod tests {
             .iter()
             .map(|(_, flow)| flow.instrument.clone().unwrap())
             .collect();
-        assert_eq!(order, vec![nas, cfd_instrument_name()]);
+        assert_eq!(order, vec![dax, nas, cfd_instrument_name()]);
     }
 
     /// A long flipped to a short before a boundary is charged there as the short it is.

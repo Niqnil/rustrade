@@ -255,7 +255,7 @@ impl Ord for ScheduledEvent {
 /// A tick that crosses many resting orders at once emits three deliverables per fill, so around
 /// three thousand simultaneous fills reach this limit too. The budget is per source event —
 /// `since_source` is reset when a source event is returned, *before* that event is routed to the
-/// venues — so the accounting is right, but a run abandoned this way is reporting a wide book
+/// venues, and when a venue is woken at its own deadline — so the accounting is right, but a run abandoned this way is reporting a wide book
 /// rather than the feedback cycle [`BarterError::SimFeedbackLoop`] names. Raise the limit with
 /// [`SimRunner::with_feedback_limit`] if that is the case.
 ///
@@ -463,8 +463,8 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// round trip is zero, schedules that fill at the instant of the request that provoked it. The
 /// account event then outranks every later source event forever: simulated time never advances and
 /// the source is never drawn again. At most [`with_feedback_limit`](Self::with_feedback_limit)
-/// account deliverables are therefore emitted with no intervening source event, after which the
-/// run is abandoned with [`BarterError::SimFeedbackLoop`], readable via [`error`](Self::error).
+/// account deliverables are therefore emitted with no intervening source event or venue deadline,
+/// after which the run is abandoned with [`BarterError::SimFeedbackLoop`], readable via [`error`](Self::error).
 ///
 /// # Panics
 /// Panics if a venue reports an account event or response whose exchange, asset or instrument is
@@ -491,7 +491,8 @@ where
     seeding: VecDeque<EngineEvent<MarketKind>>,
     /// Ceiling on `since_source`. See [`SimRunner::with_feedback_limit`].
     feedback_limit: usize,
-    /// Account deliverables emitted since the last source event, or since the source was exhausted.
+    /// Account deliverables emitted since the last source event or venue wake-up, or since the
+    /// source was exhausted.
     ///
     /// The seeding snapshots are not charged against it: they are bounded by the venue count and
     /// precede any feedback there could be.
@@ -635,8 +636,13 @@ where
         }
     }
 
-    /// Set how many account deliverables may be emitted with no intervening source event before the
-    /// run is abandoned as a zero-delay feedback cycle. Defaults to [`DEFAULT_FEEDBACK_LIMIT`].
+    /// Set how many account deliverables may be emitted with no intervening source event or venue
+    /// deadline before the run is abandoned as a zero-delay feedback cycle. Defaults to
+    /// [`DEFAULT_FEEDBACK_LIMIT`].
+    ///
+    /// A cycle that moves simulated time forward is not zero-delay and is not reported: a strategy
+    /// that re-places an order with a short deadline each time one expires advances through those
+    /// deadlines until the next source event, or until the source is exhausted.
     ///
     /// Raise it for a strategy that legitimately opens more than a few thousand orders against a
     /// single market event, or for a book deep enough that one tick fills that many resting orders
