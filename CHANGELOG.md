@@ -200,6 +200,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `SimulatedVenue::next_deadline` reports the earliest open order's deadline or held position's
     holding-cost boundary, for any driver that wants the same.
 
+- **The check of how orders ended while disconnected stops when the venue limits requests**
+  (`rustrade-execution`). Closes #529.
+  - After a reconnect, Alpaca, Binance spot and margin, Hyperliquid and IBKR clients list the
+    orders held as live and look up those no longer listed. A lookup that failed charged only its
+    own instrument, and every other listing and lookup still ran, including after the venue
+    refused one for its rate limit (Binance escalates ignored HTTP 429s to an IP ban).
+  - A listing or lookup refused with `ApiError::RateLimit` now stops the whole check: no further
+    request starts, a WARN `Order check stopped: the venue is limiting requests` replaces the INFO
+    `Order check complete`, and every instrument not yet settled is retried later with the usual
+    backoff, as a failed one always was. Any other failure still charges only its own instrument.
+
 ### Fixed
 
 - **`AlpacaClient` no longer reports Alpaca's business refusals as `Unauthenticated`**

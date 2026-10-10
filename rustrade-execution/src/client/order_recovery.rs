@@ -14,7 +14,7 @@
 
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
-    error::UnindexedClientError,
+    error::{ApiError, UnindexedClientError},
     order::{
         OrderKind, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId},
@@ -32,7 +32,7 @@ use std::{
     num::NonZeroUsize,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -684,6 +684,11 @@ pub(crate) enum OpenListing {
 /// pass that outlasts [`ORDER_CHECK_TIMEOUT_SECS`] keeps what it finished. An instrument whose
 /// listing or any lookup fails, or whose check does not finish, is retried later, asking only about
 /// the orders still held; one never started stays due as it was.
+///
+/// A listing or lookup refused with [`ApiError::RateLimit`] stops the whole check, since every
+/// request still to make would spend more against a venue already refusing: no further listing or
+/// lookup starts, and every instrument not yet settled, started or not, is retried later. Any
+/// other failure charges only its own instrument, and the check goes on.
 pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
     exchange: ExchangeId,
     known: &SharedKnownLiveOrders,
@@ -750,23 +755,39 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
         .collect();
     let mut settled = vec![false; checks.len()];
     let started = AtomicUsize::new(0);
-    let (list_open, lookup) = (&list_open, &lookup);
+    // Set by the first request the venue refuses for its rate limit, and read before any other
+    // starts.
+    let throttled = AtomicBool::new(false);
+    let (list_open, lookup, throttled) = (&list_open, &lookup, &throttled);
     let recovery = async {
         let mut reported = 0u32;
         let mut runs =
             futures::stream::iter(checks.into_iter().enumerate().map(|(index, check)| {
                 started.store(index + 1, Ordering::Relaxed);
                 async move {
+                    if throttled.load(Ordering::Relaxed) {
+                        return (index, Err(UnindexedClientError::Api(ApiError::RateLimit)));
+                    }
                     let (listed_on, keys): (Vec<_>, Vec<_>) = check.into_iter().unzip();
                     let listed = match list_open(listed_on).await {
                         Ok(listed) => listed,
-                        Err(e) => return (index, Err(e)),
+                        Err(e) => {
+                            throttled.fetch_or(is_rate_limit(&e), Ordering::Relaxed);
+                            return (index, Err(e));
+                        }
                     };
                     let unlisted: Vec<UnindexedOrderKey> = keys
                         .into_iter()
                         .flatten()
                         .filter(|key| !listed.contains(&key.cid))
                         .collect();
+                    // How many lookups each instrument has still to settle, so a check stopped
+                    // for the rate limit charges those it did not finish.
+                    let mut unsettled: FnvHashMap<InstrumentNameExchange, usize> =
+                        FnvHashMap::default();
+                    for key in &unlisted {
+                        *unsettled.entry(key.instrument.clone()).or_default() += 1;
+                    }
                     // Each lookup is settled as it ends, so one that fails, or a pass that times
                     // out, loses none of those already answered.
                     let mut lookups = futures::stream::iter(unlisted)
@@ -776,7 +797,14 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
                         })
                         .buffered(ORDER_LOOKUPS_IN_FLIGHT);
                     let mut checked = CheckedListing::default();
-                    while let Some((key, found)) = lookups.next().await {
+                    // Read before each poll, since polling the stream is what starts the next
+                    // lookups. Those already in flight when the check stops are dropped.
+                    while !throttled.load(Ordering::Relaxed)
+                        && let Some((key, found)) = lookups.next().await
+                    {
+                        if let Some(left) = unsettled.get_mut(&key.instrument) {
+                            *left -= 1;
+                        }
                         match found {
                             Ok(found) => match settle(exchange, known, key, found, tx) {
                                 Some(sent) => checked.sent += sent,
@@ -786,11 +814,20 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
                                 }
                             },
                             Err(e) => {
+                                throttled.fetch_or(is_rate_limit(&e), Ordering::Relaxed);
                                 checked
                                     .failed
                                     .entry(key.instrument)
                                     .or_insert_with(|| e.to_string());
                             }
+                        }
+                    }
+                    for (instrument, left) in unsettled {
+                        if left > 0 {
+                            checked
+                                .failed
+                                .entry(instrument)
+                                .or_insert_with(|| RATE_LIMITED.to_owned());
                         }
                     }
                     (index, Ok(checked))
@@ -823,7 +860,16 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
                 }
             }
         }
-        info!(%exchange, reported, "Order check complete");
+        if throttled.load(Ordering::Relaxed) {
+            warn!(
+                %exchange,
+                reported,
+                "Order check stopped: the venue is limiting requests, so what is left is checked \
+                 later"
+            );
+        } else {
+            info!(%exchange, reported, "Order check complete");
+        }
     };
     if tokio::time::timeout(Duration::from_secs(ORDER_CHECK_TIMEOUT_SECS), recovery)
         .await
@@ -840,6 +886,14 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
             }
         }
     }
+}
+
+/// Why an instrument whose lookups a stopped check did not finish is retried.
+const RATE_LIMITED: &str = "the venue is limiting requests";
+
+/// Whether `error` is the venue refusing a request for its rate limit, which stops an order check.
+fn is_rate_limit(error: &UnindexedClientError) -> bool {
+    matches!(error, UnindexedClientError::Api(ApiError::RateLimit))
 }
 
 /// What one listing's lookups came to, once each has been settled.
@@ -930,7 +984,7 @@ fn order_check_failed(
 mod tests {
     use super::*;
     use crate::{
-        error::{ApiError, OrderError},
+        error::{ConnectivityError, OrderError},
         order::{
             Order, OrderKey, OrderKind, TimeInForce,
             id::VenueOrderId,
@@ -1679,7 +1733,9 @@ mod tests {
             },
             |key: UnindexedOrderKey| async move {
                 if key.cid.0 == "btc-failing" {
-                    Err(UnindexedClientError::Api(ApiError::RateLimit))
+                    Err(UnindexedClientError::Connectivity(
+                        ConnectivityError::Timeout,
+                    ))
                 } else {
                     Ok(OrderLookup::Ended(Box::new(cancelled_order(&key))))
                 }
@@ -1716,6 +1772,110 @@ mod tests {
         assert!(known.contains(&ClientOrderId::new("btc-failing")));
         assert!(!known.contains(&ClientOrderId::new("btc-ended")));
         known.assert_consistent();
+    }
+
+    /// Due for one retry, having failed once.
+    fn failed_once(unchecked: &mut UncheckedOrders, instrument: &str) -> bool {
+        unchecked.failed(
+            &InstrumentNameExchange::new(instrument),
+            tokio::time::Instant::now(),
+        ) == Some(GapFailure::Retry(Duration::from_secs(
+            GAP_RETRY_BASE_SECS * 2,
+        )))
+    }
+
+    /// A lookup refused for the rate limit stops the whole check: no other listing or lookup
+    /// starts, and every instrument is retried.
+    #[tokio::test]
+    async fn a_rate_limited_lookup_stops_the_whole_check() {
+        let (known, mut unchecked) = held_on(&["AAA", "BBB", "CCC"]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (listings, lookups) = (AtomicUsize::new(0), AtomicUsize::new(0));
+
+        recover_ended_orders(
+            ExchangeId::BinanceSpot,
+            &known,
+            &mut unchecked,
+            &NoPendingFills,
+            &tx,
+            OpenListing::PerInstrument,
+            |_| {
+                listings.fetch_add(1, Ordering::Relaxed);
+                async { Ok(FnvHashSet::default()) }
+            },
+            |_| {
+                lookups.fetch_add(1, Ordering::Relaxed);
+                async { Err(UnindexedClientError::Api(ApiError::RateLimit)) }
+            },
+        )
+        .await;
+
+        assert_eq!(lookups.load(Ordering::Relaxed), 1);
+        assert_eq!(listings.load(Ordering::Relaxed), 1);
+        assert!(rx.try_recv().is_err(), "nothing reported");
+        for instrument in ["AAA", "BBB", "CCC"] {
+            assert!(failed_once(&mut unchecked, instrument), "{instrument}");
+        }
+        known.lock().assert_consistent();
+    }
+
+    /// In a batch, a lookup refused for the rate limit charges the instrument of every lookup not
+    /// settled, as well as its own.
+    #[tokio::test]
+    async fn a_rate_limited_batch_charges_the_lookups_it_did_not_settle() {
+        let (known, mut unchecked) = held_on(&["AAA", "BBB"]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let lookups = AtomicUsize::new(0);
+
+        recover_ended_orders(
+            ExchangeId::BinanceSpot,
+            &known,
+            &mut unchecked,
+            &NoPendingFills,
+            &tx,
+            OpenListing::Batched,
+            |_| async { Ok(FnvHashSet::default()) },
+            |_| {
+                lookups.fetch_add(1, Ordering::Relaxed);
+                async { Err(UnindexedClientError::Api(ApiError::RateLimit)) }
+            },
+        )
+        .await;
+
+        assert_eq!(lookups.load(Ordering::Relaxed), 1, "the other never asked");
+        assert!(rx.try_recv().is_err(), "nothing reported");
+        for instrument in ["AAA", "BBB"] {
+            assert!(failed_once(&mut unchecked, instrument), "{instrument}");
+        }
+        assert_eq!(known.lock().instruments().len(), 2, "both still held");
+    }
+
+    /// A listing refused for the rate limit stops the check too.
+    #[tokio::test]
+    async fn a_rate_limited_listing_stops_the_whole_check() {
+        let (known, mut unchecked) = held_on(&["AAA", "BBB", "CCC"]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let listings = AtomicUsize::new(0);
+
+        recover_ended_orders(
+            ExchangeId::BinanceSpot,
+            &known,
+            &mut unchecked,
+            &NoPendingFills,
+            &tx,
+            OpenListing::PerInstrument,
+            |_| {
+                listings.fetch_add(1, Ordering::Relaxed);
+                async { Err(UnindexedClientError::Api(ApiError::RateLimit)) }
+            },
+            |_: UnindexedOrderKey| async { panic!("nothing listed, nothing looked up") },
+        )
+        .await;
+
+        assert_eq!(listings.load(Ordering::Relaxed), 1);
+        for instrument in ["AAA", "BBB", "CCC"] {
+            assert!(failed_once(&mut unchecked, instrument), "{instrument}");
+        }
     }
 
     /// A batch whose listing never answers charges every instrument in it once when the pass
