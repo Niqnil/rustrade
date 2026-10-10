@@ -221,6 +221,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     past its deadline is retired at the session start.
   - `SimulatedVenue::next_deadline` reports the earliest open order's deadline or held position's
     holding-cost boundary, for any driver that wants the same.
+- **A Binance query rejection names the pair it asked about** (`rustrade-execution`). When a
+  `BinanceSpot` or `BinanceMargin` query about one instrument is refused, the
+  `ApiError::RequestRejected` message now starts with its symbol, as Binance's own text often does
+  not say which: `BTCUSDT: -11001 Isolated margin account does not exist.` Code that matches the
+  message's start needs updating; the Binance code is still in it.
 
 ### Fixed
 

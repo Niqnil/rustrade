@@ -1604,8 +1604,11 @@ impl BorrowCapacityClient for BinanceMargin {
     ///
     /// # Errors
     ///
-    /// [`ApiError::InstrumentInvalid`] for a pair Binance does not trade on this client's cross
-    /// or isolated margin.
+    /// - [`ApiError::InstrumentInvalid`] for a pair Binance does not trade on this client's cross
+    ///   or isolated margin.
+    /// - [`ApiError::RequestRejected`] with Binance's `-11001` on isolated margin, for a pair this
+    ///   account has no isolated margin account for. Open one on Binance, or ask a cross-margin
+    ///   client.
     async fn fetch_borrow_capacity(
         &self,
         instrument: &InstrumentNameExchange,
@@ -8034,5 +8037,43 @@ mod tests {
             matches!(result, Err(UnindexedClientError::Internal(ref message)) if message.contains("amount")),
             "{result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn margin_borrow_capacity_without_an_isolated_account_names_the_pair() {
+        use crate::client::BorrowCapacityClient;
+        use wiremock::{
+            Mock,
+            matchers::{method, path},
+        };
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sapi/v1/margin/maxBorrowable"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "code": -11001, "msg": "Isolated margin account does not exist."
+                })),
+            )
+            .mount(&server)
+            .await;
+        mount_borrow_terms(
+            &server,
+            btcusdt_pair(true, true),
+            btc_asset(true),
+            btc_rate("0"),
+            serde_json::json!({}),
+        )
+        .await;
+
+        let err = margin_client_at(&server, true)
+            .fetch_borrow_capacity(&InstrumentNameExchange::new("BTCUSDT"), Side::Sell)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "API: request rejected: BTCUSDT: -11001 Isolated margin account does not exist."
+        );
+        assert!(!err.is_transient());
     }
 }

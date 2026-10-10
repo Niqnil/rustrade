@@ -2681,7 +2681,9 @@ pub(crate) fn parse_binance_order_rejection(
 ///   retry can succeed; a clock that stays wrong keeps failing, so callers should bound retries.
 /// - `-1121` → [`ApiError::InstrumentInvalid`] when the request named one instrument; otherwise
 ///   there is no instrument to attach, so it falls through.
-/// - anything else → [`ApiError::RequestRejected`].
+/// - anything else → [`ApiError::RequestRejected`], prefixed with the symbol when the request
+///   named one instrument, as Binance's text often does not say which, such as `-11001 Isolated
+///   margin account does not exist.`
 fn parse_binance_query_rejection(
     msg: String,
     instrument: Option<&InstrumentNameExchange>,
@@ -2694,6 +2696,8 @@ fn parse_binance_query_rejection(
         return UnindexedClientError::Connectivity(ConnectivityError::Socket(msg));
     } else if let Some(instrument) = instrument.filter(|_| contains_error_code(&msg, "-1121")) {
         ApiError::InstrumentInvalid(instrument.clone(), msg)
+    } else if let Some(instrument) = instrument {
+        ApiError::RequestRejected(format!("{}: {msg}", instrument.name()))
     } else {
         ApiError::RequestRejected(msg)
     };
@@ -4254,6 +4258,29 @@ mod tests {
         };
         assert!(msg.contains("-1127"), "code missing from {msg:?}");
         assert!(!err.is_transient());
+    }
+
+    #[test]
+    fn a_rejected_query_naming_one_instrument_says_which() {
+        let err = classify_query(bad_request(
+            -11001,
+            "Isolated margin account does not exist.",
+        ));
+        let UnindexedClientError::Api(ApiError::RequestRejected(msg)) = &err else {
+            panic!("expected RequestRejected, got {err:?}");
+        };
+        assert!(msg.starts_with("BTCUSDT: "), "symbol missing from {msg:?}");
+        assert!(msg.contains("-11001"), "code missing from {msg:?}");
+
+        // With no single instrument in the request there is none to name.
+        let err = classify_rest_query_error(
+            &anyhow::Error::new(bad_request(-1127, "More than 24 hours.")),
+            None,
+        );
+        let UnindexedClientError::Api(ApiError::RequestRejected(msg)) = &err else {
+            panic!("expected RequestRejected, got {err:?}");
+        };
+        assert!(!msg.contains("BTCUSDT"), "{msg:?}");
     }
 
     #[test]
