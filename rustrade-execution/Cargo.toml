@@ -170,6 +170,10 @@ name = "binance_conditional_orders"
 required-features = ["binance"]
 
 [[test]]
+name = "binance_margin_borrow"
+required-features = ["binance"]
+
+[[test]]
 name = "hyperliquid_execution"
 required-features = ["hyperliquid"]
 
