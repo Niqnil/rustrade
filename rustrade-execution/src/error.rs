@@ -348,9 +348,12 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// the asset to lend or the borrow would exceed the account's limit. [`BorrowReject`] says
     /// why.
     ///
-    /// Reported by the Binance margin client, by Binance's code, and by the Alpaca client, by the
-    /// text of a 403 or 422. Other clients report such refusals as
-    /// [`OrderRejected`](Self::OrderRejected) until their venue's wording is confirmed.
+    /// Reported by the Binance margin client, by Binance's code, by the Alpaca client, by the
+    /// text of a 403 or 422, and by the
+    /// [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue), for a CFD short its
+    /// [`ShortabilityProvider`](crate::shortability::ShortabilityProvider) does not allow. Other
+    /// clients report such refusals as [`OrderRejected`](Self::OrderRejected) until their venue's
+    /// wording is confirmed.
     ///
     /// Not transient — the same request fails identically until the venue's lending changes.
     #[error("borrow rejected: {0}")]
@@ -371,6 +374,10 @@ pub struct BorrowReject {
     pub venue_code: Option<String>,
     /// The venue's message. It may itself carry the code, as Binance's does.
     pub message: String,
+    /// How much the venue could still have lent, in the units the order was sized in, where
+    /// known: the most a smaller order could have sold short. Set by the simulated venue; no live
+    /// client reports it yet.
+    pub available: Option<Decimal>,
 }
 
 impl BorrowReject {
@@ -380,7 +387,15 @@ impl BorrowReject {
             reason,
             venue_code,
             message,
+            available: None,
         }
+    }
+
+    /// With how much the venue could still have lent.
+    #[must_use]
+    pub fn with_available(mut self, available: Decimal) -> Self {
+        self.available = Some(available);
+        self
     }
 }
 
@@ -390,12 +405,17 @@ impl fmt::Display for BorrowReject {
             reason,
             venue_code,
             message,
+            available,
         } = self;
         write!(f, "{reason}")?;
         if let Some(code) = venue_code {
             write!(f, " (code {code})")?;
         }
-        write!(f, ": {message}")
+        write!(f, ": {message}")?;
+        if let Some(available) = available {
+            write!(f, " ({available} available)")?;
+        }
+        Ok(())
     }
 }
 
@@ -414,6 +434,10 @@ pub enum BorrowRejectReason {
     InventoryUnavailable,
     /// The borrow would exceed what the account may borrow (e.g. Binance `-3006`).
     BorrowLimitExceeded,
+    /// A short-sale restriction is in effect, such as the SEC's Rule 201 circuit breaker after a
+    /// 10% fall, and the order would sell short at or below the best bid. A short sale priced
+    /// above the bid may still be accepted.
+    ShortSaleRestricted,
     /// A borrow refusal of a kind not listed here. The [`BorrowReject`] message says which.
     Other,
 }
@@ -425,6 +449,7 @@ impl fmt::Display for BorrowRejectReason {
             Self::BorrowDisabled => "borrow disabled",
             Self::InventoryUnavailable => "inventory unavailable",
             Self::BorrowLimitExceeded => "borrow limit exceeded",
+            Self::ShortSaleRestricted => "short sale restricted",
             Self::Other => "other",
         })
     }
@@ -692,6 +717,7 @@ pub enum KeyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     #[test]
     fn test_connectivity_error_is_transient() {
@@ -776,6 +802,33 @@ mod tests {
             "no borrow".into(),
         ));
         assert_eq!(uncoded.to_string(), "borrow rejected: other: no borrow");
+
+        let short: UnindexedApiError = ApiError::BorrowRejected(BorrowReject::new(
+            BorrowRejectReason::ShortSaleRestricted,
+            None,
+            "priced at the bid".into(),
+        ));
+        assert_eq!(
+            short.to_string(),
+            "borrow rejected: short sale restricted: priced at the bid"
+        );
+    }
+
+    #[test]
+    fn borrow_rejected_shows_what_is_available_only_when_known() {
+        let reject = BorrowReject::new(
+            BorrowRejectReason::InventoryUnavailable,
+            None,
+            "too little to lend".into(),
+        );
+        assert_eq!(reject.available, None);
+
+        let reject = reject.with_available(dec!(2.5));
+        assert_eq!(reject.available, Some(dec!(2.5)));
+        assert_eq!(
+            reject.to_string(),
+            "inventory unavailable: too little to lend (2.5 available)"
+        );
     }
 
     #[test]

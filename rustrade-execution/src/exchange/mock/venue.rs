@@ -5,7 +5,7 @@ use crate::{
     balance::AssetBalance,
     cash_flow::{CashFlow, CashFlowId},
     client::mock::MockExecutionConfig,
-    error::{ApiError, UnindexedApiError, UnindexedOrderError},
+    error::{ApiError, BorrowReject, BorrowRejectReason, UnindexedApiError, UnindexedOrderError},
     exchange::mock::{
         account::{AccountState, Debit},
         orders::{AlreadyResting, OpenOrder, Reservation, RestingOrder},
@@ -21,6 +21,7 @@ use crate::{
         state::{Cancelled, Expired, Filled, Open, OrderState, UnindexedOrderState},
     },
     position::{Position, PositionReport},
+    shortability::ShortabilityProvider,
     trade::{AssetFees, Trade, TradeId, TradeOrigin},
 };
 use chrono::{DateTime, Utc};
@@ -181,9 +182,28 @@ pub enum VenueRegime {
 ///
 /// # Locates and the short-sale restriction
 /// This venue lends no stock: a spot sell delivers base the account must hold, so a short sale of
-/// a spot instrument is refused with [`ApiError::BalanceInsufficient`]. Nor does it model the steps
-/// a short sale on a real venue can meet before it fills: no locate is required, and no
-/// hard-to-borrow list or short-sale restriction ever refuses a CFD short.
+/// a spot instrument is refused with [`ApiError::BalanceInsufficient`].
+///
+/// A CFD short is allowed without limit by default. Configured with
+/// [`with_shortability`](Self::with_shortability), this venue asks its [`ShortabilityProvider`]
+/// about every order that would open or increase one, at the venue's clock, and refuses it with
+/// [`ApiError::BorrowRejected`] for the first of these that applies:
+/// - [`NotShortable`](BorrowRejectReason::NotShortable): the provider says the instrument is not
+///   shortable.
+/// - [`InventoryUnavailable`](BorrowRejectReason::InventoryUnavailable): the short would exceed
+///   what the provider says is available. That is the lender's total, so the account's own short
+///   counts against it, and so does every resting sell, as if it had filled. The refusal carries
+///   what is left in [`BorrowReject::available`].
+/// - [`ShortSaleRestricted`](BorrowRejectReason::ShortSaleRestricted): a short-sale restriction
+///   is in effect and the order is marketable: a market order, or a sell limit at or below the
+///   best bid (the last price, on a feed with no book). A limit above the bid rests.
+///
+/// Only the short part of an order is gated: a flip from a long is measured by the short it
+/// opens, and a buy, or a sell that only reduces a long once every resting sell has filled, is
+/// never refused. Unknown values allow
+/// the short. An order is checked once, on arrival: a resting order fills whatever the provider
+/// says later, and the easy-to-borrow flag and fee rate are not read here, since a borrow fee is
+/// charged by a [`HoldingCostModel`].
 ///
 /// # ⚠️ Caller obligations and known limitations
 /// - **Fund the quote asset of every instrument traded.** Every debit is quote-denominated except a
@@ -452,6 +472,9 @@ pub struct SimulatedVenue {
     /// Whether a holding cost has already been valued at a position's entry price for want of a
     /// market, which is warned of once per venue rather than at every boundary.
     valued_at_entry: bool,
+    /// What this venue may lend for a CFD short, or `None` to lend without limit. Set by
+    /// [`with_shortability`](Self::with_shortability).
+    shortability: Option<Arc<dyn ShortabilityProvider>>,
 }
 
 impl SimulatedVenue {
@@ -524,6 +547,7 @@ impl SimulatedVenue {
             next_charge: None,
             cash_flow_sequence: 0,
             valued_at_entry: false,
+            shortability: None,
         }
     }
 
@@ -538,6 +562,16 @@ impl SimulatedVenue {
     pub fn with_holding_costs(mut self, models: Vec<Arc<dyn HoldingCostModel>>) -> Self {
         self.holding_costs = models;
         self.refresh_next_charge();
+        self
+    }
+
+    /// This venue, refusing a CFD short that `provider` does not allow.
+    ///
+    /// Asked on the arrival of every order that would open or increase a short, as described in
+    /// the type's `# Locates and the short-sale restriction`.
+    #[must_use]
+    pub fn with_shortability(mut self, provider: Arc<dyn ShortabilityProvider>) -> Self {
+        self.shortability = Some(provider);
         self
     }
 
@@ -1582,6 +1616,11 @@ impl SimulatedVenue {
             );
         }
 
+        // Before anything touches the ledger: a refused short leaves no trace on it.
+        if let Err(error) = self.check_shortability(&request, &terms, market.as_ref()) {
+            return (build_open_order_err_response(request, error), None);
+        }
+
         let now = self.time_exchange();
 
         if request.state.kind != OrderKind::Limit {
@@ -1652,6 +1691,93 @@ impl SimulatedVenue {
             Disposition::CancelUnfilled => self.cancel_on_arrival(request, now),
             Disposition::Expire => self.expire_on_arrival(request, now),
         }
+    }
+
+    /// Refuses an order that would open or increase a CFD short which the configured
+    /// [`ShortabilityProvider`] does not allow; see the type's
+    /// `# Locates and the short-sale restriction`.
+    ///
+    /// The short an order opens is measured as if every resting sell on the instrument filled
+    /// first, so that a short this venue has already accepted on the book counts against what is
+    /// left to lend, and an order whose short part is nothing — a buy, or a sell that only reduces
+    /// a long — passes untouched. `market` is the snapshot the order will be priced from, so
+    /// whether it is marketable is judged against the book it would fill on.
+    fn check_shortability(
+        &self,
+        request: &OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
+        terms: &InstrumentTerms,
+        market: Option<&MarketSnapshot>,
+    ) -> Result<(), UnindexedApiError> {
+        let Some(provider) = &self.shortability else {
+            return Ok(());
+        };
+        if !terms.cash_settled || request.state.side != Side::Sell {
+            return Ok(());
+        }
+
+        let instrument = &request.key.instrument;
+        let resting_sells: Decimal = self
+            .account
+            .orders_open()
+            .filter(|order| order.key.instrument == *instrument && order.side == Side::Sell)
+            .map(|order| order.state.quantity_remaining(order.quantity))
+            .sum();
+        // The position left if every resting sell fills, before and after this order does too.
+        let committed = self.net_position(terms, instrument).quantity - resting_sells;
+        let short_before = (-committed).max(Decimal::ZERO);
+        let short_after = (request.state.quantity - committed).max(Decimal::ZERO);
+        if short_after <= short_before {
+            return Ok(());
+        }
+
+        let now = self.time_exchange();
+        let exchange = request.key.exchange;
+        let shortability = provider.shortability(instrument, now);
+
+        if shortability.shortable == Some(false) {
+            return Err(ApiError::BorrowRejected(BorrowReject::new(
+                BorrowRejectReason::NotShortable,
+                None,
+                format!("{instrument} cannot be sold short on {exchange} at {now}"),
+            )));
+        }
+
+        if let Some(available) = shortability.available
+            && short_after > available
+        {
+            let message = format!(
+                "selling {} {instrument} on {exchange} would take its short, resting sells \
+                 included, to {short_after}, past the {available} there is to borrow at {now}",
+                request.state.quantity
+            );
+            let left = (available - short_before).max(Decimal::ZERO);
+            return Err(ApiError::BorrowRejected(
+                BorrowReject::new(BorrowRejectReason::InventoryUnavailable, None, message)
+                    .with_available(left),
+            ));
+        }
+
+        let marketable = match request.state.kind {
+            OrderKind::Limit => request
+                .state
+                .price
+                .zip(market)
+                .is_some_and(|(limit, market)| crosses(Side::Sell, limit, market)),
+            // Every other kind this venue accepts takes whatever the book offers.
+            _ => true,
+        };
+        if marketable && provider.short_sale_restricted(instrument, now) {
+            return Err(ApiError::BorrowRejected(BorrowReject::new(
+                BorrowRejectReason::ShortSaleRestricted,
+                None,
+                format!(
+                    "{instrument} is under a short-sale restriction on {exchange} at {now}: a \
+                     short sale must be priced above the best bid"
+                ),
+            )));
+        }
+
+        Ok(())
     }
 
     /// Retires an order that asked to work only on arrival and could not, having traded nothing.
@@ -3031,6 +3157,7 @@ mod tests {
             request::RequestCancel,
             state::{ActiveOrderState, InactiveOrderState},
         },
+        shortability::{Shortability, ShortabilityTable},
     };
     use chrono::{NaiveTime, TimeDelta};
     use rustrade_instrument::{
@@ -7521,5 +7648,254 @@ mod tests {
         assert!(cfd_market(&mut venue, "5000", "5000", "5000").is_empty());
         cfd_market_fill(&mut venue, Side::Buy, "1");
         let _ = venue.advance_time(time(2));
+    }
+
+    // --- Locates and the short-sale restriction ------------------------------------------------
+
+    /// A market-driven CFD venue lending as `table` says, its clock at `time(1)` and its book
+    /// 4990 / 5000.
+    fn make_cfd_venue_lending(table: ShortabilityTable) -> SimulatedVenue {
+        let mut venue = SimulatedVenue::new_market_driven(
+            &config_from_balances(
+                vec![funded(self::usd(), d("10000000"))],
+                FeeModelConfig::default(),
+            ),
+            instruments_of(cfd_instrument()),
+        )
+        .with_shortability(Arc::new(table));
+        advance(&mut venue, time(1));
+        assert!(cfd_market(&mut venue, "4990", "5000", "5000").is_empty());
+        venue
+    }
+
+    fn lending(shortability: Shortability) -> ShortabilityTable {
+        ShortabilityTable::new().with_shortability(cfd_instrument_name(), time(0), shortability)
+    }
+
+    /// The refusal an open was answered with, having moved nothing.
+    fn borrow_rejection(outcome: &OpenOutcome) -> &BorrowReject {
+        assert!(
+            outcome.events.is_empty(),
+            "a refused short moves nothing, so it owes no events"
+        );
+        match &outcome.response.state {
+            OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                ApiError::BorrowRejected(reject),
+            ))) => reject,
+            other => panic!("expected BorrowRejected, got: {other:?}"),
+        }
+    }
+
+    fn open_cfd(venue: &mut SimulatedVenue, side: Side, quantity: &str) -> OpenOutcome {
+        venue.open_order(cfd_request(side, quantity, None))
+    }
+
+    #[test]
+    fn a_short_of_an_instrument_that_is_not_shortable_is_refused_before_the_ledger_moves() {
+        let mut venue = make_cfd_venue_lending(lending(Shortability::new().with_shortable(false)));
+
+        let outcome = open_cfd(&mut venue, Side::Sell, "1");
+
+        let reject = borrow_rejection(&outcome);
+        assert_eq!(reject.reason, BorrowRejectReason::NotShortable);
+        assert_eq!(reject.venue_code, None);
+        assert_eq!(reject.available, None);
+        assert!(reject.message.contains("spx500_usd"), "{}", reject.message);
+        assert_eq!(free_usd(&venue), d("10000000"));
+        assert_eq!(cfd_position(&venue), None);
+        assert!(venue.orders_open(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_buy_and_a_sell_that_only_reduces_a_long_are_never_refused() {
+        let mut venue = make_cfd_venue_lending(lending(Shortability::new().with_shortable(false)));
+
+        cfd_market_fill(&mut venue, Side::Buy, "2");
+        cfd_market_fill(&mut venue, Side::Sell, "1");
+        cfd_market_fill(&mut venue, Side::Sell, "1");
+        assert_eq!(cfd_position(&venue), None);
+
+        let outcome = open_cfd(&mut venue, Side::Sell, "1");
+        assert_eq!(
+            borrow_rejection(&outcome).reason,
+            BorrowRejectReason::NotShortable,
+            "once flat, the next sell opens a short"
+        );
+    }
+
+    #[test]
+    fn a_sell_reducing_a_long_that_resting_sells_already_close_opens_a_short() {
+        let mut venue = make_cfd_venue_lending(lending(Shortability::new().with_shortable(false)));
+        cfd_market_fill(&mut venue, Side::Buy, "2");
+        let rested = venue.open_order(cfd_limit("close", Side::Sell, "2", "5200"));
+        assert!(rested_open(&rested).filled_quantity.is_zero());
+
+        let outcome = open_cfd(&mut venue, Side::Sell, "1");
+
+        assert_eq!(
+            borrow_rejection(&outcome).reason,
+            BorrowRejectReason::NotShortable
+        );
+    }
+
+    /// The lender has 5 in total. The account's own short of 2 and its resting sell of 2 leave 1,
+    /// so a sell of 2 is refused saying so, and a sell of 1 is not.
+    #[test]
+    fn a_short_past_what_is_available_net_of_the_own_short_and_resting_sells_is_refused() {
+        let mut venue = make_cfd_venue_lending(lending(
+            Shortability::new()
+                .with_shortable(true)
+                .with_available(d("5")),
+        ));
+        cfd_market_fill(&mut venue, Side::Sell, "2");
+        let rested = venue.open_order(cfd_limit("rest", Side::Sell, "2", "5200"));
+        assert!(rested_open(&rested).filled_quantity.is_zero());
+        let free = free_usd(&venue);
+
+        let outcome = open_cfd(&mut venue, Side::Sell, "2");
+
+        let reject = borrow_rejection(&outcome);
+        assert_eq!(reject.reason, BorrowRejectReason::InventoryUnavailable);
+        assert_eq!(reject.available, Some(d("1")));
+        assert_eq!(free_usd(&venue), free);
+        assert_eq!(
+            cfd_position(&venue).map(|(quantity, _)| quantity),
+            Some(d("-2"))
+        );
+
+        cfd_market_fill(&mut venue, Side::Sell, "1");
+        assert_eq!(
+            cfd_position(&venue).map(|(quantity, _)| quantity),
+            Some(d("-3"))
+        );
+    }
+
+    #[test]
+    fn what_is_available_is_never_reported_below_zero() {
+        let mut venue = make_cfd_venue_lending(
+            ShortabilityTable::new()
+                .with_shortability(cfd_instrument_name(), time(0), Shortability::new())
+                .with_shortability(
+                    cfd_instrument_name(),
+                    time(2),
+                    Shortability::new().with_available(d("1")),
+                ),
+        );
+        cfd_market_fill(&mut venue, Side::Sell, "3");
+        advance(&mut venue, time(2));
+
+        let outcome = open_cfd(&mut venue, Side::Sell, "1");
+
+        let reject = borrow_rejection(&outcome);
+        assert_eq!(reject.reason, BorrowRejectReason::InventoryUnavailable);
+        assert_eq!(reject.available, Some(Decimal::ZERO));
+    }
+
+    /// From a long of 5, a sell of 9 opens a short of 4 and a sell of 8 one of 3: only the short
+    /// part is measured against the 3 available.
+    #[test]
+    fn a_flip_is_gated_on_the_short_it_opens_only() {
+        let mut venue = make_cfd_venue_lending(lending(Shortability::new().with_available(d("3"))));
+        cfd_market_fill(&mut venue, Side::Buy, "5");
+
+        let outcome = open_cfd(&mut venue, Side::Sell, "9");
+        let reject = borrow_rejection(&outcome);
+        assert_eq!(reject.reason, BorrowRejectReason::InventoryUnavailable);
+        assert_eq!(reject.available, Some(d("3")));
+        assert_eq!(
+            cfd_position(&venue).map(|(quantity, _)| quantity),
+            Some(d("5"))
+        );
+
+        cfd_market_fill(&mut venue, Side::Sell, "8");
+        assert_eq!(
+            cfd_position(&venue).map(|(quantity, _)| quantity),
+            Some(d("-3"))
+        );
+    }
+
+    #[test]
+    fn a_short_sale_restriction_refuses_a_marketable_short_and_lets_one_above_the_bid_rest() {
+        let mut venue =
+            make_cfd_venue_lending(ShortabilityTable::new().with_short_sale_restriction(
+                cfd_instrument_name(),
+                time(0),
+                time(10),
+            ));
+
+        // Reducing a long is not a short sale.
+        cfd_market_fill(&mut venue, Side::Buy, "1");
+        cfd_market_fill(&mut venue, Side::Sell, "1");
+
+        let market = open_cfd(&mut venue, Side::Sell, "1");
+        assert_eq!(
+            borrow_rejection(&market).reason,
+            BorrowRejectReason::ShortSaleRestricted
+        );
+        for (cid, limit) in [("at-bid", "4990"), ("below-bid", "4980")] {
+            let outcome = venue.open_order(cfd_limit(cid, Side::Sell, "1", limit));
+            assert_eq!(
+                borrow_rejection(&outcome).reason,
+                BorrowRejectReason::ShortSaleRestricted,
+                "a sell limit at {limit} crosses the 4990 bid"
+            );
+        }
+
+        let above = venue.open_order(cfd_limit("above-bid", Side::Sell, "1", "4995"));
+        assert!(rested_open(&above).filled_quantity.is_zero());
+        assert_eq!(cfd_position(&venue), None);
+
+        // The restriction is read at the venue's clock, so it lifts when its window ends.
+        advance(&mut venue, time(10));
+        cfd_market_fill(&mut venue, Side::Sell, "1");
+        assert_eq!(
+            cfd_position(&venue).map(|(quantity, _)| quantity),
+            Some(d("-1"))
+        );
+    }
+
+    #[test]
+    fn missing_shortability_data_allows_the_short() {
+        let mut venue = make_cfd_venue_lending(
+            ShortabilityTable::new()
+                .with_shortability(
+                    cfd_instrument_name(),
+                    time(100),
+                    Shortability::new().with_shortable(false),
+                )
+                .with_shortability(
+                    InstrumentNameExchange::new("other"),
+                    time(0),
+                    Shortability::new().with_shortable(false),
+                ),
+        );
+
+        cfd_market_fill(&mut venue, Side::Sell, "1");
+
+        assert_eq!(
+            cfd_position(&venue).map(|(quantity, _)| quantity),
+            Some(d("-1"))
+        );
+    }
+
+    /// Spot lends nothing either way: a sell of base the account does not hold is short of
+    /// balance, whatever the provider says about lending.
+    #[test]
+    fn a_spot_short_is_refused_for_its_balance_not_by_the_provider() {
+        let table = ShortabilityTable::new().with_shortability(
+            instrument_name(),
+            time(0),
+            Shortability::new().with_shortable(false),
+        );
+        let mut venue = make_venue("0", "10000").with_shortability(Arc::new(table));
+
+        let outcome = venue.open_order(sell_request("1", market_prices("50000")));
+
+        match outcome.response.state {
+            OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                ApiError::BalanceInsufficient(..),
+            ))) => {}
+            other => panic!("expected BalanceInsufficient, got: {other:?}"),
+        }
     }
 }
