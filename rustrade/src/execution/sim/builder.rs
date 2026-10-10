@@ -18,6 +18,7 @@ use rustrade_execution::{
     holding_cost::HoldingCostModel,
     indexer::AccountEventIndexer,
     map::generate_execution_instrument_map,
+    shortability::ShortabilityProvider,
 };
 use rustrade_instrument::{
     exchange::{ExchangeId, ExchangeIndex},
@@ -44,6 +45,9 @@ pub struct SimVenueOptions {
     /// Shared rather than owned, so the models, and the rate histories they carry, can be built
     /// once for a whole sweep of backtests.
     pub holding_costs: Vec<Arc<dyn HoldingCostModel>>,
+    /// What the venue may lend for a CFD short, and when a short-sale restriction is in effect —
+    /// see [`SimulatedVenue::with_shortability`]. `None` lends without limit.
+    pub shortability: Option<Arc<dyn ShortabilityProvider>>,
 }
 
 impl SimVenueOptions {
@@ -51,6 +55,13 @@ impl SimVenueOptions {
     #[must_use]
     pub fn with_holding_cost(mut self, model: Arc<dyn HoldingCostModel>) -> Self {
         self.holding_costs.push(model);
+        self
+    }
+
+    /// These options, refusing a CFD short that `provider` does not allow.
+    #[must_use]
+    pub fn with_shortability(mut self, provider: Arc<dyn ShortabilityProvider>) -> Self {
+        self.shortability = Some(provider);
         self
     }
 }
@@ -122,7 +133,10 @@ impl<'a> SimExecutionBuilder<'a> {
         config: MockExecutionConfig,
         options: SimVenueOptions,
     ) -> Result<Self, BarterError> {
-        let SimVenueOptions { holding_costs } = options;
+        let SimVenueOptions {
+            holding_costs,
+            shortability,
+        } = options;
 
         let exchange = config.mocked_exchange;
 
@@ -152,14 +166,19 @@ impl<'a> SimExecutionBuilder<'a> {
         // than skewing one direction.
         let leg = TimeDelta::milliseconds((config.latency_ms / 2) as i64);
 
+        // Market-driven: `SimRunner::poll_next` routes every source market event to this venue
+        // before the `Engine` sees it, which is what lets it accept resting orders.
+        let mut venue = SimulatedVenue::new_market_driven(
+            &config,
+            generate_mock_exchange_instruments(self.instruments, exchange),
+        )
+        .with_holding_costs(holding_costs);
+        if let Some(provider) = shortability {
+            venue = venue.with_shortability(provider);
+        }
+
         let venue = SimVenue {
-            // Market-driven: `SimRunner::poll_next` routes every source market event to this
-            // venue before the `Engine` sees it, which is what lets it accept resting orders.
-            venue: SimulatedVenue::new_market_driven(
-                &config,
-                generate_mock_exchange_instruments(self.instruments, exchange),
-            )
-            .with_holding_costs(holding_costs),
+            venue,
             indexer: AccountEventIndexer::new(Arc::new(instrument_map)),
             request_rx: execution_rx,
             to_venue: leg,

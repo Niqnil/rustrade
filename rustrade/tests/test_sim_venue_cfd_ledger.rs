@@ -40,6 +40,7 @@ use rustrade::{
             trading::TradingState,
         },
     },
+    error::BarterError,
     execution::{request::ExecutionRequest, sim::SimVenueOptions},
     risk::DefaultRiskManager,
     statistic::time::Daily,
@@ -68,6 +69,7 @@ use rustrade_execution::{
         id::{ClientOrderId, StrategyId},
         request::{OrderRequestCancel, OrderRequestOpen, RequestOpen},
     },
+    shortability::{Shortability, ShortabilityTable},
     trade::Trade,
 };
 use rustrade_instrument::{
@@ -276,15 +278,23 @@ type BacktestTxMap = rustrade::engine::execution_tx::MultiExchangeTxMap<
     rustrade_integration::channel::UnboundedTx<ExecutionRequest>,
 >;
 
-/// Opens a long of 1 at the first price it sees, and closes it once the price reaches
-/// [`RoundTrip::CLOSE_AT`].
-#[derive(Debug, Default)]
+/// Opens a position of 1 on [`opening`](Self::opening) at the first price it sees, and closes it
+/// once the price reaches [`RoundTrip::CLOSE_AT`].
+#[derive(Debug)]
 struct RoundTrip {
+    opening: Side,
     sent: AtomicUsize,
 }
 
 impl RoundTrip {
     const CLOSE_AT: Decimal = dec!(5200);
+
+    fn new(opening: Side) -> Self {
+        Self {
+            opening,
+            sent: AtomicUsize::new(0),
+        }
+    }
 }
 
 impl AlgoStrategy for RoundTrip {
@@ -310,8 +320,11 @@ impl AlgoStrategy for RoundTrip {
         let holding = !instrument.position.positions.is_empty();
 
         let side = match self.sent.load(Ordering::Relaxed) {
-            0 => Side::Buy,
-            1 if holding && price >= Self::CLOSE_AT => Side::Sell,
+            0 => self.opening,
+            1 if holding && price >= Self::CLOSE_AT => match self.opening {
+                Side::Buy => Side::Sell,
+                Side::Sell => Side::Buy,
+            },
             _ => return (std::iter::empty(), None),
         };
         self.sent.fetch_add(1, Ordering::Relaxed);
@@ -404,12 +417,25 @@ impl
     }
 }
 
-/// A round trip of 1 contract: opened at 5,000 at 22:00, through 5,100 at 22:30, closed at 5,200
-/// at 23:10, from an account funded with `margin` and charging what `venue_options` configure.
+/// A round trip of 1 contract on `opening`: opened at 5,000 at 22:00, through 5,100 at 22:30,
+/// closed at 5,200 at 23:10, from an account funded with `margin` and modelling what
+/// `venue_options` configure.
 async fn round_trip(
+    opening: Side,
     margin: Decimal,
     venue_options: FnvHashMap<ExchangeId, SimVenueOptions>,
 ) -> BacktestResult<Daily, BacktestState> {
+    try_round_trip(opening, margin, venue_options)
+        .await
+        .expect("a CFD round trip must complete")
+}
+
+/// [`round_trip`], returning the backtest's error rather than panicking on it.
+async fn try_round_trip(
+    opening: Side,
+    margin: Decimal,
+    venue_options: FnvHashMap<ExchangeId, SimVenueOptions>,
+) -> Result<BacktestResult<Daily, BacktestState>, BarterError> {
     let mut cfd = instrument(EXCHANGE, "spx500", "usd");
     cfd.kind = InstrumentKind::Cfd(CfdContract {
         contract_size: contract_size(),
@@ -466,12 +492,11 @@ async fn round_trip(
         BacktestArgsDynamic {
             id: "cfd-round-trip".into(),
             risk_free_return: Decimal::ZERO,
-            strategy: RoundTrip::default(),
+            strategy: RoundTrip::new(opening),
             risk: DefaultRiskManager::default(),
         },
     )
     .await
-    .expect("a CFD round trip must complete")
 }
 
 fn usd_end(result: &BacktestResult<Daily, BacktestState>) -> Balance {
@@ -491,7 +516,7 @@ fn usd_end(result: &BacktestResult<Daily, BacktestState>) -> Balance {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_backtest_opens_and_closes_a_cfd_with_one_positions_margin() {
     let margin = dec!(125_000);
-    let result = round_trip(margin, FnvHashMap::default()).await;
+    let result = round_trip(Side::Buy, margin, FnvHashMap::default()).await;
 
     let positions = result
         .engine_state
@@ -525,7 +550,7 @@ async fn a_backtest_charges_a_held_cfd_its_funding_and_the_engine_carries_it() {
     )]);
 
     let margin = dec!(200_000);
-    let result = round_trip(margin, options).await;
+    let result = round_trip(Side::Buy, margin, options).await;
 
     assert_eq!(usd_end(&result).total, margin + dec!(5_000) - dec!(12.75));
 
@@ -538,6 +563,53 @@ async fn a_backtest_charges_a_held_cfd_its_funding_and_the_engine_carries_it() {
         .expect("one instrument traded");
     assert_eq!(tear_sheet.carry, dec!(-12.75));
     assert_eq!(tear_sheet.pnl, dec!(5_000) - dec!(12.75));
+}
+
+fn open_positions(result: &BacktestResult<Daily, BacktestState>) -> usize {
+    result
+        .engine_state
+        .instruments
+        .instruments(&InstrumentFilter::None)
+        .flat_map(|instrument| instrument.position.positions.values())
+        .count()
+}
+
+/// The same short goes through on a venue that lends without limit, losing 1 × 25 × (5,200 −
+/// 5,000), and is refused on one whose provider says the index is not shortable. The refusal is
+/// the run's only order, so the backtest reports it as the reason it filled nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backtest_short_the_venue_will_not_lend_is_refused() {
+    let margin = dec!(200_000);
+
+    let lent = round_trip(Side::Sell, margin, FnvHashMap::default()).await;
+    assert_eq!(
+        open_positions(&lent),
+        0,
+        "the close filled, so the run ends flat"
+    );
+    assert_eq!(usd_end(&lent).total, margin - dec!(5_000));
+
+    let table = ShortabilityTable::new().with_shortability(
+        InstrumentNameExchange::new("spx500_usd"),
+        ts("2025-03-24T00:00:00Z"),
+        Shortability::new().with_shortable(false),
+    );
+    let options = FnvHashMap::from_iter([(
+        EXCHANGE,
+        SimVenueOptions::default().with_shortability(Arc::new(table)),
+    )]);
+
+    match try_round_trip(Side::Sell, margin, options).await {
+        Err(BarterError::BacktestAllOrdersRejected { rejected, reason }) => {
+            assert_eq!(rejected, 1);
+            assert!(
+                reason.contains("BorrowRejected") && reason.contains("NotShortable"),
+                "the rejection must be the venue's refusal to lend, got: {reason}"
+            );
+        }
+        Err(other) => panic!("expected BacktestAllOrdersRejected, got: {other:?}"),
+        Ok(_) => panic!("a short the venue will not lend must not fill"),
+    }
 }
 
 /// Options for an exchange no execution configuration mocks are a misconfiguration: refused
@@ -586,7 +658,7 @@ async fn venue_options_for_an_exchange_with_no_simulated_venue_are_refused() {
         BacktestArgsDynamic {
             id: "misconfigured".into(),
             risk_free_return: Decimal::ZERO,
-            strategy: RoundTrip::default(),
+            strategy: RoundTrip::new(Side::Buy),
             risk: DefaultRiskManager::default(),
         },
     )

@@ -162,6 +162,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     venue by the exchange it mocks; `Default::default()` is every venue as configured. Options for
     an exchange that no execution configuration mocks are refused with
     `BarterError::ExecutionBuilder`.
+- **The simulator can refuse a CFD short it would not lend: locates and the short-sale
+  restriction** (part of #553).
+  - `Shortability` (`rustrade-execution`, `#[non_exhaustive]`) describes what a venue says about
+    lending an instrument: whether it is shortable, whether it is easy to borrow, how much there is
+    to lend in total, and the annualised borrow fee. Every field is optional, and the values are
+    advisory: a venue can still refuse a short its flags allow. It is the type a future live
+    shortability query will return (#572).
+  - `ShortabilityProvider` gives a simulated venue the `Shortability` of an instrument at any
+    instant, and says separately whether a short-sale restriction is in effect.
+    `ShortabilityTable` is a built-in provider from per-instrument step histories and restriction
+    windows. Missing data allows the short.
+  - `SimulatedVenue::with_shortability` checks every order that would open or increase a CFD
+    short, on arrival and before the ledger moves, and refuses it with `ApiError::BorrowRejected`:
+    `NotShortable` when the provider says so; `InventoryUnavailable` when the short would exceed
+    what is available, counting the account's own short and its resting sells as filled; and the
+    new `BorrowRejectReason::ShortSaleRestricted` when a restriction is in effect and the order is
+    marketable (a market order, or a sell limit at or below the bid). A limit above the bid rests.
+    A flip is checked on the short it opens only, and a buy, or a sell that only reduces a long,
+    is never refused. A spot short is still refused for want of balance.
+  - `BorrowReject` gains `available` and `with_available`: what the venue could still have lent,
+    where known, shown by its `Display`. The simulated venue sets it on `InventoryUnavailable`.
+    `BorrowReject::new` is unchanged.
+  - `rustrade`'s `SimVenueOptions` gains `shortability` and `with_shortability`.
 
 ### Changed
 
