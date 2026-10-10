@@ -30,6 +30,7 @@ use std::{
     collections::BTreeMap,
     future::Future,
     num::NonZeroUsize,
+    ops::{Deref, DerefMut},
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -107,7 +108,73 @@ const LISTINGS_IN_FLIGHT: usize = 2;
 pub(crate) const ORDER_CHECK_TIMEOUT_SECS: u64 = 30;
 
 /// The known-live orders of one client, shared by its calls and its account streams.
-pub(crate) type SharedKnownLiveOrders = Arc<parking_lot::Mutex<KnownLiveOrders>>;
+///
+/// The account stream takes the lock for every event it observes, so nothing is logged while it
+/// is held: what the set has to say waits in it until the [`KnownLiveOrdersGuard`] drops.
+#[derive(Debug, Clone)]
+pub(crate) struct SharedKnownLiveOrders(Arc<parking_lot::Mutex<KnownLiveOrders>>);
+
+impl SharedKnownLiveOrders {
+    pub(crate) fn lock(&self) -> KnownLiveOrdersGuard<'_> {
+        KnownLiveOrdersGuard(self.0.lock())
+    }
+}
+
+/// The lock on a [`SharedKnownLiveOrders`]. On drop it logs what the set kept to say, with the
+/// lock released, then releases it again.
+#[derive(Debug)]
+pub(crate) struct KnownLiveOrdersGuard<'a>(parking_lot::MutexGuard<'a, KnownLiveOrders>);
+
+impl Deref for KnownLiveOrdersGuard<'_> {
+    type Target = KnownLiveOrders;
+
+    fn deref(&self) -> &KnownLiveOrders {
+        &self.0
+    }
+}
+
+impl DerefMut for KnownLiveOrdersGuard<'_> {
+    fn deref_mut(&mut self) -> &mut KnownLiveOrders {
+        &mut self.0
+    }
+}
+
+impl Drop for KnownLiveOrdersGuard<'_> {
+    fn drop(&mut self) {
+        if self.0.forgotten.is_empty() {
+            return;
+        }
+        let exchange = self.0.exchange;
+        let forgotten = std::mem::take(&mut self.0.forgotten);
+        // Re-taken once the logging is done, only to be released when the guard is dropped: the
+        // price of releasing it while logging without `unsafe`, paid only when there is something
+        // to log.
+        parking_lot::MutexGuard::unlocked(&mut self.0, || {
+            for Forgotten { cid, first } in forgotten {
+                if first {
+                    warn!(
+                        %exchange,
+                        %cid,
+                        held = MAX_KNOWN_LIVE_ORDERS,
+                        "Holding the most orders as live the client can, and forgetting the oldest \
+                         as more arrive: if one ended while the stream was disconnected, a \
+                         reconnect will not report it. Further orders forgotten are logged at debug"
+                    );
+                } else {
+                    debug!(%exchange, %cid, "Forgetting the oldest order held as live");
+                }
+            }
+        });
+    }
+}
+
+/// An order [`KnownLiveOrders`] forgot to make room, to log once its lock is released.
+#[derive(Debug)]
+struct Forgotten {
+    cid: ClientOrderId,
+    /// Whether it was the first of an episode, which is logged as a warning.
+    first: bool,
+}
 
 /// What [`KnownLiveOrders`] keeps about one order.
 #[derive(Debug)]
@@ -146,11 +213,15 @@ pub(crate) struct KnownLiveOrders {
     next_seq: u64,
     /// Whether the set is forgetting orders, so that it warns once per episode, not per order.
     forgetting: bool,
+    /// The orders forgotten since the lock was taken, logged by [`KnownLiveOrdersGuard`] once it
+    /// is released.
+    forgotten: Vec<Forgotten>,
 }
 
 impl KnownLiveOrders {
-    /// A new, empty set of `exchange`'s orders.
-    pub(crate) fn new(exchange: ExchangeId) -> Self {
+    /// A new, empty set of `exchange`'s orders. Clients take [`shared`](Self::shared): only its
+    /// guard logs what the set forgets.
+    fn new(exchange: ExchangeId) -> Self {
         Self {
             exchange,
             orders: FnvHashMap::default(),
@@ -160,12 +231,13 @@ impl KnownLiveOrders {
             recently_ended: LruCache::new(RECENTLY_ENDED),
             next_seq: 0,
             forgetting: false,
+            forgotten: Vec::new(),
         }
     }
 
     /// A new, empty set of `exchange`'s orders, to share.
     pub(crate) fn shared(exchange: ExchangeId) -> SharedKnownLiveOrders {
-        Arc::new(parking_lot::Mutex::new(Self::new(exchange)))
+        SharedKnownLiveOrders(Arc::new(parking_lot::Mutex::new(Self::new(exchange))))
     }
 
     /// Record that the order under `key`, of `quantity` and `kind`, is live as `open` says. An
@@ -185,48 +257,59 @@ impl KnownLiveOrders {
         if self.recently_ended.contains(cid) {
             return;
         }
-        let order_id = open.id.assigned().cloned();
-        // Re-indexed from scratch, so an entry under an id or instrument it no longer has goes.
-        let indexed = if let Some(known) = self.orders.get_mut(cid) {
-            let previous = known.order_id.take();
-            if let Some(stale) = &previous {
+        let order_id = open.id.assigned();
+        if let Some(known) = self.orders.get_mut(cid) {
+            known.quantity = quantity;
+            let moved = known.instrument != key.instrument;
+            let new_id = order_id.filter(|id| known.order_id.as_ref() != Some(*id));
+            // The common case, such as a partial fill: nothing to re-index.
+            if !moved && new_id.is_none() {
+                return;
+            }
+            // Re-indexed from scratch, so an entry under an id or instrument it no longer has
+            // goes.
+            if let Some(stale) = &known.order_id {
                 self.by_order_id
                     .remove(&(known.instrument.clone(), stale.clone()));
             }
-            if known.instrument != key.instrument {
+            if moved {
                 self.by_instrument.remove(&known.instrument, cid);
                 self.by_instrument.insert(&key.instrument, cid);
                 known.instrument = key.instrument.clone();
             }
-            known.quantity = quantity;
-            known.order_id = order_id.or(previous);
-            known.order_id.clone()
-        } else {
-            if self.orders.len() >= MAX_KNOWN_LIVE_ORDERS {
-                self.forget_oldest();
-            } else if self.orders.len() <= MAX_KNOWN_LIVE_ORDERS * 3 / 4 {
-                self.forgetting = false;
+            if let Some(new_id) = new_id {
+                known.order_id = Some(new_id.clone());
             }
-            let seq = self.next_seq;
-            self.next_seq += 1;
-            self.by_age.insert(seq, cid.clone());
-            self.by_instrument.insert(&key.instrument, cid);
-            self.orders.insert(
-                cid.clone(),
-                KnownLive {
-                    instrument: key.instrument.clone(),
-                    order_id: order_id.clone(),
-                    quantity,
-                    kind,
-                    seq,
-                },
-            );
-            order_id
-        };
-        if let Some(order_id) = indexed {
-            self.by_order_id
-                .insert((key.instrument.clone(), order_id), cid.clone());
+            if let Some(order_id) = &known.order_id {
+                self.by_order_id
+                    .insert((key.instrument.clone(), order_id.clone()), cid.clone());
+            }
+            return;
         }
+
+        if self.orders.len() >= MAX_KNOWN_LIVE_ORDERS {
+            self.forget_oldest();
+        } else if self.orders.len() <= MAX_KNOWN_LIVE_ORDERS * 3 / 4 {
+            self.forgetting = false;
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.by_age.insert(seq, cid.clone());
+        self.by_instrument.insert(&key.instrument, cid);
+        if let Some(order_id) = order_id {
+            self.by_order_id
+                .insert((key.instrument.clone(), order_id.clone()), cid.clone());
+        }
+        self.orders.insert(
+            cid.clone(),
+            KnownLive {
+                instrument: key.instrument.clone(),
+                order_id: order_id.cloned(),
+                quantity,
+                kind,
+                seq,
+            },
+        );
     }
 
     /// Record what the response to placing the order under `key`, of `quantity` and `kind`, said:
@@ -434,21 +517,10 @@ impl KnownLiveOrders {
         let Some((_, cid)) = self.by_age.pop_first() else {
             return;
         };
-        let exchange = self.exchange;
-        if self.forgetting {
-            debug!(%exchange, %cid, "Forgetting the oldest order held as live");
-        } else {
-            self.forgetting = true;
-            warn!(
-                %exchange,
-                %cid,
-                held = MAX_KNOWN_LIVE_ORDERS,
-                "Holding the most orders as live the client can, and forgetting the oldest as \
-                 more arrive: if one ended while the stream was disconnected, a reconnect will \
-                 not report it. Further orders forgotten are logged at debug"
-            );
-        }
         self.remove(&cid);
+        let first = !self.forgetting;
+        self.forgetting = true;
+        self.forgotten.push(Forgotten { cid, first });
     }
 }
 
@@ -881,7 +953,9 @@ fn settle(
             tx.send_event(event).then_some(1)
         }
         OrderLookup::Unknown => {
-            if known.ended(&key.cid) {
+            let held = known.ended(&key.cid);
+            drop(known);
+            if held {
                 warn!(
                     %exchange,
                     instrument = %key.instrument,
@@ -1216,6 +1290,119 @@ mod tests {
             );
         }
         known.assert_consistent();
+    }
+
+    /// A report that changes neither the venue id nor the instrument leaves the indexes as they
+    /// were, and one that changes either re-indexes the order under its new key only.
+    #[test]
+    fn a_live_report_re_indexes_only_what_changed() {
+        let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
+        let order = key("BTCUSDT", "a");
+        known.live(&order, dec!(2), OrderKind::Limit, &open("7", Decimal::ZERO));
+        known.live(&order, dec!(2), OrderKind::Limit, &open("7", dec!(1)));
+        known.assert_consistent();
+
+        known.live(&order, dec!(2), OrderKind::Limit, &open("8", dec!(1)));
+        known.assert_consistent();
+        known.observe(&fill("7", Some(dec!(2))));
+        assert!(known.contains(&order.cid), "no longer found by its old id");
+
+        let moved = key("ETHUSDT", "a");
+        known.live(&moved, dec!(2), OrderKind::Limit, &open("8", dec!(1)));
+        known.assert_consistent();
+        assert_eq!(
+            known.instruments(),
+            [InstrumentNameExchange::new("ETHUSDT")]
+        );
+    }
+
+    /// Run `f`, returning the level of every event it logged on this thread and whether `known`'s
+    /// lock was free when it was logged.
+    fn logged_with_lock_free(
+        known: &SharedKnownLiveOrders,
+        f: impl FnOnce(),
+    ) -> Vec<(tracing::Level, bool)> {
+        use std::sync::Mutex;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct LockFree {
+            known: SharedKnownLiveOrders,
+            seen: Arc<Mutex<Vec<(tracing::Level, bool)>>>,
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LockFree {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let free = self.known.0.try_lock().is_some();
+                self.seen
+                    .lock()
+                    .unwrap()
+                    .push((*event.metadata().level(), free));
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let layer = LockFree {
+            known: known.clone(),
+            seen: Arc::clone(&seen),
+        };
+        // Thread-local, so other tests running in parallel are not captured.
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), f);
+        seen.lock().unwrap().clone()
+    }
+
+    /// The set is locked by the account stream for every event, so what it logs on forgetting an
+    /// order waits until the lock is released.
+    #[test]
+    fn forgetting_is_logged_with_the_lock_released() {
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceSpot);
+
+        let seen = logged_with_lock_free(&known, || {
+            let mut held = known.lock();
+            for n in 0..MAX_KNOWN_LIVE_ORDERS + 2 {
+                held.live(
+                    &key("BTCUSDT", &n.to_string()),
+                    dec!(1),
+                    OrderKind::Limit,
+                    &open(&n.to_string(), Decimal::ZERO),
+                );
+            }
+            assert_eq!(held.forgotten.len(), 2, "kept while held");
+        });
+
+        assert_eq!(
+            seen,
+            [(tracing::Level::WARN, true), (tracing::Level::DEBUG, true)]
+        );
+        assert!(known.lock().forgotten.is_empty());
+        assert!(!known.lock().contains(&ClientOrderId::new("1")));
+    }
+
+    #[test]
+    fn an_order_the_venue_does_not_know_is_logged_with_the_lock_released() {
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceSpot);
+        let order = key("BTCUSDT", "a");
+        known
+            .lock()
+            .live(&order, dec!(2), OrderKind::Limit, &open("7", Decimal::ZERO));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let seen = logged_with_lock_free(&known, || {
+            let sent = settle(
+                ExchangeId::BinanceSpot,
+                &known,
+                order.clone(),
+                OrderLookup::Unknown,
+                &tx,
+            );
+            assert_eq!(sent, Some(0));
+        });
+
+        assert_eq!(seen, [(tracing::Level::WARN, true)]);
+        assert!(!known.lock().contains(&order.cid));
     }
 
     #[test]
