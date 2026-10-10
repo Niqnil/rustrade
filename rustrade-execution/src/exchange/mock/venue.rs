@@ -196,10 +196,11 @@ pub enum VenueRegime {
 ///   what is left in [`BorrowReject::available`].
 /// - [`ShortSaleRestricted`](BorrowRejectReason::ShortSaleRestricted): a short-sale restriction
 ///   is in effect and the order is marketable: a market order, or a sell limit at or below the
-///   best bid (the last price, on a feed with no book). A limit above the bid rests. A market
-///   order the [`FillModel`] cannot price, such as one against a bid-only book under
+///   best bid (the last price, on a feed with no book). A limit above the bid rests, and so does
+///   any sell limit when there is neither a bid nor a last price. A market order the
+///   [`FillModel`] cannot price, such as one against a bid-only book under
 ///   [`MidpointFillModel`](crate::fill::MidpointFillModel), is refused as unpriceable, as it would
-///   be unrestricted, and with neither a bid nor a last price a sell limit rests.
+///   be unrestricted.
 ///
 /// Only the short part of an order is gated: a flip from a long is measured by the short it
 /// opens, and a buy, or a sell that only reduces a long once every resting sell has filled, is
@@ -1765,17 +1766,19 @@ impl SimulatedVenue {
         // at the price the fill model gives it. When there is nothing to judge against, an order
         // that would take from the book is refused as unpriceable instead, which names the real
         // cause.
-        let marketable = market.is_some_and(|market| match request.state.kind {
-            OrderKind::Limit => request
-                .state
-                .price
-                .is_some_and(|limit| crosses(Side::Sell, limit, market)),
-            _ => self
-                .fill_model
-                .fill_price(&FillContext::new(Side::Sell, market))
-                .is_some(),
-        });
-        if marketable && provider.short_sale_restricted(instrument, now) {
+        let marketable = || {
+            market.is_some_and(|market| match request.state.kind {
+                OrderKind::Limit => request
+                    .state
+                    .price
+                    .is_some_and(|limit| crosses(Side::Sell, limit, market)),
+                _ => self
+                    .fill_model
+                    .fill_price(&FillContext::new(Side::Sell, market))
+                    .is_some(),
+            })
+        };
+        if provider.short_sale_restricted(instrument, now) && marketable() {
             return Err(ApiError::BorrowRejected(BorrowReject::new(
                 BorrowRejectReason::ShortSaleRestricted,
                 None,
@@ -7860,6 +7863,26 @@ mod tests {
         assert_eq!(
             cfd_position(&venue).map(|(quantity, _)| quantity),
             Some(d("-1"))
+        );
+    }
+
+    /// Whether a market sell is marketable is the fill model's to say, and one that can price it
+    /// is refused for the restriction.
+    #[test]
+    fn a_restricted_market_short_the_fill_model_can_price_is_refused_for_the_restriction() {
+        let mut venue =
+            make_cfd_venue_lending(ShortabilityTable::new().with_short_sale_restriction(
+                cfd_instrument_name(),
+                time(0),
+                time(10),
+            ));
+        venue.fill_model = SimFillConfig::Midpoint(crate::fill::MidpointFillModel);
+
+        let outcome = open_cfd(&mut venue, Side::Sell, "1");
+
+        assert_eq!(
+            borrow_rejection(&outcome).reason,
+            BorrowRejectReason::ShortSaleRestricted
         );
     }
 
