@@ -196,7 +196,8 @@ pub enum VenueRegime {
 ///   what is left in [`BorrowReject::available`].
 /// - [`ShortSaleRestricted`](BorrowRejectReason::ShortSaleRestricted): a short-sale restriction
 ///   is in effect and the order is marketable: a market order, or a sell limit at or below the
-///   best bid (the last price, on a feed with no book). A limit above the bid rests.
+///   best bid (the last price, on a feed with no book). A limit above the bid rests. With no
+///   market to price it, an order is refused as unpriceable instead, as it would be unrestricted.
 ///
 /// Only the short part of an order is gated: a flip from a long is measured by the short it
 /// opens, and a buy, or a sell that only reduces a long once every resting sell has filled, is
@@ -1757,15 +1758,16 @@ impl SimulatedVenue {
             ));
         }
 
-        let marketable = match request.state.kind {
+        // With no market, nothing is marketable: an order that would take from the book is
+        // instead refused as unpriceable, naming the absent snapshot, which is the real cause.
+        let marketable = market.is_some_and(|market| match request.state.kind {
             OrderKind::Limit => request
                 .state
                 .price
-                .zip(market)
-                .is_some_and(|(limit, market)| crosses(Side::Sell, limit, market)),
+                .is_some_and(|limit| crosses(Side::Sell, limit, market)),
             // Every other kind this venue accepts takes whatever the book offers.
             _ => true,
-        };
+        });
         if marketable && provider.short_sale_restricted(instrument, now) {
             return Err(ApiError::BorrowRejected(BorrowReject::new(
                 BorrowRejectReason::ShortSaleRestricted,
@@ -7897,5 +7899,95 @@ mod tests {
             ))) => {}
             other => panic!("expected BalanceInsufficient, got: {other:?}"),
         }
+    }
+
+    /// With no market for the instrument, a restricted market sell is refused for what it is,
+    /// unpriceable, rather than for a restriction that judges a bid there is none of.
+    #[test]
+    fn a_restricted_short_with_no_market_is_refused_as_unpriceable() {
+        let mut venue = SimulatedVenue::new_market_driven(
+            &config_from_balances(
+                vec![funded(self::usd(), d("10000000"))],
+                FeeModelConfig::default(),
+            ),
+            instruments_of(cfd_instrument()),
+        )
+        .with_shortability(Arc::new(
+            ShortabilityTable::new().with_short_sale_restriction(
+                cfd_instrument_name(),
+                time(0),
+                time(10),
+            ),
+        ));
+        advance(&mut venue, time(1));
+
+        let outcome = open_cfd(&mut venue, Side::Sell, "1");
+
+        match outcome.response.state {
+            OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                ApiError::BorrowRejected(reject),
+            ))) => panic!("expected the unpriceable rejection, got: {reject:?}"),
+            OrderState::Inactive(InactiveOrderState::OpenFailed(_)) => {}
+            other => panic!("an unpriceable order must not open, got: {other:?}"),
+        }
+    }
+
+    /// The checks apply in their documented order: not shortable before too little to lend,
+    /// and too little to lend before the restriction.
+    #[test]
+    fn the_first_refusal_that_applies_is_the_one_reported() {
+        let restricted = |shortability| {
+            lending(shortability).with_short_sale_restriction(
+                cfd_instrument_name(),
+                time(0),
+                time(10),
+            )
+        };
+
+        let mut venue = make_cfd_venue_lending(restricted(
+            Shortability::new()
+                .with_shortable(false)
+                .with_available(Decimal::ZERO),
+        ));
+        let outcome = open_cfd(&mut venue, Side::Sell, "1");
+        assert_eq!(
+            borrow_rejection(&outcome).reason,
+            BorrowRejectReason::NotShortable
+        );
+
+        let mut venue = make_cfd_venue_lending(restricted(
+            Shortability::new().with_available(Decimal::ZERO),
+        ));
+        let outcome = open_cfd(&mut venue, Side::Sell, "1");
+        assert_eq!(
+            borrow_rejection(&outcome).reason,
+            BorrowRejectReason::InventoryUnavailable
+        );
+    }
+
+    /// A flip from a long opens a short, so a restriction refuses it when it is marketable, while
+    /// the sell that only closes the same long goes through.
+    #[test]
+    fn a_short_sale_restriction_refuses_a_marketable_flip_but_not_a_close() {
+        let mut venue =
+            make_cfd_venue_lending(ShortabilityTable::new().with_short_sale_restriction(
+                cfd_instrument_name(),
+                time(0),
+                time(10),
+            ));
+        cfd_market_fill(&mut venue, Side::Buy, "2");
+
+        let outcome = open_cfd(&mut venue, Side::Sell, "3");
+        assert_eq!(
+            borrow_rejection(&outcome).reason,
+            BorrowRejectReason::ShortSaleRestricted
+        );
+        assert_eq!(
+            cfd_position(&venue).map(|(quantity, _)| quantity),
+            Some(d("2"))
+        );
+
+        cfd_market_fill(&mut venue, Side::Sell, "2");
+        assert_eq!(cfd_position(&venue), None);
     }
 }
