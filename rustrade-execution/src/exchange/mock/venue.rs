@@ -437,6 +437,15 @@ pub struct SimulatedVenue {
     /// rather than at the epoch, so a venue charges from the first instant it is driven to, not
     /// for every boundary since 1970.
     accrued_through: Option<DateTime<Utc>>,
+    /// The earliest holding-cost boundary after [`accrued_through`](Self::accrued_through) of any
+    /// position held, or `None` if there is none.
+    ///
+    /// Cached because both [`accrue`](Self::accrue), on every input, and
+    /// [`next_deadline`](Self::next_deadline) need it, and asking every model for its next
+    /// boundary — a time-zone conversion for a daily cutoff — on every market tick would cost a
+    /// long backtest real time. It can change only when a position does or a boundary is charged,
+    /// so those are where it is recomputed.
+    next_charge: Option<DateTime<Utc>>,
     /// Monotone [`CashFlowId`] source for the charges this venue posts.
     cash_flow_sequence: u64,
     /// Whether a holding cost has already been valued at a position's entry price for want of a
@@ -511,6 +520,7 @@ impl SimulatedVenue {
             regime,
             holding_costs: Vec::new(),
             accrued_through: None,
+            next_charge: None,
             cash_flow_sequence: 0,
             valued_at_entry: false,
         }
@@ -526,6 +536,7 @@ impl SimulatedVenue {
     #[must_use]
     pub fn with_holding_costs(mut self, models: Vec<Arc<dyn HoldingCostModel>>) -> Self {
         self.holding_costs = models;
+        self.refresh_next_charge();
         self
     }
 
@@ -541,7 +552,12 @@ impl SimulatedVenue {
     /// where charging starts.
     pub fn next_deadline(&self) -> Option<DateTime<Utc>> {
         let expiry = self.account.orders().next_expiry();
-        let boundary = self.accrued_through.and_then(|after| {
+        expiry.into_iter().chain(self.next_charge).min()
+    }
+
+    /// Recomputes [`next_charge`](Self::next_charge) from the positions held now.
+    fn refresh_next_charge(&mut self) {
+        self.next_charge = self.accrued_through.and_then(|after| {
             self.positions
                 .keys()
                 .flat_map(|instrument| {
@@ -551,8 +567,6 @@ impl SimulatedVenue {
                 })
                 .min()
         });
-
-        expiry.into_iter().chain(boundary).min()
     }
 
     /// Which price source this venue has, and so which order kinds it accepts.
@@ -626,6 +640,7 @@ impl SimulatedVenue {
             // The clock's first move: charging starts here.
             None => {
                 self.accrued_through = Some(now);
+                self.refresh_next_charge();
                 return Vec::new();
             }
             Some(after) if now <= after => return Vec::new(),
@@ -633,7 +648,9 @@ impl SimulatedVenue {
         };
         self.accrued_through = Some(now);
 
-        if self.holding_costs.is_empty() || self.positions.is_empty() {
+        // Nothing falls in `(after, now]`, so the first boundary after `now` is still the first
+        // after `after`, and the cache stays right.
+        if self.next_charge.is_none_or(|due| now < due) {
             return Vec::new();
         }
 
@@ -663,6 +680,7 @@ impl SimulatedVenue {
         for (boundary, instrument, index) in due {
             events.extend(self.charge_holding_cost(boundary, &instrument, index));
         }
+        self.refresh_next_charge();
         events
     }
 
@@ -2246,6 +2264,11 @@ impl SimulatedVenue {
                     self.positions.insert(instrument.clone(), position);
                 }
             }
+        }
+
+        // A position opened or closed has boundaries of its own, or no longer has any.
+        if !self.holding_costs.is_empty() {
+            self.refresh_next_charge();
         }
     }
 
