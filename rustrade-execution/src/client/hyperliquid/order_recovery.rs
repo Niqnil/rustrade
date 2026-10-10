@@ -388,6 +388,7 @@ pub(super) mod tests {
     use super::*;
     use crate::{
         AccountEventKind,
+        error::{ApiError, OrderError},
         order::{
             OrderKey,
             id::{OrderId, StrategyId, VenueOrderId},
@@ -615,7 +616,14 @@ pub(super) mod tests {
         ));
         assert!(matches!(
             state("tickRejected"),
-            InactiveOrderState::OpenFailed(_)
+            InactiveOrderState::OpenFailed(OrderError::Rejected(ApiError::OrderRejected(_)))
+        ));
+        assert!(matches!(
+            state("perpMarginRejected"),
+            InactiveOrderState::OpenFailed(OrderError::Rejected(ApiError::BalanceInsufficient(
+                None,
+                _
+            )))
         ));
     }
 

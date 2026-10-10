@@ -247,7 +247,8 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     ///
     /// The asset is `None` when it is not known which asset ran short:
     /// - the venue's rejection does not name it (e.g. Binance's "Account has insufficient
-    ///   balance for requested action"), and a client does not guess it from the order;
+    ///   balance for requested action", or any Hyperliquid margin or spot-balance refusal), and
+    ///   a client does not guess it from the order;
     /// - the venue named an asset that the [`ExecutionInstrumentMap`] does not hold, so it has no
     ///   index. [`AccountEventIndexer::api_error`] logs the name it dropped.
     ///

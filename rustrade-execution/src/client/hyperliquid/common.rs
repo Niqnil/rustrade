@@ -5,8 +5,8 @@
 //!
 //! Error mapping is in the `error` module.
 
-use crate::client::hyperliquid::error::map_sdk_error;
-use crate::error::{ApiError, OrderError, UnindexedApiError, UnindexedClientError};
+use crate::client::hyperliquid::error::{map_sdk_error, order_rejection};
+use crate::error::{OrderError, UnindexedClientError};
 use crate::order::{
     Order, OrderKey, OrderKind, TimeInForce, UnindexedOrderSnapshot,
     id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
@@ -472,31 +472,6 @@ impl OrderStatus {
     }
 }
 
-/// Classify why Hyperliquid refused an order: the error of a placement response, or a status
-/// ending in `Rejected` from `orderUpdates` or `orderStatus`.
-///
-/// The account's funds running short is [`ApiError::BalanceInsufficient`], with no asset, since
-/// Hyperliquid does not name the one that ran short:
-/// - a perp order's "Insufficient margin to place order." and the `perpMarginRejected` status;
-/// - a spot order's "Order has insufficient spot balance to trade" and the
-///   `insufficientSpotBalanceRejected` status.
-///
-/// Anything else (minimum notional, reduce-only, open-interest caps, oracle, margin-tier limit,
-/// ...) is [`ApiError::OrderRejected`]. Either way the venue's text is kept.
-pub(super) fn order_rejection(reason: String) -> UnindexedApiError {
-    let lower = reason.to_ascii_lowercase();
-    let short_of_funds = matches!(
-        reason.as_str(),
-        "perpMarginRejected" | "insufficientSpotBalanceRejected"
-    ) || lower.contains("insufficient margin")
-        || lower.contains("insufficient spot balance");
-    if short_of_funds {
-        ApiError::BalanceInsufficient(None, reason)
-    } else {
-        ApiError::OrderRejected(reason)
-    }
-}
-
 /// Convert an `orderUpdates` message into an order snapshot event on `instrument`, keyed as
 /// [`record_cid`] says.
 ///
@@ -938,6 +913,7 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 pub(super) mod info_tests {
     use super::*;
+    use crate::error::ApiError;
     use rust_decimal_macros::dec;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1422,36 +1398,6 @@ pub(super) mod info_tests {
                 assert_eq!(cancelled.filled_quantity, None);
             }
             other => panic!("expected Cancelled, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_shortfall_of_funds_is_balance_insufficient_and_anything_else_a_rejection() {
-        for reason in [
-            "perpMarginRejected",
-            "insufficientSpotBalanceRejected",
-            "Insufficient margin to place order. asset=0",
-            "Order has insufficient spot balance to trade",
-        ] {
-            assert_eq!(
-                order_rejection(reason.to_owned()),
-                ApiError::BalanceInsufficient(None, reason.to_owned()),
-                "{reason}"
-            );
-        }
-        for reason in [
-            "minTradeNtlRejected",
-            "reduceOnlyRejected",
-            "positionIncreaseAtOpenInterestCapRejected",
-            "oracleRejected",
-            "perpMaxPositionRejected",
-            "Order must have minimum value of $10.",
-        ] {
-            assert_eq!(
-                order_rejection(reason.to_owned()),
-                ApiError::OrderRejected(reason.to_owned()),
-                "{reason}"
-            );
         }
     }
 

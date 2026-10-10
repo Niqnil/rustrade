@@ -109,10 +109,34 @@ pub fn map_order_error(
         return UnindexedOrderError::Rejected(ApiError::InstrumentInvalid(instrument.clone(), msg));
     }
 
-    // All other rejections (insufficient balance, post-only crossed, price precision, etc.)
-    // Use OrderRejected since we can't cleanly extract the specific error type without
-    // more structured error responses from the SDK.
-    UnindexedOrderError::Rejected(ApiError::OrderRejected(msg))
+    // Anything else is classified by its text like a refusal in a response: a shortfall of
+    // funds is BalanceInsufficient, the rest OrderRejected.
+    UnindexedOrderError::Rejected(order_rejection(msg))
+}
+
+/// Classify why Hyperliquid refused an order: the error of a placement response or of the SDK
+/// call that sent it, or a status ending in `Rejected` from `orderUpdates` or `orderStatus`.
+///
+/// The account's funds running short is [`ApiError::BalanceInsufficient`], with no asset, since
+/// Hyperliquid does not name the one that ran short:
+/// - a perp order's "Insufficient margin to place order." and the `perpMarginRejected` status;
+/// - a spot order's "Order has insufficient spot balance to trade" and the
+///   `insufficientSpotBalanceRejected` status.
+///
+/// Anything else (minimum notional, reduce-only, open-interest caps, oracle, margin-tier limit,
+/// ...) is [`ApiError::OrderRejected`]. Either way the venue's text is kept.
+pub(super) fn order_rejection(reason: String) -> UnindexedApiError {
+    let lower = reason.to_ascii_lowercase();
+    let short_of_funds = matches!(
+        reason.as_str(),
+        "perpMarginRejected" | "insufficientSpotBalanceRejected"
+    ) || lower.contains("insufficient margin")
+        || lower.contains("insufficient spot balance");
+    if short_of_funds {
+        ApiError::BalanceInsufficient(None, reason)
+    } else {
+        ApiError::OrderRejected(reason)
+    }
 }
 
 #[cfg(test)]
@@ -222,13 +246,46 @@ mod tests {
     }
 
     #[test]
+    fn a_shortfall_of_funds_is_balance_insufficient_and_anything_else_a_rejection() {
+        for reason in [
+            "perpMarginRejected",
+            "insufficientSpotBalanceRejected",
+            "Insufficient margin to place order. asset=0",
+            "Order has insufficient spot balance to trade",
+            "INSUFFICIENT MARGIN TO PLACE ORDER.",
+        ] {
+            assert_eq!(
+                order_rejection(reason.to_owned()),
+                ApiError::BalanceInsufficient(None, reason.to_owned()),
+                "{reason}"
+            );
+        }
+        for reason in [
+            "minTradeNtlRejected",
+            "reduceOnlyRejected",
+            "positionIncreaseAtOpenInterestCapRejected",
+            "oracleRejected",
+            "perpMaxPositionRejected",
+            "marketOrderNoLiquidityRejected",
+            "badAloPxRejected",
+            "Order must have minimum value of $10.",
+        ] {
+            assert_eq!(
+                order_rejection(reason.to_owned()),
+                ApiError::OrderRejected(reason.to_owned()),
+                "{reason}"
+            );
+        }
+    }
+
+    #[test]
     fn test_map_order_error_rejected() {
         let instrument = InstrumentNameExchange::from("BTC-USDC-PERP");
 
         let err = map_order_error(make_sdk_error("insufficient margin"), &instrument);
         assert!(matches!(
             err,
-            UnindexedOrderError::Rejected(ApiError::OrderRejected(_))
+            UnindexedOrderError::Rejected(ApiError::BalanceInsufficient(None, _))
         ));
 
         let err = map_order_error(make_sdk_error("price precision too high"), &instrument);

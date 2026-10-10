@@ -78,11 +78,11 @@
 use super::common::{
     CLOID_REQUIRED, CancelOnDropStream, OpenOrder, OpenOrderListing, UserFill, cancel_outcome,
     cid_to_cloid, instrument_to_spot_coin, map_tif, millis_to_datetime, open_order_to_order,
-    open_orders, order_rejection, parse_decimal, parse_side, span_millis, spot_balances,
-    spot_base_quote, spot_pair_to_instrument, user_fills_by_time,
+    open_orders, parse_decimal, parse_side, span_millis, spot_balances, spot_base_quote,
+    spot_pair_to_instrument, user_fills_by_time,
 };
 use super::config::HyperliquidConfig;
-use super::error::{map_order_error, map_sdk_error};
+use super::error::{map_order_error, map_sdk_error, order_rejection};
 use super::order_recovery::{
     ReconnectWatch, fetch_order_record, listed_cids, lookup_from_record, remember_open,
     remember_snapshot, send_fills, send_observed, spawn_order_checks,
@@ -1508,7 +1508,7 @@ mod tests {
         }
     }
 
-    mod precision {
+    mod open_order {
         use super::super::super::common::info_tests::{
             exchange_client_against, info_client_against, test_wallet,
         };
@@ -1523,14 +1523,16 @@ mod tests {
 
         /// A spot client on [`TEST_SPOT_META`]'s pairs whose exchange endpoint rests every order.
         async fn resting_client() -> (MockServer, HyperliquidSpotClient) {
-            client_answering(serde_json::json!({"resting": {"oid": 77}})).await
+            client_responding(serde_json::json!({
+                "status": "ok",
+                "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 77}}]}},
+            }))
+            .await
         }
 
-        /// A spot client on [`TEST_SPOT_META`]'s pairs whose exchange endpoint answers every order
-        /// with `status`.
-        async fn client_answering(
-            status: serde_json::Value,
-        ) -> (MockServer, HyperliquidSpotClient) {
+        /// A spot client on [`TEST_SPOT_META`]'s pairs whose exchange endpoint answers every
+        /// request with `body`.
+        async fn client_responding(body: serde_json::Value) -> (MockServer, HyperliquidSpotClient) {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/info"))
@@ -1541,10 +1543,7 @@ mod tests {
                 .await;
             Mock::given(method("POST"))
                 .and(path("/exchange"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "status": "ok",
-                    "response": {"type": "order", "data": {"statuses": [status]}},
-                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
                 .mount(&server)
                 .await;
             let info_client = Arc::new(info_client_against(server.uri()).await);
@@ -1564,23 +1563,43 @@ mod tests {
             (server, client)
         }
 
-        /// A spot order refused for want of balance is a balance shortfall, as on other venues.
-        /// Hyperliquid names no asset.
+        /// A spot order refused for want of balance is a balance shortfall, as on other venues;
+        /// any other refusal stays a rejection. Hyperliquid names no asset. The refusal is read
+        /// both as an order's status and as the error of the whole response.
         #[tokio::test]
         async fn a_spot_order_refused_for_balance_is_balance_insufficient() {
-            const ERROR: &str = "Order has insufficient spot balance to trade";
-            let (_server, client) = client_answering(serde_json::json!({ "error": ERROR })).await;
-            let order = place_hype(&client, dec!(10), dec!(1)).await;
-            let OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
-                reported,
-            ))) = &order.state
-            else {
-                panic!("expected a rejection, got {:?}", order.state);
-            };
-            assert_eq!(
-                reported,
-                &ApiError::BalanceInsufficient(None, ERROR.to_owned())
-            );
+            const BALANCE: &str = "Order has insufficient spot balance to trade";
+            const MINIMUM: &str = "Order must have minimum value of 10 USDC.";
+            for (body, expected) in [
+                (
+                    serde_json::json!({
+                        "status": "ok",
+                        "response": {"type": "order", "data": {"statuses": [{"error": BALANCE}]}},
+                    }),
+                    ApiError::BalanceInsufficient(None, BALANCE.to_owned()),
+                ),
+                (
+                    serde_json::json!({"status": "err", "response": BALANCE}),
+                    ApiError::BalanceInsufficient(None, BALANCE.to_owned()),
+                ),
+                (
+                    serde_json::json!({
+                        "status": "ok",
+                        "response": {"type": "order", "data": {"statuses": [{"error": MINIMUM}]}},
+                    }),
+                    ApiError::OrderRejected(MINIMUM.to_owned()),
+                ),
+            ] {
+                let (_server, client) = client_responding(body.clone()).await;
+                let order = place_hype(&client, dec!(10), dec!(1)).await;
+                let OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                    reported,
+                ))) = &order.state
+                else {
+                    panic!("{body}: expected a rejection, got {:?}", order.state);
+                };
+                assert_eq!(reported, &expected, "{body}");
+            }
         }
 
         async fn place_hype(
