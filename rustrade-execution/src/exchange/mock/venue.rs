@@ -35,6 +35,7 @@ use rustrade_instrument::{
 };
 use rustrade_integration::collection::snapshot::Snapshot;
 use smol_str::ToSmolStr;
+use std::sync::Arc;
 use tracing::warn;
 
 /// Everything one request obliges a driver to deliver, in the order it must deliver it.
@@ -312,7 +313,9 @@ pub enum VenueRegime {
 /// driver next calls [`advance_time`](Self::advance_time) or [`apply_market`](Self::apply_market),
 /// whichever comes first, and the sweep spans every instrument rather than only the one that
 /// ticked. A deadline falling after the last such call is never reached at all — see
-/// [`advance_time`](Self::advance_time) for what that means for a caller.
+/// [`advance_time`](Self::advance_time) for what that means for a caller. A driver that keeps a
+/// timeline of its own can advance the clock to each [`next_deadline`](Self::next_deadline) as it
+/// falls, as `SimRunner` does, so that a deadline is reached at its own instant.
 ///
 /// A deadline is an unconditional cutoff. An order reaching it is retired even if the very tick
 /// that reached it would have crossed it, and an order that arrives already past its deadline is
@@ -425,7 +428,7 @@ pub struct SimulatedVenue {
     /// What holding a position costs over time. Empty unless set by
     /// [`with_holding_costs`](Self::with_holding_costs), and then fixed: swapping a model under
     /// a position mid-run would leave its charges to date priced by one and the rest by another.
-    holding_costs: Vec<Box<dyn HoldingCostModel>>,
+    holding_costs: Vec<Arc<dyn HoldingCostModel>>,
     /// The instant up to which every holding-cost boundary has been charged, or `None` before
     /// this venue's clock first moved.
     ///
@@ -521,7 +524,7 @@ impl SimulatedVenue {
     /// position. See the type's `# Holding costs` for when a charge is made and how it is
     /// reported.
     #[must_use]
-    pub fn with_holding_costs(mut self, models: Vec<Box<dyn HoldingCostModel>>) -> Self {
+    pub fn with_holding_costs(mut self, models: Vec<Arc<dyn HoldingCostModel>>) -> Self {
         self.holding_costs = models;
         self
     }
@@ -578,7 +581,9 @@ impl SimulatedVenue {
     /// This venue has no timer. Nothing retires an order until a driver next advances the clock or
     /// feeds a market, so a deadline falling after the last such call is never reached at all. A
     /// driver that stops driving leaves orders working past their deadline, and that is a property
-    /// of the simulation rather than something a caller can configure away.
+    /// of the simulation rather than something a caller can configure away. A driver that wants
+    /// each deadline reached at its own instant advances the clock to
+    /// [`next_deadline`](Self::next_deadline).
     ///
     /// # Returns the expiries it caused, which a driver must deliver
     /// Per retired order the events are `[balance, order]` -- the released reservation, then the
@@ -7005,8 +7010,8 @@ mod tests {
     // --- Holding costs: charged at each boundary the clock reaches -----------------------------
 
     /// Hourly funding on the CFD at `rate` per hour, so a boundary falls on every whole hour.
-    fn hourly_funding(rate: &str) -> Box<dyn HoldingCostModel> {
-        Box::new(
+    fn hourly_funding(rate: &str) -> Arc<dyn HoldingCostModel> {
+        Arc::new(
             FundingModel::new(TimeDelta::hours(1))
                 .with_rates(cfd_instrument_name(), RateSeries::constant(d(rate))),
         )
@@ -7020,7 +7025,7 @@ mod tests {
     /// A market-driven CFD venue charging `models`, its clock first moved to `time(1)`.
     fn make_cfd_venue_charging(
         usd: &str,
-        models: Vec<Box<dyn HoldingCostModel>>,
+        models: Vec<Arc<dyn HoldingCostModel>>,
     ) -> SimulatedVenue {
         let mut venue = SimulatedVenue::new_market_driven(
             &config_from_balances(vec![funded(self::usd(), d(usd))], FeeModelConfig::default()),
@@ -7264,7 +7269,7 @@ mod tests {
             }
         }
 
-        let mut venue = make_cfd_venue_charging("200000", vec![Box::new(Stuck)]);
+        let mut venue = make_cfd_venue_charging("200000", vec![Arc::new(Stuck)]);
         assert!(cfd_market(&mut venue, "5000", "5000", "5000").is_empty());
         cfd_market_fill(&mut venue, Side::Buy, "1");
         let _ = venue.advance_time(time(2));

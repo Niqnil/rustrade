@@ -54,8 +54,9 @@ use std::{collections::BTreeSet, fmt::Debug, sync::Arc};
 /// - Both methods must be pure functions of their arguments: the venue may ask for the same
 ///   boundary more than once, and charges it once.
 ///
-/// `Send` because a venue is driven from an async task.
-pub trait HoldingCostModel: Debug + Send {
+/// `Send + Sync` because a venue holds its models behind an `Arc`, so that one model, and the
+/// rate history it carries, can be shared by every run of a backtest sweep without being copied.
+pub trait HoldingCostModel: Debug + Send + Sync {
     /// The first boundary strictly after `after` at which this model charges `instrument`, or
     /// `None` if it never does.
     fn next_boundary(
@@ -517,7 +518,7 @@ impl<Tz: TimeZone> BorrowFeeModel<Tz> {
 
 impl<Tz> HoldingCostModel for BorrowFeeModel<Tz>
 where
-    Tz: TimeZone + Debug + Send,
+    Tz: TimeZone + Debug + Send + Sync,
 {
     fn next_boundary(
         &self,
@@ -602,7 +603,7 @@ impl<Tz: TimeZone> FinancingModel<Tz> {
 
 impl<Tz> HoldingCostModel for FinancingModel<Tz>
 where
-    Tz: TimeZone + Debug + Send,
+    Tz: TimeZone + Debug + Send + Sync,
 {
     fn next_boundary(
         &self,
