@@ -1052,7 +1052,9 @@ struct AlpacaOrderWs<'a> {
 /// # Rate limits
 /// Once a response reports no requests left in the current window (`X-Ratelimit-Remaining: 0`),
 /// every request, orders included, waits until the window resets (`X-Ratelimit-Reset`, at most a
-/// minute away), so it is not refused. A 429 waits the same way and is retried.
+/// minute away), so it is not refused. A 429 waits the same way, for the wait Alpaca gives or a
+/// minute without one, and is retried. Once the retries are exhausted the request fails with
+/// [`ApiError::RateLimit`], carrying that wait, and later requests still wait for it.
 ///
 /// # Fees, interest and borrow fees
 /// Every [`Trade`] this client reports carries zero fees. Equities and options trade without
@@ -1206,8 +1208,10 @@ fn observe_rate_limit_remaining(
 /// need a clone of `RequestBuilder` (which may not be cloneable with streaming bodies).
 /// For GET/POST/DELETE with fixed bodies, the closure is a cheap re-construction.
 ///
-/// On HTTP 429, reads `X-Ratelimit-Reset` (Unix epoch) to determine the cooldown
-/// duration and retries up to `MAX_RATE_LIMIT_ATTEMPTS - 1` times. Any other response reporting
+/// On HTTP 429, reads the cooldown with [`parse_rate_limit_delay`] and retries up to
+/// `MAX_RATE_LIMIT_ATTEMPTS - 1` times. Every 429, the last included, pauses later requests for
+/// that cooldown, so a caller handed [`ApiError::RateLimit`] does not meet the same refusal on its
+/// next call. Any other response reporting
 /// `X-Ratelimit-Remaining: 0` pauses later requests until that reset; see
 /// [`observe_rate_limit_remaining`].
 ///
@@ -1366,7 +1370,8 @@ where
 /// Execute a DELETE request, returning an order error on rejection.
 ///
 /// Handles 204 No Content (success), other 4xx (API rejection, see [`parse_api_error`]), and 429
-/// (rate limit). Any other response reporting `X-Ratelimit-Remaining: 0` pauses later requests,
+/// (rate limit, retried and pausing later requests as in [`rest_with_retry`]). Any other response
+/// reporting `X-Ratelimit-Remaining: 0` pauses later requests,
 /// as in [`rest_with_retry`].
 async fn rest_delete_with_retry(
     rate_limiter: &RateLimitTracker,
