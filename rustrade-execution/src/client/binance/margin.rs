@@ -13,9 +13,13 @@
 //! `userListenToken` user-data WebSocket (the retired `/sapi/v1/userDataStream` listen-key path is
 //! not used), which after a reconnect recovers missed fills and reports how orders ended
 //! meanwhile, and on cross margin also reads the Risk Data Stream for margin notices. It also
-//! implements [`OrderStatusClient`], looking orders up by client order id. Both
-//! **cross** (`isIsolated = "FALSE"`, account-wide collateral) and **isolated** (`isIsolated =
-//! "TRUE"`, per-pair sub-accounts) margin are supported, selected by
+//! implements [`OrderStatusClient`], looking orders up by client order id. Two reads beyond the
+//! trait cover what the account stream does not carry: the interest charged
+//! ([`BinanceMargin::fetch_margin_interest`]) and forced liquidations
+//! ([`BinanceMargin::fetch_forced_liquidations`]).
+//!
+//! The client supports both **cross** (`isIsolated = "FALSE"`, account-wide collateral) and
+//! **isolated** (`isIsolated = "TRUE"`, per-pair sub-accounts) margin, selected by
 //! [`BinanceMarginConfig::is_isolated`].
 //!
 //! ## Cross vs. isolated
@@ -49,6 +53,10 @@
 //!   cannot resurrect a retired order as a resting one. That order's filled quantity is settled
 //!   instead by the terminal report's own `z`, or by
 //!   [`ExecutionClient::fetch_open_orders`].
+
+mod records;
+
+pub use records::MarginForcedLiquidation;
 
 use super::margin_risk::{
     RISK_STREAM_URL, RiskStreamTask, SapiRiskListenKeys, log_liability_change,
@@ -6843,7 +6851,10 @@ mod tests {
     }
 
     /// A client of the cross account, or of the isolated BTCUSDT one, talking to `server`.
-    fn margin_client_at(server: &wiremock::MockServer, is_isolated: bool) -> BinanceMargin {
+    pub(super) fn margin_client_at(
+        server: &wiremock::MockServer,
+        is_isolated: bool,
+    ) -> BinanceMargin {
         let config = if is_isolated {
             BinanceMarginConfig::isolated(
                 "key".into(),

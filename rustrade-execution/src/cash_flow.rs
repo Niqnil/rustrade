@@ -26,6 +26,9 @@ use std::fmt::{Display, Formatter};
 /// Each producer says how it avoids sending one flow twice, and what identifies a flow when the
 /// venue gives it no [`id`](Self::id). Known producers, as of writing:
 /// - Hyperliquid perpetuals: funding, as [`CashFlowKind::Funding`]. See the client's rustdoc.
+/// - Binance margin: interest, as [`CashFlowKind::MarginInterest`], read on request by
+///   `BinanceMargin::fetch_margin_interest` rather than streamed, with Binance's transaction id.
+///   The caller drops what it has already read.
 /// - The simulated venue: whatever its configured
 ///   [`HoldingCostModel`](crate::holding_cost::HoldingCostModel)s charge, each flow once, with an
 ///   id from its own sequence.

@@ -225,7 +225,8 @@ where
 ///   fill is reported, as `External`, only when `IbkrConfig::other_clients_fills` opts in.
 /// - **Binance** marks no forced liquidation in its Spot or Margin order stream: its liquidation
 ///   markers are documented for futures only. Every fill on the account arrives, whoever placed
-///   its order.
+///   its order. `BinanceMargin::fetch_forced_liquidations` reads the margin orders Binance placed
+///   to liquidate the account, for a caller to match against its fills.
 /// - **Hyperliquid** fills carry a liquidation marker, but the SDK this crate uses drops it.
 /// - **Alpaca** marks no liquidation. Option assignment, exercise and expiry are account
 ///   activities, which this crate does not read.
