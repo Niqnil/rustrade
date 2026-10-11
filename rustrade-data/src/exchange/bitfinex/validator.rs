@@ -81,6 +81,9 @@ where
     // The subscriptions not yet acknowledged, by the id the mapper keyed them under
     let mut unacknowledged = instrument_map.0.keys().cloned().collect::<FnvHashSet<_>>();
 
+    // The channels acknowledged whose initial snapshot has not yet arrived
+    let mut awaiting_snapshot = FnvHashSet::default();
+
     // Buffer any active Subscription market events that are received during validation
     let mut buff_active_subscription_events = Vec::new();
 
@@ -133,6 +136,7 @@ where
                             if let Some(subscription) = instrument_map.0.remove(&subscription_id) {
                                 success_responses += 1;
                                 unacknowledged.remove(&subscription_id);
+                                awaiting_snapshot.insert(channel_id.0);
                                 instrument_map
                                     .0
                                     .insert(SubscriptionId(channel_id.0.to_smolstr()), subscription);
@@ -159,8 +163,14 @@ where
                     Some(Err(SocketError::Deserialise { error: _, payload }))
                         if success_responses >= 1 =>
                     {
-                        // Already active Bitfinex subscriptions will send initial snapshots
-                        init_snapshots_received += 1;
+                        // A channel's first frame after its acknowledgement, other than a
+                        // heartbeat, is its initial snapshot. Every frame is kept for processing
+                        // once validated.
+                        if snapshot_channel(&payload)
+                            .is_some_and(|channel_id| awaiting_snapshot.remove(&channel_id))
+                        {
+                            init_snapshots_received += 1;
+                        }
                         buff_active_subscription_events.push(WsMessage::text(payload));
                         continue
                     }
@@ -184,9 +194,20 @@ where
     }
 }
 
+/// The channel id of a data frame, `[CHANNEL_ID, ...]`, unless it is a heartbeat,
+/// `[CHANNEL_ID, "hb"]`.
+fn snapshot_channel(payload: &str) -> Option<u32> {
+    let frame = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    let frame = frame.as_array()?;
+    if frame.get(1).and_then(serde_json::Value::as_str) == Some("hb") {
+        return None;
+    }
+    u32::try_from(frame.first()?.as_u64()?).ok()
+}
+
 /// The error a validation failing for `reason` ends with: [`SocketError::Unacknowledged`] naming
 /// the subscriptions not acknowledged, or, once every one has been, a [`SocketError::Subscribe`]
-/// saying how many initial snapshots arrived.
+/// saying how many initial snapshots had arrived.
 fn failure_error(
     reason: String,
     unacknowledged: FnvHashSet<SubscriptionId>,
@@ -195,8 +216,8 @@ fn failure_error(
 ) -> SocketError {
     if unacknowledged.is_empty() {
         return SocketError::Subscribe(format!(
-            "{reason}; every subscription was acknowledged, but only \
-             {init_snapshots_received} of {expected_responses} initial snapshots arrived"
+            "{reason} (every subscription was acknowledged; {init_snapshots_received} of \
+             {expected_responses} initial snapshots had arrived)"
         ));
     }
 
@@ -277,6 +298,39 @@ mod tests {
         assert_eq!(map.find("53").unwrap(), &0);
         assert_eq!(map.find("54").unwrap(), &1);
         assert_eq!(buffered.len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn updates_and_heartbeats_are_kept_but_not_counted_as_snapshots() {
+        // A channel can stream before the batch's last acknowledgement arrives
+        let mut messages = stream::iter([
+            subscribed("trades", "tBTCUSD", 53),
+            text(r#"[53,"hb"]"#),
+            snapshot(53),
+            text(r#"[53,"te",[2,1791679999877,0.002,82997]]"#),
+            snapshot(53),
+            subscribed("trades", "tETHUSD", 54),
+            snapshot(54),
+        ]);
+
+        let (map, buffered) = validate_responses::<Bitfinex, _, _>(
+            map(&["trades|tBTCUSD", "trades|tETHUSD"]),
+            &mut messages,
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(map.0.len(), 2);
+        assert_eq!(buffered.len(), 5);
+    }
+
+    #[test]
+    fn a_snapshot_frame_names_its_channel_and_a_heartbeat_none() {
+        assert_eq!(snapshot_channel("[53,[[1,2,0.1,3]]]"), Some(53));
+        assert_eq!(snapshot_channel(r#"[53,"te",[1,2,0.1,3]]"#), Some(53));
+        assert_eq!(snapshot_channel(r#"[53,"hb"]"#), None);
+        assert_eq!(snapshot_channel(r#"{"event":"pong"}"#), None);
     }
 
     #[tokio::test(start_paused = true)]
@@ -372,8 +426,8 @@ mod tests {
         };
         assert_eq!(
             message,
-            "WebSocket stream terminated unexpectedly; every subscription was acknowledged, but \
-             only 1 of 2 initial snapshots arrived"
+            "WebSocket stream terminated unexpectedly (every subscription was acknowledged; 1 of \
+             2 initial snapshots had arrived)"
         );
     }
 }
