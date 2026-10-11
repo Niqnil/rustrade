@@ -119,9 +119,9 @@ impl BinanceMargin {
     ///
     /// # Span
     /// - Binance serves interest charged in the last 90 days only. A `start` before that is moved
-    ///   up to a minute inside that limit, clear of any skew between the clocks. One more than a
-    ///   minute before the limit is logged at WARN; a request for the last 90 days, a moment
-    ///   either side of it, is moved silently.
+    ///   up to a minute inside that limit, clear of any skew between the clocks. A `start` more
+    ///   than a minute before the limit is logged at WARN; one within a minute of it, on either
+    ///   side, as a request for the last 90 days is, is moved silently.
     /// - Charges are read up to `end`, or up to the local clock at the call if that is earlier.
     /// - Binance serves at most 30 days per request, so a span is read in windows of 29 days,
     ///   each paged by 100 charges. A read costs a request weight of 1 per page, at least 1 per
@@ -195,8 +195,8 @@ impl BinanceMargin {
     ///
     /// # Span
     /// Records are read up to `end`, or up to the local clock at the call if that is earlier, in
-    /// pages of 100. Binance documents no limit on the span or on how far back it serves, and
-    /// accepted a span of two years when tried. A read
+    /// pages of 100. Binance documents no limit on the span or on how far back it serves; a
+    /// two-year span was accepted when tried in October 2026, which is no guarantee. A read
     /// costs a request weight of 1 per page and, on an isolated client, as much again for each
     /// pair.
     ///
