@@ -26,6 +26,9 @@ use std::fmt::{Display, Formatter};
 /// Each producer says how it avoids sending one flow twice, and what identifies a flow when the
 /// venue gives it no [`id`](Self::id). Known producers, as of writing:
 /// - Hyperliquid perpetuals: funding, as [`CashFlowKind::Funding`]. See the client's rustdoc.
+/// - Alpaca: margin interest, fees and pass-through charges and rebates, read on request by
+///   `AlpacaClient::fetch_cash_flows` rather than streamed, with Alpaca's activity id. The caller
+///   drops what it has already read.
 /// - The simulated venue: whatever its configured
 ///   [`HoldingCostModel`](crate::holding_cost::HoldingCostModel)s charge, each flow once, with an
 ///   id from its own sequence.
@@ -111,5 +114,33 @@ impl Display for CashFlowId {
 impl CashFlowId {
     pub fn new<S: AsRef<str>>(id: S) -> Self {
         Self(SmolStr::new(id))
+    }
+}
+
+/// What one read of a venue's cash flows over a span returned, for a venue that serves them in
+/// bounded calls.
+///
+/// `resume` says whether the read stopped before the span's end:
+/// - `None`: every flow in the span the venue still holds is in `flows`.
+/// - `Some(t)`: the read stopped at its bound, and flows from `t` on may be missing from `flows`.
+///   Read on from `start = t` with the same end. That read can return again flows this one
+///   returned at or after `t`, so match them by [`CashFlowId`].
+#[non_exhaustive]
+#[must_use = "`resume` says whether the span was read to its end"]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Constructor)]
+pub struct CashFlowsRead<AssetKey, InstrumentKey> {
+    /// The flows read, in the span.
+    pub flows: Vec<CashFlow<AssetKey, InstrumentKey>>,
+    /// Where to read on from, or `None` when the read reached the span's end.
+    pub resume: Option<DateTime<Utc>>,
+}
+
+impl<AssetKey, InstrumentKey> CashFlowsRead<AssetKey, InstrumentKey> {
+    /// A read that reached the span's end.
+    pub fn complete(flows: Vec<CashFlow<AssetKey, InstrumentKey>>) -> Self {
+        Self {
+            flows,
+            resume: None,
+        }
     }
 }

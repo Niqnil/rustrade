@@ -190,6 +190,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `spotMeta`, so `rustrade-data`'s `HyperliquidMeta` now gives a perpetual's order precision
   without an execution client. A `meta` deserialized into `Perps` must now carry `szDecimals`,
   which Hyperliquid sends for every perpetual.
+- **Alpaca: read interest, fees and pass-through charges and rebates as `CashFlow`s**
+  (`rustrade-execution`, #559).
+  - `AlpacaClient::fetch_cash_flows(start, end)` reads the account's `INT`, `FEE`, `PTC` and `PTR`
+    activities, which Alpaca does not stream, and returns them as a `CashFlowsRead`: the flows,
+    and where to read on from when the call stopped at its bound of 5,000 activities, as
+    `fetch_trades` does.
+  - Margin interest becomes `MarginInterest`, with no rate or principal because Alpaca reports
+    neither. A pass-through rebate becomes `Rebate`. Fees, pass-through charges and credit
+    interest become `Other`, named by Alpaca's type and sub-type, such as `FEE.TAF`.
+  - Each flow carries Alpaca's signed `net_amount`, the activity's currency and symbol, its
+    creation time and its id. A canceled activity is left out. The caller polls, and drops the
+    ids it has already applied.
+  - `CashFlowsRead` is new in `rustrade_execution::cash_flow`.
+  - The fill reads (`fetch_trades` and the reconnect's fill recovery) now ask for `FILL`
+    activities by Alpaca's documented `activity_types` parameter, not the undocumented
+    `activity_type`.
 
 ### Changed
 
