@@ -200,8 +200,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     neither. A pass-through rebate becomes `Rebate`. Fees, pass-through charges and credit
     interest become `Other`, named by Alpaca's type and sub-type, such as `FEE.TAF`.
   - Each flow carries Alpaca's signed `net_amount`, the activity's currency and symbol, its
-    creation time and its id. A canceled activity is left out. The caller polls, and drops the
-    ids it has already applied.
+    creation time and its id. A canceled activity, or one without a creation time, is left out.
+    A `correct` activity is returned as it is, and may count cash twice beside the one it
+    corrects. The caller polls, and drops the ids it has already applied. Read spans that fit one
+    call: the resume assumes Alpaca serves these activities in order of creation, which it does
+    not document.
   - `CashFlowsRead` is new in `rustrade_execution::cash_flow`.
   - The fill reads (`fetch_trades` and the reconnect's fill recovery) now ask for `FILL`
     activities by Alpaca's documented `activity_types` parameter, not the undocumented

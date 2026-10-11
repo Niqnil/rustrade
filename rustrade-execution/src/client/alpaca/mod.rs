@@ -9030,8 +9030,10 @@ mod tests {
             canceled["status"] = serde_json::json!("canceled");
             let mut no_amount = non_trade("no-amount", "FEE", None, "0", at);
             no_amount.as_object_mut().unwrap().remove("net_amount");
-            let mut dated_only = non_trade("dated", "PTC", None, "-0.50", at);
-            dated_only.as_object_mut().unwrap().remove("created_at");
+            let mut no_created_at = non_trade("no-time", "PTC", None, "-0.50", at);
+            no_created_at.as_object_mut().unwrap().remove("created_at");
+            let mut bad_time = non_trade("bad-time", "PTC", None, "-0.50", at);
+            bad_time["created_at"] = serde_json::json!("not-a-time");
             let mut corrected = non_trade("correct", "PTC", None, "-0.40", at);
             corrected["status"] = serde_json::json!("correct");
             let mut euro = non_trade("euro", "PTR", None, "0.30", at);
@@ -9046,7 +9048,8 @@ mod tests {
                     fee,
                     canceled,
                     no_amount,
-                    dated_only,
+                    no_created_at,
+                    bad_time,
                     corrected,
                     euro,
                     non_trade("late", "FEE", None, "-0.01", "2025-04-20T05:00:00Z"),
