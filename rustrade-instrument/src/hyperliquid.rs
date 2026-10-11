@@ -160,8 +160,8 @@ impl PerpCoin {
     }
 
     /// The perpetual's `szDecimals`: the most decimal places an order's size may have. It also
-    /// caps a price's decimal places, at `6 - szDecimals`; a price is held to 5 significant
-    /// figures as well.
+    /// caps a price's decimal places, at `6 - szDecimals`; a price that is not an integer is held
+    /// to 5 significant figures as well.
     pub fn sz_decimals(&self) -> u32 {
         self.sz_decimals
     }
