@@ -245,6 +245,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     activities by Alpaca's documented `activity_types` parameter, not the undocumented
     `activity_type`.
 
+- **The venue can settle an expiring contract instead of the engine** (#566).
+  - The new `ExpiryHandling` (`Engine`, the default, or `Venue`) says who settles an instrument's
+    positions at expiry. Set it per exchange with `EngineStateBuilder::expiry_handling` or
+    `SystemBuilder::expiry_handling`. **Breaking:** `InstrumentState` gains the public
+    `expiry_handling` field (serde default `Engine`), so code that builds one needs it.
+  - With `Venue`, a `ContractExpiry` still cancels the instrument's orders and marks it processed,
+    but synthesises no settlement trade and needs no settlement price. The open positions are left
+    for the trades the venue reports for the expiry, exercise or assignment, so a position the
+    venue settles physically is not also closed by the engine at intrinsic value. The audit replica
+    follows the same rule. With `Engine`, expiry is cash-settled as before, which keeps backtests
+    unchanged.
+
 ### Changed
 
 - **Breaking: trailing stops take an activation price, and Binance's fixed-limit trailing stop has

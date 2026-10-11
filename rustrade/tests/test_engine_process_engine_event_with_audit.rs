@@ -27,6 +27,7 @@ use rustrade::{
             connectivity::{ConnectivityDimension, Health, UntrackedExchange},
             global::DefaultGlobalData,
             instrument::{
+                ExpiryHandling,
                 data::{DefaultInstrumentMarketData, InstrumentDataState},
                 filter::InstrumentFilter,
             },
@@ -62,7 +63,7 @@ use rustrade_execution::{
         state::{ActiveOrderState, Cancelled, Filled, Open, OrderState},
     },
     position::{Position, PositionReport},
-    trade::{AssetFees, Trade, TradeId},
+    trade::{AssetFees, Trade, TradeId, TradeOrigin},
 };
 use rustrade_instrument::{
     Side, Underlying,
@@ -2101,6 +2102,143 @@ fn test_contract_expiry_replica_parity_price_bail_then_settle_then_duplicate() {
     assert_eq!(live.orders.0.len(), 1);
     assert_eq!(mirrored.orders, live.orders);
     assert_eq!(mirrored.exchange_id_to_cid, live.exchange_id_to_cid);
+}
+
+/// Make the venue, not the engine, settle the option (index 0) of an option engine.
+fn venue_settles_option(engine: &mut TestEngine) {
+    engine
+        .state
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(0))
+        .expiry_handling = ExpiryHandling::Venue;
+}
+
+/// The trade a venue reports when the long option position (index 0) expires worthless.
+fn venue_expiry_trade(quantity: Decimal) -> EngineEvent<DataKind> {
+    EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::Trade(
+            Trade::new(
+                TradeId::new("venue-expiry"),
+                OrderId::new("venue-expiry"),
+                InstrumentIndex(0),
+                strategy_id(),
+                time_plus_days(STARTING_TIMESTAMP, 2),
+                Side::Sell,
+                Decimal::ZERO,
+                quantity,
+                None,
+                AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
+            )
+            .with_origin(TradeOrigin::Expiry),
+        ),
+    }))
+}
+
+/// With `ExpiryHandling::Venue`, `ContractExpiry` marks the instrument processed but closes
+/// nothing, and needs no settlement price; the venue's own trade then closes the position, once.
+#[test]
+fn test_contract_expiry_venue_settles_leaves_positions_for_the_venue() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    venue_settles_option(&mut engine);
+    // No underlying price is sent: the venue settling needs none.
+    open_option_position(&mut engine, dec!(1), dec!(1_000));
+
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
+    assert!(exited.is_empty(), "the engine synthesises no settlement");
+    let state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert!(state.expiration_processed);
+    assert_eq!(state.position.positions.len(), 1, "left for the venue");
+
+    // The venue's expiry trade closes it at zero.
+    let audit = process_with_audit(&mut engine, venue_expiry_trade(dec!(1)));
+    let EngineAudit::Process(audit) = audit.event else {
+        panic!("expected EngineAudit::Process");
+    };
+    let exits: Vec<_> = audit
+        .outputs
+        .into_iter()
+        .filter_map(|output| match output {
+            EngineOutput::PositionExit(exit) => Some(exit),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(exits.len(), 1);
+    assert_eq!(exits[0].pnl_realised, dec!(-1_000));
+    let state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert!(state.position.positions.is_empty());
+
+    // A repeated expiry stays a no-op.
+    assert!(expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0))).is_empty());
+}
+
+/// The default `ExpiryHandling::Engine` still settles, so a backtest is unchanged.
+#[test]
+fn test_contract_expiry_engine_handling_is_the_default() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let engine = build_option_engine(TradingState::Disabled, execution_tx);
+    for state in engine
+        .state
+        .instruments
+        .instruments(&InstrumentFilter::None)
+    {
+        assert_eq!(state.expiry_handling, ExpiryHandling::Engine);
+    }
+}
+
+/// The audit replica follows the live engine when the venue settles: positions kept, instrument
+/// marked processed, then closed by the venue's trade on both sides.
+#[test]
+fn test_contract_expiry_replica_parity_venue_settles() {
+    use rustrade::engine::audit::{context::EngineContext, state_replica::StateReplicaManager};
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    venue_settles_option(&mut engine);
+    open_option_position(&mut engine, dec!(1), dec!(1_000));
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: engine.state.clone(),
+        context: EngineContext {
+            time: STARTING_TIMESTAMP,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica = StateReplicaManager::new(seed_tick, dummy_updates);
+    let option = InstrumentIndex(0);
+
+    let outputs =
+        process_live_and_replica!(&mut engine, replica, EngineEvent::ContractExpiry(option));
+    assert_eq!(outputs, NoneOneOrMany::None);
+    let live = engine.state.instruments.instrument_index(&option);
+    assert_eq!(live.position.positions.len(), 1);
+    assert!(live.expiration_processed);
+    assert_eq!(
+        replica
+            .replica_engine_state()
+            .instruments
+            .instrument_index(&option),
+        live
+    );
+
+    process_live_and_replica!(&mut engine, replica, venue_expiry_trade(dec!(1)));
+    let live = engine.state.instruments.instrument_index(&option);
+    assert!(live.position.positions.is_empty());
+    assert_eq!(
+        replica
+            .replica_engine_state()
+            .instruments
+            .instrument_index(&option),
+        live
+    );
 }
 
 /// A `ContractExpiry` or `CorporateAction` is built by the caller, so its `InstrumentIndex` can

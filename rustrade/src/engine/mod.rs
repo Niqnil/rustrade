@@ -15,7 +15,10 @@ use crate::{
         state::{
             EngineState,
             connectivity::UntrackedExchange,
-            instrument::{OptionSplitPlan, data::InstrumentDataState, filter::InstrumentFilter},
+            instrument::{
+                ExpiryHandling, OptionSplitPlan, data::InstrumentDataState,
+                filter::InstrumentFilter,
+            },
             order::{Orders, in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
             position::{Position, PositionDrift, PositionExited, PositionId, SplitRoundingPolicy},
             trading::TradingState,
@@ -519,6 +522,12 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     ///
     /// If no position is open for the instrument, steps 4–5 are skipped.
     ///
+    /// If the instrument's [`ExpiryHandling`] is [`Venue`](ExpiryHandling::Venue), steps 4–5 are
+    /// skipped too. The open positions are left for the trades the venue reports for the expiry,
+    /// exercise or assignment, so nothing is closed twice. No settlement price is needed, so none
+    /// of the [`ContractExpiryNotSettled`](EngineOutput::ContractExpiryNotSettled) cases below
+    /// apply.
+    ///
     /// If the price settlement needs is unavailable, the method emits an
     /// [`EngineOutput::ContractExpiryNotSettled`] carrying
     /// [`ContractExpiryNotSettledReason::SettlementPriceUnavailable`] and synthesises no fill. The
@@ -542,8 +551,8 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     ///
     /// - **Physical settlement:** all settlements are cash-equivalent (a synthetic fill at the
     ///   settlement price adjusts PnL). No separate "deliver/receive underlying" position is
-    ///   opened. Physically-settled contracts (e.g. some futures-style options) are out of scope
-    ///   until this is revisited.
+    ///   opened. For a venue that settles physically and reports it, set
+    ///   [`ExpiryHandling::Venue`] and feed the venue's trades to the engine instead.
     pub fn process_contract_expiry<OnTradingDisabled, OnDisconnect>(
         &mut self,
         key: &InstrumentIndex,
@@ -607,8 +616,18 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         // Re-borrow after sending (which needs all of `self`).
         let instrument_state = self.state.instruments.instrument_index_mut(key);
 
-        // Steps 4–5: Synthesise settlement fills only if positions are open.
-        if instrument_state.position.positions.is_empty() {
+        // Steps 4–5: Synthesise settlement fills only if positions are open and the engine, not
+        // the venue, settles them.
+        let venue_settles = instrument_state.expiry_handling == ExpiryHandling::Venue;
+        if venue_settles || instrument_state.position.positions.is_empty() {
+            if venue_settles && !instrument_state.position.positions.is_empty() {
+                info!(
+                    instrument = ?key,
+                    positions = instrument_state.position.positions.len(),
+                    "ContractExpiry: the venue settles this instrument, so its open positions are \
+                     left for the venue's expiry, exercise or assignment trades"
+                );
+            }
             instrument_state.expiration_processed = true;
             instrument_state.orders.clear();
             instrument_state.exchange_id_to_cid.clear();

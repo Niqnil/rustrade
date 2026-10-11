@@ -546,6 +546,28 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
 /// [`TearSheet::fills_unmatched`](crate::statistic::summary::instrument::TearSheet::fills_unmatched).
 pub const MAX_RETIRED_ROUTING: usize = 64;
 
+/// Who settles an expiring instrument's positions when the engine processes a
+/// [`ContractExpiry`](crate::EngineEvent::ContractExpiry).
+///
+/// Set per instrument on [`InstrumentState::expiry_handling`], usually for every instrument of one
+/// exchange through
+/// [`EngineStateBuilder::expiry_handling`](crate::engine::state::builder::EngineStateBuilder::expiry_handling).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub enum ExpiryHandling {
+    /// The engine settles. It closes every open position with a trade it synthesises at the
+    /// settlement price, so expiry is cash-settled. The default, and the right choice for a
+    /// backtest, or for a venue that reports no trade at expiry.
+    #[default]
+    Engine,
+    /// The venue settles. It reports its own trades for the expiry, exercise or assignment, and
+    /// those trades move the positions. On `ContractExpiry` the engine cancels the instrument's
+    /// orders and marks it processed, but synthesises no trade, so a position is not closed twice.
+    ///
+    /// The positions stay open until the venue's trades arrive. A caller that never feeds them to
+    /// the engine is left holding positions on an expired instrument.
+    Venue,
+}
+
 /// Represents the current state of an instrument, including its [`Position`](super::position::Position), [`Orders`], and
 /// user provided instrument data.
 ///
@@ -590,6 +612,11 @@ pub struct InstrumentState<
     /// fees will be double-counted.
     #[serde(default)]
     pub fee_model: FeeModelConfig,
+
+    /// Who settles this instrument's positions at expiry. See [`ExpiryHandling`]. Defaults to
+    /// [`ExpiryHandling::Engine`].
+    #[serde(default)]
+    pub expiry_handling: ExpiryHandling,
 
     /// Set to `true` once a `ContractExpiry` event has been fully processed for this instrument.
     ///
@@ -1929,6 +1956,7 @@ where
         orders,
         data: _,
         fee_model: _,
+        expiry_handling: _,
         expiration_processed: _,
         corporate_actions_processed: _,
         position_ids: _,
@@ -2014,6 +2042,7 @@ where
                         orders: orders_init(),
                         data: instrument_data_init(instrument),
                         fee_model: FeeModelConfig::default(),
+                        expiry_handling: ExpiryHandling::default(),
                         expiration_processed: false,
                         corporate_actions_processed: FnvHashSet::default(),
                         position_ids: FnvHashMap::default(),
