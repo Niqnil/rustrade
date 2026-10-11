@@ -205,10 +205,9 @@ where
 
 /// Determines whether the [`Connector`] associated with this [`ExchangeId`] supports the
 /// ingestion of market data for the provided [`MarketDataInstrumentKind`].
-// The arms are grouped by `MarketDataInstrumentKind`, each group ending in a default whose
-// open-vs-closed choice is documented in place (see the `Spot` note below). Collapsing to
-// `matches!` would fold every group into one boolean expression, leaving nowhere to record which
-// defaults are deliberate and which exchange lists were verified against what.
+// The arms are grouped by `MarketDataInstrumentKind`, each group granting the exchanges whose
+// connector serves that kind and denying the rest. Collapsing to `matches!` would fold the groups
+// into one boolean expression, leaving nowhere to record which exchanges were verified.
 #[allow(clippy::match_like_matches_macro)]
 pub fn exchange_supports_instrument_kind(
     exchange: ExchangeId,
@@ -505,7 +504,8 @@ mod tests {
                 LseFutures,
                 LseOptions,
                 MassiveOptions,
-                // No connector at all.
+                // No connector at all: a sample, as `ExchangeId` cannot be enumerated. Add a new
+                // connector-backed exchange to one of the two lists.
                 BinanceMargin,
                 Deribit,
                 Other,
