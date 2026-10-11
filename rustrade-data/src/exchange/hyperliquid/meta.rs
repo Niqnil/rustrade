@@ -200,8 +200,9 @@ mod tests {
     };
 
     /// Info responses in Hyperliquid's shape, with synthetic values.
-    const META: &str = r#"{"universe": [{"name": "BTC"}, {"name": "kPEPE"}]}"#;
-    const META_XYZ: &str = r#"{"universe": [{"name": "xyz:TSLA"}]}"#;
+    const META: &str =
+        r#"{"universe": [{"name": "BTC", "szDecimals": 5}, {"name": "kPEPE", "szDecimals": 0}]}"#;
+    const META_XYZ: &str = r#"{"universe": [{"name": "xyz:TSLA", "szDecimals": 3}]}"#;
     const SPOT_META: &str = r#"{
         "universe": [
             {"name": "PURR/USDC", "tokens": [1, 0], "index": 0},

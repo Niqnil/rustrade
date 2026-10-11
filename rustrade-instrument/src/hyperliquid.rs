@@ -140,6 +140,7 @@ impl FromIterator<Perps> for Perps {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PerpCoin {
     coin: SmolStr,
+    sz_decimals: u32,
     delisted: bool,
 }
 
@@ -154,6 +155,12 @@ impl PerpCoin {
     /// default perpetual.
     pub fn deployer(&self) -> Option<&str> {
         self.coin.split_once(':').map(|(deployer, _)| deployer)
+    }
+
+    /// The perpetual's `szDecimals`: the most decimal places an order's size may have. It also
+    /// caps a price's decimal places, at `6 - szDecimals`.
+    pub fn sz_decimals(&self) -> u32 {
+        self.sz_decimals
     }
 
     /// Whether Hyperliquid has delisted the perpetual. A delisted perpetual does not trade, so
@@ -278,6 +285,8 @@ struct PerpMeta {
 #[derive(Deserialize)]
 struct PerpMetaAsset {
     name: SmolStr,
+    #[serde(rename = "szDecimals")]
+    sz_decimals: u32,
     #[serde(default, rename = "isDelisted")]
     delisted: bool,
 }
@@ -288,6 +297,7 @@ impl From<PerpMeta> for Perps {
             .into_iter()
             .map(|asset| PerpCoin {
                 coin: asset.name,
+                sz_decimals: asset.sz_decimals,
                 delisted: asset.delisted,
             })
             .collect()
@@ -510,6 +520,20 @@ mod tests {
     }
 
     #[test]
+    fn a_perpetual_carries_its_sz_decimals() {
+        let perps = perps();
+
+        assert_eq!(perps.get("BTC").unwrap().sz_decimals(), 5);
+        assert_eq!(perps.get("kPEPE").unwrap().sz_decimals(), 0);
+        assert_eq!(perps.get("xyz:TSLA").unwrap().sz_decimals(), 3);
+    }
+
+    #[test]
+    fn a_perpetual_without_sz_decimals_is_refused() {
+        assert!(serde_json::from_str::<Perps>(r#"{"universe": [{"name": "BTC"}]}"#).is_err());
+    }
+
+    #[test]
     fn perps_get_returns_the_venue_spelling_whatever_the_case_asked() {
         let perps = perps();
 
@@ -527,8 +551,10 @@ mod tests {
 
     #[test]
     fn perps_get_prefers_an_exact_match_and_refuses_an_ambiguous_one() {
-        let perps: Perps =
-            serde_json::from_str(r#"{"universe": [{"name": "ABC"}, {"name": "abc"}]}"#).unwrap();
+        let perps: Perps = serde_json::from_str(
+            r#"{"universe": [{"name": "ABC", "szDecimals": 0}, {"name": "abc", "szDecimals": 0}]}"#,
+        )
+        .unwrap();
 
         assert_eq!(perps.get("ABC").unwrap().coin(), "ABC");
         assert_eq!(perps.get("abc").unwrap().coin(), "abc");

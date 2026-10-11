@@ -185,6 +185,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     where known, shown by its `Display`. The simulated venue sets it on `InventoryUnavailable`.
     `BorrowReject::new` is unchanged.
   - `rustrade`'s `SimVenueOptions` gains `shortability` and `with_shortability`.
+- **`PerpCoin::sz_decimals`: a Hyperliquid perpetual's size precision** (`rustrade-instrument`,
+  #536). It is read from `meta`'s `szDecimals`, as `SpotPair::base_sz_decimals` is from
+  `spotMeta`, so `rustrade-data`'s `HyperliquidMeta` now gives a perpetual's order precision
+  without an execution client. A `meta` deserialized into `Perps` must now carry `szDecimals`,
+  which Hyperliquid sends for every perpetual.
 
 ### Changed
 
