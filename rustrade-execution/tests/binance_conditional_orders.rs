@@ -450,6 +450,7 @@ async fn test_trailing_stop_basis_points() {
         kind: OrderKind::TrailingStop {
             offset: dec!(100), // 100 basis points = 1%
             offset_type: TrailingOffsetType::BasisPoints,
+            activation_price: None,
         },
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
@@ -524,6 +525,7 @@ async fn test_trailing_stop_percentage() {
         kind: OrderKind::TrailingStop {
             offset: dec!(2), // 2% → converts to 200 basis points
             offset_type: TrailingOffsetType::Percentage,
+            activation_price: None,
         },
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
@@ -601,6 +603,7 @@ async fn test_trailing_stop_absolute_rejected() {
         kind: OrderKind::TrailingStop {
             offset: dec!(1000), // $1000 absolute offset - NOT SUPPORTED
             offset_type: TrailingOffsetType::Absolute,
+            activation_price: None,
         },
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,

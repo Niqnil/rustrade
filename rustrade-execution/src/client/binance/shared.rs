@@ -1037,20 +1037,20 @@ impl TrailingDelta {
 /// - `STOP_LOSS`, `STOP_LOSS_LIMIT`, `TAKE_PROFIT` and `TAKE_PROFIT_LIMIT` without a trailing delta
 ///   are [`OrderKind::Stop`], [`OrderKind::StopLimit`], [`OrderKind::TakeProfit`] and
 ///   [`OrderKind::TakeProfitLimit`], triggered at `stopPrice`.
-/// - `STOP_LOSS` with a trailing delta is an [`OrderKind::TrailingStop`] of that many basis points,
-///   whichever offset type it was placed with. A `stopPrice` alongside it is an activation price,
-///   which `TrailingStop` cannot hold yet (#539), so it decodes without it, with a warning.
+/// - `STOP_LOSS` and `STOP_LOSS_LIMIT` with a trailing delta are an [`OrderKind::TrailingStop`] and
+///   an [`OrderKind::TrailingStopFixedLimit`] of that many basis points, whichever offset type
+///   they were placed with. A positive `stopPrice` alongside is their `activation_price`.
 ///
 /// Returns `None`, with a warning, for an order this cannot describe faithfully, so that it is
 /// dropped and its listing reads as incomplete rather than describing a different order:
 /// - a type this version does not know;
 /// - a fixed-trigger order without a positive `stopPrice`;
-/// - a trailing `STOP_LOSS_LIMIT`, whose limit price stays fixed while the stop trails, unlike
-///   [`OrderKind::TrailingStopLimit`]'s (#540), and a trailing take-profit;
+/// - a trailing take-profit, which no [`OrderKind`] describes;
 /// - a conditional order whose trailing delta is [`TrailingDelta::Unknown`], which could be either
-///   a fixed or a trailing order.
+///   a fixed or a trailing order;
+/// - a trailing order whose `stopPrice` does not parse, whose activation price is then unknown.
 ///
-/// The warnings for those last two cases and for an activation price come from the venue's
+/// The warnings for the trailing take-profit and the unknown trailing delta come from the venue's
 /// shape, not from one bad order, and recur on every listing and report of the same live order;
 /// each warns on its first occurrence and every 1000th after (see [`sampled`]), and logs the rest
 /// at `debug`.
@@ -1061,8 +1061,11 @@ pub(crate) fn decode_order_kind(
     stop_price: Option<&str>,
     trailing_delta: TrailingDelta,
 ) -> Option<OrderKind> {
-    let stop_price = stop_price
-        .and_then(|raw| Decimal::from_str(raw).ok())
+    let parsed_stop_price = stop_price.map(Decimal::from_str);
+    // Not sampled: it signals a malformed venue field, not the venue's shape.
+    let unparseable_stop_price = stop_price.filter(|_| matches!(parsed_stop_price, Some(Err(_))));
+    let stop_price = parsed_stop_price
+        .and_then(Result::ok)
         .filter(|price| price.is_sign_positive() && !price.is_zero());
     let triggered = |kind: fn(Decimal) -> OrderKind| {
         if stop_price.is_none() {
@@ -1095,25 +1098,25 @@ pub(crate) fn decode_order_kind(
         ("TAKE_PROFIT_LIMIT", TrailingDelta::Absent) => {
             triggered(|trigger_price| OrderKind::TakeProfitLimit { trigger_price })
         }
-        ("STOP_LOSS", TrailingDelta::BasisPoints(bips)) => {
-            if let Some(activation_price) = stop_price {
-                static SEEN: AtomicU64 = AtomicU64::new(0);
-                let (count, warns) = sampled(&SEEN);
-                if warns {
-                    warn!(%exchange, ?order_id, %activation_price, count, "Binance trailing stop has an activation price, which TrailingStop cannot carry; reporting it without; further ones are logged at debug, with a warning every 1000th");
-                } else {
-                    debug!(%exchange, ?order_id, %activation_price, count, "Binance trailing stop has an activation price, which TrailingStop cannot carry; reporting it without");
-                }
-            }
-            Some(OrderKind::TrailingStop {
+        ("STOP_LOSS" | "STOP_LOSS_LIMIT", TrailingDelta::BasisPoints(_))
+            if unparseable_stop_price.is_some() =>
+        {
+            warn!(%exchange, ?order_id, order_type, stop_price = ?unparseable_stop_price, "Binance trailing order's stopPrice, its activation price, does not parse, dropping it");
+            None
+        }
+        ("STOP_LOSS", TrailingDelta::BasisPoints(bips)) => Some(OrderKind::TrailingStop {
+            offset: Decimal::from(bips),
+            offset_type: TrailingOffsetType::BasisPoints,
+            activation_price: stop_price,
+        }),
+        ("STOP_LOSS_LIMIT", TrailingDelta::BasisPoints(bips)) => {
+            Some(OrderKind::TrailingStopFixedLimit {
                 offset: Decimal::from(bips),
                 offset_type: TrailingOffsetType::BasisPoints,
+                activation_price: stop_price,
             })
         }
-        (
-            "STOP_LOSS_LIMIT" | "TAKE_PROFIT" | "TAKE_PROFIT_LIMIT",
-            TrailingDelta::BasisPoints(_),
-        ) => {
+        ("TAKE_PROFIT" | "TAKE_PROFIT_LIMIT", TrailingDelta::BasisPoints(_)) => {
             static SEEN: AtomicU64 = AtomicU64::new(0);
             let (count, warns) = sampled(&SEEN);
             if warns {
@@ -1153,7 +1156,8 @@ fn kind_has_limit_price(kind: &OrderKind) -> bool {
         OrderKind::Limit
         | OrderKind::StopLimit { .. }
         | OrderKind::TakeProfitLimit { .. }
-        | OrderKind::TrailingStopLimit { .. } => true,
+        | OrderKind::TrailingStopLimit { .. }
+        | OrderKind::TrailingStopFixedLimit { .. } => true,
         OrderKind::Market
         | OrderKind::Stop { .. }
         | OrderKind::TakeProfit { .. }
@@ -2880,10 +2884,11 @@ pub(crate) enum BinanceTimeInForce {
 /// Map a rustrade [`OrderKind`] + [`TimeInForce`] to Binance order semantics.
 ///
 /// Returns `None` for combinations Binance does not support (so callers surface
-/// `UnsupportedOrderType`). `TrailingStop` classifies to [`BinanceOrderType::StopLoss`], to which
-/// the caller adds a `trailingDelta` from [`trailing_delta_basis_points`]. `TrailingStopLimit`
-/// classifies to `None`: Binance's trailing `STOP_LOSS_LIMIT` keeps its limit price fixed while
-/// the stop trails, where `TrailingStopLimit`'s limit follows the stop (#540).
+/// `UnsupportedOrderType`). `TrailingStop` classifies to [`BinanceOrderType::StopLoss`] and
+/// `TrailingStopFixedLimit` to [`BinanceOrderType::StopLossLimit`], to which the caller adds a
+/// `trailingDelta` from [`trailing_delta_basis_points`] and an activation price as `stopPrice`.
+/// `TrailingStopLimit` classifies to `None`: Binance's trailing `STOP_LOSS_LIMIT` keeps its limit
+/// price fixed while the stop trails, where `TrailingStopLimit`'s limit follows the stop.
 pub(crate) fn classify_order_kind_tif(
     kind: OrderKind,
     tif: TimeInForce,
@@ -2919,7 +2924,16 @@ pub(crate) fn classify_order_kind_tif(
         },
         // Conditional orders: stop_price/trailing_delta set separately by the caller.
         OrderKind::Stop { .. } => Some((BinanceOrderType::StopLoss, None)),
-        OrderKind::StopLimit { .. } => match tif {
+        OrderKind::TrailingStopFixedLimit {
+            offset_type: TrailingOffsetType::Absolute,
+            ..
+        } => {
+            warn!("{ABSOLUTE_TRAILING_OFFSET_UNSUPPORTED}");
+            None
+        }
+        // A fixed-limit trailing stop is a STOP_LOSS_LIMIT with a trailingDelta, so it takes the
+        // time in force a stop-limit order does.
+        OrderKind::StopLimit { .. } | OrderKind::TrailingStopFixedLimit { .. } => match tif {
             // StopLimit requires TIF like regular Limit orders.
             TimeInForce::GoodUntilCancelled { post_only: false } => Some((
                 BinanceOrderType::StopLossLimit,
@@ -2971,7 +2985,7 @@ pub(crate) fn classify_order_kind_tif(
             }
         },
         // Binance's trailing STOP_LOSS_LIMIT has a fixed limit price, not one that follows the
-        // stop as TrailingStopLimit's does (#540).
+        // stop as TrailingStopLimit's does: that is TrailingStopFixedLimit.
         OrderKind::TrailingStopLimit { .. } => {
             warn!("Binance does not support TrailingStopLimit orders");
             None
@@ -3042,6 +3056,90 @@ pub(crate) fn trailing_delta_basis_points(
         }));
     }
     i32::try_from(basis_points).map_err(|_| invalid(PrecisionLimit::NotRepresentable))
+}
+
+/// What a Binance trailing order sends besides its type: its `trailingDelta`, the fixed limit
+/// `price` of a [`OrderKind::TrailingStopFixedLimit`], and an activation price as `stopPrice`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TrailingParams {
+    pub trailing_delta: i32,
+    pub price: Option<Decimal>,
+    pub stop_price: Option<Decimal>,
+}
+
+/// Why a trailing order cannot be sent to Binance as asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrailingOrderError {
+    /// Its offset cannot be sent as `trailingDelta`.
+    Delta(TrailingDeltaError),
+    /// Its activation price is not positive. Binance reads a zero `stopPrice` as none.
+    NonPositiveActivation(Decimal),
+    /// A [`OrderKind::TrailingStopFixedLimit`] without the fixed limit `price`, or with one that
+    /// is not positive.
+    LimitPrice(Option<Decimal>),
+}
+
+impl TrailingOrderError {
+    /// The order error this refusal is reported as.
+    pub(crate) fn into_order_error<AssetKey, InstrumentKey>(
+        self,
+    ) -> OrderError<AssetKey, InstrumentKey> {
+        match self {
+            Self::Delta(refused) => refused.into_order_error(),
+            Self::NonPositiveActivation(price) => OrderError::Rejected(ApiError::OrderRejected(
+                format!("a trailing stop's activation_price must be positive, got {price}"),
+            )),
+            Self::LimitPrice(price) => OrderError::Rejected(ApiError::OrderRejected(format!(
+                "TrailingStopFixedLimit requires a positive price, its fixed limit, got {price:?}"
+            ))),
+        }
+    }
+}
+
+/// The trailing fields of `kind`, or `None` when it is not a trailing order Binance places.
+/// `price` is the request's limit price. A bad offset is reported before a bad price.
+pub(crate) fn trailing_params(
+    kind: &OrderKind,
+    price: Option<Decimal>,
+) -> Result<Option<TrailingParams>, TrailingOrderError> {
+    let positive = |value: &Decimal| value.is_sign_positive() && !value.is_zero();
+    let (offset, offset_type, activation_price, fixed_limit) = match *kind {
+        OrderKind::TrailingStop {
+            offset,
+            offset_type,
+            activation_price,
+        } => (offset, offset_type, activation_price, false),
+        OrderKind::TrailingStopFixedLimit {
+            offset,
+            offset_type,
+            activation_price,
+        } => (offset, offset_type, activation_price, true),
+        OrderKind::Market
+        | OrderKind::Limit
+        | OrderKind::Stop { .. }
+        | OrderKind::StopLimit { .. }
+        | OrderKind::TakeProfit { .. }
+        | OrderKind::TakeProfitLimit { .. }
+        | OrderKind::TrailingStopLimit { .. } => return Ok(None),
+    };
+    let trailing_delta =
+        trailing_delta_basis_points(offset, offset_type).map_err(TrailingOrderError::Delta)?;
+    if let Some(activation) = activation_price.filter(|activation| !positive(activation)) {
+        return Err(TrailingOrderError::NonPositiveActivation(activation));
+    }
+    let price = if fixed_limit {
+        match price.filter(positive) {
+            Some(limit) => Some(limit),
+            None => return Err(TrailingOrderError::LimitPrice(price)),
+        }
+    } else {
+        None
+    };
+    Ok(Some(TrailingParams {
+        trailing_delta,
+        price,
+        stop_price: activation_price,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -3407,27 +3505,54 @@ mod tests {
         }
     }
 
-    /// A trailing `STOP_LOSS` decodes in basis points, with or without an activation price.
+    /// A trailing `STOP_LOSS` decodes in basis points, and a trailing `STOP_LOSS_LIMIT` as a
+    /// fixed-limit trailing stop, each with its positive `stopPrice` as the activation price.
     #[test]
-    fn a_trailing_stop_loss_decodes_as_a_trailing_stop() {
-        let trailing_stop = Some(OrderKind::TrailingStop {
-            offset: Decimal::from(25),
-            offset_type: TrailingOffsetType::BasisPoints,
-        });
-        for stop_price in [None, Some("0.00000000"), Some("105.5")] {
+    fn a_trailing_stop_loss_decodes_with_its_activation_price() {
+        use rust_decimal_macros::dec;
+        for (stop_price, activation_price) in [
+            (None, None),
+            (Some("0.00000000"), None),
+            (Some("105.5"), Some(dec!(105.5))),
+        ] {
             assert_eq!(
                 decode("STOP_LOSS", stop_price, TrailingDelta::BasisPoints(25)),
-                trailing_stop,
+                Some(OrderKind::TrailingStop {
+                    offset: Decimal::from(25),
+                    offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price,
+                }),
+                "{stop_price:?}"
+            );
+            assert_eq!(
+                decode(
+                    "STOP_LOSS_LIMIT",
+                    stop_price,
+                    TrailingDelta::BasisPoints(25)
+                ),
+                Some(OrderKind::TrailingStopFixedLimit {
+                    offset: Decimal::from(25),
+                    offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price,
+                }),
                 "{stop_price:?}"
             );
         }
     }
 
-    /// A trailing order of any other type has no `OrderKind`, and a conditional order whose
-    /// trailing delta is unknown could be either: both are dropped rather than misdescribed.
+    /// A trailing take-profit has no `OrderKind`, a conditional order whose trailing delta is
+    /// unknown could be either fixed or trailing, and a trailing order whose stopPrice does not
+    /// parse has an unknown activation price: all are dropped rather than misdescribed.
     #[test]
     fn conditional_orders_that_cannot_be_described_are_dropped() {
-        for order_type in ["STOP_LOSS_LIMIT", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT"] {
+        for order_type in ["STOP_LOSS", "STOP_LOSS_LIMIT"] {
+            assert_eq!(
+                decode(order_type, Some("x"), TrailingDelta::BasisPoints(25)),
+                None,
+                "{order_type}"
+            );
+        }
+        for order_type in ["TAKE_PROFIT", "TAKE_PROFIT_LIMIT"] {
             assert_eq!(
                 decode(order_type, Some("100"), TrailingDelta::BasisPoints(25)),
                 None,
@@ -3555,6 +3680,111 @@ mod tests {
         }
     }
 
+    /// A trailing STOP_LOSS_LIMIT row lists as a fixed-limit trailing stop with its limit price;
+    /// a zero stopPrice is no activation price.
+    #[test]
+    fn a_trailing_stop_loss_limit_row_lists_with_its_limit_price() {
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        for (stop_price, activation_price) in
+            [("0.00000000", None), ("105", Some(Decimal::from(105)))]
+        {
+            let rows = [spot_row(order_row(
+                "STOP_LOSS_LIMIT",
+                "NEW",
+                serde_json::json!({
+                    "trailingDelta": 25, "trailingTime": -1, "price": "95", "stopPrice": stop_price,
+                }),
+            ))];
+            let listing = convert_open_order_listing(&rows, ExchangeId::BinanceSpot, &btc);
+            let [order] = listing.orders.as_slice() else {
+                panic!("one order: {:?}", listing.orders);
+            };
+            assert_eq!(
+                order.kind,
+                OrderKind::TrailingStopFixedLimit {
+                    offset: Decimal::from(25),
+                    offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price,
+                }
+            );
+            assert_eq!(order.price, Some(Decimal::from(95)));
+        }
+    }
+
+    /// A trailing order's fields: its delta, a fixed limit's price, an activation price; and the
+    /// requests refused unsent.
+    #[test]
+    fn trailing_params_carry_the_delta_limit_and_activation_and_refuse_bad_prices() {
+        use rust_decimal_macros::dec;
+        let fixed_limit = |activation_price| OrderKind::TrailingStopFixedLimit {
+            offset: dec!(1.5),
+            offset_type: TrailingOffsetType::Percentage,
+            activation_price,
+        };
+        assert_eq!(trailing_params(&OrderKind::Limit, Some(dec!(1))), Ok(None));
+        assert_eq!(
+            trailing_params(&fixed_limit(Some(dec!(105))), Some(dec!(99))),
+            Ok(Some(TrailingParams {
+                trailing_delta: 150,
+                price: Some(dec!(99)),
+                stop_price: Some(dec!(105)),
+            }))
+        );
+        assert_eq!(
+            trailing_params(
+                &OrderKind::TrailingStop {
+                    offset: dec!(25),
+                    offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price: None,
+                },
+                Some(dec!(99))
+            ),
+            Ok(Some(TrailingParams {
+                trailing_delta: 25,
+                price: None,
+                stop_price: None,
+            })),
+            "a trailing stop sends no price"
+        );
+        for activation in [dec!(0), dec!(-1)] {
+            assert_eq!(
+                trailing_params(&fixed_limit(Some(activation)), Some(dec!(99))),
+                Err(TrailingOrderError::NonPositiveActivation(activation))
+            );
+        }
+        for limit in [None, Some(dec!(0))] {
+            assert_eq!(
+                trailing_params(&fixed_limit(None), limit),
+                Err(TrailingOrderError::LimitPrice(limit))
+            );
+        }
+        // A bad offset is reported before a bad price.
+        assert!(matches!(
+            trailing_params(
+                &OrderKind::TrailingStopFixedLimit {
+                    offset: dec!(1.555),
+                    offset_type: TrailingOffsetType::Percentage,
+                    activation_price: Some(dec!(0)),
+                },
+                None
+            ),
+            Err(TrailingOrderError::Delta(TrailingDeltaError::Invalid(_)))
+        ));
+        assert!(matches!(
+            TrailingOrderError::LimitPrice(None).into_order_error::<(), ()>(),
+            OrderError::Rejected(ApiError::OrderRejected(_))
+        ));
+        assert!(matches!(
+            TrailingOrderError::NonPositiveActivation(dec!(0)).into_order_error::<(), ()>(),
+            OrderError::Rejected(ApiError::OrderRejected(_))
+        ));
+        assert!(matches!(
+            TrailingOrderError::Delta(TrailingDeltaError::AbsoluteOffset)
+                .into_order_error::<(), ()>(),
+            OrderError::UnsupportedOrderType(_)
+        ));
+    }
+
     /// Spot rows report `trailingDelta`, so a trailing stop lists as one, and conditional orders
     /// list with their triggers, with no limit price where the kind takes none.
     #[test]
@@ -3592,6 +3822,7 @@ mod tests {
                     OrderKind::TrailingStop {
                         offset: Decimal::from(25),
                         offset_type: TrailingOffsetType::BasisPoints,
+                        activation_price: None,
                     },
                     None,
                 ),
@@ -3678,6 +3909,7 @@ mod tests {
         let trailing_stop = OrderKind::TrailingStop {
             offset: Decimal::from(25),
             offset_type: TrailingOffsetType::BasisPoints,
+            activation_price: None,
         };
         for row in [&row, &untriggered] {
             let Some(order) =

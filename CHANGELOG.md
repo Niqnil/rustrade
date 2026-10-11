@@ -228,6 +228,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: trailing stops take an activation price, and Binance's fixed-limit trailing stop has
+  an `OrderKind`** (`rustrade-execution`, #539, #540).
+  - **Breaking:** `OrderKind::TrailingStop` gains `activation_price: Option<Decimal>`: the price
+    the market must reach before the stop starts trailing, or `None` to trail from the next trade,
+    as before. Code that builds one, or matches it without `..`, needs the field. Which way the
+    market must reach it is the venue's: on Binance spot and margin, a sell starts trailing once
+    the market is at or below it, and a buy once at or above it.
+  - New `OrderKind::TrailingStopFixedLimit { offset, offset_type, activation_price }`: a
+    trailing stop whose limit price is fixed when it is placed, in the request's `price`. Only the
+    trigger trails. It is Binance's `STOP_LOSS_LIMIT` with `trailingDelta`. `TrailingStopLimit`,
+    whose limit follows the stop, is unchanged.
+  - `BinanceSpot` and `BinanceMargin` send an activation price as `stopPrice`, and a
+    `TrailingStopFixedLimit` as `STOP_LOSS_LIMIT` with `trailingDelta`, `price` and a stop-limit's
+    time in force. They refuse unsent, as `OrderError::Rejected`, an activation price that is not
+    positive and a `TrailingStopFixedLimit` without a positive `price`.
+  - Reading orders back (`BinanceSpot` everywhere; `BinanceMargin` on its account stream, as its
+    REST order queries still leave conditional orders out), they now report a trailing
+    `STOP_LOSS`'s activation price, and a trailing `STOP_LOSS_LIMIT` as a
+    `TrailingStopFixedLimit` with its limit price. Both used to be dropped or
+    reported without the price, with a warning. A trailing order whose `stopPrice` does not parse,
+    and a trailing take-profit, are left out with a warning.
+  - `Display` of both trailing kinds shows the activation price, as
+    `TrailingStop(1, Percentage, activation: Some(105))`. JSON stored before the field existed
+    still loads, as `None`; a positional serde format does not.
+  - Alpaca, IBKR and Hyperliquid have neither order. They reject an activation price and
+    `TrailingStopFixedLimit` with `UnsupportedOrderType`, as the simulated venue does any
+    conditional order.
 - **`SimRunner` reaches a simulated venue's deadlines at their own instants** (`rustrade`, part of
   #553).
   - A good-till-date order was retired at the first market event or request to reach its venue

@@ -67,14 +67,13 @@ use super::shared::{
     CONNECT_TIMEOUT_SECS, ExecutionReport, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS,
     HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
     PlacementResponse, RateLimitTracker, RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS,
-    SharedDedupCache, TrailingDeltaError, UnhandledEvents, UnrecoveredFills, UserDataFrame,
+    SharedDedupCache, TrailingOrderError, UnhandledEvents, UnrecoveredFills, UserDataFrame,
     WeightPool, binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
     classify_rest_query_error, convert_ended_order, convert_execution_report,
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event, drop_after,
     frame_excerpt, gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
     log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
-    recovered_order_totals, response_decode_error, rest_call_with_retry,
-    trailing_delta_basis_points,
+    recovered_order_totals, response_decode_error, rest_call_with_retry, trailing_params,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -382,10 +381,11 @@ impl BinanceMarginConfig {
 ///   [`account_snapshot`](Self::account_snapshot) for the full per-method semantics.
 ///
 /// # Trailing stops
-/// As on spot, a `TrailingStop` is placed as a `STOP_LOSS` with a `trailingDelta`, for
-/// `BasisPoints` and `Percentage` offsets that come to a whole number of basis points. Absolute
-/// offsets and `TrailingStopLimit` return [`OrderError::UnsupportedOrderType`]. See
-/// [`open_order`](Self::open_order).
+/// As on spot, a `TrailingStop` is placed as a `STOP_LOSS` with a `trailingDelta`, and a
+/// `TrailingStopFixedLimit` as a `STOP_LOSS_LIMIT` with a `trailingDelta` and its fixed limit as
+/// `price`, for `BasisPoints` and `Percentage` offsets that come to a whole number of basis
+/// points. An activation price is sent as `stopPrice`. Absolute offsets and `TrailingStopLimit`
+/// return [`OrderError::UnsupportedOrderType`]. See [`open_order`](Self::open_order).
 ///
 /// # Conditional orders read back over REST
 /// Binance margin accepts a `trailingDelta` on every conditional type (`STOP_LOSS`,
@@ -709,10 +709,13 @@ impl ExecutionClient for BinanceMargin {
     /// - `isIsolated` is config-driven (`"TRUE"` for isolated, `"FALSE"` for cross).
     /// - `autoRepayAtCancel` is set only under [`MarginSideEffect::AutoBorrowRepay`]: a `NoBorrow`
     ///   client takes no loan, so requesting repay-on-cancel would be incoherent.
-    /// - A `TrailingStop` is sent as a `STOP_LOSS` with `trailingDelta` in basis points. An
-    ///   Absolute offset, and `TrailingStopLimit`, return [`OrderError::UnsupportedOrderType`]; an
-    ///   offset that is not a positive whole number of basis points returns
-    ///   [`OrderError::InvalidPrecision`] (see the type-level docs).
+    /// - A `TrailingStop` is sent as a `STOP_LOSS` with `trailingDelta` in basis points, and a
+    ///   `TrailingStopFixedLimit` as a `STOP_LOSS_LIMIT` with `trailingDelta` and its fixed limit
+    ///   as `price`; an activation price goes as `stopPrice`. An Absolute offset, and
+    ///   `TrailingStopLimit`, return [`OrderError::UnsupportedOrderType`]; an offset that is not a
+    ///   positive whole number of basis points returns [`OrderError::InvalidPrecision`] (see the
+    ///   type-level docs). A non-positive activation price, or a `TrailingStopFixedLimit` without
+    ///   a positive `price`, is refused unsent as [`OrderError::Rejected`].
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
@@ -763,7 +766,7 @@ impl ExecutionClient for BinanceMargin {
                     ),
                 )));
             }
-            Err(BuildOrderError::TrailingDelta(refused)) => {
+            Err(BuildOrderError::Trailing(refused)) => {
                 return inactive(OrderState::inactive(refused.into_order_error()));
             }
             Err(BuildOrderError::Build(msg)) => {
@@ -3894,8 +3897,8 @@ enum BuildOrderError {
     Unsupported,
     /// The SDK params builder rejected the inputs (carries the builder's error message).
     Build(String),
-    /// A `TrailingStop`'s offset cannot be sent as `trailingDelta`.
-    TrailingDelta(TrailingDeltaError),
+    /// A trailing order cannot be sent as asked.
+    Trailing(TrailingOrderError),
 }
 
 /// Construct a margin endpoint's `isIsolated` parameter enum from the configured margin mode.
@@ -4017,9 +4020,21 @@ fn build_new_order_params(
         builder = builder.time_in_force(tif);
     }
 
-    // Conditional price fields (mirror spot): LIMIT carries price; STOP/TAKE_PROFIT carry a stop
-    // (trigger) price; the *_LIMIT variants carry both; a trailing STOP_LOSS carries a
-    // trailingDelta.
+    // A trailing order's trailingDelta, fixed limit and activation price (as stopPrice), as on
+    // spot.
+    if let Some(trailing) = trailing_params(&kind, price).map_err(BuildOrderError::Trailing)? {
+        builder = builder.trailing_delta(i64::from(trailing.trailing_delta));
+        if let Some(limit) = trailing.price {
+            builder = builder.price(limit);
+        }
+        if let Some(activation_price) = trailing.stop_price {
+            builder = builder.stop_price(activation_price);
+        }
+    }
+
+    // The other kinds' price fields (mirror spot): LIMIT carries price; STOP/TAKE_PROFIT carry a
+    // stop (trigger) price; the *_LIMIT variants carry both. No wildcard, so that a new OrderKind
+    // fails to compile until it is handled here.
     match kind {
         OrderKind::Limit => {
             builder = builder.price(price);
@@ -4030,18 +4045,12 @@ fn build_new_order_params(
         OrderKind::StopLimit { trigger_price } | OrderKind::TakeProfitLimit { trigger_price } => {
             builder = builder.price(price).stop_price(trigger_price);
         }
-        OrderKind::TrailingStop {
-            offset,
-            offset_type,
-        } => {
-            let basis_points = trailing_delta_basis_points(offset, offset_type)
-                .map_err(BuildOrderError::TrailingDelta)?;
-            builder = builder.trailing_delta(i64::from(basis_points));
-        }
-        // Market carries no price/stop_price; TrailingStopLimit is rejected earlier by
-        // convert_order_kind_tif_margin. A future OrderKind needing price fields that lands here
-        // would surface as a BuildOrderError::Build from the SDK builder, not a silent bad order.
-        _ => {}
+        // Trailing orders are set above. Market carries no price, and TrailingStopLimit is
+        // rejected by convert_order_kind_tif_margin before this.
+        OrderKind::TrailingStop { .. }
+        | OrderKind::TrailingStopFixedLimit { .. }
+        | OrderKind::Market
+        | OrderKind::TrailingStopLimit { .. } => {}
     }
 
     builder
@@ -4056,8 +4065,9 @@ fn build_new_order_params(
 /// [`MarginAccountNewOrderTimeInForceEnum`]. Mirrors spot's own `convert_order_kind_tif` adapter.
 ///
 /// Returns `None` for unsupported combinations, as spot does: a `TrailingStop` maps to a
-/// `STOP_LOSS` (with the `trailingDelta` [`build_new_order_params`] adds), and `TrailingStopLimit`
-/// and Absolute trailing offsets are unsupported.
+/// `STOP_LOSS` and a `TrailingStopFixedLimit` to a `STOP_LOSS_LIMIT` (with the `trailingDelta`
+/// [`build_new_order_params`] adds), and `TrailingStopLimit` and Absolute trailing offsets are
+/// unsupported.
 fn convert_order_kind_tif_margin(
     kind: OrderKind,
     tif: TimeInForce,
@@ -4552,6 +4562,7 @@ mod tests {
                 OrderKind::TrailingStop {
                     offset,
                     offset_type,
+                    activation_price: None,
                 },
                 gtc(),
                 MarginSideEffect::NoBorrow,
@@ -4565,6 +4576,102 @@ mod tests {
         }
     }
 
+    /// An activation price goes as `stopPrice`. A `TrailingStopFixedLimit` is a
+    /// `STOP_LOSS_LIMIT` with `trailingDelta`, its fixed limit as `price`, and a stop-limit's time
+    /// in force.
+    #[test]
+    fn trailing_orders_carry_their_activation_price_and_fixed_limit() {
+        let activation = Some(Decimal::from(50_000));
+        let trailing_stop = params(
+            Side::Sell,
+            None,
+            OrderKind::TrailingStop {
+                offset: Decimal::from(25),
+                offset_type: TrailingOffsetType::BasisPoints,
+                activation_price: activation,
+            },
+            gtc(),
+            MarginSideEffect::NoBorrow,
+        )
+        .expect("build");
+        assert_eq!(trailing_stop.r#type.as_str(), "STOP_LOSS");
+        assert_eq!(trailing_stop.trailing_delta, Some(25));
+        assert_eq!(trailing_stop.stop_price, activation);
+        assert_eq!(trailing_stop.price, None);
+
+        for activation_price in [None, activation] {
+            let fixed_limit = params(
+                Side::Sell,
+                Some(Decimal::from(49_000)),
+                OrderKind::TrailingStopFixedLimit {
+                    offset: Decimal::new(15, 1),
+                    offset_type: TrailingOffsetType::Percentage,
+                    activation_price,
+                },
+                TimeInForce::ImmediateOrCancel,
+                MarginSideEffect::NoBorrow,
+            )
+            .expect("build");
+            assert_eq!(fixed_limit.r#type.as_str(), "STOP_LOSS_LIMIT");
+            assert_eq!(fixed_limit.trailing_delta, Some(150));
+            assert_eq!(fixed_limit.price, Some(Decimal::from(49_000)));
+            assert_eq!(fixed_limit.stop_price, activation_price);
+            assert_eq!(
+                fixed_limit.time_in_force.as_ref().map(|t| t.as_str()),
+                Some("IOC")
+            );
+        }
+
+        let absolute = params(
+            Side::Sell,
+            Some(Decimal::from(49_000)),
+            OrderKind::TrailingStopFixedLimit {
+                offset: Decimal::from(100),
+                offset_type: TrailingOffsetType::Absolute,
+                activation_price: None,
+            },
+            gtc(),
+            MarginSideEffect::NoBorrow,
+        );
+        assert!(matches!(absolute, Err(BuildOrderError::Unsupported)));
+
+        // Refused unsent: a fixed limit without its price, and an activation price of zero.
+        let no_limit = params(
+            Side::Sell,
+            None,
+            OrderKind::TrailingStopFixedLimit {
+                offset: Decimal::from(25),
+                offset_type: TrailingOffsetType::BasisPoints,
+                activation_price: None,
+            },
+            gtc(),
+            MarginSideEffect::NoBorrow,
+        );
+        assert!(matches!(
+            no_limit,
+            Err(BuildOrderError::Trailing(TrailingOrderError::LimitPrice(
+                None
+            )))
+        ));
+        let zero_activation = params(
+            Side::Sell,
+            None,
+            OrderKind::TrailingStop {
+                offset: Decimal::from(25),
+                offset_type: TrailingOffsetType::BasisPoints,
+                activation_price: Some(Decimal::ZERO),
+            },
+            gtc(),
+            MarginSideEffect::NoBorrow,
+        );
+        assert!(matches!(
+            zero_activation,
+            Err(BuildOrderError::Trailing(
+                TrailingOrderError::NonPositiveActivation(_)
+            ))
+        ));
+    }
+
     #[test]
     fn absolute_trailing_offsets_and_trailing_stop_limits_are_unsupported() {
         let absolute = params(
@@ -4573,6 +4680,7 @@ mod tests {
             OrderKind::TrailingStop {
                 offset: Decimal::from(100),
                 offset_type: TrailingOffsetType::Absolute,
+                activation_price: None,
             },
             gtc(),
             MarginSideEffect::AutoBorrowRepay,
@@ -4606,14 +4714,15 @@ mod tests {
             OrderKind::TrailingStop {
                 offset: Decimal::new(155, 3),
                 offset_type: TrailingOffsetType::Percentage,
+                activation_price: None,
             },
             gtc(),
             MarginSideEffect::AutoBorrowRepay,
         );
         assert!(matches!(
             fractional,
-            Err(BuildOrderError::TrailingDelta(TrailingDeltaError::Invalid(
-                _
+            Err(BuildOrderError::Trailing(TrailingOrderError::Delta(
+                crate::client::binance::shared::TrailingDeltaError::Invalid(_)
             )))
         ));
     }
@@ -5229,6 +5338,7 @@ mod tests {
                 OrderKind::TrailingStop {
                     offset: Decimal::from(25),
                     offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price: None,
                 }
             );
             assert_eq!(snapshot.0.price, None);
@@ -7018,6 +7128,7 @@ mod tests {
         let trailing_stop = OrderKind::TrailingStop {
             offset: Decimal::from(25),
             offset_type: TrailingOffsetType::BasisPoints,
+            activation_price: None,
         };
         let hold = |known: &SharedKnownLiveOrders| {
             known.lock().live(
@@ -7209,6 +7320,7 @@ mod tests {
             request.state.kind = OrderKind::TrailingStop {
                 offset,
                 offset_type: TrailingOffsetType::BasisPoints,
+                activation_price: None,
             };
             request
         };
