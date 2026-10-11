@@ -239,8 +239,11 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// A venue ban (Binance's HTTP 418) is reported the same way: its hint, when readable, says
     /// how long it lasts.
     ///
-    /// Transient — retry after `retry_after` when given, otherwise with backoff. Build one with
-    /// [`ApiError::rate_limited`].
+    /// Transient — retry after `retry_after` when given, otherwise with backoff.
+    ///
+    /// The variant is `#[non_exhaustive]`: outside this crate, build one with
+    /// [`ApiError::rate_limited`], match it as `RateLimit { .. }`, and read the wait with
+    /// [`ApiError::retry_after`].
     #[error("rate limit exceeded{}", RetryAfter(*retry_after))]
     #[non_exhaustive]
     RateLimit { retry_after: Option<Duration> },
@@ -757,6 +760,7 @@ pub enum KeyError {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
@@ -775,6 +779,19 @@ mod tests {
 
         let other: UnindexedApiError = ApiError::Unauthenticated("bad key".to_string());
         assert_eq!(other.retry_after(), None);
+    }
+
+    #[test]
+    fn a_rate_limit_round_trips_through_serde() {
+        for retry_after in [None, Some(Duration::from_millis(7_250))] {
+            let error: UnindexedApiError = ApiError::rate_limited(retry_after);
+            let json = serde_json::to_string(&error).unwrap();
+            assert_eq!(
+                serde_json::from_str::<UnindexedApiError>(&json).unwrap(),
+                error,
+                "{json}"
+            );
+        }
     }
 
     #[test]
