@@ -30,7 +30,7 @@ use rustrade_execution::{
     trade::{Trade, TradeOrigin},
 };
 use rustrade_instrument::{
-    Keyed,
+    Keyed, Side,
     asset::{AssetIndex, name::AssetNameExchange},
     corporate_action::SplitRatio,
     exchange::{ExchangeId, ExchangeIndex},
@@ -45,7 +45,7 @@ use rustrade_integration::collection::{FnvIndexMap, snapshot::Snapshot};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::fmt::Debug;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Defines the state interface [`InstrumentDataState`] that can be implemented for custom
 /// instrument level data state.
@@ -1444,6 +1444,52 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         position.apply_carry(flow.amount, flow.time_exchange)
     }
 
+    /// Log a fill the venue forced, and count it. See [`Self::update_from_trade`].
+    fn note_forced_fill(&mut self, trade: &Trade<AssetKey, InstrumentKey>)
+    where
+        AssetKey: Debug,
+        InstrumentKey: Debug,
+    {
+        warn!(
+            instrument = ?trade.instrument,
+            order_id = %trade.order_id,
+            origin = %trade.origin,
+            side = %trade.side,
+            price = %trade.price,
+            quantity = %trade.quantity,
+            "venue forced a fill on this instrument's position"
+        );
+        self.tear_sheet.record_fill_forced();
+    }
+
+    /// The hedged position a forced fill that matched no order reduces, and what that position
+    /// holds: the one open position on the side opposite the fill's. See the forced fills section
+    /// of [`Self::update_from_trade`].
+    fn forced_fill_position(
+        &self,
+        trade: &Trade<AssetKey, InstrumentKey>,
+    ) -> Result<(PositionId, Decimal), ForcedFillUnplaced> {
+        let reduces = match trade.side {
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
+        };
+        if trade.position_side.is_some_and(|named| named != reduces) {
+            return Err(ForcedFillUnplaced::NamesTheSideItWouldGrow);
+        }
+        let mut on_side = self
+            .position
+            .positions
+            .iter()
+            .filter(|(_, position)| position.side == reduces);
+        match (on_side.next(), on_side.next()) {
+            (Some((position_id, position)), None) => {
+                Ok((position_id.clone(), position.quantity_abs))
+            }
+            (None, _) => Err(ForcedFillUnplaced::PositionsOnSide(0)),
+            (Some(_), Some(_)) => Err(ForcedFillUnplaced::PositionsOnSide(2 + on_side.count())),
+        }
+    }
+
     /// Updates the instrument state based on a new trade.
     ///
     /// This method handles:
@@ -1503,10 +1549,19 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// venue forced ([`TradeOrigin::is_forced`]) is also logged at `warn!` and counted on
     /// [`TearSheet::fills_forced`](crate::statistic::summary::instrument::TearSheet::fills_forced).
     ///
-    /// In `OmsMode::Hedging`, a forced fill matches none of this engine's orders, so it is routed
-    /// like any unmatched fill: it opens a position of its own under its order id rather than
-    /// reducing the position it closed at the venue. Which of several hedged positions a
-    /// liquidation closed is not something the fill says. Reconcile positions after one.
+    /// In `OmsMode::Hedging`, a forced fill that matches none of this engine's orders reduces the
+    /// position the venue closed, on the side opposite the fill's own: a forced sell reduces a
+    /// long. When the venue names the position's side, in [`Trade::position_side`], it must be
+    /// that side.
+    /// - With exactly one open position on that side, the fill reduces it, by no more than the
+    ///   position holds.
+    /// - With none or several, the engine cannot tell which position the venue closed, so it
+    ///   opens nothing rather than guess. Likewise when the venue names the side the fill would
+    ///   grow, and for the part of a fill larger than the position it reduces.
+    ///
+    /// What is applied to no position is logged at ERROR and counted on
+    /// [`TearSheet::fills_forced_unallocated`](crate::statistic::summary::instrument::TearSheet::fills_forced_unallocated):
+    /// the engine's positions no longer match the venue's, so reconcile them.
     pub fn update_from_trade(
         &mut self,
         trade: &Trade<AssetKey, InstrumentKey>,
@@ -1515,6 +1570,22 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         AssetKey: Debug + Clone,
         InstrumentKey: Debug + Clone + PartialEq,
     {
+        // Before routing, which can return early. Only a fill of origin `Order` is ever queued for
+        // replay, so this counts each forced fill once.
+        if trade.origin.is_forced() {
+            self.note_forced_fill(trade);
+        } else if trade.origin != TradeOrigin::Order {
+            info!(
+                instrument = ?trade.instrument,
+                order_id = %trade.order_id,
+                origin = %trade.origin,
+                "fill of origin other than this engine's orders"
+            );
+        }
+
+        // A forced fill larger than the hedged position it reduces, capped at that position's size.
+        let mut capped_forced = None;
+
         // Step 1: Resolve PositionId.
         //
         // Done BEFORE fee computation so we can return early (queue the fill) without
@@ -1633,21 +1704,59 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                                     return None;
                                 }
 
-                                let pos_id = PositionId::new(trade.order_id.0.clone());
-                                warn!(
-                                    order_id = %trade.order_id,
-                                    position_id = %pos_id,
-                                    "Hedging fill routing: no order match — opening new \
-                                     position under raw order ID. Occurs for externally-placed \
-                                     orders or orders removed by snapshot reconciliation."
-                                );
-                                // Counted separately from the case above: the cause is a fill this
-                                // engine has no order for, not a mapping it lost, and one position per
-                                // external order is a defensible outcome rather than a split.
-                                self.tear_sheet.record_fill_unmatched(&pos_id, || {
-                                    format!("no order matched {}", trade.order_id)
-                                });
-                                pos_id
+                                if trade.origin.is_forced() {
+                                    let Ok((pos_id, held)) =
+                                        self.forced_fill_position(trade).inspect_err(|reason| {
+                                            error!(
+                                                instrument = ?trade.instrument,
+                                                order_id = %trade.order_id,
+                                                origin = %trade.origin,
+                                                side = %trade.side,
+                                                position_side = ?trade.position_side,
+                                                quantity = %trade.quantity,
+                                                %reason,
+                                                "forced fill matched no order and reduces no \
+                                                 single position — applied to no position; \
+                                                 reconcile positions"
+                                            );
+                                        })
+                                    else {
+                                        self.tear_sheet.record_fill_forced_unallocated();
+                                        return None;
+                                    };
+                                    if trade.quantity.abs() > held {
+                                        error!(
+                                            instrument = ?trade.instrument,
+                                            order_id = %trade.order_id,
+                                            origin = %trade.origin,
+                                            position_id = %pos_id,
+                                            quantity = %trade.quantity,
+                                            %held,
+                                            "forced fill is larger than the position it reduces \
+                                             — the excess is applied to no position; reconcile \
+                                             positions"
+                                        );
+                                        self.tear_sheet.record_fill_forced_unallocated();
+                                        capped_forced = Some(capped_to(trade, held));
+                                    }
+                                    pos_id
+                                } else {
+                                    let pos_id = PositionId::new(trade.order_id.0.clone());
+                                    warn!(
+                                        order_id = %trade.order_id,
+                                        position_id = %pos_id,
+                                        "Hedging fill routing: no order match — opening new \
+                                         position under raw order ID. Occurs for externally-placed \
+                                         orders or orders removed by snapshot reconciliation."
+                                    );
+                                    // Counted separately from the case above: the cause is a fill this
+                                    // engine has no order for, not a mapping it lost, and one position per
+                                    // external order is a defensible outcome rather than a split.
+                                    self.tear_sheet.record_fill_unmatched(&pos_id, || {
+                                        format!("no order matched {}", trade.order_id)
+                                    });
+                                    pos_id
+                                }
                             }
                         }
                     }
@@ -1655,27 +1764,8 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             }
         };
 
-        // A forced fill is never queued above (its origin is not `Order`), so this counts each
-        // one once.
-        if trade.origin.is_forced() {
-            warn!(
-                instrument = ?trade.instrument,
-                order_id = %trade.order_id,
-                origin = %trade.origin,
-                side = %trade.side,
-                price = %trade.price,
-                quantity = %trade.quantity,
-                "venue forced a fill on this instrument's position"
-            );
-            self.tear_sheet.record_fill_forced();
-        } else if trade.origin != TradeOrigin::Order {
-            info!(
-                instrument = ?trade.instrument,
-                order_id = %trade.order_id,
-                origin = %trade.origin,
-                "fill of origin other than this engine's orders"
-            );
-        }
+        // From here, `trade` is the capped copy of a forced fill larger than its position.
+        let trade = capped_forced.as_ref().unwrap_or(trade);
 
         // Step 2: Extract contract_size and apply fee model to the trade.
         //
@@ -1938,6 +2028,52 @@ where
     )
 }
 
+/// Why a hedged forced fill that matched no order was applied to no position. See the forced
+/// fills section of [`InstrumentState::update_from_trade`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForcedFillUnplaced {
+    /// The venue named the position side the fill would grow, not reduce.
+    NamesTheSideItWouldGrow,
+    /// The side the fill reduces holds this many open positions, not one.
+    PositionsOnSide(usize),
+}
+
+impl std::fmt::Display for ForcedFillUnplaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NamesTheSideItWouldGrow => {
+                write!(f, "the venue names the position side it would grow")
+            }
+            Self::PositionsOnSide(open) => {
+                write!(f, "{open} open positions on the side it reduces")
+            }
+        }
+    }
+}
+
+/// `trade` cut to `held`, keeping its sign, with its fees cut in proportion. `held` is less than
+/// `trade.quantity.abs()`.
+fn capped_to<AssetKey, InstrumentKey>(
+    trade: &Trade<AssetKey, InstrumentKey>,
+    held: Decimal,
+) -> Trade<AssetKey, InstrumentKey>
+where
+    AssetKey: Clone,
+    InstrumentKey: Clone,
+{
+    // `trade.quantity.abs() > held >= 0`, so the division is defined and the share below one.
+    let share = held / trade.quantity.abs();
+    let mut capped = trade.clone();
+    capped.quantity = if trade.quantity.is_sign_negative() {
+        -held
+    } else {
+        held
+    };
+    capped.fees.fees *= share;
+    capped.fees.fees_quote = capped.fees.fees_quote.map(|fees| fees * share);
+    capped
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // test code: panics acceptable
 mod tests {
@@ -1952,7 +2088,7 @@ mod tests {
         },
         trade::{AssetFees, Trade, TradeId},
     };
-    use rustrade_instrument::{Side, test_utils::instrument as test_instrument};
+    use rustrade_instrument::test_utils::instrument as test_instrument;
 
     /// When a test's in-flight request was sent; no test here depends on its value.
     const TIME_SENT: DateTime<Utc> = DateTime::<Utc>::MIN_UTC;
@@ -2469,13 +2605,183 @@ mod tests {
             );
 
             assert!(state.pending_fills.is_empty(), "{origin}");
-            assert_eq!(
-                open_position_ids(&state),
-                vec![PositionId::new("venue-order")],
-                "{origin}: applied, as an unmatched fill"
-            );
-            assert_eq!(state.tear_sheet.fills_unmatched, 1, "{origin}");
+            if origin.is_forced() {
+                assert!(
+                    open_position_ids(&state).is_empty(),
+                    "{origin}: no long to reduce, so applied to no position"
+                );
+                assert_eq!(state.tear_sheet.fills_forced_unallocated, 1);
+            } else {
+                assert_eq!(
+                    open_position_ids(&state),
+                    vec![PositionId::new("venue-order")],
+                    "{origin}: applied, as an unmatched fill"
+                );
+                assert_eq!(state.tear_sheet.fills_unmatched, 1, "{origin}");
+            }
         }
+    }
+
+    /// Hedged positions opened by external fills, one per `(id, quantity)`, each keyed by its id.
+    fn hedged_positions(
+        longs: &[(&str, Decimal)],
+        shorts: &[(&str, Decimal)],
+    ) -> InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex> {
+        let mut state = instrument_state(OmsMode::Hedging);
+        for (side, positions) in [(Side::Buy, longs), (Side::Sell, shorts)] {
+            for (id, quantity) in positions {
+                state.update_from_trade(&fill(OrderId::new(*id), side, *quantity));
+            }
+        }
+        state
+    }
+
+    fn held(
+        state: &InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex>,
+        id: &str,
+    ) -> Option<Decimal> {
+        state
+            .position
+            .positions
+            .get(&PositionId::new(id))
+            .map(|position| position.quantity_abs)
+    }
+
+    fn liquidation(side: Side, quantity: Decimal) -> Trade<AssetIndex, InstrumentIndex> {
+        fill(OrderId::new("liquidation"), side, quantity).with_origin(TradeOrigin::Liquidation)
+    }
+
+    /// In Hedging mode a forced fill reduces the one position on the side it closes, not one of
+    /// its own, whatever positions the other side holds.
+    #[test]
+    fn a_hedged_forced_fill_reduces_the_one_position_on_the_side_it_closes() {
+        let mut state = hedged_positions(&[("long", dec!(5))], &[("short", dec!(3))]);
+
+        let exited = state.update_from_trade(&liquidation(Side::Sell, dec!(2)));
+
+        assert!(exited.is_none());
+        assert_eq!(held(&state, "long"), Some(dec!(3)));
+        assert_eq!(held(&state, "short"), Some(dec!(3)));
+        assert_eq!(held(&state, "liquidation"), None, "no position of its own");
+        assert_eq!(state.tear_sheet.fills_forced, 1);
+        assert_eq!(state.tear_sheet.fills_forced_unallocated, 0);
+        assert_eq!(
+            state.tear_sheet.fills_unmatched, 2,
+            "only the two opening fills"
+        );
+
+        // A forced buy reduces the short, and the venue naming that side changes nothing.
+        let exited = state
+            .update_from_trade(&liquidation(Side::Buy, dec!(3)).with_position_side(Side::Sell));
+
+        assert!(exited.is_some(), "the short is closed");
+        assert_eq!(held(&state, "short"), None);
+        assert_eq!(held(&state, "long"), Some(dec!(3)));
+        assert_eq!(state.tear_sheet.fills_forced_unallocated, 0);
+    }
+
+    /// When the side a forced fill closes holds no position, or several, the engine cannot tell
+    /// which the venue closed: it opens nothing, and counts the fill.
+    #[test]
+    fn a_hedged_forced_fill_that_reduces_no_single_position_opens_nothing() {
+        for longs in [&[][..], &[("a", dec!(2)), ("b", dec!(2))][..]] {
+            let mut state = hedged_positions(longs, &[("short", dec!(3))]);
+            let before = state.position.positions.clone();
+
+            let exited = state.update_from_trade(&liquidation(Side::Sell, dec!(1)));
+
+            assert!(exited.is_none());
+            assert_eq!(state.position.positions, before, "{} longs", longs.len());
+            assert_eq!(state.tear_sheet.fills_forced, 1);
+            assert_eq!(state.tear_sheet.fills_forced_unallocated, 1);
+            assert_eq!(
+                state
+                    .tear_sheet
+                    .generate(Decimal::ZERO, crate::statistic::time::Daily)
+                    .fills_forced_unallocated,
+                1
+            );
+        }
+    }
+
+    /// A venue that names the side a forced fill would grow contradicts the fill: the engine
+    /// applies it to no position.
+    #[test]
+    fn a_hedged_forced_fill_naming_the_side_it_would_grow_opens_nothing() {
+        let mut state = hedged_positions(&[("long", dec!(5))], &[]);
+
+        state.update_from_trade(&liquidation(Side::Sell, dec!(1)).with_position_side(Side::Sell));
+
+        assert_eq!(held(&state, "long"), Some(dec!(5)));
+        assert_eq!(state.position.positions.len(), 1);
+        assert_eq!(state.tear_sheet.fills_forced_unallocated, 1);
+    }
+
+    /// A forced fill reduces a hedged position even while an order of the engine's awaits its
+    /// ack: it is not queued behind it.
+    #[test]
+    fn a_hedged_forced_fill_is_routed_while_an_order_awaits_its_ack() {
+        let mut state = hedged_positions(&[("long", dec!(5))], &[]);
+        state.update_from_order_snapshot(Snapshot(&order(
+            ClientOrderId::new("cid-1"),
+            OrderState::active(OpenInFlight::new(TIME_SENT)),
+        )));
+
+        state.update_from_trade(&liquidation(Side::Sell, dec!(2)));
+
+        assert!(state.pending_fills.is_empty());
+        assert_eq!(held(&state, "long"), Some(dec!(3)));
+    }
+
+    /// A forced fill reported with a negative quantity is measured by its size, so a large one is
+    /// capped rather than flipping the position it reduces.
+    #[test]
+    fn a_hedged_forced_fill_with_a_negative_quantity_is_capped_by_its_size() {
+        let mut state = hedged_positions(&[("long", dec!(2))], &[]);
+
+        let exited = state.update_from_trade(&liquidation(Side::Sell, dec!(-5)));
+
+        let Some(exited) = exited else {
+            panic!("the long is closed");
+        };
+        assert_eq!(exited.quantity_abs_max, dec!(2));
+        assert!(state.position.positions.is_empty(), "no short is opened");
+        assert_eq!(state.tear_sheet.fills_forced, 1);
+        assert_eq!(state.tear_sheet.fills_forced_unallocated, 1);
+    }
+
+    /// A forced fill larger than the position it reduces closes that position and no more: the
+    /// excess opens nothing on the other side, and is counted. Its fees are cut in proportion.
+    #[test]
+    fn a_hedged_forced_fill_larger_than_its_position_closes_it_and_opens_nothing() {
+        let mut state = hedged_positions(&[("long", dec!(2))], &[]);
+        let mut forced = liquidation(Side::Sell, dec!(5));
+        forced.fees.fees = dec!(10);
+        forced.fees.fees_quote = Some(dec!(10));
+
+        let exited = state.update_from_trade(&forced);
+
+        let Some(exited) = exited else {
+            panic!("the long is closed");
+        };
+        assert_eq!(exited.position_id, PositionId::new("long"));
+        assert_eq!(exited.quantity_abs_max, dec!(2));
+        assert_eq!(exited.fees_exit.fees, dec!(4), "two fifths of the fees");
+        assert_eq!(exited.fees_exit.fees_quote, Some(dec!(4)));
+        assert!(state.position.positions.is_empty(), "no short is opened");
+        assert_eq!(state.tear_sheet.fills_forced, 1);
+        assert_eq!(state.tear_sheet.fills_forced_unallocated, 1);
+
+        // Likewise a forced buy larger than the short it reduces.
+        let mut state = hedged_positions(&[], &[("short", dec!(1))]);
+
+        let exited = state.update_from_trade(&liquidation(Side::Buy, dec!(3)));
+
+        assert_eq!(
+            exited.map(|exited| exited.position_id),
+            Some(PositionId::new("short"))
+        );
+        assert!(state.position.positions.is_empty(), "no long is opened");
     }
 
     /// A forced fill moves the position like any other, and is counted; a fill of another

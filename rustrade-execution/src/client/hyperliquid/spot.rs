@@ -1283,6 +1283,7 @@ fn spot_trades(
             },
             // As on the stream, whose copy of a fill usually arrives first; see `TradeOrigin`.
             origin: TradeOrigin::Order,
+            position_side: None,
         });
     }
 
@@ -1334,6 +1335,7 @@ fn fill_to_account_event(
         // The SDK's `TradeInfo` drops the fill's liquidation marker, so every fill is reported
         // as `Order`; see `TradeOrigin`.
         origin: TradeOrigin::Order,
+        position_side: None,
     };
 
     Some(AccountEvent::new(
