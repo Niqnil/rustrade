@@ -91,15 +91,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The engine opens nothing for a forced fill it cannot place without guessing: one whose side
     holds no open position or several, or one whose venue names the side it would grow. For a
     fill larger than the position it reduces, the excess is likewise not applied. Each case is
-    logged at ERROR and counted in the new `TearSheet::fills_forced_unallocated` and
-    `TradingSummary::fills_forced_unallocated`. Non-zero means the engine's positions no longer
+    logged at ERROR and counted in the new `TearSheet::fills_unallocated` and
+    `TradingSummary::fills_unallocated`. Non-zero means the engine's positions no longer
     match the venue's.
   - `Trade` gains `position_side: Option<Side>` (`#[serde(default)]`) and `with_position_side`,
     for a venue in hedge mode that names the position a fill belongs to. The engine checks a
     forced fill against it: it can only confirm the side the fill reduces, not choose among
     several positions on that side. No client in this crate sets it yet.
   - **Breaking:** `TearSheet`, `TearSheetGenerator` and `TradingSummary` gain
-    `fills_forced_unallocated`. They have public fields, so code that builds one with a struct
+    `fills_unallocated`. They have public fields, so code that builds one with a struct
     literal needs the new field.
 - **Margin calls and liquidation warnings: `AccountEventKind::Notice`** (`rustrade-execution`,
   part of #552).
@@ -256,6 +256,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     venue settles physically is not also closed by the engine at intrinsic value. The audit replica
     follows the same rule. With `Engine`, expiry is cash-settled as before, which keeps backtests
     unchanged.
+  - In `OmsMode::Hedging`, a fill the venue reports for an expiry, exercise or assignment that
+    matches none of the engine's orders is now routed as a forced fill is (see the #567 entry):
+    on the contract, it reduces the one open position on the side it closes, rather than opening a
+    position of its own. The share leg of an exercise or assignment, on an instrument that never
+    expires, can also open a position, as a put assignment buys shares the account did not hold.
+    With nothing on the side it closes, it opens one under its order id; with several positions
+    there, it is applied to none. `fills_forced_unallocated` from #567 is renamed
+    `fills_unallocated` on `TearSheet`, `TearSheetGenerator` and `TradingSummary`, since it now
+    counts these fills too.
 
 ### Changed
 

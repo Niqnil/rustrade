@@ -113,15 +113,18 @@ pub struct TearSheet<Interval> {
     #[serde(default)]
     pub fills_forced: usize,
 
-    /// Forced fills, or parts of one, applied to no position — `OmsMode::Hedging` only.
+    /// Venue settlement fills, or parts of one, applied to no position — `OmsMode::Hedging` only.
     ///
-    /// A forced fill matches none of this engine's orders, so in Hedging mode it reduces the one
-    /// open position on the side it closes. When there is none, or several, the engine cannot
-    /// tell which position the venue closed, and opens nothing rather than guess. The part of a
-    /// fill larger than the position it reduces is counted too. Each is logged at ERROR: the
-    /// engine's positions no longer match the venue's, so reconcile them.
+    /// A settlement fill, such as a liquidation or an option's expiry, exercise or assignment,
+    /// matches none of this engine's orders, so in Hedging mode it reduces the one open position
+    /// on the side it closes. When there is none, or several, the engine cannot tell which
+    /// position the venue closed, and opens nothing rather than guess. The part of a fill larger
+    /// than the position it reduces is counted too. Each is logged at ERROR: the engine's
+    /// positions no longer match the venue's, so reconcile them. See
+    /// [`InstrumentState::update_from_trade`](crate::engine::state::instrument::InstrumentState::update_from_trade)
+    /// for the share leg of an exercise or assignment, which may open a position instead.
     #[serde(default)]
-    pub fills_forced_unallocated: usize,
+    pub fills_unallocated: usize,
 
     /// Why the first fill of either kind above could not be routed.
     ///
@@ -183,9 +186,9 @@ pub struct TearSheetGenerator {
     #[serde(default)]
     pub fills_forced: usize,
 
-    /// Forced fills applied to no position. See [`TearSheet::fills_forced_unallocated`].
+    /// Settlement fills applied to no position. See [`TearSheet::fills_unallocated`].
     #[serde(default)]
-    pub fills_forced_unallocated: usize,
+    pub fills_unallocated: usize,
 
     /// First unroutable-fill detail seen. See [`TearSheet::first_fallback_detail`].
     #[serde(default)]
@@ -212,7 +215,7 @@ impl TearSheetGenerator {
             fills_routed_by_fallback: 0,
             fills_unmatched: 0,
             fills_forced: 0,
-            fills_forced_unallocated: 0,
+            fills_unallocated: 0,
             first_fallback_detail: None,
             fallback_positions: Vec::new(),
         }
@@ -264,10 +267,10 @@ impl TearSheetGenerator {
         self.fills_forced = self.fills_forced.saturating_add(1);
     }
 
-    /// Record a forced fill, or the part of one, applied to no position. See
-    /// [`TearSheet::fills_forced_unallocated`].
-    pub fn record_fill_forced_unallocated(&mut self) {
-        self.fills_forced_unallocated = self.fills_forced_unallocated.saturating_add(1);
+    /// Record a settlement fill, or the part of one, applied to no position. See
+    /// [`TearSheet::fills_unallocated`].
+    pub fn record_fill_unallocated(&mut self) {
+        self.fills_unallocated = self.fills_unallocated.saturating_add(1);
     }
 
     /// Note the position a fallback routing opened, and the reason if it is the first one.
@@ -392,7 +395,7 @@ impl TearSheetGenerator {
             fills_routed_by_fallback: self.fills_routed_by_fallback,
             fills_unmatched: self.fills_unmatched,
             fills_forced: self.fills_forced,
-            fills_forced_unallocated: self.fills_forced_unallocated,
+            fills_unallocated: self.fills_unallocated,
             first_fallback_detail: self.first_fallback_detail.clone(),
             fallback_positions: self.fallback_positions.clone(),
         }
