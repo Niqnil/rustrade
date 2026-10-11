@@ -13,10 +13,11 @@
 // - Event deduplication: LRU cache keyed on (trade_id/order_id, exec_type) prevents
 //   duplicate processing after reconnect + fill recovery
 // - Rate limit handling: detects HTTP 429 / Binance -1015, retries with exponential
-//   backoff (Retry-After header is not accessible through the SDK's anyhow::Error
-//   chain, so computed delays are used), blocks further REST calls until cooldown expires,
-//   and does not open a WS-API session during it. Separately, pauses REST queries until the
-//   next minute once responses report >= 90% of the request-weight limit used
+//   backoff (binance-sdk drops the Retry-After header from its rate-limit errors, so
+//   computed delays are used, and ApiError::RateLimit carries no retry_after), blocks
+//   further REST calls until cooldown expires, and does not open a WS-API session during
+//   it. Separately, pauses REST queries until the next minute once responses report
+//   >= 90% of the request-weight limit used
 // - Reconnection: account_stream auto-reconnects on WS disconnect/error with
 //   exponential backoff (1s → 30s, max 10 attempts)
 // - Heartbeat monitoring: tracks WS activity via AtomicBool flag; forces reconnect
@@ -284,7 +285,7 @@ impl WsApiUnavailable {
         match self {
             Self::RateLimited(msg) => {
                 warn!(%msg, "BinanceSpot WS-API rate-limited, request not sent");
-                UnindexedOrderError::Rejected(ApiError::RateLimit)
+                UnindexedOrderError::Rejected(ApiError::rate_limited(None))
             }
             Self::Connect(msg) => UnindexedOrderError::Connectivity(ConnectivityError::Socket(msg)),
         }
@@ -1087,7 +1088,7 @@ impl ExecutionClient for BinanceSpot {
                     // Venue response — WS session is healthy, don't tear it down. A throttle
                     // (429, -1003, a WAF 403) backs off the shared limiter so REST calls
                     // back off too.
-                    if matches!(order_err, OrderError::Rejected(ApiError::RateLimit)) {
+                    if matches!(order_err, OrderError::Rejected(ApiError::RateLimit { .. })) {
                         self.rate_limiter.on_rate_limited(None);
                     }
                     UnindexedOrderResponseCancel {
@@ -1326,7 +1327,7 @@ impl ExecutionClient for BinanceSpot {
                     // Venue response — WS session is healthy, don't tear it down. A throttle
                     // (429, -1003, a WAF 403) backs off the shared limiter so REST calls
                     // back off too.
-                    if matches!(order_err, OrderError::Rejected(ApiError::RateLimit)) {
+                    if matches!(order_err, OrderError::Rejected(ApiError::RateLimit { .. })) {
                         self.rate_limiter.on_rate_limited(None);
                     }
                     Order {
@@ -2739,16 +2740,16 @@ mod tests {
         ));
         assert_eq!(
             parse_binance_api_error("Rate limit exceeded".into(), &instrument),
-            ApiError::RateLimit
+            ApiError::rate_limited(None)
         );
         assert_eq!(
             parse_binance_api_error("Error code -1015".into(), &instrument),
-            ApiError::RateLimit
+            ApiError::rate_limited(None)
         );
         // -1003: too many requests — must also map to RateLimit (not OrderRejected)
         assert_eq!(
             parse_binance_api_error("Error -1003: too many requests".into(), &instrument),
-            ApiError::RateLimit
+            ApiError::rate_limited(None)
         );
         // -2011 maps to OrderAlreadyCancelled
         assert_eq!(
@@ -4805,7 +4806,7 @@ mod tests {
         assert!(
             matches!(
                 response.state,
-                Err(UnindexedOrderError::Rejected(ApiError::RateLimit))
+                Err(UnindexedOrderError::Rejected(ApiError::RateLimit { .. }))
             ),
             "{:?}",
             response.state
@@ -4842,7 +4843,7 @@ mod tests {
         assert!(
             matches!(
                 response.state,
-                Err(UnindexedOrderError::Rejected(ApiError::RateLimit))
+                Err(UnindexedOrderError::Rejected(ApiError::RateLimit { .. }))
             ),
             "{:?}",
             response.state
