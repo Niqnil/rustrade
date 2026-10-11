@@ -1,6 +1,7 @@
 use super::message::KrakenError;
-use rustrade_integration::{Validator, error::SocketError};
+use rustrade_integration::{Validator, error::SocketError, subscription::SubscriptionId};
 use serde::{Deserialize, Serialize};
+use smol_str::format_smolstr;
 
 /// [`Kraken`](super::Kraken) message received in response to WebSocket subscription requests.
 ///
@@ -43,6 +44,23 @@ pub enum KrakenSubResponse {
         pair: String,
     },
     Error(KrakenError),
+}
+
+impl KrakenSubResponse {
+    /// The id of the subscription a confirmation answers: `{channelName}|{pair}`, the id its
+    /// subscription was keyed under.
+    ///
+    /// Kraken echoes the pair in its own spelling, `XBT/USD` for one subscribed as `BTC/USD`, so a
+    /// subscription keyed under another spelling is not matched. `None` for a failure, which names
+    /// no channel.
+    pub fn subscription_id(&self) -> Option<SubscriptionId> {
+        match self {
+            Self::Subscribed {
+                channel_name, pair, ..
+            } => Some(SubscriptionId(format_smolstr!("{channel_name}|{pair}"))),
+            Self::Error(_) => None,
+        }
+    }
 }
 
 impl Validator for KrakenSubResponse {
@@ -134,6 +152,54 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn an_echoed_subscription_names_the_id_it_was_keyed_under() {
+        use crate::{
+            Identifier,
+            exchange::{
+                Connector, ExchangeSub,
+                kraken::{Kraken, channel::KrakenChannel, market::KrakenMarket},
+            },
+        };
+
+        /// Echo the subscription the request carries back as Kraken's confirmation, and check it
+        /// names the id the mapper keyed the subscription under.
+        fn round_trip(exchange_sub: ExchangeSub<KrakenChannel, KrakenMarket>) {
+            let keyed = exchange_sub.id();
+            let request = Kraken::requests(vec![exchange_sub]).remove(0);
+            let request: serde_json::Value =
+                serde_json::from_str(request.to_text().unwrap()).unwrap();
+            let echoed = serde_json::json!({
+                "channelID": 10001,
+                "channelName": request["subscription"]["name"],
+                "event": "subscriptionStatus",
+                "pair": request["pair"][0],
+                "status": "subscribed",
+                "subscription": request["subscription"],
+            });
+
+            let response: KrakenSubResponse = serde_json::from_value(echoed).unwrap();
+            assert_eq!(response.subscription_id(), Some(keyed));
+        }
+
+        round_trip(ExchangeSub {
+            channel: KrakenChannel::TRADES,
+            market: KrakenMarket("XBT/USD".into()),
+        });
+        round_trip(ExchangeSub {
+            channel: KrakenChannel::ORDER_BOOK_L1,
+            market: KrakenMarket("ETH/EUR".into()),
+        });
+    }
+
+    #[test]
+    fn a_failure_names_no_subscription() {
+        let failure = KrakenSubResponse::Error(KrakenError {
+            message: "Currency pair not supported XBT/USX".to_string(),
+        });
+        assert_eq!(failure.subscription_id(), None);
     }
 
     #[test]
