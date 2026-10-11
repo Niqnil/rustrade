@@ -295,7 +295,8 @@ impl<P: Protocol> Actor<P> {
         loop {
             let Ok(frame) = tokio::time::timeout_at(deadline, next_frame(&mut self.socket)).await
             else {
-                return Err(Refusal::Failed(SocketError::Subscribe(
+                return Err(Refusal::Failed(unsettled(
+                    handshake,
                     handshake.timed_out(timeout),
                 )));
             };
@@ -326,10 +327,10 @@ impl<P: Protocol> Actor<P> {
                     }
                 }
                 Read::Lost(cause) => {
-                    return Err(Refusal::Failed(SocketError::Subscribe(format!(
-                        "{} connection lost while subscribing: {cause}",
-                        P::NAME
-                    ))));
+                    return Err(Refusal::Failed(unsettled(
+                        handshake,
+                        format!("{} connection lost while subscribing: {cause}", P::NAME),
+                    )));
                 }
             }
         }
@@ -574,6 +575,18 @@ impl<P: Protocol> Actor<P> {
                 commands: self.detach.upgrade(),
             },
         }
+    }
+}
+
+/// The error a handshake that did not settle, for `reason`, fails with: naming what it had not
+/// confirmed, when it can.
+fn unsettled<Answer>(handshake: &impl Handshake<Answer>, reason: String) -> SocketError {
+    match handshake.unconfirmed() {
+        Some(unacknowledged) => SocketError::Unacknowledged {
+            reason,
+            unacknowledged,
+        },
+        None => SocketError::Subscribe(reason),
     }
 }
 
