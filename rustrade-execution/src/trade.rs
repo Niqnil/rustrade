@@ -114,7 +114,12 @@ pub struct Trade<AssetKey, InstrumentKey> {
     /// A venue in hedge mode, holding a long and a short in one instrument at once, names the
     /// position each fill belongs to (Binance USD-M futures' `LONG` and `SHORT`). The engine in
     /// `OmsMode::Hedging` checks a forced fill, which matches none of its orders, against it: a
-    /// forced fill must reduce the position the venue names.
+    /// forced fill must reduce the position the venue names. It only ever confirms the side a
+    /// reducing fill already implies, the side opposite its own, and does not choose among
+    /// several of the engine's positions on that side.
+    ///
+    /// It takes part in the derived `Eq`, `Hash` and `Ord`, as every field does: deduplicate fills
+    /// by instrument and [`id`](Self::id), not by the whole `Trade`.
     /// `None` when the venue names none, as every client in this crate does as of writing: none
     /// trades a venue in hedge mode.
     ///

@@ -1462,76 +1462,32 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         self.tear_sheet.record_fill_forced();
     }
 
-    /// The hedged position a forced fill that matched no order reduces, and, when the fill is
-    /// larger than that position, the fill capped at its size. `None` when the fill reduces no
-    /// single position. What is applied to no position is logged at ERROR and counted. See the
-    /// forced fills section of [`Self::update_from_trade`].
-    fn allocate_forced_fill(
-        &mut self,
+    /// The hedged position a forced fill that matched no order reduces, and what that position
+    /// holds: the one open position on the side opposite the fill's. See the forced fills section
+    /// of [`Self::update_from_trade`].
+    fn forced_fill_position(
+        &self,
         trade: &Trade<AssetKey, InstrumentKey>,
-    ) -> Option<(PositionId, Option<Trade<AssetKey, InstrumentKey>>)>
-    where
-        AssetKey: Debug + Clone,
-        InstrumentKey: Debug + Clone,
-    {
+    ) -> Result<(PositionId, Decimal), ForcedFillUnplaced> {
         let reduces = match trade.side {
             Side::Buy => Side::Sell,
             Side::Sell => Side::Buy,
         };
         if trade.position_side.is_some_and(|named| named != reduces) {
-            error!(
-                instrument = ?trade.instrument,
-                order_id = %trade.order_id,
-                side = %trade.side,
-                position_side = ?trade.position_side,
-                "forced fill names the position side it would grow, not reduce — applied to no \
-                 position; reconcile positions"
-            );
-            self.tear_sheet.record_fill_forced_unallocated();
-            return None;
+            return Err(ForcedFillUnplaced::NamesTheSideItWouldGrow);
         }
-
-        let on_side: Vec<(PositionId, Decimal)> = self
+        let mut on_side = self
             .position
             .positions
             .iter()
-            .filter(|(_, position)| position.side == reduces)
-            .map(|(id, position)| (id.clone(), position.quantity_abs))
-            .collect();
-        let [(position_id, held)] = on_side.as_slice() else {
-            error!(
-                instrument = ?trade.instrument,
-                order_id = %trade.order_id,
-                side = %trade.side,
-                quantity = %trade.quantity,
-                positions_on_side = on_side.len(),
-                "forced fill matched no order and reduces no single position — applied to no \
-                 position; reconcile positions"
-            );
-            self.tear_sheet.record_fill_forced_unallocated();
-            return None;
-        };
-        if trade.quantity <= *held {
-            return Some((position_id.clone(), None));
+            .filter(|(_, position)| position.side == reduces);
+        match (on_side.next(), on_side.next()) {
+            (Some((position_id, position)), None) => {
+                Ok((position_id.clone(), position.quantity_abs))
+            }
+            (None, _) => Err(ForcedFillUnplaced::PositionsOnSide(0)),
+            (Some(_), Some(_)) => Err(ForcedFillUnplaced::PositionsOnSide(2 + on_side.count())),
         }
-
-        error!(
-            instrument = ?trade.instrument,
-            order_id = %trade.order_id,
-            position_id = %position_id,
-            quantity = %trade.quantity,
-            held = %held,
-            "forced fill is larger than the position it reduces — the excess is applied to no \
-             position; reconcile positions"
-        );
-        self.tear_sheet.record_fill_forced_unallocated();
-        // `trade.quantity > held >= 0`, so the division is defined and the share below one.
-        let share = *held / trade.quantity;
-        let mut capped = trade.clone();
-        capped.quantity = *held;
-        capped.fees.fees *= share;
-        capped.fees.fees_quote = capped.fees.fees_quote.map(|fees| fees * share);
-        Some((position_id.clone(), Some(capped)))
     }
 
     /// Updates the instrument state based on a new trade.
@@ -1614,6 +1570,19 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         AssetKey: Debug + Clone,
         InstrumentKey: Debug + Clone + PartialEq,
     {
+        // Before routing, which can return early. Only a fill of origin `Order` is ever queued for
+        // replay, so this counts each forced fill once.
+        if trade.origin.is_forced() {
+            self.note_forced_fill(trade);
+        } else if trade.origin != TradeOrigin::Order {
+            info!(
+                instrument = ?trade.instrument,
+                order_id = %trade.order_id,
+                origin = %trade.origin,
+                "fill of origin other than this engine's orders"
+            );
+        }
+
         // A forced fill larger than the hedged position it reduces, capped at that position's size.
         let mut capped_forced = None;
 
@@ -1736,12 +1705,40 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                                 }
 
                                 if trade.origin.is_forced() {
-                                    let Some((pos_id, capped)) = self.allocate_forced_fill(trade)
+                                    let Ok((pos_id, held)) =
+                                        self.forced_fill_position(trade).inspect_err(|reason| {
+                                            error!(
+                                                instrument = ?trade.instrument,
+                                                order_id = %trade.order_id,
+                                                origin = %trade.origin,
+                                                side = %trade.side,
+                                                position_side = ?trade.position_side,
+                                                quantity = %trade.quantity,
+                                                %reason,
+                                                "forced fill matched no order and reduces no \
+                                                 single position — applied to no position; \
+                                                 reconcile positions"
+                                            );
+                                        })
                                     else {
-                                        self.note_forced_fill(trade);
+                                        self.tear_sheet.record_fill_forced_unallocated();
                                         return None;
                                     };
-                                    capped_forced = capped;
+                                    if trade.quantity.abs() > held {
+                                        error!(
+                                            instrument = ?trade.instrument,
+                                            order_id = %trade.order_id,
+                                            origin = %trade.origin,
+                                            position_id = %pos_id,
+                                            quantity = %trade.quantity,
+                                            %held,
+                                            "forced fill is larger than the position it reduces \
+                                             — the excess is applied to no position; reconcile \
+                                             positions"
+                                        );
+                                        self.tear_sheet.record_fill_forced_unallocated();
+                                        capped_forced = Some(capped_to(trade, held));
+                                    }
                                     pos_id
                                 } else {
                                     let pos_id = PositionId::new(trade.order_id.0.clone());
@@ -1767,19 +1764,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             }
         };
 
-        // A forced fill is never queued above (its origin is not `Order`), so this counts each
-        // one once.
-        if trade.origin.is_forced() {
-            self.note_forced_fill(trade);
-        } else if trade.origin != TradeOrigin::Order {
-            info!(
-                instrument = ?trade.instrument,
-                order_id = %trade.order_id,
-                origin = %trade.origin,
-                "fill of origin other than this engine's orders"
-            );
-        }
-
+        // From here, `trade` is the capped copy of a forced fill larger than its position.
         let trade = capped_forced.as_ref().unwrap_or(trade);
 
         // Step 2: Extract contract_size and apply fee model to the trade.
@@ -2041,6 +2026,52 @@ where
             })
             .collect(),
     )
+}
+
+/// Why a hedged forced fill that matched no order was applied to no position. See the forced
+/// fills section of [`InstrumentState::update_from_trade`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForcedFillUnplaced {
+    /// The venue named the position side the fill would grow, not reduce.
+    NamesTheSideItWouldGrow,
+    /// The side the fill reduces holds this many open positions, not one.
+    PositionsOnSide(usize),
+}
+
+impl std::fmt::Display for ForcedFillUnplaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NamesTheSideItWouldGrow => {
+                write!(f, "the venue names the position side it would grow")
+            }
+            Self::PositionsOnSide(open) => {
+                write!(f, "{open} open positions on the side it reduces")
+            }
+        }
+    }
+}
+
+/// `trade` cut to `held`, keeping its sign, with its fees cut in proportion. `held` is less than
+/// the trade's size.
+fn capped_to<AssetKey, InstrumentKey>(
+    trade: &Trade<AssetKey, InstrumentKey>,
+    held: Decimal,
+) -> Trade<AssetKey, InstrumentKey>
+where
+    AssetKey: Clone,
+    InstrumentKey: Clone,
+{
+    // `trade.quantity.abs() > held >= 0`, so the division is defined and the share below one.
+    let share = held / trade.quantity.abs();
+    let mut capped = trade.clone();
+    capped.quantity = if trade.quantity.is_sign_negative() {
+        -held
+    } else {
+        held
+    };
+    capped.fees.fees *= share;
+    capped.fees.fees_quote = capped.fees.fees_quote.map(|fees| fees * share);
+    capped
 }
 
 #[cfg(test)]
@@ -2686,6 +2717,35 @@ mod tests {
         assert_eq!(state.tear_sheet.fills_forced_unallocated, 1);
     }
 
+    /// A forced fill reduces a hedged position even while an order of the engine's awaits its
+    /// ack: it is not queued behind it.
+    #[test]
+    fn a_hedged_forced_fill_is_routed_while_an_order_awaits_its_ack() {
+        let mut state = hedged_positions(&[("long", dec!(5))], &[]);
+        state.update_from_order_snapshot(Snapshot(&order(
+            ClientOrderId::new("cid-1"),
+            OrderState::active(OpenInFlight::new(TIME_SENT)),
+        )));
+
+        state.update_from_trade(&liquidation(Side::Sell, dec!(2)));
+
+        assert!(state.pending_fills.is_empty());
+        assert_eq!(held(&state, "long"), Some(dec!(3)));
+    }
+
+    /// A forced fill reported with a negative quantity is measured by its size, so a large one is
+    /// capped rather than flipping the position it reduces.
+    #[test]
+    fn a_hedged_forced_fill_with_a_negative_quantity_is_capped_by_its_size() {
+        let mut state = hedged_positions(&[("long", dec!(2))], &[]);
+
+        let exited = state.update_from_trade(&liquidation(Side::Sell, dec!(-5)));
+
+        assert!(exited.is_some(), "the long is closed");
+        assert!(state.position.positions.is_empty(), "no short is opened");
+        assert_eq!(state.tear_sheet.fills_forced_unallocated, 1);
+    }
+
     /// A forced fill larger than the position it reduces closes that position and no more: the
     /// excess opens nothing on the other side, and is counted. Its fees are cut in proportion.
     #[test]
@@ -2700,11 +2760,24 @@ mod tests {
         let Some(exited) = exited else {
             panic!("the long is closed");
         };
+        assert_eq!(exited.position_id, PositionId::new("long"));
         assert_eq!(exited.quantity_abs_max, dec!(2));
         assert_eq!(exited.fees_exit.fees, dec!(4), "two fifths of the fees");
+        assert_eq!(exited.fees_exit.fees_quote, Some(dec!(4)));
         assert!(state.position.positions.is_empty(), "no short is opened");
         assert_eq!(state.tear_sheet.fills_forced, 1);
         assert_eq!(state.tear_sheet.fills_forced_unallocated, 1);
+
+        // Likewise a forced buy larger than the short it reduces.
+        let mut state = hedged_positions(&[], &[("short", dec!(1))]);
+
+        let exited = state.update_from_trade(&liquidation(Side::Buy, dec!(3)));
+
+        assert_eq!(
+            exited.map(|exited| exited.position_id),
+            Some(PositionId::new("short"))
+        );
+        assert!(state.position.positions.is_empty(), "no long is opened");
     }
 
     /// A forced fill moves the position like any other, and is counted; a fill of another

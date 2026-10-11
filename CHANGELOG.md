@@ -96,7 +96,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     match the venue's.
   - `Trade` gains `position_side: Option<Side>` (`#[serde(default)]`) and `with_position_side`,
     for a venue in hedge mode that names the position a fill belongs to. The engine checks a
-    forced fill against it. No client in this crate sets it yet.
+    forced fill against it: it can only confirm the side the fill reduces, not choose among
+    several positions on that side. No client in this crate sets it yet.
   - **Breaking:** `TearSheet`, `TearSheetGenerator` and `TradingSummary` gain
     `fills_forced_unallocated`. They have public fields, so code that builds one with a struct
     literal needs the new field.
