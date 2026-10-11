@@ -244,7 +244,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `None` means the venue gave none or the client cannot read it, not that a retry may follow at
     once. The variant stays transient.
   - `AlpacaClient` fills it from a 429's `Retry-After`, or else `X-RateLimit-Reset`, once its own
-    retries are exhausted, capped at Alpaca's one-minute window. Binance (`binance-sdk` drops the response headers from its rate-limit
+    retries are exhausted, capped at Alpaca's one-minute window. The last refusal now also pauses
+    the client's later requests for that wait, or 60 s without one, as the earlier refusals did;
+    before, the next request went out at once. Binance (`binance-sdk` drops the response headers from its rate-limit
     errors) and Hyperliquid (its SDK keeps none) always report `None`.
   - The check of how orders ended while disconnected retries no instrument, whatever its failure,
     before the longest wait the venue's refusals in that check asked for, and its WARN reports it

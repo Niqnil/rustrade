@@ -1278,6 +1278,8 @@ where
 
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             let reset_delay = parse_rate_limit_delay(response.headers());
+            // Every refusal pauses the client, the last included, so the next request waits too.
+            rate_limiter.on_rate_limited(reset_delay);
 
             if attempt + 1 < MAX_RATE_LIMIT_ATTEMPTS {
                 warn!(
@@ -1285,7 +1287,6 @@ where
                     max_attempts = MAX_RATE_LIMIT_ATTEMPTS,
                     "Alpaca REST rate-limited (429), retrying"
                 );
-                rate_limiter.on_rate_limited(reset_delay);
                 continue;
             }
 
@@ -1383,6 +1384,8 @@ async fn rest_delete_with_retry(
 
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
             let reset_delay = parse_rate_limit_delay(response.headers());
+            // Every refusal pauses the client, the last included, so the next request waits too.
+            rate_limiter.on_rate_limited(reset_delay);
 
             if attempt + 1 < MAX_RATE_LIMIT_ATTEMPTS {
                 warn!(
@@ -1390,7 +1393,6 @@ async fn rest_delete_with_retry(
                     max_attempts = MAX_RATE_LIMIT_ATTEMPTS,
                     "Alpaca cancel rate-limited (429), retrying"
                 );
-                rate_limiter.on_rate_limited(reset_delay);
                 continue;
             }
 
@@ -10014,6 +10016,14 @@ mod tests {
                 panic!("expected Api, got {error:?}");
             };
             assert_eq!(error.retry_after(), Some(Duration::from_secs(7)));
+            let blocked_until = rl
+                .blocked_until
+                .lock()
+                .expect("the last refusal pauses the client");
+            assert!(
+                blocked_until >= tokio::time::Instant::now() + Duration::from_secs(6),
+                "the client's next request waits for Alpaca's wait"
+            );
             assert_eq!(
                 server.received_requests().await.unwrap().len(),
                 MAX_RATE_LIMIT_ATTEMPTS as usize
@@ -10100,6 +10110,10 @@ mod tests {
                 panic!("expected Rejected, got {error:?}");
             };
             assert_eq!(error.retry_after(), Some(Duration::from_secs(5)));
+            assert!(
+                rl.blocked_until.lock().is_some(),
+                "the last refusal pauses the client"
+            );
         }
     }
 }
