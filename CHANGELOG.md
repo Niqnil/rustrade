@@ -190,6 +190,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `spotMeta`, so `rustrade-data`'s `HyperliquidMeta` now gives a perpetual's order precision
   without an execution client. A `meta` deserialized into `Perps` must now carry `szDecimals`,
   which Hyperliquid sends for every perpetual.
+- **Binance margin: read the interest charged and the forced liquidations** (`rustrade-execution`,
+  #560, #565).
+  - `BinanceMargin::fetch_margin_interest(start, end)` reads Binance's interest history and
+    returns each charge as a `CashFlow` of `MarginInterest`: a negative amount, the rate and
+    principal, and Binance's transaction id as the flow's id. Binance adds interest to the loan
+    rather than taking it from the free balance, so a flow is the cost charged, not a balance that
+    moved. An isolated client reads each configured pair and attributes its charges to it.
+    Binance serves 90 days of history: an earlier `start` is moved up, and logged at WARN.
+  - The engine adds interest to a position's carry only when it is in the instrument's quote
+    asset. Interest on a short's borrowed base asset, or interest Binance converted into BNB, is
+    left out until the caller converts it.
+  - `BinanceMargin::fetch_forced_liquidations(start, end)` reads the orders Binance placed to
+    liquidate the account, as `MarginForcedLiquidation`s: order id, pair, side, price, quantity,
+    filled quantity, average price and time. Binance marks no liquidation on the account stream,
+    so a caller can match these order ids against its fills, though Binance does not document
+    that they match.
+  - Neither is streamed: the caller decides when to read, and drops what it has already read.
 
 ### Changed
 
