@@ -20,7 +20,7 @@ use smol_str::format_smolstr;
 /// ```json
 /// ExchangeSub {
 ///     channel: KrakenChannel("trade"),
-///     market: KrakenChannel("BTC/USDT")
+///     market: KrakenMarket("BTC/USDT")
 /// }
 /// ```
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize)]

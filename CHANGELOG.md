@@ -266,9 +266,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Building the library with full debug info and all features, without incremental compilation
     (how Cargo builds a dependency), peaked at about 7 GB in one `rustc` and now peaks below 2 GB.
     Its debug info shrinks about twentyfold, as does the debug info of a binary that uses many
-    exchanges. The
-    `[profile.dev.package.rustrade-data] debug = "line-tables-only"` workaround the README
-    suggested is no longer needed.
+    exchanges. The `[profile.dev.package.rustrade-data] debug = "line-tables-only"` workaround
+    the README suggested is no longer needed.
   - The cost is one allocation per connection attempt and a dynamic call per poll of the stream.
   - `streams::consumer::init_market_stream` now requires `Exchange: Send + Sync + 'static`,
     `Instrument: 'static` and `Kind: Send + Sync + 'static`. A caller that spawns the stream, as
@@ -296,8 +295,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     time, side, price and amount.
   - An error Kraken sends once the stream is running, refusing a request, now reaches the
     caller as a stream error quoting Kraken's text, as does a data message the connector refuses,
-    such as one whose items name two symbols. v1 dropped such errors without a trace. One that
-    arrives while the subscriptions are being confirmed is logged at WARN and dropped.
+    such as one whose items name two symbols. v1 dropped such errors without a trace. A data
+    message the connector refuses that arrives while the subscriptions are being confirmed is
+    logged at WARN and dropped.
   - The message types follow v2's shapes. `KrakenTrades` and `KrakenOrderBookL1` are
     `KrakenMessage<KrakenData<_>>` over `KrakenTrade` and `KrakenTicker`, replacing
     `KrakenTradesInner`, `KrakenOrderBookL1Inner` and `KrakenSpread`. `KrakenSubResponse`,
