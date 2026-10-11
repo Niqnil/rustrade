@@ -83,18 +83,4 @@ and `massive`.
 > tick is a quote rather than a print (except on options), and live volume is fabricated on
 > `LseFx` and `LseCfd`. See the `exchange::lse` module documentation before relying on any of it.
 
-## Build memory
-
-A debug build of this crate with all features needs several GB of memory in a single `rustc`
-process, almost all of it for debug info. Cargo applies your workspace's `dev` profile to
-dependencies too, so this cost reaches you. If it matters, reduce this crate's debug info in the
-`Cargo.toml` at your workspace root; Cargo ignores `[profile]` sections in any other manifest:
-
-```toml
-[profile.dev.package.rustrade-data]
-debug = "line-tables-only"
-```
-
-This keeps file and line numbers in backtraces, and brings the peak to about 1 GB.
-
 See the [workspace README](../README.md) for documentation, examples, and contributing guidelines.

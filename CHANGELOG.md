@@ -257,6 +257,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     appearing anywhere in the message, so an error whose text merely holds those digits (an order
     id, a price) is no longer reported as one.
 
+- **Breaking: a debug build of `rustrade-data` needs about a quarter of the memory**
+  (`rustrade-data`, #387).
+  - The reconnecting market stream boxes each exchange stream it opens, and the stream of
+    connection attempts, before wrapping them. Unboxed, the debug info named the whole stream type
+    at every layer of the reconnect machinery, once per exchange and subscription kind. That made
+    up almost all of the crate's debug info.
+  - Building the library with full debug info and all features, without incremental compilation
+    (how Cargo builds a dependency), peaked at about 7 GB in one `rustc` and now peaks below 2 GB.
+    Its debug info shrinks about twentyfold, as does the debug info of a binary that uses many
+    exchanges. The
+    `[profile.dev.package.rustrade-data] debug = "line-tables-only"` workaround the README
+    suggested is no longer needed.
+  - The cost is one allocation per connection attempt and a dynamic call per poll of the stream.
+  - `streams::consumer::init_market_stream` now requires `Exchange: Send + Sync + 'static`,
+    `Instrument: 'static` and `Kind: Send + Sync + 'static`. A caller that spawns the stream, as
+    the stream builders do, already meets them. The stream it returns is still `Send` but no
+    longer `Sync`.
+
 ### Fixed
 
 - **Breaking: Kraken subscriptions made from base and quote assets work; the connector now speaks

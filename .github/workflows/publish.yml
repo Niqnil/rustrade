@@ -20,9 +20,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # The `cargo test` step is ci.yml's `--all-features` workspace test build less its examples, so
-    # it hits the same memory limit: with full debug info, its final parallel compile runs the
-    # 16 GB runner out of memory and the job is killed with exit 143 (#385). That failed the v0.7.0
-    # validation. Line tables are what ci.yml builds with; see the note on that job.
+    # it builds with the same line tables; see the note on that job. Before #387 cut the cost of
+    # full debug info, it ran the 16 GB runner out of memory and failed the v0.7.0 validation (#385).
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
