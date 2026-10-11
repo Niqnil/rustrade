@@ -108,6 +108,25 @@ pub struct Trade<AssetKey, InstrumentKey> {
     /// [`TradeOrigin::Order`].
     #[serde(default)]
     pub origin: TradeOrigin,
+    /// The side of the position the fill applies to, when the venue names one: [`Side::Buy`] for
+    /// a long, [`Side::Sell`] for a short.
+    ///
+    /// A venue in hedge mode, holding a long and a short in one instrument at once, names the
+    /// position each fill belongs to (Binance USD-M futures' `LONG` and `SHORT`). The engine in
+    /// `OmsMode::Hedging` checks a forced fill, which matches none of its orders, against it: a
+    /// forced fill must reduce the position the venue names. It only ever confirms the side a
+    /// reducing fill already implies, the side opposite its own, and does not choose among
+    /// several of the engine's positions on that side.
+    ///
+    /// It takes part in the derived `Eq`, `Hash` and `Ord`, as every field does: deduplicate fills
+    /// by instrument and [`id`](Self::id), not by the whole `Trade`.
+    /// `None` when the venue names none, as every client in this crate does as of writing: none
+    /// trades a venue in hedge mode.
+    ///
+    /// `#[serde(default)]` so trades serialised before this field existed still deserialise, as
+    /// `None`.
+    #[serde(default)]
+    pub position_side: Option<Side>,
 }
 
 impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
@@ -138,6 +157,7 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
             order_filled_quantity,
             fees,
             origin: TradeOrigin::Order,
+            position_side: None,
         }
     }
 
@@ -145,6 +165,15 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
     #[must_use]
     pub fn with_origin(self, origin: TradeOrigin) -> Self {
         Self { origin, ..self }
+    }
+
+    /// This trade with the [`position_side`](Self::position_side) the venue named.
+    #[must_use]
+    pub fn with_position_side(self, position_side: Side) -> Self {
+        Self {
+            position_side: Some(position_side),
+            ..self
+        }
     }
 
     pub fn value_quote(&self) -> Decimal {
@@ -225,7 +254,8 @@ where
 ///   fill is reported, as `External`, only when `IbkrConfig::other_clients_fills` opts in.
 /// - **Binance** marks no forced liquidation in its Spot or Margin order stream: its liquidation
 ///   markers are documented for futures only. Every fill on the account arrives, whoever placed
-///   its order.
+///   its order. `BinanceMargin::fetch_forced_liquidations` reads the margin orders Binance placed
+///   to liquidate the account, for a caller to match against its fills.
 /// - **Hyperliquid** fills carry a liquidation marker, but the SDK this crate uses drops it.
 /// - **Alpaca** marks no liquidation. Option assignment, exercise and expiry are account
 ///   activities, which this crate does not read.

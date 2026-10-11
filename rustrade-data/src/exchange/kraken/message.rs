@@ -390,10 +390,10 @@ mod tests {
 
     #[test]
     fn a_malformed_envelope_is_refused_naming_why() {
+        let error = parse_error("{}");
         assert!(
-            parse_error("{}").contains("Kraken message names neither a channel nor a method"),
-            "{}",
-            parse_error("{}")
+            error.contains("Kraken message names neither a channel nor a method"),
+            "{error}"
         );
         let error = parse_error(r#"{"channel":"trade","type":"update"}"#);
         assert!(error.contains("missing field `data`"), "{error}");

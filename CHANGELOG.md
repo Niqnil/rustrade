@@ -80,9 +80,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     a forced one at WARN and counts it in the new `TearSheet::fills_forced` and
     `TradingSummary::fills_forced`, and logs other non-`Order` fills at INFO. In `OmsMode::Hedging`
     a fill whose origin is not `Order` is no longer queued behind an order awaiting its ack, where
-    it waited for an ack that could not come; it is routed as an unmatched fill. Hedging mode still
-    opens a forced fill's own position rather than reducing the one it closed, as
-    `InstrumentState::update_from_trade` documents.
+    it waited for an ack that could not come. A fill of another origin the venue did not force is
+    routed as an unmatched fill; how a forced one is routed is in the next entry.
+- **In `OmsMode::Hedging` a forced fill reduces the position it closed** (`rustrade`,
+  `rustrade-execution`, #567).
+  - A forced fill (`TradeOrigin::is_forced`) that matches none of the engine's orders reduces the
+    one open position on the side opposite its own: a forced sell reduces a long. It opened a
+    position of its own before, leaving the engine holding the closed position and an opposite
+    one.
+  - The engine opens nothing for a forced fill it cannot place without guessing: one whose side
+    holds no open position or several, or one whose venue names the side it would grow. For a
+    fill larger than the position it reduces, the excess is likewise not applied. Each case is
+    logged at ERROR and counted in the new `TearSheet::fills_forced_unallocated` and
+    `TradingSummary::fills_forced_unallocated`. Non-zero means the engine's positions no longer
+    match the venue's.
+  - `Trade` gains `position_side: Option<Side>` (`#[serde(default)]`) and `with_position_side`,
+    for a venue in hedge mode that names the position a fill belongs to. The engine checks a
+    forced fill against it: it can only confirm the side the fill reduces, not choose among
+    several positions on that side. No client in this crate sets it yet.
+  - **Breaking:** `TearSheet`, `TearSheetGenerator` and `TradingSummary` gain
+    `fills_forced_unallocated`. They have public fields, so code that builds one with a struct
+    literal needs the new field.
 - **Margin calls and liquidation warnings: `AccountEventKind::Notice`** (`rustrade-execution`,
   part of #552).
   - An `AccountNotice` carries what the venue reported (`NoticeKind`: `MarginCall`,
@@ -190,6 +208,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `spotMeta`, so `rustrade-data`'s `HyperliquidMeta` now gives a perpetual's order precision
   without an execution client. A `meta` deserialized into `Perps` must now carry `szDecimals`,
   which Hyperliquid sends for every perpetual.
+- **Binance margin: read the interest charged and the forced liquidations** (`rustrade-execution`,
+  #560, #565).
+  - `BinanceMargin::fetch_margin_interest(start, end)` reads Binance's interest history and
+    returns each charge as a `CashFlow` of `MarginInterest`: a negative amount, the rate and
+    principal, and Binance's transaction id as the flow's id. Binance adds interest to the loan
+    rather than taking it from the free balance, so a flow is the cost charged, not a balance that
+    moved. An isolated client reads each configured pair and attributes its charges to it.
+    Binance serves 90 days of history: an earlier `start` is moved up, and logged at WARN when
+    it is more than a minute earlier.
+  - The engine adds interest to a position's carry only when it is in the instrument's quote
+    asset. Interest on a short's borrowed base asset is left out until the caller converts it.
+  - `BinanceMargin::fetch_forced_liquidations(start, end)` reads the orders Binance placed to
+    liquidate the account, as `MarginForcedLiquidation`s: order id, pair, side, price, quantity,
+    filled quantity, average price and time. Binance marks no liquidation on the account stream,
+    so a caller can match these order ids against its fills, though Binance does not document
+    that they match.
+  - Neither is streamed: the caller decides when to read, and drops what it has already read.
 - **Alpaca: read interest, fees and pass-through charges and rebates as `CashFlow`s**
   (`rustrade-execution`, #559).
   - `AlpacaClient::fetch_cash_flows(start, end)` reads the account's `INT`, `FEE`, `PTC` and `PTR`
@@ -212,6 +247,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: trailing stops take an activation price, and Binance's fixed-limit trailing stop has
+  an `OrderKind`** (`rustrade-execution`, #539, #540).
+  - **Breaking:** `OrderKind::TrailingStop` gains `activation_price: Option<Decimal>`: the price
+    the market must reach before the stop starts trailing, or `None` to trail from the next trade,
+    as before. Code that builds one, or matches it without `..`, needs the field. Which way the
+    market must reach it is the venue's: on Binance spot and margin, a sell starts trailing once
+    the market is at or below it, and a buy once at or above it.
+  - New `OrderKind::TrailingStopFixedLimit { offset, offset_type, activation_price }`: a
+    trailing stop whose limit price is fixed when it is placed, in the request's `price`. Only the
+    trigger trails. It is Binance's `STOP_LOSS_LIMIT` with `trailingDelta`. `TrailingStopLimit`,
+    whose limit follows the stop, is unchanged.
+  - `BinanceSpot` and `BinanceMargin` send an activation price as `stopPrice`, and a
+    `TrailingStopFixedLimit` as `STOP_LOSS_LIMIT` with `trailingDelta`, `price` and a stop-limit's
+    time in force. They refuse unsent, as `OrderError::Rejected`, an activation price that is not
+    positive and a `TrailingStopFixedLimit` without a positive `price`.
+  - Reading orders back (`BinanceSpot` everywhere; `BinanceMargin` on its account stream, as its
+    REST order queries still leave conditional orders out), they now report a trailing
+    `STOP_LOSS`'s activation price, and a trailing `STOP_LOSS_LIMIT` as a
+    `TrailingStopFixedLimit` with its limit price. Both used to be dropped or
+    reported without the price, with a warning. A trailing order whose `stopPrice` does not parse,
+    and a trailing take-profit, are left out with a warning.
+  - `Display` of both trailing kinds shows the activation price, as
+    `TrailingStop(1, Percentage, activation: Some(105))`. JSON stored before the field existed
+    still loads, as `None`; a positional serde format does not.
+  - Alpaca, IBKR and Hyperliquid have neither order. They reject an activation price and
+    `TrailingStopFixedLimit` with `UnsupportedOrderType`, as the simulated venue does any
+    conditional order.
 - **`SimRunner` reaches a simulated venue's deadlines at their own instants** (`rustrade`, part of
   #553).
   - A good-till-date order was retired at the first market event or request to reach its venue
@@ -285,9 +347,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Building the library with full debug info and all features, without incremental compilation
     (how Cargo builds a dependency), peaked at about 7 GB in one `rustc` and now peaks below 2 GB.
     Its debug info shrinks about twentyfold, as does the debug info of a binary that uses many
-    exchanges. The
-    `[profile.dev.package.rustrade-data] debug = "line-tables-only"` workaround the README
-    suggested is no longer needed.
+    exchanges. The `[profile.dev.package.rustrade-data] debug = "line-tables-only"` workaround
+    the README suggested is no longer needed.
   - The cost is one allocation per connection attempt and a dynamic call per poll of the stream.
   - `streams::consumer::init_market_stream` now requires `Exchange: Send + Sync + 'static`,
     `Instrument: 'static` and `Kind: Send + Sync + 'static`. A caller that spawns the stream, as
@@ -296,6 +357,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A typed subscription no longer claims spot support for an exchange that serves none**
+  (`rustrade-data`, #598). `exchange_supports_instrument_kind` granted `Spot` to every exchange not
+  denied by name, so a non-spot connector added without an edit there would claim spot. It now
+  grants `Spot` to each exchange whose connector serves a spot market, and denies it to every
+  other, as it does the other kinds. `HyperliquidPerp`, which serves perpetuals only, was granted
+  `Spot` by the old default and is now refused it. So is every `ExchangeId` with no connector.
 - **Breaking: Kraken subscriptions made from base and quote assets work; the connector now speaks
   Kraken's WebSocket v2** (`rustrade-data`). Fixes #588.
   - On Kraken's v1 API, which the connector used, every subscription built from a
@@ -315,8 +382,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     time, side, price and amount.
   - An error Kraken sends once the stream is running, refusing a request, now reaches the
     caller as a stream error quoting Kraken's text, as does a data message the connector refuses,
-    such as one whose items name two symbols. v1 dropped such errors without a trace. One that
-    arrives while the subscriptions are being confirmed is logged at WARN and dropped.
+    such as one whose items name two symbols. v1 dropped such errors without a trace. A data
+    message the connector refuses that arrives while the subscriptions are being confirmed is
+    logged at WARN and dropped.
   - The message types follow v2's shapes. `KrakenTrades` and `KrakenOrderBookL1` are
     `KrakenMessage<KrakenData<_>>` over `KrakenTrade` and `KrakenTicker`, replacing
     `KrakenTradesInner`, `KrakenOrderBookL1Inner` and `KrakenSpread`. `KrakenSubResponse`,

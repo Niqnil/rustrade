@@ -937,6 +937,7 @@ async fn test_trailing_stop_unsupported() {
         kind: OrderKind::TrailingStop {
             offset: dec!(100.0),
             offset_type: rustrade_execution::order::TrailingOffsetType::Absolute,
+            activation_price: None,
         },
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,

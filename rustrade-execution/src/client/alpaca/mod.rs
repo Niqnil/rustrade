@@ -2429,6 +2429,7 @@ impl AlpacaClient {
             OrderKind::TrailingStop {
                 offset,
                 offset_type,
+                ..
             } => match offset_type {
                 TrailingOffsetType::Percentage => (None, Some(offset.to_string()), None),
                 TrailingOffsetType::Absolute => (None, None, Some(offset.to_string())),
@@ -2439,7 +2440,8 @@ impl AlpacaClient {
             | OrderKind::Limit
             | OrderKind::TakeProfit { .. }
             | OrderKind::TakeProfitLimit { .. }
-            | OrderKind::TrailingStopLimit { .. } => (None, None, None),
+            | OrderKind::TrailingStopLimit { .. }
+            | OrderKind::TrailingStopFixedLimit { .. } => (None, None, None),
         };
 
         let body = AlpacaOrderRequest {
@@ -4746,11 +4748,13 @@ fn parse_order_kind(
                 Some(OrderKind::TrailingStop {
                     offset: pct,
                     offset_type: TrailingOffsetType::Percentage,
+                    activation_price: None,
                 })
             } else if let Some(price) = trail_price.and_then(|s| Decimal::from_str(s).ok()) {
                 Some(OrderKind::TrailingStop {
                     offset: price,
                     offset_type: TrailingOffsetType::Absolute,
+                    activation_price: None,
                 })
             } else {
                 trace!("Alpaca: trailing_stop missing trail_percent and trail_price");
@@ -4897,11 +4901,20 @@ fn map_order_kind(kind: OrderKind) -> Option<&'static str> {
         OrderKind::Limit => Some("limit"),
         OrderKind::Stop { .. } => Some("stop"),
         OrderKind::StopLimit { .. } => Some("stop_limit"),
-        OrderKind::TrailingStop { .. } => Some("trailing_stop"),
-        // Alpaca does not support take-profit or trailing stop-limit orders.
+        OrderKind::TrailingStop {
+            activation_price: None,
+            ..
+        } => Some("trailing_stop"),
+        // Alpaca has no take-profit, trailing stop-limit or fixed-limit trailing order, and no
+        // activation price on a trailing stop.
         OrderKind::TakeProfit { .. }
         | OrderKind::TakeProfitLimit { .. }
-        | OrderKind::TrailingStopLimit { .. } => None,
+        | OrderKind::TrailingStop {
+            activation_price: Some(_),
+            ..
+        }
+        | OrderKind::TrailingStopLimit { .. }
+        | OrderKind::TrailingStopFixedLimit { .. } => None,
     }
 }
 
@@ -5339,6 +5352,7 @@ mod tests {
             Some(OrderKind::TrailingStop {
                 offset: Decimal::from_str("5.0").unwrap(),
                 offset_type: TrailingOffsetType::Percentage,
+                activation_price: None,
             })
         );
 
@@ -5348,6 +5362,7 @@ mod tests {
             Some(OrderKind::TrailingStop {
                 offset: Decimal::from_str("2.50").unwrap(),
                 offset_type: TrailingOffsetType::Absolute,
+                activation_price: None,
             })
         );
 
@@ -5378,6 +5393,7 @@ mod tests {
             map_order_kind(OrderKind::TrailingStop {
                 offset: Decimal::from_str("5.0").unwrap(),
                 offset_type: TrailingOffsetType::Percentage,
+                activation_price: None,
             }),
             Some("trailing_stop")
         );
@@ -5385,8 +5401,26 @@ mod tests {
             map_order_kind(OrderKind::TrailingStop {
                 offset: Decimal::from_str("2.50").unwrap(),
                 offset_type: TrailingOffsetType::Absolute,
+                activation_price: None,
             }),
             Some("trailing_stop")
+        );
+        // Alpaca has no activation price, and no fixed-limit trailing stop
+        assert_eq!(
+            map_order_kind(OrderKind::TrailingStop {
+                offset: Decimal::from_str("5.0").unwrap(),
+                offset_type: TrailingOffsetType::Percentage,
+                activation_price: Some(Decimal::from(100)),
+            }),
+            None
+        );
+        assert_eq!(
+            map_order_kind(OrderKind::TrailingStopFixedLimit {
+                offset: Decimal::from_str("5.0").unwrap(),
+                offset_type: TrailingOffsetType::Percentage,
+                activation_price: None,
+            }),
+            None
         );
         // TrailingStopLimit is not supported by Alpaca
         assert_eq!(

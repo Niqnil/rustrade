@@ -29,6 +29,9 @@ use std::fmt::{Display, Formatter};
 /// - Alpaca: margin interest, fees and pass-through charges and rebates, read on request by
 ///   `AlpacaClient::fetch_cash_flows` rather than streamed, with Alpaca's activity id. The caller
 ///   drops what it has already read.
+/// - Binance margin: interest, as [`CashFlowKind::MarginInterest`], read on request by
+///   `BinanceMargin::fetch_margin_interest` rather than streamed, with Binance's transaction id.
+///   The caller drops what it has already read.
 /// - The simulated venue: whatever its configured
 ///   [`HoldingCostModel`](crate::holding_cost::HoldingCostModel)s charge, each flow once, with an
 ///   id from its own sequence.

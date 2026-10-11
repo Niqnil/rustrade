@@ -405,6 +405,7 @@ fn trade_with_fees(
         )),
         fees,
         origin,
+        position_side: None,
     }
 }
 
@@ -593,6 +594,7 @@ mod tests {
             order_filled_quantity: Some(Decimal::ONE),
             fees: AssetFees::new(AssetNameExchange::from("USD"), Decimal::ZERO, None),
             origin: TradeOrigin::Order,
+            position_side: None,
         }
     }
 

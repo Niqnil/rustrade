@@ -946,6 +946,7 @@ async fn test_place_and_cancel_trailing_stop_order() {
         kind: OrderKind::TrailingStop {
             offset: dec!(5.0),
             offset_type: TrailingOffsetType::Percentage,
+            activation_price: None,
         },
         time_in_force: TimeInForce::GoodUntilEndOfDay,
         position_id: None,
