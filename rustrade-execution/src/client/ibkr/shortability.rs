@@ -27,7 +27,9 @@ use tracing::{debug, warn};
 pub const DEFAULT_SHORTABILITY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// IB's error code for a request that would exceed the account's market data lines ("Max number
-/// of tickers has been reached").
+/// of tickers has been reached"). The lines are a cap on concurrent subscriptions, shared by every
+/// TWS session and API client on the account, and one frees only when a subscription is
+/// cancelled: this is not IB's rate limit, which is code 100.
 const MAX_TICKERS_CODE: i32 = 101;
 
 impl ShortabilityClient for IbkrClient {
@@ -58,7 +60,9 @@ impl ShortabilityClient for IbkrClient {
     /// - [`ConnectivityError::Timeout`] if neither tick arrives in time, or
     ///   [`ApiError::RequestRejected`] when IB sent a notice instead, such as one saying the
     ///   account lacks a market data subscription. The message carries IB's notices.
-    /// - [`ApiError::RateLimit`] if the account has no market data line free.
+    /// - [`ApiError::CapacityExceeded`] if every one of the account's market data lines is in use,
+    ///   by this client, another API client or TWS. Waiting does not free one; cancelling a
+    ///   subscription does.
     /// - [`ApiError::RequestRejected`] if IB refuses the request, with IB's code and message.
     /// - [`ConnectivityError::Socket`] if the connection to TWS/Gateway drops.
     async fn fetch_shortability(
@@ -108,9 +112,11 @@ fn instrument_invalid(instrument: &InstrumentNameExchange, reason: &str) -> Unin
 /// What an `ibapi` error answering the shortability request means for the caller.
 fn request_error(instrument: &InstrumentNameExchange, e: ibapi::Error) -> UnindexedClientError {
     match e {
-        // Market data lines are an account quota, freed as other requests end.
         ibapi::Error::Notice(notice) if notice.code == MAX_TICKERS_CODE => {
-            UnindexedClientError::Api(ApiError::rate_limited(None))
+            UnindexedClientError::Api(ApiError::CapacityExceeded(format!(
+                "{instrument}: {} {}",
+                notice.code, notice.message
+            )))
         }
         ibapi::Error::Notice(notice) => UnindexedClientError::Api(ApiError::RequestRejected(
             format!("{instrument}: {} {}", notice.code, notice.message),
@@ -201,7 +207,8 @@ impl ShortabilityTicks {
 /// connection dropping, which the caller checks.
 ///
 /// # Errors
-/// The error IB or `ibapi` ended the request with.
+/// The error IB or `ibapi` ended the request with, or IB's notice that the account has no market
+/// data line free, after which no tick comes.
 fn read_shortability_ticks(
     timeout: Duration,
     mut next: impl FnMut(Duration) -> Option<Result<SubscriptionItem<TickTypes>, ibapi::Error>>,
@@ -215,6 +222,9 @@ fn read_shortability_ticks(
         }
         match next(remaining) {
             Some(Ok(SubscriptionItem::Data(tick))) => ticks.record(&tick),
+            Some(Ok(SubscriptionItem::Notice(notice))) if notice.code == MAX_TICKERS_CODE => {
+                return Err(ibapi::Error::Notice(notice));
+            }
             Some(Ok(SubscriptionItem::Notice(notice))) => {
                 debug!(%notice, "Notice on an IBKR shortability request");
                 ticks.notices.push(notice);
@@ -443,6 +453,24 @@ mod tests {
     }
 
     #[test]
+    fn a_notice_that_no_line_is_free_ends_the_read() {
+        let started = Instant::now();
+        let error = read_shortability_ticks(
+            Duration::from_secs(5),
+            subscription(vec![Ok(SubscriptionItem::Notice(notice(
+                101,
+                "Max number of tickers has been reached",
+            )))]),
+        )
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5), "waited it out");
+        assert!(matches!(
+            request_error(&instrument(), error),
+            UnindexedClientError::Api(ApiError::CapacityExceeded(_))
+        ));
+    }
+
+    #[test]
     fn nothing_after_a_drop_is_a_socket_error() {
         let error = ShortabilityTicks::default()
             .into_shortability(&instrument(), Duration::from_millis(40), false)
@@ -471,15 +499,18 @@ mod tests {
     }
 
     #[test]
-    fn no_free_market_data_line_is_a_rate_limit() {
+    fn no_free_market_data_line_is_capacity_exceeded_not_a_rate_limit() {
         let error = request_error(
             &instrument(),
             ibapi::Error::Notice(notice(101, "Max number of tickers has been reached")),
         );
-        assert!(matches!(
+        assert_eq!(
             error,
-            UnindexedClientError::Api(ApiError::rate_limited(None))
-        ));
+            UnindexedClientError::Api(ApiError::CapacityExceeded(
+                "AAPL: 101 Max number of tickers has been reached".to_owned()
+            ))
+        );
+        assert!(!error.is_transient());
     }
 
     #[test]

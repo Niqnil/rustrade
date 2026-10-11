@@ -213,8 +213,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `with_shortability_timeout`, or `shortability_timeout_ms` in a config file), and returns what
     arrived. Nothing arriving is an error: `ConnectivityError::Timeout`, or
     `ApiError::RequestRejected` carrying IB's notices, such as one saying the account lacks the
-    stock's market data subscription. A contract that is not a stock, or not registered, is
-    `ApiError::InstrumentInvalid`.
+    stock's market data subscription. With every market data line in use, by this client,
+    another API client or TWS, it is the new `ApiError::CapacityExceeded`. A contract that is not a
+    stock, or not registered, is `ApiError::InstrumentInvalid`.
+  - `ApiError::CapacityExceeded(String)`: the venue refused because a cap on something held at
+    once is full, such as IB's market data lines. Waiting does not clear it, releasing something
+    does, so unlike `RateLimit` it is not transient.
   - An option, and a symbol the venue does not know, is `ApiError::InstrumentInvalid`.
   - `Shortability::fee_rate` now states its convention: simple, on the venue's own year basis.
 - **`PerpCoin::sz_decimals`: a Hyperliquid perpetual's size precision** (`rustrade-instrument`,

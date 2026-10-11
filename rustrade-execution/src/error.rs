@@ -248,6 +248,18 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     #[non_exhaustive]
     RateLimit { retry_after: Option<Duration> },
 
+    /// The venue refused because a cap on something held at once is full, such as IBKR's market
+    /// data lines, which every TWS session and API client on the account shares.
+    ///
+    /// Unlike [`RateLimit`](Self::RateLimit), waiting does not clear it: releasing something
+    /// does, such as cancelling another subscription, whether this client holds it or another
+    /// session on the same account does. The message carries the venue's words.
+    ///
+    /// Not transient: the same request retried with backoff alone meets the same refusal while
+    /// the cap stays full.
+    #[error("venue capacity exceeded: {0}")]
+    CapacityExceeded(String),
+
     /// Authentication failed (invalid credentials, expired key, bad signature).
     ///
     /// Unlike other API errors which affect a single request, authentication

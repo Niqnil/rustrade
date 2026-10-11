@@ -449,6 +449,7 @@ impl AccountEventIndexer {
     ) -> ApiError {
         match error {
             UnindexedApiError::RateLimit { retry_after } => ApiError::rate_limited(retry_after),
+            UnindexedApiError::CapacityExceeded(msg) => ApiError::CapacityExceeded(msg),
             UnindexedApiError::Unauthenticated(msg) => ApiError::Unauthenticated(msg),
             UnindexedApiError::AssetInvalid(asset, value) => {
                 match self.map.find_asset_index(&asset) {
