@@ -16,9 +16,10 @@
 //! implements [`OrderStatusClient`], looking orders up by client order id. Two reads beyond the
 //! trait cover what the account stream does not carry: the interest charged
 //! ([`BinanceMargin::fetch_margin_interest`]) and forced liquidations
-//! ([`BinanceMargin::fetch_forced_liquidations`]). Both
-//! **cross** (`isIsolated = "FALSE"`, account-wide collateral) and **isolated** (`isIsolated =
-//! "TRUE"`, per-pair sub-accounts) margin are supported, selected by
+//! ([`BinanceMargin::fetch_forced_liquidations`]).
+//!
+//! The client supports both **cross** (`isIsolated = "FALSE"`, account-wide collateral) and
+//! **isolated** (`isIsolated = "TRUE"`, per-pair sub-accounts) margin, selected by
 //! [`BinanceMarginConfig::is_isolated`].
 //!
 //! ## Cross vs. isolated

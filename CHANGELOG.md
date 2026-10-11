@@ -199,8 +199,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     moved. An isolated client reads each configured pair and attributes its charges to it.
     Binance serves 90 days of history: an earlier `start` is moved up, and logged at WARN.
   - The engine adds interest to a position's carry only when it is in the instrument's quote
-    asset. Interest on a short's borrowed base asset, or interest Binance converted into BNB, is
-    left out until the caller converts it.
+    asset. Interest on a short's borrowed base asset is left out until the caller converts it.
   - `BinanceMargin::fetch_forced_liquidations(start, end)` reads the orders Binance placed to
     liquidate the account, as `MarginForcedLiquidation`s: order id, pair, side, price, quantity,
     filled quantity, average price and time. Binance marks no liquidation on the account stream,

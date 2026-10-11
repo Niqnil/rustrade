@@ -90,24 +90,25 @@ impl BinanceMargin {
     /// [`time_exchange`](CashFlow::time_exchange), not a balance that moved then: the account's
     /// balance shows it as interest owed on the asset.
     ///
-    /// - [`asset`](CashFlow::asset) is the asset the interest was charged in. That is the asset
-    ///   borrowed, unless Binance converted the charge into BNB, as it does for an account that
-    ///   pays interest in BNB. Then it is BNB, while
-    ///   [`principal`](CashFlowKind::MarginInterest::principal) is still the loan, in the asset
-    ///   borrowed.
+    /// - [`asset`](CashFlow::asset) is the asset Binance's record names the charge in: the asset
+    ///   borrowed. For a charge Binance converted into BNB, as it does for an account that pays
+    ///   interest in BNB, its record also names the asset borrowed separately, and Binance does not
+    ///   document which of the two is BNB. Check a converted record before relying on its asset.
+    /// - [`principal`](CashFlowKind::MarginInterest::principal) is the loan the charge was on.
     /// - [`rate`](CashFlowKind::MarginInterest::rate) is the rate charged for the period, hourly
     ///   for an hourly charge, as Binance quotes it.
     /// - [`id`](CashFlow::id) is Binance's transaction id for the charge.
     ///
     /// The engine adds a flow attributed to an instrument to the carry of its open position only
     /// when the flow is in the instrument's quote asset. Interest on a short's borrowed base asset,
-    /// or interest paid in BNB, is not: the engine leaves it out of carry and says so. To count it,
-    /// convert it into the quote asset first.
+    /// or in BNB, is not: the engine leaves it out of carry and says so. To count it, convert it
+    /// into the quote asset first.
     ///
     /// # Delivery
     /// Nothing is pushed: the caller decides when to read, and must drop the charges it has
     /// already counted, by [`id`](CashFlow::id), before applying a read's flows. Within one read
-    /// each charge appears once.
+    /// each charge appears once: a charge read twice, as one stamped on a window's boundary is, is
+    /// kept the first time its id is seen, or, without an id, once per identical record.
     ///
     /// # Span
     /// - Binance serves interest charged in the last 90 days only. A `start` before that is moved
@@ -120,6 +121,10 @@ impl BinanceMargin {
     ///
     /// # Errors
     /// Fails if any request fails. Nothing is returned from a read that failed part way.
+    ///
+    /// A record without an asset, an amount or a time that parses is left out of a read that
+    /// succeeds, and logged at WARN. A rate or principal that does not parse is left `None`, and
+    /// logged at WARN.
     pub async fn fetch_margin_interest(
         &self,
         start: DateTime<Utc>,
@@ -159,7 +164,7 @@ impl BinanceMargin {
             .filter(|flow| (start..=end).contains(&flow.time_exchange))
             // Consecutive windows share their boundary, and a page can repeat a row when a new
             // charge lands mid-walk and shifts the pages after it.
-            .filter(|flow| seen.insert(flow.clone()))
+            .filter(|flow| seen.insert(ChargeKey::of(flow)))
             .collect();
         flows.sort_by_key(|flow| flow.time_exchange);
         Ok(flows)
@@ -183,8 +188,15 @@ impl BinanceMargin {
     /// costs a request weight of 1 per page and, on an isolated client, as much again for each
     /// pair.
     ///
+    /// A record Binance marks as of the other kind of account, isolated on a cross client or cross
+    /// on an isolated one, is left out, and logged at DEBUG.
+    ///
     /// # Errors
     /// Fails if any request fails. Nothing is returned from a read that failed part way.
+    ///
+    /// A record without an order id, a pair, a side, a filled quantity or a time that parses is
+    /// left out of a read that succeeds, and logged at WARN. A price or quantity that does not
+    /// parse is left `None`, and logged at WARN.
     pub async fn fetch_forced_liquidations(
         &self,
         start: DateTime<Utc>,
@@ -196,6 +208,7 @@ impl BinanceMargin {
         }
         let (start_ms, end_ms) = (start.timestamp_millis(), end.timestamp_millis());
 
+        let is_isolated = self.config.is_isolated;
         let rows = self
             .read_each_account(|pair| {
                 read_all_pages(move |current| {
@@ -208,7 +221,7 @@ impl BinanceMargin {
         let mut liquidations: Vec<_> = rows
             .into_iter()
             .flat_map(|(_, rows)| rows)
-            .filter_map(convert_forced_liquidation)
+            .filter_map(|row| convert_forced_liquidation(row, is_isolated))
             .filter(|liquidation| (start..=end).contains(&liquidation.time_exchange))
             // A page can repeat a row when a new record lands mid-walk and shifts the pages after
             // it. Pages run newest first, so the copy kept is the latest.
@@ -288,7 +301,7 @@ impl BinanceMargin {
         start_ms: i64,
         end_ms: i64,
         current: i64,
-    ) -> Result<Vec<GetInterestHistoryResponseRowsInner>, UnindexedClientError> {
+    ) -> Result<Page<GetInterestHistoryResponseRowsInner>, UnindexedClientError> {
         let symbol = pair.as_ref().map(|pair| pair.name().to_string());
         let response =
             rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
@@ -307,7 +320,10 @@ impl BinanceMargin {
             .await
             .map_err(|e| classify_rest_query_error(&e, pair.as_ref()))?;
         let page = response.data().await.map_err(response_decode_error)?;
-        Ok(page.rows.unwrap_or_default())
+        Ok(Page {
+            rows: page.rows.unwrap_or_default(),
+            total: page.total,
+        })
     }
 
     /// One page of `forceLiquidationRec`.
@@ -317,7 +333,7 @@ impl BinanceMargin {
         start_ms: i64,
         end_ms: i64,
         current: i64,
-    ) -> Result<Vec<GetForceLiquidationRecordResponseRowsInner>, UnindexedClientError> {
+    ) -> Result<Page<GetForceLiquidationRecordResponseRowsInner>, UnindexedClientError> {
         let symbol = pair.as_ref().map(|pair| pair.name().to_string());
         let response =
             rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
@@ -336,29 +352,77 @@ impl BinanceMargin {
             .await
             .map_err(|e| classify_rest_query_error(&e, pair.as_ref()))?;
         let page = response.data().await.map_err(response_decode_error)?;
-        Ok(page.rows.unwrap_or_default())
+        Ok(Page {
+            rows: page.rows.unwrap_or_default(),
+            total: page.total,
+        })
     }
 }
 
+/// One page of a paged history query.
+struct Page<Row> {
+    rows: Vec<Row>,
+    /// How many rows the whole query holds, as Binance counts them.
+    total: Option<i64>,
+}
+
 /// Read pages `1, 2, …` of a paged history query of [`PAGE_SIZE`] rows each, up to the first
-/// short page.
+/// short page, or the page that brings the rows read to the query's total.
 async fn read_all_pages<Row, Fut>(
     mut page: impl FnMut(i64) -> Fut,
 ) -> Result<Vec<Row>, UnindexedClientError>
 where
-    Fut: Future<Output = Result<Vec<Row>, UnindexedClientError>>,
+    Fut: Future<Output = Result<Page<Row>, UnindexedClientError>>,
 {
+    let as_count = |len: usize| i64::try_from(len).unwrap_or(i64::MAX);
     let mut rows = Vec::new();
     let mut current = 1;
     loop {
-        let batch = page(current).await?;
-        let full = i64::try_from(batch.len()).is_ok_and(|len| len >= PAGE_SIZE);
+        let Page { rows: batch, total } = page(current).await?;
+        let full = as_count(batch.len()) >= PAGE_SIZE;
         rows.extend(batch);
-        if !full {
+        // The total also ends a walk that would otherwise go on forever, were Binance to ignore
+        // the page asked for and serve the same full page each time.
+        let all_read = total.is_some_and(|total| as_count(rows.len()) >= total);
+        if !full || all_read {
             return Ok(rows);
         }
         current += 1;
     }
+}
+
+/// What tells two interest charges in one read apart: Binance's transaction id, on the pair the
+/// charge was read for, or, for a record without one, the whole flow.
+#[derive(PartialEq, Eq, Hash)]
+enum ChargeKey {
+    Id(Option<InstrumentNameExchange>, CashFlowId),
+    Flow(CashFlow<AssetNameExchange, InstrumentNameExchange>),
+}
+
+impl ChargeKey {
+    fn of(flow: &CashFlow<AssetNameExchange, InstrumentNameExchange>) -> Self {
+        match &flow.id {
+            Some(id) => Self::Id(flow.instrument.clone(), id.clone()),
+            None => Self::Flow(flow.clone()),
+        }
+    }
+}
+
+/// An optional decimal field of a `record`: `None` when absent, or, logged at WARN, when it does
+/// not parse.
+fn optional_decimal(record: &str, field: &str, value: Option<&str>) -> Option<Decimal> {
+    let value = value?;
+    Decimal::from_str(value)
+        .inspect_err(|error| {
+            warn!(
+                record,
+                field,
+                value,
+                %error,
+                "BinanceMargin record field does not parse — left out"
+            );
+        })
+        .ok()
 }
 
 /// One `interestHistory` row as a [`CashFlow`], or `None`, with a warning, if it lacks what a flow
@@ -399,7 +463,6 @@ fn convert_interest(
         );
         return None;
     };
-    let parse = |field: Option<&str>| field.and_then(|s| Decimal::from_str(s).ok());
     let instrument = row
         .isolated_symbol
         .as_deref()
@@ -407,8 +470,8 @@ fn convert_interest(
         .or_else(|| pair.cloned());
     Some(CashFlow::new(
         CashFlowKind::MarginInterest {
-            rate: parse(row.interest_rate.as_deref()),
-            principal: parse(row.principal.as_deref()),
+            rate: optional_decimal("interest", "interestRate", row.interest_rate.as_deref()),
+            principal: optional_decimal("interest", "principal", row.principal.as_deref()),
         },
         AssetNameExchange::new(asset),
         -interest,
@@ -419,9 +482,11 @@ fn convert_interest(
 }
 
 /// One `forceLiquidationRec` row as a [`MarginForcedLiquidation`], or `None`, with a warning, if
-/// it lacks what one needs.
+/// it lacks what one needs. `None` too, logged at DEBUG, when the row is marked as of the other
+/// kind of account than the client's (`is_isolated`).
 fn convert_forced_liquidation(
     row: GetForceLiquidationRecordResponseRowsInner,
+    is_isolated: bool,
 ) -> Option<MarginForcedLiquidation> {
     let Some(order_id) = row.order_id else {
         warn!(symbol = ?row.symbol, "BinanceMargin forced liquidation record missing orderId — skipped");
@@ -434,6 +499,18 @@ fn convert_forced_liquidation(
         );
         return None;
     };
+    if row
+        .is_isolated
+        .is_some_and(|row_isolated| row_isolated != is_isolated)
+    {
+        debug!(
+            order_id,
+            symbol,
+            is_isolated = row.is_isolated,
+            "BinanceMargin forced liquidation record of the other kind of margin account — left out"
+        );
+        return None;
+    }
     let Some(side) = row.side.as_deref().and_then(parse_side) else {
         warn!(
             order_id,
@@ -441,8 +518,11 @@ fn convert_forced_liquidation(
         );
         return None;
     };
-    let parse = |field: Option<&str>| field.and_then(|s| Decimal::from_str(s).ok());
-    let Some(filled_quantity) = parse(row.executed_qty.as_deref()) else {
+    let Some(filled_quantity) = row
+        .executed_qty
+        .as_deref()
+        .and_then(|s| Decimal::from_str(s).ok())
+    else {
         warn!(
             order_id,
             symbol,
@@ -465,9 +545,10 @@ fn convert_forced_liquidation(
         order_id: OrderId(format_smolstr!("{order_id}")),
         instrument: InstrumentNameExchange::new(symbol),
         side,
-        price: parse(row.price.as_deref()),
-        quantity: parse(row.qty.as_deref()),
-        avg_price: parse(row.avg_price.as_deref()).filter(|_| !filled_quantity.is_zero()),
+        price: optional_decimal("forced liquidation", "price", row.price.as_deref()),
+        quantity: optional_decimal("forced liquidation", "qty", row.qty.as_deref()),
+        avg_price: optional_decimal("forced liquidation", "avgPrice", row.avg_price.as_deref())
+            .filter(|_| !filled_quantity.is_zero()),
         filled_quantity,
         time_exchange,
     })
@@ -501,22 +582,44 @@ mod tests {
         row
     }
 
-    fn liquidation_row(order_id: i64, side: &str, filled: &str, time: DateTime<Utc>) -> Value {
+    fn liquidation_row(
+        order_id: i64,
+        side: &str,
+        filled: &str,
+        time: DateTime<Utc>,
+        is_isolated: bool,
+    ) -> Value {
         json!({
             "avgPrice": "60000", "executedQty": filled, "orderId": order_id, "price": "59000",
             "qty": "0.5", "side": side, "symbol": "BTCUSDT", "timeInForce": "GTC",
-            "isIsolated": false, "updatedTime": time.timestamp_millis(),
+            "isIsolated": is_isolated, "updatedTime": time.timestamp_millis(),
         })
     }
 
+    /// A page holding `rows`, of a query holding `total` rows in all.
+    fn page_of(rows: Vec<Value>, total: usize) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(json!({ "rows": rows, "total": total }))
+    }
+
+    /// The only page of a query.
     fn page(rows: Vec<Value>) -> ResponseTemplate {
         let total = rows.len();
-        ResponseTemplate::new(200).set_body_json(json!({ "rows": rows, "total": total }))
+        page_of(rows, total)
     }
 
     async fn mount(server: &MockServer, at: &str, response: ResponseTemplate) {
         Mock::given(method("GET"))
             .and(path(at))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+
+    /// Answer page `current` of the query at `at` with `response`.
+    async fn mount_page(server: &MockServer, at: &str, current: &str, response: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path(at))
+            .and(query_param("current", current))
             .respond_with(response)
             .mount(server)
             .await;
@@ -541,19 +644,28 @@ mod tests {
     async fn interest_is_read_window_by_window_as_negative_flows_oldest_first_once_each() {
         let server = MockServer::start().await;
         let now = Utc::now();
-        // Every window answers with the same rows, one of them outside the span.
+        let start = now - TimeDelta::days(40);
+        let boundary = start + TimeDelta::milliseconds(INTEREST_WINDOW_MS);
+        let mut no_interest = interest_row(9, now - TimeDelta::days(2), None);
+        no_interest.as_object_mut().unwrap().remove("interest");
+        let mut bad_rate = interest_row(3, now - TimeDelta::days(3), None);
+        bad_rate["interestRate"] = json!("n/a");
+        // Every window answers with the same rows: one stamped on the windows' boundary, one
+        // outside the span, and one that cannot be a flow.
         mount(
             &server,
             INTEREST_PATH,
             page(vec![
                 interest_row(2, now - TimeDelta::days(1), None),
+                no_interest,
+                bad_rate,
+                interest_row(4, boundary, None),
                 interest_row(1, now - TimeDelta::days(35), None),
                 interest_row(0, now - TimeDelta::days(50), None),
             ]),
         )
         .await;
         let client = margin_client_at(&server, false);
-        let start = now - TimeDelta::days(40);
 
         let flows = client
             .fetch_margin_interest(start, now + TimeDelta::days(5))
@@ -561,7 +673,7 @@ mod tests {
             .unwrap();
 
         let ids: Vec<_> = flows.iter().map(|flow| flow.id.clone().unwrap()).collect();
-        assert_eq!(ids, [CashFlowId::new("1"), CashFlowId::new("2")]);
+        assert_eq!(ids, ["1", "4", "3", "2"].map(CashFlowId::new));
         let flow = &flows[0];
         assert_eq!(flow.amount, dec!(-0.0125), "a charge is paid");
         assert_eq!(flow.asset, AssetNameExchange::new("USDT"));
@@ -573,17 +685,22 @@ mod tests {
                 principal: Some(dec!(1000)),
             }
         );
+        assert_eq!(
+            flows[2].kind,
+            CashFlowKind::MarginInterest {
+                rate: None,
+                principal: Some(dec!(1000)),
+            },
+            "a rate that does not parse is left out, not the charge"
+        );
 
         let queries = queries(&server).await;
         let [first, second] = queries.as_slice() else {
             panic!("two windows: {queries:?}");
         };
         assert_eq!(millis(first, "startTime"), start.timestamp_millis());
-        assert_eq!(
-            millis(first, "endTime") - millis(first, "startTime"),
-            INTEREST_WINDOW_MS
-        );
-        assert_eq!(millis(second, "startTime"), millis(first, "endTime"));
+        assert_eq!(millis(first, "endTime"), boundary.timestamp_millis());
+        assert_eq!(millis(second, "startTime"), boundary.timestamp_millis());
         assert!(
             millis(second, "endTime") <= Utc::now().timestamp_millis(),
             "read up to the local clock, not `end`"
@@ -596,19 +713,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_interest_page_reads_the_next() {
+    async fn a_charge_repeated_with_its_id_is_kept_once() {
+        let server = MockServer::start().await;
+        let now = Utc::now();
+        let mut corrected = interest_row(1, now - TimeDelta::hours(1), None);
+        corrected["interest"] = json!("0.02");
+        mount(
+            &server,
+            INTEREST_PATH,
+            page(vec![
+                corrected,
+                interest_row(1, now - TimeDelta::hours(1), None),
+            ]),
+        )
+        .await;
+        let client = margin_client_at(&server, false);
+
+        let flows = client
+            .fetch_margin_interest(now - TimeDelta::days(1), now)
+            .await
+            .unwrap();
+
+        let [flow] = flows.as_slice() else {
+            panic!("one charge: {flows:?}");
+        };
+        assert_eq!(flow.amount, dec!(-0.02), "the first copy read is kept");
+    }
+
+    #[tokio::test]
+    async fn a_span_of_one_instant_is_read_in_one_request() {
+        let server = MockServer::start().await;
+        // In whole milliseconds, as Binance stamps a charge, so the charge is inside the span.
+        let at =
+            DateTime::from_timestamp_millis((Utc::now() - TimeDelta::hours(1)).timestamp_millis())
+                .unwrap();
+        mount(
+            &server,
+            INTEREST_PATH,
+            page(vec![interest_row(1, at, None)]),
+        )
+        .await;
+        let client = margin_client_at(&server, false);
+
+        let flows = client.fetch_margin_interest(at, at).await.unwrap();
+
+        assert_eq!(flows.len(), 1);
+        let queries = queries(&server).await;
+        let [query] = queries.as_slice() else {
+            panic!("one request: {queries:?}");
+        };
+        assert_eq!(millis(query, "startTime"), at.timestamp_millis());
+        assert_eq!(millis(query, "endTime"), at.timestamp_millis());
+    }
+
+    #[tokio::test]
+    async fn a_full_page_reads_the_next_until_the_total_is_read() {
         let server = MockServer::start().await;
         let now = Utc::now();
         let time = now - TimeDelta::hours(1);
-        let full = (0..100).map(|id| interest_row(id, time, None)).collect();
-        for (current, rows) in [("1", full), ("2", vec![interest_row(100, time, None)])] {
-            Mock::given(method("GET"))
-                .and(path(INTEREST_PATH))
-                .and(query_param("current", current))
-                .respond_with(page(rows))
-                .mount(&server)
-                .await;
-        }
+        let full: Vec<_> = (0..100).map(|id| interest_row(id, time, None)).collect();
+        mount_page(&server, INTEREST_PATH, "1", page_of(full.clone(), 101)).await;
+        mount_page(
+            &server,
+            INTEREST_PATH,
+            "2",
+            page_of(vec![interest_row(100, time, None)], 101),
+        )
+        .await;
         let client = margin_client_at(&server, false);
 
         let flows = client
@@ -618,6 +789,19 @@ mod tests {
 
         assert_eq!(flows.len(), 101);
         assert_eq!(queries(&server).await.len(), 2);
+
+        // A full page holding the whole total is the last, even were Binance to serve it again.
+        let server = MockServer::start().await;
+        mount(&server, INTEREST_PATH, page_of(full, 100)).await;
+        let client = margin_client_at(&server, false);
+
+        let flows = client
+            .fetch_margin_interest(now - TimeDelta::days(1), now)
+            .await
+            .unwrap();
+
+        assert_eq!(flows.len(), 100);
+        assert_eq!(queries(&server).await.len(), 1);
     }
 
     #[tokio::test]
@@ -664,16 +848,16 @@ mod tests {
             .fetch_margin_interest(before - TimeDelta::days(200), before)
             .await
             .unwrap();
+        let after = Utc::now();
 
         assert!(flows.is_empty());
         let queries = queries(&server).await;
         let first = millis(&queries[0], "startTime");
+        let horizon = |now: DateTime<Utc>| {
+            (now - INTEREST_LOOKBACK + INTEREST_LOOKBACK_MARGIN).timestamp_millis()
+        };
         assert!(
-            first >= (before - INTEREST_LOOKBACK).timestamp_millis(),
-            "{first}"
-        );
-        assert!(
-            first <= (Utc::now() - TimeDelta::days(89)).timestamp_millis(),
+            (horizon(before)..=horizon(after)).contains(&first),
             "{first}"
         );
         assert_eq!(queries.len(), 4, "90 days in windows of 29");
@@ -732,21 +916,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forced_liquidations_are_read_oldest_first_once_each() {
+    async fn forced_liquidations_of_the_clients_account_are_read_oldest_first_once_each() {
         for is_isolated in [false, true] {
             let server = MockServer::start().await;
             let now = Utc::now();
-            let mut no_order_id = liquidation_row(9, "SELL", "0.5", now);
+            let row = |order_id, side, filled, time| {
+                liquidation_row(order_id, side, filled, time, is_isolated)
+            };
+            let mut no_order_id = row(9, "SELL", "0.5", now);
             no_order_id.as_object_mut().unwrap().remove("orderId");
             mount(
                 &server,
                 LIQUIDATION_PATH,
                 page(vec![
-                    liquidation_row(2, "SELL", "0.5", now - TimeDelta::hours(1)),
-                    liquidation_row(2, "SELL", "0.5", now - TimeDelta::hours(1)),
+                    row(2, "SELL", "0.5", now - TimeDelta::hours(1)),
+                    row(2, "SELL", "0.5", now - TimeDelta::hours(1)),
                     no_order_id,
-                    liquidation_row(1, "BUY", "0", now - TimeDelta::hours(2)),
-                    liquidation_row(0, "BUY", "0.5", now - TimeDelta::days(3)),
+                    liquidation_row(8, "SELL", "0.5", now, !is_isolated),
+                    row(1, "BUY", "0", now - TimeDelta::hours(2)),
+                    row(0, "BUY", "0.5", now - TimeDelta::days(3)),
                 ]),
             )
             .await;
@@ -789,5 +977,32 @@ mod tests {
                 is_isolated.then_some("BTCUSDT"),
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_full_page_of_forced_liquidations_reads_the_next() {
+        let server = MockServer::start().await;
+        let now = Utc::now();
+        let time = now - TimeDelta::hours(1);
+        let full = (0..100)
+            .map(|id| liquidation_row(id, "SELL", "0.5", time, false))
+            .collect();
+        mount_page(&server, LIQUIDATION_PATH, "1", page_of(full, 101)).await;
+        mount_page(
+            &server,
+            LIQUIDATION_PATH,
+            "2",
+            page_of(vec![liquidation_row(100, "SELL", "0.5", time, false)], 101),
+        )
+        .await;
+        let client = margin_client_at(&server, false);
+
+        let liquidations = client
+            .fetch_forced_liquidations(now - TimeDelta::days(1), now)
+            .await
+            .unwrap();
+
+        assert_eq!(liquidations.len(), 101);
+        assert_eq!(queries(&server).await.len(), 2);
     }
 }
