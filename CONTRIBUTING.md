@@ -20,12 +20,13 @@ unaffected — the flag is scoped to the Linux GNU target.
 
 That same target also sets `-C split-debuginfo=unpacked`, which writes DWARF to `.dwo`
 sidecar files next to the object files instead of into the linked binary. Debug builds
-here are dominated by `.debug_str` — monomorphised type names — and the examples that
-instantiate the stream machinery across every exchange come within a few percent of the
-4 GiB ceiling on a 32-bit relocation, with one crossing it and failing to link. Splitting
-the debug info leaves well under one percent of that behind. The visible cost is a
-`target/` directory holding thousands of `.dwo` files; `cargo clean` clears them with
-everything else.
+here are dominated by `.debug_str` — monomorphised type names. The examples that
+instantiate the stream machinery across every exchange once came within a few percent of
+the 4 GiB ceiling on a 32-bit relocation, and one crossed it and failed to link. Since the
+market stream's reconnect chain was type-erased they carry about a twentieth of that.
+Splitting the debug info keeps the binaries smaller and that ceiling out of reach. The
+visible cost is a `target/` directory holding thousands of `.dwo` files; `cargo clean`
+clears them with everything else.
 
 ## Branching Strategy
 

@@ -14,7 +14,7 @@ use crate::{
     subscription::{Subscription, SubscriptionKind, display_subscriptions_without_exchange},
 };
 use derive_more::Constructor;
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, stream::BoxStream};
 use rustrade_instrument::exchange::ExchangeId;
 use serde::{Deserialize, Serialize};
 use std::fmt::Display;
@@ -62,9 +62,9 @@ pub async fn init_market_stream<Exchange, Instrument, Kind>(
     subscriptions: Vec<Subscription<Exchange, Instrument, Kind>>,
 ) -> Result<impl Stream<Item = MarketStreamResult<Instrument::Key, Kind::Event>>, DataError>
 where
-    Exchange: StreamSelector<Instrument, Kind>,
-    Instrument: InstrumentData + Display,
-    Kind: SubscriptionKind + Display,
+    Exchange: StreamSelector<Instrument, Kind> + Send + Sync + 'static,
+    Instrument: InstrumentData + Display + 'static,
+    Kind: SubscriptionKind + Display + Send + Sync + 'static,
     Subscription<Exchange, Instrument, Kind>:
         Identifier<Exchange::Channel> + Identifier<Exchange::Market>,
 {
@@ -85,15 +85,23 @@ where
         "MarketStream with auto reconnect initialising"
     );
 
-    let attempts =
-        init_reconnecting_stream(move || {
-            let subscriber = subscriber.clone();
-            let subscriptions = subscriptions.clone();
-            async move {
-                Exchange::Stream::init::<Exchange::SnapFetcher>(&subscriber, &subscriptions).await
-            }
-        })
-        .await?;
+    // Both the exchange stream and the stream of attempts are boxed before the reconnect
+    // combinators wrap them. Unboxed, every combinator's type name repeats the whole exchange
+    // stream and init closure types, nested a dozen deep, once per exchange and subscription kind.
+    // Those names are almost all of this crate's debug info: they took a full-debug build of it
+    // to several GB in one rustc. Boxed, the combinators are instantiated once per event type.
+    // The cost is one allocation per connection attempt and a virtual call per poll.
+    let attempts = init_reconnecting_stream(move || {
+        let subscriber = subscriber.clone();
+        let subscriptions = subscriptions.clone();
+        async move {
+            Exchange::Stream::init::<Exchange::SnapFetcher>(&subscriber, &subscriptions)
+                .await
+                .map(StreamExt::boxed)
+        }
+    })
+    .await?
+    .boxed();
 
     Ok(market_stream_events(attempts, policy, stream_key, exchange))
 }
@@ -102,16 +110,12 @@ where
 ///
 /// Each initialised stream's items, ended early by a terminal error, then one `Reconnecting`. A
 /// failed attempt ends no stream, so it yields `ReinitFailed` and no further `Reconnecting`.
-fn market_stream_events<Attempts, St, T>(
-    attempts: Attempts,
+fn market_stream_events<T>(
+    attempts: BoxStream<'static, Result<BoxStream<'static, Result<T, DataError>>, DataError>>,
     policy: ReconnectionBackoffPolicy,
     stream_key: StreamKey,
     exchange: ExchangeId,
-) -> impl Stream<Item = reconnect::Event<ExchangeId, Result<T, DataError>>>
-where
-    Attempts: Stream<Item = Result<St, DataError>>,
-    St: Stream<Item = Result<T, DataError>>,
-{
+) -> impl Stream<Item = reconnect::Event<ExchangeId, Result<T, DataError>>> {
     attempts
         .with_reconnect_backoff_reporting(policy, stream_key)
         .map(move |initialised| {
@@ -164,8 +168,8 @@ mod tests {
 
     type Item = Result<u8, DataError>;
 
-    fn initialised(items: Vec<Item>) -> Result<stream::Iter<std::vec::IntoIter<Item>>, DataError> {
-        Ok(stream::iter(items))
+    fn initialised(items: Vec<Item>) -> Result<BoxStream<'static, Item>, DataError> {
+        Ok(stream::iter(items).boxed())
     }
 
     fn unacknowledged() -> DataError {
@@ -186,7 +190,7 @@ mod tests {
         ]);
 
         let events = market_stream_events(
-            attempts,
+            attempts.boxed(),
             POLICY,
             StreamKey::new("market_stream", exchange, Some("l2")),
             exchange,
@@ -223,7 +227,7 @@ mod tests {
         let attempts = stream::iter([initialised(vec![Ok(1), Err(terminal), Ok(2)])]);
 
         let events = market_stream_events(
-            attempts,
+            attempts.boxed(),
             POLICY,
             StreamKey::new("market_stream", exchange, Some("l2")),
             exchange,
