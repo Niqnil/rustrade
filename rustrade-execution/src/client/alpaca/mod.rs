@@ -112,7 +112,8 @@ const FILL_RECOVERY_TIMEOUT_SECS: u64 = 30;
 const SIGNAL_RECOVERY_LOOKBACK_MS: i64 = 1_500;
 /// Alpaca's activity page size limit.
 const ALPACA_MAX_ACTIVITIES: usize = 100;
-/// Default cooldown when rate-limited (if X-Ratelimit-Reset header is absent).
+/// Cooldown when rate-limited without a readable wait, and the longest wait read from Alpaca's
+/// headers: the length of its rate-limit window.
 const DEFAULT_RATE_LIMIT_DELAY_SECS: u64 = 60;
 /// Total REST attempts (1 initial + retries) before giving up on rate-limit errors.
 /// The loop runs `0..MAX_RATE_LIMIT_ATTEMPTS`, retrying while `attempt + 1 < MAX`.
@@ -1137,10 +1138,15 @@ impl AlpacaClient {
 
 /// How long Alpaca asks a rate-limited client to wait, from a 429's headers.
 ///
-/// `Retry-After`, a delay in seconds, when present. Otherwise `X-RateLimit-Reset`, which Alpaca
-/// documents: a Unix timestamp in seconds, read as the time from now until then, at least 1 s so
-/// a reset already past never busy-loops. `None` when neither header is readable; callers fall
-/// back to [`DEFAULT_RATE_LIMIT_DELAY_SECS`].
+/// `Retry-After`, a delay in seconds, when present: taken as given, zero included, and not read in
+/// its HTTP-date form. Otherwise `X-RateLimit-Reset`, which Alpaca documents: a Unix timestamp in
+/// seconds, read as the time from now until then, at least 1 s so a reset already past never
+/// busy-loops. `None` when neither header is readable; callers fall back to
+/// [`DEFAULT_RATE_LIMIT_DELAY_SECS`].
+///
+/// Either is capped at [`DEFAULT_RATE_LIMIT_DELAY_SECS`], the length of Alpaca's window: a longer
+/// wait is a bad header or clock skew, and must not hold orders back for longer, nor overflow the
+/// cooldown's deadline.
 ///
 /// The data crate's Alpaca REST client reads a 429 by the same rule.
 fn parse_rate_limit_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
@@ -1151,21 +1157,26 @@ fn parse_rate_limit_delay(headers: &reqwest::header::HeaderMap) -> Option<Durati
             .and_then(|value| value.trim().parse::<u64>().ok())
     };
 
-    if let Some(seconds) = header("retry-after") {
-        return Some(Duration::from_secs(seconds));
-    }
-    header("x-ratelimit-reset").map(|reset| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        Duration::from_secs(reset.saturating_sub(now).max(1))
-    })
+    let seconds = match header("retry-after") {
+        Some(seconds) => seconds,
+        None => {
+            let reset = header("x-ratelimit-reset")?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            reset.saturating_sub(now).max(1)
+        }
+    };
+    Some(Duration::from_secs(
+        seconds.min(DEFAULT_RATE_LIMIT_DELAY_SECS),
+    ))
 }
 
 /// Pause every request until the window resets when a response reports none remaining in it.
 ///
-/// The pause is at most [`DEFAULT_RATE_LIMIT_DELAY_SECS`], the length of Alpaca's window. Call on
+/// The pause is at most [`DEFAULT_RATE_LIMIT_DELAY_SECS`], the length of Alpaca's window, as
+/// [`parse_rate_limit_delay`] caps it. Call on
 /// any response except a 429, which sets its own cooldown. Without an
 /// `X-Ratelimit-Reset` there is nothing to pause until, so the next request goes ahead and a 429,
 /// if it comes, backs off.
@@ -1182,10 +1193,7 @@ fn observe_rate_limit_remaining(
         return;
     }
     match parse_rate_limit_delay(headers) {
-        // Alpaca's window is a minute, so a reset further out is a bad header or clock skew, and
-        // must not hold orders back for longer.
-        Some(reset) => rate_limiter
-            .on_bucket_exhausted(reset.min(Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS))),
+        Some(reset) => rate_limiter.on_bucket_exhausted(reset),
         None => debug!(
             "Alpaca REST rate-limit window exhausted (X-Ratelimit-Remaining: 0) without X-Ratelimit-Reset"
         ),
@@ -7194,6 +7202,26 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn a_rate_limit_delay_is_capped_at_alpacas_window() {
+        let window = Some(Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS));
+        for (name, value) in [("retry-after", u64::MAX), ("x-ratelimit-reset", u64::MAX)] {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(name, value.to_string().parse().unwrap());
+            assert_eq!(parse_rate_limit_delay(&headers), window, "{name}");
+            // Nor does it overflow the cooldown's deadline.
+            RateLimitTracker::new().on_rate_limited(parse_rate_limit_delay(&headers));
+        }
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after", "0".parse().unwrap());
+        assert_eq!(
+            parse_rate_limit_delay(&headers),
+            Some(Duration::ZERO),
+            "taken as given"
+        );
     }
 
     // M-4: parse_time_in_force — pin the unknown-value fallback to GoodUntilEndOfDay.

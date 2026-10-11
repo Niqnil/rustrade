@@ -32,7 +32,8 @@ const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Maximum retry attempts for rate-limited requests.
 const MAX_RETRY_ATTEMPTS: u32 = 3;
 
-/// Default delay when rate-limited, if Alpaca sends no wait (see [`parse_rate_limit_delay`]).
+/// Delay when rate-limited without a readable wait, and the longest wait read from Alpaca's
+/// headers: the length of its rate-limit window (see [`parse_rate_limit_delay`]).
 const DEFAULT_RATE_LIMIT_DELAY_SECS: u64 = 60;
 
 /// Errors from Alpaca REST API operations.
@@ -294,9 +295,13 @@ impl AlpacaRestClient {
 
 /// How long Alpaca asks a rate-limited client to wait, from a 429's headers.
 ///
-/// `Retry-After`, a delay in seconds, when present. Otherwise `X-RateLimit-Reset`, which Alpaca
-/// documents: a Unix timestamp in seconds, read as the time from now until then, at least 1 s so
-/// a reset already past never busy-loops. `None` when neither header is readable.
+/// `Retry-After`, a delay in seconds, when present: taken as given, zero included, and not read in
+/// its HTTP-date form. Otherwise `X-RateLimit-Reset`, which Alpaca documents: a Unix timestamp in
+/// seconds, read as the time from now until then, at least 1 s so a reset already past never
+/// busy-loops. `None` when neither header is readable.
+///
+/// Either is capped at [`DEFAULT_RATE_LIMIT_DELAY_SECS`], the length of Alpaca's window: a longer
+/// wait is a bad header or clock skew, and must not stall the client for longer.
 ///
 /// The execution crate's Alpaca client reads a 429 by the same rule.
 fn parse_rate_limit_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
@@ -307,22 +312,26 @@ fn parse_rate_limit_delay(headers: &reqwest::header::HeaderMap) -> Option<Durati
             .and_then(|value| value.trim().parse::<u64>().ok())
     };
 
-    if let Some(seconds) = header("retry-after") {
-        return Some(Duration::from_secs(seconds));
-    }
-    header("x-ratelimit-reset").map(|reset| {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        Duration::from_secs(reset.saturating_sub(now).max(1))
-    })
+    let seconds = match header("retry-after") {
+        Some(seconds) => seconds,
+        None => {
+            let reset = header("x-ratelimit-reset")?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            reset.saturating_sub(now).max(1)
+        }
+    };
+    Some(Duration::from_secs(
+        seconds.min(DEFAULT_RATE_LIMIT_DELAY_SECS),
+    ))
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
-    use super::{AlpacaRestClient, parse_rate_limit_delay};
+    use super::{AlpacaRestClient, DEFAULT_RATE_LIMIT_DELAY_SECS, parse_rate_limit_delay};
     use reqwest::header::HeaderMap;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -363,6 +372,12 @@ mod tests {
         assert_eq!(parse_rate_limit_delay(&HeaderMap::new()), None);
         let malformed = headers(&[("retry-after", "soon".to_string())]);
         assert_eq!(parse_rate_limit_delay(&malformed), None);
+
+        let window = Some(Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS));
+        for name in ["retry-after", "x-ratelimit-reset"] {
+            let huge = headers(&[(name, u64::MAX.to_string())]);
+            assert_eq!(parse_rate_limit_delay(&huge), window, "{name}");
+        }
     }
 
     #[test]
