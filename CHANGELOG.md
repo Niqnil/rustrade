@@ -220,6 +220,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     carrying how many instruments it deferred, in place of the INFO `Order check complete`; each
     instrument's retry is logged at DEBUG instead of WARN.
 
+- **Kraken, Bitfinex and Massive name the subscriptions they left unacknowledged**
+  (`rustrade-data`, #514).
+  - Kraken implements `Connector::acknowledged_subscription` from the channel and pair its
+    confirmation echoes, so a failed batch names only the subscriptions Kraken did not confirm.
+    Kraken echoes a pair in its own spelling (`XBT/USD` for one subscribed as `BTC/USD`), and a
+    subscription keyed under another spelling still names the whole batch.
+  - `BitfinexWebSocketSubValidator` and Massive's subscriber now fail with
+    `SocketError::Unacknowledged`, carried into `DataError::SubscriptionsUnacknowledged`, where
+    they returned `SocketError::Subscribe`, flattened to `DataError::Socket`. A caller matching
+    `DataError::Socket` for these failures must match the new variant. Bitfinex's error event names
+    the channel and symbol it refused, and the reason now quotes them. Massive's refusal names
+    none, so the refused subscription is among those it lists. The subscriptions are listed in
+    the error's field rather than in its reason, so the reason texts changed: Massive's timeout no
+    longer says `never confirmed: ...`.
+
 ### Fixed
 
 - **`AlpacaClient` no longer reports Alpaca's business refusals as `Unauthenticated`**
@@ -257,6 +272,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     lookups.
   - Other refusals (minimum notional, reduce-only, open-interest caps, oracle, margin-tier limit)
     stay `OrderRejected`.
+
+- **Bitfinex subscription validation could wait for ever, or fail a healthy batch**
+  (`rustrade-data`, part of #514).
+  - `BitfinexWebSocketSubValidator` re-armed its timeout on every message, so a subscription
+    Bitfinex never answered was not reported while another subscription in the batch kept
+    streaming. The timeout is now one deadline for the whole validation, as it already was for
+    the shared `WebSocketSubValidator`.
+  - It counted every data frame after the first acknowledgement as an initial snapshot, and
+    waited for exactly one per subscription. A heartbeat or update arriving before the batch's
+    last acknowledgement overshot the count, and the batch failed at the timeout. It now counts a
+    channel's first frame other than a heartbeat, once per channel.
 
 ## [0.10.1] - 2026-10-09
 
