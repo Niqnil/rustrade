@@ -235,6 +235,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the error's field rather than in its reason, so the reason texts changed: Massive's timeout no
     longer says `never confirmed: ...`.
 
+- **Breaking: `ApiError::RateLimit` carries the venue's wait** (`rustrade-execution`, #585).
+  - It is now `RateLimit { retry_after: Option<Duration> }`, `#[non_exhaustive]`: match it as
+    `RateLimit { .. }` and build it with `ApiError::rate_limited(retry_after)`. The new
+    `ApiError::retry_after()` reads the wait, and the message adds `; retry after <wait>` when
+    there is one. Its serialized form changes from the unit variant's string to an object.
+  - `retry_after` is the venue's minimum wait, measured from when the client read the refusal.
+    `None` means the venue gave none or the client cannot read it, not that a retry may follow at
+    once. The variant stays transient.
+  - `AlpacaClient` fills it from a 429's `Retry-After`, or else `X-RateLimit-Reset`, once its own
+    retries are exhausted. Binance (`binance-sdk` drops the response headers from its rate-limit
+    errors) and Hyperliquid (its SDK keeps none) always report `None`.
+  - The check of how orders ended while disconnected waits at least the longest wait the venue's
+    refusals asked for before retrying the instruments it deferred, and its WARN reports it as
+    `venue_wait_ms`.
+  - `rustrade-data`'s Alpaca REST client reads a 429 by the same rule: it now also honours
+    `X-RateLimit-Reset` when Alpaca sends no `Retry-After`, instead of waiting a fixed 60 s.
+  - Hyperliquid recognises a rate limit by the SDK's HTTP 429 status rather than by `429`
+    appearing anywhere in the message, so an error whose text merely holds those digits (an order
+    id, a price) is no longer reported as one.
+
 ### Fixed
 
 - **`AlpacaClient` no longer reports Alpaca's business refusals as `Unauthenticated`**
