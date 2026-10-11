@@ -264,7 +264,8 @@ pub(super) fn wire_order(
         OrderKind::TakeProfitLimit { trigger_price } => trigger(trigger_price, false, "tp"),
         OrderKind::Market
         | OrderKind::TrailingStop { .. }
-        | OrderKind::TrailingStopLimit { .. } => Err(WireOrderError::UnsupportedKind),
+        | OrderKind::TrailingStopLimit { .. }
+        | OrderKind::TrailingStopFixedLimit { .. } => Err(WireOrderError::UnsupportedKind),
     }
 }
 

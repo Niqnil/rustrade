@@ -1294,6 +1294,7 @@ mod tests {
         let trailing_stop = OrderKind::TrailingStop {
             offset: dec!(1.5),
             offset_type: crate::order::TrailingOffsetType::Percentage,
+            activation_price: None,
         };
         let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
         let order = key("BTCUSDT", "trailing");
@@ -1312,6 +1313,7 @@ mod tests {
             OrderKind::TrailingStop {
                 offset: dec!(150),
                 offset_type: crate::order::TrailingOffsetType::BasisPoints,
+                activation_price: None,
             },
             &open("7", dec!(1)),
         );

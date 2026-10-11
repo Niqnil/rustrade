@@ -1052,7 +1052,9 @@ impl ExecutionClient for HyperliquidClient {
                         .to_string(),
                 );
             }
-            OrderKind::TrailingStop { .. } | OrderKind::TrailingStopLimit { .. } => {
+            OrderKind::TrailingStop { .. }
+            | OrderKind::TrailingStopLimit { .. }
+            | OrderKind::TrailingStopFixedLimit { .. } => {
                 return make_unsupported(
                     "Hyperliquid does not support trailing stop orders".to_string(),
                 );

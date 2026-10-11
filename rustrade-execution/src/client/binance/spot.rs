@@ -1193,8 +1193,23 @@ impl ExecutionClient for BinanceSpot {
             OrderKind::TrailingStop {
                 offset,
                 offset_type,
+                activation_price,
+            }
+            | OrderKind::TrailingStopFixedLimit {
+                offset,
+                offset_type,
+                activation_price,
             } => match trailing_delta_basis_points(offset, offset_type) {
-                Ok(basis_points) => params_builder = params_builder.trailing_delta(basis_points),
+                Ok(basis_points) => {
+                    params_builder = params_builder.trailing_delta(basis_points);
+                    if matches!(kind, OrderKind::TrailingStopFixedLimit { .. }) {
+                        params_builder = params_builder.price(price);
+                    }
+                    // Binance's activation price for a trailing order is its stopPrice.
+                    if let Some(activation_price) = activation_price {
+                        params_builder = params_builder.stop_price(activation_price);
+                    }
+                }
                 Err(refused) => {
                     return Order {
                         key: order_key,
@@ -2389,7 +2404,8 @@ fn convert_account_position(
 ///   must surface this so end users can convert absolute offsets to basis points
 ///   themselves: `basis_points = (absolute / price) * 10000`
 /// - `TrailingStopLimit`: Binance's trailing `STOP_LOSS_LIMIT` keeps its limit price fixed while
-///   the stop trails, where `TrailingStopLimit`'s limit follows the stop (#540)
+///   the stop trails, where `TrailingStopLimit`'s limit follows the stop. That order is
+///   `TrailingStopFixedLimit`, which converts to `STOP_LOSS_LIMIT`.
 ///
 fn convert_order_kind_tif(
     kind: OrderKind,
@@ -2683,6 +2699,7 @@ mod tests {
                 OrderKind::TrailingStop {
                     offset: Decimal::from(100),
                     offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price: None,
                 },
                 TimeInForce::GoodUntilCancelled { post_only: false }
             ),
@@ -2693,6 +2710,7 @@ mod tests {
                 OrderKind::TrailingStop {
                     offset: Decimal::from(5),
                     offset_type: TrailingOffsetType::Percentage,
+                    activation_price: None,
                 },
                 TimeInForce::GoodUntilCancelled { post_only: false }
             ),
@@ -2705,6 +2723,7 @@ mod tests {
                 OrderKind::TrailingStop {
                     offset: Decimal::from(10),
                     offset_type: TrailingOffsetType::Absolute,
+                    activation_price: None,
                 },
                 TimeInForce::GoodUntilCancelled { post_only: false }
             )
@@ -2720,6 +2739,34 @@ mod tests {
                     stop_price: Decimal::from(95),
                     limit_offset: Decimal::from(10),
                 },
+                TimeInForce::GoodUntilCancelled { post_only: false }
+            )
+            .is_none()
+        );
+    }
+
+    /// A fixed-limit trailing stop is a STOP_LOSS_LIMIT, timed as a stop-limit order is; an
+    /// Absolute offset cannot be sent.
+    #[test]
+    fn a_fixed_limit_trailing_stop_converts_to_stop_loss_limit() {
+        let fixed_limit = |offset_type| OrderKind::TrailingStopFixedLimit {
+            offset: Decimal::from(100),
+            offset_type,
+            activation_price: Some(Decimal::from(50_000)),
+        };
+        assert!(matches!(
+            convert_order_kind_tif(
+                fixed_limit(TrailingOffsetType::BasisPoints),
+                TimeInForce::GoodUntilCancelled { post_only: false }
+            ),
+            Some((
+                OrderPlaceTypeEnum::StopLossLimit,
+                Some(OrderPlaceTimeInForceEnum::Gtc)
+            ))
+        ));
+        assert!(
+            convert_order_kind_tif(
+                fixed_limit(TrailingOffsetType::Absolute),
                 TimeInForce::GoodUntilCancelled { post_only: false }
             )
             .is_none()

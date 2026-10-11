@@ -287,6 +287,15 @@ pub enum OrderKind {
     TrailingStop {
         offset: Decimal,
         offset_type: TrailingOffsetType,
+        /// The price the market must reach before the stop starts trailing, or `None` to trail
+        /// from the next trade.
+        ///
+        /// Which way the market must reach it is the venue's. On Binance spot and margin, whose
+        /// trailing stop is a `STOP_LOSS` with a `stopPrice`, a sell starts trailing once the
+        /// market is at or below it and a buy once at or above it. A client whose venue has no
+        /// activation price rejects `Some` with
+        /// [`OrderError::UnsupportedOrderType`](crate::error::OrderError::UnsupportedOrderType).
+        activation_price: Option<Decimal>,
     },
     /// Trailing stop-limit order - when triggered, submits a limit order offset from the stop.
     ///
@@ -305,6 +314,21 @@ pub enum OrderKind {
         stop_price: Decimal,
         /// Offset from the triggered stop price to set the limit price.
         limit_offset: Decimal,
+    },
+    /// Trailing stop whose limit price is fixed when it is placed: only the trigger trails, and
+    /// once it triggers the order works at [`OrderRequestOpen`]'s `price`, as a
+    /// [`StopLimit`](Self::StopLimit) does. Binance spot and margin's `STOP_LOSS_LIMIT` with a
+    /// `trailingDelta`.
+    ///
+    /// Unlike [`TrailingStopLimit`](Self::TrailingStopLimit), whose limit follows the triggered
+    /// stop. A client whose venue has no such order rejects it with
+    /// [`OrderError::UnsupportedOrderType`](crate::error::OrderError::UnsupportedOrderType).
+    #[display("TrailingStopFixedLimit({offset}, {offset_type})")]
+    TrailingStopFixedLimit {
+        offset: Decimal,
+        offset_type: TrailingOffsetType,
+        /// As [`TrailingStop`](Self::TrailingStop)'s `activation_price`.
+        activation_price: Option<Decimal>,
     },
 }
 

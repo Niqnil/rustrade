@@ -4010,8 +4010,9 @@ fn build_new_order_params(
     }
 
     // Conditional price fields (mirror spot): LIMIT carries price; STOP/TAKE_PROFIT carry a stop
-    // (trigger) price; the *_LIMIT variants carry both; a trailing STOP_LOSS carries a
-    // trailingDelta.
+    // (trigger) price; the *_LIMIT variants carry both; a trailing STOP_LOSS or STOP_LOSS_LIMIT
+    // carries a trailingDelta, the latter its fixed limit price, and either an activation price
+    // as its stopPrice.
     match kind {
         OrderKind::Limit => {
             builder = builder.price(price);
@@ -4025,10 +4026,23 @@ fn build_new_order_params(
         OrderKind::TrailingStop {
             offset,
             offset_type,
+            activation_price,
+        }
+        | OrderKind::TrailingStopFixedLimit {
+            offset,
+            offset_type,
+            activation_price,
         } => {
             let basis_points = trailing_delta_basis_points(offset, offset_type)
                 .map_err(BuildOrderError::TrailingDelta)?;
             builder = builder.trailing_delta(i64::from(basis_points));
+            if matches!(kind, OrderKind::TrailingStopFixedLimit { .. }) {
+                builder = builder.price(price);
+            }
+            // Binance's activation price for a trailing order is its stopPrice.
+            if let Some(activation_price) = activation_price {
+                builder = builder.stop_price(activation_price);
+            }
         }
         // Market carries no price/stop_price; TrailingStopLimit is rejected earlier by
         // convert_order_kind_tif_margin. A future OrderKind needing price fields that lands here
@@ -4048,8 +4062,9 @@ fn build_new_order_params(
 /// [`MarginAccountNewOrderTimeInForceEnum`]. Mirrors spot's own `convert_order_kind_tif` adapter.
 ///
 /// Returns `None` for unsupported combinations, as spot does: a `TrailingStop` maps to a
-/// `STOP_LOSS` (with the `trailingDelta` [`build_new_order_params`] adds), and `TrailingStopLimit`
-/// and Absolute trailing offsets are unsupported.
+/// `STOP_LOSS` and a `TrailingStopFixedLimit` to a `STOP_LOSS_LIMIT` (with the `trailingDelta`
+/// [`build_new_order_params`] adds), and `TrailingStopLimit` and Absolute trailing offsets are
+/// unsupported.
 fn convert_order_kind_tif_margin(
     kind: OrderKind,
     tif: TimeInForce,
@@ -4544,6 +4559,7 @@ mod tests {
                 OrderKind::TrailingStop {
                     offset,
                     offset_type,
+                    activation_price: None,
                 },
                 gtc(),
                 MarginSideEffect::NoBorrow,
@@ -4557,6 +4573,66 @@ mod tests {
         }
     }
 
+    /// An activation price goes as `stopPrice`. A `TrailingStopFixedLimit` is a
+    /// `STOP_LOSS_LIMIT` with `trailingDelta`, its fixed limit as `price`, and a stop-limit's time
+    /// in force.
+    #[test]
+    fn trailing_orders_carry_their_activation_price_and_fixed_limit() {
+        let activation = Some(Decimal::from(50_000));
+        let trailing_stop = params(
+            Side::Sell,
+            None,
+            OrderKind::TrailingStop {
+                offset: Decimal::from(25),
+                offset_type: TrailingOffsetType::BasisPoints,
+                activation_price: activation,
+            },
+            gtc(),
+            MarginSideEffect::NoBorrow,
+        )
+        .expect("build");
+        assert_eq!(trailing_stop.r#type.as_str(), "STOP_LOSS");
+        assert_eq!(trailing_stop.trailing_delta, Some(25));
+        assert_eq!(trailing_stop.stop_price, activation);
+        assert_eq!(trailing_stop.price, None);
+
+        for activation_price in [None, activation] {
+            let fixed_limit = params(
+                Side::Sell,
+                Some(Decimal::from(49_000)),
+                OrderKind::TrailingStopFixedLimit {
+                    offset: Decimal::new(15, 1),
+                    offset_type: TrailingOffsetType::Percentage,
+                    activation_price,
+                },
+                TimeInForce::ImmediateOrCancel,
+                MarginSideEffect::NoBorrow,
+            )
+            .expect("build");
+            assert_eq!(fixed_limit.r#type.as_str(), "STOP_LOSS_LIMIT");
+            assert_eq!(fixed_limit.trailing_delta, Some(150));
+            assert_eq!(fixed_limit.price, Some(Decimal::from(49_000)));
+            assert_eq!(fixed_limit.stop_price, activation_price);
+            assert_eq!(
+                fixed_limit.time_in_force.as_ref().map(|t| t.as_str()),
+                Some("IOC")
+            );
+        }
+
+        let absolute = params(
+            Side::Sell,
+            Some(Decimal::from(49_000)),
+            OrderKind::TrailingStopFixedLimit {
+                offset: Decimal::from(100),
+                offset_type: TrailingOffsetType::Absolute,
+                activation_price: None,
+            },
+            gtc(),
+            MarginSideEffect::NoBorrow,
+        );
+        assert!(matches!(absolute, Err(BuildOrderError::Unsupported)));
+    }
+
     #[test]
     fn absolute_trailing_offsets_and_trailing_stop_limits_are_unsupported() {
         let absolute = params(
@@ -4565,6 +4641,7 @@ mod tests {
             OrderKind::TrailingStop {
                 offset: Decimal::from(100),
                 offset_type: TrailingOffsetType::Absolute,
+                activation_price: None,
             },
             gtc(),
             MarginSideEffect::AutoBorrowRepay,
@@ -4598,6 +4675,7 @@ mod tests {
             OrderKind::TrailingStop {
                 offset: Decimal::new(155, 3),
                 offset_type: TrailingOffsetType::Percentage,
+                activation_price: None,
             },
             gtc(),
             MarginSideEffect::AutoBorrowRepay,
@@ -5221,6 +5299,7 @@ mod tests {
                 OrderKind::TrailingStop {
                     offset: Decimal::from(25),
                     offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price: None,
                 }
             );
             assert_eq!(snapshot.0.price, None);
@@ -7007,6 +7086,7 @@ mod tests {
         let trailing_stop = OrderKind::TrailingStop {
             offset: Decimal::from(25),
             offset_type: TrailingOffsetType::BasisPoints,
+            activation_price: None,
         };
         let hold = |known: &SharedKnownLiveOrders| {
             known.lock().live(
@@ -7198,6 +7278,7 @@ mod tests {
             request.state.kind = OrderKind::TrailingStop {
                 offset,
                 offset_type: TrailingOffsetType::BasisPoints,
+                activation_price: None,
             };
             request
         };
