@@ -121,7 +121,8 @@ impl CashFlowId {
 /// bounded calls.
 ///
 /// `resume` says whether the read stopped before the span's end:
-/// - `None`: every flow in the span the venue still holds is in `flows`.
+/// - `None`: every flow in the span the venue still holds, and the client reports, is in `flows`.
+///   Each client documents the records it leaves out.
 /// - `Some(t)`: the read stopped at its bound, and flows from `t` on may be missing from `flows`.
 ///   Read on from `start = t` with the same end. That read can return again flows this one
 ///   returned at or after `t`, so match them by [`CashFlowId`].

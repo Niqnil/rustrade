@@ -748,7 +748,8 @@ struct AlpacaNonTradeActivity {
     /// is typically the day after the trade it was charged on.
     #[serde(default)]
     created_at: Option<String>,
-    /// The day the activity occurred or settled.
+    /// The day the activity occurred or settled. Logged only: `after`, `until` and the flow's
+    /// time use `created_at`.
     #[serde(default)]
     date: Option<String>,
     /// Signed: negative when the account paid.
@@ -1998,8 +1999,8 @@ impl AlpacaClient {
     ///
     /// Alpaca streams none of these: `trade_updates` carries order events only. Nothing is pushed:
     /// the caller decides when to read, and must drop the flows it has already applied, by
-    /// [`id`](CashFlow::id), before applying a read's. Each is in the account's cash, so the
-    /// account's USD balance includes it once Alpaca has posted it.
+    /// [`id`](CashFlow::id), before applying a read's. Alpaca posts each to the account's cash,
+    /// so the account's USD balance already includes a flow read here.
     ///
     /// # What each activity becomes
     ///
@@ -2015,19 +2016,28 @@ impl AlpacaClient {
     /// - [`amount`](CashFlow::amount) is Alpaca's `net_amount`, negative when the account paid.
     /// - [`asset`](CashFlow::asset) is its `currency`, or `USD` when it names none.
     /// - [`instrument`](CashFlow::instrument) is its `symbol`, when it names one.
-    /// - [`time_exchange`](CashFlow::time_exchange) is when Alpaca created the activity, or the
-    ///   start of its `date`, in UTC, when it gives no creation time. A fee is typically created
-    ///   the day after the trade it was charged on.
+    /// - [`time_exchange`](CashFlow::time_exchange) is when Alpaca created the activity
+    ///   (`created_at`), which its `after` and `until` filter on. A fee is typically created the
+    ///   day after the trade it was charged on.
     /// - [`id`](CashFlow::id) is Alpaca's activity id.
     ///
-    /// # Records left out
-    /// An activity Alpaca marks `canceled` is left out, and logged at INFO. A flow read before it
-    /// was canceled is not reversed: the caller reconciles against the account's cash. An
-    /// activity without an amount or a time that parses is left out, and logged at WARN.
+    /// # Status
+    /// - An activity Alpaca marks `canceled` is left out, and logged at INFO. A flow read before
+    ///   it was canceled is not reversed: the caller reconciles against the account's cash.
+    /// - One marked `correct` is returned like any other. Alpaca does not document whether a
+    ///   correction stands beside the activity it corrects or replaces it, so a caller applying
+    ///   both by id may count the cash twice. Reconcile against the account's cash.
     ///
-    /// # Cost
+    /// An activity without an amount or a creation time that parses is left out, and logged at
+    /// WARN.
+    ///
+    /// # Cost and resuming
     /// One call sends up to 50 requests, reading at most 5,000 activities, and returns `resume`
-    /// when it stops there.
+    /// when it stops there: the millisecond of the last activity's creation time. That resume is
+    /// exact only if Alpaca serves these activities in order of creation, as it serves fills in
+    /// order of time; its documentation orders them by "activity datetime" without saying which
+    /// time, and this ordering has not been observed for them. Read spans short enough to fit one
+    /// call, as the volume of these activities usually allows, and `resume` stays `None`.
     ///
     /// # Errors
     /// Fails if a request fails, or, with [`UnindexedClientError::Internal`], if more activities
@@ -2588,10 +2598,7 @@ impl PagedActivity for AlpacaNonTradeActivity {
     }
 
     fn time(&self) -> Option<DateTime<Utc>> {
-        self.created_at
-            .as_deref()
-            .and_then(parse_timestamp)
-            .or_else(|| self.date.as_deref().and_then(parse_date))
+        self.created_at.as_deref().and_then(parse_timestamp)
     }
 }
 
@@ -4869,16 +4876,6 @@ fn convert_cash_flow(
         time_exchange,
         Some(CashFlowId::new(id)),
     ))
-}
-
-/// The start of a `YYYY-MM-DD` day, or of an RFC 3339 time's own, in UTC.
-fn parse_date(s: &str) -> Option<DateTime<Utc>> {
-    parse_timestamp(s).or_else(|| {
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-            .ok()
-            .and_then(|date| date.and_hms_opt(0, 0, 0))
-            .map(|time| time.and_utc())
-    })
 }
 
 fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
@@ -9035,6 +9032,8 @@ mod tests {
             no_amount.as_object_mut().unwrap().remove("net_amount");
             let mut dated_only = non_trade("dated", "PTC", None, "-0.50", at);
             dated_only.as_object_mut().unwrap().remove("created_at");
+            let mut corrected = non_trade("correct", "PTC", None, "-0.40", at);
+            corrected["status"] = serde_json::json!("correct");
             let mut euro = non_trade("euro", "PTR", None, "0.30", at);
             euro["currency"] = serde_json::json!("EUR");
             let server = MockServer::start().await;
@@ -9048,6 +9047,7 @@ mod tests {
                     canceled,
                     no_amount,
                     dated_only,
+                    corrected,
                     euro,
                     non_trade("late", "FEE", None, "-0.01", "2025-04-20T05:00:00Z"),
                 ])))
@@ -9077,7 +9077,7 @@ mod tests {
                     ("int-paid", interest),
                     ("int-credit", CashFlowKind::Other("INT.CDT".into())),
                     ("fee", CashFlowKind::Other("FEE.TAF".into())),
-                    ("dated", CashFlowKind::Other("PTC".into())),
+                    ("correct", CashFlowKind::Other("PTC".into())),
                     ("euro", CashFlowKind::Rebate),
                 ]
                 .map(|(id, kind)| (id.to_owned(), kind))
@@ -9097,9 +9097,9 @@ mod tests {
                 Some(InstrumentNameExchange::new("SPY"))
             );
             assert_eq!(
-                by_id("dated").time_exchange,
-                time("2025-04-18T00:00:00Z"),
-                "without a creation time, the start of its date"
+                by_id("correct").amount,
+                Decimal::new(-40, 2),
+                "a correction is returned as it is"
             );
             assert_eq!(by_id("euro").asset, AssetNameExchange::new("EUR"));
 
@@ -9156,6 +9156,59 @@ mod tests {
 
             assert!(read.flows.is_empty() && read.resume.is_none());
             assert!(query_pairs(&server).await.is_empty());
+        }
+
+        /// A span holding more activities than one call reads returns those it read and says
+        /// where to read on from: the millisecond of the last one's creation.
+        #[tokio::test]
+        async fn fetch_cash_flows_that_stops_at_its_bound_says_where_to_read_on() {
+            let base = time("2025-04-18T05:00:00Z");
+            let activities: Vec<_> = (0..6_000_i64)
+                .map(|n| {
+                    let created =
+                        (base + TimeDelta::seconds(n)).to_rfc3339_opts(SecondsFormat::Micros, true);
+                    non_trade(&format!("{n:017}::fee"), "FEE", None, "-0.01", &created)
+                })
+                .collect();
+            // Every page answers in order after the token, as Alpaca pages by id.
+            struct Paged(Vec<serde_json::Value>);
+            impl Respond for Paged {
+                fn respond(&self, request: &Request) -> ResponseTemplate {
+                    let token = request
+                        .url
+                        .query_pairs()
+                        .find(|(name, _)| name == "page_token")
+                        .map(|(_, value)| value.into_owned());
+                    let page: Vec<_> = self
+                        .0
+                        .iter()
+                        .skip_while(|activity| {
+                            token
+                                .as_deref()
+                                .is_some_and(|token| activity["id"] != token)
+                        })
+                        .skip(usize::from(token.is_some()))
+                        .take(ALPACA_MAX_ACTIVITIES)
+                        .cloned()
+                        .collect();
+                    ResponseTemplate::new(200).set_body_json(page)
+                }
+            }
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(Paged(activities))
+                .mount(&server)
+                .await;
+            let client = client_for(&server);
+
+            let read = client
+                .fetch_cash_flows(base, base + TimeDelta::days(1))
+                .await
+                .unwrap();
+
+            assert_eq!(read.flows.len(), 5_000);
+            assert_eq!(read.resume, Some(base + TimeDelta::seconds(4_999)));
         }
 
         /// A read whose every page holds activities of the span's first millisecond cannot
