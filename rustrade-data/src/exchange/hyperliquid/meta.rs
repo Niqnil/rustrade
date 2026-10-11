@@ -242,6 +242,8 @@ mod tests {
 
         assert_eq!(meta.perps().len(), 3);
         assert_eq!(meta.perp_coin("KPEPE").unwrap().coin(), "kPEPE");
+        assert_eq!(meta.perp_coin("BTC").unwrap().sz_decimals(), 5);
+        assert_eq!(meta.perp_coin("xyz:TSLA").unwrap().sz_decimals(), 3);
         assert_eq!(meta.perp_coin("xyz:TSLA").unwrap().deployer(), Some("xyz"));
         assert_eq!(meta.spot_pair("hype", "usdc").unwrap().coin(), "@107");
         assert_eq!(meta.spot_pair("PURR", "USDC").unwrap().coin(), "PURR/USDC");

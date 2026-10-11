@@ -82,7 +82,9 @@ pub enum Network {
 /// default perpetuals or, read with a `dex` field, one builder deployer's (HIP-3) perpetuals,
 /// named `deployer:ASSET`. Collect several sets, such as the defaults and each deployer's, into
 /// one with [`FromIterator`]. A coin listed twice keeps the later listing; the default and
-/// deployers' sets cannot share a coin, as a deployer's carry its prefix.
+/// deployers' sets cannot share a coin, as a deployer's carry its prefix. Every perpetual listed
+/// must carry `szDecimals`, which Hyperliquid sends for all of them: a response without it fails
+/// to deserialize.
 ///
 /// Delisted perpetuals are kept, marked by [`PerpCoin::is_delisted`]: their names stay taken.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -158,7 +160,8 @@ impl PerpCoin {
     }
 
     /// The perpetual's `szDecimals`: the most decimal places an order's size may have. It also
-    /// caps a price's decimal places, at `6 - szDecimals`.
+    /// caps a price's decimal places, at `6 - szDecimals`; a price is held to 5 significant
+    /// figures as well.
     pub fn sz_decimals(&self) -> u32 {
         self.sz_decimals
     }
