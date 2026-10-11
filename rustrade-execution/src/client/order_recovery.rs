@@ -640,6 +640,9 @@ impl UncheckedOrders {
     /// `min_delay` is the venue's own wait after refusing a request for its rate limit, or zero.
     /// A long one, such as a ban's, holds the retry back for all of it while the failure still
     /// counts toward [`MAX_GAP_RETRIES`].
+    ///
+    /// Retry delays are bounded: the base backoff by [`MAX_GAP_RETRIES`], and `min_delay` by
+    /// whichever client read it from the venue, so `now + delay` cannot overflow.
     pub(crate) fn failed(
         &mut self,
         instrument: &InstrumentNameExchange,
@@ -655,6 +658,17 @@ impl UncheckedOrders {
         let delay = Duration::from_secs(GAP_RETRY_BASE_SECS << (check.failures - 1)).max(min_delay);
         check.retry_at = Some(now + delay);
         Some(GapFailure::Retry(delay))
+    }
+
+    /// Hold back the retry of `instrument`, if it is waiting, until at least `until`.
+    pub(crate) fn hold_until(
+        &mut self,
+        instrument: &InstrumentNameExchange,
+        until: tokio::time::Instant,
+    ) {
+        if let Some(check) = self.0.get_mut(instrument) {
+            check.retry_at = Some(check.retry_at.map_or(until, |retry_at| retry_at.max(until)));
+        }
     }
 
     /// Whether `instrument` is waiting for a check.
@@ -787,10 +801,14 @@ pub(crate) enum OpenListing {
 /// A listing or lookup refused with [`ApiError::RateLimit`] stops the whole check, since every
 /// request still to make would spend more against a venue already refusing. Once the refusal is
 /// read no further listing or lookup starts, those already started are settled as they answer, and
-/// every instrument not settled, started or not, is retried later with the usual backoff, or after
-/// the longest wait the venue's refusals asked for if that is longer. A refusal that outlasts the
-/// backoff can therefore give up on an instrument never asked about.
+/// every instrument not settled, started or not, is retried later with the usual backoff. A refusal
+/// that outlasts the backoff can therefore give up on an instrument never asked about.
 /// Any other failure charges only its own instrument, and the check goes on.
+///
+/// Every instrument the check retries later, for whatever reason, waits at least the longest wait
+/// the venue's refusals in this check asked for, since a request sent sooner would be refused too.
+/// A longer wait read after an instrument was charged still holds it back, unless the check is
+/// dropped first.
 pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
     exchange: ExchangeId,
     known: &SharedKnownLiveOrders,
@@ -861,6 +879,9 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
     // starts.
     let throttled = Throttled::default();
     let (list_open, lookup, throttled) = (&list_open, &lookup, &throttled);
+    // Instruments this check charged with a failure, held back once it ends until the longest wait
+    // the venue asked for, which a request still in flight when one was charged can raise.
+    let mut charged: Vec<&InstrumentNameExchange> = Vec::new();
     let recovery = async {
         let mut reported = 0u32;
         // Instruments retried for the venue's rate limit, logged once rather than each.
@@ -959,6 +980,7 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
                                     reason,
                                     throttled.wait(),
                                 ));
+                                charged.push(instrument);
                             }
                             None => unchecked.checked(instrument),
                         }
@@ -974,6 +996,7 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
                             &reason,
                             throttled.wait(),
                         ));
+                        charged.push(instrument);
                     }
                 }
             }
@@ -1007,9 +1030,17 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
                     unchecked,
                     instrument,
                     "order check timed out",
-                    Duration::ZERO,
+                    throttled.wait(),
                 );
+                charged.push(instrument);
             }
+        }
+    }
+    let venue_wait = throttled.wait();
+    if !venue_wait.is_zero() {
+        let until = tokio::time::Instant::now() + venue_wait;
+        for instrument in charged {
+            unchecked.hold_until(instrument, until);
         }
     }
 }
@@ -1126,8 +1157,8 @@ fn settle(
 /// Returns whether it is a retry for the venue's rate limit, which is logged at debug: the check
 /// stopped for it warns once for all of them.
 ///
-/// An instrument retried for the rate limit waits at least `venue_wait`, the longest wait the
-/// venue's refusals asked for; any other waits the usual backoff.
+/// The retry waits at least `venue_wait`, the longest wait the venue's refusals in this check asked
+/// for so far, whatever the reason: a request sent sooner would be refused too.
 fn order_check_failed(
     exchange: ExchangeId,
     unchecked: &mut UncheckedOrders,
@@ -1136,12 +1167,7 @@ fn order_check_failed(
     venue_wait: Duration,
 ) -> bool {
     let rate_limited = reason == RATE_LIMITED;
-    let min_delay = if rate_limited {
-        venue_wait
-    } else {
-        Duration::ZERO
-    };
-    match unchecked.failed(instrument, tokio::time::Instant::now(), min_delay) {
+    match unchecked.failed(instrument, tokio::time::Instant::now(), venue_wait) {
         Some(GapFailure::Retry(delay)) => {
             if rate_limited {
                 debug!(
@@ -2203,6 +2229,65 @@ mod tests {
                 InstrumentNameExchange::new("BBB")
             ]
         );
+    }
+
+    /// A longer wait the venue asks for after an instrument was charged still holds that
+    /// instrument back, whether a shorter wait or another failure charged it, as it does the
+    /// instrument never asked about.
+    #[tokio::test]
+    async fn a_longer_wait_read_later_holds_back_every_instrument_charged() {
+        let long = Duration::from_secs(GAP_RETRY_BASE_SECS * 10);
+        let first_failures = [
+            UnindexedClientError::Api(ApiError::rate_limited(Some(Duration::from_secs(1)))),
+            UnindexedClientError::Connectivity(ConnectivityError::Timeout),
+        ];
+        for first in first_failures {
+            let (known, mut unchecked) = held_on(&["AAA", "BBB", "CCC"]);
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let started = tokio::time::Instant::now();
+
+            recover_ended_orders(
+                ExchangeId::BinanceSpot,
+                &known,
+                &mut unchecked,
+                &NoPendingFills,
+                &tx,
+                OpenListing::PerInstrument,
+                |instruments: Vec<InstrumentNameExchange>| {
+                    let first = first.clone();
+                    async move {
+                        // AAA's and BBB's listings are both in flight before either fails, and
+                        // AAA's failure is read first.
+                        if instruments[0].name().as_str() == "AAA" {
+                            tokio::task::yield_now().await;
+                            return Err(first);
+                        }
+                        for _ in 0..3 {
+                            tokio::task::yield_now().await;
+                        }
+                        Err(UnindexedClientError::Api(ApiError::rate_limited(Some(
+                            long,
+                        ))))
+                    }
+                },
+                |_: UnindexedOrderKey| async { panic!("nothing listed, nothing looked up") },
+            )
+            .await;
+
+            assert!(
+                unchecked
+                    .ready(&NoPendingFills, started + long - Duration::from_secs(1))
+                    .is_empty(),
+                "{first:?}: retried before the longest wait"
+            );
+            assert_eq!(
+                unchecked
+                    .ready(&NoPendingFills, tokio::time::Instant::now() + long)
+                    .len(),
+                3,
+                "{first:?}"
+            );
+        }
     }
 
     #[test]
