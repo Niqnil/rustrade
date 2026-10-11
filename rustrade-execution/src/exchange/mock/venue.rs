@@ -196,9 +196,11 @@ pub enum VenueRegime {
 ///   what is left in [`BorrowReject::available`].
 /// - [`ShortSaleRestricted`](BorrowRejectReason::ShortSaleRestricted): a short-sale restriction
 ///   is in effect and the order is marketable: a market order, or a sell limit at or below the
-///   best bid (the last price, on a feed with no book). A limit above the bid rests. With neither
-///   a bid nor a last price, a market order is refused as unpriceable, as it would be
-///   unrestricted, and a sell limit rests.
+///   best bid (the last price, on a feed with no book). A limit above the bid rests, and so does
+///   any sell limit when there is neither a bid nor a last price. A market order the
+///   [`FillModel`] cannot price, such as one against a bid-only book under
+///   [`MidpointFillModel`](crate::fill::MidpointFillModel), is refused as unpriceable, as it would
+///   be unrestricted.
 ///
 /// Only the short part of an order is gated: a flip from a long is measured by the short it
 /// opens, and a buy, or a sell that only reduces a long once every resting sell has filled, is
@@ -1759,18 +1761,24 @@ impl SimulatedVenue {
             ));
         }
 
-        // Judged against what a sell trades against, the bid, else the last price, as `crosses`
-        // judges it. Without either, a restriction has nothing to judge: an order that would take
-        // from the book is refused as unpriceable instead, which names the real cause.
-        let marketable = market.is_some_and(|market| match request.state.kind {
-            OrderKind::Limit => request
-                .state
-                .price
-                .is_some_and(|limit| crosses(Side::Sell, limit, market)),
-            // Every other kind this venue accepts takes whatever the book offers.
-            _ => market.best_bid.or(market.last_price).is_some(),
-        });
-        if marketable && provider.short_sale_restricted(instrument, now) {
+        // A limit is judged against what a sell trades against, the bid, else the last price, as
+        // `crosses` judges it. Every other kind this venue accepts takes whatever the book offers,
+        // at the price the fill model gives it. When there is nothing to judge against, an order
+        // that would take from the book is refused as unpriceable instead, which names the real
+        // cause.
+        let marketable = || {
+            market.is_some_and(|market| match request.state.kind {
+                OrderKind::Limit => request
+                    .state
+                    .price
+                    .is_some_and(|limit| crosses(Side::Sell, limit, market)),
+                _ => self
+                    .fill_model
+                    .fill_price(&FillContext::new(Side::Sell, market))
+                    .is_some(),
+            })
+        };
+        if provider.short_sale_restricted(instrument, now) && marketable() {
             return Err(ApiError::BorrowRejected(BorrowReject::new(
                 BorrowRejectReason::ShortSaleRestricted,
                 None,
@@ -7858,6 +7866,26 @@ mod tests {
         );
     }
 
+    /// Whether a market sell is marketable is the fill model's to say, and one that can price it
+    /// is refused for the restriction.
+    #[test]
+    fn a_restricted_market_short_the_fill_model_can_price_is_refused_for_the_restriction() {
+        let mut venue =
+            make_cfd_venue_lending(ShortabilityTable::new().with_short_sale_restriction(
+                cfd_instrument_name(),
+                time(0),
+                time(10),
+            ));
+        venue.fill_model = SimFillConfig::Midpoint(crate::fill::MidpointFillModel);
+
+        let outcome = open_cfd(&mut venue, Side::Sell, "1");
+
+        assert_eq!(
+            borrow_rejection(&outcome).reason,
+            BorrowRejectReason::ShortSaleRestricted
+        );
+    }
+
     #[test]
     fn missing_shortability_data_allows_the_short() {
         let mut venue = make_cfd_venue_lending(
@@ -7903,12 +7931,12 @@ mod tests {
         }
     }
 
-    /// With no price to judge a restriction against, a restricted market sell is refused for what
-    /// it is, unpriceable, naming which of the two unpriceable causes occurred, rather than for a
-    /// restriction that judges a bid there is none of.
+    /// With no price to fill at, a restricted market sell is refused for what it is, unpriceable,
+    /// naming which of the two unpriceable causes occurred, rather than for a restriction that
+    /// judges a bid it could not fill against.
     #[test]
     fn a_restricted_short_with_no_price_is_refused_as_unpriceable() {
-        let reason_of = |market| {
+        let reason_of = |fill_model, market| {
             let mut venue = make_cfd_venue("10000000", FeeModelConfig::default())
                 .with_shortability(Arc::new(
                     ShortabilityTable::new().with_short_sale_restriction(
@@ -7917,6 +7945,7 @@ mod tests {
                         time(10),
                     ),
                 ));
+            venue.fill_model = fill_model;
             advance(&mut venue, time(1));
             match venue
                 .open_order(cfd_request(Side::Sell, "1", market))
@@ -7930,10 +7959,24 @@ mod tests {
             }
         };
 
-        let absent = reason_of(None);
+        let absent = reason_of(SimFillConfig::default(), None);
         assert!(absent.contains("no market snapshot"), "{absent}");
-        let empty = reason_of(Some(MarketSnapshot::default()));
+        let empty = reason_of(SimFillConfig::default(), Some(MarketSnapshot::default()));
         assert!(empty.contains("no market price available yet"), "{empty}");
+
+        // A bid alone has no midpoint, so `MidpointFillModel` cannot price the sell.
+        let bid_only = MarketSnapshot {
+            best_bid: Some(d("4990")),
+            ..MarketSnapshot::default()
+        };
+        let midpoint = reason_of(
+            SimFillConfig::Midpoint(crate::fill::MidpointFillModel),
+            Some(bid_only),
+        );
+        assert!(
+            midpoint.contains("no market price available yet"),
+            "{midpoint}"
+        );
     }
 
     /// The checks apply in their documented order: not shortable before too little to lend,

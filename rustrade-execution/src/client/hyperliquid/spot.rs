@@ -76,10 +76,10 @@
 //! [`super`] module documentation for why.
 
 use super::common::{
-    CLOID_REQUIRED, CancelOnDropStream, OpenOrder, OpenOrderListing, UserFill, cancel_outcome,
-    cid_to_cloid, instrument_to_spot_coin, map_tif, millis_to_datetime, open_order_to_order,
-    open_orders, parse_decimal, parse_side, span_millis, spot_balances, spot_base_quote,
-    spot_pair_to_instrument, user_fills_by_time,
+    CLOID_REQUIRED, CancelOnDropStream, InstrumentFilter, OpenOrder, OpenOrderListing, UserFill,
+    cancel_outcome, cid_to_cloid, instrument_to_spot_coin, map_tif, millis_to_datetime,
+    open_order_to_order, open_orders, parse_decimal, parse_side, span_millis, spot_balances,
+    spot_base_quote, spot_pair_to_instrument, user_fills_by_time,
 };
 use super::config::HyperliquidConfig;
 use super::error::{map_order_error, map_sdk_error, order_rejection};
@@ -1175,13 +1175,7 @@ fn spot_open_orders(
     pairs: &SpotPairs,
     instruments: &[InstrumentNameExchange],
 ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
-    let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
-        None
-    } else {
-        let mut set = HashSet::with_capacity(instruments.len());
-        set.extend(instruments.iter().cloned());
-        Some(set)
-    };
+    let instrument_filter = InstrumentFilter::new(instruments);
 
     let mut orders = Vec::new();
     for order in rows {
@@ -1189,10 +1183,7 @@ fn spot_open_orders(
             continue;
         };
         let instrument = spot_pair_to_instrument(pair);
-        if instrument_filter
-            .as_ref()
-            .is_some_and(|f| !f.contains(&instrument))
-        {
+        if !instrument_filter.matches(&instrument) {
             continue;
         }
         orders.extend(open_order_to_order(
@@ -1217,13 +1208,7 @@ fn spot_trades(
     end: DateTime<Utc>,
     instruments: &[InstrumentNameExchange],
 ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
-    let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
-        None
-    } else {
-        let mut set = HashSet::with_capacity(instruments.len());
-        set.extend(instruments.iter().cloned());
-        Some(set)
-    };
+    let instrument_filter = InstrumentFilter::new(instruments);
 
     let mut result = Vec::new();
     for fill in fills {
@@ -1233,10 +1218,7 @@ fn spot_trades(
         let (base_asset, quote_asset) = (pair.base(), pair.quote());
         let instrument = spot_pair_to_instrument(pair);
 
-        if instrument_filter
-            .as_ref()
-            .is_some_and(|f| !f.contains(&instrument))
-        {
+        if !instrument_filter.matches(&instrument) {
             continue;
         }
 
