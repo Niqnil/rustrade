@@ -32,7 +32,7 @@ const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// Maximum retry attempts for rate-limited requests.
 const MAX_RETRY_ATTEMPTS: u32 = 3;
 
-/// Default delay when rate-limited (if no `Retry-After` header).
+/// Default delay when rate-limited, if Alpaca sends no wait (see [`parse_rate_limit_delay`]).
 const DEFAULT_RATE_LIMIT_DELAY_SECS: u64 = 60;
 
 /// Errors from Alpaca REST API operations.
@@ -263,7 +263,7 @@ impl AlpacaRestClient {
                     return Err(AlpacaRestError::RateLimitExceeded { attempts });
                 }
 
-                let delay = parse_retry_after(response.headers())
+                let delay = parse_rate_limit_delay(response.headers())
                     .unwrap_or(Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS));
 
                 warn!(
@@ -292,22 +292,78 @@ impl AlpacaRestClient {
     }
 }
 
-/// Parse the `Retry-After` header (delay in seconds).
+/// How long Alpaca asks a rate-limited client to wait, from a 429's headers.
 ///
-/// `x-ratelimit-reset` is intentionally not used as a fallback because it carries a Unix epoch
-/// timestamp, not a duration; mis-interpreting it would produce sleeps measured in years.
-fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
-    headers
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .map(Duration::from_secs)
+/// `Retry-After`, a delay in seconds, when present. Otherwise `X-RateLimit-Reset`, which Alpaca
+/// documents: a Unix timestamp in seconds, read as the time from now until then, at least 1 s so
+/// a reset already past never busy-loops. `None` when neither header is readable.
+///
+/// The execution crate's Alpaca client reads a 429 by the same rule.
+fn parse_rate_limit_delay(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+    };
+
+    if let Some(seconds) = header("retry-after") {
+        return Some(Duration::from_secs(seconds));
+    }
+    header("x-ratelimit-reset").map(|reset| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Duration::from_secs(reset.saturating_sub(now).max(1))
+    })
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
-    use super::AlpacaRestClient;
+    use super::{AlpacaRestClient, parse_rate_limit_delay};
+    use reqwest::header::HeaderMap;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn headers(pairs: &[(&'static str, String)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(*name, value.parse().unwrap());
+        }
+        headers
+    }
+
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[test]
+    fn a_rate_limit_delay_prefers_retry_after_then_reads_the_reset_time() {
+        let both = headers(&[
+            ("retry-after", "7".to_string()),
+            ("x-ratelimit-reset", (now() + 30).to_string()),
+        ]);
+        assert_eq!(parse_rate_limit_delay(&both), Some(Duration::from_secs(7)));
+
+        let reset =
+            parse_rate_limit_delay(&headers(&[("x-ratelimit-reset", (now() + 30).to_string())]))
+                .unwrap();
+        assert!(
+            (Duration::from_secs(29)..=Duration::from_secs(30)).contains(&reset),
+            "{reset:?}"
+        );
+
+        let past = headers(&[("x-ratelimit-reset", (now() - 5).to_string())]);
+        assert_eq!(parse_rate_limit_delay(&past), Some(Duration::from_secs(1)));
+
+        assert_eq!(parse_rate_limit_delay(&HeaderMap::new()), None);
+        let malformed = headers(&[("retry-after", "soon".to_string())]);
+        assert_eq!(parse_rate_limit_delay(&malformed), None);
+    }
 
     #[test]
     fn client_debug_hides_credentials() {
