@@ -206,9 +206,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     whose limit follows the stop, is unchanged.
   - `BinanceSpot` and `BinanceMargin` send an activation price as `stopPrice`, and a
     `TrailingStopFixedLimit` as `STOP_LOSS_LIMIT` with `trailingDelta`, `price` and a stop-limit's
-    time in force. Reading orders back, they now report a trailing `STOP_LOSS`'s activation price,
-    and a trailing `STOP_LOSS_LIMIT` as a `TrailingStopFixedLimit`. Both used to be dropped or
-    reported without the price, with a warning. A trailing take-profit is still left out.
+    time in force. They refuse unsent, as `OrderError::Rejected`, an activation price that is not
+    positive and a `TrailingStopFixedLimit` without a positive `price`.
+  - Reading orders back, they now report a trailing `STOP_LOSS`'s activation price, and a trailing
+    `STOP_LOSS_LIMIT` as a `TrailingStopFixedLimit` with its limit price. Both used to be dropped or
+    reported without the price, with a warning. A trailing order whose `stopPrice` does not parse,
+    and a trailing take-profit, are left out with a warning.
+  - `Display` of both trailing kinds shows the activation price, as
+    `TrailingStop(1, Percentage, activation: Some(105))`. JSON stored before the field existed
+    still loads, as `None`; a positional serde format does not.
   - Alpaca, IBKR and Hyperliquid have neither order. They reject an activation price and
     `TrailingStopFixedLimit` with `UnsupportedOrderType`, as the simulated venue does any
     conditional order.

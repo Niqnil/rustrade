@@ -65,8 +65,13 @@ Additional order types:
 | TakeProfitLimit | ❌ | ❌ | ✅ | ✅ |
 | TrailingStop | ✅ | ⚠️ | ⚠️ | ❌ |
 | TrailingStopLimit | ✅ | ❌ | ❌ | ❌ |
+| TrailingStopFixedLimit | ❌ | ❌ | ⚠️ | ❌ |
 
-⚠️ Binance `TrailingStop` supports `BasisPoints` and `Percentage` offsets only;
+A trailing stop's `activation_price` is supported by Binance only (sent as `stopPrice`); the
+others reject `Some`. `TrailingStopFixedLimit` is Binance's `STOP_LOSS_LIMIT` with a
+`trailingDelta`: its limit stays at the request's `price` while the trigger trails.
+
+⚠️ Binance `TrailingStop` and `TrailingStopFixedLimit` support `BasisPoints` and `Percentage` offsets only;
 `Absolute` offsets are rejected as unsupported, and an offset that does not come to a
 positive whole number of basis points is refused (`OrderError::InvalidPrecision`), not
 rounded. ⚠️ Alpaca `TrailingStop` supports

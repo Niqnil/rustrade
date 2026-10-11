@@ -130,7 +130,9 @@ where
 pub struct Order<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex, State = OrderState> {
     pub key: OrderKey<ExchangeKey, InstrumentKey>,
     pub side: Side,
-    /// Limit price for the order. `None` for Market/Stop/TrailingStop orders.
+    /// Limit price for the order. `None` for Market/Stop/TrailingStop orders, and for a
+    /// TrailingStopLimit, whose limit follows its stop; the fixed limit of a
+    /// TrailingStopFixedLimit.
     pub price: Option<Decimal>,
     pub quantity: Decimal,
     pub kind: OrderKind,
@@ -250,7 +252,7 @@ pub enum TrailingOffsetType {
     Absolute,
     /// Percentage of the current price (e.g., 5% trailing distance).
     Percentage,
-    /// Basis points (1/100th of 1%). Used by Binance.
+    /// Basis points (1/100th of 1%). What Binance's `trailingDelta` takes.
     BasisPoints,
 }
 
@@ -283,7 +285,7 @@ pub enum OrderKind {
         trigger_price: Decimal,
     },
     /// Trailing stop order - stop price trails the market by a specified offset.
-    #[display("TrailingStop({offset}, {offset_type})")]
+    #[display("TrailingStop({offset}, {offset_type}, activation: {activation_price:?})")]
     TrailingStop {
         offset: Decimal,
         offset_type: TrailingOffsetType,
@@ -294,7 +296,11 @@ pub enum OrderKind {
         /// trailing stop is a `STOP_LOSS` with a `stopPrice`, a sell starts trailing once the
         /// market is at or below it and a buy once at or above it. A client whose venue has no
         /// activation price rejects `Some` with
-        /// [`OrderError::UnsupportedOrderType`](crate::error::OrderError::UnsupportedOrderType).
+        /// [`OrderError::UnsupportedOrderType`](crate::error::OrderError::UnsupportedOrderType),
+        /// and one that sends it refuses a price that is not positive.
+        ///
+        /// Read back from a venue, it is the price the venue reports in the same field, which
+        /// Binance does not document as fixed once the stop activates.
         activation_price: Option<Decimal>,
     },
     /// Trailing stop-limit order - when triggered, submits a limit order offset from the stop.
@@ -323,7 +329,7 @@ pub enum OrderKind {
     /// Unlike [`TrailingStopLimit`](Self::TrailingStopLimit), whose limit follows the triggered
     /// stop. A client whose venue has no such order rejects it with
     /// [`OrderError::UnsupportedOrderType`](crate::error::OrderError::UnsupportedOrderType).
-    #[display("TrailingStopFixedLimit({offset}, {offset_type})")]
+    #[display("TrailingStopFixedLimit({offset}, {offset_type}, activation: {activation_price:?})")]
     TrailingStopFixedLimit {
         offset: Decimal,
         offset_type: TrailingOffsetType,
@@ -462,5 +468,48 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let deserialized: OrderKind = serde_json::from_str(&json).unwrap();
         assert_eq!(original, deserialized);
+    }
+    /// The trailing kinds round-trip with and without an activation price, and a `TrailingStop`
+    /// stored before it had one still loads, without one. Display shows it.
+    #[test]
+    fn trailing_kinds_round_trip_and_a_stored_trailing_stop_loads() {
+        for activation_price in [None, Some(dec!(105))] {
+            for original in [
+                OrderKind::TrailingStop {
+                    offset: dec!(1),
+                    offset_type: TrailingOffsetType::Percentage,
+                    activation_price,
+                },
+                OrderKind::TrailingStopFixedLimit {
+                    offset: dec!(25),
+                    offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price,
+                },
+            ] {
+                let json = serde_json::to_string(&original).unwrap();
+                let deserialized: OrderKind = serde_json::from_str(&json).unwrap();
+                assert_eq!(original, deserialized);
+            }
+        }
+        let stored: OrderKind =
+            serde_json::from_str(r#"{"TrailingStop":{"offset":"1","offset_type":"Percentage"}}"#)
+                .unwrap();
+        assert_eq!(
+            stored,
+            OrderKind::TrailingStop {
+                offset: dec!(1),
+                offset_type: TrailingOffsetType::Percentage,
+                activation_price: None,
+            }
+        );
+        assert_eq!(
+            OrderKind::TrailingStop {
+                offset: dec!(1),
+                offset_type: TrailingOffsetType::Percentage,
+                activation_price: Some(dec!(105)),
+            }
+            .to_string(),
+            "TrailingStop(1, Percentage, activation: Some(105))"
+        );
     }
 }

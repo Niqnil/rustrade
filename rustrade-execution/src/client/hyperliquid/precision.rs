@@ -602,5 +602,17 @@ mod tests {
             refused(OrderKind::Market, None, dec!(1)),
             WireOrderError::UnsupportedKind
         );
+        assert_eq!(
+            refused(
+                OrderKind::TrailingStopFixedLimit {
+                    offset: dec!(1),
+                    offset_type: crate::order::TrailingOffsetType::Percentage,
+                    activation_price: None,
+                },
+                Some(dec!(100)),
+                dec!(1)
+            ),
+            WireOrderError::UnsupportedKind
+        );
     }
 }
