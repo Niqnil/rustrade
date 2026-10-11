@@ -205,10 +205,9 @@ where
 
 /// Determines whether the [`Connector`] associated with this [`ExchangeId`] supports the
 /// ingestion of market data for the provided [`MarketDataInstrumentKind`].
-// The arms are grouped by `MarketDataInstrumentKind`, each group ending in a default whose
-// open-vs-closed choice is documented in place (see the `Spot` note below). Collapsing to
-// `matches!` would fold every group into one boolean expression, leaving nowhere to record which
-// defaults are deliberate and which exchange lists were verified against what.
+// The arms are grouped by `MarketDataInstrumentKind`, each group granting the exchanges whose
+// connector serves that kind and denying the rest. Collapsing to `matches!` would fold the groups
+// into one boolean expression, leaving nowhere to record which exchanges were verified.
 #[allow(clippy::match_like_matches_macro)]
 pub fn exchange_supports_instrument_kind(
     exchange: ExchangeId,
@@ -219,22 +218,16 @@ pub fn exchange_supports_instrument_kind(
     };
 
     match (exchange, instrument_kind) {
-        // Spot
+        // Spot: granted per exchange whose connector serves a spot market, denied to every other,
+        // as the other kinds are. A new connector serving spot must be added here, or its spot
+        // subscriptions fail validation, which says so.
         (
-            BinanceFuturesUsd | Bitmex | BybitPerpetualsUsd | GateioPerpetualsUsd
-            | GateioPerpetualsBtc,
+            AlpacaCrypto | AlpacaIex | AlpacaSip | BinanceSpot | Bitfinex | BybitSpot | Coinbase
+            | GateioSpot | HyperliquidSpot | Kraken | LseFx | LseCrypto | LseEquities
+            | MassiveStocks | MassiveCrypto | MassiveForex | Okx,
             Spot,
-        ) => false,
-        (LseFx | LseCrypto | LseEquities, Spot) => true,
-        (LseCfd | LseFutures | LseOptions, Spot) => false,
-        (MassiveStocks | MassiveCrypto | MassiveForex, Spot) => true,
-        (MassiveOptions, Spot) => false,
-        // NOTE: this default is OPEN -- an exchange that serves no spot market claims spot support
-        // unless it is denied above, with no compile error to prompt the edit. It is left open
-        // deliberately: closing it means writing an explicit arm for every existing variant and
-        // re-verifying each one's spot coverage, which is tracked separately rather than smuggled
-        // in here. Deny explicitly above when adding a non-spot exchange.
-        (_, Spot) => true,
+        ) => true,
+        (_, Spot) => false,
 
         // Future
         (GateioFuturesUsd | GateioFuturesBtc | Okx, Future { .. }) => true,
@@ -468,6 +461,62 @@ mod tests {
             },
         };
 
+        /// Spot is granted to exactly the exchanges whose connector serves a spot market, and
+        /// denied to every other, connector or not, rather than claimed by default.
+        #[test]
+        fn spot_is_granted_only_where_a_connector_serves_it() {
+            use ExchangeId::*;
+            for exchange in [
+                AlpacaCrypto,
+                AlpacaIex,
+                AlpacaSip,
+                BinanceSpot,
+                Bitfinex,
+                BybitSpot,
+                Coinbase,
+                GateioSpot,
+                HyperliquidSpot,
+                Kraken,
+                LseFx,
+                LseCrypto,
+                LseEquities,
+                MassiveStocks,
+                MassiveCrypto,
+                MassiveForex,
+                Okx,
+            ] {
+                assert!(
+                    exchange_supports_instrument_kind(exchange, &MarketDataInstrumentKind::Spot),
+                    "{exchange:?}"
+                );
+            }
+            for exchange in [
+                BinanceFuturesUsd,
+                Bitmex,
+                BybitPerpetualsUsd,
+                GateioFuturesBtc,
+                GateioFuturesUsd,
+                GateioOptions,
+                GateioPerpetualsBtc,
+                GateioPerpetualsUsd,
+                HyperliquidPerp,
+                LseCfd,
+                LseFutures,
+                LseOptions,
+                MassiveOptions,
+                // No connector at all: a sample, as `ExchangeId` cannot be enumerated. Add a new
+                // connector-backed exchange to one of the two lists.
+                BinanceMargin,
+                Deribit,
+                Other,
+            ] {
+                assert!(
+                    !exchange_supports_instrument_kind(exchange, &MarketDataInstrumentKind::Spot),
+                    "{exchange:?}"
+                );
+            }
+        }
+
         /// The London Strategic Edge datasets, paired with the single
         /// [`MarketDataInstrumentKind`] each one serves.
         const LSE: [(ExchangeId, MarketDataInstrumentKind); 5] = [
@@ -480,9 +529,7 @@ mod tests {
 
         #[test]
         fn test_lse_supports_exactly_its_own_kind() {
-            // Each dataset serves one kind and must deny the others. The denials matter as much as
-            // the grants: `exchange_supports_instrument_kind`'s `(_, Spot) => true` default means
-            // a CFD-only dataset would otherwise claim spot support with no edit and no error.
+            // Each dataset serves one kind and must deny the others.
             for (exchange, supported) in LSE {
                 assert!(
                     exchange_supports_instrument_kind(exchange, &supported),
