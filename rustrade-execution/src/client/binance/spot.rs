@@ -1179,7 +1179,7 @@ impl ExecutionClient for BinanceSpot {
 
         // A trailing order's trailingDelta, fixed limit and activation price.
         match trailing_params(&kind, price) {
-            Some(Ok(trailing)) => {
+            Ok(Some(trailing)) => {
                 params_builder = params_builder.trailing_delta(trailing.trailing_delta);
                 if let Some(limit) = trailing.price {
                     params_builder = params_builder.price(limit);
@@ -1189,7 +1189,7 @@ impl ExecutionClient for BinanceSpot {
                     params_builder = params_builder.stop_price(activation_price);
                 }
             }
-            Some(Err(refused)) => {
+            Err(refused) => {
                 return Order {
                     key: order_key,
                     side,
@@ -1200,7 +1200,7 @@ impl ExecutionClient for BinanceSpot {
                     state: OrderState::inactive(refused.into_order_error()),
                 };
             }
-            None => {}
+            Ok(None) => {}
         }
 
         // The other kinds' price and stopPrice, in a match with no wildcard, so that a new

@@ -208,8 +208,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `TrailingStopFixedLimit` as `STOP_LOSS_LIMIT` with `trailingDelta`, `price` and a stop-limit's
     time in force. They refuse unsent, as `OrderError::Rejected`, an activation price that is not
     positive and a `TrailingStopFixedLimit` without a positive `price`.
-  - Reading orders back, they now report a trailing `STOP_LOSS`'s activation price, and a trailing
-    `STOP_LOSS_LIMIT` as a `TrailingStopFixedLimit` with its limit price. Both used to be dropped or
+  - Reading orders back (`BinanceSpot` everywhere; `BinanceMargin` on its account stream, as its
+    REST order queries still leave conditional orders out), they now report a trailing
+    `STOP_LOSS`'s activation price, and a trailing `STOP_LOSS_LIMIT` as a
+    `TrailingStopFixedLimit` with its limit price. Both used to be dropped or
     reported without the price, with a warning. A trailing order whose `stopPrice` does not parse,
     and a trailing take-profit, are left out with a warning.
   - `Display` of both trailing kinds shows the activation price, as

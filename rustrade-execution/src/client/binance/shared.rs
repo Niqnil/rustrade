@@ -1047,8 +1047,7 @@ impl TrailingDelta {
 /// - a fixed-trigger order without a positive `stopPrice`;
 /// - a trailing take-profit, which no [`OrderKind`] describes;
 /// - a conditional order whose trailing delta is [`TrailingDelta::Unknown`], which could be either
-///   a fixed or a trailing order.
-///
+///   a fixed or a trailing order;
 /// - a trailing order whose `stopPrice` does not parse, whose activation price is then unknown.
 ///
 /// The warnings for the trailing take-profit and the unknown trailing delta come from the venue's
@@ -1062,9 +1061,11 @@ pub(crate) fn decode_order_kind(
     stop_price: Option<&str>,
     trailing_delta: TrailingDelta,
 ) -> Option<OrderKind> {
-    let unparseable_stop_price = stop_price.filter(|raw| Decimal::from_str(raw).is_err());
-    let stop_price = stop_price
-        .and_then(|raw| Decimal::from_str(raw).ok())
+    let parsed_stop_price = stop_price.map(Decimal::from_str);
+    // Not sampled: it signals a malformed venue field, not the venue's shape.
+    let unparseable_stop_price = stop_price.filter(|_| matches!(parsed_stop_price, Some(Err(_))));
+    let stop_price = parsed_stop_price
+        .and_then(Result::ok)
         .filter(|price| price.is_sign_positive() && !price.is_zero());
     let triggered = |kind: fn(Decimal) -> OrderKind| {
         if stop_price.is_none() {
@@ -3096,11 +3097,11 @@ impl TrailingOrderError {
 }
 
 /// The trailing fields of `kind`, or `None` when it is not a trailing order Binance places.
-/// `price` is the request's limit price.
+/// `price` is the request's limit price. A bad offset is reported before a bad price.
 pub(crate) fn trailing_params(
     kind: &OrderKind,
     price: Option<Decimal>,
-) -> Option<Result<TrailingParams, TrailingOrderError>> {
+) -> Result<Option<TrailingParams>, TrailingOrderError> {
     let positive = |value: &Decimal| value.is_sign_positive() && !value.is_zero();
     let (offset, offset_type, activation_price, fixed_limit) = match *kind {
         OrderKind::TrailingStop {
@@ -3119,28 +3120,26 @@ pub(crate) fn trailing_params(
         | OrderKind::StopLimit { .. }
         | OrderKind::TakeProfit { .. }
         | OrderKind::TakeProfitLimit { .. }
-        | OrderKind::TrailingStopLimit { .. } => return None,
+        | OrderKind::TrailingStopLimit { .. } => return Ok(None),
     };
-    Some((|| {
-        let trailing_delta =
-            trailing_delta_basis_points(offset, offset_type).map_err(TrailingOrderError::Delta)?;
-        if let Some(activation) = activation_price.filter(|activation| !positive(activation)) {
-            return Err(TrailingOrderError::NonPositiveActivation(activation));
+    let trailing_delta =
+        trailing_delta_basis_points(offset, offset_type).map_err(TrailingOrderError::Delta)?;
+    if let Some(activation) = activation_price.filter(|activation| !positive(activation)) {
+        return Err(TrailingOrderError::NonPositiveActivation(activation));
+    }
+    let price = if fixed_limit {
+        match price.filter(positive) {
+            Some(limit) => Some(limit),
+            None => return Err(TrailingOrderError::LimitPrice(price)),
         }
-        let price = if fixed_limit {
-            match price.filter(positive) {
-                Some(limit) => Some(limit),
-                None => return Err(TrailingOrderError::LimitPrice(price)),
-            }
-        } else {
-            None
-        };
-        Ok(TrailingParams {
-            trailing_delta,
-            price,
-            stop_price: activation_price,
-        })
-    })())
+    } else {
+        None
+    };
+    Ok(Some(TrailingParams {
+        trailing_delta,
+        price,
+        stop_price: activation_price,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -3686,24 +3685,30 @@ mod tests {
     #[test]
     fn a_trailing_stop_loss_limit_row_lists_with_its_limit_price() {
         let btc = InstrumentNameExchange::new("BTCUSDT");
-        let rows = [spot_row(order_row(
-            "STOP_LOSS_LIMIT",
-            "NEW",
-            serde_json::json!({"trailingDelta": 25, "trailingTime": -1, "price": "95"}),
-        ))];
-        let listing = convert_open_order_listing(&rows, ExchangeId::BinanceSpot, &btc);
-        let [order] = listing.orders.as_slice() else {
-            panic!("one order: {:?}", listing.orders);
-        };
-        assert_eq!(
-            order.kind,
-            OrderKind::TrailingStopFixedLimit {
-                offset: Decimal::from(25),
-                offset_type: TrailingOffsetType::BasisPoints,
-                activation_price: None,
-            }
-        );
-        assert_eq!(order.price, Some(Decimal::from(95)));
+        for (stop_price, activation_price) in
+            [("0.00000000", None), ("105", Some(Decimal::from(105)))]
+        {
+            let rows = [spot_row(order_row(
+                "STOP_LOSS_LIMIT",
+                "NEW",
+                serde_json::json!({
+                    "trailingDelta": 25, "trailingTime": -1, "price": "95", "stopPrice": stop_price,
+                }),
+            ))];
+            let listing = convert_open_order_listing(&rows, ExchangeId::BinanceSpot, &btc);
+            let [order] = listing.orders.as_slice() else {
+                panic!("one order: {:?}", listing.orders);
+            };
+            assert_eq!(
+                order.kind,
+                OrderKind::TrailingStopFixedLimit {
+                    offset: Decimal::from(25),
+                    offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price,
+                }
+            );
+            assert_eq!(order.price, Some(Decimal::from(95)));
+        }
     }
 
     /// A trailing order's fields: its delta, a fixed limit's price, an activation price; and the
@@ -3716,10 +3721,10 @@ mod tests {
             offset_type: TrailingOffsetType::Percentage,
             activation_price,
         };
-        assert_eq!(trailing_params(&OrderKind::Limit, Some(dec!(1))), None);
+        assert_eq!(trailing_params(&OrderKind::Limit, Some(dec!(1))), Ok(None));
         assert_eq!(
             trailing_params(&fixed_limit(Some(dec!(105))), Some(dec!(99))),
-            Some(Ok(TrailingParams {
+            Ok(Some(TrailingParams {
                 trailing_delta: 150,
                 price: Some(dec!(99)),
                 stop_price: Some(dec!(105)),
@@ -3734,7 +3739,7 @@ mod tests {
                 },
                 Some(dec!(99))
             ),
-            Some(Ok(TrailingParams {
+            Ok(Some(TrailingParams {
                 trailing_delta: 25,
                 price: None,
                 stop_price: None,
@@ -3744,18 +3749,39 @@ mod tests {
         for activation in [dec!(0), dec!(-1)] {
             assert_eq!(
                 trailing_params(&fixed_limit(Some(activation)), Some(dec!(99))),
-                Some(Err(TrailingOrderError::NonPositiveActivation(activation)))
+                Err(TrailingOrderError::NonPositiveActivation(activation))
             );
         }
         for limit in [None, Some(dec!(0))] {
             assert_eq!(
                 trailing_params(&fixed_limit(None), limit),
-                Some(Err(TrailingOrderError::LimitPrice(limit)))
+                Err(TrailingOrderError::LimitPrice(limit))
             );
         }
+        // A bad offset is reported before a bad price.
+        assert!(matches!(
+            trailing_params(
+                &OrderKind::TrailingStopFixedLimit {
+                    offset: dec!(1.555),
+                    offset_type: TrailingOffsetType::Percentage,
+                    activation_price: Some(dec!(0)),
+                },
+                None
+            ),
+            Err(TrailingOrderError::Delta(TrailingDeltaError::Invalid(_)))
+        ));
         assert!(matches!(
             TrailingOrderError::LimitPrice(None).into_order_error::<(), ()>(),
             OrderError::Rejected(ApiError::OrderRejected(_))
+        ));
+        assert!(matches!(
+            TrailingOrderError::NonPositiveActivation(dec!(0)).into_order_error::<(), ()>(),
+            OrderError::Rejected(ApiError::OrderRejected(_))
+        ));
+        assert!(matches!(
+            TrailingOrderError::Delta(TrailingDeltaError::AbsoluteOffset)
+                .into_order_error::<(), ()>(),
+            OrderError::UnsupportedOrderType(_)
         ));
     }
 

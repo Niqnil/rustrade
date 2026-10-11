@@ -4014,8 +4014,7 @@ fn build_new_order_params(
 
     // A trailing order's trailingDelta, fixed limit and activation price (as stopPrice), as on
     // spot.
-    if let Some(trailing) = trailing_params(&kind, price) {
-        let trailing = trailing.map_err(BuildOrderError::Trailing)?;
+    if let Some(trailing) = trailing_params(&kind, price).map_err(BuildOrderError::Trailing)? {
         builder = builder.trailing_delta(i64::from(trailing.trailing_delta));
         if let Some(limit) = trailing.price {
             builder = builder.price(limit);
