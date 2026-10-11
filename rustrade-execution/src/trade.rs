@@ -108,6 +108,20 @@ pub struct Trade<AssetKey, InstrumentKey> {
     /// [`TradeOrigin::Order`].
     #[serde(default)]
     pub origin: TradeOrigin,
+    /// The side of the position the fill applies to, when the venue names one: [`Side::Buy`] for
+    /// a long, [`Side::Sell`] for a short.
+    ///
+    /// A venue in hedge mode, holding a long and a short in one instrument at once, names the
+    /// position each fill belongs to (Binance USD-M futures' `LONG` and `SHORT`). The engine in
+    /// `OmsMode::Hedging` checks a forced fill, which matches none of its orders, against it: a
+    /// forced fill must reduce the position the venue names.
+    /// `None` when the venue names none, as every client in this crate does as of writing: none
+    /// trades a venue in hedge mode.
+    ///
+    /// `#[serde(default)]` so trades serialised before this field existed still deserialise, as
+    /// `None`.
+    #[serde(default)]
+    pub position_side: Option<Side>,
 }
 
 impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
@@ -138,6 +152,7 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
             order_filled_quantity,
             fees,
             origin: TradeOrigin::Order,
+            position_side: None,
         }
     }
 
@@ -145,6 +160,15 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
     #[must_use]
     pub fn with_origin(self, origin: TradeOrigin) -> Self {
         Self { origin, ..self }
+    }
+
+    /// This trade with the [`position_side`](Self::position_side) the venue named.
+    #[must_use]
+    pub fn with_position_side(self, position_side: Side) -> Self {
+        Self {
+            position_side: Some(position_side),
+            ..self
+        }
     }
 
     pub fn value_quote(&self) -> Decimal {

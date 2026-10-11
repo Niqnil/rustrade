@@ -80,9 +80,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     a forced one at WARN and counts it in the new `TearSheet::fills_forced` and
     `TradingSummary::fills_forced`, and logs other non-`Order` fills at INFO. In `OmsMode::Hedging`
     a fill whose origin is not `Order` is no longer queued behind an order awaiting its ack, where
-    it waited for an ack that could not come; it is routed as an unmatched fill. Hedging mode still
-    opens a forced fill's own position rather than reducing the one it closed, as
-    `InstrumentState::update_from_trade` documents.
+    it waited for an ack that could not come. A fill of another origin the venue did not force is
+    routed as an unmatched fill; how a forced one is routed is in the next entry.
+- **In `OmsMode::Hedging` a forced fill reduces the position it closed** (`rustrade`,
+  `rustrade-execution`, #567).
+  - A forced fill (`TradeOrigin::is_forced`) that matches none of the engine's orders reduces the
+    one open position on the side opposite its own: a forced sell reduces a long. It opened a
+    position of its own before, leaving the engine holding the closed position and an opposite
+    one.
+  - The engine opens nothing for a forced fill it cannot place without guessing: one whose side
+    holds no open position or several, or one whose venue names the side it would grow. For a
+    fill larger than the position it reduces, the excess is likewise not applied. Each case is
+    logged at ERROR and counted in the new `TearSheet::fills_forced_unallocated` and
+    `TradingSummary::fills_forced_unallocated`. Non-zero means the engine's positions no longer
+    match the venue's.
+  - `Trade` gains `position_side: Option<Side>` (`#[serde(default)]`) and `with_position_side`,
+    for a venue in hedge mode that names the position a fill belongs to. The engine checks a
+    forced fill against it. No client in this crate sets it yet.
+  - **Breaking:** `TearSheet`, `TearSheetGenerator` and `TradingSummary` gain
+    `fills_forced_unallocated`. They have public fields, so code that builds one with a struct
+    literal needs the new field.
 - **Margin calls and liquidation warnings: `AccountEventKind::Notice`** (`rustrade-execution`,
   part of #552).
   - An `AccountNotice` carries what the venue reported (`NoticeKind`: `MarginCall`,
