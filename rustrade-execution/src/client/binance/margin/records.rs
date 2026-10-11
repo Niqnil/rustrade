@@ -43,6 +43,11 @@ const INTEREST_WINDOW_MS: i64 = 29 * 24 * 60 * 60 * 1000;
 /// The most rows Binance returns in one page of either history.
 const PAGE_SIZE: i64 = 100;
 
+/// The most pages one query is read for: 50,000 rows. A query needing more fails rather than
+/// loop on, as it would were Binance to ignore the page asked for and serve the same full page
+/// each time.
+const MAX_PAGES: i64 = 500;
+
 /// How many isolated pairs are read at once.
 const CONCURRENT_PAIRS: usize = 8;
 
@@ -90,10 +95,11 @@ impl BinanceMargin {
     /// [`time_exchange`](CashFlow::time_exchange), not a balance that moved then: the account's
     /// balance shows it as interest owed on the asset.
     ///
-    /// - [`asset`](CashFlow::asset) is the asset Binance's record names the charge in: the asset
-    ///   borrowed. For a charge Binance converted into BNB, as it does for an account that pays
-    ///   interest in BNB, its record also names the asset borrowed separately, and Binance does not
-    ///   document which of the two is BNB. Check a converted record before relying on its asset.
+    /// - [`asset`](CashFlow::asset) is the `asset` field of Binance's record. Binance charges
+    ///   interest in the asset borrowed, or converts it into BNB for an account that pays interest
+    ///   in BNB. A converted record also names the asset borrowed, in a separate field, and Binance
+    ///   does not document which of the two fields holds BNB. Check a converted record before
+    ///   relying on its asset.
     /// - [`principal`](CashFlowKind::MarginInterest::principal) is the loan the charge was on.
     /// - [`rate`](CashFlowKind::MarginInterest::rate) is the rate charged for the period, hourly
     ///   for an hourly charge, as Binance quotes it.
@@ -108,7 +114,8 @@ impl BinanceMargin {
     /// Nothing is pushed: the caller decides when to read, and must drop the charges it has
     /// already counted, by [`id`](CashFlow::id), before applying a read's flows. Within one read
     /// each charge appears once: a charge read twice, as one stamped on a window's boundary is, is
-    /// kept the first time its id is seen, or, without an id, once per identical record.
+    /// kept the first time its id is seen in its asset and pair, or, without an id, once per
+    /// identical record.
     ///
     /// # Span
     /// - Binance serves interest charged in the last 90 days only. A `start` before that is moved
@@ -119,12 +126,13 @@ impl BinanceMargin {
     ///   each paged by 100 charges. A read costs a request weight of 1 per page, at least 1 per
     ///   window, and, on an isolated client, as much again for each pair.
     ///
-    /// # Errors
-    /// Fails if any request fails. Nothing is returned from a read that failed part way.
+    /// # Records left out
+    /// A record without an asset, an amount or a time that parses is left out, and logged at WARN.
+    /// A rate or principal that does not parse is left `None`, and logged at WARN.
     ///
-    /// A record without an asset, an amount or a time that parses is left out of a read that
-    /// succeeds, and logged at WARN. A rate or principal that does not parse is left `None`, and
-    /// logged at WARN.
+    /// # Errors
+    /// Fails if any request fails, or if one window of one account holds more than 50,000
+    /// charges. Nothing is returned from a read that failed part way.
     pub async fn fetch_margin_interest(
         &self,
         start: DateTime<Utc>,
@@ -188,15 +196,17 @@ impl BinanceMargin {
     /// costs a request weight of 1 per page and, on an isolated client, as much again for each
     /// pair.
     ///
-    /// A record Binance marks as of the other kind of account, isolated on a cross client or cross
-    /// on an isolated one, is left out, and logged at DEBUG.
+    /// # Records left out
+    /// - A record without an order id, a pair, a side, a filled quantity or a time that parses is
+    ///   left out, and logged at WARN. A price or quantity that does not parse is left `None`, and
+    ///   logged at WARN.
+    /// - On a cross client, a record Binance marks as isolated is left out, and logged at WARN:
+    ///   the cross query should not return one. An isolated client asks for one pair at a time,
+    ///   and keeps what Binance returns for it.
     ///
     /// # Errors
-    /// Fails if any request fails. Nothing is returned from a read that failed part way.
-    ///
-    /// A record without an order id, a pair, a side, a filled quantity or a time that parses is
-    /// left out of a read that succeeds, and logged at WARN. A price or quantity that does not
-    /// parse is left `None`, and logged at WARN.
+    /// Fails if any request fails, or if one account holds more than 50,000 records in the span.
+    /// Nothing is returned from a read that failed part way.
     pub async fn fetch_forced_liquidations(
         &self,
         start: DateTime<Utc>,
@@ -301,7 +311,7 @@ impl BinanceMargin {
         start_ms: i64,
         end_ms: i64,
         current: i64,
-    ) -> Result<Page<GetInterestHistoryResponseRowsInner>, UnindexedClientError> {
+    ) -> Result<Vec<GetInterestHistoryResponseRowsInner>, UnindexedClientError> {
         let symbol = pair.as_ref().map(|pair| pair.name().to_string());
         let response =
             rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
@@ -320,10 +330,7 @@ impl BinanceMargin {
             .await
             .map_err(|e| classify_rest_query_error(&e, pair.as_ref()))?;
         let page = response.data().await.map_err(response_decode_error)?;
-        Ok(Page {
-            rows: page.rows.unwrap_or_default(),
-            total: page.total,
-        })
+        Ok(page.rows.unwrap_or_default())
     }
 
     /// One page of `forceLiquidationRec`.
@@ -333,7 +340,7 @@ impl BinanceMargin {
         start_ms: i64,
         end_ms: i64,
         current: i64,
-    ) -> Result<Page<GetForceLiquidationRecordResponseRowsInner>, UnindexedClientError> {
+    ) -> Result<Vec<GetForceLiquidationRecordResponseRowsInner>, UnindexedClientError> {
         let symbol = pair.as_ref().map(|pair| pair.name().to_string());
         let response =
             rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
@@ -352,66 +359,58 @@ impl BinanceMargin {
             .await
             .map_err(|e| classify_rest_query_error(&e, pair.as_ref()))?;
         let page = response.data().await.map_err(response_decode_error)?;
-        Ok(Page {
-            rows: page.rows.unwrap_or_default(),
-            total: page.total,
-        })
+        Ok(page.rows.unwrap_or_default())
     }
 }
 
-/// One page of a paged history query.
-struct Page<Row> {
-    rows: Vec<Row>,
-    /// How many rows the whole query holds, as Binance counts them.
-    total: Option<i64>,
-}
-
 /// Read pages `1, 2, …` of a paged history query of [`PAGE_SIZE`] rows each, up to the first
-/// short page, or the page that brings the rows read to the query's total.
+/// short page. Fails once [`MAX_PAGES`] pages were full.
 async fn read_all_pages<Row, Fut>(
     mut page: impl FnMut(i64) -> Fut,
 ) -> Result<Vec<Row>, UnindexedClientError>
 where
-    Fut: Future<Output = Result<Page<Row>, UnindexedClientError>>,
+    Fut: Future<Output = Result<Vec<Row>, UnindexedClientError>>,
 {
-    let as_count = |len: usize| i64::try_from(len).unwrap_or(i64::MAX);
     let mut rows = Vec::new();
-    let mut current = 1;
-    loop {
-        let Page { rows: batch, total } = page(current).await?;
-        let full = as_count(batch.len()) >= PAGE_SIZE;
+    for current in 1..=MAX_PAGES {
+        let batch = page(current).await?;
+        let full = i64::try_from(batch.len()).is_ok_and(|len| len >= PAGE_SIZE);
         rows.extend(batch);
-        // The total also ends a walk that would otherwise go on forever, were Binance to ignore
-        // the page asked for and serve the same full page each time.
-        let all_read = total.is_some_and(|total| as_count(rows.len()) >= total);
-        if !full || all_read {
+        if !full {
             return Ok(rows);
         }
-        current += 1;
     }
+    Err(UnindexedClientError::Internal(format!(
+        "Binance margin history query still full after {MAX_PAGES} pages of {PAGE_SIZE}: \
+         narrow the span"
+    )))
 }
 
-/// What tells two interest charges in one read apart: Binance's transaction id, on the pair the
-/// charge was read for, or, for a record without one, the whole flow.
+/// What tells two interest charges in one read apart: Binance's transaction id, in the charge's
+/// asset and pair, or, for a record without one, the whole flow.
 #[derive(PartialEq, Eq, Hash)]
 enum ChargeKey {
-    Id(Option<InstrumentNameExchange>, CashFlowId),
+    Id(
+        AssetNameExchange,
+        Option<InstrumentNameExchange>,
+        CashFlowId,
+    ),
     Flow(CashFlow<AssetNameExchange, InstrumentNameExchange>),
 }
 
 impl ChargeKey {
     fn of(flow: &CashFlow<AssetNameExchange, InstrumentNameExchange>) -> Self {
         match &flow.id {
-            Some(id) => Self::Id(flow.instrument.clone(), id.clone()),
+            Some(id) => Self::Id(flow.asset.clone(), flow.instrument.clone(), id.clone()),
             None => Self::Flow(flow.clone()),
         }
     }
 }
 
-/// An optional decimal field of a `record`: `None` when absent, or, logged at WARN, when it does
-/// not parse.
+/// An optional decimal field of a `record`: `None` when absent or empty, or, logged at WARN, when
+/// it does not parse.
 fn optional_decimal(record: &str, field: &str, value: Option<&str>) -> Option<Decimal> {
-    let value = value?;
+    let value = value.filter(|value| !value.is_empty())?;
     Decimal::from_str(value)
         .inspect_err(|error| {
             warn!(
@@ -482,8 +481,8 @@ fn convert_interest(
 }
 
 /// One `forceLiquidationRec` row as a [`MarginForcedLiquidation`], or `None`, with a warning, if
-/// it lacks what one needs. `None` too, logged at DEBUG, when the row is marked as of the other
-/// kind of account than the client's (`is_isolated`).
+/// it lacks what one needs. `None` too, logged at WARN, on a cross client (`is_isolated` false)
+/// when Binance marks the row as isolated.
 fn convert_forced_liquidation(
     row: GetForceLiquidationRecordResponseRowsInner,
     is_isolated: bool,
@@ -499,15 +498,13 @@ fn convert_forced_liquidation(
         );
         return None;
     };
-    if row
-        .is_isolated
-        .is_some_and(|row_isolated| row_isolated != is_isolated)
-    {
-        debug!(
+    // An isolated client's query names its pair, so what it returns is that pair's. A cross
+    // query names none, so an isolated pair's record there is not the cross account's.
+    if !is_isolated && row.is_isolated == Some(true) {
+        warn!(
             order_id,
             symbol,
-            is_isolated = row.is_isolated,
-            "BinanceMargin forced liquidation record of the other kind of margin account — left out"
+            "BinanceMargin cross forced liquidation read returned an isolated record — left out"
         );
         return None;
     }
@@ -547,8 +544,9 @@ fn convert_forced_liquidation(
         side,
         price: optional_decimal("forced liquidation", "price", row.price.as_deref()),
         quantity: optional_decimal("forced liquidation", "qty", row.qty.as_deref()),
-        avg_price: optional_decimal("forced liquidation", "avgPrice", row.avg_price.as_deref())
-            .filter(|_| !filled_quantity.is_zero()),
+        avg_price: (!filled_quantity.is_zero())
+            .then(|| optional_decimal("forced liquidation", "avgPrice", row.avg_price.as_deref()))
+            .flatten(),
         filled_quantity,
         time_exchange,
     })
@@ -596,15 +594,9 @@ mod tests {
         })
     }
 
-    /// A page holding `rows`, of a query holding `total` rows in all.
-    fn page_of(rows: Vec<Value>, total: usize) -> ResponseTemplate {
-        ResponseTemplate::new(200).set_body_json(json!({ "rows": rows, "total": total }))
-    }
-
-    /// The only page of a query.
     fn page(rows: Vec<Value>) -> ResponseTemplate {
         let total = rows.len();
-        page_of(rows, total)
+        ResponseTemplate::new(200).set_body_json(json!({ "rows": rows, "total": total }))
     }
 
     async fn mount(server: &MockServer, at: &str, response: ResponseTemplate) {
@@ -767,17 +759,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_full_page_reads_the_next_until_the_total_is_read() {
+    async fn a_full_page_reads_the_next() {
         let server = MockServer::start().await;
         let now = Utc::now();
         let time = now - TimeDelta::hours(1);
-        let full: Vec<_> = (0..100).map(|id| interest_row(id, time, None)).collect();
-        mount_page(&server, INTEREST_PATH, "1", page_of(full.clone(), 101)).await;
+        let full = (0..100).map(|id| interest_row(id, time, None)).collect();
+        mount_page(&server, INTEREST_PATH, "1", page(full)).await;
         mount_page(
             &server,
             INTEREST_PATH,
             "2",
-            page_of(vec![interest_row(100, time, None)], 101),
+            page(vec![interest_row(100, time, None)]),
         )
         .await;
         let client = margin_client_at(&server, false);
@@ -789,19 +781,30 @@ mod tests {
 
         assert_eq!(flows.len(), 101);
         assert_eq!(queries(&server).await.len(), 2);
+    }
 
-        // A full page holding the whole total is the last, even were Binance to serve it again.
+    #[tokio::test]
+    async fn a_query_still_full_after_the_most_pages_fails() {
         let server = MockServer::start().await;
-        mount(&server, INTEREST_PATH, page_of(full, 100)).await;
+        let now = Utc::now();
+        let time = now - TimeDelta::hours(1);
+        // As were Binance to ignore the page asked for.
+        let full = (0..100).map(|id| interest_row(id, time, None)).collect();
+        mount(&server, INTEREST_PATH, page(full)).await;
         let client = margin_client_at(&server, false);
 
-        let flows = client
+        let result = client
             .fetch_margin_interest(now - TimeDelta::days(1), now)
-            .await
-            .unwrap();
+            .await;
 
-        assert_eq!(flows.len(), 100);
-        assert_eq!(queries(&server).await.len(), 1);
+        assert!(
+            matches!(result, Err(UnindexedClientError::Internal(_))),
+            "{result:?}"
+        );
+        assert_eq!(
+            i64::try_from(queries(&server).await.len()).unwrap(),
+            MAX_PAGES
+        );
     }
 
     #[tokio::test]
@@ -932,7 +935,8 @@ mod tests {
                     row(2, "SELL", "0.5", now - TimeDelta::hours(1)),
                     row(2, "SELL", "0.5", now - TimeDelta::hours(1)),
                     no_order_id,
-                    liquidation_row(8, "SELL", "0.5", now, !is_isolated),
+                    // Marked isolated: not the cross account's, but the isolated pair's.
+                    liquidation_row(8, "SELL", "0.5", now, true),
                     row(1, "BUY", "0", now - TimeDelta::hours(2)),
                     row(0, "BUY", "0.5", now - TimeDelta::days(3)),
                 ]),
@@ -945,8 +949,13 @@ mod tests {
                 .await
                 .unwrap();
 
-            let [unfilled, filled] = liquidations.as_slice() else {
-                panic!("two in the span: {liquidations:?}");
+            let (unfilled, filled) = match (is_isolated, liquidations.as_slice()) {
+                (false, [unfilled, filled]) => (unfilled, filled),
+                (true, [unfilled, filled, marked]) => {
+                    assert_eq!(marked.order_id, OrderId::new("8"));
+                    (unfilled, filled)
+                }
+                _ => panic!("is_isolated = {is_isolated}: {liquidations:?}"),
             };
             assert_eq!(unfilled.order_id, OrderId::new("1"));
             assert_eq!(unfilled.side, Side::Buy);
@@ -987,12 +996,12 @@ mod tests {
         let full = (0..100)
             .map(|id| liquidation_row(id, "SELL", "0.5", time, false))
             .collect();
-        mount_page(&server, LIQUIDATION_PATH, "1", page_of(full, 101)).await;
+        mount_page(&server, LIQUIDATION_PATH, "1", page(full)).await;
         mount_page(
             &server,
             LIQUIDATION_PATH,
             "2",
-            page_of(vec![liquidation_row(100, "SELL", "0.5", time, false)], 101),
+            page(vec![liquidation_row(100, "SELL", "0.5", time, false)]),
         )
         .await;
         let client = margin_client_at(&server, false);
