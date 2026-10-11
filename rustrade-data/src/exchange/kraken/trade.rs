@@ -176,19 +176,4 @@ mod tests {
             assert_eq!(trades.id(), None, "{message}");
         }
     }
-
-    #[test]
-    fn a_message_mixing_symbols_is_refused() {
-        let input = message(&[
-            trade("BTC/USD", "buy", "1", "1", 1),
-            trade("ETH/USD", "buy", "1", "1", 2),
-        ]);
-        assert!(serde_json::from_str::<KrakenTrades>(&input).is_err());
-    }
-
-    #[test]
-    fn a_ticker_message_is_not_trades() {
-        let input = r#"{"channel":"ticker","type":"update","data":[{"symbol":"BTC/USD","bid":1.0,"bid_qty":1.0,"ask":2.0,"ask_qty":1.0,"timestamp":"2018-08-18T17:40:57.321597Z"}]}"#;
-        assert!(serde_json::from_str::<KrakenTrades>(input).is_err());
-    }
 }

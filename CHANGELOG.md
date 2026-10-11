@@ -276,6 +276,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     offer and opens with the current top of book. It replaces v1's `spread` channel.
   - A Kraken `PublicTrade`'s `id` is now Kraken's trade id. It used to be built from the trade's
     time, side, price and amount.
+  - An error Kraken sends once the stream is running, refusing a request, now reaches the
+    caller as a stream error quoting Kraken's text. v1's error event was dropped without a trace.
+    So is a data message the connector refuses, such as one whose items name two symbols.
   - The message types follow v2's shapes. `KrakenTrades` and `KrakenOrderBookL1` are
     `KrakenMessage<KrakenData<_>>` over `KrakenTrade` and `KrakenTicker`, replacing
     `KrakenTradesInner`, `KrakenOrderBookL1Inner` and `KrakenSpread`. `KrakenSubResponse`,

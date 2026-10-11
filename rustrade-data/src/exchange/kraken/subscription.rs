@@ -8,6 +8,10 @@ use serde::{Deserialize, Serialize};
 /// Kraken answers each symbol of a request on its own, so one request for several symbols gets
 /// one response per symbol.
 ///
+/// Any message carrying an `error` is a failure, including one that answers no subscription, such
+/// as `{"error":"Malformed request","method":"error",...}`. Naming no symbol, it fails the whole
+/// batch.
+///
 /// ### Raw Payload Examples
 /// See docs: <https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/trade>
 /// #### Subscription Trade Success

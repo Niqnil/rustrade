@@ -1,8 +1,12 @@
 use super::channel::KrakenChannel;
 use crate::{Identifier, exchange::ExchangeSub};
 use rustrade_integration::subscription::SubscriptionId;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{
+    Deserialize, Serialize,
+    de::{self, DeserializeOwned, IgnoredAny, MapAccess, Visitor},
+};
 use smol_str::SmolStr;
+use std::marker::PhantomData;
 
 /// [`Kraken`](super::Kraken) message variants that can be received over
 /// [`WebSocket`](rustrade_integration::protocol::websocket::WebSocket).
@@ -91,7 +95,15 @@ use smol_str::SmolStr;
 ///     "time_out": "2018-11-12T21:14:59.545901Z"
 /// }
 /// ```
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Deserialize, Serialize)]
+///
+/// ### Parsing
+/// A message is told apart by its `channel`: the data channel `T` streams, `heartbeat` or
+/// `status`. One without a `channel` is a response to a request, such as a pong. Parsing fails,
+/// with a reason naming the cause, for:
+/// - a response carrying an `error`, which Kraken sends to a request it refused;
+/// - a channel other than these;
+/// - a data message the [`KrakenData`] rules refuse, or whose items do not parse.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize)]
 #[serde(untagged)]
 pub enum KrakenMessage<T> {
     Data(T),
@@ -110,6 +122,93 @@ where
     }
 }
 
+impl<'de, T> Deserialize<'de> for KrakenMessage<KrakenData<T>>
+where
+    T: KrakenChannelData,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(KrakenMessageVisitor(PhantomData))
+    }
+}
+
+/// Dispatches a [`KrakenMessage`] on its `channel` as it reads the message, rather than buffering
+/// it to try each variant in turn, so a refused data message keeps its own reason.
+struct KrakenMessageVisitor<T>(PhantomData<T>);
+
+impl<'de, T> Visitor<'de> for KrakenMessageVisitor<T>
+where
+    T: KrakenChannelData,
+{
+    type Value = KrakenMessage<KrakenData<T>>;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "a Kraken WebSocket v2 message")
+    }
+
+    fn visit_map<Map>(self, mut map: Map) -> Result<Self::Value, Map::Error>
+    where
+        Map: MapAccess<'de>,
+    {
+        let mut channel: Option<SmolStr> = None;
+        let mut data: Option<Vec<T>> = None;
+        // `data` read before `channel` named its type. Kraken sends `channel` first, so this is
+        // only a fallback for a reordered message
+        let mut data_unread: Option<serde_json::Value> = None;
+        let mut method: Option<SmolStr> = None;
+        let mut error: Option<String> = None;
+
+        while let Some(key) = map.next_key::<SmolStr>()? {
+            match key.as_str() {
+                "channel" => channel = Some(map.next_value()?),
+                "data" if channel.as_deref() == Some(T::CHANNEL.as_ref()) => {
+                    data = Some(map.next_value()?)
+                }
+                "data" if channel.is_none() => data_unread = Some(map.next_value()?),
+                "method" => method = Some(map.next_value()?),
+                "error" => error = Some(map.next_value()?),
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+
+        match (channel, method) {
+            (Some(channel), _) if channel == T::CHANNEL.as_ref() => {
+                let data = match (data, data_unread) {
+                    (Some(data), _) => data,
+                    (None, Some(unread)) => {
+                        Vec::<T>::deserialize(unread).map_err(de::Error::custom)?
+                    }
+                    (None, None) => return Err(de::Error::missing_field("data")),
+                };
+                KrakenData::new(data)
+                    .map(KrakenMessage::Data)
+                    .map_err(de::Error::custom)
+            }
+            (Some(channel), _) => match channel.as_str() {
+                "heartbeat" => Ok(KrakenMessage::Event(KrakenEvent::Heartbeat)),
+                "status" => Ok(KrakenMessage::Event(KrakenEvent::Status)),
+                other => Err(de::Error::custom(format_args!(
+                    "unexpected Kraken channel {other} on a {} stream",
+                    T::CHANNEL.as_ref()
+                ))),
+            },
+            (None, Some(method)) => match error {
+                None => Ok(KrakenMessage::Event(KrakenEvent::Response { method })),
+                Some(error) => Err(de::Error::custom(format_args!(
+                    "Kraken refused a request ({method}): {error}"
+                ))),
+            },
+            (None, None) => Err(de::Error::custom(
+                "Kraken message names neither a channel nor a method",
+            )),
+        }
+    }
+}
+
 /// An item a [`Kraken`](super::Kraken) data channel streams, such as one trade.
 pub trait KrakenChannelData: DeserializeOwned {
     /// The channel that streams this item.
@@ -122,8 +221,8 @@ pub trait KrakenChannelData: DeserializeOwned {
 /// One [`Kraken`](super::Kraken) data channel message: a batch of items for one symbol, with the
 /// [`SubscriptionId`] they route to (eg/ "trade|BTC/USD").
 ///
-/// Deserialising fails for a message from another channel, and for one whose items name more
-/// than one symbol, since a message is routed to a single subscription.
+/// A message whose items name more than one symbol is refused, since a message is routed to a
+/// single subscription.
 ///
 /// See [`KrakenMessage`] for full raw payload examples.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize)]
@@ -134,43 +233,22 @@ pub struct KrakenData<T> {
     pub data: Vec<T>,
 }
 
-impl<T> Identifier<Option<SubscriptionId>> for KrakenData<T> {
-    fn id(&self) -> Option<SubscriptionId> {
-        self.subscription_id.clone()
-    }
-}
-
-impl<'de, T> Deserialize<'de> for KrakenData<T>
+impl<T> KrakenData<T>
 where
     T: KrakenChannelData,
 {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct Raw<T> {
-            channel: SmolStr,
-            data: Vec<T>,
-        }
-
-        let Raw { channel, data } = Raw::<T>::deserialize(deserializer)?;
-        if channel != T::CHANNEL.as_ref() {
-            return Err(serde::de::Error::custom(format_args!(
-                "expected a Kraken {} message, got {channel}",
-                T::CHANNEL.as_ref()
-            )));
-        }
-
+    /// The batch `data`, routed by its items' symbol; an error naming two of them if they differ.
+    fn new(data: Vec<T>) -> Result<Self, String> {
         let subscription_id = match data.split_first() {
             None => None,
             Some((first, rest)) => {
                 if let Some(other) = rest.iter().find(|item| item.symbol() != first.symbol()) {
-                    return Err(serde::de::Error::custom(format_args!(
-                        "Kraken {channel} message mixes symbols {} and {}",
+                    return Err(format!(
+                        "Kraken {} message mixes symbols {} and {}",
+                        T::CHANNEL.as_ref(),
                         first.symbol(),
                         other.symbol()
-                    )));
+                    ));
                 }
                 Some(ExchangeSub::from((T::CHANNEL, first.symbol())).id())
             }
@@ -183,39 +261,29 @@ where
     }
 }
 
+impl<T> Identifier<Option<SubscriptionId>> for KrakenData<T> {
+    fn id(&self) -> Option<SubscriptionId> {
+        self.subscription_id.clone()
+    }
+}
+
 /// [`Kraken`](super::Kraken) messages received over the WebSocket which are not subscription data.
 ///
-/// eg/ [`Kraken`](super::Kraken) sends a [`KrakenChannelEvent::Heartbeat`] each second while
+/// eg/ [`Kraken`](super::Kraken) sends a [`KrakenEvent::Heartbeat`] each second while
 /// subscriptions are active and no other message is due.
 ///
 /// See [`KrakenMessage`] for full raw payload examples.
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum KrakenEvent {
-    /// A message on a channel that carries no subscription data.
-    Channel(KrakenChannelEvent),
-    /// A response to a request, such as a pong or an error.
-    Response(KrakenResponse),
-}
-
-/// [`Kraken`](super::Kraken) channels that carry no subscription data.
 ///
 /// See docs: <https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/heartbeat> <br>
 /// See docs: <https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/status>
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize, Serialize)]
-#[serde(tag = "channel", rename_all = "snake_case")]
-pub enum KrakenChannelEvent {
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Serialize)]
+pub enum KrakenEvent {
+    /// The `heartbeat` channel.
     Heartbeat,
+    /// The `status` channel, sent on connecting and when the venue's state changes.
     Status,
-}
-
-/// [`Kraken`](super::Kraken) response to a request, eg/ `{"method": "pong", ...}`, or an error
-/// such as `{"error": "Malformed request", "method": "error", "success": false, ...}`.
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize, Serialize)]
-pub struct KrakenResponse {
-    pub method: SmolStr,
-    #[serde(default)]
-    pub error: Option<String>,
+    /// A response to a request that succeeded, such as a pong.
+    Response { method: SmolStr },
 }
 
 /// [`Kraken`](super::Kraken) error message received over the WebSocket, naming the symbol it
@@ -236,50 +304,106 @@ pub struct KrakenError {
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use crate::exchange::kraken::trade::KrakenTrades;
+
+    const TIMES: &str =
+        r#""time_in":"2018-11-12T21:14:59.545897Z","time_out":"2018-11-12T21:14:59.545901Z""#;
+
+    fn trade(symbol: &str) -> String {
+        format!(
+            r#"{{"symbol":"{symbol}","side":"buy","price":1.5,"qty":2,"ord_type":"limit","trade_id":1,"timestamp":"2018-11-12T21:14:59.545897Z"}}"#
+        )
+    }
+
+    fn parse_error(message: &str) -> String {
+        serde_json::from_str::<KrakenTrades>(message)
+            .unwrap_err()
+            .to_string()
+    }
 
     #[test]
     fn heartbeat_and_status_are_events() {
-        let heartbeat: KrakenMessage<()> =
-            serde_json::from_str(r#"{"channel":"heartbeat"}"#).unwrap();
-        assert_eq!(
-            heartbeat,
-            KrakenMessage::Event(KrakenEvent::Channel(KrakenChannelEvent::Heartbeat))
-        );
+        let heartbeat: KrakenTrades = serde_json::from_str(r#"{"channel":"heartbeat"}"#).unwrap();
+        assert_eq!(heartbeat, KrakenMessage::Event(KrakenEvent::Heartbeat));
 
-        let status: KrakenMessage<()> = serde_json::from_str(
+        let status: KrakenTrades = serde_json::from_str(
             r#"{"channel":"status","type":"update","data":[{"api_version":"v2","connection_id":1,"system":"online","version":"2.0.0"}]}"#,
         )
         .unwrap();
+        assert_eq!(status, KrakenMessage::Event(KrakenEvent::Status));
+    }
+
+    #[test]
+    fn a_successful_response_is_an_event() {
+        let pong: KrakenTrades =
+            serde_json::from_str(&format!(r#"{{"method":"pong","req_id":1,{TIMES}}}"#)).unwrap();
         assert_eq!(
-            status,
-            KrakenMessage::Event(KrakenEvent::Channel(KrakenChannelEvent::Status))
+            pong,
+            KrakenMessage::Event(KrakenEvent::Response {
+                method: "pong".into()
+            })
         );
     }
 
     #[test]
-    fn responses_are_events() {
-        let pong: KrakenMessage<()> = serde_json::from_str(
-            r#"{"method":"pong","req_id":1,"time_in":"2018-11-12T21:14:59.545897Z","time_out":"2018-11-12T21:14:59.545901Z"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            pong,
-            KrakenMessage::Event(KrakenEvent::Response(KrakenResponse {
-                method: "pong".into(),
-                error: None,
-            }))
+    fn a_refused_request_is_an_error_quoting_kraken() {
+        let error = parse_error(&format!(
+            r#"{{"error":"Malformed request","method":"error","success":false,{TIMES}}}"#
+        ));
+        assert!(
+            error.contains("Kraken refused a request (error): Malformed request"),
+            "{error}"
         );
+    }
 
-        let error: KrakenMessage<()> = serde_json::from_str(
-            r#"{"error":"Malformed request","method":"error","success":false,"time_in":"2018-11-12T21:14:59.545897Z","time_out":"2018-11-12T21:14:59.545901Z"}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            error,
-            KrakenMessage::Event(KrakenEvent::Response(KrakenResponse {
-                method: "error".into(),
-                error: Some("Malformed request".to_owned()),
-            }))
+    #[test]
+    fn a_message_mixing_symbols_is_refused_naming_them() {
+        let error = parse_error(&format!(
+            r#"{{"channel":"trade","type":"update","data":[{},{}]}}"#,
+            trade("BTC/USD"),
+            trade("ETH/USD")
+        ));
+        assert!(
+            error.contains("Kraken trade message mixes symbols BTC/USD and ETH/USD"),
+            "{error}"
         );
+    }
+
+    #[test]
+    fn another_data_channel_is_refused_naming_it() {
+        let error = parse_error(
+            r#"{"channel":"ticker","type":"update","data":[{"symbol":"BTC/USD","bid":1.0,"bid_qty":1.0,"ask":2.0,"ask_qty":1.0,"timestamp":"2018-11-12T21:14:59.545897Z"}]}"#,
+        );
+        assert!(
+            error.contains("unexpected Kraken channel ticker on a trade stream"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_item_that_does_not_parse_keeps_its_reason() {
+        let error = parse_error(
+            r#"{"channel":"trade","type":"update","data":[{"symbol":"BTC/USD","side":"buy","price":1.5,"qty":2,"ord_type":"limit","timestamp":"2018-11-12T21:14:59.545897Z"}]}"#,
+        );
+        assert!(error.contains("missing field `trade_id`"), "{error}");
+    }
+
+    #[test]
+    fn data_before_its_channel_still_parses() {
+        let trades: KrakenTrades = serde_json::from_str(&format!(
+            r#"{{"data":[{}],"type":"update","channel":"trade"}}"#,
+            trade("BTC/USD")
+        ))
+        .unwrap();
+
+        let KrakenMessage::Data(trades) = trades else {
+            panic!("expected data, got {trades:?}");
+        };
+        assert_eq!(
+            trades.subscription_id,
+            Some(SubscriptionId::from("trade|BTC/USD"))
+        );
+        assert_eq!(trades.data.len(), 1);
+        assert_eq!(trades.data[0].symbol, "BTC/USD");
     }
 }
