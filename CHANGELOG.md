@@ -246,6 +246,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `activity_type`.
 
 - **The venue can settle an expiring contract instead of the engine** (#566).
+  - `AlpacaClient::fetch_option_events(start, end)` (`rustrade-execution`) reads the trades
+    Alpaca made when an option was exercised, assigned or expired, as a `TradesRead`. Each
+    `OPEXP`, `OPEXC` and `OPASN` activity becomes a trade on the contract at a price of 0, with
+    origin `Expiry`, `Exercise` or `Assignment`. Each `OPTRD`, the shares an exercise or
+    assignment traded at the strike, becomes a trade on the underlying with the origin of the
+    exercise or assignment it pairs with: same date, root symbol and strike, and the side the
+    contract implies. An `OPTRD` that pairs with none is `External`, logged at WARN. The read
+    covers the whole UTC days of the span, so both legs are read together.
   - The new `ExpiryHandling` (`Engine`, the default, or `Venue`) says who settles an instrument's
     positions at expiry. Set it per exchange with `EngineStateBuilder::expiry_handling` or
     `SystemBuilder::expiry_handling`. **Breaking:** `InstrumentState` gains the public
