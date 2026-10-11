@@ -277,6 +277,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A typed subscription no longer claims spot support for an exchange that serves none**
+  (`rustrade-data`). `exchange_supports_instrument_kind` granted `Spot` to every exchange not
+  denied by name, so a non-spot connector added without an edit there would claim spot. It now
+  grants `Spot` to each exchange whose connector serves a spot market, and denies it to every
+  other, as it does the other kinds. `HyperliquidPerp`, which serves perpetuals only, was granted
+  `Spot` by the old default and is now refused it. So is every `ExchangeId` with no connector.
 - **Breaking: Kraken subscriptions made from base and quote assets work; the connector now speaks
   Kraken's WebSocket v2** (`rustrade-data`). Fixes #588.
   - On Kraken's v1 API, which the connector used, every subscription built from a
