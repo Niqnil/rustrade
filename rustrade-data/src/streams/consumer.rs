@@ -87,10 +87,10 @@ where
 
     // Both the exchange stream and the stream of attempts are boxed before the reconnect
     // combinators wrap them. Unboxed, every combinator's type name repeats the whole exchange
-    // stream and init closure types, nested a dozen deep, once per exchange and subscription kind.
-    // Those names are almost all of this crate's debug info: they took a full-debug build of it
-    // to several GB in one rustc. Boxed, the combinators are instantiated once per event type.
-    // The cost is one allocation per connection attempt and a virtual call per poll.
+    // stream and init closure types, nested ten or more deep, once per exchange and subscription
+    // kind. Those names are almost all of this crate's debug info: they took a full-debug build
+    // of it to several GB in one rustc. Boxed, the combinators are instantiated once per event
+    // type. The cost is one allocation per connection attempt and a virtual call per poll.
     let attempts = init_reconnecting_stream(move || {
         let subscriber = subscriber.clone();
         let subscriptions = subscriptions.clone();

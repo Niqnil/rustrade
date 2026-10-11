@@ -170,8 +170,8 @@ jobs:
     # They were adopted when the `rustrade-data` library compiled at up to 13 GB in one rustc
     # process on this 16 GB runner, almost all of it debug info, and the job was intermittently
     # killed with exit 143 (#385). Type-erasing the market stream's reconnect chain (#387) brought
-    # that compile under 2 GB at full debug (measured locally), so they are now a saving, not
-    # what keeps the job alive. This is a profile setting, not a rustflag, so
+    # that compile under 2 GB at full debug (measured locally), so they should now be a saving
+    # rather than what keeps the job alive. This is a profile setting, not a rustflag, so
     # `.cargo/config.toml`'s mold and `split-debuginfo` flags still apply.
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
