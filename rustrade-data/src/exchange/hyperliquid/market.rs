@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn a_market_instrument_data_subscribes_by_the_venue_spelling() {
         let perps: Perps =
-            serde_json::from_str(r#"{"universe": [{"name": "kPEPE"}, {"name": "xyz:TSLA"}]}"#)
+            serde_json::from_str(r#"{"universe": [{"name": "kPEPE", "szDecimals": 0}, {"name": "xyz:TSLA", "szDecimals": 3}]}"#)
                 .unwrap();
         let spot_pairs: SpotPairs = serde_json::from_str(
             r#"{

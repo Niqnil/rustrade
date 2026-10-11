@@ -33,7 +33,7 @@ impl From<UnindexedClientError> for HyperliquidConnectError {
     fn from(error: UnindexedClientError) -> Self {
         match error {
             UnindexedClientError::Connectivity(error) => Self::Connectivity(error),
-            UnindexedClientError::Api(UnindexedApiError::RateLimit) => {
+            UnindexedClientError::Api(UnindexedApiError::RateLimit { .. }) => {
                 Self::Connectivity(ConnectivityError::Socket(error.to_string()))
             }
             other => Self::Metadata(other.to_string()),
@@ -45,16 +45,25 @@ impl From<UnindexedClientError> for HyperliquidConnectError {
 ///
 /// The SDK uses its own error type internally, so we pattern-match on error messages
 /// to determine transient vs permanent errors.
+///
+/// A rate limit carries no `retry_after`: the SDK keeps no response headers, and Hyperliquid
+/// documents no wait.
 pub fn map_sdk_error(error: hyperliquid_rust_sdk::Error) -> UnindexedClientError {
+    // An HTTP 429 is a rate limit whatever its body says.
+    if let hyperliquid_rust_sdk::Error::ClientRequest {
+        status_code: 429, ..
+    } = error
+    {
+        return UnindexedClientError::Api(UnindexedApiError::rate_limited(None));
+    }
+
     let msg = error.to_string();
     let msg_lower = msg.to_lowercase();
 
-    // Check for rate limiting first (transient) — avoid full msg allocation when possible
-    if msg_lower.contains("rate limit")
-        || msg_lower.contains("too many requests")
-        || msg_lower.contains("429")
-    {
-        return UnindexedClientError::Api(UnindexedApiError::RateLimit);
+    // Check for rate limiting first (transient). Matched on the words, not a bare "429", which
+    // an order id or a price in the message can hold.
+    if msg_lower.contains("rate limit") || msg_lower.contains("too many requests") {
+        return UnindexedClientError::Api(UnindexedApiError::rate_limited(None));
     }
 
     // Check for connectivity/network errors (transient)
@@ -184,23 +193,38 @@ mod tests {
 
     #[test]
     fn test_map_sdk_error_rate_limit() {
+        let rate_limited = UnindexedClientError::Api(UnindexedApiError::rate_limited(None));
+
         let err = map_sdk_error(make_sdk_error("rate limit exceeded"));
-        assert!(matches!(
-            err,
-            UnindexedClientError::Api(UnindexedApiError::RateLimit)
-        ));
+        assert_eq!(err, rate_limited);
 
         let err = map_sdk_error(make_sdk_error("too many requests"));
-        assert!(matches!(
-            err,
-            UnindexedClientError::Api(UnindexedApiError::RateLimit)
-        ));
+        assert_eq!(err, rate_limited);
 
-        let err = map_sdk_error(make_sdk_error("HTTP 429"));
-        assert!(matches!(
-            err,
-            UnindexedClientError::Api(UnindexedApiError::RateLimit)
-        ));
+        let err = map_sdk_error(Error::ClientRequest {
+            status_code: 429,
+            error_code: None,
+            error_message: "slow down".to_string(),
+            error_data: None,
+        });
+        assert_eq!(err, rate_limited);
+    }
+
+    #[test]
+    fn a_message_merely_holding_429_is_not_a_rate_limit() {
+        let err = map_sdk_error(Error::ClientRequest {
+            status_code: 400,
+            error_code: None,
+            error_message: "Order 74291 has invalid price 4290".to_string(),
+            error_data: None,
+        });
+        assert!(
+            !matches!(
+                err,
+                UnindexedClientError::Api(UnindexedApiError::RateLimit { .. })
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -306,7 +330,9 @@ mod tests {
             HyperliquidConnectError::Connectivity(socket)
         );
         assert!(matches!(
-            HyperliquidConnectError::from(UnindexedClientError::Api(UnindexedApiError::RateLimit)),
+            HyperliquidConnectError::from(UnindexedClientError::Api(
+                UnindexedApiError::rate_limited(None)
+            )),
             HyperliquidConnectError::Connectivity(ConnectivityError::Socket(_))
         ));
         assert!(matches!(

@@ -200,8 +200,9 @@ mod tests {
     };
 
     /// Info responses in Hyperliquid's shape, with synthetic values.
-    const META: &str = r#"{"universe": [{"name": "BTC"}, {"name": "kPEPE"}]}"#;
-    const META_XYZ: &str = r#"{"universe": [{"name": "xyz:TSLA"}]}"#;
+    const META: &str =
+        r#"{"universe": [{"name": "BTC", "szDecimals": 5}, {"name": "kPEPE", "szDecimals": 0}]}"#;
+    const META_XYZ: &str = r#"{"universe": [{"name": "xyz:TSLA", "szDecimals": 3}]}"#;
     const SPOT_META: &str = r#"{
         "universe": [
             {"name": "PURR/USDC", "tokens": [1, 0], "index": 0},
@@ -241,6 +242,8 @@ mod tests {
 
         assert_eq!(meta.perps().len(), 3);
         assert_eq!(meta.perp_coin("KPEPE").unwrap().coin(), "kPEPE");
+        assert_eq!(meta.perp_coin("BTC").unwrap().sz_decimals(), 5);
+        assert_eq!(meta.perp_coin("xyz:TSLA").unwrap().sz_decimals(), 3);
         assert_eq!(meta.perp_coin("xyz:TSLA").unwrap().deployer(), Some("xyz"));
         assert_eq!(meta.spot_pair("hype", "usdc").unwrap().coin(), "@107");
         assert_eq!(meta.spot_pair("PURR", "USDC").unwrap().coin(), "PURR/USDC");

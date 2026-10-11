@@ -295,7 +295,8 @@ impl<P: Protocol> Actor<P> {
         loop {
             let Ok(frame) = tokio::time::timeout_at(deadline, next_frame(&mut self.socket)).await
             else {
-                return Err(Refusal::Failed(SocketError::Subscribe(
+                return Err(Refusal::Failed(unsettled(
+                    handshake,
                     handshake.timed_out(timeout),
                 )));
             };
@@ -326,10 +327,10 @@ impl<P: Protocol> Actor<P> {
                     }
                 }
                 Read::Lost(cause) => {
-                    return Err(Refusal::Failed(SocketError::Subscribe(format!(
-                        "{} connection lost while subscribing: {cause}",
-                        P::NAME
-                    ))));
+                    return Err(Refusal::Failed(unsettled(
+                        handshake,
+                        format!("{} connection lost while subscribing: {cause}", P::NAME),
+                    )));
                 }
             }
         }
@@ -577,6 +578,18 @@ impl<P: Protocol> Actor<P> {
     }
 }
 
+/// The error a handshake that did not settle, for `reason`, fails with: naming what it had not
+/// confirmed, when it can.
+fn unsettled<Answer>(handshake: &impl Handshake<Answer>, reason: String) -> SocketError {
+    match handshake.unconfirmed() {
+        Some(unacknowledged) => SocketError::Unacknowledged {
+            reason,
+            unacknowledged,
+        },
+        None => SocketError::Subscribe(reason),
+    }
+}
+
 fn not_open<P: Protocol>() -> SocketError {
     SocketError::Subscribe(format!("{} connection is not open", P::NAME))
 }
@@ -617,7 +630,7 @@ mod tests {
     use crate::subscriber::shared::{Connections, Frame};
     use futures::FutureExt;
     use rustrade_instrument::exchange::ExchangeId;
-    use rustrade_integration::protocol::websocket::connect;
+    use rustrade_integration::{protocol::websocket::connect, subscription::SubscriptionId};
     use tokio::net::TcpListener;
     use tokio_tungstenite::WebSocketStream;
 
@@ -748,6 +761,7 @@ mod tests {
     struct Answered;
 
     struct Counted {
+        sending: Vec<&'static str>,
         expected: usize,
         confirmed: usize,
     }
@@ -763,6 +777,16 @@ mod tests {
 
         fn timed_out(&self, _: Duration) -> String {
             "timed out".to_owned()
+        }
+
+        /// The slots after those confirmed: the provider answers in the order they were sent.
+        fn unconfirmed(&self) -> Option<Vec<SubscriptionId>> {
+            Some(
+                self.sending[self.confirmed..]
+                    .iter()
+                    .map(|slot| SubscriptionId::from(*slot))
+                    .collect(),
+            )
         }
 
         fn refusal(&self, error: SocketError) -> SocketError {
@@ -797,6 +821,7 @@ mod tests {
             (
                 vec![WsMessage::text(sending.join(","))],
                 Counted {
+                    sending: sending.to_vec(),
                     expected: sending.len(),
                     confirmed: 0,
                 },
@@ -861,6 +886,59 @@ mod tests {
             error.to_string().contains("refused; 2 of 2 confirmed"),
             "{error}"
         );
+    }
+
+    /// Answer the one subscribe with `answers`, then close the socket.
+    async fn answering_then_closing(answers: &'static str) -> Url {
+        server(move |mut websocket| async move {
+            websocket.next().await.unwrap().unwrap();
+            websocket.send(WsMessage::text(answers)).await.unwrap();
+            websocket.close(None).await.unwrap();
+        })
+        .await
+    }
+
+    fn unacknowledged(error: SocketError) -> (String, Vec<SubscriptionId>) {
+        match error {
+            SocketError::Unacknowledged {
+                reason,
+                unacknowledged,
+            } => (reason, unacknowledged),
+            other => panic!("expected Unacknowledged, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_timeout_names_what_the_handshake_did_not_confirm() {
+        let connections = Connections::<Answered>::new(());
+        let mut request = request(answering("y").await);
+        request.timeout = Duration::from_millis(200);
+
+        let error = connections
+            .attach(request)
+            .await
+            .expect_err("an unconfirmed subscribe attached");
+
+        let (reason, unacknowledged) = unacknowledged(error);
+        assert_eq!(reason, "timed out");
+        assert_eq!(unacknowledged, [SubscriptionId::from("MSFT")]);
+    }
+
+    #[tokio::test]
+    async fn a_lost_connection_names_what_the_handshake_did_not_confirm() {
+        let connections = Connections::<Answered>::new(());
+
+        let error = connections
+            .attach(request(answering_then_closing("y").await))
+            .await
+            .expect_err("an unconfirmed subscribe attached");
+
+        let (reason, unacknowledged) = unacknowledged(error);
+        assert!(
+            reason.starts_with("Answered connection lost while subscribing"),
+            "{reason}"
+        );
+        assert_eq!(unacknowledged, [SubscriptionId::from("MSFT")]);
     }
 
     #[tokio::test]

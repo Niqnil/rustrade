@@ -217,6 +217,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `ApiError::InstrumentInvalid`.
   - An option, and a symbol the venue does not know, is `ApiError::InstrumentInvalid`.
   - `Shortability::fee_rate` now states its convention: simple, on the venue's own year basis.
+- **`PerpCoin::sz_decimals`: a Hyperliquid perpetual's size precision** (`rustrade-instrument`,
+  #536). It is read from `meta`'s `szDecimals`, as `SpotPair::base_sz_decimals` is from
+  `spotMeta`, so `rustrade-data`'s `HyperliquidMeta` now gives a perpetual's order precision
+  without an execution client. A `meta` deserialized into `Perps` must now carry `szDecimals`,
+  which Hyperliquid sends for every perpetual.
 
 ### Changed
 
@@ -251,6 +256,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Such a pass ends with one WARN, `Order check stopped: the venue is limiting requests…`,
     carrying how many instruments it deferred, in place of the INFO `Order check complete`; each
     instrument's retry is logged at DEBUG instead of WARN.
+
+- **Kraken, Bitfinex and Massive name the subscriptions they left unacknowledged**
+  (`rustrade-data`, #514).
+  - Kraken implements `Connector::acknowledged_subscription` from the channel and pair its
+    confirmation echoes, so a failed batch names only the subscriptions Kraken did not confirm.
+    Kraken echoes a pair in its own spelling (`XBT/USD` for one subscribed as `BTC/USD`), and a
+    subscription keyed under another spelling still names the whole batch.
+  - `BitfinexWebSocketSubValidator` and Massive's subscriber now fail with
+    `SocketError::Unacknowledged`, carried into `DataError::SubscriptionsUnacknowledged`, where
+    they returned `SocketError::Subscribe`, flattened to `DataError::Socket`. A caller matching
+    `DataError::Socket` for these failures must match the new variant. Bitfinex's error event names
+    the channel and symbol it refused, and the reason now quotes them. Massive's refusal names
+    none, so the refused subscription is among those it lists. The subscriptions are listed in
+    the error's field rather than in its reason, so the reason texts changed: Massive's timeout no
+    longer says `never confirmed: ...`.
+
+- **Breaking: `ApiError::RateLimit` carries the venue's wait** (`rustrade-execution`, #585).
+  - It is now `RateLimit { retry_after: Option<Duration> }`, `#[non_exhaustive]`: match it as
+    `RateLimit { .. }` and build it with `ApiError::rate_limited(retry_after)`. The new
+    `ApiError::retry_after()` reads the wait, and the message adds `; retry after <wait>` when
+    there is one. Its serialized form changes from the unit variant's string to an object.
+  - `retry_after` is the venue's minimum wait, measured from when the client read the refusal.
+    `None` means the venue gave none or the client cannot read it, not that a retry may follow at
+    once. The variant stays transient.
+  - `AlpacaClient` fills it from a 429's `Retry-After`, or else `X-RateLimit-Reset`, once its own
+    retries are exhausted, capped at Alpaca's one-minute window. The last refusal now also pauses
+    the client's later requests for that wait, or 60 s without one, as the earlier refusals did;
+    before, the next request went out at once.
+  - Binance (`binance-sdk` drops the response headers from its rate-limit errors) and Hyperliquid
+    (its SDK keeps none) always report `None`.
+  - The check of how orders ended while disconnected retries no instrument, whatever its failure,
+    before the longest wait the venue's refusals in that check asked for, and its WARN reports it
+    as `venue_wait_ms`.
+  - `rustrade-data`'s Alpaca REST client reads a 429 by the same rule: it now also honours
+    `X-RateLimit-Reset` when Alpaca sends no `Retry-After`, instead of waiting a fixed 60 s, and
+    waits no longer than the window however large a header says.
+  - Hyperliquid recognises a rate limit by the SDK's HTTP 429 status rather than by `429`
+    appearing anywhere in the message, so an error whose text merely holds those digits (an order
+    id, a price) is no longer reported as one.
 
 ### Fixed
 
@@ -289,6 +333,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     lookups.
   - Other refusals (minimum notional, reduce-only, open-interest caps, oracle, margin-tier limit)
     stay `OrderRejected`.
+
+- **Bitfinex subscription validation could wait for ever, or fail a healthy batch**
+  (`rustrade-data`, part of #514).
+  - `BitfinexWebSocketSubValidator` re-armed its timeout on every message, so a subscription
+    Bitfinex never answered was not reported while another subscription in the batch kept
+    streaming. The timeout is now one deadline for the whole validation, as it already was for
+    the shared `WebSocketSubValidator`.
+  - It counted every data frame after the first acknowledgement as an initial snapshot, and
+    waited for exactly one per subscription. A heartbeat or update arriving before the batch's
+    last acknowledgement overshot the count, and the batch failed at the timeout. It now counts a
+    channel's first frame other than a heartbeat, once per channel.
 
 ## [0.10.1] - 2026-10-09
 

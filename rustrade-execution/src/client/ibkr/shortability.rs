@@ -110,7 +110,7 @@ fn request_error(instrument: &InstrumentNameExchange, e: ibapi::Error) -> Uninde
     match e {
         // Market data lines are an account quota, freed as other requests end.
         ibapi::Error::Notice(notice) if notice.code == MAX_TICKERS_CODE => {
-            UnindexedClientError::Api(ApiError::RateLimit)
+            UnindexedClientError::Api(ApiError::rate_limited(None))
         }
         ibapi::Error::Notice(notice) => UnindexedClientError::Api(ApiError::RequestRejected(
             format!("{instrument}: {} {}", notice.code, notice.message),
@@ -478,7 +478,7 @@ mod tests {
         );
         assert!(matches!(
             error,
-            UnindexedClientError::Api(ApiError::RateLimit)
+            UnindexedClientError::Api(ApiError::rate_limited(None))
         ));
     }
 

@@ -396,8 +396,9 @@ const _: () = assert!(
     BINANCE_MAX_TRADES <= i32::MAX as usize,
     "BINANCE_MAX_TRADES overflows i32"
 );
-/// Default delay when rate-limited (exponential backoff; Binance's `Retry-After`
-/// header is not accessible through the SDK's `anyhow::Error` chain).
+/// Default delay when rate-limited (exponential backoff). Binance sends `Retry-After` on a 429 or
+/// 418, but `binance-sdk` drops the response headers from its rate-limit errors, so neither this
+/// delay nor [`ApiError::RateLimit`]'s `retry_after` can use it.
 pub(crate) const DEFAULT_RATE_LIMIT_DELAY_SECS: u64 = 10;
 /// Maximum number of REST retry attempts on rate-limit errors.
 pub(crate) const MAX_RATE_LIMIT_RETRIES: u32 = 3;
@@ -2584,7 +2585,7 @@ pub(crate) fn parse_binance_api_error(
         return ApiError::Unauthenticated(error_msg);
     }
     if has_rate_limit_error_code(&error_msg) {
-        return ApiError::RateLimit;
+        return ApiError::rate_limited(None);
     }
     if contains_error_code(&error_msg, "-2011") {
         // -2011: "Unknown order sent" — typically means already cancelled/filled
@@ -2629,7 +2630,7 @@ pub(crate) fn parse_binance_api_error(
         // guessed from the order.
         ApiError::BalanceInsufficient(None, error_msg)
     } else if contains_ignore_case(&error_msg, "rate limit") {
-        ApiError::RateLimit
+        ApiError::rate_limited(None)
     } else if contains_ignore_case(&error_msg, "unknown order") {
         // -2011/-2013 map to OrderAlreadyCancelled via numeric code above.
         // The text-only fallback here (no code present) maps "unknown order" to
@@ -2691,7 +2692,7 @@ fn parse_binance_query_rejection(
     let api = if is_auth_failure(&msg) {
         ApiError::Unauthenticated(msg)
     } else if has_rate_limit_error_code(&msg) {
-        ApiError::RateLimit
+        ApiError::rate_limited(None)
     } else if has_venue_failure_code(&msg) || contains_error_code(&msg, "-1021") {
         return UnindexedClientError::Connectivity(ConnectivityError::Socket(msg));
     } else if let Some(instrument) = instrument.filter(|_| contains_error_code(&msg, "-1121")) {
@@ -2733,7 +2734,7 @@ pub(crate) fn classify_rest_query_error(
     }
     if let Some(ce) = e.downcast_ref::<ConnectorError>() {
         return match classify_connector_error(ce) {
-            RequestFailure::RateLimited => UnindexedClientError::Api(ApiError::RateLimit),
+            RequestFailure::RateLimited => UnindexedClientError::Api(ApiError::rate_limited(None)),
             RequestFailure::Unauthenticated(msg) => {
                 UnindexedClientError::Api(ApiError::Unauthenticated(msg))
             }
@@ -3225,7 +3226,7 @@ fn order_error_from(
     instrument: &InstrumentNameExchange,
 ) -> UnindexedOrderError {
     match failure {
-        RequestFailure::RateLimited => OrderError::Rejected(ApiError::RateLimit),
+        RequestFailure::RateLimited => OrderError::Rejected(ApiError::rate_limited(None)),
         RequestFailure::Unauthenticated(msg) => {
             OrderError::Rejected(ApiError::Unauthenticated(msg))
         }
@@ -4192,7 +4193,7 @@ mod tests {
         ] {
             assert!(matches!(
                 classify_err(ce),
-                OrderError::Rejected(ApiError::RateLimit)
+                OrderError::Rejected(ApiError::RateLimit { .. })
             ));
         }
     }
@@ -4335,7 +4336,7 @@ mod tests {
         for code in [-1003, -1015] {
             let err = classify_query(bad_request(code, "Too much request weight used."));
             assert!(
-                matches!(err, UnindexedClientError::Api(ApiError::RateLimit)),
+                matches!(err, UnindexedClientError::Api(ApiError::RateLimit { .. })),
                 "{code}: got {err:?}"
             );
         }
@@ -4380,7 +4381,7 @@ mod tests {
         });
         assert!(matches!(
             err,
-            UnindexedClientError::Api(ApiError::RateLimit)
+            UnindexedClientError::Api(ApiError::RateLimit { .. })
         ));
 
         let err = classify_query(ConnectorError::UnauthorizedError {
@@ -4459,7 +4460,7 @@ mod tests {
             code: None,
         });
         assert!(
-            matches!(err, UnindexedClientError::Api(ApiError::RateLimit)),
+            matches!(err, UnindexedClientError::Api(ApiError::RateLimit { .. })),
             "got {err:?}"
         );
 
@@ -4495,7 +4496,7 @@ mod tests {
                 msg: "<html>403 Forbidden</html>".to_string(),
                 code: None,
             }),
-            OrderError::Rejected(ApiError::RateLimit)
+            OrderError::Rejected(ApiError::RateLimit { .. })
         ));
     }
 
@@ -4748,7 +4749,7 @@ mod tests {
         for code in [429, 418, 403] {
             let err = classify_ws(code, "Unknown error");
             assert!(
-                matches!(err, Some(OrderError::Rejected(ApiError::RateLimit))),
+                matches!(err, Some(OrderError::Rejected(ApiError::RateLimit { .. }))),
                 "{code}: got {err:?}"
             );
         }
@@ -4788,7 +4789,7 @@ mod tests {
         );
         let err = classify_ws(-1003, "Too much request weight used.");
         assert!(
-            matches!(err, Some(OrderError::Rejected(ApiError::RateLimit))),
+            matches!(err, Some(OrderError::Rejected(ApiError::RateLimit { .. }))),
             "got {err:?}"
         );
     }

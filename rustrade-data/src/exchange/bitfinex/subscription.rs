@@ -31,6 +31,8 @@ use serde::{Deserialize, Serialize};
 /// #### Subscription Failure
 /// ``` json
 /// {
+///    "channel": "trades",
+///    "symbol": "tNOSUCH",
 ///    "event": "error",
 ///    "msg": ERROR_MSG,
 ///    "code": ERROR_CODE
@@ -60,6 +62,14 @@ impl Validator for BitfinexPlatformEvent {
                 ))),
             },
             BitfinexPlatformEvent::Subscribed(_) => Ok(self),
+            BitfinexPlatformEvent::Error(BitfinexError {
+                msg,
+                code,
+                channel: Some(channel),
+                symbol: Some(symbol),
+            }) => Err(SocketError::Subscribe(format!(
+                "Bitfinex refused {channel} {symbol}: {msg} (code {code})"
+            ))),
             BitfinexPlatformEvent::Error(error) => Err(SocketError::Subscribe(format!(
                 "received failure subscription response code: {} with message: {}",
                 error.code, error.msg,
@@ -135,6 +145,8 @@ pub enum Status {
 /// #### Subscription Failure
 /// ``` json
 /// {
+///    "channel": "trades",
+///    "symbol": "tNOSUCH",
 ///    "event": "error",
 ///    "msg": ERROR_MSG,
 ///    "code": ERROR_CODE
@@ -171,6 +183,12 @@ pub struct BitfinexChannelId(pub u32);
 pub struct BitfinexError {
     msg: String,
     code: u32,
+    /// The channel of the subscription refused, when the error answers one.
+    #[serde(default)]
+    channel: Option<String>,
+    /// The symbol of the subscription refused, when the error answers one.
+    #[serde(default)]
+    symbol: Option<String>,
 }
 
 impl<'de> Deserialize<'de> for Status {
@@ -259,6 +277,18 @@ mod tests {
                 expected: Ok(BitfinexPlatformEvent::Error(BitfinexError {
                     msg: "Already subscribed".to_owned(),
                     code: 10202,
+                    channel: None,
+                    symbol: None,
+                })),
+            },
+            // TC3: Input response is an error naming the subscription it refuses
+            TestCase {
+                input: r#"{"channel": "trades", "symbol": "tNOSUCH", "event": "error", "msg": "symbol: invalid", "code": 10300, "pair": "NOSUCH"}"#,
+                expected: Ok(BitfinexPlatformEvent::Error(BitfinexError {
+                    msg: "symbol: invalid".to_owned(),
+                    code: 10300,
+                    channel: Some("trades".to_owned()),
+                    symbol: Some("tNOSUCH".to_owned()),
                 })),
             },
         ];
@@ -335,6 +365,8 @@ mod tests {
                 input: BitfinexPlatformEvent::Error(BitfinexError {
                     msg: "error message".to_string(),
                     code: 0,
+                    channel: None,
+                    symbol: None,
                 }),
                 expected: Err(SocketError::Subscribe(format!(
                     "received failure subscription response code: {} with message: {}",

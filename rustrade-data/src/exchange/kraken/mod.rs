@@ -12,7 +12,10 @@ use crate::{
 };
 use derive_more::Display;
 use rustrade_instrument::exchange::ExchangeId;
-use rustrade_integration::protocol::websocket::{WebSocketSerdeParser, WsMessage};
+use rustrade_integration::{
+    protocol::websocket::{WebSocketSerdeParser, WsMessage},
+    subscription::SubscriptionId,
+};
 use rustrade_macro::{DeExchange, SerExchange};
 use serde_json::json;
 use url::Url;
@@ -93,6 +96,10 @@ impl Connector for Kraken {
                 )
             })
             .collect()
+    }
+
+    fn acknowledged_subscription(response: &Self::SubResponse) -> Option<SubscriptionId> {
+        response.subscription_id()
     }
 }
 
