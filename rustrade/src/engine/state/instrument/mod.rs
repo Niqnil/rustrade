@@ -2052,7 +2052,7 @@ impl std::fmt::Display for ForcedFillUnplaced {
 }
 
 /// `trade` cut to `held`, keeping its sign, with its fees cut in proportion. `held` is less than
-/// the trade's size.
+/// `trade.quantity.abs()`.
 fn capped_to<AssetKey, InstrumentKey>(
     trade: &Trade<AssetKey, InstrumentKey>,
     held: Decimal,
@@ -2741,8 +2741,12 @@ mod tests {
 
         let exited = state.update_from_trade(&liquidation(Side::Sell, dec!(-5)));
 
-        assert!(exited.is_some(), "the long is closed");
+        let Some(exited) = exited else {
+            panic!("the long is closed");
+        };
+        assert_eq!(exited.quantity_abs_max, dec!(2));
         assert!(state.position.positions.is_empty(), "no short is opened");
+        assert_eq!(state.tear_sheet.fills_forced, 1);
         assert_eq!(state.tear_sheet.fills_forced_unallocated, 1);
     }
 
