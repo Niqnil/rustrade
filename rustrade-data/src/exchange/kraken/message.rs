@@ -389,6 +389,24 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_envelope_is_refused_naming_why() {
+        assert!(
+            parse_error("{}").contains("Kraken message names neither a channel nor a method"),
+            "{}",
+            parse_error("{}")
+        );
+        let error = parse_error(r#"{"channel":"trade","type":"update"}"#);
+        assert!(error.contains("missing field `data`"), "{error}");
+    }
+
+    #[test]
+    fn data_before_another_channel_is_not_read_as_items() {
+        let status: KrakenTrades =
+            serde_json::from_str(r#"{"data":[{"system":"online"}],"channel":"status"}"#).unwrap();
+        assert_eq!(status, KrakenMessage::Event(KrakenEvent::Status));
+    }
+
+    #[test]
     fn data_before_its_channel_still_parses() {
         let trades: KrakenTrades = serde_json::from_str(&format!(
             r#"{{"data":[{}],"type":"update","channel":"trade"}}"#,
