@@ -222,10 +222,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Kraken, Bitfinex and Massive name the subscriptions they left unacknowledged**
   (`rustrade-data`, #514).
-  - Kraken implements `Connector::acknowledged_subscription` from the channel and pair its
+  - Kraken implements `Connector::acknowledged_subscription` from the channel and symbol its
     confirmation echoes, so a failed batch names only the subscriptions Kraken did not confirm.
-    Kraken echoes a pair in its own spelling (`XBT/USD` for one subscribed as `BTC/USD`), and a
-    subscription keyed under another spelling still names the whole batch.
   - `BitfinexWebSocketSubValidator` and Massive's subscriber now fail with
     `SocketError::Unacknowledged`, carried into `DataError::SubscriptionsUnacknowledged`, where
     they returned `SocketError::Subscribe`, flattened to `DataError::Socket`. A caller matching
@@ -260,6 +258,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     id, a price) is no longer reported as one.
 
 ### Fixed
+
+- **Breaking: Kraken subscriptions made from base and quote assets work; the connector now speaks
+  Kraken's WebSocket v2** (`rustrade-data`). Fixes #588.
+  - On Kraken's v1 API, which the connector used, every subscription built from a
+    `MarketDataInstrument` failed: the pair was spelled in lower case (`btc/usd`), which v1
+    refuses. v1 also renames bitcoin `XBT`, so a `BTC/USD` subscription was confirmed, but its
+    data never reached it.
+  - The connector now uses `wss://ws.kraken.com/v2` (`BASE_URL_KRAKEN`). Symbols are `BASE/QUOTE`
+    in upper case (`BTC/USD`), and Kraken echoes them as sent. A subscription built from base and
+    quote assets is spelled that way.
+  - **Breaking:** a `MarketInstrumentData` whose `name_exchange` holds a v1 spelling, such as
+    `XBT/USD` or `XDG/USD`, is now refused. Spell it as v2 does (`BTC/USD`, `DOGE/USD`). Kraken
+    refuses each symbol on its own, so a failed batch names only the refused subscriptions, and the
+    reason quotes the symbol.
+  - `OrderBooksL1` comes from v2's ticker channel, which updates on each change to the best bid or
+    offer and opens with the current top of book. It replaces v1's `spread` channel.
+  - A Kraken `PublicTrade`'s `id` is now Kraken's trade id. It used to be built from the trade's
+    time, side, price and amount.
+  - An error Kraken sends once the stream is running, refusing a request, now reaches the
+    caller as a stream error quoting Kraken's text, as does a data message the connector refuses,
+    such as one whose items name two symbols. v1 dropped such errors without a trace. One that
+    arrives while the subscriptions are being confirmed is logged at WARN and dropped.
+  - The message types follow v2's shapes. `KrakenTrades` and `KrakenOrderBookL1` are
+    `KrakenMessage<KrakenData<_>>` over `KrakenTrade` and `KrakenTicker`, replacing
+    `KrakenTradesInner`, `KrakenOrderBookL1Inner` and `KrakenSpread`. `KrakenSubResponse`,
+    `KrakenEvent` and `KrakenError` changed with them, and `KrakenChannel::ORDER_BOOK_L1` is
+    `"ticker"`.
 
 - **`AlpacaClient` no longer reports Alpaca's business refusals as `Unauthenticated`**
   (`rustrade-execution`). Fixes #570.
