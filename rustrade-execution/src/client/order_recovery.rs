@@ -641,8 +641,9 @@ impl UncheckedOrders {
     /// A long one, such as a ban's, holds the retry back for all of it while the failure still
     /// counts toward [`MAX_GAP_RETRIES`].
     ///
-    /// Retry delays are bounded: the base backoff by [`MAX_GAP_RETRIES`], and `min_delay` by
-    /// whichever client read it from the venue, so `now + delay` cannot overflow.
+    /// The base backoff is bounded by [`MAX_GAP_RETRIES`]. `min_delay` is bounded only by the
+    /// client that read it from the venue, as every client in this crate bounds it, so that
+    /// `now + delay` does not overflow.
     pub(crate) fn failed(
         &mut self,
         instrument: &InstrumentNameExchange,
@@ -2005,6 +2006,51 @@ mod tests {
         )
         .await;
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// An instrument whose check timed out waits as long as the venue asked in another
+    /// instrument's refusal.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_instrument_waits_for_the_venues_wait() {
+        let (known, mut unchecked) = held_on(&["AAA", "SLOW"]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let long = Duration::from_secs(GAP_RETRY_BASE_SECS * 10);
+
+        recover_ended_orders(
+            ExchangeId::BinanceSpot,
+            &known,
+            &mut unchecked,
+            &NoPendingFills,
+            &tx,
+            OpenListing::PerInstrument,
+            |instruments: Vec<InstrumentNameExchange>| async move {
+                if instruments[0].name().as_str() == "SLOW" {
+                    std::future::pending::<()>().await;
+                }
+                // SLOW's listing is in flight before AAA's is refused.
+                tokio::task::yield_now().await;
+                Err(UnindexedClientError::Api(ApiError::rate_limited(Some(
+                    long,
+                ))))
+            },
+            |_: UnindexedOrderKey| async { panic!("nothing listed, nothing looked up") },
+        )
+        .await;
+
+        let timed_out = tokio::time::Instant::now();
+        assert!(
+            unchecked
+                .ready(&NoPendingFills, timed_out + long - Duration::from_secs(1))
+                .is_empty(),
+            "retried before the venue's wait"
+        );
+        assert_eq!(
+            unchecked.ready(&NoPendingFills, timed_out + long * 2),
+            [
+                InstrumentNameExchange::new("AAA"),
+                InstrumentNameExchange::new("SLOW")
+            ]
+        );
     }
 
     /// Two instruments are checked at a time, in name order. When the pass times out, the two
