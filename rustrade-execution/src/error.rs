@@ -21,7 +21,7 @@ use rustrade_instrument::{
 };
 use rustrade_integration::error::SocketError;
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{fmt, time::Duration};
 use thiserror::Error;
 
 /// Type alias for a [`ClientError`] that is keyed on [`AssetNameExchange`] and
@@ -111,7 +111,7 @@ impl<AssetKey, InstrumentKey> ClientError<AssetKey, InstrumentKey> {
     ///
     /// # Transient errors
     /// - [`Connectivity`](Self::Connectivity) errors (timeout, socket, offline)
-    /// - [`Api::RateLimit`](ApiError::RateLimit)
+    /// - [`Api::RateLimit`](ApiError::RateLimit), though not before its `retry_after`
     ///
     /// # Non-transient errors
     /// - Other [`Api`](Self::Api) errors (invalid instrument, insufficient balance, etc.)
@@ -121,7 +121,7 @@ impl<AssetKey, InstrumentKey> ClientError<AssetKey, InstrumentKey> {
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Connectivity(e) => e.is_transient(),
-            Self::Api(ApiError::RateLimit) => true,
+            Self::Api(ApiError::RateLimit { .. }) => true,
             Self::Api(_) => false,
             Self::TaskFailed(_) => false,
             Self::Internal(_) => false,
@@ -224,14 +224,26 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
 
     /// Request was rejected due to rate limiting.
     ///
-    /// The exchange enforces request quotas and the caller has exceeded them.
-    /// Some exchanges provide a `Retry-After` header or similar hint; the client
-    /// may incorporate this into internal retry logic before surfacing this error.
+    /// The exchange enforces request quotas and the caller has exceeded them. The client may
+    /// already have waited and retried within its own bounded retries before surfacing this.
     ///
-    /// Transient — retry with backoff. Typical backoff is 10-60 seconds, but
-    /// respect exchange-specific guidance if available.
-    #[error("rate limit exceeded")]
-    RateLimit,
+    /// `retry_after` is the venue's own minimum wait, measured from when the client read the
+    /// refusal: do not retry sooner. `None` means the venue sent no hint, or the client cannot
+    /// read it, and is not permission to retry at once. Which clients fill it:
+    /// - **Alpaca:** from a 429's `Retry-After`, or else `X-RateLimit-Reset`, once the client's
+    ///   own retries are exhausted.
+    /// - **Binance:** never, for now: `binance-sdk` drops the response headers, `Retry-After`
+    ///   among them, from its rate-limit errors.
+    /// - **Hyperliquid:** never: its SDK keeps no headers, and Hyperliquid documents no hint.
+    ///
+    /// A venue ban (Binance's HTTP 418) is reported the same way: its hint, when readable, says
+    /// how long it lasts.
+    ///
+    /// Transient — retry after `retry_after` when given, otherwise with backoff. Build one with
+    /// [`ApiError::rate_limited`].
+    #[error("rate limit exceeded{}", RetryAfter(*retry_after))]
+    #[non_exhaustive]
+    RateLimit { retry_after: Option<Duration> },
 
     /// Authentication failed (invalid credentials, expired key, bad signature).
     ///
@@ -358,6 +370,35 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// Not transient — the same request fails identically until the venue's lending changes.
     #[error("borrow rejected: {0}")]
     BorrowRejected(BorrowReject),
+}
+
+impl<AssetKey, InstrumentKey> ApiError<AssetKey, InstrumentKey> {
+    /// A [`RateLimit`](Self::RateLimit) refusal, with the venue's minimum wait when it sent one.
+    pub fn rate_limited(retry_after: Option<Duration>) -> Self {
+        Self::RateLimit { retry_after }
+    }
+
+    /// The venue's minimum wait before a retry: `Some` only for a
+    /// [`RateLimit`](Self::RateLimit) whose venue sent a hint the client could read.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::RateLimit { retry_after } => *retry_after,
+            _ => None,
+        }
+    }
+}
+
+/// Formats a [`RateLimit`](ApiError::RateLimit)'s hint for its message: nothing when there is
+/// none.
+struct RetryAfter(Option<Duration>);
+
+impl fmt::Display for RetryAfter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(retry_after) => write!(f, "; retry after {retry_after:?}"),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Why a venue refused to lend for an order, as carried by [`ApiError::BorrowRejected`].
@@ -599,7 +640,8 @@ impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
     ///
     /// # Transient errors
     /// - [`Connectivity`](Self::Connectivity) errors (timeout, socket, offline)
-    /// - [`Rejected(ApiError::RateLimit)`](ApiError::RateLimit)
+    /// - [`Rejected(ApiError::RateLimit)`](ApiError::RateLimit), though not before its
+    ///   `retry_after`
     ///
     /// # Non-transient errors
     /// - Other [`Rejected`](Self::Rejected) errors (invalid instrument, insufficient balance,
@@ -609,7 +651,7 @@ impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Connectivity(e) => e.is_transient(),
-            Self::Rejected(ApiError::RateLimit) => true,
+            Self::Rejected(ApiError::RateLimit { .. }) => true,
             Self::Rejected(_) => false,
             Self::UnsupportedOrderType(_) | Self::InvalidPrecision(_) => false,
         }
@@ -720,6 +762,22 @@ mod tests {
     use rust_decimal_macros::dec;
 
     #[test]
+    fn a_rate_limit_carries_and_shows_the_venues_wait() {
+        let hinted: UnindexedApiError = ApiError::rate_limited(Some(Duration::from_secs(7)));
+        assert_eq!(hinted.retry_after(), Some(Duration::from_secs(7)));
+        assert_eq!(hinted.to_string(), "rate limit exceeded; retry after 7s");
+        assert!(UnindexedClientError::Api(hinted.clone()).is_transient());
+        assert!(UnindexedOrderError::Rejected(hinted).is_transient());
+
+        let unhinted: UnindexedApiError = ApiError::rate_limited(None);
+        assert_eq!(unhinted.retry_after(), None);
+        assert_eq!(unhinted.to_string(), "rate limit exceeded");
+
+        let other: UnindexedApiError = ApiError::Unauthenticated("bad key".to_string());
+        assert_eq!(other.retry_after(), None);
+    }
+
+    #[test]
     fn test_connectivity_error_is_transient() {
         assert!(ConnectivityError::Timeout.is_transient());
         assert!(ConnectivityError::Socket("connection refused".into()).is_transient());
@@ -737,7 +795,7 @@ mod tests {
 
     #[test]
     fn test_client_error_is_transient_rate_limit() {
-        let err: ClientError = ClientError::Api(ApiError::RateLimit);
+        let err: ClientError = ClientError::Api(ApiError::rate_limited(None));
         assert!(err.is_transient());
     }
 
@@ -885,7 +943,7 @@ mod tests {
 
     #[test]
     fn test_order_error_is_transient_rate_limit() {
-        let err: UnindexedOrderError = OrderError::Rejected(ApiError::RateLimit);
+        let err: UnindexedOrderError = OrderError::Rejected(ApiError::rate_limited(None));
         assert!(err.is_transient(), "expected transient for {:?}", err);
     }
 

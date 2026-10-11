@@ -448,7 +448,7 @@ impl AccountEventIndexer {
         rejected: fn(String) -> ApiError,
     ) -> ApiError {
         match error {
-            UnindexedApiError::RateLimit => ApiError::RateLimit,
+            UnindexedApiError::RateLimit { retry_after } => ApiError::rate_limited(retry_after),
             UnindexedApiError::Unauthenticated(msg) => ApiError::Unauthenticated(msg),
             UnindexedApiError::AssetInvalid(asset, value) => {
                 match self.map.find_asset_index(&asset) {
