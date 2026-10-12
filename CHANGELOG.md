@@ -568,8 +568,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     activation price is not represented yet (#539); one placed with an activation price is reported
     without it, with a warning.
 - **`BinanceMargin` could drop every account-stream report for some orders** (`rustrade-execution`).
-  binance-sdk's margin `ExecutionReport` declares `d`, `D`, `j`, `J` and `v` strings, where its spot
-  model and Binance's documentation have numbers (binance/binance-connector-rust#108). A report
+  binance-sdk's margin `ExecutionReport` declared `d`, `D`, `j`, `J` and `v` strings until 74.1.1,
+  where its spot model and Binance's documentation have numbers (binance/binance-connector-rust#108). A report
   carrying one as a number failed to decode and was dropped whole, fills included: every report of
   a trailing order, of an order placed with a strategy id, or of a self-trade-prevention expiry.
   Both clients now decode `executionReport` into their own type, which reads only the fields it

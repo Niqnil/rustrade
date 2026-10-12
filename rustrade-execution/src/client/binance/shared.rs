@@ -10,9 +10,10 @@
 //! trait, [`BinanceOrderFields`], which is identical across every SDK type implementing it even
 //! though the structs around it are not. The WebSocket user-data `executionReport` is decoded into
 //! this crate's own [`ExecutionReport`] instead, which reads only the keys the converter uses, so a
-//! change in the SDK's generated wire types cannot drop a fill. Either way one converter serves both
-//! clients and keeps a venue name out of it. The remaining SDK-typed converters, which differ between spot's WS-API enums and
-//! margin's REST params, deliberately stay in their respective modules.
+//! key it does not read cannot fail a report, as it can through the SDK's strictly typed models.
+//! Either way one converter serves both clients and keeps a venue name out of it. The remaining
+//! SDK-typed converters, which differ between spot's WS-API enums and margin's REST params,
+//! deliberately stay in their respective modules.
 //!
 //! Event deduplication lives in [`crate::client::dedup`], shared with the other clients that
 //! need it, and is re-exported here so Binance call sites keep a single import site.
@@ -1934,9 +1935,9 @@ pub(crate) fn order_running_totals<T: BinanceExecutionFields>(
 /// A Binance user-data `executionReport`, as both the spot and margin clients read it.
 ///
 /// binance-sdk generates one report type per stream family, each typing every key strictly, and
-/// those types change between releases: until 74.1.1 the margin stream's declared `d`, `D`, `j`,
-/// `J`, `u`, `U`, `a` and `v` strings, where spot's declared them integers and Binance's docs show
-/// numbers. 74.1.1 retyped them to integers, in a patch release. Decoding into an SDK type ties
+/// those types change between releases: until 74.1.1 the margin stream's report type declared `d`,
+/// `D`, `j`, `J`, `u`, `U`, `a` and `v` strings, where spot's declared them integers and Binance's
+/// docs show numbers. 74.1.1 retyped them to integers, in a patch release. Decoding into an SDK type ties
 /// every report to the SDK and the venue agreeing on the type of every key, including keys this
 /// crate never reads, and a report that fails to decode is logged and dropped, fill included. This
 /// type models only the keys the converter reads and ignores every other, so an unread key cannot
