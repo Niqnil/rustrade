@@ -562,6 +562,8 @@ pub enum ExpiryHandling {
     /// The venue settles. It reports its own trades for the expiry, exercise or assignment, and
     /// those trades move the positions. On `ContractExpiry` the engine cancels the instrument's
     /// orders and marks it processed, but synthesises no trade, so a position is not closed twice.
+    /// In `OmsMode::Netting` the venue's trades move the one position; in `OmsMode::Hedging`, see
+    /// the settlement fills section of [`InstrumentState::update_from_trade`].
     ///
     /// The positions stay open until the venue's trades arrive. A caller that never feeds them to
     /// the engine is left holding positions on an expired instrument.
@@ -1494,8 +1496,12 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     fn settlement_leg(&self, origin: TradeOrigin) -> Option<SettlementLeg> {
         match origin {
             TradeOrigin::Order | TradeOrigin::External => None,
-            TradeOrigin::Liquidation | TradeOrigin::Adl => Some(SettlementLeg::Contract),
-            TradeOrigin::Assignment | TradeOrigin::Exercise | TradeOrigin::Expiry => {
+            TradeOrigin::Liquidation | TradeOrigin::Adl | TradeOrigin::Expiry => {
+                Some(SettlementLeg::Contract)
+            }
+            // Only the contract expires: the same origin on an instrument that never expires is
+            // the shares the exercise or assignment delivered.
+            TradeOrigin::Assignment | TradeOrigin::Exercise => {
                 Some(if self.instrument.kind.expiry().is_some() {
                     SettlementLeg::Contract
                 } else {
@@ -2114,8 +2120,8 @@ where
 /// [`InstrumentState::update_from_trade`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SettlementLeg {
-    /// A fill on the position the venue settles: a liquidation or auto-deleveraging, or the
-    /// expiry, exercise or assignment of a contract that expires. It only reduces.
+    /// A fill on the position the venue settles: a liquidation, auto-deleveraging or expiry, or
+    /// the exercise or assignment of a contract that expires. It only reduces.
     Contract,
     /// The share leg of an exercise or assignment, on an instrument that never expires. It can
     /// open a position as well as reduce one.
@@ -2932,6 +2938,19 @@ mod tests {
         let mut state = as_option(hedged_positions(&[("long", dec!(2))], &[]));
         state.update_from_trade(&venue_fill(TradeOrigin::Expiry, Side::Buy, dec!(1)));
         assert_eq!(held(&state, "venue"), None);
+        assert_eq!(state.tear_sheet.fills_unallocated, 1);
+    }
+
+    /// An expiry only closes a contract, so on an instrument that never expires it opens nothing,
+    /// unlike the share leg of an exercise or assignment.
+    #[test]
+    fn a_hedged_expiry_on_an_instrument_that_never_expires_opens_nothing() {
+        let mut state = hedged_positions(&[("stock", dec!(100))], &[]);
+
+        state.update_from_trade(&venue_fill(TradeOrigin::Expiry, Side::Buy, dec!(100)));
+
+        assert_eq!(held(&state, "venue"), None, "no position of its own");
+        assert_eq!(held(&state, "stock"), Some(dec!(100)));
         assert_eq!(state.tear_sheet.fills_unallocated, 1);
     }
 

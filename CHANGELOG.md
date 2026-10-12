@@ -252,8 +252,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     origin `Expiry`, `Exercise` or `Assignment`. Each `OPTRD`, the shares an exercise or
     assignment traded at the strike, becomes a trade on the underlying with the origin of the
     exercise or assignment it pairs with: same date, root symbol and strike, and the side the
-    contract implies. An `OPTRD` that pairs with none is `External`, logged at WARN. The read
-    covers the whole UTC days of the span, so both legs are read together.
+    contract implies, preferring the one whose contracts deliver its shares at 100 a contract.
+    An `OPTRD` that pairs with none is `External`, logged at WARN. The read covers the whole UTC
+    days of the span, so both legs are read together. An activity without a creation time is
+    returned by its date, by every read that covers that day. A read that stops at its 5,000
+    activity cap can return an `OPTRD` as `External` before its pair is read, and more than 5,000
+    option activities in one UTC day cannot be read through; the rustdoc says how to handle both.
   - The new `ExpiryHandling` (`Engine`, the default, or `Venue`) says who settles an instrument's
     positions at expiry. Set it per exchange with `EngineStateBuilder::expiry_handling` or
     `SystemBuilder::expiry_handling`. **Breaking:** `InstrumentState` gains the public

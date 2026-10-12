@@ -110,7 +110,7 @@ pub struct SystemBuilder<'a, Clock, Strategy, Risk, MarketStream, GlobalData, Fn
     in_flight_deadline_overrides: Vec<(ExchangeId, Option<Duration>)>,
     balances: FnvHashMap<ExchangeAsset<AssetNameInternal>, Balance>,
     positions: Vec<PositionSeed>,
-    expiry_handling: Vec<(ExchangeId, ExpiryHandling)>,
+    expiry_handling: FnvHashMap<ExchangeId, ExpiryHandling>,
 }
 
 impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
@@ -130,7 +130,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             in_flight_deadline_overrides: Vec::new(),
             balances: FnvHashMap::default(),
             positions: Vec::new(),
-            expiry_handling: Vec::new(),
+            expiry_handling: FnvHashMap::default(),
         }
     }
 
@@ -189,7 +189,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
     ///
     /// See [`EngineStateBuilder::expiry_handling`]. For the same exchange the last call wins.
     pub fn expiry_handling(mut self, exchange: ExchangeId, handling: ExpiryHandling) -> Self {
-        self.expiry_handling.push((exchange, handling));
+        self.expiry_handling.insert(exchange, handling);
         self
     }
 

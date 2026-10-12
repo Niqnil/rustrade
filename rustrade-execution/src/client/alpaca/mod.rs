@@ -735,9 +735,12 @@ struct AlpacaActivity {
     cum_qty: Option<String>,
 }
 
-/// A non-trade account activity: a cash movement such as interest or a fee, as Alpaca's activities
-/// endpoint serves it. Every field but the id and type is optional in Alpaca's schema, so a record
-/// missing one still decodes and the conversion decides what it can do without it.
+/// A non-trade account activity, as Alpaca's activities endpoint serves it: a cash movement such as
+/// interest or a fee, read by [`AlpacaClient::fetch_cash_flows`], or an option exercise,
+/// assignment or expiry, read by [`AlpacaClient::fetch_option_events`]. A cash flow uses the
+/// amount, currency and symbol; an option event uses the quantity, price, symbol and date. Every
+/// field but the id and type is optional in Alpaca's schema, so a record missing one still decodes
+/// and the conversion decides what it can do without it.
 #[derive(Debug, Deserialize)]
 struct AlpacaNonTradeActivity {
     id: String,
@@ -2121,7 +2124,10 @@ impl AlpacaClient {
     /// - The contract leaves at a price of 0. What it was worth at exercise or assignment is in the
     ///   shares traded at the strike.
     /// - [`time_exchange`](Trade::time_exchange) is when Alpaca created the activity
-    ///   (`created_at`), or the start of its `date`, in UTC, when it gives no creation time.
+    ///   (`created_at`), or the start of its `date`, in UTC, when it gives no creation time. Such
+    ///   a dated activity is in the span when its `date` is one of the span's UTC days, so a read
+    ///   up to now still returns one posted today, and successive reads within one day each
+    ///   return it again.
     /// - [`id`](Trade::id) and [`order_id`](Trade::order_id) are Alpaca's activity id, since no
     ///   order produced the trade. [`strategy`](Trade::strategy) is unknown, and fees are zero.
     ///
@@ -2131,10 +2137,11 @@ impl AlpacaClient {
     /// an `OPEXC` or `OPASN` of the same `date` whose contract's root symbol is the `OPTRD`'s
     /// symbol, whose strike is its price, and whose kind implies its side: exercising a call or
     /// being assigned on a put buys the shares, and the other two sell them. Each is paired at
-    /// most once, in the order Alpaca returns them. An `OPTRD` with no such partner is returned as
-    /// [`External`](TradeOrigin::External), and logged at WARN. The read covers the whole UTC days
-    /// of `start` and `end`, so that both legs are read together, and returns only the trades in
-    /// `start..=end`.
+    /// most once, in the order Alpaca returns them, preferring one of 100 shares a contract, the
+    /// standard size, so that two exercises at one strike pair with their own shares. An `OPTRD`
+    /// with no such partner is returned as [`External`](TradeOrigin::External), and logged at
+    /// WARN. The read covers the whole UTC days of `start` and `end`, so that both legs are read
+    /// together, and returns only the trades in `start..=end`.
     ///
     /// # Status
     /// An activity Alpaca marks `canceled` is left out, and logged at INFO. An activity without a
@@ -2144,11 +2151,19 @@ impl AlpacaClient {
     /// # Cost and resuming
     /// As [`fetch_cash_flows`](Self::fetch_cash_flows): one call sends up to 50 requests, reading
     /// at most 5,000 activities, and returns `resume` when it stops there. A read from `resume`
-    /// reads its whole UTC day again, so drop by id what was already applied.
+    /// reads its whole UTC day again, so drop by id what was already applied. So more than 5,000
+    /// option activities in one UTC day cannot be read through; see Errors.
+    ///
+    /// A read that stops at the cap can split an exercise or assignment from its share leg, and
+    /// return the `OPTRD` as [`External`](TradeOrigin::External) while the next read, from
+    /// `resume`, returns it again with its pair's origin. A caller dropping trades by id keeps
+    /// the first. When a read returns `resume`, hold back its `External` `OPTRD`s until the next
+    /// read.
     ///
     /// # Errors
     /// Fails if a request fails, or, with [`UnindexedClientError::Internal`], if a read from
-    /// `resume` could not advance.
+    /// `resume` could not advance: one UTC day holds more option activities than one call reads.
+    /// That includes a day whose activities before `start` alone fill the call.
     pub async fn fetch_option_events(
         &self,
         start: DateTime<Utc>,
@@ -2160,10 +2175,7 @@ impl AlpacaClient {
         }
         // Whole UTC days, so the legs of one exercise or assignment are read together.
         let read_start = start.date_naive().and_time(NaiveTime::MIN).and_utc();
-        let read_end = end
-            .date_naive()
-            .and_hms_milli_opt(23, 59, 59, 999)
-            .map_or(end, |day_end| day_end.and_utc());
+        let read_end = end.date_naive().and_time(LAST_MILLISECOND).and_utc();
         let page = paginate_activities::<AlpacaNonTradeActivity>(
             &self.http,
             &self.rate_limiter,
@@ -2185,11 +2197,10 @@ impl AlpacaClient {
             )));
         };
 
-        let trades = convert_option_events(&page.activities)
-            .into_iter()
-            .filter(|trade| (start..=end).contains(&trade.time_exchange))
-            .collect();
-        Ok(TradesRead::new(trades, resume))
+        Ok(TradesRead::new(
+            convert_option_events(&page.activities, start, end),
+            resume,
+        ))
     }
 
     /// Place an order with an explicit `position_intent` override.
@@ -2718,6 +2729,12 @@ const CASH_FLOW_ACTIVITIES: &str = "INT,FEE,PTC,PTR";
 
 /// The `activity_types` [`AlpacaClient::fetch_option_events`] asks for.
 const OPTION_EVENT_ACTIVITIES: &str = "OPASN,OPEXC,OPEXP,OPTRD";
+
+/// The last millisecond of a day, where [`AlpacaClient::fetch_option_events`] ends its read.
+const LAST_MILLISECOND: NaiveTime = match NaiveTime::from_hms_milli_opt(23, 59, 59, 999) {
+    Some(time) => time,
+    None => panic!("23:59:59.999 is a time of day"),
+};
 
 /// Where a bounded read of `start..=end` that stopped at `resume` should read on from: `None` when
 /// it read the whole span, or `Err(())` when a read from `resume` would stop where this one did.
@@ -5001,8 +5018,24 @@ struct OptionLeg<'a> {
     price: Option<Decimal>,
     date: Option<NaiveDate>,
     time: DateTime<Utc>,
+    /// Whether `time` is Alpaca's `created_at`, not the start of `date`.
+    created: bool,
     /// `None` for the share leg (`OPTRD`), whose origin is its pair's.
     origin: Option<TradeOrigin>,
+    /// On an exercise or assignment, its contract as [`occ_contract`] reads it.
+    contract: Option<(&'a str, bool, Decimal)>,
+}
+
+impl OptionLeg<'_> {
+    /// Whether the leg is in `start..=end`: by its creation time, or, when Alpaca gave none, by
+    /// its `date`, so that a read up to now still returns a leg dated today.
+    fn is_within(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> bool {
+        if self.created {
+            (start..=end).contains(&self.time)
+        } else {
+            (start.date_naive()..=end.date_naive()).contains(&self.time.date_naive())
+        }
+    }
 }
 
 /// An option activity as an [`OptionLeg`], or `None`, logged, if it is canceled, of another type,
@@ -5034,11 +5067,8 @@ fn option_leg(activity: &AlpacaNonTradeActivity) -> Option<OptionLeg<'_>> {
         .date
         .as_deref()
         .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
-    let time = activity
-        .created_at
-        .as_deref()
-        .and_then(parse_timestamp)
-        .or_else(|| date.map(|date| date.and_time(NaiveTime::MIN).and_utc()));
+    let created_at = activity.created_at.as_deref().and_then(parse_timestamp);
+    let time = created_at.or_else(|| date.map(|date| date.and_time(NaiveTime::MIN).and_utc()));
     let symbol = activity
         .symbol
         .as_deref()
@@ -5068,6 +5098,12 @@ fn option_leg(activity: &AlpacaNonTradeActivity) -> Option<OptionLeg<'_>> {
         warn!(id, price = ?activity.price, "Alpaca OPTRD missing/unparseable price — left out");
         return None;
     }
+    let contract = matches!(
+        origin,
+        Some(TradeOrigin::Exercise | TradeOrigin::Assignment)
+    )
+    .then(|| occ_contract(symbol))
+    .flatten();
     Some(OptionLeg {
         id,
         symbol,
@@ -5075,7 +5111,9 @@ fn option_leg(activity: &AlpacaNonTradeActivity) -> Option<OptionLeg<'_>> {
         price,
         date,
         time,
+        created: created_at.is_some(),
         origin,
+        contract,
     })
 }
 
@@ -5102,7 +5140,7 @@ fn occ_contract(symbol: &str) -> Option<(&str, bool, Decimal)> {
 /// Whether `contract`, an exercise or assignment, is the one `shares`, an `OPTRD`, is the share
 /// leg of. See [`AlpacaClient::fetch_option_events`].
 fn is_share_leg_of(shares: &OptionLeg<'_>, contract: &OptionLeg<'_>) -> bool {
-    let Some((root, is_call, strike)) = occ_contract(contract.symbol) else {
+    let Some((root, is_call, strike)) = contract.contract else {
         return false;
     };
     // Exercising a call, or being assigned on a put, buys the shares.
@@ -5118,20 +5156,32 @@ fn is_share_leg_of(shares: &OptionLeg<'_>, contract: &OptionLeg<'_>) -> bool {
         && shares.quantity.is_sign_positive() == buys
 }
 
-/// Option activities as [`Trade`]s, each share leg given the origin of the exercise or assignment
-/// it pairs with. See [`AlpacaClient::fetch_option_events`].
+/// The option activities in `start..=end` as [`Trade`]s, each share leg given the origin of the
+/// exercise or assignment it pairs with, which may lie outside the span. See
+/// [`AlpacaClient::fetch_option_events`].
 fn convert_option_events(
     activities: &[AlpacaNonTradeActivity],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
 ) -> Vec<Trade<AssetNameExchange, InstrumentNameExchange>> {
     let legs: Vec<_> = activities.iter().filter_map(option_leg).collect();
     let mut paired = vec![false; legs.len()];
     legs.iter()
-        .map(|leg| {
+        .filter_map(|leg| {
+            // Every share leg is paired, in or out of the span, so that one outside it does not
+            // take the partner of one inside.
             let origin = leg.origin.unwrap_or_else(|| {
-                let partner = legs
-                    .iter()
-                    .enumerate()
-                    .position(|(index, contract)| !paired[index] && is_share_leg_of(leg, contract));
+                let pairs = |index: &usize| !paired[*index] && is_share_leg_of(leg, &legs[*index]);
+                // The standard contract delivers 100 shares. A match of that size goes first, so
+                // that two exercises at one strike each pair with their own shares; an adjusted
+                // contract, delivering another amount, still pairs with the first match.
+                let delivers_its_shares = |index: &usize| {
+                    legs[*index].quantity.abs() * Decimal::ONE_HUNDRED == leg.quantity.abs()
+                };
+                let partner = (0..legs.len())
+                    .filter(pairs)
+                    .find(delivers_its_shares)
+                    .or_else(|| (0..legs.len()).find(pairs));
                 match partner {
                     Some(index) => {
                         paired[index] = true;
@@ -5149,12 +5199,15 @@ fn convert_option_events(
                     }
                 }
             });
+            if !leg.is_within(start, end) {
+                return None;
+            }
             let side = if leg.quantity.is_sign_negative() {
                 Side::Sell
             } else {
                 Side::Buy
             };
-            Trade::new(
+            let trade = Trade::new(
                 TradeId::new(leg.id),
                 OrderId::new(leg.id),
                 InstrumentNameExchange::new(leg.symbol),
@@ -5170,7 +5223,8 @@ fn convert_option_events(
                     Some(Decimal::ZERO),
                 ),
             )
-            .with_origin(origin)
+            .with_origin(origin);
+            Some(trade)
         })
         .collect()
 }
@@ -9787,8 +9841,43 @@ mod tests {
             assert_eq!(origin("other-day"), Some(TradeOrigin::External));
         }
 
+        /// A share leg pairs with the exercise or assignment whose contracts deliver its shares,
+        /// 100 a contract, though another that would buy them comes first. One of another size
+        /// still pairs, with the first match left.
+        #[tokio::test]
+        async fn fetch_option_events_pairs_a_share_leg_by_its_size() {
+            let day = "2024-03-01";
+            let server = serve_json(serde_json::json!([
+                // Being assigned on a put and exercising a call both buy at the strike.
+                option_activity("asn-two", "OPASN", "QS240301P00006500", "2", day),
+                option_activity("exc-one", "OPEXC", "QS240301C00006500", "-1", day),
+                option_activity("exc-adjusted", "OPEXC", "QS240301C00006500", "-1", day),
+                share_leg("hundred", "QS", "100", "6.5", day),
+                share_leg("two-hundred", "QS", "200", "6.5", day),
+                share_leg("hundred-fifty", "QS", "150", "6.5", day),
+            ]))
+            .await;
+            let client = client_for(&server);
+
+            let read = client
+                .fetch_option_events(time("2024-03-01T00:00:00Z"), time("2024-03-01T23:00:00Z"))
+                .await
+                .unwrap();
+
+            let origin = |id: &str| {
+                read.trades
+                    .iter()
+                    .find(|trade| trade.id == TradeId::new(id))
+                    .map(|trade| trade.origin)
+            };
+            assert_eq!(origin("hundred"), Some(TradeOrigin::Exercise));
+            assert_eq!(origin("two-hundred"), Some(TradeOrigin::Assignment));
+            assert_eq!(origin("hundred-fifty"), Some(TradeOrigin::Exercise));
+        }
+
         /// The read covers the whole UTC days of the span, so both legs of an event are read
-        /// together, and returns only what is in the span.
+        /// together, and returns only what is in the span: by creation time, or, without one, by
+        /// date.
         #[tokio::test]
         async fn fetch_option_events_reads_whole_days_and_returns_the_span() {
             let mut early =
@@ -9797,7 +9886,19 @@ mod tests {
             let mut inside =
                 option_activity("inside", "OPEXP", "QS240301C00011500", "-1", "2024-03-01");
             inside["created_at"] = serde_json::json!("2024-03-01T16:00:00Z");
-            let server = serve_json(serde_json::json!([early, inside])).await;
+            let server = serve_json(serde_json::json!([
+                option_activity(
+                    "dated-before",
+                    "OPEXP",
+                    "QS240229C00010500",
+                    "-1",
+                    "2024-02-29"
+                ),
+                early,
+                option_activity("dated", "OPEXP", "QS240301C00012500", "-1", "2024-03-01"),
+                inside,
+            ]))
+            .await;
             let client = client_for(&server);
 
             let read = client
@@ -9810,7 +9911,7 @@ mod tests {
                 .iter()
                 .map(|trade| trade.id.0.to_string())
                 .collect();
-            assert_eq!(ids, ["inside"]);
+            assert_eq!(ids, ["dated", "inside"]);
             let queries = query_pairs(&server).await;
             let [query] = queries.as_slice() else {
                 panic!("one request: {queries:?}");
