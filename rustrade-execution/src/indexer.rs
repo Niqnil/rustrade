@@ -448,7 +448,7 @@ impl AccountEventIndexer {
         rejected: fn(String) -> ApiError,
     ) -> ApiError {
         match error {
-            UnindexedApiError::RateLimit => ApiError::RateLimit,
+            UnindexedApiError::RateLimit { retry_after } => ApiError::rate_limited(retry_after),
             UnindexedApiError::Unauthenticated(msg) => ApiError::Unauthenticated(msg),
             UnindexedApiError::AssetInvalid(asset, value) => {
                 match self.map.find_asset_index(&asset) {
@@ -670,6 +670,7 @@ impl AccountEventIndexer {
             order_filled_quantity,
             fees,
             origin,
+            position_side,
         } = trade;
 
         let instrument_index = self.map.find_instrument_index(&instrument)?;
@@ -709,6 +710,7 @@ impl AccountEventIndexer {
                 fees_quote,
             },
             origin,
+            position_side,
         })
     }
 }

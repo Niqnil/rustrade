@@ -13,10 +13,11 @@
 // - Event deduplication: LRU cache keyed on (trade_id/order_id, exec_type) prevents
 //   duplicate processing after reconnect + fill recovery
 // - Rate limit handling: detects HTTP 429 / Binance -1015, retries with exponential
-//   backoff (Retry-After header is not accessible through the SDK's anyhow::Error
-//   chain, so computed delays are used), blocks further REST calls until cooldown expires,
-//   and does not open a WS-API session during it. Separately, pauses REST queries until the
-//   next minute once responses report >= 90% of the request-weight limit used
+//   backoff (binance-sdk drops the Retry-After header from its rate-limit errors, so
+//   computed delays are used, and ApiError::RateLimit carries no retry_after), blocks
+//   further REST calls until cooldown expires, and does not open a WS-API session during
+//   it. Separately, pauses REST queries until the next minute once responses report
+//   >= 90% of the request-weight limit used
 // - Reconnection: account_stream auto-reconnects on WS disconnect/error with
 //   exponential backoff (1s → 30s, max 10 attempts)
 // - Heartbeat monitoring: tracks WS activity via AtomicBool flag; forces reconnect
@@ -45,7 +46,7 @@ use super::shared::{
     frame_excerpt, gap_failed, gap_time, is_duplicate, is_handshake_rate_limit, is_unknown_order,
     log_unhandled_event, log_unrecognised_frame, new_dedup_cache, parse_user_data_frame,
     placed_order_state, recovered_order_totals, response_decode_error, rest_call_with_retry,
-    trailing_delta_basis_points, unix_ms,
+    trailing_params, unix_ms,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -284,7 +285,7 @@ impl WsApiUnavailable {
         match self {
             Self::RateLimited(msg) => {
                 warn!(%msg, "BinanceSpot WS-API rate-limited, request not sent");
-                UnindexedOrderError::Rejected(ApiError::RateLimit)
+                UnindexedOrderError::Rejected(ApiError::rate_limited(None))
             }
             Self::Connect(msg) => UnindexedOrderError::Connectivity(ConnectivityError::Socket(msg)),
         }
@@ -1087,7 +1088,7 @@ impl ExecutionClient for BinanceSpot {
                     // Venue response — WS session is healthy, don't tear it down. A throttle
                     // (429, -1003, a WAF 403) backs off the shared limiter so REST calls
                     // back off too.
-                    if matches!(order_err, OrderError::Rejected(ApiError::RateLimit)) {
+                    if matches!(order_err, OrderError::Rejected(ApiError::RateLimit { .. })) {
                         self.rate_limiter.on_rate_limited(None);
                     }
                     UnindexedOrderResponseCancel {
@@ -1176,8 +1177,34 @@ impl ExecutionClient for BinanceSpot {
                 .quantity(quantity)
                 .new_client_order_id(cid.0.to_string());
 
-        // Set price, stop_price, and trailing_delta in a single exhaustive match
-        // so that adding a new OrderKind variant fails to compile until handled here.
+        // A trailing order's trailingDelta, fixed limit and activation price.
+        match trailing_params(&kind, price) {
+            Ok(Some(trailing)) => {
+                params_builder = params_builder.trailing_delta(trailing.trailing_delta);
+                if let Some(limit) = trailing.price {
+                    params_builder = params_builder.price(limit);
+                }
+                if let Some(activation_price) = trailing.stop_price {
+                    // Binance's activation price for a trailing order is its stopPrice.
+                    params_builder = params_builder.stop_price(activation_price);
+                }
+            }
+            Err(refused) => {
+                return Order {
+                    key: order_key,
+                    side,
+                    price,
+                    quantity,
+                    kind,
+                    time_in_force,
+                    state: OrderState::inactive(refused.into_order_error()),
+                };
+            }
+            Ok(None) => {}
+        }
+
+        // The other kinds' price and stopPrice, in a match with no wildcard, so that a new
+        // OrderKind fails to compile until it is handled here.
         match kind {
             OrderKind::Limit => {
                 params_builder = params_builder.price(price);
@@ -1189,27 +1216,12 @@ impl ExecutionClient for BinanceSpot {
             | OrderKind::TakeProfitLimit { trigger_price } => {
                 params_builder = params_builder.price(price).stop_price(trigger_price);
             }
-            OrderKind::TrailingStop {
-                offset,
-                offset_type,
-            } => match trailing_delta_basis_points(offset, offset_type) {
-                Ok(basis_points) => params_builder = params_builder.trailing_delta(basis_points),
-                Err(refused) => {
-                    return Order {
-                        key: order_key,
-                        side,
-                        price,
-                        quantity,
-                        kind,
-                        time_in_force,
-                        state: OrderState::inactive(refused.into_order_error()),
-                    };
-                }
-            },
-            // Market needs no price/stop_price/trailing_delta; TrailingStopLimit is already
-            // rejected by convert_order_kind_tif above. The wildcard also catches any future
-            // variant added before this match is updated.
-            _ => {}
+            // Trailing orders are set above. Market sends no price, and TrailingStopLimit is
+            // rejected by convert_order_kind_tif before this.
+            OrderKind::TrailingStop { .. }
+            | OrderKind::TrailingStopFixedLimit { .. }
+            | OrderKind::Market
+            | OrderKind::TrailingStopLimit { .. } => {}
         }
 
         if let Some(tif) = binance_tif {
@@ -1326,7 +1338,7 @@ impl ExecutionClient for BinanceSpot {
                     // Venue response — WS session is healthy, don't tear it down. A throttle
                     // (429, -1003, a WAF 403) backs off the shared limiter so REST calls
                     // back off too.
-                    if matches!(order_err, OrderError::Rejected(ApiError::RateLimit)) {
+                    if matches!(order_err, OrderError::Rejected(ApiError::RateLimit { .. })) {
                         self.rate_limiter.on_rate_limited(None);
                     }
                     Order {
@@ -2256,7 +2268,7 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
     match event_type {
         "executionReport" => {
             // Single typed pass straight from the inner event — no intermediate DOM, and only the
-            // matched branch deserializes its payload. The SDK struct ignores the unknown `e` tag.
+            // matched branch deserializes its payload. `ExecutionReport` ignores the unknown `e` tag.
             match serde_json::from_str::<ExecutionReport>(event) {
                 Ok(report) => {
                     convert_execution_report(&report, ExchangeId::BinanceSpot, buf);
@@ -2388,7 +2400,8 @@ fn convert_account_position(
 ///   must surface this so end users can convert absolute offsets to basis points
 ///   themselves: `basis_points = (absolute / price) * 10000`
 /// - `TrailingStopLimit`: Binance's trailing `STOP_LOSS_LIMIT` keeps its limit price fixed while
-///   the stop trails, where `TrailingStopLimit`'s limit follows the stop (#540)
+///   the stop trails, where `TrailingStopLimit`'s limit follows the stop. That order is
+///   `TrailingStopFixedLimit`, which converts to `STOP_LOSS_LIMIT`.
 ///
 fn convert_order_kind_tif(
     kind: OrderKind,
@@ -2682,6 +2695,7 @@ mod tests {
                 OrderKind::TrailingStop {
                     offset: Decimal::from(100),
                     offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price: None,
                 },
                 TimeInForce::GoodUntilCancelled { post_only: false }
             ),
@@ -2692,6 +2706,7 @@ mod tests {
                 OrderKind::TrailingStop {
                     offset: Decimal::from(5),
                     offset_type: TrailingOffsetType::Percentage,
+                    activation_price: None,
                 },
                 TimeInForce::GoodUntilCancelled { post_only: false }
             ),
@@ -2704,6 +2719,7 @@ mod tests {
                 OrderKind::TrailingStop {
                     offset: Decimal::from(10),
                     offset_type: TrailingOffsetType::Absolute,
+                    activation_price: None,
                 },
                 TimeInForce::GoodUntilCancelled { post_only: false }
             )
@@ -2725,6 +2741,34 @@ mod tests {
         );
     }
 
+    /// A fixed-limit trailing stop is a STOP_LOSS_LIMIT, timed as a stop-limit order is; an
+    /// Absolute offset cannot be sent.
+    #[test]
+    fn a_fixed_limit_trailing_stop_converts_to_stop_loss_limit() {
+        let fixed_limit = |offset_type| OrderKind::TrailingStopFixedLimit {
+            offset: Decimal::from(100),
+            offset_type,
+            activation_price: Some(Decimal::from(50_000)),
+        };
+        assert!(matches!(
+            convert_order_kind_tif(
+                fixed_limit(TrailingOffsetType::BasisPoints),
+                TimeInForce::GoodUntilCancelled { post_only: false }
+            ),
+            Some((
+                OrderPlaceTypeEnum::StopLossLimit,
+                Some(OrderPlaceTimeInForceEnum::Gtc)
+            ))
+        ));
+        assert!(
+            convert_order_kind_tif(
+                fixed_limit(TrailingOffsetType::Absolute),
+                TimeInForce::GoodUntilCancelled { post_only: false }
+            )
+            .is_none()
+        );
+    }
+
     #[test]
     fn test_parse_binance_api_error() {
         let instrument = InstrumentNameExchange::new("BTCUSDT");
@@ -2739,16 +2783,16 @@ mod tests {
         ));
         assert_eq!(
             parse_binance_api_error("Rate limit exceeded".into(), &instrument),
-            ApiError::RateLimit
+            ApiError::rate_limited(None)
         );
         assert_eq!(
             parse_binance_api_error("Error code -1015".into(), &instrument),
-            ApiError::RateLimit
+            ApiError::rate_limited(None)
         );
         // -1003: too many requests — must also map to RateLimit (not OrderRejected)
         assert_eq!(
             parse_binance_api_error("Error -1003: too many requests".into(), &instrument),
-            ApiError::RateLimit
+            ApiError::rate_limited(None)
         );
         // -2011 maps to OrderAlreadyCancelled
         assert_eq!(
@@ -3364,6 +3408,38 @@ mod tests {
             }
             other => panic!("NEW should yield OrderSnapshot, got {other:?}"),
         }
+    }
+
+    /// A trailing STOP_LOSS_LIMIT reported on the stream is a fixed-limit trailing stop, with its
+    /// limit price and its stopPrice as the activation price.
+    #[test]
+    fn a_trailing_stop_loss_limit_report_keeps_its_limit_and_activation_price() {
+        let report = ExecutionReport {
+            execution_type: Some("NEW".to_string()),
+            side: Some("SELL".to_string()),
+            order_type: Some("STOP_LOSS_LIMIT".to_string()),
+            price: Some("49000.00".to_string()),
+            stop_price: Some("50000.00".to_string()),
+            trailing_delta: Some(WireInt::Int(25)),
+            order_quantity: Some("0.01".to_string()),
+            time_in_force: Some("GTC".to_string()),
+            cumulative_filled_quantity: Some("0".to_string()),
+            ..make_base_report()
+        };
+
+        let event = sole_event(convert(report)).expect("NEW event should produce Some");
+        let AccountEventKind::OrderSnapshot(snap) = &event.kind else {
+            panic!("NEW should yield OrderSnapshot, got {:?}", event.kind);
+        };
+        assert_eq!(
+            snap.0.kind,
+            OrderKind::TrailingStopFixedLimit {
+                offset: Decimal::from(25),
+                offset_type: TrailingOffsetType::BasisPoints,
+                activation_price: Some(Decimal::from(50_000)),
+            }
+        );
+        assert_eq!(snap.0.price, Some(Decimal::from(49_000)));
     }
 
     /// A report without its order type (`o`) cannot say what kind the order is, so its snapshot
@@ -4805,7 +4881,7 @@ mod tests {
         assert!(
             matches!(
                 response.state,
-                Err(UnindexedOrderError::Rejected(ApiError::RateLimit))
+                Err(UnindexedOrderError::Rejected(ApiError::RateLimit { .. }))
             ),
             "{:?}",
             response.state
@@ -4842,7 +4918,7 @@ mod tests {
         assert!(
             matches!(
                 response.state,
-                Err(UnindexedOrderError::Rejected(ApiError::RateLimit))
+                Err(UnindexedOrderError::Rejected(ApiError::RateLimit { .. }))
             ),
             "{:?}",
             response.state

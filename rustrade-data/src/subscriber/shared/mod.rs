@@ -60,6 +60,7 @@ use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::{
     error::SocketError,
     protocol::websocket::{WebSocket, WsError, WsMessage},
+    subscription::SubscriptionId,
 };
 use std::{
     fmt::Debug,
@@ -220,6 +221,15 @@ pub(crate) trait Handshake<Answer>: Send {
 
     /// Why the handshake did not settle within `timeout`.
     fn timed_out(&self, timeout: Duration) -> String;
+
+    /// The subscriptions not yet confirmed, as the ids the mapper keyed them under, when the
+    /// handshake can name them.
+    ///
+    /// A handshake that times out or loses its socket then fails with
+    /// [`SocketError::Unacknowledged`] naming them, rather than [`SocketError::Subscribe`].
+    fn unconfirmed(&self) -> Option<Vec<SubscriptionId>> {
+        None
+    }
 
     /// Add to a refusal what the handshake knows of it, such as what was not confirmed.
     ///

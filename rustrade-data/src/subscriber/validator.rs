@@ -228,6 +228,70 @@ mod tests {
         assert_eq!(unacknowledged, ids(&["trades|BTC-USDT", "trades|ETH-USDT"]));
     }
 
+    mod kraken {
+        use super::*;
+        use crate::exchange::kraken::Kraken;
+
+        fn kraken_ack(channel: &str, symbol: &str) -> Result<WsMessage, WsError> {
+            Ok(WsMessage::text(format!(
+                r#"{{"method":"subscribe","result":{{"channel":"{channel}","snapshot":false,"symbol":"{symbol}"}},"success":true,"time_in":"2018-11-12T21:14:59.545897Z","time_out":"2018-11-12T21:14:59.545901Z"}}"#
+            )))
+        }
+
+        fn kraken_status() -> Result<WsMessage, WsError> {
+            Ok(WsMessage::text(
+                r#"{"channel":"status","type":"update","data":[{"api_version":"v2","connection_id":1,"system":"online","version":"2.0.0"}]}"#,
+            ))
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn every_acknowledgement_validates_past_the_status_message() {
+            let mut messages = stream::iter([
+                kraken_status(),
+                kraken_ack("trade", "BTC/USD"),
+                Ok(WsMessage::text(r#"{"channel":"heartbeat"}"#)),
+                kraken_ack("trade", "ETH/USD"),
+            ]);
+
+            let (map, buffered) = validate_responses::<Kraken, _, _>(
+                map(&["trade|BTC/USD", "trade|ETH/USD"]),
+                &mut messages,
+                TIMEOUT,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(map.0.len(), 2);
+            assert_eq!(buffered.len(), 2);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_refused_symbol_is_named_alone() {
+            let mut messages = stream::iter([
+                kraken_status(),
+                kraken_ack("ticker", "BTC/USD"),
+                Ok(WsMessage::text(
+                    r#"{"error":"Currency pair not supported XBT/USD","method":"subscribe","success":false,"symbol":"XBT/USD","time_in":"2018-11-12T21:14:59.545897Z","time_out":"2018-11-12T21:14:59.545901Z"}"#,
+                )),
+            ]);
+
+            let error = validate_responses::<Kraken, _, _>(
+                map(&["ticker|BTC/USD", "ticker|XBT/USD"]),
+                &mut messages,
+                TIMEOUT,
+            )
+            .await
+            .unwrap_err();
+
+            let (reason, unacknowledged) = unacknowledged(error);
+            assert_eq!(
+                reason,
+                "received failure subscription response for XBT/USD: Currency pair not supported XBT/USD"
+            );
+            assert_eq!(unacknowledged, ids(&["ticker|XBT/USD"]));
+        }
+    }
+
     #[cfg(feature = "hyperliquid")]
     mod hyperliquid {
         use super::*;

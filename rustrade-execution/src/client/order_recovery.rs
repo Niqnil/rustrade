@@ -33,7 +33,7 @@ use std::{
     ops::{Deref, DerefMut},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -634,12 +634,21 @@ impl UncheckedOrders {
     }
 
     /// Record that a check of `instrument` failed or did not finish at `now`: it is retried after a
-    /// backoff, or dropped once it has failed [`MAX_GAP_RETRIES`] retries. Returns which, or `None`
-    /// if the instrument is not waiting.
+    /// backoff of at least `min_delay`, or dropped once it has failed [`MAX_GAP_RETRIES`] retries.
+    /// Returns which, or `None` if the instrument is not waiting.
+    ///
+    /// `min_delay` is the venue's own wait after refusing a request for its rate limit, or zero.
+    /// A long one, such as a ban's, holds the retry back for all of it while the failure still
+    /// counts toward [`MAX_GAP_RETRIES`].
+    ///
+    /// The base backoff is bounded by [`MAX_GAP_RETRIES`]. `min_delay` is bounded only by the
+    /// client that read it from the venue, as every client in this crate bounds it, so that
+    /// `now + delay` does not overflow.
     pub(crate) fn failed(
         &mut self,
         instrument: &InstrumentNameExchange,
         now: tokio::time::Instant,
+        min_delay: Duration,
     ) -> Option<GapFailure> {
         let check = self.0.get_mut(instrument)?;
         check.failures += 1;
@@ -647,9 +656,20 @@ impl UncheckedOrders {
             self.0.remove(instrument);
             return Some(GapFailure::GivenUp);
         }
-        let delay = Duration::from_secs(GAP_RETRY_BASE_SECS << (check.failures - 1));
+        let delay = Duration::from_secs(GAP_RETRY_BASE_SECS << (check.failures - 1)).max(min_delay);
         check.retry_at = Some(now + delay);
         Some(GapFailure::Retry(delay))
+    }
+
+    /// Hold back the retry of `instrument`, if it is waiting, until at least `until`.
+    pub(crate) fn hold_until(
+        &mut self,
+        instrument: &InstrumentNameExchange,
+        until: tokio::time::Instant,
+    ) {
+        if let Some(check) = self.0.get_mut(instrument) {
+            check.retry_at = Some(check.retry_at.map_or(until, |retry_at| retry_at.max(until)));
+        }
     }
 
     /// Whether `instrument` is waiting for a check.
@@ -782,9 +802,14 @@ pub(crate) enum OpenListing {
 /// A listing or lookup refused with [`ApiError::RateLimit`] stops the whole check, since every
 /// request still to make would spend more against a venue already refusing. Once the refusal is
 /// read no further listing or lookup starts, those already started are settled as they answer, and
-/// every instrument not settled, started or not, is retried later with the usual backoff. A
-/// refusal that outlasts that backoff can therefore give up on an instrument never asked about.
+/// every instrument not settled, started or not, is retried later with the usual backoff. A refusal
+/// that outlasts the backoff can therefore give up on an instrument never asked about.
 /// Any other failure charges only its own instrument, and the check goes on.
+///
+/// Every instrument the check retries later, for whatever reason, waits at least the longest wait
+/// the venue's refusals in this check asked for, since a request sent sooner would be refused too.
+/// A longer wait read after an instrument was charged still holds it back, unless the check is
+/// dropped first.
 pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
     exchange: ExchangeId,
     known: &SharedKnownLiveOrders,
@@ -853,8 +878,11 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
     let started = AtomicUsize::new(0);
     // Set by the first request the venue refuses for its rate limit, and read before any other
     // starts.
-    let throttled = AtomicBool::new(false);
+    let throttled = Throttled::default();
     let (list_open, lookup, throttled) = (&list_open, &lookup, &throttled);
+    // Instruments this check charged with a failure, held back once it ends until the longest wait
+    // the venue asked for, which a request still in flight when one was charged can raise.
+    let mut charged: Vec<&InstrumentNameExchange> = Vec::new();
     let recovery = async {
         let mut reported = 0u32;
         // Instruments retried for the venue's rate limit, logged once rather than each.
@@ -863,14 +891,17 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
             futures::stream::iter(checks.into_iter().enumerate().map(|(index, check)| {
                 started.store(index + 1, Ordering::Relaxed);
                 async move {
-                    if throttled.load(Ordering::Relaxed) {
-                        return (index, Err(UnindexedClientError::Api(ApiError::RateLimit)));
+                    if throttled.stopped() {
+                        return (
+                            index,
+                            Err(UnindexedClientError::Api(ApiError::rate_limited(None))),
+                        );
                     }
                     let (listed_on, keys): (Vec<_>, Vec<_>) = check.into_iter().unzip();
                     let listed = match list_open(listed_on).await {
                         Ok(listed) => listed,
                         Err(e) => {
-                            note_failure(throttled, &e);
+                            throttled.note(&e);
                             return (index, Err(e));
                         }
                     };
@@ -891,7 +922,7 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
                     // for its rate limit, no further lookup is taken from the source, and those
                     // already started are settled as they answer.
                     let mut lookups = futures::stream::iter(unlisted)
-                        .take_while(|_| std::future::ready(!throttled.load(Ordering::Relaxed)))
+                        .take_while(|_| std::future::ready(!throttled.stopped()))
                         .map(|key| async move {
                             let found = lookup(key.clone()).await;
                             (key, found)
@@ -911,7 +942,7 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
                                 }
                             },
                             Err(e) => {
-                                note_failure(throttled, &e);
+                                throttled.note(&e);
                                 checked
                                     .failed
                                     .entry(key.instrument)
@@ -944,8 +975,13 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
                         match checked.failed.get(instrument) {
                             Some(reason) => {
                                 deferred += usize::from(order_check_failed(
-                                    exchange, unchecked, instrument, reason,
+                                    exchange,
+                                    unchecked,
+                                    instrument,
+                                    reason,
+                                    throttled.wait(),
                                 ));
+                                charged.push(instrument);
                             }
                             None => unchecked.checked(instrument),
                         }
@@ -955,17 +991,23 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
                     let reason = failure_reason(&e);
                     for instrument in &instruments[index] {
                         deferred += usize::from(order_check_failed(
-                            exchange, unchecked, instrument, &reason,
+                            exchange,
+                            unchecked,
+                            instrument,
+                            &reason,
+                            throttled.wait(),
                         ));
+                        charged.push(instrument);
                     }
                 }
             }
         }
-        if throttled.load(Ordering::Relaxed) {
+        if throttled.stopped() {
             warn!(
                 %exchange,
                 reported,
                 deferred,
+                venue_wait_ms = u64::try_from(throttled.wait().as_millis()).unwrap_or(u64::MAX),
                 "Order check stopped: the venue is limiting requests, so the instruments not \
                  checked are retried later"
             );
@@ -984,8 +1026,22 @@ pub(crate) async fn recover_ended_orders<L, LFut, Q, QFut>(
             .filter(|(_, settled)| !**settled)
         {
             for instrument in check {
-                order_check_failed(exchange, unchecked, instrument, "order check timed out");
+                order_check_failed(
+                    exchange,
+                    unchecked,
+                    instrument,
+                    "order check timed out",
+                    throttled.wait(),
+                );
+                charged.push(instrument);
             }
+        }
+    }
+    let venue_wait = throttled.wait();
+    if !venue_wait.is_zero() {
+        let until = tokio::time::Instant::now() + venue_wait;
+        for instrument in charged {
+            unchecked.hold_until(instrument, until);
         }
     }
 }
@@ -996,13 +1052,38 @@ const RATE_LIMITED: &str = "the venue is limiting requests";
 
 /// Whether `error` is the venue refusing a request for its rate limit, which stops an order check.
 fn is_rate_limit(error: &UnindexedClientError) -> bool {
-    matches!(error, UnindexedClientError::Api(ApiError::RateLimit))
+    matches!(error, UnindexedClientError::Api(ApiError::RateLimit { .. }))
 }
 
-/// Stop the order check if `error` is the venue refusing a request for its rate limit.
-fn note_failure(throttled: &AtomicBool, error: &UnindexedClientError) {
-    if is_rate_limit(error) {
-        throttled.store(true, Ordering::Relaxed);
+/// Whether the venue has refused one of an order check's requests for its rate limit, and the
+/// longest wait its refusals asked for.
+#[derive(Debug, Default)]
+struct Throttled {
+    stopped: AtomicBool,
+    /// The longest `retry_after` seen, in milliseconds.
+    wait_ms: AtomicU64,
+}
+
+impl Throttled {
+    /// Stop the check if `error` is the venue refusing a request for its rate limit, keeping the
+    /// longest wait asked for.
+    fn note(&self, error: &UnindexedClientError) {
+        if let UnindexedClientError::Api(ApiError::RateLimit { retry_after, .. }) = error {
+            if let Some(wait) = retry_after {
+                let wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+                self.wait_ms.fetch_max(wait_ms, Ordering::Relaxed);
+            }
+            self.stopped.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Relaxed)
+    }
+
+    /// The longest wait the venue's refusals asked for: zero when none gave one.
+    fn wait(&self) -> Duration {
+        Duration::from_millis(self.wait_ms.load(Ordering::Relaxed))
     }
 }
 
@@ -1076,14 +1157,18 @@ fn settle(
 ///
 /// Returns whether it is a retry for the venue's rate limit, which is logged at debug: the check
 /// stopped for it warns once for all of them.
+///
+/// The retry waits at least `venue_wait`, the longest wait the venue's refusals in this check asked
+/// for so far, whatever the reason: a request sent sooner would be refused too.
 fn order_check_failed(
     exchange: ExchangeId,
     unchecked: &mut UncheckedOrders,
     instrument: &InstrumentNameExchange,
     reason: &str,
+    venue_wait: Duration,
 ) -> bool {
     let rate_limited = reason == RATE_LIMITED;
-    match unchecked.failed(instrument, tokio::time::Instant::now()) {
+    match unchecked.failed(instrument, tokio::time::Instant::now(), venue_wait) {
         Some(GapFailure::Retry(delay)) => {
             if rate_limited {
                 debug!(
@@ -1209,6 +1294,7 @@ mod tests {
         let trailing_stop = OrderKind::TrailingStop {
             offset: dec!(1.5),
             offset_type: crate::order::TrailingOffsetType::Percentage,
+            activation_price: None,
         };
         let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
         let order = key("BTCUSDT", "trailing");
@@ -1227,6 +1313,7 @@ mod tests {
             OrderKind::TrailingStop {
                 offset: dec!(150),
                 offset_type: crate::order::TrailingOffsetType::BasisPoints,
+                activation_price: None,
             },
             &open("7", dec!(1)),
         );
@@ -1722,7 +1809,7 @@ mod tests {
         let mut unchecked = UncheckedOrders::default();
         unchecked.open([btc.clone()]);
         let start = tokio::time::Instant::now();
-        unchecked.failed(&btc, start);
+        unchecked.failed(&btc, start, Duration::ZERO);
         let pending = pending_on(&btc);
         let later = start + Duration::from_secs(GAP_RETRY_BASE_SECS * 2);
 
@@ -1744,9 +1831,9 @@ mod tests {
         let mut unchecked = UncheckedOrders::default();
         unchecked.open([btc.clone(), eth.clone()]);
         let now = tokio::time::Instant::now();
-        unchecked.failed(&btc, now);
-        unchecked.failed(&btc, now);
-        unchecked.failed(&eth, now);
+        unchecked.failed(&btc, now, Duration::ZERO);
+        unchecked.failed(&btc, now, Duration::ZERO);
+        unchecked.failed(&eth, now, Duration::ZERO);
         let pending = NoPendingFills;
 
         let base = Duration::from_secs(GAP_RETRY_BASE_SECS);
@@ -1773,15 +1860,25 @@ mod tests {
 
         for retry in 0..MAX_GAP_RETRIES {
             let delay = Duration::from_secs(GAP_RETRY_BASE_SECS << retry);
-            assert_eq!(unchecked.failed(&btc, now), Some(GapFailure::Retry(delay)));
+            assert_eq!(
+                unchecked.failed(&btc, now, Duration::ZERO),
+                Some(GapFailure::Retry(delay))
+            );
             assert_eq!(unchecked.next_due(&pending), Some(now + delay));
             assert!(unchecked.ready(&pending, now).is_empty(), "waits");
             assert_eq!(unchecked.ready(&pending, now + delay).len(), 1);
         }
-        assert_eq!(unchecked.failed(&btc, now), Some(GapFailure::GivenUp));
+        assert_eq!(
+            unchecked.failed(&btc, now, Duration::ZERO),
+            Some(GapFailure::GivenUp)
+        );
         assert!(unchecked.is_empty());
         assert_eq!(unchecked.next_due(&pending), None);
-        assert_eq!(unchecked.failed(&btc, now), None, "no longer waiting");
+        assert_eq!(
+            unchecked.failed(&btc, now, Duration::ZERO),
+            None,
+            "no longer waiting"
+        );
     }
 
     fn cancelled_order(key: &UnindexedOrderKey) -> UnindexedInactiveOrder {
@@ -1842,7 +1939,7 @@ mod tests {
             &[key("BTCUSDT", "a"), key("BTCUSDT", "b")],
             |key| async move {
                 if key.cid.0 == "b" {
-                    Err(UnindexedClientError::Api(ApiError::RateLimit))
+                    Err(UnindexedClientError::Api(ApiError::rate_limited(None)))
                 } else {
                     Ok(OrderLookup::Ended(Box::new(cancelled_order(&key))))
                 }
@@ -1852,7 +1949,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(UnindexedClientError::Api(ApiError::RateLimit))
+            Err(UnindexedClientError::Api(ApiError::RateLimit { .. }))
         ));
     }
 
@@ -1913,6 +2010,51 @@ mod tests {
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
     }
 
+    /// An instrument whose check timed out waits as long as the venue asked in another
+    /// instrument's refusal.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_instrument_waits_for_the_venues_wait() {
+        let (known, mut unchecked) = held_on(&["AAA", "SLOW"]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let long = Duration::from_secs(GAP_RETRY_BASE_SECS * 10);
+
+        recover_ended_orders(
+            ExchangeId::BinanceSpot,
+            &known,
+            &mut unchecked,
+            &NoPendingFills,
+            &tx,
+            OpenListing::PerInstrument,
+            |instruments: Vec<InstrumentNameExchange>| async move {
+                if instruments[0].name().as_str() == "SLOW" {
+                    std::future::pending::<()>().await;
+                }
+                // SLOW's listing is in flight before AAA's is refused.
+                tokio::task::yield_now().await;
+                Err(UnindexedClientError::Api(ApiError::rate_limited(Some(
+                    long,
+                ))))
+            },
+            |_: UnindexedOrderKey| async { panic!("nothing listed, nothing looked up") },
+        )
+        .await;
+
+        let timed_out = tokio::time::Instant::now();
+        assert!(
+            unchecked
+                .ready(&NoPendingFills, timed_out + long - Duration::from_secs(1))
+                .is_empty(),
+            "retried before the venue's wait"
+        );
+        assert_eq!(
+            unchecked.ready(&NoPendingFills, timed_out + long * 2),
+            [
+                InstrumentNameExchange::new("AAA"),
+                InstrumentNameExchange::new("SLOW")
+            ]
+        );
+    }
+
     /// Two instruments are checked at a time, in name order. When the pass times out, the two
     /// started and unfinished have failed once, and the one never started stays due as it was.
     #[tokio::test(start_paused = true)]
@@ -1934,7 +2076,11 @@ mod tests {
         assert_eq!(unchecked.ready(&pending, retry).len(), 3);
         for instrument in ["SLOWA", "SLOWB"] {
             assert_eq!(
-                unchecked.failed(&InstrumentNameExchange::new(instrument), retry),
+                unchecked.failed(
+                    &InstrumentNameExchange::new(instrument),
+                    retry,
+                    Duration::ZERO
+                ),
                 Some(GapFailure::Retry(Duration::from_secs(
                     GAP_RETRY_BASE_SECS * 2
                 ))),
@@ -2034,7 +2180,7 @@ mod tests {
         assert!(!unchecked.contains(&InstrumentNameExchange::new("ETHUSDT")));
         assert!(unchecked.contains(&btc), "BTCUSDT waits for a retry");
         assert_eq!(
-            unchecked.failed(&btc, tokio::time::Instant::now()),
+            unchecked.failed(&btc, tokio::time::Instant::now(), Duration::ZERO),
             Some(GapFailure::Retry(Duration::from_secs(
                 GAP_RETRY_BASE_SECS * 2
             ))),
@@ -2051,6 +2197,7 @@ mod tests {
         unchecked.failed(
             &InstrumentNameExchange::new(instrument),
             tokio::time::Instant::now(),
+            Duration::ZERO,
         ) == Some(GapFailure::Retry(Duration::from_secs(
             GAP_RETRY_BASE_SECS * 2,
         )))
@@ -2077,7 +2224,7 @@ mod tests {
             },
             |_| {
                 lookups.fetch_add(1, Ordering::Relaxed);
-                async { Err(UnindexedClientError::Api(ApiError::RateLimit)) }
+                async { Err(UnindexedClientError::Api(ApiError::rate_limited(None))) }
             },
         )
         .await;
@@ -2089,6 +2236,146 @@ mod tests {
             assert!(failed_once(&mut unchecked, instrument), "{instrument}");
         }
         known.lock().assert_consistent();
+    }
+
+    /// A rate-limited instrument is retried no sooner than the venue's refusal asked, even when
+    /// that is longer than the backoff.
+    #[tokio::test]
+    async fn a_rate_limit_hint_longer_than_the_backoff_holds_the_retry_back() {
+        let (known, mut unchecked) = held_on(&["AAA", "BBB"]);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let wait = Duration::from_secs(GAP_RETRY_BASE_SECS * 10);
+        let started = tokio::time::Instant::now();
+
+        recover_ended_orders(
+            ExchangeId::BinanceSpot,
+            &known,
+            &mut unchecked,
+            &NoPendingFills,
+            &tx,
+            OpenListing::PerInstrument,
+            |_| async { Ok(FnvHashSet::default()) },
+            move |_| async move {
+                Err(UnindexedClientError::Api(ApiError::rate_limited(Some(
+                    wait,
+                ))))
+            },
+        )
+        .await;
+
+        let due = unchecked.next_due(&NoPendingFills).unwrap();
+        assert!(due >= started + wait, "retried before the venue's wait");
+        assert!(
+            unchecked
+                .ready(&NoPendingFills, started + wait - Duration::from_secs(1))
+                .is_empty()
+        );
+        assert_eq!(
+            unchecked.ready(&NoPendingFills, tokio::time::Instant::now() + wait),
+            [
+                InstrumentNameExchange::new("AAA"),
+                InstrumentNameExchange::new("BBB")
+            ]
+        );
+    }
+
+    /// A longer wait the venue asks for after an instrument was charged still holds that
+    /// instrument back, whether a shorter wait or another failure charged it, as it does the
+    /// instrument never asked about.
+    #[tokio::test]
+    async fn a_longer_wait_read_later_holds_back_every_instrument_charged() {
+        let long = Duration::from_secs(GAP_RETRY_BASE_SECS * 10);
+        let first_failures = [
+            UnindexedClientError::Api(ApiError::rate_limited(Some(Duration::from_secs(1)))),
+            UnindexedClientError::Connectivity(ConnectivityError::Timeout),
+        ];
+        for first in first_failures {
+            let (known, mut unchecked) = held_on(&["AAA", "BBB", "CCC"]);
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let started = tokio::time::Instant::now();
+
+            recover_ended_orders(
+                ExchangeId::BinanceSpot,
+                &known,
+                &mut unchecked,
+                &NoPendingFills,
+                &tx,
+                OpenListing::PerInstrument,
+                |instruments: Vec<InstrumentNameExchange>| {
+                    let first = first.clone();
+                    async move {
+                        // AAA's and BBB's listings are both in flight before either fails, and
+                        // AAA's failure is read first.
+                        if instruments[0].name().as_str() == "AAA" {
+                            tokio::task::yield_now().await;
+                            return Err(first);
+                        }
+                        for _ in 0..3 {
+                            tokio::task::yield_now().await;
+                        }
+                        Err(UnindexedClientError::Api(ApiError::rate_limited(Some(
+                            long,
+                        ))))
+                    }
+                },
+                |_: UnindexedOrderKey| async { panic!("nothing listed, nothing looked up") },
+            )
+            .await;
+
+            assert!(
+                unchecked
+                    .ready(&NoPendingFills, started + long - Duration::from_secs(1))
+                    .is_empty(),
+                "{first:?}: retried before the longest wait"
+            );
+            assert_eq!(
+                unchecked
+                    .ready(&NoPendingFills, tokio::time::Instant::now() + long)
+                    .len(),
+                3,
+                "{first:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_retry_waits_the_longer_of_the_backoff_and_the_minimum() {
+        let (_, mut unchecked) = held_on(&["AAA"]);
+        let aaa = InstrumentNameExchange::new("AAA");
+        let now = tokio::time::Instant::now();
+        let backoff = Duration::from_secs(GAP_RETRY_BASE_SECS);
+
+        assert_eq!(
+            unchecked.failed(&aaa, now, backoff * 3),
+            Some(GapFailure::Retry(backoff * 3))
+        );
+        assert_eq!(
+            unchecked.failed(&aaa, now, Duration::from_secs(1)),
+            Some(GapFailure::Retry(backoff * 2)),
+            "a shorter minimum leaves the backoff"
+        );
+    }
+
+    #[test]
+    fn a_check_stopped_by_the_rate_limit_keeps_the_longest_wait() {
+        let throttled = Throttled::default();
+        assert!(!throttled.stopped());
+
+        throttled.note(&UnindexedClientError::Connectivity(
+            ConnectivityError::Timeout,
+        ));
+        assert!(!throttled.stopped(), "only a rate limit stops the check");
+
+        throttled.note(&UnindexedClientError::Api(ApiError::rate_limited(None)));
+        assert!(throttled.stopped());
+        assert_eq!(throttled.wait(), Duration::ZERO);
+
+        for secs in [300, 900, 60] {
+            throttled.note(&UnindexedClientError::Api(ApiError::rate_limited(Some(
+                Duration::from_secs(secs),
+            ))));
+        }
+        assert_eq!(throttled.wait(), Duration::from_secs(900));
     }
 
     /// In a batch, a lookup refused for the rate limit charges every instrument it refused.
@@ -2108,7 +2395,7 @@ mod tests {
             |_| async { Ok(FnvHashSet::default()) },
             |_| {
                 lookups.fetch_add(1, Ordering::Relaxed);
-                async { Err(UnindexedClientError::Api(ApiError::RateLimit)) }
+                async { Err(UnindexedClientError::Api(ApiError::rate_limited(None))) }
             },
         )
         .await;
@@ -2149,7 +2436,7 @@ mod tests {
                     // another lookup before it.
                     tokio::task::yield_now().await;
                     if first {
-                        return Err(UnindexedClientError::Api(ApiError::RateLimit));
+                        return Err(UnindexedClientError::Api(ApiError::rate_limited(None)));
                     }
                     tokio::task::yield_now().await;
                     Ok(OrderLookup::Ended(Box::new(cancelled_order(&key))))
@@ -2190,7 +2477,7 @@ mod tests {
             OpenListing::PerInstrument,
             |_| {
                 listings.fetch_add(1, Ordering::Relaxed);
-                async { Err(UnindexedClientError::Api(ApiError::RateLimit)) }
+                async { Err(UnindexedClientError::Api(ApiError::rate_limited(None))) }
             },
             |_: UnindexedOrderKey| async { panic!("nothing listed, nothing looked up") },
         )
@@ -2232,7 +2519,11 @@ mod tests {
         );
         for instrument in ["AAA", "BBB"] {
             assert_eq!(
-                unchecked.failed(&InstrumentNameExchange::new(instrument), now),
+                unchecked.failed(
+                    &InstrumentNameExchange::new(instrument),
+                    now,
+                    Duration::ZERO
+                ),
                 Some(GapFailure::Retry(Duration::from_secs(
                     GAP_RETRY_BASE_SECS * 2
                 ))),

@@ -561,9 +561,11 @@ impl Subscriber for MassiveSubscriber {
     /// or whitespace (as an instrument the cluster cannot spell is written), or on the options
     /// cluster names an instrument that is not an option contract. Once connected, it returns one if
     /// authentication is refused (a key without WebSocket access to the cluster among the
-    /// reasons), Massive refuses a subscription, or the subscription timeout passes before every
+    /// reasons). It returns [`SocketError::Unacknowledged`], naming the subscriptions Massive had
+    /// not confirmed, if Massive refuses one (its refusal names none, so the refused one is among
+    /// them), the connection is lost, or the subscription timeout passes before every
     /// subscription is confirmed. Massive does not answer a subscription to a channel the cluster
-    /// does not publish, so that surfaces as the timeout, naming what was never confirmed.
+    /// does not publish, so that surfaces as the timeout.
     async fn subscribe<Exchange, Instrument, Kind>(
         &self,
         subscriptions: &[Subscription<Exchange, Instrument, Kind>],

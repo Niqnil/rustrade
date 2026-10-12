@@ -1,63 +1,47 @@
-use super::KrakenMessage;
+use super::{
+    KrakenMessage,
+    channel::KrakenChannel,
+    message::{KrakenChannelData, KrakenData},
+};
 use crate::{
-    Identifier,
     event::{MarketEvent, MarketIter},
     subscription::trade::PublicTrade,
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rustrade_instrument::{Side, exchange::ExchangeId};
-use rustrade_integration::{
-    serde::de::{datetime_utc_from_epoch_duration, extract_next},
-    subscription::SubscriptionId,
-};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use smol_str::{SmolStr, format_smolstr};
 
 /// Terse type alias for an [`Kraken`](super::Kraken) real-time trades WebSocket message.
-pub type KrakenTrades = KrakenMessage<KrakenTradesInner>;
-
-/// Collection of [`KrakenTrade`] items with an associated [`SubscriptionId`] (eg/ "trade|XBT/USD").
-///
-/// See [`KrakenMessage`] for full raw payload examples.
-///
-/// See docs: <https://docs.kraken.com/websockets/#message-trade>
-#[derive(Clone, PartialEq, PartialOrd, Debug, Serialize)]
-pub struct KrakenTradesInner {
-    pub subscription_id: SubscriptionId,
-    pub trades: Vec<KrakenTrade>,
-}
+pub type KrakenTrades = KrakenMessage<KrakenData<KrakenTrade>>;
 
 /// [`Kraken`](super::Kraken) trade.
 ///
 /// See [`KrakenMessage`] for full raw payload examples.
 ///
-/// See docs: <https://docs.kraken.com/websockets/#message-trade>
-#[derive(Copy, Clone, PartialEq, PartialOrd, Debug, Serialize)]
+/// See docs: <https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/trade>
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Deserialize, Serialize)]
 pub struct KrakenTrade {
-    pub price: Decimal,
-    #[serde(rename = "quantity")]
-    pub amount: Decimal,
-    pub time: DateTime<Utc>,
+    pub symbol: SmolStr,
     pub side: Side,
+    #[serde(deserialize_with = "rust_decimal::serde::float::deserialize")]
+    pub price: Decimal,
+    #[serde(
+        rename = "qty",
+        deserialize_with = "rust_decimal::serde::float::deserialize"
+    )]
+    pub amount: Decimal,
+    pub trade_id: u64,
+    pub timestamp: DateTime<Utc>,
 }
 
-impl Identifier<Option<SubscriptionId>> for KrakenTradesInner {
-    fn id(&self) -> Option<SubscriptionId> {
-        Some(self.subscription_id.clone())
+impl KrakenChannelData for KrakenTrade {
+    const CHANNEL: KrakenChannel = KrakenChannel::TRADES;
+
+    fn symbol(&self) -> &str {
+        &self.symbol
     }
-}
-
-/// Generate a custom [`Kraken`](super::Kraken) trade identifier since it is not provided in the
-/// [`KrakenTrade`] model. Returns [`SmolStr`] (typically heap-allocated due to ID length).
-fn custom_kraken_trade_id(trade: &KrakenTrade) -> SmolStr {
-    format_smolstr!(
-        "{}_{}_{}_{}",
-        trade.time.timestamp_micros(),
-        trade.side,
-        trade.price,
-        trade.amount
-    )
 }
 
 impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, KrakenTrades)>
@@ -65,234 +49,131 @@ impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, KrakenTrades)>
 {
     fn from((exchange, instrument, trades): (ExchangeId, InstrumentKey, KrakenTrades)) -> Self {
         match trades {
-            KrakenTrades::Data(trades) => trades
-                .trades
-                .into_iter()
-                .map(|trade| {
-                    Ok(MarketEvent {
-                        time_exchange: trade.time,
-                        time_received: Utc::now(),
-                        exchange,
-                        instrument: instrument.clone(),
-                        kind: PublicTrade {
-                            id: custom_kraken_trade_id(&trade),
-                            price: trade.price,
-                            amount: trade.amount,
-                            side: Some(trade.side),
-                        },
+            KrakenTrades::Data(trades) => {
+                let time_received = Utc::now();
+                trades
+                    .data
+                    .into_iter()
+                    .map(|trade| {
+                        Ok(MarketEvent {
+                            time_exchange: trade.timestamp,
+                            time_received,
+                            exchange,
+                            instrument: instrument.clone(),
+                            kind: PublicTrade {
+                                id: format_smolstr!("{}", trade.trade_id),
+                                price: trade.price,
+                                amount: trade.amount,
+                                side: Some(trade.side),
+                            },
+                        })
                     })
-                })
-                .collect(),
+                    .collect()
+            }
             KrakenTrades::Event(_) => Self(vec![]),
         }
     }
 }
 
-impl<'de> serde::de::Deserialize<'de> for KrakenTradesInner {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct SeqVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for SeqVisitor {
-            type Value = KrakenTradesInner;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("KrakenTradesInner struct from the Kraken WebSocket API")
-            }
-
-            fn visit_seq<SeqAccessor>(
-                self,
-                mut seq: SeqAccessor,
-            ) -> Result<Self::Value, SeqAccessor::Error>
-            where
-                SeqAccessor: serde::de::SeqAccess<'de>,
-            {
-                // KrakenTrades Sequence Format:
-                // [channelID, [[price, volume, time, side, orderType, misc]], channelName, pair]
-                // <https://docs.kraken.com/websockets/#message-trade>
-
-                // Extract deprecated channelID & ignore
-                let _: serde::de::IgnoredAny = extract_next(&mut seq, "channelID")?;
-
-                // Extract Vec<KrakenTrade>
-                let trades = extract_next(&mut seq, "Vec<KrakenTrade>")?;
-
-                // Extract channelName (eg/ "trade") & ignore
-                let _: serde::de::IgnoredAny = extract_next(&mut seq, "channelName")?;
-
-                // Extract pair (eg/ "XBT/USD") & map to SubscriptionId (ie/ "trade|{pair}")
-                let subscription_id = extract_next::<SeqAccessor, String>(&mut seq, "pair")
-                    .map(|pair| SubscriptionId::from(format!("trade|{pair}")))?;
-
-                // Ignore any additional elements or SerDe will fail
-                //  '--> Exchange may add fields without warning
-                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
-
-                Ok(KrakenTradesInner {
-                    subscription_id,
-                    trades,
-                })
-            }
-        }
-
-        // Use Visitor implementation to deserialise the KrakenTrades
-        deserializer.deserialize_seq(SeqVisitor)
-    }
-}
-
-impl<'de> serde::de::Deserialize<'de> for KrakenTrade {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::de::Deserializer<'de>,
-    {
-        struct SeqVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for SeqVisitor {
-            type Value = KrakenTrade;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("KrakenTrade struct from the Kraken WebSocket API")
-            }
-
-            fn visit_seq<SeqAccessor>(
-                self,
-                mut seq: SeqAccessor,
-            ) -> Result<Self::Value, SeqAccessor::Error>
-            where
-                SeqAccessor: serde::de::SeqAccess<'de>,
-            {
-                // KrakenTrade Sequence Format:
-                // [price, volume, time, side, orderType, misc]
-                // <https://docs.kraken.com/websockets/#message-trade>
-
-                // Extract String price & parse to Decimal
-                let price = extract_next::<SeqAccessor, String>(&mut seq, "price")?
-                    .parse()
-                    .map_err(serde::de::Error::custom)?;
-
-                // Extract String amount & parse to Decimal
-                let amount = extract_next::<SeqAccessor, String>(&mut seq, "quantity")?
-                    .parse()
-                    .map_err(serde::de::Error::custom)?;
-
-                // Extract String time, parse to f64, map to DateTime<Utc>
-                let time = extract_next::<SeqAccessor, String>(&mut seq, "time")?
-                    .parse()
-                    .map(|time: f64| {
-                        datetime_utc_from_epoch_duration(std::time::Duration::from_secs_f64(time))
-                    })
-                    .map_err(serde::de::Error::custom)?;
-
-                // Extract Side
-                let side: Side = extract_next(&mut seq, "side")?;
-
-                // Ignore any additional elements or SerDe will fail
-                //  '--> Exchange may add fields without warning
-                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
-
-                Ok(KrakenTrade {
-                    price,
-                    amount,
-                    time,
-                    side,
-                })
-            }
-        }
-
-        // Use Visitor implementation to deserialise the KrakenTrade
-        deserializer.deserialize_seq(SeqVisitor)
-    }
-}
-
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use crate::Identifier;
+    use chrono::TimeZone;
+    use rust_decimal_macros::dec;
+    use rustrade_integration::subscription::SubscriptionId;
 
-    mod de {
-        use super::*;
-        use rust_decimal_macros::dec;
-        use rustrade_instrument::Side;
-        use rustrade_integration::{
-            error::SocketError, serde::de::datetime_utc_from_epoch_duration,
-            subscription::SubscriptionId,
-        };
+    fn trade(symbol: &str, side: &str, price: &str, qty: &str, trade_id: u64) -> String {
+        format!(
+            r#"{{"symbol":"{symbol}","side":"{side}","price":{price},"qty":{qty},"ord_type":"limit","trade_id":{trade_id},"timestamp":"2018-08-18T17:40:57.321597Z"}}"#
+        )
+    }
 
-        #[test]
-        fn test_kraken_message_trades() {
-            struct TestCase {
-                input: &'static str,
-                expected: Result<KrakenTrades, SocketError>,
+    fn message(trades: &[String]) -> String {
+        format!(
+            r#"{{"channel":"trade","type":"update","data":[{}]}}"#,
+            trades.join(",")
+        )
+    }
+
+    #[test]
+    fn test_kraken_message_trades() {
+        let input = message(&[
+            trade("BTC/USD", "sell", "5541.2", "0.15850568", 1001),
+            trade("BTC/USD", "buy", "6060", "5.006e-05", 1002),
+        ]);
+
+        let actual: KrakenTrades = serde_json::from_str(&input).unwrap();
+
+        let time = Utc
+            .with_ymd_and_hms(2018, 8, 18, 17, 40, 57)
+            .unwrap()
+            .checked_add_signed(chrono::Duration::microseconds(321_597))
+            .unwrap();
+        assert_eq!(
+            actual,
+            KrakenTrades::Data(KrakenData {
+                subscription_id: Some(SubscriptionId::from("trade|BTC/USD")),
+                data: vec![
+                    KrakenTrade {
+                        symbol: "BTC/USD".into(),
+                        side: Side::Sell,
+                        price: dec!(5541.2),
+                        amount: dec!(0.15850568),
+                        trade_id: 1001,
+                        timestamp: time,
+                    },
+                    KrakenTrade {
+                        symbol: "BTC/USD".into(),
+                        side: Side::Buy,
+                        price: dec!(6060),
+                        amount: dec!(0.00005006),
+                        trade_id: 1002,
+                        timestamp: time,
+                    },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn trades_become_public_trades_keyed_by_kraken_trade_id() {
+        let input = message(&[trade("ETH/USD", "sell", "2509.41", "0.02625345", 67552113)]);
+        let trades: KrakenTrades = serde_json::from_str(&input).unwrap();
+
+        let events = MarketIter::<&str, PublicTrade>::from((ExchangeId::Kraken, "eth", trades)).0;
+
+        assert_eq!(events.len(), 1);
+        let event = events.into_iter().next().unwrap().unwrap();
+        assert_eq!(event.instrument, "eth");
+        assert_eq!(
+            event.kind,
+            PublicTrade {
+                id: "67552113".into(),
+                price: dec!(2509.41),
+                amount: dec!(0.02625345),
+                side: Some(Side::Sell),
             }
+        );
+    }
 
-            let tests = vec![TestCase {
-                // TC0: valid KrakenTrades::Data(KrakenTradesInner)
-                input: r#"
-                    [
-                        0,
-                        [
-                            [
-                                "5541.20000",
-                                "0.15850568",
-                                "1534614057.321597",
-                                "s",
-                                "l",
-                                ""
-                            ],
-                            [
-                                "6060.00000",
-                                "0.02455000",
-                                "1534614057.324998",
-                                "b",
-                                "l",
-                                ""
-                            ]
-                        ],
-                      "trade",
-                      "XBT/USD"
-                    ]
-                    "#,
-                expected: Ok(KrakenTrades::Data(KrakenTradesInner {
-                    subscription_id: SubscriptionId::from("trade|XBT/USD"),
-                    trades: vec![
-                        KrakenTrade {
-                            price: dec!(5541.20000),
-                            amount: dec!(0.15850568),
-                            time: datetime_utc_from_epoch_duration(
-                                std::time::Duration::from_secs_f64(1534614057.321597),
-                            ),
-                            side: Side::Sell,
-                        },
-                        KrakenTrade {
-                            price: dec!(6060.00000),
-                            amount: dec!(0.02455000),
-                            time: datetime_utc_from_epoch_duration(
-                                std::time::Duration::from_secs_f64(1534614057.324998),
-                            ),
-                            side: Side::Buy,
-                        },
-                    ],
-                })),
-            }];
+    #[test]
+    fn a_message_without_trades_routes_nowhere() {
+        let trades: KrakenTrades = serde_json::from_str(&message(&[])).unwrap();
+        assert_eq!(trades.id(), None);
+    }
 
-            for (index, test) in tests.into_iter().enumerate() {
-                let actual = serde_json::from_str::<KrakenTrades>(test.input);
-                match (actual, test.expected) {
-                    (Ok(actual), Ok(expected)) => {
-                        assert_eq!(actual, expected, "TC{} failed", index)
-                    }
-                    (Err(_), Err(_)) => {
-                        // Test passed
-                    }
-                    (actual, expected) => {
-                        // Test failed
-                        panic!(
-                            "TC{index} failed because actual != expected. \nActual: {actual:?}\nExpected: {expected:?}\n"
-                        );
-                    }
-                }
-            }
+    #[test]
+    fn messages_that_carry_no_trades_route_nowhere() {
+        for message in [
+            r#"{"channel":"heartbeat"}"#,
+            r#"{"channel":"status","type":"update","data":[{"api_version":"v2","connection_id":1,"system":"online","version":"2.0.0"}]}"#,
+            r#"{"method":"pong","time_in":"2018-11-12T21:14:59.545897Z","time_out":"2018-11-12T21:14:59.545901Z"}"#,
+        ] {
+            let trades: KrakenTrades = serde_json::from_str(message).unwrap();
+            assert!(matches!(trades, KrakenMessage::Event(_)), "{message}");
+            assert_eq!(trades.id(), None, "{message}");
         }
     }
 }
