@@ -30,7 +30,7 @@ impl std::fmt::Display for PublicTrades {
 ///
 /// Uses [`SmolStr`] for `id` to avoid heap allocation for typical trade IDs
 /// (up to 23 bytes on 64-bit systems are stored inline). Exceptions that
-/// heap-allocate: Bitmex UUIDs (36 bytes), Kraken composite IDs (~34 bytes).
+/// heap-allocate: Bitmex UUIDs (36 bytes).
 ///
 /// # Side Field
 ///

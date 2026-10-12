@@ -46,6 +46,7 @@ use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope,
     InstrumentAccountSnapshot, UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
+    cash_flow::{CashFlow, CashFlowId, CashFlowKind, CashFlowsRead},
     client::{
         BracketOrderClient, ExecutionClient, OrderStatusClient, ShortabilityClient,
         order_recovery::{
@@ -75,9 +76,9 @@ use crate::{
     parse_env_bool,
     position::{Position, PositionReport},
     shortability::Shortability,
-    trade::{AssetFees, Trade, TradeAmendmentKind, TradeId, TradesRead},
+    trade::{AssetFees, Trade, TradeAmendmentKind, TradeId, TradeOrigin, TradesRead},
 };
-use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, SecondsFormat, TimeDelta, Utc};
 use fnv::{FnvHashMap, FnvHashSet};
 use futures::{SinkExt as _, StreamExt as _, stream::BoxStream};
 use indexmap::IndexMap;
@@ -91,7 +92,7 @@ use rustrade_instrument::{
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use rustrade_integration::protocol::websocket::{WebSocket, WsMessage};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use smol_str::{SmolStr, format_smolstr};
 use std::{num::NonZeroUsize, pin::Pin, str::FromStr, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
@@ -735,6 +736,46 @@ struct AlpacaActivity {
     cum_qty: Option<String>,
 }
 
+/// A non-trade account activity, as Alpaca's activities endpoint serves it: a cash movement such as
+/// interest or a fee, read by [`AlpacaClient::fetch_cash_flows`], or an option exercise,
+/// assignment or expiry, read by [`AlpacaClient::fetch_option_events`]. A cash flow uses the
+/// amount, currency and symbol; an option event uses the quantity, price, symbol and date. Every
+/// field but the id and type is optional in Alpaca's schema, so a record missing one still decodes
+/// and the conversion decides what it can do without it.
+#[derive(Debug, Deserialize)]
+struct AlpacaNonTradeActivity {
+    id: String,
+    activity_type: String,
+    #[serde(default)]
+    activity_sub_type: Option<String>,
+    /// When Alpaca created the activity, which its `after` and `until` filter on. For a fee, this
+    /// is typically the day after the trade it was charged on.
+    #[serde(default)]
+    created_at: Option<String>,
+    /// The day the activity occurred or settled, as `YYYY-MM-DD`. A cash flow's time uses
+    /// `created_at`, which `after` and `until` filter on. An option event falls back to it when
+    /// `created_at` is missing, and pairs the legs of an exercise or assignment by it.
+    #[serde(default)]
+    date: Option<String>,
+    /// Signed: negative when the account paid.
+    #[serde(default)]
+    net_amount: Option<String>,
+    /// Signed: negative when the account sold. Contracts on an option event, or shares on the
+    /// share leg (`OPTRD`) of an exercise or assignment.
+    #[serde(default)]
+    qty: Option<String>,
+    /// On the share leg (`OPTRD`) of an exercise or assignment, the strike the shares traded at.
+    #[serde(default)]
+    price: Option<String>,
+    #[serde(default)]
+    currency: Option<String>,
+    #[serde(default)]
+    symbol: Option<String>,
+    /// `executed`, `correct` or `canceled`.
+    #[serde(default)]
+    status: Option<String>,
+}
+
 /// The body of an Alpaca error response: `{"code": 40310000, "message": "..."}`.
 ///
 /// `code` is absent from some responses, notably the bare `{"message": "forbidden."}` that a
@@ -1062,11 +1103,11 @@ struct AlpacaOrderWs<'a> {
 /// commission. Alpaca's fill events carry no fee for crypto either: it is taken from the asset
 /// the trade credits, so it shows only in that asset's balance.
 ///
-/// Alpaca posts its other charges, such as margin interest and stock borrow fees, to the
-/// account's cash as account activities. A USD balance's `total` is that cash, so it includes a
-/// charge once Alpaca has posted it. This client reads only `FILL` activities, so the charges
-/// themselves are not reported, and [`ExecutionClient::account_stream`] delivers no balances.
-/// PnL computed from fills excludes all of them.
+/// Alpaca posts its other charges, such as margin interest and fees, to the account's cash as
+/// account activities. A USD balance's `total` is that cash, so it includes a charge once Alpaca
+/// has posted it. [`ExecutionClient::account_stream`] delivers none of them, nor any balance:
+/// Alpaca streams neither. [`AlpacaClient::fetch_cash_flows`] reads them on request. PnL computed
+/// from fills excludes them.
 ///
 /// Cloning is cheap: all inner state is behind `Arc`.
 #[derive(Clone)]
@@ -1918,21 +1959,17 @@ impl ExecutionClient for AlpacaClient {
         if start > end || end < DateTime::UNIX_EPOCH {
             return Ok(TradesRead::complete(Vec::new()));
         }
-        let page = paginate_activities(
+        let page = paginate_activities::<AlpacaActivity>(
             &self.http,
             &self.rate_limiter,
             self.base_url(),
+            FILL_ACTIVITIES,
             start,
             Some(end),
         )
         .await?;
 
-        // Alpaca's `until` is not exact, and is not sent for an `end` not yet reached, so the
-        // read can run past `end`. Activities are ascending by millisecond, so a resume past `end`
-        // means every activity in the span was read.
-        let resume = page.resume.filter(|resume| *resume <= end);
-        // A read from `resume` would stop where this one did, so it cannot advance.
-        if resume.is_some_and(|resume| resume <= floor_millis(start)) {
+        let Ok(resume) = span_resume(page.resume, start, end) else {
             error!(
                 %start,
                 fills_read = page.activities.len(),
@@ -1941,7 +1978,7 @@ impl ExecutionClient for AlpacaClient {
             return Err(UnindexedClientError::Truncated {
                 fills_read: page.activities.len(),
             });
-        }
+        };
 
         // Empty instruments slice means "all instruments" — same convention as
         // fetch_open_orders.
@@ -1969,6 +2006,204 @@ impl ExecutionClient for AlpacaClient {
 // ---------------------------------------------------------------------------
 
 impl AlpacaClient {
+    /// Read the cash Alpaca moved into or out of the account other than by a trade, from `start`
+    /// to `end`: interest, fees, and pass-through charges and rebates.
+    ///
+    /// Alpaca streams none of these: `trade_updates` carries order events only. Nothing is pushed:
+    /// the caller decides when to read, and must drop the flows it has already applied, by
+    /// [`id`](CashFlow::id), before applying a read's. Alpaca posts each to the account's cash,
+    /// so the account's USD balance already includes a flow read here.
+    ///
+    /// # What each activity becomes
+    ///
+    /// | Activity | [`CashFlowKind`] |
+    /// |---|---|
+    /// | `INT` of sub-type `MGN`, or with no sub-type and a negative amount | [`MarginInterest`](CashFlowKind::MarginInterest), with no rate or principal: Alpaca reports neither |
+    /// | `PTR`, a pass-through rebate | [`Rebate`](CashFlowKind::Rebate) |
+    /// | Any other: `FEE`, `PTC`, credit interest | [`Other`](CashFlowKind::Other), naming the type and, when Alpaca gives one, the sub-type, as `FEE.TAF` |
+    ///
+    /// Alpaca documents no activity type for a stock borrow fee. Should it post one as one of
+    /// these, it arrives as [`Other`](CashFlowKind::Other) with its own name.
+    ///
+    /// - [`amount`](CashFlow::amount) is Alpaca's `net_amount`, negative when the account paid.
+    /// - [`asset`](CashFlow::asset) is its `currency`, or `USD` when it names none.
+    /// - [`instrument`](CashFlow::instrument) is its `symbol`, when it names one.
+    /// - [`time_exchange`](CashFlow::time_exchange) is when Alpaca created the activity
+    ///   (`created_at`), which its `after` and `until` filter on. A fee is typically created the
+    ///   day after the trade it was charged on.
+    /// - [`id`](CashFlow::id) is Alpaca's activity id.
+    ///
+    /// # Status
+    /// - An activity Alpaca marks `canceled` is left out, and logged at INFO. A flow read before
+    ///   it was canceled is not reversed: the caller reconciles against the account's cash.
+    /// - One marked `correct` is returned like any other. Alpaca does not document whether a
+    ///   correction stands beside the activity it corrects or replaces it, so a caller applying
+    ///   both by id may count the cash twice. Reconcile against the account's cash.
+    ///
+    /// An activity without an amount or a creation time that parses is left out, and logged at
+    /// WARN.
+    ///
+    /// # Cost and resuming
+    /// One call sends up to 50 requests, reading at most 5,000 activities, and returns `resume`
+    /// when it stops there: the millisecond of the last activity's creation time. That resume is
+    /// exact only if Alpaca serves these activities in order of creation, as it serves fills in
+    /// order of time; its documentation orders them by "activity datetime" without saying which
+    /// time, and this ordering has not been observed for them. Read spans short enough to fit one
+    /// call, as the volume of these activities usually allows, and `resume` stays `None`.
+    ///
+    /// # Errors
+    /// Fails if a request fails, or, with [`UnindexedClientError::Internal`], if more activities
+    /// share the span's first millisecond than one call reads, so a read from `resume` could not
+    /// advance.
+    pub async fn fetch_cash_flows(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<CashFlowsRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError>
+    {
+        // An empty span, or one ending before the epoch, holds nothing Alpaca has.
+        if start > end || end < DateTime::UNIX_EPOCH {
+            return Ok(CashFlowsRead::complete(Vec::new()));
+        }
+        let page = paginate_activities::<AlpacaNonTradeActivity>(
+            &self.http,
+            &self.rate_limiter,
+            self.base_url(),
+            CASH_FLOW_ACTIVITIES,
+            start,
+            Some(end),
+        )
+        .await?;
+        let Ok(resume) = span_resume(page.resume, start, end) else {
+            error!(
+                %start,
+                activities_read = page.activities.len(),
+                "Alpaca fetch_cash_flows: a full read did not advance past the span's first \
+                 millisecond"
+            );
+            return Err(UnindexedClientError::Internal(format!(
+                "Alpaca cash-flow read of {} activities did not advance past {start}",
+                page.activities.len()
+            )));
+        };
+
+        let flows = page
+            .activities
+            .iter()
+            .filter_map(convert_cash_flow)
+            // Alpaca's bounds are not exact (see `paginate_activities`), so the span is applied
+            // here.
+            .filter(|flow| (start..=end).contains(&flow.time_exchange))
+            .collect();
+        Ok(CashFlowsRead::new(flows, resume))
+    }
+
+    /// Read the trades Alpaca made when an option contract was exercised, assigned or expired,
+    /// from `start` to `end`.
+    ///
+    /// Alpaca reports these as account activities, not fills: `trade_updates` carries none of
+    /// them, and [`fetch_trades`](crate::client::ExecutionClient::fetch_trades) reads fills only.
+    /// Nothing is pushed: the caller decides when to read, and must drop the trades it has
+    /// already applied, by [`id`](Trade::id), before applying a read's. To let these trades move
+    /// the engine's positions without the engine also settling the contract at expiry, set the
+    /// exchange's expiry handling to `Venue` (see `ExpiryHandling` in the `rustrade` crate).
+    ///
+    /// # What each activity becomes
+    ///
+    /// Each becomes one [`Trade`], whose [`origin`](Trade::origin) says why it happened:
+    ///
+    /// | Activity | Instrument | [`TradeOrigin`] | Price |
+    /// |---|---|---|---|
+    /// | `OPEXP`, expiry | the contract | [`Expiry`](TradeOrigin::Expiry) | 0 |
+    /// | `OPEXC`, exercise | the contract | [`Exercise`](TradeOrigin::Exercise) | 0 |
+    /// | `OPASN`, assignment | the contract | [`Assignment`](TradeOrigin::Assignment) | 0 |
+    /// | `OPTRD`, the shares an exercise or assignment trades | the underlying | that of its exercise or assignment, else [`External`](TradeOrigin::External) | the strike |
+    ///
+    /// - [`side`](Trade::side) and [`quantity`](Trade::quantity) come from Alpaca's signed `qty`:
+    ///   negative is a sell. An exercised long or an expiring long is sold; an assigned short is
+    ///   bought. Quantities are in contracts on the contract, and in shares on `OPTRD`.
+    /// - The contract leaves at a price of 0. What it was worth at exercise or assignment is in the
+    ///   shares traded at the strike.
+    /// - [`time_exchange`](Trade::time_exchange) is when Alpaca created the activity
+    ///   (`created_at`), or the start of its `date`, in UTC, when it gives no creation time. Such
+    ///   a dated activity is in the span when its `date` is one of the span's UTC days, so a read
+    ///   up to now still returns one posted today, and successive reads within one day each
+    ///   return it again.
+    /// - [`id`](Trade::id) and [`order_id`](Trade::order_id) are Alpaca's activity id, since no
+    ///   order produced the trade. [`strategy`](Trade::strategy) is unknown, and fees are zero.
+    ///
+    /// # Pairing the share leg
+    ///
+    /// `OPTRD` names the underlying, not the contract, so its origin is found by pairing it with
+    /// an `OPEXC` or `OPASN` of the same `date` whose contract's root symbol is the `OPTRD`'s
+    /// symbol, whose strike is its price, and whose kind implies its side: exercising a call or
+    /// being assigned on a put buys the shares, and the other two sell them. Each is paired at
+    /// most once, in the order Alpaca returns them, preferring one of 100 shares a contract, the
+    /// standard size, so that two exercises at one strike pair with their own shares. An `OPTRD`
+    /// with no such partner is returned as [`External`](TradeOrigin::External), and logged at
+    /// WARN. The read covers the whole UTC days of `start` and `end`, so that both legs are read
+    /// together, and returns only the trades in `start..=end`.
+    ///
+    /// # Status
+    /// An activity Alpaca marks `canceled` is left out, and logged at INFO. An activity without a
+    /// symbol, a non-zero quantity or a time, an `OPTRD` without a price, or one of another type
+    /// is left out, and logged at WARN.
+    ///
+    /// # Cost and resuming
+    /// As [`fetch_cash_flows`](Self::fetch_cash_flows): one call sends up to 50 requests, reading
+    /// at most 5,000 activities, and returns `resume` when it stops there. A read from `resume`
+    /// reads its whole UTC day again, so drop by id what was already applied. So more than 5,000
+    /// option activities in one UTC day cannot be read through; see Errors.
+    ///
+    /// A read that stops at the cap can split an exercise or assignment from its share leg, and
+    /// return the `OPTRD` as [`External`](TradeOrigin::External) while the next read, from
+    /// `resume`, returns it again with its pair's origin. A caller dropping trades by id keeps
+    /// the first. When a read returns `resume`, hold back its `External` `OPTRD`s until the next
+    /// read.
+    ///
+    /// # Errors
+    /// Fails if a request fails, or, with [`UnindexedClientError::Internal`], if a read from
+    /// `resume` could not advance: one UTC day holds more option activities than one call reads.
+    /// That includes a day whose activities before `start` alone fill the call.
+    pub async fn fetch_option_events(
+        &self,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError> {
+        // An empty span, or one ending before the epoch, holds nothing Alpaca has.
+        if start > end || end < DateTime::UNIX_EPOCH {
+            return Ok(TradesRead::complete(Vec::new()));
+        }
+        // Whole UTC days, so the legs of one exercise or assignment are read together.
+        let read_start = start.date_naive().and_time(NaiveTime::MIN).and_utc();
+        let read_end = end.date_naive().and_time(LAST_MILLISECOND).and_utc();
+        let page = paginate_activities::<AlpacaNonTradeActivity>(
+            &self.http,
+            &self.rate_limiter,
+            self.base_url(),
+            OPTION_EVENT_ACTIVITIES,
+            read_start,
+            Some(read_end),
+        )
+        .await?;
+        let Ok(resume) = span_resume(page.resume, start, end) else {
+            error!(
+                %start,
+                activities_read = page.activities.len(),
+                "Alpaca fetch_option_events: a full read did not advance past the span's start"
+            );
+            return Err(UnindexedClientError::Internal(format!(
+                "Alpaca option-event read of {} activities did not advance past {start}",
+                page.activities.len()
+            )));
+        };
+
+        Ok(TradesRead::new(
+            convert_option_events(&page.activities, start, end),
+            resume,
+        ))
+    }
+
     /// Place an order with an explicit `position_intent` override.
     ///
     /// Use this instead of `ExecutionClient::open_order` when you need to specify
@@ -2312,6 +2547,7 @@ impl AlpacaClient {
             OrderKind::TrailingStop {
                 offset,
                 offset_type,
+                ..
             } => match offset_type {
                 TrailingOffsetType::Percentage => (None, Some(offset.to_string()), None),
                 TrailingOffsetType::Absolute => (None, None, Some(offset.to_string())),
@@ -2322,7 +2558,8 @@ impl AlpacaClient {
             | OrderKind::Limit
             | OrderKind::TakeProfit { .. }
             | OrderKind::TakeProfitLimit { .. }
-            | OrderKind::TrailingStopLimit { .. } => (None, None, None),
+            | OrderKind::TrailingStopLimit { .. }
+            | OrderKind::TrailingStopFixedLimit { .. } => (None, None, None),
         };
 
         let body = AlpacaOrderRequest {
@@ -2456,10 +2693,72 @@ async fn fetch_raw_open_orders(
 /// recovery, can take; a read that reaches it says where to read on from.
 const MAX_ACTIVITY_PAGES: usize = 50;
 
+/// An account activity that [`paginate_activities`] pages through.
+trait PagedActivity: DeserializeOwned {
+    /// The activity's id, which is also the token for the page after it.
+    fn id(&self) -> &str;
+    /// The time Alpaca orders activities by and applies `after` and `until` to, or `None` when it
+    /// does not parse.
+    fn time(&self) -> Option<DateTime<Utc>>;
+}
+
+impl PagedActivity for AlpacaActivity {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn time(&self) -> Option<DateTime<Utc>> {
+        parse_timestamp(&self.transaction_time)
+    }
+}
+
+impl PagedActivity for AlpacaNonTradeActivity {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn time(&self) -> Option<DateTime<Utc>> {
+        self.created_at.as_deref().and_then(parse_timestamp)
+    }
+}
+
+/// The `activity_types` a read of fills asks for.
+const FILL_ACTIVITIES: &str = "FILL";
+
+/// The `activity_types` [`AlpacaClient::fetch_cash_flows`] asks for.
+const CASH_FLOW_ACTIVITIES: &str = "INT,FEE,PTC,PTR";
+
+/// The `activity_types` [`AlpacaClient::fetch_option_events`] asks for.
+const OPTION_EVENT_ACTIVITIES: &str = "OPASN,OPEXC,OPEXP,OPTRD";
+
+/// The last millisecond of a day, where [`AlpacaClient::fetch_option_events`] ends its read.
+const LAST_MILLISECOND: NaiveTime = match NaiveTime::from_hms_milli_opt(23, 59, 59, 999) {
+    Some(time) => time,
+    None => panic!("23:59:59.999 is a time of day"),
+};
+
+/// Where a bounded read of `start..=end` that stopped at `resume` should read on from: `None` when
+/// it read the whole span, or `Err(())` when a read from `resume` would stop where this one did.
+///
+/// Alpaca's `until` is not exact, and is not sent for an `end` not yet reached, so a read can run
+/// past `end`. Activities are ascending by millisecond, so a resume past `end` means every
+/// activity in the span was read.
+fn span_resume(
+    resume: Option<DateTime<Utc>>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>, ()> {
+    let resume = resume.filter(|resume| *resume <= end);
+    if resume.is_some_and(|resume| resume <= floor_millis(start)) {
+        return Err(());
+    }
+    Ok(resume)
+}
+
 /// What one [`paginate_activities`] call read.
-struct ActivityPage {
-    /// Every FILL activity read, in Alpaca's ascending order.
-    activities: Vec<AlpacaActivity>,
+struct ActivityPage<A> {
+    /// Every activity read, in Alpaca's ascending order.
+    activities: Vec<A>,
     /// Set when the read stopped at [`MAX_ACTIVITY_PAGES`]: every activity before this time was
     /// read, and some from it on may not have been.
     resume: Option<DateTime<Utc>>,
@@ -2470,8 +2769,8 @@ fn floor_millis(time: DateTime<Utc>) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(time.timestamp_millis()).unwrap_or(time)
 }
 
-/// Fetch the FILL activities from `start`, and up to `end` if given, using token-based
-/// pagination.
+/// Fetch the activities of the `activity_types` named in `types` (comma-separated) from `start`,
+/// and up to `end` if given, using token-based pagination.
 ///
 /// Alpaca returns up to `ALPACA_MAX_ACTIVITIES` per page. If a full page is
 /// returned, the next request uses the last item's `id` as the `page_token`.
@@ -2504,13 +2803,14 @@ const _: () = assert!(
     "PAGE_SIZE_STR must be updated to match ALPACA_MAX_ACTIVITIES",
 );
 
-async fn paginate_activities(
+async fn paginate_activities<A: PagedActivity>(
     http: &reqwest::Client,
     rate_limiter: &RateLimitTracker,
     base: &str,
+    types: &str,
     start: DateTime<Utc>,
     end: Option<DateTime<Utc>>,
-) -> Result<ActivityPage, UnindexedClientError> {
+) -> Result<ActivityPage<A>, UnindexedClientError> {
     // Clamped to the epoch so a far-past `start` still formats as RFC 3339; Alpaca holds nothing
     // older. An `end` not yet reached sends no `until`, so a far-future one cannot overflow.
     let after =
@@ -2532,9 +2832,9 @@ async fn paginate_activities(
         pages += 1;
         // Borrow page_token as &str so the closure can capture by reference without cloning.
         let page_token_ref = page_token.as_deref();
-        let activities: Vec<AlpacaActivity> = rest_with_retry(rate_limiter, || {
+        let activities: Vec<A> = rest_with_retry(rate_limiter, || {
             let mut req = http.get(format!("{base}/v2/account/activities")).query(&[
-                ("activity_type", "FILL"),
+                ("activity_types", types),
                 ("after", after.as_str()),
                 ("page_size", PAGE_SIZE_STR),
                 ("direction", "asc"),
@@ -2559,7 +2859,7 @@ async fn paginate_activities(
         // begins with the item AFTER the token, so the boundary item is not re-delivered.
         // The pagination contract relies on this property — verify against Alpaca API docs
         // if behaviour changes.
-        let page_token_candidate = activities.last().map(|a| a.id.clone());
+        let page_token_candidate = activities.last().map(|a| a.id().to_owned());
         all.extend(activities);
 
         if page_len < ALPACA_MAX_ACTIVITIES {
@@ -2583,7 +2883,7 @@ async fn paginate_activities(
         floor_millis(
             all.iter()
                 .rev()
-                .find_map(|activity| parse_timestamp(&activity.transaction_time))
+                .find_map(PagedActivity::time)
                 .unwrap_or(start),
         )
     });
@@ -3352,7 +3652,16 @@ async fn recover_fills(
         instruments.iter().map(|i| i.name().as_str()).collect()
     };
 
-    let page = match paginate_activities(http, rate_limiter, base, after, None).await {
+    let page = match paginate_activities::<AlpacaActivity>(
+        http,
+        rate_limiter,
+        base,
+        FILL_ACTIVITIES,
+        after,
+        None,
+    )
+    .await
+    {
         Ok(p) => p,
         Err(e) => {
             error!(%e, "Alpaca fill recovery: REST request failed");
@@ -4566,11 +4875,13 @@ fn parse_order_kind(
                 Some(OrderKind::TrailingStop {
                     offset: pct,
                     offset_type: TrailingOffsetType::Percentage,
+                    activation_price: None,
                 })
             } else if let Some(price) = trail_price.and_then(|s| Decimal::from_str(s).ok()) {
                 Some(OrderKind::TrailingStop {
                     offset: price,
                     offset_type: TrailingOffsetType::Absolute,
+                    activation_price: None,
                 })
             } else {
                 trace!("Alpaca: trailing_stop missing trail_percent and trail_price");
@@ -4631,6 +4942,294 @@ fn alpaca_filled_qty(order_id: &str, filled_qty: Option<&str>) -> Option<Decimal
     }
 }
 
+/// A non-trade activity as a [`CashFlow`], or `None` if Alpaca canceled it or it lacks an amount
+/// or a time. See [`AlpacaClient::fetch_cash_flows`].
+fn convert_cash_flow(
+    activity: &AlpacaNonTradeActivity,
+) -> Option<CashFlow<AssetNameExchange, InstrumentNameExchange>> {
+    let id = activity.id.as_str();
+    if activity.status.as_deref() == Some("canceled") {
+        info!(id, activity_type = %activity.activity_type, "Alpaca activity canceled — left out");
+        return None;
+    }
+    let Some(amount) = activity
+        .net_amount
+        .as_deref()
+        .and_then(|amount| Decimal::from_str(amount).ok())
+    else {
+        warn!(id, net_amount = ?activity.net_amount, "Alpaca activity missing/unparseable net_amount — left out");
+        return None;
+    };
+    let Some(time_exchange) = activity.time() else {
+        warn!(
+            id,
+            created_at = ?activity.created_at,
+            date = ?activity.date,
+            "Alpaca activity missing/unparseable time — left out"
+        );
+        return None;
+    };
+    let sub_type = activity
+        .activity_sub_type
+        .as_deref()
+        .filter(|sub_type| !sub_type.is_empty());
+    let kind = match (activity.activity_type.as_str(), sub_type) {
+        ("INT", Some("MGN")) => CashFlowKind::MarginInterest {
+            rate: None,
+            principal: None,
+        },
+        // Credit interest is received; margin interest is paid.
+        ("INT", None) if amount.is_sign_negative() => CashFlowKind::MarginInterest {
+            rate: None,
+            principal: None,
+        },
+        ("PTR", _) => CashFlowKind::Rebate,
+        (activity_type, Some(sub_type)) => {
+            CashFlowKind::Other(format!("{activity_type}.{sub_type}"))
+        }
+        (activity_type, None) => CashFlowKind::Other(activity_type.to_owned()),
+    };
+    Some(CashFlow::new(
+        kind,
+        AssetNameExchange::new(
+            activity
+                .currency
+                .as_deref()
+                .filter(|currency| !currency.is_empty())
+                .unwrap_or("USD"),
+        ),
+        amount,
+        activity
+            .symbol
+            .as_deref()
+            .filter(|symbol| !symbol.is_empty())
+            .map(InstrumentNameExchange::new),
+        time_exchange,
+        Some(CashFlowId::new(id)),
+    ))
+}
+
+/// One option activity, read for [`convert_option_events`].
+struct OptionLeg<'a> {
+    id: &'a str,
+    symbol: &'a str,
+    /// Signed: negative is a sell.
+    quantity: Decimal,
+    /// The strike, on the share leg only.
+    price: Option<Decimal>,
+    date: Option<NaiveDate>,
+    time: DateTime<Utc>,
+    /// Whether `time` is Alpaca's `created_at`, not the start of `date`.
+    created: bool,
+    /// `None` for the share leg (`OPTRD`), whose origin is its pair's.
+    origin: Option<TradeOrigin>,
+    /// On an exercise or assignment, its contract as [`occ_contract`] reads it.
+    contract: Option<(&'a str, bool, Decimal)>,
+}
+
+impl OptionLeg<'_> {
+    /// Whether the leg is in `start..=end`: by its creation time, or, when Alpaca gave none, by
+    /// its `date`, so that a read up to now still returns a leg dated today.
+    fn is_within(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> bool {
+        if self.created {
+            (start..=end).contains(&self.time)
+        } else {
+            (start.date_naive()..=end.date_naive()).contains(&self.time.date_naive())
+        }
+    }
+}
+
+/// An option activity as an [`OptionLeg`], or `None`, logged, if it is canceled, of another type,
+/// or lacks what its trade needs. See [`AlpacaClient::fetch_option_events`].
+fn option_leg(activity: &AlpacaNonTradeActivity) -> Option<OptionLeg<'_>> {
+    let id = activity.id.as_str();
+    let activity_type = activity.activity_type.as_str();
+    if activity.status.as_deref() == Some("canceled") {
+        info!(
+            id,
+            activity_type, "Alpaca option activity canceled — left out"
+        );
+        return None;
+    }
+    let origin = match activity_type {
+        "OPEXP" => Some(TradeOrigin::Expiry),
+        "OPEXC" => Some(TradeOrigin::Exercise),
+        "OPASN" => Some(TradeOrigin::Assignment),
+        "OPTRD" => None,
+        _ => {
+            warn!(
+                id,
+                activity_type, "Alpaca activity is not an option event — left out"
+            );
+            return None;
+        }
+    };
+    let date = activity
+        .date
+        .as_deref()
+        .and_then(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok());
+    let created_at = activity.created_at.as_deref().and_then(parse_timestamp);
+    let time = created_at.or_else(|| date.map(|date| date.and_time(NaiveTime::MIN).and_utc()));
+    let symbol = activity
+        .symbol
+        .as_deref()
+        .filter(|symbol| !symbol.is_empty());
+    let quantity = activity
+        .qty
+        .as_deref()
+        .and_then(|qty| Decimal::from_str(qty).ok())
+        .filter(|qty| !qty.is_zero());
+    let price = activity
+        .price
+        .as_deref()
+        .and_then(|price| Decimal::from_str(price).ok());
+    let (Some(symbol), Some(quantity), Some(time)) = (symbol, quantity, time) else {
+        warn!(
+            id,
+            activity_type,
+            symbol = ?activity.symbol,
+            qty = ?activity.qty,
+            created_at = ?activity.created_at,
+            date = ?activity.date,
+            "Alpaca option activity missing/unparseable symbol, quantity or time — left out"
+        );
+        return None;
+    };
+    if origin.is_none() && price.is_none() {
+        warn!(id, price = ?activity.price, "Alpaca OPTRD missing/unparseable price — left out");
+        return None;
+    }
+    let contract = matches!(
+        origin,
+        Some(TradeOrigin::Exercise | TradeOrigin::Assignment)
+    )
+    .then(|| occ_contract(symbol))
+    .flatten();
+    Some(OptionLeg {
+        id,
+        symbol,
+        quantity,
+        price,
+        date,
+        time,
+        created: created_at.is_some(),
+        origin,
+        contract,
+    })
+}
+
+/// The root symbol, whether it is a call, and the strike of a contract, from its OCC symbol: the
+/// root, then the expiry as `YYMMDD`, `C` or `P`, and the strike in thousandths over eight digits.
+fn occ_contract(symbol: &str) -> Option<(&str, bool, Decimal)> {
+    let split = symbol.len().checked_sub(15)?;
+    let (root, tail) = (
+        symbol.get(..split)?.trim_end(),
+        symbol.get(split..)?.as_bytes(),
+    );
+    let is_call = match tail[6] {
+        b'C' => true,
+        b'P' => false,
+        _ => return None,
+    };
+    if root.is_empty() || !tail[..6].iter().chain(&tail[7..]).all(u8::is_ascii_digit) {
+        return None;
+    }
+    let strike = std::str::from_utf8(&tail[7..]).ok()?.parse::<i64>().ok()?;
+    Some((root, is_call, Decimal::new(strike, 3)))
+}
+
+/// Whether `contract`, an exercise or assignment, is the one `shares`, an `OPTRD`, is the share
+/// leg of. See [`AlpacaClient::fetch_option_events`].
+fn is_share_leg_of(shares: &OptionLeg<'_>, contract: &OptionLeg<'_>) -> bool {
+    let Some((root, is_call, strike)) = contract.contract else {
+        return false;
+    };
+    // Exercising a call, or being assigned on a put, buys the shares.
+    let buys = match contract.origin {
+        Some(TradeOrigin::Exercise) => is_call,
+        Some(TradeOrigin::Assignment) => !is_call,
+        _ => return false,
+    };
+    shares.date.is_some()
+        && shares.date == contract.date
+        && shares.symbol == root
+        && shares.price == Some(strike)
+        && shares.quantity.is_sign_positive() == buys
+}
+
+/// The option activities in `start..=end` as [`Trade`]s, each share leg given the origin of the
+/// exercise or assignment it pairs with, which may lie outside the span. See
+/// [`AlpacaClient::fetch_option_events`].
+fn convert_option_events(
+    activities: &[AlpacaNonTradeActivity],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> Vec<Trade<AssetNameExchange, InstrumentNameExchange>> {
+    let legs: Vec<_> = activities.iter().filter_map(option_leg).collect();
+    let mut paired = vec![false; legs.len()];
+    legs.iter()
+        .filter_map(|leg| {
+            // Every share leg is paired, in or out of the span, so that one outside it does not
+            // take the partner of one inside.
+            let origin = leg.origin.unwrap_or_else(|| {
+                let pairs = |index: &usize| !paired[*index] && is_share_leg_of(leg, &legs[*index]);
+                // The standard contract delivers 100 shares. A match of that size goes first, so
+                // that two exercises at one strike each pair with their own shares; an adjusted
+                // contract, delivering another amount, still pairs with the first match.
+                let delivers_its_shares = |index: &usize| {
+                    legs[*index].quantity.abs() * Decimal::ONE_HUNDRED == leg.quantity.abs()
+                };
+                let partner = (0..legs.len())
+                    .filter(pairs)
+                    .find(delivers_its_shares)
+                    .or_else(|| (0..legs.len()).find(pairs));
+                match partner {
+                    Some(index) => {
+                        paired[index] = true;
+                        legs[index].origin.unwrap_or(TradeOrigin::External)
+                    }
+                    None => {
+                        warn!(
+                            id = leg.id,
+                            symbol = leg.symbol,
+                            date = ?leg.date,
+                            "Alpaca OPTRD pairs with no exercise or assignment read — reported as \
+                             External"
+                        );
+                        TradeOrigin::External
+                    }
+                }
+            });
+            if !leg.is_within(start, end) {
+                return None;
+            }
+            let side = if leg.quantity.is_sign_negative() {
+                Side::Sell
+            } else {
+                Side::Buy
+            };
+            let trade = Trade::new(
+                TradeId::new(leg.id),
+                OrderId::new(leg.id),
+                InstrumentNameExchange::new(leg.symbol),
+                StrategyId::unknown(),
+                leg.time,
+                side,
+                leg.price.unwrap_or(Decimal::ZERO),
+                leg.quantity.abs(),
+                None,
+                AssetFees::new(
+                    AssetNameExchange::from(USD),
+                    Decimal::ZERO,
+                    Some(Decimal::ZERO),
+                ),
+            )
+            .with_origin(origin);
+            Some(trade)
+        })
+        .collect()
+}
+
 fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .ok()
@@ -4650,11 +5249,20 @@ fn map_order_kind(kind: OrderKind) -> Option<&'static str> {
         OrderKind::Limit => Some("limit"),
         OrderKind::Stop { .. } => Some("stop"),
         OrderKind::StopLimit { .. } => Some("stop_limit"),
-        OrderKind::TrailingStop { .. } => Some("trailing_stop"),
-        // Alpaca does not support take-profit or trailing stop-limit orders.
+        OrderKind::TrailingStop {
+            activation_price: None,
+            ..
+        } => Some("trailing_stop"),
+        // Alpaca has no take-profit, trailing stop-limit or fixed-limit trailing order, and no
+        // activation price on a trailing stop.
         OrderKind::TakeProfit { .. }
         | OrderKind::TakeProfitLimit { .. }
-        | OrderKind::TrailingStopLimit { .. } => None,
+        | OrderKind::TrailingStop {
+            activation_price: Some(_),
+            ..
+        }
+        | OrderKind::TrailingStopLimit { .. }
+        | OrderKind::TrailingStopFixedLimit { .. } => None,
     }
 }
 
@@ -5219,6 +5827,7 @@ mod tests {
             Some(OrderKind::TrailingStop {
                 offset: Decimal::from_str("5.0").unwrap(),
                 offset_type: TrailingOffsetType::Percentage,
+                activation_price: None,
             })
         );
 
@@ -5228,6 +5837,7 @@ mod tests {
             Some(OrderKind::TrailingStop {
                 offset: Decimal::from_str("2.50").unwrap(),
                 offset_type: TrailingOffsetType::Absolute,
+                activation_price: None,
             })
         );
 
@@ -5258,6 +5868,7 @@ mod tests {
             map_order_kind(OrderKind::TrailingStop {
                 offset: Decimal::from_str("5.0").unwrap(),
                 offset_type: TrailingOffsetType::Percentage,
+                activation_price: None,
             }),
             Some("trailing_stop")
         );
@@ -5265,8 +5876,26 @@ mod tests {
             map_order_kind(OrderKind::TrailingStop {
                 offset: Decimal::from_str("2.50").unwrap(),
                 offset_type: TrailingOffsetType::Absolute,
+                activation_price: None,
             }),
             Some("trailing_stop")
+        );
+        // Alpaca has no activation price, and no fixed-limit trailing stop
+        assert_eq!(
+            map_order_kind(OrderKind::TrailingStop {
+                offset: Decimal::from_str("5.0").unwrap(),
+                offset_type: TrailingOffsetType::Percentage,
+                activation_price: Some(Decimal::from(100)),
+            }),
+            None
+        );
+        assert_eq!(
+            map_order_kind(OrderKind::TrailingStopFixedLimit {
+                offset: Decimal::from_str("5.0").unwrap(),
+                offset_type: TrailingOffsetType::Percentage,
+                activation_price: None,
+            }),
+            None
         );
         // TrailingStopLimit is not supported by Alpaca
         assert_eq!(
@@ -7503,9 +8132,16 @@ mod tests {
 
             let http = reqwest::Client::new();
             let rl = RateLimitTracker::new();
-            let result = paginate_activities(&http, &rl, &server.uri(), recovery_after(), None)
-                .await
-                .unwrap();
+            let result = paginate_activities::<AlpacaActivity>(
+                &http,
+                &rl,
+                &server.uri(),
+                FILL_ACTIVITIES,
+                recovery_after(),
+                None,
+            )
+            .await
+            .unwrap();
 
             assert_eq!(result.activities.len(), 5);
             assert_eq!(result.resume, None);
@@ -7528,9 +8164,16 @@ mod tests {
 
             let http = reqwest::Client::new();
             let rl = RateLimitTracker::new();
-            let result = paginate_activities(&http, &rl, &server.uri(), recovery_after(), None)
-                .await
-                .unwrap();
+            let result = paginate_activities::<AlpacaActivity>(
+                &http,
+                &rl,
+                &server.uri(),
+                FILL_ACTIVITIES,
+                recovery_after(),
+                None,
+            )
+            .await
+            .unwrap();
 
             assert_eq!(result.activities.len(), ALPACA_MAX_ACTIVITIES);
             assert_eq!(result.resume, None);
@@ -7557,9 +8200,16 @@ mod tests {
 
             let http = reqwest::Client::new();
             let rl = RateLimitTracker::new();
-            let result = paginate_activities(&http, &rl, &server.uri(), recovery_after(), None)
-                .await
-                .unwrap();
+            let result = paginate_activities::<AlpacaActivity>(
+                &http,
+                &rl,
+                &server.uri(),
+                FILL_ACTIVITIES,
+                recovery_after(),
+                None,
+            )
+            .await
+            .unwrap();
 
             assert_eq!(result.activities.len(), ALPACA_MAX_ACTIVITIES + 37);
             assert_eq!(result.resume, None);
@@ -7585,9 +8235,16 @@ mod tests {
 
             let http = reqwest::Client::new();
             let rl = RateLimitTracker::new();
-            let result = paginate_activities(&http, &rl, &server.uri(), recovery_after(), None)
-                .await
-                .unwrap();
+            let result = paginate_activities::<AlpacaActivity>(
+                &http,
+                &rl,
+                &server.uri(),
+                FILL_ACTIVITIES,
+                recovery_after(),
+                None,
+            )
+            .await
+            .unwrap();
 
             assert!(
                 result.resume.is_some(),
@@ -8840,6 +9497,575 @@ mod tests {
                 .mount(&server)
                 .await;
             server
+        }
+
+        /// A non-trade activity of `activity_type` and `sub_type`, for `net_amount`, created at
+        /// `created_at`.
+        fn non_trade(
+            id: &str,
+            activity_type: &str,
+            sub_type: Option<&str>,
+            net_amount: &str,
+            created_at: &str,
+        ) -> serde_json::Value {
+            let mut activity = serde_json::json!({
+                "id": id, "activity_type": activity_type, "net_amount": net_amount,
+                "created_at": created_at, "date": &created_at[..10], "currency": "USD",
+                "status": "executed",
+            });
+            if let Some(sub_type) = sub_type {
+                activity["activity_sub_type"] = serde_json::json!(sub_type);
+            }
+            activity
+        }
+
+        /// The query of every request `server` received.
+        async fn query_pairs(server: &MockServer) -> Vec<Vec<(String, String)>> {
+            let Some(requests) = server.received_requests().await else {
+                panic!("requests are recorded");
+            };
+            requests
+                .iter()
+                .map(|request| request.url.query_pairs().into_owned().collect())
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn fetch_cash_flows_maps_each_activity_type_and_leaves_out_what_it_cannot_use() {
+            let at = "2025-04-18T05:00:00Z";
+            let mut fee = non_trade("fee", "FEE", Some("TAF"), "-0.02", at);
+            fee["symbol"] = serde_json::json!("SPY");
+            let mut canceled = non_trade("canceled", "FEE", Some("REG"), "-0.01", at);
+            canceled["status"] = serde_json::json!("canceled");
+            let mut no_amount = non_trade("no-amount", "FEE", None, "0", at);
+            no_amount.as_object_mut().unwrap().remove("net_amount");
+            let mut no_created_at = non_trade("no-time", "PTC", None, "-0.50", at);
+            no_created_at.as_object_mut().unwrap().remove("created_at");
+            let mut bad_time = non_trade("bad-time", "PTC", None, "-0.50", at);
+            bad_time["created_at"] = serde_json::json!("not-a-time");
+            let mut corrected = non_trade("correct", "PTC", None, "-0.40", at);
+            corrected["status"] = serde_json::json!("correct");
+            let mut euro = non_trade("euro", "PTR", None, "0.30", at);
+            euro["currency"] = serde_json::json!("EUR");
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    non_trade("mgn", "INT", Some("MGN"), "-12.50", at),
+                    non_trade("int-paid", "INT", None, "-3.00", at),
+                    non_trade("int-credit", "INT", Some("CDT"), "1.00", at),
+                    fee,
+                    canceled,
+                    no_amount,
+                    no_created_at,
+                    bad_time,
+                    corrected,
+                    euro,
+                    non_trade("late", "FEE", None, "-0.01", "2025-04-20T05:00:00Z"),
+                ])))
+                .mount(&server)
+                .await;
+            let client = client_for(&server);
+
+            let read = client
+                .fetch_cash_flows(time("2025-04-18T00:00:00Z"), time("2025-04-19T00:00:00Z"))
+                .await
+                .unwrap();
+
+            assert_eq!(read.resume, None);
+            let kinds: Vec<_> = read
+                .flows
+                .iter()
+                .map(|flow| (flow.id.clone().unwrap().0.to_string(), flow.kind.clone()))
+                .collect();
+            let interest = CashFlowKind::MarginInterest {
+                rate: None,
+                principal: None,
+            };
+            assert_eq!(
+                kinds,
+                [
+                    ("mgn", interest.clone()),
+                    ("int-paid", interest),
+                    ("int-credit", CashFlowKind::Other("INT.CDT".into())),
+                    ("fee", CashFlowKind::Other("FEE.TAF".into())),
+                    ("correct", CashFlowKind::Other("PTC".into())),
+                    ("euro", CashFlowKind::Rebate),
+                ]
+                .map(|(id, kind)| (id.to_owned(), kind))
+            );
+            let by_id = |id: &str| {
+                read.flows
+                    .iter()
+                    .find(|flow| flow.id == Some(CashFlowId::new(id)))
+                    .unwrap()
+            };
+            assert_eq!(by_id("mgn").amount, Decimal::new(-1250, 2));
+            assert_eq!(by_id("mgn").asset, AssetNameExchange::new("USD"));
+            assert_eq!(by_id("mgn").instrument, None);
+            assert_eq!(by_id("mgn").time_exchange, time(at));
+            assert_eq!(
+                by_id("fee").instrument,
+                Some(InstrumentNameExchange::new("SPY"))
+            );
+            assert_eq!(
+                by_id("correct").amount,
+                Decimal::new(-40, 2),
+                "a correction is returned as it is"
+            );
+            assert_eq!(by_id("euro").asset, AssetNameExchange::new("EUR"));
+
+            let queries = query_pairs(&server).await;
+            let [query] = queries.as_slice() else {
+                panic!("one request: {queries:?}");
+            };
+            assert!(
+                query.contains(&("activity_types".into(), "INT,FEE,PTC,PTR".into())),
+                "{query:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn fetch_trades_asks_for_fills_by_the_documented_parameter() {
+            use crate::client::ExecutionClient;
+
+            let server = serve_activities(Vec::new()).await;
+            let client = client_for(&server);
+
+            let read = client
+                .fetch_trades(
+                    time("2025-04-18T00:00:00Z"),
+                    time("2025-04-19T00:00:00Z"),
+                    &[],
+                )
+                .await
+                .unwrap();
+
+            assert!(read.trades.is_empty());
+            let queries = query_pairs(&server).await;
+            let [query] = queries.as_slice() else {
+                panic!("one request: {queries:?}");
+            };
+            assert!(
+                query.contains(&("activity_types".into(), "FILL".into())),
+                "{query:?}"
+            );
+            assert!(
+                !query.iter().any(|(name, _)| name == "activity_type"),
+                "{query:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn fetch_cash_flows_reads_nothing_for_an_empty_span() {
+            let server = MockServer::start().await;
+            let client = client_for(&server);
+
+            let read = client
+                .fetch_cash_flows(time("2025-04-19T00:00:00Z"), time("2025-04-18T00:00:00Z"))
+                .await
+                .unwrap();
+
+            assert!(read.flows.is_empty() && read.resume.is_none());
+            assert!(query_pairs(&server).await.is_empty());
+        }
+
+        /// A span holding more activities than one call reads returns those it read and says
+        /// where to read on from: the millisecond of the last one's creation.
+        #[tokio::test]
+        async fn fetch_cash_flows_that_stops_at_its_bound_says_where_to_read_on() {
+            let base = time("2025-04-18T05:00:00Z");
+            let activities: Vec<_> = (0..6_000_i64)
+                .map(|n| {
+                    let created =
+                        (base + TimeDelta::seconds(n)).to_rfc3339_opts(SecondsFormat::Micros, true);
+                    non_trade(&format!("{n:017}::fee"), "FEE", None, "-0.01", &created)
+                })
+                .collect();
+            // Every page answers in order after the token, as Alpaca pages by id.
+            struct Paged(Vec<serde_json::Value>);
+            impl Respond for Paged {
+                fn respond(&self, request: &Request) -> ResponseTemplate {
+                    let token = request
+                        .url
+                        .query_pairs()
+                        .find(|(name, _)| name == "page_token")
+                        .map(|(_, value)| value.into_owned());
+                    let page: Vec<_> = self
+                        .0
+                        .iter()
+                        .skip_while(|activity| {
+                            token
+                                .as_deref()
+                                .is_some_and(|token| activity["id"] != token)
+                        })
+                        .skip(usize::from(token.is_some()))
+                        .take(ALPACA_MAX_ACTIVITIES)
+                        .cloned()
+                        .collect();
+                    ResponseTemplate::new(200).set_body_json(page)
+                }
+            }
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(Paged(activities))
+                .mount(&server)
+                .await;
+            let client = client_for(&server);
+
+            let read = client
+                .fetch_cash_flows(base, base + TimeDelta::days(1))
+                .await
+                .unwrap();
+
+            assert_eq!(read.flows.len(), 5_000);
+            assert_eq!(read.resume, Some(base + TimeDelta::seconds(4_999)));
+        }
+
+        /// A read whose every page holds activities of the span's first millisecond cannot
+        /// advance, so it fails rather than return a `resume` that would loop.
+        #[tokio::test]
+        async fn fetch_cash_flows_that_cannot_advance_fails() {
+            let at = "2025-04-18T05:00:00Z";
+            let full: Vec<_> = (0..ALPACA_MAX_ACTIVITIES)
+                .map(|n| non_trade(&format!("fee-{n}"), "FEE", None, "-0.01", at))
+                .collect();
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(full))
+                .mount(&server)
+                .await;
+            let client = client_for(&server);
+
+            let result = client
+                .fetch_cash_flows(time(at), time("2025-04-19T00:00:00Z"))
+                .await;
+
+            assert!(
+                matches!(result, Err(UnindexedClientError::Internal(_))),
+                "{result:?}"
+            );
+        }
+
+        /// An option activity of `activity_type` on `symbol`, for the signed `qty`, dated `date`,
+        /// with no creation time.
+        fn option_activity(
+            id: &str,
+            activity_type: &str,
+            symbol: &str,
+            qty: &str,
+            date: &str,
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "id": id, "activity_type": activity_type, "symbol": symbol, "qty": qty,
+                "date": date, "net_amount": "0", "status": "executed",
+            })
+        }
+
+        /// The share leg (`OPTRD`) of an exercise or assignment, at `price`.
+        fn share_leg(
+            id: &str,
+            symbol: &str,
+            qty: &str,
+            price: &str,
+            date: &str,
+        ) -> serde_json::Value {
+            let mut activity = option_activity(id, "OPTRD", symbol, qty, date);
+            activity["price"] = serde_json::json!(price);
+            activity
+        }
+
+        async fn serve_json(activities: serde_json::Value) -> MockServer {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(activities))
+                .mount(&server)
+                .await;
+            server
+        }
+
+        #[test]
+        fn occ_contract_reads_the_root_kind_and_strike() {
+            assert_eq!(
+                occ_contract("QS240301C00006500"),
+                Some(("QS", true, Decimal::new(65, 1)))
+            );
+            assert_eq!(
+                occ_contract("AAPL240119P00150000"),
+                Some(("AAPL", false, Decimal::from(150)))
+            );
+            for not_occ in [
+                "QS",
+                "240301C00006500",
+                "QS240301X00006500",
+                "QS2403O1C00006500",
+            ] {
+                assert_eq!(occ_contract(not_occ), None, "{not_occ}");
+            }
+        }
+
+        #[tokio::test]
+        async fn fetch_option_events_maps_each_activity_and_pairs_the_share_legs() {
+            let day = "2024-03-01";
+            let mut expiry = option_activity("exp", "OPEXP", "QS240301C00010500", "-1", day);
+            expiry["created_at"] = serde_json::json!("2024-03-01T21:30:00Z");
+            let mut canceled = option_activity("canceled", "OPEXP", "QS240301P00000500", "-1", day);
+            canceled["status"] = serde_json::json!("canceled");
+            let server = serve_json(serde_json::json!([
+                expiry,
+                option_activity("exc", "OPEXC", "QS240301C00006500", "-1", day),
+                share_leg("exc-shares", "QS", "100", "6.5", day),
+                option_activity("asn", "OPASN", "QS240301P00009000", "1", day),
+                share_leg("asn-shares", "QS", "100", "9", day),
+                share_leg("orphan", "QS", "-100", "7", day),
+                canceled,
+                option_activity("no-price", "OPTRD", "QS", "100", day),
+                option_activity("no-qty", "OPEXP", "QS240301C00011000", "0", day),
+                option_activity("later", "OPEXP", "QS240308C00010500", "-1", "2024-03-02"),
+            ]))
+            .await;
+            let client = client_for(&server);
+
+            let read = client
+                .fetch_option_events(time("2024-03-01T00:00:00Z"), time("2024-03-01T23:00:00Z"))
+                .await
+                .unwrap();
+
+            assert_eq!(read.resume, None);
+            let summary: Vec<_> = read
+                .trades
+                .iter()
+                .map(|trade| {
+                    (
+                        trade.id.0.to_string(),
+                        trade.instrument.name().to_string(),
+                        trade.origin,
+                        trade.side,
+                        trade.price,
+                        trade.quantity,
+                    )
+                })
+                .collect();
+            let row = |id: &str, symbol: &str, origin, side, price: Decimal, quantity: i64| {
+                (
+                    id.to_owned(),
+                    symbol.to_owned(),
+                    origin,
+                    side,
+                    price,
+                    Decimal::from(quantity),
+                )
+            };
+            assert_eq!(
+                summary,
+                [
+                    row(
+                        "exp",
+                        "QS240301C00010500",
+                        TradeOrigin::Expiry,
+                        Side::Sell,
+                        Decimal::ZERO,
+                        1
+                    ),
+                    row(
+                        "exc",
+                        "QS240301C00006500",
+                        TradeOrigin::Exercise,
+                        Side::Sell,
+                        Decimal::ZERO,
+                        1
+                    ),
+                    row(
+                        "exc-shares",
+                        "QS",
+                        TradeOrigin::Exercise,
+                        Side::Buy,
+                        Decimal::new(65, 1),
+                        100
+                    ),
+                    row(
+                        "asn",
+                        "QS240301P00009000",
+                        TradeOrigin::Assignment,
+                        Side::Buy,
+                        Decimal::ZERO,
+                        1
+                    ),
+                    row(
+                        "asn-shares",
+                        "QS",
+                        TradeOrigin::Assignment,
+                        Side::Buy,
+                        Decimal::from(9),
+                        100
+                    ),
+                    row(
+                        "orphan",
+                        "QS",
+                        TradeOrigin::External,
+                        Side::Sell,
+                        Decimal::from(7),
+                        100
+                    ),
+                ]
+            );
+            let exp = &read.trades[0];
+            assert_eq!(
+                exp.time_exchange,
+                time("2024-03-01T21:30:00Z"),
+                "created_at"
+            );
+            assert_eq!(exp.order_id, OrderId::new("exp"));
+            assert_eq!(exp.fees.fees, Decimal::ZERO);
+            assert_eq!(
+                read.trades[1].time_exchange,
+                time("2024-03-01T00:00:00Z"),
+                "no created_at: the start of its date"
+            );
+
+            let queries = query_pairs(&server).await;
+            let [query] = queries.as_slice() else {
+                panic!("one request: {queries:?}");
+            };
+            assert!(
+                query.contains(&("activity_types".into(), "OPASN,OPEXC,OPEXP,OPTRD".into())),
+                "{query:?}"
+            );
+        }
+
+        /// A share leg pairs with the exercise or assignment whose kind implies its side, not with
+        /// another at the same strike, and each pairs once.
+        #[tokio::test]
+        async fn fetch_option_events_pairs_a_share_leg_by_its_side() {
+            let day = "2024-03-01";
+            let server = serve_json(serde_json::json!([
+                option_activity("exc-call", "OPEXC", "QS240301C00006500", "-1", day),
+                option_activity("asn-call", "OPASN", "QS240301C00006500", "1", day),
+                share_leg("sold", "QS", "-100", "6.5", day),
+                share_leg("bought", "QS", "100", "6.5", day),
+                share_leg("bought-again", "QS", "100", "6.5", day),
+                share_leg("other-day", "QS", "100", "6.5", "2024-02-29"),
+            ]))
+            .await;
+            let client = client_for(&server);
+
+            let read = client
+                .fetch_option_events(time("2024-02-29T00:00:00Z"), time("2024-03-01T23:00:00Z"))
+                .await
+                .unwrap();
+
+            let origin = |id: &str| {
+                read.trades
+                    .iter()
+                    .find(|trade| trade.id == TradeId::new(id))
+                    .map(|trade| trade.origin)
+            };
+            assert_eq!(origin("sold"), Some(TradeOrigin::Assignment));
+            assert_eq!(origin("bought"), Some(TradeOrigin::Exercise));
+            assert_eq!(origin("bought-again"), Some(TradeOrigin::External));
+            assert_eq!(origin("other-day"), Some(TradeOrigin::External));
+        }
+
+        /// A share leg pairs with the exercise or assignment whose contracts deliver its shares,
+        /// 100 a contract, though another that would buy them comes first. One of another size
+        /// still pairs, with the first match left.
+        #[tokio::test]
+        async fn fetch_option_events_pairs_a_share_leg_by_its_size() {
+            let day = "2024-03-01";
+            let server = serve_json(serde_json::json!([
+                // Being assigned on a put and exercising a call both buy at the strike.
+                option_activity("asn-two", "OPASN", "QS240301P00006500", "2", day),
+                option_activity("exc-one", "OPEXC", "QS240301C00006500", "-1", day),
+                option_activity("exc-adjusted", "OPEXC", "QS240301C00006500", "-1", day),
+                share_leg("hundred", "QS", "100", "6.5", day),
+                share_leg("two-hundred", "QS", "200", "6.5", day),
+                share_leg("hundred-fifty", "QS", "150", "6.5", day),
+            ]))
+            .await;
+            let client = client_for(&server);
+
+            let read = client
+                .fetch_option_events(time("2024-03-01T00:00:00Z"), time("2024-03-01T23:00:00Z"))
+                .await
+                .unwrap();
+
+            let origin = |id: &str| {
+                read.trades
+                    .iter()
+                    .find(|trade| trade.id == TradeId::new(id))
+                    .map(|trade| trade.origin)
+            };
+            assert_eq!(origin("hundred"), Some(TradeOrigin::Exercise));
+            assert_eq!(origin("two-hundred"), Some(TradeOrigin::Assignment));
+            assert_eq!(origin("hundred-fifty"), Some(TradeOrigin::Exercise));
+        }
+
+        /// The read covers the whole UTC days of the span, so both legs of an event are read
+        /// together, and returns only what is in the span: by creation time, or, without one, by
+        /// date.
+        #[tokio::test]
+        async fn fetch_option_events_reads_whole_days_and_returns_the_span() {
+            let mut early =
+                option_activity("early", "OPEXP", "QS240301C00010500", "-1", "2024-03-01");
+            early["created_at"] = serde_json::json!("2024-03-01T10:00:00Z");
+            let mut inside =
+                option_activity("inside", "OPEXP", "QS240301C00011500", "-1", "2024-03-01");
+            inside["created_at"] = serde_json::json!("2024-03-01T16:00:00Z");
+            let server = serve_json(serde_json::json!([
+                option_activity(
+                    "dated-before",
+                    "OPEXP",
+                    "QS240229C00010500",
+                    "-1",
+                    "2024-02-29"
+                ),
+                early,
+                option_activity("dated", "OPEXP", "QS240301C00012500", "-1", "2024-03-01"),
+                inside,
+            ]))
+            .await;
+            let client = client_for(&server);
+
+            let read = client
+                .fetch_option_events(time("2024-03-01T15:00:00Z"), time("2024-03-01T17:00:00Z"))
+                .await
+                .unwrap();
+
+            let ids: Vec<_> = read
+                .trades
+                .iter()
+                .map(|trade| trade.id.0.to_string())
+                .collect();
+            assert_eq!(ids, ["dated", "inside"]);
+            let queries = query_pairs(&server).await;
+            let [query] = queries.as_slice() else {
+                panic!("one request: {queries:?}");
+            };
+            assert!(
+                query.contains(&("after".into(), "2024-03-01T00:00:00.000Z".into())),
+                "{query:?}"
+            );
+            assert!(
+                query.contains(&("until".into(), "2024-03-02T00:00:00.000Z".into())),
+                "{query:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn fetch_option_events_reads_nothing_for_an_empty_span() {
+            let server = MockServer::start().await;
+            let client = client_for(&server);
+
+            let read = client
+                .fetch_option_events(time("2024-03-02T00:00:00Z"), time("2024-03-01T00:00:00Z"))
+                .await
+                .unwrap();
+
+            assert!(read.trades.is_empty() && read.resume.is_none());
+            assert!(query_pairs(&server).await.is_empty());
         }
 
         /// Read `start..=end` to its end, from each call's `resume`, returning the trade ids

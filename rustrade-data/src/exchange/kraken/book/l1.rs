@@ -1,61 +1,65 @@
-use super::super::KrakenMessage;
+use super::super::{
+    KrakenMessage,
+    channel::KrakenChannel,
+    message::{KrakenChannelData, KrakenData},
+};
 use crate::{
-    Identifier,
     books::Level,
     event::{MarketEvent, MarketIter},
-    exchange::{kraken::channel::KrakenChannel, subscription::ExchangeSub},
     subscription::book::OrderBookL1,
 };
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rustrade_instrument::exchange::ExchangeId;
-use rustrade_integration::{serde::de::extract_next, subscription::SubscriptionId};
 use serde::{Deserialize, Serialize};
+use smol_str::SmolStr;
 
 /// Terse type alias for an [`Kraken`](super::super::Kraken) real-time OrderBook Level1
 /// (top of books) WebSocket message.
-pub type KrakenOrderBookL1 = KrakenMessage<KrakenOrderBookL1Inner>;
+pub type KrakenOrderBookL1 = KrakenMessage<KrakenData<KrakenTicker>>;
 
-/// [`Kraken`](super::super::Kraken) real-time OrderBook Level1 (top of books) data and the
-/// associated [`SubscriptionId`].
+/// [`Kraken`](super::super::Kraken) best bid and ask, from the ticker channel.
+///
+/// The other ticker fields (last trade, volume, daily range) are not read.
 ///
 /// See [`KrakenMessage`] for full raw payload examples.
 ///
-/// See docs: <https://docs.kraken.com/websockets/#message-spread>
-#[derive(Clone, PartialEq, PartialOrd, Debug, Serialize)]
-pub struct KrakenOrderBookL1Inner {
-    pub subscription_id: SubscriptionId,
-    pub spread: KrakenSpread,
-}
-
-/// [`Kraken`](super::super::Kraken) best bid and ask.
-///
-/// See [`KrakenMessage`] for full raw payload examples.
-///
-/// See docs: <https://docs.kraken.com/websockets/#message-spread>
-#[derive(Clone, Copy, PartialEq, PartialOrd, Debug, Deserialize, Serialize)]
-pub struct KrakenSpread {
-    #[serde(with = "rust_decimal::serde::str")]
+/// See docs: <https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/ticker>
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Deserialize, Serialize)]
+pub struct KrakenTicker {
+    pub symbol: SmolStr,
+    #[serde(
+        rename = "bid",
+        deserialize_with = "rust_decimal::serde::float::deserialize"
+    )]
     pub best_bid_price: Decimal,
-    #[serde(with = "rust_decimal::serde::str")]
+    #[serde(
+        rename = "bid_qty",
+        deserialize_with = "rust_decimal::serde::float::deserialize"
+    )]
+    pub best_bid_amount: Decimal,
+    #[serde(
+        rename = "ask",
+        deserialize_with = "rust_decimal::serde::float::deserialize"
+    )]
     pub best_ask_price: Decimal,
     #[serde(
-        deserialize_with = "rustrade_integration::serde::de::de_str_f64_epoch_s_as_datetime_utc"
+        rename = "ask_qty",
+        deserialize_with = "rust_decimal::serde::float::deserialize"
     )]
-    pub time: DateTime<Utc>,
-    #[serde(with = "rust_decimal::serde::str")]
-    pub best_bid_amount: Decimal,
-    #[serde(with = "rust_decimal::serde::str")]
     pub best_ask_amount: Decimal,
+    pub timestamp: DateTime<Utc>,
 }
 
-impl Identifier<Option<SubscriptionId>> for KrakenOrderBookL1Inner {
-    fn id(&self) -> Option<SubscriptionId> {
-        Some(self.subscription_id.clone())
+impl KrakenChannelData for KrakenTicker {
+    const CHANNEL: KrakenChannel = KrakenChannel::ORDER_BOOK_L1;
+
+    fn symbol(&self) -> &str {
+        &self.symbol
     }
 }
 
-impl<InstrumentKey> From<(ExchangeId, InstrumentKey, KrakenOrderBookL1)>
+impl<InstrumentKey: Clone> From<(ExchangeId, InstrumentKey, KrakenOrderBookL1)>
     for MarketIter<InstrumentKey, OrderBookL1>
 {
     fn from(
@@ -63,161 +67,99 @@ impl<InstrumentKey> From<(ExchangeId, InstrumentKey, KrakenOrderBookL1)>
     ) -> Self {
         match book {
             KrakenOrderBookL1::Data(book) => {
-                let best_ask = if book.spread.best_ask_price.is_zero() {
-                    None
-                } else {
-                    Some(Level::new(
-                        book.spread.best_ask_price,
-                        book.spread.best_ask_amount,
-                    ))
-                };
+                let time_received = Utc::now();
+                book.data
+                    .into_iter()
+                    .map(|ticker| {
+                        // A side with no orders is sent as a zero price
+                        let level = |price: Decimal, amount| {
+                            (!price.is_zero()).then(|| Level::new(price, amount))
+                        };
 
-                let best_bid = if book.spread.best_bid_price.is_zero() {
-                    None
-                } else {
-                    Some(Level::new(
-                        book.spread.best_bid_price,
-                        book.spread.best_bid_amount,
-                    ))
-                };
-
-                Self(vec![Ok(MarketEvent {
-                    time_exchange: book.spread.time,
-                    time_received: Utc::now(),
-                    exchange: exchange_id,
-                    instrument,
-                    kind: OrderBookL1 {
-                        last_update_time: book.spread.time,
-                        best_bid,
-                        best_ask,
-                    },
-                })])
+                        Ok(MarketEvent {
+                            time_exchange: ticker.timestamp,
+                            time_received,
+                            exchange: exchange_id,
+                            instrument: instrument.clone(),
+                            kind: OrderBookL1 {
+                                last_update_time: ticker.timestamp,
+                                best_bid: level(ticker.best_bid_price, ticker.best_bid_amount),
+                                best_ask: level(ticker.best_ask_price, ticker.best_ask_amount),
+                            },
+                        })
+                    })
+                    .collect()
             }
             KrakenOrderBookL1::Event(_) => MarketIter(vec![]),
         }
     }
 }
 
-impl<'de> serde::de::Deserialize<'de> for KrakenOrderBookL1Inner {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct SeqVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for SeqVisitor {
-            type Value = KrakenOrderBookL1Inner;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("KrakenOrderBookL1Inner struct from the Kraken WebSocket API")
-            }
-
-            fn visit_seq<SeqAccessor>(
-                self,
-                mut seq: SeqAccessor,
-            ) -> Result<Self::Value, SeqAccessor::Error>
-            where
-                SeqAccessor: serde::de::SeqAccess<'de>,
-            {
-                // KrakenOrderBookL1Inner Sequence Format:
-                // [channelID, [bid, ask, timestamp, bidVolume, askVolume], channelName, pair]
-                // <https://docs.kraken.com/websockets/#message-book>
-
-                // Extract deprecated channelID & ignore
-                let _: serde::de::IgnoredAny = extract_next(&mut seq, "channelID")?;
-
-                // Extract spread
-                let spread = extract_next(&mut seq, "spread")?;
-
-                // Extract channelName (eg/ "spread") & ignore
-                let _: serde::de::IgnoredAny = extract_next(&mut seq, "channelName")?;
-
-                // Extract pair (eg/ "XBT/USD") & map to SubscriptionId (ie/ "spread|{pair}")
-                let subscription_id = extract_next::<SeqAccessor, String>(&mut seq, "pair")
-                    .map(|market| ExchangeSub::from((KrakenChannel::ORDER_BOOK_L1, market)).id())?;
-
-                // Ignore any additional elements or SerDe will fail
-                //  '--> Exchange may add fields without warning
-                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
-
-                Ok(KrakenOrderBookL1Inner {
-                    subscription_id,
-                    spread,
-                })
-            }
-        }
-
-        // Use Visitor implementation to deserialize the KrakenOrderBookL1Inner
-        deserializer.deserialize_seq(SeqVisitor)
-    }
-}
-
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+    use rust_decimal_macros::dec;
+    use rustrade_integration::subscription::SubscriptionId;
 
-    mod de {
-        use super::*;
-        use rust_decimal_macros::dec;
-        use rustrade_integration::{
-            error::SocketError, serde::de::datetime_utc_from_epoch_duration,
-            subscription::SubscriptionId,
-        };
+    const TICKER: &str = r#"{"channel":"ticker","type":"update","data":[{"symbol":"BTC/USD","bid":5698.4,"bid_qty":1.01234567,"ask":5700.0,"ask_qty":0.98765432,"last":5699.1,"volume":1234.5,"vwap":5650.2,"low":5600.0,"high":5710.0,"change":12.3,"change_pct":0.22,"timestamp":"2018-11-12T21:14:59.545897Z"}]}"#;
 
-        #[test]
-        fn test_kraken_message_order_book_l1() {
-            struct TestCase {
-                input: &'static str,
-                expected: Result<KrakenOrderBookL1, SocketError>,
+    fn time() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2018, 11, 12, 21, 14, 59)
+            .unwrap()
+            .checked_add_signed(chrono::Duration::microseconds(545_897))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_kraken_message_order_book_l1() {
+        let actual: KrakenOrderBookL1 = serde_json::from_str(TICKER).unwrap();
+
+        assert_eq!(
+            actual,
+            KrakenOrderBookL1::Data(KrakenData {
+                subscription_id: Some(SubscriptionId::from("ticker|BTC/USD")),
+                data: vec![KrakenTicker {
+                    symbol: "BTC/USD".into(),
+                    best_bid_price: dec!(5698.4),
+                    best_bid_amount: dec!(1.01234567),
+                    best_ask_price: dec!(5700),
+                    best_ask_amount: dec!(0.98765432),
+                    timestamp: time(),
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn a_ticker_becomes_the_top_of_book() {
+        let book: KrakenOrderBookL1 = serde_json::from_str(TICKER).unwrap();
+
+        let events = MarketIter::<&str, OrderBookL1>::from((ExchangeId::Kraken, "btc", book)).0;
+
+        assert_eq!(events.len(), 1);
+        let event = events.into_iter().next().unwrap().unwrap();
+        assert_eq!(event.time_exchange, time());
+        assert_eq!(
+            event.kind,
+            OrderBookL1 {
+                last_update_time: time(),
+                best_bid: Some(Level::new(dec!(5698.4), dec!(1.01234567))),
+                best_ask: Some(Level::new(dec!(5700), dec!(0.98765432))),
             }
+        );
+    }
 
-            let tests = vec![TestCase {
-                // TC0: valid KrakenOrderBookL1::Data(KrakenOrderBookL1Inner)
-                input: r#"
-                    [
-                        0,
-                        [
-                            "5698.40000",
-                            "5700.00000",
-                            "1542057299.545897",
-                            "1.01234567",
-                            "0.98765432"
-                        ],
-                        "spread",
-                        "XBT/USD"
-                    ]
-                    "#,
-                expected: Ok(KrakenOrderBookL1::Data(KrakenOrderBookL1Inner {
-                    subscription_id: SubscriptionId::from("spread|XBT/USD"),
-                    spread: KrakenSpread {
-                        best_bid_price: dec!(5698.40000),
-                        best_bid_amount: dec!(1.01234567),
-                        time: datetime_utc_from_epoch_duration(std::time::Duration::from_secs_f64(
-                            1542057299.545897,
-                        )),
-                        best_ask_price: dec!(5700.00000),
-                        best_ask_amount: dec!(0.98765432),
-                    },
-                })),
-            }];
+    #[test]
+    fn a_zero_price_is_an_empty_side() {
+        let input = TICKER.replace(r#""bid":5698.4"#, r#""bid":0"#);
+        let book: KrakenOrderBookL1 = serde_json::from_str(&input).unwrap();
 
-            for (index, test) in tests.into_iter().enumerate() {
-                let actual = serde_json::from_str::<KrakenOrderBookL1>(test.input);
-                match (actual, test.expected) {
-                    (Ok(actual), Ok(expected)) => {
-                        assert_eq!(actual, expected, "TC{} failed", index)
-                    }
-                    (Err(_), Err(_)) => {
-                        // Test passed
-                    }
-                    (actual, expected) => {
-                        // Test failed
-                        panic!(
-                            "TC{index} failed because actual != expected. \nActual: {actual:?}\nExpected: {expected:?}\n"
-                        );
-                    }
-                }
-            }
-        }
+        let events = MarketIter::<&str, OrderBookL1>::from((ExchangeId::Kraken, "btc", book)).0;
+
+        let event = events.into_iter().next().unwrap().unwrap();
+        assert_eq!(event.kind.best_bid, None);
+        assert!(event.kind.best_ask.is_some());
     }
 }

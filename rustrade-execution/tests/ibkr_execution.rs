@@ -1080,6 +1080,7 @@ async fn test_place_and_cancel_trailing_stop_percentage() {
         kind: OrderKind::TrailingStop {
             offset: dec!(50), // 50% trailing offset
             offset_type: TrailingOffsetType::Percentage,
+            activation_price: None,
         },
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,

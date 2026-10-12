@@ -3,7 +3,7 @@ use crate::{
         EngineState,
         asset::generate_empty_indexed_asset_states,
         connectivity::generate_empty_indexed_connectivity_states,
-        instrument::generate_indexed_instrument_states,
+        instrument::{ExpiryHandling, generate_indexed_instrument_states},
         order::Orders,
         position::{OmsMode, PositionManager, PositionSeed, PositionSeedError},
         trading::TradingState,
@@ -21,7 +21,7 @@ use rustrade_instrument::{
     instrument::{Instrument, InstrumentIndex},
 };
 use rustrade_integration::collection::snapshot::Snapshot;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Builder utility for an [`EngineState`] instance.
 #[derive(Debug, Clone)]
@@ -48,6 +48,9 @@ pub struct EngineStateBuilder<'a, GlobalData, FnInstrumentData> {
     execution_venues: Option<FnvHashSet<ExchangeId>>,
     /// Open positions to place in the built state — see [`EngineStateBuilder::positions`].
     positions: Vec<PositionSeed>,
+    /// [`ExpiryHandling`] per exchange — see [`EngineStateBuilder::expiry_handling`]. An exchange
+    /// not named keeps [`ExpiryHandling::Engine`].
+    expiry_handling: FnvHashMap<ExchangeId, ExpiryHandling>,
 }
 
 impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInstrumentData> {
@@ -74,6 +77,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             balance_basis: BalanceBasis::default(),
             execution_venues: None,
             positions: Vec::new(),
+            expiry_handling: FnvHashMap::default(),
         }
     }
 
@@ -101,6 +105,22 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
         Iter: IntoIterator<Item = ExchangeId>,
     {
         self.execution_venues = Some(venues.into_iter().collect());
+        self
+    }
+
+    /// Optionally set who settles expiring contracts on `exchange`'s instruments — see
+    /// [`ExpiryHandling`].
+    ///
+    /// Every exchange not named here keeps [`ExpiryHandling::Engine`]: the engine closes each
+    /// position with a synthesised settlement trade. Choose [`ExpiryHandling::Venue`] for an
+    /// exchange whose execution client reports its own trades for an expiry, exercise or
+    /// assignment, and whose trades the caller feeds to the engine. Otherwise each position is
+    /// closed twice, once by the engine and once by the venue.
+    ///
+    /// Calling this again for the same exchange replaces the earlier setting. An exchange none of
+    /// the instruments trades on is ignored, with a warning at build.
+    pub fn expiry_handling(mut self, exchange: ExchangeId, handling: ExpiryHandling) -> Self {
+        self.expiry_handling.insert(exchange, handling);
         self
     }
 
@@ -248,6 +268,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             balance_basis,
             execution_venues,
             positions,
+            expiry_handling,
         } = self;
 
         // Default if not provided
@@ -273,6 +294,26 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
                 }))
         }
 
+        // Key each exchange's ExpiryHandling by its ExchangeIndex, which is what an instrument
+        // state carries. An exchange outside the index has no instrument to apply it to.
+        let expiry_handling: FnvHashMap<ExchangeIndex, ExpiryHandling> = expiry_handling
+            .into_iter()
+            .filter_map(
+                |(exchange, handling)| match instruments.find_exchange_index(exchange) {
+                    Ok(index) => Some((index, handling)),
+                    Err(_) => {
+                        warn!(
+                            %exchange,
+                            ?handling,
+                            "EngineStateBuilder::expiry_handling names an exchange no instrument \
+                             trades on — ignored"
+                        );
+                        None
+                    }
+                },
+            )
+            .collect();
+
         // Generate empty InstrumentStates using provided FnInstrumentData etc.
         let mut instruments = generate_indexed_instrument_states(
             instruments,
@@ -281,6 +322,13 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             Orders::default,
             instrument_data_init,
         );
+
+        // Apply each exchange's ExpiryHandling to its instruments
+        for state in instruments.0.values_mut() {
+            if let Some(handling) = expiry_handling.get(&state.instrument.exchange) {
+                state.expiry_handling = *handling;
+            }
+        }
 
         // Seed open positions into their instruments' PositionManagers
         for seed in positions {
@@ -417,6 +465,26 @@ mod tests {
         );
 
         assert_eq!(generator.generate(Annual365).basis, BalanceBasis::NetAsset);
+    }
+
+    /// [`EngineStateBuilder::expiry_handling`] reaches every instrument of the named exchange and
+    /// no other; an exchange no instrument trades on is ignored.
+    #[test]
+    fn expiry_handling_reaches_only_the_named_exchanges_instruments() {
+        let instruments = seed_instruments();
+        let state: EngineState<(), ()> = EngineState::builder(&instruments, (), |_| ())
+            .expiry_handling(ExchangeId::BinanceFuturesUsd, ExpiryHandling::Venue)
+            .expiry_handling(ExchangeId::Kraken, ExpiryHandling::Venue)
+            .build();
+
+        let handling = |name: &str| {
+            state
+                .instruments
+                .instrument(&InstrumentNameInternal::new(name))
+                .expiry_handling
+        };
+        assert_eq!(handling(PERP), ExpiryHandling::Venue);
+        assert_eq!(handling(SPOT), ExpiryHandling::Engine);
     }
 
     /// End-to-end seam for [`EngineStateBuilder::execution_venues`]: the declared set has to reach

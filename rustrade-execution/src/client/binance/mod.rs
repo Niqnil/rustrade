@@ -48,5 +48,5 @@ mod margin_risk;
 mod shared;
 mod spot;
 
-pub use margin::{BinanceMargin, BinanceMarginConfig, MarginSideEffect};
+pub use margin::{BinanceMargin, BinanceMarginConfig, MarginForcedLiquidation, MarginSideEffect};
 pub use spot::{BinanceSpot, BinanceSpotConfig, BinanceSpotConfigError};

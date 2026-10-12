@@ -128,7 +128,8 @@
 //! - `TakeProfit` → market order triggered at take-profit price (`tpsl: "tp"`, `is_market: true`)
 //! - `TakeProfitLimit` → limit order triggered at take-profit price (`tpsl: "tp"`, `is_market: false`)
 //!
-//! **Unsupported**: `TrailingStop`, `TrailingStopLimit` (Hyperliquid does not support trailing stops)
+//! **Unsupported**: `TrailingStop`, `TrailingStopLimit`, `TrailingStopFixedLimit` (Hyperliquid
+//! does not support trailing stops)
 //!
 //! **SDK limitations** (hyperliquid_rust_sdk 0.6.x): neither the open orders this client reads
 //! nor `OrderUpdate` carry an order's trigger fields or time in force, so orders from both are
@@ -1052,7 +1053,9 @@ impl ExecutionClient for HyperliquidClient {
                         .to_string(),
                 );
             }
-            OrderKind::TrailingStop { .. } | OrderKind::TrailingStopLimit { .. } => {
+            OrderKind::TrailingStop { .. }
+            | OrderKind::TrailingStopLimit { .. }
+            | OrderKind::TrailingStopFixedLimit { .. } => {
                 return make_unsupported(
                     "Hyperliquid does not support trailing stop orders".to_string(),
                 );
@@ -1339,6 +1342,7 @@ impl ExecutionClient for HyperliquidClient {
                 fees: perp_fill_fees(fill.fee_token.as_deref(), fee, collateral),
                 // As on the stream, whose copy of a fill usually arrives first; see `TradeOrigin`.
                 origin: TradeOrigin::Order,
+                position_side: None,
             });
         }
 
@@ -1481,6 +1485,7 @@ fn fill_to_account_event(
         // The SDK's `TradeInfo` drops the fill's liquidation marker, so every fill is reported
         // as `Order`; see `TradeOrigin`.
         origin: TradeOrigin::Order,
+        position_side: None,
     };
 
     Some(AccountEvent::new(
