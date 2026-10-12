@@ -42,6 +42,8 @@ use serial_test as _;
 #[cfg(test)]
 use temp_env as _;
 #[cfg(test)]
+use tokio_tungstenite as _;
+#[cfg(test)]
 use tracing_subscriber as _;
 #[cfg(test)]
 use wiremock as _;
