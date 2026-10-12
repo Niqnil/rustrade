@@ -34,6 +34,15 @@ use tracing::{debug, warn};
 /// [`IbkrConfig::shortability_timeout`](super::IbkrConfig::shortability_timeout) says otherwise.
 pub const DEFAULT_SHORTABILITY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long [`IbkrClient::fetch_shortability`] waits for tick 89 once tick 46 has arrived without
+/// it.
+///
+/// For a stock IB has shares of, it sends both ticks together. For one it has few or none of, it
+/// can send tick 46 and no tick 89 at all, and the read would otherwise wait out the whole
+/// timeout for it. The grace still takes a tick 89 that IB sends just after tick 46.
+// PROVISIONAL: set from the regular-hours probe (2x the longest 46-to-89 gap seen, at least 2 s).
+const SHORTABLE_SHARES_GRACE: Duration = Duration::from_secs(2);
+
 /// IB's error code for a request that would exceed the account's market data lines ("Max number
 /// of tickers has been reached"). The lines are a cap on concurrent subscriptions, shared by every
 /// TWS session and API client on the account, and one frees only when a subscription is
@@ -65,10 +74,12 @@ impl ShortabilityClient for IbkrClient {
     ///
     /// The request is read until both ticks have arrived, or for
     /// [`IbkrConfig::shortability_timeout`](super::IbkrConfig::shortability_timeout) (10 s by
-    /// default); one that arrives alone is returned on its own. While it runs it holds one of the
-    /// account's market data lines, and it is cancelled when the read ends. The read runs on a
-    /// blocking thread, so dropping the returned future does not end it early: it runs to its
-    /// end, holding the line until then.
+    /// default); one that arrives alone is returned on its own. Once tick 46 has arrived, tick 89
+    /// is waited for at most 2 s more: IB sends both together for a stock it has shares of, and
+    /// can send no tick 89 at all for one it has few or none of, which then comes back with
+    /// `available` unknown. While it runs it holds one of the account's market data lines, and it
+    /// is cancelled when the read ends. The read runs on a blocking thread, so dropping the
+    /// returned future does not end it early: it runs to its end, holding the line until then.
     ///
     /// The request asks for IB's delayed market data, which IB serves only where the account has
     /// no live subscription for the stock, so an account without one still gets the ticks. IB
@@ -121,8 +132,10 @@ impl ShortabilityClient for IbkrClient {
                 .subscribe()
                 .map_err(|e| request_error(&instrument, e))?;
             // Dropping the subscription at the end of this closure cancels the request.
-            let ticks = read_shortability_ticks(timeout, |wait| subscription.next_timeout(wait))
-                .map_err(|e| request_error(&instrument, e))?;
+            let ticks = read_shortability_ticks(timeout, SHORTABLE_SHARES_GRACE, |wait| {
+                subscription.next_timeout(wait)
+            })
+            .map_err(|e| request_error(&instrument, e))?;
             ticks.into_shortability(&instrument, client.is_connected())
         })
         .await
@@ -227,7 +240,7 @@ impl ShortabilityTicks {
 }
 
 /// Read the shortability request's ticks until both have arrived or `timeout` has passed since
-/// the read began.
+/// the read began. Once tick 46 has arrived, tick 89 is waited for at most `grace` more.
 ///
 /// `next` is the subscription's `next_timeout`, which answers `None` when its wait runs out and
 /// when the request ends. A streaming request ends only on an error, which comes first, or on the
@@ -241,9 +254,10 @@ impl ShortabilityTicks {
 /// data line free, after which no tick comes.
 fn read_shortability_ticks(
     timeout: Duration,
+    grace: Duration,
     mut next: impl FnMut(Duration) -> Option<Result<SubscriptionItem<TickTypes>, ibapi::Error>>,
 ) -> Result<ShortabilityTicks, ibapi::Error> {
-    let deadline = Instant::now() + timeout;
+    let mut deadline = Instant::now() + timeout;
     let mut ticks = ShortabilityTicks::default();
     while !ticks.is_complete() {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -251,7 +265,13 @@ fn read_shortability_ticks(
             break;
         }
         match next(remaining) {
-            Some(Ok(SubscriptionItem::Data(tick))) => ticks.record(&tick),
+            Some(Ok(SubscriptionItem::Data(tick))) => {
+                let had_level = ticks.level.is_some();
+                ticks.record(&tick);
+                if !had_level && ticks.level.is_some() && ticks.shares.is_none() {
+                    deadline = deadline.min(Instant::now() + grace);
+                }
+            }
             Some(Ok(SubscriptionItem::Notice(notice))) if notice.code == MAX_TICKERS_CODE => {
                 return Err(ibapi::Error::Notice(notice));
             }
@@ -402,6 +422,7 @@ mod tests {
         let started = Instant::now();
         let ticks = read_shortability_ticks(
             timeout,
+            SHORTABLE_SHARES_GRACE,
             subscription(vec![
                 generic(TickType::Shortable, 3.0),
                 generic(TickType::Bid, 1.0),
@@ -418,6 +439,7 @@ mod tests {
     fn shares_are_read_from_a_generic_tick_too() {
         let ticks = read_shortability_ticks(
             Duration::from_secs(5),
+            SHORTABLE_SHARES_GRACE,
             subscription(vec![
                 generic(TickType::ShortableShares, 100.0),
                 generic(TickType::Shortable, 2.0),
@@ -432,6 +454,7 @@ mod tests {
     fn a_tick_that_arrives_alone_is_returned_after_the_timeout() {
         let ticks = read_shortability_ticks(
             Duration::from_millis(40),
+            SHORTABLE_SHARES_GRACE,
             subscription(vec![generic(TickType::Shortable, 2.0)]),
         )
         .unwrap();
@@ -444,10 +467,46 @@ mod tests {
         );
     }
 
+    /// Tick 46 alone ends the read once the grace for tick 89 has passed, well before the
+    /// timeout, and is returned on its own. Tick 89 alone still waits for tick 46.
+    #[test]
+    fn tick_46_alone_waits_only_the_grace_for_tick_89() {
+        let timeout = Duration::from_secs(5);
+        let started = Instant::now();
+        let ticks = read_shortability_ticks(
+            timeout,
+            Duration::from_millis(40),
+            subscription(vec![
+                generic(TickType::Shortable, 2.0),
+                generic(TickType::Bid, 1.0),
+            ]),
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "waited past the grace"
+        );
+        assert_eq!((ticks.level, ticks.shares), (Some(2.0), None));
+
+        let started = Instant::now();
+        let ticks = read_shortability_ticks(
+            Duration::from_millis(300),
+            Duration::from_millis(40),
+            subscription(vec![size(TickType::ShortableShares, 100.0)]),
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() >= Duration::from_millis(300),
+            "tick 89 alone starts no grace"
+        );
+        assert_eq!((ticks.level, ticks.shares), (None, Some(100.0)));
+    }
+
     #[test]
     fn a_non_finite_tick_is_no_answer() {
         let ticks = read_shortability_ticks(
             Duration::from_millis(40),
+            SHORTABLE_SHARES_GRACE,
             subscription(vec![generic(TickType::Shortable, f64::NAN)]),
         )
         .unwrap();
@@ -456,8 +515,12 @@ mod tests {
 
     #[test]
     fn nothing_in_time_is_a_timeout() {
-        let ticks =
-            read_shortability_ticks(Duration::from_millis(40), subscription(vec![])).unwrap();
+        let ticks = read_shortability_ticks(
+            Duration::from_millis(40),
+            SHORTABLE_SHARES_GRACE,
+            subscription(vec![]),
+        )
+        .unwrap();
         let error = ticks.into_shortability(&instrument(), true).unwrap_err();
         assert!(matches!(
             error,
@@ -470,6 +533,7 @@ mod tests {
         let started = Instant::now();
         let ticks = read_shortability_ticks(
             Duration::from_secs(5),
+            SHORTABLE_SHARES_GRACE,
             subscription(vec![Ok(SubscriptionItem::Notice(notice(
                 10089,
                 "Requested market data requires additional subscription for API.",
@@ -492,6 +556,7 @@ mod tests {
     fn a_delayed_data_notice_is_followed_by_the_ticks() {
         let ticks = read_shortability_ticks(
             Duration::from_secs(5),
+            SHORTABLE_SHARES_GRACE,
             subscription(vec![
                 Ok(SubscriptionItem::Notice(notice(
                     10167,
@@ -512,6 +577,7 @@ mod tests {
         let started = Instant::now();
         let error = read_shortability_ticks(
             Duration::from_secs(5),
+            SHORTABLE_SHARES_GRACE,
             subscription(vec![Ok(SubscriptionItem::Notice(notice(
                 101,
                 "Max number of tickers has been reached",
@@ -540,6 +606,7 @@ mod tests {
     fn an_error_ends_the_read() {
         let error = read_shortability_ticks(
             Duration::from_secs(5),
+            SHORTABLE_SHARES_GRACE,
             subscription(vec![
                 generic(TickType::Shortable, 3.0),
                 Err(ibapi::Error::Notice(notice(354, "Not subscribed"))),

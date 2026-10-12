@@ -247,7 +247,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     one of the account's market data lines until both ticks arrive or the new
     `IbkrConfig::shortability_timeout` runs out (10 s by default; set it with
     `with_shortability_timeout`, or `shortability_timeout_ms` in a config file), and returns what
-    arrived. The request asks for IB's delayed market data, which IB serves only where the
+    arrived. Once tick 46 has arrived, tick 89 is waited for at most 2 s more: IB can send none
+    for a stock it has few shares of, which then comes back with `available` unknown. The request
+    asks for IB's delayed market data, which IB serves only where the
     account has no live subscription for the stock, so an account without one, such as a paper
     account, still gets the ticks. Nothing arriving is an error: `ConnectivityError::Timeout`, or
     `ApiError::RequestRejected` carrying IB's notices; a notice that the account may not have the
