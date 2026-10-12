@@ -59,7 +59,8 @@ pub(crate) enum DedupEventKind {
     },
     Cancelled,
     /// A funding payment, keyed on its instrument and funding time because the venue gives it no
-    /// id.
+    /// id. Only Hyperliquid's funding stream produces one, so it exists only with that client.
+    #[cfg(feature = "hyperliquid")]
     Funding,
     /// An account notice, keyed on its instrument (empty for the account as a whole), the venue's
     /// status and the time the venue sent it, since a notice has no id. A venue that sends one

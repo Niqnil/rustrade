@@ -10,6 +10,18 @@
 //! Binance-string parsers) from the `shared` module, so resilience behaviour is
 //! implemented once and reused rather than duplicated per client.
 //!
+//! # Every fill on the account is delivered
+//!
+//! Both clients' account streams report every fill on the account, whoever placed the order:
+//! this client, another API client, another program, or the venue's own app. Binance marks none
+//! of them as another client's, so each arrives as [`TradeOrigin::Order`](crate::trade::TradeOrigin::Order).
+//! Fill recovery after a reconnect and `fetch_trades` read the account's fills the same way.
+//!
+//! A consumer that trades the account outside the engine it feeds therefore filters those fills
+//! out itself. [`Trade::client_order_id`](crate::trade::Trade::client_order_id) carries the client
+//! order id each fill's order was placed with, so orders placed outside the engine under ids
+//! of their own, such as with a prefix, can be recognised by their fills.
+//!
 //! # Logging: `binance_sdk` writes request credentials at `DEBUG`
 //!
 //! Both clients run on the `binance-sdk` crate, whose WebSocket API client logs every outgoing

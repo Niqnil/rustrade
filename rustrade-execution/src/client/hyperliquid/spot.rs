@@ -77,9 +77,9 @@
 
 use super::common::{
     CLOID_REQUIRED, CancelOnDropStream, InstrumentFilter, OpenOrder, OpenOrderListing, UserFill,
-    cancel_outcome, cid_to_cloid, instrument_to_spot_coin, map_tif, millis_to_datetime,
-    open_order_to_order, open_orders, parse_decimal, parse_side, span_millis, spot_balances,
-    spot_base_quote, spot_pair_to_instrument, user_fills_by_time,
+    cancel_outcome, cid_to_cloid, cloid_to_cid, instrument_to_spot_coin, map_tif,
+    millis_to_datetime, open_order_to_order, open_orders, parse_decimal, parse_side, span_millis,
+    spot_balances, spot_base_quote, spot_pair_to_instrument, user_fills_by_time,
 };
 use super::config::HyperliquidConfig;
 use super::error::{map_order_error, map_sdk_error, order_rejection};
@@ -1286,6 +1286,7 @@ fn spot_trades(
             // As on the stream, whose copy of a fill usually arrives first; see `TradeOrigin`.
             origin: TradeOrigin::Order,
             position_side: None,
+            client_order_id: fill.cloid.as_deref().and_then(cloid_to_cid),
         });
     }
 
@@ -1338,6 +1339,7 @@ fn fill_to_account_event(
         // as `Order`; see `TradeOrigin`.
         origin: TradeOrigin::Order,
         position_side: None,
+        client_order_id: fill.cloid.as_deref().and_then(cloid_to_cid),
     };
 
     Some(AccountEvent::new(

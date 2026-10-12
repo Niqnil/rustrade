@@ -672,6 +672,7 @@ impl AccountEventIndexer {
             fees,
             origin,
             position_side,
+            client_order_id,
         } = trade;
 
         let instrument_index = self.map.find_instrument_index(&instrument)?;
@@ -712,6 +713,7 @@ impl AccountEventIndexer {
             },
             origin,
             position_side,
+            client_order_id,
         })
     }
 }

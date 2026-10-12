@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`Trade::client_order_id`: the client order id of the order a fill belongs to**
+  (`rustrade-execution`, #605).
+  - A fill now carries the client order id its order was placed with, where the venue reports
+    one, as `Option<ClientOrderId>`. It is set with the new `Trade::with_client_order_id`, and a
+    stored trade without it still loads. `Trade` is `#[non_exhaustive]`, so the field is additive.
+  - Reported by the Binance Spot and Margin streams (`c`), Alpaca's `trade_updates`, IBKR (the
+    order reference), Hyperliquid (from the order's cloid) and `SimulatedVenue`. Binance fill
+    recovery after a disconnect now also reads each recovered fill's order for it: one more
+    request per order (Spot `GET /api/v3/order`, weight 4; Margin `GET /sapi/v1/margin/order`,
+    weight 10), under the recovery's existing time limit. Binance `fetch_trades` and Alpaca's
+    activity reads report none.
+  - Venues' account streams report every fill on the account, whoever placed the order, and in
+    `OmsMode::Netting` the engine applies each one to the position. The docs now say so, on the
+    engine's `InstrumentState::update_from_trade` and on the Binance clients. A consumer that
+    trades the account outside the engine must keep those fills from it, and can now recognise
+    them by their client order ids.
 - **`AccountEventKind::CashFlow`: cash moved into or out of an account other than by a trade**
   (`rustrade-execution`, #549).
   - A `CashFlow` carries what it is for (`CashFlowKind`: `Funding`, `BorrowFee`,

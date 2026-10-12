@@ -1,5 +1,5 @@
 use crate::{
-    order::id::{OrderId, StrategyId},
+    order::id::{ClientOrderId, OrderId, StrategyId},
     trade::{AssetFees, Trade, TradeId, TradeOrigin},
 };
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -406,6 +406,10 @@ fn trade_with_fees(
         fees,
         origin,
         position_side: None,
+        // The order reference: this client places each order with its client order id there.
+        // Another client's order carries whatever reference that client gave it, if any.
+        client_order_id: (!exec.order_reference.is_empty())
+            .then(|| ClientOrderId::new(exec.order_reference.as_str())),
     }
 }
 
@@ -515,6 +519,38 @@ mod tests {
         assert_eq!(dt.hour(), 10);
     }
 
+    /// A fill reports the order reference as its client order id: this client places each order
+    /// with its client order id there. An order placed without one reports none.
+    #[test]
+    fn a_fill_carries_the_order_reference_as_its_client_order_id() {
+        let buffer = ExecutionBuffer::new();
+        for (exec_id, reference) in [("a", "outside-1"), ("b", "")] {
+            buffer.add_execution(
+                ExecutionData {
+                    execution: ibapi::orders::Execution {
+                        execution_id: exec_id.to_string(),
+                        order_reference: reference.to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ResolvedExecution {
+                    instrument: InstrumentNameExchange::new("AAPL"),
+                    order_id: ib_order_id(1),
+                    origin: TradeOrigin::Order,
+                },
+            );
+        }
+
+        let mut trades = buffer.take_without_commission();
+        trades.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(
+            trades[0].client_order_id,
+            Some(ClientOrderId::new("outside-1"))
+        );
+        assert_eq!(trades[1].client_order_id, None);
+    }
+
     #[test]
     fn drain_into_moves_everything_and_keeps_the_target() {
         let execution = |exec_id: &str| ExecutionData {
@@ -595,6 +631,7 @@ mod tests {
             fees: AssetFees::new(AssetNameExchange::from("USD"), Decimal::ZERO, None),
             origin: TradeOrigin::Order,
             position_side: None,
+            client_order_id: None,
         }
     }
 
