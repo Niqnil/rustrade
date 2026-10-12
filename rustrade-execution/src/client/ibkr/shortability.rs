@@ -56,6 +56,11 @@ impl ShortabilityClient for IbkrClient {
     ///   `easy_to_borrow` is left unknown.
     /// - tick 89, the shares IB has to lend, as `available`.
     ///
+    /// A stock that is `shortable` but not `easy_to_borrow` needs a locate. IB accepts a short
+    /// sale of it and holds the order while it looks for shares (IB's code 404, which this client
+    /// reports as a working order, not a rejection), and may never find them. So `shortable`
+    /// says a short sale may be tried, not that shares are on hand.
+    ///
     /// `fee_rate` is unknown: IB reports no borrow fee to the API.
     ///
     /// The request is read until both ticks have arrived, or for

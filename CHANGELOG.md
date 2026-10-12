@@ -226,17 +226,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `IbkrClient` implements `ShortabilityClient` from IB's shortable ticks, through a streaming
     market data request for generic tick 236: tick 46's level gives shortable and easy to borrow,
     and tick 89 the shares IB has to lend. IB reports no borrow fee to the API, so the fee is
-    unknown. The request holds one of the account's market data lines until both ticks arrive or
-    the new `IbkrConfig::shortability_timeout` runs out (10 s by default; set it with
+    unknown. A stock that is shortable but not easy to borrow needs a locate: IB holds a short
+    sale of it while it looks for shares (code 404), and may never find them. The request holds
+    one of the account's market data lines until both ticks arrive or the new
+    `IbkrConfig::shortability_timeout` runs out (10 s by default; set it with
     `with_shortability_timeout`, or `shortability_timeout_ms` in a config file), and returns what
     arrived. The request asks for IB's delayed market data, which IB serves only where the
     account has no live subscription for the stock, so an account without one, such as a paper
     account, still gets the ticks. Nothing arriving is an error: `ConnectivityError::Timeout`, or
     `ApiError::RequestRejected` carrying IB's notices; a notice that the account may not have the
     stock's market data, live or delayed, ends the wait at once. With every market data line in
-    use, by this client,
-    another API client or TWS, it is the new `ApiError::CapacityExceeded`. A contract that is not a
-    stock, or not registered, is `ApiError::InstrumentInvalid`.
+    use, by this client, another API client or TWS, it is the new `ApiError::CapacityExceeded`. A
+    contract that is not a stock, or not registered, is `ApiError::InstrumentInvalid`.
   - `ApiError::CapacityExceeded(String)`: the venue refused because a cap on something held at
     once is full, such as IB's market data lines. Waiting does not clear it, releasing something
     does, so unlike `RateLimit` it is not transient.
