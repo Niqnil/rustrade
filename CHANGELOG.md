@@ -234,8 +234,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     to borrow, and a zero fee for an easy-to-borrow stock, which Alpaca charges nothing to borrow.
     Alpaca publishes no hard-to-borrow rate, so that fee is unknown, and its flags may be a day old.
   - `BinanceMargin` implements both, for its cross or isolated margin. A pair is shortable when it
-    is traded on margin, may be sold and its base asset may be borrowed; the fee is the base
-    asset's next hourly interest rate times 24 × 365. A query costs 102 of Binance's per-IP request
+    is traded on margin, may be sold and its base asset may be borrowed; Binance's delisting
+    schedule is not read, so a pair due to be delisted reads shortable until Binance clears those
+    flags. The fee is the base asset's next hourly interest rate times 24 × 365. A query costs 102 of Binance's per-IP request
     weight on cross margin and 111 on isolated, almost all of it the interest rate; the borrow
     capacity costs 51 and 60. Binance does not say how much it has to lend in total, so
     `available` is unknown there.

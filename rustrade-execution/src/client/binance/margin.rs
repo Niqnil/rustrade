@@ -1573,6 +1573,9 @@ impl ShortabilityClient for BinanceMargin {
     /// - `shortable` is whether the pair is traded on margin and may be sold
     ///   (`/sapi/v1/margin/allPairs`, or `isolated/allPairs` on isolated margin), and its base
     ///   asset may be borrowed (`/sapi/v1/margin/allAssets`). Any of them false makes it false.
+    ///   Binance's delisting schedule (`delistTime`) is not read, as Binance documents neither its
+    ///   unit nor when it is present, so a pair due to be delisted reads shortable until Binance
+    ///   clears these flags.
     /// - `fee_rate` is the base asset's next hourly interest rate
     ///   (`/sapi/v1/margin/next-hourly-interest-rate`, for this client's cross or isolated margin)
     ///   times 24 × 365. It is this account's rate, at its VIP level, for the coming hour only.
