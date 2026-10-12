@@ -319,6 +319,7 @@ pub fn exchange_supports_instrument_kind_sub_kind(
         (Kraken, Spot, PublicTrades | OrderBooksL1) => true,
         (Okx, Spot | Future { .. } | Perpetual | Option { .. }, PublicTrades) => true,
         (HyperliquidPerp, Perpetual, PublicTrades | OrderBooksL2) => true,
+        (HyperliquidSpot, Spot, PublicTrades | OrderBooksL2) => true,
 
         // Alpaca's top of book is its quote: `OrderBooksL1` reads the `quotes` channel, which the
         // typed `Quotes` kind also serves. `Quotes` itself has no arm because `DynamicStreams`, the
@@ -697,6 +698,45 @@ mod tests {
                     );
                 }
             }
+        }
+
+        #[test]
+        fn hyperliquid_serves_trades_and_depth_on_each_connector_for_its_own_kind_only() {
+            for (exchange, kind) in [
+                (
+                    ExchangeId::HyperliquidPerp,
+                    MarketDataInstrumentKind::Perpetual,
+                ),
+                (ExchangeId::HyperliquidSpot, MarketDataInstrumentKind::Spot),
+            ] {
+                for sub_kind in [SubKind::PublicTrades, SubKind::OrderBooksL2] {
+                    assert!(
+                        exchange_supports_instrument_kind_sub_kind(&exchange, &kind, sub_kind),
+                        "{exchange:?} should support ({kind:?}, {sub_kind})"
+                    );
+                }
+                for sub_kind in [
+                    SubKind::OrderBooksL1,
+                    SubKind::OrderBooksL3,
+                    SubKind::Liquidations,
+                    SubKind::Quotes,
+                ] {
+                    assert!(
+                        !exchange_supports_instrument_kind_sub_kind(&exchange, &kind, sub_kind),
+                        "{exchange:?} should not support ({kind:?}, {sub_kind})"
+                    );
+                }
+            }
+            assert!(!exchange_supports_instrument_kind_sub_kind(
+                &ExchangeId::HyperliquidSpot,
+                &MarketDataInstrumentKind::Perpetual,
+                SubKind::PublicTrades
+            ));
+            assert!(!exchange_supports_instrument_kind_sub_kind(
+                &ExchangeId::HyperliquidPerp,
+                &MarketDataInstrumentKind::Spot,
+                SubKind::PublicTrades
+            ));
         }
     }
 

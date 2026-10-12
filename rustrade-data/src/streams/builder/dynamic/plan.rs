@@ -8,7 +8,7 @@ use super::DynamicSubscribers;
 #[cfg(feature = "alpaca")]
 use crate::exchange::alpaca::{AlpacaCrypto, AlpacaIex, AlpacaSip, AlpacaSubscriber};
 #[cfg(feature = "hyperliquid")]
-use crate::exchange::hyperliquid::Hyperliquid;
+use crate::exchange::hyperliquid::{Hyperliquid, HyperliquidSpot};
 #[cfg(feature = "lse")]
 use crate::exchange::lse::{
     LseCfd, LseCrypto, LseEquities, LseFutures, LseFx, LseOptions, live::LseSubscriber,
@@ -355,8 +355,24 @@ where
             (ExchangeId::HyperliquidPerp, L2) => {
                 group(ws, Hyperliquid, OrderBooksL2, subs, tx(&txs.l2s, exchange))
             }
+            #[cfg(feature = "hyperliquid")]
+            (ExchangeId::HyperliquidSpot, Trades) => group(
+                ws,
+                HyperliquidSpot,
+                PublicTrades,
+                subs,
+                tx(&txs.trades, exchange),
+            ),
+            #[cfg(feature = "hyperliquid")]
+            (ExchangeId::HyperliquidSpot, L2) => group(
+                ws,
+                HyperliquidSpot,
+                OrderBooksL2,
+                subs,
+                tx(&txs.l2s, exchange),
+            ),
             #[cfg(not(feature = "hyperliquid"))]
-            (ExchangeId::HyperliquidPerp, Trades | L2) => {
+            (ExchangeId::HyperliquidPerp | ExchangeId::HyperliquidSpot, Trades | L2) => {
                 return Err(feature_disabled(exchange, "hyperliquid"));
             }
 
