@@ -19,7 +19,9 @@ use std::fmt::{Display, Formatter};
 /// apply each one once. The engine adds a flow attributed to an instrument to the `carry` of that
 /// instrument's open position (see `Position::carry` in `rustrade`), and applies none to
 /// balances. A venue's balances already include the flows it has posted, so adding a flow to a
-/// balance read after it counts the flow twice.
+/// balance read after it counts the flow twice. Carry a venue has accrued but not yet posted is no
+/// flow: a venue that reports it puts it in
+/// [`Balance::accrued`](crate::balance::Balance::accrued).
 ///
 /// # Delivery
 ///

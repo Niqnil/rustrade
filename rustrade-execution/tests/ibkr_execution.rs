@@ -354,8 +354,14 @@ async fn test_fetch_balances() {
     println!("Fetched {} balance(s)", balances.len());
     for balance in &balances {
         println!(
-            "  {}: total={}, free={}",
-            balance.asset, balance.balance.total, balance.balance.free
+            "  {}: total={}, free={}, accrued={:?}",
+            balance.asset, balance.balance.total, balance.balance.free, balance.balance.accrued
+        );
+        // One balance per currency held: the ledger's BASE row is a conversion, not a currency.
+        assert_ne!(balance.asset.as_ref(), "BASE", "{balance:?}");
+        assert!(
+            balance.balance.free <= balance.balance.total,
+            "free is capped at total: {balance:?}"
         );
     }
 }

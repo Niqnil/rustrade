@@ -46,22 +46,26 @@ pub struct MarginDetails {
     pub interest: Decimal,
 }
 
-/// Per-asset balance: gross holdings, the freely-tradable portion, and optional margin debt.
+/// Per-asset balance: gross holdings, the freely-tradable portion, optional margin debt and
+/// optional accrued carry.
 ///
-/// Construct via [`Balance::new`] (cash) or [`Balance::new_margin`] (per-asset debt). `total` is
-/// gross holdings and `free` the freely-tradable portion; the remainder (`total - free`, exposed
-/// by [`Balance::used`]) is reserved against resting orders. Callers building the struct literally
-/// must keep `free <= total`.
+/// Construct via [`Balance::new`] (cash) or [`Balance::new_margin`] (per-asset debt), then
+/// [`Balance::with_accrued`] where the venue reports an accrual. The struct is
+/// `#[non_exhaustive]`, so code outside this crate builds it only through those, and later fields
+/// are additive. `total` is gross holdings and `free` the freely-tradable portion; the remainder
+/// (`total - free`, exposed by [`Balance::used`]) is reserved against resting orders. Producers
+/// keep `free <= total`.
 ///
 /// `margin: None` denotes a cash / no-debt context, **not** "unknown debt" — see [`Balance::margin`]
 /// and [`Balance::net_asset`].
 ///
-/// `Ord`/`PartialOrd` are derived and compare lexicographically over `(total, free, margin)`
-/// (`None` sorts before `Some`); they exist for use as collection keys and generic bounds, not as a
+/// `Ord`/`PartialOrd` are derived and compare lexicographically over
+/// `(total, free, margin, accrued)` (`None` sorts before `Some`); they exist for use as collection keys and generic bounds, not as a
 /// financial ranking. Use [`Balance::net_asset`] for value comparisons that account for debt.
 #[derive(
     Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize, Serialize,
 )]
+#[non_exhaustive]
 pub struct Balance {
     /// Gross holdings of the asset (`free + locked`). Unaffected by any borrowing — debt is
     /// carried separately in [`Balance::margin`].
@@ -71,9 +75,10 @@ pub struct Balance {
     /// the client's `account_snapshot`.
     ///
     /// A carrying cost (funding, margin interest, a borrow fee) reaches `total` only once the venue
-    /// posts it to the account, hourly at some venues and monthly at others. Until then no figure
-    /// here carries it, except the accrued [`MarginDetails::interest`] of a venue that reports
-    /// one. Each client's rustdoc says what its venue posts and when.
+    /// posts it to the account, hourly at some venues and monthly at others. Until then `total`
+    /// leaves it out. A venue that reports the pending amount puts it in [`Balance::accrued`], or,
+    /// for interest on a loan, in [`MarginDetails::interest`]. Each client's rustdoc says what its
+    /// venue posts and when.
     pub total: Decimal,
     /// Portion of `total` available to trade (not reserved against resting orders).
     pub free: Decimal,
@@ -85,6 +90,22 @@ pub struct Balance {
     /// asset". See [`Balance::net_asset`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub margin: Option<MarginDetails>,
+    /// Carry accrued to date and not yet posted to `total`: interest earned or charged, and
+    /// whatever else the venue accrues the same way. Signed: positive is an amount the account
+    /// will receive, negative one it will pay.
+    ///
+    /// The cash the account holds once the accrual posts is `total + accrued`. The venue resets
+    /// the accrual as it posts it, so the two never count the same amount twice. `None` means the
+    /// venue does not report one, not that nothing has accrued.
+    ///
+    /// This differs from [`MarginDetails::interest`], which is interest owed on a loan of the
+    /// asset and is paid out of a later repayment, not added to cash.
+    ///
+    /// Like debt, it is only as fresh as the last
+    /// [`BalanceSnapshot`](crate::AccountEventKind::BalanceSnapshot) for the asset: a
+    /// [`BalanceUpdate`] carries none, and [`Balance::apply_stream_update`] keeps the prior value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accrued: Option<Decimal>,
 }
 
 impl Balance {
@@ -94,6 +115,7 @@ impl Balance {
             total,
             free,
             margin: None,
+            accrued: None,
         }
     }
 
@@ -108,7 +130,15 @@ impl Balance {
             total,
             free,
             margin: Some(MarginDetails { borrowed, interest }),
+            accrued: None,
         }
+    }
+
+    /// Set [`Balance::accrued`], the carry accrued and not yet posted to `total`.
+    #[must_use]
+    pub const fn with_accrued(mut self, accrued: Decimal) -> Self {
+        self.accrued = Some(accrued);
+        self
     }
 
     /// Portion of `total` reserved against resting orders (`total - free`).
@@ -142,9 +172,10 @@ impl Balance {
     /// Merge a WS partial [`BalanceUpdate`] onto an optional prior [`Balance`], preserving debt.
     ///
     /// Applies the stream's live `free`/`locked` (recomputing `total = free + locked`) while
-    /// carrying forward any [`MarginDetails`] from `prior` — a partial update never carries debt, so
-    /// this is the single-sourced "debt fresh as of last snapshot, `free`/`locked` live over the
-    /// stream" merge. On a cold start (`prior = None`) the result has `margin: None`.
+    /// carrying forward any [`MarginDetails`] and [`Balance::accrued`] from `prior` — a partial
+    /// update carries neither, so this is the single-sourced "debt and accruals fresh as of last
+    /// snapshot, `free`/`locked` live over the stream" merge. On a cold start (`prior = None`) the
+    /// result has `margin: None` and `accrued: None`.
     ///
     /// This is the same no-clobber merge the engine applies internally for asset-keyed balances. It
     /// is exposed so consumers applying per-instrument
@@ -155,6 +186,7 @@ impl Balance {
             total: update.total(),
             free: update.free,
             margin: prior.and_then(|b| b.margin),
+            accrued: prior.and_then(|b| b.accrued),
         }
     }
 }
@@ -259,5 +291,38 @@ mod tests {
         let round_trip: Balance =
             serde_json::from_str(&serde_json::to_string(&margin).unwrap()).unwrap();
         assert_eq!(round_trip, margin);
+    }
+
+    #[test]
+    fn balance_serde_accrued_is_optional() {
+        let json = serde_json::to_string(&Balance::new(dec!(1), dec!(1))).unwrap();
+        assert!(
+            !json.contains("accrued"),
+            "a balance without an accrual must not serialise the field"
+        );
+        // A balance stored before the field existed still loads.
+        let stored: Balance = serde_json::from_str(r#"{"total":"1","free":"1"}"#).unwrap();
+        assert_eq!(stored.accrued, None);
+
+        let accrued = Balance::new(dec!(1), dec!(1)).with_accrued(dec!(-0.25));
+        let round_trip: Balance =
+            serde_json::from_str(&serde_json::to_string(&accrued).unwrap()).unwrap();
+        assert_eq!(round_trip, accrued);
+        assert_eq!(round_trip.accrued, Some(dec!(-0.25)));
+    }
+
+    #[test]
+    fn apply_stream_update_keeps_debt_and_accrual() {
+        let prior =
+            Balance::new_margin(dec!(10), dec!(10), dec!(3), dec!(0.1)).with_accrued(dec!(1.5));
+        let merged =
+            Balance::apply_stream_update(Some(prior), &BalanceUpdate::new(dec!(4), dec!(2)));
+        assert_eq!(merged.total, dec!(6));
+        assert_eq!(merged.free, dec!(4));
+        assert_eq!(merged.margin, prior.margin);
+        assert_eq!(merged.accrued, Some(dec!(1.5)));
+
+        let cold = Balance::apply_stream_update(None, &BalanceUpdate::new(dec!(4), dec!(2)));
+        assert_eq!((cold.margin, cold.accrued), (None, None));
     }
 }

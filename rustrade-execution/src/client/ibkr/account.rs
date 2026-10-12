@@ -5,7 +5,7 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use fnv::FnvHashMap;
-use ibapi::contracts::SecurityType;
+use ibapi::{accounts::AccountSummaryTags, contracts::SecurityType};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     asset::name::AssetNameExchange, instrument::name::InstrumentNameExchange,
@@ -14,17 +14,47 @@ use smol_str::SmolStr;
 use std::str::FromStr;
 use tracing::warn;
 
-/// Aggregated balance data per currency from AccountSummary events.
+/// The account-summary tags [`BalanceAggregator`] reads: `AvailableFunds`, and IB's per-currency
+/// ledger for every currency of every account in the group.
+pub const BALANCE_SUMMARY_TAGS: &[&str] = &[
+    AccountSummaryTags::AVAILABLE_FUNDS,
+    AccountSummaryTags::LEDGER_ALL,
+];
+
+/// The ledger's row for its totals converted into base currency. It is a sum of the other rows,
+/// not a currency anyone holds.
+const LEDGER_BASE: &str = "BASE";
+
+/// Per-currency balances from an account-summary listing of [`BALANCE_SUMMARY_TAGS`].
+///
+/// One balance per currency in IB's ledger (`$LEDGER:ALL`), whose values IB sums over every
+/// account in the group:
+/// - `total` is the currency's `TotalCashBalance`, or its `CashBalance` when that is missing.
+///   IB defines both, like the account-level `TotalCashValue`, as cash recognized at the time of
+///   trade plus futures PnL.
+/// - `accrued` is the currency's `AccruedCash`: interest accrued this month and not yet posted.
+/// - `free` is `total`, capped at the accounts' `AvailableFunds` converted into the currency at
+///   the ledger's `ExchangeRate`. `AvailableFunds` is account-level and in base currency only, so
+///   every row is capped by the same funds and the rows' `free` values do not add up. Without
+///   `AvailableFunds`, or without a rate for a currency it must be converted from or to, `free`
+///   is `total`.
+///
+/// The ledger's `BASE` row is skipped.
 #[derive(Debug, Default)]
 pub struct BalanceAggregator {
     // SmolStr avoids heap allocation for short currency codes (USD, EUR, etc.)
-    balances: FnvHashMap<SmolStr, CurrencyBalance>,
+    ledger: FnvHashMap<SmolStr, LedgerCurrency>,
+    /// `AvailableFunds` per account, each in its account's base currency.
+    available_funds: Vec<(SmolStr, Decimal)>,
 }
 
 #[derive(Debug, Default, Clone)]
-struct CurrencyBalance {
-    total_cash: Option<Decimal>,
-    available_funds: Option<Decimal>,
+struct LedgerCurrency {
+    total_cash_balance: Option<Decimal>,
+    cash_balance: Option<Decimal>,
+    accrued_cash: Option<Decimal>,
+    /// Base-currency units per unit of this currency.
+    exchange_rate: Option<Decimal>,
 }
 
 impl BalanceAggregator {
@@ -34,41 +64,66 @@ impl BalanceAggregator {
 
     /// Process an AccountSummary event.
     pub fn process(&mut self, summary: &ibapi::accounts::AccountSummary) {
-        let currency = SmolStr::new(&summary.currency);
-        let entry = self.balances.entry(currency).or_default();
-
-        match summary.tag.as_str() {
-            "TotalCashValue" => {
-                // Parse directly to Decimal to preserve precision
-                match Decimal::from_str(&summary.value) {
-                    Ok(val) => entry.total_cash = Some(val),
-                    Err(e) => {
-                        warn!(tag = %summary.tag, value = %summary.value, error = %e, "Failed to parse balance")
-                    }
+        let field: fn(&mut LedgerCurrency) -> &mut Option<Decimal> = match summary.tag.as_str() {
+            AccountSummaryTags::AVAILABLE_FUNDS => {
+                if let Some(value) = parse_summary_value(summary) {
+                    self.available_funds
+                        .push((SmolStr::new(&summary.currency), value));
                 }
+                return;
             }
-            "AvailableFunds" => match Decimal::from_str(&summary.value) {
-                Ok(val) => entry.available_funds = Some(val),
-                Err(e) => {
-                    warn!(tag = %summary.tag, value = %summary.value, error = %e, "Failed to parse balance")
-                }
-            },
-            _ => {}
+            "TotalCashBalance" => |c| &mut c.total_cash_balance,
+            "CashBalance" => |c| &mut c.cash_balance,
+            AccountSummaryTags::ACCRUED_CASH => |c| &mut c.accrued_cash,
+            "ExchangeRate" => |c| &mut c.exchange_rate,
+            _ => return,
+        };
+        if let Some(value) = parse_summary_value(summary) {
+            let currency = self
+                .ledger
+                .entry(SmolStr::new(&summary.currency))
+                .or_default();
+            *field(currency) = Some(value);
         }
     }
 
     /// Convert aggregated data to rustrade AssetBalance list.
     pub fn to_balances(&self) -> Vec<AssetBalance<AssetNameExchange>> {
         let now = Utc::now();
-        self.balances
-            .iter()
-            .filter_map(|(currency, bal)| {
-                let total = bal.total_cash?;
-                let free = bal.available_funds.unwrap_or(total);
+        let rate = |currency: &str| {
+            self.ledger
+                .get(currency)
+                .and_then(|c| c.exchange_rate)
+                .filter(|rate| *rate > Decimal::ZERO)
+        };
+        // Every account's `AvailableFunds`, in base currency; `None` if any cannot be converted.
+        let available_funds = (!self.available_funds.is_empty())
+            .then(|| {
+                self.available_funds
+                    .iter()
+                    .map(|(currency, value)| rate(currency).and_then(|r| value.checked_mul(r)))
+                    .sum::<Option<Decimal>>()
+            })
+            .flatten();
 
+        self.ledger
+            .iter()
+            .filter(|(currency, _)| currency.as_str() != LEDGER_BASE)
+            .filter_map(|(currency, ledger)| {
+                let Some(total) = ledger.total_cash_balance.or(ledger.cash_balance) else {
+                    warn!(%currency, "IB's ledger lists the currency without a cash balance; skipped");
+                    return None;
+                };
+                let free = available_funds
+                    .zip(rate(currency))
+                    .and_then(|(funds, rate)| funds.checked_div(rate))
+                    .map_or(total, |funds| total.min(funds));
+
+                let mut balance = Balance::new(total, free);
+                balance.accrued = ledger.accrued_cash;
                 Some(AssetBalance {
                     asset: AssetNameExchange::from(currency.as_str()),
-                    balance: Balance::new(total, free),
+                    balance,
                     time_exchange: now,
                 })
             })
@@ -77,8 +132,19 @@ impl BalanceAggregator {
 
     /// Clear all aggregated data.
     pub fn clear(&mut self) {
-        self.balances.clear();
+        self.ledger.clear();
+        self.available_funds.clear();
     }
+}
+
+/// Parse an account-summary value, warning if it is not a number.
+fn parse_summary_value(summary: &ibapi::accounts::AccountSummary) -> Option<Decimal> {
+    // Parse directly to Decimal to preserve precision
+    Decimal::from_str(&summary.value)
+        .inspect_err(|e| {
+            warn!(tag = %summary.tag, value = %summary.value, error = %e, "Failed to parse balance")
+        })
+        .ok()
 }
 
 /// Collects IB position reports into at most one [`Position`] per instrument.
@@ -289,7 +355,6 @@ mod tests {
     use super::*;
     use ibapi::accounts::AccountSummary;
     use rust_decimal_macros::dec;
-    use std::str::FromStr;
 
     fn mock_account_summary(tag: &str, value: &str, currency: &str) -> AccountSummary {
         AccountSummary {
@@ -300,24 +365,134 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_balance_aggregator() {
-        let mut agg = BalanceAggregator::new();
+    /// Feed `agg` one account's `AvailableFunds` and a ledger row per `(currency, cash,
+    /// accrued, rate)`, as `$LEDGER:ALL` lists them.
+    fn ledger(
+        agg: &mut BalanceAggregator,
+        available_funds: Option<(&str, &str)>,
+        rows: &[(&str, &str, &str, &str)],
+    ) {
+        if let Some((currency, value)) = available_funds {
+            agg.process(&mock_account_summary("AvailableFunds", value, currency));
+        }
+        for &(currency, cash, accrued, rate) in rows {
+            for (tag, value) in [
+                ("Currency", currency),
+                ("CashBalance", cash),
+                ("TotalCashBalance", cash),
+                ("AccruedCash", accrued),
+                ("ExchangeRate", rate),
+                ("RealCurrency", currency),
+            ] {
+                agg.process(&mock_account_summary(tag, value, currency));
+            }
+        }
+    }
 
-        agg.process(&mock_account_summary("TotalCashValue", "10000.50", "USD"));
-        agg.process(&mock_account_summary("AvailableFunds", "8000.25", "USD"));
-        agg.process(&mock_account_summary("TotalCashValue", "5000.00", "EUR"));
+    fn balance_of<'a>(
+        balances: &'a [AssetBalance<AssetNameExchange>],
+        currency: &str,
+    ) -> &'a Balance {
+        &balances
+            .iter()
+            .find(|b| b.asset.as_ref() == currency)
+            .unwrap()
+            .balance
+    }
+
+    /// The shape of a paper account's ledger: base SGD with some USD. Each currency is its own
+    /// balance with its accrual, and the BASE row is not one.
+    #[test]
+    fn test_balance_aggregator_reads_the_ledger_per_currency() {
+        let mut agg = BalanceAggregator::new();
+        ledger(
+            &mut agg,
+            Some(("SGD", "1001324.57")),
+            &[
+                ("SGD", "1001190.04", "123.90", "1.00"),
+                ("USD", "8.30", "0.00", "1.2801581"),
+                ("BASE", "1001200.6653", "123.90", "1.00"),
+            ],
+        );
 
         let balances = agg.to_balances();
-        assert_eq!(balances.len(), 2);
+        assert_eq!(balances.len(), 2, "{balances:?}");
+        let sgd = balance_of(&balances, "SGD");
+        assert_eq!(sgd.total, dec!(1001190.04));
+        assert_eq!(sgd.free, dec!(1001190.04), "free is capped at total");
+        assert_eq!(sgd.accrued, Some(dec!(123.90)));
+        let usd = balance_of(&balances, "USD");
+        assert_eq!(usd.total, dec!(8.30));
+        assert_eq!(usd.free, dec!(8.30));
+        assert_eq!(usd.accrued, Some(dec!(0.00)));
+    }
 
-        let usd = balances.iter().find(|b| b.asset.as_ref() == "USD").unwrap();
-        assert_eq!(usd.balance.total, Decimal::from_str("10000.50").unwrap());
-        assert_eq!(usd.balance.free, Decimal::from_str("8000.25").unwrap());
+    /// `free` is the account's `AvailableFunds` in the row's currency when that is below its cash.
+    #[test]
+    fn test_balance_aggregator_caps_free_at_available_funds() {
+        let mut agg = BalanceAggregator::new();
+        ledger(
+            &mut agg,
+            Some(("SGD", "1280")),
+            &[("SGD", "5000", "0", "1"), ("USD", "4000", "-2.5", "1.28")],
+        );
 
-        let eur = balances.iter().find(|b| b.asset.as_ref() == "EUR").unwrap();
-        assert_eq!(eur.balance.total, Decimal::from_str("5000.00").unwrap());
-        assert_eq!(eur.balance.free, Decimal::from_str("5000.00").unwrap());
+        let balances = agg.to_balances();
+        assert_eq!(balance_of(&balances, "SGD").free, dec!(1280));
+        let usd = balance_of(&balances, "USD");
+        assert_eq!(usd.free, dec!(1000), "1280 SGD at 1.28 SGD per USD");
+        assert_eq!(usd.accrued, Some(dec!(-2.5)));
+    }
+
+    /// Several accounts' `AvailableFunds` are summed in base currency, like the ledger.
+    #[test]
+    fn test_balance_aggregator_sums_available_funds_over_accounts() {
+        let mut agg = BalanceAggregator::new();
+        agg.process(&mock_account_summary("AvailableFunds", "100", "USD"));
+        ledger(
+            &mut agg,
+            Some(("SGD", "72")),
+            &[("SGD", "1000", "0", "1"), ("USD", "1000", "0", "1.28")],
+        );
+
+        let balances = agg.to_balances();
+        assert_eq!(
+            balance_of(&balances, "SGD").free,
+            dec!(200),
+            "72 + 100 × 1.28"
+        );
+        assert_eq!(balance_of(&balances, "USD").free, dec!(156.25));
+    }
+
+    /// Without `AvailableFunds`, or a rate to convert it, `free` is `total`; an unparseable value
+    /// is skipped.
+    #[test]
+    fn test_balance_aggregator_free_is_total_without_funds_or_rate() {
+        let mut agg = BalanceAggregator::new();
+        ledger(&mut agg, None, &[("USD", "-50", "-0.1", "1")]);
+        let usd = *balance_of(&agg.to_balances(), "USD");
+        assert_eq!((usd.total, usd.free), (dec!(-50), dec!(-50)));
+
+        let mut agg = BalanceAggregator::new();
+        ledger(&mut agg, Some(("SGD", "10")), &[("USD", "500", "0", "n/a")]);
+        assert_eq!(balance_of(&agg.to_balances(), "USD").free, dec!(500));
+    }
+
+    /// `CashBalance` stands in when `TotalCashBalance` is missing, and a currency with neither, or
+    /// without `AccruedCash`, is handled.
+    #[test]
+    fn test_balance_aggregator_cash_fallbacks() {
+        let mut agg = BalanceAggregator::new();
+        agg.process(&mock_account_summary("CashBalance", "75", "EUR"));
+        agg.process(&mock_account_summary("AccruedCash", "1", "JPY"));
+
+        let balances = agg.to_balances();
+        assert_eq!(balances.len(), 1, "JPY has no cash: {balances:?}");
+        let eur = balance_of(&balances, "EUR");
+        assert_eq!(
+            (eur.total, eur.free, eur.accrued),
+            (dec!(75), dec!(75), None)
+        );
     }
 
     fn report(
@@ -556,7 +731,7 @@ mod tests {
     #[test]
     fn test_balance_aggregator_clear() {
         let mut agg = BalanceAggregator::new();
-        agg.process(&mock_account_summary("TotalCashValue", "1000", "USD"));
+        ledger(&mut agg, Some(("USD", "900")), &[("USD", "1000", "0", "1")]);
         assert_eq!(agg.to_balances().len(), 1);
 
         agg.clear();

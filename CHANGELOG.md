@@ -280,6 +280,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: balances carry accrued interest, and IBKR reports one balance per currency it
+  holds** (`rustrade-execution`, #561).
+  - **Breaking:** `Balance` gains `accrued: Option<Decimal>`: carry the venue has accrued and not
+    yet posted to `total`, signed positive when the account will receive it, so the cash the
+    account will hold once it posts is `total + accrued`. `None` means the venue reports none. It
+    is kept, like margin debt, when a stream update is applied (`Balance::apply_stream_update`),
+    and a stored balance without it still loads. `Balance` is now `#[non_exhaustive]`: build it
+    with `Balance::new` or `Balance::new_margin`, plus the new `with_accrued`, and match it with
+    `..`. Later fields will not break that code.
+  - **Breaking in behaviour:** `IbkrClient` read balances from the account summary in base
+    currency only. It reported one balance, named for the base currency, that already included the
+    other currencies converted into it. It now reads IB's per-currency ledger, so each currency the
+    account holds is its own balance, in that currency. Code that took the single balance as
+    the whole account's cash must now convert and sum the currencies itself.
+  - IBKR's `total` is a currency's `TotalCashBalance` (else `CashBalance`), and `accrued` its
+    `AccruedCash`: interest accrued this month, posted to cash at the month's end or early in the
+    next. IB does not document whether stock borrow fees accrue in it. `free` is `total`, capped at
+    the account's `AvailableFunds` converted into the currency. It used to be `AvailableFunds`
+    itself, which can exceed `total`. IB reports `AvailableFunds` for the whole account only, so
+    every currency is capped by the same funds. With several accounts, the balances sum them, as
+    IB's ledger does.
+
 - **`binance-sdk` 74.0.0 → 74.1.1** (`rustrade-execution`, `binance` feature). The three
   `binance_sdk::common` internals the margin user-data stream couples to were re-verified before
   merge, and hold by construction: `common/` is byte-identical to 74.0.0. The one change that
