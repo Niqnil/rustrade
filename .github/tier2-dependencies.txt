@@ -629,7 +629,8 @@ binance-sdk=74.1.1  # 2026-10-12 | Exchange SDK, signing/IO. PINNED: margin user
 #   2. `WebsocketEventEmitter::subscribe` (websocket.rs:128-146): one task, one unbounded channel, sequential
 #      callback; registered at margin.rs:2146.
 #   3. `send_request` (utils.rs:951), 7 args, timestamp/signature/X-MBX-APIKEY unchanged; the hand-rolled
-#      `userListenToken` POST (margin.rs:1617) passes the same 7 args. Still no `userListenToken` binding (#109 stays blocked).
+#      `userListenToken` POST (margin.rs:1617) passes the same 7 args. Still no `userListenToken` binding
+#      (#109 stays blocked).
 # `diff -rq` delta: algo (new spot `volume_participation` endpoint), vip_loan, w3w_prediction and
 # derivatives_trading_options REST models -- none compiled under `spot` + `margin_trading` -- plus ONE file we
 # compile: margin_trading/websocket_streams/models/execution_report.rs retypes `d`, `D`, `j`, `J`, `u`, `U`,

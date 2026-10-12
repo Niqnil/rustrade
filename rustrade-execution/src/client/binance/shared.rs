@@ -1937,12 +1937,12 @@ pub(crate) fn order_running_totals<T: BinanceExecutionFields>(
 /// binance-sdk generates one report type per stream family, each typing every key strictly, and
 /// those types change between releases: until 74.1.1 the margin stream's report type declared `d`,
 /// `D`, `j`, `J`, `u`, `U`, `a` and `v` strings, where spot's declared them integers and Binance's
-/// docs show numbers. 74.1.1 retyped them to integers, in a patch release. Decoding into an SDK type ties
-/// every report to the SDK and the venue agreeing on the type of every key, including keys this
-/// crate never reads, and a report that fails to decode is logged and dropped, fill included. This
-/// type models only the keys the converter reads and ignores every other, so an unread key cannot
-/// fail a decode, and the two clients decode through one definition, which the spot testnet
-/// exercises for margin too.
+/// docs show numbers. 74.1.1 retyped them to integers, in a patch release. Decoding into an SDK
+/// type ties every report to the SDK and the venue agreeing on the type of every key, including
+/// keys this crate never reads, and a report that fails to decode is logged and dropped, fill
+/// included. This type models only the keys the converter reads and ignores every other, so an
+/// unread key cannot fail a decode, and the two clients decode through one definition, which the
+/// spot testnet exercises for margin too.
 ///
 /// Every field is optional: which keys a report carries depends on its execution type, and each
 /// use below says what it does without one.
