@@ -152,7 +152,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Breaking, in behaviour:** these refusals no longer arrive as `OrderRejected` or
     `BalanceInsufficient`. Code matching on those for a refused short or borrow must match
     `BorrowRejected` too. `ApiError` is `#[non_exhaustive]`, so the variant is additive at compile
-    time.
+    time. Likewise, the Binance shortfalls below that are now `BalanceInsufficient` (`-3023`, and
+    an `executionReport` with status `REJECTED`) no longer arrive as `OrderRejected`.
   - `BinanceMargin` maps by code: `-3006` → `BorrowLimitExceeded`; `-3008`, `-3012` and `-3014` →
     `BorrowDisabled`; `-3045` → `InventoryUnavailable`. All five were `OrderRejected` before.
   - Binance's `-3041` and `-3023` are now `BalanceInsufficient` by code; `-3023`'s wording was
