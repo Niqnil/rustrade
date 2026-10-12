@@ -84,7 +84,7 @@
 
 use ibapi::{
     contracts::{Contract, Currency, Exchange, SecurityType, Symbol},
-    market_data::realtime::generic_tick,
+    market_data::{MarketDataType, realtime::generic_tick},
 };
 use rust_decimal_macros::dec;
 use rustrade_execution::{
@@ -2099,6 +2099,25 @@ fn test_shortability_raw_ticks() {
         test_client_id_base() + 26,
     )
     .expect("connection failed");
+
+    // IBKR_MARKET_DATA_TYPE: 1 live (IB's default), 2 frozen, 3 delayed, 4 delayed frozen. An
+    // account without a live subscription gets notice 10089 and no ticks under 1.
+    if let Some(data_type) = std::env::var("IBKR_MARKET_DATA_TYPE")
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+    {
+        let data_type = match data_type {
+            1 => MarketDataType::Realtime,
+            2 => MarketDataType::Frozen,
+            3 => MarketDataType::Delayed,
+            4 => MarketDataType::DelayedFrozen,
+            other => panic!("IBKR_MARKET_DATA_TYPE must be 1 to 4, not {other}"),
+        };
+        println!("market data type: {data_type:?}");
+        client
+            .switch_market_data_type(data_type)
+            .expect("switch_market_data_type failed");
+    }
 
     for symbol in shortability_symbols() {
         let contract = Contract::stock(symbol.as_str()).build();
