@@ -4590,24 +4590,27 @@ fn trade_amendment_event(
         match (id, price, quantity, parse_side(&order.side)) {
             (Some(id), Some(price), Some(quantity), Some(side)) if quantity > Decimal::ZERO => {
                 TradeAmendmentKind::Corrected {
-                    replacement: Trade::new(
-                        id,
-                        order_id.clone(),
-                        instrument.clone(),
-                        StrategyId::unknown(),
-                        time_exchange,
-                        side,
-                        price,
-                        quantity,
-                        // What `order.filled_qty` means on a correction is undocumented, so the
-                        // replacement does not claim a cumulative.
-                        None,
-                        // As on a fill: no fee info in WebSocket updates.
-                        AssetFees::new(
-                            AssetNameExchange::from(USD),
-                            Decimal::ZERO,
-                            Some(Decimal::ZERO),
+                    replacement: with_reported_cid(
+                        Trade::new(
+                            id,
+                            order_id.clone(),
+                            instrument.clone(),
+                            StrategyId::unknown(),
+                            time_exchange,
+                            side,
+                            price,
+                            quantity,
+                            // What `order.filled_qty` means on a correction is undocumented, so the
+                            // replacement does not claim a cumulative.
+                            None,
+                            // As on a fill: no fee info in WebSocket updates.
+                            AssetFees::new(
+                                AssetNameExchange::from(USD),
+                                Decimal::ZERO,
+                                Some(Decimal::ZERO),
+                            ),
                         ),
+                        order.client_order_id.as_ref(),
                     ),
                 }
             }
@@ -4734,6 +4737,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
                     Some(Decimal::ZERO),
                 ),
             );
+            let trade = with_reported_cid(trade, order.client_order_id.as_ref());
             let trade_event = UnindexedAccountEvent::new(
                 ExchangeId::AlpacaBroker,
                 AccountEventKind::Trade(trade),
@@ -5227,6 +5231,18 @@ fn convert_option_events(
             Some(trade)
         })
         .collect()
+}
+
+/// `trade` with the client order id its WebSocket order update reported, if any.
+fn with_reported_cid<AssetKey, InstrumentKey>(
+    trade: Trade<AssetKey, InstrumentKey>,
+    client_order_id: Option<&SmolStr>,
+) -> Trade<AssetKey, InstrumentKey> {
+    match client_order_id {
+        // A `SmolStr` clone shares a long id rather than copying it.
+        Some(cid) if !cid.is_empty() => trade.with_client_order_id(ClientOrderId(cid.clone())),
+        _ => trade,
+    }
 }
 
 fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
@@ -6380,6 +6396,25 @@ mod tests {
         (trade, order)
     }
 
+    /// A fill carries the client order id its order was placed with, so a consumer can attribute
+    /// it before any response names the order.
+    #[test]
+    fn test_convert_trade_update_fill_carries_the_client_order_id() {
+        let mut order = make_order_ws("ord-1", "SPY", "buy", "1");
+        order.client_order_id = Some(SmolStr::new("outside-1"));
+        let update = AlpacaTradeUpdate {
+            event: SmolStr::new("fill"),
+            execution_id: Some("exec-1"),
+            previous_execution_id: None,
+            order,
+            price: Some("150.00"),
+            qty: Some("1"),
+            timestamp: Some("2025-04-18T14:30:00Z"),
+        };
+        let (trade, _order) = fill_events(convert_trade_update(update));
+        assert_eq!(trade.client_order_id, Some(ClientOrderId::new("outside-1")));
+    }
+
     #[test]
     fn test_convert_trade_update_fill_produces_trade_with_execution_id() {
         let update = AlpacaTradeUpdate {
@@ -6394,6 +6429,10 @@ mod tests {
         let (trade, order) = fill_events(convert_trade_update(update));
         // The venue's execution id, which the fill's FILL activity carries too.
         assert_eq!(trade.id.0.as_str(), "exec-1");
+        assert_eq!(
+            trade.client_order_id, None,
+            "the update names no client order id"
+        );
         assert_eq!(trade.price, Decimal::from_str("150.00").unwrap());
         assert_eq!(trade.quantity, Decimal::from_str("1").unwrap());
 

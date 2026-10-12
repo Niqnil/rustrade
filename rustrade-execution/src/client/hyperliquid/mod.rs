@@ -218,8 +218,8 @@ use crate::{
 use chrono::{DateTime, Utc};
 use common::{
     CLOID_REQUIRED, CancelOnDropStream, InstrumentFilter, OpenOrderListing, UnknownCoins,
-    cancel_outcome, cid_to_cloid, map_tif, millis_to_datetime, open_order_to_order, parse_decimal,
-    parse_side, span_millis, user_fills_by_time, warn_unknown_coins,
+    cancel_outcome, cid_to_cloid, cloid_to_cid, map_tif, millis_to_datetime, open_order_to_order,
+    parse_decimal, parse_side, span_millis, user_fills_by_time, warn_unknown_coins,
 };
 pub use config::{HyperliquidConfig, HyperliquidConfigError, Network};
 pub use error::HyperliquidConnectError;
@@ -1343,6 +1343,7 @@ impl ExecutionClient for HyperliquidClient {
                 // As on the stream, whose copy of a fill usually arrives first; see `TradeOrigin`.
                 origin: TradeOrigin::Order,
                 position_side: None,
+                client_order_id: fill.cloid.as_deref().and_then(cloid_to_cid),
             });
         }
 
@@ -1486,6 +1487,7 @@ fn fill_to_account_event(
         // as `Order`; see `TradeOrigin`.
         origin: TradeOrigin::Order,
         position_side: None,
+        client_order_id: fill.cloid.as_deref().and_then(cloid_to_cid),
     };
 
     Some(AccountEvent::new(
@@ -2272,6 +2274,30 @@ mod tests {
         }
     }
 
+    /// A fill reports its order's cloid as the client order id the order was placed under.
+    #[tokio::test]
+    async fn a_fill_carries_the_client_order_id_of_its_cloid() {
+        let fill_json = r#"{
+            "coin": "flx:TSLA", "side": "B", "px": "250", "sz": "2",
+            "time": 1714100000000, "hash": "0xhip3", "startPosition": "0",
+            "dir": "Open Long", "closedPnl": "0", "oid": 7,
+            "cloid": "0x0123456789abcdef0123456789abcdef",
+            "crossed": true, "fee": "0.2", "feeToken": "USDH", "tid": 77
+        }"#;
+        let fill: hyperliquid_rust_sdk::TradeInfo = serde_json::from_str(fill_json).unwrap();
+
+        let dexes = perp_dexes::tests::xyz_and_flx().await;
+        let AccountEventKind::Trade(trade) = fill_to_account_event(&fill, &dexes).unwrap().kind
+        else {
+            panic!("Expected Trade event");
+        };
+        assert_eq!(
+            trade.client_order_id,
+            cloid_to_cid("0x0123456789abcdef0123456789abcdef")
+        );
+        assert!(trade.client_order_id.is_some());
+    }
+
     #[tokio::test]
     async fn a_builder_deployed_fill_is_named_and_charged_in_its_dex_collateral() {
         // A HIP-3 perpetual settles in its deployer's collateral, which is not always USDC.
@@ -2289,6 +2315,7 @@ mod tests {
             panic!("Expected Trade event");
         };
         assert_eq!(trade.instrument.as_ref(), "flx:TSLA-USDH-PERP");
+        assert_eq!(trade.client_order_id, None, "placed without a cloid");
         assert_eq!(trade.fees.asset.as_ref(), "USDH");
         assert_eq!(trade.fees.fees, dec!(0.2));
         assert_eq!(

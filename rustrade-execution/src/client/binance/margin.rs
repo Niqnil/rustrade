@@ -73,7 +73,8 @@ use super::shared::{
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event, drop_after,
     frame_excerpt, gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
     log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
-    recovered_order_totals, response_decode_error, rest_call_with_retry, trailing_params,
+    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
+    trailing_params,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -448,6 +449,13 @@ impl BinanceMarginConfig {
 /// `BinanceMargin` clients in a single engine (e.g. one cross, one isolated) therefore collides
 /// their exchange identity. A single engine should run **at most one** `BinanceMargin` client; a
 /// consumer needing cross and isolated concurrently runs them in separate engines.
+///
+/// # Fills of other clients' orders
+/// The account stream, fill recovery and `fetch_trades` report every fill on the account, whoever
+/// placed the order, and Binance does not say who did. A consumer that also trades the account
+/// outside the engine filters those fills itself, for example by
+/// [`Trade::client_order_id`](crate::trade::Trade::client_order_id). See the
+/// [module docs](super#every-fill-on-the-account-is-delivered).
 #[derive(Clone)]
 pub struct BinanceMargin {
     config: Arc<BinanceMarginConfig>,
@@ -2221,7 +2229,9 @@ fn register_user_data_listener(
 ///
 /// `myTrades` reports executions only, with no cumulative, so each recovered trade's
 /// `order_filled_quantity` is rebuilt from its order's executions by
-/// [`recovered_order_totals`]. A trade whose order could not be looked up keeps `None`.
+/// [`recovered_order_totals`]. Nor does it carry a client order id, so each recovered trade's
+/// `client_order_id` is then read from its order by [`recovered_order_cids`], with whatever time
+/// the walks left. A trade whose order could not be looked up keeps `None` in either.
 ///
 /// Margin `myTrades` is read by time in windows under 24 hours (see
 /// [`paginate_margin_my_trades`]), so each day of a gap before its first fill costs one sequential
@@ -2305,12 +2315,24 @@ async fn recover_margin_fills(
                         },
                     )
                     .await;
+                    // After the walks, so these reads only use time the walks left: the walks
+                    // matter more, since a fill without a cumulative leaves its order behind.
+                    let cids = recovered_order_cids(
+                        ExchangeId::BinanceMargin,
+                        &inst,
+                        &raw,
+                        order_executions_deadline,
+                        |order_id| fetch_margin_order_cid(&rest, &rl, &inst, order_id, is_isolated),
+                    )
+                    .await;
                     let trades = raw
                         .iter()
                         .filter_map(|t| {
                             let mut trade = convert_margin_trade(t, &inst)?;
                             trade.order_filled_quantity =
                                 t.id.and_then(|id| totals.get(&id).copied());
+                            trade.client_order_id =
+                                t.order_id.and_then(|id| cids.get(&id).cloned());
                             Some(trade)
                         })
                         .collect::<Vec<_>>();
@@ -3277,6 +3299,45 @@ async fn fetch_margin_order_lookup(
                 OrderLookup::Ended(Box::new(order))
             }),
     )
+}
+
+/// The client order id of the order `order_id` on `instrument`, read with
+/// `GET /sapi/v1/margin/order` (weight 10) in the cross or isolated account as `is_isolated`
+/// says, for fill recovery: `myTrades` carries none. `None` if Binance reports none, or does not
+/// know the order.
+async fn fetch_margin_order_cid(
+    rest: &Arc<RestApi>,
+    rate_limiter: &RateLimitTracker,
+    instrument: &InstrumentNameExchange,
+    order_id: i64,
+    is_isolated: bool,
+) -> Result<Option<ClientOrderId>, UnindexedClientError> {
+    let symbol = instrument.name().to_string();
+    let isolated = QueryMarginAccountsOrderIsIsolatedEnum::from_flag(is_isolated);
+    let response = match rest_call_with_retry(rest, rate_limiter, RequestKind::Essential, |rest| {
+        let (symbol, isolated) = (symbol.clone(), isolated.clone());
+        Box::pin(async move {
+            let params = QueryMarginAccountsOrderParams::builder(symbol)
+                .order_id(order_id)
+                .is_isolated(isolated)
+                .build()?;
+            rest.query_margin_accounts_order(params).await
+        })
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(e) if is_unknown_order(&e) => {
+            debug!(%instrument, order_id, error = %e, "BinanceMargin does not know this order");
+            return Ok(None);
+        }
+        Err(e) => return Err(classify_rest_query_error(&e, Some(instrument))),
+    };
+    let row = response.data().await.map_err(response_decode_error)?;
+    Ok(row
+        .client_order_id
+        .filter(|cid| !cid.is_empty())
+        .map(ClientOrderId::new))
 }
 
 /// The client order ids `GET /sapi/v1/margin/openOrders` lists on `instruments` (weight 10 each,
@@ -5377,6 +5438,7 @@ mod tests {
                 assert_eq!(t.quantity, Decimal::new(5, 1));
                 assert_eq!(t.fees.asset.name().as_str(), "BNB"); // 3rd-party fee asset preserved
                 assert_eq!(t.fees.fees, Decimal::new(1, 3));
+                assert_eq!(t.client_order_id, Some(ClientOrderId::new("cid-1")));
             }
             other => panic!("expected Trade, got {other:?}"),
         }
@@ -5474,6 +5536,25 @@ mod tests {
             AccountEventKind::OrderCancelled(resp) => assert!(resp.state.is_ok()),
             other => panic!("expected OrderCancelled, got {other:?}"),
         }
+    }
+
+    /// A report without `c` gives its fill no client order id, rather than the exchange id the
+    /// order snapshot falls back to.
+    #[test]
+    fn margin_ws_trade_without_a_client_order_id_reports_none() {
+        let frame = push(serde_json::json!({
+            "e": "executionReport", "s": "BTCUSDT", "S": "SELL", "o": "MARKET",
+            "x": "TRADE", "X": "FILLED", "i": 12_345_i64,
+            "t": 99_i64, "l": "1", "L": "48000", "z": "1",
+            "q": "1", "n": "0", "N": "USDT", "T": 1_700_000_000_000_i64,
+        }));
+        let mut buf = Vec::new();
+        assert!(!convert_margin_user_data_events(&frame, &mut buf));
+        let AccountEventKind::Trade(trade) = &buf[0].kind else {
+            panic!("expected Trade, got {:?}", buf[0].kind);
+        };
+        assert_eq!(trade.order_id.0.as_str(), "12345");
+        assert_eq!(trade.client_order_id, None);
     }
 
     #[test]
@@ -6332,6 +6413,106 @@ mod tests {
             .map(|request| request.url.query_pairs().into_owned().collect())
             .collect();
         (read.into_iter().map(|t| t.id.unwrap()).collect(), requests)
+    }
+
+    /// Recovery reads each recovered fill's order once, in the account it trades, for the client
+    /// order id `myTrades` lacks. An order Binance no longer knows leaves its fill without one.
+    #[tokio::test]
+    async fn recovered_margin_fills_carry_their_orders_client_order_ids() {
+        recovered_margin_fills_carry_client_order_ids(true).await;
+        recovered_margin_fills_carry_client_order_ids(false).await;
+    }
+
+    async fn recovered_margin_fills_carry_client_order_ids(is_isolated: bool) {
+        let disconnect = Utc::now() - chrono::Duration::minutes(10);
+        let reconnect = Utc::now() - chrono::Duration::minutes(5);
+        let fill_time = (disconnect + chrono::Duration::minutes(1)).timestamp_millis();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/myTrades"))
+            .respond_with(MarginMyTradesVenue {
+                trades: vec![(1, fill_time, 1), (2, fill_time, 2)],
+                end_exclusive: false,
+            })
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+            .and(wiremock::matchers::query_param("orderId", "1"))
+            .and(wiremock::matchers::query_param(
+                "isIsolated",
+                if is_isolated { "TRUE" } else { "FALSE" },
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"symbol": "BTCUSDT", "orderId": 1, "clientOrderId": "repay-1"}),
+            ))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+            .and(wiremock::matchers::query_param("orderId", "2"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400).set_body_json(
+                    serde_json::json!({"code": -2013, "msg": "Order does not exist."}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        let rest = Arc::new(MarginTradingRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .unwrap(),
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut unrecovered = UnrecoveredFills::default();
+        unrecovered.open(
+            &[InstrumentNameExchange::new("BTCUSDT")],
+            disconnect,
+            reconnect,
+        );
+
+        recover_margin_fills(
+            &rest,
+            &Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
+            &mut unrecovered,
+            &tx,
+            &new_dedup_cache(),
+            &KnownLiveOrders::shared(ExchangeId::BinanceMargin),
+            is_isolated,
+        )
+        .await;
+
+        let mut cids: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event.kind {
+                AccountEventKind::Trade(trade) => Some((
+                    trade.id.0.to_string(),
+                    trade.client_order_id,
+                    trade.order_filled_quantity.is_some(),
+                )),
+                _ => None,
+            })
+            .collect();
+        cids.sort();
+        // The cumulatives from the walks, read first, are untouched by the reads after them.
+        assert_eq!(
+            cids,
+            [
+                ("1".to_string(), Some(ClientOrderId::new("repay-1")), true),
+                ("2".to_string(), None, true),
+            ],
+            "is_isolated: {is_isolated}"
+        );
+        let order_reads = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/sapi/v1/margin/order")
+            .count();
+        assert_eq!(order_reads, 2, "one read per order");
     }
 
     /// A venue whose trades each belong to an order of the same id.
