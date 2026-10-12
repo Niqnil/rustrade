@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-12
+
 ### Added
 
 - **`Trade::client_order_id`: the client order id of the order a fill belongs to**
@@ -71,8 +73,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     change a copy by assigning its fields: struct literals and `..trade` updates no longer compile.
   - `TradeOrigin` (`#[non_exhaustive]`): `Order`, `Liquidation`, `Adl`, `Assignment`, `Exercise`,
     `Expiry` and `External`. `Order` means no other origin was reported, not that the client placed
-    the order; its rustdoc lists what each venue reports. Binance, Hyperliquid, Alpaca and the
-    simulated venue report `Order` only for now. `is_forced()` is true for `Liquidation`, `Adl`
+    the order; its rustdoc lists what each venue reports. Binance, Hyperliquid and the simulated
+    venue report `Order` only, and Alpaca does too except in `fetch_option_events` (below), which
+    reports `Expiry`, `Exercise` and `Assignment`. `is_forced()` is true for `Liquidation`, `Adl`
     and `Assignment`. A `Trade`'s `Display` shows its origin when it is not `Order`.
   - `IbkrClient` reports a fill IB flags as an IB-initiated liquidation as `Liquidation`, whichever
     API client placed the order; it was dropped when another client had. Fill recovery and
@@ -114,9 +117,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     for a venue in hedge mode that names the position a fill belongs to. The engine checks a
     forced fill against it: it can only confirm the side the fill reduces, not choose among
     several positions on that side. No client in this crate sets it yet.
-  - **Breaking:** `TearSheet`, `TearSheetGenerator` and `TradingSummary` gain
-    `fills_unallocated`. They have public fields, so code that builds one with a struct
-    literal needs the new field.
+  - **Breaking:** `TearSheet`, `TearSheetGenerator` and `TradingSummary` gain `fills_forced`
+    and `fills_unallocated`, and `TearSheet` and `PnLReturns` gain `carry` (all above). They have
+    public fields, so code that builds one with a struct literal needs the new fields.
 - **Margin calls and liquidation warnings: `AccountEventKind::Notice`** (`rustrade-execution`,
   part of #552).
   - An `AccountNotice` carries what the venue reported (`NoticeKind`: `MarginCall`,
@@ -201,8 +204,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `Shortability` (`rustrade-execution`, `#[non_exhaustive]`) describes what a venue says about
     lending an instrument: whether it is shortable, whether it is easy to borrow, how much there is
     to lend in total, and the annualised borrow fee. Every field is optional, and the values are
-    advisory: a venue can still refuse a short its flags allow. It is the type a future live
-    shortability query will return (#572).
+    advisory: a venue can still refuse a short its flags allow. It is also the type
+    `ShortabilityClient::fetch_shortability` returns (#572, below).
   - `ShortabilityProvider` gives a simulated venue the `Shortability` of an instrument at any
     instant, and says separately whether a short-sale restriction is in effect.
     `ShortabilityTable` is a built-in provider from per-instrument step histories and restriction
@@ -236,10 +239,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `BinanceMargin` implements both, for its cross or isolated margin. A pair is shortable when it
     is traded on margin, may be sold and its base asset may be borrowed; Binance's delisting
     schedule is not read, so a pair due to be delisted reads shortable until Binance clears those
-    flags. The fee is the base asset's next hourly interest rate times 24 × 365. A query costs 102 of Binance's per-IP request
-    weight on cross margin and 111 on isolated, almost all of it the interest rate; the borrow
-    capacity costs 51 and 60. Binance does not say how much it has to lend in total, so
-    `available` is unknown there.
+    flags. The fee is the base asset's next hourly interest rate times 24 × 365. A query costs
+    102 of Binance's per-IP request weight on cross margin and 111 on isolated, almost all of it
+    the interest rate; the borrow capacity costs 51 and 60. Binance does not say how much it has
+    to lend in total, so `available` is unknown there.
   - `IbkrClient` implements `ShortabilityClient` from IB's shortable ticks, through a streaming
     market data request for generic tick 236: tick 46's level gives shortable and easy to borrow,
     and tick 89 the shares IB has to lend. IB reports no borrow fee to the API, so the fee is
@@ -250,9 +253,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `with_shortability_timeout`, or `shortability_timeout_ms` in a config file), and returns what
     arrived. Once tick 46 has arrived, tick 89 is waited for at most 2 s more: IB can send none
     for a stock it has few shares of, which then comes back with `available` unknown. The request
-    asks for IB's delayed market data, which IB serves only where the
-    account has no live subscription for the stock, so an account without one, such as a paper
-    account, still gets the ticks. Nothing arriving is an error: `ConnectivityError::Timeout`, or
+    asks for IB's delayed market data, which IB serves only where the account has no live
+    subscription for the stock, so an account without one, such as a paper account, still gets
+    the ticks. Nothing arriving is an error: `ConnectivityError::Timeout`, or
     `ApiError::RequestRejected` carrying IB's notices; a notice that the account may not have the
     stock's market data, live or delayed, ends the wait at once. With every market data line in
     use, by this client, another API client or TWS, it is the new `ApiError::CapacityExceeded`. A
@@ -265,8 +268,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`PerpCoin::sz_decimals`: a Hyperliquid perpetual's size precision** (`rustrade-instrument`,
   #536). It is read from `meta`'s `szDecimals`, as `SpotPair::base_sz_decimals` is from
   `spotMeta`, so `rustrade-data`'s `HyperliquidMeta` now gives a perpetual's order precision
-  without an execution client. A `meta` deserialized into `Perps` must now carry `szDecimals`,
-  which Hyperliquid sends for every perpetual.
+  without an execution client. **Breaking:** a `meta` deserialized into `Perps` must now carry
+  `szDecimals`, which Hyperliquid sends for every perpetual.
 - **Binance margin: read the interest charged and the forced liquidations** (`rustrade-execution`,
   #560, #565).
   - `BinanceMargin::fetch_margin_interest(start, end)` reads Binance's interest history and
@@ -333,9 +336,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     position of its own. The share leg of an exercise or assignment, on an instrument that never
     expires, can also open a position, as a put assignment buys shares the account did not hold.
     With nothing on the side it closes, it opens one under its order id; with several positions
-    there, it is applied to none. `fills_forced_unallocated` from #567 is renamed
-    `fills_unallocated` on `TearSheet`, `TearSheetGenerator` and `TradingSummary`, since it now
-    counts these fills too.
+    there, it is applied to none. Such fills are counted in `fills_unallocated` too.
 
 ### Changed
 
@@ -388,8 +389,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A Binance query rejection names the pair it asked about** (`rustrade-execution`). When a
   `BinanceSpot` or `BinanceMargin` query about one instrument is refused, the
   `ApiError::RequestRejected` message now starts with its symbol, as Binance's own text often does
-  not say which: `BTCUSDT: -11001 Isolated margin account does not exist.` Code that matches the
-  message's start needs updating; the Binance code is still in it.
+  not say which: `BTCUSDT: -11001 Isolated margin account does not exist.` **Breaking, in
+  behaviour:** code that matches the message's start needs updating; the Binance code is still in
+  it.
 
 - **The check of how orders ended while disconnected stops when the venue limits requests**
   (`rustrade-execution`). Closes #529.
@@ -412,12 +414,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     confirmation echoes, so a failed batch names only the subscriptions Kraken did not confirm.
   - `BitfinexWebSocketSubValidator` and Massive's subscriber now fail with
     `SocketError::Unacknowledged`, carried into `DataError::SubscriptionsUnacknowledged`, where
-    they returned `SocketError::Subscribe`, flattened to `DataError::Socket`. A caller matching
-    `DataError::Socket` for these failures must match the new variant. Bitfinex's error event names
-    the channel and symbol it refused, and the reason now quotes them. Massive's refusal names
-    none, so the refused subscription is among those it lists. The subscriptions are listed in
-    the error's field rather than in its reason, so the reason texts changed: Massive's timeout no
-    longer says `never confirmed: ...`.
+    they returned `SocketError::Subscribe`, flattened to `DataError::Socket`. **Breaking, in
+    behaviour:** a caller matching `DataError::Socket` for these failures must match the new
+    variant. Bitfinex's error event names the channel and symbol it refused, and the reason now
+    quotes them. Massive's refusal names none, so the refused subscription is among those it
+    lists. The subscriptions are listed in the error's field rather than in its reason, so the
+    reason texts changed: Massive's timeout no longer says `never confirmed: ...`.
 
 - **Breaking: `ApiError::RateLimit` carries the venue's wait** (`rustrade-execution`, #585).
   - It is now `RateLimit { retry_after: Option<Duration> }`, `#[non_exhaustive]`: match it as
@@ -477,8 +479,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`rustrade-data`, #598). `exchange_supports_instrument_kind` granted `Spot` to every exchange not
   denied by name, so a non-spot connector added without an edit there would claim spot. It now
   grants `Spot` to each exchange whose connector serves a spot market, and denies it to every
-  other, as it does the other kinds. `HyperliquidPerp`, which serves perpetuals only, was granted
-  `Spot` by the old default and is now refused it. So is every `ExchangeId` with no connector.
+  other, as it does the other kinds. **Breaking, in behaviour:** `HyperliquidPerp`, which serves
+  perpetuals only, was granted `Spot` by the old default and is now refused it. So is every
+  `ExchangeId` with no connector.
 - **Breaking: Kraken subscriptions made from base and quote assets work; the connector now speaks
   Kraken's WebSocket v2** (`rustrade-data`). Fixes #588.
   - On Kraken's v1 API, which the connector used, every subscription built from a
@@ -521,6 +524,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A refusal's message now starts with the body's code when it has one, e.g.
     `40310000 insufficient buying power`. That covers every 4xx except a 404 and the
     `Unauthenticated` ones, and changes the text of 422 refusals too.
+  - **Breaking, in behaviour:** a 403 with a code no longer arrives as `Unauthenticated`. Code
+    that stops trading on it, or matches a refusal's message text, needs updating.
 - **`IbkrClient` no longer reports an order held for a short-sale locate as rejected**
   (`rustrade-execution`). Fixes #569.
   - TWS code 404 ("Shares for this order are not immediately available for short sale. The order
@@ -531,6 +536,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     open with nothing filled, and the account stream carries its later status. When the notice is
     the first thing TWS sends about the order, the hold is logged at WARN with the order id and
     TWS's text.
+  - **Breaking, in behaviour:** placement no longer returns `OrderRejected` for code 404. Code
+    that treated it as dead must expect the order to stay open and possibly fill.
 - **`HyperliquidClient` and `HyperliquidSpotClient` report a shortfall of funds as
   `BalanceInsufficient`** (`rustrade-execution`). Fixes #571.
   - Before, every Hyperliquid refusal was `OrderRejected`, so a caller could not handle a shortfall
@@ -542,6 +549,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     lookups.
   - Other refusals (minimum notional, reduce-only, open-interest caps, oracle, margin-tier limit)
     stay `OrderRejected`.
+  - **Breaking, in behaviour:** a shortfall of funds no longer arrives as `OrderRejected`. Code
+    matching on it for a shortfall must match `BalanceInsufficient` too.
 
 - **Bitfinex subscription validation could wait for ever, or fail a healthy batch**
   (`rustrade-data`, part of #514).
