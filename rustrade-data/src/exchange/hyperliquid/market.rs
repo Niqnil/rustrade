@@ -186,4 +186,17 @@ mod tests {
         assert_eq!(market(HyperliquidSpot, spot("purr")), "PURR/USDC");
         assert_eq!(market(HyperliquidSpot, spot("@107")), "@107");
     }
+
+    #[test]
+    fn a_keyed_instrument_subscribes_as_its_value_does() {
+        let perp = MarketDataInstrument::new("btc", "usdc", MarketDataInstrumentKind::Perpetual);
+        assert_eq!(market(Hyperliquid, Keyed::new(0, perp)), "BTC");
+
+        let spot = |base| MarketDataInstrument::new(base, "usdc", MarketDataInstrumentKind::Spot);
+        assert_eq!(
+            market(HyperliquidSpot, Keyed::new(0, spot("purr"))),
+            "PURR/USDC"
+        );
+        assert_eq!(market(HyperliquidSpot, Keyed::new(0, spot("@107"))), "@107");
+    }
 }
