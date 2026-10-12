@@ -1807,11 +1807,10 @@ pub(crate) const ORDER_EXECUTIONS_BUDGET: Duration =
 
 /// How many orders' executions one instrument's recovery reads at once.
 ///
-/// Recovery already runs up to eight instruments at once, and reads orders' executions and their
-/// client order ids side by side, so this allows 64 lookups in flight. Each is weight 4 or 5
-/// (Spot: `GET /api/v3/order`, `myTrades` with `orderId`) or 10 (Margin) against a limit of
-/// several thousand a minute, and [`rest_call_with_retry`] backs off when Binance signals the
-/// limit.
+/// Recovery already runs up to eight instruments at once, so this allows 32 lookups in flight.
+/// Each is weight 4 or 5 (Spot: `GET /api/v3/order`, `myTrades` with `orderId`) or 10 (Margin)
+/// against a limit of several thousand a minute, and [`rest_call_with_retry`] backs off when
+/// Binance signals the limit.
 pub(crate) const ORDER_EXECUTIONS_IN_FLIGHT: usize = 4;
 
 /// The cumulative filled quantity of each recovered execution's order, as of that execution,
@@ -1868,8 +1867,10 @@ where
 ///
 /// `myTrades` carries no client order id, so a recovered fill cannot report the one its order was
 /// placed with on its own: this reads each order with `fetch`, `GET /api/v3/order` (weight 4) or
-/// `GET /sapi/v1/margin/order` (weight 10), alongside [`recovered_order_totals`]'s lookups and
-/// under the same `deadline`. Up to [`ORDER_EXECUTIONS_IN_FLIGHT`] orders are read at once.
+/// `GET /sapi/v1/margin/order` (weight 10). Callers run it after [`recovered_order_totals`],
+/// under the same `deadline`, so it uses only the time those walks left: a fill without its
+/// cumulative leaves its order behind, while one without its client order id is only harder to
+/// attribute. Up to [`ORDER_EXECUTIONS_IN_FLIGHT`] orders are read at once.
 ///
 /// An order is left out, and its recovered fills carry no
 /// [`Trade::client_order_id`](crate::trade::Trade::client_order_id), when its lookup fails, when
@@ -2340,10 +2341,10 @@ pub(crate) fn convert_execution_report(
                 order_filled_quantity,
                 AssetFees::new(fee_asset, commission, None),
             );
-            // The order's own `c`, not `cid`, which falls back to the exchange id.
+            // Only the order's own `c`: `cid` falls back to the exchange id without one.
             let trade = match report.client_order_id.as_deref() {
-                Some(c) => trade.with_client_order_id(ClientOrderId::new(c)),
-                None => trade,
+                Some(c) if !c.is_empty() => trade.with_client_order_id(cid.clone()),
+                _ => trade,
             };
             buf.push(UnindexedAccountEvent::new(
                 exchange,

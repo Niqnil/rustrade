@@ -1252,6 +1252,24 @@ pub(super) mod info_tests {
     /// `CID` as the venue reports it back: `0x` and the 32 lowercase hex digits.
     const CLOID: &str = "0x85b60bff64d549ec95af6268d7d1df63";
 
+    /// A REST fill decodes its order's cloid, and one placed without a cloid decodes as `None`.
+    #[test]
+    fn a_user_fill_reads_its_cloid() {
+        let fill = |cloid: &str| {
+            serde_json::from_str::<UserFill>(&format!(
+                r#"{{"coin": "BTC", "side": "B", "px": "1", "sz": "1", "time": 1, "oid": 7,
+                    "fee": "0", "tid": 9{cloid}}}"#
+            ))
+            .unwrap()
+        };
+
+        let with = fill(&format!(r#", "cloid": "{CLOID}""#));
+        assert_eq!(with.cloid.as_deref(), Some(CLOID));
+        assert!(cloid_to_cid(CLOID).is_some());
+        assert_eq!(fill("").cloid, None);
+        assert_eq!(fill(r#", "cloid": null"#).cloid, None);
+    }
+
     #[test]
     fn only_the_canonical_uuid_form_can_be_a_cloid() {
         let cloid = cid_to_cloid(&ClientOrderId::new(CID)).unwrap();

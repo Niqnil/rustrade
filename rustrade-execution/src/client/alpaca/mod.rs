@@ -4610,7 +4610,7 @@ fn trade_amendment_event(
                                 Some(Decimal::ZERO),
                             ),
                         ),
-                        order.client_order_id.as_deref(),
+                        order.client_order_id.as_ref(),
                     ),
                 }
             }
@@ -4737,7 +4737,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
                     Some(Decimal::ZERO),
                 ),
             );
-            let trade = with_reported_cid(trade, order.client_order_id.as_deref());
+            let trade = with_reported_cid(trade, order.client_order_id.as_ref());
             let trade_event = UnindexedAccountEvent::new(
                 ExchangeId::AlpacaBroker,
                 AccountEventKind::Trade(trade),
@@ -5236,10 +5236,11 @@ fn convert_option_events(
 /// `trade` with the client order id its WebSocket order update reported, if any.
 fn with_reported_cid<AssetKey, InstrumentKey>(
     trade: Trade<AssetKey, InstrumentKey>,
-    client_order_id: Option<&str>,
+    client_order_id: Option<&SmolStr>,
 ) -> Trade<AssetKey, InstrumentKey> {
     match client_order_id {
-        Some(cid) if !cid.is_empty() => trade.with_client_order_id(ClientOrderId::new(cid)),
+        // A `SmolStr` clone shares a long id rather than copying it.
+        Some(cid) if !cid.is_empty() => trade.with_client_order_id(ClientOrderId(cid.clone())),
         _ => trade,
     }
 }

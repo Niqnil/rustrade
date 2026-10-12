@@ -449,6 +449,13 @@ impl BinanceMarginConfig {
 /// `BinanceMargin` clients in a single engine (e.g. one cross, one isolated) therefore collides
 /// their exchange identity. A single engine should run **at most one** `BinanceMargin` client; a
 /// consumer needing cross and isolated concurrently runs them in separate engines.
+///
+/// # Fills of other clients' orders
+/// The account stream, fill recovery and `fetch_trades` report every fill on the account, whoever
+/// placed the order, and Binance does not say who did. A consumer that also trades the account
+/// outside the engine filters those fills itself, for example by
+/// [`Trade::client_order_id`](crate::trade::Trade::client_order_id). See the
+/// [module docs](super#every-fill-on-the-account-is-delivered).
 #[derive(Clone)]
 pub struct BinanceMargin {
     config: Arc<BinanceMarginConfig>,
@@ -2222,7 +2229,9 @@ fn register_user_data_listener(
 ///
 /// `myTrades` reports executions only, with no cumulative, so each recovered trade's
 /// `order_filled_quantity` is rebuilt from its order's executions by
-/// [`recovered_order_totals`]. A trade whose order could not be looked up keeps `None`.
+/// [`recovered_order_totals`]. Nor does it carry a client order id, so each recovered trade's
+/// `client_order_id` is then read from its order by [`recovered_order_cids`], with whatever time
+/// the walks left. A trade whose order could not be looked up keeps `None` in either.
 ///
 /// Margin `myTrades` is read by time in windows under 24 hours (see
 /// [`paginate_margin_my_trades`]), so each day of a gap before its first fill costs one sequential
@@ -2289,34 +2298,33 @@ async fn recover_margin_fills(
                     // `myTrades` carries no cumulative, so each recovered fill's is rebuilt from
                     // its order's executions; without it the fill advances the position but not
                     // the order.
-                    // Nor a client order id, so each recovered fill's order is read for it.
-                    let (totals, cids) = futures::join!(
-                        recovered_order_totals(
-                            ExchangeId::BinanceMargin,
-                            &inst,
-                            &raw,
-                            order_executions_deadline,
-                            |order_id| {
-                                paginate_margin_my_trades(
-                                    &rest,
-                                    &rl,
-                                    &inst,
-                                    MyTradesFrom::Order(order_id),
-                                    is_isolated,
-                                    RequestKind::Essential,
-                                )
-                            },
-                        ),
-                        recovered_order_cids(
-                            ExchangeId::BinanceMargin,
-                            &inst,
-                            &raw,
-                            order_executions_deadline,
-                            |order_id| {
-                                fetch_margin_order_cid(&rest, &rl, &inst, order_id, is_isolated)
-                            },
-                        ),
-                    );
+                    let totals = recovered_order_totals(
+                        ExchangeId::BinanceMargin,
+                        &inst,
+                        &raw,
+                        order_executions_deadline,
+                        |order_id| {
+                            paginate_margin_my_trades(
+                                &rest,
+                                &rl,
+                                &inst,
+                                MyTradesFrom::Order(order_id),
+                                is_isolated,
+                                RequestKind::Essential,
+                            )
+                        },
+                    )
+                    .await;
+                    // After the walks, so these reads only use time the walks left: the walks
+                    // matter more, since a fill without a cumulative leaves its order behind.
+                    let cids = recovered_order_cids(
+                        ExchangeId::BinanceMargin,
+                        &inst,
+                        &raw,
+                        order_executions_deadline,
+                        |order_id| fetch_margin_order_cid(&rest, &rl, &inst, order_id, is_isolated),
+                    )
+                    .await;
                     let trades = raw
                         .iter()
                         .filter_map(|t| {
@@ -6405,6 +6413,94 @@ mod tests {
             .map(|request| request.url.query_pairs().into_owned().collect())
             .collect();
         (read.into_iter().map(|t| t.id.unwrap()).collect(), requests)
+    }
+
+    /// Recovery reads each recovered fill's order once, in the account it trades, for the client
+    /// order id `myTrades` lacks. An order Binance no longer knows leaves its fill without one.
+    #[tokio::test]
+    async fn recovered_margin_fills_carry_their_orders_client_order_ids() {
+        let disconnect = Utc::now() - chrono::Duration::minutes(10);
+        let reconnect = Utc::now() - chrono::Duration::minutes(5);
+        let fill_time = (disconnect + chrono::Duration::minutes(1)).timestamp_millis();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/myTrades"))
+            .respond_with(MarginMyTradesVenue {
+                trades: vec![(1, fill_time, 1), (2, fill_time, 2)],
+                end_exclusive: false,
+            })
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+            .and(wiremock::matchers::query_param("orderId", "1"))
+            .and(wiremock::matchers::query_param("isIsolated", "TRUE"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"symbol": "BTCUSDT", "orderId": 1, "clientOrderId": "repay-1"}),
+            ))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+            .and(wiremock::matchers::query_param("orderId", "2"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400).set_body_json(
+                    serde_json::json!({"code": -2013, "msg": "Order does not exist."}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        let rest = Arc::new(MarginTradingRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .unwrap(),
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut unrecovered = UnrecoveredFills::default();
+        unrecovered.open(
+            &[InstrumentNameExchange::new("BTCUSDT")],
+            disconnect,
+            reconnect,
+        );
+
+        recover_margin_fills(
+            &rest,
+            &Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
+            &mut unrecovered,
+            &tx,
+            &new_dedup_cache(),
+            &KnownLiveOrders::shared(ExchangeId::BinanceMargin),
+            true,
+        )
+        .await;
+
+        let mut cids: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event.kind {
+                AccountEventKind::Trade(trade) => {
+                    Some((trade.id.0.to_string(), trade.client_order_id))
+                }
+                _ => None,
+            })
+            .collect();
+        cids.sort();
+        assert_eq!(
+            cids,
+            [
+                ("1".to_string(), Some(ClientOrderId::new("repay-1"))),
+                ("2".to_string(), None),
+            ]
+        );
+        let order_reads = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/sapi/v1/margin/order")
+            .count();
+        assert_eq!(order_reads, 2, "one read per order");
     }
 
     /// A venue whose trades each belong to an order of the same id.
