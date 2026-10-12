@@ -390,6 +390,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Breaking: `DynamicStreams` serves Hyperliquid spot** (`rustrade-data`, `hyperliquid` feature).
+  Fixes #600. The support matrix and router had arms for `HyperliquidPerp` only, so every
+  `HyperliquidSpot` subscription was refused with `SocketError::Unsupported`, though the typed
+  `HyperliquidSpot` connector serves it. `HyperliquidSpot` now streams `PublicTrades` and
+  `OrderBooksL2` for `Spot` through `DynamicStreams`, as the typed connector does.
+  - **Breaking:** `exchange::hyperliquid::market::HyperliquidInstrument` now names both markets.
+    `hyperliquid_market` is renamed `hyperliquid_perp_market`, and a new required
+    `hyperliquid_spot_market` gives the spot coin. One blanket `Identifier` impl per connector
+    replaces the three concrete `HyperliquidSpot` impls. Only a type that implements the trait
+    itself needs changes; the instrument types this crate provides already implement both
+    methods.
 - **A typed subscription no longer claims spot support for an exchange that serves none**
   (`rustrade-data`, #598). `exchange_supports_instrument_kind` granted `Spot` to every exchange not
   denied by name, so a non-spot connector added without an edit there would claim spot. It now

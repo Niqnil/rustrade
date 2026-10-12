@@ -31,16 +31,20 @@ use smol_str::{SmolStr, StrExt, format_smolstr};
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize, Serialize)]
 pub struct HyperliquidMarket(pub SmolStr);
 
-/// An instrument representation a Hyperliquid perpetual subscription can name as a market.
+/// An instrument representation a Hyperliquid subscription can name as a market, perpetual or
+/// spot.
 ///
 /// Implemented for every instrument type this crate subscribes with: [`MarketDataInstrument`],
-/// [`Keyed`] over it, and [`MarketInstrumentData`]. One blanket `Identifier` impl covers them all,
-/// which is also what lets
-/// [`DynamicStreams`](crate::streams::builder::dynamic::DynamicStreams) route to this integration
+/// [`Keyed`] over it, and [`MarketInstrumentData`]. One blanket `Identifier` impl per connector
+/// covers them all, which is also what lets
+/// [`DynamicStreams`](crate::streams::builder::dynamic::DynamicStreams) route to both connectors
 /// through a single bound on the instrument type.
 pub trait HyperliquidInstrument {
-    /// The perpetual market this instrument subscribes to.
-    fn hyperliquid_market(&self) -> HyperliquidMarket;
+    /// The perpetual market this instrument subscribes to with [`Hyperliquid`].
+    fn hyperliquid_perp_market(&self) -> HyperliquidMarket;
+
+    /// The spot market this instrument subscribes to with [`HyperliquidSpot`].
+    fn hyperliquid_spot_market(&self) -> HyperliquidMarket;
 }
 
 impl<Instrument, Kind> Identifier<HyperliquidMarket> for Subscription<Hyperliquid, Instrument, Kind>
@@ -48,56 +52,44 @@ where
     Instrument: HyperliquidInstrument,
 {
     fn id(&self) -> HyperliquidMarket {
-        self.instrument.hyperliquid_market()
+        self.instrument.hyperliquid_perp_market()
+    }
+}
+
+impl<Instrument, Kind> Identifier<HyperliquidMarket>
+    for Subscription<HyperliquidSpot, Instrument, Kind>
+where
+    Instrument: HyperliquidInstrument,
+{
+    fn id(&self) -> HyperliquidMarket {
+        self.instrument.hyperliquid_spot_market()
     }
 }
 
 impl HyperliquidInstrument for MarketDataInstrument {
-    fn hyperliquid_market(&self) -> HyperliquidMarket {
-        hyperliquid_market(&self.base)
+    fn hyperliquid_perp_market(&self) -> HyperliquidMarket {
+        hyperliquid_perp_market(&self.base)
+    }
+
+    fn hyperliquid_spot_market(&self) -> HyperliquidMarket {
+        hyperliquid_spot_market(&self.base, &self.quote)
     }
 }
 
 impl<InstrumentKey> HyperliquidInstrument for Keyed<InstrumentKey, MarketDataInstrument> {
-    fn hyperliquid_market(&self) -> HyperliquidMarket {
-        self.value.hyperliquid_market()
+    fn hyperliquid_perp_market(&self) -> HyperliquidMarket {
+        self.value.hyperliquid_perp_market()
+    }
+
+    fn hyperliquid_spot_market(&self) -> HyperliquidMarket {
+        self.value.hyperliquid_spot_market()
     }
 }
 
 /// The perpetual coin a [`MarketDataInstrument`] names: its base asset, upper-cased. See the
 /// [module docs](self) for the coins this gets wrong.
-fn hyperliquid_market(base: &AssetNameInternal) -> HyperliquidMarket {
+fn hyperliquid_perp_market(base: &AssetNameInternal) -> HyperliquidMarket {
     HyperliquidMarket(base.name().to_uppercase_smolstr())
-}
-
-impl<InstrumentKey> HyperliquidInstrument for MarketInstrumentData<InstrumentKey> {
-    fn hyperliquid_market(&self) -> HyperliquidMarket {
-        HyperliquidMarket(self.name_exchange.name().clone())
-    }
-}
-
-impl AsRef<str> for HyperliquidMarket {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-// HyperliquidSpot implementations
-
-impl<Kind> Identifier<HyperliquidMarket>
-    for Subscription<HyperliquidSpot, MarketDataInstrument, Kind>
-{
-    fn id(&self) -> HyperliquidMarket {
-        hyperliquid_spot_market(&self.instrument.base, &self.instrument.quote)
-    }
-}
-
-impl<InstrumentKey, Kind> Identifier<HyperliquidMarket>
-    for Subscription<HyperliquidSpot, Keyed<InstrumentKey, MarketDataInstrument>, Kind>
-{
-    fn id(&self) -> HyperliquidMarket {
-        hyperliquid_spot_market(&self.instrument.value.base, &self.instrument.value.quote)
-    }
 }
 
 /// The spot coin a [`MarketDataInstrument`] names: its base asset if that is an `@{index}`
@@ -119,11 +111,21 @@ fn hyperliquid_spot_market(
     }
 }
 
-impl<InstrumentKey, Kind> Identifier<HyperliquidMarket>
-    for Subscription<HyperliquidSpot, MarketInstrumentData<InstrumentKey>, Kind>
-{
-    fn id(&self) -> HyperliquidMarket {
-        HyperliquidMarket(self.instrument.name_exchange.name().clone())
+/// Built from a [`HyperliquidMeta`](super::HyperliquidMeta) lookup, so `name_exchange` is
+/// already the venue's coin, whichever connector subscribes with it.
+impl<InstrumentKey> HyperliquidInstrument for MarketInstrumentData<InstrumentKey> {
+    fn hyperliquid_perp_market(&self) -> HyperliquidMarket {
+        HyperliquidMarket(self.name_exchange.name().clone())
+    }
+
+    fn hyperliquid_spot_market(&self) -> HyperliquidMarket {
+        HyperliquidMarket(self.name_exchange.name().clone())
+    }
+}
+
+impl AsRef<str> for HyperliquidMarket {
+    fn as_ref(&self) -> &str {
+        &self.0
     }
 }
 
