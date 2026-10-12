@@ -1947,6 +1947,21 @@ async fn for_each_recovered_order<T, R, F, Fut>(
     order_ids.sort_unstable();
     order_ids.dedup();
 
+    // `timeout_at` polls before it checks, so past the deadline the first poll would still send
+    // the first reads only to drop them.
+    if tokio::time::Instant::now() >= deadline {
+        if !order_ids.is_empty() {
+            warn!(
+                %exchange, %instrument,
+                orders_left = order_ids.len(),
+                budget = ?ORDER_EXECUTIONS_BUDGET,
+                "fill recovery ran out of time before reading {reading}; the orders' recovered \
+                 fills carry no {lost}"
+            );
+        }
+        return;
+    }
+
     let fetch = &fetch;
     let mut lookups = futures::stream::iter(order_ids.iter().copied())
         .map(|order_id| async move { (order_id, fetch(order_id).await) })
@@ -4399,6 +4414,22 @@ mod tests {
 
         assert_eq!(totals.get(&20), None);
         assert_eq!(totals.get(&21), Some(&Decimal::ONE));
+    }
+
+    /// Past the deadline, as when the walks before them used the whole budget, the reads for
+    /// client order ids send nothing.
+    #[tokio::test]
+    async fn a_lookup_past_its_deadline_sends_nothing() {
+        let recovered = [execution(20, 1, "1")];
+        let cids = recovered_order_cids(
+            ExchangeId::BinanceSpot,
+            &btcusdt(),
+            &recovered,
+            tokio::time::Instant::now(),
+            |_| async { panic!("no read past the deadline") },
+        )
+        .await;
+        assert!(cids.is_empty());
     }
 
     /// Each recovered order is read once for its client order id. One the venue reports none for,

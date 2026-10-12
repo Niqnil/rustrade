@@ -6419,6 +6419,11 @@ mod tests {
     /// order id `myTrades` lacks. An order Binance no longer knows leaves its fill without one.
     #[tokio::test]
     async fn recovered_margin_fills_carry_their_orders_client_order_ids() {
+        recovered_margin_fills_carry_client_order_ids(true).await;
+        recovered_margin_fills_carry_client_order_ids(false).await;
+    }
+
+    async fn recovered_margin_fills_carry_client_order_ids(is_isolated: bool) {
         let disconnect = Utc::now() - chrono::Duration::minutes(10);
         let reconnect = Utc::now() - chrono::Duration::minutes(5);
         let fill_time = (disconnect + chrono::Duration::minutes(1)).timestamp_millis();
@@ -6434,7 +6439,10 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/sapi/v1/margin/order"))
             .and(wiremock::matchers::query_param("orderId", "1"))
-            .and(wiremock::matchers::query_param("isIsolated", "TRUE"))
+            .and(wiremock::matchers::query_param(
+                "isIsolated",
+                if is_isolated { "TRUE" } else { "FALSE" },
+            ))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({"symbol": "BTCUSDT", "orderId": 1, "clientOrderId": "repay-1"}),
             ))
@@ -6473,25 +6481,29 @@ mod tests {
             &tx,
             &new_dedup_cache(),
             &KnownLiveOrders::shared(ExchangeId::BinanceMargin),
-            true,
+            is_isolated,
         )
         .await;
 
         let mut cids: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|event| match event.kind {
-                AccountEventKind::Trade(trade) => {
-                    Some((trade.id.0.to_string(), trade.client_order_id))
-                }
+                AccountEventKind::Trade(trade) => Some((
+                    trade.id.0.to_string(),
+                    trade.client_order_id,
+                    trade.order_filled_quantity.is_some(),
+                )),
                 _ => None,
             })
             .collect();
         cids.sort();
+        // The cumulatives from the walks, read first, are untouched by the reads after them.
         assert_eq!(
             cids,
             [
-                ("1".to_string(), Some(ClientOrderId::new("repay-1"))),
-                ("2".to_string(), None),
-            ]
+                ("1".to_string(), Some(ClientOrderId::new("repay-1")), true),
+                ("2".to_string(), None, true),
+            ],
+            "is_isolated: {is_isolated}"
         );
         let order_reads = server
             .received_requests()

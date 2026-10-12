@@ -5291,6 +5291,19 @@ mod tests {
             })
         };
         let server = wiremock::MockServer::start().await;
+        // Each order's own walk returns its one execution; the span read returns both.
+        for id in [1, 2] {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/v3/myTrades"))
+                .and(wiremock::matchers::query_param("orderId", id.to_string()))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([trade(id)])),
+                )
+                .with_priority(1)
+                .mount(&server)
+                .await;
+        }
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/v3/myTrades"))
             .respond_with(
@@ -5346,18 +5359,25 @@ mod tests {
 
         let mut cids: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
             .filter_map(|event| match event.kind {
-                AccountEventKind::Trade(trade) => {
-                    Some((trade.id.0.to_string(), trade.client_order_id))
-                }
+                AccountEventKind::Trade(trade) => Some((
+                    trade.id.0.to_string(),
+                    trade.client_order_id,
+                    trade.order_filled_quantity,
+                )),
                 _ => None,
             })
             .collect();
         cids.sort();
+        // The cumulatives from the walks, read first, are untouched by the reads after them.
         assert_eq!(
             cids,
             [
-                ("1".to_string(), Some(ClientOrderId::new("sweep-1"))),
-                ("2".to_string(), None),
+                (
+                    "1".to_string(),
+                    Some(ClientOrderId::new("sweep-1")),
+                    Some(Decimal::ONE)
+                ),
+                ("2".to_string(), None, Some(Decimal::ONE)),
             ]
         );
         let order_reads = server
