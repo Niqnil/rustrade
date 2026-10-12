@@ -9,10 +9,11 @@
 //! reuse them unchanged. The REST order-response converter names the field subset it reads as a
 //! trait, [`BinanceOrderFields`], which is identical across every SDK type implementing it even
 //! though the structs around it are not. The WebSocket user-data `executionReport` is decoded into
-//! this crate's own [`ExecutionReport`] instead, because the SDK's spot and margin report types
-//! disagree on wire types. Either way one converter serves both clients and keeps a venue name out
-//! of it. The remaining SDK-typed converters, which differ between spot's WS-API enums and
-//! margin's REST params, deliberately stay in their respective modules.
+//! this crate's own [`ExecutionReport`] instead, which reads only the keys the converter uses, so a
+//! key it does not read cannot fail a report, as it can through the SDK's strictly typed models.
+//! Either way one converter serves both clients and keeps a venue name out of it. The remaining
+//! SDK-typed converters, which differ between spot's WS-API enums and margin's REST params,
+//! deliberately stay in their respective modules.
 //!
 //! Event deduplication lives in [`crate::client::dedup`], shared with the other clients that
 //! need it, and is re-exported here so Binance call sites keep a single import site.
@@ -1933,13 +1934,15 @@ pub(crate) fn order_running_totals<T: BinanceExecutionFields>(
 
 /// A Binance user-data `executionReport`, as both the spot and margin clients read it.
 ///
-/// binance-sdk generates one report type per stream family, and they disagree on wire types that
-/// Binance documents as identical: the margin stream's declares `d`, `D`, `j`, `J` and `v` strings
-/// where spot's declares them integers, and Binance's docs show numbers
-/// (binance/binance-connector-rust#108). Decoding into an SDK type can therefore fail a whole
-/// report, fills included, over a key this crate never reads. This type models only the keys the
-/// converter reads and ignores every other, so an unread key cannot fail a decode, and the two
-/// clients decode through one definition, which the spot testnet exercises for margin too.
+/// binance-sdk generates one report type per stream family, each typing every key strictly, and
+/// those types change between releases: until 74.1.1 the margin stream's report type declared `d`,
+/// `D`, `j`, `J`, `u`, `U`, `a` and `v` strings, where spot's declared them integers and Binance's
+/// docs show numbers. 74.1.1 retyped them to integers, in a patch release. Decoding into an SDK
+/// type ties every report to the SDK and the venue agreeing on the type of every key, including
+/// keys this crate never reads, and a report that fails to decode is logged and dropped, fill
+/// included. This type models only the keys the converter reads and ignores every other, so an
+/// unread key cannot fail a decode, and the two clients decode through one definition, which the
+/// spot testnet exercises for margin too.
 ///
 /// Every field is optional: which keys a report carries depends on its execution type, and each
 /// use below says what it does without one.
@@ -2014,7 +2017,8 @@ pub(crate) struct ExecutionReport {
     #[serde(rename = "P")]
     pub(crate) stop_price: Option<String>,
     /// `d`: the trailing delta in basis points, sent only for a trailing order. Binance's docs show
-    /// a number and the margin SDK model a string, so either is accepted.
+    /// a number, but the margin SDK model declared a string until 74.1.1, and margin has no
+    /// testnet to confirm which the live stream sends, so either is accepted.
     #[serde(rename = "d")]
     pub(crate) trailing_delta: Option<WireInt>,
 }
@@ -3380,8 +3384,8 @@ mod tests {
     }
 
     /// `d` decodes whether Binance sends it as a number, as its docs show, or as a string, as the
-    /// margin SDK model declares; anything else is kept as unreadable rather than failing the
-    /// report.
+    /// margin SDK model declared until 74.1.1; anything else is kept as unreadable rather than
+    /// failing the report.
     #[test]
     fn a_report_reads_the_trailing_delta_as_a_number_or_a_string() {
         assert_eq!(report(r#"{}"#).trailing_delta, None);
@@ -3415,23 +3419,33 @@ mod tests {
         );
     }
 
-    /// Keys the converter does not read cannot fail a report, whatever their type. binance-sdk's
-    /// margin stream model fails on the numbers Binance documents for `d`, `D`, `j`, `J` and `v`
-    /// (binance/binance-connector-rust#108); this asserts that too, so an SDK fix is noticed.
+    /// Keys the converter does not read cannot fail a report, whatever their type: the keys whose
+    /// type binance-sdk's margin model has changed (`D`, `j`, `J`, `u`, `U`, `a`, `v`) decode as
+    /// numbers, as strings and as `null`, and the keys it reads come through each time.
     #[test]
     fn keys_the_converter_does_not_read_cannot_fail_a_report() {
-        let json = r#"{"e":"executionReport","x":"NEW","i":7,"o":"STOP_LOSS","P":"0",
-            "d":4,"D":1668680518494,"j":1,"J":1000000,"v":3,"W":1499405658658,"V":"NONE"}"#;
-        let parsed = report(json);
-        assert_eq!(parsed.execution_type.as_deref(), Some("NEW"));
-        assert_eq!(parsed.trailing_delta, Some(WireInt::Int(4)));
-        assert!(
-            serde_json::from_str::<binance_sdk::margin_trading::websocket_streams::ExecutionReport>(
-                json
-            )
-            .is_err(),
-            "binance-sdk's margin report now decodes numeric d/D/j/J/v; revisit ExecutionReport"
-        );
+        for (unread, delta) in [
+            (
+                r#""D":1668680518494,"j":1,"J":1000000,"u":2,"U":3,"a":5,"v":3"#,
+                "4",
+            ),
+            (
+                r#""D":"1668680518494","j":"1","J":"1000000","u":"2","U":"3","a":"5","v":"3""#,
+                r#""4""#,
+            ),
+            (
+                r#""D":null,"j":null,"J":null,"u":null,"U":null,"a":null,"v":null"#,
+                "4",
+            ),
+        ] {
+            let json = format!(
+                r#"{{"e":"executionReport","x":"NEW","i":7,"o":"STOP_LOSS","P":"0","d":{delta},{unread},"W":1499405658658,"V":"NONE"}}"#
+            );
+            let parsed = report(&json);
+            assert_eq!(parsed.execution_type.as_deref(), Some("NEW"), "{json}");
+            assert_eq!(parsed.order_id, Some(7), "{json}");
+            assert_eq!(parsed.trailing_delta, Some(WireInt::Int(4)), "{json}");
+        }
     }
 
     #[test]
