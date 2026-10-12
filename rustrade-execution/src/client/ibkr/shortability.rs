@@ -40,7 +40,11 @@ pub const DEFAULT_SHORTABILITY_TIMEOUT: Duration = Duration::from_secs(10);
 /// For a stock IB has shares of, it sends both ticks together. For one it has few or none of, it
 /// can send tick 46 and no tick 89 at all, and the read would otherwise wait out the whole
 /// timeout for it. The grace still takes a tick 89 that IB sends just after tick 46.
-// PROVISIONAL: set from the regular-hours probe (2x the longest 46-to-89 gap seen, at least 2 s).
+///
+/// Measured on a paper account in regular trading hours: a stock IB had shares of got both ticks
+/// in the same message, and stocks at level 2.0 got no tick 89 within a minute. With no gap to
+/// scale from, the grace is a small margin for a tick 89 that trails tick 46 rather than a
+/// measured bound.
 const SHORTABLE_SHARES_GRACE: Duration = Duration::from_secs(2);
 
 /// IB's error code for a request that would exceed the account's market data lines ("Max number
