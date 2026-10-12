@@ -4,7 +4,10 @@ use crate::{
         EngineMeta, EngineOutput, Processor, SplitCommitContext,
         audit::{AuditTick, EngineAudit, ProcessAudit, context::EngineContext},
         classify_option_split, split_plan_position_mut,
-        state::{EngineState, instrument::data::InstrumentDataState},
+        state::{
+            EngineState,
+            instrument::{ExpiryHandling, data::InstrumentDataState},
+        },
     },
     execution::AccountStreamEvent,
 };
@@ -227,8 +230,10 @@ where
                 //   without touching state → neither does the replica.
                 // - Any `PositionExit` output → live engine processed expiry → clear
                 //   positions and mark processed.
-                // - No `PositionExit` outputs but instrument has no positions → live
-                //   engine took the empty branch and marked it processed → mark only.
+                // - No `PositionExit` outputs but instrument has no positions, or the venue
+                //   settles it (`ExpiryHandling::Venue`) → live engine took the no-settlement
+                //   branch and marked it processed → mark only, leaving any position for the
+                //   venue's trades.
                 let not_settled = outputs.iter().any(|o| {
                     matches!(
                         o,
@@ -280,7 +285,9 @@ where
                     instrument_state.position_ids.clear();
                     instrument_state.pending_fills.clear();
                     instrument_state.expiration_processed = true;
-                } else if instrument_state.position.positions.is_empty() {
+                } else if instrument_state.position.positions.is_empty()
+                    || instrument_state.expiry_handling == ExpiryHandling::Venue
+                {
                     instrument_state.orders.clear();
                     instrument_state.exchange_id_to_cid.clear();
                     instrument_state.retired_routing.clear();

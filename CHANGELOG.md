@@ -91,15 +91,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The engine opens nothing for a forced fill it cannot place without guessing: one whose side
     holds no open position or several, or one whose venue names the side it would grow. For a
     fill larger than the position it reduces, the excess is likewise not applied. Each case is
-    logged at ERROR and counted in the new `TearSheet::fills_forced_unallocated` and
-    `TradingSummary::fills_forced_unallocated`. Non-zero means the engine's positions no longer
+    logged at ERROR and counted in the new `TearSheet::fills_unallocated` and
+    `TradingSummary::fills_unallocated`. Non-zero means the engine's positions no longer
     match the venue's.
   - `Trade` gains `position_side: Option<Side>` (`#[serde(default)]`) and `with_position_side`,
     for a venue in hedge mode that names the position a fill belongs to. The engine checks a
     forced fill against it: it can only confirm the side the fill reduces, not choose among
     several positions on that side. No client in this crate sets it yet.
   - **Breaking:** `TearSheet`, `TearSheetGenerator` and `TradingSummary` gain
-    `fills_forced_unallocated`. They have public fields, so code that builds one with a struct
+    `fills_unallocated`. They have public fields, so code that builds one with a struct
     literal needs the new field.
 - **Margin calls and liquidation warnings: `AccountEventKind::Notice`** (`rustrade-execution`,
   part of #552).
@@ -244,6 +244,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The fill reads (`fetch_trades` and the reconnect's fill recovery) now ask for `FILL`
     activities by Alpaca's documented `activity_types` parameter, not the undocumented
     `activity_type`.
+
+- **The venue can settle an expiring contract instead of the engine** (#566).
+  - `AlpacaClient::fetch_option_events(start, end)` (`rustrade-execution`) reads the trades
+    Alpaca made when an option was exercised, assigned or expired, as a `TradesRead`. Each
+    `OPEXP`, `OPEXC` and `OPASN` activity becomes a trade on the contract at a price of 0, with
+    origin `Expiry`, `Exercise` or `Assignment`. Each `OPTRD`, the shares an exercise or
+    assignment traded at the strike, becomes a trade on the underlying with the origin of the
+    exercise or assignment it pairs with: same date, root symbol and strike, and the side the
+    contract implies, preferring the one whose contracts deliver its shares at 100 a contract.
+    An `OPTRD` that pairs with none is `External`, logged at WARN. The read covers the whole UTC
+    days of the span, so both legs are read together. An activity without a creation time is
+    returned by its date, by every read that covers that day. A read that stops at its 5,000
+    activity cap can return an `OPTRD` as `External` before its pair is read, and more than 5,000
+    option activities in one UTC day cannot be read through; the rustdoc says how to handle both.
+  - The new `ExpiryHandling` (`Engine`, the default, or `Venue`) says who settles an instrument's
+    positions at expiry. Set it per exchange with `EngineStateBuilder::expiry_handling` or
+    `SystemBuilder::expiry_handling`. **Breaking:** `InstrumentState` gains the public
+    `expiry_handling` field (serde default `Engine`), so code that builds one needs it.
+  - With `Venue`, a `ContractExpiry` still cancels the instrument's orders and marks it processed,
+    but synthesises no settlement trade and needs no settlement price. The open positions are left
+    for the trades the venue reports for the expiry, exercise or assignment, so a position the
+    venue settles physically is not also closed by the engine at intrinsic value. The audit replica
+    follows the same rule. With `Engine`, expiry is cash-settled as before, which keeps backtests
+    unchanged.
+  - In `OmsMode::Hedging`, a fill the venue reports for an expiry, exercise or assignment that
+    matches none of the engine's orders is now routed as a forced fill is (see the #567 entry):
+    on the contract, it reduces the one open position on the side it closes, rather than opening a
+    position of its own. The share leg of an exercise or assignment, on an instrument that never
+    expires, can also open a position, as a put assignment buys shares the account did not hold.
+    With nothing on the side it closes, it opens one under its order id; with several positions
+    there, it is applied to none. `fills_forced_unallocated` from #567 is renamed
+    `fills_unallocated` on `TearSheet`, `TearSheetGenerator` and `TradingSummary`, since it now
+    counts these fills too.
 
 ### Changed
 

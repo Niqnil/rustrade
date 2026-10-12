@@ -308,6 +308,36 @@ async fn test_fetch_trades_and_cash_flows() {
     }
 }
 
+/// The activities endpoint accepts the option event types. A paper account may hold no option
+/// events, so this checks that the read succeeds and its trades are in the span, not that there
+/// are any.
+#[tokio::test]
+#[ignore]
+async fn test_fetch_option_events() {
+    init_logging();
+
+    let client = AlpacaClient::new(test_config());
+    let end = chrono::Utc::now();
+    let start = end - chrono::TimeDelta::days(30);
+
+    let read = client
+        .fetch_option_events(start, end)
+        .await
+        .expect("fetch_option_events");
+    println!(
+        "Option events, 30 days: {} (resume: {:?})",
+        read.trades.len(),
+        read.resume
+    );
+    for trade in &read.trades {
+        println!(
+            "  {} {} {} {} @ {}",
+            trade.origin, trade.instrument, trade.side, trade.quantity, trade.price
+        );
+        assert!((start..=end).contains(&trade.time_exchange));
+    }
+}
+
 // ============================================================================
 // Order Lifecycle Tests
 // ============================================================================

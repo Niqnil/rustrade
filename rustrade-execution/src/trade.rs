@@ -246,7 +246,7 @@ where
 /// | Interactive Brokers | [`Liquidation`](Self::Liquidation), [`External`](Self::External) (opt-in), `Order` |
 /// | Binance Spot / Margin | `Order` only |
 /// | Hyperliquid | `Order` only |
-/// | Alpaca | `Order` only |
+/// | Alpaca | `Order` on fills; [`Expiry`](Self::Expiry), [`Exercise`](Self::Exercise), [`Assignment`](Self::Assignment) and [`External`](Self::External) from `AlpacaClient::fetch_option_events` |
 /// | [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue) | `Order` only |
 /// | The `rustrade` engine's expiry settlement | [`Expiry`](Self::Expiry) |
 ///

@@ -93,12 +93,12 @@ pub struct TradingSummary<Interval> {
     #[serde(default)]
     pub fills_forced: usize,
 
-    /// Forced fills, or parts of them, applied to no position this session, summed over every
-    /// instrument — `OmsMode::Hedging` only. Non-zero means the engine's positions no longer
+    /// Venue settlement fills, or parts of them, applied to no position this session, summed over
+    /// every instrument — `OmsMode::Hedging` only. Non-zero means the engine's positions no longer
     /// match the venue's. See
-    /// [`TearSheet::fills_forced_unallocated`](instrument::TearSheet::fills_forced_unallocated).
+    /// [`TearSheet::fills_unallocated`](instrument::TearSheet::fills_unallocated).
     #[serde(default)]
-    pub fills_forced_unallocated: usize,
+    pub fills_unallocated: usize,
 }
 
 impl<Interval> TradingSummary<Interval> {
@@ -274,7 +274,7 @@ impl TradingSummaryGenerator {
             fills_routed_by_fallback,
             fills_unmatched,
             fills_forced,
-            fills_forced_unallocated,
+            fills_unallocated,
         ) = self.instruments.values().fold(
             (0usize, 0usize, 0usize, 0usize, 0usize, 0usize),
             |(opened, rejected, fallback, unmatched, forced, unallocated), generator| {
@@ -284,7 +284,7 @@ impl TradingSummaryGenerator {
                     fallback.saturating_add(generator.fills_routed_by_fallback),
                     unmatched.saturating_add(generator.fills_unmatched),
                     forced.saturating_add(generator.fills_forced),
-                    unallocated.saturating_add(generator.fills_forced_unallocated),
+                    unallocated.saturating_add(generator.fills_unallocated),
                 )
             },
         );
@@ -300,7 +300,7 @@ impl TradingSummaryGenerator {
             fills_routed_by_fallback,
             fills_unmatched,
             fills_forced,
-            fills_forced_unallocated,
+            fills_unallocated,
         }
     }
 }
