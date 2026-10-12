@@ -219,6 +219,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     where known, shown by its `Display`. The simulated venue sets it on `InventoryUnavailable`.
     `BorrowReject::new` is unchanged.
   - `rustrade`'s `SimVenueOptions` gains `shortability` and `with_shortability`.
+- **Ask a live venue what it would lend for a short sale, and how much this account can borrow**
+  (`rustrade-execution`, #572).
+  - `ShortabilityClient::fetch_shortability(&instrument)` returns the `Shortability` a simulated
+    venue already reads. It is a capability trait, like `OrderStatusClient`: a client whose venue
+    does not report it does not implement it. The answer is advisory, so a short sale must still
+    handle `ApiError::BorrowRejected`, and each implementation states what its requests cost.
+  - `BorrowCapacityClient::fetch_borrow_capacity(&instrument, side)` returns a `BorrowCapacity`:
+    the asset an order on that side would borrow (the base for a sell, the quote for a buy), how
+    much more of it this account can borrow now, and the account's limit. It is a separate type
+    from `Shortability` because it is net of the account's collateral and borrows: replayed into a
+    simulated venue as the lender's total, it would count the account's own short twice.
+  - `AlpacaClient` implements `ShortabilityClient` from `GET /v2/assets/{symbol}`: shortable, easy
+    to borrow, and a zero fee for an easy-to-borrow stock, which Alpaca charges nothing to borrow.
+    Alpaca publishes no hard-to-borrow rate, so that fee is unknown, and its flags may be a day old.
+  - `BinanceMargin` implements both, for its cross or isolated margin. A pair is shortable when it
+    is traded on margin, may be sold and its base asset may be borrowed; Binance's delisting
+    schedule is not read, so a pair due to be delisted reads shortable until Binance clears those
+    flags. The fee is the base asset's next hourly interest rate times 24 × 365. A query costs 102 of Binance's per-IP request
+    weight on cross margin and 111 on isolated, almost all of it the interest rate; the borrow
+    capacity costs 51 and 60. Binance does not say how much it has to lend in total, so
+    `available` is unknown there.
+  - `IbkrClient` implements `ShortabilityClient` from IB's shortable ticks, through a streaming
+    market data request for generic tick 236: tick 46's level gives shortable and easy to borrow,
+    and tick 89 the shares IB has to lend. IB reports no borrow fee to the API, so the fee is
+    unknown. A stock that is shortable but not easy to borrow needs a locate: IB holds a short
+    sale of it while it looks for shares (code 404), and may never find them. The request holds
+    one of the account's market data lines until both ticks arrive or the new
+    `IbkrConfig::shortability_timeout` runs out (10 s by default; set it with
+    `with_shortability_timeout`, or `shortability_timeout_ms` in a config file), and returns what
+    arrived. Once tick 46 has arrived, tick 89 is waited for at most 2 s more: IB can send none
+    for a stock it has few shares of, which then comes back with `available` unknown. The request
+    asks for IB's delayed market data, which IB serves only where the
+    account has no live subscription for the stock, so an account without one, such as a paper
+    account, still gets the ticks. Nothing arriving is an error: `ConnectivityError::Timeout`, or
+    `ApiError::RequestRejected` carrying IB's notices; a notice that the account may not have the
+    stock's market data, live or delayed, ends the wait at once. With every market data line in
+    use, by this client, another API client or TWS, it is the new `ApiError::CapacityExceeded`. A
+    contract that is not a stock, or not registered, is `ApiError::InstrumentInvalid`.
+  - `ApiError::CapacityExceeded(String)`: the venue refused because a cap on something held at
+    once is full, such as IB's market data lines. Waiting does not clear it, releasing something
+    does, so unlike `RateLimit` it is not transient.
+  - An option, and a symbol the venue does not know, is `ApiError::InstrumentInvalid`.
+  - `Shortability::fee_rate` now states its convention: simple, on the venue's own year basis.
 - **`PerpCoin::sz_decimals`: a Hyperliquid perpetual's size precision** (`rustrade-instrument`,
   #536). It is read from `meta`'s `szDecimals`, as `SpotPair::base_sz_decimals` is from
   `spotMeta`, so `rustrade-data`'s `HyperliquidMeta` now gives a perpetual's order precision
@@ -342,6 +385,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     past its deadline is retired at the session start.
   - `SimulatedVenue::next_deadline` reports the earliest open order's deadline or held position's
     holding-cost boundary, for any driver that wants the same.
+- **A Binance query rejection names the pair it asked about** (`rustrade-execution`). When a
+  `BinanceSpot` or `BinanceMargin` query about one instrument is refused, the
+  `ApiError::RequestRejected` message now starts with its symbol, as Binance's own text often does
+  not say which: `BTCUSDT: -11001 Isolated margin account does not exist.` Code that matches the
+  message's start needs updating; the Binance code is still in it.
 
 - **The check of how orders ended while disconnected stops when the venue limits requests**
   (`rustrade-execution`). Closes #529.

@@ -234,6 +234,57 @@ async fn test_fetch_balances() {
 }
 
 // ============================================================================
+// Shortability Tests
+// ============================================================================
+
+#[tokio::test]
+#[ignore]
+async fn test_fetch_shortability() {
+    use rust_decimal::Decimal;
+    use rustrade_execution::{client::ShortabilityClient, error::ApiError, error::ClientError};
+
+    init_logging();
+    let client = AlpacaClient::new(test_config());
+
+    let spy = client
+        .fetch_shortability(&spy_instrument())
+        .await
+        .expect("SPY shortability");
+    println!("SPY: {spy:?}");
+    assert_eq!(spy.shortable, Some(true), "SPY is shortable");
+    assert_eq!(spy.easy_to_borrow, Some(true), "SPY is easy to borrow");
+    assert_eq!(
+        spy.fee_rate,
+        Some(Decimal::ZERO),
+        "Alpaca charges no ETB fee"
+    );
+    assert_eq!(spy.available, None);
+
+    // The pair's slash must reach Alpaca escaped, as one path segment.
+    let btc = client
+        .fetch_shortability(&btc_instrument())
+        .await
+        .expect("BTC/USD shortability");
+    println!("BTC/USD: {btc:?}");
+    // Alpaca lends no crypto. Its `borrow_status` is for US equities only, but a crypto asset
+    // still carries the `easy_to_borrow` flag, false, which is reported as given.
+    assert_eq!(btc.shortable, Some(false), "Alpaca does not short crypto");
+    assert_eq!(btc.fee_rate, None);
+
+    let unknown = client
+        .fetch_shortability(&InstrumentNameExchange::new("NOSUCHSYMBOLXYZ"))
+        .await;
+    println!("unknown: {unknown:?}");
+    assert!(
+        matches!(
+            unknown,
+            Err(ClientError::Api(ApiError::InstrumentInvalid(..)))
+        ),
+        "{unknown:?}"
+    );
+}
+
+// ============================================================================
 // Open Orders Tests
 // ============================================================================
 

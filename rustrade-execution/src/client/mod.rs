@@ -53,6 +53,7 @@
 use crate::{
     UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::AssetBalance,
+    borrow_capacity::BorrowCapacity,
     error::UnindexedClientError,
     order::{
         Order, UnindexedInactiveOrder, UnindexedOrderKey,
@@ -60,11 +61,13 @@ use crate::{
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Open, UnindexedOrderState},
     },
+    shortability::Shortability,
     trade::TradesRead,
 };
 use chrono::{DateTime, Utc};
 use futures::Stream;
 use rustrade_instrument::{
+    Side,
     asset::name::AssetNameExchange,
     exchange::ExchangeId,
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
@@ -548,6 +551,86 @@ pub trait OrderStatusClient: ExecutionClient {
         &self,
         orders: &[UnindexedOrderKey],
     ) -> impl Future<Output = Result<Vec<UnindexedInactiveOrder>, UnindexedClientError>> + Send;
+}
+
+/// Extension trait for clients that can say what the venue would lend for a short sale.
+///
+/// Answers, before an order is sent, the question a short sale otherwise learns only from its
+/// rejection: whether the instrument may be sold short, whether it is easy to borrow, how much the
+/// venue has to lend and at what fee. Each venue reports a different subset, so each field of the
+/// [`Shortability`] it returns is optional; the implementations say which fields they fill.
+///
+/// # Type-Level Capability
+///
+/// A supertrait of [`ExecutionClient`], for the reason [`BracketOrderClient`] is one: a client
+/// whose venue has nothing to lend, or that does not report it, does not implement it. A simulated
+/// venue reads the same [`Shortability`] from a
+/// [`ShortabilityProvider`](crate::shortability::ShortabilityProvider) instead.
+pub trait ShortabilityClient: ExecutionClient {
+    /// What the venue says about lending `instrument` for a short sale.
+    ///
+    /// # Contract
+    ///
+    /// - **Advisory.** `Ok` describes the venue's lending as it reported it, not a promise to lend:
+    ///   a short sale must still handle
+    ///   [`ApiError::BorrowRejected`](crate::error::ApiError::BorrowRejected).
+    /// - **Not this account's capacity.** [`Shortability::available`] is what the venue has to
+    ///   lend, not what is left of it for this account; that is
+    ///   [`BorrowCapacityClient::fetch_borrow_capacity`], where a venue reports it.
+    /// - **May be expensive.** An implementation may make several requests, some of them heavy
+    ///   against the venue's rate limit, or hold a scarce resource such as a market data line;
+    ///   each says what it costs. Fetch it when deciding on a short, not on every tick.
+    /// - **May be slow.** Where the venue streams its answer rather than replying to a request,
+    ///   the call waits for it, up to a timeout the implementation documents: seconds, not
+    ///   milliseconds.
+    /// - **May outlive its future.** An implementation that reads on a blocking thread finishes
+    ///   that read, and releases what it holds, even when the returned future is dropped first;
+    ///   each says so.
+    ///
+    /// # Errors
+    ///
+    /// - [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid) for an
+    ///   instrument the venue does not know, or one of a kind that is not sold short by borrowing
+    ///   it, such as an option.
+    /// - An error, rather than a [`Shortability`] with nothing known, when the venue does not
+    ///   answer, including when the account is not entitled to the answer, such as one without the
+    ///   market data subscription a venue sends it through.
+    fn fetch_shortability(
+        &self,
+        instrument: &InstrumentNameExchange,
+    ) -> impl Future<Output = Result<Shortability, UnindexedClientError>> + Send;
+}
+
+/// Extension trait for clients that can say how much more this account can borrow.
+///
+/// Where [`ShortabilityClient`] says what the venue has to lend, this says how much of it this
+/// account could take now, given its collateral, its limit and what it has already borrowed. The
+/// two are separate types because they are different facts; see [`BorrowCapacity`].
+///
+/// # Type-Level Capability
+///
+/// A supertrait of [`ExecutionClient`], for the reason [`BracketOrderClient`] is one. Only a venue
+/// that lends against an account's collateral and reports what is left of it implements it.
+pub trait BorrowCapacityClient: ExecutionClient {
+    /// How much this account can borrow now for an order on `instrument` on `side`.
+    ///
+    /// A sell borrows the instrument's base asset, which is a short; a buy borrows its quote asset,
+    /// which is a leveraged long. The result names that asset, and its amounts are in its units.
+    ///
+    /// # Contract
+    ///
+    /// **Advisory**, as [`BorrowCapacity`] says: the amounts are not reserved, so an order sized to
+    /// them must still handle [`ApiError::BorrowRejected`](crate::error::ApiError::BorrowRejected).
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid) for an instrument
+    /// the client cannot borrow against, such as a pair the venue does not trade on margin.
+    fn fetch_borrow_capacity(
+        &self,
+        instrument: &InstrumentNameExchange,
+        side: Side,
+    ) -> impl Future<Output = Result<BorrowCapacity, UnindexedClientError>> + Send;
 }
 
 /// The capability table, pinned.
