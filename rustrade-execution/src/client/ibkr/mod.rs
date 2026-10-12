@@ -248,7 +248,8 @@ pub struct IbkrConfig {
     /// waits for IB's shortability ticks before answering with what has arrived, or failing when
     /// nothing has. [`DEFAULT_SHORTABILITY_TIMEOUT`] by default.
     ///
-    /// The request holds one of the account's market data lines for up to this long.
+    /// The request holds one of the account's market data lines for up to this long. Zero ends
+    /// every request before a tick can arrive, so each one fails with a timeout.
     /// Serialised as whole milliseconds, under `shortability_timeout_ms`.
     #[serde(
         rename = "shortability_timeout_ms",

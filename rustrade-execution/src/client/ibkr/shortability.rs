@@ -82,7 +82,8 @@ impl ShortabilityClient for IbkrClient {
     /// is waited for at most 2 s more: IB sends both together for a stock it has shares of, and
     /// can send no tick 89 at all for one it has few or none of, which then comes back with
     /// `available` unknown. While it runs it holds one of the account's market data lines, and it
-    /// is cancelled when the read ends. The read runs on a blocking thread, so dropping the
+    /// is cancelled when the read ends. Calls made at once each hold their own line, so checking
+    /// many stocks together can fill the account's lines. The read runs on a blocking thread, so dropping the
     /// returned future does not end it early: it runs to its end, holding the line until then.
     ///
     /// The request asks for IB's delayed market data, which IB serves only where the account has
