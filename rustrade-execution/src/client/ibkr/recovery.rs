@@ -975,6 +975,7 @@ mod tests {
             fees: AssetFees::new(AssetNameExchange::from("USD"), Decimal::ONE, None),
             origin: TradeOrigin::Order,
             position_side: None,
+            client_order_id: None,
         }
     }
 

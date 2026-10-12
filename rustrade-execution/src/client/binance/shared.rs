@@ -1807,9 +1807,11 @@ pub(crate) const ORDER_EXECUTIONS_BUDGET: Duration =
 
 /// How many orders' executions one instrument's recovery reads at once.
 ///
-/// Recovery already runs up to eight instruments at once, so this allows 32 lookups in flight.
-/// Each is weight 5 (Spot, `myTrades` with `orderId`) or 10 (Margin) against a limit of several
-/// thousand a minute, and [`rest_call_with_retry`] backs off when Binance signals the limit.
+/// Recovery already runs up to eight instruments at once, and reads orders' executions and their
+/// client order ids side by side, so this allows 64 lookups in flight. Each is weight 4 or 5
+/// (Spot: `GET /api/v3/order`, `myTrades` with `orderId`) or 10 (Margin) against a limit of
+/// several thousand a minute, and [`rest_call_with_retry`] backs off when Binance signals the
+/// limit.
 pub(crate) const ORDER_EXECUTIONS_IN_FLIGHT: usize = 4;
 
 /// The cumulative filled quantity of each recovered execution's order, as of that execution,
@@ -1837,8 +1839,109 @@ where
     F: Fn(i64) -> Fut,
     Fut: Future<Output = Result<Vec<T>, UnindexedClientError>>,
 {
+    let mut totals = fnv::FnvHashMap::default();
+    for_each_recovered_order(
+        RecoveredOrderLookup {
+            exchange,
+            instrument,
+            reading: "orders' executions",
+            lost: "cumulative filled quantity",
+        },
+        recovered,
+        deadline,
+        fetch,
+        |order_id, executions| match order_running_totals(order_id, &executions) {
+            Some(running) => totals.extend(running),
+            None => warn!(
+                %exchange, %instrument, order_id, executions = executions.len(),
+                "fill recovery read an order's executions it cannot sum (a missing id or size, \
+                 or another order's execution); its recovered fills carry no cumulative filled \
+                 quantity"
+            ),
+        },
+    )
+    .await;
+    totals
+}
+
+/// The client order id of each order among `recovered`, keyed by order id.
+///
+/// `myTrades` carries no client order id, so a recovered fill cannot report the one its order was
+/// placed with on its own: this reads each order with `fetch`, `GET /api/v3/order` (weight 4) or
+/// `GET /sapi/v1/margin/order` (weight 10), alongside [`recovered_order_totals`]'s lookups and
+/// under the same `deadline`. Up to [`ORDER_EXECUTIONS_IN_FLIGHT`] orders are read at once.
+///
+/// An order is left out, and its recovered fills carry no
+/// [`Trade::client_order_id`](crate::trade::Trade::client_order_id), when its lookup fails, when
+/// the venue reports no id for it (`fetch` returns `None`), or once `deadline` passes. Failures
+/// and the deadline are logged.
+pub(crate) async fn recovered_order_cids<T, F, Fut>(
+    exchange: ExchangeId,
+    instrument: &InstrumentNameExchange,
+    recovered: &[T],
+    deadline: tokio::time::Instant,
+    fetch: F,
+) -> fnv::FnvHashMap<i64, ClientOrderId>
+where
+    T: BinanceExecutionFields,
+    F: Fn(i64) -> Fut,
+    Fut: Future<Output = Result<Option<ClientOrderId>, UnindexedClientError>>,
+{
+    let mut cids = fnv::FnvHashMap::default();
+    for_each_recovered_order(
+        RecoveredOrderLookup {
+            exchange,
+            instrument,
+            reading: "orders",
+            lost: "client order id",
+        },
+        recovered,
+        deadline,
+        fetch,
+        |order_id, cid| {
+            if let Some(cid) = cid {
+                cids.insert(order_id, cid);
+            }
+        },
+    )
+    .await;
+    cids
+}
+
+/// What a fill-recovery lookup over recovered orders reads, named in what it logs.
+struct RecoveredOrderLookup<'a> {
+    exchange: ExchangeId,
+    instrument: &'a InstrumentNameExchange,
+    /// What each lookup reads, such as "orders' executions".
+    reading: &'static str,
+    /// What a recovered fill goes without when its order's lookup is lost.
+    lost: &'static str,
+}
+
+/// Look up each order among `recovered` with `fetch`, up to [`ORDER_EXECUTIONS_IN_FLIGHT`] at
+/// once, handing each result to `settle`, until every order is read or `deadline` passes.
+///
+/// A failed lookup, and the orders still unread at the deadline, are logged and skipped: the
+/// lookups only enrich recovered fills, so none of them may hold one back.
+async fn for_each_recovered_order<T, R, F, Fut>(
+    lookup: RecoveredOrderLookup<'_>,
+    recovered: &[T],
+    deadline: tokio::time::Instant,
+    fetch: F,
+    mut settle: impl FnMut(i64, R),
+) where
+    T: BinanceExecutionFields,
+    F: Fn(i64) -> Fut,
+    Fut: Future<Output = Result<R, UnindexedClientError>>,
+{
     use futures::StreamExt as _;
 
+    let RecoveredOrderLookup {
+        exchange,
+        instrument,
+        reading,
+        lost,
+    } = lookup;
     let mut order_ids: Vec<i64> = recovered.iter().filter_map(|t| t.order_id()).collect();
     order_ids.sort_unstable();
     order_ids.dedup();
@@ -1848,10 +1951,9 @@ where
         .map(|order_id| async move { (order_id, fetch(order_id).await) })
         .buffer_unordered(ORDER_EXECUTIONS_IN_FLIGHT);
 
-    let mut totals = fnv::FnvHashMap::default();
     let mut settled = 0;
     loop {
-        let (order_id, walk) = match tokio::time::timeout_at(deadline, lookups.next()).await {
+        let (order_id, result) = match tokio::time::timeout_at(deadline, lookups.next()).await {
             Ok(Some(lookup)) => lookup,
             Ok(None) => break,
             Err(_elapsed) => {
@@ -1859,35 +1961,22 @@ where
                     %exchange, %instrument,
                     orders_left = order_ids.len() - settled,
                     budget = ?ORDER_EXECUTIONS_BUDGET,
-                    "fill recovery ran out of time reading orders' executions; the remaining \
-                     orders' recovered fills carry no cumulative filled quantity"
+                    "fill recovery ran out of time reading {reading}; the remaining orders' \
+                     recovered fills carry no {lost}"
                 );
                 break;
             }
         };
         settled += 1;
-        let executions = match walk {
-            Ok(executions) => executions,
-            Err(error) => {
-                warn!(
-                    %exchange, %instrument, order_id, %error,
-                    "fill recovery could not read the order's executions; its recovered fills \
-                     carry no cumulative filled quantity"
-                );
-                continue;
-            }
-        };
-        match order_running_totals(order_id, &executions) {
-            Some(running) => totals.extend(running),
-            None => warn!(
-                %exchange, %instrument, order_id, executions = executions.len(),
-                "fill recovery read an order's executions it cannot sum (a missing id or size, \
-                 or another order's execution); its recovered fills carry no cumulative filled \
-                 quantity"
+        match result {
+            Ok(value) => settle(order_id, value),
+            Err(error) => warn!(
+                %exchange, %instrument, order_id, %error,
+                "fill recovery could not read {reading} for an order; its recovered fills carry \
+                 no {lost}"
             ),
         }
     }
-    totals
 }
 
 /// `(trade id, cumulative filled quantity as of that execution)` for every execution of one
@@ -2251,6 +2340,11 @@ pub(crate) fn convert_execution_report(
                 order_filled_quantity,
                 AssetFees::new(fee_asset, commission, None),
             );
+            // The order's own `c`, not `cid`, which falls back to the exchange id.
+            let trade = match report.client_order_id.as_deref() {
+                Some(c) => trade.with_client_order_id(ClientOrderId::new(c)),
+                None => trade,
+            };
             buf.push(UnindexedAccountEvent::new(
                 exchange,
                 AccountEventKind::Trade(trade),
@@ -4304,6 +4398,43 @@ mod tests {
 
         assert_eq!(totals.get(&20), None);
         assert_eq!(totals.get(&21), Some(&Decimal::ONE));
+    }
+
+    /// Each recovered order is read once for its client order id. One the venue reports none for,
+    /// and one whose read fails, are left out without holding back the others.
+    #[tokio::test]
+    async fn recovered_orders_are_read_for_their_client_order_ids() {
+        let recovered = [
+            execution(20, 1, "1"),
+            execution(21, 1, "1"),
+            execution(22, 2, "1"),
+            execution(23, 3, "1"),
+        ];
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+
+        let cids = recovered_order_cids(
+            ExchangeId::BinanceMargin,
+            &btcusdt(),
+            &recovered,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            |order_id| {
+                reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                async move {
+                    match order_id {
+                        1 => Ok(Some(ClientOrderId::new("sweep-1"))),
+                        2 => Ok(None),
+                        _ => Err(UnindexedClientError::Connectivity(
+                            ConnectivityError::Socket("connection reset".into()),
+                        )),
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(reads.into_inner(), 3, "one read per order");
+        assert_eq!(cids.len(), 1, "{cids:?}");
+        assert_eq!(cids.get(&1), Some(&ClientOrderId::new("sweep-1")));
     }
 
     #[tokio::test(start_paused = true)]

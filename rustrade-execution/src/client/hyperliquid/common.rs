@@ -118,6 +118,9 @@ pub struct UserFill {
     /// SDK's own type omits it, so it has never been observed through this dependency. The caller
     /// falls back to inferring the asset from the side when it is absent.
     pub fee_token: Option<String>,
+    /// The cloid of the order filled, in the venue's form ([`cloid_to_cid`]). Absent for an order
+    /// placed without one.
+    pub cloid: Option<String>,
 }
 
 /// The span `start..=end` in epoch milliseconds, as `userFillsByTime` takes it, or `None` when it

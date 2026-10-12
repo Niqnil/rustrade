@@ -1601,6 +1601,16 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// venue forced ([`TradeOrigin::is_forced`]) is also logged at `warn!` and counted on
     /// [`TearSheet::fills_forced`](crate::statistic::summary::instrument::TearSheet::fills_forced).
     ///
+    /// # Fills of orders this engine did not place
+    ///
+    /// A venue's account stream reports every fill on the account, whoever placed the order, and
+    /// most venues cannot say which client did (see [`TradeOrigin`]). In `OmsMode::Netting` such a
+    /// fill moves the netting position like any other: nothing logs or counts it, as the engine
+    /// cannot tell it from a fill of its own whose order it no longer tracks. A consumer that
+    /// trades the account outside this engine, by hand or from another program, must keep those
+    /// fills from it, or the engine holds a position the consumer never asked it to. A fill's
+    /// [`Trade::client_order_id`] names the order it belongs to where the venue reports one.
+    ///
     /// # Settlement fills
     ///
     /// In `OmsMode::Hedging`, a fill of any origin but [`Order`](TradeOrigin::Order) and

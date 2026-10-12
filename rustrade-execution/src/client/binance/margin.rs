@@ -73,7 +73,8 @@ use super::shared::{
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event, drop_after,
     frame_excerpt, gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
     log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
-    recovered_order_totals, response_decode_error, rest_call_with_retry, trailing_params,
+    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
+    trailing_params,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -2288,29 +2289,42 @@ async fn recover_margin_fills(
                     // `myTrades` carries no cumulative, so each recovered fill's is rebuilt from
                     // its order's executions; without it the fill advances the position but not
                     // the order.
-                    let totals = recovered_order_totals(
-                        ExchangeId::BinanceMargin,
-                        &inst,
-                        &raw,
-                        order_executions_deadline,
-                        |order_id| {
-                            paginate_margin_my_trades(
-                                &rest,
-                                &rl,
-                                &inst,
-                                MyTradesFrom::Order(order_id),
-                                is_isolated,
-                                RequestKind::Essential,
-                            )
-                        },
-                    )
-                    .await;
+                    // Nor a client order id, so each recovered fill's order is read for it.
+                    let (totals, cids) = futures::join!(
+                        recovered_order_totals(
+                            ExchangeId::BinanceMargin,
+                            &inst,
+                            &raw,
+                            order_executions_deadline,
+                            |order_id| {
+                                paginate_margin_my_trades(
+                                    &rest,
+                                    &rl,
+                                    &inst,
+                                    MyTradesFrom::Order(order_id),
+                                    is_isolated,
+                                    RequestKind::Essential,
+                                )
+                            },
+                        ),
+                        recovered_order_cids(
+                            ExchangeId::BinanceMargin,
+                            &inst,
+                            &raw,
+                            order_executions_deadline,
+                            |order_id| {
+                                fetch_margin_order_cid(&rest, &rl, &inst, order_id, is_isolated)
+                            },
+                        ),
+                    );
                     let trades = raw
                         .iter()
                         .filter_map(|t| {
                             let mut trade = convert_margin_trade(t, &inst)?;
                             trade.order_filled_quantity =
                                 t.id.and_then(|id| totals.get(&id).copied());
+                            trade.client_order_id =
+                                t.order_id.and_then(|id| cids.get(&id).cloned());
                             Some(trade)
                         })
                         .collect::<Vec<_>>();
@@ -3277,6 +3291,45 @@ async fn fetch_margin_order_lookup(
                 OrderLookup::Ended(Box::new(order))
             }),
     )
+}
+
+/// The client order id of the order `order_id` on `instrument`, read with
+/// `GET /sapi/v1/margin/order` (weight 10) in the cross or isolated account as `is_isolated`
+/// says, for fill recovery: `myTrades` carries none. `None` if Binance reports none, or does not
+/// know the order.
+async fn fetch_margin_order_cid(
+    rest: &Arc<RestApi>,
+    rate_limiter: &RateLimitTracker,
+    instrument: &InstrumentNameExchange,
+    order_id: i64,
+    is_isolated: bool,
+) -> Result<Option<ClientOrderId>, UnindexedClientError> {
+    let symbol = instrument.name().to_string();
+    let isolated = QueryMarginAccountsOrderIsIsolatedEnum::from_flag(is_isolated);
+    let response = match rest_call_with_retry(rest, rate_limiter, RequestKind::Essential, |rest| {
+        let (symbol, isolated) = (symbol.clone(), isolated.clone());
+        Box::pin(async move {
+            let params = QueryMarginAccountsOrderParams::builder(symbol)
+                .order_id(order_id)
+                .is_isolated(isolated)
+                .build()?;
+            rest.query_margin_accounts_order(params).await
+        })
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(e) if is_unknown_order(&e) => {
+            debug!(%instrument, order_id, error = %e, "BinanceMargin does not know this order");
+            return Ok(None);
+        }
+        Err(e) => return Err(classify_rest_query_error(&e, Some(instrument))),
+    };
+    let row = response.data().await.map_err(response_decode_error)?;
+    Ok(row
+        .client_order_id
+        .filter(|cid| !cid.is_empty())
+        .map(ClientOrderId::new))
 }
 
 /// The client order ids `GET /sapi/v1/margin/openOrders` lists on `instruments` (weight 10 each,
@@ -5377,6 +5430,7 @@ mod tests {
                 assert_eq!(t.quantity, Decimal::new(5, 1));
                 assert_eq!(t.fees.asset.name().as_str(), "BNB"); // 3rd-party fee asset preserved
                 assert_eq!(t.fees.fees, Decimal::new(1, 3));
+                assert_eq!(t.client_order_id, Some(ClientOrderId::new("cid-1")));
             }
             other => panic!("expected Trade, got {other:?}"),
         }
@@ -5474,6 +5528,25 @@ mod tests {
             AccountEventKind::OrderCancelled(resp) => assert!(resp.state.is_ok()),
             other => panic!("expected OrderCancelled, got {other:?}"),
         }
+    }
+
+    /// A report without `c` gives its fill no client order id, rather than the exchange id the
+    /// order snapshot falls back to.
+    #[test]
+    fn margin_ws_trade_without_a_client_order_id_reports_none() {
+        let frame = push(serde_json::json!({
+            "e": "executionReport", "s": "BTCUSDT", "S": "SELL", "o": "MARKET",
+            "x": "TRADE", "X": "FILLED", "i": 12_345_i64,
+            "t": 99_i64, "l": "1", "L": "48000", "z": "1",
+            "q": "1", "n": "0", "N": "USDT", "T": 1_700_000_000_000_i64,
+        }));
+        let mut buf = Vec::new();
+        assert!(!convert_margin_user_data_events(&frame, &mut buf));
+        let AccountEventKind::Trade(trade) = &buf[0].kind else {
+            panic!("expected Trade, got {:?}", buf[0].kind);
+        };
+        assert_eq!(trade.order_id.0.as_str(), "12345");
+        assert_eq!(trade.client_order_id, None);
     }
 
     #[test]

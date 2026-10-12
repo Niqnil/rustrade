@@ -45,8 +45,8 @@ use super::shared::{
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event, drop_after,
     frame_excerpt, gap_failed, gap_time, is_duplicate, is_handshake_rate_limit, is_unknown_order,
     log_unhandled_event, log_unrecognised_frame, new_dedup_cache, parse_user_data_frame,
-    placed_order_state, recovered_order_totals, response_decode_error, rest_call_with_retry,
-    trailing_params, unix_ms,
+    placed_order_state, recovered_order_cids, recovered_order_totals, response_decode_error,
+    rest_call_with_retry, trailing_params, unix_ms,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -557,6 +557,39 @@ async fn fetch_order_lookup(
                 OrderLookup::Ended(Box::new(order))
             }),
     )
+}
+
+/// The client order id of the order `order_id` on `instrument`, read with `GET /api/v3/order`
+/// (weight 4), for fill recovery: `myTrades` carries none. `None` if Binance reports none, or
+/// does not know the order.
+async fn fetch_order_cid(
+    rest: &Arc<RestApi>,
+    rate_limiter: &RateLimitTracker,
+    instrument: &InstrumentNameExchange,
+    order_id: i64,
+) -> Result<Option<ClientOrderId>, UnindexedClientError> {
+    let symbol = instrument.name().to_string();
+    let response = match rest_call_with_retry(rest, rate_limiter, RequestKind::Essential, |rest| {
+        let symbol = symbol.clone();
+        Box::pin(async move {
+            let params = GetOrderParams::builder(symbol).order_id(order_id).build()?;
+            rest.get_order(params).await
+        })
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(e) if is_unknown_order(&e) => {
+            debug!(%instrument, order_id, error = %e, "BinanceSpot does not know this order");
+            return Ok(None);
+        }
+        Err(e) => return Err(classify_rest_query_error(&e, Some(instrument))),
+    };
+    let row = response.data().await.map_err(response_decode_error)?;
+    Ok(row
+        .client_order_id
+        .filter(|cid| !cid.is_empty())
+        .map(ClientOrderId::new))
 }
 
 /// The client order ids `GET /api/v3/openOrders` lists on `instruments` (weight 6 each, one at a
@@ -1957,28 +1990,39 @@ async fn recover_fills(
                     // `myTrades` carries no cumulative, so each recovered fill's is rebuilt from
                     // its order's executions; without it the fill advances the position but not
                     // the order.
-                    let totals = recovered_order_totals(
-                        ExchangeId::BinanceSpot,
-                        &inst,
-                        &raw,
-                        order_executions_deadline,
-                        |order_id| {
-                            paginate_my_trades(
-                                &rest,
-                                &rl,
-                                &inst,
-                                MyTradesFrom::Order(order_id),
-                                RequestKind::Essential,
-                            )
-                        },
-                    )
-                    .await;
+                    // Nor a client order id, so each recovered fill's order is read for it.
+                    let (totals, cids) = futures::join!(
+                        recovered_order_totals(
+                            ExchangeId::BinanceSpot,
+                            &inst,
+                            &raw,
+                            order_executions_deadline,
+                            |order_id| {
+                                paginate_my_trades(
+                                    &rest,
+                                    &rl,
+                                    &inst,
+                                    MyTradesFrom::Order(order_id),
+                                    RequestKind::Essential,
+                                )
+                            },
+                        ),
+                        recovered_order_cids(
+                            ExchangeId::BinanceSpot,
+                            &inst,
+                            &raw,
+                            order_executions_deadline,
+                            |order_id| fetch_order_cid(&rest, &rl, &inst, order_id),
+                        ),
+                    );
                     let trades: Vec<_> = raw
                         .iter()
                         .filter_map(|t| {
                             let mut trade = convert_my_trade(t, &inst)?;
                             trade.order_filled_quantity =
                                 t.id.and_then(|id| totals.get(&id).copied());
+                            trade.client_order_id =
+                                t.order_id.and_then(|id| cids.get(&id).cloned());
                             Some(trade)
                         })
                         .collect();
