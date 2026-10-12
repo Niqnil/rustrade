@@ -46,9 +46,10 @@
 //!
 //! [`ShortabilityClient`](crate::client::ShortabilityClient) reads what IB says about lending a
 //! stock from its shortable market data ticks, so unlike the rest of this client it uses one of
-//! the account's market data lines while it runs, and IB answers it only for an account entitled
-//! to the stock's market data. See `fetch_shortability` under [`IbkrClient`]'s trait
-//! implementations, and [`IbkrConfig::shortability_timeout`].
+//! the account's market data lines while it runs. It asks for IB's delayed data, which IB serves
+//! only where the account has no live subscription, so an account without one still gets an
+//! answer. See `fetch_shortability` under [`IbkrClient`]'s trait implementations, and
+//! [`IbkrConfig::shortability_timeout`].
 //!
 //! # Limitations
 //!

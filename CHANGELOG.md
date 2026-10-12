@@ -229,9 +229,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     unknown. The request holds one of the account's market data lines until both ticks arrive or
     the new `IbkrConfig::shortability_timeout` runs out (10 s by default; set it with
     `with_shortability_timeout`, or `shortability_timeout_ms` in a config file), and returns what
-    arrived. Nothing arriving is an error: `ConnectivityError::Timeout`, or
-    `ApiError::RequestRejected` carrying IB's notices, such as one saying the account lacks the
-    stock's market data subscription. With every market data line in use, by this client,
+    arrived. The request asks for IB's delayed market data, which IB serves only where the
+    account has no live subscription for the stock, so an account without one, such as a paper
+    account, still gets the ticks. Nothing arriving is an error: `ConnectivityError::Timeout`, or
+    `ApiError::RequestRejected` carrying IB's notices; a notice that the account may not have the
+    stock's market data, live or delayed, ends the wait at once. With every market data line in
+    use, by this client,
     another API client or TWS, it is the new `ApiError::CapacityExceeded`. A contract that is not a
     stock, or not registered, is `ApiError::InstrumentInvalid`.
   - `ApiError::CapacityExceeded(String)`: the venue refused because a cap on something held at
