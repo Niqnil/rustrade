@@ -2268,7 +2268,7 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
     match event_type {
         "executionReport" => {
             // Single typed pass straight from the inner event — no intermediate DOM, and only the
-            // matched branch deserializes its payload. The SDK struct ignores the unknown `e` tag.
+            // matched branch deserializes its payload. `ExecutionReport` ignores the unknown `e` tag.
             match serde_json::from_str::<ExecutionReport>(event) {
                 Ok(report) => {
                     convert_execution_report(&report, ExchangeId::BinanceSpot, buf);

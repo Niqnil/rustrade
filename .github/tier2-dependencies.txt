@@ -323,7 +323,7 @@ ibapi=5.0.0  # 2026-10-06 | Financial protocol, community-maintained, no officia
 #
 # Exercised against the paper gateway (positions, account_snapshot, EUR.USD paper orders). The #[ignore]d
 # ibkr integration tests still do not run in CI.
-binance-sdk=74.0.0  # 2026-10-08 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
+binance-sdk=74.1.1  # 2026-10-12 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
 #   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
 #   3. common::utils::send_request                        — signature + HMAC signing + X-MBX-APIKEY header (hand-rolled `userListenToken` POST; SDK binds no endpoint for it)
@@ -617,6 +617,33 @@ binance-sdk=74.0.0  # 2026-10-08 | Exchange SDK, signing/IO. PINNED: margin user
 # Dependency surface: Cargo.toml.orig differs by the version line and one removed dual_investment
 # `[[example]]` only; `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]` and `[features]`
 # identical. Our Cargo.lock delta is binance-sdk's version + checksum alone. CONSUMER-SIDE API CHURN: NONE.
+#
+# Re-verified against the =74.1.1 crates.io source on 2026-10-12 (74.0.0 -> 74.1.1; 74.1.0 touched Algo
+# REST only). .crate sha256 6783851f4426db4fb2fd50a90622ee2f59ca0a67b9c280a6930a28cde9e9659b matches the
+# index; publisher unchanged (solutionsGH); published from git 7f20df2a5c51e5bedc115232654e25a9dd9951bc.
+# `src/common/` (all 8 files), `src/lib.rs` and build.rs are BYTE-IDENTICAL to 74.0.0 (websocket.rs md5
+# 367bbb4fe76c40d401ba23bcaba8c08a, utils.rs 1541c46b7c5ba4f5f7ef57286c99695d), so all 3 internals hold BY
+# CONSTRUCTION. Confirmed in the source anyway:
+#   1. `send_message` (websocket.rs:1667), WebsocketMessageSendOptions (:1439) unchanged; margin call sites
+#      margin.rs:1702 and :1742 still pass `WebsocketMessageSendOptions::new()`.
+#   2. `WebsocketEventEmitter::subscribe` (websocket.rs:128-146): one task, one unbounded channel, sequential
+#      callback; registered at margin.rs:2146.
+#   3. `send_request` (utils.rs:951), 7 args, timestamp/signature/X-MBX-APIKEY unchanged; the hand-rolled
+#      `userListenToken` POST passes the same 7 args. Still no `userListenToken` binding (#109 stays blocked).
+# `diff -rq` delta: algo (new spot `volume_participation` endpoint), vip_loan, w3w_prediction and
+# derivatives_trading_options REST models -- none compiled under `spot` + `margin_trading` -- plus ONE file we
+# compile: margin_trading/websocket_streams/models/execution_report.rs retypes `d`, `D`, `j`, `J`, `u`, `U`,
+# `a`, `v` from Option<String> to Option<i64>, matching the unchanged spot model (fixes upstream
+# binance-connector-rust#108). Neither client decodes executionReport through the SDK type (shared.rs's own
+# `ExecutionReport`, kept deliberately: the SDK retypes keys in patch releases), so the only consumer-side
+# change was retiring the test that asserted the SDK margin model failed on numeric d/D/j/J/v, replaced
+# by a test that our decoder survives those keys as numbers, strings and null. Spot report models unchanged.
+# Security: PASS, unchanged -- `unsafe` count in src/ is 17 in both versions, all in the byte-identical
+# utils.rs (test-only env set/remove + comments); no new hosts, env, filesystem, process or encoded-blob
+# sites in the delta. No RUSTSEC advisory for binance-sdk (advisory-db 7eebec6).
+# Dependency surface: Cargo.toml.orig differs by the version line and one added algo `[[example]]` only;
+# `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]` and `[features]` identical. Our Cargo.lock
+# delta is binance-sdk's version + checksum alone.
 quick-xml  # 2026-07-08 | New direct dep (XML parsing of broker Flex statements). Reviewed @ 0.41.0: #![forbid(unsafe_code)] crate-wide, zero net-new transitive deps (serde+memchr only, both already in tree), no RUSTSEC advisories, de-facto-standard parser. Not pinned — any version bump still needs review.
 #   Re-reviewed @ 0.42.0 (2026-09-16), the review this entry's "any version bump still needs
 #   review" mandates. All four properties recorded at 0.41.0 re-verified and still hold:

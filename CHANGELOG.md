@@ -280,6 +280,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`binance-sdk` 74.0.0 → 74.1.1** (`rustrade-execution`, `binance` feature). The three
+  `binance_sdk::common` internals the margin user-data stream couples to were re-verified before
+  merge, and hold by construction: `common/` is byte-identical to 74.0.0. The one change that
+  reaches the compiled code is that the margin stream's execution report now types `d`, `D`, `j`,
+  `J`, `u`, `U`, `a` and `v` as integers rather than strings, matching spot and Binance's docs.
+  Neither client decodes that report through the SDK type, so behaviour is unchanged. The other
+  changes are in modules the `binance` feature does not compile.
+
 - **Breaking: trailing stops take an activation price, and Binance's fixed-limit trailing stop has
   an `OrderKind`** (`rustrade-execution`, #539, #540).
   - **Breaking:** `OrderKind::TrailingStop` gains `activation_price: Option<Decimal>`: the price
