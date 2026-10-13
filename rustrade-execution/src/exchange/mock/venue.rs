@@ -189,7 +189,8 @@ pub enum VenueRegime {
 /// about every order that would open or increase one, at the venue's clock, and refuses it with
 /// [`ApiError::BorrowRejected`] for the first of these that applies:
 /// - [`NotShortable`](BorrowRejectReason::NotShortable): the provider says the instrument is not
-///   shortable.
+///   shortable, or that it is delisted at or before the venue's clock
+///   ([`Shortability::delisting_at`](crate::shortability::Shortability::delisting_at)).
 /// - [`InventoryUnavailable`](BorrowRejectReason::InventoryUnavailable): the short would exceed
 ///   what the provider says is available. That is the lender's total, so the account's own short
 ///   counts against it, and so does every resting sell, as if it had filled. The refusal carries
@@ -1740,6 +1741,18 @@ impl SimulatedVenue {
         let exchange = request.key.exchange;
         let shortability = provider.shortability(instrument, now);
 
+        if let Some(delisting_at) = shortability.delisting_at
+            && delisting_at <= now
+        {
+            return Err(ApiError::BorrowRejected(BorrowReject::new(
+                BorrowRejectReason::NotShortable,
+                None,
+                format!(
+                    "{instrument} cannot be sold short on {exchange} at {now}: it is delisted at \
+                     {delisting_at}"
+                ),
+            )));
+        }
         if shortability.shortable == Some(false) {
             return Err(ApiError::BorrowRejected(BorrowReject::new(
                 BorrowRejectReason::NotShortable,
@@ -7720,6 +7733,30 @@ mod tests {
         assert_eq!(free_usd(&venue), d("10000000"));
         assert_eq!(cfd_position(&venue), None);
         assert!(venue.orders_open(&[]).is_empty());
+    }
+
+    /// A delisting time at or before the clock refuses the short even when the provider still
+    /// calls the instrument shortable; one still ahead does not.
+    #[test]
+    fn a_short_at_or_after_the_delisting_time_is_refused_and_one_before_it_is_not() {
+        let delisted = Shortability::new()
+            .with_shortable(true)
+            .with_delisting_at(time(1));
+        let mut venue = make_cfd_venue_lending(lending(delisted));
+
+        let outcome = open_cfd(&mut venue, Side::Sell, "1");
+
+        let reject = borrow_rejection(&outcome);
+        assert_eq!(reject.reason, BorrowRejectReason::NotShortable);
+        assert!(reject.message.contains("delisted"), "{}", reject.message);
+        assert_eq!(cfd_position(&venue), None);
+
+        let ahead = Shortability::new()
+            .with_shortable(true)
+            .with_delisting_at(time(2));
+        let mut venue = make_cfd_venue_lending(lending(ahead));
+        cfd_market_fill(&mut venue, Side::Sell, "1");
+        assert!(cfd_position(&venue).is_some(), "not delisted yet");
     }
 
     #[test]

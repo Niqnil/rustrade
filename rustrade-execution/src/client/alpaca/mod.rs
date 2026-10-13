@@ -5510,6 +5510,7 @@ impl ShortabilityClient for AlpacaClient {
     ///   a hard-to-borrow stock, so its fee is unknown.
     /// - `available` is unknown. Alpaca's locate quotes report what it can lend of a hard-to-borrow
     ///   stock, but they are not on paper accounts and are not read here.
+    /// - `delisting_at` is unknown: Alpaca's asset carries no delisting date.
     ///
     /// Alpaca updates its borrow flags from a daily list, so they may be up to a day old.
     ///

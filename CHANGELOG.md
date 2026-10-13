@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`Shortability::delisting_at`: when the venue will stop lending an instrument or trading it on
+  margin** (`rustrade-execution`, #608).
+  - A new optional field, with `with_delisting_at`. A short still open at that time may be closed
+    by the venue. A time already passed means the instrument is no longer shortable.
+  - `BinanceMargin::fetch_shortability` reads Binance's margin delisting schedule
+    (`/sapi/v1/margin/delist-schedule`). On cross margin, a pair is delisted with the first of
+    its base and quote assets; on isolated margin, by its own symbol. A pair whose delisting time
+    has passed is now `shortable: false`. Before, it read shortable until Binance cleared its
+    flags. The query now costs 202 of Binance's per-IP request weight on cross margin and 211 on
+    isolated, up from 102 and 111.
+  - `SimulatedVenue::with_shortability` refuses a short with `NotShortable` from the
+    provider's `delisting_at` on, even if the provider still says the instrument is shortable.
+  - `AlpacaClient` and `IbkrClient` leave it unknown: neither venue reports one.
+
 ### Changed
 
 - **Breaking: balances carry accrued interest, and IBKR reports one balance per currency it

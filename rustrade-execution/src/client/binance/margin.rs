@@ -118,13 +118,13 @@ use binance_sdk::{
         MarginTradingRestApi,
         rest_api::{
             GetAllCrossMarginPairsParams, GetAllIsolatedMarginSymbolParams,
-            GetAllMarginAssetsParams, GetFutureHourlyInterestRateIsIsolatedEnum,
-            GetFutureHourlyInterestRateParams, MarginAccountCancelOrderIsIsolatedEnum,
-            MarginAccountCancelOrderParams, MarginAccountNewOrderIsIsolatedEnum,
-            MarginAccountNewOrderNewOrderRespTypeEnum, MarginAccountNewOrderParams,
-            MarginAccountNewOrderSideEffectTypeEnum, MarginAccountNewOrderSideEnum,
-            MarginAccountNewOrderTimeInForceEnum, MarginAccountNewOrderTypeEnum,
-            QueryCrossMarginAccountDetailsParams,
+            GetAllMarginAssetsParams, GetDelistScheduleParams,
+            GetFutureHourlyInterestRateIsIsolatedEnum, GetFutureHourlyInterestRateParams,
+            MarginAccountCancelOrderIsIsolatedEnum, MarginAccountCancelOrderParams,
+            MarginAccountNewOrderIsIsolatedEnum, MarginAccountNewOrderNewOrderRespTypeEnum,
+            MarginAccountNewOrderParams, MarginAccountNewOrderSideEffectTypeEnum,
+            MarginAccountNewOrderSideEnum, MarginAccountNewOrderTimeInForceEnum,
+            MarginAccountNewOrderTypeEnum, QueryCrossMarginAccountDetailsParams,
             QueryCrossMarginAccountDetailsResponseUserAssetsInner,
             QueryIsolatedMarginAccountInfoParams,
             QueryIsolatedMarginAccountInfoResponseAssetsInner,
@@ -1566,16 +1566,18 @@ impl OrderStatusClient for BinanceMargin {
 const HOURS_PER_YEAR: u32 = 24 * 365;
 
 impl ShortabilityClient for BinanceMargin {
-    /// Reads the pair, its base asset and the base asset's next hourly interest rate, which cost
-    /// 102 of Binance's per-IP request weight on cross margin and 111 on isolated, almost all of
-    /// it the interest rate.
+    /// Reads the pair, its base asset, the base asset's next hourly interest rate and Binance's
+    /// margin delisting schedule, which cost 202 of Binance's per-IP request weight on cross
+    /// margin and 211 on isolated, almost all of it the interest rate and the schedule.
     ///
     /// - `shortable` is whether the pair is traded on margin and may be sold
-    ///   (`/sapi/v1/margin/allPairs`, or `isolated/allPairs` on isolated margin), and its base
-    ///   asset may be borrowed (`/sapi/v1/margin/allAssets`). Any of them false makes it false.
-    ///   Binance's delisting schedule (`delistTime`) is not read, as Binance documents neither its
-    ///   unit nor when it is present, so a pair due to be delisted reads shortable until Binance
-    ///   clears these flags.
+    ///   (`/sapi/v1/margin/allPairs`, or `isolated/allPairs` on isolated margin), its base asset
+    ///   may be borrowed (`/sapi/v1/margin/allAssets`), and its delisting time, if any, is still
+    ///   ahead. Any of them false makes it false.
+    /// - `delisting_at` is when Binance will delist the pair from this client's margin, from
+    ///   `/sapi/v1/margin/delist-schedule`, which lists only what is due to be delisted. On cross
+    ///   margin Binance schedules assets, so the pair goes with the first of its base and quote
+    ///   assets to be delisted. On isolated margin it schedules the pair itself.
     /// - `fee_rate` is the base asset's next hourly interest rate
     ///   (`/sapi/v1/margin/next-hourly-interest-rate`, for this client's cross or isolated margin)
     ///   times 24 × 365. It is this account's rate, at its VIP level, for the coming hour only.
@@ -1593,14 +1595,24 @@ impl ShortabilityClient for BinanceMargin {
         instrument: &InstrumentNameExchange,
     ) -> Result<Shortability, UnindexedClientError> {
         let pair = self.fetch_margin_pair(instrument).await?;
-        let (borrowable, hourly_rate) = tokio::try_join!(
+        let (borrowable, hourly_rate, delisting_at) = tokio::try_join!(
             self.fetch_asset_borrowable(&pair.base),
             self.fetch_next_hourly_interest_rate(&pair.base),
+            self.fetch_delisting_at(instrument, &pair),
         )?;
 
         let mut shortability = Shortability::new();
+        if let Some(delisting_at) = delisting_at {
+            shortability = shortability.with_delisting_at(delisting_at);
+        }
         // Any flag false is enough to forbid the short; all must be known true to allow it.
-        let flags = [pair.is_margin_trade, pair.is_sell_allowed, borrowable];
+        let not_delisted = Some(delisting_at.is_none_or(|delisting_at| delisting_at > Utc::now()));
+        let flags = [
+            pair.is_margin_trade,
+            pair.is_sell_allowed,
+            borrowable,
+            not_delisted,
+        ];
         if flags.contains(&Some(false)) {
             shortability = shortability.with_shortable(false);
         } else if flags.iter().all(|flag| *flag == Some(true)) {
@@ -1791,6 +1803,62 @@ impl BinanceMargin {
             .into_iter()
             .find(|listed| listed.asset_name.as_deref() == Some(name.as_str()))
             .and_then(|listed| listed.is_borrowable))
+    }
+
+    /// When Binance will delist `instrument` from this client's margin, from
+    /// `/sapi/v1/margin/delist-schedule` (weight 100). On cross margin it is the earliest time
+    /// either of the pair's assets is listed under, and on isolated margin the earliest the pair
+    /// is listed under. `None` if neither is scheduled.
+    async fn fetch_delisting_at(
+        &self,
+        instrument: &InstrumentNameExchange,
+        pair: &MarginPair,
+    ) -> Result<Option<DateTime<Utc>>, UnindexedClientError> {
+        let response =
+            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                Box::pin(async move {
+                    let params = GetDelistScheduleParams::builder().build()?;
+                    rest.get_delist_schedule(params).await
+                })
+            })
+            .await
+            .map_err(|e| classify_rest_query_error(&e, None))?;
+        let schedule = response.data().await.map_err(response_decode_error)?;
+
+        let symbol = instrument.name().as_str();
+        let (base, quote) = (pair.base.name().as_str(), pair.quote.name().as_str());
+        let mut earliest: Option<DateTime<Utc>> = None;
+        for entry in schedule {
+            let scheduled = if self.config.is_isolated {
+                entry
+                    .isolated_margin_symbols
+                    .iter()
+                    .flatten()
+                    .any(|listed| listed == symbol)
+            } else {
+                entry
+                    .cross_margin_assets
+                    .iter()
+                    .flatten()
+                    .any(|listed| listed == base || listed == quote)
+            };
+            if !scheduled {
+                continue;
+            }
+            // Milliseconds, as Binance confirmed for every margin endpoint carrying `delistTime`.
+            let delisting_at = entry
+                .delist_time
+                .and_then(DateTime::from_timestamp_millis)
+                .ok_or_else(|| {
+                    UnindexedClientError::Internal(format!(
+                        "decoding Binance response: delist-schedule lists {symbol} with delistTime \
+                         {:?}",
+                        entry.delist_time
+                    ))
+                })?;
+            earliest = Some(earliest.map_or(delisting_at, |earliest| earliest.min(delisting_at)));
+        }
+        Ok(earliest)
     }
 
     /// `asset`'s next hourly interest rate on this client's cross or isolated margin, a fraction
@@ -8083,7 +8151,8 @@ mod tests {
     }
 
     /// Answer the requests behind `fetch_shortability` and `fetch_borrow_capacity`: the BTCUSDT
-    /// pair on cross and isolated margin, the base asset, its hourly rate and its max borrow.
+    /// pair on cross and isolated margin, the base asset, its hourly rate, its max borrow, and an
+    /// empty delisting schedule, which [`mount_delist_schedule`] overrides.
     async fn mount_borrow_terms(
         server: &wiremock::MockServer,
         pair: serde_json::Value,
@@ -8101,6 +8170,7 @@ mod tests {
             ("/sapi/v1/margin/allAssets", asset),
             ("/sapi/v1/margin/next-hourly-interest-rate", rate),
             ("/sapi/v1/margin/maxBorrowable", max_borrow),
+            ("/sapi/v1/margin/delist-schedule", serde_json::json!([])),
         ] {
             Mock::given(method("GET"))
                 .and(path(route))
@@ -8108,6 +8178,21 @@ mod tests {
                 .mount(server)
                 .await;
         }
+    }
+
+    /// Answer `/sapi/v1/margin/delist-schedule` with `schedule`, ahead of the empty one
+    /// [`mount_borrow_terms`] mounts.
+    async fn mount_delist_schedule(server: &wiremock::MockServer, schedule: serde_json::Value) {
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path},
+        };
+        Mock::given(method("GET"))
+            .and(path("/sapi/v1/margin/delist-schedule"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(schedule))
+            .with_priority(1)
+            .mount(server)
+            .await;
     }
 
     fn btcusdt_pair(is_margin_trade: bool, is_sell_allowed: bool) -> serde_json::Value {
@@ -8230,6 +8315,132 @@ mod tests {
             assert_eq!(shortability.easy_to_borrow, None);
             assert_eq!(shortability.available, None);
         }
+    }
+
+    /// Cross margin schedules assets, so either of the pair's assets delists the pair; isolated
+    /// margin schedules symbols. The earliest matching time is reported, in milliseconds, and once
+    /// it has passed the pair is not shortable.
+    #[tokio::test]
+    async fn margin_shortability_reads_the_delisting_schedule_for_this_margin() {
+        use crate::client::ShortabilityClient;
+        let past = Utc::now() - chrono::Duration::hours(1);
+        let soon = Utc::now() + chrono::Duration::days(3);
+        let later = soon + chrono::Duration::days(7);
+        let entry = |time: DateTime<Utc>, assets: &[&str], symbols: &[&str]| {
+            serde_json::json!({
+                "delistTime": time.timestamp_millis(),
+                "crossMarginAssets": assets,
+                "isolatedMarginSymbols": symbols,
+            })
+        };
+        let millis = |time: DateTime<Utc>| DateTime::from_timestamp_millis(time.timestamp_millis());
+        let cases = [
+            // Cross: the base asset, the quote asset, the earliest of two, none matching.
+            (
+                false,
+                vec![entry(soon, &["BTC"], &[])],
+                millis(soon),
+                Some(true),
+            ),
+            (
+                false,
+                vec![entry(soon, &["USDT"], &[])],
+                millis(soon),
+                Some(true),
+            ),
+            (
+                false,
+                vec![
+                    entry(later, &["BTC"], &[]),
+                    entry(soon, &["ETH", "USDT"], &[]),
+                ],
+                millis(soon),
+                Some(true),
+            ),
+            (
+                false,
+                vec![entry(soon, &["ETH"], &["BTCUSDT"])],
+                None,
+                Some(true),
+            ),
+            (
+                false,
+                vec![entry(past, &["BTC"], &[])],
+                millis(past),
+                Some(false),
+            ),
+            // Isolated: the symbol only, never the assets.
+            (
+                true,
+                vec![entry(soon, &[], &["BTCUSDT"])],
+                millis(soon),
+                Some(true),
+            ),
+            (
+                true,
+                vec![entry(soon, &["BTC", "USDT"], &["ETHUSDT"])],
+                None,
+                Some(true),
+            ),
+            (
+                true,
+                vec![entry(past, &[], &["BTCUSDT"])],
+                millis(past),
+                Some(false),
+            ),
+        ];
+        for (is_isolated, schedule, delisting_at, shortable) in cases {
+            let server = wiremock::MockServer::start().await;
+            mount_borrow_terms(
+                &server,
+                btcusdt_pair(true, true),
+                btc_asset(true),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            )
+            .await;
+            let schedule = serde_json::Value::from(schedule);
+            mount_delist_schedule(&server, schedule.clone()).await;
+
+            let shortability = margin_client_at(&server, is_isolated)
+                .fetch_shortability(&InstrumentNameExchange::new("BTCUSDT"))
+                .await
+                .unwrap();
+
+            let case = format!("isolated: {is_isolated}, {schedule}");
+            assert_eq!(shortability.delisting_at, delisting_at, "{case}");
+            assert_eq!(shortability.shortable, shortable, "{case}");
+        }
+    }
+
+    /// A scheduled entry without a readable time is an error, not a pair left shortable.
+    #[tokio::test]
+    async fn margin_shortability_of_a_scheduled_pair_without_a_time_is_an_error() {
+        use crate::client::ShortabilityClient;
+        let server = wiremock::MockServer::start().await;
+        mount_borrow_terms(
+            &server,
+            btcusdt_pair(true, true),
+            btc_asset(true),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        )
+        .await;
+        mount_delist_schedule(
+            &server,
+            serde_json::json!([{ "crossMarginAssets": ["BTC"] }]),
+        )
+        .await;
+
+        let result = margin_client_at(&server, false)
+            .fetch_shortability(&InstrumentNameExchange::new("BTCUSDT"))
+            .await;
+
+        assert!(
+            matches!(result, Err(UnindexedClientError::Internal(ref message))
+                if message.contains("delistTime")),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
