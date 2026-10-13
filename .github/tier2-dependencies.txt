@@ -359,7 +359,8 @@ ibapi=5.1.0  # 2026-10-13 | Financial protocol, community-maintained, no officia
 #     (transport/sync.rs:1389-1398); 5.0.0 shut down the read side only. TCP closes even while clones or
 #     subscriptions are held, so the client id is freed. Held subscriptions still yield Err(Shutdown), then end.
 #     IbkrClient::disconnect's rustdoc, which told callers to drop every clone before reusing the id, was
-#     rewritten in the same PR. NOT verified live: that TWS frees the id fast enough for an immediate reconnect.
+#     rewritten in the same PR; it says a reconnect right after may meet error 326 and need a retry, as the
+#     #[ignore]d restart test in tests/ibkr_execution.rs already does (up to 15 s). NOT yet run live on 5.1.0.
 #   - HISTORICAL fetch() (#967): a response closed before HistoricalDataEnd is UnexpectedEndOfStream, a wrong
 #     second message UnexpectedResponse (market_data/historical/sync.rs:279-286); 5.0.0 returned the bars with
 #     start/end at the epoch. We surface it as DataError::Socket and never read start/end.

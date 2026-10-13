@@ -263,11 +263,10 @@ where
 
     /// Disconnect from IB Gateway.
     ///
-    /// Signals the client to shut down, which will cause worker threads to exit
-    /// when they next attempt an IB operation. This releases the client ID for reuse.
-    ///
-    /// Call this before dropping to ensure IB Gateway releases the connection promptly.
-    /// Worker threads will terminate when they observe the disconnected state.
+    /// Closes the connection to IB Gateway, which ends every worker's subscription at once: each
+    /// worker sends one terminal [`DataError::Socket`] carrying `ibapi`'s shutdown error, and the
+    /// channel then closes. IB Gateway frees the client ID once it has processed the close, which
+    /// can take a moment. Dropping the stream disconnects too.
     ///
     /// This is idempotent — calling it multiple times is safe.
     pub fn disconnect(&self) {

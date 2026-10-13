@@ -111,9 +111,8 @@
 //!    `account_stream` ends with `StreamTerminated`, and `account_stream` on the
 //!    shut-down client fails, so replace the client, by reconnecting with
 //!    [`IbkrClient::connect_sync`] and choosing the client ID: the caller's decision. The old
-//!    client's ID stays in use until every clone of it is dropped (see
-//!    [`IbkrClient::disconnect`]). A new
-//!    `IbkrClient` tracks the orders the old one placed once an account snapshot or
+//!    client's connection is closed in each case, so TWS/Gateway frees its ID once it has
+//!    processed the close (see [`IbkrClient::disconnect`]). A new `IbkrClient` tracks the orders the old one placed once an account snapshot or
 //!    `fetch_open_orders` lists them; until then their events are dropped.
 //! 3. **Stale state cleanup**: Periodically call [`IbkrClient::clear_stale_executions`],
 //!    [`IbkrClient::clear_stale_order_ids`], and [`IbkrClient::clear_stale_pending_cancels`]
@@ -1534,9 +1533,11 @@ impl IbkrClient {
     ///
     /// This closes the TCP connection, even while other clones of this client ([`IbkrClient`]
     /// implements [`Clone`] and shares one connection) or their subscriptions are still alive.
-    /// TWS/Gateway frees the API client ID once it sees the connection close, so
-    /// [`connect_sync`](Self::connect_sync) can reconnect under the same ID without dropping the
-    /// clones first. A clone that outlives the call is shut down, not reconnected.
+    /// TWS/Gateway frees the API client ID once it has processed the close, which can take a
+    /// moment: [`connect_sync`](Self::connect_sync) under the same ID right after this call may be
+    /// refused with IB error 326 ("client id is already in use"), and succeeds on a retry. The
+    /// clones need not be dropped first. A clone that outlives the call is shut down, not
+    /// reconnected.
     ///
     /// This is idempotent — calling it multiple times is safe.
     pub fn disconnect(&self) {
