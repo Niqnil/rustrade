@@ -33,8 +33,8 @@
 //! # Balances and carrying costs
 //!
 //! Balances are read from IB's account summary, one per currency in IB's ledger (`$LEDGER:ALL`),
-//! named by the currency's code. Every account the login manages is summed, as IB sums the ledger
-//! over the account group. [`ExecutionClient::account_stream`] delivers no balances.
+//! named by the currency's code. Every account the login manages is summed per currency.
+//! [`ExecutionClient::account_stream`] delivers no balances.
 //!
 //! - `total` is the currency's `TotalCashBalance` (else `CashBalance`): its cash, negative while
 //!   the account borrows it. It is not converted into the base currency.
@@ -43,7 +43,9 @@
 //!   earns it.
 //! - `free` is `total`, capped at the account's `AvailableFunds` converted into the currency at
 //!   IB's ledger rate. IB reports `AvailableFunds` only for the whole account, so every currency
-//!   is capped by the same funds and the `free` values do not add up.
+//!   is capped by the same funds and the `free` values do not add up. It is negative when `total`
+//!   is. With several accounts, each is capped by its own funds before they are summed. Without a
+//!   rate to convert the funds, `free` is `total`, logged at WARN.
 //!
 //! The ledger's `BASE` row, every currency converted into the base currency and summed, is not
 //! returned.

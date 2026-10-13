@@ -60,8 +60,9 @@ pub struct MarginDetails {
 /// and [`Balance::net_asset`].
 ///
 /// `Ord`/`PartialOrd` are derived and compare lexicographically over
-/// `(total, free, margin, accrued)` (`None` sorts before `Some`); they exist for use as collection keys and generic bounds, not as a
-/// financial ranking. Use [`Balance::net_asset`] for value comparisons that account for debt.
+/// `(total, free, margin, accrued)` (`None` sorts before `Some`); they exist for use as collection
+/// keys and generic bounds, not as a financial ranking. Use [`Balance::net_asset`] for value
+/// comparisons that account for debt.
 #[derive(
     Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Deserialize, Serialize,
 )]

@@ -28,8 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     next. IB does not document whether stock borrow fees accrue in it. `free` is `total`, capped at
     the account's `AvailableFunds` converted into the currency. It used to be `AvailableFunds`
     itself, which can exceed `total`. IB reports `AvailableFunds` for the whole account only, so
-    every currency is capped by the same funds. With several accounts, the balances sum them, as
-    IB's ledger does.
+    every currency is capped by the same funds. With several accounts, each currency is summed
+    over them, each account capped by its own funds first. Without a rate to convert the funds,
+    `free` is `total`, logged at WARN.
 
 ## [0.11.0] - 2026-10-12
 
