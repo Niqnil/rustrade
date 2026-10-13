@@ -42,6 +42,14 @@ pub struct Shortability {
     /// over 365 days. A simulated venue's holding costs apply their own
     /// [`DayCount`](crate::holding_cost::DayCount) to whatever rate they are given.
     pub fee_rate: Option<Decimal>,
+    /// When the venue has announced it will stop lending the instrument or trading it on margin.
+    ///
+    /// A short still open then may be closed by the venue. A time already passed means the
+    /// instrument is no longer shortable: a
+    /// [`ShortabilityClient`](crate::client::ShortabilityClient) that reports one must also report
+    /// `shortable` as `Some(false)`, and the simulated venue refuses a short from this time on,
+    /// whatever `shortable` says.
+    pub delisting_at: Option<DateTime<Utc>>,
 }
 
 impl Shortability {
@@ -75,6 +83,13 @@ impl Shortability {
     #[must_use]
     pub fn with_fee_rate(mut self, fee_rate: Decimal) -> Self {
         self.fee_rate = Some(fee_rate);
+        self
+    }
+
+    /// With when the venue will stop lending the instrument or trading it on margin.
+    #[must_use]
+    pub fn with_delisting_at(mut self, delisting_at: DateTime<Utc>) -> Self {
+        self.delisting_at = Some(delisting_at);
         self
     }
 }
@@ -217,6 +232,7 @@ mod tests {
                 easy_to_borrow: None,
                 available: None,
                 fee_rate: None,
+                delisting_at: None,
             }
         );
 
@@ -224,18 +240,21 @@ mod tests {
             .with_shortable(true)
             .with_easy_to_borrow(false)
             .with_available(dec!(1500))
-            .with_fee_rate(dec!(0.12));
+            .with_fee_rate(dec!(0.12))
+            .with_delisting_at(utc("2026-10-20T00:00:00Z"));
         assert_eq!(full.shortable, Some(true));
         assert_eq!(full.easy_to_borrow, Some(false));
         assert_eq!(full.available, Some(dec!(1500)));
         assert_eq!(full.fee_rate, Some(dec!(0.12)));
+        assert_eq!(full.delisting_at, Some(utc("2026-10-20T00:00:00Z")));
     }
 
     #[test]
     fn shortability_round_trips_through_serde_and_reads_missing_fields_as_unknown() {
         let full = Shortability::new()
             .with_shortable(true)
-            .with_available(dec!(10));
+            .with_available(dec!(10))
+            .with_delisting_at(utc("2026-10-20T00:00:00Z"));
         let json = serde_json::to_string(&full).unwrap();
         assert_eq!(serde_json::from_str::<Shortability>(&json).unwrap(), full);
 
