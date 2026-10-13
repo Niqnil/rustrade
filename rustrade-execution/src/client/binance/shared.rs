@@ -1808,8 +1808,9 @@ pub(crate) const ORDER_EXECUTIONS_BUDGET: Duration =
 /// How many orders' executions one instrument's recovery reads at once.
 ///
 /// Recovery already runs up to eight instruments at once, so this allows 32 lookups in flight.
-/// Each is weight 5 (Spot, `myTrades` with `orderId`) or 10 (Margin) against a limit of several
-/// thousand a minute, and [`rest_call_with_retry`] backs off when Binance signals the limit.
+/// Each is weight 4 or 5 (Spot: `GET /api/v3/order`, `myTrades` with `orderId`) or 10 (Margin)
+/// against a limit of several thousand a minute, and [`rest_call_with_retry`] backs off when
+/// Binance signals the limit.
 pub(crate) const ORDER_EXECUTIONS_IN_FLIGHT: usize = 4;
 
 /// The cumulative filled quantity of each recovered execution's order, as of that execution,
@@ -1837,47 +1838,18 @@ where
     F: Fn(i64) -> Fut,
     Fut: Future<Output = Result<Vec<T>, UnindexedClientError>>,
 {
-    use futures::StreamExt as _;
-
-    let mut order_ids: Vec<i64> = recovered.iter().filter_map(|t| t.order_id()).collect();
-    order_ids.sort_unstable();
-    order_ids.dedup();
-
-    let fetch = &fetch;
-    let mut lookups = futures::stream::iter(order_ids.iter().copied())
-        .map(|order_id| async move { (order_id, fetch(order_id).await) })
-        .buffer_unordered(ORDER_EXECUTIONS_IN_FLIGHT);
-
     let mut totals = fnv::FnvHashMap::default();
-    let mut settled = 0;
-    loop {
-        let (order_id, walk) = match tokio::time::timeout_at(deadline, lookups.next()).await {
-            Ok(Some(lookup)) => lookup,
-            Ok(None) => break,
-            Err(_elapsed) => {
-                warn!(
-                    %exchange, %instrument,
-                    orders_left = order_ids.len() - settled,
-                    budget = ?ORDER_EXECUTIONS_BUDGET,
-                    "fill recovery ran out of time reading orders' executions; the remaining \
-                     orders' recovered fills carry no cumulative filled quantity"
-                );
-                break;
-            }
-        };
-        settled += 1;
-        let executions = match walk {
-            Ok(executions) => executions,
-            Err(error) => {
-                warn!(
-                    %exchange, %instrument, order_id, %error,
-                    "fill recovery could not read the order's executions; its recovered fills \
-                     carry no cumulative filled quantity"
-                );
-                continue;
-            }
-        };
-        match order_running_totals(order_id, &executions) {
+    for_each_recovered_order(
+        RecoveredOrderLookup {
+            exchange,
+            instrument,
+            reading: "orders' executions",
+            lost: "cumulative filled quantity",
+        },
+        recovered,
+        deadline,
+        fetch,
+        |order_id, executions| match order_running_totals(order_id, &executions) {
             Some(running) => totals.extend(running),
             None => warn!(
                 %exchange, %instrument, order_id, executions = executions.len(),
@@ -1885,9 +1857,142 @@ where
                  or another order's execution); its recovered fills carry no cumulative filled \
                  quantity"
             ),
+        },
+    )
+    .await;
+    totals
+}
+
+/// The client order id of each order among `recovered`, keyed by order id.
+///
+/// `myTrades` carries no client order id, so a recovered fill cannot report the one its order was
+/// placed with on its own: this reads each order with `fetch`, `GET /api/v3/order` (weight 4) or
+/// `GET /sapi/v1/margin/order` (weight 10). Callers run it after [`recovered_order_totals`],
+/// under the same `deadline`, so it uses only the time those walks left: a fill without its
+/// cumulative leaves its order behind, while one without its client order id is only harder to
+/// attribute. Up to [`ORDER_EXECUTIONS_IN_FLIGHT`] orders are read at once.
+///
+/// An order is left out, and its recovered fills carry no
+/// [`Trade::client_order_id`](crate::trade::Trade::client_order_id), when its lookup fails, when
+/// the venue reports no id for it (`fetch` returns `None`), or once `deadline` passes. Failures
+/// and the deadline are logged.
+pub(crate) async fn recovered_order_cids<T, F, Fut>(
+    exchange: ExchangeId,
+    instrument: &InstrumentNameExchange,
+    recovered: &[T],
+    deadline: tokio::time::Instant,
+    fetch: F,
+) -> fnv::FnvHashMap<i64, ClientOrderId>
+where
+    T: BinanceExecutionFields,
+    F: Fn(i64) -> Fut,
+    Fut: Future<Output = Result<Option<ClientOrderId>, UnindexedClientError>>,
+{
+    let mut cids = fnv::FnvHashMap::default();
+    for_each_recovered_order(
+        RecoveredOrderLookup {
+            exchange,
+            instrument,
+            reading: "orders",
+            lost: "client order id",
+        },
+        recovered,
+        deadline,
+        fetch,
+        |order_id, cid| {
+            if let Some(cid) = cid {
+                cids.insert(order_id, cid);
+            }
+        },
+    )
+    .await;
+    cids
+}
+
+/// What a fill-recovery lookup over recovered orders reads, named in what it logs.
+struct RecoveredOrderLookup<'a> {
+    exchange: ExchangeId,
+    instrument: &'a InstrumentNameExchange,
+    /// What each lookup reads, such as "orders' executions".
+    reading: &'static str,
+    /// What a recovered fill goes without when its order's lookup is lost.
+    lost: &'static str,
+}
+
+/// Look up each order among `recovered` with `fetch`, up to [`ORDER_EXECUTIONS_IN_FLIGHT`] at
+/// once, handing each result to `settle`, until every order is read or `deadline` passes.
+///
+/// A failed lookup, and the orders still unread at the deadline, are logged and skipped: the
+/// lookups only enrich recovered fills, so none of them may hold one back.
+async fn for_each_recovered_order<T, R, F, Fut>(
+    lookup: RecoveredOrderLookup<'_>,
+    recovered: &[T],
+    deadline: tokio::time::Instant,
+    fetch: F,
+    mut settle: impl FnMut(i64, R),
+) where
+    T: BinanceExecutionFields,
+    F: Fn(i64) -> Fut,
+    Fut: Future<Output = Result<R, UnindexedClientError>>,
+{
+    use futures::StreamExt as _;
+
+    let RecoveredOrderLookup {
+        exchange,
+        instrument,
+        reading,
+        lost,
+    } = lookup;
+    let mut order_ids: Vec<i64> = recovered.iter().filter_map(|t| t.order_id()).collect();
+    order_ids.sort_unstable();
+    order_ids.dedup();
+
+    // `timeout_at` polls before it checks, so past the deadline the first poll would still send
+    // the first reads only to drop them.
+    if tokio::time::Instant::now() >= deadline {
+        if !order_ids.is_empty() {
+            warn!(
+                %exchange, %instrument,
+                orders_left = order_ids.len(),
+                budget = ?ORDER_EXECUTIONS_BUDGET,
+                "fill recovery ran out of time before reading {reading}; the orders' recovered \
+                 fills carry no {lost}"
+            );
+        }
+        return;
+    }
+
+    let fetch = &fetch;
+    let mut lookups = futures::stream::iter(order_ids.iter().copied())
+        .map(|order_id| async move { (order_id, fetch(order_id).await) })
+        .buffer_unordered(ORDER_EXECUTIONS_IN_FLIGHT);
+
+    let mut settled = 0;
+    loop {
+        let (order_id, result) = match tokio::time::timeout_at(deadline, lookups.next()).await {
+            Ok(Some(lookup)) => lookup,
+            Ok(None) => break,
+            Err(_elapsed) => {
+                warn!(
+                    %exchange, %instrument,
+                    orders_left = order_ids.len() - settled,
+                    budget = ?ORDER_EXECUTIONS_BUDGET,
+                    "fill recovery ran out of time reading {reading}; the remaining orders' \
+                     recovered fills carry no {lost}"
+                );
+                break;
+            }
+        };
+        settled += 1;
+        match result {
+            Ok(value) => settle(order_id, value),
+            Err(error) => warn!(
+                %exchange, %instrument, order_id, %error,
+                "fill recovery could not read {reading} for an order; its recovered fills carry \
+                 no {lost}"
+            ),
         }
     }
-    totals
 }
 
 /// `(trade id, cumulative filled quantity as of that execution)` for every execution of one
@@ -2251,6 +2356,11 @@ pub(crate) fn convert_execution_report(
                 order_filled_quantity,
                 AssetFees::new(fee_asset, commission, None),
             );
+            // Only the order's own `c`: `cid` falls back to the exchange id without one.
+            let trade = match report.client_order_id.as_deref() {
+                Some(c) if !c.is_empty() => trade.with_client_order_id(cid.clone()),
+                _ => trade,
+            };
             buf.push(UnindexedAccountEvent::new(
                 exchange,
                 AccountEventKind::Trade(trade),
@@ -2690,7 +2800,9 @@ pub(crate) fn parse_binance_order_rejection(
 ///   retry can succeed; a clock that stays wrong keeps failing, so callers should bound retries.
 /// - `-1121` → [`ApiError::InstrumentInvalid`] when the request named one instrument; otherwise
 ///   there is no instrument to attach, so it falls through.
-/// - anything else → [`ApiError::RequestRejected`].
+/// - anything else → [`ApiError::RequestRejected`], prefixed with the symbol when the request
+///   named one instrument, as Binance's text often does not say which, such as `-11001 Isolated
+///   margin account does not exist.`
 fn parse_binance_query_rejection(
     msg: String,
     instrument: Option<&InstrumentNameExchange>,
@@ -2703,6 +2815,8 @@ fn parse_binance_query_rejection(
         return UnindexedClientError::Connectivity(ConnectivityError::Socket(msg));
     } else if let Some(instrument) = instrument.filter(|_| contains_error_code(&msg, "-1121")) {
         ApiError::InstrumentInvalid(instrument.clone(), msg)
+    } else if let Some(instrument) = instrument {
+        ApiError::RequestRejected(format!("{}: {msg}", instrument.name()))
     } else {
         ApiError::RequestRejected(msg)
     };
@@ -4306,6 +4420,59 @@ mod tests {
         assert_eq!(totals.get(&21), Some(&Decimal::ONE));
     }
 
+    /// Past the deadline, as when the walks before them used the whole budget, the reads for
+    /// client order ids send nothing.
+    #[tokio::test]
+    async fn a_lookup_past_its_deadline_sends_nothing() {
+        let recovered = [execution(20, 1, "1")];
+        let cids = recovered_order_cids(
+            ExchangeId::BinanceSpot,
+            &btcusdt(),
+            &recovered,
+            tokio::time::Instant::now(),
+            |_| async { panic!("no read past the deadline") },
+        )
+        .await;
+        assert!(cids.is_empty());
+    }
+
+    /// Each recovered order is read once for its client order id. One the venue reports none for,
+    /// and one whose read fails, are left out without holding back the others.
+    #[tokio::test]
+    async fn recovered_orders_are_read_for_their_client_order_ids() {
+        let recovered = [
+            execution(20, 1, "1"),
+            execution(21, 1, "1"),
+            execution(22, 2, "1"),
+            execution(23, 3, "1"),
+        ];
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+
+        let cids = recovered_order_cids(
+            ExchangeId::BinanceMargin,
+            &btcusdt(),
+            &recovered,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            |order_id| {
+                reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                async move {
+                    match order_id {
+                        1 => Ok(Some(ClientOrderId::new("sweep-1"))),
+                        2 => Ok(None),
+                        _ => Err(UnindexedClientError::Connectivity(
+                            ConnectivityError::Socket("connection reset".into()),
+                        )),
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(reads.into_inner(), 3, "one read per order");
+        assert_eq!(cids.len(), 1, "{cids:?}");
+        assert_eq!(cids.get(&1), Some(&ClientOrderId::new("sweep-1")));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn lookups_stop_at_the_deadline_keeping_the_walks_that_answered() {
         // Order 1's walk never answers; order 2's does. Recovery must return what it has at the
@@ -4501,6 +4668,29 @@ mod tests {
         };
         assert!(msg.contains("-1127"), "code missing from {msg:?}");
         assert!(!err.is_transient());
+    }
+
+    #[test]
+    fn a_rejected_query_naming_one_instrument_says_which() {
+        let err = classify_query(bad_request(
+            -11001,
+            "Isolated margin account does not exist.",
+        ));
+        let UnindexedClientError::Api(ApiError::RequestRejected(msg)) = &err else {
+            panic!("expected RequestRejected, got {err:?}");
+        };
+        assert!(msg.starts_with("BTCUSDT: "), "symbol missing from {msg:?}");
+        assert!(msg.contains("-11001"), "code missing from {msg:?}");
+
+        // With no single instrument in the request there is none to name.
+        let err = classify_rest_query_error(
+            &anyhow::Error::new(bad_request(-1127, "More than 24 hours.")),
+            None,
+        );
+        let UnindexedClientError::Api(ApiError::RequestRejected(msg)) = &err else {
+            panic!("expected RequestRejected, got {err:?}");
+        };
+        assert!(!msg.contains("BTCUSDT"), "{msg:?}");
     }
 
     #[test]

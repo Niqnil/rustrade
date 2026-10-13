@@ -1078,6 +1078,7 @@ impl SimulatedVenue {
                 fees: settlement.fees,
                 origin: TradeOrigin::Order,
                 position_side: None,
+                client_order_id: Some(order.key.cid.clone()),
             };
 
             self.account.ack_trade(trade.clone());
@@ -2084,6 +2085,7 @@ impl SimulatedVenue {
             fees: fill.fees,
             origin: TradeOrigin::Order,
             position_side: None,
+            client_order_id: Some(request.key.cid.clone()),
         };
 
         // Booked here rather than by the caller, so that whatever this order became is decided in

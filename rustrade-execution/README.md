@@ -7,11 +7,11 @@ Execution client library for streaming private account data and executing orders
 | Exchange | Constructor | InstrumentKinds | Features |
 |:--------:|:-----------:|:---------------:|:--------:|
 | **BinanceSpot** | `BinanceSpot::new(BinanceSpotConfig)` | Spot | Orders, Balances, OrderRecovery |
-| **BinanceMargin** | `BinanceMargin::new(BinanceMarginConfig)` | Spot (cross/isolated margin) | Orders, Balances, OrderRecovery |
-| **Alpaca** | `AlpacaClient::new(AlpacaConfig)` | Spot (Equities, Crypto), Option | Orders, Balances, Positions, BracketOrders, OrderRecovery |
+| **BinanceMargin** | `BinanceMargin::new(BinanceMarginConfig)` | Spot (cross/isolated margin) | Orders, Balances, OrderRecovery, Shortability, BorrowCapacity |
+| **Alpaca** | `AlpacaClient::new(AlpacaConfig)` | Spot (Equities, Crypto), Option | Orders, Balances, Positions, BracketOrders, OrderRecovery, Shortability |
 | **Hyperliquid** | `HyperliquidClient::connect(HyperliquidConfig)` | Perpetual | Orders, Balances, Positions, OrderRecovery |
 | **HyperliquidSpot** | `HyperliquidSpotClient::connect(HyperliquidConfig)` | Spot | Orders, Balances, OrderRecovery |
-| **IBKR** | `IbkrClient::connect_sync(IbkrConfig)` | Spot, Future, Option | Orders, Balances, Positions, BracketOrders, OrderRecovery |
+| **IBKR** | `IbkrClient::connect_sync(IbkrConfig)` | Spot, Future, Option | Orders, Balances, Positions, BracketOrders, OrderRecovery, Shortability |
 
 **Positions** means `account_snapshot` reports each open position in
 `InstrumentAccountSnapshot::position`: signed quantity, entry price and unrealised PnL, plus
@@ -35,6 +35,15 @@ Margin) and Hyperliquid Spot a holding is an asset balance instead, and `positio
 **OrderRecovery** means the client implements `OrderStatusClient::fetch_ended_orders`, which
 reads how the listed orders ended at the venue. After an account-stream outage, each client uses
 it to report the orders that ended while the stream was down.
+
+**Shortability** means the client implements `ShortabilityClient::fetch_shortability`, which asks
+the venue whether it would lend an instrument for a short sale: whether it is shortable and easy to
+borrow, how much the venue has to lend, and the borrow fee, each where the venue says. The answer
+is advisory, so a short sale must still handle `ApiError::BorrowRejected`. **BorrowCapacity** means
+the client implements `BorrowCapacityClient::fetch_borrow_capacity`, which reports how much more of
+the asset an order on a given side would borrow this account can borrow now, and its limit. Each
+implementation's rustdoc states what a query costs: IBKR's holds a market data line for up to
+`IbkrConfig::shortability_timeout` (10 s by default), and Binance's use request weight.
 
 The `new` constructors are `ExecutionClient::new`. Each connector is behind a Cargo feature, and
 none is enabled by default: `alpaca`, `binance` (Spot and Margin), `hyperliquid` (perpetuals and

@@ -1,4 +1,4 @@
-use crate::order::id::{OrderId, StrategyId};
+use crate::order::id::{ClientOrderId, OrderId, StrategyId};
 use chrono::{DateTime, Utc};
 use derive_more::{Constructor, From};
 use rust_decimal::Decimal;
@@ -127,6 +127,35 @@ pub struct Trade<AssetKey, InstrumentKey> {
     /// `None`.
     #[serde(default)]
     pub position_side: Option<Side>,
+    /// The client order id of the order this fill belongs to, as the venue reported it with the
+    /// fill.
+    ///
+    /// The id is chosen before the order is sent, so a consumer can attribute a fill by it at
+    /// once. That includes a fill of an order placed outside the engine on the same account,
+    /// which no order the engine knows matches: [`order_id`](Self::order_id) is the venue's, and
+    /// the fill can arrive before the venue's response to the order names it, or long after, in a
+    /// recovery read. A consumer that trades an account outside the engine can mark those orders'
+    /// client order ids, by a prefix say, and keep their fills from the engine.
+    ///
+    /// `None` means the fill's payload did not carry one. It is not a claim that the order has
+    /// none. Known producers, as of writing:
+    ///
+    /// | Source | Reports it |
+    /// |---|---|
+    /// | Binance Spot / Margin WebSocket `executionReport` | yes (`c`) |
+    /// | Binance Spot / Margin fill recovery after a disconnect | yes, read from each recovered fill's order; `None` where that lookup failed or ran out of time |
+    /// | Binance Spot / Margin `fetch_trades` (`myTrades` REST) | no |
+    /// | Alpaca WebSocket `trade_updates` | yes (`order.client_order_id`) |
+    /// | Alpaca account-activities REST (fill recovery, `fetch_trades`), `fetch_option_events` | no |
+    /// | Interactive Brokers executions | yes, the order reference, which this crate's client sets to the client order id; `None` for an order without one |
+    /// | Hyperliquid `userFills` | yes, the client order id the order's cloid maps to; `None` for an order placed without a cloid |
+    /// | `SimulatedVenue` | yes |
+    /// | The `rustrade` engine's expiry settlement | no |
+    ///
+    /// `#[serde(default)]` so trades serialised before this field existed still deserialise, as
+    /// `None`.
+    #[serde(default)]
+    pub client_order_id: Option<ClientOrderId>,
 }
 
 impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
@@ -158,6 +187,7 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
             fees,
             origin: TradeOrigin::Order,
             position_side: None,
+            client_order_id: None,
         }
     }
 
@@ -172,6 +202,15 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
     pub fn with_position_side(self, position_side: Side) -> Self {
         Self {
             position_side: Some(position_side),
+            ..self
+        }
+    }
+
+    /// This trade with the [`client_order_id`](Self::client_order_id) the venue reported.
+    #[must_use]
+    pub fn with_client_order_id(self, client_order_id: ClientOrderId) -> Self {
+        Self {
+            client_order_id: Some(client_order_id),
             ..self
         }
     }

@@ -42,6 +42,8 @@ use serial_test as _;
 #[cfg(test)]
 use temp_env as _;
 #[cfg(test)]
+use tokio_tungstenite as _;
+#[cfg(test)]
 use tracing_subscriber as _;
 #[cfg(test)]
 use wiremock as _;
@@ -75,6 +77,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 pub mod balance;
+pub mod borrow_capacity;
+pub use borrow_capacity::BorrowCapacity;
 pub mod cash_flow;
 pub use cash_flow::{CashFlow, CashFlowId, CashFlowKind, CashFlowsRead};
 pub mod client;
