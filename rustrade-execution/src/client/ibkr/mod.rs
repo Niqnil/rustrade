@@ -32,15 +32,29 @@
 //!
 //! # Balances and carrying costs
 //!
-//! Balances are read from IB's account summary, one per currency: `total` is `TotalCashValue` and
-//! `free` is `AvailableFunds`. No other tag is read, and [`ExecutionClient::account_stream`]
-//! delivers no balances.
+//! Balances are read from IB's account summary, one per currency in IB's ledger (`$LEDGER:ALL`),
+//! named by the currency's code. Every account the login manages is summed per currency.
+//! [`ExecutionClient::account_stream`] delivers no balances.
 //!
-//! As IB documents it, margin interest and stock borrow fees accrue through the month, reported
-//! under the `AccruedCash` tag, and are posted to cash monthly. Until they are posted,
-//! `TotalCashValue`, and so `total`, leaves them out: up to a month of charges. This client does
-//! not read `AccruedCash`. Fills carry none of these charges, so PnL computed from them excludes
-//! them too.
+//! - `total` is the currency's `TotalCashBalance` (else `CashBalance`): its cash, negative while
+//!   the account borrows it. It is not converted into the base currency.
+//! - `accrued` ([`Balance::accrued`](crate::balance::Balance::accrued)) is the currency's
+//!   `AccruedCash`: interest accrued this month and not yet posted, positive when the account
+//!   earns it.
+//! - `free` is `total`, capped at the account's `AvailableFunds` converted into the currency at
+//!   IB's ledger rate. IB reports `AvailableFunds` only for the whole account, so every currency
+//!   is capped by the same funds and the `free` values do not add up. It is negative when `total`
+//!   is. With several accounts, each is capped by its own funds before they are summed. Without a
+//!   rate to convert the funds, `free` is `total`, logged at WARN.
+//!
+//! The ledger's `BASE` row, every currency converted into the base currency and summed, is not
+//! returned.
+//!
+//! As IB documents it, interest accrues daily through the month in `AccruedCash` and is posted to
+//! cash at the month's end or in the first days of the next. Until then `total` leaves it out, so
+//! the cash the account will hold is `total + accrued`. Stock borrow fees accrue daily too; IB
+//! does not document whether they accrue in `AccruedCash` or when they post. Fills carry none of
+//! these charges, so PnL computed from them excludes them too.
 //!
 //! # Shortability
 //!
@@ -3086,7 +3100,7 @@ impl ExecutionClient for IbkrClient {
             // not an account ID. Using account ID causes error 321 "Unified group name is invalid".
             // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
             let sub = client
-                .account_summary(&ACCOUNT_GROUP_ALL, &["TotalCashValue", "AvailableFunds"])
+                .account_summary(&ACCOUNT_GROUP_ALL, account::BALANCE_SUMMARY_TAGS)
                 .map_err(|e| UnindexedClientError::Internal(format!("account_summary: {e}")))?;
 
             let mut balances = read_account_summary(
@@ -5262,7 +5276,7 @@ mod order_reader_tests {
                 Ok(SubscriptionItem::Data(AccountSummaryResult::Summary(
                     AccountSummary {
                         account: "DU1".to_string(),
-                        tag: "TotalCashValue".to_string(),
+                        tag: "TotalCashBalance".to_string(),
                         value: "100".to_string(),
                         currency: "USD".to_string(),
                     },
