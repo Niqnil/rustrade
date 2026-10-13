@@ -1939,11 +1939,9 @@ async fn test_orders_found_by_client_order_id_across_a_restart() {
     };
     assert_eq!(cancelled.filled_quantity, Some(rust_decimal::Decimal::ZERO));
 
-    // A restart: a new client under the same API client id, which has never seen the order. The
-    // socket closes only when the last handle to the client goes, and IB then takes a moment to
-    // release the id.
+    // A restart: a new client under the same API client id, which has never seen the order.
+    // `disconnect` closes the socket, and IB then takes a moment to release the id.
     client.disconnect();
-    drop(client);
     let mut restarted = Err(String::new());
     for _ in 0..15 {
         tokio::time::sleep(Duration::from_secs(1)).await;
