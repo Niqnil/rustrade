@@ -162,9 +162,10 @@ pub struct IbkrMarketStream<K> {
     rx: mpsc::UnboundedReceiver<Result<MarketEvent<K, DataKind>, DataError>>,
     client: Arc<Client>,
     /// Set by [`disconnect`](Self::disconnect) before it closes the connection, so that a worker
-    /// can tell the caller's own close from a shutdown `ibapi` or TWS/Gateway caused: both reach
-    /// it as `ibapi::Error::Shutdown`. Should `ibapi` shut down on its own just before the caller
-    /// disconnects, a worker that reads the error only afterwards takes it for the caller's close.
+    /// can tell the caller's own close from a shutdown `ibapi` or TWS/Gateway caused: `ibapi`
+    /// reports both alike, as `Error::Shutdown` to a running subscription and as
+    /// `Error::ConnectionReset` to one still being sent. Once it is set, any error that ends a
+    /// worker is taken for the caller's close, even one `ibapi` raised on its own just before.
     closing: Arc<AtomicBool>,
 }
 
@@ -659,8 +660,10 @@ impl<K> IbkrMarketStream<K> {
     /// stream then ends (`None`) once every worker has exited, with no error item for the close:
     /// a close the caller asked for is not a failure. A shutdown `ibapi` or TWS/Gateway causes
     /// instead, such as reconnection given up or the API session ended, still reaches the stream
-    /// as one terminal [`DataError::Socket`] per subscription. IB Gateway frees the client ID once
-    /// it has processed the close, which can take a moment. Dropping the stream disconnects too.
+    /// as one terminal [`DataError::Socket`] per subscription; one that comes just before this
+    /// call, but reaches a worker only after it, ends that worker quietly too. IB Gateway frees the
+    /// client ID once it has processed the close, which can take a moment. Dropping the stream
+    /// disconnects too.
     ///
     /// This is idempotent — calling it multiple times is safe.
     pub fn disconnect(&self) {
@@ -680,8 +683,10 @@ impl<K> Drop for IbkrMarketStream<K> {
 /// End a worker on `error`: log it, and send it to the stream as the worker's terminal
 /// [`DataError::Socket`], `"{stage} {symbol}: {error}"`.
 ///
-/// The exception is the shutdown the stream's own [`disconnect`](IbkrMarketStream::disconnect)
-/// causes, once `closing` is set: it is logged at debug and nothing is sent.
+/// Once `closing` is set, the stream's own [`disconnect`](IbkrMarketStream::disconnect) has
+/// begun, and any error is logged at debug and nothing is sent: `ibapi` reports that close as
+/// more than one error, depending on how far the worker got, and the caller is ending the
+/// stream anyway.
 fn report_worker_error<T>(
     closing: &AtomicBool,
     tx: &mpsc::UnboundedSender<Result<T, DataError>>,
@@ -689,8 +694,8 @@ fn report_worker_error<T>(
     symbol: &str,
     error: ibapi::Error,
 ) {
-    if matches!(error, ibapi::Error::Shutdown) && closing.load(Ordering::Acquire) {
-        debug!(symbol, "{stage} ended by disconnect");
+    if closing.load(Ordering::Acquire) {
+        debug!(symbol, error = %error, "{stage} ended by disconnect");
         return;
     }
     error!(symbol, error = %error, "{stage} failed");
@@ -734,20 +739,29 @@ mod tests {
 
     #[test]
     fn a_shutdown_the_caller_did_not_ask_for_reaches_the_stream() {
-        let Some(msg) = worker_error_sent(false, ibapi::Error::Shutdown) else {
-            panic!("no error item");
-        };
-        assert!(msg.starts_with("quotes subscription AAPL: "), "{msg}");
+        assert_eq!(
+            worker_error_sent(false, ibapi::Error::Shutdown),
+            Some(format!(
+                "quotes subscription AAPL: {}",
+                ibapi::Error::Shutdown
+            ))
+        );
     }
 
     #[test]
-    fn the_callers_own_disconnect_ends_a_worker_without_an_error_item() {
+    fn a_connection_reset_the_caller_did_not_ask_for_reaches_the_stream() {
+        assert!(worker_error_sent(false, ibapi::Error::ConnectionReset).is_some());
+    }
+
+    #[test]
+    fn the_callers_own_disconnect_ends_a_running_worker_without_an_error_item() {
         assert_eq!(worker_error_sent(true, ibapi::Error::Shutdown), None);
     }
 
     #[test]
-    fn other_errors_reach_the_stream_even_while_disconnecting() {
-        assert!(worker_error_sent(true, ibapi::Error::ConnectionReset).is_some());
+    fn the_callers_own_disconnect_ends_a_subscribing_worker_without_an_error_item() {
+        // `ibapi` refuses a subscription sent after the close began with `ConnectionReset`.
+        assert_eq!(worker_error_sent(true, ibapi::Error::ConnectionReset), None);
     }
 
     #[test]

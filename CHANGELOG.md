@@ -50,7 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream error as a reason to reconnect would reconnect a stream it had just closed. After
   `disconnect` the stream now ends with `None` once its workers exit, logged at DEBUG.
   A shutdown `ibapi` or TWS/Gateway causes, such as reconnection given up or the API session
-  ended, still reaches the stream as a `DataError::Socket` per subscription, logged at ERROR.
+  ended, still reaches the stream as a `DataError::Socket` per subscription, logged at ERROR,
+  unless it reaches a worker only after the caller's `disconnect`.
 
 ## [0.11.0] - 2026-10-12
 
