@@ -112,8 +112,9 @@
 //!    shut-down client fails, so replace the client, by reconnecting with
 //!    [`IbkrClient::connect_sync`] and choosing the client ID: the caller's decision. The old
 //!    client's connection is closed in each case, so TWS/Gateway frees its ID once it has
-//!    processed the close (see [`IbkrClient::disconnect`]). A new `IbkrClient` tracks the orders the old one placed once an account snapshot or
-//!    `fetch_open_orders` lists them; until then their events are dropped.
+//!    processed the close (see [`IbkrClient::disconnect`]). A new `IbkrClient` tracks the
+//!    orders the old one placed once an account snapshot or `fetch_open_orders` lists them;
+//!    until then their events are dropped.
 //! 3. **Stale state cleanup**: Periodically call [`IbkrClient::clear_stale_executions`],
 //!    [`IbkrClient::clear_stale_order_ids`], and [`IbkrClient::clear_stale_pending_cancels`]
 //!
