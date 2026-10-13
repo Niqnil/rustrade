@@ -32,6 +32,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     over them, each account capped by its own funds first. Without a rate to convert the funds,
     `free` is `total`, logged at WARN.
 
+- **`ibapi` 5.0.0 → 5.1.0** (`rustrade-execution`, `rustrade-data`, `rustrade-instrument`, feature
+  `ibkr`). The bytes sent for every order are unchanged. Two changes reach the compiled code:
+  - `disconnect` on `IbkrClient`, `IbkrMarketStream` and `IbkrHistoricalData` now closes the TCP
+    connection even while clones of the client or their subscriptions are still alive. Before, `ibapi` shut down only the read side and kept the connection open until the last
+    clone was dropped, so TWS/Gateway refused a reconnect under the same client ID with error 326.
+    The ID is now free once TWS/Gateway sees the close. The rustdoc said to drop every clone first;
+    it no longer does.
+  - An IBKR historical bar request whose response closes before IB's end marker is now a
+    `DataError::Socket` instead of a silently complete set of bars.
+
 ## [0.11.0] - 2026-10-12
 
 ### Added

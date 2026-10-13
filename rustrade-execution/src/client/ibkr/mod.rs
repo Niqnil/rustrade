@@ -1532,12 +1532,11 @@ impl IbkrClient {
     ///
     /// # Client ID release
     ///
-    /// This does not release the API client ID. `ibapi` keeps the TCP connection open until the
-    /// last clone of this client is dropped ([`IbkrClient`] implements [`Clone`] and shares one
-    /// connection), and TWS/Gateway treats the ID as in use while the connection is open. To
-    /// reconnect under the same ID, drop every clone first; otherwise
-    /// [`connect_sync`](Self::connect_sync) is refused with IB error 326 ("client id is already in
-    /// use").
+    /// This closes the TCP connection, even while other clones of this client ([`IbkrClient`]
+    /// implements [`Clone`] and shares one connection) or their subscriptions are still alive.
+    /// TWS/Gateway frees the API client ID once it sees the connection close, so
+    /// [`connect_sync`](Self::connect_sync) can reconnect under the same ID without dropping the
+    /// clones first. A clone that outlives the call is shut down, not reconnected.
     ///
     /// This is idempotent — calling it multiple times is safe.
     pub fn disconnect(&self) {
