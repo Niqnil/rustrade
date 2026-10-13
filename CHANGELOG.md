@@ -44,6 +44,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - An IBKR historical bar request whose response closes before IB's end marker is now a
     `DataError::Socket` instead of a silently complete set of bars.
 
+- **`IbkrMarketStream` ends cleanly after its own `disconnect`** (`rustrade-data`, feature
+  `ibkr`). Each subscription used to end with a `DataError::Socket` carrying `ibapi`'s shutdown
+  error, logged at ERROR, even when the caller had asked for the close. A consumer that treats a
+  stream error as a reason to reconnect would reconnect a stream it had just closed. After
+  `disconnect` the stream now ends with `None` once its workers exit, logged at DEBUG.
+  A shutdown `ibapi` or TWS/Gateway causes, such as reconnection given up or the API session
+  ended, still reaches the stream as a `DataError::Socket` per subscription, logged at ERROR.
+
 ## [0.11.0] - 2026-10-12
 
 ### Added

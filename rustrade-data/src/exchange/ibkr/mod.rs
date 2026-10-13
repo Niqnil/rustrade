@@ -94,7 +94,10 @@ use serde::{Deserialize, Serialize};
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll},
 };
 use subscription::{IbkrSubscription, IbkrSubscriptionKind};
@@ -138,6 +141,8 @@ impl Default for IbkrStreamConfig {
 /// - Worker threads terminate when:
 ///   - The channel closes (this stream is dropped)
 ///   - The IB subscription ends (disconnect or server-side cancel)
+/// - The stream ends once every worker has exited. A worker ended by an error first sends it as
+///   a terminal `DataError::Socket`, except when [`disconnect`](Self::disconnect) ended it.
 ///
 /// # Memory Usage
 ///
@@ -156,6 +161,11 @@ impl Default for IbkrStreamConfig {
 pub struct IbkrMarketStream<K> {
     rx: mpsc::UnboundedReceiver<Result<MarketEvent<K, DataKind>, DataError>>,
     client: Arc<Client>,
+    /// Set by [`disconnect`](Self::disconnect) before it closes the connection, so that a worker
+    /// can tell the caller's own close from a shutdown `ibapi` or TWS/Gateway caused: both reach
+    /// it as `ibapi::Error::Shutdown`. Should `ibapi` shut down on its own just before the caller
+    /// disconnects, a worker that reads the error only afterwards takes it for the caller's close.
+    closing: Arc<AtomicBool>,
 }
 
 impl<K> futures::Stream for IbkrMarketStream<K> {
@@ -199,6 +209,7 @@ where
             .map_err(|e| DataError::Socket(format!("IB connect: {e}")))?;
 
         let client = Arc::new(client);
+        let closing = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::unbounded_channel();
 
         let mut active_subscriptions = 0;
@@ -222,6 +233,7 @@ where
                     contract,
                     sub.key.clone(),
                     tx.clone(),
+                    closing.clone(),
                 ),
                 IbkrSubscriptionKind::Depth { rows } => Self::run_depth_subscription(
                     client.clone(),
@@ -229,18 +241,21 @@ where
                     sub.key.clone(),
                     rows,
                     tx.clone(),
+                    closing.clone(),
                 ),
                 IbkrSubscriptionKind::Trades => Self::run_trades_subscription(
                     client.clone(),
                     contract,
                     sub.key.clone(),
                     tx.clone(),
+                    closing.clone(),
                 ),
                 IbkrSubscriptionKind::OptionGreeks => Self::run_option_greeks_subscription(
                     client.clone(),
                     contract,
                     sub.key.clone(),
                     tx.clone(),
+                    closing.clone(),
                 ),
             };
 
@@ -258,20 +273,11 @@ where
             ));
         }
 
-        Ok(Self { rx, client })
-    }
-
-    /// Disconnect from IB Gateway.
-    ///
-    /// Closes the connection to IB Gateway, which ends every worker's subscription at once: each
-    /// worker sends one terminal [`DataError::Socket`] carrying `ibapi`'s shutdown error, and the
-    /// channel then closes. IB Gateway frees the client ID once it has processed the close, which
-    /// can take a moment. Dropping the stream disconnects too.
-    ///
-    /// This is idempotent — calling it multiple times is safe.
-    pub fn disconnect(&self) {
-        debug!("Disconnecting IbkrMarketStream");
-        self.client.disconnect();
+        Ok(Self {
+            rx,
+            client,
+            closing,
+        })
     }
 
     fn run_quotes_subscription(
@@ -279,6 +285,7 @@ where
         contract: ibapi::contracts::Contract,
         key: K,
         tx: mpsc::UnboundedSender<Result<MarketEvent<K, DataKind>, DataError>>,
+        closing: Arc<AtomicBool>,
     ) -> Result<(), DataError> {
         let symbol = contract.symbol.to_string();
         let symbol_clone = symbol.clone();
@@ -296,10 +303,7 @@ where
                     let sub = match client.market_data(&contract).subscribe() {
                         Ok(s) => s,
                         Err(e) => {
-                            error!(symbol = %symbol, error = %e, "Failed to subscribe to quotes");
-                            let _ = tx.send(Err(DataError::Socket(format!(
-                                "quotes subscription {symbol}: {e}"
-                            ))));
+                            report_worker_error(&closing, &tx, "quotes subscription", &symbol, e);
                             return;
                         }
                     };
@@ -313,10 +317,13 @@ where
                         let tick = match tick {
                             Ok(t) => t,
                             Err(e) => {
-                                error!(symbol = %symbol, error = %e, "Quotes subscription error");
-                                let _ = tx.send(Err(DataError::Socket(format!(
-                                    "quotes subscription {symbol}: {e}"
-                                ))));
+                                report_worker_error(
+                                    &closing,
+                                    &tx,
+                                    "quotes subscription",
+                                    &symbol,
+                                    e,
+                                );
                                 break;
                             }
                         };
@@ -361,6 +368,7 @@ where
         key: K,
         rows: i32,
         tx: mpsc::UnboundedSender<Result<MarketEvent<K, DataKind>, DataError>>,
+        closing: Arc<AtomicBool>,
     ) -> Result<(), DataError> {
         let symbol = contract.symbol.to_string();
         let symbol_clone = symbol.clone();
@@ -380,10 +388,7 @@ where
                     let sub = match client.market_depth(&contract, rows).subscribe() {
                         Ok(s) => s,
                         Err(e) => {
-                            error!(symbol = %symbol, error = %e, "Failed to subscribe to depth");
-                            let _ = tx.send(Err(DataError::Socket(format!(
-                                "depth subscription {symbol}: {e}"
-                            ))));
+                            report_worker_error(&closing, &tx, "depth subscription", &symbol, e);
                             return;
                         }
                     };
@@ -397,10 +402,13 @@ where
                         let item = match item {
                             Ok(i) => i,
                             Err(e) => {
-                                error!(symbol = %symbol, error = %e, "Depth subscription error");
-                                let _ = tx.send(Err(DataError::Socket(format!(
-                                    "depth subscription {symbol}: {e}"
-                                ))));
+                                report_worker_error(
+                                    &closing,
+                                    &tx,
+                                    "depth subscription",
+                                    &symbol,
+                                    e,
+                                );
                                 break;
                             }
                         };
@@ -475,6 +483,7 @@ where
         contract: ibapi::contracts::Contract,
         key: K,
         tx: mpsc::UnboundedSender<Result<MarketEvent<K, DataKind>, DataError>>,
+        closing: Arc<AtomicBool>,
     ) -> Result<(), DataError> {
         let symbol = contract.symbol.to_string();
         let symbol_clone = symbol.clone();
@@ -492,10 +501,7 @@ where
                     let sub = match client.tick_by_tick(&contract, 0).all_last() {
                         Ok(s) => s,
                         Err(e) => {
-                            error!(symbol = %symbol, error = %e, "Failed to subscribe to trades");
-                            let _ = tx.send(Err(DataError::Socket(format!(
-                                "trades subscription {symbol}: {e}"
-                            ))));
+                            report_worker_error(&closing, &tx, "trades subscription", &symbol, e);
                             return;
                         }
                     };
@@ -504,10 +510,13 @@ where
                         let trade = match trade {
                             Ok(t) => t,
                             Err(e) => {
-                                error!(symbol = %symbol, error = %e, "Trades subscription error");
-                                let _ = tx.send(Err(DataError::Socket(format!(
-                                    "trades subscription {symbol}: {e}"
-                                ))));
+                                report_worker_error(
+                                    &closing,
+                                    &tx,
+                                    "trades subscription",
+                                    &symbol,
+                                    e,
+                                );
                                 break;
                             }
                         };
@@ -555,6 +564,7 @@ where
         contract: ibapi::contracts::Contract,
         key: K,
         tx: mpsc::UnboundedSender<Result<MarketEvent<K, DataKind>, DataError>>,
+        closing: Arc<AtomicBool>,
     ) -> Result<(), DataError> {
         if contract.security_type != SecurityType::Option {
             return Err(DataError::Socket(format!(
@@ -579,10 +589,13 @@ where
                     let sub = match client.market_data(&contract).subscribe() {
                         Ok(s) => s,
                         Err(e) => {
-                            error!(symbol = %symbol, error = %e, "Failed to subscribe to option Greeks");
-                            let _ = tx.send(Err(DataError::Socket(format!(
-                                "option Greeks subscription {symbol}: {e}"
-                            ))));
+                            report_worker_error(
+                                &closing,
+                                &tx,
+                                "option Greeks subscription",
+                                &symbol,
+                                e,
+                            );
                             return;
                         }
                     };
@@ -593,10 +606,13 @@ where
                         let tick = match tick {
                             Ok(t) => t,
                             Err(e) => {
-                                error!(symbol = %symbol, error = %e, "Option Greeks subscription error");
-                                let _ = tx.send(Err(DataError::Socket(format!(
-                                    "option Greeks subscription {symbol}: {e}"
-                                ))));
+                                report_worker_error(
+                                    &closing,
+                                    &tx,
+                                    "option Greeks subscription",
+                                    &symbol,
+                                    e,
+                                );
                                 break;
                             }
                         };
@@ -636,11 +652,49 @@ where
     }
 }
 
+impl<K> IbkrMarketStream<K> {
+    /// Disconnect from IB Gateway.
+    ///
+    /// Closes the connection to IB Gateway, which ends every worker's subscription at once. The
+    /// stream then ends (`None`) once every worker has exited, with no error item for the close:
+    /// a close the caller asked for is not a failure. A shutdown `ibapi` or TWS/Gateway causes
+    /// instead, such as reconnection given up or the API session ended, still reaches the stream
+    /// as one terminal [`DataError::Socket`] per subscription. IB Gateway frees the client ID once
+    /// it has processed the close, which can take a moment. Dropping the stream disconnects too.
+    ///
+    /// This is idempotent — calling it multiple times is safe.
+    pub fn disconnect(&self) {
+        debug!("Disconnecting IbkrMarketStream");
+        self.closing.store(true, Ordering::Release);
+        self.client.disconnect();
+    }
+}
+
 impl<K> Drop for IbkrMarketStream<K> {
     fn drop(&mut self) {
         debug!("Dropping IbkrMarketStream, disconnecting client");
-        self.client.disconnect();
+        self.disconnect();
     }
+}
+
+/// End a worker on `error`: log it, and send it to the stream as the worker's terminal
+/// [`DataError::Socket`], `"{stage} {symbol}: {error}"`.
+///
+/// The exception is the shutdown the stream's own [`disconnect`](IbkrMarketStream::disconnect)
+/// causes, once `closing` is set: it is logged at debug and nothing is sent.
+fn report_worker_error<T>(
+    closing: &AtomicBool,
+    tx: &mpsc::UnboundedSender<Result<T, DataError>>,
+    stage: &str,
+    symbol: &str,
+    error: ibapi::Error,
+) {
+    if matches!(error, ibapi::Error::Shutdown) && closing.load(Ordering::Acquire) {
+        debug!(symbol, "{stage} ended by disconnect");
+        return;
+    }
+    error!(symbol, error = %error, "{stage} failed");
+    let _ = tx.send(Err(DataError::Socket(format!("{stage} {symbol}: {error}"))));
 }
 
 /// Convert f64 to Decimal, returning None for invalid values.
@@ -661,6 +715,40 @@ pub(crate) fn decimal_from_f64(value: f64) -> Option<Decimal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn worker_error_sent(closing: bool, error: ibapi::Error) -> Option<String> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Result<(), DataError>>();
+        report_worker_error(
+            &AtomicBool::new(closing),
+            &tx,
+            "quotes subscription",
+            "AAPL",
+            error,
+        );
+        match rx.try_recv() {
+            Ok(Err(DataError::Socket(msg))) => Some(msg),
+            Ok(other) => panic!("unexpected item: {other:?}"),
+            Err(_) => None,
+        }
+    }
+
+    #[test]
+    fn a_shutdown_the_caller_did_not_ask_for_reaches_the_stream() {
+        let Some(msg) = worker_error_sent(false, ibapi::Error::Shutdown) else {
+            panic!("no error item");
+        };
+        assert!(msg.starts_with("quotes subscription AAPL: "), "{msg}");
+    }
+
+    #[test]
+    fn the_callers_own_disconnect_ends_a_worker_without_an_error_item() {
+        assert_eq!(worker_error_sent(true, ibapi::Error::Shutdown), None);
+    }
+
+    #[test]
+    fn other_errors_reach_the_stream_even_while_disconnecting() {
+        assert!(worker_error_sent(true, ibapi::Error::ConnectionReset).is_some());
+    }
 
     #[test]
     fn decimal_from_f64_handles_special_values() {
