@@ -1588,8 +1588,10 @@ impl ShortabilityClient for BinanceMargin {
     ///
     /// # Errors
     ///
-    /// [`ApiError::InstrumentInvalid`] for a pair Binance does not trade on this client's cross
-    /// or isolated margin.
+    /// - [`ApiError::InstrumentInvalid`] for a pair Binance does not trade on this client's cross
+    ///   or isolated margin.
+    /// - Whatever error any of the requests returns, the delisting schedule's included: an unread
+    ///   schedule is not reported as no delisting scheduled.
     async fn fetch_shortability(
         &self,
         instrument: &InstrumentNameExchange,
@@ -1605,7 +1607,9 @@ impl ShortabilityClient for BinanceMargin {
         if let Some(delisting_at) = delisting_at {
             shortability = shortability.with_delisting_at(delisting_at);
         }
-        // Any flag false is enough to forbid the short; all must be known true to allow it.
+        // Any flag false is enough to forbid the short; all must be known true to allow it. The
+        // schedule lists everything due to be delisted, so a pair absent from it is known not to
+        // be, and this flag is never unknown.
         let not_delisted = Some(delisting_at.is_none_or(|delisting_at| delisting_at > Utc::now()));
         let flags = [
             pair.is_margin_trade,

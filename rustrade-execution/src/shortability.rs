@@ -45,9 +45,10 @@ pub struct Shortability {
     /// When the venue has announced it will stop lending the instrument or trading it on margin.
     ///
     /// A short still open then may be closed by the venue. A time already passed means the
-    /// instrument is no longer shortable: a venue client reporting one also reports `shortable` as
-    /// `Some(false)`, and the simulated venue refuses a short from this time on, whatever
-    /// `shortable` says.
+    /// instrument is no longer shortable: a
+    /// [`ShortabilityClient`](crate::client::ShortabilityClient) that reports one must also report
+    /// `shortable` as `Some(false)`, and the simulated venue refuses a short from this time on,
+    /// whatever `shortable` says.
     pub delisting_at: Option<DateTime<Utc>>,
 }
 
