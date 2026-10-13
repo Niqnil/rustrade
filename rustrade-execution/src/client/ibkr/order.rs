@@ -587,6 +587,7 @@ pub(crate) fn order_shape_from_ib(order: &Order) -> Result<OrderShape, String> {
                 OrderKind::TrailingStop {
                     offset,
                     offset_type,
+                    activation_price: None,
                 },
                 None,
                 time_in_force,
@@ -793,6 +794,8 @@ fn require_limit_price(
 ///   `trail_stop_price`, `limit_price_offset`
 /// - `TakeProfit` → `Err(UnsupportedOrderKind)` (IBKR has no native TP; use bracket orders)
 /// - `TakeProfitLimit` → `Err(UnsupportedOrderKind)` (IBKR has no native TP; use bracket orders)
+/// - `TrailingStop` with an `activation_price`, and `TrailingStopFixedLimit` →
+///   `Err(UnsupportedOrderKind)` (IBKR has neither)
 /// - `BasisPoints` offset type → Error (not supported by IBKR)
 ///
 /// # Price Requirements
@@ -856,6 +859,7 @@ pub fn build_ib_order(
         OrderKind::TrailingStop {
             offset,
             offset_type,
+            activation_price: None,
         } => {
             let offset_f64 = decimal_to_f64(*offset)?;
             match offset_type {
@@ -933,8 +937,15 @@ pub fn build_ib_order(
         }
 
         // IBKR does not have native take-profit order types. Callers should use
-        // bracket orders or manage TP logic at the strategy level.
-        OrderKind::TakeProfit { .. } | OrderKind::TakeProfitLimit { .. } => {
+        // bracket orders or manage TP logic at the strategy level. Its trailing orders take no
+        // activation price, and its trailing limit follows the stop rather than staying fixed.
+        OrderKind::TakeProfit { .. }
+        | OrderKind::TakeProfitLimit { .. }
+        | OrderKind::TrailingStop {
+            activation_price: Some(_),
+            ..
+        }
+        | OrderKind::TrailingStopFixedLimit { .. } => {
             return Err(OrderMappingError::UnsupportedOrderKind(*kind));
         }
     };
@@ -1607,6 +1618,7 @@ mod tests {
             &OrderKind::TrailingStop {
                 offset: Decimal::from(5),
                 offset_type: TrailingOffsetType::Percentage,
+                activation_price: None,
             },
             None, // Trailing stop orders have no limit price
             &TimeInForce::GoodUntilCancelled { post_only: false },
@@ -1629,6 +1641,7 @@ mod tests {
             &OrderKind::TrailingStop {
                 offset: Decimal::from(2),
                 offset_type: TrailingOffsetType::Absolute,
+                activation_price: None,
             },
             None, // Trailing stop orders have no limit price
             &TimeInForce::GoodUntilCancelled { post_only: false },
@@ -1754,6 +1767,7 @@ mod tests {
             &OrderKind::TrailingStop {
                 offset: Decimal::from(50), // 50 basis points
                 offset_type: TrailingOffsetType::BasisPoints,
+                activation_price: None,
             },
             None, // Trailing stop orders have no limit price
             &TimeInForce::GoodUntilCancelled { post_only: false },
@@ -1788,6 +1802,36 @@ mod tests {
                 TrailingOffsetType::BasisPoints
             ))
         ));
+    }
+
+    /// IBKR has no activation price on a trailing stop, and no fixed-limit trailing stop.
+    #[test]
+    fn test_build_activated_and_fixed_limit_trailing_stops_unsupported() {
+        let tif = TimeInForce::GoodUntilCancelled { post_only: false };
+        for kind in [
+            OrderKind::TrailingStop {
+                offset: Decimal::from(2),
+                offset_type: TrailingOffsetType::Percentage,
+                activation_price: Some(Decimal::from(150)),
+            },
+            OrderKind::TrailingStopFixedLimit {
+                offset: Decimal::from(2),
+                offset_type: TrailingOffsetType::Percentage,
+                activation_price: None,
+            },
+        ] {
+            let result = build_ib_order(
+                rustrade_instrument::Side::Sell,
+                100.0,
+                &kind,
+                Some(Decimal::from(140)),
+                &tif,
+            );
+            assert!(
+                matches!(result, Err(OrderMappingError::UnsupportedOrderKind(_))),
+                "{kind}: {result:?}"
+            );
+        }
     }
 
     #[test]
@@ -1969,6 +2013,7 @@ mod tests {
             &OrderKind::TrailingStop {
                 offset: Decimal::from(5),
                 offset_type: TrailingOffsetType::Percentage,
+                activation_price: None,
             },
             None, // Trailing stop orders have no limit price
             &TimeInForce::AtClose,
@@ -2277,6 +2322,7 @@ mod tests {
                 OrderKind::TrailingStop {
                     offset: dec!(2.5),
                     offset_type: TrailingOffsetType::Percentage,
+                    activation_price: None,
                 },
                 None,
             ),
@@ -2284,6 +2330,7 @@ mod tests {
                 OrderKind::TrailingStop {
                     offset: dec!(1.75),
                     offset_type: TrailingOffsetType::Absolute,
+                    activation_price: None,
                 },
                 None,
             ),

@@ -76,13 +76,13 @@
 //! [`super`] module documentation for why.
 
 use super::common::{
-    CLOID_REQUIRED, CancelOnDropStream, OpenOrder, OpenOrderListing, UserFill, cancel_outcome,
-    cid_to_cloid, instrument_to_spot_coin, map_tif, millis_to_datetime, open_order_to_order,
-    open_orders, parse_decimal, parse_side, span_millis, spot_balances, spot_base_quote,
-    spot_pair_to_instrument, user_fills_by_time,
+    CLOID_REQUIRED, CancelOnDropStream, InstrumentFilter, OpenOrder, OpenOrderListing, UserFill,
+    cancel_outcome, cid_to_cloid, cloid_to_cid, instrument_to_spot_coin, map_tif,
+    millis_to_datetime, open_order_to_order, open_orders, parse_decimal, parse_side, span_millis,
+    spot_balances, spot_base_quote, spot_pair_to_instrument, user_fills_by_time,
 };
 use super::config::HyperliquidConfig;
-use super::error::{map_order_error, map_sdk_error};
+use super::error::{map_order_error, map_sdk_error, order_rejection};
 use super::order_recovery::{
     ReconnectWatch, fetch_order_record, listed_cids, lookup_from_record, remember_open,
     remember_snapshot, send_fills, send_observed, spawn_order_checks,
@@ -109,7 +109,7 @@ use crate::{
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Filled, Open, OrderState, UnindexedOrderState},
     },
-    trade::{AssetFees, Trade, TradeId, TradesRead},
+    trade::{AssetFees, Trade, TradeId, TradeOrigin, TradesRead},
 };
 use chrono::{DateTime, Utc};
 use ethers::signers::Signer;
@@ -828,7 +828,9 @@ impl ExecutionClient for HyperliquidSpotClient {
                         .to_string(),
                 );
             }
-            OrderKind::TrailingStop { .. } | OrderKind::TrailingStopLimit { .. } => {
+            OrderKind::TrailingStop { .. }
+            | OrderKind::TrailingStopLimit { .. }
+            | OrderKind::TrailingStopFixedLimit { .. } => {
                 return make_unsupported(
                     "Hyperliquid does not support trailing stop orders".to_string(),
                 );
@@ -988,9 +990,7 @@ impl ExecutionClient for HyperliquidSpotClient {
                     }
                     Some(ExchangeDataStatus::Error(msg)) => {
                         warn!(%msg, "Spot order rejected by exchange");
-                        OrderState::inactive(OrderError::Rejected(
-                            crate::error::ApiError::OrderRejected(msg),
-                        ))
+                        OrderState::inactive(OrderError::Rejected(order_rejection(msg)))
                     }
                     Some(
                         ExchangeDataStatus::WaitingForFill | ExchangeDataStatus::WaitingForTrigger,
@@ -1017,9 +1017,7 @@ impl ExecutionClient for HyperliquidSpotClient {
             }
             ExchangeResponseStatus::Err(msg) => {
                 warn!(%msg, "Spot order rejected");
-                OrderState::inactive(OrderError::Rejected(crate::error::ApiError::OrderRejected(
-                    msg,
-                )))
+                OrderState::inactive(OrderError::Rejected(order_rejection(msg)))
             }
         };
 
@@ -1179,13 +1177,7 @@ fn spot_open_orders(
     pairs: &SpotPairs,
     instruments: &[InstrumentNameExchange],
 ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
-    let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
-        None
-    } else {
-        let mut set = HashSet::with_capacity(instruments.len());
-        set.extend(instruments.iter().cloned());
-        Some(set)
-    };
+    let instrument_filter = InstrumentFilter::new(instruments);
 
     let mut orders = Vec::new();
     for order in rows {
@@ -1193,10 +1185,7 @@ fn spot_open_orders(
             continue;
         };
         let instrument = spot_pair_to_instrument(pair);
-        if instrument_filter
-            .as_ref()
-            .is_some_and(|f| !f.contains(&instrument))
-        {
+        if !instrument_filter.matches(&instrument) {
             continue;
         }
         orders.extend(open_order_to_order(
@@ -1221,13 +1210,7 @@ fn spot_trades(
     end: DateTime<Utc>,
     instruments: &[InstrumentNameExchange],
 ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError> {
-    let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
-        None
-    } else {
-        let mut set = HashSet::with_capacity(instruments.len());
-        set.extend(instruments.iter().cloned());
-        Some(set)
-    };
+    let instrument_filter = InstrumentFilter::new(instruments);
 
     let mut result = Vec::new();
     for fill in fills {
@@ -1237,10 +1220,7 @@ fn spot_trades(
         let (base_asset, quote_asset) = (pair.base(), pair.quote());
         let instrument = spot_pair_to_instrument(pair);
 
-        if instrument_filter
-            .as_ref()
-            .is_some_and(|f| !f.contains(&instrument))
-        {
+        if !instrument_filter.matches(&instrument) {
             continue;
         }
 
@@ -1303,6 +1283,10 @@ fn spot_trades(
                     None
                 },
             },
+            // As on the stream, whose copy of a fill usually arrives first; see `TradeOrigin`.
+            origin: TradeOrigin::Order,
+            position_side: None,
+            client_order_id: fill.cloid.as_deref().and_then(cloid_to_cid),
         });
     }
 
@@ -1351,6 +1335,11 @@ fn fill_to_account_event(
                 None
             },
         },
+        // The SDK's `TradeInfo` drops the fill's liquidation marker, so every fill is reported
+        // as `Order`; see `TradeOrigin`.
+        origin: TradeOrigin::Order,
+        position_side: None,
+        client_order_id: fill.cloid.as_deref().and_then(cloid_to_cid),
     };
 
     Some(AccountEvent::new(
@@ -1507,7 +1496,7 @@ mod tests {
         }
     }
 
-    mod precision {
+    mod open_order {
         use super::super::super::common::info_tests::{
             exchange_client_against, info_client_against, test_wallet,
         };
@@ -1522,6 +1511,16 @@ mod tests {
 
         /// A spot client on [`TEST_SPOT_META`]'s pairs whose exchange endpoint rests every order.
         async fn resting_client() -> (MockServer, HyperliquidSpotClient) {
+            client_responding(serde_json::json!({
+                "status": "ok",
+                "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 77}}]}},
+            }))
+            .await
+        }
+
+        /// A spot client on [`TEST_SPOT_META`]'s pairs whose exchange endpoint answers every
+        /// request with `body`.
+        async fn client_responding(body: serde_json::Value) -> (MockServer, HyperliquidSpotClient) {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/info"))
@@ -1532,10 +1531,7 @@ mod tests {
                 .await;
             Mock::given(method("POST"))
                 .and(path("/exchange"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "status": "ok",
-                    "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 77}}]}},
-                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
                 .mount(&server)
                 .await;
             let info_client = Arc::new(info_client_against(server.uri()).await);
@@ -1553,6 +1549,45 @@ mod tests {
                 known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidSpot),
             };
             (server, client)
+        }
+
+        /// A spot order refused for want of balance is a balance shortfall, as on other venues;
+        /// any other refusal stays a rejection. Hyperliquid names no asset. The refusal is read
+        /// both as an order's status and as the error of the whole response.
+        #[tokio::test]
+        async fn a_spot_order_refused_for_balance_is_balance_insufficient() {
+            const BALANCE: &str = "Order has insufficient spot balance to trade";
+            const MINIMUM: &str = "Order must have minimum value of 10 USDC.";
+            for (body, expected) in [
+                (
+                    serde_json::json!({
+                        "status": "ok",
+                        "response": {"type": "order", "data": {"statuses": [{"error": BALANCE}]}},
+                    }),
+                    ApiError::BalanceInsufficient(None, BALANCE.to_owned()),
+                ),
+                (
+                    serde_json::json!({"status": "err", "response": BALANCE}),
+                    ApiError::BalanceInsufficient(None, BALANCE.to_owned()),
+                ),
+                (
+                    serde_json::json!({
+                        "status": "ok",
+                        "response": {"type": "order", "data": {"statuses": [{"error": MINIMUM}]}},
+                    }),
+                    ApiError::OrderRejected(MINIMUM.to_owned()),
+                ),
+            ] {
+                let (_server, client) = client_responding(body.clone()).await;
+                let order = place_hype(&client, dec!(10), dec!(1)).await;
+                let OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                    reported,
+                ))) = &order.state
+                else {
+                    panic!("{body}: expected a rejection, got {:?}", order.state);
+                };
+                assert_eq!(reported, &expected, "{body}");
+            }
         }
 
         async fn place_hype(

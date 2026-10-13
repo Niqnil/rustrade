@@ -160,6 +160,7 @@ async fn backtest_derives_venue_roles_from_the_execution_clients_it_builds() {
 
     let args_constant = Arc::new(BacktestArgsConstant {
         instruments,
+        venue_options: Default::default(),
         executions: vec![ExecutionConfig::Mock(mock_config())],
         market_data,
         summary_interval: Daily,

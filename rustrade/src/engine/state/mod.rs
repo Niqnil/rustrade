@@ -29,7 +29,7 @@ use rustrade_instrument::{
 use rustrade_integration::collection::{one_or_many::OneOrMany, snapshot::Snapshot};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
-use tracing::{error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Asset-centric state and associated state management logic.
 pub mod asset;
@@ -455,6 +455,56 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                 );
                 None
             }
+            AccountEventKind::CashFlow(flow) => {
+                // The venue's balances already include what it has posted, so a flow is applied
+                // to no balance (that would count it twice). One attributed to an instrument goes
+                // to its open position's carry, when it can be attributed without guessing.
+                match &flow.instrument {
+                    Some(instrument) => {
+                        let instrument_state = self.instruments.instrument_index_mut(instrument);
+                        // Not applied: already logged, and the flow stays on the account feed.
+                        let _ = instrument_state.update_from_cash_flow(flow);
+                        instrument_state.data.process(event);
+                    }
+                    None => debug!(
+                        exchange = ?event.exchange,
+                        kind = ?flow.kind,
+                        asset = ?flow.asset,
+                        amount = %flow.amount,
+                        time_exchange = %flow.time_exchange,
+                        "account-level cash flow received — not applied to positions or balances",
+                    ),
+                }
+                None
+            }
+            AccountEventKind::Notice(notice) => {
+                // Reported, not acted on: what to do about a margin call or liquidation is the
+                // consumer's policy. A consumer that wants the latest notice keeps it from the
+                // `GlobalData` update below, which every account event reaches. Not routed to an
+                // instrument's data state: a notice changes nothing there.
+                if notice.kind.is_escalation() {
+                    warn!(
+                        exchange = ?event.exchange,
+                        kind = %notice.kind,
+                        status = %notice.status,
+                        instrument = ?notice.instrument,
+                        margin_level = ?notice.margin_level,
+                        time_exchange = %notice.time_exchange,
+                        "venue reported rising margin risk on the account",
+                    );
+                } else {
+                    info!(
+                        exchange = ?event.exchange,
+                        kind = %notice.kind,
+                        status = %notice.status,
+                        instrument = ?notice.instrument,
+                        margin_level = ?notice.margin_level,
+                        time_exchange = %notice.time_exchange,
+                        "venue reported a change in the account's margin state",
+                    );
+                }
+                None
+            }
             _ => None,
         };
 
@@ -752,5 +802,116 @@ mod tests {
         assert_eq!(state.assets, before.assets);
         assert_eq!(state.instruments, before.instruments);
         assert_eq!(state.trading, before.trading);
+    }
+
+    /// A notice, rising risk or not, attributed or not, changes no engine state.
+    #[test]
+    fn a_notice_changes_no_state() {
+        use crate::engine::state::{
+            global::DefaultGlobalData, instrument::data::DefaultInstrumentMarketData,
+        };
+        use chrono::{DateTime, Utc};
+        use rust_decimal_macros::dec;
+        use rustrade_execution::notice::{AccountNotice, NoticeKind};
+        use smol_str::SmolStr;
+
+        let instruments = IndexedInstruments::new([test_instrument(EXECUTION, "btc", "usdt")]);
+        let mut state: EngineState<DefaultGlobalData, DefaultInstrumentMarketData> =
+            EngineState::builder(&instruments, DefaultGlobalData, |_| {
+                DefaultInstrumentMarketData::default()
+            })
+            .build();
+        let before = state.clone();
+
+        for (kind, instrument) in [
+            (NoticeKind::Liquidation, Some(InstrumentIndex::new(0))),
+            (NoticeKind::MarginCall, None),
+            (NoticeKind::MarginRestored, None),
+        ] {
+            let event = AccountEvent::new(
+                ExchangeIndex::new(0),
+                AccountEventKind::Notice(AccountNotice::new(
+                    kind,
+                    instrument,
+                    DateTime::<Utc>::MIN_UTC,
+                    Some(dec!(1.05)),
+                    SmolStr::new("STATUS"),
+                )),
+            );
+            assert_eq!(state.update_from_account(&event), None, "{kind}");
+        }
+        assert_eq!(state.assets, before.assets);
+        assert_eq!(state.instruments, before.instruments);
+        assert_eq!(state.trading, before.trading);
+    }
+
+    /// A cash flow attributed to an instrument reaches its open position's carry and nothing
+    /// else; an account-level one changes no state.
+    #[test]
+    fn a_cash_flow_reaches_only_its_instruments_open_position() {
+        use crate::engine::state::{
+            global::DefaultGlobalData, instrument::data::DefaultInstrumentMarketData,
+            position::PositionSeed,
+        };
+        use chrono::{DateTime, Utc};
+        use rust_decimal::Decimal;
+        use rust_decimal_macros::dec;
+        use rustrade_execution::cash_flow::{CashFlow, CashFlowKind};
+        use rustrade_instrument::Side;
+
+        let instruments = IndexedInstruments::new([test_instrument(EXECUTION, "btc", "usdt")]);
+        let name = instruments.instruments()[0].value.name_internal.clone();
+        let quote = instruments.instruments()[0].value.underlying.quote;
+        let time = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let mut state: EngineState<DefaultGlobalData, DefaultInstrumentMarketData> =
+            EngineState::builder(&instruments, DefaultGlobalData, |_| {
+                DefaultInstrumentMarketData::default()
+            })
+            .time_engine_start(time)
+            .positions([PositionSeed::new(
+                name,
+                Side::Sell,
+                dec!(1),
+                dec!(100),
+                time,
+            )])
+            .try_build()
+            .unwrap();
+        let flow = |instrument| {
+            AccountEvent::new(
+                ExchangeIndex::new(0),
+                AccountEventKind::CashFlow(CashFlow::new(
+                    CashFlowKind::Funding {
+                        rate: None,
+                        position_quantity: None,
+                    },
+                    quote,
+                    dec!(0.75),
+                    instrument,
+                    time,
+                    None,
+                )),
+            )
+        };
+
+        let before = state.clone();
+        assert_eq!(state.update_from_account(&flow(None)), None);
+        assert_eq!(state.assets, before.assets);
+        assert_eq!(state.instruments, before.instruments);
+
+        assert_eq!(
+            state.update_from_account(&flow(Some(InstrumentIndex::new(0)))),
+            None
+        );
+        assert_eq!(state.assets, before.assets);
+        let positions = &state
+            .instruments
+            .instrument_index(&InstrumentIndex::new(0))
+            .position
+            .positions;
+        assert_eq!(positions.len(), 1);
+        let position = positions.values().next().unwrap();
+        assert_eq!(position.carry, dec!(0.75));
+        assert_eq!(position.pnl_realised, Decimal::ZERO);
     }
 }

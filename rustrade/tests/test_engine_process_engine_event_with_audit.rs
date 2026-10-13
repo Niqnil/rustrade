@@ -27,6 +27,7 @@ use rustrade::{
             connectivity::{ConnectivityDimension, Health, UntrackedExchange},
             global::DefaultGlobalData,
             instrument::{
+                ExpiryHandling,
                 data::{DefaultInstrumentMarketData, InstrumentDataState},
                 filter::InstrumentFilter,
             },
@@ -62,7 +63,7 @@ use rustrade_execution::{
         state::{ActiveOrderState, Cancelled, Filled, Open, OrderState},
     },
     position::{Position, PositionReport},
-    trade::{AssetFees, Trade, TradeId},
+    trade::{AssetFees, Trade, TradeId, TradeOrigin},
 };
 use rustrade_instrument::{
     Side, Underlying,
@@ -510,6 +511,7 @@ fn test_engine_process_engine_event_with_audit() {
                 quantity_abs_max: dec!(1.0),
                 pnl_realised: dec!(7000.0), // (-10k entry - 1k fees)+(20k exit - 2k fees) = 7k
                 fees_enter: asset_fees(0, dec!(1_000.0)),
+                carry: Decimal::ZERO,
                 fees_exit: asset_fees(0, dec!(2_000.0)),
                 time_enter: time_plus_days(STARTING_TIMESTAMP, 2),
                 time_exit: time_plus_days(STARTING_TIMESTAMP, 3),
@@ -711,6 +713,7 @@ fn test_engine_process_engine_event_with_audit() {
                 fees_enter: asset_fees(1, dec!(0.01)), // 0.01 btc
                 fees_exit: asset_fees(1, dec!(0.005)), // 0.005 btc
                 time_enter: time_plus_days(STARTING_TIMESTAMP, 2),
+                carry: Decimal::ZERO,
                 time_exit: time_plus_days(STARTING_TIMESTAMP, 5),
                 trades: vec![gen_trade_id(1), gen_trade_id(1)],
             }
@@ -1277,21 +1280,21 @@ fn account_event_trade(
 ) -> EngineEvent<DataKind> {
     EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::Trade(Trade {
-            id: gen_trade_id(instrument),
-            order_id: gen_order_id(instrument),
-            instrument: InstrumentIndex(instrument),
-            strategy: strategy_id(),
-            time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
+        kind: AccountEventKind::Trade(Trade::new(
+            gen_trade_id(instrument),
+            gen_order_id(instrument),
+            InstrumentIndex(instrument),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, time_plus),
             side,
-            price: Decimal::try_from(price).unwrap(),
-            quantity: Decimal::try_from(quantity).unwrap(),
-            order_filled_quantity: None,
-            fees: asset_fees(
+            Decimal::try_from(price).unwrap(),
+            Decimal::try_from(quantity).unwrap(),
+            None,
+            asset_fees(
                 instrument,
                 Decimal::try_from(price * quantity * QUOTE_FEES_PERCENT).unwrap(),
             ),
-        }),
+        )),
     }))
 }
 
@@ -1434,19 +1437,19 @@ fn expiry_exits(
 fn open_option_position(engine: &mut TestEngine, quantity: Decimal, price: Decimal) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::Trade(Trade {
-            id: TradeId::new("opt-trade-open"),
-            order_id: gen_order_id(0),
-            instrument: InstrumentIndex(0),
-            strategy: strategy_id(),
-            time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
-            side: Side::Buy,
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new("opt-trade-open"),
+            gen_order_id(0),
+            InstrumentIndex(0),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, 1),
+            Side::Buy,
             price,
             quantity,
             // Option instrument quote is USD = AssetIndex(1) in option engine
-            order_filled_quantity: None,
-            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
-        }),
+            None,
+            AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
+        )),
     }));
     engine.process(event);
 }
@@ -2101,6 +2104,143 @@ fn test_contract_expiry_replica_parity_price_bail_then_settle_then_duplicate() {
     assert_eq!(mirrored.exchange_id_to_cid, live.exchange_id_to_cid);
 }
 
+/// Make the venue, not the engine, settle the option (index 0) of an option engine.
+fn venue_settles_option(engine: &mut TestEngine) {
+    engine
+        .state
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(0))
+        .expiry_handling = ExpiryHandling::Venue;
+}
+
+/// The trade a venue reports when the long option position (index 0) expires worthless.
+fn venue_expiry_trade(quantity: Decimal) -> EngineEvent<DataKind> {
+    EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::Trade(
+            Trade::new(
+                TradeId::new("venue-expiry"),
+                OrderId::new("venue-expiry"),
+                InstrumentIndex(0),
+                strategy_id(),
+                time_plus_days(STARTING_TIMESTAMP, 2),
+                Side::Sell,
+                Decimal::ZERO,
+                quantity,
+                None,
+                AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
+            )
+            .with_origin(TradeOrigin::Expiry),
+        ),
+    }))
+}
+
+/// With `ExpiryHandling::Venue`, `ContractExpiry` marks the instrument processed but closes
+/// nothing, and needs no settlement price; the venue's own trade then closes the position, once.
+#[test]
+fn test_contract_expiry_venue_settles_leaves_positions_for_the_venue() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    venue_settles_option(&mut engine);
+    // No underlying price is sent: the venue settling needs none.
+    open_option_position(&mut engine, dec!(1), dec!(1_000));
+
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
+    assert!(exited.is_empty(), "the engine synthesises no settlement");
+    let state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert!(state.expiration_processed);
+    assert_eq!(state.position.positions.len(), 1, "left for the venue");
+
+    // The venue's expiry trade closes it at zero.
+    let audit = process_with_audit(&mut engine, venue_expiry_trade(dec!(1)));
+    let EngineAudit::Process(audit) = audit.event else {
+        panic!("expected EngineAudit::Process");
+    };
+    let exits: Vec<_> = audit
+        .outputs
+        .into_iter()
+        .filter_map(|output| match output {
+            EngineOutput::PositionExit(exit) => Some(exit),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(exits.len(), 1);
+    assert_eq!(exits[0].pnl_realised, dec!(-1_000));
+    let state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert!(state.position.positions.is_empty());
+
+    // A repeated expiry stays a no-op.
+    assert!(expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0))).is_empty());
+}
+
+/// The default `ExpiryHandling::Engine` still settles, so a backtest is unchanged.
+#[test]
+fn test_contract_expiry_engine_handling_is_the_default() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let engine = build_option_engine(TradingState::Disabled, execution_tx);
+    for state in engine
+        .state
+        .instruments
+        .instruments(&InstrumentFilter::None)
+    {
+        assert_eq!(state.expiry_handling, ExpiryHandling::Engine);
+    }
+}
+
+/// The audit replica follows the live engine when the venue settles: positions kept, instrument
+/// marked processed, then closed by the venue's trade on both sides.
+#[test]
+fn test_contract_expiry_replica_parity_venue_settles() {
+    use rustrade::engine::audit::{context::EngineContext, state_replica::StateReplicaManager};
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    venue_settles_option(&mut engine);
+    open_option_position(&mut engine, dec!(1), dec!(1_000));
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: engine.state.clone(),
+        context: EngineContext {
+            time: STARTING_TIMESTAMP,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica = StateReplicaManager::new(seed_tick, dummy_updates);
+    let option = InstrumentIndex(0);
+
+    let outputs =
+        process_live_and_replica!(&mut engine, replica, EngineEvent::ContractExpiry(option));
+    assert_eq!(outputs, NoneOneOrMany::None);
+    let live = engine.state.instruments.instrument_index(&option);
+    assert_eq!(live.position.positions.len(), 1);
+    assert!(live.expiration_processed);
+    assert_eq!(
+        replica
+            .replica_engine_state()
+            .instruments
+            .instrument_index(&option),
+        live
+    );
+
+    process_live_and_replica!(&mut engine, replica, venue_expiry_trade(dec!(1)));
+    let live = engine.state.instruments.instrument_index(&option);
+    assert!(live.position.positions.is_empty());
+    assert_eq!(
+        replica
+            .replica_engine_state()
+            .instruments
+            .instrument_index(&option),
+        live
+    );
+}
+
 /// A `ContractExpiry` or `CorporateAction` is built by the caller, so its `InstrumentIndex` can
 /// name no instrument the engine was built with. It is rejected observably and touches nothing,
 /// on the live engine and on the audit replica, instead of panicking either.
@@ -2612,18 +2752,18 @@ fn open_position_via_trade(
 ) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::Trade(Trade {
-            id: TradeId::new(tag),
-            order_id: OrderId::new(tag),
-            instrument: InstrumentIndex(instrument),
-            strategy: strategy_id(),
-            time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new(tag),
+            OrderId::new(tag),
+            InstrumentIndex(instrument),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, time_plus),
             side,
             price,
             quantity,
-            order_filled_quantity: None,
-            fees: asset_fees(instrument, dec!(0)),
-        }),
+            None,
+            asset_fees(instrument, dec!(0)),
+        )),
     }));
     engine.process(event);
 }
@@ -3194,18 +3334,18 @@ fn open_option_position_via_trade(
 ) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::Trade(Trade {
-            id: TradeId::new(tag),
-            order_id: OrderId::new(tag),
-            instrument: InstrumentIndex(0),
-            strategy: strategy_id(),
-            time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new(tag),
+            OrderId::new(tag),
+            InstrumentIndex(0),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, time_plus),
             side,
             price,
             quantity,
-            order_filled_quantity: None,
-            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
-        }),
+            None,
+            AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
+        )),
     }));
     engine.process(event);
 }
@@ -4216,18 +4356,18 @@ fn option_trade_event(
 ) -> EngineEvent<DataKind> {
     EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::Trade(Trade {
-            id: TradeId::new(tag),
-            order_id: OrderId::new(tag),
-            instrument: InstrumentIndex(instrument),
-            strategy: strategy_id(),
-            time_exchange: time_plus_days(STARTING_TIMESTAMP, time_plus),
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new(tag),
+            OrderId::new(tag),
+            InstrumentIndex(instrument),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, time_plus),
             side,
             price,
             quantity,
-            order_filled_quantity: None,
-            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
-        }),
+            None,
+            AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
+        )),
     }))
 }
 
@@ -4495,19 +4635,19 @@ fn open_option_position_side(
     };
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::Trade(Trade {
-            id: trade_id,
-            order_id: gen_order_id(0),
-            instrument: InstrumentIndex(0),
-            strategy: strategy_id(),
-            time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
+        kind: AccountEventKind::Trade(Trade::new(
+            trade_id,
+            gen_order_id(0),
+            InstrumentIndex(0),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, 1),
             side,
             price,
             quantity,
             // Put option instrument quote is USD = AssetIndex(1)
-            order_filled_quantity: None,
-            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
-        }),
+            None,
+            AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
+        )),
     }));
     engine.process(event);
 }
@@ -4740,20 +4880,20 @@ fn send_order_ack(
 fn send_fill(engine: &mut TestEngine, exchange_order_id: OrderId, side: Side, price: Decimal) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::Trade(Trade {
-            id: TradeId::new(format!("fill-{}", exchange_order_id.0.as_str())),
-            order_id: exchange_order_id,
-            instrument: InstrumentIndex(0),
-            strategy: strategy_id(),
-            time_exchange: time_plus_days(STARTING_TIMESTAMP, 2),
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new(format!("fill-{}", exchange_order_id.0.as_str())),
+            exchange_order_id,
+            InstrumentIndex(0),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, 2),
             side,
             price,
-            quantity: dec!(1),
+            dec!(1),
             // BTCUSDT (instrument 0) quote = usdt = AssetIndex(2). Fee is zero here regardless, but
             // use the correct quote asset for the instrument this helper always fills (index 0).
-            order_filled_quantity: None,
-            fees: asset_fees(0, Decimal::ZERO),
-        }),
+            None,
+            asset_fees(0, Decimal::ZERO),
+        )),
     }));
     engine.process(event);
 }
@@ -5457,19 +5597,19 @@ fn test_fee_model_per_contract_augments_trade_fees() {
     // should augment it with 1 contract × $0.65 = $0.65.
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::Trade(Trade {
-            id: TradeId::new("fee-test-trade"),
-            order_id: gen_order_id(0),
-            instrument: InstrumentIndex(0),
-            strategy: strategy_id(),
-            time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
-            side: Side::Buy,
-            price: dec!(1_000),
-            quantity: dec!(1),
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new("fee-test-trade"),
+            gen_order_id(0),
+            InstrumentIndex(0),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, 1),
+            Side::Buy,
+            dec!(1_000),
+            dec!(1),
             // Option engine: quote is USD = AssetIndex(1). Exchange reports zero commission.
-            order_filled_quantity: None,
-            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
-        }),
+            None,
+            AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
+        )),
     }));
     engine.process(event);
 
@@ -6257,19 +6397,19 @@ fn open_position_on(
 ) {
     let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
         exchange: ExchangeIndex(0),
-        kind: AccountEventKind::Trade(Trade {
-            id: TradeId::new(tag),
-            order_id: OrderId::new(tag),
-            instrument: InstrumentIndex(instrument),
-            strategy: strategy_id(),
-            time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new(tag),
+            OrderId::new(tag),
+            InstrumentIndex(instrument),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, 1),
             side,
             price,
             quantity,
             // Quote asset of every instrument in the ambiguous fixture is usd = AssetIndex(1).
-            order_filled_quantity: None,
-            fees: AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
-        }),
+            None,
+            AssetFees::new(AssetIndex(1), Decimal::ZERO, Some(Decimal::ZERO)),
+        )),
     }));
     engine.process(event);
 }
@@ -7532,6 +7672,7 @@ fn test_account_snapshot_position_drift() {
         PositionReport::from_position(Position::new(
             quantity,
             Some(entry_price),
+            None,
             None,
             None,
             None,

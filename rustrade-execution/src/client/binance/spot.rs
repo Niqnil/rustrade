@@ -13,10 +13,11 @@
 // - Event deduplication: LRU cache keyed on (trade_id/order_id, exec_type) prevents
 //   duplicate processing after reconnect + fill recovery
 // - Rate limit handling: detects HTTP 429 / Binance -1015, retries with exponential
-//   backoff (Retry-After header is not accessible through the SDK's anyhow::Error
-//   chain, so computed delays are used), blocks further REST calls until cooldown expires,
-//   and does not open a WS-API session during it. Separately, pauses REST queries until the
-//   next minute once responses report >= 90% of the request-weight limit used
+//   backoff (binance-sdk drops the Retry-After header from its rate-limit errors, so
+//   computed delays are used, and ApiError::RateLimit carries no retry_after), blocks
+//   further REST calls until cooldown expires, and does not open a WS-API session during
+//   it. Separately, pauses REST queries until the next minute once responses report
+//   >= 90% of the request-weight limit used
 // - Reconnection: account_stream auto-reconnects on WS disconnect/error with
 //   exponential backoff (1s → 30s, max 10 attempts)
 // - Heartbeat monitoring: tracks WS activity via AtomicBool flag; forces reconnect
@@ -44,8 +45,8 @@ use super::shared::{
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event, drop_after,
     frame_excerpt, gap_failed, gap_time, is_duplicate, is_handshake_rate_limit, is_unknown_order,
     log_unhandled_event, log_unrecognised_frame, new_dedup_cache, parse_user_data_frame,
-    placed_order_state, recovered_order_totals, response_decode_error, rest_call_with_retry,
-    trailing_delta_basis_points, unix_ms,
+    placed_order_state, recovered_order_cids, recovered_order_totals, response_decode_error,
+    rest_call_with_retry, trailing_params, unix_ms,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -284,7 +285,7 @@ impl WsApiUnavailable {
         match self {
             Self::RateLimited(msg) => {
                 warn!(%msg, "BinanceSpot WS-API rate-limited, request not sent");
-                UnindexedOrderError::Rejected(ApiError::RateLimit)
+                UnindexedOrderError::Rejected(ApiError::rate_limited(None))
             }
             Self::Connect(msg) => UnindexedOrderError::Connectivity(ConnectivityError::Socket(msg)),
         }
@@ -306,6 +307,13 @@ impl WsApiUnavailable {
 /// could outlast the recovery's 30 s and delay its fills to a retry. After Binance answers with a
 /// rate-limit error, REST calls wait out a cooldown, and an order or cancel that would have to
 /// open a new WebSocket API session fails with [`ApiError::RateLimit`] instead, unsent.
+///
+/// # Fills of other clients' orders
+/// The account stream, fill recovery and `fetch_trades` report every fill on the account, whoever
+/// placed the order, and Binance does not say who did. A consumer that also trades the account
+/// outside the engine filters those fills itself, for example by
+/// [`Trade::client_order_id`](crate::trade::Trade::client_order_id). See the
+/// [module docs](super#every-fill-on-the-account-is-delivered).
 #[derive(Clone)]
 pub struct BinanceSpot {
     config: Arc<BinanceSpotConfig>,
@@ -556,6 +564,39 @@ async fn fetch_order_lookup(
                 OrderLookup::Ended(Box::new(order))
             }),
     )
+}
+
+/// The client order id of the order `order_id` on `instrument`, read with `GET /api/v3/order`
+/// (weight 4), for fill recovery: `myTrades` carries none. `None` if Binance reports none, or
+/// does not know the order.
+async fn fetch_order_cid(
+    rest: &Arc<RestApi>,
+    rate_limiter: &RateLimitTracker,
+    instrument: &InstrumentNameExchange,
+    order_id: i64,
+) -> Result<Option<ClientOrderId>, UnindexedClientError> {
+    let symbol = instrument.name().to_string();
+    let response = match rest_call_with_retry(rest, rate_limiter, RequestKind::Essential, |rest| {
+        let symbol = symbol.clone();
+        Box::pin(async move {
+            let params = GetOrderParams::builder(symbol).order_id(order_id).build()?;
+            rest.get_order(params).await
+        })
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(e) if is_unknown_order(&e) => {
+            debug!(%instrument, order_id, error = %e, "BinanceSpot does not know this order");
+            return Ok(None);
+        }
+        Err(e) => return Err(classify_rest_query_error(&e, Some(instrument))),
+    };
+    let row = response.data().await.map_err(response_decode_error)?;
+    Ok(row
+        .client_order_id
+        .filter(|cid| !cid.is_empty())
+        .map(ClientOrderId::new))
 }
 
 /// The client order ids `GET /api/v3/openOrders` lists on `instruments` (weight 6 each, one at a
@@ -1087,7 +1128,7 @@ impl ExecutionClient for BinanceSpot {
                     // Venue response — WS session is healthy, don't tear it down. A throttle
                     // (429, -1003, a WAF 403) backs off the shared limiter so REST calls
                     // back off too.
-                    if matches!(order_err, OrderError::Rejected(ApiError::RateLimit)) {
+                    if matches!(order_err, OrderError::Rejected(ApiError::RateLimit { .. })) {
                         self.rate_limiter.on_rate_limited(None);
                     }
                     UnindexedOrderResponseCancel {
@@ -1176,8 +1217,34 @@ impl ExecutionClient for BinanceSpot {
                 .quantity(quantity)
                 .new_client_order_id(cid.0.to_string());
 
-        // Set price, stop_price, and trailing_delta in a single exhaustive match
-        // so that adding a new OrderKind variant fails to compile until handled here.
+        // A trailing order's trailingDelta, fixed limit and activation price.
+        match trailing_params(&kind, price) {
+            Ok(Some(trailing)) => {
+                params_builder = params_builder.trailing_delta(trailing.trailing_delta);
+                if let Some(limit) = trailing.price {
+                    params_builder = params_builder.price(limit);
+                }
+                if let Some(activation_price) = trailing.stop_price {
+                    // Binance's activation price for a trailing order is its stopPrice.
+                    params_builder = params_builder.stop_price(activation_price);
+                }
+            }
+            Err(refused) => {
+                return Order {
+                    key: order_key,
+                    side,
+                    price,
+                    quantity,
+                    kind,
+                    time_in_force,
+                    state: OrderState::inactive(refused.into_order_error()),
+                };
+            }
+            Ok(None) => {}
+        }
+
+        // The other kinds' price and stopPrice, in a match with no wildcard, so that a new
+        // OrderKind fails to compile until it is handled here.
         match kind {
             OrderKind::Limit => {
                 params_builder = params_builder.price(price);
@@ -1189,27 +1256,12 @@ impl ExecutionClient for BinanceSpot {
             | OrderKind::TakeProfitLimit { trigger_price } => {
                 params_builder = params_builder.price(price).stop_price(trigger_price);
             }
-            OrderKind::TrailingStop {
-                offset,
-                offset_type,
-            } => match trailing_delta_basis_points(offset, offset_type) {
-                Ok(basis_points) => params_builder = params_builder.trailing_delta(basis_points),
-                Err(refused) => {
-                    return Order {
-                        key: order_key,
-                        side,
-                        price,
-                        quantity,
-                        kind,
-                        time_in_force,
-                        state: OrderState::inactive(refused.into_order_error()),
-                    };
-                }
-            },
-            // Market needs no price/stop_price/trailing_delta; TrailingStopLimit is already
-            // rejected by convert_order_kind_tif above. The wildcard also catches any future
-            // variant added before this match is updated.
-            _ => {}
+            // Trailing orders are set above. Market sends no price, and TrailingStopLimit is
+            // rejected by convert_order_kind_tif before this.
+            OrderKind::TrailingStop { .. }
+            | OrderKind::TrailingStopFixedLimit { .. }
+            | OrderKind::Market
+            | OrderKind::TrailingStopLimit { .. } => {}
         }
 
         if let Some(tif) = binance_tif {
@@ -1326,7 +1378,7 @@ impl ExecutionClient for BinanceSpot {
                     // Venue response — WS session is healthy, don't tear it down. A throttle
                     // (429, -1003, a WAF 403) backs off the shared limiter so REST calls
                     // back off too.
-                    if matches!(order_err, OrderError::Rejected(ApiError::RateLimit)) {
+                    if matches!(order_err, OrderError::Rejected(ApiError::RateLimit { .. })) {
                         self.rate_limiter.on_rate_limited(None);
                     }
                     Order {
@@ -1886,7 +1938,9 @@ async fn connection_manager(
 ///
 /// `myTrades` reports executions only, with no cumulative, so each recovered trade's
 /// `order_filled_quantity` is rebuilt from its order's executions by
-/// [`recovered_order_totals`]. A trade whose order could not be looked up keeps `None`.
+/// [`recovered_order_totals`]. Nor does it carry a client order id, so each recovered trade's
+/// `client_order_id` is then read from its order by [`recovered_order_cids`], with whatever time
+/// the walks left. A trade whose order could not be looked up keeps `None` in either.
 ///
 /// The whole recovery is bounded by [`FILL_RECOVERY_TIMEOUT_SECS`]. Fills forwarded before the
 /// deadline stay delivered. Its reads are [`RequestKind::Essential`]: they wait out a rate-limit
@@ -1961,12 +2015,24 @@ async fn recover_fills(
                         },
                     )
                     .await;
+                    // After the walks, so these reads only use time the walks left: the walks
+                    // matter more, since a fill without a cumulative leaves its order behind.
+                    let cids = recovered_order_cids(
+                        ExchangeId::BinanceSpot,
+                        &inst,
+                        &raw,
+                        order_executions_deadline,
+                        |order_id| fetch_order_cid(&rest, &rl, &inst, order_id),
+                    )
+                    .await;
                     let trades: Vec<_> = raw
                         .iter()
                         .filter_map(|t| {
                             let mut trade = convert_my_trade(t, &inst)?;
                             trade.order_filled_quantity =
                                 t.id.and_then(|id| totals.get(&id).copied());
+                            trade.client_order_id =
+                                t.order_id.and_then(|id| cids.get(&id).cloned());
                             Some(trade)
                         })
                         .collect();
@@ -2256,7 +2322,7 @@ fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -
     match event_type {
         "executionReport" => {
             // Single typed pass straight from the inner event — no intermediate DOM, and only the
-            // matched branch deserializes its payload. The SDK struct ignores the unknown `e` tag.
+            // matched branch deserializes its payload. `ExecutionReport` ignores the unknown `e` tag.
             match serde_json::from_str::<ExecutionReport>(event) {
                 Ok(report) => {
                     convert_execution_report(&report, ExchangeId::BinanceSpot, buf);
@@ -2388,7 +2454,8 @@ fn convert_account_position(
 ///   must surface this so end users can convert absolute offsets to basis points
 ///   themselves: `basis_points = (absolute / price) * 10000`
 /// - `TrailingStopLimit`: Binance's trailing `STOP_LOSS_LIMIT` keeps its limit price fixed while
-///   the stop trails, where `TrailingStopLimit`'s limit follows the stop (#540)
+///   the stop trails, where `TrailingStopLimit`'s limit follows the stop. That order is
+///   `TrailingStopFixedLimit`, which converts to `STOP_LOSS_LIMIT`.
 ///
 fn convert_order_kind_tif(
     kind: OrderKind,
@@ -2682,6 +2749,7 @@ mod tests {
                 OrderKind::TrailingStop {
                     offset: Decimal::from(100),
                     offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price: None,
                 },
                 TimeInForce::GoodUntilCancelled { post_only: false }
             ),
@@ -2692,6 +2760,7 @@ mod tests {
                 OrderKind::TrailingStop {
                     offset: Decimal::from(5),
                     offset_type: TrailingOffsetType::Percentage,
+                    activation_price: None,
                 },
                 TimeInForce::GoodUntilCancelled { post_only: false }
             ),
@@ -2704,6 +2773,7 @@ mod tests {
                 OrderKind::TrailingStop {
                     offset: Decimal::from(10),
                     offset_type: TrailingOffsetType::Absolute,
+                    activation_price: None,
                 },
                 TimeInForce::GoodUntilCancelled { post_only: false }
             )
@@ -2725,6 +2795,34 @@ mod tests {
         );
     }
 
+    /// A fixed-limit trailing stop is a STOP_LOSS_LIMIT, timed as a stop-limit order is; an
+    /// Absolute offset cannot be sent.
+    #[test]
+    fn a_fixed_limit_trailing_stop_converts_to_stop_loss_limit() {
+        let fixed_limit = |offset_type| OrderKind::TrailingStopFixedLimit {
+            offset: Decimal::from(100),
+            offset_type,
+            activation_price: Some(Decimal::from(50_000)),
+        };
+        assert!(matches!(
+            convert_order_kind_tif(
+                fixed_limit(TrailingOffsetType::BasisPoints),
+                TimeInForce::GoodUntilCancelled { post_only: false }
+            ),
+            Some((
+                OrderPlaceTypeEnum::StopLossLimit,
+                Some(OrderPlaceTimeInForceEnum::Gtc)
+            ))
+        ));
+        assert!(
+            convert_order_kind_tif(
+                fixed_limit(TrailingOffsetType::Absolute),
+                TimeInForce::GoodUntilCancelled { post_only: false }
+            )
+            .is_none()
+        );
+    }
+
     #[test]
     fn test_parse_binance_api_error() {
         let instrument = InstrumentNameExchange::new("BTCUSDT");
@@ -2739,16 +2837,16 @@ mod tests {
         ));
         assert_eq!(
             parse_binance_api_error("Rate limit exceeded".into(), &instrument),
-            ApiError::RateLimit
+            ApiError::rate_limited(None)
         );
         assert_eq!(
             parse_binance_api_error("Error code -1015".into(), &instrument),
-            ApiError::RateLimit
+            ApiError::rate_limited(None)
         );
         // -1003: too many requests — must also map to RateLimit (not OrderRejected)
         assert_eq!(
             parse_binance_api_error("Error -1003: too many requests".into(), &instrument),
-            ApiError::RateLimit
+            ApiError::rate_limited(None)
         );
         // -2011 maps to OrderAlreadyCancelled
         assert_eq!(
@@ -3366,6 +3464,38 @@ mod tests {
         }
     }
 
+    /// A trailing STOP_LOSS_LIMIT reported on the stream is a fixed-limit trailing stop, with its
+    /// limit price and its stopPrice as the activation price.
+    #[test]
+    fn a_trailing_stop_loss_limit_report_keeps_its_limit_and_activation_price() {
+        let report = ExecutionReport {
+            execution_type: Some("NEW".to_string()),
+            side: Some("SELL".to_string()),
+            order_type: Some("STOP_LOSS_LIMIT".to_string()),
+            price: Some("49000.00".to_string()),
+            stop_price: Some("50000.00".to_string()),
+            trailing_delta: Some(WireInt::Int(25)),
+            order_quantity: Some("0.01".to_string()),
+            time_in_force: Some("GTC".to_string()),
+            cumulative_filled_quantity: Some("0".to_string()),
+            ..make_base_report()
+        };
+
+        let event = sole_event(convert(report)).expect("NEW event should produce Some");
+        let AccountEventKind::OrderSnapshot(snap) = &event.kind else {
+            panic!("NEW should yield OrderSnapshot, got {:?}", event.kind);
+        };
+        assert_eq!(
+            snap.0.kind,
+            OrderKind::TrailingStopFixedLimit {
+                offset: Decimal::from(25),
+                offset_type: TrailingOffsetType::BasisPoints,
+                activation_price: Some(Decimal::from(50_000)),
+            }
+        );
+        assert_eq!(snap.0.price, Some(Decimal::from(49_000)));
+    }
+
     /// A report without its order type (`o`) cannot say what kind the order is, so its snapshot
     /// is dropped, as a REST row without one is, rather than read as a `Limit`. A fill it reports
     /// is still emitted.
@@ -3673,8 +3803,39 @@ mod tests {
 
         let event = sole_event(convert(report)).expect("REJECTED should produce Some");
         assert!(
-            matches!(event.kind, AccountEventKind::OrderCancelled(ref r) if r.state.is_err()),
-            "REJECTED should yield OrderCancelled with Err state"
+            matches!(
+                event.kind,
+                AccountEventKind::OrderCancelled(ref r) if matches!(
+                    &r.state,
+                    Err(OrderError::Rejected(ApiError::BalanceInsufficient(None, reason)))
+                        if reason == "INSUFFICIENT_FUNDS"
+                )
+            ),
+            "a REJECTED shortfall should go through the classifier, got {:?}",
+            event.kind
+        );
+    }
+
+    #[test]
+    fn test_convert_execution_report_rejected_for_another_reason() {
+        let report = ExecutionReport {
+            execution_type: Some("REJECTED".to_string()),
+            reject_reason: Some("WOULD_MATCH_IMMEDIATELY".to_string()),
+            ..make_base_report()
+        };
+
+        let event = sole_event(convert(report)).expect("REJECTED should produce Some");
+        assert!(
+            matches!(
+                event.kind,
+                AccountEventKind::OrderCancelled(ref r) if matches!(
+                    &r.state,
+                    Err(OrderError::Rejected(ApiError::OrderRejected(reason)))
+                        if reason == "WOULD_MATCH_IMMEDIATELY"
+                )
+            ),
+            "an unrecognised REJECTED reason should stay OrderRejected, got {:?}",
+            event.kind
         );
     }
 
@@ -4774,7 +4935,7 @@ mod tests {
         assert!(
             matches!(
                 response.state,
-                Err(UnindexedOrderError::Rejected(ApiError::RateLimit))
+                Err(UnindexedOrderError::Rejected(ApiError::RateLimit { .. }))
             ),
             "{:?}",
             response.state
@@ -4811,7 +4972,7 @@ mod tests {
         assert!(
             matches!(
                 response.state,
-                Err(UnindexedOrderError::Rejected(ApiError::RateLimit))
+                Err(UnindexedOrderError::Rejected(ApiError::RateLimit { .. }))
             ),
             "{:?}",
             response.state
@@ -5113,6 +5274,120 @@ mod tests {
             .collect();
         let start = disconnect.timestamp_millis().to_string();
         assert_eq!(start_times, [start.clone(), start]);
+    }
+
+    /// Recovery reads each recovered fill's order once for the client order id `myTrades` lacks.
+    /// An order Binance no longer knows leaves its fill without one, and the fill still goes out.
+    #[tokio::test]
+    async fn recovered_fills_carry_their_orders_client_order_ids() {
+        let disconnect = Utc::now() - chrono::Duration::minutes(10);
+        let reconnect = Utc::now() - chrono::Duration::minutes(5);
+        let trade = |id: i64| {
+            serde_json::json!({
+                "symbol": "BTCUSDT", "id": id, "orderId": id, "price": "100", "qty": "1",
+                "commission": "0", "commissionAsset": "USDT",
+                "time": (disconnect + chrono::Duration::minutes(1)).timestamp_millis(),
+                "isBuyer": true, "isMaker": false, "isBestMatch": true,
+            })
+        };
+        let server = wiremock::MockServer::start().await;
+        // Each order's own walk returns its one execution; the span read returns both.
+        for id in [1, 2] {
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path("/api/v3/myTrades"))
+                .and(wiremock::matchers::query_param("orderId", id.to_string()))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([trade(id)])),
+                )
+                .with_priority(1)
+                .mount(&server)
+                .await;
+        }
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/myTrades"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([trade(1), trade(2)])),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/order"))
+            .and(wiremock::matchers::query_param("orderId", "1"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"symbol": "BTCUSDT", "orderId": 1, "clientOrderId": "sweep-1"}),
+            ))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/order"))
+            .and(wiremock::matchers::query_param("orderId", "2"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400).set_body_json(
+                    serde_json::json!({"code": -2013, "msg": "Order does not exist."}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        let rest = Arc::new(SpotRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .unwrap(),
+        ));
+        let tracker = Arc::new(RateLimitTracker::new(WeightPool::Spot));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut unrecovered = UnrecoveredFills::default();
+        unrecovered.open(
+            &[InstrumentNameExchange::new("BTCUSDT")],
+            disconnect,
+            reconnect,
+        );
+
+        recover_fills(
+            &rest,
+            &tracker,
+            &mut unrecovered,
+            &tx,
+            &new_dedup_cache(),
+            &KnownLiveOrders::shared(ExchangeId::BinanceSpot),
+        )
+        .await;
+
+        let mut cids: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event.kind {
+                AccountEventKind::Trade(trade) => Some((
+                    trade.id.0.to_string(),
+                    trade.client_order_id,
+                    trade.order_filled_quantity,
+                )),
+                _ => None,
+            })
+            .collect();
+        cids.sort();
+        // The cumulatives from the walks, read first, are untouched by the reads after them.
+        assert_eq!(
+            cids,
+            [
+                (
+                    "1".to_string(),
+                    Some(ClientOrderId::new("sweep-1")),
+                    Some(Decimal::ONE)
+                ),
+                ("2".to_string(), None, Some(Decimal::ONE)),
+            ]
+        );
+        let order_reads = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/api/v3/order")
+            .count();
+        assert_eq!(order_reads, 2, "one read per order");
     }
 
     /// A span walk reads on by id through a full page inside the span, and stops at the page that

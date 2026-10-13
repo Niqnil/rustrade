@@ -5,8 +5,8 @@
 //!
 //! Error mapping is in the `error` module.
 
-use crate::client::hyperliquid::error::map_sdk_error;
-use crate::error::{ApiError, OrderError, UnindexedClientError};
+use crate::client::hyperliquid::error::{map_sdk_error, order_rejection};
+use crate::error::{OrderError, UnindexedClientError};
 use crate::order::{
     Order, OrderKey, OrderKind, TimeInForce, UnindexedOrderSnapshot,
     id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
@@ -18,6 +18,7 @@ use crate::{
     position::PositionReport,
 };
 use chrono::{DateTime, TimeZone, Utc};
+use fnv::FnvHashSet;
 use futures::Stream;
 use hyperliquid_rust_sdk::{ExchangeDataStatus, ExchangeResponseStatus};
 use rust_decimal::Decimal;
@@ -117,6 +118,9 @@ pub struct UserFill {
     /// SDK's own type omits it, so it has never been observed through this dependency. The caller
     /// falls back to inferring the asset from the side when it is absent.
     pub fee_token: Option<String>,
+    /// The cloid of the order filled, in the venue's form ([`cloid_to_cid`]). Absent for an order
+    /// placed without one.
+    pub cloid: Option<String>,
 }
 
 /// The span `start..=end` in epoch milliseconds, as `userFillsByTime` takes it, or `None` when it
@@ -358,6 +362,21 @@ pub(super) fn open_order_to_order(
     })
 }
 
+/// Which instruments a read keeps: those in the slice it was given, or every one when the slice is
+/// empty, the "return all" sentinel of [`ExecutionClient`](crate::client::ExecutionClient)'s reads.
+pub(super) struct InstrumentFilter<'a>(Option<FnvHashSet<&'a InstrumentNameExchange>>);
+
+impl<'a> InstrumentFilter<'a> {
+    pub(super) fn new(instruments: &'a [InstrumentNameExchange]) -> Self {
+        Self((!instruments.is_empty()).then(|| instruments.iter().collect()))
+    }
+
+    /// Whether the read keeps `instrument`.
+    pub(super) fn matches(&self, instrument: &InstrumentNameExchange) -> bool {
+        self.0.as_ref().is_none_or(|set| set.contains(instrument))
+    }
+}
+
 type UnindexedInstrumentAccountSnapshot =
     InstrumentAccountSnapshot<ExchangeId, AssetNameExchange, InstrumentNameExchange>;
 
@@ -400,7 +419,7 @@ impl OpenOrderListing {
                 })
         }
 
-        let requested_set = requested.iter().collect::<HashSet<_>>();
+        let filter = InstrumentFilter::new(requested);
         let mut listing = HashMap::with_capacity(requested.len());
 
         for instrument in requested {
@@ -411,7 +430,7 @@ impl OpenOrderListing {
             let Some(instrument) = to_instrument(&row.coin) else {
                 continue;
             };
-            if !requested_set.is_empty() && !requested_set.contains(&instrument) {
+            if !filter.matches(&instrument) {
                 continue;
             }
             let order = open_order_to_order(row, exchange, instrument.clone());
@@ -536,9 +555,9 @@ pub(super) fn order_update_to_order(
         OrderStatus::Cancelled => {
             OrderState::inactive(Cancelled::new(order_id, time_exchange, filled_quantity()))
         }
-        OrderStatus::Rejected => OrderState::inactive(OrderError::Rejected(
-            ApiError::OrderRejected(update.status.clone()),
-        )),
+        OrderStatus::Rejected => {
+            OrderState::inactive(OrderError::Rejected(order_rejection(update.status.clone())))
+        }
     };
 
     // The update carries neither the order's kind nor its time in force.
@@ -760,6 +779,22 @@ mod tests {
     use rust_decimal_macros::dec;
 
     #[test]
+    fn an_instrument_filter_keeps_what_it_was_given_or_everything_when_given_nothing() {
+        let (btc, eth) = (
+            InstrumentNameExchange::new("BTC"),
+            InstrumentNameExchange::new("ETH"),
+        );
+
+        let all = InstrumentFilter::new(&[]);
+        assert!(all.matches(&btc) && all.matches(&eth));
+
+        let given = [btc.clone()];
+        let one = InstrumentFilter::new(&given);
+        assert!(one.matches(&btc));
+        assert!(!one.matches(&eth));
+    }
+
+    #[test]
     fn test_parse_decimal_valid() {
         assert_eq!(parse_decimal("123.456", "test"), Some(dec!(123.456)));
         assert_eq!(parse_decimal("0", "test"), Some(dec!(0)));
@@ -913,6 +948,7 @@ mod tests {
 #[allow(clippy::unwrap_used)]
 pub(super) mod info_tests {
     use super::*;
+    use crate::error::ApiError;
     use rust_decimal_macros::dec;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1216,6 +1252,24 @@ pub(super) mod info_tests {
     /// `CID` as the venue reports it back: `0x` and the 32 lowercase hex digits.
     const CLOID: &str = "0x85b60bff64d549ec95af6268d7d1df63";
 
+    /// A REST fill decodes its order's cloid, and one placed without a cloid decodes as `None`.
+    #[test]
+    fn a_user_fill_reads_its_cloid() {
+        let fill = |cloid: &str| {
+            serde_json::from_str::<UserFill>(&format!(
+                r#"{{"coin": "BTC", "side": "B", "px": "1", "sz": "1", "time": 1, "oid": 7,
+                    "fee": "0", "tid": 9{cloid}}}"#
+            ))
+            .unwrap()
+        };
+
+        let with = fill(&format!(r#", "cloid": "{CLOID}""#));
+        assert_eq!(with.cloid.as_deref(), Some(CLOID));
+        assert!(cloid_to_cid(CLOID).is_some());
+        assert_eq!(fill("").cloid, None);
+        assert_eq!(fill(r#", "cloid": null"#).cloid, None);
+    }
+
     #[test]
     fn only_the_canonical_uuid_form_can_be_a_cloid() {
         let cloid = cid_to_cloid(&ClientOrderId::new(CID)).unwrap();
@@ -1397,6 +1451,22 @@ pub(super) mod info_tests {
                 assert_eq!(cancelled.filled_quantity, None);
             }
             other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_status_saying_funds_ran_short_ends_the_order_as_balance_insufficient() {
+        for status in ["perpMarginRejected", "insufficientSpotBalanceRejected"] {
+            let update = order_update(status, &format!(r#""{CLOID}""#), "0.0075");
+            let order = snapshot_of(
+                order_update_to_account_event(&update, ExchangeId::HyperliquidPerp, eth()).unwrap(),
+            );
+            match order.state {
+                OrderState::Inactive(crate::order::state::InactiveOrderState::OpenFailed(
+                    OrderError::Rejected(ApiError::BalanceInsufficient(None, reason)),
+                )) => assert_eq!(reason, status),
+                other => panic!("{status}: expected BalanceInsufficient, got {other:?}"),
+            }
         }
     }
 

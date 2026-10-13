@@ -8,7 +8,7 @@
 //! for CI, and requires IB Gateway/TWS running locally.
 //!
 //! **Tested locally:** All execution tests (Tier 0) run on paper trading accounts
-//! — no market data subscriptions needed.
+//! — no market data subscriptions needed. The shortability tests (Tier 1) need market data.
 //!
 //! # Safety
 //!
@@ -67,22 +67,37 @@
 //! | `test_place_moo_order_premarket` | Market-on-Open (timing-sensitive) |
 //! | `test_place_loo_order_premarket` | Limit-on-Open (timing-sensitive) |
 //! | `test_orders_found_by_client_order_id_across_a_restart` | Snapshot orders, adoption after a restart, ended-order lookup |
+//!
+//! ## Tier 1: Market Data
+//!
+//! IB sends its shortable ticks only to an account entitled to the stock's market data; a paper
+//! account may need the live account's market data shared with it. Both tests read the stocks in
+//! `IBKR_SHORTABILITY_SYMBOLS` (comma-separated, default `AAPL`).
+//!
+//! | Test | Description |
+//! |------|-------------|
+//! | `test_fetch_shortability` | `fetch_shortability` per stock, timed, and an unregistered one refused |
+//! | `test_shortability_raw_ticks` | Print every item of a generic tick 236 request, with arrival times, for `IBKR_PROBE_SECS` (default 30) per stock |
 
 #![cfg(feature = "ibkr")]
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Integration tests: panics are the correct failure mode
 
-use ibapi::contracts::{Contract, Currency, Exchange, SecurityType, Symbol};
+use ibapi::{
+    contracts::{Contract, Currency, Exchange, SecurityType, Symbol},
+    market_data::{MarketDataType, realtime::generic_tick},
+};
 use rust_decimal_macros::dec;
 use rustrade_execution::{
     AccountEventKind,
     client::{
-        ExecutionClient, OrderStatusClient,
+        ExecutionClient, OrderStatusClient, ShortabilityClient,
         ibkr::{
             ContractConfig, ContractSkipReason, IbkrClient, IbkrConfig, IbkrConnectError,
             SkippedContract,
             contract::{ContractConfigError, ResolveContractError, stock_contract},
         },
     },
+    error::{ApiError, ClientError},
     order::{
         OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
         id::{ClientOrderId, StrategyId},
@@ -95,7 +110,7 @@ use rustrade_instrument::{
     instrument::name::InstrumentNameExchange,
 };
 use serial_test::serial;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_stream::StreamExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -116,35 +131,35 @@ fn test_client_id_base() -> i32 {
         .unwrap_or(200)
 }
 
+fn test_port() -> u16 {
+    std::env::var("IBKR_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(4002)
+}
+
 fn test_config(client_id_offset: i32) -> IbkrConfig {
-    IbkrConfig {
-        host: "127.0.0.1".to_string(),
-        port: std::env::var("IBKR_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(4002),
-        client_id: test_client_id_base() + client_id_offset,
-        account: std::env::var("IBKR_PAPER_ACCOUNT").expect("IBKR_PAPER_ACCOUNT env var required"),
-        contracts: vec![],
-    }
+    IbkrConfig::new(
+        "127.0.0.1",
+        test_port(),
+        test_client_id_base() + client_id_offset,
+        std::env::var("IBKR_PAPER_ACCOUNT").expect("IBKR_PAPER_ACCOUNT env var required"),
+    )
 }
 
 /// AAPL resolved through `IbkrConfig::contracts`, so IB's listings, which name contracts by id,
 /// can be attributed to it.
 fn resolved_aapl_config(client_id_offset: i32) -> IbkrConfig {
-    IbkrConfig {
-        contracts: vec![ContractConfig {
-            name: "AAPL".to_string(),
-            symbol: "AAPL".to_string(),
-            security_type: "STK".to_string(),
-            exchange: "SMART".to_string(),
-            currency: "USD".to_string(),
-            last_trade_date: None,
-            strike: None,
-            right: None,
-        }],
-        ..test_config(client_id_offset)
-    }
+    test_config(client_id_offset).with_contracts(vec![ContractConfig {
+        name: "AAPL".to_string(),
+        symbol: "AAPL".to_string(),
+        security_type: "STK".to_string(),
+        exchange: "SMART".to_string(),
+        currency: "USD".to_string(),
+        last_trade_date: None,
+        strike: None,
+        right: None,
+    }])
 }
 
 fn aapl_instrument() -> InstrumentNameExchange {
@@ -1065,6 +1080,7 @@ async fn test_place_and_cancel_trailing_stop_percentage() {
         kind: OrderKind::TrailingStop {
             offset: dec!(50), // 50% trailing offset
             offset_type: TrailingOffsetType::Percentage,
+            activation_price: None,
         },
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
@@ -1995,4 +2011,145 @@ async fn test_orders_found_by_client_order_id_across_a_restart() {
             .expect("fetch_ended_orders failed")
             .is_empty()
     );
+}
+
+// ============================================================================
+// Shortability Tests — Tier 1: Market Data
+// ============================================================================
+
+/// The stocks the shortability tests read: `IBKR_SHORTABILITY_SYMBOLS`, or AAPL.
+fn shortability_symbols() -> Vec<String> {
+    std::env::var("IBKR_SHORTABILITY_SYMBOLS")
+        .ok()
+        .map(|symbols| {
+            symbols
+                .split(',')
+                .map(str::trim)
+                .filter(|symbol| !symbol.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|symbols| !symbols.is_empty())
+        .unwrap_or_else(|| vec!["AAPL".to_owned()])
+}
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_fetch_shortability() {
+    init_logging();
+
+    let symbols = shortability_symbols();
+    let contracts = symbols
+        .iter()
+        .map(|symbol| ContractConfig {
+            name: symbol.clone(),
+            symbol: symbol.clone(),
+            security_type: "STK".to_string(),
+            exchange: "SMART".to_string(),
+            currency: "USD".to_string(),
+            last_trade_date: None,
+            strike: None,
+            right: None,
+        })
+        .collect();
+    let config = test_config(25).with_contracts(contracts);
+    let client = connect_client(config).await.expect("connection failed");
+
+    // Every stock is read and printed before any is asserted on, so one run reports them all.
+    let mut results = Vec::new();
+    for symbol in &symbols {
+        let started = Instant::now();
+        let result = client
+            .fetch_shortability(&InstrumentNameExchange::from(symbol.as_str()))
+            .await;
+        println!("{symbol}: {result:?} in {:?}", started.elapsed());
+        results.push((symbol, result));
+    }
+    for (symbol, result) in results {
+        result.unwrap_or_else(|e| panic!("{symbol}: {e}"));
+    }
+
+    let unknown = client.fetch_shortability(&"UNKNOWN_SYMBOL".into()).await;
+    assert!(
+        matches!(
+            unknown,
+            Err(ClientError::Api(ApiError::InstrumentInvalid(..)))
+        ),
+        "{unknown:?}"
+    );
+}
+
+/// Prints every item IB sends to a streaming generic tick 236 request, with the time since the
+/// request, so the ticks' latency and form can be read off. Asserts nothing.
+#[test]
+#[ignore]
+#[serial]
+fn test_shortability_raw_ticks() {
+    init_logging();
+
+    let window = Duration::from_secs(
+        std::env::var("IBKR_PROBE_SECS")
+            .ok()
+            .and_then(|secs| secs.parse().ok())
+            .unwrap_or(30),
+    );
+    let client = ibapi::client::blocking::Client::connect(
+        &format!("127.0.0.1:{}", test_port()),
+        test_client_id_base() + 26,
+    )
+    .expect("connection failed");
+
+    // IBKR_MARKET_DATA_TYPE: 1 live (IB's default), 2 frozen, 3 delayed, 4 delayed frozen. An
+    // account without a live subscription gets notice 10089 and no ticks under 1.
+    if let Some(data_type) = std::env::var("IBKR_MARKET_DATA_TYPE")
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+    {
+        let data_type = match data_type {
+            1 => MarketDataType::Realtime,
+            2 => MarketDataType::Frozen,
+            3 => MarketDataType::Delayed,
+            4 => MarketDataType::DelayedFrozen,
+            other => panic!("IBKR_MARKET_DATA_TYPE must be 1 to 4, not {other}"),
+        };
+        println!("market data type: {data_type:?}");
+        client
+            .switch_market_data_type(data_type)
+            .expect("switch_market_data_type failed");
+    }
+
+    for symbol in shortability_symbols() {
+        let contract = Contract::stock(symbol.as_str()).build();
+        let subscription = match client
+            .market_data(&contract)
+            .generic_ticks(&[generic_tick::SHORTABLE])
+            .subscribe()
+        {
+            Ok(subscription) => subscription,
+            Err(e) => {
+                println!("{symbol}: subscribe failed: {e}");
+                continue;
+            }
+        };
+        let started = Instant::now();
+        loop {
+            let remaining = window.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            match subscription.next_timeout(remaining) {
+                Some(item) => {
+                    println!("{symbol} +{:>6} ms {item:?}", started.elapsed().as_millis())
+                }
+                None => {
+                    println!(
+                        "{symbol} +{:>6} ms end of the read",
+                        started.elapsed().as_millis()
+                    );
+                    break;
+                }
+            }
+        }
+    }
 }

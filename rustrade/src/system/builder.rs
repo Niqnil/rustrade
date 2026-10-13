@@ -7,7 +7,8 @@ use crate::{
         in_flight::{InFlightDeadlineError, InFlightDeadlines},
         run::{async_run, async_run_with_audit, sync_run, sync_run_with_audit},
         state::{
-            EngineState, builder::EngineStateBuilder, position::PositionSeed, trading::TradingState,
+            EngineState, builder::EngineStateBuilder, instrument::ExpiryHandling,
+            position::PositionSeed, trading::TradingState,
         },
     },
     error::BarterError,
@@ -109,6 +110,7 @@ pub struct SystemBuilder<'a, Clock, Strategy, Risk, MarketStream, GlobalData, Fn
     in_flight_deadline_overrides: Vec<(ExchangeId, Option<Duration>)>,
     balances: FnvHashMap<ExchangeAsset<AssetNameInternal>, Balance>,
     positions: Vec<PositionSeed>,
+    expiry_handling: FnvHashMap<ExchangeId, ExpiryHandling>,
 }
 
 impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
@@ -128,6 +130,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             in_flight_deadline_overrides: Vec::new(),
             balances: FnvHashMap::default(),
             positions: Vec::new(),
+            expiry_handling: FnvHashMap::default(),
         }
     }
 
@@ -179,6 +182,14 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
     /// execution client in the system, or the deadline is zero.
     pub fn in_flight_deadline(mut self, exchange: ExchangeId, deadline: Option<Duration>) -> Self {
         self.in_flight_deadline_overrides.push((exchange, deadline));
+        self
+    }
+
+    /// Optionally set who settles expiring contracts on `exchange`'s instruments.
+    ///
+    /// See [`EngineStateBuilder::expiry_handling`]. For the same exchange the last call wins.
+    pub fn expiry_handling(mut self, exchange: ExchangeId, handling: ExpiryHandling) -> Self {
+        self.expiry_handling.insert(exchange, handling);
         self
     }
 
@@ -262,6 +273,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             in_flight_deadline_overrides,
             balances,
             positions,
+            expiry_handling,
         } = self;
 
         // Default if not provided
@@ -305,7 +317,12 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
                     .into_iter()
                     .map(|(key, value)| Keyed::new(key, value)),
             )
-            .positions(positions)
+            .positions(positions);
+        let state = expiry_handling
+            .into_iter()
+            .fold(state, |state, (exchange, handling)| {
+                state.expiry_handling(exchange, handling)
+            })
             .try_build()?;
 
         // Construct Engine
@@ -662,6 +679,7 @@ mod tests {
         let position = VenuePosition::new(
             dec!(-0.5),
             Some(dec!(30000)),
+            None,
             None,
             None,
             None,

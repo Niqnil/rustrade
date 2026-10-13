@@ -160,6 +160,7 @@ fn args_constant_with_market_data(
 
     Arc::new(BacktestArgsConstant {
         instruments,
+        venue_options: Default::default(),
         executions,
         market_data,
         summary_interval: Daily,
@@ -352,20 +353,20 @@ fn seed_long_position_event(
     Timed::new(
         EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
             exchange: ExchangeIndex(0),
-            kind: AccountEventKind::Trade(Trade {
-                id: TradeId::new("seed-fill"),
-                order_id: OrderId::new("seed-fill"),
-                instrument: InstrumentIndex::new(instrument),
-                strategy: StrategyId::new("seed"),
-                time_exchange: ts(time),
-                side: Side::Buy,
+            kind: AccountEventKind::Trade(Trade::new(
+                TradeId::new("seed-fill"),
+                OrderId::new("seed-fill"),
+                InstrumentIndex::new(instrument),
+                StrategyId::new("seed"),
+                ts(time),
+                Side::Buy,
                 price,
                 // Zero fees keep `price_entry_average` clean; the asset only needs to be a valid
                 // index (fees don't affect the split-scaled fields asserted below).
                 quantity,
-                order_filled_quantity: None,
-                fees: AssetFees::new(AssetIndex(0), dec!(0), Some(dec!(0))),
-            }),
+                None,
+                AssetFees::new(AssetIndex(0), dec!(0), Some(dec!(0))),
+            )),
         })),
         ts(time),
     )

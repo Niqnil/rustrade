@@ -54,6 +54,7 @@ use rustrade_instrument::{
     exchange::ExchangeId,
     instrument::market_data::{MarketDataInstrument, kind::MarketDataInstrumentKind},
 };
+use rustrade_integration::subscription::SubscriptionId;
 use serde_json::{Value, json};
 use serial_test::serial;
 use std::{
@@ -623,14 +624,16 @@ async fn a_refusal_ahead_of_its_confirmations_fails_naming_only_what_went_unconf
     )
     .await
     .unwrap_err();
-    let message = refused.to_string();
-    assert!(message.contains("not authorized"), "{message}");
-    let (_, unconfirmed) = message
-        .split_once("among those it did not confirm: ")
-        .unwrap_or_else(|| panic!("names what went unconfirmed: {message}"));
-    assert!(unconfirmed.starts_with("XQ.ETH-USD"), "{message}");
-    assert!(!unconfirmed.contains("XQ.BTC-USD"), "{message}");
-    assert!(message.contains("shared by every stream"), "{message}");
+    let DataError::SubscriptionsUnacknowledged {
+        reason,
+        unacknowledged,
+    } = refused
+    else {
+        panic!("names what went unconfirmed: {refused:?}");
+    };
+    assert!(reason.contains("not authorized"), "{reason}");
+    assert!(reason.contains("shared by every stream"), "{reason}");
+    assert_eq!(unacknowledged, [SubscriptionId::from("XQ|ETH-USD")]);
 
     provider
         .until("the unsubscribe", |provider| provider.sent_on(1).len() == 3)

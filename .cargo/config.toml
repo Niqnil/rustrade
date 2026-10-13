@@ -4,10 +4,11 @@
 rustflags = [
     "-C", "link-arg=-fuse-ld=mold",
     # Keep debug info out of the linked image. Debug builds of this workspace are
-    # dominated by `.debug_str` (monomorphised type names), and in the examples that
-    # instantiate the stream machinery across every exchange it reaches 70-96% of the
-    # 4 GiB ceiling on a 32-bit relocation -- one of them crosses it and fails to link
-    # outright. Emitting DWARF to `.dwo` sidecars instead leaves ~0.07% behind.
+    # dominated by `.debug_str` (monomorphised type names). Before the market stream's
+    # reconnect chain was type-erased (#387), the examples that instantiate it across every
+    # exchange reached 70-96% of the 4 GiB ceiling on a 32-bit relocation, and one crossed it
+    # and failed to link. They now carry about a twentieth of that. Emitting DWARF to `.dwo`
+    # sidecars keeps the binaries smaller and the ceiling out of reach if type names grow again.
     #
     # Scoped to the Linux GNU target rather than set in `[profile.dev]` because
     # Windows-MSVC accepts only `packed`/`off`. It costs nothing in release, which

@@ -3,7 +3,7 @@ use crate::{
         EngineState,
         asset::generate_empty_indexed_asset_states,
         connectivity::generate_empty_indexed_connectivity_states,
-        instrument::generate_indexed_instrument_states,
+        instrument::{ExpiryHandling, generate_indexed_instrument_states},
         order::Orders,
         position::{OmsMode, PositionManager, PositionSeed, PositionSeedError},
         trading::TradingState,
@@ -21,7 +21,7 @@ use rustrade_instrument::{
     instrument::{Instrument, InstrumentIndex},
 };
 use rustrade_integration::collection::snapshot::Snapshot;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Builder utility for an [`EngineState`] instance.
 #[derive(Debug, Clone)]
@@ -48,6 +48,9 @@ pub struct EngineStateBuilder<'a, GlobalData, FnInstrumentData> {
     execution_venues: Option<FnvHashSet<ExchangeId>>,
     /// Open positions to place in the built state — see [`EngineStateBuilder::positions`].
     positions: Vec<PositionSeed>,
+    /// [`ExpiryHandling`] per exchange — see [`EngineStateBuilder::expiry_handling`]. An exchange
+    /// not named keeps [`ExpiryHandling::Engine`].
+    expiry_handling: FnvHashMap<ExchangeId, ExpiryHandling>,
 }
 
 impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInstrumentData> {
@@ -74,6 +77,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             balance_basis: BalanceBasis::default(),
             execution_venues: None,
             positions: Vec::new(),
+            expiry_handling: FnvHashMap::default(),
         }
     }
 
@@ -101,6 +105,22 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
         Iter: IntoIterator<Item = ExchangeId>,
     {
         self.execution_venues = Some(venues.into_iter().collect());
+        self
+    }
+
+    /// Optionally set who settles expiring contracts on `exchange`'s instruments — see
+    /// [`ExpiryHandling`].
+    ///
+    /// Every exchange not named here keeps [`ExpiryHandling::Engine`]: the engine closes each
+    /// position with a synthesised settlement trade. Choose [`ExpiryHandling::Venue`] for an
+    /// exchange whose execution client reports its own trades for an expiry, exercise or
+    /// assignment, and whose trades the caller feeds to the engine. Otherwise each position is
+    /// closed twice, once by the engine and once by the venue.
+    ///
+    /// Calling this again for the same exchange replaces the earlier setting. An exchange none of
+    /// the instruments trades on is ignored, with a warning at build.
+    pub fn expiry_handling(mut self, exchange: ExchangeId, handling: ExpiryHandling) -> Self {
+        self.expiry_handling.insert(exchange, handling);
         self
     }
 
@@ -248,6 +268,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             balance_basis,
             execution_venues,
             positions,
+            expiry_handling,
         } = self;
 
         // Default if not provided
@@ -273,6 +294,26 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
                 }))
         }
 
+        // Key each exchange's ExpiryHandling by its ExchangeIndex, which is what an instrument
+        // state carries. An exchange outside the index has no instrument to apply it to.
+        let expiry_handling: FnvHashMap<ExchangeIndex, ExpiryHandling> = expiry_handling
+            .into_iter()
+            .filter_map(
+                |(exchange, handling)| match instruments.find_exchange_index(exchange) {
+                    Ok(index) => Some((index, handling)),
+                    Err(_) => {
+                        warn!(
+                            %exchange,
+                            ?handling,
+                            "EngineStateBuilder::expiry_handling names an exchange no instrument \
+                             trades on — ignored"
+                        );
+                        None
+                    }
+                },
+            )
+            .collect();
+
         // Generate empty InstrumentStates using provided FnInstrumentData etc.
         let mut instruments = generate_indexed_instrument_states(
             instruments,
@@ -281,6 +322,13 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             Orders::default,
             instrument_data_init,
         );
+
+        // Apply each exchange's ExpiryHandling to its instruments
+        for state in instruments.0.values_mut() {
+            if let Some(handling) = expiry_handling.get(&state.instrument.exchange) {
+                state.expiry_handling = *handling;
+            }
+        }
 
         // Seed open positions into their instruments' PositionManagers
         for seed in positions {
@@ -312,7 +360,7 @@ mod tests {
         engine::state::{
             EngineState,
             connectivity::VenueRole,
-            position::{PnlUnrealisedUpdate, PositionId},
+            position::{CarryUpdate, PnlUnrealisedUpdate, PositionId},
         },
         statistic::{summary::TradingSummaryGenerator, time::Annual365},
     };
@@ -419,6 +467,26 @@ mod tests {
         assert_eq!(generator.generate(Annual365).basis, BalanceBasis::NetAsset);
     }
 
+    /// [`EngineStateBuilder::expiry_handling`] reaches every instrument of the named exchange and
+    /// no other; an exchange no instrument trades on is ignored.
+    #[test]
+    fn expiry_handling_reaches_only_the_named_exchanges_instruments() {
+        let instruments = seed_instruments();
+        let state: EngineState<(), ()> = EngineState::builder(&instruments, (), |_| ())
+            .expiry_handling(ExchangeId::BinanceFuturesUsd, ExpiryHandling::Venue)
+            .expiry_handling(ExchangeId::Kraken, ExpiryHandling::Venue)
+            .build();
+
+        let handling = |name: &str| {
+            state
+                .instruments
+                .instrument(&InstrumentNameInternal::new(name))
+                .expiry_handling
+        };
+        assert_eq!(handling(PERP), ExpiryHandling::Venue);
+        assert_eq!(handling(SPOT), ExpiryHandling::Engine);
+    }
+
     /// End-to-end seam for [`EngineStateBuilder::execution_venues`]: the declared set has to reach
     /// [`generate_empty_indexed_connectivity_states`] for the built state's roles to differ from
     /// the instrument-model approximation. The generator is unit-tested at its own seam; this pins
@@ -502,6 +570,7 @@ mod tests {
         assert_eq!(position.quantity_abs_max, dec!(0.5));
         assert_eq!(position.pnl_unrealised, Decimal::ZERO);
         assert_eq!(position.pnl_realised, Decimal::ZERO);
+        assert_eq!(position.carry, Decimal::ZERO);
         assert_eq!(
             position.fees_enter,
             AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO))
@@ -537,18 +606,18 @@ mod tests {
             .instrument_mut(&InstrumentNameInternal::new(SPOT));
         let quote = spot.instrument.underlying.quote;
         let exited = spot
-            .update_from_trade(&Trade {
-                id: TradeId::new("close"),
-                order_id: OrderId::new("close"),
-                instrument: spot.key,
-                strategy: StrategyId::new("strategy"),
-                time_exchange: time(3_000),
-                side: Side::Sell,
-                price: dec!(52_000),
-                quantity: dec!(0.5),
-                order_filled_quantity: None,
-                fees: AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
-            })
+            .update_from_trade(&Trade::new(
+                TradeId::new("close"),
+                OrderId::new("close"),
+                spot.key,
+                StrategyId::new("strategy"),
+                time(3_000),
+                Side::Sell,
+                dec!(52_000),
+                dec!(0.5),
+                None,
+                AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
+            ))
             .expect("a fill for the whole quantity exits the seeded position");
 
         assert_eq!(exited.position_id, PositionId::NETTING);
@@ -617,20 +686,71 @@ mod tests {
         assert_eq!(position.pnl_realised, dec!(0.25));
     }
 
-    /// A seed serialised without `fees_enter` still deserialises, with zero entry fees.
+    /// A seed serialised without `fees_enter` or `carry` still deserialises, with both zero.
     #[test]
-    fn seed_without_fees_enter_deserialises_with_zero_fees() {
+    fn seed_without_fees_enter_or_carry_deserialises_with_zeros() {
         let seed = long_seed(SPOT, dec!(0.5));
         let mut json = serde_json::to_value(&seed).unwrap();
-        json.as_object_mut()
-            .unwrap()
-            .remove("fees_enter")
-            .expect("a serialised seed holds fees_enter");
+        let fields = json.as_object_mut().unwrap();
+        for field in ["fees_enter", "carry"] {
+            fields
+                .remove(field)
+                .unwrap_or_else(|| panic!("a serialised seed holds {field}"));
+        }
 
         let deserialised: PositionSeed = serde_json::from_value(json).unwrap();
 
         assert_eq!(deserialised.fees_enter, Decimal::ZERO);
+        assert_eq!(deserialised.carry, Decimal::ZERO);
         assert_eq!(deserialised, seed);
+    }
+
+    /// Seeded carry starts the position's carry, apart from realised PnL, and reaches the exit
+    /// with the carry posted while the engine held it.
+    #[test]
+    fn seeded_carry_is_kept_apart_from_realised_pnl_and_reaches_the_exit() {
+        let instruments = seed_instruments();
+        let mut state = try_build(
+            &instruments,
+            OmsMode::Netting,
+            vec![long_seed(SPOT, dec!(0.5)).with_carry(dec!(-4))],
+        )
+        .unwrap();
+
+        let spot = state
+            .instruments
+            .instrument_mut(&InstrumentNameInternal::new(SPOT));
+        let quote = spot.instrument.underlying.quote;
+        let position = spot
+            .position
+            .positions
+            .get_mut(&PositionId::NETTING)
+            .unwrap();
+        assert_eq!(position.carry, dec!(-4));
+        assert_eq!(position.pnl_realised, Decimal::ZERO);
+        assert_eq!(
+            position.apply_carry(dec!(1.5), time(2_000)),
+            CarryUpdate::Applied
+        );
+
+        let exited = spot
+            .update_from_trade(&Trade::new(
+                TradeId::new("close"),
+                OrderId::new("close"),
+                spot.key,
+                StrategyId::new("strategy"),
+                time(3_000),
+                Side::Sell,
+                dec!(52_000),
+                dec!(0.5),
+                None,
+                AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
+            ))
+            .expect("a fill for the whole quantity exits the seeded position");
+
+        assert_eq!(exited.pnl_realised, dec!(1_000));
+        assert_eq!(exited.carry, dec!(-2.5));
+        assert_eq!(exited.pnl_realised_net(), Some(dec!(997.5)));
     }
 
     /// Closing a position seeded with entry fees nets them out of its realised PnL, together with
@@ -650,18 +770,18 @@ mod tests {
             .instrument_mut(&InstrumentNameInternal::new(SPOT));
         let quote = spot.instrument.underlying.quote;
         let exited = spot
-            .update_from_trade(&Trade {
-                id: TradeId::new("close"),
-                order_id: OrderId::new("close"),
-                instrument: spot.key,
-                strategy: StrategyId::new("strategy"),
-                time_exchange: time(3_000),
-                side: Side::Sell,
-                price: dec!(52_000),
-                quantity: dec!(0.5),
-                order_filled_quantity: None,
-                fees: AssetFees::new(quote, dec!(3), Some(dec!(3))),
-            })
+            .update_from_trade(&Trade::new(
+                TradeId::new("close"),
+                OrderId::new("close"),
+                spot.key,
+                StrategyId::new("strategy"),
+                time(3_000),
+                Side::Sell,
+                dec!(52_000),
+                dec!(0.5),
+                None,
+                AssetFees::new(quote, dec!(3), Some(dec!(3))),
+            ))
             .expect("a fill for the whole quantity exits the seeded position");
 
         // 0.5 * (52_000 - 50_000) = 1_000, less 5 entry and 3 exit fees.
@@ -726,17 +846,19 @@ mod tests {
         spot.position_ids.insert(cid.clone(), PositionId::new("a"));
         spot.exchange_id_to_cid.insert(OrderId::new("close_a"), cid);
 
-        let sell = |id: &str, quantity| Trade {
-            id: TradeId::new(id),
-            order_id: OrderId::new("close_a"),
-            instrument: key,
-            strategy: StrategyId::new("strategy"),
-            time_exchange: time(3_000),
-            side: Side::Sell,
-            price: dec!(52_000),
-            quantity,
-            order_filled_quantity: None,
-            fees: AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
+        let sell = |id: &str, quantity| {
+            Trade::new(
+                TradeId::new(id),
+                OrderId::new("close_a"),
+                key,
+                StrategyId::new("strategy"),
+                time(3_000),
+                Side::Sell,
+                dec!(52_000),
+                quantity,
+                None,
+                AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
+            )
         };
 
         let first = sell("fill_1", dec!(1));

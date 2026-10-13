@@ -5,18 +5,20 @@ use crate::{
     subscriber::validator::SubscriptionValidator,
     subscription::{Map, SubscriptionKind},
 };
-use futures::StreamExt;
+use fnv::FnvHashSet;
+use futures::{Stream, StreamExt};
 use rustrade_integration::{
     Validator,
     error::SocketError,
     protocol::{
         StreamParser,
-        websocket::{WebSocket, WebSocketSerdeParser, WsMessage},
+        websocket::{WebSocket, WebSocketSerdeParser, WsError, WsMessage},
     },
     subscription::SubscriptionId,
 };
 use serde::{Deserialize, Serialize};
 use smol_str::ToSmolStr;
+use std::time::Duration;
 use tracing::debug;
 
 /// [`Bitfinex`](super::Bitfinex) specific [`SubscriptionValidator`].
@@ -30,6 +32,10 @@ use tracing::debug;
 /// - Therefore the [`SubscriptionId`] format must change during [`BitfinexWebSocketSubValidator::validate`]
 ///   to use the [`BitfinexChannelId`](super::subscription::BitfinexChannelId)
 ///   (see module level "SubscriptionId" documentation notes for more details).
+///
+/// A batch that fails names the subscriptions Bitfinex had not acknowledged, in
+/// [`SocketError::Unacknowledged`]. Bitfinex echoes each subscription it accepts, so the rest
+/// are left out.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize, Serialize)]
 pub struct BitfinexWebSocketSubValidator;
 
@@ -37,7 +43,7 @@ impl SubscriptionValidator for BitfinexWebSocketSubValidator {
     type Parser = WebSocketSerdeParser;
 
     async fn validate<Exchange, Instrument, Kind>(
-        mut instrument_map: Map<Instrument>,
+        instrument_map: Map<Instrument>,
         websocket: &mut WebSocket,
     ) -> Result<(Map<Instrument>, Vec<WsMessage>), SocketError>
     where
@@ -45,99 +51,383 @@ impl SubscriptionValidator for BitfinexWebSocketSubValidator {
         Instrument: Send,
         Kind: SubscriptionKind + Send,
     {
-        // Establish exchange specific subscription validation parameters
-        let timeout = Exchange::subscription_timeout();
-        let expected_responses = Exchange::expected_responses(&instrument_map);
+        validate_responses::<Exchange, _, _>(
+            instrument_map,
+            websocket,
+            Exchange::subscription_timeout(),
+        )
+        .await
+    }
+}
 
-        // Parameter to keep track of successful Subscription outcomes
-        // '--> Bitfinex sends snapshots as the first message, so count them also
-        let mut success_responses = 0usize;
-        let mut init_snapshots_received = 0usize;
+/// Reads `messages` until every subscription has been acknowledged and has sent its initial
+/// snapshot, re-keying each acknowledged one by its channel id, or fails naming the
+/// subscriptions left unacknowledged.
+///
+/// Generic over the message source so the validation logic is testable without a socket.
+async fn validate_responses<Exchange, Instrument, Messages>(
+    mut instrument_map: Map<Instrument>,
+    messages: &mut Messages,
+    timeout: Duration,
+) -> Result<(Map<Instrument>, Vec<WsMessage>), SocketError>
+where
+    Exchange: Connector,
+    Messages: Stream<Item = Result<WsMessage, WsError>> + Unpin,
+{
+    let expected_responses = Exchange::expected_responses(&instrument_map);
+    let mut success_responses = 0usize;
+    let mut init_snapshots_received = 0usize;
 
-        // Buffer any active Subscription market events that are received during validation
-        let mut buff_active_subscription_events = Vec::new();
+    // The subscriptions not yet acknowledged, by the id the mapper keyed them under
+    let mut unacknowledged = instrument_map.0.keys().cloned().collect::<FnvHashSet<_>>();
 
-        loop {
-            // Break if all Subscriptions were a success
-            if success_responses == expected_responses
-                && init_snapshots_received == expected_responses
-            {
-                debug!(exchange = %Exchange::ID, "validated exchange WebSocket subscriptions");
-                break Ok((instrument_map, buff_active_subscription_events));
-            }
+    // The channels acknowledged whose initial snapshot has not yet arrived
+    let mut awaiting_snapshot = FnvHashSet::default();
 
-            tokio::select! {
-                // If timeout reached, return SubscribeError
-                _ = tokio::time::sleep(timeout) => {
-                    break Err(SocketError::Subscribe(
-                        format!("subscription validation timeout reached: {timeout:?}")
-                    ))
-                },
-                // Parse incoming messages and determine subscription outcomes
-                message = websocket.next() => {
-                    let response = match message {
-                        Some(response) => response,
-                        None => break Err(SocketError::Subscribe("WebSocket stream terminated unexpectedly".to_string()))
-                    };
+    // Buffer any active Subscription market events that are received during validation
+    let mut buff_active_subscription_events = Vec::new();
 
-                    match <WebSocketSerdeParser as StreamParser<BitfinexPlatformEvent>>::parse(response) {
-                        Some(Ok(response)) => match response.validate() {
-                            // Bitfinex server is online
-                            Ok(BitfinexPlatformEvent::PlatformStatus(status)) => {
+    // One deadline for the whole validation. A sleep re-armed per message would never expire
+    // while an acknowledged subscription keeps streaming events.
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+
+    loop {
+        // Break if all Subscriptions were a success
+        if success_responses == expected_responses && init_snapshots_received == expected_responses
+        {
+            debug!(exchange = %Exchange::ID, "validated exchange WebSocket subscriptions");
+            break Ok((instrument_map, buff_active_subscription_events));
+        }
+
+        let failure = tokio::select! {
+            _ = &mut deadline => format!("subscription validation timeout reached: {timeout:?}"),
+            message = messages.next() => {
+                let Some(response) = message else {
+                    break Err(failure_error(
+                        "WebSocket stream terminated unexpectedly".to_owned(),
+                        unacknowledged,
+                        init_snapshots_received,
+                        expected_responses,
+                    ));
+                };
+
+                match <WebSocketSerdeParser as StreamParser<BitfinexPlatformEvent>>::parse(response) {
+                    Some(Ok(response)) => match response.validate() {
+                        // Bitfinex platform status is online
+                        Ok(BitfinexPlatformEvent::PlatformStatus(status)) => {
+                            debug!(
+                                exchange = %Exchange::ID,
+                                %success_responses,
+                                %expected_responses,
+                                payload = ?status,
+                                "received Bitfinex platform status",
+                            );
+                            continue
+                        }
+
+                        // Subscription success
+                        Ok(BitfinexPlatformEvent::Subscribed(response)) => {
+                            // Determine SubscriptionId associated with the success response
+                            let BitfinexSubResponse { channel, market, channel_id } = &response;
+                            let subscription_id = ExchangeSub::from((channel, market)).id();
+
+                            // Replace SubscriptionId with SubscriptionId(channel_id)
+                            if let Some(subscription) = instrument_map.0.remove(&subscription_id) {
+                                success_responses += 1;
+                                unacknowledged.remove(&subscription_id);
+                                awaiting_snapshot.insert(channel_id.0);
+                                instrument_map
+                                    .0
+                                    .insert(SubscriptionId(channel_id.0.to_smolstr()), subscription);
+
                                 debug!(
                                     exchange = %Exchange::ID,
                                     %success_responses,
                                     %expected_responses,
-                                    payload = ?status,
-                                    "received Bitfinex platform status",
+                                    payload = ?response,
+                                    "received valid Ok subscription response",
                                 );
                             }
-
-                            // Subscription success
-                            Ok(BitfinexPlatformEvent::Subscribed(response)) => {
-                                // Determine SubscriptionId associated with the success response
-                                let BitfinexSubResponse { channel, market, channel_id } = &response;
-                                let subscription_id = ExchangeSub::from((channel, market)).id();
-
-                                // Replace SubscriptionId with SubscriptionId(channel_id)
-                                if let Some(subscription) = instrument_map.0.remove(&subscription_id) {
-                                    success_responses += 1;
-                                    instrument_map.0.insert(SubscriptionId(channel_id.0.to_smolstr()), subscription);
-
-                                    debug!(
-                                        exchange = %Exchange::ID,
-                                        %success_responses,
-                                        %expected_responses,
-                                        payload = ?response,
-                                        "received valid Ok subscription response",
-                                    );
-                                }
-                            }
-
-                            // Subscription failure
-                            Err(err) => break Err(err),
-
-                            // Not reachable after BitfinexPlatformEvent validate()
-                            Ok(BitfinexPlatformEvent::Error(error)) => panic!("{error:?}"),
+                            continue
                         }
-                        Some(Err(SocketError::Deserialise { error: _, payload })) if success_responses >= 1 => {
-                            // Already active Bitfinex subscriptions will send initial snapshots
+
+                        // Subscription failure: the venue's own message, without the
+                        // `Subscribe` wrapper `Unacknowledged` would repeat
+                        Err(SocketError::Subscribe(message)) => message,
+                        Err(error) => error.to_string(),
+
+                        // `validate` turns every error event into an `Err`
+                        Ok(BitfinexPlatformEvent::Error(error)) => format!("{error:?}"),
+                    }
+                    Some(Err(SocketError::Deserialise { error: _, payload }))
+                        if success_responses >= 1 =>
+                    {
+                        // A channel's first frame after its acknowledgement, other than a
+                        // heartbeat, is its initial snapshot. Every frame is kept for processing
+                        // once validated.
+                        if snapshot_channel(&payload)
+                            .is_some_and(|channel_id| awaiting_snapshot.remove(&channel_id))
+                        {
                             init_snapshots_received += 1;
-                            buff_active_subscription_events.push(WsMessage::text(payload));
-                            continue
                         }
-                        Some(Err(SocketError::Terminated(close_frame))) => {
-                            break Err(SocketError::Subscribe(
-                                format!("received WebSocket CloseFrame: {close_frame}")
-                            ))
-                        }
-                        _ => {
-                            // Pings, Pongs, Frames, etc.
-                            continue
-                        }
+                        buff_active_subscription_events.push(WsMessage::text(payload));
+                        continue
+                    }
+                    Some(Err(SocketError::Terminated(close_frame))) => {
+                        format!("received WebSocket CloseFrame: {close_frame}")
+                    }
+                    _ => {
+                        // Pings, Pongs, Frames, etc.
+                        continue
                     }
                 }
             }
+        };
+
+        break Err(failure_error(
+            failure,
+            unacknowledged,
+            init_snapshots_received,
+            expected_responses,
+        ));
+    }
+}
+
+/// The channel id of a data frame, `[CHANNEL_ID, ...]`, unless it is a heartbeat,
+/// `[CHANNEL_ID, "hb"]`.
+fn snapshot_channel(payload: &str) -> Option<u32> {
+    let frame = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    let frame = frame.as_array()?;
+    if frame.get(1).and_then(serde_json::Value::as_str) == Some("hb") {
+        return None;
+    }
+    u32::try_from(frame.first()?.as_u64()?).ok()
+}
+
+/// The error a validation failing for `reason` ends with: [`SocketError::Unacknowledged`] naming
+/// the subscriptions not acknowledged, or, once every one has been, a [`SocketError::Subscribe`]
+/// saying how many initial snapshots had arrived.
+fn failure_error(
+    reason: String,
+    unacknowledged: FnvHashSet<SubscriptionId>,
+    init_snapshots_received: usize,
+    expected_responses: usize,
+) -> SocketError {
+    if unacknowledged.is_empty() {
+        return SocketError::Subscribe(format!(
+            "{reason} (every subscription was acknowledged; {init_snapshots_received} of \
+             {expected_responses} initial snapshots had arrived)"
+        ));
+    }
+
+    let mut unacknowledged = unacknowledged.into_iter().collect::<Vec<_>>();
+    unacknowledged.sort_unstable();
+    SocketError::Unacknowledged {
+        reason,
+        unacknowledged,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+    use crate::exchange::bitfinex::Bitfinex;
+    use futures::stream;
+
+    const TIMEOUT: Duration = Duration::from_secs(10);
+
+    fn map(ids: &[&str]) -> Map<usize> {
+        ids.iter()
+            .enumerate()
+            .map(|(key, id)| (SubscriptionId::from(*id), key))
+            .collect()
+    }
+
+    fn ids(ids: &[&str]) -> Vec<SubscriptionId> {
+        ids.iter().map(|id| SubscriptionId::from(*id)).collect()
+    }
+
+    fn unacknowledged(error: SocketError) -> (String, Vec<SubscriptionId>) {
+        match error {
+            SocketError::Unacknowledged {
+                reason,
+                unacknowledged,
+            } => (reason, unacknowledged),
+            other => panic!("expected Unacknowledged, got {other:?}"),
         }
+    }
+
+    fn text(message: &str) -> Result<WsMessage, WsError> {
+        Ok(WsMessage::text(message.to_owned()))
+    }
+
+    fn subscribed(channel: &str, symbol: &str, channel_id: u32) -> Result<WsMessage, WsError> {
+        Ok(WsMessage::text(format!(
+            r#"{{"event":"subscribed","channel":"{channel}","chanId":{channel_id},"symbol":"{symbol}","pair":"X"}}"#
+        )))
+    }
+
+    fn snapshot(channel_id: u32) -> Result<WsMessage, WsError> {
+        Ok(WsMessage::text(format!(
+            "[{channel_id},[[1,1791679984451,0.1,82995]]]"
+        )))
+    }
+
+    const INFO: &str = r#"{"event":"info","version":2,"serverId":"x","platform":{"status":1}}"#;
+
+    #[tokio::test(start_paused = true)]
+    async fn every_acknowledgement_rekeys_its_subscription_by_channel_id() {
+        let mut messages = stream::iter([
+            text(INFO),
+            subscribed("trades", "tBTCUSD", 53),
+            snapshot(53),
+            subscribed("trades", "tETHUSD", 54),
+            snapshot(54),
+        ]);
+
+        let (map, buffered) = validate_responses::<Bitfinex, _, _>(
+            map(&["trades|tBTCUSD", "trades|tETHUSD"]),
+            &mut messages,
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(map.find("53").unwrap(), &0);
+        assert_eq!(map.find("54").unwrap(), &1);
+        assert_eq!(buffered.len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn updates_and_heartbeats_are_kept_but_not_counted_as_snapshots() {
+        // A channel can stream before the batch's last acknowledgement arrives
+        let mut messages = stream::iter([
+            subscribed("trades", "tBTCUSD", 53),
+            text(r#"[53,"hb"]"#),
+            snapshot(53),
+            text(r#"[53,"te",[2,1791679999877,0.002,82997]]"#),
+            snapshot(53),
+            subscribed("trades", "tETHUSD", 54),
+            snapshot(54),
+        ]);
+
+        let (map, buffered) = validate_responses::<Bitfinex, _, _>(
+            map(&["trades|tBTCUSD", "trades|tETHUSD"]),
+            &mut messages,
+            TIMEOUT,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(map.0.len(), 2);
+        assert_eq!(buffered.len(), 5);
+    }
+
+    #[test]
+    fn a_snapshot_frame_names_its_channel_and_a_heartbeat_none() {
+        assert_eq!(snapshot_channel("[53,[[1,2,0.1,3]]]"), Some(53));
+        assert_eq!(snapshot_channel(r#"[53,"te",[1,2,0.1,3]]"#), Some(53));
+        assert_eq!(snapshot_channel(r#"[53,"hb"]"#), None);
+        assert_eq!(snapshot_channel(r#"{"event":"pong"}"#), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_names_the_subscriptions_left_unacknowledged() {
+        // As Bitfinex answers an unknown symbol: an error naming the subscription it refuses
+        let mut messages = stream::iter([
+            text(INFO),
+            subscribed("trades", "tBTCUSD", 53),
+            text(
+                r#"{"channel":"trades","symbol":"tNOSUCH","event":"error","msg":"symbol: invalid","code":10300,"pair":"NOSUCH"}"#,
+            ),
+        ]);
+
+        let error = validate_responses::<Bitfinex, _, _>(
+            map(&["trades|tBTCUSD", "trades|tNOSUCH", "trades|tETHUSD"]),
+            &mut messages,
+            TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+
+        let (reason, unacknowledged) = unacknowledged(error);
+        assert_eq!(
+            reason,
+            "Bitfinex refused trades tNOSUCH: symbol: invalid (code 10300)"
+        );
+        assert_eq!(unacknowledged, ids(&["trades|tETHUSD", "trades|tNOSUCH"]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_connection_names_the_subscriptions_left_unacknowledged() {
+        let mut messages = stream::iter([subscribed("trades", "tBTCUSD", 53)]);
+
+        let error = validate_responses::<Bitfinex, _, _>(
+            map(&["trades|tBTCUSD", "book|tETHUSD"]),
+            &mut messages,
+            TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+
+        let (reason, unacknowledged) = unacknowledged(error);
+        assert_eq!(reason, "WebSocket stream terminated unexpectedly");
+        assert_eq!(unacknowledged, ids(&["book|tETHUSD"]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_timeout_fires_while_an_acknowledged_subscription_keeps_streaming() {
+        // One heartbeat a second, forever: a sleep re-armed per message would never expire
+        let heartbeats = stream::unfold((), |()| async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Some((text(r#"[53,"hb"]"#), ()))
+        });
+        let mut messages =
+            Box::pin(stream::iter([subscribed("trades", "tBTCUSD", 53)]).chain(heartbeats));
+        let started = tokio::time::Instant::now();
+
+        let error = validate_responses::<Bitfinex, _, _>(
+            map(&["trades|tBTCUSD", "trades|tETHUSD"]),
+            &mut messages,
+            TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(started.elapsed(), TIMEOUT);
+        let (reason, unacknowledged) = unacknowledged(error);
+        assert_eq!(
+            reason,
+            format!("subscription validation timeout reached: {TIMEOUT:?}")
+        );
+        assert_eq!(unacknowledged, ids(&["trades|tETHUSD"]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_missing_snapshot_after_every_acknowledgement_says_so() {
+        let mut messages = stream::iter([
+            subscribed("trades", "tBTCUSD", 53),
+            subscribed("trades", "tETHUSD", 54),
+            snapshot(53),
+        ]);
+
+        let error = validate_responses::<Bitfinex, _, _>(
+            map(&["trades|tBTCUSD", "trades|tETHUSD"]),
+            &mut messages,
+            TIMEOUT,
+        )
+        .await
+        .unwrap_err();
+
+        let SocketError::Subscribe(message) = error else {
+            panic!("expected Subscribe, got {error:?}");
+        };
+        assert_eq!(
+            message,
+            "WebSocket stream terminated unexpectedly (every subscription was acknowledged; 1 of \
+             2 initial snapshots had arrived)"
+        );
     }
 }

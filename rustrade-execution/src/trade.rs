@@ -1,4 +1,4 @@
-use crate::order::id::{OrderId, StrategyId};
+use crate::order::id::{ClientOrderId, OrderId, StrategyId};
 use chrono::{DateTime, Utc};
 use derive_more::{Constructor, From};
 use rust_decimal::Decimal;
@@ -52,9 +52,13 @@ impl TradeId {
     }
 }
 
-#[derive(
-    Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
-)]
+/// One execution: a fill the venue reported, or one the engine settled itself.
+///
+/// `#[non_exhaustive]`, so a field can be added without breaking a caller. Outside this crate,
+/// build one with [`Trade::new`] and the `with_*` methods, and change a copy by assigning its
+/// public fields.
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct Trade<AssetKey, InstrumentKey> {
     pub id: TradeId,
     pub order_id: OrderId,
@@ -97,9 +101,120 @@ pub struct Trade<AssetKey, InstrumentKey> {
     #[serde(default)]
     pub order_filled_quantity: Option<Decimal>,
     pub fees: AssetFees<AssetKey>,
+    /// Why the fill happened, as far as its producer can tell. See [`TradeOrigin`] for what each
+    /// venue reports.
+    ///
+    /// `#[serde(default)]` so trades serialised before this field existed still deserialise, as
+    /// [`TradeOrigin::Order`].
+    #[serde(default)]
+    pub origin: TradeOrigin,
+    /// The side of the position the fill applies to, when the venue names one: [`Side::Buy`] for
+    /// a long, [`Side::Sell`] for a short.
+    ///
+    /// A venue in hedge mode, holding a long and a short in one instrument at once, names the
+    /// position each fill belongs to (Binance USD-M futures' `LONG` and `SHORT`). The engine in
+    /// `OmsMode::Hedging` checks a forced fill, which matches none of its orders, against it: a
+    /// forced fill must reduce the position the venue names. It only ever confirms the side a
+    /// reducing fill already implies, the side opposite its own, and does not choose among
+    /// several of the engine's positions on that side.
+    ///
+    /// It takes part in the derived `Eq`, `Hash` and `Ord`, as every field does: deduplicate fills
+    /// by instrument and [`id`](Self::id), not by the whole `Trade`.
+    /// `None` when the venue names none, as every client in this crate does as of writing: none
+    /// trades a venue in hedge mode.
+    ///
+    /// `#[serde(default)]` so trades serialised before this field existed still deserialise, as
+    /// `None`.
+    #[serde(default)]
+    pub position_side: Option<Side>,
+    /// The client order id of the order this fill belongs to, as the venue reported it with the
+    /// fill.
+    ///
+    /// The id is chosen before the order is sent, so a consumer can attribute a fill by it at
+    /// once. That includes a fill of an order placed outside the engine on the same account,
+    /// which no order the engine knows matches: [`order_id`](Self::order_id) is the venue's, and
+    /// the fill can arrive before the venue's response to the order names it, or long after, in a
+    /// recovery read. A consumer that trades an account outside the engine can mark those orders'
+    /// client order ids, by a prefix say, and keep their fills from the engine.
+    ///
+    /// `None` means the fill's payload did not carry one. It is not a claim that the order has
+    /// none. Known producers, as of writing:
+    ///
+    /// | Source | Reports it |
+    /// |---|---|
+    /// | Binance Spot / Margin WebSocket `executionReport` | yes (`c`) |
+    /// | Binance Spot / Margin fill recovery after a disconnect | yes, read from each recovered fill's order; `None` where that lookup failed or ran out of time |
+    /// | Binance Spot / Margin `fetch_trades` (`myTrades` REST) | no |
+    /// | Alpaca WebSocket `trade_updates` | yes (`order.client_order_id`) |
+    /// | Alpaca account-activities REST (fill recovery, `fetch_trades`), `fetch_option_events` | no |
+    /// | Interactive Brokers executions | yes, the order reference, which this crate's client sets to the client order id; `None` for an order without one |
+    /// | Hyperliquid `userFills` | yes, the client order id the order's cloid maps to; `None` for an order placed without a cloid |
+    /// | `SimulatedVenue` | yes |
+    /// | The `rustrade` engine's expiry settlement | no |
+    ///
+    /// `#[serde(default)]` so trades serialised before this field existed still deserialise, as
+    /// `None`.
+    #[serde(default)]
+    pub client_order_id: Option<ClientOrderId>,
 }
 
 impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
+    /// A trade of [`TradeOrigin::Order`]. Set another origin with
+    /// [`with_origin`](Self::with_origin).
+    #[allow(clippy::too_many_arguments)] // One argument per field a fill always has.
+    pub fn new(
+        id: TradeId,
+        order_id: OrderId,
+        instrument: InstrumentKey,
+        strategy: StrategyId,
+        time_exchange: DateTime<Utc>,
+        side: Side,
+        price: Decimal,
+        quantity: Decimal,
+        order_filled_quantity: Option<Decimal>,
+        fees: AssetFees<AssetKey>,
+    ) -> Self {
+        Self {
+            id,
+            order_id,
+            instrument,
+            strategy,
+            time_exchange,
+            side,
+            price,
+            quantity,
+            order_filled_quantity,
+            fees,
+            origin: TradeOrigin::Order,
+            position_side: None,
+            client_order_id: None,
+        }
+    }
+
+    /// This trade with its [`origin`](Self::origin) set.
+    #[must_use]
+    pub fn with_origin(self, origin: TradeOrigin) -> Self {
+        Self { origin, ..self }
+    }
+
+    /// This trade with the [`position_side`](Self::position_side) the venue named.
+    #[must_use]
+    pub fn with_position_side(self, position_side: Side) -> Self {
+        Self {
+            position_side: Some(position_side),
+            ..self
+        }
+    }
+
+    /// This trade with the [`client_order_id`](Self::client_order_id) the venue reported.
+    #[must_use]
+    pub fn with_client_order_id(self, client_order_id: ClientOrderId) -> Self {
+        Self {
+            client_order_id: Some(client_order_id),
+            ..self
+        }
+    }
+
     pub fn value_quote(&self) -> Decimal {
         self.price * self.quantity.abs()
     }
@@ -146,9 +261,105 @@ where
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ instrument: {}, side: {}, price: {}, quantity: {}, time: {} }}",
+            "{{ instrument: {}, side: {}, price: {}, quantity: {}, time: {}",
             self.instrument, self.side, self.price, self.quantity, self.time_exchange
-        )
+        )?;
+        // Shown only when it is not the default, so a forced fill stands out in a log line.
+        if self.origin != TradeOrigin::Order {
+            write!(f, ", origin: {}", self.origin)?;
+        }
+        write!(f, " }}")
+    }
+}
+
+/// Why a [`Trade`] happened, as far as its producer can tell.
+///
+/// # `Order` is the default, not a guarantee
+///
+/// [`Order`](Self::Order) means the producer reported no other origin. Most venues mark some
+/// origins and not others, so a fill can be `Order` and still be forced, or still be for an order
+/// this client did not place. What each producer reports, as of writing:
+///
+/// | Source | Reports |
+/// |---|---|
+/// | Interactive Brokers | [`Liquidation`](Self::Liquidation), [`External`](Self::External) (opt-in), `Order` |
+/// | Binance Spot / Margin | `Order` only |
+/// | Hyperliquid | `Order` only |
+/// | Alpaca | `Order` on fills; [`Expiry`](Self::Expiry), [`Exercise`](Self::Exercise), [`Assignment`](Self::Assignment) and [`External`](Self::External) from `AlpacaClient::fetch_option_events` |
+/// | [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue) | `Order` only |
+/// | The `rustrade` engine's expiry settlement | [`Expiry`](Self::Expiry) |
+///
+/// - **Interactive Brokers** flags a fill of an IB-initiated liquidation. Another API client's
+///   fill is reported, as `External`, only when `IbkrConfig::other_clients_fills` opts in.
+/// - **Binance** marks no forced liquidation in its Spot or Margin order stream: its liquidation
+///   markers are documented for futures only. Every fill on the account arrives, whoever placed
+///   its order. `BinanceMargin::fetch_forced_liquidations` reads the margin orders Binance placed
+///   to liquidate the account, for a caller to match against its fills.
+/// - **Hyperliquid** fills carry a liquidation marker, but the SDK this crate uses drops it.
+/// - **Alpaca** marks no liquidation. Option assignment, exercise and expiry are account
+///   activities, which this crate does not read.
+/// - The **simulated venue** models no liquidation.
+///
+/// A forced variant takes precedence over [`External`](Self::External): a liquidation is
+/// reported as a liquidation whoever placed the order it closed.
+///
+/// # Serialised form and ordering
+///
+/// Serialised as the variant's name (`"Liquidation"`), as [`Side`] is, while `Display` writes it
+/// in lower case (`liquidation`). The names are a stored format: they are not renamed, and new
+/// variants are added after the existing ones. A trade with an origin a build does not know does
+/// not deserialise in that build.
+///
+/// `Ord` follows declaration order. It exists so [`Trade`] can derive `Ord`, and carries no
+/// meaning beyond that.
+#[non_exhaustive]
+#[derive(
+    Debug, Copy, Clone, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize,
+)]
+pub enum TradeOrigin {
+    /// A fill of an order, with no other origin reported. See the type's docs for why this is not
+    /// a guarantee that this client placed the order.
+    #[default]
+    Order,
+    /// The venue or broker closed the position because the account fell short of margin.
+    Liquidation,
+    /// The venue reduced the position against a counterparty it was liquidating
+    /// (auto-deleveraging).
+    Adl,
+    /// An option this account was short was assigned.
+    Assignment,
+    /// An option this account held was exercised, by the holder or automatically.
+    Exercise,
+    /// The instrument expired and the position was settled.
+    Expiry,
+    /// A fill of an order that another client, such as another API connection or the venue's own
+    /// trading screen, placed on the same account.
+    External,
+}
+
+impl TradeOrigin {
+    /// Whether the position changed without the account placing an order for it: a
+    /// [`Liquidation`](Self::Liquidation), an [`Adl`](Self::Adl) or an
+    /// [`Assignment`](Self::Assignment).
+    ///
+    /// An [`Exercise`](Self::Exercise) is the holder's right, and an [`Expiry`](Self::Expiry) is
+    /// the instrument's end, so neither counts.
+    pub fn is_forced(self) -> bool {
+        matches!(self, Self::Liquidation | Self::Adl | Self::Assignment)
+    }
+}
+
+impl Display for TradeOrigin {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Order => "order",
+            Self::Liquidation => "liquidation",
+            Self::Adl => "adl",
+            Self::Assignment => "assignment",
+            Self::Exercise => "exercise",
+            Self::Expiry => "expiry",
+            Self::External => "external",
+        })
     }
 }
 
@@ -281,5 +492,85 @@ impl<AssetKey> Default for AssetFees<Option<AssetKey>> {
             fees: Decimal::ZERO,
             fees_quote: None,
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+    use rustrade_instrument::{
+        asset::name::AssetNameExchange, instrument::name::InstrumentNameExchange,
+    };
+
+    fn trade() -> Trade<AssetNameExchange, InstrumentNameExchange> {
+        Trade::new(
+            TradeId::new("t-1"),
+            OrderId::new("o-1"),
+            InstrumentNameExchange::new("btc_usdt"),
+            StrategyId::unknown(),
+            DateTime::<Utc>::MIN_UTC,
+            Side::Sell,
+            Decimal::ONE,
+            Decimal::TWO,
+            None,
+            AssetFees::new(AssetNameExchange::from("usdt"), Decimal::ZERO, None),
+        )
+    }
+
+    #[test]
+    fn a_trade_is_of_an_order_unless_given_another_origin() {
+        assert_eq!(trade().origin, TradeOrigin::Order);
+        assert_eq!(
+            trade().with_origin(TradeOrigin::Adl).origin,
+            TradeOrigin::Adl
+        );
+    }
+
+    /// A trade serialised before `origin` existed still loads, as an order's.
+    #[test]
+    fn a_trade_without_an_origin_deserialises_as_an_orders() {
+        let mut json = serde_json::to_value(trade().with_origin(TradeOrigin::External)).unwrap();
+        assert_eq!(json["origin"], "External");
+        json.as_object_mut().unwrap().remove("origin");
+
+        let read: Trade<AssetNameExchange, InstrumentNameExchange> =
+            serde_json::from_value(json).unwrap();
+        assert_eq!(read, trade());
+    }
+
+    #[test]
+    fn display_names_the_origin_only_when_it_is_not_an_orders() {
+        assert!(!trade().to_string().contains("origin"));
+        assert!(
+            trade()
+                .with_origin(TradeOrigin::Liquidation)
+                .to_string()
+                .ends_with(", origin: liquidation }")
+        );
+    }
+
+    #[test]
+    fn only_liquidation_adl_and_assignment_are_forced() {
+        let forced: Vec<_> = [
+            TradeOrigin::Order,
+            TradeOrigin::Liquidation,
+            TradeOrigin::Adl,
+            TradeOrigin::Assignment,
+            TradeOrigin::Exercise,
+            TradeOrigin::Expiry,
+            TradeOrigin::External,
+        ]
+        .into_iter()
+        .filter(|origin| origin.is_forced())
+        .collect();
+        assert_eq!(
+            forced,
+            [
+                TradeOrigin::Liquidation,
+                TradeOrigin::Adl,
+                TradeOrigin::Assignment
+            ]
+        );
     }
 }

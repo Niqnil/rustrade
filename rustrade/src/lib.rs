@@ -165,7 +165,9 @@ pub enum EngineEvent<
     ///
     /// The library handles: cancelling open orders, computing the settlement price (intrinsic
     /// value for an option, the last price for a future), synthesising a closing fill, and setting
-    /// the `expiration_processed` flag.
+    /// the `expiration_processed` flag. For an instrument whose
+    /// [`ExpiryHandling`](engine::state::instrument::ExpiryHandling) is `Venue`, it synthesises no
+    /// fill: the venue's own trades close the positions.
     ///
     /// **Caller obligation**: inject this event when `Utc::now() >= contract.expiry`, and only
     /// for an instrument that expires. One that never expires (`Spot`, `Perpetual`, `Cfd`), or a
@@ -389,22 +391,22 @@ pub mod test_utils {
         quantity: f64,
         fees: f64,
     ) -> Trade<QuoteAsset, InstrumentNameInternal> {
-        Trade {
-            id: TradeId::new("trade_id"),
-            order_id: OrderId::new("order_id"),
-            instrument: InstrumentNameInternal::new("instrument"),
-            strategy: StrategyId::new("strategy"),
+        Trade::new(
+            TradeId::new("trade_id"),
+            OrderId::new("order_id"),
+            InstrumentNameInternal::new("instrument"),
+            StrategyId::new("strategy"),
             time_exchange,
             side,
-            price: price.try_into().unwrap(),
-            quantity: quantity.try_into().unwrap(),
-            order_filled_quantity: None,
-            fees: AssetFees {
+            price.try_into().unwrap(),
+            quantity.try_into().unwrap(),
+            None,
+            AssetFees {
                 asset: QuoteAsset,
                 fees: fees.try_into().unwrap(),
                 fees_quote: Some(fees.try_into().unwrap()),
             },
-        }
+        )
     }
 
     pub fn asset_state(

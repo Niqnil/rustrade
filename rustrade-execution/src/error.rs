@@ -21,7 +21,7 @@ use rustrade_instrument::{
 };
 use rustrade_integration::error::SocketError;
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{fmt, time::Duration};
 use thiserror::Error;
 
 /// Type alias for a [`ClientError`] that is keyed on [`AssetNameExchange`] and
@@ -111,7 +111,7 @@ impl<AssetKey, InstrumentKey> ClientError<AssetKey, InstrumentKey> {
     ///
     /// # Transient errors
     /// - [`Connectivity`](Self::Connectivity) errors (timeout, socket, offline)
-    /// - [`Api::RateLimit`](ApiError::RateLimit)
+    /// - [`Api::RateLimit`](ApiError::RateLimit), though not before its `retry_after`
     ///
     /// # Non-transient errors
     /// - Other [`Api`](Self::Api) errors (invalid instrument, insufficient balance, etc.)
@@ -121,7 +121,7 @@ impl<AssetKey, InstrumentKey> ClientError<AssetKey, InstrumentKey> {
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Connectivity(e) => e.is_transient(),
-            Self::Api(ApiError::RateLimit) => true,
+            Self::Api(ApiError::RateLimit { .. }) => true,
             Self::Api(_) => false,
             Self::TaskFailed(_) => false,
             Self::Internal(_) => false,
@@ -224,14 +224,41 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
 
     /// Request was rejected due to rate limiting.
     ///
-    /// The exchange enforces request quotas and the caller has exceeded them.
-    /// Some exchanges provide a `Retry-After` header or similar hint; the client
-    /// may incorporate this into internal retry logic before surfacing this error.
+    /// The exchange enforces request quotas and the caller has exceeded them. The client may
+    /// already have waited and retried within its own bounded retries before surfacing this.
     ///
-    /// Transient — retry with backoff. Typical backoff is 10-60 seconds, but
-    /// respect exchange-specific guidance if available.
-    #[error("rate limit exceeded")]
-    RateLimit,
+    /// `retry_after` is the venue's own minimum wait, measured from when the client read the
+    /// refusal: do not retry sooner. `None` means the venue sent no hint, or the client cannot
+    /// read it, and is not permission to retry at once. Which clients fill it:
+    /// - **Alpaca:** from a 429's `Retry-After`, or else `X-RateLimit-Reset`, once the client's
+    ///   own retries are exhausted.
+    /// - **Binance:** never, for now: `binance-sdk` drops the response headers, `Retry-After`
+    ///   among them, from its rate-limit errors.
+    /// - **Hyperliquid:** never: its SDK keeps no headers, and Hyperliquid documents no hint.
+    ///
+    /// A venue ban (Binance's HTTP 418) is reported the same way: its hint, when readable, says
+    /// how long it lasts.
+    ///
+    /// Transient — retry after `retry_after` when given, otherwise with backoff.
+    ///
+    /// The variant is `#[non_exhaustive]`: outside this crate, build one with
+    /// [`ApiError::rate_limited`], match it as `RateLimit { .. }`, and read the wait with
+    /// [`ApiError::retry_after`].
+    #[error("rate limit exceeded{}", RetryAfter(*retry_after))]
+    #[non_exhaustive]
+    RateLimit { retry_after: Option<Duration> },
+
+    /// The venue refused because a cap on something held at once is full, such as IBKR's market
+    /// data lines, which every TWS session and API client on the account shares.
+    ///
+    /// Unlike [`RateLimit`](Self::RateLimit), waiting does not clear it: releasing something
+    /// does, such as cancelling another subscription, whether this client holds it or another
+    /// session on the same account does. The message carries the venue's words.
+    ///
+    /// Not transient: the same request retried with backoff alone meets the same refusal while
+    /// the cap stays full.
+    #[error("venue capacity exceeded: {0}")]
+    CapacityExceeded(String),
 
     /// Authentication failed (invalid credentials, expired key, bad signature).
     ///
@@ -247,7 +274,8 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     ///
     /// The asset is `None` when it is not known which asset ran short:
     /// - the venue's rejection does not name it (e.g. Binance's "Account has insufficient
-    ///   balance for requested action"), and a client does not guess it from the order;
+    ///   balance for requested action", or any Hyperliquid margin or spot-balance refusal), and
+    ///   a client does not guess it from the order;
     /// - the venue named an asset that the [`ExecutionInstrumentMap`] does not hold, so it has no
     ///   index. [`AccountEventIndexer::api_error`] logs the name it dropped.
     ///
@@ -336,6 +364,151 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// Not transient — the same request fails identically on retry. Change the request.
     #[error("request rejected: {0}")]
     RequestRejected(String),
+
+    /// Order refused because the venue would not lend what it needed: a short sale, or a margin
+    /// order that borrows to cover itself.
+    ///
+    /// Distinct from [`OrderRejected`](Self::OrderRejected) so a caller can tell a refused borrow
+    /// apart from a malformed order, and from [`BalanceInsufficient`](Self::BalanceInsufficient),
+    /// which is the account's own funds running short. A borrow can be refused for a long too: on
+    /// Binance margin, an order that borrows to buy is refused when the venue has too little of
+    /// the asset to lend or the borrow would exceed the account's limit. [`BorrowReject`] says
+    /// why.
+    ///
+    /// Reported by the Binance margin client, by Binance's code, by the Alpaca client, by the
+    /// text of a 403 or 422, and by the
+    /// [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue), for a CFD short its
+    /// [`ShortabilityProvider`](crate::shortability::ShortabilityProvider) does not allow. Other
+    /// clients report such refusals as [`OrderRejected`](Self::OrderRejected) until their venue's
+    /// wording is confirmed.
+    ///
+    /// Not transient — the same request fails identically until the venue's lending changes.
+    #[error("borrow rejected: {0}")]
+    BorrowRejected(BorrowReject),
+}
+
+impl<AssetKey, InstrumentKey> ApiError<AssetKey, InstrumentKey> {
+    /// A [`RateLimit`](Self::RateLimit) refusal, with the venue's minimum wait when it sent one.
+    pub fn rate_limited(retry_after: Option<Duration>) -> Self {
+        Self::RateLimit { retry_after }
+    }
+
+    /// The venue's minimum wait before a retry: `Some` only for a
+    /// [`RateLimit`](Self::RateLimit) whose venue sent a hint the client could read.
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::RateLimit { retry_after } => *retry_after,
+            _ => None,
+        }
+    }
+}
+
+/// Formats a [`RateLimit`](ApiError::RateLimit)'s hint for its message: nothing when there is
+/// none.
+struct RetryAfter(Option<Duration>);
+
+impl fmt::Display for RetryAfter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(retry_after) => write!(f, "; retry after {retry_after:?}"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Why a venue refused to lend for an order, as carried by [`ApiError::BorrowRejected`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub struct BorrowReject {
+    /// The kind of refusal.
+    pub reason: BorrowRejectReason,
+    /// The venue's own code for the refusal, where it gave one (e.g. `-3045` on Binance,
+    /// `40310000` on Alpaca).
+    ///
+    /// For diagnostics only, not a stable contract: match on [`reason`](Self::reason) instead. A
+    /// venue may reuse a code for several refusals, as Alpaca's generic `40310000` is.
+    pub venue_code: Option<String>,
+    /// The venue's message. It may itself carry the code, as Binance's does.
+    pub message: String,
+    /// How much the venue could still have lent, in the units the order was sized in, where
+    /// known: the most a smaller order could have sold short. Set by the simulated venue; no live
+    /// client reports it yet.
+    pub available: Option<Decimal>,
+}
+
+impl BorrowReject {
+    /// A refusal for `reason`, with the venue's code where it gave one, and its message.
+    pub fn new(reason: BorrowRejectReason, venue_code: Option<String>, message: String) -> Self {
+        Self {
+            reason,
+            venue_code,
+            message,
+            available: None,
+        }
+    }
+
+    /// With how much the venue could still have lent.
+    #[must_use]
+    pub fn with_available(mut self, available: Decimal) -> Self {
+        self.available = Some(available);
+        self
+    }
+}
+
+impl fmt::Display for BorrowReject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            reason,
+            venue_code,
+            message,
+            available,
+        } = self;
+        write!(f, "{reason}")?;
+        if let Some(code) = venue_code {
+            write!(f, " (code {code})")?;
+        }
+        write!(f, ": {message}")?;
+        if let Some(available) = available {
+            write!(f, " ({available} available)")?;
+        }
+        Ok(())
+    }
+}
+
+/// The kind of borrow refusal carried by a [`BorrowReject`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub enum BorrowRejectReason {
+    /// The instrument cannot be sold short at all, whoever asks (e.g. Alpaca's "asset X cannot be
+    /// sold short").
+    NotShortable,
+    /// Borrowing is barred for this account, or for this asset on this account (e.g. Binance
+    /// `-3008`, `-3012` and `-3014`, Alpaca's "account is not allowed to short").
+    BorrowDisabled,
+    /// The venue has too little of the asset to lend right now (e.g. Binance `-3045`). It may
+    /// lend again later.
+    InventoryUnavailable,
+    /// The borrow would exceed what the account may borrow (e.g. Binance `-3006`).
+    BorrowLimitExceeded,
+    /// A short-sale restriction is in effect, such as the SEC's Rule 201 circuit breaker after a
+    /// 10% fall, and the order would sell short at or below the best bid. A short sale priced
+    /// above the bid may still be accepted.
+    ShortSaleRestricted,
+    /// A borrow refusal of a kind not listed here. The [`BorrowReject`] message says which.
+    Other,
+}
+
+impl fmt::Display for BorrowRejectReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotShortable => "not shortable",
+            Self::BorrowDisabled => "borrow disabled",
+            Self::InventoryUnavailable => "inventory unavailable",
+            Self::BorrowLimitExceeded => "borrow limit exceeded",
+            Self::ShortSaleRestricted => "short sale restricted",
+            Self::Other => "other",
+        })
+    }
 }
 
 /// Represents all errors that can be generated when cancelling or opening orders.
@@ -482,16 +655,18 @@ impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
     ///
     /// # Transient errors
     /// - [`Connectivity`](Self::Connectivity) errors (timeout, socket, offline)
-    /// - [`Rejected(ApiError::RateLimit)`](ApiError::RateLimit)
+    /// - [`Rejected(ApiError::RateLimit)`](ApiError::RateLimit), though not before its
+    ///   `retry_after`
     ///
     /// # Non-transient errors
-    /// - Other [`Rejected`](Self::Rejected) errors (invalid instrument, insufficient balance, etc.)
+    /// - Other [`Rejected`](Self::Rejected) errors (invalid instrument, insufficient balance,
+    ///   refused borrow, etc.)
     /// - [`UnsupportedOrderType`](Self::UnsupportedOrderType) and
     ///   [`InvalidPrecision`](Self::InvalidPrecision)
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Connectivity(e) => e.is_transient(),
-            Self::Rejected(ApiError::RateLimit) => true,
+            Self::Rejected(ApiError::RateLimit { .. }) => true,
             Self::Rejected(_) => false,
             Self::UnsupportedOrderType(_) | Self::InvalidPrecision(_) => false,
         }
@@ -597,8 +772,39 @@ pub enum KeyError {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn a_rate_limit_carries_and_shows_the_venues_wait() {
+        let hinted: UnindexedApiError = ApiError::rate_limited(Some(Duration::from_secs(7)));
+        assert_eq!(hinted.retry_after(), Some(Duration::from_secs(7)));
+        assert_eq!(hinted.to_string(), "rate limit exceeded; retry after 7s");
+        assert!(UnindexedClientError::Api(hinted.clone()).is_transient());
+        assert!(UnindexedOrderError::Rejected(hinted).is_transient());
+
+        let unhinted: UnindexedApiError = ApiError::rate_limited(None);
+        assert_eq!(unhinted.retry_after(), None);
+        assert_eq!(unhinted.to_string(), "rate limit exceeded");
+
+        let other: UnindexedApiError = ApiError::Unauthenticated("bad key".to_string());
+        assert_eq!(other.retry_after(), None);
+    }
+
+    #[test]
+    fn a_rate_limit_round_trips_through_serde() {
+        for retry_after in [None, Some(Duration::from_millis(7_250))] {
+            let error: UnindexedApiError = ApiError::rate_limited(retry_after);
+            let json = serde_json::to_string(&error).unwrap();
+            assert_eq!(
+                serde_json::from_str::<UnindexedApiError>(&json).unwrap(),
+                error,
+                "{json}"
+            );
+        }
+    }
 
     #[test]
     fn test_connectivity_error_is_transient() {
@@ -618,7 +824,7 @@ mod tests {
 
     #[test]
     fn test_client_error_is_transient_rate_limit() {
-        let err: ClientError = ClientError::Api(ApiError::RateLimit);
+        let err: ClientError = ClientError::Api(ApiError::rate_limited(None));
         assert!(err.is_transient());
     }
 
@@ -656,6 +862,60 @@ mod tests {
         let err: ClientError =
             ClientError::Api(ApiError::RequestRejected("-1127 More than 24 hours".into()));
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
+
+        let err: ClientError = ClientError::Api(ApiError::BorrowRejected(BorrowReject::new(
+            BorrowRejectReason::InventoryUnavailable,
+            Some("-3045".into()),
+            "-3045 The system doesn't have enough asset now.".into(),
+        )));
+        assert!(!err.is_transient(), "expected non-transient for {:?}", err);
+    }
+
+    #[test]
+    fn borrow_rejected_shows_its_reason_and_code() {
+        let coded: UnindexedApiError = ApiError::BorrowRejected(BorrowReject::new(
+            BorrowRejectReason::BorrowDisabled,
+            Some("40310000".into()),
+            "account is not allowed to short".into(),
+        ));
+        assert_eq!(
+            coded.to_string(),
+            "borrow rejected: borrow disabled (code 40310000): account is not allowed to short"
+        );
+
+        let uncoded: UnindexedApiError = ApiError::BorrowRejected(BorrowReject::new(
+            BorrowRejectReason::Other,
+            None,
+            "no borrow".into(),
+        ));
+        assert_eq!(uncoded.to_string(), "borrow rejected: other: no borrow");
+
+        let short: UnindexedApiError = ApiError::BorrowRejected(BorrowReject::new(
+            BorrowRejectReason::ShortSaleRestricted,
+            None,
+            "priced at the bid".into(),
+        ));
+        assert_eq!(
+            short.to_string(),
+            "borrow rejected: short sale restricted: priced at the bid"
+        );
+    }
+
+    #[test]
+    fn borrow_rejected_shows_what_is_available_only_when_known() {
+        let reject = BorrowReject::new(
+            BorrowRejectReason::InventoryUnavailable,
+            None,
+            "too little to lend".into(),
+        );
+        assert_eq!(reject.available, None);
+
+        let reject = reject.with_available(dec!(2.5));
+        assert_eq!(reject.available, Some(dec!(2.5)));
+        assert_eq!(
+            reject.to_string(),
+            "inventory unavailable: too little to lend (2.5 available)"
+        );
     }
 
     #[test]
@@ -712,7 +972,7 @@ mod tests {
 
     #[test]
     fn test_order_error_is_transient_rate_limit() {
-        let err: UnindexedOrderError = OrderError::Rejected(ApiError::RateLimit);
+        let err: UnindexedOrderError = OrderError::Rejected(ApiError::rate_limited(None));
         assert!(err.is_transient(), "expected transient for {:?}", err);
     }
 
@@ -723,6 +983,14 @@ mod tests {
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
 
         let err: UnindexedOrderError = OrderError::Rejected(ApiError::OrderAlreadyCancelled);
+        assert!(!err.is_transient(), "expected non-transient for {:?}", err);
+
+        let err: UnindexedOrderError =
+            OrderError::Rejected(ApiError::BorrowRejected(BorrowReject::new(
+                BorrowRejectReason::NotShortable,
+                None,
+                "asset XYZ cannot be sold short".into(),
+            )));
         assert!(!err.is_transient(), "expected non-transient for {:?}", err);
 
         let err: UnindexedOrderError = OrderError::Rejected(ApiError::BalanceInsufficient(

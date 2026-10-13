@@ -20,7 +20,8 @@
 //!   the response into [`common::UserFill`] rather than the SDK's type, which drops `tid` and
 //!   `feeToken`.
 //! - REST (`ExchangeClient`): open_order, cancel_order
-//! - WebSocket (`InfoClient` with `with_reconnect`): account_stream via UserFills + OrderUpdates subscriptions
+//! - WebSocket (`InfoClient` with `with_reconnect`): account_stream via UserFills + OrderUpdates +
+//!   UserFundings subscriptions
 //! - REST (`InfoClient`), after each reconnect and through [`OrderStatusClient`]: how the orders
 //!   held as live ended, by `openOrders` and `orderStatus`
 //!
@@ -32,7 +33,7 @@
 //! |----------------|----------------|
 //! | **Reconnection** | `InfoClient::with_reconnect()` handles WebSocket reconnection automatically |
 //! | **Heartbeat** | SDK manages WebSocket ping/pong internally |
-//! | **Deduplication** | This client's own, on the fills stream. See below. |
+//! | **Deduplication** | This client's own, on the fills and funding payments. See below and [Funding](self#funding). |
 //! | **Fill recovery** | Only the recent fills the venue's `userFills` snapshot redelivers on each resubscription — use [`ExecutionClient::fetch_trades`] for older ones |
 //! | **Ended-order recovery** | This client's own, after each reconnect: see [`HyperliquidClient`]'s `account_stream` and [`OrderStatusClient`] |
 //!
@@ -127,7 +128,8 @@
 //! - `TakeProfit` → market order triggered at take-profit price (`tpsl: "tp"`, `is_market: true`)
 //! - `TakeProfitLimit` → limit order triggered at take-profit price (`tpsl: "tp"`, `is_market: false`)
 //!
-//! **Unsupported**: `TrailingStop`, `TrailingStopLimit` (Hyperliquid does not support trailing stops)
+//! **Unsupported**: `TrailingStop`, `TrailingStopLimit`, `TrailingStopFixedLimit` (Hyperliquid
+//! does not support trailing stops)
 //!
 //! **SDK limitations** (hyperliquid_rust_sdk 0.6.x): neither the open orders this client reads
 //! nor `OrderUpdate` carry an order's trigger fields or time in force, so orders from both are
@@ -137,21 +139,38 @@
 //! # Funding
 //!
 //! Hyperliquid settles perpetual funding every hour, as a payment into or out of the collateral
-//! that margins the position. Under the standard account mode a DEX's balance is its
-//! `accountValue`, which includes the funding paid and received, and the positions' unrealised
-//! PnL too. Under a unified account or portfolio margin a balance is the collateral token's spot
-//! balance; whether Hyperliquid books funding there at once has not been checked. Apart from
-//! the balances, nothing this client reports includes funding:
-//! - The account stream subscribes to fills and order updates only. No funding payment arrives as
-//!   an event, and no balance does either: balances are read only by
-//!   [`account_snapshot`](HyperliquidClient#method.account_snapshot) and
-//!   [`fetch_balances`](ExecutionClient::fetch_balances).
-//! - A position's [`unrealized_pnl`](crate::position::Position::unrealized_pnl) is Hyperliquid's
-//!   `unrealizedPnl`, which comes from price alone. The `cumFunding` Hyperliquid lists beside it
-//!   is not read.
-//! - Fills carry no funding, so PnL computed from them excludes it too.
+//! that margins the position. The perpetuals account stream reports each payment, from the
+//! `userFundings` subscription, as an [`AccountEventKind::CashFlow`] of
+//! [`CashFlowKind::Funding`](crate::cash_flow::CashFlowKind::Funding):
+//! - `amount` is Hyperliquid's `usdc`, signed positive when the account received it. Its asset is
+//!   the collateral of the perpetual's DEX. Hyperliquid names the field `usdc` on every DEX, and
+//!   that it is in the collateral on a HIP-3 DEX settling in another token is this client's
+//!   reading, not documented. `rate` is `fundingRate` and `position_quantity` is the signed `szi`.
+//! - Hyperliquid gives a payment no id, so `id` is `None`. The instrument and `time_exchange`
+//!   identify it.
+//! - The subscription opens with a snapshot of recent payments, so a stream's first events can
+//!   predate it: filter on `time_exchange` to take only new ones. The SDK resubscribes on every
+//!   reconnect and the snapshot comes again, so this client sends each payment once per
+//!   [`ExecutionClient::account_stream`] call, as it does fills. Hyperliquid does not document
+//!   how far back the snapshot reaches, so payments made during a long outage can be missing;
+//!   Hyperliquid's `userFunding` history has them.
+//! - The spot client's stream carries none.
 //!
-//! A caller that needs a position's funding reads Hyperliquid's `userFunding` history itself.
+//! Under the standard account mode a DEX's balance is its `accountValue`, which includes the
+//! funding paid and received, and the positions' unrealised PnL too, so adding payments to a
+//! balance read after them counts them twice. Under a unified account or portfolio margin a
+//! balance is the collateral token's spot balance; whether Hyperliquid books funding there at
+//! once has not been checked. The stream carries no balance: balances are read only by
+//! [`account_snapshot`](HyperliquidClient#method.account_snapshot) and
+//! [`fetch_balances`](ExecutionClient::fetch_balances).
+//!
+//! Positions report funding apart from their PnL:
+//! - A position's [`unrealized_pnl`](crate::position::Position::unrealized_pnl) is Hyperliquid's
+//!   `unrealizedPnl`, which comes from price alone.
+//! - Its [`carry`](crate::position::Position::carry) is the funding since the position opened,
+//!   from Hyperliquid's `cumFunding.sinceOpen` with the sign flipped: Hyperliquid counts funding
+//!   paid as positive, and `carry` counts it as negative, as a payment's `amount` does.
+//! - Fills carry no funding, so PnL computed from them excludes it too.
 //!
 //! # Limitations
 //!
@@ -165,6 +184,7 @@
 pub mod common;
 pub mod config;
 pub mod error;
+mod funding;
 mod order_recovery;
 mod perp_account;
 mod perp_dexes;
@@ -193,19 +213,20 @@ use crate::{
         state::{Filled, Open, OrderState, UnindexedOrderState},
     },
     position::{Position, PositionReport},
-    trade::{AssetFees, Trade, TradeId, TradesRead},
+    trade::{AssetFees, Trade, TradeId, TradeOrigin, TradesRead},
 };
 use chrono::{DateTime, Utc};
 use common::{
-    CLOID_REQUIRED, CancelOnDropStream, OpenOrderListing, UnknownCoins, cancel_outcome,
-    cid_to_cloid, map_tif, millis_to_datetime, open_order_to_order, parse_decimal, parse_side,
-    span_millis, user_fills_by_time, warn_unknown_coins,
+    CLOID_REQUIRED, CancelOnDropStream, InstrumentFilter, OpenOrderListing, UnknownCoins,
+    cancel_outcome, cid_to_cloid, cloid_to_cid, map_tif, millis_to_datetime, open_order_to_order,
+    parse_decimal, parse_side, span_millis, user_fills_by_time, warn_unknown_coins,
 };
 pub use config::{HyperliquidConfig, HyperliquidConfigError, Network};
 pub use error::HyperliquidConnectError;
-use error::map_order_error;
+use error::{map_order_error, order_rejection};
 use ethers::signers::Signer;
 use fnv::FnvHashSet;
+use funding::{funding_cash_flow, send_fundings};
 use futures::{StreamExt, stream::BoxStream};
 use hyperliquid_rust_sdk::{ExchangeClient, InfoClient, Message, Subscription};
 use order_recovery::{
@@ -224,12 +245,9 @@ use rustrade_instrument::{
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use smol_str::format_smolstr;
-use std::{
-    collections::HashSet,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -442,14 +460,7 @@ impl ExecutionClient for HyperliquidClient {
             perp_account::snapshot_balances(info_client, address, dexes, mode, &states, now)
                 .await?;
 
-        // Build instrument filter if provided
-        let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
-            None
-        } else {
-            let mut set = HashSet::with_capacity(instruments.len());
-            set.extend(instruments.iter().cloned());
-            Some(set)
-        };
+        let instrument_filter = InstrumentFilter::new(instruments);
 
         warn_unknown_coins(open_orders.iter().map(|order| order.coin.as_str()));
         let mut listing = OpenOrderListing::new(
@@ -467,10 +478,7 @@ impl ExecutionClient for HyperliquidClient {
                 continue;
             };
 
-            if instrument_filter
-                .as_ref()
-                .is_some_and(|f| !f.contains(&instrument))
-            {
+            if !instrument_filter.matches(&instrument) {
                 continue;
             }
 
@@ -508,20 +516,24 @@ impl ExecutionClient for HyperliquidClient {
         Ok(snapshot)
     }
 
-    /// Returns a live stream of account events (fills, order updates).
+    /// Returns a live stream of account events (fills, order updates, funding payments).
+    ///
+    /// Funding payments arrive as [`AccountEventKind::CashFlow`]; see the [module
+    /// docs](self#funding).
     ///
     /// # Instrument filtering
     ///
     /// The `instruments` parameter is **ignored** — Hyperliquid's WebSocket API does not
-    /// support per-instrument subscriptions for user events. All fills and order updates
-    /// across all instruments are delivered. Consumers requiring instrument filtering
-    /// must filter client-side.
+    /// support per-instrument subscriptions for user events. All fills, order updates and
+    /// funding payments across all instruments are delivered. Consumers requiring instrument
+    /// filtering must filter client-side.
     ///
     /// # Task lifecycle
     ///
-    /// Spawns three background tasks (fills, orders, and the reconnect's order check below) that
-    /// are automatically cancelled when the returned stream is dropped. The `ws_client` is held by
-    /// the orders task; when cancelled, the tasks exit and the WebSocket connection closes.
+    /// Spawns four background tasks (fills, orders, funding payments, and the reconnect's order
+    /// check below) that are automatically cancelled when the returned stream is dropped. The
+    /// `ws_client` is held by the orders task; when cancelled, the tasks exit and the WebSocket
+    /// connection closes.
     ///
     /// # Orders that ended while disconnected
     ///
@@ -563,6 +575,12 @@ impl ExecutionClient for HyperliquidClient {
     ///   that fails charges every instrument in it. An order Hyperliquid does not know stops being
     ///   held, logged at `warn`; one still live, or in a state this version cannot read, stays
     ///   held.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectivityError::Socket`] if the WebSocket cannot be opened, or if any of the
+    /// `userFills`, `orderUpdates` and `userFundings` subscriptions fails: the stream is not
+    /// opened with only some of them.
     async fn account_stream(
         &self,
         _assets: &[AssetNameExchange],
@@ -580,6 +598,7 @@ impl ExecutionClient for HyperliquidClient {
         // Create channels for subscriptions
         let (fills_tx, mut fills_rx) = mpsc::unbounded_channel::<Message>();
         let (orders_tx, mut orders_rx) = mpsc::unbounded_channel::<Message>();
+        let (fundings_tx, mut fundings_rx) = mpsc::unbounded_channel::<Message>();
 
         // Subscribe to user fills
         ws_client
@@ -592,6 +611,12 @@ impl ExecutionClient for HyperliquidClient {
             .subscribe(Subscription::OrderUpdates { user }, orders_tx)
             .await
             .map_err(|e| ConnectivityError::Socket(format!("OrderUpdates subscribe: {e}")))?;
+
+        // Subscribe to funding payments
+        ws_client
+            .subscribe(Subscription::UserFundings { user }, fundings_tx)
+            .await
+            .map_err(|e| ConnectivityError::Socket(format!("UserFundings subscribe: {e}")))?;
 
         info!(%user, "Subscribed to Hyperliquid account stream");
 
@@ -694,6 +719,59 @@ impl ExecutionClient for HyperliquidClient {
                                 // Transient, non-terminal: the loop continues. Log only — no
                                 // in-band event (consumers took no action on the old StreamError).
                                 error!(%e, "UserFills WebSocket error");
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+
+        // Spawn task to process funding payments. It sends no terminal event: the SDK closes every
+        // subscription's channel together, and the fills and orders tasks report that.
+        let fundings_event_tx = event_tx.clone();
+        let fundings_cancel = cancel_token.clone();
+        let fundings_dexes = self.dexes.clone();
+        // Like the fills cache, scoped to this stream and surviving reconnects within it.
+        let fundings_dedup = new_dedup_cache();
+        tokio::spawn(async move {
+            let mut unknown_coins = UnknownCoins::default();
+            let mut unconfigured = UnconfiguredDexes::default();
+            loop {
+                tokio::select! {
+                    biased;
+                    () = fundings_cancel.cancelled() => {
+                        debug!("Fundings task cancelled");
+                        return;
+                    }
+                    msg = fundings_rx.recv() => {
+                        let Some(msg) = msg else {
+                            debug!("Fundings receiver closed");
+                            return;
+                        };
+                        match msg {
+                            Message::UserFundings(fundings) => {
+                                let convert = |funding: &hyperliquid_rust_sdk::UserFunding| {
+                                    unknown_coins.warn_once(&funding.coin);
+                                    unconfigured.warn_once(&fundings_dexes, &funding.coin);
+                                    funding_cash_flow(funding, &fundings_dexes)
+                                };
+                                if !send_fundings(
+                                    &fundings.data,
+                                    convert,
+                                    &fundings_dedup,
+                                    &fundings_event_tx,
+                                ) {
+                                    debug!("Fundings event channel closed");
+                                    return;
+                                }
+                            }
+                            Message::NoData => {
+                                warn!("UserFundings WebSocket disconnected");
+                            }
+                            Message::HyperliquidError(e) => {
+                                // Transient, non-terminal: the loop continues.
+                                error!(%e, "UserFundings WebSocket error");
                             }
                             _ => {}
                         }
@@ -975,7 +1053,9 @@ impl ExecutionClient for HyperliquidClient {
                         .to_string(),
                 );
             }
-            OrderKind::TrailingStop { .. } | OrderKind::TrailingStopLimit { .. } => {
+            OrderKind::TrailingStop { .. }
+            | OrderKind::TrailingStopLimit { .. }
+            | OrderKind::TrailingStopFixedLimit { .. } => {
                 return make_unsupported(
                     "Hyperliquid does not support trailing stop orders".to_string(),
                 );
@@ -1096,9 +1176,7 @@ impl ExecutionClient for HyperliquidClient {
                     }
                     Some(ExchangeDataStatus::Error(msg)) => {
                         warn!(%msg, "Order rejected by exchange");
-                        OrderState::inactive(OrderError::Rejected(
-                            crate::error::ApiError::OrderRejected(msg),
-                        ))
+                        OrderState::inactive(OrderError::Rejected(order_rejection(msg)))
                     }
                     Some(
                         ExchangeDataStatus::WaitingForFill | ExchangeDataStatus::WaitingForTrigger,
@@ -1127,9 +1205,7 @@ impl ExecutionClient for HyperliquidClient {
             }
             ExchangeResponseStatus::Err(msg) => {
                 warn!(%msg, "Order rejected");
-                OrderState::inactive(OrderError::Rejected(crate::error::ApiError::OrderRejected(
-                    msg,
-                )))
+                OrderState::inactive(OrderError::Rejected(order_rejection(msg)))
             }
         };
         let order = Order {
@@ -1179,22 +1255,13 @@ impl ExecutionClient for HyperliquidClient {
             perp_account::open_orders(&self.info_client, address, &self.dexes).await?;
         warn_unknown_coins(open_orders.iter().map(|order| order.coin.as_str()));
 
-        let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
-            None
-        } else {
-            let mut set = HashSet::with_capacity(instruments.len());
-            set.extend(instruments.iter().cloned());
-            Some(set)
-        };
+        let instrument_filter = InstrumentFilter::new(instruments);
 
         let orders: Vec<_> = open_orders
             .iter()
             .filter_map(|order| {
                 let instrument = self.dexes.instrument(&order.coin)?;
-                if instrument_filter
-                    .as_ref()
-                    .is_some_and(|f| !f.contains(&instrument))
-                {
+                if !instrument_filter.matches(&instrument) {
                     return None;
                 }
                 open_order_to_order(order, ExchangeId::HyperliquidPerp, instrument)
@@ -1229,13 +1296,7 @@ impl ExecutionClient for HyperliquidClient {
         warn_unknown_coins(fills.iter().map(|fill| fill.coin.as_str()));
         warn_unconfigured_dexes(&self.dexes, fills.iter().map(|fill| fill.coin.as_str()));
 
-        let instrument_filter: Option<HashSet<_>> = if instruments.is_empty() {
-            None
-        } else {
-            let mut set = HashSet::with_capacity(instruments.len());
-            set.extend(instruments.iter().cloned());
-            Some(set)
-        };
+        let instrument_filter = InstrumentFilter::new(instruments);
 
         let mut result = Vec::new();
         for fill in fills {
@@ -1243,10 +1304,7 @@ impl ExecutionClient for HyperliquidClient {
                 continue;
             };
 
-            if instrument_filter
-                .as_ref()
-                .is_some_and(|f| !f.contains(&instrument))
-            {
+            if !instrument_filter.matches(&instrument) {
                 continue;
             }
 
@@ -1282,6 +1340,10 @@ impl ExecutionClient for HyperliquidClient {
                 // state as its own `OrderUpdate` message.
                 order_filled_quantity: None,
                 fees: perp_fill_fees(fill.fee_token.as_deref(), fee, collateral),
+                // As on the stream, whose copy of a fill usually arrives first; see `TradeOrigin`.
+                origin: TradeOrigin::Order,
+                position_side: None,
+                client_order_id: fill.cloid.as_deref().and_then(cloid_to_cid),
             });
         }
 
@@ -1369,6 +1431,8 @@ fn perp_position_report(
             .as_ref()
             .and_then(|p| parse_decimal(p, "liquidation_px")),
         Some(Decimal::from(position.leverage.value)),
+        // Hyperliquid counts funding paid as positive; carry counts it as negative.
+        parse_decimal(&position.cum_funding.since_open, "cum_funding.since_open").map(|paid| -paid),
         now,
     ))
 }
@@ -1419,6 +1483,11 @@ fn fill_to_account_event(
         // from an `OrderUpdate` -- which Hyperliquid sends as its own message.
         order_filled_quantity: None,
         fees: perp_fill_fees(Some(&fill.fee_token), fee, collateral),
+        // The SDK's `TradeInfo` drops the fill's liquidation marker, so every fill is reported
+        // as `Order`; see `TradeOrigin`.
+        origin: TradeOrigin::Order,
+        position_side: None,
+        client_order_id: fill.cloid.as_deref().and_then(cloid_to_cid),
     };
 
     Some(AccountEvent::new(
@@ -1633,25 +1702,83 @@ mod tests {
         }
     }
 
-    mod precision {
+    mod open_order {
         use super::*;
-        use crate::error::{OrderField, PrecisionLimit, PrecisionViolation};
+        use crate::error::{ApiError, OrderField, PrecisionLimit, PrecisionViolation};
         use crate::order::{OrderEvent, request::RequestOpen, state::InactiveOrderState};
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         /// A server whose exchange endpoint rests every order it is sent.
         async fn resting_server() -> MockServer {
+            server_responding(serde_json::json!({
+                "status": "ok",
+                "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 77}}]}},
+            }))
+            .await
+        }
+
+        /// A server whose exchange endpoint answers every request with `body`.
+        async fn server_responding(body: serde_json::Value) -> MockServer {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/exchange"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "status": "ok",
-                    "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 77}}]}},
-                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
                 .mount(&server)
                 .await;
             server
+        }
+
+        /// A refusal for want of margin is a balance shortfall, as on other venues; any other
+        /// refusal stays a rejection. Hyperliquid names no asset. The refusal is read both as an
+        /// order's status and as the error of the whole response.
+        #[tokio::test]
+        async fn an_order_refused_for_margin_is_balance_insufficient() {
+            const MARGIN: &str = "Insufficient margin to place order. asset=0";
+            const MINIMUM: &str = "Order must have minimum value of $10. asset=0";
+            let in_status = |error: &str| {
+                serde_json::json!({
+                    "status": "ok",
+                    "response": {"type": "order", "data": {"statuses": [{"error": error}]}},
+                })
+            };
+            let in_response = |error: &str| serde_json::json!({"status": "err", "response": error});
+            for (body, expected) in [
+                (
+                    in_status(MARGIN),
+                    ApiError::BalanceInsufficient(None, MARGIN.to_owned()),
+                ),
+                (
+                    in_response(MARGIN),
+                    ApiError::BalanceInsufficient(None, MARGIN.to_owned()),
+                ),
+                (
+                    in_status(MINIMUM),
+                    ApiError::OrderRejected(MINIMUM.to_owned()),
+                ),
+                (
+                    in_response(MINIMUM),
+                    ApiError::OrderRejected(MINIMUM.to_owned()),
+                ),
+            ] {
+                let server = server_responding(body.clone()).await;
+                let client = client_against(&server, HashMap::from([("BTC".to_owned(), 0)])).await;
+                let order = place(
+                    &client,
+                    &InstrumentNameExchange::from("BTC-USDC-PERP"),
+                    OrderKind::Limit,
+                    Some(dec!(50000)),
+                    dec!(0.001),
+                )
+                .await;
+                let OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                    reported,
+                ))) = &order.state
+                else {
+                    panic!("{body}: expected a rejection, got {:?}", order.state);
+                };
+                assert_eq!(reported, &expected, "{body}");
+            }
         }
 
         async fn place(
@@ -2070,7 +2197,7 @@ mod tests {
             "szi": szi,
             "unrealizedPnl": "1.5",
             "maxLeverage": 50,
-            "cumFunding": {"allTime": "0", "sinceOpen": "0", "sinceChange": "0"}
+            "cumFunding": {"allTime": "3.5", "sinceOpen": "1.25", "sinceChange": "0"}
         }))
         .unwrap()
     }
@@ -2080,9 +2207,20 @@ mod tests {
         let now = Utc::now();
         let open = perp_position_report(&perp_position("-0.01"), now);
         let position = open.open().unwrap();
+        // Funding paid since open is positive on Hyperliquid and negative as carry.
         assert_eq!(
-            (position.quantity, position.entry_price, position.leverage),
-            (dec!(-0.01), Some(dec!(50000.0)), Some(dec!(5)))
+            (
+                position.quantity,
+                position.entry_price,
+                position.leverage,
+                position.carry
+            ),
+            (
+                dec!(-0.01),
+                Some(dec!(50000.0)),
+                Some(dec!(5)),
+                Some(dec!(-1.25))
+            )
         );
         assert_eq!(
             perp_position_report(&perp_position("0.0"), now),
@@ -2136,6 +2274,30 @@ mod tests {
         }
     }
 
+    /// A fill reports its order's cloid as the client order id the order was placed under.
+    #[tokio::test]
+    async fn a_fill_carries_the_client_order_id_of_its_cloid() {
+        let fill_json = r#"{
+            "coin": "flx:TSLA", "side": "B", "px": "250", "sz": "2",
+            "time": 1714100000000, "hash": "0xhip3", "startPosition": "0",
+            "dir": "Open Long", "closedPnl": "0", "oid": 7,
+            "cloid": "0x0123456789abcdef0123456789abcdef",
+            "crossed": true, "fee": "0.2", "feeToken": "USDH", "tid": 77
+        }"#;
+        let fill: hyperliquid_rust_sdk::TradeInfo = serde_json::from_str(fill_json).unwrap();
+
+        let dexes = perp_dexes::tests::xyz_and_flx().await;
+        let AccountEventKind::Trade(trade) = fill_to_account_event(&fill, &dexes).unwrap().kind
+        else {
+            panic!("Expected Trade event");
+        };
+        assert_eq!(
+            trade.client_order_id,
+            cloid_to_cid("0x0123456789abcdef0123456789abcdef")
+        );
+        assert!(trade.client_order_id.is_some());
+    }
+
     #[tokio::test]
     async fn a_builder_deployed_fill_is_named_and_charged_in_its_dex_collateral() {
         // A HIP-3 perpetual settles in its deployer's collateral, which is not always USDC.
@@ -2153,6 +2315,7 @@ mod tests {
             panic!("Expected Trade event");
         };
         assert_eq!(trade.instrument.as_ref(), "flx:TSLA-USDH-PERP");
+        assert_eq!(trade.client_order_id, None, "placed without a cloid");
         assert_eq!(trade.fees.asset.as_ref(), "USDH");
         assert_eq!(trade.fees.fees, dec!(0.2));
         assert_eq!(

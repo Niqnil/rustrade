@@ -1,6 +1,6 @@
 [package]
 name = "rustrade-execution"
-version = "0.10.1"
+version = "0.11.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -112,7 +112,7 @@ reqwest = { workspace = true, optional = true } # HTTP client for Alpaca REST AP
 # `margin_trading` is bundled with `spot` under the single `binance` feature (one feature per
 # exchange, matching alpaca/ibkr/hyperliquid). It ships ahead of the BinanceMargin client being
 # fully wired so spot + margin compile together; spot-only users pay the margin module's build cost.
-binance-sdk = { version = "=74.0.0", features = ["spot", "margin_trading"], optional = true }
+binance-sdk = { version = "=74.1.1", features = ["spot", "margin_trading"], optional = true }
 anyhow = { workspace = true, optional = true }                              # Required: binance-sdk's public API returns anyhow::Result
 
 # Shared between "alpaca" and "binance" features
@@ -150,6 +150,8 @@ serde_json = { workspace = true }
 temp-env = { workspace = true }
 # Serial test execution for integration tests that share exchange state
 serial_test = { workspace = true }
+# Daylight-saving zones for the holding-cost cutoff tests (already an optional dependency)
+chrono-tz = { workspace = true }
 
 # Integration tests whose contents are entirely feature-gated. Without `required-features`, the
 # target still builds with the feature off and libtest reports "0 passed" -- a green run that
@@ -165,6 +167,14 @@ required-features = ["alpaca"]
 
 [[test]]
 name = "binance_conditional_orders"
+required-features = ["binance"]
+
+[[test]]
+name = "binance_margin_borrow"
+required-features = ["binance"]
+
+[[test]]
+name = "binance_margin_records"
 required-features = ["binance"]
 
 [[test]]

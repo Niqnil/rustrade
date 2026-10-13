@@ -9,10 +9,11 @@
 //! reuse them unchanged. The REST order-response converter names the field subset it reads as a
 //! trait, [`BinanceOrderFields`], which is identical across every SDK type implementing it even
 //! though the structs around it are not. The WebSocket user-data `executionReport` is decoded into
-//! this crate's own [`ExecutionReport`] instead, because the SDK's spot and margin report types
-//! disagree on wire types. Either way one converter serves both clients and keeps a venue name out
-//! of it. The remaining SDK-typed converters, which differ between spot's WS-API enums and
-//! margin's REST params, deliberately stay in their respective modules.
+//! this crate's own [`ExecutionReport`] instead, which reads only the keys the converter uses, so a
+//! key it does not read cannot fail a report, as it can through the SDK's strictly typed models.
+//! Either way one converter serves both clients and keeps a venue name out of it. The remaining
+//! SDK-typed converters, which differ between spot's WS-API enums and margin's REST params,
+//! deliberately stay in their respective modules.
 //!
 //! Event deduplication lives in [`crate::client::dedup`], shared with the other clients that
 //! need it, and is re-exported here so Binance call sites keep a single import site.
@@ -20,8 +21,8 @@
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
     error::{
-        ApiError, ConnectivityError, OrderError, OrderField, PrecisionLimit, PrecisionViolation,
-        UnindexedClientError, UnindexedOrderError,
+        ApiError, BorrowReject, BorrowRejectReason, ConnectivityError, OrderError, OrderField,
+        PrecisionLimit, PrecisionViolation, UnindexedClientError, UnindexedOrderError,
     },
     fill_recovery::{FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope},
     order::{
@@ -396,8 +397,9 @@ const _: () = assert!(
     BINANCE_MAX_TRADES <= i32::MAX as usize,
     "BINANCE_MAX_TRADES overflows i32"
 );
-/// Default delay when rate-limited (exponential backoff; Binance's `Retry-After`
-/// header is not accessible through the SDK's `anyhow::Error` chain).
+/// Default delay when rate-limited (exponential backoff). Binance sends `Retry-After` on a 429 or
+/// 418, but `binance-sdk` drops the response headers from its rate-limit errors, so neither this
+/// delay nor [`ApiError::RateLimit`]'s `retry_after` can use it.
 pub(crate) const DEFAULT_RATE_LIMIT_DELAY_SECS: u64 = 10;
 /// Maximum number of REST retry attempts on rate-limit errors.
 pub(crate) const MAX_RATE_LIMIT_RETRIES: u32 = 3;
@@ -523,7 +525,7 @@ impl UnhandledEvents {
     pub(crate) const fn new() -> Self {
         Self {
             count: AtomicU64::new(0),
-            types: parking_lot::const_mutex(Vec::new()),
+            types: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -1036,20 +1038,20 @@ impl TrailingDelta {
 /// - `STOP_LOSS`, `STOP_LOSS_LIMIT`, `TAKE_PROFIT` and `TAKE_PROFIT_LIMIT` without a trailing delta
 ///   are [`OrderKind::Stop`], [`OrderKind::StopLimit`], [`OrderKind::TakeProfit`] and
 ///   [`OrderKind::TakeProfitLimit`], triggered at `stopPrice`.
-/// - `STOP_LOSS` with a trailing delta is an [`OrderKind::TrailingStop`] of that many basis points,
-///   whichever offset type it was placed with. A `stopPrice` alongside it is an activation price,
-///   which `TrailingStop` cannot hold yet (#539), so it decodes without it, with a warning.
+/// - `STOP_LOSS` and `STOP_LOSS_LIMIT` with a trailing delta are an [`OrderKind::TrailingStop`] and
+///   an [`OrderKind::TrailingStopFixedLimit`] of that many basis points, whichever offset type
+///   they were placed with. A positive `stopPrice` alongside is their `activation_price`.
 ///
 /// Returns `None`, with a warning, for an order this cannot describe faithfully, so that it is
 /// dropped and its listing reads as incomplete rather than describing a different order:
 /// - a type this version does not know;
 /// - a fixed-trigger order without a positive `stopPrice`;
-/// - a trailing `STOP_LOSS_LIMIT`, whose limit price stays fixed while the stop trails, unlike
-///   [`OrderKind::TrailingStopLimit`]'s (#540), and a trailing take-profit;
+/// - a trailing take-profit, which no [`OrderKind`] describes;
 /// - a conditional order whose trailing delta is [`TrailingDelta::Unknown`], which could be either
-///   a fixed or a trailing order.
+///   a fixed or a trailing order;
+/// - a trailing order whose `stopPrice` does not parse, whose activation price is then unknown.
 ///
-/// The warnings for those last two cases and for an activation price come from the venue's
+/// The warnings for the trailing take-profit and the unknown trailing delta come from the venue's
 /// shape, not from one bad order, and recur on every listing and report of the same live order;
 /// each warns on its first occurrence and every 1000th after (see [`sampled`]), and logs the rest
 /// at `debug`.
@@ -1060,8 +1062,11 @@ pub(crate) fn decode_order_kind(
     stop_price: Option<&str>,
     trailing_delta: TrailingDelta,
 ) -> Option<OrderKind> {
-    let stop_price = stop_price
-        .and_then(|raw| Decimal::from_str(raw).ok())
+    let parsed_stop_price = stop_price.map(Decimal::from_str);
+    // Not sampled: it signals a malformed venue field, not the venue's shape.
+    let unparseable_stop_price = stop_price.filter(|_| matches!(parsed_stop_price, Some(Err(_))));
+    let stop_price = parsed_stop_price
+        .and_then(Result::ok)
         .filter(|price| price.is_sign_positive() && !price.is_zero());
     let triggered = |kind: fn(Decimal) -> OrderKind| {
         if stop_price.is_none() {
@@ -1094,25 +1099,25 @@ pub(crate) fn decode_order_kind(
         ("TAKE_PROFIT_LIMIT", TrailingDelta::Absent) => {
             triggered(|trigger_price| OrderKind::TakeProfitLimit { trigger_price })
         }
-        ("STOP_LOSS", TrailingDelta::BasisPoints(bips)) => {
-            if let Some(activation_price) = stop_price {
-                static SEEN: AtomicU64 = AtomicU64::new(0);
-                let (count, warns) = sampled(&SEEN);
-                if warns {
-                    warn!(%exchange, ?order_id, %activation_price, count, "Binance trailing stop has an activation price, which TrailingStop cannot carry; reporting it without; further ones are logged at debug, with a warning every 1000th");
-                } else {
-                    debug!(%exchange, ?order_id, %activation_price, count, "Binance trailing stop has an activation price, which TrailingStop cannot carry; reporting it without");
-                }
-            }
-            Some(OrderKind::TrailingStop {
+        ("STOP_LOSS" | "STOP_LOSS_LIMIT", TrailingDelta::BasisPoints(_))
+            if unparseable_stop_price.is_some() =>
+        {
+            warn!(%exchange, ?order_id, order_type, stop_price = ?unparseable_stop_price, "Binance trailing order's stopPrice, its activation price, does not parse, dropping it");
+            None
+        }
+        ("STOP_LOSS", TrailingDelta::BasisPoints(bips)) => Some(OrderKind::TrailingStop {
+            offset: Decimal::from(bips),
+            offset_type: TrailingOffsetType::BasisPoints,
+            activation_price: stop_price,
+        }),
+        ("STOP_LOSS_LIMIT", TrailingDelta::BasisPoints(bips)) => {
+            Some(OrderKind::TrailingStopFixedLimit {
                 offset: Decimal::from(bips),
                 offset_type: TrailingOffsetType::BasisPoints,
+                activation_price: stop_price,
             })
         }
-        (
-            "STOP_LOSS_LIMIT" | "TAKE_PROFIT" | "TAKE_PROFIT_LIMIT",
-            TrailingDelta::BasisPoints(_),
-        ) => {
+        ("TAKE_PROFIT" | "TAKE_PROFIT_LIMIT", TrailingDelta::BasisPoints(_)) => {
             static SEEN: AtomicU64 = AtomicU64::new(0);
             let (count, warns) = sampled(&SEEN);
             if warns {
@@ -1152,7 +1157,8 @@ fn kind_has_limit_price(kind: &OrderKind) -> bool {
         OrderKind::Limit
         | OrderKind::StopLimit { .. }
         | OrderKind::TakeProfitLimit { .. }
-        | OrderKind::TrailingStopLimit { .. } => true,
+        | OrderKind::TrailingStopLimit { .. }
+        | OrderKind::TrailingStopFixedLimit { .. } => true,
         OrderKind::Market
         | OrderKind::Stop { .. }
         | OrderKind::TakeProfit { .. }
@@ -1802,8 +1808,9 @@ pub(crate) const ORDER_EXECUTIONS_BUDGET: Duration =
 /// How many orders' executions one instrument's recovery reads at once.
 ///
 /// Recovery already runs up to eight instruments at once, so this allows 32 lookups in flight.
-/// Each is weight 5 (Spot, `myTrades` with `orderId`) or 10 (Margin) against a limit of several
-/// thousand a minute, and [`rest_call_with_retry`] backs off when Binance signals the limit.
+/// Each is weight 4 or 5 (Spot: `GET /api/v3/order`, `myTrades` with `orderId`) or 10 (Margin)
+/// against a limit of several thousand a minute, and [`rest_call_with_retry`] backs off when
+/// Binance signals the limit.
 pub(crate) const ORDER_EXECUTIONS_IN_FLIGHT: usize = 4;
 
 /// The cumulative filled quantity of each recovered execution's order, as of that execution,
@@ -1831,47 +1838,18 @@ where
     F: Fn(i64) -> Fut,
     Fut: Future<Output = Result<Vec<T>, UnindexedClientError>>,
 {
-    use futures::StreamExt as _;
-
-    let mut order_ids: Vec<i64> = recovered.iter().filter_map(|t| t.order_id()).collect();
-    order_ids.sort_unstable();
-    order_ids.dedup();
-
-    let fetch = &fetch;
-    let mut lookups = futures::stream::iter(order_ids.iter().copied())
-        .map(|order_id| async move { (order_id, fetch(order_id).await) })
-        .buffer_unordered(ORDER_EXECUTIONS_IN_FLIGHT);
-
     let mut totals = fnv::FnvHashMap::default();
-    let mut settled = 0;
-    loop {
-        let (order_id, walk) = match tokio::time::timeout_at(deadline, lookups.next()).await {
-            Ok(Some(lookup)) => lookup,
-            Ok(None) => break,
-            Err(_elapsed) => {
-                warn!(
-                    %exchange, %instrument,
-                    orders_left = order_ids.len() - settled,
-                    budget = ?ORDER_EXECUTIONS_BUDGET,
-                    "fill recovery ran out of time reading orders' executions; the remaining \
-                     orders' recovered fills carry no cumulative filled quantity"
-                );
-                break;
-            }
-        };
-        settled += 1;
-        let executions = match walk {
-            Ok(executions) => executions,
-            Err(error) => {
-                warn!(
-                    %exchange, %instrument, order_id, %error,
-                    "fill recovery could not read the order's executions; its recovered fills \
-                     carry no cumulative filled quantity"
-                );
-                continue;
-            }
-        };
-        match order_running_totals(order_id, &executions) {
+    for_each_recovered_order(
+        RecoveredOrderLookup {
+            exchange,
+            instrument,
+            reading: "orders' executions",
+            lost: "cumulative filled quantity",
+        },
+        recovered,
+        deadline,
+        fetch,
+        |order_id, executions| match order_running_totals(order_id, &executions) {
             Some(running) => totals.extend(running),
             None => warn!(
                 %exchange, %instrument, order_id, executions = executions.len(),
@@ -1879,9 +1857,142 @@ where
                  or another order's execution); its recovered fills carry no cumulative filled \
                  quantity"
             ),
+        },
+    )
+    .await;
+    totals
+}
+
+/// The client order id of each order among `recovered`, keyed by order id.
+///
+/// `myTrades` carries no client order id, so a recovered fill cannot report the one its order was
+/// placed with on its own: this reads each order with `fetch`, `GET /api/v3/order` (weight 4) or
+/// `GET /sapi/v1/margin/order` (weight 10). Callers run it after [`recovered_order_totals`],
+/// under the same `deadline`, so it uses only the time those walks left: a fill without its
+/// cumulative leaves its order behind, while one without its client order id is only harder to
+/// attribute. Up to [`ORDER_EXECUTIONS_IN_FLIGHT`] orders are read at once.
+///
+/// An order is left out, and its recovered fills carry no
+/// [`Trade::client_order_id`](crate::trade::Trade::client_order_id), when its lookup fails, when
+/// the venue reports no id for it (`fetch` returns `None`), or once `deadline` passes. Failures
+/// and the deadline are logged.
+pub(crate) async fn recovered_order_cids<T, F, Fut>(
+    exchange: ExchangeId,
+    instrument: &InstrumentNameExchange,
+    recovered: &[T],
+    deadline: tokio::time::Instant,
+    fetch: F,
+) -> fnv::FnvHashMap<i64, ClientOrderId>
+where
+    T: BinanceExecutionFields,
+    F: Fn(i64) -> Fut,
+    Fut: Future<Output = Result<Option<ClientOrderId>, UnindexedClientError>>,
+{
+    let mut cids = fnv::FnvHashMap::default();
+    for_each_recovered_order(
+        RecoveredOrderLookup {
+            exchange,
+            instrument,
+            reading: "orders",
+            lost: "client order id",
+        },
+        recovered,
+        deadline,
+        fetch,
+        |order_id, cid| {
+            if let Some(cid) = cid {
+                cids.insert(order_id, cid);
+            }
+        },
+    )
+    .await;
+    cids
+}
+
+/// What a fill-recovery lookup over recovered orders reads, named in what it logs.
+struct RecoveredOrderLookup<'a> {
+    exchange: ExchangeId,
+    instrument: &'a InstrumentNameExchange,
+    /// What each lookup reads, such as "orders' executions".
+    reading: &'static str,
+    /// What a recovered fill goes without when its order's lookup is lost.
+    lost: &'static str,
+}
+
+/// Look up each order among `recovered` with `fetch`, up to [`ORDER_EXECUTIONS_IN_FLIGHT`] at
+/// once, handing each result to `settle`, until every order is read or `deadline` passes.
+///
+/// A failed lookup, and the orders still unread at the deadline, are logged and skipped: the
+/// lookups only enrich recovered fills, so none of them may hold one back.
+async fn for_each_recovered_order<T, R, F, Fut>(
+    lookup: RecoveredOrderLookup<'_>,
+    recovered: &[T],
+    deadline: tokio::time::Instant,
+    fetch: F,
+    mut settle: impl FnMut(i64, R),
+) where
+    T: BinanceExecutionFields,
+    F: Fn(i64) -> Fut,
+    Fut: Future<Output = Result<R, UnindexedClientError>>,
+{
+    use futures::StreamExt as _;
+
+    let RecoveredOrderLookup {
+        exchange,
+        instrument,
+        reading,
+        lost,
+    } = lookup;
+    let mut order_ids: Vec<i64> = recovered.iter().filter_map(|t| t.order_id()).collect();
+    order_ids.sort_unstable();
+    order_ids.dedup();
+
+    // `timeout_at` polls before it checks, so past the deadline the first poll would still send
+    // the first reads only to drop them.
+    if tokio::time::Instant::now() >= deadline {
+        if !order_ids.is_empty() {
+            warn!(
+                %exchange, %instrument,
+                orders_left = order_ids.len(),
+                budget = ?ORDER_EXECUTIONS_BUDGET,
+                "fill recovery ran out of time before reading {reading}; the orders' recovered \
+                 fills carry no {lost}"
+            );
+        }
+        return;
+    }
+
+    let fetch = &fetch;
+    let mut lookups = futures::stream::iter(order_ids.iter().copied())
+        .map(|order_id| async move { (order_id, fetch(order_id).await) })
+        .buffer_unordered(ORDER_EXECUTIONS_IN_FLIGHT);
+
+    let mut settled = 0;
+    loop {
+        let (order_id, result) = match tokio::time::timeout_at(deadline, lookups.next()).await {
+            Ok(Some(lookup)) => lookup,
+            Ok(None) => break,
+            Err(_elapsed) => {
+                warn!(
+                    %exchange, %instrument,
+                    orders_left = order_ids.len() - settled,
+                    budget = ?ORDER_EXECUTIONS_BUDGET,
+                    "fill recovery ran out of time reading {reading}; the remaining orders' \
+                     recovered fills carry no {lost}"
+                );
+                break;
+            }
+        };
+        settled += 1;
+        match result {
+            Ok(value) => settle(order_id, value),
+            Err(error) => warn!(
+                %exchange, %instrument, order_id, %error,
+                "fill recovery could not read {reading} for an order; its recovered fills carry \
+                 no {lost}"
+            ),
         }
     }
-    totals
 }
 
 /// `(trade id, cumulative filled quantity as of that execution)` for every execution of one
@@ -1928,13 +2039,15 @@ pub(crate) fn order_running_totals<T: BinanceExecutionFields>(
 
 /// A Binance user-data `executionReport`, as both the spot and margin clients read it.
 ///
-/// binance-sdk generates one report type per stream family, and they disagree on wire types that
-/// Binance documents as identical: the margin stream's declares `d`, `D`, `j`, `J` and `v` strings
-/// where spot's declares them integers, and Binance's docs show numbers
-/// (binance/binance-connector-rust#108). Decoding into an SDK type can therefore fail a whole
-/// report, fills included, over a key this crate never reads. This type models only the keys the
-/// converter reads and ignores every other, so an unread key cannot fail a decode, and the two
-/// clients decode through one definition, which the spot testnet exercises for margin too.
+/// binance-sdk generates one report type per stream family, each typing every key strictly, and
+/// those types change between releases: until 74.1.1 the margin stream's report type declared `d`,
+/// `D`, `j`, `J`, `u`, `U`, `a` and `v` strings, where spot's declared them integers and Binance's
+/// docs show numbers. 74.1.1 retyped them to integers, in a patch release. Decoding into an SDK
+/// type ties every report to the SDK and the venue agreeing on the type of every key, including
+/// keys this crate never reads, and a report that fails to decode is logged and dropped, fill
+/// included. This type models only the keys the converter reads and ignores every other, so an
+/// unread key cannot fail a decode, and the two clients decode through one definition, which the
+/// spot testnet exercises for margin too.
 ///
 /// Every field is optional: which keys a report carries depends on its execution type, and each
 /// use below says what it does without one.
@@ -2009,7 +2122,8 @@ pub(crate) struct ExecutionReport {
     #[serde(rename = "P")]
     pub(crate) stop_price: Option<String>,
     /// `d`: the trailing delta in basis points, sent only for a trailing order. Binance's docs show
-    /// a number and the margin SDK model a string, so either is accepted.
+    /// a number, but the margin SDK model declared a string until 74.1.1, and margin has no
+    /// testnet to confirm which the live stream sends, so either is accepted.
     #[serde(rename = "d")]
     pub(crate) trailing_delta: Option<WireInt>,
 }
@@ -2242,6 +2356,11 @@ pub(crate) fn convert_execution_report(
                 order_filled_quantity,
                 AssetFees::new(fee_asset, commission, None),
             );
+            // Only the order's own `c`: `cid` falls back to the exchange id without one.
+            let trade = match report.client_order_id.as_deref() {
+                Some(c) if !c.is_empty() => trade.with_client_order_id(cid.clone()),
+                _ => trade,
+            };
             buf.push(UnindexedAccountEvent::new(
                 exchange,
                 AccountEventKind::Trade(trade),
@@ -2285,17 +2404,19 @@ pub(crate) fn convert_execution_report(
         "REJECTED" => {
             // Rejected by the matching engine after initial acceptance (e.g. insufficient funds
             // discovered post-validation). Mapped to OrderCancelled with an error state so the
-            // engine removes this order.
+            // engine removes this order. The reason (`r`) goes through the same classifier as a
+            // synchronous rejection, so one refusal is reported alike whichever path brings it.
+            // `r` is a name such as `INSUFFICIENT_FUNDS`, never a numeric code, so only the
+            // classifier's text heuristics can match it: a refused borrow never arrives this way.
             let reject_reason = report.reject_reason.as_deref().unwrap_or("unknown");
             warn!(
                 %exchange, %symbol, %order_id, reason = reject_reason,
                 "Binance order REJECTED by matching engine"
             );
+            let error = parse_binance_api_error(reject_reason.to_string(), &symbol);
             let response = UnindexedOrderResponseCancel {
                 key: OrderKey::new(exchange, symbol, StrategyId::unknown(), cid),
-                state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
-                    reject_reason.to_string(),
-                ))),
+                state: Err(UnindexedOrderError::Rejected(error)),
             };
             buf.push(UnindexedAccountEvent::new(
                 exchange,
@@ -2537,6 +2658,33 @@ fn has_rate_limit_error_code(msg: &str) -> bool {
     contains_error_code(msg, "-1003") || contains_error_code(msg, "-1015")
 }
 
+/// Binance margin codes for a refused borrow, and the [`BorrowRejectReason`] each means.
+///
+/// The margin client always sends `sideEffectType`, so an order that needs a borrow is refused
+/// with one of these. `-3013` (below the minimum borrow) is a malformed order, not a refusal to
+/// lend, so it stays [`ApiError::OrderRejected`].
+const BORROW_REJECT_CODES: [(&str, BorrowRejectReason); 5] = [
+    // EXCEED_MAX_BORROWABLE: "Your borrow amount has exceed maximum borrow amount."
+    ("-3006", BorrowRejectReason::BorrowLimitExceeded),
+    // "Borrow not allowed."
+    ("-3008", BorrowRejectReason::BorrowDisabled),
+    // "Borrow is banned for this asset."
+    ("-3012", BorrowRejectReason::BorrowDisabled),
+    // "Borrow is banned for this account."
+    ("-3014", BorrowRejectReason::BorrowDisabled),
+    // INSUFFICIENT_INVENTORY: "The system doesn't have enough asset now."
+    ("-3045", BorrowRejectReason::InventoryUnavailable),
+];
+
+/// The code and [`BorrowRejectReason`] of the borrow refusal a Binance error message carries,
+/// by its code ([`BORROW_REJECT_CODES`]).
+fn borrow_reject_code(msg: &str) -> Option<(&'static str, BorrowRejectReason)> {
+    BORROW_REJECT_CODES
+        .iter()
+        .copied()
+        .find(|(code, _)| contains_error_code(msg, code))
+}
+
 /// Parse Binance error strings to rustrade ApiError, in an order's context.
 ///
 /// Order and cancel paths call it through [`parse_binance_order_rejection`], which first catches
@@ -2555,7 +2703,7 @@ pub(crate) fn parse_binance_api_error(
         return ApiError::Unauthenticated(error_msg);
     }
     if has_rate_limit_error_code(&error_msg) {
-        return ApiError::RateLimit;
+        return ApiError::rate_limited(None);
     }
     if contains_error_code(&error_msg, "-2011") {
         // -2011: "Unknown order sent" — typically means already cancelled/filled
@@ -2568,6 +2716,19 @@ pub(crate) fn parse_binance_api_error(
     }
     if contains_error_code(&error_msg, "-1121") {
         return ApiError::InstrumentInvalid(instrument.clone(), error_msg);
+    }
+    if let Some((code, reason)) = borrow_reject_code(&error_msg) {
+        return ApiError::BorrowRejected(BorrowReject::new(
+            reason,
+            Some(code.to_owned()),
+            error_msg,
+        ));
+    }
+    // -3041 ("Balance is not enough") and -3023 ("You can't transfer out/place order under
+    // current margin level.") are the margin account's own collateral running short, not a
+    // refused borrow. The wording of -3023 escapes the text heuristic below, so both go by code.
+    if contains_error_code(&error_msg, "-3041") || contains_error_code(&error_msg, "-3023") {
+        return ApiError::BalanceInsufficient(None, error_msg);
     }
     // -2010 (NEW_ORDER_REJECTED) is deliberately not matched by code: Binance gives it for dozens
     // of reasons ("Account has insufficient balance for requested action.", "Order would trigger
@@ -2587,7 +2748,7 @@ pub(crate) fn parse_binance_api_error(
         // guessed from the order.
         ApiError::BalanceInsufficient(None, error_msg)
     } else if contains_ignore_case(&error_msg, "rate limit") {
-        ApiError::RateLimit
+        ApiError::rate_limited(None)
     } else if contains_ignore_case(&error_msg, "unknown order") {
         // -2011/-2013 map to OrderAlreadyCancelled via numeric code above.
         // The text-only fallback here (no code present) maps "unknown order" to
@@ -2639,7 +2800,9 @@ pub(crate) fn parse_binance_order_rejection(
 ///   retry can succeed; a clock that stays wrong keeps failing, so callers should bound retries.
 /// - `-1121` → [`ApiError::InstrumentInvalid`] when the request named one instrument; otherwise
 ///   there is no instrument to attach, so it falls through.
-/// - anything else → [`ApiError::RequestRejected`].
+/// - anything else → [`ApiError::RequestRejected`], prefixed with the symbol when the request
+///   named one instrument, as Binance's text often does not say which, such as `-11001 Isolated
+///   margin account does not exist.`
 fn parse_binance_query_rejection(
     msg: String,
     instrument: Option<&InstrumentNameExchange>,
@@ -2647,11 +2810,13 @@ fn parse_binance_query_rejection(
     let api = if is_auth_failure(&msg) {
         ApiError::Unauthenticated(msg)
     } else if has_rate_limit_error_code(&msg) {
-        ApiError::RateLimit
+        ApiError::rate_limited(None)
     } else if has_venue_failure_code(&msg) || contains_error_code(&msg, "-1021") {
         return UnindexedClientError::Connectivity(ConnectivityError::Socket(msg));
     } else if let Some(instrument) = instrument.filter(|_| contains_error_code(&msg, "-1121")) {
         ApiError::InstrumentInvalid(instrument.clone(), msg)
+    } else if let Some(instrument) = instrument {
+        ApiError::RequestRejected(format!("{}: {msg}", instrument.name()))
     } else {
         ApiError::RequestRejected(msg)
     };
@@ -2687,7 +2852,7 @@ pub(crate) fn classify_rest_query_error(
     }
     if let Some(ce) = e.downcast_ref::<ConnectorError>() {
         return match classify_connector_error(ce) {
-            RequestFailure::RateLimited => UnindexedClientError::Api(ApiError::RateLimit),
+            RequestFailure::RateLimited => UnindexedClientError::Api(ApiError::rate_limited(None)),
             RequestFailure::Unauthenticated(msg) => {
                 UnindexedClientError::Api(ApiError::Unauthenticated(msg))
             }
@@ -2837,10 +3002,11 @@ pub(crate) enum BinanceTimeInForce {
 /// Map a rustrade [`OrderKind`] + [`TimeInForce`] to Binance order semantics.
 ///
 /// Returns `None` for combinations Binance does not support (so callers surface
-/// `UnsupportedOrderType`). `TrailingStop` classifies to [`BinanceOrderType::StopLoss`], to which
-/// the caller adds a `trailingDelta` from [`trailing_delta_basis_points`]. `TrailingStopLimit`
-/// classifies to `None`: Binance's trailing `STOP_LOSS_LIMIT` keeps its limit price fixed while
-/// the stop trails, where `TrailingStopLimit`'s limit follows the stop (#540).
+/// `UnsupportedOrderType`). `TrailingStop` classifies to [`BinanceOrderType::StopLoss`] and
+/// `TrailingStopFixedLimit` to [`BinanceOrderType::StopLossLimit`], to which the caller adds a
+/// `trailingDelta` from [`trailing_delta_basis_points`] and an activation price as `stopPrice`.
+/// `TrailingStopLimit` classifies to `None`: Binance's trailing `STOP_LOSS_LIMIT` keeps its limit
+/// price fixed while the stop trails, where `TrailingStopLimit`'s limit follows the stop.
 pub(crate) fn classify_order_kind_tif(
     kind: OrderKind,
     tif: TimeInForce,
@@ -2876,7 +3042,16 @@ pub(crate) fn classify_order_kind_tif(
         },
         // Conditional orders: stop_price/trailing_delta set separately by the caller.
         OrderKind::Stop { .. } => Some((BinanceOrderType::StopLoss, None)),
-        OrderKind::StopLimit { .. } => match tif {
+        OrderKind::TrailingStopFixedLimit {
+            offset_type: TrailingOffsetType::Absolute,
+            ..
+        } => {
+            warn!("{ABSOLUTE_TRAILING_OFFSET_UNSUPPORTED}");
+            None
+        }
+        // A fixed-limit trailing stop is a STOP_LOSS_LIMIT with a trailingDelta, so it takes the
+        // time in force a stop-limit order does.
+        OrderKind::StopLimit { .. } | OrderKind::TrailingStopFixedLimit { .. } => match tif {
             // StopLimit requires TIF like regular Limit orders.
             TimeInForce::GoodUntilCancelled { post_only: false } => Some((
                 BinanceOrderType::StopLossLimit,
@@ -2928,7 +3103,7 @@ pub(crate) fn classify_order_kind_tif(
             }
         },
         // Binance's trailing STOP_LOSS_LIMIT has a fixed limit price, not one that follows the
-        // stop as TrailingStopLimit's does (#540).
+        // stop as TrailingStopLimit's does: that is TrailingStopFixedLimit.
         OrderKind::TrailingStopLimit { .. } => {
             warn!("Binance does not support TrailingStopLimit orders");
             None
@@ -2999,6 +3174,90 @@ pub(crate) fn trailing_delta_basis_points(
         }));
     }
     i32::try_from(basis_points).map_err(|_| invalid(PrecisionLimit::NotRepresentable))
+}
+
+/// What a Binance trailing order sends besides its type: its `trailingDelta`, the fixed limit
+/// `price` of a [`OrderKind::TrailingStopFixedLimit`], and an activation price as `stopPrice`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TrailingParams {
+    pub trailing_delta: i32,
+    pub price: Option<Decimal>,
+    pub stop_price: Option<Decimal>,
+}
+
+/// Why a trailing order cannot be sent to Binance as asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrailingOrderError {
+    /// Its offset cannot be sent as `trailingDelta`.
+    Delta(TrailingDeltaError),
+    /// Its activation price is not positive. Binance reads a zero `stopPrice` as none.
+    NonPositiveActivation(Decimal),
+    /// A [`OrderKind::TrailingStopFixedLimit`] without the fixed limit `price`, or with one that
+    /// is not positive.
+    LimitPrice(Option<Decimal>),
+}
+
+impl TrailingOrderError {
+    /// The order error this refusal is reported as.
+    pub(crate) fn into_order_error<AssetKey, InstrumentKey>(
+        self,
+    ) -> OrderError<AssetKey, InstrumentKey> {
+        match self {
+            Self::Delta(refused) => refused.into_order_error(),
+            Self::NonPositiveActivation(price) => OrderError::Rejected(ApiError::OrderRejected(
+                format!("a trailing stop's activation_price must be positive, got {price}"),
+            )),
+            Self::LimitPrice(price) => OrderError::Rejected(ApiError::OrderRejected(format!(
+                "TrailingStopFixedLimit requires a positive price, its fixed limit, got {price:?}"
+            ))),
+        }
+    }
+}
+
+/// The trailing fields of `kind`, or `None` when it is not a trailing order Binance places.
+/// `price` is the request's limit price. A bad offset is reported before a bad price.
+pub(crate) fn trailing_params(
+    kind: &OrderKind,
+    price: Option<Decimal>,
+) -> Result<Option<TrailingParams>, TrailingOrderError> {
+    let positive = |value: &Decimal| value.is_sign_positive() && !value.is_zero();
+    let (offset, offset_type, activation_price, fixed_limit) = match *kind {
+        OrderKind::TrailingStop {
+            offset,
+            offset_type,
+            activation_price,
+        } => (offset, offset_type, activation_price, false),
+        OrderKind::TrailingStopFixedLimit {
+            offset,
+            offset_type,
+            activation_price,
+        } => (offset, offset_type, activation_price, true),
+        OrderKind::Market
+        | OrderKind::Limit
+        | OrderKind::Stop { .. }
+        | OrderKind::StopLimit { .. }
+        | OrderKind::TakeProfit { .. }
+        | OrderKind::TakeProfitLimit { .. }
+        | OrderKind::TrailingStopLimit { .. } => return Ok(None),
+    };
+    let trailing_delta =
+        trailing_delta_basis_points(offset, offset_type).map_err(TrailingOrderError::Delta)?;
+    if let Some(activation) = activation_price.filter(|activation| !positive(activation)) {
+        return Err(TrailingOrderError::NonPositiveActivation(activation));
+    }
+    let price = if fixed_limit {
+        match price.filter(positive) {
+            Some(limit) => Some(limit),
+            None => return Err(TrailingOrderError::LimitPrice(price)),
+        }
+    } else {
+        None
+    };
+    Ok(Some(TrailingParams {
+        trailing_delta,
+        price,
+        stop_price: activation_price,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -3179,7 +3438,7 @@ fn order_error_from(
     instrument: &InstrumentNameExchange,
 ) -> UnindexedOrderError {
     match failure {
-        RequestFailure::RateLimited => OrderError::Rejected(ApiError::RateLimit),
+        RequestFailure::RateLimited => OrderError::Rejected(ApiError::rate_limited(None)),
         RequestFailure::Unauthenticated(msg) => {
             OrderError::Rejected(ApiError::Unauthenticated(msg))
         }
@@ -3239,8 +3498,8 @@ mod tests {
     }
 
     /// `d` decodes whether Binance sends it as a number, as its docs show, or as a string, as the
-    /// margin SDK model declares; anything else is kept as unreadable rather than failing the
-    /// report.
+    /// margin SDK model declared until 74.1.1; anything else is kept as unreadable rather than
+    /// failing the report.
     #[test]
     fn a_report_reads_the_trailing_delta_as_a_number_or_a_string() {
         assert_eq!(report(r#"{}"#).trailing_delta, None);
@@ -3274,23 +3533,33 @@ mod tests {
         );
     }
 
-    /// Keys the converter does not read cannot fail a report, whatever their type. binance-sdk's
-    /// margin stream model fails on the numbers Binance documents for `d`, `D`, `j`, `J` and `v`
-    /// (binance/binance-connector-rust#108); this asserts that too, so an SDK fix is noticed.
+    /// Keys the converter does not read cannot fail a report, whatever their type: the keys whose
+    /// type binance-sdk's margin model has changed (`D`, `j`, `J`, `u`, `U`, `a`, `v`) decode as
+    /// numbers, as strings and as `null`, and the keys it reads come through each time.
     #[test]
     fn keys_the_converter_does_not_read_cannot_fail_a_report() {
-        let json = r#"{"e":"executionReport","x":"NEW","i":7,"o":"STOP_LOSS","P":"0",
-            "d":4,"D":1668680518494,"j":1,"J":1000000,"v":3,"W":1499405658658,"V":"NONE"}"#;
-        let parsed = report(json);
-        assert_eq!(parsed.execution_type.as_deref(), Some("NEW"));
-        assert_eq!(parsed.trailing_delta, Some(WireInt::Int(4)));
-        assert!(
-            serde_json::from_str::<binance_sdk::margin_trading::websocket_streams::ExecutionReport>(
-                json
-            )
-            .is_err(),
-            "binance-sdk's margin report now decodes numeric d/D/j/J/v; revisit ExecutionReport"
-        );
+        for (unread, delta) in [
+            (
+                r#""D":1668680518494,"j":1,"J":1000000,"u":2,"U":3,"a":5,"v":3"#,
+                "4",
+            ),
+            (
+                r#""D":"1668680518494","j":"1","J":"1000000","u":"2","U":"3","a":"5","v":"3""#,
+                r#""4""#,
+            ),
+            (
+                r#""D":null,"j":null,"J":null,"u":null,"U":null,"a":null,"v":null"#,
+                "4",
+            ),
+        ] {
+            let json = format!(
+                r#"{{"e":"executionReport","x":"NEW","i":7,"o":"STOP_LOSS","P":"0","d":{delta},{unread},"W":1499405658658,"V":"NONE"}}"#
+            );
+            let parsed = report(&json);
+            assert_eq!(parsed.execution_type.as_deref(), Some("NEW"), "{json}");
+            assert_eq!(parsed.order_id, Some(7), "{json}");
+            assert_eq!(parsed.trailing_delta, Some(WireInt::Int(4)), "{json}");
+        }
     }
 
     #[test]
@@ -3364,27 +3633,54 @@ mod tests {
         }
     }
 
-    /// A trailing `STOP_LOSS` decodes in basis points, with or without an activation price.
+    /// A trailing `STOP_LOSS` decodes in basis points, and a trailing `STOP_LOSS_LIMIT` as a
+    /// fixed-limit trailing stop, each with its positive `stopPrice` as the activation price.
     #[test]
-    fn a_trailing_stop_loss_decodes_as_a_trailing_stop() {
-        let trailing_stop = Some(OrderKind::TrailingStop {
-            offset: Decimal::from(25),
-            offset_type: TrailingOffsetType::BasisPoints,
-        });
-        for stop_price in [None, Some("0.00000000"), Some("105.5")] {
+    fn a_trailing_stop_loss_decodes_with_its_activation_price() {
+        use rust_decimal_macros::dec;
+        for (stop_price, activation_price) in [
+            (None, None),
+            (Some("0.00000000"), None),
+            (Some("105.5"), Some(dec!(105.5))),
+        ] {
             assert_eq!(
                 decode("STOP_LOSS", stop_price, TrailingDelta::BasisPoints(25)),
-                trailing_stop,
+                Some(OrderKind::TrailingStop {
+                    offset: Decimal::from(25),
+                    offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price,
+                }),
+                "{stop_price:?}"
+            );
+            assert_eq!(
+                decode(
+                    "STOP_LOSS_LIMIT",
+                    stop_price,
+                    TrailingDelta::BasisPoints(25)
+                ),
+                Some(OrderKind::TrailingStopFixedLimit {
+                    offset: Decimal::from(25),
+                    offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price,
+                }),
                 "{stop_price:?}"
             );
         }
     }
 
-    /// A trailing order of any other type has no `OrderKind`, and a conditional order whose
-    /// trailing delta is unknown could be either: both are dropped rather than misdescribed.
+    /// A trailing take-profit has no `OrderKind`, a conditional order whose trailing delta is
+    /// unknown could be either fixed or trailing, and a trailing order whose stopPrice does not
+    /// parse has an unknown activation price: all are dropped rather than misdescribed.
     #[test]
     fn conditional_orders_that_cannot_be_described_are_dropped() {
-        for order_type in ["STOP_LOSS_LIMIT", "TAKE_PROFIT", "TAKE_PROFIT_LIMIT"] {
+        for order_type in ["STOP_LOSS", "STOP_LOSS_LIMIT"] {
+            assert_eq!(
+                decode(order_type, Some("x"), TrailingDelta::BasisPoints(25)),
+                None,
+                "{order_type}"
+            );
+        }
+        for order_type in ["TAKE_PROFIT", "TAKE_PROFIT_LIMIT"] {
             assert_eq!(
                 decode(order_type, Some("100"), TrailingDelta::BasisPoints(25)),
                 None,
@@ -3512,6 +3808,111 @@ mod tests {
         }
     }
 
+    /// A trailing STOP_LOSS_LIMIT row lists as a fixed-limit trailing stop with its limit price;
+    /// a zero stopPrice is no activation price.
+    #[test]
+    fn a_trailing_stop_loss_limit_row_lists_with_its_limit_price() {
+        let btc = InstrumentNameExchange::new("BTCUSDT");
+        for (stop_price, activation_price) in
+            [("0.00000000", None), ("105", Some(Decimal::from(105)))]
+        {
+            let rows = [spot_row(order_row(
+                "STOP_LOSS_LIMIT",
+                "NEW",
+                serde_json::json!({
+                    "trailingDelta": 25, "trailingTime": -1, "price": "95", "stopPrice": stop_price,
+                }),
+            ))];
+            let listing = convert_open_order_listing(&rows, ExchangeId::BinanceSpot, &btc);
+            let [order] = listing.orders.as_slice() else {
+                panic!("one order: {:?}", listing.orders);
+            };
+            assert_eq!(
+                order.kind,
+                OrderKind::TrailingStopFixedLimit {
+                    offset: Decimal::from(25),
+                    offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price,
+                }
+            );
+            assert_eq!(order.price, Some(Decimal::from(95)));
+        }
+    }
+
+    /// A trailing order's fields: its delta, a fixed limit's price, an activation price; and the
+    /// requests refused unsent.
+    #[test]
+    fn trailing_params_carry_the_delta_limit_and_activation_and_refuse_bad_prices() {
+        use rust_decimal_macros::dec;
+        let fixed_limit = |activation_price| OrderKind::TrailingStopFixedLimit {
+            offset: dec!(1.5),
+            offset_type: TrailingOffsetType::Percentage,
+            activation_price,
+        };
+        assert_eq!(trailing_params(&OrderKind::Limit, Some(dec!(1))), Ok(None));
+        assert_eq!(
+            trailing_params(&fixed_limit(Some(dec!(105))), Some(dec!(99))),
+            Ok(Some(TrailingParams {
+                trailing_delta: 150,
+                price: Some(dec!(99)),
+                stop_price: Some(dec!(105)),
+            }))
+        );
+        assert_eq!(
+            trailing_params(
+                &OrderKind::TrailingStop {
+                    offset: dec!(25),
+                    offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price: None,
+                },
+                Some(dec!(99))
+            ),
+            Ok(Some(TrailingParams {
+                trailing_delta: 25,
+                price: None,
+                stop_price: None,
+            })),
+            "a trailing stop sends no price"
+        );
+        for activation in [dec!(0), dec!(-1)] {
+            assert_eq!(
+                trailing_params(&fixed_limit(Some(activation)), Some(dec!(99))),
+                Err(TrailingOrderError::NonPositiveActivation(activation))
+            );
+        }
+        for limit in [None, Some(dec!(0))] {
+            assert_eq!(
+                trailing_params(&fixed_limit(None), limit),
+                Err(TrailingOrderError::LimitPrice(limit))
+            );
+        }
+        // A bad offset is reported before a bad price.
+        assert!(matches!(
+            trailing_params(
+                &OrderKind::TrailingStopFixedLimit {
+                    offset: dec!(1.555),
+                    offset_type: TrailingOffsetType::Percentage,
+                    activation_price: Some(dec!(0)),
+                },
+                None
+            ),
+            Err(TrailingOrderError::Delta(TrailingDeltaError::Invalid(_)))
+        ));
+        assert!(matches!(
+            TrailingOrderError::LimitPrice(None).into_order_error::<(), ()>(),
+            OrderError::Rejected(ApiError::OrderRejected(_))
+        ));
+        assert!(matches!(
+            TrailingOrderError::NonPositiveActivation(dec!(0)).into_order_error::<(), ()>(),
+            OrderError::Rejected(ApiError::OrderRejected(_))
+        ));
+        assert!(matches!(
+            TrailingOrderError::Delta(TrailingDeltaError::AbsoluteOffset)
+                .into_order_error::<(), ()>(),
+            OrderError::UnsupportedOrderType(_)
+        ));
+    }
+
     /// Spot rows report `trailingDelta`, so a trailing stop lists as one, and conditional orders
     /// list with their triggers, with no limit price where the kind takes none.
     #[test]
@@ -3549,6 +3950,7 @@ mod tests {
                     OrderKind::TrailingStop {
                         offset: Decimal::from(25),
                         offset_type: TrailingOffsetType::BasisPoints,
+                        activation_price: None,
                     },
                     None,
                 ),
@@ -3635,6 +4037,7 @@ mod tests {
         let trailing_stop = OrderKind::TrailingStop {
             offset: Decimal::from(25),
             offset_type: TrailingOffsetType::BasisPoints,
+            activation_price: None,
         };
         for row in [&row, &untriggered] {
             let Some(order) =
@@ -4017,6 +4420,59 @@ mod tests {
         assert_eq!(totals.get(&21), Some(&Decimal::ONE));
     }
 
+    /// Past the deadline, as when the walks before them used the whole budget, the reads for
+    /// client order ids send nothing.
+    #[tokio::test]
+    async fn a_lookup_past_its_deadline_sends_nothing() {
+        let recovered = [execution(20, 1, "1")];
+        let cids = recovered_order_cids(
+            ExchangeId::BinanceSpot,
+            &btcusdt(),
+            &recovered,
+            tokio::time::Instant::now(),
+            |_| async { panic!("no read past the deadline") },
+        )
+        .await;
+        assert!(cids.is_empty());
+    }
+
+    /// Each recovered order is read once for its client order id. One the venue reports none for,
+    /// and one whose read fails, are left out without holding back the others.
+    #[tokio::test]
+    async fn recovered_orders_are_read_for_their_client_order_ids() {
+        let recovered = [
+            execution(20, 1, "1"),
+            execution(21, 1, "1"),
+            execution(22, 2, "1"),
+            execution(23, 3, "1"),
+        ];
+        let reads = std::sync::atomic::AtomicUsize::new(0);
+
+        let cids = recovered_order_cids(
+            ExchangeId::BinanceMargin,
+            &btcusdt(),
+            &recovered,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            |order_id| {
+                reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                async move {
+                    match order_id {
+                        1 => Ok(Some(ClientOrderId::new("sweep-1"))),
+                        2 => Ok(None),
+                        _ => Err(UnindexedClientError::Connectivity(
+                            ConnectivityError::Socket("connection reset".into()),
+                        )),
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(reads.into_inner(), 3, "one read per order");
+        assert_eq!(cids.len(), 1, "{cids:?}");
+        assert_eq!(cids.get(&1), Some(&ClientOrderId::new("sweep-1")));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn lookups_stop_at_the_deadline_keeping_the_walks_that_answered() {
         // Order 1's walk never answers; order 2's does. Recovery must return what it has at the
@@ -4146,7 +4602,7 @@ mod tests {
         ] {
             assert!(matches!(
                 classify_err(ce),
-                OrderError::Rejected(ApiError::RateLimit)
+                OrderError::Rejected(ApiError::RateLimit { .. })
             ));
         }
     }
@@ -4215,6 +4671,29 @@ mod tests {
     }
 
     #[test]
+    fn a_rejected_query_naming_one_instrument_says_which() {
+        let err = classify_query(bad_request(
+            -11001,
+            "Isolated margin account does not exist.",
+        ));
+        let UnindexedClientError::Api(ApiError::RequestRejected(msg)) = &err else {
+            panic!("expected RequestRejected, got {err:?}");
+        };
+        assert!(msg.starts_with("BTCUSDT: "), "symbol missing from {msg:?}");
+        assert!(msg.contains("-11001"), "code missing from {msg:?}");
+
+        // With no single instrument in the request there is none to name.
+        let err = classify_rest_query_error(
+            &anyhow::Error::new(bad_request(-1127, "More than 24 hours.")),
+            None,
+        );
+        let UnindexedClientError::Api(ApiError::RequestRejected(msg)) = &err else {
+            panic!("expected RequestRejected, got {err:?}");
+        };
+        assert!(!msg.contains("BTCUSDT"), "{msg:?}");
+    }
+
+    #[test]
     fn a_query_naming_an_invalid_symbol_is_an_invalid_instrument() {
         let err = classify_query(bad_request(-1121, "Invalid symbol."));
         assert!(
@@ -4266,7 +4745,7 @@ mod tests {
         for code in [-1003, -1015] {
             let err = classify_query(bad_request(code, "Too much request weight used."));
             assert!(
-                matches!(err, UnindexedClientError::Api(ApiError::RateLimit)),
+                matches!(err, UnindexedClientError::Api(ApiError::RateLimit { .. })),
                 "{code}: got {err:?}"
             );
         }
@@ -4311,7 +4790,7 @@ mod tests {
         });
         assert!(matches!(
             err,
-            UnindexedClientError::Api(ApiError::RateLimit)
+            UnindexedClientError::Api(ApiError::RateLimit { .. })
         ));
 
         let err = classify_query(ConnectorError::UnauthorizedError {
@@ -4390,7 +4869,7 @@ mod tests {
             code: None,
         });
         assert!(
-            matches!(err, UnindexedClientError::Api(ApiError::RateLimit)),
+            matches!(err, UnindexedClientError::Api(ApiError::RateLimit { .. })),
             "got {err:?}"
         );
 
@@ -4426,7 +4905,7 @@ mod tests {
                 msg: "<html>403 Forbidden</html>".to_string(),
                 code: None,
             }),
-            OrderError::Rejected(ApiError::RateLimit)
+            OrderError::Rejected(ApiError::RateLimit { .. })
         ));
     }
 
@@ -4532,6 +5011,92 @@ mod tests {
         }
     }
 
+    /// A margin order that needs a borrow is refused by a `-3xxx` code. A refused borrow is
+    /// [`ApiError::BorrowRejected`] by its code, over REST (the code spliced into the message) and
+    /// over the WS API (the code in the error's text) alike, whatever the wording says.
+    #[test]
+    fn a_borrow_refusal_is_read_by_its_code() {
+        for (code, msg, reason) in [
+            (
+                -3006,
+                "Your borrow amount has exceed maximum borrow amount.",
+                BorrowRejectReason::BorrowLimitExceeded,
+            ),
+            (
+                -3008,
+                "Borrow not allowed.",
+                BorrowRejectReason::BorrowDisabled,
+            ),
+            (
+                -3012,
+                "Borrow is banned for this asset.",
+                BorrowRejectReason::BorrowDisabled,
+            ),
+            (
+                -3014,
+                "Borrow is banned for this account.",
+                BorrowRejectReason::BorrowDisabled,
+            ),
+            (
+                -3045,
+                "The system doesn't have enough asset now.",
+                BorrowRejectReason::InventoryUnavailable,
+            ),
+        ] {
+            let rest = classify_err(ConnectorError::BadRequestError {
+                msg: msg.to_string(),
+                code: Some(code),
+            });
+            let expected =
+                BorrowReject::new(reason, Some(code.to_string()), format!("{code} {msg}"));
+            assert_eq!(
+                rest,
+                OrderError::Rejected(ApiError::BorrowRejected(expected)),
+                "REST {code}"
+            );
+
+            let ws = classify_ws(code, msg);
+            assert!(
+                matches!(
+                    &ws,
+                    Some(OrderError::Rejected(ApiError::BorrowRejected(reject)))
+                        if reject.reason == reason
+                            && reject.venue_code.as_deref() == Some(code.to_string().as_str())
+                ),
+                "WS API {code}: got {ws:?}"
+            );
+        }
+    }
+
+    /// The margin account's own collateral running short is a shortfall, not a refused borrow,
+    /// and goes by code. A borrow below the minimum, or a pair or account barred from trading, is
+    /// a plain rejection.
+    #[test]
+    fn other_margin_codes_are_not_borrow_refusals() {
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        for msg in [
+            "-3041 Balance is not enough",
+            "-3023 You can't transfer out/place order under current margin level.",
+        ] {
+            assert_eq!(
+                parse_binance_api_error(msg.to_string(), &instrument),
+                ApiError::BalanceInsufficient(None, msg.to_string()),
+                "{msg:?}"
+            );
+        }
+        for msg in [
+            "-3013 Borrow amount less than minimum borrow amount.",
+            "-3021 Margin account are not allowed to trade this trading pair.",
+            "-3022 You account's trading is banned.",
+        ] {
+            assert_eq!(
+                parse_binance_api_error(msg.to_string(), &instrument),
+                ApiError::OrderRejected(msg.to_string()),
+                "{msg:?}"
+            );
+        }
+    }
+
     #[test]
     fn order_rejections_keep_their_order_meaning() {
         let instrument = InstrumentNameExchange::new("BTCUSDT");
@@ -4593,7 +5158,7 @@ mod tests {
         for code in [429, 418, 403] {
             let err = classify_ws(code, "Unknown error");
             assert!(
-                matches!(err, Some(OrderError::Rejected(ApiError::RateLimit))),
+                matches!(err, Some(OrderError::Rejected(ApiError::RateLimit { .. }))),
                 "{code}: got {err:?}"
             );
         }
@@ -4633,7 +5198,7 @@ mod tests {
         );
         let err = classify_ws(-1003, "Too much request weight used.");
         assert!(
-            matches!(err, Some(OrderError::Rejected(ApiError::RateLimit))),
+            matches!(err, Some(OrderError::Rejected(ApiError::RateLimit { .. }))),
             "got {err:?}"
         );
     }

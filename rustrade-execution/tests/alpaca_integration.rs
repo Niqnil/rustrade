@@ -234,6 +234,57 @@ async fn test_fetch_balances() {
 }
 
 // ============================================================================
+// Shortability Tests
+// ============================================================================
+
+#[tokio::test]
+#[ignore]
+async fn test_fetch_shortability() {
+    use rust_decimal::Decimal;
+    use rustrade_execution::{client::ShortabilityClient, error::ApiError, error::ClientError};
+
+    init_logging();
+    let client = AlpacaClient::new(test_config());
+
+    let spy = client
+        .fetch_shortability(&spy_instrument())
+        .await
+        .expect("SPY shortability");
+    println!("SPY: {spy:?}");
+    assert_eq!(spy.shortable, Some(true), "SPY is shortable");
+    assert_eq!(spy.easy_to_borrow, Some(true), "SPY is easy to borrow");
+    assert_eq!(
+        spy.fee_rate,
+        Some(Decimal::ZERO),
+        "Alpaca charges no ETB fee"
+    );
+    assert_eq!(spy.available, None);
+
+    // The pair's slash must reach Alpaca escaped, as one path segment.
+    let btc = client
+        .fetch_shortability(&btc_instrument())
+        .await
+        .expect("BTC/USD shortability");
+    println!("BTC/USD: {btc:?}");
+    // Alpaca lends no crypto. Its `borrow_status` is for US equities only, but a crypto asset
+    // still carries the `easy_to_borrow` flag, false, which is reported as given.
+    assert_eq!(btc.shortable, Some(false), "Alpaca does not short crypto");
+    assert_eq!(btc.fee_rate, None);
+
+    let unknown = client
+        .fetch_shortability(&InstrumentNameExchange::new("NOSUCHSYMBOLXYZ"))
+        .await;
+    println!("unknown: {unknown:?}");
+    assert!(
+        matches!(
+            unknown,
+            Err(ClientError::Api(ApiError::InstrumentInvalid(..)))
+        ),
+        "{unknown:?}"
+    );
+}
+
+// ============================================================================
 // Open Orders Tests
 // ============================================================================
 
@@ -261,6 +312,80 @@ async fn test_fetch_open_orders() {
             "  {:?} {} {} @ {:?}",
             order.side, order.quantity, order.key.instrument, order.price
         );
+    }
+}
+
+/// The activities endpoint answers both reads built on it: fills, and the non-trade activities
+/// read as cash flows. A paper account may hold neither, so this checks that each read succeeds
+/// and its records are in the span, not that there are any.
+#[tokio::test]
+#[ignore]
+async fn test_fetch_trades_and_cash_flows() {
+    init_logging();
+
+    let client = AlpacaClient::new(test_config());
+    let end = chrono::Utc::now();
+    let start = end - chrono::TimeDelta::days(30);
+
+    let trades = client
+        .fetch_trades(start, end, &[])
+        .await
+        .expect("fetch_trades");
+    println!(
+        "Fills, 30 days: {} (resume: {:?})",
+        trades.trades.len(),
+        trades.resume
+    );
+    assert!(
+        trades
+            .trades
+            .iter()
+            .all(|trade| (start..=end).contains(&trade.time_exchange))
+    );
+
+    let flows = client
+        .fetch_cash_flows(start, end)
+        .await
+        .expect("fetch_cash_flows");
+    println!(
+        "Cash flows, 30 days: {} (resume: {:?})",
+        flows.flows.len(),
+        flows.resume
+    );
+    for flow in &flows.flows {
+        println!("  {:?} {} {}", flow.kind, flow.amount, flow.asset);
+        assert!((start..=end).contains(&flow.time_exchange));
+        assert!(flow.id.is_some());
+    }
+}
+
+/// The activities endpoint accepts the option event types. A paper account may hold no option
+/// events, so this checks that the read succeeds and its trades are in the span, not that there
+/// are any.
+#[tokio::test]
+#[ignore]
+async fn test_fetch_option_events() {
+    init_logging();
+
+    let client = AlpacaClient::new(test_config());
+    let end = chrono::Utc::now();
+    let start = end - chrono::TimeDelta::days(30);
+
+    let read = client
+        .fetch_option_events(start, end)
+        .await
+        .expect("fetch_option_events");
+    println!(
+        "Option events, 30 days: {} (resume: {:?})",
+        read.trades.len(),
+        read.resume
+    );
+    for trade in &read.trades {
+        println!(
+            "  {} {} {} {} @ {}",
+            trade.origin, trade.instrument, trade.side, trade.quantity, trade.price
+        );
+        assert!((start..=end).contains(&trade.time_exchange));
     }
 }
 
@@ -902,6 +1027,7 @@ async fn test_place_and_cancel_trailing_stop_order() {
         kind: OrderKind::TrailingStop {
             offset: dec!(5.0),
             offset_type: TrailingOffsetType::Percentage,
+            activation_price: None,
         },
         time_in_force: TimeInForce::GoodUntilEndOfDay,
         position_id: None,

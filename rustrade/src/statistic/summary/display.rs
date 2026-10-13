@@ -179,6 +179,7 @@ where
             ts.orders_rejected.to_string()
         });
         self.add_instrument_metric_row(&mut table, "PnL", |ts| format!("{:.2}", ts.pnl));
+        self.add_instrument_metric_row(&mut table, "Carry", |ts| format!("{:.2}", ts.carry));
         self.add_instrument_metric_row(&mut table, &format!("Return {interval}"), |ts| {
             format_percentage(ts.pnl_return.value, 2)
         });
@@ -370,6 +371,8 @@ mod tests {
             orders_rejected: 0,
             fills_routed_by_fallback: 0,
             fills_unmatched: 0,
+            fills_forced: 0,
+            fills_unallocated: 0,
         }
     }
 
@@ -428,6 +431,8 @@ mod tests {
             orders_rejected: 0,
             fills_routed_by_fallback,
             fills_unmatched,
+            fills_forced: 0,
+            fills_unallocated: 0,
         }
     }
 

@@ -15,7 +15,10 @@ use crate::{
         state::{
             EngineState,
             connectivity::UntrackedExchange,
-            instrument::{OptionSplitPlan, data::InstrumentDataState, filter::InstrumentFilter},
+            instrument::{
+                ExpiryHandling, OptionSplitPlan, data::InstrumentDataState,
+                filter::InstrumentFilter,
+            },
             order::{Orders, in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
             position::{Position, PositionDrift, PositionExited, PositionId, SplitRoundingPolicy},
             trading::TradingState,
@@ -37,7 +40,7 @@ use rustrade_data::{event::MarketEvent, streams::consumer::MarketStreamEvent};
 use rustrade_execution::{
     AccountEvent, AccountEventKind,
     order::{Order, id::ClientOrderId},
-    trade::{AssetFees, Trade, TradeId},
+    trade::{AssetFees, Trade, TradeId, TradeOrigin},
 };
 use rustrade_instrument::{
     Side,
@@ -519,6 +522,12 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     ///
     /// If no position is open for the instrument, steps 4–5 are skipped.
     ///
+    /// If the instrument's [`ExpiryHandling`] is [`Venue`](ExpiryHandling::Venue), steps 4–5 are
+    /// skipped too. The open positions are left for the trades the venue reports for the expiry,
+    /// exercise or assignment, so nothing is closed twice. No settlement price is needed, so none
+    /// of the [`ContractExpiryNotSettled`](EngineOutput::ContractExpiryNotSettled) cases below
+    /// apply.
+    ///
     /// If the price settlement needs is unavailable, the method emits an
     /// [`EngineOutput::ContractExpiryNotSettled`] carrying
     /// [`ContractExpiryNotSettledReason::SettlementPriceUnavailable`] and synthesises no fill. The
@@ -542,8 +551,8 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     ///
     /// - **Physical settlement:** all settlements are cash-equivalent (a synthetic fill at the
     ///   settlement price adjusts PnL). No separate "deliver/receive underlying" position is
-    ///   opened. Physically-settled contracts (e.g. some futures-style options) are out of scope
-    ///   until this is revisited.
+    ///   opened. For a venue that settles physically and reports it, set
+    ///   [`ExpiryHandling::Venue`] and feed the venue's trades to the engine instead.
     pub fn process_contract_expiry<OnTradingDisabled, OnDisconnect>(
         &mut self,
         key: &InstrumentIndex,
@@ -607,8 +616,18 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         // Re-borrow after sending (which needs all of `self`).
         let instrument_state = self.state.instruments.instrument_index_mut(key);
 
-        // Steps 4–5: Synthesise settlement fills only if positions are open.
-        if instrument_state.position.positions.is_empty() {
+        // Steps 4–5: Synthesise settlement fills only if positions are open and the engine, not
+        // the venue, settles them.
+        let venue_settles = instrument_state.expiry_handling == ExpiryHandling::Venue;
+        if venue_settles || instrument_state.position.positions.is_empty() {
+            if venue_settles && !instrument_state.position.positions.is_empty() {
+                info!(
+                    instrument = ?key,
+                    positions = instrument_state.position.positions.len(),
+                    "ContractExpiry: the venue settles this instrument, so its open positions are \
+                     left for the venue's expiry, exercise or assignment trades"
+                );
+            }
             instrument_state.expiration_processed = true;
             instrument_state.orders.clear();
             instrument_state.exchange_id_to_cid.clear();
@@ -752,24 +771,25 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             );
             // Use the instrument's quote asset for fee tracking (amount is zero)
             let quote_asset = instrument_state.instrument.underlying.quote;
-            let settlement_trade = Trade {
-                id: TradeId::new(&trade_tag),
-                order_id: rustrade_execution::order::id::OrderId::new(&trade_tag),
-                instrument: *key,
-                strategy: rustrade_execution::order::id::StrategyId::ENGINE_EXPIRY,
-                time_exchange: engine_time,
-                side: closing_side,
+            let settlement_trade = Trade::new(
+                TradeId::new(&trade_tag),
+                rustrade_execution::order::id::OrderId::new(&trade_tag),
+                *key,
+                rustrade_execution::order::id::StrategyId::ENGINE_EXPIRY,
+                engine_time,
+                closing_side,
+                settlement_price,
+                closing_quantity,
                 // Engine-generated settlement, not a venue execution: there is no order for it
                 // to advance.
-                order_filled_quantity: None,
-                price: settlement_price,
-                quantity: closing_quantity,
-                fees: AssetFees {
+                None,
+                AssetFees {
                     asset: quote_asset,
                     fees: Decimal::ZERO,
                     fees_quote: Some(Decimal::ZERO),
                 },
-            };
+            )
+            .with_origin(TradeOrigin::Expiry);
 
             // Route settlement directly to the correct position by ID.
             // We bypass InstrumentState::update_from_trade (which calls update_from_trade
@@ -1619,7 +1639,7 @@ pub enum EngineOutput<
     /// Output of an actioned [`Command`].
     ///
     /// **Inline.** [`ActionOutput`]'s inner order payloads are boxed at the root (#195), so
-    /// `ActionOutput` is only ~96 B — well under the ~232 B [`PositionExit`](Self::PositionExit)
+    /// `ActionOutput` is only ~96 B — well under the ~248 B [`PositionExit`](Self::PositionExit)
     /// variant that floors this enum's size. Carrying it inline therefore costs `EngineOutput`
     /// nothing in stack size (and thus in the per-tick [`ProcessAudit`] copy), while avoiding a
     /// heap allocation and pointer indirection on the command path that an outer `Box` would add.
@@ -1635,7 +1655,7 @@ pub enum EngineOutput<
     /// path).
     ///
     /// **Inline.** `GenerateAlgoOrdersOutput`'s inner order payloads are boxed at the root (#195),
-    /// so it is only ~144 B — under the ~232 B [`PositionExit`](Self::PositionExit) variant that
+    /// so it is only ~144 B — under the ~248 B [`PositionExit`](Self::PositionExit) variant that
     /// floors this enum's size. Carrying it inline therefore costs `EngineOutput` nothing in stack
     /// size (and thus in the per-tick [`ProcessAudit`] copy). The only allocation is the root
     /// boxing of the orders themselves, paid solely when the strategy actually emits some — the
@@ -2126,7 +2146,7 @@ mod size_guard {
     use super::*;
 
     /// Regression guard: `EngineOutput` stays small so the per-tick `ProcessAudit` copy is cheap. Its
-    /// floor is the largest variant `PositionExit(PositionExited)` (~232 B). The `AlgoOrders`/
+    /// floor is the largest variant `PositionExit(PositionExited)` (~248 B). The `AlgoOrders`/
     /// `Commanded` variants are carried inline, but their order payloads are boxed at the root (#195)
     /// — `GenerateAlgoOrdersOutput` ~144 B, `ActionOutput` ~96 B — so both sit under the
     /// `PositionExit` floor and neither dominates. This bound (<= 256 B) catches a large regression —
@@ -2134,13 +2154,13 @@ mod size_guard {
     /// above the floor — while leaving headroom for unrelated growth.
     #[test]
     fn engine_output_stays_small() {
-        // Measured 232 B, floored by the PositionExit variant.
+        // Measured 248 B, floored by the PositionExit variant (232 B before its `carry` field).
         let size = std::mem::size_of::<EngineOutput<(), (), ExchangeIndex, InstrumentIndex>>();
         assert!(
             size <= 256,
             "EngineOutput grew to {size} B (expected <= 256): a variant gained a large inline \
              payload. AlgoOrders/Commanded order payloads must stay root-boxed (#195) so those \
-             variants sit under the ~232 B PositionExit floor."
+             variants sit under the ~248 B PositionExit floor."
         );
     }
 }

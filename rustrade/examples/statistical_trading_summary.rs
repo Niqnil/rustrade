@@ -132,6 +132,7 @@ fn generate_synthetic_updates(base_time: DateTime<Utc>) -> Vec<ContrivedEvents> 
             price_entry_average: dec!(1.0),
             quantity_abs_max: dec!(1000.0),
             pnl_realised: dec!(2000.0), // 2000 usdt profit
+            carry: Decimal::ZERO,
             fees_enter: AssetFees {
                 asset: QuoteAsset,
                 fees: dec!(0.0),
@@ -167,6 +168,7 @@ fn generate_synthetic_updates(base_time: DateTime<Utc>) -> Vec<ContrivedEvents> 
             quantity_abs_max: dec!(2000.0),
             pnl_realised: dec!(1000.0), // 1000 usdt profit
             fees_enter: AssetFees::default(),
+            carry: Decimal::ZERO,
             fees_exit: AssetFees::default(),
             time_enter: base_time.checked_add_days(Days::new(2)).unwrap(),
             time_exit: base_time.checked_add_days(Days::new(3)).unwrap(),
@@ -193,6 +195,7 @@ fn generate_synthetic_updates(base_time: DateTime<Utc>) -> Vec<ContrivedEvents> 
             quantity_abs_max: dec!(2000.0),
             pnl_realised: dec!(-2000.0), // 2000 usdt loss
             fees_enter: AssetFees::default(),
+            carry: Decimal::ZERO,
             fees_exit: AssetFees::default(),
             time_enter: base_time.checked_add_days(Days::new(4)).unwrap(),
             time_exit: base_time.checked_add_days(Days::new(5)).unwrap(),
@@ -225,6 +228,7 @@ fn generate_synthetic_updates(base_time: DateTime<Utc>) -> Vec<ContrivedEvents> 
             quantity_abs_max: dec!(6000.0),
             pnl_realised: dec!(-1000.0), // 1000 usdt loss
             fees_enter: AssetFees::default(),
+            carry: Decimal::ZERO,
             fees_exit: AssetFees::default(),
             time_enter: base_time.checked_add_days(Days::new(6)).unwrap(),
             time_exit: base_time.checked_add_days(Days::new(8)).unwrap(),
@@ -255,6 +259,7 @@ fn generate_synthetic_updates(base_time: DateTime<Utc>) -> Vec<ContrivedEvents> 
             quantity_abs_max: dec!(6000.0),
             pnl_realised: dec!(500.0), // 500 usdt profit
             fees_enter: AssetFees::default(),
+            carry: Decimal::ZERO,
             fees_exit: AssetFees::default(),
             time_enter: base_time.checked_add_days(Days::new(10)).unwrap(),
             time_exit: base_time.checked_add_days(Days::new(11)).unwrap(),

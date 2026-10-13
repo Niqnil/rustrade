@@ -85,6 +85,20 @@ pub struct TradingSummary<Interval> {
     /// position per external order is a reasonable reading of them.
     #[serde(default)]
     pub fills_unmatched: usize,
+
+    /// Fills the venues forced this session, summed over every instrument: liquidations,
+    /// auto-deleveraging and option assignments. See
+    /// [`TearSheet::fills_forced`](instrument::TearSheet::fills_forced) for why zero is not proof
+    /// that none happened.
+    #[serde(default)]
+    pub fills_forced: usize,
+
+    /// Venue settlement fills, or parts of them, applied to no position this session, summed over
+    /// every instrument — `OmsMode::Hedging` only. Non-zero means the engine's positions no longer
+    /// match the venue's. See
+    /// [`TearSheet::fills_unallocated`](instrument::TearSheet::fills_unallocated).
+    #[serde(default)]
+    pub fills_unallocated: usize,
 }
 
 impl<Interval> TradingSummary<Interval> {
@@ -254,18 +268,26 @@ impl TradingSummaryGenerator {
             .map(|generator| generator.basis)
             .unwrap_or_default();
 
-        let (orders_opened, orders_rejected, fills_routed_by_fallback, fills_unmatched) =
-            self.instruments.values().fold(
-                (0usize, 0usize, 0usize, 0usize),
-                |(opened, rejected, fallback, unmatched), generator| {
-                    (
-                        opened.saturating_add(generator.orders_opened),
-                        rejected.saturating_add(generator.orders_rejected),
-                        fallback.saturating_add(generator.fills_routed_by_fallback),
-                        unmatched.saturating_add(generator.fills_unmatched),
-                    )
-                },
-            );
+        let (
+            orders_opened,
+            orders_rejected,
+            fills_routed_by_fallback,
+            fills_unmatched,
+            fills_forced,
+            fills_unallocated,
+        ) = self.instruments.values().fold(
+            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize),
+            |(opened, rejected, fallback, unmatched, forced, unallocated), generator| {
+                (
+                    opened.saturating_add(generator.orders_opened),
+                    rejected.saturating_add(generator.orders_rejected),
+                    fallback.saturating_add(generator.fills_routed_by_fallback),
+                    unmatched.saturating_add(generator.fills_unmatched),
+                    forced.saturating_add(generator.fills_forced),
+                    unallocated.saturating_add(generator.fills_unallocated),
+                )
+            },
+        );
 
         TradingSummary {
             time_engine_start: self.time_engine_start,
@@ -277,6 +299,8 @@ impl TradingSummaryGenerator {
             orders_rejected,
             fills_routed_by_fallback,
             fills_unmatched,
+            fills_forced,
+            fills_unallocated,
         }
     }
 }

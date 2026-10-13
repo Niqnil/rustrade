@@ -31,7 +31,8 @@
 //!
 //! # What Massive does not answer
 //! Massive says nothing at all to a subscription for a channel it does not publish, so an attach
-//! naming one waits out its timeout, and the timeout names what was never confirmed. It confirms a
+//! naming one waits out its timeout, and the timeout names what was never confirmed, in
+//! [`SocketError::Unacknowledged`]. It confirms a
 //! subscription to a market it does not list, and then publishes nothing for it: a misspelt
 //! market is indistinguishable from a quiet one.
 //!
@@ -69,10 +70,11 @@ use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::{
     error::SocketError,
     protocol::websocket::{WebSocket, WsError, WsMessage, connect},
+    subscription::SubscriptionId,
 };
 use serde::{Deserialize, Deserializer};
 use serde_json::json;
-use smol_str::SmolStr;
+use smol_str::{SmolStr, format_smolstr};
 use std::{
     fmt,
     pin::Pin,
@@ -207,12 +209,15 @@ pub(super) struct Confirmations {
 }
 
 impl Confirmations {
-    fn outstanding(&self) -> String {
-        self.outstanding
+    /// Those still unconfirmed, as the ids the mapper keyed them under, sorted.
+    fn outstanding(&self) -> Vec<SubscriptionId> {
+        let mut outstanding = self
+            .outstanding
             .iter()
-            .map(Slot::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
+            .map(|slot| SubscriptionId(format_smolstr!("{}|{}", slot.event, slot.market)))
+            .collect::<Vec<_>>();
+        outstanding.sort_unstable();
+        outstanding
     }
 }
 
@@ -232,22 +237,25 @@ impl Handshake<Slot> for Confirmations {
 
     fn timed_out(&self, timeout: Duration) -> String {
         format!(
-            "subscription validation timeout reached: {timeout:?}; Massive never confirmed: {}. \
-             Massive does not answer a subscription to a channel it does not publish on the \
-             cluster, so one that waits for ever is usually a channel the cluster does not offer",
-            self.outstanding()
+            "subscription validation timeout reached: {timeout:?}. Massive does not answer a \
+             subscription to a channel it does not publish on the cluster, so one that waits for \
+             ever is usually a channel the cluster does not offer"
         )
+    }
+
+    fn unconfirmed(&self) -> Option<Vec<SubscriptionId>> {
+        Some(self.outstanding())
     }
 
     /// Name what the refusal may be for: Massive's names nothing, and whatever it refused is among
     /// what it never confirmed.
     fn refusal(&self, error: SocketError) -> SocketError {
         match error {
-            SocketError::Subscribe(message) if !self.outstanding.is_empty() => {
-                SocketError::Subscribe(format!(
-                    "{message}; Massive refused a subscription among those it did not confirm: {}",
-                    self.outstanding()
-                ))
+            SocketError::Subscribe(reason) if !self.outstanding.is_empty() => {
+                SocketError::Unacknowledged {
+                    reason,
+                    unacknowledged: self.outstanding(),
+                }
             }
             other => other,
         }
@@ -361,11 +369,21 @@ impl Protocol for Massive {
 
     /// Add to a refusal what the stream cannot see: the cluster's subscriptions are shared.
     fn refused(error: SocketError) -> SocketError {
-        match error {
-            SocketError::Subscribe(message) => SocketError::Subscribe(format!(
-                "{message} (the connection is shared by every stream this subscriber and its \
+        let shared = |reason: String| {
+            format!(
+                "{reason} (the connection is shared by every stream this subscriber and its \
                  clones open on the cluster)"
-            )),
+            )
+        };
+        match error {
+            SocketError::Subscribe(message) => SocketError::Subscribe(shared(message)),
+            SocketError::Unacknowledged {
+                reason,
+                unacknowledged,
+            } => SocketError::Unacknowledged {
+                reason: shared(reason),
+                unacknowledged,
+            },
             other => other,
         }
     }
@@ -786,17 +804,21 @@ mod tests {
         handshake.observe(slot("XQ", "BTC-USD"));
         assert!(!handshake.is_settled());
 
-        let timed_out = handshake.timed_out(Duration::from_secs(10));
-        assert!(
-            timed_out.contains("never confirmed: XT.BTC-USD"),
-            "{timed_out}"
+        assert_eq!(
+            handshake.unconfirmed(),
+            Some(vec![SubscriptionId::from("XT|BTC-USD")])
         );
 
-        let refused = handshake
-            .refusal(SocketError::Subscribe("not authorized".to_owned()))
-            .to_string();
-        assert!(refused.contains("not authorized"), "{refused}");
-        assert!(refused.contains("XT.BTC-USD"), "{refused}");
+        let refused = handshake.refusal(SocketError::Subscribe("not authorized".to_owned()));
+        assert!(
+            matches!(
+                &refused,
+                SocketError::Unacknowledged { reason, unacknowledged }
+                    if reason == "not authorized"
+                        && unacknowledged == &[SubscriptionId::from("XT|BTC-USD")]
+            ),
+            "{refused:?}"
+        );
 
         handshake.observe(slot("XT", "BTC-USD"));
         assert!(handshake.is_settled());

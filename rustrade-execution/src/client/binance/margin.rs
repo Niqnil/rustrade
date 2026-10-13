@@ -10,11 +10,17 @@
 //! [`BinanceMarginConfig`], [`MarginSideEffect`]) and a full [`ExecutionClient`] implementation:
 //! order submission/cancel and account snapshot / balance / open-order / trade queries over REST,
 //! plus a live account event stream ([`ExecutionClient::account_stream`]) over the hand-rolled
-//! `userListenToken` user-data WebSocket (the SDK's retired listen-key path is not used), which
-//! after a reconnect recovers missed fills and reports how orders ended meanwhile. It also
-//! implements [`OrderStatusClient`], looking orders up by client order id. Both
-//! **cross** (`isIsolated = "FALSE"`, account-wide collateral) and **isolated** (`isIsolated =
-//! "TRUE"`, per-pair sub-accounts) margin are supported, selected by
+//! `userListenToken` user-data WebSocket (the retired `/sapi/v1/userDataStream` listen-key path is
+//! not used), which after a reconnect recovers missed fills and reports how orders ended
+//! meanwhile, and on cross margin also reads the Risk Data Stream for margin notices. It also
+//! implements [`OrderStatusClient`], looking orders up by client order id, and reports a pair's
+//! borrow terms ([`ShortabilityClient`]) and how much this account can borrow for it
+//! ([`BorrowCapacityClient`]). Two reads beyond the traits cover what the account stream does not
+//! carry: the interest charged ([`BinanceMargin::fetch_margin_interest`]) and forced liquidations
+//! ([`BinanceMargin::fetch_forced_liquidations`]).
+//!
+//! The client supports both **cross** (`isIsolated = "FALSE"`, account-wide collateral) and
+//! **isolated** (`isIsolated = "TRUE"`, per-pair sub-accounts) margin, selected by
 //! [`BinanceMarginConfig::is_isolated`].
 //!
 //! ## Cross vs. isolated
@@ -49,27 +55,36 @@
 //!   instead by the terminal report's own `z`, or by
 //!   [`ExecutionClient::fetch_open_orders`].
 
+mod records;
+
+pub use records::MarginForcedLiquidation;
+
+use super::margin_risk::{
+    RISK_STREAM_URL, RiskStreamTask, SapiRiskListenKeys, log_liability_change,
+    log_margin_level_change, margin_level_notice,
+};
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, ExecutionReport, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS,
     HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
     PlacementResponse, RateLimitTracker, RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS,
-    SharedDedupCache, TrailingDeltaError, UnhandledEvents, UnrecoveredFills, UserDataFrame,
+    SharedDedupCache, TrailingOrderError, UnhandledEvents, UnrecoveredFills, UserDataFrame,
     WeightPool, binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
     classify_rest_query_error, convert_ended_order, convert_execution_report,
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event, drop_after,
     frame_excerpt, gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
     log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
-    recovered_order_totals, response_decode_error, rest_call_with_retry,
-    trailing_delta_basis_points,
+    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
+    trailing_params,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
     InstrumentBalanceUpdate, IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
+    borrow_capacity::BorrowCapacity,
     client::{
-        ExecutionClient, OrderStatusClient,
+        BorrowCapacityClient, ExecutionClient, OrderStatusClient, ShortabilityClient,
         order_recovery::{
             KnownLiveOrders, OpenListing, OrderLookup, SharedKnownLiveOrders, UncheckedOrders,
             fetch_ended_by_key, recover_ended_orders,
@@ -86,6 +101,7 @@ use crate::{
         state::{Cancelled, Open, OrderState, UnindexedOrderState},
     },
     position::PositionReport,
+    shortability::Shortability,
     trade::{AssetFees, Trade, TradeId, TradesRead},
 };
 use binance_sdk::{
@@ -101,18 +117,21 @@ use binance_sdk::{
     margin_trading::{
         MarginTradingRestApi,
         rest_api::{
-            MarginAccountCancelOrderIsIsolatedEnum, MarginAccountCancelOrderParams,
-            MarginAccountNewOrderIsIsolatedEnum, MarginAccountNewOrderNewOrderRespTypeEnum,
-            MarginAccountNewOrderParams, MarginAccountNewOrderSideEffectTypeEnum,
-            MarginAccountNewOrderSideEnum, MarginAccountNewOrderTimeInForceEnum,
-            MarginAccountNewOrderTypeEnum, QueryCrossMarginAccountDetailsParams,
+            GetAllCrossMarginPairsParams, GetAllIsolatedMarginSymbolParams,
+            GetAllMarginAssetsParams, GetFutureHourlyInterestRateIsIsolatedEnum,
+            GetFutureHourlyInterestRateParams, MarginAccountCancelOrderIsIsolatedEnum,
+            MarginAccountCancelOrderParams, MarginAccountNewOrderIsIsolatedEnum,
+            MarginAccountNewOrderNewOrderRespTypeEnum, MarginAccountNewOrderParams,
+            MarginAccountNewOrderSideEffectTypeEnum, MarginAccountNewOrderSideEnum,
+            MarginAccountNewOrderTimeInForceEnum, MarginAccountNewOrderTypeEnum,
+            QueryCrossMarginAccountDetailsParams,
             QueryCrossMarginAccountDetailsResponseUserAssetsInner,
             QueryIsolatedMarginAccountInfoParams,
             QueryIsolatedMarginAccountInfoResponseAssetsInner,
             QueryMarginAccountsOpenOrdersIsIsolatedEnum, QueryMarginAccountsOpenOrdersParams,
             QueryMarginAccountsOrderIsIsolatedEnum, QueryMarginAccountsOrderParams,
             QueryMarginAccountsTradeListIsIsolatedEnum, QueryMarginAccountsTradeListParams,
-            QueryMarginAccountsTradeListResponseInner, RestApi,
+            QueryMarginAccountsTradeListResponseInner, QueryMaxBorrowParams, RestApi,
         },
         websocket_streams::{
             MarginLevelStatusChange, OutboundAccountPosition, UserLiabilityChange,
@@ -345,7 +364,8 @@ impl BinanceMarginConfig {
 ///
 /// Places orders and queries account state over the margin REST API
 /// (`margin_trading::rest_api`), and streams live account events via a hand-rolled
-/// `userListenToken` flow over the WS API, not the SDK's retired listen-key path.
+/// `userListenToken` flow over the WS API, not the retired `/sapi/v1/userDataStream` listen-key
+/// path.
 ///
 /// See [`BinanceMarginConfig::testnet`] for the no-testnet caveat. The behaviour a caller most needs to know
 /// is summarised below, with links to the authoritative detail.
@@ -368,10 +388,11 @@ impl BinanceMarginConfig {
 ///   [`account_snapshot`](Self::account_snapshot) for the full per-method semantics.
 ///
 /// # Trailing stops
-/// As on spot, a `TrailingStop` is placed as a `STOP_LOSS` with a `trailingDelta`, for
-/// `BasisPoints` and `Percentage` offsets that come to a whole number of basis points. Absolute
-/// offsets and `TrailingStopLimit` return [`OrderError::UnsupportedOrderType`]. See
-/// [`open_order`](Self::open_order).
+/// As on spot, a `TrailingStop` is placed as a `STOP_LOSS` with a `trailingDelta`, and a
+/// `TrailingStopFixedLimit` as a `STOP_LOSS_LIMIT` with a `trailingDelta` and its fixed limit as
+/// `price`, for `BasisPoints` and `Percentage` offsets that come to a whole number of basis
+/// points. An activation price is sent as `stopPrice`. Absolute offsets and `TrailingStopLimit`
+/// return [`OrderError::UnsupportedOrderType`]. See [`open_order`](Self::open_order).
 ///
 /// # Conditional orders read back over REST
 /// Binance margin accepts a `trailingDelta` on every conditional type (`STOP_LOSS`,
@@ -393,10 +414,15 @@ impl BinanceMarginConfig {
 ///
 /// # User-data stream (`userListenToken`)
 /// [`account_stream`](Self::account_stream) is hand-rolled over the `userListenToken` model — the
-/// legacy margin listen-key user-data API was retired by Binance on 2026-02-20 and the SDK binds
-/// only the dead endpoint. There is **no keepalive ping** (the retired listen-key `PUT` mechanism):
-/// instead the token (~24h validity) is re-acquired and re-subscribed before its `expirationTime`,
-/// transparently across reconnects.
+/// legacy margin listen-key user-data API (`/sapi/v1/userDataStream`) was retired by Binance on
+/// 2026-02-20, and binance-sdk has no binding for its replacement. There is **no keepalive ping**
+/// (the retired listen-key `PUT` mechanism): instead the token (~24h validity) is re-acquired and
+/// re-subscribed before its `expirationTime`, transparently across reconnects.
+///
+/// The Risk Data Stream a cross account stream also reads (see
+/// [`account_stream`](Self::account_stream)'s "Margin notices") is a different, current API: its
+/// listen key comes from `/sapi/v1/margin/listen-key`, which binance-sdk does bind, and is kept
+/// alive every 30 minutes.
 ///
 /// # Margin balances & debt-freshness
 /// Balances carry per-asset margin debt: [`Balance::net_asset`](crate::balance::Balance::net_asset)
@@ -429,6 +455,13 @@ impl BinanceMarginConfig {
 /// `BinanceMargin` clients in a single engine (e.g. one cross, one isolated) therefore collides
 /// their exchange identity. A single engine should run **at most one** `BinanceMargin` client; a
 /// consumer needing cross and isolated concurrently runs them in separate engines.
+///
+/// # Fills of other clients' orders
+/// The account stream, fill recovery and `fetch_trades` report every fill on the account, whoever
+/// placed the order, and Binance does not say who did. A consumer that also trades the account
+/// outside the engine filters those fills itself, for example by
+/// [`Trade::client_order_id`](crate::trade::Trade::client_order_id). See the
+/// [module docs](super#every-fill-on-the-account-is-delivered).
 #[derive(Clone)]
 pub struct BinanceMargin {
     config: Arc<BinanceMarginConfig>,
@@ -690,10 +723,13 @@ impl ExecutionClient for BinanceMargin {
     /// - `isIsolated` is config-driven (`"TRUE"` for isolated, `"FALSE"` for cross).
     /// - `autoRepayAtCancel` is set only under [`MarginSideEffect::AutoBorrowRepay`]: a `NoBorrow`
     ///   client takes no loan, so requesting repay-on-cancel would be incoherent.
-    /// - A `TrailingStop` is sent as a `STOP_LOSS` with `trailingDelta` in basis points. An
-    ///   Absolute offset, and `TrailingStopLimit`, return [`OrderError::UnsupportedOrderType`]; an
-    ///   offset that is not a positive whole number of basis points returns
-    ///   [`OrderError::InvalidPrecision`] (see the type-level docs).
+    /// - A `TrailingStop` is sent as a `STOP_LOSS` with `trailingDelta` in basis points, and a
+    ///   `TrailingStopFixedLimit` as a `STOP_LOSS_LIMIT` with `trailingDelta` and its fixed limit
+    ///   as `price`; an activation price goes as `stopPrice`. An Absolute offset, and
+    ///   `TrailingStopLimit`, return [`OrderError::UnsupportedOrderType`]; an offset that is not a
+    ///   positive whole number of basis points returns [`OrderError::InvalidPrecision`] (see the
+    ///   type-level docs). A non-positive activation price, or a `TrailingStopFixedLimit` without
+    ///   a positive `price`, is refused unsent as [`OrderError::Rejected`].
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
@@ -744,7 +780,7 @@ impl ExecutionClient for BinanceMargin {
                     ),
                 )));
             }
-            Err(BuildOrderError::TrailingDelta(refused)) => {
+            Err(BuildOrderError::Trailing(refused)) => {
                 return inactive(OrderState::inactive(refused.into_order_error()));
             }
             Err(BuildOrderError::Build(msg)) => {
@@ -1238,6 +1274,33 @@ impl ExecutionClient for BinanceMargin {
     /// but never re-establishes debt; `USER_LIABILITY_CHANGE` is logged observably, not applied to
     /// balance state.
     ///
+    /// # Margin notices
+    /// Binance's `MARGIN_LEVEL_STATUS_CHANGE` is delivered as an
+    /// [`AccountEventKind::Notice`]. Its status maps to a
+    /// [`NoticeKind`](crate::NoticeKind): `MARGIN_CALL` → `MarginCall`, `PRE_LIQUIDATION` →
+    /// `LiquidationWarning`, `FORCE_LIQUIDATION` → `Liquidation`, `NORMAL` and `EXCESSIVE` →
+    /// `MarginRestored`, anything else → `Other`, with Binance's status verbatim in
+    /// [`AccountNotice::status`](crate::AccountNotice::status) and its margin level (`l`) in
+    /// [`margin_level`](crate::AccountNotice::margin_level).
+    ///
+    /// Binance's own SDKs read the event from the **Risk Data Stream**
+    /// (`wss://margin-stream.binance.com`, keyed by `POST /sapi/v1/margin/listen-key`). Whether the
+    /// `userListenToken` stream sends it too is not documented, so:
+    /// - **Cross** reads both, and a notice sent on both is delivered once (matched on status and
+    ///   Binance's event time; a frame with no time is stamped on arrival, so its two copies both
+    ///   arrive). Notices name no instrument. The Risk Data Stream is a side channel, in a task of
+    ///   its own: if it cannot get a listen key or connect, that is logged at `warn` and retried
+    ///   with backoff up to 5 minutes, without limit, and the account stream carries on. Its key is
+    ///   kept alive every 30 minutes (weight 1) and left to lapse when the stream ends.
+    /// - **Isolated** reads only the `userListenToken` stream, so receives notices only if Binance
+    ///   sends them there (unconfirmed). A notice names the pair whose subscription it came on, or
+    ///   no instrument, with a `warn`, when the frame's `subscriptionId` is missing or unmapped.
+    ///
+    /// Each arrival is logged at `info`, naming the stream, before the duplicate is dropped. A
+    /// notice sent while a stream is disconnected is not recovered.
+    ///
+    /// `USER_LIABILITY_CHANGE`, on either stream, is logged at `info` and not forwarded.
+    ///
     /// # Startup race window
     /// Like spot, fills arriving between subscribe and the listener being registered may be missed;
     /// callers requiring startup fill completeness must call [`ExecutionClient::fetch_trades`] with
@@ -1424,7 +1487,19 @@ impl ExecutionClient for BinanceMargin {
                 UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
             })?;
 
-            tokio::spawn(margin_connection_manager(
+            // The risk data stream runs beside the manager, for the margin notices it carries, in
+            // a task of its own so nothing in it can end the account stream, and is aborted when
+            // the manager's task ends or is aborted (see `margin_risk`).
+            let risk = RiskStreamTask::spawn(
+                SapiRiskListenKeys {
+                    rest: rest.clone(),
+                    rate_limiter: rate_limiter.clone(),
+                },
+                RISK_STREAM_URL.to_owned(),
+                tx.clone(),
+                dedup.clone(),
+            );
+            let manager = margin_connection_manager(
                 tx,
                 dedup,
                 ws_config,
@@ -1434,7 +1509,11 @@ impl ExecutionClient for BinanceMargin {
                 known_live,
                 instruments,
                 Some((initial_ws, initial_token)),
-            ))
+            );
+            tokio::spawn(async move {
+                let _risk = risk;
+                manager.await;
+            })
         };
 
         let rx_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
@@ -1477,6 +1556,292 @@ impl OrderStatusClient for BinanceMargin {
         })
         .await
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shortability and borrow capacity
+// ---------------------------------------------------------------------------
+
+/// Hours in the 365-day year a Binance hourly interest rate is annualised over.
+const HOURS_PER_YEAR: u32 = 24 * 365;
+
+impl ShortabilityClient for BinanceMargin {
+    /// Reads the pair, its base asset and the base asset's next hourly interest rate, which cost
+    /// 102 of Binance's per-IP request weight on cross margin and 111 on isolated, almost all of
+    /// it the interest rate.
+    ///
+    /// - `shortable` is whether the pair is traded on margin and may be sold
+    ///   (`/sapi/v1/margin/allPairs`, or `isolated/allPairs` on isolated margin), and its base
+    ///   asset may be borrowed (`/sapi/v1/margin/allAssets`). Any of them false makes it false.
+    ///   Binance's delisting schedule (`delistTime`) is not read, as Binance documents neither its
+    ///   unit nor when it is present, so a pair due to be delisted reads shortable until Binance
+    ///   clears these flags.
+    /// - `fee_rate` is the base asset's next hourly interest rate
+    ///   (`/sapi/v1/margin/next-hourly-interest-rate`, for this client's cross or isolated margin)
+    ///   times 24 × 365. It is this account's rate, at its VIP level, for the coming hour only.
+    /// - `easy_to_borrow` is unknown: Binance has no such distinction.
+    /// - `available` is unknown: Binance does not say how much it has to lend in total, only how
+    ///   much this account can borrow, which
+    ///   [`fetch_borrow_capacity`](BorrowCapacityClient::fetch_borrow_capacity) reports.
+    ///
+    /// # Errors
+    ///
+    /// [`ApiError::InstrumentInvalid`] for a pair Binance does not trade on this client's cross
+    /// or isolated margin.
+    async fn fetch_shortability(
+        &self,
+        instrument: &InstrumentNameExchange,
+    ) -> Result<Shortability, UnindexedClientError> {
+        let pair = self.fetch_margin_pair(instrument).await?;
+        let (borrowable, hourly_rate) = tokio::try_join!(
+            self.fetch_asset_borrowable(&pair.base),
+            self.fetch_next_hourly_interest_rate(&pair.base),
+        )?;
+
+        let mut shortability = Shortability::new();
+        // Any flag false is enough to forbid the short; all must be known true to allow it.
+        let flags = [pair.is_margin_trade, pair.is_sell_allowed, borrowable];
+        if flags.contains(&Some(false)) {
+            shortability = shortability.with_shortable(false);
+        } else if flags.iter().all(|flag| *flag == Some(true)) {
+            shortability = shortability.with_shortable(true);
+        }
+        if let Some(hourly_rate) = hourly_rate {
+            shortability = shortability.with_fee_rate(hourly_rate * Decimal::from(HOURS_PER_YEAR));
+        }
+        Ok(shortability)
+    }
+}
+
+impl BorrowCapacityClient for BinanceMargin {
+    /// Reads the pair, then `/sapi/v1/margin/maxBorrowable` for the asset an order on `side`
+    /// borrows, on this client's cross margin or on the pair's isolated account. They cost 51 of
+    /// Binance's per-IP request weight on cross margin and 60 on isolated.
+    ///
+    /// `borrowable_now` is Binance's `amount`, which it describes as the account's "max
+    /// borrowable amount with sufficient system availability", so it is also capped by what
+    /// Binance has to lend. `account_limit` is its `borrowLimit`, the most the account's VIP level
+    /// allows.
+    ///
+    /// # Errors
+    ///
+    /// - [`ApiError::InstrumentInvalid`] for a pair Binance does not trade on this client's cross
+    ///   or isolated margin.
+    /// - [`ApiError::RequestRejected`] with Binance's `-11001` on isolated margin, for a pair this
+    ///   account has no isolated margin account for. Open one on Binance, or ask a cross-margin
+    ///   client.
+    async fn fetch_borrow_capacity(
+        &self,
+        instrument: &InstrumentNameExchange,
+        side: Side,
+    ) -> Result<BorrowCapacity, UnindexedClientError> {
+        let pair = self.fetch_margin_pair(instrument).await?;
+        let asset = match side {
+            Side::Buy => pair.quote,
+            Side::Sell => pair.base,
+        };
+        let isolated_symbol = self
+            .config
+            .is_isolated
+            .then(|| instrument.name().to_string());
+        let response =
+            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                let asset = asset.name().to_string();
+                let isolated_symbol = isolated_symbol.clone();
+                Box::pin(async move {
+                    let params = QueryMaxBorrowParams::builder(asset)
+                        .isolated_symbol(isolated_symbol)
+                        .build()?;
+                    rest.query_max_borrow(params).await
+                })
+            })
+            .await
+            .map_err(|e| classify_rest_query_error(&e, Some(instrument)))?;
+        let max_borrow = response.data().await.map_err(response_decode_error)?;
+
+        let mut capacity = BorrowCapacity::new(asset);
+        if let Some(amount) = optional_decimal("amount", max_borrow.amount.as_deref())? {
+            capacity = capacity.with_borrowable_now(amount);
+        }
+        if let Some(limit) = optional_decimal("borrowLimit", max_borrow.borrow_limit.as_deref())? {
+            capacity = capacity.with_account_limit(limit);
+        }
+        Ok(capacity)
+    }
+}
+
+/// A margin pair as Binance lists it, for this client's cross or isolated margin.
+#[derive(Debug)]
+struct MarginPair {
+    base: AssetNameExchange,
+    quote: AssetNameExchange,
+    is_margin_trade: Option<bool>,
+    is_sell_allowed: Option<bool>,
+}
+
+impl BinanceMargin {
+    /// `instrument` as Binance lists it for this client's margin: `/sapi/v1/margin/allPairs`
+    /// (weight 1) on cross, `/sapi/v1/margin/isolated/allPairs` (weight 10) on isolated, both
+    /// filtered to the one symbol.
+    async fn fetch_margin_pair(
+        &self,
+        instrument: &InstrumentNameExchange,
+    ) -> Result<MarginPair, UnindexedClientError> {
+        let symbol = instrument.name().to_string();
+        let listed = if self.config.is_isolated {
+            let response =
+                rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                    let symbol = symbol.clone();
+                    Box::pin(async move {
+                        let params = GetAllIsolatedMarginSymbolParams::builder()
+                            .symbol(symbol)
+                            .build()?;
+                        rest.get_all_isolated_margin_symbol(params).await
+                    })
+                })
+                .await
+                .map_err(|e| classify_rest_query_error(&e, Some(instrument)))?;
+            response
+                .data()
+                .await
+                .map_err(response_decode_error)?
+                .into_iter()
+                .find(|pair| pair.symbol.as_deref() == Some(symbol.as_str()))
+                .map(|pair| {
+                    (
+                        pair.base,
+                        pair.quote,
+                        pair.is_margin_trade,
+                        pair.is_sell_allowed,
+                    )
+                })
+        } else {
+            let response =
+                rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                    let symbol = symbol.clone();
+                    Box::pin(async move {
+                        let params = GetAllCrossMarginPairsParams::builder()
+                            .symbol(symbol)
+                            .build()?;
+                        rest.get_all_cross_margin_pairs(params).await
+                    })
+                })
+                .await
+                .map_err(|e| classify_rest_query_error(&e, Some(instrument)))?;
+            response
+                .data()
+                .await
+                .map_err(response_decode_error)?
+                .into_iter()
+                .find(|pair| pair.symbol.as_deref() == Some(symbol.as_str()))
+                .map(|pair| {
+                    (
+                        pair.base,
+                        pair.quote,
+                        pair.is_margin_trade,
+                        pair.is_sell_allowed,
+                    )
+                })
+        };
+        let margin = if self.config.is_isolated {
+            "isolated"
+        } else {
+            "cross"
+        };
+        let Some((base, quote, is_margin_trade, is_sell_allowed)) = listed else {
+            return Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(
+                instrument.clone(),
+                format!("Binance lists no {margin} margin pair {symbol}"),
+            )));
+        };
+        let (Some(base), Some(quote)) = (base, quote) else {
+            return Err(UnindexedClientError::Internal(format!(
+                "Binance lists {margin} margin pair {symbol} without its base or quote asset"
+            )));
+        };
+        Ok(MarginPair {
+            base: AssetNameExchange::new(base),
+            quote: AssetNameExchange::new(quote),
+            is_margin_trade,
+            is_sell_allowed,
+        })
+    }
+
+    /// Whether Binance lends `asset` on margin: its `isBorrowable` in `/sapi/v1/margin/allAssets`
+    /// (weight 1). Unknown if Binance does not list it.
+    async fn fetch_asset_borrowable(
+        &self,
+        asset: &AssetNameExchange,
+    ) -> Result<Option<bool>, UnindexedClientError> {
+        let name = asset.name().to_string();
+        let response =
+            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                let name = name.clone();
+                Box::pin(async move {
+                    let params = GetAllMarginAssetsParams::builder().asset(name).build()?;
+                    rest.get_all_margin_assets(params).await
+                })
+            })
+            .await
+            .map_err(|e| classify_rest_query_error(&e, None))?;
+        Ok(response
+            .data()
+            .await
+            .map_err(response_decode_error)?
+            .into_iter()
+            .find(|listed| listed.asset_name.as_deref() == Some(name.as_str()))
+            .and_then(|listed| listed.is_borrowable))
+    }
+
+    /// `asset`'s next hourly interest rate on this client's cross or isolated margin, a fraction
+    /// per hour: `/sapi/v1/margin/next-hourly-interest-rate` (weight 100). Unknown if Binance does
+    /// not answer for it.
+    async fn fetch_next_hourly_interest_rate(
+        &self,
+        asset: &AssetNameExchange,
+    ) -> Result<Option<Decimal>, UnindexedClientError> {
+        let name = asset.name().to_string();
+        let is_isolated = self.config.is_isolated;
+        let response =
+            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                let name = name.clone();
+                Box::pin(async move {
+                    let params = GetFutureHourlyInterestRateParams::builder(
+                        name,
+                        IsolatedFlag::from_flag(is_isolated),
+                    )
+                    .build()?;
+                    rest.get_future_hourly_interest_rate(params).await
+                })
+            })
+            .await
+            .map_err(|e| classify_rest_query_error(&e, None))?;
+        let rate = response
+            .data()
+            .await
+            .map_err(response_decode_error)?
+            .into_iter()
+            .find(|listed| listed.asset.as_deref() == Some(name.as_str()))
+            .and_then(|listed| listed.next_hourly_interest_rate);
+        optional_decimal("nextHourlyInterestRate", rate.as_deref())
+    }
+}
+
+/// A decimal Binance may leave out: absent is `None`, but present and unreadable is an error, so a
+/// malformed amount is not mistaken for an unreported one.
+fn optional_decimal(
+    field: &str,
+    value: Option<&str>,
+) -> Result<Option<Decimal>, UnindexedClientError> {
+    value
+        .map(|value| {
+            Decimal::from_str(value).map_err(|error| {
+                UnindexedClientError::Internal(format!(
+                    "decoding Binance response: {field} {value:?}: {error}"
+                ))
+            })
+        })
+        .transpose()
 }
 
 // ---------------------------------------------------------------------------
@@ -1704,13 +2069,57 @@ fn cross_account_position_handler(
     convert_margin_account_position(position, buf);
 }
 
+/// Cross-margin notice attribution: a cross account's margin level is the whole account's, so a
+/// notice names no instrument. The `notice_instrument` passed to
+/// [`convert_margin_user_data_events_with`] / the cross manager.
+fn cross_notice_instrument(_subscription_id: Option<i64>) -> Option<InstrumentNameExchange> {
+    None
+}
+
+/// Isolated-margin notice attribution: the pair whose subscription the frame came on, recovered
+/// from `subscription_id` via `sub_map` as [`route_isolated_account_position`] recovers a balance
+/// frame's. A notice whose subscription is missing or unmapped is still delivered, naming no
+/// instrument, with a `warn`: losing a margin call costs more than losing its attribution, and
+/// unlike a balance there is no snapshot to repair it.
+fn isolated_notice_instrument(
+    subscription_id: Option<i64>,
+    sub_map: &Mutex<HashMap<i64, InstrumentNameExchange>>,
+) -> Option<InstrumentNameExchange> {
+    let Some(sub_id) = subscription_id else {
+        warn!(
+            "BinanceMargin isolated: MARGIN_LEVEL_STATUS_CHANGE without subscriptionId — \
+             delivering the notice without an instrument"
+        );
+        return None;
+    };
+    let instrument = sub_map
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&sub_id)
+        .cloned();
+    if instrument.is_none() {
+        warn!(
+            subscription_id = sub_id,
+            "BinanceMargin isolated: MARGIN_LEVEL_STATUS_CHANGE for unmapped subscriptionId — \
+             delivering the notice without an instrument"
+        );
+    }
+    instrument
+}
+
 /// Cross-margin convenience wrapper over [`convert_margin_user_data_events_with`] using
-/// [`cross_account_position_handler`] (account-wide `BalanceStreamUpdate`s). Test-only: the cross
-/// manager calls the listener helper with the handler directly, but the converter unit tests exercise
-/// frame discrimination through this two-arg form (they do not route balances per-instrument).
+/// [`cross_account_position_handler`] (account-wide `BalanceStreamUpdate`s) and
+/// [`cross_notice_instrument`]. Test-only: the cross manager calls the listener helper with the
+/// handlers directly, but the converter unit tests exercise frame discrimination through this
+/// two-arg form (they do not route balances per-instrument).
 #[cfg(test)]
 fn convert_margin_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> bool {
-    convert_margin_user_data_events_with(frame, buf, &mut cross_account_position_handler)
+    convert_margin_user_data_events_with(
+        frame,
+        buf,
+        &mut cross_account_position_handler,
+        &mut cross_notice_instrument,
+    )
 }
 
 /// Frame discrimination for the WS-API user-data delivery, as observed live.
@@ -1723,11 +2132,12 @@ fn convert_margin_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEv
 /// is seen rather than dropped silently. Deserialization of a known event type is defensive: a
 /// mismatch is logged and the event dropped (observable), never silently mis-parsed.
 ///
-/// The `outboundAccountPosition` (balance) arm is delegated to `handle_position` — the **only** arm
-/// that differs between cross (account-wide `BalanceStreamUpdate`) and isolated (per-instrument
-/// `InstrumentBalanceUpdate`, routed via the frame's `subscriptionId`). Everything else
-/// (`executionReport` routing by inner `s`, the observable-only margin events, termination
-/// signalling) is single-sourced here.
+/// Two arms differ between cross and isolated, and are delegated: the `outboundAccountPosition`
+/// (balance) arm to `handle_position` (cross: account-wide `BalanceStreamUpdate`; isolated:
+/// per-instrument `InstrumentBalanceUpdate`, routed via the frame's `subscriptionId`), and the
+/// instrument a `MARGIN_LEVEL_STATUS_CHANGE` notice names to `notice_instrument` (cross: none;
+/// isolated: the subscription's pair). Everything else (`executionReport` routing by inner `s`,
+/// the margin events, termination signalling) is single-sourced here.
 fn convert_margin_user_data_events_with(
     frame: &str,
     buf: &mut Vec<UnindexedAccountEvent>,
@@ -1736,6 +2146,7 @@ fn convert_margin_user_data_events_with(
         Option<i64>,
         &mut Vec<UnindexedAccountEvent>,
     ),
+    notice_instrument: &mut impl FnMut(Option<i64>) -> Option<InstrumentNameExchange>,
 ) -> bool {
     let (subscription_id, event_type, event_raw) = match parse_user_data_frame(frame) {
         // RPC responses (subscribe ack, errors): not a user-data event.
@@ -1756,7 +2167,21 @@ fn convert_margin_user_data_events_with(
             // Single typed pass straight from the raw inner slice — no intermediate DOM, and only
             // the matched branch deserializes its payload.
             match serde_json::from_str::<ExecutionReport>(event_raw) {
-                Ok(report) => convert_execution_report(&report, ExchangeId::BinanceMargin, buf),
+                Ok(report) => {
+                    // Evidence for a future margin-liquidation marker: Binance documents none for
+                    // margin, so a forced liquidation's report looks like any other. These fields
+                    // are where one would show.
+                    debug!(
+                        symbol = report.symbol.as_deref().unwrap_or("?"),
+                        order_id = ?report.order_id,
+                        client_order_id = report.client_order_id.as_deref().unwrap_or("?"),
+                        order_type = report.order_type.as_deref().unwrap_or("?"),
+                        execution_type = report.execution_type.as_deref().unwrap_or("?"),
+                        order_status = report.order_status.as_deref().unwrap_or("?"),
+                        "BinanceMargin executionReport"
+                    );
+                    convert_execution_report(&report, ExchangeId::BinanceMargin, buf);
+                }
                 Err(e) => {
                     warn!(error = %e, frame = frame_excerpt(event_raw), "BinanceMargin: undeserializable executionReport, dropping")
                 }
@@ -1785,22 +2210,12 @@ fn convert_margin_user_data_events_with(
         "USER_LIABILITY_CHANGE" | "userLiabilityChange" => {
             // Observable, NOT accumulated into balance state: borrow/repay is a
             // delta, and folding it in would be the position tracking the library refuses. Surfaced
-            // via logs; consumers needing exact live debt refresh via account_snapshot. Always
-            // deserialized (rare borrow/repay path, not per-frame) so a parse failure — exchange
-            // schema drift — is surfaced at WARN rather than silently dropped, even when INFO is
-            // filtered out (observable failures over silent ones). The success log itself is INFO-gated.
+            // via logs, naming this stream (the risk data stream logs its copy too); consumers
+            // needing exact live debt refresh via account_snapshot. Always deserialized (rare
+            // borrow/repay path, not per-frame) so a parse failure — exchange schema drift — is
+            // surfaced at WARN rather than silently dropped (observable failures over silent ones).
             match serde_json::from_str::<UserLiabilityChange>(event_raw) {
-                Ok(c) => {
-                    if tracing::enabled!(tracing::Level::INFO) {
-                        info!(
-                            asset = c.a.as_deref().unwrap_or("?"),
-                            kind = c.t.as_deref().unwrap_or("?"),
-                            principal = c.p.as_deref().unwrap_or("?"),
-                            interest = c.i.as_deref().unwrap_or("?"),
-                            "BinanceMargin USER_LIABILITY_CHANGE (observable; not applied to balance state)"
-                        );
-                    }
-                }
+                Ok(c) => log_liability_change(&c, "user data"),
                 Err(e) => warn!(
                     error = %e,
                     frame = frame_excerpt(event_raw),
@@ -1810,23 +2225,21 @@ fn convert_margin_user_data_events_with(
             false
         }
         "MARGIN_LEVEL_STATUS_CHANGE" | "marginLevelStatusChange" => {
-            // Liquidation-risk signal — observable, no policy (the library takes no defensive action).
-            // The level guard skips the deserialize allocation when WARN is filtered out, mirroring
-            // USER_LIABILITY_CHANGE above. A parse failure on a liquidation-risk frame is surfaced
-            // rather than dropped silently (observable failures over silent ones).
-            if tracing::enabled!(tracing::Level::WARN) {
-                match serde_json::from_str::<MarginLevelStatusChange>(event_raw) {
-                    Ok(c) => warn!(
-                        margin_level = c.l.as_deref().unwrap_or("?"),
-                        status = c.s.as_deref().unwrap_or("?"),
-                        "BinanceMargin MARGIN_LEVEL_STATUS_CHANGE (liquidation risk; observable, no policy)"
-                    ),
-                    Err(e) => warn!(
-                        error = %e,
-                        frame = frame_excerpt(event_raw),
-                        "BinanceMargin: undeserializable MARGIN_LEVEL_STATUS_CHANGE, dropping"
-                    ),
+            // Forwarded as a Notice; what to do about it is the consumer's policy. The risk data
+            // stream may send the same change, and the listener's dedup gate delivers it once.
+            match serde_json::from_str::<MarginLevelStatusChange>(event_raw) {
+                Ok(change) => {
+                    log_margin_level_change(&change, "user data");
+                    buf.extend(margin_level_notice(
+                        change,
+                        notice_instrument(subscription_id),
+                    ));
                 }
+                Err(e) => warn!(
+                    error = %e,
+                    frame = frame_excerpt(event_raw),
+                    "BinanceMargin: undeserializable MARGIN_LEVEL_STATUS_CHANGE, dropping"
+                ),
             }
             false
         }
@@ -1996,10 +2409,11 @@ fn route_isolated_account_position(
 /// Register the WS-API event-dispatch callback shared by both margin managers.
 ///
 /// Single-sources the demux/dedup/dispatch + heartbeat + terminal-signal logic the cross and
-/// isolated managers both need; only the `outboundAccountPosition` (balance) arm differs and is
-/// supplied as `handle_position` (cross → account-wide `BalanceStreamUpdate` via
-/// [`cross_account_position_handler`]; isolated → per-instrument `InstrumentBalanceUpdate` via
-/// [`route_isolated_account_position`]). Returns the [`Subscription`] handle; the caller must
+/// isolated managers both need; only the `outboundAccountPosition` (balance) arm and the
+/// instrument a margin notice names differ, supplied as `handle_position` (cross → account-wide
+/// `BalanceStreamUpdate` via [`cross_account_position_handler`]; isolated → per-instrument
+/// `InstrumentBalanceUpdate` via [`route_isolated_account_position`]) and `notice_instrument`
+/// ([`cross_notice_instrument`]; [`isolated_notice_instrument`]). Returns the [`Subscription`] handle; the caller must
 /// `unsubscribe()` it on disconnect. `heartbeat_flag` is shared with the caller's monitor loop
 /// (set on every inbound frame/ping); `signal_tx` fires once on a terminal condition
 /// (consumer-drop, socket error/close, or exchange `eventStreamTerminated`). Each event `known`
@@ -2017,6 +2431,7 @@ fn register_user_data_listener(
         &mut Vec<UnindexedAccountEvent>,
     ) + Send
     + 'static,
+    mut notice_instrument: impl FnMut(Option<i64>) -> Option<InstrumentNameExchange> + Send + 'static,
 ) -> Subscription {
     let mut signal_tx_opt = Some(signal_tx);
     let mut event_tx = Some(tx);
@@ -2039,6 +2454,7 @@ fn register_user_data_listener(
                     &json_str,
                     &mut event_buf,
                     &mut handle_position,
+                    &mut notice_instrument,
                 );
                 for ev in event_buf.drain(..) {
                     if let Some(key) = dedup_key_from_event(&ev)
@@ -2105,7 +2521,9 @@ fn register_user_data_listener(
 ///
 /// `myTrades` reports executions only, with no cumulative, so each recovered trade's
 /// `order_filled_quantity` is rebuilt from its order's executions by
-/// [`recovered_order_totals`]. A trade whose order could not be looked up keeps `None`.
+/// [`recovered_order_totals`]. Nor does it carry a client order id, so each recovered trade's
+/// `client_order_id` is then read from its order by [`recovered_order_cids`], with whatever time
+/// the walks left. A trade whose order could not be looked up keeps `None` in either.
 ///
 /// Margin `myTrades` is read by time in windows under 24 hours (see
 /// [`paginate_margin_my_trades`]), so each day of a gap before its first fill costs one sequential
@@ -2189,12 +2607,24 @@ async fn recover_margin_fills(
                         },
                     )
                     .await;
+                    // After the walks, so these reads only use time the walks left: the walks
+                    // matter more, since a fill without a cumulative leaves its order behind.
+                    let cids = recovered_order_cids(
+                        ExchangeId::BinanceMargin,
+                        &inst,
+                        &raw,
+                        order_executions_deadline,
+                        |order_id| fetch_margin_order_cid(&rest, &rl, &inst, order_id, is_isolated),
+                    )
+                    .await;
                     let trades = raw
                         .iter()
                         .filter_map(|t| {
                             let mut trade = convert_margin_trade(t, &inst)?;
                             trade.order_filled_quantity =
                                 t.id.and_then(|id| totals.get(&id).copied());
+                            trade.client_order_id =
+                                t.order_id.and_then(|id| cids.get(&id).cloned());
                             Some(trade)
                         })
                         .collect::<Vec<_>>();
@@ -2396,6 +2826,7 @@ async fn margin_connection_manager(
             heartbeat_flag.clone(),
             signal_tx,
             cross_account_position_handler,
+            cross_notice_instrument,
         );
 
         // --- Subscribe (token is the sole auth) ---
@@ -2721,6 +3152,10 @@ async fn isolated_connect_and_subscribe(
             route_isolated_account_position(position, subscription_id, &sub_map, &base_quote, buf);
         }
     };
+    let notice_instrument = {
+        let sub_map = sub_map.clone();
+        move |subscription_id| isolated_notice_instrument(subscription_id, &sub_map)
+    };
     // Register BEFORE subscribing so a pushed event arriving mid-fan-out is not missed.
     let subscription = register_user_data_listener(
         &ws,
@@ -2730,6 +3165,7 @@ async fn isolated_connect_and_subscribe(
         heartbeat_flag.clone(),
         signal_tx,
         handle_position,
+        notice_instrument,
     );
 
     let earliest_expiry_ms = earliest_token_expiry_ms(tokens);
@@ -3155,6 +3591,45 @@ async fn fetch_margin_order_lookup(
                 OrderLookup::Ended(Box::new(order))
             }),
     )
+}
+
+/// The client order id of the order `order_id` on `instrument`, read with
+/// `GET /sapi/v1/margin/order` (weight 10) in the cross or isolated account as `is_isolated`
+/// says, for fill recovery: `myTrades` carries none. `None` if Binance reports none, or does not
+/// know the order.
+async fn fetch_margin_order_cid(
+    rest: &Arc<RestApi>,
+    rate_limiter: &RateLimitTracker,
+    instrument: &InstrumentNameExchange,
+    order_id: i64,
+    is_isolated: bool,
+) -> Result<Option<ClientOrderId>, UnindexedClientError> {
+    let symbol = instrument.name().to_string();
+    let isolated = QueryMarginAccountsOrderIsIsolatedEnum::from_flag(is_isolated);
+    let response = match rest_call_with_retry(rest, rate_limiter, RequestKind::Essential, |rest| {
+        let (symbol, isolated) = (symbol.clone(), isolated.clone());
+        Box::pin(async move {
+            let params = QueryMarginAccountsOrderParams::builder(symbol)
+                .order_id(order_id)
+                .is_isolated(isolated)
+                .build()?;
+            rest.query_margin_accounts_order(params).await
+        })
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(e) if is_unknown_order(&e) => {
+            debug!(%instrument, order_id, error = %e, "BinanceMargin does not know this order");
+            return Ok(None);
+        }
+        Err(e) => return Err(classify_rest_query_error(&e, Some(instrument))),
+    };
+    let row = response.data().await.map_err(response_decode_error)?;
+    Ok(row
+        .client_order_id
+        .filter(|cid| !cid.is_empty())
+        .map(ClientOrderId::new))
 }
 
 /// The client order ids `GET /sapi/v1/margin/openOrders` lists on `instruments` (weight 10 each,
@@ -3775,8 +4250,8 @@ enum BuildOrderError {
     Unsupported,
     /// The SDK params builder rejected the inputs (carries the builder's error message).
     Build(String),
-    /// A `TrailingStop`'s offset cannot be sent as `trailingDelta`.
-    TrailingDelta(TrailingDeltaError),
+    /// A trailing order cannot be sent as asked.
+    Trailing(TrailingOrderError),
 }
 
 /// Construct a margin endpoint's `isIsolated` parameter enum from the configured margin mode.
@@ -3816,6 +4291,7 @@ impl_isolated_flag!(
     QueryMarginAccountsOpenOrdersIsIsolatedEnum,
     QueryMarginAccountsOrderIsIsolatedEnum,
     QueryMarginAccountsTradeListIsIsolatedEnum,
+    GetFutureHourlyInterestRateIsIsolatedEnum,
 );
 
 /// Build the margin cancel-order params (pure; no I/O).
@@ -3898,9 +4374,21 @@ fn build_new_order_params(
         builder = builder.time_in_force(tif);
     }
 
-    // Conditional price fields (mirror spot): LIMIT carries price; STOP/TAKE_PROFIT carry a stop
-    // (trigger) price; the *_LIMIT variants carry both; a trailing STOP_LOSS carries a
-    // trailingDelta.
+    // A trailing order's trailingDelta, fixed limit and activation price (as stopPrice), as on
+    // spot.
+    if let Some(trailing) = trailing_params(&kind, price).map_err(BuildOrderError::Trailing)? {
+        builder = builder.trailing_delta(i64::from(trailing.trailing_delta));
+        if let Some(limit) = trailing.price {
+            builder = builder.price(limit);
+        }
+        if let Some(activation_price) = trailing.stop_price {
+            builder = builder.stop_price(activation_price);
+        }
+    }
+
+    // The other kinds' price fields (mirror spot): LIMIT carries price; STOP/TAKE_PROFIT carry a
+    // stop (trigger) price; the *_LIMIT variants carry both. No wildcard, so that a new OrderKind
+    // fails to compile until it is handled here.
     match kind {
         OrderKind::Limit => {
             builder = builder.price(price);
@@ -3911,18 +4399,12 @@ fn build_new_order_params(
         OrderKind::StopLimit { trigger_price } | OrderKind::TakeProfitLimit { trigger_price } => {
             builder = builder.price(price).stop_price(trigger_price);
         }
-        OrderKind::TrailingStop {
-            offset,
-            offset_type,
-        } => {
-            let basis_points = trailing_delta_basis_points(offset, offset_type)
-                .map_err(BuildOrderError::TrailingDelta)?;
-            builder = builder.trailing_delta(i64::from(basis_points));
-        }
-        // Market carries no price/stop_price; TrailingStopLimit is rejected earlier by
-        // convert_order_kind_tif_margin. A future OrderKind needing price fields that lands here
-        // would surface as a BuildOrderError::Build from the SDK builder, not a silent bad order.
-        _ => {}
+        // Trailing orders are set above. Market carries no price, and TrailingStopLimit is
+        // rejected by convert_order_kind_tif_margin before this.
+        OrderKind::TrailingStop { .. }
+        | OrderKind::TrailingStopFixedLimit { .. }
+        | OrderKind::Market
+        | OrderKind::TrailingStopLimit { .. } => {}
     }
 
     builder
@@ -3937,8 +4419,9 @@ fn build_new_order_params(
 /// [`MarginAccountNewOrderTimeInForceEnum`]. Mirrors spot's own `convert_order_kind_tif` adapter.
 ///
 /// Returns `None` for unsupported combinations, as spot does: a `TrailingStop` maps to a
-/// `STOP_LOSS` (with the `trailingDelta` [`build_new_order_params`] adds), and `TrailingStopLimit`
-/// and Absolute trailing offsets are unsupported.
+/// `STOP_LOSS` and a `TrailingStopFixedLimit` to a `STOP_LOSS_LIMIT` (with the `trailingDelta`
+/// [`build_new_order_params`] adds), and `TrailingStopLimit` and Absolute trailing offsets are
+/// unsupported.
 fn convert_order_kind_tif_margin(
     kind: OrderKind,
     tif: TimeInForce,
@@ -3969,6 +4452,7 @@ fn convert_order_kind_tif_margin(
 mod tests {
     use super::*;
     use crate::client::binance::shared::convert_open_order;
+    use crate::notice::{AccountNotice, NoticeKind};
     use crate::order::state::ActiveOrderState;
     use binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner;
 
@@ -4432,6 +4916,7 @@ mod tests {
                 OrderKind::TrailingStop {
                     offset,
                     offset_type,
+                    activation_price: None,
                 },
                 gtc(),
                 MarginSideEffect::NoBorrow,
@@ -4445,6 +4930,102 @@ mod tests {
         }
     }
 
+    /// An activation price goes as `stopPrice`. A `TrailingStopFixedLimit` is a
+    /// `STOP_LOSS_LIMIT` with `trailingDelta`, its fixed limit as `price`, and a stop-limit's time
+    /// in force.
+    #[test]
+    fn trailing_orders_carry_their_activation_price_and_fixed_limit() {
+        let activation = Some(Decimal::from(50_000));
+        let trailing_stop = params(
+            Side::Sell,
+            None,
+            OrderKind::TrailingStop {
+                offset: Decimal::from(25),
+                offset_type: TrailingOffsetType::BasisPoints,
+                activation_price: activation,
+            },
+            gtc(),
+            MarginSideEffect::NoBorrow,
+        )
+        .expect("build");
+        assert_eq!(trailing_stop.r#type.as_str(), "STOP_LOSS");
+        assert_eq!(trailing_stop.trailing_delta, Some(25));
+        assert_eq!(trailing_stop.stop_price, activation);
+        assert_eq!(trailing_stop.price, None);
+
+        for activation_price in [None, activation] {
+            let fixed_limit = params(
+                Side::Sell,
+                Some(Decimal::from(49_000)),
+                OrderKind::TrailingStopFixedLimit {
+                    offset: Decimal::new(15, 1),
+                    offset_type: TrailingOffsetType::Percentage,
+                    activation_price,
+                },
+                TimeInForce::ImmediateOrCancel,
+                MarginSideEffect::NoBorrow,
+            )
+            .expect("build");
+            assert_eq!(fixed_limit.r#type.as_str(), "STOP_LOSS_LIMIT");
+            assert_eq!(fixed_limit.trailing_delta, Some(150));
+            assert_eq!(fixed_limit.price, Some(Decimal::from(49_000)));
+            assert_eq!(fixed_limit.stop_price, activation_price);
+            assert_eq!(
+                fixed_limit.time_in_force.as_ref().map(|t| t.as_str()),
+                Some("IOC")
+            );
+        }
+
+        let absolute = params(
+            Side::Sell,
+            Some(Decimal::from(49_000)),
+            OrderKind::TrailingStopFixedLimit {
+                offset: Decimal::from(100),
+                offset_type: TrailingOffsetType::Absolute,
+                activation_price: None,
+            },
+            gtc(),
+            MarginSideEffect::NoBorrow,
+        );
+        assert!(matches!(absolute, Err(BuildOrderError::Unsupported)));
+
+        // Refused unsent: a fixed limit without its price, and an activation price of zero.
+        let no_limit = params(
+            Side::Sell,
+            None,
+            OrderKind::TrailingStopFixedLimit {
+                offset: Decimal::from(25),
+                offset_type: TrailingOffsetType::BasisPoints,
+                activation_price: None,
+            },
+            gtc(),
+            MarginSideEffect::NoBorrow,
+        );
+        assert!(matches!(
+            no_limit,
+            Err(BuildOrderError::Trailing(TrailingOrderError::LimitPrice(
+                None
+            )))
+        ));
+        let zero_activation = params(
+            Side::Sell,
+            None,
+            OrderKind::TrailingStop {
+                offset: Decimal::from(25),
+                offset_type: TrailingOffsetType::BasisPoints,
+                activation_price: Some(Decimal::ZERO),
+            },
+            gtc(),
+            MarginSideEffect::NoBorrow,
+        );
+        assert!(matches!(
+            zero_activation,
+            Err(BuildOrderError::Trailing(
+                TrailingOrderError::NonPositiveActivation(_)
+            ))
+        ));
+    }
+
     #[test]
     fn absolute_trailing_offsets_and_trailing_stop_limits_are_unsupported() {
         let absolute = params(
@@ -4453,6 +5034,7 @@ mod tests {
             OrderKind::TrailingStop {
                 offset: Decimal::from(100),
                 offset_type: TrailingOffsetType::Absolute,
+                activation_price: None,
             },
             gtc(),
             MarginSideEffect::AutoBorrowRepay,
@@ -4486,14 +5068,15 @@ mod tests {
             OrderKind::TrailingStop {
                 offset: Decimal::new(155, 3),
                 offset_type: TrailingOffsetType::Percentage,
+                activation_price: None,
             },
             gtc(),
             MarginSideEffect::AutoBorrowRepay,
         );
         assert!(matches!(
             fractional,
-            Err(BuildOrderError::TrailingDelta(TrailingDeltaError::Invalid(
-                _
+            Err(BuildOrderError::Trailing(TrailingOrderError::Delta(
+                crate::client::binance::shared::TrailingDeltaError::Invalid(_)
             )))
         ));
     }
@@ -5109,6 +5692,7 @@ mod tests {
                 OrderKind::TrailingStop {
                     offset: Decimal::from(25),
                     offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price: None,
                 }
             );
             assert_eq!(snapshot.0.price, None);
@@ -5147,6 +5731,7 @@ mod tests {
                 assert_eq!(t.quantity, Decimal::new(5, 1));
                 assert_eq!(t.fees.asset.name().as_str(), "BNB"); // 3rd-party fee asset preserved
                 assert_eq!(t.fees.fees, Decimal::new(1, 3));
+                assert_eq!(t.client_order_id, Some(ClientOrderId::new("cid-1")));
             }
             other => panic!("expected Trade, got {other:?}"),
         }
@@ -5246,6 +5831,25 @@ mod tests {
         }
     }
 
+    /// A report without `c` gives its fill no client order id, rather than the exchange id the
+    /// order snapshot falls back to.
+    #[test]
+    fn margin_ws_trade_without_a_client_order_id_reports_none() {
+        let frame = push(serde_json::json!({
+            "e": "executionReport", "s": "BTCUSDT", "S": "SELL", "o": "MARKET",
+            "x": "TRADE", "X": "FILLED", "i": 12_345_i64,
+            "t": 99_i64, "l": "1", "L": "48000", "z": "1",
+            "q": "1", "n": "0", "N": "USDT", "T": 1_700_000_000_000_i64,
+        }));
+        let mut buf = Vec::new();
+        assert!(!convert_margin_user_data_events(&frame, &mut buf));
+        let AccountEventKind::Trade(trade) = &buf[0].kind else {
+            panic!("expected Trade, got {:?}", buf[0].kind);
+        };
+        assert_eq!(trade.order_id.0.as_str(), "12345");
+        assert_eq!(trade.client_order_id, None);
+    }
+
     #[test]
     fn margin_ws_execution_report_missing_symbol_is_dropped() {
         // Symbol absent → defensively dropped (observable warn), never a half-built event.
@@ -5288,18 +5892,104 @@ mod tests {
     }
 
     #[test]
-    fn margin_ws_margin_specific_events_are_observable_only() {
-        // USER_LIABILITY_CHANGE / MARGIN_LEVEL_STATUS_CHANGE are logged, NOT forwarded as account
-        // events and NOT signalled as reconnects: observable, not accumulated.
+    fn margin_ws_liability_change_is_observable_only() {
+        // USER_LIABILITY_CHANGE is logged, NOT forwarded as an account event and NOT signalled as
+        // a reconnect: observable, not accumulated.
         let mut buf = Vec::new();
         assert!(!convert_margin_user_data_events(
             &push(documented_liability_change("USER_LIABILITY_CHANGE")),
             &mut buf
         ));
+        assert!(buf.is_empty());
+    }
+
+    /// The notice a converter pushed, which must be its only event.
+    fn only_notice(buf: &[UnindexedAccountEvent]) -> &AccountNotice<InstrumentNameExchange> {
+        match buf {
+            [
+                UnindexedAccountEvent {
+                    exchange: ExchangeId::BinanceMargin,
+                    kind: AccountEventKind::Notice(notice),
+                },
+            ] => notice,
+            other => panic!("expected one BinanceMargin notice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn margin_ws_margin_level_change_is_forwarded_as_a_notice() {
+        let mut buf = Vec::new();
         assert!(!convert_margin_user_data_events(
             &push(documented_margin_level_change("MARGIN_LEVEL_STATUS_CHANGE")),
             &mut buf
         ));
+        assert_eq!(
+            only_notice(&buf),
+            &AccountNotice::new(
+                NoticeKind::MarginCall,
+                None,
+                Utc.timestamp_millis_opt(1_573_200_697_110).unwrap(),
+                Some(Decimal::new(125, 2)),
+                SmolStr::new("MARGIN_CALL"),
+            ),
+            "cross names no instrument"
+        );
+    }
+
+    #[test]
+    fn margin_level_statuses_map_to_notice_kinds() {
+        for (status, kind) in [
+            ("MARGIN_CALL", NoticeKind::MarginCall),
+            ("PRE_LIQUIDATION", NoticeKind::LiquidationWarning),
+            ("FORCE_LIQUIDATION", NoticeKind::Liquidation),
+            ("NORMAL", NoticeKind::MarginRestored),
+            ("EXCESSIVE", NoticeKind::MarginRestored),
+            ("SOME_FUTURE_STATUS", NoticeKind::Other),
+        ] {
+            let mut buf = Vec::new();
+            let frame = push(serde_json::json!({
+                "e": "MARGIN_LEVEL_STATUS_CHANGE", "E": 1_700_000_000_000_i64, "l": "1.5",
+                "s": status,
+            }));
+            convert_margin_user_data_events(&frame, &mut buf);
+            let notice = only_notice(&buf);
+            assert_eq!(notice.kind, kind, "{status}");
+            assert_eq!(notice.status, status, "the raw status is kept");
+        }
+    }
+
+    #[test]
+    fn a_margin_level_change_missing_parts_is_still_delivered_where_it_can_be() {
+        // No readable margin level: delivered without one.
+        let mut buf = Vec::new();
+        convert_margin_user_data_events(
+            &push(serde_json::json!({
+                "e": "MARGIN_LEVEL_STATUS_CHANGE", "E": 1_700_000_000_000_i64, "l": "n/a",
+                "s": "FORCE_LIQUIDATION",
+            })),
+            &mut buf,
+        );
+        let notice = only_notice(&buf);
+        assert_eq!(notice.kind, NoticeKind::Liquidation);
+        assert_eq!(notice.margin_level, None);
+
+        // No time: stamped now.
+        let before = Utc::now();
+        let mut buf = Vec::new();
+        convert_margin_user_data_events(
+            &push(serde_json::json!({ "e": "MARGIN_LEVEL_STATUS_CHANGE", "s": "MARGIN_CALL" })),
+            &mut buf,
+        );
+        assert!(only_notice(&buf).time_exchange >= before);
+
+        // No status: nothing to classify, dropped.
+        let mut buf = Vec::new();
+        convert_margin_user_data_events(
+            &push(serde_json::json!({
+                "e": "MARGIN_LEVEL_STATUS_CHANGE", "E": 1_700_000_000_000_i64, "l": "1.5",
+            })),
+            &mut buf,
+        );
         assert!(buf.is_empty());
     }
 
@@ -5333,7 +6023,7 @@ mod tests {
             (
                 "MARGIN_LEVEL_STATUS_CHANGE",
                 documented_margin_level_change("MARGIN_LEVEL_STATUS_CHANGE"),
-                "MARGIN_LEVEL_STATUS_CHANGE (liquidation risk",
+                "MARGIN_LEVEL_STATUS_CHANGE received",
             ),
             // Accepted until a live frame settles which spelling the userListenToken stream sends.
             (
@@ -5344,14 +6034,19 @@ mod tests {
             (
                 "marginLevelStatusChange",
                 documented_margin_level_change("marginLevelStatusChange"),
-                "MARGIN_LEVEL_STATUS_CHANGE (liquidation risk",
+                "MARGIN_LEVEL_STATUS_CHANGE received",
             ),
         ] {
             let mut buf = Vec::new();
             let (terminated, messages) =
                 log_messages(|| convert_margin_user_data_events(&push(frame), &mut buf));
             assert!(!terminated, "{e}");
-            assert!(buf.is_empty(), "{e}");
+            // Only the margin-level arm forwards anything: its notice.
+            assert_eq!(
+                buf.len(),
+                usize::from(expected.starts_with("MARGIN")),
+                "{e}"
+            );
             assert!(
                 messages.iter().any(|m| m.contains(expected)),
                 "{e}: expected its own arm's log, got {messages:?}"
@@ -5677,6 +6372,81 @@ mod tests {
     }
 
     #[test]
+    fn isolated_margin_level_change_names_its_subscriptions_pair_or_none() {
+        let sub_map = Arc::new(Mutex::new(HashMap::from([(7_i64, btcusdt())])));
+        let notice_on = |subscription_id: i64| {
+            let mut buf = Vec::new();
+            let frame = push_with_sub(
+                subscription_id,
+                documented_margin_level_change("MARGIN_LEVEL_STATUS_CHANGE"),
+            );
+            assert!(!convert_margin_user_data_events_with(
+                &frame,
+                &mut buf,
+                &mut cross_account_position_handler,
+                &mut |id| isolated_notice_instrument(id, &sub_map),
+            ));
+            only_notice(&buf).instrument.clone()
+        };
+
+        assert_eq!(notice_on(7), Some(btcusdt()));
+        // Unmapped: still delivered, unattributed, rather than dropped like a balance frame.
+        assert_eq!(notice_on(99), None);
+        // No subscriptionId at all.
+        assert_eq!(isolated_notice_instrument(None, &sub_map), None);
+    }
+
+    #[test]
+    fn the_two_streams_key_one_notice_alike() {
+        // The same change, as each stream frames it, must collide in the shared cache.
+        use crate::client::binance::margin_risk::{RiskFrame, convert_risk_frame};
+
+        let change = documented_margin_level_change("MARGIN_LEVEL_STATUS_CHANGE");
+        let mut from_user_data = Vec::new();
+        convert_margin_user_data_events(&push(change.clone()), &mut from_user_data);
+        let mut from_risk = Vec::new();
+        let risk_frame = serde_json::json!({ "stream": "listen-key", "data": change });
+        assert_eq!(
+            convert_risk_frame(&risk_frame.to_string(), "listen-key", &mut from_risk),
+            RiskFrame::Continue
+        );
+
+        let dedup = new_dedup_cache();
+        let key = |events: &[UnindexedAccountEvent]| dedup_key_from_event(&events[0]).unwrap();
+        assert!(!is_duplicate(&dedup, key(&from_user_data)));
+        assert!(
+            is_duplicate(&dedup, key(&from_risk)),
+            "the risk data stream's copy is dropped"
+        );
+    }
+
+    #[test]
+    fn a_notice_from_both_streams_is_delivered_once() {
+        // The user-data stream and the risk data stream key a notice alike (status + event time),
+        // so the shared cache drops the second copy whichever arrives first. A later change with
+        // the same status is a new notice.
+        let dedup = new_dedup_cache();
+        let notice = |time_ms: i64| {
+            let mut buf = Vec::new();
+            convert_margin_user_data_events(
+                &push(serde_json::json!({
+                    "e": "MARGIN_LEVEL_STATUS_CHANGE", "E": time_ms, "l": "1.1",
+                    "s": "MARGIN_CALL",
+                })),
+                &mut buf,
+            );
+            buf.pop().unwrap()
+        };
+        let is_new = |event: &UnindexedAccountEvent| {
+            !is_duplicate(&dedup, dedup_key_from_event(event).unwrap())
+        };
+
+        assert!(is_new(&notice(1_700_000_000_000)));
+        assert!(!is_new(&notice(1_700_000_000_000)), "second copy dropped");
+        assert!(is_new(&notice(1_700_000_060_000)), "a later notice is new");
+    }
+
+    #[test]
     fn isolated_outbound_position_routes_to_instrument_balance_update() {
         let sub_map = Arc::new(Mutex::new(HashMap::from([(7_i64, btcusdt())])));
         let base_quote = Arc::new(HashMap::from([(
@@ -5703,7 +6473,8 @@ mod tests {
         assert!(!convert_margin_user_data_events_with(
             &frame,
             &mut buf,
-            &mut handler
+            &mut handler,
+            &mut cross_notice_instrument,
         ));
         assert_eq!(buf.len(), 1, "one InstrumentBalanceUpdate for the pair");
         match &buf[0].kind {
@@ -5749,7 +6520,8 @@ mod tests {
         assert!(!convert_margin_user_data_events_with(
             &frame,
             &mut buf,
-            &mut handler
+            &mut handler,
+            &mut cross_notice_instrument,
         ));
         assert!(buf.is_empty(), "unmapped subscriptionId frame is dropped");
     }
@@ -5779,7 +6551,8 @@ mod tests {
         assert!(!convert_margin_user_data_events_with(
             &frame,
             &mut buf,
-            &mut handler
+            &mut handler,
+            &mut cross_notice_instrument,
         ));
         assert!(buf.is_empty(), "missing quote side → frame dropped");
     }
@@ -5806,7 +6579,8 @@ mod tests {
         assert!(!convert_margin_user_data_events_with(
             &frame,
             &mut buf,
-            &mut handler
+            &mut handler,
+            &mut cross_notice_instrument,
         ));
         assert_eq!(buf.len(), 2, "the execution and its order snapshot");
         match &buf[0].kind {
@@ -5932,6 +6706,106 @@ mod tests {
             .map(|request| request.url.query_pairs().into_owned().collect())
             .collect();
         (read.into_iter().map(|t| t.id.unwrap()).collect(), requests)
+    }
+
+    /// Recovery reads each recovered fill's order once, in the account it trades, for the client
+    /// order id `myTrades` lacks. An order Binance no longer knows leaves its fill without one.
+    #[tokio::test]
+    async fn recovered_margin_fills_carry_their_orders_client_order_ids() {
+        recovered_margin_fills_carry_client_order_ids(true).await;
+        recovered_margin_fills_carry_client_order_ids(false).await;
+    }
+
+    async fn recovered_margin_fills_carry_client_order_ids(is_isolated: bool) {
+        let disconnect = Utc::now() - chrono::Duration::minutes(10);
+        let reconnect = Utc::now() - chrono::Duration::minutes(5);
+        let fill_time = (disconnect + chrono::Duration::minutes(1)).timestamp_millis();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/myTrades"))
+            .respond_with(MarginMyTradesVenue {
+                trades: vec![(1, fill_time, 1), (2, fill_time, 2)],
+                end_exclusive: false,
+            })
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+            .and(wiremock::matchers::query_param("orderId", "1"))
+            .and(wiremock::matchers::query_param(
+                "isIsolated",
+                if is_isolated { "TRUE" } else { "FALSE" },
+            ))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"symbol": "BTCUSDT", "orderId": 1, "clientOrderId": "repay-1"}),
+            ))
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+            .and(wiremock::matchers::query_param("orderId", "2"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400).set_body_json(
+                    serde_json::json!({"code": -2013, "msg": "Order does not exist."}),
+                ),
+            )
+            .mount(&server)
+            .await;
+        let rest = Arc::new(MarginTradingRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(server.uri())
+                .build()
+                .unwrap(),
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut unrecovered = UnrecoveredFills::default();
+        unrecovered.open(
+            &[InstrumentNameExchange::new("BTCUSDT")],
+            disconnect,
+            reconnect,
+        );
+
+        recover_margin_fills(
+            &rest,
+            &Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
+            &mut unrecovered,
+            &tx,
+            &new_dedup_cache(),
+            &KnownLiveOrders::shared(ExchangeId::BinanceMargin),
+            is_isolated,
+        )
+        .await;
+
+        let mut cids: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|event| match event.kind {
+                AccountEventKind::Trade(trade) => Some((
+                    trade.id.0.to_string(),
+                    trade.client_order_id,
+                    trade.order_filled_quantity.is_some(),
+                )),
+                _ => None,
+            })
+            .collect();
+        cids.sort();
+        // The cumulatives from the walks, read first, are untouched by the reads after them.
+        assert_eq!(
+            cids,
+            [
+                ("1".to_string(), Some(ClientOrderId::new("repay-1")), true),
+                ("2".to_string(), None, true),
+            ],
+            "is_isolated: {is_isolated}"
+        );
+        let order_reads = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == "/sapi/v1/margin/order")
+            .count();
+        assert_eq!(order_reads, 2, "one read per order");
     }
 
     /// A venue whose trades each belong to an order of the same id.
@@ -6561,7 +7435,10 @@ mod tests {
     }
 
     /// A client of the cross account, or of the isolated BTCUSDT one, talking to `server`.
-    fn margin_client_at(server: &wiremock::MockServer, is_isolated: bool) -> BinanceMargin {
+    pub(super) fn margin_client_at(
+        server: &wiremock::MockServer,
+        is_isolated: bool,
+    ) -> BinanceMargin {
         let config = if is_isolated {
             BinanceMarginConfig::isolated(
                 "key".into(),
@@ -6725,6 +7602,7 @@ mod tests {
         let trailing_stop = OrderKind::TrailingStop {
             offset: Decimal::from(25),
             offset_type: TrailingOffsetType::BasisPoints,
+            activation_price: None,
         };
         let hold = |known: &SharedKnownLiveOrders| {
             known.lock().live(
@@ -6916,6 +7794,7 @@ mod tests {
             request.state.kind = OrderKind::TrailingStop {
                 offset,
                 offset_type: TrailingOffsetType::BasisPoints,
+                activation_price: None,
             };
             request
         };
@@ -7201,5 +8080,306 @@ mod tests {
                 "{cid}: not held, even after a late live report"
             );
         }
+    }
+
+    /// Answer the requests behind `fetch_shortability` and `fetch_borrow_capacity`: the BTCUSDT
+    /// pair on cross and isolated margin, the base asset, its hourly rate and its max borrow.
+    async fn mount_borrow_terms(
+        server: &wiremock::MockServer,
+        pair: serde_json::Value,
+        asset: serde_json::Value,
+        rate: serde_json::Value,
+        max_borrow: serde_json::Value,
+    ) {
+        use wiremock::{
+            Mock, ResponseTemplate,
+            matchers::{method, path},
+        };
+        for (route, body) in [
+            ("/sapi/v1/margin/allPairs", pair.clone()),
+            ("/sapi/v1/margin/isolated/allPairs", pair),
+            ("/sapi/v1/margin/allAssets", asset),
+            ("/sapi/v1/margin/next-hourly-interest-rate", rate),
+            ("/sapi/v1/margin/maxBorrowable", max_borrow),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(server)
+                .await;
+        }
+    }
+
+    fn btcusdt_pair(is_margin_trade: bool, is_sell_allowed: bool) -> serde_json::Value {
+        serde_json::json!([{
+            "base": "BTC", "quote": "USDT", "symbol": "BTCUSDT",
+            "isMarginTrade": is_margin_trade, "isSellAllowed": is_sell_allowed, "isBuyAllowed": true,
+        }])
+    }
+
+    fn btc_asset(is_borrowable: bool) -> serde_json::Value {
+        serde_json::json!([{ "assetName": "BTC", "isBorrowable": is_borrowable }])
+    }
+
+    fn btc_rate(rate: &str) -> serde_json::Value {
+        serde_json::json!([{ "asset": "BTC", "nextHourlyInterestRate": rate }])
+    }
+
+    /// The value of `key` in the query of the request `server` received on `route`.
+    async fn query_value(server: &wiremock::MockServer, route: &str, key: &str) -> Option<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .find(|request| request.url.path() == route)
+            .and_then(|request| {
+                request
+                    .url
+                    .query_pairs()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.into_owned())
+            })
+    }
+
+    #[tokio::test]
+    async fn margin_shortability_reads_the_pair_the_asset_and_the_annualised_rate() {
+        use crate::client::ShortabilityClient;
+        use rust_decimal_macros::dec;
+        for (is_isolated, pairs_route, flag) in [
+            (false, "/sapi/v1/margin/allPairs", "FALSE"),
+            (true, "/sapi/v1/margin/isolated/allPairs", "TRUE"),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            mount_borrow_terms(
+                &server,
+                btcusdt_pair(true, true),
+                btc_asset(true),
+                btc_rate("0.00000571"),
+                serde_json::json!({}),
+            )
+            .await;
+
+            let shortability = margin_client_at(&server, is_isolated)
+                .fetch_shortability(&InstrumentNameExchange::new("BTCUSDT"))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                shortability,
+                Shortability::new()
+                    .with_shortable(true)
+                    .with_fee_rate(dec!(0.00000571) * dec!(8760)),
+                "isolated: {is_isolated}"
+            );
+            assert_eq!(
+                query_value(&server, pairs_route, "symbol").await.as_deref(),
+                Some("BTCUSDT"),
+                "the pair list is asked for the one symbol"
+            );
+            assert_eq!(
+                query_value(&server, "/sapi/v1/margin/allAssets", "asset")
+                    .await
+                    .as_deref(),
+                Some("BTC"),
+                "the base asset is the one borrowed"
+            );
+            let rate = "/sapi/v1/margin/next-hourly-interest-rate";
+            assert_eq!(
+                query_value(&server, rate, "assets").await.as_deref(),
+                Some("BTC")
+            );
+            assert_eq!(
+                query_value(&server, rate, "isIsolated").await.as_deref(),
+                Some(flag)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn margin_shortability_is_refused_by_any_flag_and_unknown_without_them() {
+        use crate::client::ShortabilityClient;
+        let cases = [
+            (btcusdt_pair(false, true), btc_asset(true), Some(false)),
+            (btcusdt_pair(true, false), btc_asset(true), Some(false)),
+            (btcusdt_pair(true, true), btc_asset(false), Some(false)),
+            // Binance does not list the asset, so whether it lends it is unknown.
+            (btcusdt_pair(true, true), serde_json::json!([]), None),
+        ];
+        for (pair, asset, shortable) in cases {
+            let server = wiremock::MockServer::start().await;
+            mount_borrow_terms(
+                &server,
+                pair.clone(),
+                asset.clone(),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            )
+            .await;
+
+            let shortability = margin_client_at(&server, false)
+                .fetch_shortability(&InstrumentNameExchange::new("BTCUSDT"))
+                .await
+                .unwrap();
+
+            assert_eq!(shortability.shortable, shortable, "{pair} {asset}");
+            assert_eq!(
+                shortability.fee_rate, None,
+                "no rate returned is an unknown fee"
+            );
+            assert_eq!(shortability.easy_to_borrow, None);
+            assert_eq!(shortability.available, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn margin_shortability_of_an_unlisted_pair_is_an_invalid_instrument() {
+        use crate::client::ShortabilityClient;
+        let server = wiremock::MockServer::start().await;
+        mount_borrow_terms(
+            &server,
+            serde_json::json!([]),
+            btc_asset(true),
+            btc_rate("0.00000571"),
+            serde_json::json!({}),
+        )
+        .await;
+
+        let result = margin_client_at(&server, false)
+            .fetch_shortability(&InstrumentNameExchange::new("BTCUSDT"))
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(ref instrument, _)))
+                    if instrument.name().as_str() == "BTCUSDT"
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn margin_borrow_capacity_asks_for_the_asset_the_side_borrows() {
+        use crate::client::BorrowCapacityClient;
+        use rust_decimal_macros::dec;
+        for (is_isolated, side, asset, isolated_symbol) in [
+            (false, Side::Sell, "BTC", None),
+            (false, Side::Buy, "USDT", None),
+            (true, Side::Sell, "BTC", Some("BTCUSDT")),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            mount_borrow_terms(
+                &server,
+                btcusdt_pair(true, true),
+                btc_asset(true),
+                btc_rate("0.00000571"),
+                serde_json::json!({ "amount": "1.69248805", "borrowLimit": "60" }),
+            )
+            .await;
+
+            let capacity = margin_client_at(&server, is_isolated)
+                .fetch_borrow_capacity(&InstrumentNameExchange::new("BTCUSDT"), side)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                capacity,
+                BorrowCapacity::new(AssetNameExchange::new(asset))
+                    .with_borrowable_now(dec!(1.69248805))
+                    .with_account_limit(dec!(60)),
+                "{side:?} isolated: {is_isolated}"
+            );
+            let max_borrow = "/sapi/v1/margin/maxBorrowable";
+            assert_eq!(
+                query_value(&server, max_borrow, "asset").await.as_deref(),
+                Some(asset)
+            );
+            assert_eq!(
+                query_value(&server, max_borrow, "isolatedSymbol")
+                    .await
+                    .as_deref(),
+                isolated_symbol,
+                "only isolated margin names the pair's account"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn margin_borrow_capacity_keeps_an_omitted_amount_unknown_and_fails_a_malformed_one() {
+        use crate::client::BorrowCapacityClient;
+        use rust_decimal_macros::dec;
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+
+        let server = wiremock::MockServer::start().await;
+        mount_borrow_terms(
+            &server,
+            btcusdt_pair(true, true),
+            btc_asset(true),
+            btc_rate("0"),
+            serde_json::json!({ "borrowLimit": "60" }),
+        )
+        .await;
+        let capacity = margin_client_at(&server, false)
+            .fetch_borrow_capacity(&instrument, Side::Sell)
+            .await
+            .unwrap();
+        assert_eq!(capacity.borrowable_now, None);
+        assert_eq!(capacity.account_limit, Some(dec!(60)));
+
+        let server = wiremock::MockServer::start().await;
+        mount_borrow_terms(
+            &server,
+            btcusdt_pair(true, true),
+            btc_asset(true),
+            btc_rate("0"),
+            serde_json::json!({ "amount": "lots", "borrowLimit": "60" }),
+        )
+        .await;
+        let result = margin_client_at(&server, false)
+            .fetch_borrow_capacity(&instrument, Side::Sell)
+            .await;
+        assert!(
+            matches!(result, Err(UnindexedClientError::Internal(ref message)) if message.contains("amount")),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn margin_borrow_capacity_without_an_isolated_account_names_the_pair() {
+        use crate::client::BorrowCapacityClient;
+        use wiremock::{
+            Mock,
+            matchers::{method, path},
+        };
+        let server = wiremock::MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sapi/v1/margin/maxBorrowable"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "code": -11001, "msg": "Isolated margin account does not exist."
+                })),
+            )
+            .mount(&server)
+            .await;
+        mount_borrow_terms(
+            &server,
+            btcusdt_pair(true, true),
+            btc_asset(true),
+            btc_rate("0"),
+            serde_json::json!({}),
+        )
+        .await;
+
+        let err = margin_client_at(&server, true)
+            .fetch_borrow_capacity(&InstrumentNameExchange::new("BTCUSDT"), Side::Sell)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "API: request rejected: BTCUSDT: -11001 Isolated margin account does not exist."
+        );
+        assert!(!err.is_transient());
     }
 }

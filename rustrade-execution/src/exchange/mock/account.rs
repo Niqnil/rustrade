@@ -337,6 +337,31 @@ impl AccountState {
         balance.clone()
     }
 
+    /// Moves `amount` of `asset` into the account, or out of it when negative, whatever `free`
+    /// holds.
+    ///
+    /// For a charge the account cannot refuse, such as a holding cost: a venue posts carry whether
+    /// or not the account can cover it. `total` and `free` move together, so what is held stays
+    /// held, and a debit larger than `free` takes `free` below zero rather than being refused. The
+    /// caller reports that, since only it knows what the charge was for.
+    ///
+    /// # Panics
+    /// Panics if `asset` has no balance — see [`reserve`](Self::reserve).
+    pub fn charge(
+        &mut self,
+        asset: &AssetNameExchange,
+        amount: Decimal,
+        time_exchange: DateTime<Utc>,
+    ) -> AssetBalance<AssetNameExchange> {
+        let balance = self.balance_expect(asset);
+
+        balance.balance.total += amount;
+        balance.balance.free += amount;
+        balance.time_exchange = time_exchange;
+
+        balance.clone()
+    }
+
     /// Commits one arriving order's whole ledger effect, or none of it.
     ///
     /// One order's arrival can both settle a fill and take a hold: a taker that the book could
@@ -626,6 +651,21 @@ mod tests {
             }
         );
         assert_eq!(usd_balance(&account), Balance::new(dec!(100), dec!(100)));
+    }
+
+    #[test]
+    fn a_charge_moves_total_and_free_together_and_may_take_free_negative() {
+        let mut account = account_with_usd(dec!(100));
+        account
+            .reserve(&usd(), dec!(60), DateTime::<Utc>::MIN_UTC)
+            .unwrap();
+
+        let charged = account.charge(&usd(), dec!(-50), DateTime::<Utc>::MIN_UTC);
+        assert_eq!(charged.balance, Balance::new(dec!(50), dec!(-10)));
+        assert_eq!(usd_balance(&account), Balance::new(dec!(50), dec!(-10)));
+
+        let credited = account.charge(&usd(), dec!(15), DateTime::<Utc>::MIN_UTC);
+        assert_eq!(credited.balance, Balance::new(dec!(65), dec!(5)));
     }
 
     /// A snapshot holding `orders`, as a configured `initial_state` would.

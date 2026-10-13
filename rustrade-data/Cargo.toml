@@ -1,6 +1,6 @@
 [package]
 name = "rustrade-data"
-version = "0.10.1"
+version = "0.11.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -20,13 +20,7 @@ all-features = true
 default = []
 ibkr = ["dep:ibapi", "dep:time", "dep:quick-xml", "rustrade-instrument/ibkr"]
 hyperliquid = ["dep:hyperliquid_rust_sdk", "rustrade-instrument/hyperliquid"]
-# `serde-with-float` provides the field-level `rust_decimal::serde::float` / `float_option`
-# helpers the clients use to deserialize `new_rate`/`old_rate` (and Massive's price/size) JSON
-# numbers into `Decimal`. It deliberately does NOT enable the global `serde-float` feature, whose
-# extra effect is to flip every `Decimal`'s default serialization workspace-wide to a lossy f64
-# number (Cargo unifies features across the build). Keeping it field-level preserves the
-# deterministic, lossless string wire format for all other `Decimal` values.
-alpaca = ["rust_decimal/serde-with-float", "serde_json/raw_value"]
+alpaca = ["serde_json/raw_value"]
 databento = ["dep:databento"]
 # London Strategic Edge. No extra dependencies today; the feature exists so the integration is
 # opt-in from the start, matching every other provider in this crate.
@@ -46,7 +40,7 @@ lse = ["dep:sha2", "dep:hex", "reqwest/stream", "tokio/fs", "tokio/io-util"]
 # The column-reader API this uses needs none of it. Tier-2 reviewed — see
 # `.github/tier2-dependencies.txt`.
 lse-parquet = ["lse", "dep:parquet"]
-massive = ["dep:urlencoding", "rust_decimal/serde-with-float", "serde_json/raw_value"]
+massive = ["dep:urlencoding", "serde_json/raw_value"]
 
 [dev-dependencies]
 rustrade-instrument = { workspace = true, features = ["test-utils"] }
@@ -118,7 +112,14 @@ serde_json = { workspace = true }
 
 # Data Structures
 parking_lot = { workspace = true }
-rust_decimal = { workspace = true, features = ["serde-with-str"] }
+# `serde-with-float` provides the field-level `rust_decimal::serde::float` / `float_option`
+# helpers that deserialize JSON numbers into `Decimal` (Kraken's prices and sizes, Alpaca's
+# `new_rate`/`old_rate`, Massive's price/size). It deliberately does NOT enable the global
+# `serde-float` feature, whose extra effect is to flip every `Decimal`'s default serialization
+# workspace-wide to a lossy f64 number (Cargo unifies features across the build). Keeping it
+# field-level preserves the deterministic, lossless string wire format for all other `Decimal`
+# values.
+rust_decimal = { workspace = true, features = ["serde-with-str", "serde-with-float"] }
 smol_str = { workspace = true, features = ["serde"] }
 
 # Misc

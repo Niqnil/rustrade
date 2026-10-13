@@ -92,7 +92,7 @@ where
 /// [`SendRequestsOutput`] for the sent/errored requests and the `*_refused` fields below — so this
 /// aggregate stays small (~144 B) instead of inlining six full `OrderEvent`s (~928 B, #195). That is
 /// small enough for [`EngineOutput`]'s `AlgoOrders` variant to carry it **inline** (it sits under the
-/// ~232 B `PositionExit` variant that floors `EngineOutput`), so no outer box is needed. `Box<T>` is
+/// ~248 B `PositionExit` variant that floors `EngineOutput`), so no outer box is needed. `Box<T>` is
 /// serde-transparent, so the wire format is unchanged.
 ///
 /// [`EngineOutput`]: crate::engine::EngineOutput

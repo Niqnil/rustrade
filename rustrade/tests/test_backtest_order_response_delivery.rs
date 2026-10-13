@@ -327,6 +327,7 @@ fn args_constant()
 
     Arc::new(BacktestArgsConstant {
         instruments,
+        venue_options: Default::default(),
         executions: vec![ExecutionConfig::Mock(MockExecutionConfig {
             mocked_exchange: EXCHANGE,
             initial_state: AccountSnapshot {

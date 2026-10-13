@@ -1139,6 +1139,50 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "hyperliquid")]
+    #[test]
+    fn hyperliquid_spot_trades_and_depth_are_validated_and_routed() {
+        let batch: Vec<_> = [SubKind::PublicTrades, SubKind::OrderBooksL2]
+            .into_iter()
+            .map(|sub_kind| {
+                subscription(
+                    ExchangeId::HyperliquidSpot,
+                    MarketDataInstrumentKind::Spot,
+                    sub_kind,
+                )
+            })
+            .collect();
+
+        let batches = validate_batches([batch]).unwrap();
+        let groups = route(batches, &DynamicSubscribers::default()).unwrap();
+
+        // One group per kind; the futures are dropped unpolled, so nothing connects.
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[cfg(not(feature = "hyperliquid"))]
+    #[test]
+    fn a_hyperliquid_spot_subscription_without_the_feature_names_the_feature() {
+        let error = route(
+            vec![vec![subscription(
+                ExchangeId::HyperliquidSpot,
+                MarketDataInstrumentKind::Spot,
+                SubKind::PublicTrades,
+            )]],
+            &DynamicSubscribers::default(),
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(
+            error,
+            DataError::FeatureDisabled {
+                exchange: ExchangeId::HyperliquidSpot,
+                feature: "hyperliquid".to_owned(),
+            }
+        );
+    }
+
     #[cfg(feature = "alpaca")]
     #[test]
     fn one_alpaca_batch_across_feeds_and_kinds_shares_one_subscriber() {
