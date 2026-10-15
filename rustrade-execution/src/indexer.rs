@@ -324,24 +324,22 @@ impl AccountEventIndexer {
         }
     }
 
-    /// Index an [`InstrumentBalanceUpdate`]'s instrument and `base`/`quote` asset keys.
+    /// Index an [`InstrumentBalanceUpdate`]'s instrument and asset keys.
     ///
     /// # Errors
-    /// Returns `IndexError` if the instrument or either asset is not registered in the map.
+    /// Returns `IndexError` if the instrument or the asset is not registered in the map.
     pub fn instrument_balance_update(
         &self,
         update: InstrumentBalanceUpdate<AssetNameExchange, InstrumentNameExchange>,
     ) -> Result<InstrumentBalanceUpdate, IndexError> {
         let InstrumentBalanceUpdate {
             instrument,
-            base,
-            quote,
+            balance,
         } = update;
 
         Ok(InstrumentBalanceUpdate {
             instrument: self.map.find_instrument_index(&instrument)?,
-            base: self.asset_balance_update(base)?,
-            quote: self.asset_balance_update(quote)?,
+            balance: self.asset_balance_update(balance)?,
         })
     }
 

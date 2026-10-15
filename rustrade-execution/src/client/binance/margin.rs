@@ -1362,7 +1362,7 @@ impl ExecutionClient for BinanceMargin {
     /// The isolated stream delivers live fills and order updates (routed by the inner `symbol`) **and**
     /// live per-pair `free`/`locked` balances, emitted as
     /// [`AccountEventKind::InstrumentBalanceUpdate`]
-    /// (base + quote per pair). Debt totals (`borrowed`/`interest`) stay REST-`BalanceSnapshot`-fresh
+    /// (one per asset that changed: base, quote or both). Debt totals (`borrowed`/`interest`) stay REST-`BalanceSnapshot`-fresh
     /// per the debt-freshness contract; the stream keeps only `free`/`locked` live.
     ///
     /// **Consumption contract (important):** the engine deliberately does **not** store
@@ -2379,16 +2379,21 @@ fn convert_margin_account_position(
     }
 }
 
-/// Route an isolated `outboundAccountPosition` frame to an [`InstrumentBalanceUpdate`] (Tier B).
+/// Route an isolated `outboundAccountPosition` frame to [`InstrumentBalanceUpdate`]s (Tier B), one
+/// per listed asset of the pair.
 ///
 /// The frame carries no symbol inline, so the pair is recovered from `subscription_id` via
-/// `sub_map` (populated from the per-symbol subscribe acks). The flat `b[]` asset list is then
-/// split into `base`/`quote` by **asset-name equality** against the pair's known `(base, quote)`
-/// from `base_quote` (the authoritative startup map — never string-matched against the symbol).
-/// Emits one `InstrumentBalanceUpdate` carrying both sides' free/locked. Dropped with a `warn!`
-/// (observable, never mis-applied) when: the `subscriptionId` is missing/unmapped; the pair's
-/// base/quote is unknown; or either side is absent/unparseable in the frame. The engine does not
-/// store this variant (`_ => None` wildcard); the wrapper consumes it off the account-event feed.
+/// `sub_map` (populated from the per-symbol subscribe acks). Each entry of the flat `B` asset list
+/// is kept when its name **equals** the pair's known base or quote from `base_quote` (the
+/// authoritative startup map — never string-matched against the symbol). Binance lists only the
+/// assets whose balance changed, so a frame may carry one side or both; each yields its own event
+/// and the other side is not reported (never fabricated as zero).
+///
+/// The whole frame is dropped with a `warn!` (observable, never mis-applied) when the
+/// `subscriptionId` is missing or unmapped, or the pair's base/quote is unknown. An entry with no
+/// asset name or an unparseable `free`/`locked` is skipped with a `warn!`. An asset that is neither
+/// base nor quote is skipped at `debug!`. The engine does not store this variant (`_ => None`
+/// wildcard); the wrapper consumes it off the account-event feed.
 fn route_isolated_account_position(
     position: OutboundAccountPosition,
     subscription_id: Option<i64>,
@@ -2431,21 +2436,16 @@ fn route_isolated_account_position(
         .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
         .unwrap_or_else(Utc::now);
 
-    let mut base_update: Option<AssetBalanceUpdate<AssetNameExchange>> = None;
-    let mut quote_update: Option<AssetBalanceUpdate<AssetNameExchange>> = None;
     for b in position.b_uppercase.unwrap_or_default() {
         let Some(asset) = b.a.as_deref() else {
             warn!(instrument = %instrument.name(), "BinanceMargin isolated account position entry missing asset name");
             continue;
         };
-        // Only the pair's own base/quote are relevant; ignore any stray asset on the frame.
-        let side = if asset == base_asset.name().as_str() {
-            &mut base_update
-        } else if asset == quote_asset.name().as_str() {
-            &mut quote_update
-        } else {
+        // Only the pair's own base/quote are relevant; any other asset is not part of the pair.
+        if asset != base_asset.name().as_str() && asset != quote_asset.name().as_str() {
+            debug!(%asset, instrument = %instrument.name(), "BinanceMargin isolated account position: skipping asset outside the pair");
             continue;
-        };
+        }
         let (Some(free), Some(locked)) = (
             b.f.as_deref().and_then(|s| Decimal::from_str(s).ok()),
             b.l.as_deref().and_then(|s| Decimal::from_str(s).ok()),
@@ -2453,29 +2453,18 @@ fn route_isolated_account_position(
             warn!(%asset, instrument = %instrument.name(), "BinanceMargin isolated account position missing/unparseable free/locked");
             continue;
         };
-        *side = Some(AssetBalanceUpdate::new(
-            AssetNameExchange::new(asset),
-            BalanceUpdate::new(free, locked),
-            time_exchange,
+        buf.push(UnindexedAccountEvent::new(
+            ExchangeId::BinanceMargin,
+            AccountEventKind::InstrumentBalanceUpdate(InstrumentBalanceUpdate::new(
+                instrument.clone(),
+                AssetBalanceUpdate::new(
+                    AssetNameExchange::new(asset),
+                    BalanceUpdate::new(free, locked),
+                    time_exchange,
+                ),
+            )),
         ));
     }
-
-    // InstrumentBalanceUpdate carries BOTH sides; a frame missing either is dropped rather than
-    // fabricating a zero side (which would silently report a wrong free/locked). A trade-driven
-    // outboundAccountPosition changes both base and quote together, so both are normally present.
-    let (Some(base), Some(quote)) = (base_update, quote_update) else {
-        warn!(
-            instrument = %instrument.name(),
-            "BinanceMargin isolated: outboundAccountPosition missing base or quote side — dropping (no partial InstrumentBalanceUpdate)"
-        );
-        return;
-    };
-    buf.push(UnindexedAccountEvent::new(
-        ExchangeId::BinanceMargin,
-        AccountEventKind::InstrumentBalanceUpdate(InstrumentBalanceUpdate::new(
-            instrument, base, quote,
-        )),
-    ));
 }
 
 /// Register the WS-API event-dispatch callback shared by both margin managers.
@@ -6378,6 +6367,22 @@ mod tests {
         InstrumentNameExchange::new("BTCUSDT")
     }
 
+    /// `(instrument, asset, free, locked)` of each event, which must all be
+    /// `InstrumentBalanceUpdate`s.
+    fn isolated_balances(buf: &[UnindexedAccountEvent]) -> Vec<(&str, &str, Decimal, Decimal)> {
+        buf.iter()
+            .map(|event| match &event.kind {
+                AccountEventKind::InstrumentBalanceUpdate(ibu) => (
+                    ibu.instrument.name().as_str(),
+                    ibu.balance.asset.name().as_str(),
+                    ibu.balance.update.free,
+                    ibu.balance.update.locked,
+                ),
+                other => panic!("expected InstrumentBalanceUpdate, got {other:?}"),
+            })
+            .collect()
+    }
+
     fn token(expiration_time_ms: i64) -> UserListenToken {
         UserListenToken {
             token: "t".to_string(),
@@ -6549,24 +6554,20 @@ mod tests {
             &mut handler,
             &mut cross_notice_instrument,
         ));
-        assert_eq!(buf.len(), 1, "one InstrumentBalanceUpdate for the pair");
-        match &buf[0].kind {
-            AccountEventKind::InstrumentBalanceUpdate(ibu) => {
-                assert_eq!(ibu.instrument.name().as_str(), "BTCUSDT");
-                assert_eq!(ibu.base.asset.name().as_str(), "BTC");
-                assert_eq!(ibu.base.update.free, Decimal::new(5, 1));
-                assert_eq!(ibu.base.update.locked, Decimal::new(1, 1));
-                assert_eq!(ibu.quote.asset.name().as_str(), "USDT");
-                assert_eq!(ibu.quote.update.free, Decimal::from(1000));
-                assert_eq!(ibu.quote.update.locked, Decimal::from(50));
-            }
-            other => panic!("expected InstrumentBalanceUpdate, got {other:?}"),
-        }
-        // Crucially NOT the asset-keyed BalanceStreamUpdate (which would corrupt AssetStates).
-        assert!(!matches!(
-            buf[0].kind,
-            AccountEventKind::BalanceStreamUpdate(_)
-        ));
+        // One InstrumentBalanceUpdate per asset, in frame order — crucially NOT the asset-keyed
+        // BalanceStreamUpdate (which would corrupt AssetStates).
+        assert_eq!(
+            isolated_balances(&buf),
+            vec![
+                ("BTCUSDT", "USDT", Decimal::from(1000), Decimal::from(50)),
+                ("BTCUSDT", "BTC", Decimal::new(5, 1), Decimal::new(1, 1)),
+            ]
+        );
+        let time = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+        assert!(buf.iter().all(|event| matches!(
+            &event.kind,
+            AccountEventKind::InstrumentBalanceUpdate(ibu) if ibu.balance.time_exchange == time
+        )));
     }
 
     #[test]
@@ -6600,9 +6601,46 @@ mod tests {
     }
 
     #[test]
-    fn isolated_outbound_position_missing_side_dropped() {
-        // Only the base side present → no partial InstrumentBalanceUpdate (would fabricate a zero
-        // quote, silently mis-reporting free/locked). Dropped with a warn instead.
+    fn isolated_outbound_position_with_one_side_emits_that_side() {
+        // Binance lists only the assets whose balance changed. A frame with one side yields that
+        // side alone; the other is not reported, never fabricated as zero.
+        for (listed, free) in [("BTC", Decimal::new(5, 1)), ("USDT", Decimal::from(20))] {
+            let sub_map = Arc::new(Mutex::new(HashMap::from([(7_i64, btcusdt())])));
+            let base_quote = Arc::new(HashMap::from([(
+                btcusdt(),
+                (
+                    AssetNameExchange::new("BTC"),
+                    AssetNameExchange::new("USDT"),
+                ),
+            )]));
+            let mut handler = isolated_handler(sub_map, base_quote);
+
+            let frame = push_with_sub(
+                7,
+                serde_json::json!({
+                    "e": "outboundAccountPosition", "u": 1_700_000_000_000_i64,
+                    "B": [{ "a": listed, "f": free.to_string(), "l": "0" }],
+                }),
+            );
+            let mut buf = Vec::new();
+            assert!(!convert_margin_user_data_events_with(
+                &frame,
+                &mut buf,
+                &mut handler,
+                &mut cross_notice_instrument,
+            ));
+            assert_eq!(
+                isolated_balances(&buf),
+                vec![("BTCUSDT", listed, free, Decimal::ZERO)],
+                "only {listed} listed"
+            );
+        }
+    }
+
+    #[test]
+    fn isolated_outbound_position_skips_assets_outside_the_pair() {
+        // An asset that is neither the pair's base nor its quote is skipped; the pair's own asset
+        // on the same frame is still emitted. A frame with only stray assets emits nothing.
         let sub_map = Arc::new(Mutex::new(HashMap::from([(7_i64, btcusdt())])));
         let base_quote = Arc::new(HashMap::from([(
             btcusdt(),
@@ -6613,21 +6651,40 @@ mod tests {
         )]));
         let mut handler = isolated_handler(sub_map, base_quote);
 
-        let frame = push_with_sub(
+        let mixed = push_with_sub(
             7,
             serde_json::json!({
                 "e": "outboundAccountPosition", "u": 1_700_000_000_000_i64,
-                "B": [{ "a": "BTC", "f": "0.5", "l": "0" }],
+                "B": [{ "a": "BNB", "f": "3", "l": "0" }, { "a": "USDT", "f": "20", "l": "1" }],
             }),
         );
         let mut buf = Vec::new();
         assert!(!convert_margin_user_data_events_with(
-            &frame,
+            &mixed,
             &mut buf,
             &mut handler,
             &mut cross_notice_instrument,
         ));
-        assert!(buf.is_empty(), "missing quote side → frame dropped");
+        assert_eq!(
+            isolated_balances(&buf),
+            vec![("BTCUSDT", "USDT", Decimal::from(20), Decimal::ONE)]
+        );
+
+        let stray_only = push_with_sub(
+            7,
+            serde_json::json!({
+                "e": "outboundAccountPosition", "u": 1_700_000_000_000_i64,
+                "B": [{ "a": "BNB", "f": "3", "l": "0" }],
+            }),
+        );
+        let mut buf = Vec::new();
+        assert!(!convert_margin_user_data_events_with(
+            &stray_only,
+            &mut buf,
+            &mut handler,
+            &mut cross_notice_instrument,
+        ));
+        assert!(buf.is_empty(), "no asset of the pair → nothing emitted");
     }
 
     #[test]

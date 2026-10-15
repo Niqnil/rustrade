@@ -109,6 +109,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Breaking:** `InstrumentState::update_from_trade`, `update_from_order_snapshot` and
     `update_from_account_snapshot` now require `AssetKey: PartialEq`.
 
+- **Binance isolated margin reports a balance frame that lists one asset** (`rustrade-execution`,
+  feature `binance`).
+  - Binance's isolated `outboundAccountPosition` lists only the assets whose balance changed, so a
+    frame can carry the pair's base or its quote alone. `InstrumentBalanceUpdate` required both,
+    and such a frame was dropped with a WARN, leaving that side's live `free`/`locked` stale until
+    the next REST snapshot.
+  - **Breaking:** `InstrumentBalanceUpdate` now carries one asset, `{ instrument, balance }`, in
+    place of `base` and `quote`, like `BalanceStreamUpdate` on the cross path. A frame yields one
+    event per listed asset of the pair: one or two. Apply each to the `(instrument, asset)` it
+    names and keep the pair's other asset as it was. To tell base from quote, compare
+    `balance.asset` with the instrument's base and quote.
+  - An asset on the frame that is neither the pair's base nor its quote is skipped at DEBUG.
+
 - **The simulated venue credits what a spot fill receives** (`rustrade-execution`).
   - **Breaking in behaviour:** `SimulatedVenue` debited the asset a spot fill paid with and
     never credited the one it received. A buy took quote and delivered no base, and a sell took
