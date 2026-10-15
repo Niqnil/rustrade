@@ -11,7 +11,8 @@
 //! after each one:
 //! - the change in the venue's base balance equals the engine's signed position, and
 //! - the account's PnL marked at the last price, its quote change plus its base change at that
-//!   price, equals the engine's realised plus unrealised PnL before exit fees.
+//!   price, equals the engine's realised plus unrealised PnL before exit fees, less the fee of any
+//!   fill that moved no holding from flat, which no position books.
 
 use std::sync::Arc;
 
@@ -202,6 +203,9 @@ fn run(fee_model: FeeModelConfig, spot_fee_asset: SpotFeeAsset, seed: u64) -> Ru
     let mut venue = venue(fee_model, spot_fee_asset);
     let mut rng = Rng(seed);
     let mut realised_exited = Decimal::ZERO;
+    // Fees of fills that moved no holding on a flat instrument. Such a fill opens no position, so
+    // its fee reaches no position's PnL, as `InstrumentState::update_from_trade` documents.
+    let mut fees_unbooked = Decimal::ZERO;
     let mut stats = RunStats::default();
 
     for step in 0..FILLS_PER_RUN {
@@ -224,6 +228,18 @@ fn run(fee_model: FeeModelConfig, spot_fee_asset: SpotFeeAsset, seed: u64) -> Ru
                 }
                 if trade.fees.asset == base_index && trade.fees.fees > quantity {
                     stats.fees_above_quantity += 1;
+                }
+                if trade.fees.asset == base_index && trade.fees.fees == quantity {
+                    stats.fees_equal_to_quantity += 1;
+                    let flat = engine
+                        .instruments
+                        .instrument_index(&InstrumentIndex(0))
+                        .position
+                        .positions
+                        .is_empty();
+                    if flat {
+                        fees_unbooked += trade.fees.fees_quote.unwrap();
+                    }
                 }
             }
             if let Some(exited) = engine.update_from_account(&event) {
@@ -255,7 +271,7 @@ fn run(fee_model: FeeModelConfig, spot_fee_asset: SpotFeeAsset, seed: u64) -> Ru
         );
 
         let account_pnl = balance_total(&venue, quote()) - INITIAL_QUOTE + base_moved * price;
-        let engine_pnl = realised_exited + pnl_open;
+        let engine_pnl = realised_exited + pnl_open - fees_unbooked;
         assert!(
             (account_pnl - engine_pnl).abs() <= PNL_TOLERANCE,
             "step {step} ({spot_fee_asset:?}, {fee_model:?}): the account made {account_pnl} \
@@ -272,9 +288,11 @@ struct RunStats {
     base_fees: usize,
     /// Fills whose base fee exceeded their quantity, which move the holding against their side.
     fees_above_quantity: usize,
+    /// Fills whose base fee equalled their quantity, which move no holding.
+    fees_equal_to_quantity: usize,
 }
 
-fn fee_models() -> [FeeModelConfig; 4] {
+fn fee_models() -> [FeeModelConfig; 5] {
     [
         FeeModelConfig::Percentage(PercentageFeeModel::new(dec!(0.001))),
         // A rebate on every fill: a negative base fee adds to what a buy receives. Inverting its
@@ -287,6 +305,11 @@ fn fee_models() -> [FeeModelConfig; 4] {
         // from the account, and the engine moves the holding down.
         FeeModelConfig::PerContract(PerContractFeeModel {
             commission_per_contract: dec!(300),
+        }),
+        // Equal to one of the prices, where in base it is exactly the quantity a buy receives,
+        // so the buy moves no holding.
+        FeeModelConfig::PerContract(PerContractFeeModel {
+            commission_per_contract: dec!(100),
         }),
     ]
 }
@@ -305,16 +328,21 @@ fn under_quote_fees_the_account_and_the_engine_agree_fill_by_fill() {
 /// `Received` charges a buy's fee in base, which the engine nets from its position.
 #[test]
 fn under_received_fees_the_account_and_the_engine_agree_fill_by_fill() {
-    let mut fees_above_quantity = 0;
+    let (mut fees_above_quantity, mut fees_equal_to_quantity) = (0, 0);
     for fee_model in fee_models() {
         for seed in [1, 7, 42] {
             let stats = run(fee_model, SpotFeeAsset::Received, seed);
             assert!(stats.base_fees > 0, "{fee_model:?}: some buys pay in base");
             fees_above_quantity += stats.fees_above_quantity;
+            fees_equal_to_quantity += stats.fees_equal_to_quantity;
         }
     }
     assert!(
         fees_above_quantity > 0,
         "the flat fee must exceed some buy's quantity, so that edge is exercised"
+    );
+    assert!(
+        fees_equal_to_quantity > 0,
+        "the flat fee must equal some buy's quantity, so that edge is exercised"
     );
 }

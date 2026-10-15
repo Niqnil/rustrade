@@ -102,7 +102,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     a remainder below one lot. Rounding a close to the lot step is the strategy's concern. A
     spot-margin short closed by a buy keeps the fee as a residual short.
   - A base fee larger than the fill's quantity moves the holding the other way. A fill that nets
-    to zero charges its fee to the open position, and opens no position from flat, with a WARN.
+    to zero charges its fee to the open position. From flat it opens no position, with a WARN, as
+    does any fill of zero quantity, which used to open an empty position.
+  - Only the fee the venue reported is netted. A `FeeModelConfig` fee the engine adds is in quote
+    and reaches PnL alone.
   - **Breaking:** `InstrumentState::update_from_trade`, `update_from_order_snapshot` and
     `update_from_account_snapshot` now require `AssetKey: PartialEq`.
 

@@ -208,7 +208,7 @@ impl Default for FeeModelConfig {
 /// | [`Quote`](Self::Quote) | quote, on top of the notional | quote, out of the proceeds |
 /// | [`Received`](Self::Received) | base, out of the quantity received | quote, out of the proceeds |
 ///
-/// A fee in base is the quote fee divided by the fill price. The fill reports it in base, with
+/// A fee in base is the quote fee divided by the fill price, to `Decimal`'s 28 digits. The fill reports it in base, with
 /// that quote fee as its [`AssetFees::fees_quote`](crate::trade::AssetFees::fees_quote).
 ///
 /// Venues differ, and so do accounts on one venue. `Quote` matches Coinbase spot's default.
