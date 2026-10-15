@@ -90,6 +90,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     in `fees_enter` / `fees_exit`. PnL therefore overstates a position whose fees were paid in a
     third asset, by those fees, until the consumer prices them (#620). The simulated venue charges
     fees in quote, so a backtest counts them (#621).
+  - **Breaking in behaviour:** a position's `fees_enter.fees_quote` / `fees_exit.fees_quote` total
+    is now the sum of the quote equivalents its fees had, the figure PnL charged. It is `None`
+    only while no fee had one. Before, one fee without a quote equivalent made the total `None`.
+    That also made the unrealised PnL's exit-fee estimate drop every entry fee.
+  - A `FeeModelConfig` fee now reaches PnL on a fill whose own fee has no quote equivalent. Before,
+    it was dropped there.
 
 ## [0.11.0] - 2026-10-12
 

@@ -112,9 +112,9 @@ impl IndexedInstrumentsBuilder {
     /// the account reports a BNB balance. Once it is registered, fees and balances in that asset
     /// index like any other, and the engine keeps a balance for it.
     ///
-    /// A fee charged in such an asset is neither the instrument's base nor its quote, so it has no
-    /// quote equivalent. The `rustrade` engine leaves it out of position PnL, and values nothing
-    /// in the asset's balance.
+    /// A fee charged in such an asset is neither the instrument's base nor its quote, so the
+    /// execution indexer gives it no quote equivalent (`AssetFees::fees_quote` is `None`). How
+    /// that fee and the asset's balance are valued is up to the consumer.
     ///
     /// Pass the venue that holds the balance, the **execution** venue. An asset registers balance
     /// state on its exchange, so registering one on a data-only venue seeds a balance that venue

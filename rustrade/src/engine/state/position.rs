@@ -772,9 +772,14 @@ pub struct Position<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     pub carry: Decimal,
 
     /// Cumulative fees paid when entering/increasing [`Position`] quantity.
+    ///
+    /// `fees` sums the raw amounts as the venue charged them, whatever their asset. `fees_quote`
+    /// sums the quote equivalents of the fees that have one, which is what PnL charged; it is
+    /// `None` only while no fee has had one.
     pub fees_enter: AssetFees<AssetKey>,
 
-    /// Cumulative fees paid when exiting/reducing [`Position`] quantity.
+    /// Cumulative fees paid when exiting/reducing [`Position`] quantity, summed as
+    /// [`fees_enter`](Self::fees_enter) is.
     pub fees_exit: AssetFees<AssetKey>,
 
     /// Timestamp of [`Trade`] that triggered the initial [`Position`] entry.
@@ -877,10 +882,7 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                 }
                 self.fees_enter.fees += trade.fees.fees;
                 self.fees_enter.fees_quote =
-                    match (self.fees_enter.fees_quote, trade.fees.fees_quote) {
-                        (Some(a), Some(b)) => Some(a + b),
-                        _ => None,
-                    };
+                    sum_quote_fees(self.fees_enter.fees_quote, trade.fees.fees_quote);
                 self.time_exchange_update = trade.time_exchange;
                 self.update_pnl_unrealised_post_trade(trade.price);
 
@@ -896,11 +898,8 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                 // Update remaining Position state
                 self.quantity_abs -= trade.quantity.abs();
                 self.fees_exit.fees += trade.fees.fees;
-                self.fees_exit.fees_quote = match (self.fees_exit.fees_quote, trade.fees.fees_quote)
-                {
-                    (Some(a), Some(b)) => Some(a + b),
-                    _ => None,
-                };
+                self.fees_exit.fees_quote =
+                    sum_quote_fees(self.fees_exit.fees_quote, trade.fees.fees_quote);
                 self.time_exchange_update = trade.time_exchange;
 
                 // Update pnl_unrealised for remaining Position
@@ -912,11 +911,8 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
             (Buy, Sell) | (Sell, Buy) if self.quantity_abs == trade.quantity.abs() => {
                 self.quantity_abs -= trade.quantity.abs();
                 self.fees_exit.fees += trade.fees.fees;
-                self.fees_exit.fees_quote = match (self.fees_exit.fees_quote, trade.fees.fees_quote)
-                {
-                    (Some(a), Some(b)) => Some(a + b),
-                    _ => None,
-                };
+                self.fees_exit.fees_quote =
+                    sum_quote_fees(self.fees_exit.fees_quote, trade.fees.fees_quote);
                 self.time_exchange_update = trade.time_exchange;
                 let closed_fee_quote = fee_in_quote(&trade.fees);
                 // Overflow is held + warned inside `update_pnl_realised`; observed via logs here.
@@ -954,10 +950,8 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                     .fees_quote
                     .map(|fq| fq * (self.quantity_abs / trade.quantity.abs()));
                 self.fees_exit.fees += fee_exit;
-                self.fees_exit.fees_quote = match (self.fees_exit.fees_quote, fee_exit_quote) {
-                    (Some(a), Some(b)) => Some(a + b),
-                    _ => None,
-                };
+                self.fees_exit.fees_quote =
+                    sum_quote_fees(self.fees_exit.fees_quote, fee_exit_quote);
                 self.time_exchange_update = trade.time_exchange;
                 // Overflow is held + warned inside `update_pnl_realised`; observed via logs here.
                 let _ = self.update_pnl_realised(
@@ -1089,9 +1083,8 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
             self.quantity_abs,
             self.quantity_abs_max,
             // Quote-equivalent entry fee (see `update_pnl_unrealised`), for dimensional
-            // consistency with the quote-denominated PnL terms. `fees_enter.fees_quote` is `None`
-            // once any entry fee had no quote equivalent, so the estimate then leaves out the
-            // entry fees (see `fee_in_quote`).
+            // consistency with the quote-denominated PnL terms: the entry fees that have a quote
+            // equivalent, as realised PnL charged them (see `sum_quote_fees`).
             fee_in_quote(&self.fees_enter),
             price,
             self.contract_size,
@@ -1594,6 +1587,19 @@ pub fn calculate_pnl_unrealised(
 /// Converting it needs a price the position does not have.
 fn fee_in_quote<AssetKey>(fees: &AssetFees<AssetKey>) -> Decimal {
     fees.fees_quote.unwrap_or(Decimal::ZERO)
+}
+
+/// Add a fee's quote equivalent to a [`Position`]'s running total of them, as
+/// [`fees_enter`](Position::fees_enter) and [`fees_exit`](Position::fees_exit) keep it.
+///
+/// The total is the sum of the quote equivalents the fees have, which is what PnL charged (see
+/// [`fee_in_quote`]). A fee with none adds nothing, so one fee in a third asset does not erase
+/// the others. The total is `None` only while no fee has had one.
+fn sum_quote_fees(total: Option<Decimal>, fee: Option<Decimal>) -> Option<Decimal> {
+    match (total, fee) {
+        (None, None) => None,
+        (total, fee) => Some(total.unwrap_or(Decimal::ZERO) + fee.unwrap_or(Decimal::ZERO)),
+    }
 }
 
 /// Approximate the exit fees from closing a [`Position`] with `quantity_abs`.
@@ -2329,8 +2335,9 @@ mod tests {
             "the raw fee is still recorded"
         );
         assert_eq!(
-            exited.fees_exit.fees_quote, None,
-            "one exit fee had no quote equivalent"
+            exited.fees_exit.fees_quote,
+            Some(dec!(1.0)),
+            "the exit fee total keeps the quote fee the other exit fee had no equivalent for"
         );
     }
 
@@ -2355,6 +2362,13 @@ mod tests {
             panic!("an increase keeps the position open");
         };
         assert_eq!(position.pnl_realised, dec!(-1.0));
+        assert_eq!(
+            position.fees_enter.fees_quote,
+            Some(dec!(1.0)),
+            "the third-party fee does not erase the quote fee from the total"
+        );
+        // The unrealised exit-fee estimate uses that total: 0 price move − (2/2) × 1.
+        assert_eq!(position.pnl_unrealised, dec!(-1.0));
 
         // Flip with a sell of 4 @ 110 and a third-party fee of 8: the 2 closed realise
         // (110 − 100) × 2 = 20 with no fee, and the new short of 2 opens with no fee charged.
@@ -2379,6 +2393,15 @@ mod tests {
             next.fees_enter.fees,
             dec!(4.0),
             "half of the raw fee is recorded"
+        );
+        assert_eq!(
+            next.fees_enter.fees_quote, None,
+            "no fee of the new position had one"
+        );
+        assert_eq!(
+            exited.fees_exit.fees_quote,
+            Some(Decimal::ZERO),
+            "the closed position's exit fee had no quote equivalent to add"
         );
     }
 

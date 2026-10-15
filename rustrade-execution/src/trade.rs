@@ -454,7 +454,8 @@ pub struct AssetFees<AssetKey> {
     ///
     /// The engine's position PnL counts only this quote equivalent. A fee with `None` is left
     /// out of PnL, and its raw [`fees`](Self::fees) stays recorded on the position. A consumer that
-    /// wants it counted prices it.
+    /// wants it counted prices it. On a position's running fee totals, this is the sum of the
+    /// quote equivalents its fees had, and `None` only while none had one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fees_quote: Option<Decimal>,
 }

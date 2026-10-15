@@ -5629,6 +5629,51 @@ fn test_fee_model_per_contract_augments_trade_fees() {
     assert_eq!(pos.pnl_realised, dec!(-0.65));
 }
 
+/// A fill whose own fee has no quote equivalent (`fees_quote: None`: a fee in a third asset, or
+/// one the indexer zeroed because its asset was unmapped) still gets the fee model's quote fee
+/// charged to PnL.
+#[test]
+fn test_fee_model_charges_a_fill_whose_fee_has_no_quote_equivalent() {
+    let (execution_tx, _) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    engine
+        .state
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(0))
+        .fee_model = FeeModelConfig::PerContract(PerContractFeeModel {
+        commission_per_contract: dec!(0.65),
+    });
+
+    let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new("fee-test-trade"),
+            gen_order_id(0),
+            InstrumentIndex(0),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, 1),
+            Side::Buy,
+            dec!(1_000),
+            dec!(1),
+            None,
+            // As the indexer zeroes a fee whose asset is not in its map.
+            AssetFees::new(AssetIndex(1), Decimal::ZERO, None),
+        )),
+    }));
+    engine.process(event);
+
+    let pos = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0))
+        .position
+        .positions
+        .get(&PositionId::NETTING)
+        .expect("position should be open");
+    assert_eq!(pos.fees_enter.fees_quote, Some(dec!(0.65)));
+    assert_eq!(pos.pnl_realised, dec!(-0.65));
+}
+
 #[test]
 fn test_fee_model_zero_no_fees_on_trade() {
     let (execution_tx, _) = mpsc_unbounded();

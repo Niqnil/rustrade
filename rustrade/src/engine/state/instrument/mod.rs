@@ -1887,8 +1887,10 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         } else {
             let mut with_fee = trade.clone();
             with_fee.fees.fees += computed_fee;
-            // computed_fee is in quote terms; add to fees_quote if available
-            with_fee.fees.fees_quote = trade.fees.fees_quote.map(|fq| fq + computed_fee);
+            // computed_fee is in quote terms, so it adds to the quote equivalent PnL charges even
+            // when the venue's own fee has none (a fee in a third asset, or one the indexer zeroed).
+            with_fee.fees.fees_quote =
+                Some(trade.fees.fees_quote.unwrap_or(Decimal::ZERO) + computed_fee);
             augmented = with_fee;
             &augmented
         };
