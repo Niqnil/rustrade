@@ -2331,7 +2331,8 @@ pub(crate) fn convert_execution_report(
             };
             // Use the venue's own commission asset (N: e.g. BNB, USDT, BTC). fees_quote is None
             // here; the indexer computes it if the fee is in the quote or base asset. The
-            // "UNKNOWN" fallback (rare: the API omits N) will fail indexing.
+            // "UNKNOWN" fallback (rare: the API omits N): the indexer keeps the trade with its
+            // fee zeroed, and warns.
             let fee_asset = report
                 .commission_asset
                 .as_deref()

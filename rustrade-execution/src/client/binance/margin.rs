@@ -4289,7 +4289,8 @@ fn convert_margin_trade(
 
     // Use actual commission asset from Binance (e.g., BNB, USDT, BTC). fees_quote is None here;
     // the indexer computes it when the fee is in quote or base asset. "UNKNOWN" fallback (rare:
-    // API omits commissionAsset) will fail indexing rather than silently misattribute the fee.
+    // API omits commissionAsset): the indexer keeps the trade with its fee zeroed, and warns,
+    // rather than misattribute the fee to an asset.
     let fee_asset = t
         .commission_asset
         .as_deref()

@@ -105,6 +105,36 @@ impl IndexedInstrumentsBuilder {
         self
     }
 
+    /// Registers an asset that no added [`Instrument`] implies, together with its exchange.
+    ///
+    /// This is for an asset the account holds or pays with but does not trade. An example is
+    /// BNB on Binance spot with "pay fees with BNB" turned on: fills report their fee in BNB, and
+    /// the account reports a BNB balance. Once it is registered, fees and balances in that asset
+    /// index like any other, and the engine keeps a balance for it.
+    ///
+    /// A fee charged in such an asset is neither the instrument's base nor its quote, so the
+    /// execution indexer gives it no quote equivalent (`AssetFees::fees_quote` is `None`). How
+    /// that fee and the asset's balance are valued is up to the consumer.
+    ///
+    /// Pass the venue that holds the balance, the **execution** venue. An asset registers balance
+    /// state on its exchange, so registering one on a data-only venue seeds a balance that venue
+    /// can never report (see [`Self::add_instrument`]).
+    ///
+    /// Assets are validated and indexed by [`Self::try_build`] the same way whichever method added
+    /// them:
+    /// - An exact duplicate of an asset an instrument implies is removed.
+    /// - A name that conflicts with another asset on the same exchange fails the build, such as the
+    ///   same `name_internal` with a different `name_exchange`, or an exchange name differing only
+    ///   in case.
+    /// - [`AssetIndex`] values are assigned after sorting, so registering an asset can change the
+    ///   indices of others. Resolve indices from the built [`IndexedInstruments`], never hard-code
+    ///   them.
+    pub fn add_asset(mut self, asset: ExchangeAsset<Asset>) -> Self {
+        self.exchanges.push(asset.exchange);
+        self.assets.push(asset);
+        self
+    }
+
     /// Builds an [`IndexedInstruments`], panicking if the added [`Instrument`]s are not a valid
     /// collection.
     ///
@@ -482,6 +512,81 @@ mod tests {
                 spec: None
             }
         );
+    }
+
+    #[test]
+    fn add_asset_registers_an_asset_no_instrument_implies() {
+        let indexed = IndexedInstrumentsBuilder::default()
+            .add_instrument(instrument(ExchangeId::BinanceSpot, "btc", "usdt"))
+            .add_asset(exchange_asset(ExchangeId::BinanceSpot, "bnb"))
+            .build();
+
+        assert_eq!(indexed.exchanges().len(), 1);
+        let assets: Vec<_> = indexed.assets().iter().map(|a| &a.value).collect();
+        assert_eq!(
+            assets,
+            [
+                &exchange_asset(ExchangeId::BinanceSpot, "bnb"),
+                &exchange_asset(ExchangeId::BinanceSpot, "btc"),
+                &exchange_asset(ExchangeId::BinanceSpot, "usdt"),
+            ]
+        );
+
+        // The instrument's assets still resolve by name after the fee asset sorts before them.
+        let underlying = &indexed.instruments()[0].value.underlying;
+        assert_eq!(
+            indexed.assets()[underlying.base.index()]
+                .value
+                .asset
+                .name_internal
+                .as_ref(),
+            "btc"
+        );
+        assert_eq!(
+            indexed.assets()[underlying.quote.index()]
+                .value
+                .asset
+                .name_internal
+                .as_ref(),
+            "usdt"
+        );
+    }
+
+    #[test]
+    fn add_asset_dedups_with_an_instrument_asset_and_registers_its_exchange() {
+        let indexed = IndexedInstrumentsBuilder::default()
+            .add_instrument(instrument(ExchangeId::BinanceSpot, "btc", "usdt"))
+            .add_asset(exchange_asset(ExchangeId::BinanceSpot, "usdt"))
+            .add_asset(exchange_asset(ExchangeId::Kraken, "bnb"))
+            .build();
+
+        assert_eq!(indexed.assets().len(), 3, "usdt once, plus Kraken's bnb");
+        assert!(
+            indexed
+                .exchanges()
+                .iter()
+                .any(|exchange| exchange.value == ExchangeId::Kraken),
+            "an asset's exchange is registered even with no instrument on it"
+        );
+    }
+
+    #[test]
+    fn add_asset_with_a_conflicting_name_fails_the_build() {
+        let with = |asset: Asset| {
+            IndexedInstrumentsBuilder::default()
+                .add_instrument(instrument(ExchangeId::BinanceSpot, "btc", "usdt"))
+                .add_asset(ExchangeAsset::new(ExchangeId::BinanceSpot, asset))
+                .try_build()
+        };
+
+        assert!(matches!(
+            with(Asset::new("usdt", "tether")),
+            Err(IndexError::DuplicateAssetNameInternal(_))
+        ));
+        assert!(matches!(
+            with(Asset::new("usdt_2", "USDT")),
+            Err(IndexError::DuplicateAssetNameExchange(_))
+        ));
     }
 
     #[test]

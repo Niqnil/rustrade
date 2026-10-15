@@ -20,6 +20,7 @@ use crate::{
     trade::{AssetFees, Trade, TradeAmendment, TradeAmendmentKind},
 };
 use derive_more::Constructor;
+use rust_decimal::Decimal;
 use rustrade_instrument::{
     asset::{AssetIndex, name::AssetNameExchange},
     exchange::{ExchangeId, ExchangeIndex},
@@ -650,11 +651,22 @@ impl AccountEventIndexer {
     /// - Fee in base asset: `fees_quote = Some(fees * price)`
     /// - Fee in third-party asset (e.g., BNB): `fees_quote = None`
     ///
+    /// # A fee asset that is not in the map
+    /// The trade is kept, with its fee zeroed: `fees` is `0` in the instrument's quote asset and
+    /// `fees_quote` is `None`. A `warn` names the fee's asset and amount. Dropping the trade would
+    /// leave the engine's position different from the venue's, which costs far more than one
+    /// unknown fee. The `warn` is per trade, so an account that pays every fee in an unregistered
+    /// asset logs one per fill until the asset is registered. Two cases reach this:
+    /// - An asset the account pays fees in but no instrument implies, such as BNB on Binance spot
+    ///   with "pay fees with BNB" turned on. Register it with
+    ///   [`IndexedInstrumentsBuilder::add_asset`](rustrade_instrument::index::builder::IndexedInstrumentsBuilder::add_asset)
+    ///   to keep its fee.
+    /// - The `"UNKNOWN"` placeholder some integrations use when the venue gave no fee asset: IBKR
+    ///   `fetch_trades` for an execution IB sent no commission report for, and Binance when a
+    ///   report omits `commissionAsset`.
+    ///
     /// # Errors
-    /// Returns `IndexError` if fee asset is not in the map. Some integrations use
-    /// "UNKNOWN" as a placeholder when fee data is unavailable (e.g., IBKR `fetch_trades` for an
-    /// execution IB sent no commission report for, Binance when API omits `commission_asset`).
-    /// These trades will fail indexing.
+    /// Returns `IndexError` if the trade's instrument is not in the map.
     pub fn trade(
         &self,
         trade: Trade<AssetNameExchange, InstrumentNameExchange>,
@@ -676,25 +688,47 @@ impl AccountEventIndexer {
         } = trade;
 
         let instrument_index = self.map.find_instrument_index(&instrument)?;
-        let fee_asset_index = self.map.find_asset_index(&fees.asset)?;
-
-        // Compute fees_quote based on fee asset relationship to instrument
-        let fees_quote = self
+        // Invariant check: `find_instrument_index` resolves only names built from `instruments`,
+        // so the index is always present. Failing loudly beats indexing a fee against nothing.
+        let underlying = &self
             .map
             .instruments
             .get_index(instrument_index.index())
-            .and_then(|instr| {
-                if fee_asset_index == instr.underlying.quote {
+            .ok_or_else(|| {
+                IndexError::InstrumentIndex(format!(
+                    "ExecutionInstrumentMap has no instrument at {instrument_index} for {instrument}"
+                ))
+            })?
+            .underlying;
+
+        let fees = match self.map.find_asset_index(&fees.asset) {
+            Ok(fee_asset) => {
+                let fees_quote = if fee_asset == underlying.quote {
                     // Fee is in quote asset — no conversion needed
                     Some(fees.fees)
-                } else if fee_asset_index == instr.underlying.base {
+                } else if fee_asset == underlying.base {
                     // Fee is in base asset — convert using trade price
                     Some(fees.fees * trade_price)
                 } else {
                     // Fee is in third-party asset (e.g., BNB) — needs external price
                     None
-                }
-            });
+                };
+                AssetFees::new(fee_asset, fees.fees, fees_quote)
+            }
+            Err(error) => {
+                warn!(
+                    exchange = %self.map.exchange.value,
+                    %instrument,
+                    trade_id = %id,
+                    fee_asset = %fees.asset,
+                    fee = %fees.fees,
+                    %error,
+                    "trade's fee asset is not in the map, keeping the trade with its fee zeroed; \
+                     register the asset with IndexedInstrumentsBuilder::add_asset to keep its fee",
+                );
+                AssetFees::new(underlying.quote, Decimal::ZERO, None)
+            }
+        };
 
         Ok(Trade {
             id,
@@ -706,11 +740,7 @@ impl AccountEventIndexer {
             price: trade_price,
             quantity,
             order_filled_quantity,
-            fees: AssetFees {
-                asset: fee_asset_index,
-                fees: fees.fees,
-                fees_quote,
-            },
+            fees,
             origin,
             position_side,
             client_order_id,
@@ -956,6 +986,101 @@ mod tests {
             ))
             .is_err(),
             "an unmapped instrument fails the amendment"
+        );
+    }
+
+    /// A fill is never dropped for its fee: an unmapped fee asset, or the `"UNKNOWN"` placeholder,
+    /// keeps the trade with its fee zeroed in quote and `fees_quote: None`, with one `warn`. A fee
+    /// asset registered with `add_asset` indexes as a third-party fee.
+    #[test]
+    fn trade_keeps_a_fill_whose_fee_asset_is_unmapped() {
+        use crate::{
+            order::id::{OrderId, StrategyId},
+            trade::TradeId,
+        };
+        use rust_decimal_macros::dec;
+        use rustrade_instrument::{Side, index::builder::IndexedInstrumentsBuilder};
+
+        let fill = |fee_asset: &str, fee| {
+            Trade::new(
+                TradeId::new("t-1"),
+                OrderId::new("ord-1"),
+                InstrumentNameExchange::new("BTC_USDT"),
+                StrategyId::unknown(),
+                DateTime::<Utc>::MIN_UTC,
+                Side::Buy,
+                dec!(50000),
+                dec!(0.01),
+                None,
+                AssetFees::new(AssetNameExchange::new(fee_asset), fee, None),
+            )
+        };
+        let asset = |indexer: &AccountEventIndexer, name: &str| {
+            indexer
+                .map
+                .find_asset_index(&AssetNameExchange::new(name))
+                .unwrap()
+        };
+
+        let indexer = binance_indexer();
+        let usdt = asset(&indexer, "USDT");
+        let btc = asset(&indexer, "BTC");
+
+        let (quote, warnings) = count_warnings(|| indexer.trade(fill("USDT", dec!(0.5))));
+        assert_eq!(
+            quote.unwrap().fees,
+            AssetFees::new(usdt, dec!(0.5), Some(dec!(0.5)))
+        );
+        assert_eq!(warnings, 0);
+
+        let (base, warnings) = count_warnings(|| indexer.trade(fill("BTC", dec!(0.00001))));
+        assert_eq!(
+            base.unwrap().fees,
+            AssetFees::new(btc, dec!(0.00001), Some(dec!(0.5)))
+        );
+        assert_eq!(warnings, 0);
+
+        for unmapped in ["BNB", "UNKNOWN"] {
+            let (kept, warnings) = count_warnings(|| indexer.trade(fill(unmapped, dec!(0.001))));
+            let kept = kept.unwrap_or_else(|error| panic!("{unmapped}: dropped: {error}"));
+            assert_eq!(
+                kept.quantity,
+                dec!(0.01),
+                "{unmapped}: the fill itself is intact"
+            );
+            assert_eq!(
+                kept.fees,
+                AssetFees::new(usdt, Decimal::ZERO, None),
+                "{unmapped}: fee zeroed in quote, with no quote equivalent"
+            );
+            assert_eq!(warnings, 1, "{unmapped}: the zeroed fee is reported");
+        }
+
+        let instruments = IndexedInstrumentsBuilder::new()
+            .add_instrument(test_utils::instrument(
+                ExchangeId::BinanceSpot,
+                "BTC",
+                "USDT",
+            ))
+            .add_asset(test_utils::exchange_asset(ExchangeId::BinanceSpot, "BNB"))
+            .build();
+        let with_bnb = AccountEventIndexer::new(Arc::new(
+            generate_execution_instrument_map(&instruments, ExchangeId::BinanceSpot).unwrap(),
+        ));
+        let bnb = asset(&with_bnb, "BNB");
+        let (third_party, warnings) = count_warnings(|| with_bnb.trade(fill("BNB", dec!(0.001))));
+        assert_eq!(
+            third_party.unwrap().fees,
+            AssetFees::new(bnb, dec!(0.001), None),
+            "a registered fee asset keeps its fee, with no quote equivalent"
+        );
+        assert_eq!(warnings, 0);
+
+        let mut unmapped_instrument = fill("USDT", dec!(0.5));
+        unmapped_instrument.instrument = InstrumentNameExchange::new("ETH_USDT");
+        assert!(
+            indexer.trade(unmapped_instrument).is_err(),
+            "an unmapped instrument still fails"
         );
     }
 
