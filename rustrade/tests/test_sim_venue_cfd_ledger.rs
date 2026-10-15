@@ -632,6 +632,24 @@ async fn a_backtest_fills_at_slipped_prices_and_through_a_custom_fill_model() {
             .pnl,
         dec!(2_445)
     );
+
+    // A short is slipped the other way: sold at 4,950, bought back at 5,252, so it loses
+    // 1 × 25 × 302.
+    let short = try_round_trip_slipped(Side::Sell, margin, FnvHashMap::default(), slippage)
+        .await
+        .expect("a slipped short round trip must complete");
+    assert_eq!(usd_end(&short).total, margin - dec!(7_550));
+    assert_eq!(
+        short
+            .summary
+            .trading_summary
+            .instruments
+            .values()
+            .next()
+            .unwrap()
+            .pnl,
+        dec!(-7_550)
+    );
 }
 
 fn open_positions(result: &BacktestResult<Daily, BacktestState>) -> usize {

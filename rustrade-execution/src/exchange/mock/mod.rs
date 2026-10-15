@@ -781,6 +781,39 @@ mod tests {
         );
     }
 
+    /// The async driver builds its venue from the configuration, slippage included.
+    #[tokio::test]
+    async fn the_driver_fills_at_the_configured_slippage() {
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut events) = broadcast::channel(16);
+        let config = MockExecutionConfig {
+            slippage: crate::slippage::SlippageConfig::fixed(d("0.01")).unwrap(),
+            ..spot_config("100", "10000000", FeeModelConfig::default())
+        };
+        let exchange = MockExchange::new(config, request_rx, event_tx, spot_instruments());
+        let driver = tokio::spawn(exchange.run());
+
+        let (response_tx, response_rx) = oneshot::channel();
+        request_tx
+            .send(MockExchangeRequest::open_order(
+                Utc::now(),
+                response_tx,
+                buy_request("0.01", market_prices("50000")),
+            ))
+            .unwrap();
+        response_rx.await.expect("the open is answered");
+        drop(request_tx);
+        driver.await.unwrap();
+
+        let prices = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event.kind {
+                AccountEventKind::Trade(trade) => Some(trade.price),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prices, vec![d("50500")], "50,000 bought 1% above");
+    }
+
     /// A cancel is rejected by the venue, and the driver answers the channel it was asked on.
     ///
     /// The rejection itself is the venue's own; what this pins is that the driver

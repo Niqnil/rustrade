@@ -52,7 +52,8 @@ pub struct SimVenueOptions {
     /// Prices each taker fill in place of the configuration's
     /// [`fill_model`](MockExecutionConfig::fill_model) — see
     /// [`SimulatedVenue::with_fill_model`]. `None` uses the configured one. The configured
-    /// [`slippage`](MockExecutionConfig::slippage) applies to either.
+    /// [`slippage`](MockExecutionConfig::slippage) applies to either. Like every option here, it
+    /// is not part of the serialisable configuration.
     pub fill_model: Option<Arc<dyn FillModel>>,
 }
 

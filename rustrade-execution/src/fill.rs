@@ -84,6 +84,9 @@ impl<'a> FillContext<'a> {
 /// takes `&self`. Randomness belongs in the venue's [`SlippageConfig`], whose seeded stream
 /// advances exactly once per fill.
 ///
+/// The price returned must be a real market price: the venue's arithmetic on it, slippage and
+/// settlement included, panics on `Decimal` overflow.
+///
 /// # It fills optimistically by default
 ///
 /// The venue prices a taker at the market as it stands when the order arrives, which in a backtest

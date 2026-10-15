@@ -1,9 +1,9 @@
 //! Adverse slippage on the simulated venue's taker fills.
 //!
-//! [`SlippageConfig`] says how far a fill is moved against the order that takes liquidity, and
-//! [`Slippage`] is that configuration plus the random stream it draws from. The venue applies it
-//! to the price its [`FillModel`](crate::fill::FillModel) gives, so slippage composes with every
-//! pricing model alike.
+//! [`SlippageConfig`] says how far a fill is moved against the order that takes liquidity. The
+//! venue holds it with the random stream it draws from, and applies it to the price its
+//! [`FillModel`](crate::fill::FillModel) gives, so slippage composes with every pricing model
+//! alike.
 //!
 //! # Backtest-only
 //!
@@ -39,17 +39,25 @@ use thiserror::Error;
 /// market later reaches fills at its own limit exactly, with no slippage, as a maker's fill does.
 ///
 /// A slipped fill is not bounded by the bar's or the book's range: a large rate on a short bar can
-/// print outside that bar's high and low. Capping it would silently erase most of the rate.
+/// print outside that bar's high and low. Capping it would silently erase most of the rate. Nor
+/// is it rounded to the instrument's tick, which the venue does not know.
+///
+/// A short sale under a short-sale restriction is judged on the price before slippage, so the
+/// slipped fill of a sale the venue allowed may print below the best bid.
 ///
 /// # Reproducibility
 ///
 /// [`uniform`](Self::uniform) draws from its own generator, seeded by the `u64` in this
 /// configuration and used for nothing else, so a run is reproducible from its seed: the same seed
 /// and the same sequence of orders give the same fill prices. The generator is xoshiro256++, which
-/// the `rand` crate guarantees gives the same stream in every version. One draw is made for each
-/// fill that trades: an order that is refused, cancelled on arrival or rests without trading
-/// takes none. A rate whose two ends are equal makes no draw at all, so a zero rate is identical
-/// to configuring no slippage.
+/// the `rand` crate documents as portable, and a test pins the rates a seed gives. One draw is made
+/// for each fill that trades: an order that is refused, cancelled on arrival or rests without
+/// trading takes none. A rate whose two ends are equal makes no draw at all, so a zero rate is
+/// identical to configuring no slippage.
+///
+/// A drawn rate is rounded to [`RATE_DECIMAL_PLACES`] decimal places, a resolution far finer than
+/// any price tick, so a slipped price carries at most that many more decimal places than the price
+/// it slipped.
 ///
 /// # Validation
 ///
@@ -175,20 +183,23 @@ pub enum SlippageConfigError {
     Inverted { low: Decimal, high: Decimal },
 }
 
+/// How many decimal places a [`SlippageConfig::uniform`] draw is rounded to.
+pub const RATE_DECIMAL_PLACES: u32 = 12;
+
 /// A [`SlippageConfig`] and the random stream it draws from: what the simulated venue applies to
 /// each taker fill.
 ///
 /// Built once per venue from its configuration, and held for the venue's lifetime, so the stream
 /// advances one draw per fill across the whole run.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Slippage {
+pub(crate) struct Slippage {
     config: SlippageConfig,
     rng: Xoshiro256PlusPlus,
 }
 
 impl Slippage {
     /// The slippage `config` describes, its stream at the start of its seed.
-    pub fn new(config: SlippageConfig) -> Self {
+    pub(crate) fn new(config: SlippageConfig) -> Self {
         Self {
             config,
             // A configuration without a seed never draws, so the stream it gets is never read.
@@ -196,15 +207,13 @@ impl Slippage {
         }
     }
 
-    /// The configuration this slippage was built from.
-    pub fn config(&self) -> SlippageConfig {
-        self.config
-    }
-
     /// `reference` moved against an order trading `side`, by a rate drawn for this one fill.
     ///
     /// Advances the stream by one draw unless the configured range is a single rate.
-    pub fn apply(&mut self, side: Side, reference: Decimal) -> Decimal {
+    ///
+    /// # Panics
+    /// On `Decimal` overflow, which takes a reference above about 3.9 × 10²⁸.
+    pub(crate) fn apply(&mut self, side: Side, reference: Decimal) -> Decimal {
         let rate = self.draw();
         if rate.is_zero() {
             return reference;
@@ -226,7 +235,11 @@ impl Slippage {
         // does not promise to keep, so a seed's prices hold across `rand` versions. Both factors
         // of the product lie in `[0, 1]`, so it cannot overflow.
         let unit = Decimal::from(self.rng.next_u64()) / Decimal::from(u64::MAX);
-        low + (high - low) * unit
+        // Rounded so a slipped price does not carry `Decimal`'s full 28 places, then clamped,
+        // since rounding can step past a bound given with more places than this keeps.
+        (low + (high - low) * unit)
+            .round_dp(RATE_DECIMAL_PLACES)
+            .clamp(low, high)
     }
 }
 
@@ -316,13 +329,40 @@ mod tests {
         assert_eq!(rates, GOLDEN_RATES.map(d).to_vec());
     }
 
-    /// The first three rates of seed 42 over `[0.01, 0.025]`. Cross-checked against an independent
-    /// implementation of SplitMix64 seeding and xoshiro256++ from their published reference code.
-    const GOLDEN_RATES: [&str; 3] = [
-        "0.0222145771768436479843294918",
-        "0.0147823156009249183850225810",
-        "0.0247584125226623325452642722",
+    /// Pins the prices too, so a change in how `Decimal` multiplies or rounds is caught as well.
+    #[test]
+    fn a_seed_gives_the_same_prices_in_every_version() {
+        let mut slippage =
+            Slippage::new(SlippageConfig::uniform(d("0.01"), d("0.025"), 42).unwrap());
+        let prices = [Side::Buy, Side::Sell, Side::Buy]
+            .map(|side| slippage.apply(side, d("49000.5")).to_string());
+        assert_eq!(prices, GOLDEN_PRICES);
+    }
+
+    const GOLDEN_PRICES: [&str; 3] = [
+        "50089.0253889615885",
+        "48276.1591443931995",
+        "50213.6745928332615",
     ];
+
+    /// A bound given with more places than a draw keeps is still never stepped past.
+    #[test]
+    fn a_rounded_draw_stays_inside_a_finely_given_range() {
+        let (low, high) = (d("0.0100000000004"), d("0.0100000000006"));
+        let mut slippage = Slippage::new(SlippageConfig::uniform(low, high, 1).unwrap());
+        for _ in 0..1_000 {
+            let rate = slippage.draw();
+            assert!(
+                low <= rate && rate <= high,
+                "{rate} outside [{low}, {high}]"
+            );
+        }
+    }
+
+    /// The first three rates of seed 42 over `[0.01, 0.025]`, rounded to 12 places. Cross-checked
+    /// against an independent implementation of SplitMix64 seeding and xoshiro256++ from their
+    /// published reference code.
+    const GOLDEN_RATES: [&str; 3] = ["0.022214577177", "0.014782315601", "0.024758412523"];
 
     #[test]
     fn the_constructors_refuse_a_rate_the_venue_cannot_apply() {

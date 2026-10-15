@@ -24,10 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     else with a `SlippageConfigError`.
   - One draw per fill that trades. An order that is refused, cancelled on arrival or rests
     without trading takes none, and a range of one rate makes no draw. The generator is
-    xoshiro256++, which `rand` guarantees gives the same stream in every version.
+    xoshiro256++, which `rand` documents as portable. A drawn rate is rounded to 12 decimal
+    places. A short sale under a short-sale restriction is judged on the price before slippage.
   - A custom `FillModel` can now be plugged in, with `SimulatedVenue::with_fill_model` or
     `SimVenueOptions::with_fill_model` (`rustrade`). `FillContext` gains `quantity`, the order's
-    quantity, so a model can price by size.
+    quantity, so a model can price by size. A custom model is not part of the serialisable
+    configuration, so the async `MockExchange` driver, which builds its venue from that
+    configuration, cannot take one.
   - **Breaking:** `MockExecutionConfig` has a new field, so a struct literal or a
     `MockExecutionConfig::new` call must supply it. A serialised config without it still loads,
     as no slippage. `FillContext::new` takes the quantity. `FillModel` now requires

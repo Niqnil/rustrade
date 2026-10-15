@@ -617,6 +617,10 @@ impl SimulatedVenue {
     /// [`FillContext::quantity`]. The configured
     /// [`slippage`](MockExecutionConfig::slippage) still applies to whatever price it returns. See
     /// [`FillModel`] for what an implementation must uphold.
+    ///
+    /// The model is not part of the configuration, so a serialised configuration no longer says
+    /// what priced the fills: its `fill_model` is unused. A venue that `MockExchange` drives is
+    /// built from its configuration alone, so it takes no custom model.
     #[must_use]
     pub fn with_fill_model(mut self, model: Arc<dyn FillModel>) -> Self {
         self.fill_model = model;
@@ -4630,6 +4634,88 @@ mod tests {
         );
 
         assert_eq!(venue.slippage, Slippage::new(config.slippage));
+    }
+
+    /// A funded spot venue on a book offering `depth`, moving every taker fill by `slippage`.
+    fn slipped_venue_offering(
+        usdt: &str,
+        slippage: SlippageConfig,
+        depth: MarketDepth,
+    ) -> SimulatedVenue {
+        let config = MockExecutionConfig {
+            slippage,
+            ..spot_config("10", usdt, FeeModelConfig::default())
+        };
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+        advance(&mut venue, time(1));
+        let fed = venue.apply_market(&instrument_name(), book("47800", "47900"), depth, time(1));
+        assert!(fed.is_empty(), "an empty book fills nothing");
+        venue
+    }
+
+    /// The book fills 1 of 3: that fill is slipped, with one draw, and the remainder rests at the
+    /// order's own limit.
+    #[test]
+    fn a_part_filled_order_is_slipped_once_and_rests_the_rest_at_its_limit() {
+        let mut venue = slipped_venue_offering("1000000", uniform(8), sized("1"));
+        let mut expected = Slippage::new(uniform(8));
+        let price = expected.apply(Side::Buy, d("47900"));
+
+        let outcome = venue.open_order(limit_request("part", Side::Buy, "3", "50000", gtc()));
+        let trade = filled_trade(&outcome);
+        assert_eq!((trade.quantity, trade.price), (d("1"), price));
+        assert_eq!(rested_open(&outcome).filled_quantity, d("1"));
+        assert_eq!(venue.slippage, expected, "one fill, one draw");
+        assert_eq!(
+            venue
+                .account
+                .orders()
+                .resting(&instrument_name(), Side::Buy)
+                .map(|order| order.price)
+                .collect::<Vec<_>>(),
+            vec![Some(d("50000"))],
+            "the remainder rests at its limit, unslipped"
+        );
+    }
+
+    /// A fill-or-kill the book can only part fill trades nothing, so it takes no draw.
+    #[test]
+    fn a_killed_order_takes_no_draw() {
+        let mut venue = slipped_venue_offering("1000000", uniform(8), sized("1"));
+        let outcome = venue.open_order(limit_request(
+            "kill",
+            Side::Buy,
+            "3",
+            "50000",
+            TimeInForce::FillOrKill,
+        ));
+        assert!(
+            matches!(
+                outcome.response.state,
+                OrderState::Inactive(InactiveOrderState::Cancelled(_))
+            ),
+            "{:?}",
+            outcome.response.state
+        );
+        assert_eq!(venue.slippage, Slippage::new(uniform(8)));
+    }
+
+    /// The fill is affordable, its remainder's hold is not: refused whole, and the draw handed back.
+    #[test]
+    fn a_part_filled_order_refused_for_its_hold_hands_back_its_draw() {
+        let mut venue = slipped_venue_offering("60000", uniform(8), sized("1"));
+        let outcome = venue.open_order(limit_request("split", Side::Buy, "3", "50000", gtc()));
+        assert!(
+            matches!(
+                outcome.response.state,
+                OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                    ApiError::BalanceInsufficient(..)
+                )))
+            ),
+            "{:?}",
+            outcome.response.state
+        );
+        assert_eq!(venue.slippage, Slippage::new(uniform(8)));
     }
 
     /// An order the ledger refuses never traded, so the next fill gets the rate it would have got
