@@ -60,6 +60,25 @@ ignore = [
     # gate. Re-check the 0.4 entry in Cargo.lock if h2 is ever downgraded or re-resolved.
     # Drop this entry once hyperliquid_rust_sdk and ethers move off reqwest 0.11.
     { id = "RUSTSEC-2026-0258", reason = "h2 0.3 has no patched release; reached only via the hyperliquid feature (hyperliquid_rust_sdk/ethers -> reqwest 0.11 -> hyper 0.14)" },
+
+    # rustls advisories of 2026-10-15. Two instances are in the lockfile; only one is ours to fix:
+    #   * rustls 0.23.x, our own TLS stack -- FIXED, bumped to 0.23.46 (patched >= 0.23.46) for
+    #     all four (RUSTSEC-2026-0346/0347/0348/0349).
+    #   * rustls 0.21.12, kept here for the two that also name it. No patched 0.21.x exists. Every
+    #     path to it runs through the `hyperliquid` feature (hyperliquid_rust_sdk 0.6 and our own
+    #     optional ethers 2.0 -> reqwest 0.11 / tokio-tungstenite 0.20), so it is not compiled
+    #     under the default feature set. Neither applies to that use:
+    #       - 0346: secrets reach `Debug` output only through a custom `ClientSessionStore` that
+    #         formats session values; that path uses rustls's default store.
+    #       - 0349: a forged ServerHello downgrades the post-quantum hybrid key exchange
+    #         (X25519MLKEM768) to classical. rustls 0.21 offers no post-quantum group, so it is
+    #         classical-only already, and there is nothing to downgrade.
+    # As with h2 above, an `id` ignore also silences these for 0.23.x. Unlike h2, that line has a
+    # gate besides the Cargo.lock pin: the rustls entry in `[bans] deny` below fails cargo deny on
+    # any rustls from 0.22 up to (but not including) 0.23.46. Drop both ignores, and that ban, once
+    # hyperliquid_rust_sdk and ethers move off rustls 0.21.
+    { id = "RUSTSEC-2026-0346", reason = "rustls 0.21 has no patched release; reached only via the hyperliquid feature; no custom ClientSessionStore" },
+    { id = "RUSTSEC-2026-0349", reason = "rustls 0.21 has no patched release; reached only via the hyperliquid feature; 0.21 offers no post-quantum group to downgrade" },
 ]
 
 # Licenses - strict permissive only
@@ -119,13 +138,20 @@ highlight = "all"
 #
 # Until now that invariant lived only in comments, which nothing checks. Cargo unifies features
 # workspace-wide, so *any* future dependency pulling `parquet` with defaults re-admits the lot
-# silently. These entries make `cargo deny` fail the moment it happens. If arrow ever becomes a
-# deliberate dependency, that is a tier-2 review, and removing these lines is how it is recorded.
+# silently. The four arrow entries below make `cargo deny` fail the moment it happens. If arrow
+# ever becomes a deliberate dependency, that is a tier-2 review, and removing those four lines is
+# how it is recorded. (The rustls entry after them is unrelated; its own comment explains it.)
 deny = [
     { name = "arrow" },
     { name = "arrow-array" },
     { name = "arrow-buffer" },
     { name = "arrow-schema" },
+
+    # rustls 0.22 to 0.23.45 carry RUSTSEC-2026-0346/0349, which `[advisories] ignore` above must
+    # suppress by id for the unpatched 0.21 line. That ignore cannot be scoped to a version, so this
+    # ban is what keeps the 0.23 line at or above its fixed release (0.23.46). 0.21 is outside the
+    # range on purpose. Drop it together with those two ignores.
+    { crate = "rustls:>=0.22, <0.23.46" },
 ]
 
 # Sources - only allow crates.io
