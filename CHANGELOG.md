@@ -90,10 +90,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     then reports its terminal order, as before.
   - The asset a fill receives is created at zero if the account never held it, so a backtest
     needs to fund only what its orders pay with.
-  - **Breaking:** `AccountState::commit` takes the fill's credit as an `Option<&Credit>`, which
-    names its asset, and returns `Committed`: the paid balance, and the received one when that is
-    another asset. New `AccountState::deliver`. `BalanceInsufficient` gains the `asset` that was
-    short and is no longer `Copy`.
+  - **Breaking:** `AccountState::commit` takes the fill's credit as an `Option<&Credit>`, where it
+    took a `Decimal` paid back into the paying asset. `Credit` is either `PaidBack`, what a CFD
+    close pays back into the asset the order paid with, or a `Delivery` in another asset, what a
+    spot fill receives. `commit` returns `Committed`: the paid balance, and the received one for a
+    delivery. New `AccountState::deliver`, unchecked like `charge`. `BalanceInsufficient` gains the
+    `asset` that was short and is no longer `Copy`.
 
 - **A fill is no longer dropped because its fee asset is unknown** (`rustrade-execution`,
   `rustrade-instrument`, `rustrade`).

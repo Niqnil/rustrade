@@ -363,29 +363,36 @@ impl AccountState {
         balance.clone()
     }
 
-    /// Moves `amount` of `asset` into the account, or out of it when negative, creating the
-    /// balance at zero if the account has never held `asset`.
+    /// Moves a [`Delivery`] into the account, or out of it when negative, creating the balance at
+    /// zero if the account has never held its asset.
     ///
     /// What a fill delivers: the base a spot buy receives, or the proceeds of a spot sell. A
     /// venue credits the asset an order receives whether or not the account held it before, so
     /// unlike every debit, an absent balance here is not a mis-specified fixture. `total` and
     /// `free` move together, as for [`charge`](Self::charge).
+    ///
+    /// **Unchecked**, like [`charge`](Self::charge): a negative delivery larger than `free` takes
+    /// `free` below zero rather than being refused. [`commit`](Self::commit) is the checked path,
+    /// and a fill that can be refused goes through it.
     pub fn deliver(
         &mut self,
-        credit: &Credit,
+        delivery: &Delivery,
         time_exchange: DateTime<Utc>,
     ) -> AssetBalance<AssetNameExchange> {
-        let balance = self
-            .balances
-            .entry(credit.asset.clone())
-            .or_insert_with(|| AssetBalance {
-                asset: credit.asset.clone(),
-                balance: Balance::new(Decimal::ZERO, Decimal::ZERO),
-                time_exchange,
-            });
+        let balance = match self.balances.get_mut(&delivery.asset) {
+            Some(balance) => balance,
+            None => self
+                .balances
+                .entry(delivery.asset.clone())
+                .or_insert_with(|| AssetBalance {
+                    asset: delivery.asset.clone(),
+                    balance: Balance::new(Decimal::ZERO, Decimal::ZERO),
+                    time_exchange,
+                }),
+        };
 
-        balance.balance.total += credit.amount;
-        balance.balance.free += credit.amount;
+        balance.balance.total += delivery.amount;
+        balance.balance.free += delivery.amount;
         balance.time_exchange = time_exchange;
 
         balance.clone()
@@ -415,17 +422,18 @@ impl AccountState {
     /// moved: the one it paid with, and the one it received when that is another asset.
     ///
     /// # What the fill pays back
-    /// `credit` is what the fill gives the account, and where it goes decides what it does:
-    /// - **Into the paying asset** — the margin and realised PnL of the part of a CFD fill that
-    ///   closes a position. It counts towards what `free` must cover, because one fill can carry
-    ///   both: a CFD flip, closing a long and opening a short in one order, is paid back for the
-    ///   long and posts margin for the short, so the flip is funded by the long it closes. It is
-    ///   never negative: a loss beyond the margin is part of the debit.
-    /// - **Into another asset** — what a spot fill delivers: base for a buy, the proceeds net of
-    ///   the fee for a sell. It funds nothing, since it is not the asset paid with, and it is
-    ///   [delivered](Self::deliver) whether or not the account held that asset before. It is
-    ///   negative only for a sell whose fee exceeds its proceeds, and then that asset's `free`
-    ///   must cover the excess too.
+    /// `credit` is what the fill gives the account, and which [`Credit`] it is decides what it
+    /// does:
+    /// - **[`PaidBack`](Credit::PaidBack)**, into the paying asset — the margin and realised PnL
+    ///   of the part of a CFD fill that closes a position. It counts towards what `free` must
+    ///   cover, because one fill can carry both: a CFD flip, closing a long and opening a short in
+    ///   one order, is paid back for the long and posts margin for the short, so the flip is
+    ///   funded by the long it closes.
+    /// - **[`Delivery`](Credit::Delivery)**, into another asset — what a spot fill receives: base
+    ///   for a buy, the proceeds net of the fee for a sell. It funds nothing, since it is not the
+    ///   asset paid with, and it is [delivered](Self::deliver) whether or not the account held
+    ///   that asset before. It is negative only for a sell whose fee exceeds its proceeds, and
+    ///   then that asset's `free` must cover the excess too.
     ///
     /// Nothing is credited until every requirement is known to be covered, so a refusal still
     /// leaves the ledger exactly as it was. `None` is an arrival with nothing to pay back: an
@@ -439,24 +447,24 @@ impl AccountState {
     ///
     /// # Panics
     /// Panics if the paying asset has no balance — see [`reserve`](Self::reserve). Debug-asserts
-    /// that a credit into the paying asset is not negative.
+    /// that a [`PaidBack`](Credit::PaidBack) credit is not negative.
     pub fn commit(
         &mut self,
         debit: &Debit,
         credit: Option<&Credit>,
         time_exchange: DateTime<Utc>,
     ) -> Result<Committed, BalanceInsufficient> {
-        let (funding, delivered) = match credit {
-            Some(credit) if credit.asset == debit.asset => {
+        let (funding, delivery) = match credit {
+            Some(Credit::PaidBack(amount)) => {
                 debug_assert!(
-                    !credit.amount.is_sign_negative(),
-                    "a credit of {} {} is negative: a loss beyond the margin is debited",
-                    credit.amount,
-                    credit.asset
+                    !amount.is_sign_negative(),
+                    "a credit of {amount} {} is negative: a loss beyond the margin is debited",
+                    debit.asset
                 );
-                (credit.amount, None)
+                (*amount, None)
             }
-            other => (Decimal::ZERO, other),
+            Some(Credit::Delivery(delivery)) => (Decimal::ZERO, Some(delivery)),
+            None => (Decimal::ZERO, None),
         };
 
         // Asked for as one requirement, so a refusal refuses the arrival rather than half of it.
@@ -472,16 +480,16 @@ impl AccountState {
 
         // A delivery that takes rather than gives -- a sell whose fee exceeds its proceeds -- must
         // be covered before anything moves too. An asset never held has nothing free.
-        if let Some(credit) = delivered.filter(|credit| credit.amount.is_sign_negative()) {
+        if let Some(delivery) = delivery.filter(|delivery| delivery.amount.is_sign_negative()) {
             let free = self
                 .balances
-                .get(&credit.asset)
+                .get(&delivery.asset)
                 .map_or(Decimal::ZERO, |balance| balance.balance.free);
-            if free + credit.amount < Decimal::ZERO {
+            if free + delivery.amount < Decimal::ZERO {
                 return Err(BalanceInsufficient {
-                    asset: credit.asset.clone(),
+                    asset: delivery.asset.clone(),
                     free,
-                    required: -credit.amount,
+                    required: -delivery.amount,
                 });
             }
         }
@@ -498,7 +506,7 @@ impl AccountState {
         // settled stays held.
         self.reserve(&debit.asset, required, time_exchange)?;
         let paid = self.settle(&debit.asset, debit.settled, time_exchange);
-        let received = delivered.map(|credit| self.deliver(credit, time_exchange));
+        let received = delivery.map(|delivery| self.deliver(delivery, time_exchange));
 
         Ok(Committed { paid, received })
     }
@@ -543,16 +551,27 @@ pub struct Debit {
     pub reserved: Decimal,
 }
 
-/// What one fill gives the account, in one asset.
+/// What one fill gives the account. See [`AccountState::commit`].
 ///
-/// Into the asset the order paid with, it is what a CFD fill that closes a position pays back.
-/// Into another asset, it is what a spot fill delivers. See [`AccountState::commit`].
+/// Two kinds, because where a credit goes decides what it does: one paid back into the asset the
+/// order paid with funds that order, and one delivered in another asset does not.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Credit {
-    /// The asset credited.
+pub enum Credit {
+    /// Paid back into the asset the order paid with: the margin and realised PnL of the part of a
+    /// CFD fill that closes a position. Zero for a fill that closes nothing, and never negative,
+    /// since a loss beyond the margin is part of the debit.
+    PaidBack(Decimal),
+    /// Delivered in another asset: what a spot fill receives.
+    Delivery(Delivery),
+}
+
+/// What a spot fill delivers, in the asset it receives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivery {
+    /// The asset received: base for a buy, quote for a sell.
     pub asset: AssetNameExchange,
     /// Denominated in [`asset`](Self::asset), net of any fee charged in it. Negative only for a
-    /// spot sell whose fee exceeds its proceeds.
+    /// sell whose fee exceeds its proceeds.
     pub amount: Decimal,
 }
 
@@ -711,10 +730,7 @@ mod tests {
             reserved: dec!(40),
         };
 
-        let credit = Credit {
-            asset: usd(),
-            amount: dec!(200),
-        };
+        let credit = Credit::PaidBack(dec!(200));
 
         let Ok(committed) = account.commit(&debit, Some(&credit), DateTime::<Utc>::MIN_UTC) else {
             panic!("100 free plus a 200 credit covers 290");
@@ -738,10 +754,7 @@ mod tests {
             reserved: dec!(60),
         };
 
-        let credit = Credit {
-            asset: usd(),
-            amount: dec!(200),
-        };
+        let credit = Credit::PaidBack(dec!(200));
 
         let Err(insufficient) = account.commit(&debit, Some(&credit), DateTime::<Utc>::MIN_UTC)
         else {
@@ -780,10 +793,10 @@ mod tests {
             settled: dec!(100),
             reserved: dec!(0),
         };
-        let credit = Credit {
+        let credit = Credit::Delivery(Delivery {
             asset: btc(),
             amount: dec!(2),
-        };
+        });
 
         let Ok(committed) = account.commit(&debit, Some(&credit), DateTime::<Utc>::MIN_UTC) else {
             panic!("100 free covers 100");
@@ -810,10 +823,10 @@ mod tests {
             settled: dec!(101),
             reserved: dec!(0),
         };
-        let credit = Credit {
+        let credit = Credit::Delivery(Delivery {
             asset: btc(),
             amount: dec!(1000),
-        };
+        });
 
         let Err(insufficient) = account.commit(&debit, Some(&credit), DateTime::<Utc>::MIN_UTC)
         else {
@@ -854,10 +867,10 @@ mod tests {
             settled: dec!(1),
             reserved: dec!(0),
         };
-        let short = Credit {
+        let short = Credit::Delivery(Delivery {
             asset: usd(),
             amount: dec!(-4),
-        };
+        });
 
         let Err(insufficient) = account.commit(&debit, Some(&short), DateTime::<Utc>::MIN_UTC)
         else {
@@ -877,10 +890,10 @@ mod tests {
         );
         assert_eq!(usd_balance(&account), Balance::new(dec!(3), dec!(3)));
 
-        let covered = Credit {
+        let covered = Credit::Delivery(Delivery {
             asset: usd(),
             amount: dec!(-2),
-        };
+        });
         let Ok(committed) = account.commit(&debit, Some(&covered), DateTime::<Utc>::MIN_UTC) else {
             panic!("3 usd free covers a 2 usd excess fee");
         };
