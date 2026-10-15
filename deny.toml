@@ -73,8 +73,10 @@ ignore = [
     #       - 0349: a forged ServerHello downgrades the post-quantum hybrid key exchange
     #         (X25519MLKEM768) to classical. rustls 0.21 offers no post-quantum group, so it is
     #         classical-only already, and there is nothing to downgrade.
-    # As with h2 above, an `id` ignore also silences these for 0.23.x; Cargo.lock's 0.23.46 pin is
-    # what protects us there. Drop both once hyperliquid_rust_sdk and ethers move off rustls 0.21.
+    # As with h2 above, an `id` ignore also silences these for 0.23.x. Unlike h2, that line has a
+    # gate besides the Cargo.lock pin: the rustls entry in `[bans] deny` below fails cargo deny on
+    # any rustls from 0.22 up to (but not including) 0.23.46. Drop both ignores, and that ban, once
+    # hyperliquid_rust_sdk and ethers move off rustls 0.21.
     { id = "RUSTSEC-2026-0346", reason = "rustls 0.21 has no patched release; reached only via the hyperliquid feature; no custom ClientSessionStore" },
     { id = "RUSTSEC-2026-0349", reason = "rustls 0.21 has no patched release; reached only via the hyperliquid feature; 0.21 offers no post-quantum group to downgrade" },
 ]
@@ -143,6 +145,12 @@ deny = [
     { name = "arrow-array" },
     { name = "arrow-buffer" },
     { name = "arrow-schema" },
+
+    # rustls 0.22 to 0.23.45 carry RUSTSEC-2026-0346/0349, which `[advisories] ignore` above must
+    # suppress by id for the unpatched 0.21 line. That ignore cannot be scoped to a version, so this
+    # ban is what keeps the 0.23 line at or above its fixed release (0.23.46). 0.21 is outside the
+    # range on purpose. Drop it together with those two ignores.
+    { crate = "rustls:>=0.22, <0.23.46" },
 ]
 
 # Sources - only allow crates.io
