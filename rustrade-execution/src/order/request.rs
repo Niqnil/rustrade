@@ -102,8 +102,8 @@ pub struct RequestOpen {
     /// [`MockExecution`](crate::client::mock::MockExecution) and
     /// [`MockExchange`](crate::exchange::mock::MockExchange) use: the request's snapshot is priced
     /// through the venue's [`FillModel`](crate::fill::FillModel), and without it a market order
-    /// carries no price at all — the venue ignores `price` on an [`OrderKind::Market`] — so the
-    /// venue can only reject.
+    /// has no limit price to fall back on — the venue ignores `price` on an
+    /// [`OrderKind::Market`] — so the venue can only reject.
     ///
     /// A [`MarketDriven`](crate::exchange::mock::venue::VenueRegime::MarketDriven) venue ignores it and
     /// prices from its own book, like a live one. This field is then decision-time provenance
