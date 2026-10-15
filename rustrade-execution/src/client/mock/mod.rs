@@ -7,7 +7,7 @@ use crate::{
         UnindexedOrderError,
     },
     exchange::mock::request::MockExchangeRequest,
-    fee::FeeModelConfig,
+    fee::{FeeModelConfig, SpotFeeAsset},
     fill::SimFillConfig,
     order::{
         Order, OrderKey, UnindexedInactiveOrder, UnindexedOrderKey,
@@ -50,6 +50,12 @@ pub struct MockExecutionConfig {
     /// simulation when market prices are injected alongside orders.
     #[serde(default)]
     pub fill_model: SimFillConfig,
+    /// Which asset the mock exchange charges a spot fill's fee in.
+    ///
+    /// Defaults to [`SpotFeeAsset::Quote`], on both sides. [`SpotFeeAsset::Received`] takes a
+    /// buy's fee out of the base it receives, as Binance spot does by default.
+    #[serde(default)]
+    pub spot_fee_asset: SpotFeeAsset,
 }
 
 #[derive(Debug, Constructor)]

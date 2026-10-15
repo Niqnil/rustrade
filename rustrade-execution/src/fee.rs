@@ -198,6 +198,54 @@ impl Default for FeeModelConfig {
     }
 }
 
+/// Which asset the simulated venue charges a spot fill's fee in.
+///
+/// The amount always comes from the venue's [`FeeModelConfig`], which prices a fee in quote. This
+/// rule says only which balance it is taken from, so it changes no cost, only which asset pays it:
+///
+/// | Rule | Buy | Sell |
+/// |---|---|---|
+/// | [`Quote`](Self::Quote) | quote, on top of the notional | quote, out of the proceeds |
+/// | [`Received`](Self::Received) | base, out of the quantity received | quote, out of the proceeds |
+///
+/// A fee in base is the quote fee divided by the fill price, to `Decimal`'s 28 digits. The fill
+/// reports it in base, with that quote fee as its
+/// [`AssetFees::fees_quote`](crate::trade::AssetFees::fees_quote).
+///
+/// Venues differ, and so do accounts on one venue. `Quote` matches Coinbase spot's default.
+/// `Received` matches Binance spot's default, with BNB fee payment turned off. Pick the rule of
+/// the account a backtest stands in for. A CFD fill is cash-settled, so its fee is always in
+/// quote, whatever this says.
+///
+/// # A buy's fee in base
+/// Under `Received`, a buy receives its quantity less the fee, and the engine nets a base fee from
+/// a spot position (see `rustrade`'s `InstrumentState::update_from_trade`), so the two stay equal.
+/// The holding is then not a round number: a buy of 1 with a 0.1 % fee holds 0.999. A live venue
+/// sells only whole multiples of its lot step, so a full-size close there can leave a remainder
+/// below one lot, which only that venue's own dust conversion can clear. Rounding a close to the
+/// lot step is the strategy's to do. This venue has no lot step, so a close here sells the whole
+/// holding.
+///
+/// A flat fee on a tiny buy can exceed the quantity it receives. The excess is then taken from the
+/// base balance, and the order is refused if that cannot cover it, as a sell whose fee exceeds its
+/// proceeds takes the excess from quote. A fill at a price that is not positive cannot be
+/// converted, so it is charged in quote under either rule.
+///
+/// `#[non_exhaustive]`: a rule that charges a third asset, such as BNB, may be added.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
+)]
+#[non_exhaustive]
+pub enum SpotFeeAsset {
+    /// The fee is in quote on both sides: on top of what a buy pays, and out of what a sell
+    /// receives. Venue-neutral, and the base a fill moves is exactly its quantity.
+    #[default]
+    Quote,
+    /// The fee is in the asset the fill receives: base out of a buy's quantity, quote out of a
+    /// sell's proceeds.
+    Received,
+}
+
 impl FeeModel for FeeModelConfig {
     fn compute_fee(
         &self,

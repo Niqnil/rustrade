@@ -117,6 +117,7 @@ fn mock_config() -> MockExecutionConfig {
         latency_ms: 0,
         fee_model: Default::default(),
         fill_model: Default::default(),
+        spot_fee_asset: Default::default(),
     }
 }
 

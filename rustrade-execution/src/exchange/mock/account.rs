@@ -430,10 +430,10 @@ impl AccountState {
     ///   one order, is paid back for the long and posts margin for the short, so the flip is
     ///   funded by the long it closes.
     /// - **[`Delivery`](Credit::Delivery)**, into another asset — what a spot fill receives: base
-    ///   for a buy, the proceeds net of the fee for a sell. It funds nothing, since it is not the
-    ///   asset paid with, and it is [delivered](Self::deliver) whether or not the account held
-    ///   that asset before. It is negative only for a sell whose fee exceeds its proceeds, and
-    ///   then that asset's `free` must cover the excess too.
+    ///   for a buy, the proceeds for a sell, each net of any fee charged in it. It funds nothing,
+    ///   since it is not the asset paid with, and it is [delivered](Self::deliver) whether or not
+    ///   the account held that asset before. It is negative only for a fill whose fee exceeds
+    ///   what it receives, and then that asset's `free` must cover the excess too.
     ///
     /// Nothing is credited until every requirement is known to be covered, so a refusal still
     /// leaves the ledger exactly as it was. `None` is an arrival with nothing to pay back: an
@@ -478,8 +478,8 @@ impl AccountState {
             });
         }
 
-        // A delivery that takes rather than gives -- a sell whose fee exceeds its proceeds -- must
-        // be covered before anything moves too. An asset never held has nothing free.
+        // A delivery that takes rather than gives -- a fill whose fee exceeds what it receives --
+        // must be covered before anything moves too. An asset never held has nothing free.
         if let Some(delivery) = delivery.filter(|delivery| delivery.amount.is_sign_negative()) {
             let free = self
                 .balances
@@ -571,7 +571,7 @@ pub struct Delivery {
     /// The asset received: base for a buy, quote for a sell.
     pub asset: AssetNameExchange,
     /// Denominated in [`asset`](Self::asset), net of any fee charged in it. Negative only for a
-    /// sell whose fee exceeds its proceeds.
+    /// fill whose fee exceeds what it receives.
     pub amount: Decimal,
 }
 
@@ -849,8 +849,8 @@ mod tests {
         );
     }
 
-    /// A sell whose fee exceeds its proceeds takes the excess from the asset it receives, and is
-    /// refused, moving nothing, when that asset cannot cover it.
+    /// A fill whose fee exceeds what it receives takes the excess from the asset it receives, and
+    /// is refused, moving nothing, when that asset cannot cover it.
     #[test]
     fn a_negative_delivery_must_be_covered_by_its_own_asset() {
         let mut account = AccountState::new(

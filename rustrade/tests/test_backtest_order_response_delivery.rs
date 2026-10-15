@@ -339,6 +339,7 @@ fn args_constant()
             latency_ms: 0,
             fee_model: Default::default(),
             fill_model: Default::default(),
+            spot_fee_asset: Default::default(),
         })],
         market_data: MarketDataInMemory::new(Arc::new(market_events)),
         summary_interval: Daily,

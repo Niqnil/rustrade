@@ -376,7 +376,7 @@ pub(crate) mod fixtures {
         InstrumentAccountSnapshot, UnindexedAccountSnapshot,
         balance::{AssetBalance, Balance},
         client::mock::MockExecutionConfig,
-        fee::FeeModelConfig,
+        fee::{FeeModelConfig, SpotFeeAsset},
         fill::SimFillConfig,
         market::MarketSnapshot,
         order::{
@@ -455,6 +455,7 @@ pub(crate) mod fixtures {
             0, // latency_ms
             fee_model,
             fill_model,
+            SpotFeeAsset::default(),
         )
     }
 
@@ -485,6 +486,7 @@ pub(crate) mod fixtures {
             0, // latency_ms
             FeeModelConfig::default(),
             SimFillConfig::default(),
+            SpotFeeAsset::default(),
         )
     }
 

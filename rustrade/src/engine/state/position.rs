@@ -314,6 +314,18 @@ impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, Instrumen
                 position.contract_size = contract_size;
                 position.update_from_trade(trade)
             }
+            // A fill that moves nothing opens nothing: a spot fill whose base fee equals its
+            // quantity, once the fee is netted. Its fee has no position to be charged to.
+            None if trade.quantity.is_zero() => {
+                warn!(
+                    instrument = ?trade.instrument,
+                    order_id = %trade.order_id,
+                    fees = %trade.fees.fees,
+                    "fill of zero quantity on a flat position slot opens no position, so its fee \
+                     reaches no position's PnL"
+                );
+                (None, None)
+            }
             None => {
                 // New position — set contract_size before any PnL calculations.
                 let mut position = Position::from(trade);
@@ -618,8 +630,13 @@ pub enum PositionSeedError {
 /// so it is left out of both PnL figures. Its raw amount stays in
 /// [`fees_enter`](Position::fees_enter) / [`fees_exit`](Position::fees_exit). So PnL overstates
 /// the result of a position whose fees were paid in a third asset, by those fees, until a consumer
-/// prices them. The simulated venue charges fees in quote, so a backtest counts them where a live
-/// run with such fees does not.
+/// prices them. The simulated venue never charges a fee in a third asset, so a backtest counts
+/// fees that a live run paying them in one does not.
+///
+/// A position's quantity is the sum of its fills' quantities, as they reach it. A spot fill whose
+/// fee is in the base asset reaches it with the fee already netted, by
+/// [`InstrumentState::update_from_trade`](super::instrument::InstrumentState::update_from_trade),
+/// so a spot position is what the account holds rather than what it traded.
 ///
 /// # Type Parameters
 /// - `AssetKey`: The type representing the asset used for fees (e.g. AssetIndex, QuoteAsset, etc.)
