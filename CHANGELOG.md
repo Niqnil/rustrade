@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - One draw per fill that trades. An order that is refused, cancelled on arrival or rests
     without trading takes none, and a range of one rate makes no draw. The generator is
     xoshiro256++, which `rand` documents as portable. A drawn rate is rounded to 12 decimal
-    places. A short sale under a short-sale restriction is judged on the price before slippage.
+    places and kept within the range.
   - A custom `FillModel` can now be plugged in, with `SimulatedVenue::with_fill_model` or
     `SimVenueOptions::with_fill_model` (`rustrade`). `FillContext` gains `quantity`, the order's
     quantity, so a model can price by size. A custom model is not part of the serialisable

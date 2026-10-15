@@ -42,9 +42,6 @@ use thiserror::Error;
 /// print outside that bar's high and low. Capping it would silently erase most of the rate. Nor
 /// is it rounded to the instrument's tick, which the venue does not know.
 ///
-/// A short sale under a short-sale restriction is judged on the price before slippage, so the
-/// slipped fill of a sale the venue allowed may print below the best bid.
-///
 /// # Reproducibility
 ///
 /// [`uniform`](Self::uniform) draws from its own generator, seeded by the `u64` in this
@@ -55,9 +52,9 @@ use thiserror::Error;
 /// trading takes none. A rate whose two ends are equal makes no draw at all, so a zero rate is
 /// identical to configuring no slippage.
 ///
-/// A drawn rate is rounded to [`RATE_DECIMAL_PLACES`] decimal places, a resolution far finer than
-/// any price tick, so a slipped price carries at most that many more decimal places than the price
-/// it slipped.
+/// A rate drawn between the two ends is rounded to [`RATE_DECIMAL_PLACES`] decimal places, a
+/// resolution far finer than any price tick. So with ends given to at most that many places, a
+/// slipped price carries at most that many more decimal places than the price it slipped.
 ///
 /// # Validation
 ///
