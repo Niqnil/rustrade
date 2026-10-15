@@ -162,13 +162,9 @@ impl BinanceWsConnection for Arc<binance_sdk::common::websocket::WebsocketApi> {
 /// in place and reports the result. Wrap a connection only once it has connected: disconnecting
 /// one that never did makes binance-sdk log a WARN.
 ///
-/// # Known limitations (binance-sdk 74.1.1)
-/// - A disconnect while binance-sdk is reconnecting a socket the server dropped does nothing: the
-///   SDK closes only a connected socket, and its reconnect then completes.
-/// - binance-sdk renews each connection about 23 h after it opens, and its renewal reconnects a
-///   connection even after it was disconnected. A closed connection can therefore come back.
-///
-/// Neither can be prevented through the SDK's public API on the connection itself.
+/// A disconnected connection stays closed: binance-sdk skips its own reconnect and its 23 h
+/// renewal once a connection is disconnected, including a reconnect already pending when the
+/// disconnect is called.
 pub(crate) struct DisconnectOnDrop<W: BinanceWsConnection> {
     /// `None` once [`disconnect`](Self::disconnect) has finished.
     ws: Option<W>,
@@ -547,8 +543,8 @@ const _: () = assert!(
     "BINANCE_MAX_TRADES overflows i32"
 );
 /// Default delay when rate-limited (exponential backoff). Binance sends `Retry-After` on a 429 or
-/// 418, but `binance-sdk` drops the response headers from its rate-limit errors, so neither this
-/// delay nor [`ApiError::RateLimit`]'s `retry_after` can use it.
+/// 418, and `binance-sdk` reports it with its rate-limit errors, but neither this delay nor
+/// [`ApiError::RateLimit`]'s `retry_after` reads it yet.
 pub(crate) const DEFAULT_RATE_LIMIT_DELAY_SECS: u64 = 10;
 /// Maximum number of REST retry attempts on rate-limit errors.
 pub(crate) const MAX_RATE_LIMIT_RETRIES: u32 = 3;
@@ -4832,10 +4828,12 @@ mod tests {
             ConnectorError::TooManyRequestsError {
                 msg: "Too many requests.".to_string(),
                 code: Some(-1003),
+                retry_after: None,
             },
             ConnectorError::RateLimitBanError {
                 msg: "IP banned.".to_string(),
                 code: Some(-1003),
+                retry_after: None,
             },
         ] {
             assert!(matches!(
@@ -5025,6 +5023,7 @@ mod tests {
         let err = classify_query(ConnectorError::TooManyRequestsError {
             msg: "Too many requests.".to_string(),
             code: Some(-1003),
+            retry_after: None,
         });
         assert!(matches!(
             err,
@@ -5380,6 +5379,7 @@ mod tests {
             &anyhow::Error::new(WebsocketError::ResponseError {
                 code,
                 message: message.to_string(),
+                retry_after: None,
             }),
             &InstrumentNameExchange::new("BTCUSDT"),
         )
@@ -5427,6 +5427,7 @@ mod tests {
         let wrapped = anyhow::Error::new(WebsocketError::ResponseError {
             code: -1007,
             message: "Timeout waiting for response from backend server.".to_string(),
+            retry_after: None,
         })
         .context("outer");
         let err = classify_ws_order_error(&wrapped, &InstrumentNameExchange::new("BTCUSDT"));
