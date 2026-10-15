@@ -2220,8 +2220,8 @@ impl std::fmt::Display for SettlementFillUnplaced {
 /// `q + f`. A negative fee, a rebate, adds to it. The result's side is the sign of that move, so
 /// a fee larger than a buy's quantity sells, and a move of zero keeps the fill's side with a
 /// quantity of zero. The caller keeps the fill's price and fees, so PnL is charged the fee's quote
-/// equivalent while the netted quantity carries the fill's price: buying `q − f` at `p` and paying `f × p` costs
-/// `q × p`, what the fill paid.
+/// equivalent while the netted quantity carries the fill's price: buying `q − f` at `p` and
+/// paying `f × p` costs `q × p`, what the fill paid.
 ///
 /// Spot only, spot margin included. A derivative's position is counted in contracts, and an
 /// inverse contract pays its fees in the settlement coin, so a fee there is not a holding.
