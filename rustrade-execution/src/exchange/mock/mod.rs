@@ -456,6 +456,7 @@ pub(crate) mod fixtures {
             fee_model,
             fill_model,
             SpotFeeAsset::default(),
+            crate::slippage::SlippageConfig::default(),
         )
     }
 
@@ -487,6 +488,7 @@ pub(crate) mod fixtures {
             FeeModelConfig::default(),
             SimFillConfig::default(),
             SpotFeeAsset::default(),
+            crate::slippage::SlippageConfig::default(),
         )
     }
 

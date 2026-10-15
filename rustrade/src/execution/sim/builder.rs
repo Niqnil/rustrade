@@ -15,6 +15,7 @@ use rustrade_execution::{
         mock::{MockExecution, MockExecutionConfig},
     },
     exchange::mock::SimulatedVenue,
+    fill::FillModel,
     holding_cost::HoldingCostModel,
     indexer::AccountEventIndexer,
     map::generate_execution_instrument_map,
@@ -48,6 +49,11 @@ pub struct SimVenueOptions {
     /// What the venue may lend for a CFD short, and when a short-sale restriction is in effect —
     /// see [`SimulatedVenue::with_shortability`]. `None` lends without limit.
     pub shortability: Option<Arc<dyn ShortabilityProvider>>,
+    /// Prices each taker fill in place of the configuration's
+    /// [`fill_model`](MockExecutionConfig::fill_model) — see
+    /// [`SimulatedVenue::with_fill_model`]. `None` uses the configured one. The configured
+    /// [`slippage`](MockExecutionConfig::slippage) applies to either.
+    pub fill_model: Option<Arc<dyn FillModel>>,
 }
 
 impl SimVenueOptions {
@@ -62,6 +68,14 @@ impl SimVenueOptions {
     #[must_use]
     pub fn with_shortability(mut self, provider: Arc<dyn ShortabilityProvider>) -> Self {
         self.shortability = Some(provider);
+        self
+    }
+
+    /// These options, pricing each taker fill with `model` — see [`FillModel`] for what an
+    /// implementation must uphold.
+    #[must_use]
+    pub fn with_fill_model(mut self, model: Arc<dyn FillModel>) -> Self {
+        self.fill_model = Some(model);
         self
     }
 }
@@ -136,6 +150,7 @@ impl<'a> SimExecutionBuilder<'a> {
         let SimVenueOptions {
             holding_costs,
             shortability,
+            fill_model,
         } = options;
 
         let exchange = config.mocked_exchange;
@@ -175,6 +190,9 @@ impl<'a> SimExecutionBuilder<'a> {
         .with_holding_costs(holding_costs);
         if let Some(provider) = shortability {
             venue = venue.with_shortability(provider);
+        }
+        if let Some(model) = fill_model {
+            venue = venue.with_fill_model(model);
         }
 
         let venue = SimVenue {

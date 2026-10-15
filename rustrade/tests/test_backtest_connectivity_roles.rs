@@ -118,6 +118,7 @@ fn mock_config() -> MockExecutionConfig {
         fee_model: Default::default(),
         fill_model: Default::default(),
         spot_fee_asset: Default::default(),
+        slippage: Default::default(),
     }
 }
 
