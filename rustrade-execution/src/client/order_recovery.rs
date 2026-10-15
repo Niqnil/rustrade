@@ -123,6 +123,12 @@ impl SharedKnownLiveOrders {
             log: ForgottenLog::default(),
         }
     }
+
+    /// How many handles share the set: a test's check that a dropped stream released its own.
+    #[cfg(test)]
+    pub(crate) fn holders(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
 }
 
 /// The lock on a [`SharedKnownLiveOrders`]. On drop it releases the lock, then logs what the set
