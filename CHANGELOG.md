@@ -120,8 +120,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     event per listed asset of the pair: one or two. Apply each to the `(instrument, asset)` it
     names and keep the pair's other asset as it was. To tell base from quote, compare
     `balance.asset` with the instrument's base and quote.
-  - An asset on the frame that is neither the pair's base nor its quote is skipped at DEBUG,
-    where it was skipped silently, so a frame listing none of the pair's assets yields no event.
+  - An asset on the frame that is neither the pair's base nor its quote is skipped at DEBUG; it
+    was skipped silently before. A frame listing none of the pair's assets yields no event.
     An entry with an unparseable `free`/`locked` is skipped with a WARN and no longer drops the
     pair's other asset.
 
