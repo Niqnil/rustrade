@@ -65,17 +65,17 @@ use super::margin_risk::{
 };
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
-    CONNECT_TIMEOUT_SECS, ExecutionReport, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS,
-    HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
-    PlacementResponse, RateLimitTracker, RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS,
-    SharedDedupCache, TrailingOrderError, UnhandledEvents, UnrecoveredFills, UserDataFrame,
-    WeightPool, binance_filled_qty, classify_order_kind_tif, classify_rest_order_error,
-    classify_rest_query_error, convert_ended_order, convert_execution_report,
-    convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event, drop_after,
-    frame_excerpt, gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
-    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
-    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
-    trailing_params,
+    CONNECT_TIMEOUT_SECS, DisconnectOnDrop, ExecutionReport, ExponentialBackoff,
+    FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET,
+    OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
+    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, TrailingOrderError, UnhandledEvents,
+    UnrecoveredFills, UserDataFrame, WeightPool, binance_filled_qty, classify_order_kind_tif,
+    classify_rest_order_error, classify_rest_query_error, convert_ended_order,
+    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
+    dedup_key_from_event, drop_after, frame_excerpt, gap_failed, gap_time, is_duplicate,
+    is_unknown_order, log_unhandled_event, log_unrecognised_frame, new_dedup_cache,
+    parse_user_data_frame, placed_order_state, recovered_order_cids, recovered_order_totals,
+    response_decode_error, rest_call_with_retry, trailing_params,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -2044,7 +2044,7 @@ fn token_renew_after(expiration_time_ms: i64) -> Duration {
 /// rather than relying on the SDK's internal timeout (an unstable, version-pinned detail).
 async fn connect_margin_ws(
     ws_config: &ConfigurationWebsocketApi,
-) -> anyhow::Result<Arc<WsApiBase>> {
+) -> anyhow::Result<DisconnectOnDrop<Arc<WsApiBase>>> {
     let ws = WsApiBase::new(ws_config.clone(), vec![]);
     // Mirrors BinanceSpot's reconnect path: a stalled connect must not block the connection
     // manager for an OS-length TCP timeout if the SDK's internal bound ever changes.
@@ -2056,7 +2056,8 @@ async fn connect_margin_ws(
     .map_err(|_| {
         anyhow::anyhow!("BinanceMargin WS connect timed out after {CONNECT_TIMEOUT_SECS}s")
     })??;
-    Ok(ws)
+    // Closed when dropped, so a manager aborted with its stream does not leave the socket open.
+    Ok(DisconnectOnDrop::new(ws, "BinanceMargin account stream"))
 }
 
 /// Subscribe to the user-data stream over an existing WS-API connection.
@@ -2806,7 +2807,7 @@ async fn margin_connection_manager(
     rate_limiter: Arc<RateLimitTracker>,
     known: SharedKnownLiveOrders,
     instruments: Vec<InstrumentNameExchange>,
-    initial: Option<(Arc<WsApiBase>, UserListenToken)>,
+    initial: Option<(DisconnectOnDrop<Arc<WsApiBase>>, UserListenToken)>,
 ) {
     enum DisconnectReason {
         Signal,
@@ -3169,7 +3170,7 @@ fn earliest_token_expiry_ms(tokens: &[(InstrumentNameExchange, UserListenToken)]
 /// A live, subscribed isolated connection: the single multiplexed socket plus the per-connection
 /// lifecycle handles the manager's monitor loop needs.
 struct IsolatedLiveConn {
-    ws: Arc<WsApiBase>,
+    ws: DisconnectOnDrop<Arc<WsApiBase>>,
     subscription: Subscription,
     signal_rx: oneshot::Receiver<()>,
     heartbeat_flag: Arc<AtomicBool>,

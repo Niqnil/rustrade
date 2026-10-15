@@ -84,10 +84,11 @@ use tracing::{debug, error, info, trace, warn};
 
 /// Wrapper stream that aborts the connection_manager JoinHandle when dropped.
 ///
-/// This ensures the channel and its associated task are cleaned up when the
-/// consumer drops the account_stream. Note: `abort()` cancels at the next `.await`
-/// point — if the task is mid-disconnect, the TCP connection may not close
-/// gracefully. The OS will reclaim the socket via keepalive/FIN_WAIT timeout.
+/// This ensures the channel and its associated task are cleaned up when the consumer drops the
+/// account_stream. `abort()` cancels the task at its next `.await`, wherever that is: in fill
+/// recovery, a connect, a backoff or the monitor loop. The manager therefore holds every
+/// connection in a [`DisconnectOnDrop`], whose drop closes the socket. Without it the socket
+/// would stay open, since binance-sdk keeps it in detached tasks that answer the server's pings.
 pub(crate) struct AbortOnDropStream<S> {
     inner: S,
     handle: tokio::task::JoinHandle<()>,
@@ -114,6 +115,110 @@ impl<S: futures::Stream + Unpin> futures::Stream for AbortOnDropStream<S> {
 impl<S> Drop for AbortOnDropStream<S> {
     fn drop(&mut self) {
         self.handle.abort();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DisconnectOnDrop — closes a binance-sdk WebSocket connection when dropped
+// ---------------------------------------------------------------------------
+
+/// A binance-sdk WebSocket API connection that can be closed.
+///
+/// Implemented for the spot WebSocket API and for the SDK's common one, which margin drives
+/// directly. Both are cheap handles onto shared connection state.
+pub(crate) trait BinanceWsConnection: Send + Sync + 'static {
+    /// Close the connection: binance-sdk sends a Close frame once pending requests drain.
+    fn close(&self) -> impl Future<Output = anyhow::Result<()>> + Send;
+}
+
+impl BinanceWsConnection for binance_sdk::spot::websocket_api::WebsocketApi {
+    fn close(&self) -> impl Future<Output = anyhow::Result<()>> + Send {
+        self.disconnect()
+    }
+}
+
+impl BinanceWsConnection for Arc<binance_sdk::common::websocket::WebsocketApi> {
+    async fn close(&self) -> anyhow::Result<()> {
+        self.disconnect().await.map_err(anyhow::Error::msg)
+    }
+}
+
+/// Owns a connected binance-sdk WebSocket connection and closes it when dropped.
+///
+/// binance-sdk reads and writes each socket in detached tasks, which keep it open and answer the
+/// server's pings until `disconnect()` is called. Dropping the SDK's handle does not close it. So
+/// a connection whose owner is dropped or aborted before it disconnects, such as a connection
+/// manager aborted with its stream, would stay open for the life of the runtime.
+///
+/// Dropping this guard spawns that disconnect on the current Tokio runtime. binance-sdk bounds
+/// it: up to 30 s to drain pending requests, and 30 s overall. A failure is logged at WARN.
+/// Dropped outside a runtime, it cannot spawn, and logs a WARN instead; the socket's tasks then
+/// end with the runtime that runs them. [`disconnect`](Self::disconnect) closes the connection
+/// in place and reports the result. Wrap a connection only once it has connected: disconnecting
+/// one that never did makes binance-sdk log a WARN.
+pub(crate) struct DisconnectOnDrop<W: BinanceWsConnection> {
+    /// `None` once [`disconnect`](Self::disconnect) has finished.
+    ws: Option<W>,
+    /// Names the connection in logs, e.g. "BinanceSpot account stream".
+    label: &'static str,
+}
+
+impl<W: BinanceWsConnection> DisconnectOnDrop<W> {
+    pub(crate) fn new(ws: W, label: &'static str) -> Self {
+        Self {
+            ws: Some(ws),
+            label,
+        }
+    }
+
+    /// Close the connection and wait for binance-sdk to report the result.
+    ///
+    /// If this future is dropped before it finishes, for example by a timeout or an abort, the
+    /// guard still holds the connection, and its drop spawns the disconnect again.
+    pub(crate) async fn disconnect(mut self) -> anyhow::Result<()> {
+        let result = match &self.ws {
+            Some(ws) => ws.close().await,
+            None => Ok(()),
+        };
+        self.ws = None;
+        result
+    }
+}
+
+impl<W: BinanceWsConnection> std::ops::Deref for DisconnectOnDrop<W> {
+    type Target = W;
+
+    // `ws` is `None` only after `disconnect`, which consumes the guard, so no caller sees it.
+    #[allow(clippy::expect_used)] // Invariant: only the consuming `disconnect` clears it
+    fn deref(&self) -> &W {
+        self.ws
+            .as_ref()
+            .expect("DisconnectOnDrop holds its connection until disconnected")
+    }
+}
+
+impl<W: BinanceWsConnection> Drop for DisconnectOnDrop<W> {
+    fn drop(&mut self) {
+        let Some(ws) = self.ws.take() else { return };
+        let label = self.label;
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                debug!(
+                    connection = label,
+                    "closing a dropped Binance WebSocket connection"
+                );
+                runtime.spawn(async move {
+                    if let Err(e) = ws.close().await {
+                        warn!(%e, connection = label, "failed to close a dropped Binance WebSocket connection");
+                    }
+                });
+            }
+            Err(_) => warn!(
+                connection = label,
+                "Binance WebSocket connection dropped outside a Tokio runtime: it cannot be \
+                 closed, and stays open until the runtime running it shuts down"
+            ),
+        }
     }
 }
 
@@ -3451,6 +3556,71 @@ fn order_error_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A connection that counts its closes, and whose close never finishes while `stall` is set.
+    #[derive(Clone, Default)]
+    struct CountingWs {
+        closes: Arc<AtomicU32>,
+        stall: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl BinanceWsConnection for CountingWs {
+        async fn close(&self) -> anyhow::Result<()> {
+            self.closes.fetch_add(1, Ordering::SeqCst);
+            if self.stall.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+    }
+
+    impl CountingWs {
+        /// Closes so far, once every task the guard spawned has had a chance to run.
+        async fn closes(&self) -> u32 {
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            self.closes.load(Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dropped_guard_closes_its_connection() {
+        let ws = CountingWs::default();
+        drop(DisconnectOnDrop::new(ws.clone(), "test"));
+        assert_eq!(ws.closes().await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_guard_does_not_close_again_on_drop() {
+        let ws = CountingWs::default();
+        let result = DisconnectOnDrop::new(ws.clone(), "test").disconnect().await;
+        assert!(result.is_ok());
+        assert_eq!(ws.closes().await, 1);
+    }
+
+    /// A disconnect abandoned part-way, by a timeout or an abort, leaves the connection to the
+    /// guard's drop, which closes it again.
+    #[tokio::test]
+    async fn an_abandoned_disconnect_closes_again_on_drop() {
+        let ws = CountingWs::default();
+        ws.stall.store(true, Ordering::SeqCst);
+        let disconnect = DisconnectOnDrop::new(ws.clone(), "test").disconnect();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), disconnect)
+                .await
+                .is_err()
+        );
+        assert_eq!(ws.closes().await, 2);
+    }
+
+    /// Outside a runtime the guard cannot spawn the close; it logs instead of panicking.
+    #[test]
+    fn a_guard_dropped_outside_a_runtime_does_not_panic() {
+        let ws = CountingWs::default();
+        drop(DisconnectOnDrop::new(ws.clone(), "test"));
+        assert_eq!(ws.closes.load(Ordering::SeqCst), 0);
+    }
 
     /// The loud path runs for the first event of each type and for every 1000th event overall, so
     /// a frequent unhandled type cannot hide a later one; repeats of a type stay quiet.

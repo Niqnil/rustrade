@@ -36,17 +36,17 @@
 
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
-    CONNECT_TIMEOUT_SECS, ExecutionReport, ExponentialBackoff, FILL_RECOVERY_TIMEOUT_SECS,
-    HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
-    PlacementResponse, RateLimitTracker, RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS,
-    SharedDedupCache, UnhandledEvents, UnrecoveredFills, UserDataFrame, WeightPool,
-    binance_filled_qty, classify_order_kind_tif, classify_rest_query_error,
-    classify_ws_order_error, convert_ended_order, convert_execution_report,
-    convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event, drop_after,
-    frame_excerpt, gap_failed, gap_time, is_duplicate, is_handshake_rate_limit, is_unknown_order,
-    log_unhandled_event, log_unrecognised_frame, new_dedup_cache, parse_user_data_frame,
-    placed_order_state, recovered_order_cids, recovered_order_totals, response_decode_error,
-    rest_call_with_retry, trailing_params, unix_ms,
+    CONNECT_TIMEOUT_SECS, DisconnectOnDrop, ExecutionReport, ExponentialBackoff,
+    FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET,
+    OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
+    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
+    UserDataFrame, WeightPool, binance_filled_qty, classify_order_kind_tif,
+    classify_rest_query_error, classify_ws_order_error, convert_ended_order,
+    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
+    dedup_key_from_event, drop_after, frame_excerpt, gap_failed, gap_time, is_duplicate,
+    is_handshake_rate_limit, is_unknown_order, log_unhandled_event, log_unrecognised_frame,
+    new_dedup_cache, parse_user_data_frame, placed_order_state, recovered_order_cids,
+    recovered_order_totals, response_decode_error, rest_call_with_retry, trailing_params, unix_ms,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -324,8 +324,8 @@ pub struct BinanceSpot {
     // Distinct from the account_stream WS session created in connection_manager.
     // Lazily connected on the first open_order / cancel_order call; cleared on
     // connectivity errors so the next call reconnects. All clones share the same
-    // session via Arc<RwLock<...>>.
-    ws_api: Arc<RwLock<Option<WebsocketApi>>>,
+    // session via Arc<RwLock<...>>; the guard closes it when the last clone drops.
+    ws_api: Arc<RwLock<Option<DisconnectOnDrop<WebsocketApi>>>>,
     // shared rate-limit tracker across all REST calls
     rate_limiter: Arc<RateLimitTracker>,
     // The orders seen live and not yet seen end, which a reconnect asks about. Shared by every
@@ -400,7 +400,7 @@ impl BinanceSpot {
         {
             let guard = self.ws_api.read().await;
             if let Some(ref ws) = *guard {
-                return Ok(ws.clone());
+                return Ok(WebsocketApi::clone(ws));
             }
         }
         // Slow path: write lock to connect.
@@ -412,7 +412,7 @@ impl BinanceSpot {
         let mut guard = self.ws_api.write().await;
         // Double-check after acquiring write lock (another task may have connected)
         if let Some(ref ws) = *guard {
-            return Ok(ws.clone());
+            return Ok(WebsocketApi::clone(ws));
         }
         if self.rate_limiter.is_blocked() {
             return Err(WsApiUnavailable::RateLimited(
@@ -437,7 +437,10 @@ impl BinanceSpot {
                 )));
             }
         };
-        *guard = Some(ws.clone());
+        *guard = Some(DisconnectOnDrop::new(
+            ws.clone(),
+            "BinanceSpot order session",
+        ));
         Ok(ws)
     }
 
@@ -459,6 +462,7 @@ impl BinanceSpot {
             guard.take()
         };
         if let Some(ws) = ws {
+            // On timeout the dropped guard spawns the disconnect again, in the background.
             match tokio::time::timeout(Duration::from_secs(5), ws.disconnect()).await {
                 Ok(Err(e)) => warn!(%e, "BinanceSpot failed to disconnect stale WS session"),
                 Err(_) => warn!("BinanceSpot WS disconnect timed out (5s)"),
@@ -948,6 +952,8 @@ impl ExecutionClient for BinanceSpot {
         let initial_ws = ws_handle.connect().await.map_err(|e| {
             UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
         })?;
+        // Closed if this future is dropped before the manager takes it over.
+        let initial_ws = DisconnectOnDrop::new(initial_ws, ACCOUNT_STREAM_WS);
 
         #[allow(clippy::expect_used)] // Builder has no required fields; infallible
         let params = UserDataStreamSubscribeSignatureParams::builder()
@@ -960,10 +966,9 @@ impl ExecutionClient for BinanceSpot {
         {
             Ok(_) => {}
             Err(e) => {
-                // binance-sdk has no Drop impl for TCP close — must disconnect
-                // explicitly to avoid leaking the connection on subscribe failure.
-                // Awaiting inline (rather than spawning) ensures the socket is cleaned
-                // up before returning Err, matching the pattern used in clear_ws_api.
+                // Awaiting the disconnect inline (rather than leaving it to the guard's drop)
+                // ensures the socket is cleaned up before returning Err, matching the pattern
+                // used in clear_ws_api.
                 match tokio::time::timeout(Duration::from_secs(5), initial_ws.disconnect()).await {
                     Ok(Err(de)) => {
                         warn!(%de, "BinanceSpot failed to disconnect WS after subscribe failure")
@@ -1567,10 +1572,16 @@ impl OrderStatusClient for BinanceSpot {
     }
 }
 
+/// Names the account stream's connection in [`DisconnectOnDrop`]'s logs.
+const ACCOUNT_STREAM_WS: &str = "BinanceSpot account stream";
+
 /// Connect to Binance WS and subscribe to the user data stream.
-/// On failure, disconnects the WS to avoid leaking the TCP connection.
-async fn connect_and_subscribe(ws_handle: &WebsocketApiHandle) -> anyhow::Result<WebsocketApi> {
-    let ws = ws_handle.connect().await?;
+/// On a subscribe failure, the dropped guard disconnects the WS so the TCP connection is not
+/// leaked.
+async fn connect_and_subscribe(
+    ws_handle: &WebsocketApiHandle,
+) -> anyhow::Result<DisconnectOnDrop<WebsocketApi>> {
+    let ws = DisconnectOnDrop::new(ws_handle.connect().await?, ACCOUNT_STREAM_WS);
     #[allow(clippy::expect_used)] // Builder has no required fields; infallible
     let params = UserDataStreamSubscribeSignatureParams::builder()
         .build()
@@ -1578,24 +1589,9 @@ async fn connect_and_subscribe(ws_handle: &WebsocketApiHandle) -> anyhow::Result
     match ws.user_data_stream_subscribe_signature(params).await {
         Ok(_) => Ok(ws),
         Err(e) => {
+            // The disconnect runs in the background: the reconnect loop backs off and retries
+            // without waiting for it.
             warn!(%e, "BinanceSpot WS subscribe failed, cleaning up connection");
-            let ws_cleanup = ws;
-            // fire-and-forget disconnect — the JoinHandle is intentionally
-            // dropped. Unlike `clear_ws_api` (which awaits inline to prevent unbounded
-            // task accumulation under rapid retries), here we're on the connect failure
-            // path: at most 3 cleanup tasks may overlap during early attempts (1s, 2s,
-            // 4s backoff < 5s cleanup timeout); starting at attempt 3 the backoff
-            // (8s) exceeds the cleanup timeout so no further accumulation occurs.
-            // Each cleanup task is bounded to 5s — acceptable accumulation.
-            // If the Tokio runtime shuts down before the task completes, the task is
-            // cancelled and the TCP socket is reclaimed by the OS.
-            tokio::spawn(async move {
-                match tokio::time::timeout(Duration::from_secs(5), ws_cleanup.disconnect()).await {
-                    Ok(Err(dc_err)) => warn!(%dc_err, "BinanceSpot WS cleanup disconnect failed"),
-                    Err(_) => warn!("BinanceSpot WS cleanup disconnect timed out (5s)"),
-                    Ok(Ok(())) => {}
-                }
-            });
             Err(e)
         }
     }
@@ -1617,8 +1613,9 @@ async fn connect_and_subscribe(ws_handle: &WebsocketApiHandle) -> anyhow::Result
 /// via the `JoinHandle`. Because the handle is transferred to `AbortOnDropStream` and
 /// dropped, the panic is discarded at drop — the consumer will observe the
 /// `UnboundedReceiverStream` ending (yielding `None`), indistinguishable from normal
-/// max-reconnect exhaustion. The WS subscription cleanup (`subscription.unsubscribe()`)
-/// at the end of the loop body will be skipped on panic. If you change this to `.await`
+/// max-reconnect exhaustion. The cleanup at the end of the loop body is skipped on a panic or an
+/// abort, but the connection is still closed by its [`DisconnectOnDrop`] guard, and closing it
+/// ends the SDK's subscription task. If you change this to `.await`
 /// the handle, check `JoinError::is_panic()`.
 // inherent complexity from reconnection loop (connect → subscribe → callback →
 // fill recovery → heartbeat monitor → cleanup → backoff). Not worth splitting further.
@@ -1631,7 +1628,7 @@ async fn connection_manager(
     rate_limiter: Arc<RateLimitTracker>,
     known: SharedKnownLiveOrders,
     instruments: Vec<InstrumentNameExchange>,
-    initial_ws: Option<WebsocketApi>,
+    initial_ws: Option<DisconnectOnDrop<WebsocketApi>>,
 ) {
     let mut backoff = ExponentialBackoff::new();
     let mut disconnect_time: Option<DateTime<Utc>> = None;
@@ -1892,8 +1889,8 @@ async fn connection_manager(
         // callback occur after this point. The old `heartbeat_flag` Arc is therefore
         // safe to drop here. Re-verify on SDK upgrade if the callback invocation model changes.
         subscription.unsubscribe();
-        // binance-sdk WebsocketApi has no Drop impl that closes the TCP
-        // connection — must call disconnect() explicitly
+        // binance-sdk WebsocketApi has no Drop impl that closes the TCP connection. Disconnect
+        // explicitly to report the result; the guard's drop is the fallback.
         if let Err(e) = ws.disconnect().await {
             warn!(%e, "BinanceSpot failed to disconnect WebSocket");
         }
@@ -5043,6 +5040,98 @@ mod tests {
         )
         .await
         .expect("orders never wait on the pause");
+    }
+
+    /// A local WebSocket server that answers every request with `result`, and reports on the
+    /// returned channel each connection the client closes with a Close frame.
+    async fn ws_server_reporting_close(
+        result: serde_json::Value,
+    ) -> (String, mpsc::UnboundedReceiver<()>) {
+        use futures::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let (closed_tx, closed_rx) = mpsc::unbounded_channel();
+        let url = ws_server(move |stream| {
+            let result = result.clone();
+            let closed_tx = closed_tx.clone();
+            async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                    return;
+                };
+                while let Some(Ok(message)) = ws.next().await {
+                    match message {
+                        Message::Text(text) => {
+                            let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                            let response = serde_json::json!({
+                                "id": request["id"],
+                                "status": 200,
+                                "result": result,
+                            });
+                            if ws.send(Message::text(response.to_string())).await.is_err() {
+                                return;
+                            }
+                        }
+                        Message::Close(_) => {
+                            let _ = closed_tx.send(());
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        })
+        .await;
+        (url, closed_rx)
+    }
+
+    /// Dropping the account stream closes its WebSocket connection. binance-sdk keeps a socket
+    /// open in detached tasks until it is disconnected, so aborting the manager alone left it open.
+    #[tokio::test]
+    async fn dropping_the_account_stream_closes_its_connection() {
+        let (url, mut closed) =
+            ws_server_reporting_close(serde_json::json!({ "subscriptionId": 0 })).await;
+        let client = client_with_ws_api(url);
+
+        let stream = client.account_stream(&[], &[]).await.unwrap();
+        drop(stream);
+
+        tokio::time::timeout(Duration::from_secs(5), closed.recv())
+            .await
+            .expect("the dropped stream closes its connection")
+            .unwrap();
+    }
+
+    /// The order session is shared by every clone of a client, and closed when the last one is
+    /// dropped.
+    #[tokio::test]
+    async fn dropping_the_last_client_closes_its_order_session() {
+        let (url, mut closed) = ws_server_reporting_close(serde_json::json!({
+            "symbol": "BTCUSDT",
+            "origClientOrderId": "cid",
+            "orderId": 7,
+            "transactTime": 1_700_000_000_000_i64,
+            "executedQty": "0",
+        }))
+        .await;
+        let client = client_with_ws_api(url);
+        let clone = client.clone();
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        let response = client.cancel_order(cancel_request(&instrument)).await;
+        assert!(response.state.is_ok(), "{:?}", response.state);
+
+        drop(client);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), closed.recv())
+                .await
+                .is_err(),
+            "a clone still holds the session"
+        );
+
+        drop(clone);
+        tokio::time::timeout(Duration::from_secs(5), closed.recv())
+            .await
+            .expect("the last client's drop closes the session")
+            .unwrap();
     }
 
     /// Fill recovery does not wait for the pause near the weight limit, which could outlast its
