@@ -155,20 +155,26 @@ Passing tests show that the code runs, not that the tests would notice if it cha
 against each one. A change the tests catch is a *caught* mutant. A change they still pass on
 is a *missed* mutant: behaviour that no test pins.
 
+Only the mutated crate's own tests run against each mutant. A mutant in `rustrade-execution`
+that only a test in `rustrade` would catch is therefore reported as missed.
+
 CI's `cargo mutants` job runs it on the lines each PR changes. The job is informational, so
-it stays green when a mutant is missed. Each missed mutant is annotated on its line in the
-PR's diff and listed in the job summary. For each one, either:
+it stays green when a mutant is missed. The job summary lists every missed mutant, and the
+first few are also annotated on their lines in the PR's diff (GitHub caps how many annotations
+a job shows). For each one, either:
 
 - **add a test that fails on the mutant**, or
 - **explain in the PR why it is equivalent**: the change cannot alter anything observable, for
-  example `<` against `<=` where the two operands can never be equal.
+  example `<` against `<=` where the two operands can never be equal, or
+- **name the test in another crate that catches it**.
 
 To run the same check locally, on your committed changes:
 
 ```bash
 cargo install --locked cargo-mutants@27.1.0
-git diff origin/develop... > pr.diff
-cargo mutants --in-diff pr.diff --cargo-arg=--lib --cargo-arg=--bins --cargo-arg=--tests
+git diff origin/develop... > "${TMPDIR:-/tmp}/pr.diff"
+cargo mutants --in-diff "${TMPDIR:-/tmp}/pr.diff" \
+  --cargo-arg=--lib --cargo-arg=--bins --cargo-arg=--tests
 ```
 
 `.cargo/mutants.toml` supplies the rest: `--all-features`, so that feature-gated code is built
@@ -180,8 +186,9 @@ debug info. Results land in `mutants.out/`, with the missed mutants in `missed.t
   directory on disk.
 - The diff must match the working tree. Commit or stash any further edits to the files it
   touches first, or cargo-mutants refuses to run.
-- To narrow a run, mutate one crate with `-p <crate>`, or replace `--cargo-arg=--tests` with
-  `--cargo-arg=--test=<file>` to run one test file.
+- To narrow a run, mutate one crate with `-p <crate>`. With it, replacing `--cargo-arg=--tests`
+  with `--cargo-arg=--test=<file>` runs that one integration test file in place of all of them
+  (the crate's unit tests still run).
 - Never pass `--in-place` locally. CI uses it on a throwaway runner, but it mutates your working
   tree, and a run that is killed part-way can leave a mutant in it.
 

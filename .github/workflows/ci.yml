@@ -310,9 +310,10 @@ jobs:
         run: cargo doc --locked --workspace --all-features --no-deps --document-private-items
 
   # Mutation-tests the lines this PR changes. cargo-mutants alters each one (a `<` to `<=`, a
-  # function body to `Default::default()`, ...) and reruns the tests; a mutant the tests still pass
-  # on marks behaviour no test pins. cargo-mutants itself annotates each missed mutant on its line
-  # when it runs under GitHub Actions, and the job summary lists them all.
+  # function body to `Default::default()`, ...) and reruns the tests of the mutated crate; a mutant
+  # they still pass on marks behaviour no test in that crate pins. cargo-mutants itself annotates
+  # missed mutants on their lines when it runs under GitHub Actions, and the job summary lists
+  # them all.
   #
   # Informational: not a required check, and a missed mutant or a timeout leaves it green. It fails
   # only when the run itself does, for example when the tests already fail without any mutation.
@@ -335,18 +336,21 @@ jobs:
         with:
           fetch-depth: 2
 
-      # cargo-mutants mutates Rust source only, so a PR that changes none has nothing to test, and
-      # every step below skips. The `HEAD^2` check is the same guard as in `changes`.
+      # cargo-mutants mutates only the sources of library and binary targets, never `tests/`,
+      # `examples/` or `benches/`, so a PR that changes no `src/` has nothing to mutate and every
+      # step below skips. The diff is cut to the same files: a binary file, a mode change or a rename
+      # elsewhere could otherwise make it unparseable. In a pathspec `*` also matches `/`, so this
+      # covers nested modules. The `HEAD^2` check is the same guard as in `changes`.
       - name: Extract the PR's diff
         id: diff
         run: |
           git rev-parse --verify --quiet HEAD^2 > /dev/null
-          git diff HEAD^1 HEAD > "$RUNNER_TEMP/pr.diff"
-          if git diff --name-only HEAD^1 HEAD -- '*.rs' | grep -q .; then
+          git diff --no-renames HEAD^1 HEAD -- '*/src/*.rs' > "$RUNNER_TEMP/pr.diff"
+          if [ -s "$RUNNER_TEMP/pr.diff" ]; then
             echo "rust=true" >> "$GITHUB_OUTPUT"
           else
             echo "rust=false" >> "$GITHUB_OUTPUT"
-            echo "No Rust source changed: nothing to mutate" >> "$GITHUB_STEP_SUMMARY"
+            echo "No crate source changed: nothing to mutate" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Free disk space  # As in `test`, which builds the same targets
@@ -367,8 +371,13 @@ jobs:
 
       # `test`'s cache, restored read-only. This job runs only on PRs, and a PR run can save a cache
       # only to its own ref, so a cache of this job's own would start cold on every new PR. `test`
-      # saves one on every push to `develop`, which leaves the dependencies here already built, and
-      # this job takes no share of the repository's cache quota.
+      # saves one on every push to `develop`, and this job takes no share of the cache quota.
+      #
+      # The reuse is partial. cargo-mutants builds with `--package=<mutated crate>`, not
+      # `--workspace`, which unifies some dependencies' features differently, so each run first
+      # rebuilds those: 84 crates for `rustrade-execution` and 95 for `rustrade`, measured locally.
+      # `--test-workspace` would hit the cache in full, but then every mutant rebuilds and tests
+      # every crate that depends on its own.
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
         if: steps.diff.outputs.rust == 'true'
         with:
@@ -394,17 +403,18 @@ jobs:
         if: steps.diff.outputs.rust == 'true'
         run: |
           status=0
-          timeout --signal=INT --kill-after=2m 45m \
+          timeout --signal=INT --kill-after=2m 40m \
             cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" --in-place --profile=test \
-              --cargo-arg=--lib --cargo-arg=--bins --cargo-arg=--tests \
+              --cargo-arg=--locked --cargo-arg=--lib --cargo-arg=--bins --cargo-arg=--tests \
               --output "$RUNNER_TEMP" \
             || status=$?
-          # 2: a mutant was missed. 3: a mutant timed out. 124: the run was cut short. Each is a
-          # result for the summary to report, not a failure of the job.
+          # 2: a mutant was missed. 3: a mutant timed out. 124: the run was cut short, and 137: it
+          # was then killed for ignoring the interrupt. Each is a result for the summary to
+          # report, not a failure of the job.
           case $status in
             0) ;;
             2|3) echo "cargo-mutants exited $status: see the summary" ;;
-            124) echo "Stopped after 45 minutes: the summary covers the mutants tested so far" \
+            124|137) echo "Stopped after 40 minutes: the summary covers the mutants tested so far" \
                    | tee -a "$GITHUB_STEP_SUMMARY" ;;
             *) exit "$status" ;;
           esac
