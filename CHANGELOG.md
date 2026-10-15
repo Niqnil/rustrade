@@ -94,12 +94,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     it is disconnected. So the socket stayed open, and the account's user-data subscription live,
     for as long as the Tokio runtime ran. The spot client's order session was never closed
     either.
-  - Every connection is now closed when its owner is dropped or aborted, wherever it is: in fill
-    recovery, a reconnect or a backoff. The account stream's socket closes when the stream is
-    dropped, and the spot order session closes when the last clone of its `BinanceSpot` is
-    dropped. The close runs in the background on the current runtime, and a failure is logged
-    at WARN. A connection dropped outside a Tokio runtime cannot be closed; that is logged at
-    WARN too.
+  - A connection is now closed when its owner is dropped or aborted, in fill recovery, a
+    reconnect or a backoff alike. The account stream's socket closes when the stream is dropped,
+    and the spot order session closes when the last clone of its `BinanceSpot` is dropped. The
+    close runs in the background on the current runtime, and a failure is logged at WARN. A
+    connection dropped outside a Tokio runtime cannot be closed; that is logged at WARN too.
+  - A dropped account stream also stops its event callback. It used to run for the life of the
+    runtime, holding the stream's state.
+  - Known limitations of binance-sdk 74.1.1: a disconnect while the SDK is reconnecting a socket
+    the server dropped does nothing, and the SDK's renewal about 23 hours after a connection
+    opens reconnects it even after it was closed.
 
 - **A spot position nets a fee paid in its base asset** (`rustrade`).
   - **Breaking in behaviour:** a spot fill whose fee the venue charged in the instrument's base

@@ -40,7 +40,7 @@ use super::shared::{
     FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET,
     OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
-    UserDataFrame, WeightPool, binance_filled_qty, classify_order_kind_tif,
+    UnsubscribeOnDrop, UserDataFrame, WeightPool, binance_filled_qty, classify_order_kind_tif,
     classify_rest_query_error, classify_ws_order_error, convert_ended_order,
     convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
     dedup_key_from_event, drop_after, frame_excerpt, gap_failed, gap_time, is_duplicate,
@@ -455,8 +455,9 @@ impl BinanceSpot {
         // events are received on both connections because the user data stream
         // subscription lives only on the connection_manager WS session, not on the
         // ws_api order session managed here.
-        // Awaiting inline (rather than spawning) prevents unbounded task accumulation
-        // under rapid retries during a network partition.
+        // Awaiting inline (rather than spawning) bounds task accumulation under rapid retries
+        // during a network partition: a disconnect that outlasts the 5 s wait continues in a
+        // task the guard spawns, which binance-sdk bounds to 30 s.
         let ws = {
             let mut guard = self.ws_api.write().await;
             guard.take()
@@ -1614,8 +1615,8 @@ async fn connect_and_subscribe(
 /// dropped, the panic is discarded at drop — the consumer will observe the
 /// `UnboundedReceiverStream` ending (yielding `None`), indistinguishable from normal
 /// max-reconnect exhaustion. The cleanup at the end of the loop body is skipped on a panic or an
-/// abort, but the connection is still closed by its [`DisconnectOnDrop`] guard, and closing it
-/// ends the SDK's subscription task. If you change this to `.await`
+/// abort, but the connection is still closed by its [`DisconnectOnDrop`] guard, and the
+/// subscription unsubscribed by its [`UnsubscribeOnDrop`]. If you change this to `.await`
 /// the handle, check `JoinError::is_panic()`.
 // inherent complexity from reconnection loop (connect → subscribe → callback →
 // fill recovery → heartbeat monitor → cleanup → backoff). Not worth splitting further.
@@ -1770,6 +1771,8 @@ async fn connection_manager(
                 _ => {}
             }
         });
+        // Unsubscribed on drop too, so an abort does not leak the callback task.
+        let subscription = UnsubscribeOnDrop::new(subscription);
 
         // --- Recovery after reconnect (each with a timeout to avoid blocking forever) ---
         // Runs after subscribe_on_ws_events so live events during recovery are captured.
@@ -5086,19 +5089,24 @@ mod tests {
 
     /// Dropping the account stream closes its WebSocket connection. binance-sdk keeps a socket
     /// open in detached tasks until it is disconnected, so aborting the manager alone left it open.
+    /// Dropped at once, the manager has not started and holds the connection as its argument;
+    /// dropped later, it holds it in its loop.
     #[tokio::test]
     async fn dropping_the_account_stream_closes_its_connection() {
-        let (url, mut closed) =
-            ws_server_reporting_close(serde_json::json!({ "subscriptionId": 0 })).await;
-        let client = client_with_ws_api(url);
+        for running in [Duration::ZERO, Duration::from_millis(100)] {
+            let (url, mut closed) =
+                ws_server_reporting_close(serde_json::json!({ "subscriptionId": 0 })).await;
+            let client = client_with_ws_api(url);
 
-        let stream = client.account_stream(&[], &[]).await.unwrap();
-        drop(stream);
+            let stream = client.account_stream(&[], &[]).await.unwrap();
+            tokio::time::sleep(running).await;
+            drop(stream);
 
-        tokio::time::timeout(Duration::from_secs(5), closed.recv())
-            .await
-            .expect("the dropped stream closes its connection")
-            .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), closed.recv())
+                .await
+                .expect("the dropped stream closes its connection")
+                .unwrap();
+        }
     }
 
     /// The order session is shared by every clone of a client, and closed when the last one is

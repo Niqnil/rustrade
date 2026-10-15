@@ -48,6 +48,7 @@ use crate::client::order_recovery::{
 use binance_sdk::common::{
     errors::{ConnectorError, WebsocketError},
     models::{Interval, ParamBuildError, RateLimitType, RestApiResponse, WebsocketApiRateLimit},
+    websocket::Subscription,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use rust_decimal::Decimal;
@@ -85,10 +86,13 @@ use tracing::{debug, error, info, trace, warn};
 /// Wrapper stream that aborts the connection_manager JoinHandle when dropped.
 ///
 /// This ensures the channel and its associated task are cleaned up when the consumer drops the
-/// account_stream. `abort()` cancels the task at its next `.await`, wherever that is: in fill
-/// recovery, a connect, a backoff or the monitor loop. The manager therefore holds every
-/// connection in a [`DisconnectOnDrop`], whose drop closes the socket. Without it the socket
-/// would stay open, since binance-sdk keeps it in detached tasks that answer the server's pings.
+/// account_stream. `abort()` cancels the task at its next `.await`: in fill recovery, a
+/// reconnect, a backoff or the monitor loop. The manager therefore holds every connection that
+/// has finished connecting in a [`DisconnectOnDrop`], whose drop closes the socket, and its event
+/// subscription in an [`UnsubscribeOnDrop`]. Without them the socket would stay open, since
+/// binance-sdk keeps it in detached tasks that answer the server's pings, and the subscription's
+/// callback task would never end. An abort during the SDK's own connect, before it returns the
+/// connection, is not covered.
 pub(crate) struct AbortOnDropStream<S> {
     inner: S,
     handle: tokio::task::JoinHandle<()>,
@@ -153,9 +157,18 @@ impl BinanceWsConnection for Arc<binance_sdk::common::websocket::WebsocketApi> {
 /// Dropping this guard spawns that disconnect on the current Tokio runtime. binance-sdk bounds
 /// it: up to 30 s to drain pending requests, and 30 s overall. A failure is logged at WARN.
 /// Dropped outside a runtime, it cannot spawn, and logs a WARN instead; the socket's tasks then
-/// end with the runtime that runs them. [`disconnect`](Self::disconnect) closes the connection
+/// end with the runtime that runs them. A runtime that is shutting down drops the spawned task
+/// unrun, and its sockets close with it. [`disconnect`](Self::disconnect) closes the connection
 /// in place and reports the result. Wrap a connection only once it has connected: disconnecting
 /// one that never did makes binance-sdk log a WARN.
+///
+/// # Known limitations (binance-sdk 74.1.1)
+/// - A disconnect while binance-sdk is reconnecting a socket the server dropped does nothing: the
+///   SDK closes only a connected socket, and its reconnect then completes.
+/// - binance-sdk renews each connection about 23 h after it opens, and its renewal reconnects a
+///   connection even after it was disconnected. A closed connection can therefore come back.
+///
+/// Neither can be prevented through the SDK's public API on the connection itself.
 pub(crate) struct DisconnectOnDrop<W: BinanceWsConnection> {
     /// `None` once [`disconnect`](Self::disconnect) has finished.
     ws: Option<W>,
@@ -173,8 +186,9 @@ impl<W: BinanceWsConnection> DisconnectOnDrop<W> {
 
     /// Close the connection and wait for binance-sdk to report the result.
     ///
-    /// If this future is dropped before it finishes, for example by a timeout or an abort, the
-    /// guard still holds the connection, and its drop spawns the disconnect again.
+    /// An `Err` is final: the guard does not retry it. If this future is dropped before it
+    /// finishes, for example by a timeout or an abort, the guard still holds the connection, and
+    /// its drop spawns the disconnect again, so binance-sdk may log the close twice.
     pub(crate) async fn disconnect(mut self) -> anyhow::Result<()> {
         let result = match &self.ws {
             Some(ws) => ws.close().await,
@@ -218,6 +232,36 @@ impl<W: BinanceWsConnection> Drop for DisconnectOnDrop<W> {
                 "Binance WebSocket connection dropped outside a Tokio runtime: it cannot be \
                  closed, and stays open until the runtime running it shuts down"
             ),
+        }
+    }
+}
+
+/// A binance-sdk WebSocket event subscription, unsubscribed when dropped.
+///
+/// binance-sdk runs each subscription's callback in its own task, which ends only on
+/// [`Subscription::unsubscribe`]: the SDK keeps the event channel's senders alive for good, even
+/// after the connection is disconnected and every handle to it dropped. A subscription dropped
+/// without unsubscribing, as by a connection manager aborted with its stream, would leak that task
+/// and everything its callback holds.
+pub(crate) struct UnsubscribeOnDrop(Option<Subscription>);
+
+impl UnsubscribeOnDrop {
+    pub(crate) fn new(subscription: Subscription) -> Self {
+        Self(Some(subscription))
+    }
+
+    /// Stop the callback task now.
+    pub(crate) fn unsubscribe(mut self) {
+        if let Some(subscription) = self.0.take() {
+            subscription.unsubscribe();
+        }
+    }
+}
+
+impl Drop for UnsubscribeOnDrop {
+    fn drop(&mut self) {
+        if let Some(subscription) = self.0.take() {
+            subscription.unsubscribe();
         }
     }
 }
@@ -3612,6 +3656,29 @@ mod tests {
                 .is_err()
         );
         assert_eq!(ws.closes().await, 2);
+    }
+
+    /// binance-sdk ends a subscription's callback task only on unsubscribe, even with the
+    /// connection gone, so the guard unsubscribes when dropped.
+    #[tokio::test]
+    async fn a_dropped_subscription_guard_stops_its_callback() {
+        let emitter = binance_sdk::common::websocket::WebsocketEventEmitter::new();
+        let callback_state = Arc::new(());
+        let held = Arc::clone(&callback_state);
+        let subscription = emitter.subscribe(move |_| {
+            let _ = &held;
+        });
+
+        drop(UnsubscribeOnDrop::new(subscription));
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(
+            Arc::strong_count(&callback_state),
+            1,
+            "the callback was dropped"
+        );
     }
 
     /// Outside a runtime the guard cannot spawn the close; it logs instead of panicking.

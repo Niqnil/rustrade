@@ -69,13 +69,13 @@ use super::shared::{
     FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET,
     OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, TrailingOrderError, UnhandledEvents,
-    UnrecoveredFills, UserDataFrame, WeightPool, binance_filled_qty, classify_order_kind_tif,
-    classify_rest_order_error, classify_rest_query_error, convert_ended_order,
-    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
-    dedup_key_from_event, drop_after, frame_excerpt, gap_failed, gap_time, is_duplicate,
-    is_unknown_order, log_unhandled_event, log_unrecognised_frame, new_dedup_cache,
-    parse_user_data_frame, placed_order_state, recovered_order_cids, recovered_order_totals,
-    response_decode_error, rest_call_with_retry, trailing_params,
+    UnrecoveredFills, UnsubscribeOnDrop, UserDataFrame, WeightPool, binance_filled_qty,
+    classify_order_kind_tif, classify_rest_order_error, classify_rest_query_error,
+    convert_ended_order, convert_execution_report, convert_open_order_listing,
+    convert_open_order_owned_symbol, dedup_key_from_event, drop_after, frame_excerpt, gap_failed,
+    gap_time, is_duplicate, is_unknown_order, log_unhandled_event, log_unrecognised_frame,
+    new_dedup_cache, parse_user_data_frame, placed_order_state, recovered_order_cids,
+    recovered_order_totals, response_decode_error, rest_call_with_retry, trailing_params,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -110,8 +110,7 @@ use binance_sdk::{
         constants::{MARGIN_TRADING_REST_API_PROD_URL, SPOT_WS_API_PROD_URL},
         models::WebsocketEvent,
         websocket::{
-            SendWebsocketMessageResult, Subscription, WebsocketApi as WsApiBase,
-            WebsocketMessageSendOptions,
+            SendWebsocketMessageResult, WebsocketApi as WsApiBase, WebsocketMessageSendOptions,
         },
     },
     margin_trading::{
@@ -2477,11 +2476,11 @@ fn route_isolated_account_position(
 /// instrument a margin notice names differ, supplied as `handle_position` (cross → account-wide
 /// `BalanceStreamUpdate` via [`cross_account_position_handler`]; isolated → per-instrument
 /// `InstrumentBalanceUpdate` via [`route_isolated_account_position`]) and `notice_instrument`
-/// ([`cross_notice_instrument`]; [`isolated_notice_instrument`]). Returns the [`Subscription`] handle; the caller must
-/// `unsubscribe()` it on disconnect. `heartbeat_flag` is shared with the caller's monitor loop
-/// (set on every inbound frame/ping); `signal_tx` fires once on a terminal condition
-/// (consumer-drop, socket error/close, or exchange `eventStreamTerminated`). Each event `known`
-/// learns from updates it before it is sent.
+/// ([`cross_notice_instrument`]; [`isolated_notice_instrument`]). Returns the subscription,
+/// which the caller unsubscribes on disconnect; dropping it unsubscribes too. `heartbeat_flag` is
+/// shared with the caller's monitor loop (set on every inbound frame/ping); `signal_tx` fires
+/// once on a terminal condition (consumer-drop, socket error/close, or exchange
+/// `eventStreamTerminated`). Each event `known` learns from updates it before it is sent.
 fn register_user_data_listener(
     ws: &Arc<WsApiBase>,
     tx: mpsc::UnboundedSender<UnindexedAccountEvent>,
@@ -2496,7 +2495,7 @@ fn register_user_data_listener(
     ) + Send
     + 'static,
     mut notice_instrument: impl FnMut(Option<i64>) -> Option<InstrumentNameExchange> + Send + 'static,
-) -> Subscription {
+) -> UnsubscribeOnDrop {
     let mut signal_tx_opt = Some(signal_tx);
     let mut event_tx = Some(tx);
     // 32 comfortably covers a typical account's outboundAccountPosition (one entry per asset) plus
@@ -2507,7 +2506,7 @@ fn register_user_data_listener(
     // Safety — non-atomic Option::take() in the callback is safe: binance-sdk drives one spawned
     // task per subscription, invoking the FnMut sequentially (verified =70.2.0; re-verify on SDK
     // upgrade). Same contract spot relies on.
-    ws.common.events.subscribe(move |event| {
+    UnsubscribeOnDrop::new(ws.common.events.subscribe(move |event| {
         let Some(ref sender) = event_tx else { return };
         match event {
             WebsocketEvent::Message(json_str) => {
@@ -2573,7 +2572,7 @@ fn register_user_data_listener(
                 trace!("BinanceMargin ignoring unhandled WebsocketEvent variant");
             }
         }
-    })
+    }))
 }
 
 /// Recover the fills of every gap in `unrecovered` that is due, via REST `myTrades`, routed
@@ -3171,7 +3170,7 @@ fn earliest_token_expiry_ms(tokens: &[(InstrumentNameExchange, UserListenToken)]
 /// lifecycle handles the manager's monitor loop needs.
 struct IsolatedLiveConn {
     ws: DisconnectOnDrop<Arc<WsApiBase>>,
-    subscription: Subscription,
+    subscription: UnsubscribeOnDrop,
     signal_rx: oneshot::Receiver<()>,
     heartbeat_flag: Arc<AtomicBool>,
     /// Earliest `expirationTime` across the N tokens — drives the planned-renewal deadline (the
@@ -4516,6 +4515,41 @@ fn convert_order_kind_tif_margin(
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+
+    /// The connection both margin managers open is closed when dropped, as when a manager is
+    /// aborted with its stream: binance-sdk keeps a socket open until it is disconnected.
+    #[tokio::test]
+    async fn a_dropped_margin_connection_is_closed() {
+        use futures::StreamExt as _;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (closed_tx, mut closed) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = ws.next().await {
+                if let Message::Close(_) = message {
+                    let _ = closed_tx.send(());
+                    return;
+                }
+            }
+        });
+        let config = ConfigurationWebsocketApi::builder()
+            .api_key("key")
+            .api_secret("secret")
+            .ws_url(url)
+            .build()
+            .unwrap();
+
+        drop(connect_margin_ws(&config).await.unwrap());
+
+        tokio::time::timeout(Duration::from_secs(5), closed.recv())
+            .await
+            .expect("the dropped connection is closed")
+            .unwrap();
+    }
     use crate::client::binance::shared::convert_open_order;
     use crate::notice::{AccountNotice, NoticeKind};
     use crate::order::state::ActiveOrderState;
