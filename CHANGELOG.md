@@ -72,6 +72,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`binance-sdk` 74.1.1 → 75.0.0** (`rustrade-execution`, `binance` feature). The three
+  `binance_sdk::common` internals the margin user-data stream couples to were re-verified before
+  merge, and hold: `send_message` and `send_request` are unchanged, and the event emitter still
+  runs each callback sequentially. The SDK changes that reach the compiled code:
+  - A disconnected WebSocket connection stays closed. 74.1.1 reopened it about 23 hours after it
+    first opened, through its scheduled renewal, and completed a reconnect that was pending when
+    the disconnect was called. The reopened socket stayed open, idle, for the life of the
+    process.
+  - The SDK's rate-limit errors now carry Binance's requested wait. `BinanceSpot` and
+    `BinanceMargin` do not read it yet: `ApiError::RateLimit`'s `retry_after` is still `None` for
+    Binance.
+  - Support for signed WebSocket streams, which the `binance` feature does not use.
+
 - **Breaking: balances carry accrued interest, and IBKR reports one balance per currency it
   holds** (`rustrade-execution`, #561).
   - **Breaking:** `Balance` gains `accrued: Option<Decimal>`: carry the venue has accrued and not
@@ -139,9 +152,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     connection dropped outside a Tokio runtime cannot be closed; that is logged at WARN too.
   - A dropped account stream also stops its event callback. It used to run for the life of the
     runtime, holding the stream's state.
-  - Known limitations of binance-sdk 74.1.1: a disconnect while the SDK is reconnecting a socket
-    the server dropped does nothing, and the SDK's renewal about 23 hours after a connection
-    opens reconnects it even after it was closed.
+  - A closed connection stays closed, now that binance-sdk 75.0.0 (see Changed) no longer
+    reconnects it.
 
 - **A spot position nets a fee paid in its base asset** (`rustrade`).
   - **Breaking in behaviour:** a spot fill whose fee the venue charged in the instrument's base
