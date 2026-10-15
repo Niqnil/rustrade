@@ -412,8 +412,8 @@ pub enum VenueRegime {
 /// one was going to — so a CFD fill is costed again when it fills: its hold is released and the
 /// fill settled afresh, still as one balance restatement. If the account can no longer afford it,
 /// the order is **cancelled** rather than filled, as a venue re-checking margin at fill time would
-/// cancel it. That includes an order a configured `initial_state` seeded, which for spot would be
-/// a panic.
+/// cancel it. That includes an order a configured `initial_state` seeded, which for an ordinary
+/// spot order would be a panic.
 ///
 /// A resting spot sell holds the base it delivers, and nothing for its fee, which comes out of its
 /// proceeds. A sell whose fee exceeds its proceeds takes the excess from quote, so it is costed
