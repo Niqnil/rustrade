@@ -71,6 +71,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The simulated venue credits what a spot fill receives** (`rustrade-execution`).
+  - **Breaking in behaviour:** `SimulatedVenue` debited the asset a spot fill paid with and
+    never credited the one it received. A buy took quote and delivered no base, and a sell took
+    base and paid no proceeds. So its spot balances tracked cash committed rather than holdings,
+    and anything valued from them, such as a backtest's per-asset balances and their drawdowns,
+    was wrong after the first fill. A buy now credits the base it bought, and a sell credits its
+    proceeds in quote.
+  - **Breaking in behaviour:** the fee is charged in quote on both sides: on top of what a buy
+    pays, and out of what a sell receives. A sell used to pay its fee in base, converted at the
+    fill price, while its `Trade` reported the fee in quote. The base a fill moves is now exactly
+    its quantity, which is what the engine's position counts. A per-unit fee
+    (`PerContractFeeModel`) on a spot sell is now charged as quote. A sell whose fee exceeds its
+    proceeds takes the excess from quote, and is refused, or cancelled if it was resting, when
+    quote cannot cover it.
+  - **Breaking in behaviour:** a spot fill reports `[paid balance, received balance, trade]`,
+    one restatement per asset it moved, where it reported `[balance, trade]`. A resting fill
+    then reports its terminal order, as before.
+  - The asset a fill receives is created at zero if the account never held it, so a backtest
+    needs to fund only what its orders pay with.
+  - **Breaking:** `AccountState::commit` takes the fill's credit as an `Option<&Credit>`, where it
+    took a `Decimal` paid back into the paying asset. `Credit` is either `PaidBack`, what a CFD
+    close pays back into the asset the order paid with, or a `Delivery` in another asset, what a
+    spot fill receives. `commit` returns `Committed`: the paid balance, and the received one for a
+    delivery. New `AccountState::deliver`, unchecked like `charge`. `BalanceInsufficient` gains the
+    `asset` that was short and is no longer `Copy`.
+
 - **A fill is no longer dropped because its fee asset is unknown** (`rustrade-execution`,
   `rustrade-instrument`, `rustrade`).
   - `AccountEventIndexer` failed a whole trade when its fee asset was not in the instrument map,
