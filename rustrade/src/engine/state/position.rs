@@ -2335,6 +2335,54 @@ mod tests {
     }
 
     #[test]
+    fn increase_and_flip_leave_out_a_fee_with_no_quote_equivalent() {
+        let base_time = DateTime::<Utc>::MIN_UTC;
+        let no_quote_equivalent = |mut trade: Trade<QuoteAsset, InstrumentNameInternal>| {
+            trade.fees.fees_quote = None;
+            trade
+        };
+
+        // Enter 1 @ 100 with a quote fee of 1, then increase by 1 @ 100 with a third-party fee
+        // of 4: only the quote fee is charged.
+        let position = Position::from(&trade(base_time, Side::Buy, 100.0, 1.0, 1.0));
+        let (Some(position), None) = position.update_from_trade(&no_quote_equivalent(trade(
+            time_plus_days(base_time, 1),
+            Side::Buy,
+            100.0,
+            1.0,
+            4.0,
+        ))) else {
+            panic!("an increase keeps the position open");
+        };
+        assert_eq!(position.pnl_realised, dec!(-1.0));
+
+        // Flip with a sell of 4 @ 110 and a third-party fee of 8: the 2 closed realise
+        // (110 − 100) × 2 = 20 with no fee, and the new short of 2 opens with no fee charged.
+        let (Some(next), Some(exited)) = position.update_from_trade(&no_quote_equivalent(trade(
+            time_plus_days(base_time, 2),
+            Side::Sell,
+            110.0,
+            4.0,
+            8.0,
+        ))) else {
+            panic!("a flip exits the position and opens the next");
+        };
+        assert_eq!(
+            exited.pnl_realised,
+            dec!(19.0),
+            "20 − the 1 quote entry fee"
+        );
+        assert_eq!(next.side, Side::Sell);
+        assert_eq!(next.quantity_abs, dec!(2.0));
+        assert_eq!(next.pnl_realised, Decimal::ZERO);
+        assert_eq!(
+            next.fees_enter.fees,
+            dec!(4.0),
+            "half of the raw fee is recorded"
+        );
+    }
+
+    #[test]
     fn test_update_pnl_unrealised_holds_last_good_on_overflow() {
         // Regression for the overflow-safety contract (#177): on the per-market-tick path an
         // extreme feed `price` that overflows `Decimal` must NOT panic, must report

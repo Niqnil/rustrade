@@ -655,7 +655,8 @@ impl AccountEventIndexer {
     /// The trade is kept, with its fee zeroed: `fees` is `0` in the instrument's quote asset and
     /// `fees_quote` is `None`. A `warn` names the fee's asset and amount. Dropping the trade would
     /// leave the engine's position different from the venue's, which costs far more than one
-    /// unknown fee. Two cases reach this:
+    /// unknown fee. The `warn` is per trade, so an account that pays every fee in an unregistered
+    /// asset logs one per fill until the asset is registered. Two cases reach this:
     /// - An asset the account pays fees in but no instrument implies, such as BNB on Binance spot
     ///   with "pay fees with BNB" turned on. Register it with
     ///   [`IndexedInstrumentsBuilder::add_asset`](rustrade_instrument::index::builder::IndexedInstrumentsBuilder::add_asset)
@@ -687,6 +688,8 @@ impl AccountEventIndexer {
         } = trade;
 
         let instrument_index = self.map.find_instrument_index(&instrument)?;
+        // Invariant check: `find_instrument_index` resolves only names built from `instruments`,
+        // so the index is always present. Failing loudly beats indexing a fee against nothing.
         let underlying = &self
             .map
             .instruments

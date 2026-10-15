@@ -112,15 +112,23 @@ impl IndexedInstrumentsBuilder {
     /// the account reports a BNB balance. Once it is registered, fees and balances in that asset
     /// index like any other, and the engine keeps a balance for it.
     ///
-    /// What the engine does with such an asset:
-    /// - It keeps its balance as reported, like any other asset's.
-    /// - It values nothing in it. The engine has no account equity summed across assets, so an
-    ///   asset with no instrument needs no price.
-    /// - A fee charged in it has no quote equivalent (`AssetFees::fees_quote` is `None`), so it is
-    ///   left out of the position's PnL. A consumer that wants it counted prices it.
+    /// A fee charged in such an asset is neither the instrument's base nor its quote, so it has no
+    /// quote equivalent. The `rustrade` engine leaves it out of position PnL, and values nothing
+    /// in the asset's balance.
     ///
-    /// Registering an asset that an instrument also implies is harmless: duplicates are removed by
-    /// [`Self::try_build`], which validates assets the same way whichever method added them.
+    /// Pass the venue that holds the balance, the **execution** venue. An asset registers balance
+    /// state on its exchange, so registering one on a data-only venue seeds a balance that venue
+    /// can never report (see [`Self::add_instrument`]).
+    ///
+    /// Assets are validated and indexed by [`Self::try_build`] the same way whichever method added
+    /// them:
+    /// - An exact duplicate of an asset an instrument implies is removed.
+    /// - A name that conflicts with another asset on the same exchange fails the build, such as the
+    ///   same `name_internal` with a different `name_exchange`, or an exchange name differing only
+    ///   in case.
+    /// - [`AssetIndex`] values are assigned after sorting, so registering an asset can change the
+    ///   indices of others. Resolve indices from the built [`IndexedInstruments`], never hard-code
+    ///   them.
     pub fn add_asset(mut self, asset: ExchangeAsset<Asset>) -> Self {
         self.exchanges.push(asset.exchange);
         self.assets.push(asset);
@@ -560,6 +568,25 @@ mod tests {
                 .any(|exchange| exchange.value == ExchangeId::Kraken),
             "an asset's exchange is registered even with no instrument on it"
         );
+    }
+
+    #[test]
+    fn add_asset_with_a_conflicting_name_fails_the_build() {
+        let with = |asset: Asset| {
+            IndexedInstrumentsBuilder::default()
+                .add_instrument(instrument(ExchangeId::BinanceSpot, "btc", "usdt"))
+                .add_asset(ExchangeAsset::new(ExchangeId::BinanceSpot, asset))
+                .try_build()
+        };
+
+        assert!(matches!(
+            with(Asset::new("usdt", "tether")),
+            Err(IndexError::DuplicateAssetNameInternal(_))
+        ));
+        assert!(matches!(
+            with(Asset::new("usdt_2", "USDT")),
+            Err(IndexError::DuplicateAssetNameExchange(_))
+        ));
     }
 
     #[test]
