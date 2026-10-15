@@ -93,3 +93,9 @@ prost = { version = "0.14.3" }
 temp-env = { version = "0.3" }
 serial_test = { version = "4.0" }
 tempfile = { version = "3" }
+
+# For cargo-mutants (see `.cargo/mutants.toml`), which rebuilds the mutated crate and its dependents
+# once per mutant. Debug info is much of each rebuild's cost, and a mutant's outcome never needs it.
+[profile.mutants]
+inherits = "test"
+debug = "none"

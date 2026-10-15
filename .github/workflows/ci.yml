@@ -309,6 +309,137 @@ jobs:
             -D rustdoc::invalid_html_tags
         run: cargo doc --locked --workspace --all-features --no-deps --document-private-items
 
+  # Mutation-tests the lines this PR changes. cargo-mutants alters each one (a `<` to `<=`, a
+  # function body to `Default::default()`, ...) and reruns the tests; a mutant the tests still pass
+  # on marks behaviour no test pins. cargo-mutants itself annotates each missed mutant on its line
+  # when it runs under GitHub Actions, and the job summary lists them all.
+  #
+  # Informational: not a required check, and a missed mutant or a timeout leaves it green. It fails
+  # only when the run itself does, for example when the tests already fail without any mutation.
+  # See CONTRIBUTING.md, "Mutation testing".
+  mutants:
+    name: cargo mutants
+    needs: [fmt, check]
+    # Only a PR has a diff to scope the run to. The rest is `test`'s gate.
+    if: ${{ github.event_name == 'pull_request' && !cancelled() && needs.fmt.result == 'success' && needs.check.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Must match `test`'s `env` exactly. The cache restored below is `test`'s, and rust-cache hashes
+    # `CARGO_*` variables into its key, so any difference here misses it.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      # Depth 2 fetches the base branch tip, the test merge commit's first parent; see `changes`.
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 2
+
+      # cargo-mutants mutates Rust source only, so a PR that changes none has nothing to test, and
+      # every step below skips. The `HEAD^2` check is the same guard as in `changes`.
+      - name: Extract the PR's diff
+        id: diff
+        run: |
+          git rev-parse --verify --quiet HEAD^2 > /dev/null
+          git diff HEAD^1 HEAD > "$RUNNER_TEMP/pr.diff"
+          if git diff --name-only HEAD^1 HEAD -- '*.rs' | grep -q .; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+            echo "No Rust source changed: nothing to mutate" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Free disk space  # As in `test`, which builds the same targets
+        if: steps.diff.outputs.rust == 'true'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
+
+      - name: Install mold linker
+        if: steps.diff.outputs.rust == 'true'
+        uses: rui314/setup-mold@da13e0b42e392e3a45d1215033a2270b849d7d36  # v1
+        with:
+          mold-version: ${{ env.MOLD_VERSION }}
+
+      - name: Install stable toolchain
+        if: steps.diff.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+
+      # `test`'s cache, restored read-only. This job runs only on PRs, and a PR run can save a cache
+      # only to its own ref, so a cache of this job's own would start cold on every new PR. `test`
+      # saves one on every push to `develop`, which leaves the dependencies here already built, and
+      # this job takes no share of the repository's cache quota.
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
+        if: steps.diff.outputs.rust == 'true'
+        with:
+          shared-key: "rustrade-ci-test"
+          save-if: false
+
+      # Compiled on every run, since the cache above is never saved.
+      - name: Install cargo-mutants
+        if: steps.diff.outputs.rust == 'true'
+        run: cargo install --locked cargo-mutants@27.1.0
+
+      # - `--in-place` mutates this checkout rather than a copy, so the build reuses the restored
+      #   `target/` without copying it. That runs one mutant at a time, and is safe only because the
+      #   runner is discarded afterwards: never pass it locally.
+      # - `--profile=test` replaces `.cargo/mutants.toml`'s local-only profile with the one `test`
+      #   built the cache under.
+      # - The targets go in `--cargo-arg`, not after `--`: cargo-mutants passes trailing arguments
+      #   to the test phase only, and its build phase would then link every example too.
+      # - `timeout` interrupts the run with time left in the job, so a large PR still gets a summary
+      #   of the mutants tested so far. cargo-mutants records each outcome as it lands.
+      - name: Run cargo mutants
+        id: mutants
+        if: steps.diff.outputs.rust == 'true'
+        run: |
+          status=0
+          timeout --signal=INT --kill-after=2m 45m \
+            cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" --in-place --profile=test \
+              --cargo-arg=--lib --cargo-arg=--bins --cargo-arg=--tests \
+              --output "$RUNNER_TEMP" \
+            || status=$?
+          # 2: a mutant was missed. 3: a mutant timed out. 124: the run was cut short. Each is a
+          # result for the summary to report, not a failure of the job.
+          case $status in
+            0) ;;
+            2|3) echo "cargo-mutants exited $status: see the summary" ;;
+            124) echo "Stopped after 45 minutes: the summary covers the mutants tested so far" \
+                   | tee -a "$GITHUB_STEP_SUMMARY" ;;
+            *) exit "$status" ;;
+          esac
+
+      - name: Summary
+        if: ${{ !cancelled() && steps.diff.outputs.rust == 'true' }}
+        env:
+          OUTCOME: ${{ steps.mutants.outcome }}
+        run: |
+          out="$RUNNER_TEMP/mutants.out"
+          count() { if [ -f "$out/$1.txt" ]; then wc -l < "$out/$1.txt"; else echo 0; fi; }
+          {
+            echo "### Mutation testing"
+            if [ "$OUTCOME" != success ]; then
+              echo "The run failed, so any counts below are partial: see the \`Run cargo mutants\` log."
+            fi
+            if [ ! -d "$out" ]; then
+              if [ "$OUTCOME" = success ]; then
+                echo "No mutants: the diff touches no code cargo-mutants can mutate."
+              fi
+              exit 0
+            fi
+            echo "| Caught | Missed | Timed out | Unviable |"
+            echo "|---|---|---|---|"
+            echo "| $(count caught) | $(count missed) | $(count timeout) | $(count unviable) |"
+            if [ -s "$out/missed.txt" ]; then
+              echo
+              echo "Missed: add a test that fails on the mutant, or explain in the PR why it is"
+              echo "equivalent to the original."
+              echo '```'
+              cat "$out/missed.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   audit:
     name: cargo audit
     needs: changes

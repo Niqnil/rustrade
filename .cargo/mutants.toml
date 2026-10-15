@@ -1,0 +1,22 @@
+# cargo-mutants configuration, read by local runs and by CI's `mutants` job.
+# See CONTRIBUTING.md, "Mutation testing".
+
+# Every integration in `rustrade-data` and `rustrade-execution` sits behind its own feature, and
+# both crates declare `default = []`. Without this the gated code is compiled out of the mutated
+# build, so no test can reach it, and every mutant in it is reported as missed.
+all_features = true
+
+# Copy the tree into each scratch build directory without the files `.gitignore` excludes.
+gitignore = true
+
+# `[profile.mutants]` in the workspace `Cargo.toml`: the test profile without debug info, which a
+# mutant's outcome never needs. CI overrides it with `--profile=test` to reuse the `test` job's
+# build cache.
+profile = "mutants"
+
+# Two settings deliberately left out:
+# - `cap_lints`: cargo-mutants applies it through `CARGO_ENCODED_RUSTFLAGS`, which replaces the
+#   rustflags in `.cargo/config.toml` rather than adding to them.
+# - Test-target selection (`additional_cargo_args`, `additional_cargo_test_args`): cargo-mutants
+#   appends these to the command line's own rather than replacing them, so a default set here
+#   could not be narrowed by a run that wants fewer targets.

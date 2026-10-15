@@ -147,6 +147,44 @@ Both halves matter. Without `--features <provider>` the test file's contents are
 out and the binary holds no tests at all; without `-- --ignored` the `#[ignore]` markers
 mean none of them run. Either omission produces a green run that asserted nothing.
 
+### Mutation testing
+
+Passing tests show that the code runs, not that the tests would notice if it changed.
+[cargo-mutants](https://mutants.rs) checks that: it makes small changes to the code (`<` to
+`<=`, `&&` to `||`, a function body replaced with `Default::default()`) and reruns the tests
+against each one. A change the tests catch is a *caught* mutant. A change they still pass on
+is a *missed* mutant: behaviour that no test pins.
+
+CI's `cargo mutants` job runs it on the lines each PR changes. The job is informational, so
+it stays green when a mutant is missed. Each missed mutant is annotated on its line in the
+PR's diff and listed in the job summary. For each one, either:
+
+- **add a test that fails on the mutant**, or
+- **explain in the PR why it is equivalent**: the change cannot alter anything observable, for
+  example `<` against `<=` where the two operands can never be equal.
+
+To run the same check locally, on your committed changes:
+
+```bash
+cargo install --locked cargo-mutants@27.1.0
+git diff origin/develop... > pr.diff
+cargo mutants --in-diff pr.diff --cargo-arg=--lib --cargo-arg=--bins --cargo-arg=--tests
+```
+
+`.cargo/mutants.toml` supplies the rest: `--all-features`, so that feature-gated code is built
+and tested rather than reported as missed, and the `mutants` profile, which builds without
+debug info. Results land in `mutants.out/`, with the missed mutants in `missed.txt`.
+
+- cargo-mutants copies the source tree into a temporary directory for each build, which needs
+  free space in `$TMPDIR`. If `/tmp` is a small RAM-backed filesystem, point `TMPDIR` at a
+  directory on disk.
+- The diff must match the working tree. Commit or stash any further edits to the files it
+  touches first, or cargo-mutants refuses to run.
+- To narrow a run, mutate one crate with `-p <crate>`, or replace `--cargo-arg=--tests` with
+  `--cargo-arg=--test=<file>` to run one test file.
+- Never pass `--in-place` locally. CI uses it on a throwaway runner, but it mutates your working
+  tree, and a run that is killed part-way can leave a mutant in it.
+
 ## Changelog & Versioning
 
 We follow [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
