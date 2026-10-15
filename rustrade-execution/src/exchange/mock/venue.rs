@@ -1402,8 +1402,9 @@ impl SimulatedVenue {
     /// reservation now held against it -- and no trade, because nothing traded.
     ///
     /// A Market order has no limit price, and any price it carries is ignored, so the venue prices
-    /// it from whichever market its [`VenueRegime`] gives it -- its own on a [`MarketDriven`](VenueRegime::MarketDriven) venue,
-    /// and [`RequestOpen::market`](crate::order::request::RequestOpen::market) on a
+    /// it from whichever market its [`VenueRegime`] gives it -- its own on a
+    /// [`MarketDriven`](VenueRegime::MarketDriven) venue, and
+    /// [`RequestOpen::market`](crate::order::request::RequestOpen::market) on a
     /// [`RequestPriced`](VenueRegime::RequestPriced) one. A Limit order is always judged and priced
     /// against this venue's own market; see the type's `# How an order is priced`.
     pub fn open_order(
@@ -2312,9 +2313,9 @@ impl SimulatedVenue {
                 OrderState::fully_filled(filled)
             }
 
-            // A market order carries no price, so its remainder has nothing to rest at and retires
-            // carrying what did trade -- which is what `Cancelled::filled_quantity` is for, and the
-            // first time this venue makes it non-zero.
+            // A market order has no limit price, so its remainder has nothing to rest at and
+            // retires carrying what did trade -- which is what `Cancelled::filled_quantity` is for,
+            // and the first time this venue makes it non-zero.
             None => {
                 let cancelled = Cancelled {
                     id: order_id,
@@ -3018,7 +3019,7 @@ fn disposition(
 /// derived at the two call sites that can reach it. Carrying the limit price *here* rather than
 /// re-reading [`RequestOpen::price`](crate::order::request::RequestOpen::price) is what makes
 /// "rest what is left" unrepresentable for an order that has nowhere to rest it: a market order
-/// carries no price, so it cannot construct [`Rest`](Self::Rest) at all.
+/// has no limit price, so it cannot construct [`Rest`](Self::Rest) at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Remainder {
     /// Joins the book at this limit and waits to be crossed.
@@ -5319,7 +5320,7 @@ mod tests {
 
     /// A Market order the venue cannot price is rejected, not panicked on.
     ///
-    /// A Market order carries no limit price of its own to fall back on, so with no usable
+    /// A Market order has no limit price of its own to fall back on, so with no usable
     /// snapshot there is no price anywhere. This used to hit an `expect`. Because the async driver
     /// runs as a spawned task, that killed the exchange, dropped the request receiver, and turned
     /// every later order into `ExchangeOffline` -- so a backtest ran to completion over the whole
@@ -5373,11 +5374,25 @@ mod tests {
     /// A price on a market order is ignored, as the live clients ignore it, so it is no fallback:
     /// with nothing to price from, the order is still unpriceable rather than filled at the price
     /// its sender happened to stamp.
+    ///
+    /// Both regimes can reach the fallback: a request-priced venue sent no usable snapshot, and a
+    /// market-driven venue never fed the instrument.
     #[test]
     fn a_market_order_is_never_filled_at_a_price_it_carries() {
-        for market in [None, Some(MarketSnapshot::default())] {
-            let mut venue = make_venue("10", "10000000");
+        let mut market_driven = make_market_venue("10", "10000000");
+        advance(&mut market_driven, time(1));
 
+        let cases = [
+            ("request-priced", make_venue("10", "10000000"), None),
+            (
+                "request-priced",
+                make_venue("10", "10000000"),
+                Some(MarketSnapshot::default()),
+            ),
+            ("market-driven", market_driven, None),
+        ];
+
+        for (regime, mut venue, market) in cases {
             let outcome = venue.open_order(priced_market_order(Side::Buy, "1", market));
 
             assert!(
@@ -5387,12 +5402,12 @@ mod tests {
                         UnindexedOrderError::Rejected(ApiError::OrderRejected(_))
                     ))
                 ),
-                "expected the unpriceable rejection, got {:?} (market={market:?})",
+                "expected the unpriceable rejection, got {:?} ({regime}, market={market:?})",
                 outcome.response.state
             );
             assert!(
                 outcome.events.is_empty(),
-                "nothing filled (market={market:?})"
+                "nothing filled ({regime}, market={market:?})"
             );
         }
     }
