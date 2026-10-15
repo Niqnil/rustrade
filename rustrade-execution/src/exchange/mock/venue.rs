@@ -11,7 +11,7 @@ use crate::{
         orders::{AlreadyResting, OpenOrder, Reservation, RestingOrder},
     },
     fee::{FeeModel, FeeModelConfig, Liquidity, SpotFeeAsset},
-    fill::{FillContext, FillModel, SimFillConfig},
+    fill::{FillContext, FillModel},
     holding_cost::{HeldPosition, HoldingCostModel},
     market::{MarketDepth, MarketSnapshot},
     order::{
@@ -22,6 +22,7 @@ use crate::{
     },
     position::{Position, PositionReport},
     shortability::ShortabilityProvider,
+    slippage::Slippage,
     trade::{AssetFees, Trade, TradeId, TradeOrigin},
 };
 use chrono::{DateTime, Utc};
@@ -295,13 +296,15 @@ pub enum VenueRegime {
 /// distinguish.
 ///
 /// Given that market, the three cases are:
-/// - **A market order**, and **a limit order marketable on arrival** — priced by the [`FillModel`].
-///   A limit order is then *clamped* to its own limit: a buy never fills above it, a sell never
-///   below. Both are charged [`Liquidity::Taker`].
+/// - **A market order**, and **a limit order marketable on arrival** — priced by the [`FillModel`],
+///   then moved against the order by the configured
+///   [`slippage`](crate::client::mock::MockExecutionConfig::slippage). A limit order is then
+///   *clamped* to its own limit: a buy never fills above it, a sell never below. Both are charged
+///   [`Liquidity::Taker`].
 /// - **A resting limit order** — fills at its own limit price exactly, and never reaches the
-///   [`FillModel`]. Deriving a better price from the book would credit price improvement no resting
-///   order can obtain: a maker is paid the price it quoted, and improvement accrues to the
-///   aggressor that crossed it. Charged [`Liquidity::Maker`].
+///   [`FillModel`] or the slippage. Deriving a better price from the book would credit price
+///   improvement no resting order can obtain: a maker is paid the price it quoted, and improvement
+///   accrues to the aggressor that crossed it. Charged [`Liquidity::Maker`].
 ///
 /// The marketable and resting rules agree exactly at the crossing point — an order arriving when
 /// `best_ask == limit` fills at the limit either way — and diverge only where the order genuinely
@@ -437,7 +440,13 @@ pub struct SimulatedVenue {
     pub fee_model: FeeModelConfig,
     /// Which asset a spot fill's fee is charged in. See `# How a spot fill is accounted`.
     pub spot_fee_asset: SpotFeeAsset,
-    pub fill_model: SimFillConfig,
+    /// Prices each taker fill. Built from the configuration's
+    /// [`fill_model`](MockExecutionConfig::fill_model) unless replaced by
+    /// [`with_fill_model`](Self::with_fill_model).
+    fill_model: Arc<dyn FillModel>,
+    /// Moves each taker fill against the order, from its own seeded stream. Private: the stream's
+    /// position is what makes a run reproducible from its seed, so nothing else may draw from it.
+    slippage: Slippage,
     pub instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
     pub account: AccountState,
     /// This venue's own view of each instrument it trades, as of the last
@@ -567,7 +576,8 @@ impl SimulatedVenue {
             exchange: config.mocked_exchange,
             fee_model: config.fee_model,
             spot_fee_asset: config.spot_fee_asset,
-            fill_model: config.fill_model,
+            fill_model: Arc::new(config.fill_model),
+            slippage: Slippage::new(config.slippage),
             instruments,
             account,
             market: FnvHashMap::default(),
@@ -597,6 +607,23 @@ impl SimulatedVenue {
     pub fn with_holding_costs(mut self, models: Vec<Arc<dyn HoldingCostModel>>) -> Self {
         self.holding_costs = models;
         self.refresh_next_charge();
+        self
+    }
+
+    /// This venue, pricing each taker fill with `model` rather than the configured
+    /// [`fill_model`](MockExecutionConfig::fill_model).
+    ///
+    /// The way to plug in a model of your own, such as a size-aware impact model reading
+    /// [`FillContext::quantity`]. The configured
+    /// [`slippage`](MockExecutionConfig::slippage) still applies to whatever price it returns. See
+    /// [`FillModel`] for what an implementation must uphold.
+    ///
+    /// The model is not part of the configuration, so a serialised configuration no longer says
+    /// what priced the fills: its `fill_model` is unused. A venue that `MockExchange` drives is
+    /// built from its configuration alone, so it takes no custom model.
+    #[must_use]
+    pub fn with_fill_model(mut self, model: Arc<dyn FillModel>) -> Self {
+        self.fill_model = model;
         self
     }
 
@@ -1852,7 +1879,11 @@ impl SimulatedVenue {
                     .is_some_and(|limit| crosses(Side::Sell, limit, market)),
                 _ => self
                     .fill_model
-                    .fill_price(&FillContext::new(Side::Sell, market))
+                    .fill_price(&FillContext::new(
+                        Side::Sell,
+                        request.state.quantity,
+                        market,
+                    ))
                     .is_some(),
             })
         };
@@ -2005,9 +2036,13 @@ impl SimulatedVenue {
         // The order's own price is deliberately NOT handed to the model. A limit constrains the
         // result, not the pricing: a model reads the book and returns where a taker prints, and
         // this venue is what bounds that by the order's terms. See `FillModel`'s contract.
-        let maybe_fill_price = self
+        let maybe_reference = self
             .fill_model
-            .fill_price(&FillContext::new(request.state.side, &market))
+            .fill_price(&FillContext::new(
+                request.state.side,
+                request.state.quantity,
+                &market,
+            ))
             // For `OrderKind::Market` this is `.or(None)`, since a market order carries no price.
             // For a marketable limit it is the last resort that makes the rejection below
             // unreachable: an order whose limit the market crossed necessarily has one.
@@ -2024,7 +2059,7 @@ impl SimulatedVenue {
         //
         // The two causes get different messages because they have different fixes: an absent
         // snapshot is a wiring problem in the caller, an empty one is a timing problem in the data.
-        let Some(fill_price) = maybe_fill_price else {
+        let Some(reference) = maybe_reference else {
             let cause = if market_supplied {
                 "no market price available yet"
             } else {
@@ -2041,18 +2076,6 @@ impl SimulatedVenue {
                 ),
                 None,
             );
-        };
-
-        // The clamp, and the only place a limit price bounds a fill. A taker crossing the spread
-        // can be filled better than its limit but never worse, so a buy never prints above it and
-        // a sell never below. Applied here rather than inside the model because it is a property of
-        // the order's terms, not of how the market is read.
-        let fill_price = match request.state.price {
-            Some(limit) if request.state.kind == OrderKind::Limit => match request.state.side {
-                Side::Buy => fill_price.min(limit),
-                Side::Sell => fill_price.max(limit),
-            },
-            _ => fill_price,
         };
 
         let time_exchange = self.time_exchange();
@@ -2078,6 +2101,25 @@ impl SimulatedVenue {
                 }
             };
         }
+
+        // Slipped only now that the order is known to trade, so the stream advances exactly once
+        // per fill, and an order that is cancelled or rests whole takes no draw. One the ledger
+        // refuses below hands its draw back, which needs the stream as it was.
+        let slippage_before = self.slippage.clone();
+        let fill_price = self.slippage.apply(side, reference);
+
+        // The clamp, and the only place a limit price bounds a fill. A taker crossing the spread
+        // can be filled better than its limit but never worse, so a buy never prints above it and
+        // a sell never below. Applied here rather than inside the model because it is a property of
+        // the order's terms, not of how the market is read, and after the slippage so that no
+        // rate, however large, fills an order past its limit.
+        let fill_price = match request.state.price {
+            Some(limit) if request.state.kind == OrderKind::Limit => match side {
+                Side::Buy => fill_price.min(limit),
+                Side::Sell => fill_price.max(limit),
+            },
+            _ => fill_price,
+        };
 
         // Marketable on arrival, so this fill takes liquidity and is charged the taker rate.
         let position = self.net_position(terms, &request.key.instrument);
@@ -2120,6 +2162,9 @@ impl SimulatedVenue {
         {
             Ok(committed) => committed,
             Err(insufficient) => {
+                // Refused, so it never traded: the next fill draws the rate it would have drawn had
+                // this order never been sent.
+                self.slippage = slippage_before;
                 return (
                     build_open_order_err_response(
                         request,
@@ -3254,7 +3299,7 @@ mod tests {
             orders::{OpenOrders, as_open},
         },
         fee::{PerContractFeeModel, PercentageFeeModel},
-        fill::BidAskFillModel,
+        fill::{BidAskFillModel, SimFillConfig},
         holding_cost::{
             AccrualDays, BorrowFeeModel, DailyAccrual, DayCount, FinancingModel, FinancingRates,
             FundingModel, HoldingCharge, RateSeries, WeekendsOnly,
@@ -3266,6 +3311,7 @@ mod tests {
             state::{ActiveOrderState, InactiveOrderState},
         },
         shortability::{Shortability, ShortabilityTable},
+        slippage::SlippageConfig,
     };
     use chrono::{NaiveTime, TimeDelta};
     use rustrade_instrument::{
@@ -4005,6 +4051,7 @@ mod tests {
             FeeModelConfig::default(),
             SimFillConfig::default(),
             SpotFeeAsset::default(),
+            crate::slippage::SlippageConfig::default(),
         );
         let mut venue = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
         assert_eq!(cfd_position(&venue), Some((d("-1"), Some(d("5000")))));
@@ -4043,6 +4090,7 @@ mod tests {
             FeeModelConfig::default(),
             SimFillConfig::default(),
             SpotFeeAsset::default(),
+            crate::slippage::SlippageConfig::default(),
         );
         let _ = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
     }
@@ -4397,7 +4445,7 @@ mod tests {
     #[test]
     fn bid_ask_fill_model_fills_at_ask_price_and_deducts_correct_balance() {
         let mut venue = make_venue("0", "10000"); // 0 BTC, 10 000 USDT
-        venue.fill_model = SimFillConfig::BidAsk(BidAskFillModel);
+        venue.fill_model = Arc::new(SimFillConfig::BidAsk(BidAskFillModel));
 
         let market = Some(MarketSnapshot {
             best_bid: Some(d("99.5")),
@@ -4428,6 +4476,348 @@ mod tests {
             usdt.balance.free,
             d("9899.5"),
             "quote balance must decrease by fill_price * qty"
+        );
+    }
+
+    // --- Slippage ---
+
+    /// A funded spot config moving every taker fill by `slippage`.
+    fn slipped_config(slippage: SlippageConfig) -> MockExecutionConfig {
+        MockExecutionConfig {
+            slippage,
+            ..spot_config("10", "1000000", FeeModelConfig::default())
+        }
+    }
+
+    fn last(price: &str) -> Option<MarketSnapshot> {
+        Some(MarketSnapshot {
+            last_price: Some(d(price)),
+            ..MarketSnapshot::default()
+        })
+    }
+
+    fn uniform(seed: u64) -> SlippageConfig {
+        SlippageConfig::uniform(d("0.01"), d("0.025"), seed).unwrap()
+    }
+
+    #[test]
+    fn a_fixed_slippage_moves_a_market_fill_against_the_order_and_settles_that_price() {
+        let config = slipped_config(SlippageConfig::fixed(d("0.01")).unwrap());
+        let mut venue = SimulatedVenue::new(&config, spot_instruments());
+
+        let bought = venue.open_order(buy_request("2", last("100")));
+        assert_eq!(filled_trade(&bought).price, d("101"), "a buy pays 1% above");
+        assert_eq!(
+            venue.account.balance_mut(&quote()).unwrap().balance.free,
+            d("999798"),
+            "the quote debited is the slipped price times the quantity"
+        );
+
+        let sold = venue.open_order(sell_request("2", last("100")));
+        assert_eq!(
+            filled_trade(&sold).price,
+            d("99"),
+            "a sell receives 1% below"
+        );
+        assert_eq!(
+            venue.account.balance_mut(&quote()).unwrap().balance.free,
+            d("999996"),
+            "the round trip cost the 1% on each side"
+        );
+    }
+
+    /// The clamp comes after the slippage, so no rate fills a limit order past its own limit.
+    #[test]
+    fn a_slipped_marketable_limit_never_fills_past_its_limit() {
+        let fill = |rate: &str, side: Side, limit: &str| {
+            let config = slipped_config(SlippageConfig::fixed(d(rate)).unwrap());
+            let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+            advance(&mut venue, time(1));
+            let fed = venue.apply_market(
+                &instrument_name(),
+                book("49000", "49100"),
+                MarketDepth::UNKNOWN,
+                time(1),
+            );
+            assert!(fed.is_empty(), "an empty book fills nothing");
+            let outcome = venue.open_order(limit_request("cid", side, "1", limit, gtc()));
+            filled_trade(&outcome).price
+        };
+
+        assert_eq!(
+            fill("0.01", Side::Buy, "49200"),
+            d("49200"),
+            "49591 slipped, clamped to the limit"
+        );
+        assert_eq!(
+            fill("0.01", Side::Sell, "48800"),
+            d("48800"),
+            "48510 slipped, clamped to the limit"
+        );
+        assert_eq!(
+            fill("0.001", Side::Buy, "49200"),
+            d("49149.1"),
+            "inside the limit, the slipped price stands"
+        );
+    }
+
+    /// A resting order is the maker, so it fills at its own limit and leaves the stream alone.
+    #[test]
+    fn a_resting_fill_is_not_slipped_and_takes_no_draw() {
+        let config = MockExecutionConfig {
+            slippage: uniform(5),
+            ..spot_config("10", "1000000", maker_taker_fee())
+        };
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+        advance(&mut venue, time(1));
+        let fed = venue.apply_market(
+            &instrument_name(),
+            book("49000", "49100"),
+            MarketDepth::UNKNOWN,
+            time(1),
+        );
+        assert!(fed.is_empty(), "an empty book fills nothing");
+        let rested = venue.open_order(limit_request("resting", Side::Buy, "1", "48000", gtc()));
+        rested_open(&rested);
+        assert_eq!(
+            venue.slippage,
+            Slippage::new(config.slippage),
+            "resting drew nothing"
+        );
+
+        advance(&mut venue, time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("47800", "47900"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
+        assert_eq!(trade_of(&events[2]).price, d("48000"));
+        assert_eq!(
+            venue.slippage,
+            Slippage::new(config.slippage),
+            "the maker's fill drew nothing"
+        );
+    }
+
+    /// A marketable order the book has no size for trades nothing, whether it then rests or is
+    /// cancelled, so it takes no draw.
+    #[test]
+    fn an_order_the_book_cannot_fill_takes_no_draw() {
+        let config = slipped_config(uniform(3));
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+        advance(&mut venue, time(1));
+        let fed = venue.apply_market(
+            &instrument_name(),
+            book("47800", "47900"),
+            MarketDepth::new(Some(d("1")), Some(Decimal::ZERO)),
+            time(1),
+        );
+        assert!(fed.is_empty(), "an empty book fills nothing");
+
+        let rested = venue.open_order(limit_request("rests", Side::Buy, "1", "48000", gtc()));
+        assert_eq!(rested_open(&rested).filled_quantity, Decimal::ZERO);
+        let cancelled = venue.open_order(limit_request(
+            "cancels",
+            Side::Buy,
+            "1",
+            "48000",
+            TimeInForce::ImmediateOrCancel,
+        ));
+        assert!(
+            matches!(
+                cancelled.response.state,
+                OrderState::Inactive(InactiveOrderState::Cancelled(_))
+            ),
+            "{:?}",
+            cancelled.response.state
+        );
+
+        assert_eq!(venue.slippage, Slippage::new(config.slippage));
+    }
+
+    /// A funded spot venue on a book offering `depth`, moving every taker fill by `slippage`.
+    fn slipped_venue_offering(
+        usdt: &str,
+        slippage: SlippageConfig,
+        depth: MarketDepth,
+    ) -> SimulatedVenue {
+        let config = MockExecutionConfig {
+            slippage,
+            ..spot_config("10", usdt, FeeModelConfig::default())
+        };
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+        advance(&mut venue, time(1));
+        let fed = venue.apply_market(&instrument_name(), book("47800", "47900"), depth, time(1));
+        assert!(fed.is_empty(), "an empty book fills nothing");
+        venue
+    }
+
+    /// The book fills 1 of 3: that fill is slipped, with one draw, and the remainder rests at the
+    /// order's own limit.
+    #[test]
+    fn a_part_filled_order_is_slipped_once_and_rests_the_rest_at_its_limit() {
+        let mut venue = slipped_venue_offering("1000000", uniform(8), sized("1"));
+        let mut expected = Slippage::new(uniform(8));
+        let price = expected.apply(Side::Buy, d("47900"));
+
+        let outcome = venue.open_order(limit_request("part", Side::Buy, "3", "50000", gtc()));
+        let trade = filled_trade(&outcome);
+        assert_eq!((trade.quantity, trade.price), (d("1"), price));
+        assert_eq!(rested_open(&outcome).filled_quantity, d("1"));
+        assert_eq!(venue.slippage, expected, "one fill, one draw");
+        assert_eq!(
+            venue
+                .account
+                .orders()
+                .resting(&instrument_name(), Side::Buy)
+                .map(|order| order.price)
+                .collect::<Vec<_>>(),
+            vec![Some(d("50000"))],
+            "the remainder rests at its limit, unslipped"
+        );
+    }
+
+    /// A fill-or-kill the book can only part fill trades nothing, so it takes no draw.
+    #[test]
+    fn a_killed_order_takes_no_draw() {
+        let mut venue = slipped_venue_offering("1000000", uniform(8), sized("1"));
+        let outcome = venue.open_order(limit_request(
+            "kill",
+            Side::Buy,
+            "3",
+            "50000",
+            TimeInForce::FillOrKill,
+        ));
+        assert!(
+            matches!(
+                outcome.response.state,
+                OrderState::Inactive(InactiveOrderState::Cancelled(_))
+            ),
+            "{:?}",
+            outcome.response.state
+        );
+        assert_eq!(venue.slippage, Slippage::new(uniform(8)));
+    }
+
+    /// The fill is affordable, its remainder's hold is not: refused whole, and the draw handed back.
+    #[test]
+    fn a_part_filled_order_refused_for_its_hold_hands_back_its_draw() {
+        let mut venue = slipped_venue_offering("60000", uniform(8), sized("1"));
+        let outcome = venue.open_order(limit_request("split", Side::Buy, "3", "50000", gtc()));
+        assert!(
+            matches!(
+                outcome.response.state,
+                OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                    ApiError::BalanceInsufficient(..)
+                )))
+            ),
+            "{:?}",
+            outcome.response.state
+        );
+        assert_eq!(venue.slippage, Slippage::new(uniform(8)));
+    }
+
+    /// An order the ledger refuses never traded, so the next fill gets the rate it would have got
+    /// had the refused order never been sent.
+    #[test]
+    fn a_refused_order_hands_back_its_draw() {
+        let config = slipped_config(uniform(11));
+        let mut venue = SimulatedVenue::new(&config, spot_instruments());
+
+        let refused = venue.open_order(buy_request("1000000", last("100")));
+        assert!(
+            matches!(
+                refused.response.state,
+                OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                    ApiError::BalanceInsufficient(..)
+                )))
+            ),
+            "{:?}",
+            refused.response.state
+        );
+        assert_eq!(venue.slippage, Slippage::new(config.slippage));
+
+        let mut fresh = SimulatedVenue::new(&config, spot_instruments());
+        assert_eq!(
+            filled_trade(&venue.open_order(buy_request("1", last("100")))).price,
+            filled_trade(&fresh.open_order(buy_request("1", last("100")))).price,
+        );
+    }
+
+    /// The prices of a sequence of fills, alternating buys and sells, on a venue built from
+    /// `config`.
+    fn slipped_prices(config: &MockExecutionConfig) -> Vec<Decimal> {
+        let mut venue = SimulatedVenue::new(config, spot_instruments());
+        (0..20)
+            .map(|i| {
+                let request = if i % 2 == 0 {
+                    buy_request("0.1", last("100"))
+                } else {
+                    sell_request("0.1", last("100"))
+                };
+                filled_trade(&venue.open_order(request)).price
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_seeded_venue_reproduces_its_prices_within_the_range() {
+        let prices = slipped_prices(&slipped_config(uniform(42)));
+        assert_eq!(prices, slipped_prices(&slipped_config(uniform(42))));
+        assert_ne!(prices, slipped_prices(&slipped_config(uniform(43))));
+
+        for (i, price) in prices.iter().enumerate() {
+            // Buys pay 1% to 2.5% above 100, sells receive 1% to 2.5% below.
+            let (low, high) = if i % 2 == 0 {
+                (d("101"), d("102.5"))
+            } else {
+                (d("97.5"), d("99"))
+            };
+            assert!(
+                low <= *price && *price <= high,
+                "fill {i} at {price} outside [{low}, {high}]"
+            );
+        }
+    }
+
+    /// A zero rate never draws and never multiplies, so it is the unslipped price exactly, scale
+    /// included.
+    #[test]
+    fn a_zero_rate_is_identical_to_no_slippage() {
+        let none = slipped_prices(&slipped_config(SlippageConfig::none()));
+        let zero = slipped_prices(&slipped_config(
+            SlippageConfig::uniform(Decimal::ZERO, Decimal::ZERO, 42).unwrap(),
+        ));
+        assert_eq!(
+            none.iter().map(Decimal::to_string).collect::<Vec<_>>(),
+            zero.iter().map(Decimal::to_string).collect::<Vec<_>>()
+        );
+    }
+
+    /// Prices a fill one unit of price above the last trade for each unit of quantity.
+    #[derive(Debug)]
+    struct SizeImpact;
+
+    impl FillModel for SizeImpact {
+        fn fill_price(&self, fill: &FillContext<'_>) -> Option<Decimal> {
+            fill.market.last_price.map(|last| last + fill.quantity)
+        }
+    }
+
+    /// A custom model prices from the order's quantity, and the configured slippage still
+    /// applies to what it returns.
+    #[test]
+    fn a_custom_fill_model_sees_the_quantity_and_is_still_slipped() {
+        let config = slipped_config(SlippageConfig::fixed(d("0.01")).unwrap());
+        let mut venue =
+            SimulatedVenue::new(&config, spot_instruments()).with_fill_model(Arc::new(SizeImpact));
+
+        let outcome = venue.open_order(buy_request("3", last("100")));
+        assert_eq!(
+            filled_trade(&outcome).price,
+            d("104.03"),
+            "(100 + 3) x 1.01"
         );
     }
 
@@ -5281,7 +5671,7 @@ mod tests {
     #[test]
     fn a_limit_order_is_rejected_before_a_fill_model_is_consulted() {
         let mut venue = make_venue("100", "10000000");
-        venue.fill_model = SimFillConfig::Midpoint(crate::fill::MidpointFillModel);
+        venue.fill_model = Arc::new(SimFillConfig::Midpoint(crate::fill::MidpointFillModel));
 
         let mut request = buy_request("1", market_prices("50000"));
         request.state.kind = OrderKind::Limit;
@@ -8477,7 +8867,7 @@ mod tests {
                 time(0),
                 time(10),
             ));
-        venue.fill_model = SimFillConfig::Midpoint(crate::fill::MidpointFillModel);
+        venue.fill_model = Arc::new(SimFillConfig::Midpoint(crate::fill::MidpointFillModel));
 
         let outcome = open_cfd(&mut venue, Side::Sell, "1");
 
@@ -8537,7 +8927,7 @@ mod tests {
     /// judges a bid it could not fill against.
     #[test]
     fn a_restricted_short_with_no_price_is_refused_as_unpriceable() {
-        let reason_of = |fill_model, market| {
+        let reason_of = |fill_model: SimFillConfig, market| {
             let mut venue = make_cfd_venue("10000000", FeeModelConfig::default())
                 .with_shortability(Arc::new(
                     ShortabilityTable::new().with_short_sale_restriction(
@@ -8546,7 +8936,7 @@ mod tests {
                         time(10),
                     ),
                 ));
-            venue.fill_model = fill_model;
+            venue.fill_model = Arc::new(fill_model);
             advance(&mut venue, time(1));
             match venue
                 .open_order(cfd_request(Side::Sell, "1", market))

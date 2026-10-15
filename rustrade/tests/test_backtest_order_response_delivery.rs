@@ -340,6 +340,7 @@ fn args_constant()
             fee_model: Default::default(),
             fill_model: Default::default(),
             spot_fee_asset: Default::default(),
+            slippage: Default::default(),
         })],
         market_data: MarketDataInMemory::new(Arc::new(market_events)),
         summary_interval: Daily,

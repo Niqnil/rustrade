@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Slippage on the simulated venue, and custom fill models** (`rustrade-execution`, `rustrade`,
+  #625).
+  - New `MockExecutionConfig::slippage`, a `SlippageConfig`. It moves every taker fill against the
+    order, as a fraction of the price the fill model gave: a buy at `price × (1 + s)`, a sell at
+    `price × (1 − s)`. `SlippageConfig::fixed(rate)` uses one rate for every fill.
+    `SlippageConfig::uniform(low, high, seed)` draws a fresh rate for each fill, uniformly from
+    `[low, high]`, from its own generator seeded by `seed`, so a run is reproducible from its
+    seed. The default, `SlippageConfig::none()`, leaves prices as they were.
+  - It applies after any fill model, before a limit order's clamp, so a limit order is never
+    filled past its limit. A resting order that the market reaches still fills at its own limit,
+    unslipped. A slipped fill is not capped at the bar's or the book's range.
+  - Rates must satisfy `0 ≤ low ≤ high < 1`. The constructors and deserialisation refuse anything
+    else with a `SlippageConfigError`.
+  - One draw per fill that trades. An order that is refused, cancelled on arrival or rests
+    without trading takes none, and a range of one rate makes no draw. The generator is
+    xoshiro256++, which `rand` documents as portable. A drawn rate is rounded to 12 decimal
+    places and kept within the range.
+  - A custom `FillModel` can now be plugged in, with `SimulatedVenue::with_fill_model` or
+    `SimVenueOptions::with_fill_model` (`rustrade`). `FillContext` gains `quantity`, the order's
+    quantity, so a model can price by size. A custom model is not part of the serialisable
+    configuration, so the async `MockExchange` driver, which builds its venue from that
+    configuration, cannot take one.
+  - **Breaking:** `MockExecutionConfig` has a new field, so a struct literal or a
+    `MockExecutionConfig::new` call must supply it. A serialised config without it still loads,
+    as no slippage. `FillContext::new` takes the quantity. `FillModel` now requires
+    `Debug + Send + Sync`. `SimulatedVenue::fill_model` is no longer a public field: set it with
+    `with_fill_model`.
+  - `FillModel`'s rustdoc now says that the venue may call it more than once per order, so it
+    must be a pure function of its context. It also says that a taker fill at the market as it
+    stands, on bars the close just seen, is optimistic rather than look-ahead.
+
 - **The simulated venue can charge a spot buy's fee in the base it receives**
   (`rustrade-execution`).
   - New `MockExecutionConfig::spot_fee_asset`, a `SpotFeeAsset`, beside `fee_model`, and the

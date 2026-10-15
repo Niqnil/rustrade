@@ -2,17 +2,17 @@ use crate::market::MarketSnapshot;
 use rust_decimal::Decimal;
 use rustrade_instrument::Side;
 use serde::{Deserialize, Serialize};
+use std::fmt::Debug;
 
 /// Everything a [`FillModel`] may price from.
 ///
 /// # Fields are added, never removed
 ///
 /// An implementation only ever reads this, so every increase in the simulated venue's fidelity —
-/// the order's quantity for a size-aware impact model, sizes at the touch, depth, a queue
-/// position — arrives as a new field rather than as a new parameter on
-/// [`fill_price`](FillModel::fill_price). That is what `#[non_exhaustive]` is for here:
-/// constructing one outside this crate would turn each such addition back into a breaking change,
-/// which is the churn this type exists to end.
+/// sizes at the touch, depth, a queue position — arrives as a new field rather than as a new
+/// parameter on [`fill_price`](FillModel::fill_price). That is what `#[non_exhaustive]` is for
+/// here: constructing one outside this crate would turn each such addition back into a breaking
+/// change, which is the churn this type exists to end.
 ///
 /// The order's limit price is deliberately absent — see [`FillModel`].
 #[non_exhaustive]
@@ -20,14 +20,24 @@ use serde::{Deserialize, Serialize};
 pub struct FillContext<'a> {
     /// Which way the order trades.
     pub side: Side,
+    /// How much the order asks to trade, which a size-aware impact model prices from.
+    ///
+    /// This is the order's whole quantity. Where the book shows less size than that, the venue
+    /// fills only what the book has and prices that part at what the model returns, so a model
+    /// reading this prices the order as if all of it traded.
+    pub quantity: Decimal,
     /// The venue's view of the instrument. Every field is optional and absence is ordinary; see
     /// [`MarketSnapshot`].
     pub market: &'a MarketSnapshot,
 }
 
 impl<'a> FillContext<'a> {
-    pub fn new(side: Side, market: &'a MarketSnapshot) -> Self {
-        Self { side, market }
+    pub fn new(side: Side, quantity: Decimal, market: &'a MarketSnapshot) -> Self {
+        Self {
+            side,
+            quantity,
+            market,
+        }
     }
 }
 
@@ -58,15 +68,41 @@ impl<'a> FillContext<'a> {
 ///
 /// # Extensibility
 ///
-/// Implement this to model slippage, market impact, or other execution dynamics. The built-in
-/// models ([`LastPriceFillModel`], [`BidAskFillModel`], [`MidpointFillModel`]) are baselines.
+/// Implement this to model market impact or other execution dynamics, and hand it to the venue
+/// with [`SimulatedVenue::with_fill_model`]. The built-in models ([`LastPriceFillModel`],
+/// [`BidAskFillModel`], [`MidpointFillModel`]) are baselines, and [`SimFillConfig`] selects one of
+/// them from a serialisable configuration.
+///
+/// Adverse slippage, fixed or drawn at random, needs no model of its own: the venue applies its
+/// [`SlippageConfig`] to whatever price the model returns, whichever model that is.
+///
+/// # It must be a pure function of its context
+///
+/// The venue may call [`fill_price`](Self::fill_price) more than once for one order, and for
+/// orders that never fill: it asks, for instance, whether a short sale is priceable at all before
+/// deciding to refuse it. So the same context must always give the same price, which is why this
+/// takes `&self`. Randomness belongs in the venue's [`SlippageConfig`], whose seeded stream
+/// advances exactly once per fill.
+///
+/// The price returned must be a real market price: the venue's arithmetic on it, slippage and
+/// settlement included, panics on `Decimal` overflow.
+///
+/// # It fills optimistically by default
+///
+/// The venue prices a taker at the market as it stands when the order arrives, which in a backtest
+/// on bars is the close of the bar the strategy has just seen. That is not look-ahead, since the
+/// close is known when deciding, but it is optimistic: it assumes trading at an observed price with
+/// no latency and, unless a model or slippage says otherwise, no cost of crossing.
 ///
 /// # Returns
 ///
 /// `None` when the context carries nothing this model can price from — no prices at all on the
 /// first ticks of a backtest, say. The venue turns that into a rejection naming the instrument
 /// rather than a panic.
-pub trait FillModel {
+///
+/// [`SimulatedVenue::with_fill_model`]: crate::exchange::mock::SimulatedVenue::with_fill_model
+/// [`SlippageConfig`]: crate::slippage::SlippageConfig
+pub trait FillModel: Debug + Send + Sync {
     fn fill_price(&self, fill: &FillContext<'_>) -> Option<Decimal>;
 }
 
@@ -132,11 +168,14 @@ impl FillModel for MidpointFillModel {
     }
 }
 
-/// Enum-dispatched fill model for use in types that require `Clone`,
-/// `Serialize`, and `Deserialize` (e.g. `MockExchangeConfig`).
+/// Selects one of the built-in fill models from a serialisable configuration, as
+/// [`MockExecutionConfig::fill_model`] does. Defaults to [`LastPriceFillModel`].
 ///
-/// Prefer this over `Box<dyn FillModel>` when the field must be part of
-/// a derived `serde` struct. Defaults to [`LastPriceFillModel`].
+/// A model of your own cannot be named here; hand it to the venue with
+/// [`SimulatedVenue::with_fill_model`] instead.
+///
+/// [`MockExecutionConfig::fill_model`]: crate::client::mock::MockExecutionConfig::fill_model
+/// [`SimulatedVenue::with_fill_model`]: crate::exchange::mock::SimulatedVenue::with_fill_model
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub enum SimFillConfig {
     LastPrice(LastPriceFillModel),
@@ -187,7 +226,7 @@ mod tests {
     fn last_price_market_buy_uses_last() {
         let market = prices();
         assert_eq!(
-            LastPriceFillModel.fill_price(&FillContext::new(Side::Buy, &market)),
+            LastPriceFillModel.fill_price(&FillContext::new(Side::Buy, Decimal::ONE, &market)),
             Some(d("100.0"))
         );
     }
@@ -196,7 +235,7 @@ mod tests {
     fn bid_ask_market_buy_uses_ask() {
         let market = prices();
         assert_eq!(
-            BidAskFillModel.fill_price(&FillContext::new(Side::Buy, &market)),
+            BidAskFillModel.fill_price(&FillContext::new(Side::Buy, Decimal::ONE, &market)),
             Some(d("100.5"))
         );
     }
@@ -205,7 +244,7 @@ mod tests {
     fn bid_ask_market_sell_uses_bid() {
         let market = prices();
         assert_eq!(
-            BidAskFillModel.fill_price(&FillContext::new(Side::Sell, &market)),
+            BidAskFillModel.fill_price(&FillContext::new(Side::Sell, Decimal::ONE, &market)),
             Some(d("99.5"))
         );
     }
@@ -214,7 +253,7 @@ mod tests {
     fn midpoint_uses_mid() {
         let market = prices();
         assert_eq!(
-            MidpointFillModel.fill_price(&FillContext::new(Side::Buy, &market)),
+            MidpointFillModel.fill_price(&FillContext::new(Side::Buy, Decimal::ONE, &market)),
             Some(d("100.0"))
         );
     }
@@ -224,6 +263,7 @@ mod tests {
         assert_eq!(
             MidpointFillModel.fill_price(&FillContext::new(
                 Side::Buy,
+                Decimal::ONE,
                 &snapshot(None, None, Some(d("100.0")))
             )),
             Some(d("100.0"))
@@ -237,8 +277,8 @@ mod tests {
         let market = prices();
         let cfg = SimFillConfig::LastPrice(LastPriceFillModel);
         assert_eq!(
-            cfg.fill_price(&FillContext::new(Side::Buy, &market)),
-            LastPriceFillModel.fill_price(&FillContext::new(Side::Buy, &market))
+            cfg.fill_price(&FillContext::new(Side::Buy, Decimal::ONE, &market)),
+            LastPriceFillModel.fill_price(&FillContext::new(Side::Buy, Decimal::ONE, &market))
         );
     }
 
@@ -247,8 +287,8 @@ mod tests {
         let market = prices();
         let cfg = SimFillConfig::BidAsk(BidAskFillModel);
         assert_eq!(
-            cfg.fill_price(&FillContext::new(Side::Sell, &market)),
-            BidAskFillModel.fill_price(&FillContext::new(Side::Sell, &market))
+            cfg.fill_price(&FillContext::new(Side::Sell, Decimal::ONE, &market)),
+            BidAskFillModel.fill_price(&FillContext::new(Side::Sell, Decimal::ONE, &market))
         );
     }
 
@@ -257,8 +297,8 @@ mod tests {
         let market = prices();
         let cfg = SimFillConfig::Midpoint(MidpointFillModel);
         assert_eq!(
-            cfg.fill_price(&FillContext::new(Side::Buy, &market)),
-            MidpointFillModel.fill_price(&FillContext::new(Side::Buy, &market))
+            cfg.fill_price(&FillContext::new(Side::Buy, Decimal::ONE, &market)),
+            MidpointFillModel.fill_price(&FillContext::new(Side::Buy, Decimal::ONE, &market))
         );
     }
 
@@ -277,13 +317,19 @@ mod tests {
         // No market data at all — e.g. first tick of a backtest before any prices arrive.
         // The mock exchange falls back to request.state.price when fill_price returns None.
         assert_eq!(
-            LastPriceFillModel
-                .fill_price(&FillContext::new(Side::Buy, &snapshot(None, None, None))),
+            LastPriceFillModel.fill_price(&FillContext::new(
+                Side::Buy,
+                Decimal::ONE,
+                &snapshot(None, None, None)
+            )),
             None
         );
         assert_eq!(
-            LastPriceFillModel
-                .fill_price(&FillContext::new(Side::Sell, &snapshot(None, None, None))),
+            LastPriceFillModel.fill_price(&FillContext::new(
+                Side::Sell,
+                Decimal::ONE,
+                &snapshot(None, None, None)
+            )),
             None
         );
     }
@@ -295,12 +341,12 @@ mod tests {
         // fallback that was previously untested.
         let market = snapshot(Some(d("99.5")), Some(d("100.5")), None);
         assert_eq!(
-            LastPriceFillModel.fill_price(&FillContext::new(Side::Buy, &market)),
+            LastPriceFillModel.fill_price(&FillContext::new(Side::Buy, Decimal::ONE, &market)),
             Some(d("100.5")),
             "Buy with no last_price should fall back to best_ask"
         );
         assert_eq!(
-            LastPriceFillModel.fill_price(&FillContext::new(Side::Sell, &market)),
+            LastPriceFillModel.fill_price(&FillContext::new(Side::Sell, Decimal::ONE, &market)),
             Some(d("99.5")),
             "Sell with no last_price should fall back to best_bid"
         );
@@ -317,6 +363,7 @@ mod tests {
         assert_eq!(
             MidpointFillModel.fill_price(&FillContext::new(
                 Side::Buy,
+                Decimal::ONE,
                 &snapshot(Some(d("99.5")), None, Some(d("100.0")))
             )),
             Some(d("100.0"))
@@ -328,6 +375,7 @@ mod tests {
         assert_eq!(
             MidpointFillModel.fill_price(&FillContext::new(
                 Side::Sell,
+                Decimal::ONE,
                 &snapshot(None, Some(d("100.5")), Some(d("100.0")))
             )),
             Some(d("100.0"))
@@ -344,7 +392,7 @@ mod tests {
     fn midpoint_complete_book_prices_at_mid_not_last() {
         let market = snapshot(Some(d("99.5")), Some(d("100.5")), Some(d("110.0")));
         assert_eq!(
-            MidpointFillModel.fill_price(&FillContext::new(Side::Buy, &market)),
+            MidpointFillModel.fill_price(&FillContext::new(Side::Buy, Decimal::ONE, &market)),
             Some(d("100.0")),
             "the midpoint of 99.5/100.5, not the stale 110.0 print"
         );
@@ -355,7 +403,7 @@ mod tests {
     fn every_model_returns_none_on_an_empty_snapshot() {
         let empty = MarketSnapshot::default();
         for side in [Side::Buy, Side::Sell] {
-            let fill = FillContext::new(side, &empty);
+            let fill = FillContext::new(side, Decimal::ONE, &empty);
             assert_eq!(LastPriceFillModel.fill_price(&fill), None);
             assert_eq!(BidAskFillModel.fill_price(&fill), None);
             assert_eq!(MidpointFillModel.fill_price(&fill), None);

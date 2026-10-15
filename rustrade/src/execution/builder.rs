@@ -769,6 +769,7 @@ mod tests {
             fee_model: Default::default(),
             fill_model: Default::default(),
             spot_fee_asset: Default::default(),
+            slippage: Default::default(),
         }
     }
 

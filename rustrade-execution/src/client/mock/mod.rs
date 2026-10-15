@@ -14,6 +14,7 @@ use crate::{
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Open, OrderState, UnindexedOrderState},
     },
+    slippage::SlippageConfig,
     trade::TradesRead,
 };
 use chrono::{DateTime, Utc};
@@ -56,6 +57,14 @@ pub struct MockExecutionConfig {
     /// buy's fee out of the base it receives, as Binance spot does by default.
     #[serde(default)]
     pub spot_fee_asset: SpotFeeAsset,
+    /// How far the mock exchange moves each taker fill against the order, after the
+    /// [`fill_model`](Self::fill_model) has priced it.
+    ///
+    /// Defaults to [`SlippageConfig::none`]. A seeded [`SlippageConfig::uniform`] draws a fresh
+    /// rate for each fill, reproducibly from its seed. See [`SlippageConfig`] for what it applies
+    /// to and how.
+    #[serde(default)]
+    pub slippage: SlippageConfig,
 }
 
 #[derive(Debug, Constructor)]

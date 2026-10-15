@@ -110,7 +110,9 @@ pub use notice::{AccountNotice, NoticeKind};
 pub mod order;
 pub mod position;
 pub mod shortability;
+pub mod slippage;
 pub use shortability::{Shortability, ShortabilityProvider, ShortabilityTable};
+pub use slippage::{SlippageConfig, SlippageConfigError};
 pub mod trade;
 
 /// Convenient type alias for an [`AccountEvent`] keyed with [`ExchangeId`],
