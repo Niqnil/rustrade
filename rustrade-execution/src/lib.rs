@@ -477,7 +477,8 @@ pub struct IsolatedMarginRisk {
 /// the asset that changed yields one event, and a frame listing both yields two. Apply each one
 /// to the `(instrument, asset)` it names and leave the pair's other asset as it was. Which side
 /// it is follows from comparing [`AssetBalanceUpdate::asset`] with the instrument's base and
-/// quote.
+/// quote. The two events from one frame share a `time_exchange` but arrive separately, so a
+/// consumer can see one side updated before the other.
 ///
 /// It carries no debt, so applying it keeps `free`/`locked` live while preserving any known
 /// per-asset debt (use [`Balance::apply_stream_update`](balance::Balance::apply_stream_update)).

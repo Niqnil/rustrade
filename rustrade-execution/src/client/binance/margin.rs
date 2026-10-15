@@ -1361,9 +1361,11 @@ impl ExecutionClient for BinanceMargin {
     /// ## Live per-pair balances — [`InstrumentBalanceUpdate`](crate::AccountEventKind::InstrumentBalanceUpdate)
     /// The isolated stream delivers live fills and order updates (routed by the inner `symbol`) **and**
     /// live per-pair `free`/`locked` balances, emitted as
-    /// [`AccountEventKind::InstrumentBalanceUpdate`]
-    /// (one per asset that changed: base, quote or both). Debt totals (`borrowed`/`interest`) stay REST-`BalanceSnapshot`-fresh
-    /// per the debt-freshness contract; the stream keeps only `free`/`locked` live.
+    /// [`AccountEventKind::InstrumentBalanceUpdate`], one per asset whose balance changed: base,
+    /// quote or both. A side that did not change is not reported.
+    ///
+    /// Debt totals (`borrowed`/`interest`) stay REST-`BalanceSnapshot`-fresh per the
+    /// debt-freshness contract; the stream keeps only `free`/`locked` live.
     ///
     /// **Consumption contract (important):** the engine deliberately does **not** store
     /// `InstrumentBalanceUpdate` — it falls through `update_from_account`'s `_ => None` wildcard,
@@ -6685,6 +6687,39 @@ mod tests {
             &mut cross_notice_instrument,
         ));
         assert!(buf.is_empty(), "no asset of the pair → nothing emitted");
+    }
+
+    #[test]
+    fn isolated_outbound_position_unparseable_entry_keeps_the_other_side() {
+        // A bad free/locked on one asset skips that entry only; the pair's other asset is emitted.
+        let sub_map = Arc::new(Mutex::new(HashMap::from([(7_i64, btcusdt())])));
+        let base_quote = Arc::new(HashMap::from([(
+            btcusdt(),
+            (
+                AssetNameExchange::new("BTC"),
+                AssetNameExchange::new("USDT"),
+            ),
+        )]));
+        let mut handler = isolated_handler(sub_map, base_quote);
+
+        let frame = push_with_sub(
+            7,
+            serde_json::json!({
+                "e": "outboundAccountPosition", "u": 1_700_000_000_000_i64,
+                "B": [{ "a": "BTC", "f": "x", "l": "0" }, { "a": "USDT", "f": "20", "l": "1" }],
+            }),
+        );
+        let mut buf = Vec::new();
+        assert!(!convert_margin_user_data_events_with(
+            &frame,
+            &mut buf,
+            &mut handler,
+            &mut cross_notice_instrument,
+        ));
+        assert_eq!(
+            isolated_balances(&buf),
+            vec![("BTCUSDT", "USDT", Decimal::from(20), Decimal::ONE)]
+        );
     }
 
     #[test]
