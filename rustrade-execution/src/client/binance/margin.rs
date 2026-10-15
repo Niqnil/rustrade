@@ -4515,6 +4515,10 @@ fn convert_order_kind_tif_margin(
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use crate::client::binance::shared::convert_open_order;
+    use crate::notice::{AccountNotice, NoticeKind};
+    use crate::order::state::ActiveOrderState;
+    use binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner;
 
     /// The connection both margin managers open is closed when dropped, as when a manager is
     /// aborted with its stream: binance-sdk keeps a socket open until it is disconnected.
@@ -4550,10 +4554,6 @@ mod tests {
             .expect("the dropped connection is closed")
             .unwrap();
     }
-    use crate::client::binance::shared::convert_open_order;
-    use crate::notice::{AccountNotice, NoticeKind};
-    use crate::order::state::ActiveOrderState;
-    use binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner;
 
     #[test]
     fn margin_side_effect_default_is_auto_borrow_repay() {
