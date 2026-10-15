@@ -60,6 +60,23 @@ ignore = [
     # gate. Re-check the 0.4 entry in Cargo.lock if h2 is ever downgraded or re-resolved.
     # Drop this entry once hyperliquid_rust_sdk and ethers move off reqwest 0.11.
     { id = "RUSTSEC-2026-0258", reason = "h2 0.3 has no patched release; reached only via the hyperliquid feature (hyperliquid_rust_sdk/ethers -> reqwest 0.11 -> hyper 0.14)" },
+
+    # rustls advisories of 2026-10-15. Two instances are in the lockfile; only one is ours to fix:
+    #   * rustls 0.23.x, our own TLS stack -- FIXED, bumped to 0.23.46 (patched >= 0.23.46) for
+    #     all four (RUSTSEC-2026-0346/0347/0348/0349).
+    #   * rustls 0.21.12, kept here for the two that also name it. No patched 0.21.x exists. Every
+    #     path to it runs through the `hyperliquid` feature (hyperliquid_rust_sdk 0.6 and our own
+    #     optional ethers 2.0 -> reqwest 0.11 / tokio-tungstenite 0.20), so it is not compiled
+    #     under the default feature set. Neither applies to that use:
+    #       - 0346: secrets reach `Debug` output only through a custom `ClientSessionStore` that
+    #         formats session values; that path uses rustls's default store.
+    #       - 0349: a forged ServerHello downgrades the post-quantum hybrid key exchange
+    #         (X25519MLKEM768) to classical. rustls 0.21 offers no post-quantum group, so it is
+    #         classical-only already, and there is nothing to downgrade.
+    # As with h2 above, an `id` ignore also silences these for 0.23.x; Cargo.lock's 0.23.46 pin is
+    # what protects us there. Drop both once hyperliquid_rust_sdk and ethers move off rustls 0.21.
+    { id = "RUSTSEC-2026-0346", reason = "rustls 0.21 has no patched release; reached only via the hyperliquid feature; no custom ClientSessionStore" },
+    { id = "RUSTSEC-2026-0349", reason = "rustls 0.21 has no patched release; reached only via the hyperliquid feature; 0.21 offers no post-quantum group to downgrade" },
 ]
 
 # Licenses - strict permissive only
