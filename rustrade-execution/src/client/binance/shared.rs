@@ -162,9 +162,8 @@ impl BinanceWsConnection for Arc<binance_sdk::common::websocket::WebsocketApi> {
 /// in place and reports the result. Wrap a connection only once it has connected: disconnecting
 /// one that never did makes binance-sdk log a WARN.
 ///
-/// A disconnected connection stays closed: binance-sdk skips its own reconnect and its 23 h
-/// renewal once a connection is disconnected, including a reconnect already pending when the
-/// disconnect is called.
+/// A disconnected connection stays closed: once `disconnect()` is called on it, binance-sdk skips
+/// its own reconnect and its 23 h renewal, including a reconnect already pending at that point.
 pub(crate) struct DisconnectOnDrop<W: BinanceWsConnection> {
     /// `None` once [`disconnect`](Self::disconnect) has finished.
     ws: Option<W>,

@@ -79,7 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A disconnected WebSocket connection stays closed. 74.1.1 reopened it about 23 hours after it
     first opened, through its scheduled renewal, and completed a reconnect that was pending when
     the disconnect was called. The reopened socket stayed open, idle, for the life of the
-    process, counting against Binance's per-IP connection limits.
+    process.
   - The SDK's rate-limit errors now carry Binance's requested wait. `BinanceSpot` and
     `BinanceMargin` do not read it yet: `ApiError::RateLimit`'s `retry_after` is still `None` for
     Binance.
