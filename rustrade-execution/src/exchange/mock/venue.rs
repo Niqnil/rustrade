@@ -10,7 +10,7 @@ use crate::{
         account::{AccountState, Committed, Credit, Debit, Delivery},
         orders::{AlreadyResting, OpenOrder, Reservation, RestingOrder},
     },
-    fee::{FeeModel, FeeModelConfig, Liquidity},
+    fee::{FeeModel, FeeModelConfig, Liquidity, SpotFeeAsset},
     fill::{FillContext, FillModel, SimFillConfig},
     holding_cost::{HeldPosition, HoldingCostModel},
     market::{MarketDepth, MarketSnapshot},
@@ -125,17 +125,26 @@ pub enum VenueRegime {
 /// the fee, so this ledger and the engine's position accounting cannot disagree by that multiplier.
 ///
 /// # How a spot fill is accounted
-/// A spot fill exchanges the two assets, and the fee is charged in the quote asset on both sides:
+/// A spot fill exchanges the two assets. Which asset its fee is charged in is
+/// [`spot_fee_asset`](Self::spot_fee_asset), a [`SpotFeeAsset`] rule; the amount comes from
+/// [`fee_model`](Self::fee_model), priced in quote. Under the default,
+/// [`SpotFeeAsset::Quote`], the fee is charged in quote on both sides:
 /// - **A buy** pays `price × quantity` plus the fee in quote, and receives `quantity` of base.
 /// - **A sell** delivers `quantity` of base, and receives `price × quantity` less the fee in quote.
-///   A sell whose fee exceeds its proceeds, which only a flat per-unit fee on a near-worthless
-///   instrument can produce, takes the excess from the quote balance, and is refused if that
-///   cannot cover it.
 ///
-/// So the base a fill moves is always its quantity, and the engine's position, which counts the
-/// same quantity, agrees with this ledger's base balance. The fee the fill reports in
-/// [`Trade::fees`] is the quote the ledger charged. A fill restates both balances it moved, the
-/// one it paid with first, before the [`Trade`].
+/// Under [`SpotFeeAsset::Received`], a sell is the same, and **a buy** pays `price × quantity` in
+/// quote and receives `quantity` less the fee in base, the quote fee divided by the price. A fill
+/// at a price that is not positive cannot be converted, so its fee is in quote.
+///
+/// A fill whose fee exceeds what it receives, which only a flat per-unit fee on a near-worthless
+/// fill can produce, takes the excess from the balance of the asset it receives, and is refused
+/// if that cannot cover it.
+///
+/// The fee the fill reports in [`Trade::fees`] is the one the ledger charged, in the asset it
+/// charged. So the base a fill moves is its quantity less any fee it reports in base, and the
+/// engine's position, which nets a base fee from a spot quantity, agrees with this ledger's base
+/// balance. A fill restates both balances it moved, the one it paid with first, before the
+/// [`Trade`].
 ///
 /// # How a CFD is accounted
 /// This venue keeps one net position per CFD instrument, in contracts, and splits every fill
@@ -225,7 +234,8 @@ pub enum VenueRegime {
 ///
 /// # ⚠️ Caller obligations and known limitations
 /// - **Fund the quote asset of every instrument traded.** Every debit is quote-denominated except a
-///   spot sell, which debits base. A missing balance to debit is a **panic**, not an error: the
+///   spot sell, which debits base, and the excess fee of a fill whose fee exceeds what it receives
+///   (see `# How a spot fill is accounted`). A missing balance to debit is a **panic**, not an error: the
 ///   balances are this venue's own fixture, so an absent one is a mis-specified test rather than a
 ///   runtime condition. A CFD settling in an account currency that is not the quote asset still
 ///   needs the **quote** asset funded — see below.
@@ -415,16 +425,18 @@ pub enum VenueRegime {
 /// cancel it. That includes an order a configured `initial_state` seeded, which for an ordinary
 /// spot order would be a panic.
 ///
-/// A resting spot sell holds the base it delivers, and nothing for its fee, which comes out of its
-/// proceeds. A sell whose fee exceeds its proceeds takes the excess from quote, so it is costed
-/// afresh when it fills, as a CFD order is, and cancelled, seeded or not, if quote cannot cover the
-/// excess.
+/// A resting spot order holds what it pays with, and nothing for a fee that comes out of what it
+/// receives. A fill whose fee exceeds what it receives takes the excess from the asset it receives,
+/// so it is costed afresh when it fills, as a CFD order is, and cancelled, seeded or not, if that
+/// asset cannot cover the excess.
 ///
 /// [`AccountState::commit`]: crate::exchange::mock::account::AccountState::commit
 #[derive(Debug)]
 pub struct SimulatedVenue {
     pub exchange: ExchangeId,
     pub fee_model: FeeModelConfig,
+    /// Which asset a spot fill's fee is charged in. See `# How a spot fill is accounted`.
+    pub spot_fee_asset: SpotFeeAsset,
     pub fill_model: SimFillConfig,
     pub instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
     pub account: AccountState,
@@ -554,6 +566,7 @@ impl SimulatedVenue {
         Self {
             exchange: config.mocked_exchange,
             fee_model: config.fee_model,
+            spot_fee_asset: config.spot_fee_asset,
             fill_model: config.fill_model,
             instruments,
             account,
@@ -1141,13 +1154,14 @@ impl SimulatedVenue {
     /// afresh, as one ledger move with one restatement. If the account can no longer afford it,
     /// the result is [`RestingSettlement::Unaffordable`] and the order is cancelled, as a venue
     /// re-checking margin at fill time would cancel it, rather than filled with balance the account
-    /// does not have. A spot sell whose fee exceeds its proceeds is the same: its hold covers the
-    /// base it delivers, not the quote the excess fee takes, so it is checked afresh.
+    /// does not have. A spot fill whose fee exceeds what it receives is the same: its hold covers
+    /// what it pays with, not the excess fee taken from the asset it receives, so it is checked
+    /// afresh.
     ///
     /// # Panics
     /// Panics if a spot order the venue holds nothing against cannot be afforded when it fills —
-    /// see this type's caller obligations on `initial_state` — unless it is a sell whose fee
-    /// exceeds its proceeds, which is checked afresh and cancelled like a CFD order.
+    /// see this type's caller obligations on `initial_state` — unless its fee exceeds what it
+    /// receives, which is checked afresh and cancelled like a CFD order.
     fn settle_resting(
         &mut self,
         order: &OpenOrder,
@@ -1157,7 +1171,7 @@ impl SimulatedVenue {
     ) -> RestingSettlement {
         let delivery = match &settlement.credit {
             Credit::Delivery(delivery) if !delivery.amount.is_sign_negative() => delivery,
-            // A cash-settled fill, or a spot sell whose fee exceeds its proceeds.
+            // A cash-settled fill, or a spot fill whose fee exceeds what it receives.
             Credit::PaidBack(_) | Credit::Delivery(_) => {
                 return self.settle_resting_afresh(reservation, settlement, time_exchange);
             }
@@ -2556,12 +2570,29 @@ impl SimulatedVenue {
             };
         }
 
-        // A spot fill exchanges the two assets and charges its fee in quote on either side: on top
-        // of what a buy pays, and out of what a sell receives. So the base it moves is exactly its
-        // quantity, which is what the engine's position counts, and the fee it reports in quote is
-        // the fee charged.
+        // A spot fill exchanges the two assets. Its fee comes out of what a sell receives, in quote,
+        // and under `SpotFeeAsset::Quote` on top of what a buy pays, so the base it moves is exactly
+        // its quantity. Under `Received` a buy's fee comes out of the base it receives instead,
+        // converted at the fill price. That base fee is what the engine nets from its position, so
+        // the two still agree. The fee each fill reports is the one charged, in the asset charged.
         let notional = price * quantity * terms.contract_size;
         match side {
+            Side::Buy
+                if self.spot_fee_asset == SpotFeeAsset::Received
+                    && price > Decimal::ZERO
+                    && !fees_quote.is_zero() =>
+            {
+                let fee_base = fees_quote / price;
+                Settlement {
+                    asset: terms.underlying.quote.clone(),
+                    amount: notional,
+                    credit: Credit::Delivery(Delivery {
+                        asset: terms.underlying.base.clone(),
+                        amount: quantity - fee_base,
+                    }),
+                    fees: AssetFees::new(terms.underlying.base.clone(), fee_base, Some(fees_quote)),
+                }
+            }
             Side::Buy => Settlement {
                 asset: terms.underlying.quote.clone(),
                 amount: notional + fees_quote,
@@ -3029,7 +3060,8 @@ enum RestingSettlement {
     /// The fill settled, restating these balances.
     Settled(Committed),
     /// A fill the account can no longer afford, so the order is cancelled instead: a cash-settled
-    /// one, or a spot sell whose fee exceeds its proceeds by more than the quote balance holds.
+    /// one, or a spot fill whose fee exceeds what it receives by more than that asset's balance
+    /// holds.
     /// Carries the balance its released hold restated, if it held anything.
     Unaffordable {
         released: Option<AssetBalance<AssetNameExchange>>,
@@ -3056,9 +3088,10 @@ struct Settlement {
     /// What the fill gives the account. For a CFD, the margin and realised PnL of the part that
     /// closes a position, [paid back](Credit::PaidBack) into [`asset`](Self::asset). For spot, a
     /// [delivery](Credit::Delivery) in the other asset: the base a buy receives, or the quote a
-    /// sell receives net of its fee.
+    /// sell receives, net of any fee charged in it.
     credit: Credit,
-    /// Always quote-denominated, whatever [`asset`](Self::asset) is.
+    /// In the asset the fee is charged in: quote, or base for a buy under
+    /// [`SpotFeeAsset::Received`]. Its `fees_quote` is always the quote fee.
     fees: AssetFees<AssetNameExchange>,
 }
 
@@ -3971,6 +4004,7 @@ mod tests {
             0,
             FeeModelConfig::default(),
             SimFillConfig::default(),
+            SpotFeeAsset::default(),
         );
         let mut venue = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
         assert_eq!(cfd_position(&venue), Some((d("-1"), Some(d("5000")))));
@@ -4008,6 +4042,7 @@ mod tests {
             0,
             FeeModelConfig::default(),
             SimFillConfig::default(),
+            SpotFeeAsset::default(),
         );
         let _ = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
     }
@@ -4684,6 +4719,174 @@ mod tests {
             "{:?}",
             order_of(&events[3]).state
         );
+    }
+
+    // --- SpotFeeAsset::Received: a buy's fee comes out of the base it receives -----------------
+
+    fn received(mut venue: SimulatedVenue) -> SimulatedVenue {
+        venue.spot_fee_asset = SpotFeeAsset::Received;
+        venue
+    }
+
+    /// A buy pays its notional alone, and receives its quantity less the fee converted to base at
+    /// the fill price. The fill reports that base fee, with the quote fee it came from.
+    #[test]
+    fn received_takes_a_buys_fee_from_the_base_it_receives() {
+        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel::new(d("0.001")));
+        let mut venue = received(make_venue_with_fee("0", "10000", fee_model));
+
+        // Notional 10 * 100 = 1000, fee 1 quote = 0.01 base.
+        let outcome = venue.open_order(buy_request("10", market_prices("100")));
+
+        assert_eq!(
+            filled_balance(&outcome).balance,
+            Balance::new(d("9000"), d("9000"))
+        );
+        assert_eq!(filled_received(&outcome).asset, base());
+        assert_eq!(
+            filled_received(&outcome).balance,
+            Balance::new(d("9.99"), d("9.99"))
+        );
+        assert_eq!(
+            filled_trade(&outcome).fees,
+            AssetFees::new(base(), d("0.01"), Some(d("1")))
+        );
+    }
+
+    /// A sell's fee is in quote, out of its proceeds, under either rule.
+    #[test]
+    fn received_takes_a_sells_fee_from_its_proceeds() {
+        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel::new(d("0.001")));
+        let mut venue = received(make_venue_with_fee("10", "0", fee_model));
+
+        let outcome = venue.open_order(sell_request("1", market_prices("100")));
+
+        assert_eq!(
+            filled_balance(&outcome).balance,
+            Balance::new(d("9"), d("9"))
+        );
+        assert_eq!(
+            filled_received(&outcome).balance,
+            Balance::new(d("99.9"), d("99.9"))
+        );
+        assert_eq!(
+            filled_trade(&outcome).fees,
+            AssetFees::new(quote(), d("0.1"), Some(d("0.1")))
+        );
+    }
+
+    /// A buy whose base fee exceeds its quantity takes the excess from base, and is refused with
+    /// nothing moved when base cannot cover it.
+    #[test]
+    fn a_received_buy_whose_fee_exceeds_its_quantity_needs_the_excess_in_base() {
+        let fee_model = FeeModelConfig::PerContract(PerContractFeeModel {
+            commission_per_contract: d("2"),
+        });
+
+        // Notional 1 * 1 = 1, fee 2 quote = 2 base: the buy owes 1 base on top of the 1 it receives.
+        let mut short_of_base = received(make_venue_with_fee("0", "10", fee_model));
+        let refused = short_of_base.open_order(buy_request("1", market_prices("1")));
+        match refused.response.state {
+            OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                ApiError::BalanceInsufficient(Some(asset), _),
+            ))) => assert_eq!(asset, base(), "the asset short is base, not quote"),
+            other => panic!("expected BalanceInsufficient, got: {other:?}"),
+        }
+        assert!(refused.events.is_empty(), "a refusal moves nothing");
+        assert_eq!(
+            short_of_base.account.balance_mut(&quote()).unwrap().balance,
+            Balance::new(d("10"), d("10"))
+        );
+
+        let mut covered = received(make_venue_with_fee("5", "10", fee_model));
+        let filled = covered.open_order(buy_request("1", market_prices("1")));
+        assert_eq!(
+            filled_balance(&filled).balance,
+            Balance::new(d("9"), d("9"))
+        );
+        assert_eq!(
+            filled_received(&filled).balance,
+            Balance::new(d("4"), d("4"))
+        );
+    }
+
+    /// A resting buy holds its notional alone, since its fee comes out of the base it receives,
+    /// and its fill settles exactly what it held.
+    #[test]
+    fn a_resting_received_buy_holds_only_its_notional() {
+        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel::new(d("0.001")));
+        let mut venue = received(make_market_venue_with(
+            "0",
+            "10000",
+            fee_model,
+            SimFillConfig::default(),
+        ));
+        advance(&mut venue, time(1));
+        assert!(
+            venue
+                .apply_market(
+                    &instrument_name(),
+                    book("101", "102"),
+                    MarketDepth::UNKNOWN,
+                    time(1)
+                )
+                .is_empty()
+        );
+
+        let rested = venue.open_order(limit_request("b", Side::Buy, "10", "100", gtc()));
+        assert_eq!(rested.events.len(), 1, "a 102 ask does not reach 100");
+        assert_eq!(
+            balance_of(&rested.events[0]).balance,
+            Balance::new(d("10000"), d("9000"))
+        );
+
+        advance(&mut venue, time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("98", "99"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
+
+        assert_eq!(
+            events.len(),
+            4,
+            "the quote paid, the base received, the trade, then the terminal order"
+        );
+        assert_eq!(
+            balance_of(&events[0]).balance,
+            Balance::new(d("9000"), d("9000"))
+        );
+        assert_eq!(
+            balance_of(&events[1]).balance,
+            Balance::new(d("9.99"), d("9.99"))
+        );
+        assert_eq!(
+            trade_of(&events[2]).fees,
+            AssetFees::new(base(), d("0.01"), Some(d("1")))
+        );
+    }
+
+    /// A fee cannot be converted to base at a price that is not positive, so such a buy is
+    /// charged in quote, as under the default rule.
+    #[test]
+    fn a_received_buy_at_a_zero_price_is_charged_in_quote() {
+        let fee_model = FeeModelConfig::PerContract(PerContractFeeModel {
+            commission_per_contract: d("1"),
+        });
+        let mut venue = received(make_venue_with_fee("0", "10", fee_model));
+
+        let outcome = venue.open_order(buy_request("1", market_prices("0")));
+
+        assert_eq!(
+            filled_balance(&outcome).balance,
+            Balance::new(d("9"), d("9"))
+        );
+        assert_eq!(
+            filled_received(&outcome).balance,
+            Balance::new(d("1"), d("1"))
+        );
+        assert_eq!(filled_trade(&outcome).fees.asset, quote());
     }
 
     #[test]

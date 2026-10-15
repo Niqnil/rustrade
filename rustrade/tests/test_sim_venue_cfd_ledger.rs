@@ -122,6 +122,7 @@ fn mock_config(usd_balance: Decimal, fee_model: FeeModelConfig) -> MockExecution
         latency_ms: 0,
         fee_model,
         fill_model: SimFillConfig::default(),
+        spot_fee_asset: Default::default(),
     }
 }
 

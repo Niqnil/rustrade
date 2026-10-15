@@ -855,7 +855,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// `exchange` — the identity match shared by the kind-specific predicates above, with no
     /// [`InstrumentKind`] constraint of its own.
     ///
-    /// Both `base` AND `quote` are matched: [`Underlying`](rustrade_instrument::Underlying)
+    /// Both `base` AND `quote` are matched: [`Underlying`]
     /// is a full pair identity, so without the quote filter a BTC/USDT action would also reach
     /// BTC/USDC instruments.
     fn is_on_underlying(&self, base: &AssetKey, quote: &AssetKey, exchange: &ExchangeKey) -> bool
@@ -4099,7 +4099,9 @@ mod tests {
 
         let mut close = fill_charging(Side::Sell, dec!(0.999), quote, Decimal::ZERO);
         close.price = dec!(110);
-        let exited = state.update_from_trade(&close).expect("the sell closes the holding");
+        let exited = state
+            .update_from_trade(&close)
+            .expect("the sell closes the holding");
 
         assert_eq!(exited.pnl_realised, dec!(9.89));
         assert!(netting_position(&state).is_none());

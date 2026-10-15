@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The simulated venue can charge a spot buy's fee in the base it receives**
+  (`rustrade-execution`).
+  - New `MockExecutionConfig::spot_fee_asset`, a `SpotFeeAsset`, beside `fee_model`, and the
+    matching `SimulatedVenue::spot_fee_asset`. It says which asset a spot fill's fee is charged in;
+    the amount still comes from the fee model. `Quote`, the default, charges it in quote on both
+    sides, as before. `Received` charges a buy's fee in base, out of the quantity it receives,
+    converted at the fill price, and a sell's in quote, out of its proceeds. That is Binance
+    spot's default with BNB fee payment turned off. The fill reports the fee in the asset charged.
+  - A fill whose fee exceeds what it receives, which only a large per-unit fee on a small fill can
+    produce, takes the excess from that asset's balance and is refused, or cancelled if it was
+    resting, when the balance cannot cover it. A buy at a price that is not positive is charged in
+    quote.
+  - **Breaking:** `MockExecutionConfig` has a new field, so a struct literal or a
+    `MockExecutionConfig::new` call must supply it. A serialised config without it still loads,
+    as `Quote`.
+
 - **`Shortability::delisting_at`: when the venue will stop lending an instrument or trading it on
   margin** (`rustrade-execution`, #608).
   - A new optional field, with `with_delisting_at`. A short still open at that time may be closed
@@ -70,6 +86,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unless it reaches a worker only after the caller's `disconnect`.
 
 ### Fixed
+
+- **A spot position nets a fee paid in its base asset** (`rustrade`).
+  - **Breaking in behaviour:** a spot fill whose fee the venue charged in the instrument's base
+    asset moved the engine's position by its full quantity, so the position held more than the
+    account did. Binance spot takes a buy's fee out of the base it delivers unless BNB pays it, so
+    every such long was overstated by its fee, and a full-size close, `ClosePositions` included,
+    asked to sell more than the account held. On a `Spot` instrument, spot margin included, the
+    position now moves by the fill's signed quantity less the fee, on either side: a buy of 1 with
+    a fee of 0.001 in base holds 0.999. A rebate adds to it. PnL is still charged the fee's quote
+    equivalent, so a round trip's realised PnL is what the account made.
+  - Derivatives are unchanged: their positions count contracts, and an inverse contract pays its
+    fees in the settlement coin. So is a fee in quote or in a third asset such as BNB.
+  - The holding is exact, not lot-sized, so a full-size close on a venue with a lot step can leave
+    a remainder below one lot. Rounding a close to the lot step is the strategy's concern. A
+    spot-margin short closed by a buy keeps the fee as a residual short.
+  - A base fee larger than the fill's quantity moves the holding the other way. A fill that nets
+    to zero charges its fee to the open position, and opens no position from flat, with a WARN.
+  - **Breaking:** `InstrumentState::update_from_trade`, `update_from_order_snapshot` and
+    `update_from_account_snapshot` now require `AssetKey: PartialEq`.
 
 - **The simulated venue credits what a spot fill receives** (`rustrade-execution`).
   - **Breaking in behaviour:** `SimulatedVenue` debited the asset a spot fill paid with and
