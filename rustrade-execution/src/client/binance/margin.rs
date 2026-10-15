@@ -395,9 +395,11 @@ impl BinanceMarginConfig {
 ///
 /// # Conditional orders read back over REST
 /// Binance margin accepts a `trailingDelta` on every conditional type (`STOP_LOSS`,
-/// `STOP_LOSS_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`), but its REST order queries, as
-/// binance-sdk models them, do not report one (#541). A conditional order read over REST could
-/// therefore be a fixed or a trailing order, so [`fetch_open_orders`](Self::fetch_open_orders) and
+/// `STOP_LOSS_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`), and the REST order queries this client
+/// reads (`openOrders` and `order`) do not report it: Binance returns neither `trailingDelta` nor
+/// `trailingTime` there (#541). A trailing order placed without an activation price reads
+/// `stopPrice` `"0"`. A conditional order read over REST could therefore be a fixed or a trailing
+/// order, so [`fetch_open_orders`](Self::fetch_open_orders) and
 /// [`account_snapshot`](Self::account_snapshot) leave a live one out rather than describe it
 /// wrongly. `account_snapshot` reports such a listing incomplete; `fetch_open_orders` has no way
 /// to, so there the omission shows only in the log. The [`account_stream`](Self::account_stream)
