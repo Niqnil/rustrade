@@ -172,7 +172,7 @@ To run the same check locally, on your committed changes:
 
 ```bash
 cargo install --locked cargo-mutants@27.1.0
-git diff origin/develop... > "${TMPDIR:-/tmp}/pr.diff"
+git diff --no-renames origin/develop... -- '*/src/*.rs' > "${TMPDIR:-/tmp}/pr.diff"
 cargo mutants --in-diff "${TMPDIR:-/tmp}/pr.diff" \
   --cargo-arg=--lib --cargo-arg=--bins --cargo-arg=--tests
 ```

@@ -408,13 +408,13 @@ jobs:
               --cargo-arg=--locked --cargo-arg=--lib --cargo-arg=--bins --cargo-arg=--tests \
               --output "$RUNNER_TEMP" \
             || status=$?
-          # 2: a mutant was missed. 3: a mutant timed out. 124: the run was cut short, and 137: it
-          # was then killed for ignoring the interrupt. Each is a result for the summary to
-          # report, not a failure of the job.
+          # 2: a mutant was missed. 3: a mutant timed out. 124: the run was cut short. 137: it was
+          # killed, normally after ignoring the interrupt, though the OOM killer exits the same
+          # way. Each is a result for the summary to report, not a failure of the job.
           case $status in
             0) ;;
             2|3) echo "cargo-mutants exited $status: see the summary" ;;
-            124|137) echo "Stopped after 40 minutes: the summary covers the mutants tested so far" \
+            124|137) echo "Stopped early (exit $status): the summary covers the mutants tested so far" \
                    | tee -a "$GITHUB_STEP_SUMMARY" ;;
             *) exit "$status" ;;
           esac
