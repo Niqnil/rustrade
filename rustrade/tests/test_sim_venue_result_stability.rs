@@ -18,8 +18,10 @@
 //! It is not a claim that the number may *never* move. Pricing a market order from the venue's own
 //! book rather than from the snapshot its request carried moved it deliberately: the fixture runs at
 //! `latency_ms: 100`, so each order now pays the market 50ms after it was decided rather than the
-//! market it was decided against. The job of this test is to make that a diff somebody signed off
-//! on, not to forbid it.
+//! market it was decided against. Crediting what a spot fill receives moved the per-asset closing
+//! balances and their drawdowns, and left every instrument's PnL, fees and trade counts as they
+//! were. The job of this test is to make each such move a diff somebody signed off on, not to
+//! forbid it.
 //!
 //! # Why the summary rather than the engine state
 //!

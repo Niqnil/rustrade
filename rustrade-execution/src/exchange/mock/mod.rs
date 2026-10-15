@@ -756,14 +756,17 @@ mod tests {
             );
         }
 
+        // Each fill also restates the base it received; this test pins the quote it paid with.
         let balances = std::iter::from_fn(|| events.try_recv().ok())
             .filter_map(|event| match event.kind {
-                AccountEventKind::BalanceSnapshot(snapshot) => Some(snapshot.0.balance.total),
+                AccountEventKind::BalanceSnapshot(snapshot) if snapshot.0.asset == quote() => {
+                    Some(snapshot.0.balance.total)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
 
-        // One balance snapshot per fill, each debiting the quote asset by the same notional.
+        // One quote snapshot per fill, each debiting the quote asset by the same notional.
         let expected = (1..=FILLS)
             .map(|nth| d(usdt_start) - d(DEBIT_PER_FILL) * Decimal::from(nth))
             .collect::<Vec<_>>();
@@ -840,7 +843,7 @@ mod tests {
 
         assert_eq!(
             kinds,
-            ["balance", "trade", "order"],
+            ["balance", "balance", "trade", "order"],
             "the fill's events must all precede the sweep, which for a seeded order — held with \
              no reservation — owes only its terminal snapshot"
         );

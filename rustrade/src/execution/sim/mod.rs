@@ -1748,7 +1748,14 @@ mod tests {
 
         assert_eq!(
             harness.rest().await,
-            vec!["balance", "trade", "order", "market", "after_drain"],
+            vec![
+                "balance",
+                "balance",
+                "trade",
+                "order",
+                "market",
+                "after_drain"
+            ],
             "the whole fill precedes the second event at instant 10"
         );
     }
@@ -1770,7 +1777,15 @@ mod tests {
 
         assert_eq!(
             harness.rest().await,
-            vec!["aux", "balance", "trade", "order", "market", "after_drain"],
+            vec![
+                "aux",
+                "balance",
+                "balance",
+                "trade",
+                "order",
+                "market",
+                "after_drain"
+            ],
             "the aux event at instant 10 leads the fill scheduled at instant 10"
         );
     }
@@ -1805,6 +1820,7 @@ mod tests {
             run(0).await,
             vec![
                 "balance",
+                "balance",
                 "trade",
                 "order",
                 "market",
@@ -1820,6 +1836,7 @@ mod tests {
             run(200).await,
             vec![
                 "market",
+                "balance",
                 "balance",
                 "trade",
                 "order",
@@ -1849,7 +1866,7 @@ mod tests {
 
         assert_eq!(
             harness.rest().await,
-            vec!["after_drain", "balance", "trade", "order"],
+            vec!["after_drain", "balance", "balance", "trade", "order"],
             "the Engine is told to stop first, then everything owed is delivered"
         );
     }
@@ -1908,13 +1925,14 @@ mod tests {
     ///
     /// Each delivered account event provokes another order whose outcome is stamped at the same
     /// instant, so it outranks every later source event: simulated time stops and the queue grows
-    /// without bound. The limit is lowered here to make the runaway three events long instead of
-    /// ten thousand; `a_strategy_trading_on_its_own_fills_is_reported_rather_than_hung` covers the
-    /// same condition end to end at the real default.
+    /// without bound. The limit is lowered here to make the runaway four events long, one spot
+    /// fill, instead of ten thousand. The test
+    /// `a_strategy_trading_on_its_own_fills_is_reported_rather_than_hung` covers the same
+    /// condition end to end at the real default.
     #[tokio::test]
     async fn the_feedback_limit_reports_a_zero_delay_cycle_rather_than_emitting_forever() {
         let mut harness = Harness::new(0, vec![market(10, dec!(100)), market(20, dec!(100))]);
-        harness.runner = harness.runner.with_feedback_limit(3);
+        harness.runner = harness.runner.with_feedback_limit(4);
 
         assert_eq!(harness.next().await, Some("snapshot"));
         assert_eq!(harness.next().await, Some("market"));
@@ -1926,7 +1944,7 @@ mod tests {
 
         assert_eq!(
             harness.rest().await,
-            vec!["balance", "trade", "order"],
+            vec!["balance", "balance", "trade", "order"],
             "exactly `limit` account events are emitted with no source event between them"
         );
 
@@ -1936,7 +1954,7 @@ mod tests {
             Some(&BarterError::SimFeedbackLoop {
                 exchange: EXCHANGE,
                 time: at(10),
-                limit: 3,
+                limit: 4,
             }),
             "the report names the venue and the instant simulated time stopped at"
         );
@@ -1954,14 +1972,15 @@ mod tests {
                 market(30, dec!(100)),
             ],
         );
-        harness.runner = harness.runner.with_feedback_limit(3);
+        harness.runner = harness.runner.with_feedback_limit(4);
 
         assert_eq!(harness.next().await, Some("snapshot"));
         assert_eq!(harness.next().await, Some("market"));
 
-        // Three deliverables at instant 10 — exactly the budget, and no more.
+        // Four deliverables at instant 10 — exactly the budget, and no more.
         harness.clock.advance_to(at(10));
         harness.send_open(dec!(100));
+        assert_eq!(harness.next().await, Some("balance"));
         assert_eq!(harness.next().await, Some("balance"));
         assert_eq!(harness.next().await, Some("trade"));
         assert_eq!(harness.next().await, Some("order"));
@@ -1973,7 +1992,14 @@ mod tests {
 
         assert_eq!(
             harness.rest().await,
-            vec!["balance", "trade", "order", "market", "after_drain"],
+            vec![
+                "balance",
+                "balance",
+                "trade",
+                "order",
+                "market",
+                "after_drain"
+            ],
             "a second full fill is delivered, so the budget was reset rather than accumulated"
         );
         assert_eq!(harness.runner.error(), None);
@@ -2130,6 +2156,7 @@ mod tests {
                 "market",
                 // ...and only then the fill it caused, trade before terminal order.
                 "balance",
+                "balance",
                 "trade",
                 "order",
                 "market",
@@ -2169,6 +2196,7 @@ mod tests {
                 "order", //
                 "market",
                 "balance",
+                "balance",
                 "trade",
                 "order", //
                 "market",
@@ -2206,6 +2234,7 @@ mod tests {
                 "order", //
                 "aux",
                 "market",
+                "balance",
                 "balance",
                 "trade",
                 "order", //
@@ -2247,6 +2276,7 @@ mod tests {
                 // event at 550 and before the one at 700. Two legs would have put it at 700.
                 "market",
                 "market",
+                "balance",
                 "balance",
                 "trade",
                 "order", //
@@ -2552,6 +2582,7 @@ mod tests {
             vec![
                 "market", //
                 "balance",
+                "balance",
                 "trade",
                 "order", //
                 "market",
@@ -2605,6 +2636,7 @@ mod tests {
                 "balance",
                 "order", //
                 // And the tick that followed it onto the book crossed it, also visible at 210.
+                "balance",
                 "balance",
                 "trade",
                 "order", //
@@ -2660,6 +2692,7 @@ mod tests {
             vec![
                 // The tick at 340 crosses the resting order; the fill is visible at 440.
                 "market",
+                "balance",
                 "balance",
                 "trade",
                 "order",
