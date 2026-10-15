@@ -138,8 +138,9 @@ highlight = "all"
 #
 # Until now that invariant lived only in comments, which nothing checks. Cargo unifies features
 # workspace-wide, so *any* future dependency pulling `parquet` with defaults re-admits the lot
-# silently. These entries make `cargo deny` fail the moment it happens. If arrow ever becomes a
-# deliberate dependency, that is a tier-2 review, and removing these lines is how it is recorded.
+# silently. The four arrow entries below make `cargo deny` fail the moment it happens. If arrow
+# ever becomes a deliberate dependency, that is a tier-2 review, and removing those four lines is
+# how it is recorded. (The rustls entry after them is unrelated; its own comment explains it.)
 deny = [
     { name = "arrow" },
     { name = "arrow-array" },
