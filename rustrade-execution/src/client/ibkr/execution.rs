@@ -322,6 +322,9 @@ pub(super) fn keep_latest_revisions(
 }
 
 /// The fee asset of a trade whose commission report IB did not send.
+///
+/// No instrument implies it, so the indexer keeps such a trade with its fee zeroed and warns
+/// (see [`AccountEventIndexer::trade`](crate::indexer::AccountEventIndexer::trade)).
 pub const UNKNOWN_FEE_ASSET: &str = "UNKNOWN";
 
 /// The venue order id of IB order `ib_order_id`, as [`Open`](crate::order::state::Open) and every

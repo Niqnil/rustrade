@@ -2260,7 +2260,8 @@ fn convert_my_trade(
     // Use actual commission asset from Binance (e.g., BNB, USDT, BTC).
     // fees_quote is set to None here; the indexer will compute it if fee is in
     // quote or base asset. For third-party assets (BNB), downstream must convert.
-    // "UNKNOWN" fallback (rare: API omits commission_asset) will fail indexing.
+    // "UNKNOWN" fallback (rare: API omits commission_asset): the indexer keeps the trade with
+    // its fee zeroed, and warns.
     let fee_asset = t
         .commission_asset
         .as_deref()

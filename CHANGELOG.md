@@ -69,6 +69,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ended, still reaches the stream as a `DataError::Socket` per subscription, logged at ERROR,
   unless it reaches a worker only after the caller's `disconnect`.
 
+### Fixed
+
+- **A fill is no longer dropped because its fee asset is unknown** (`rustrade-execution`,
+  `rustrade-instrument`, `rustrade`).
+  - `AccountEventIndexer` failed a whole trade when its fee asset was not in the instrument map,
+    and the engine's account stream dropped it. The engine then held a position the venue did
+    not. This hit every Binance spot fill with "pay fees with BNB" turned on, and every fill with
+    the `"UNKNOWN"` fee placeholder (IBKR with no commission report, Binance with no
+    `commissionAsset`).
+  - Such a trade is now kept with its fee zeroed: `0` in the instrument's quote asset, with
+    `fees_quote: None`. A WARN names the fee's asset and amount.
+  - New `IndexedInstrumentsBuilder::add_asset` registers an asset that no instrument implies,
+    such as BNB, so its fees and balances index for real. Before, there was no way to register
+    one, so a BNB balance update was dropped too. The engine keeps its balance and values
+    nothing in it.
+  - **Breaking in behaviour:** a fee with no quote equivalent (`fees_quote: None`: a third-party
+    asset such as BNB, or a zeroed one) is now left out of `Position` PnL, realised and unrealised.
+    Before, its raw amount, in another asset, was subtracted from quote PnL. The raw amount stays
+    in `fees_enter` / `fees_exit`. PnL therefore overstates a position whose fees were paid in a
+    third asset, by those fees, until the consumer prices them (#620). The simulated venue charges
+    fees in quote, so a backtest counts them (#621).
+
 ## [0.11.0] - 2026-10-12
 
 ### Added

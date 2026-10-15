@@ -448,7 +448,13 @@ pub struct AssetFees<AssetKey> {
     /// Fee value in quote currency when computable.
     /// - `Some(fees)` if fee asset == quote asset
     /// - `Some(fees * price)` if fee asset == base asset (computed by indexer)
-    /// - `None` if fee asset is third-party (e.g., BNB) — requires external price data
+    /// - `None` if fee asset is third-party (e.g., BNB), which needs external price data. Also
+    ///   `None` when the indexer zeroed a fee whose asset was not in its map (see
+    ///   [`AccountEventIndexer::trade`](crate::indexer::AccountEventIndexer::trade)).
+    ///
+    /// The engine's position PnL counts only this quote equivalent. A fee with `None` is left
+    /// out of PnL, and its raw [`fees`](Self::fees) stays recorded on the position. A consumer that
+    /// wants it counted prices it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fees_quote: Option<Decimal>,
 }

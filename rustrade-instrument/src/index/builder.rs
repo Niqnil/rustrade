@@ -105,6 +105,28 @@ impl IndexedInstrumentsBuilder {
         self
     }
 
+    /// Registers an asset that no added [`Instrument`] implies, together with its exchange.
+    ///
+    /// This is for an asset the account holds or pays with but does not trade. An example is
+    /// BNB on Binance spot with "pay fees with BNB" turned on: fills report their fee in BNB, and
+    /// the account reports a BNB balance. Once it is registered, fees and balances in that asset
+    /// index like any other, and the engine keeps a balance for it.
+    ///
+    /// What the engine does with such an asset:
+    /// - It keeps its balance as reported, like any other asset's.
+    /// - It values nothing in it. The engine has no account equity summed across assets, so an
+    ///   asset with no instrument needs no price.
+    /// - A fee charged in it has no quote equivalent (`AssetFees::fees_quote` is `None`), so it is
+    ///   left out of the position's PnL. A consumer that wants it counted prices it.
+    ///
+    /// Registering an asset that an instrument also implies is harmless: duplicates are removed by
+    /// [`Self::try_build`], which validates assets the same way whichever method added them.
+    pub fn add_asset(mut self, asset: ExchangeAsset<Asset>) -> Self {
+        self.exchanges.push(asset.exchange);
+        self.assets.push(asset);
+        self
+    }
+
     /// Builds an [`IndexedInstruments`], panicking if the added [`Instrument`]s are not a valid
     /// collection.
     ///
@@ -481,6 +503,62 @@ mod tests {
                 kind: InstrumentKind::Spot,
                 spec: None
             }
+        );
+    }
+
+    #[test]
+    fn add_asset_registers_an_asset_no_instrument_implies() {
+        let indexed = IndexedInstrumentsBuilder::default()
+            .add_instrument(instrument(ExchangeId::BinanceSpot, "btc", "usdt"))
+            .add_asset(exchange_asset(ExchangeId::BinanceSpot, "bnb"))
+            .build();
+
+        assert_eq!(indexed.exchanges().len(), 1);
+        let assets: Vec<_> = indexed.assets().iter().map(|a| &a.value).collect();
+        assert_eq!(
+            assets,
+            [
+                &exchange_asset(ExchangeId::BinanceSpot, "bnb"),
+                &exchange_asset(ExchangeId::BinanceSpot, "btc"),
+                &exchange_asset(ExchangeId::BinanceSpot, "usdt"),
+            ]
+        );
+
+        // The instrument's assets still resolve by name after the fee asset sorts before them.
+        let underlying = &indexed.instruments()[0].value.underlying;
+        assert_eq!(
+            indexed.assets()[underlying.base.index()]
+                .value
+                .asset
+                .name_internal
+                .as_ref(),
+            "btc"
+        );
+        assert_eq!(
+            indexed.assets()[underlying.quote.index()]
+                .value
+                .asset
+                .name_internal
+                .as_ref(),
+            "usdt"
+        );
+    }
+
+    #[test]
+    fn add_asset_dedups_with_an_instrument_asset_and_registers_its_exchange() {
+        let indexed = IndexedInstrumentsBuilder::default()
+            .add_instrument(instrument(ExchangeId::BinanceSpot, "btc", "usdt"))
+            .add_asset(exchange_asset(ExchangeId::BinanceSpot, "usdt"))
+            .add_asset(exchange_asset(ExchangeId::Kraken, "bnb"))
+            .build();
+
+        assert_eq!(indexed.assets().len(), 3, "usdt once, plus Kraken's bnb");
+        assert!(
+            indexed
+                .exchanges()
+                .iter()
+                .any(|exchange| exchange.value == ExchangeId::Kraken),
+            "an asset's exchange is registered even with no instrument on it"
         );
     }
 
