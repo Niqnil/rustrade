@@ -784,12 +784,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Breaking:** `STOP_LOSS_LIMIT` and `TAKE_PROFIT_LIMIT` orders, which these listings returned as
   `Limit` orders, are no longer in them.
   - Binance margin accepts a `trailingDelta` on every conditional type (`STOP_LOSS`,
-    `STOP_LOSS_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`), and its REST order queries do not
-    report it: Binance returns neither `trailingDelta` nor `trailingTime` there (#541). A
-    conditional row could therefore be a fixed or a trailing order, so `fetch_open_orders` and
-    `account_snapshot` now leave it out, with a warning. `account_snapshot` reports such a listing
-    incomplete; `fetch_open_orders` returns no completeness flag, so there only the warning shows
-    it. `STOP_LOSS` and `TAKE_PROFIT` rows were already left out.
+    `STOP_LOSS_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`), and the REST order queries the client
+    reads (`openOrders` and `order`) do not report it: Binance returns neither `trailingDelta` nor
+    `trailingTime` there (#541). A conditional row could therefore be a fixed or a trailing order,
+    so `fetch_open_orders` and `account_snapshot` now leave it out, with a warning.
+    `account_snapshot` reports such a listing incomplete; `fetch_open_orders` returns no
+    completeness flag, so there only the warning shows it. `STOP_LOSS` and `TAKE_PROFIT` rows were
+    already left out.
   - The account stream reports these orders in full.
   - `fetch_ended_orders`, and the stream's check after a reconnect, still report such an order
     ended, so a stop that fired is not held as live. It is reported with the kind the client
