@@ -118,6 +118,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The simulated venue ignores a price sent with a market order** (`rustrade-execution`).
+  `RequestOpen::price` is documented as `None` for a market order, but nothing enforced it. A
+  market order that carried a price anyway was filled at that price when the venue had no market
+  to price it from, instead of being rejected as unpriceable. Only a limit order's price now
+  prices or bounds a fill, as with the live clients that accept market orders (Binance, IBKR,
+  Alpaca), which drop such a price.
+
 - **A dropped Binance stream or client closes its WebSocket connection** (`rustrade-execution`,
   feature `binance`).
   - Dropping a `BinanceSpot` or `BinanceMargin` account stream aborted its connection task, and

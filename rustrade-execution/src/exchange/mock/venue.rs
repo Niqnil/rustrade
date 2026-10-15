@@ -1401,8 +1401,8 @@ impl SimulatedVenue {
     /// order can be reported `FullyFilled`; an open that rests reports `[balance]` alone -- the
     /// reservation now held against it -- and no trade, because nothing traded.
     ///
-    /// A Market order carries no limit price, so the venue prices it from whichever market its
-    /// [`VenueRegime`] gives it -- its own on a [`MarketDriven`](VenueRegime::MarketDriven) venue,
+    /// A Market order has no limit price, and any price it carries is ignored, so the venue prices
+    /// it from whichever market its [`VenueRegime`] gives it -- its own on a [`MarketDriven`](VenueRegime::MarketDriven) venue,
     /// and [`RequestOpen::market`](crate::order::request::RequestOpen::market) on a
     /// [`RequestPriced`](VenueRegime::RequestPriced) one. A Limit order is always judged and priced
     /// against this venue's own market; see the type's `# How an order is priced`.
@@ -2033,6 +2033,13 @@ impl SimulatedVenue {
         let market_supplied = market.is_some();
         let market = market.unwrap_or_default();
 
+        // Only a limit order's price is a limit. Any other kind's is ignored, as the live clients
+        // ignore a price sent with a market order: it neither prices the fill nor bounds it.
+        let limit = match request.state.kind {
+            OrderKind::Limit => request.state.price,
+            _ => None,
+        };
+
         // The order's own price is deliberately NOT handed to the model. A limit constrains the
         // result, not the pricing: a model reads the book and returns where a taker prints, and
         // this venue is what bounds that by the order's terms. See `FillModel`'s contract.
@@ -2043,10 +2050,10 @@ impl SimulatedVenue {
                 request.state.quantity,
                 &market,
             ))
-            // For `OrderKind::Market` this is `.or(None)`, since a market order carries no price.
-            // For a marketable limit it is the last resort that makes the rejection below
-            // unreachable: an order whose limit the market crossed necessarily has one.
-            .or(request.state.price);
+            // For a market order this is `.or(None)`, whatever price it carries. For a marketable
+            // limit it is the last resort that makes the rejection below unreachable: an order
+            // whose limit the market crossed necessarily has one.
+            .or(limit);
 
         // No price anywhere. Ordinary user data -- a cold start, a thin instrument, a subscription
         // that was never made, or a caller that supplied no snapshot at all -- not a violated
@@ -2113,12 +2120,10 @@ impl SimulatedVenue {
         // a sell never below. Applied here rather than inside the model because it is a property of
         // the order's terms, not of how the market is read, and after the slippage so that no
         // rate, however large, fills an order past its limit.
-        let fill_price = match request.state.price {
-            Some(limit) if request.state.kind == OrderKind::Limit => match side {
-                Side::Buy => fill_price.min(limit),
-                Side::Sell => fill_price.max(limit),
-            },
-            _ => fill_price,
+        let fill_price = match (limit, side) {
+            (Some(limit), Side::Buy) => fill_price.min(limit),
+            (Some(limit), Side::Sell) => fill_price.max(limit),
+            (None, _) => fill_price,
         };
 
         // Marketable on arrival, so this fill takes liquidity and is charged the taker rate.
@@ -5350,6 +5355,64 @@ mod tests {
                 usd.balance.free,
                 d("10000000"),
                 "a rejected order must not move the balance (market={market:?})"
+            );
+        }
+    }
+
+    /// A market order carrying a price, as `RequestOpen::price` documents it should not.
+    fn priced_market_order(
+        side: Side,
+        price: &str,
+        market: Option<MarketSnapshot>,
+    ) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
+        let mut request = request(instrument_name(), side, "1", market);
+        request.state.price = Some(d(price));
+        request
+    }
+
+    /// A price on a market order is ignored, as the live clients ignore it, so it is no fallback:
+    /// with nothing to price from, the order is still unpriceable rather than filled at the price
+    /// its sender happened to stamp.
+    #[test]
+    fn a_market_order_is_never_filled_at_a_price_it_carries() {
+        for market in [None, Some(MarketSnapshot::default())] {
+            let mut venue = make_venue("10", "10000000");
+
+            let outcome = venue.open_order(priced_market_order(Side::Buy, "1", market));
+
+            assert!(
+                matches!(
+                    outcome.response.state,
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(
+                        UnindexedOrderError::Rejected(ApiError::OrderRejected(_))
+                    ))
+                ),
+                "expected the unpriceable rejection, got {:?} (market={market:?})",
+                outcome.response.state
+            );
+            assert!(
+                outcome.events.is_empty(),
+                "nothing filled (market={market:?})"
+            );
+        }
+    }
+
+    /// Nor does a price on a market order bound its fill, as a limit would.
+    #[test]
+    fn a_market_order_is_not_clamped_by_a_price_it_carries() {
+        for (side, stray) in [(Side::Buy, "90"), (Side::Sell, "110")] {
+            let mut venue = make_venue("10", "10000000");
+            let market = Some(MarketSnapshot {
+                last_price: Some(d("100")),
+                ..MarketSnapshot::default()
+            });
+
+            let outcome = venue.open_order(priced_market_order(side, stray, market));
+
+            assert_eq!(
+                filled_trade(&outcome).price,
+                d("100"),
+                "a {side:?} fills at the market, not clamped to its stray {stray}"
             );
         }
     }
