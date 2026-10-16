@@ -5309,6 +5309,62 @@ mod tests {
         assert_eq!(subscribes.load(Ordering::SeqCst), 1);
     }
 
+    /// A reconnect facing a cooldown short enough to wait through waits it out, rather than
+    /// connecting into it once its backoff has passed.
+    #[tokio::test]
+    async fn a_reconnect_waits_out_a_short_cooldown() {
+        use futures::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let subscribed_at = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let url = ws_server({
+            let subscribed_at = Arc::clone(&subscribed_at);
+            move |stream| {
+                let subscribed_at = Arc::clone(&subscribed_at);
+                async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    while let Some(Ok(message)) = ws.next().await {
+                        let Message::Text(text) = message else {
+                            continue;
+                        };
+                        subscribed_at.lock().push(tokio::time::Instant::now());
+                        let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        if ws
+                            .send(Message::text(subscribed(&request).to_string()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        // The first connection drops shortly after; the second stays.
+                        if subscribed_at.lock().len() == 1 {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            let _ = ws.close(None).await;
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+        let client = client_with_ws_api(url);
+        let _stream = client.account_stream(&[], &[]).await.unwrap();
+        let cooldown = Duration::from_secs(3);
+        client.rate_limiter.on_rate_limited(Some(cooldown));
+        let cooled = tokio::time::Instant::now() + cooldown;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while subscribed_at.lock().len() < 2 {
+            assert!(tokio::time::Instant::now() < deadline, "no reconnect");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The backoff's first wait is a second: the cooldown, not the backoff, set the time.
+        assert!(subscribed_at.lock()[1] >= cooled);
+    }
+
     /// A cancel that waited on another's handshake, which Binance refused, is not sent and opens
     /// no second session: it reports the cooldown the refusal started.
     #[tokio::test]
