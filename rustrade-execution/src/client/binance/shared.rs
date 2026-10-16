@@ -938,11 +938,12 @@ impl RateLimitTracker {
     /// Binance refusing it for a rate limit: a handshake refused with 429 or 418, or a WS-API
     /// rate-limit response such as `-1003`. Returns whether it was one.
     ///
-    /// The SDK reports a refused handshake as text, without its `Retry-After`, so that refusal
-    /// starts the default cooldown. A WS-API response names the end of a ban, which is honoured.
+    /// The SDK reports a refused handshake as text, without its `Retry-After`, so a 429 starts the
+    /// default cooldown and a 418 Binance's shortest ban ([`HandshakeRefusal::retry_after`]). A
+    /// WS-API response names the end of a ban, which is honoured.
     pub(crate) fn on_stream_refused(&self, e: &anyhow::Error) -> bool {
-        let retry_after = if is_handshake_rate_limit(e) {
-            None
+        let retry_after = if let Some(refusal) = HandshakeRefusal::of(e) {
+            refusal.retry_after()
         } else if let Some(RequestFailure::RateLimited(retry_after)) = ws_response_failure(e) {
             retry_after
         } else {
@@ -1204,19 +1205,48 @@ pub(crate) fn is_rate_limit_error(e: &anyhow::Error) -> bool {
     false
 }
 
-/// Whether a WebSocket connect failed because Binance refused the handshake for rate limiting:
-/// HTTP 429, or 418 for an IP ban.
-///
-/// depends on the SDK reporting a refused handshake as `WebsocketError::Handshake` holding
-/// tungstenite's `HTTP error: <status>` text (not a public API contract).
-pub(crate) fn is_handshake_rate_limit(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<WebsocketError>(),
-            Some(WebsocketError::Handshake(msg))
-                if msg.contains("HTTP error: 429") || msg.contains("HTTP error: 418")
-        )
-    })
+/// Binance's shortest IP ban: it documents a ban as lasting from 2 minutes to 3 days, longer for
+/// repeat offenders. A handshake refused with 418 starts a cooldown this long, since the SDK drops
+/// the handshake's `Retry-After`.
+pub(crate) const MIN_IP_BAN: Duration = Duration::from_secs(120);
+
+/// Binance refusing a WebSocket handshake for rate limiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandshakeRefusal {
+    /// HTTP 429: too many requests.
+    Throttled,
+    /// HTTP 418: the IP is banned.
+    Banned,
+}
+
+impl HandshakeRefusal {
+    /// The refusal a failed WebSocket connect was, or `None` when Binance did not refuse the
+    /// handshake for rate limiting.
+    ///
+    /// depends on the SDK reporting a refused handshake as `WebsocketError::Handshake` holding
+    /// tungstenite's `HTTP error: <status>` text (not a public API contract).
+    pub(crate) fn of(e: &anyhow::Error) -> Option<Self> {
+        e.chain()
+            .find_map(|cause| match cause.downcast_ref::<WebsocketError>()? {
+                WebsocketError::Handshake(msg) if msg.contains("HTTP error: 429") => {
+                    Some(Self::Throttled)
+                }
+                WebsocketError::Handshake(msg) if msg.contains("HTTP error: 418") => {
+                    Some(Self::Banned)
+                }
+                _ => None,
+            })
+    }
+
+    /// The wait the refusal starts a cooldown for. The SDK drops the handshake's `Retry-After`,
+    /// so a throttle names none, and the default cooldown applies; a ban lasts at least
+    /// [`MIN_IP_BAN`], and connecting sooner would be refused, and could lengthen it.
+    pub(crate) fn retry_after(self) -> Option<Duration> {
+        match self {
+            Self::Throttled => None,
+            Self::Banned => Some(MIN_IP_BAN),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5719,8 +5749,9 @@ mod tests {
         );
     }
 
-    /// A refused handshake and a WS-API rate-limit response start a cooldown, the second as long
-    /// as the ban it names; any other failure starts none.
+    /// A refused handshake and a WS-API rate-limit response start a cooldown: a 429 the default,
+    /// a 418 Binance's shortest ban, and a response as long as the ban it names. Any other failure
+    /// starts none.
     #[tokio::test]
     async fn only_a_rate_limit_refusal_of_a_stream_connect_starts_a_cooldown() {
         let handshake = |msg: &str| anyhow::Error::new(WebsocketError::Handshake(msg.into()));
@@ -5745,10 +5776,18 @@ mod tests {
         assert!(!tracker.on_stream_refused(&anyhow::anyhow!("connection reset")));
         assert_eq!(tracker.cooldown_remaining(), None);
 
-        assert!(tracker.on_stream_refused(&handshake("HTTP error: 418 I'm a teapot")));
+        assert!(tracker.on_stream_refused(&handshake("HTTP error: 429 Too Many Requests")));
         let default = Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS);
         assert!(
             about(&tracker, default),
+            "{:?}",
+            tracker.cooldown_remaining()
+        );
+
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        assert!(tracker.on_stream_refused(&handshake("HTTP error: 418 I'm a teapot")));
+        assert!(
+            about(&tracker, MIN_IP_BAN),
             "{:?}",
             tracker.cooldown_remaining()
         );
@@ -6301,28 +6340,33 @@ mod tests {
         assert!(!waits(&tracker, RequestKind::Query).await);
     }
 
-    /// A handshake Binance refused with 429 or 418 is a rate limit; other failures are not.
+    /// A handshake Binance refused with 429 is a throttle and with 418 a ban, which waits out
+    /// Binance's shortest; other failures are neither.
     #[test]
     fn handshake_rate_limit_is_recognised() {
         let handshake = |msg: &str| anyhow::Error::new(WebsocketError::Handshake(msg.into()));
-        assert!(is_handshake_rate_limit(&handshake(
-            "HTTP error: 429 Too Many Requests"
-        )));
-        assert!(is_handshake_rate_limit(&handshake(
-            "HTTP error: 418 I'm a teapot"
-        )));
-        assert!(is_handshake_rate_limit(
-            &handshake("HTTP error: 429 Too Many Requests").context("connecting")
-        ));
-        assert!(!is_handshake_rate_limit(&handshake(
-            "HTTP error: 503 Service Unavailable"
-        )));
-        assert!(!is_handshake_rate_limit(&anyhow::Error::new(
-            WebsocketError::Timeout
-        )));
-        assert!(!is_handshake_rate_limit(&anyhow::anyhow!(
-            "HTTP error: 429 Too Many Requests"
-        )));
+        let throttled = HandshakeRefusal::of(&handshake("HTTP error: 429 Too Many Requests"));
+        assert_eq!(throttled, Some(HandshakeRefusal::Throttled));
+        assert_eq!(HandshakeRefusal::Throttled.retry_after(), None);
+        let banned = HandshakeRefusal::of(&handshake("HTTP error: 418 I'm a teapot"));
+        assert_eq!(banned, Some(HandshakeRefusal::Banned));
+        assert_eq!(
+            HandshakeRefusal::Banned.retry_after(),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            HandshakeRefusal::of(
+                &handshake("HTTP error: 429 Too Many Requests").context("connecting")
+            ),
+            Some(HandshakeRefusal::Throttled)
+        );
+        for other in [
+            handshake("HTTP error: 503 Service Unavailable"),
+            anyhow::Error::new(WebsocketError::Timeout),
+            anyhow::anyhow!("HTTP error: 429 Too Many Requests"),
+        ] {
+            assert_eq!(HandshakeRefusal::of(&other), None, "{other:#}");
+        }
     }
 
     /// What placing an order reports, by the response's status: an order that ended in the

@@ -206,7 +206,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Behaviour:** a stream's handshake refused with 429 or 418, or a user-data subscribe refused
     for a rate limit (`-1003`), starts the cooldown, as an order's refusal does, so REST calls and
     orders back off too. A subscribe refusal's ban time is honoured. A refused handshake names no
-    wait, so it starts the 10 s default.
+    wait (the SDK drops its `Retry-After`), so a 429 starts the 10 s default and a 418, an IP ban,
+    Binance's shortest ban, 2 minutes. The same applies to `BinanceSpot`'s order session: a 418
+    on its handshake used to start the 10 s default.
   - **Behaviour:** `ExecutionManager` re-opens an ended account stream no sooner than the
     `retry_after` its failed attempt carried, even when its backoff policy is shorter. New
     `ReconnectingStream::with_reconnect_backoff_reporting_hinted` takes that wait from each

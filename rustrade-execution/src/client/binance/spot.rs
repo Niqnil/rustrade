@@ -39,17 +39,16 @@
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, DisconnectOnDrop, ExecutionReport, ExponentialBackoff,
-    FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET,
-    OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
+    FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal, MyTradesFrom,
+    ORDER_EXECUTIONS_BUDGET, OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
     UnsubscribeOnDrop, UserDataFrame, WeightPool, binance_filled_qty, classify_order_kind_tif,
     classify_rest_query_error, classify_ws_order_error, convert_ended_order,
     convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
     dedup_key_from_event, disconnect_error, drop_after, frame_excerpt, gap_failed, gap_time,
-    is_duplicate, is_handshake_rate_limit, is_unknown_order, log_unhandled_event,
-    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
-    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
-    trailing_params, unix_ms,
+    is_duplicate, is_unknown_order, log_unhandled_event, log_unrecognised_frame, new_dedup_cache,
+    parse_user_data_frame, placed_order_state, recovered_order_cids, recovered_order_totals,
+    response_decode_error, rest_call_with_retry, trailing_params, unix_ms,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -325,9 +324,9 @@ impl WsApiUnavailable {
 /// the open with [`ApiError::RateLimit`], unsent, or ends a running stream with
 /// [`StreamTerminationReason::RateLimited`](crate::error::StreamTerminationReason::RateLimited),
 /// carrying the time left. A handshake or user-data subscribe Binance refuses for a rate limit
-/// starts a cooldown, as an order's refusal does. A refused handshake names no wait, so it starts
+/// starts a cooldown, as an order's refusal does. A refused handshake names no wait, so a 429 starts
 /// the 10 s default, and handshakes refused that way spend the reconnect budget as any failure
-/// does.
+/// does; a 418, an IP ban, starts Binance's shortest ban, 2 minutes, and so ends the stream.
 ///
 /// # Fills of other clients' orders
 /// The account stream, fill recovery and `fetch_trades` report every fill on the account, whoever
@@ -456,16 +455,19 @@ impl BinanceSpot {
         .await
         {
             Ok(Ok(ws)) => ws,
-            Ok(Err(e)) if is_handshake_rate_limit(&e) => {
+            Ok(Err(e)) => {
+                let Some(refusal) = HandshakeRefusal::of(&e) else {
+                    return Err(WsApiUnavailable::Connect(format!("{e:#}")));
+                };
                 // The SDK reports a refused handshake as text, without its `Retry-After`.
                 warn!(error = %format!("{e:#}"), "Binance refused the WS-API handshake");
-                self.rate_limiter.on_rate_limited(None);
+                let retry_after = refusal.retry_after();
+                self.rate_limiter.on_rate_limited(retry_after);
                 return Err(WsApiUnavailable::RateLimited {
                     msg: format!("{e:#}"),
-                    retry_after: None,
+                    retry_after,
                 });
             }
-            Ok(Err(e)) => return Err(WsApiUnavailable::Connect(format!("{e:#}"))),
             Err(_) => {
                 return Err(WsApiUnavailable::Connect(format!(
                     "BinanceSpot WS connect timed out after {CONNECT_TIMEOUT_SECS}s"
@@ -5222,8 +5224,8 @@ mod tests {
         assert_cooldown_about(&client, TWO_MINUTE_BAN);
     }
 
-    /// An account-stream handshake Binance refuses with 429 starts a cooldown, and the open fails
-    /// as a rate limit.
+    /// An account-stream handshake Binance refuses with 418, an IP ban, starts a cooldown as long as
+    /// Binance's shortest ban, and the open fails as a rate limit with that wait.
     #[tokio::test]
     async fn a_refused_account_stream_handshake_starts_a_cooldown() {
         use tokio_tungstenite::tungstenite::http;
@@ -5242,9 +5244,16 @@ mod tests {
         .await;
         let client = client_with_ws_api(url);
 
-        rate_limited_wait(client.account_stream(&[], &[]).await);
+        let wait = rate_limited_wait(client.account_stream(&[], &[]).await);
 
-        assert_cooldown_about(&client, Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS));
+        // A 418 is an IP ban: Binance's shortest, as the SDK drops its `Retry-After`.
+        assert!(
+            wait.is_some_and(
+                |wait| wait <= MIN_IP_BAN && wait > MIN_IP_BAN - Duration::from_secs(5)
+            ),
+            "{wait:?}"
+        );
+        assert_cooldown_about(&client, MIN_IP_BAN);
     }
 
     /// A connection that drops while a long cooldown is active ends the stream at once with the
@@ -5291,7 +5300,7 @@ mod tests {
 
         let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
-            .expect("the stream ends at once, without backing off")
+            .expect("the stream ends rate-limited within the timeout")
             .expect("it reports why before it ends");
 
         match event.kind {
@@ -5586,6 +5595,33 @@ mod tests {
             response.state
         );
         assert!(client.rate_limiter.is_blocked());
+    }
+
+    /// A WS-API handshake Binance refuses with 418, an IP ban, holds requests back for Binance's
+    /// shortest ban, and the cancel that needed the session fails with that wait.
+    #[tokio::test]
+    async fn a_handshake_refused_with_418_starts_the_shortest_ban() {
+        use tokio_tungstenite::tungstenite::http;
+
+        let url = ws_server(|stream| async move {
+            // tungstenite's handshake callback fixes the error type to a whole HTTP response.
+            #[allow(clippy::result_large_err)]
+            let refuse = |_: &http::Request<()>, _| {
+                Err(http::Response::builder()
+                    .status(http::StatusCode::IM_A_TEAPOT)
+                    .body(None)
+                    .unwrap())
+            };
+            let _ = tokio_tungstenite::accept_hdr_async(stream, refuse).await;
+        })
+        .await;
+        let client = client_with_ws_api(url);
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+
+        let response = client.cancel_order(cancel_request(&instrument)).await;
+
+        assert_rate_limited_for(&response.state, MIN_IP_BAN);
+        assert_cooldown_about(&client, MIN_IP_BAN);
     }
 
     /// A WS-API cancel response carries the spot pool's weight limit and usage: the limit

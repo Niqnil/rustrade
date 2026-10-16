@@ -458,8 +458,9 @@ impl BinanceMarginConfig {
 /// the open with [`ApiError::RateLimit`], unsent, or ends a running stream with
 /// [`StreamTerminationReason::RateLimited`](crate::error::StreamTerminationReason::RateLimited),
 /// carrying the time left. A connect or subscribe Binance refuses for a rate limit starts a
-/// cooldown, as a REST refusal does. A refused handshake names no wait, so it starts the 10 s
-/// default, and handshakes refused that way spend the reconnect budget as any failure does.
+/// cooldown, as a REST refusal does. A refused handshake names no wait, so a 429 starts the 10 s
+/// default, and handshakes refused that way spend the reconnect budget as any failure does; a 418,
+/// an IP ban, starts Binance's shortest ban, 2 minutes, and so ends the stream.
 ///
 /// # One client per engine (`ExchangeId`)
 /// All emitted events — cross and isolated alike — are stamped [`ExchangeId::BinanceMargin`], and
@@ -4726,7 +4727,7 @@ mod tests {
     async fn rate_limited_end(rx: &mut mpsc::UnboundedReceiver<UnindexedAccountEvent>) -> Duration {
         let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
-            .expect("the stream ends at once, without backing off")
+            .expect("the stream ends rate-limited within the timeout")
             .expect("it reports why before it ends");
         let AccountEventKind::StreamTerminated(StreamTerminationReason::RateLimited {
             retry_after,
