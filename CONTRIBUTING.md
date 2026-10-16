@@ -323,16 +323,16 @@ user of the library would need it in the same form. If so, it belongs here.
 - Per-trade decisions, such as when to borrow or repay, and which margin mode or account an order
   goes through.
 - The rules and values of risk limits and safety checks.
-- What to do once the library gives up: whether to resume a stream that has ended, retry a failed
-  request or halt. The library's own reconnects and retries are bounded, and it reports when they
-  run out.
+- What to do when a stream ends or a request fails: whether to resume, retry or halt. Each
+  component documents its own reconnects and retries, and when, if ever, it gives up.
 - When to trade: gating orders by trading hours or a market calendar.
 - Computing greeks and other analytics from market data.
 
 The library should make a policy possible without choosing it. It exposes what a consumer needs to
 decide, such as a `retry_after`, a stream's termination reason or a venue notice, and leaves the
 decision to the consumer. When a venue rule needs a threshold, make it a documented default the
-caller can override, or expose what the caller needs to decide around it.
+caller can override, or end the operation and report what the caller needs, such as how long to
+wait.
 
 ## Questions?
 
