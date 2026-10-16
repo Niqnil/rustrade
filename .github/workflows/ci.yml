@@ -320,9 +320,9 @@ jobs:
   # See CONTRIBUTING.md, "Mutation testing".
   #
   # The mutants are split across parallel shards, each a job of its own. A job tests one mutant at
-  # a time, at roughly 30 s each (more on a slow runner), after about 5 minutes of setup, so a
-  # single job ran out of time at about 60. Three shards fit roughly 200. Each shard repeats the
-  # setup, so add one only when diffs outgrow that.
+  # a time, at roughly 30 s each (more on a slow runner), after about 5 minutes of setup, so on a
+  # slow runner a single job ran out of time at about 60. Three shards fit about 180 even there.
+  # Each shard repeats the setup, so add one only when diffs outgrow that.
   mutants:
     name: cargo mutants (shard ${{ matrix.shard }}/${{ strategy.job-total }})
     needs: [fmt, check]
