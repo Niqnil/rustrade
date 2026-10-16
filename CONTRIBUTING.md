@@ -294,14 +294,45 @@ We use a **two-PR flow** so `develop` and `main` stay in sync — the version bu
    # fix the cause, then re-tag and re-push as in step 5
    ```
 
-## What NOT to Contribute
+## Scope: Library or Downstream
 
-This is a generic trading engine library. The following belong in downstream consumers, not here:
+rustrade is a general-purpose trading library. It draws the line between **mechanism** and
+**policy**. The library delivers events correctly and models each venue faithfully. The decisions
+a trading system makes with them belong to that system. To place a change, ask whether a different
+user of the library would need it in the same form. If so, it belongs here.
 
-- Trading strategy
-- Exchange-specific business logic (margin routing, position tracking)
-- Greeks computation
-- Market hours logic
+**In the library:**
+
+- **Venue adapters, including each venue's own rules where correct delivery needs them.** An
+  adapter translates the venue's orders, fills, balances, positions and errors into the generic
+  types, honours its rate limits and bans, and reads what it reports about margin, borrowing and
+  delistings. Venue-specific code is expected here, as long as it describes the venue rather than
+  deciding for the caller.
+- **The engine's accounting:** positions, PnL, fees and the trading summary, computed from the
+  generic types, whichever venue they came from.
+- **The hooks a policy plugs into:** for example the engine's `RiskManager`, which filters order
+  requests, and its trading state, which can disable trading.
+- **Simulation:** simulated venues, fill, fee and holding-cost models, and backtesting. These are
+  configurable rather than tuned to one consumer.
+- **Market data as the source sends it,** including option greeks that a venue or data provider
+  computes.
+
+**Downstream, in the consumer:**
+
+- Trading strategy, signals and position sizing.
+- Per-trade decisions, such as when to borrow or repay, and which margin mode or account an order
+  goes through.
+- The rules and values of risk limits and safety checks.
+- What to do when a stream ends or a request fails: whether to resume, retry or halt. Each
+  component documents its own reconnects and retries, and when, if ever, it gives up.
+- When to trade: gating orders by trading hours or a market calendar.
+- Computing greeks and other analytics from market data.
+
+The library should make a policy possible without choosing it. It exposes what a consumer needs to
+decide, such as a `retry_after`, a stream's termination reason or a venue notice, and leaves the
+decision to the consumer. When a venue rule needs a threshold, make it a documented default the
+caller can override, or end the operation and report what the caller needs, such as how long to
+wait.
 
 ## Questions?
 
