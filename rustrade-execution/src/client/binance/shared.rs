@@ -22,7 +22,8 @@ use crate::{
     AccountEventKind, UnindexedAccountEvent,
     error::{
         ApiError, BorrowReject, BorrowRejectReason, ConnectivityError, OrderError, OrderField,
-        PrecisionLimit, PrecisionViolation, UnindexedClientError, UnindexedOrderError,
+        PrecisionLimit, PrecisionViolation, StreamTerminationReason, UnindexedClientError,
+        UnindexedOrderError,
     },
     fill_recovery::{FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope},
     order::{
@@ -854,7 +855,7 @@ impl RateLimitTracker {
             };
             let now = tokio::time::Instant::now();
             if let Some(remaining) = blocked_until.map(|until| until.saturating_duration_since(now))
-                && remaining > MAX_COOLDOWN_SLEEP
+                && too_long_to_sleep(remaining)
             {
                 return Err(CooldownActive { remaining });
             }
@@ -931,6 +932,73 @@ impl RateLimitTracker {
                 "Binance entering rate-limit degradation mode"
             );
         }
+    }
+
+    /// Record `e`, a failed account-stream connect or subscribe, in the cooldown when it is
+    /// Binance refusing it for a rate limit: a handshake refused with 429 or 418, or a WS-API
+    /// rate-limit response such as `-1003`. Returns whether it was one.
+    ///
+    /// The SDK reports a refused handshake as text, without its `Retry-After`, so a 429 starts the
+    /// default cooldown and a 418 Binance's shortest ban ([`HandshakeRefusal::retry_after`]). A
+    /// WS-API response names the end of a ban, which is honoured.
+    pub(crate) fn on_stream_refused(&self, e: &anyhow::Error) -> bool {
+        let retry_after = if let Some(refusal) = HandshakeRefusal::of(e) {
+            refusal.retry_after()
+        } else if let Some(RequestFailure::RateLimited(retry_after)) = ws_response_failure(e) {
+            retry_after
+        } else {
+            return false;
+        };
+        warn!(error = %format_args!("{e:#}"), "Binance refused an account-stream connect for a rate limit");
+        self.on_rate_limited(retry_after);
+        true
+    }
+
+    /// Wait, before an account stream connects or reconnects, for a rate-limit cooldown short
+    /// enough to sleep through ([`MAX_COOLDOWN_SLEEP`]), as a request would.
+    ///
+    /// # Errors
+    /// [`StreamTerminationReason::RateLimited`] with the time left, when the cooldown is longer:
+    /// connecting during it would be refused, and could lengthen a ban.
+    pub(crate) async fn before_stream_connect(&self) -> Result<(), StreamTerminationReason> {
+        self.wait_if_blocked(RequestKind::Essential)
+            .await
+            .map_err(|cooldown| end_for_cooldown(cooldown.remaining))
+    }
+
+    /// Wait, before an account stream is opened, for a rate-limit cooldown short enough to sleep
+    /// through, as [`before_stream_connect`](Self::before_stream_connect) does for a reconnect.
+    ///
+    /// # Errors
+    /// [`ApiError::RateLimit`] with the time left, when the cooldown is longer. Nothing was sent.
+    pub(crate) async fn before_stream_open(&self) -> Result<(), UnindexedClientError> {
+        self.wait_if_blocked(RequestKind::Essential)
+            .await
+            .map_err(|cooldown| {
+                UnindexedClientError::Api(ApiError::rate_limited(Some(cooldown.remaining)))
+            })
+    }
+
+    /// The error opening an account stream fails with, when its connect or subscribe failed with
+    /// `e`. A rate-limit refusal is recorded ([`on_stream_refused`](Self::on_stream_refused)) and
+    /// reported as [`ApiError::RateLimit`] with the cooldown's time left; any other failure as
+    /// `otherwise` makes it.
+    pub(crate) fn stream_open_error(
+        &self,
+        e: &anyhow::Error,
+        otherwise: impl FnOnce(&anyhow::Error) -> UnindexedClientError,
+    ) -> UnindexedClientError {
+        if self.on_stream_refused(e) {
+            UnindexedClientError::Api(ApiError::rate_limited(self.cooldown_remaining()))
+        } else {
+            otherwise(e)
+        }
+    }
+
+    /// How long the cooldown has left, when that is longer than a request sleeps through.
+    fn too_long_to_wait(&self) -> Option<Duration> {
+        self.cooldown_remaining()
+            .filter(|remaining| too_long_to_sleep(*remaining))
     }
 
     /// Record the weight a successful REST response reports as used, for a request sent at
@@ -1137,19 +1205,48 @@ pub(crate) fn is_rate_limit_error(e: &anyhow::Error) -> bool {
     false
 }
 
-/// Whether a WebSocket connect failed because Binance refused the handshake for rate limiting:
-/// HTTP 429, or 418 for an IP ban.
-///
-/// depends on the SDK reporting a refused handshake as `WebsocketError::Handshake` holding
-/// tungstenite's `HTTP error: <status>` text (not a public API contract).
-pub(crate) fn is_handshake_rate_limit(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<WebsocketError>(),
-            Some(WebsocketError::Handshake(msg))
-                if msg.contains("HTTP error: 429") || msg.contains("HTTP error: 418")
-        )
-    })
+/// Binance's shortest IP ban: it documents a ban as lasting from 2 minutes to 3 days, longer for
+/// repeat offenders. A handshake refused with 418 starts a cooldown this long, since the SDK drops
+/// the handshake's `Retry-After`.
+pub(crate) const MIN_IP_BAN: Duration = Duration::from_secs(120);
+
+/// Binance refusing a WebSocket handshake for rate limiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandshakeRefusal {
+    /// HTTP 429: too many requests.
+    Throttled,
+    /// HTTP 418: the IP is banned.
+    Banned,
+}
+
+impl HandshakeRefusal {
+    /// The refusal a failed WebSocket connect was, or `None` when Binance did not refuse the
+    /// handshake for rate limiting.
+    ///
+    /// depends on the SDK reporting a refused handshake as `WebsocketError::Handshake` holding
+    /// tungstenite's `HTTP error: <status>` text (not a public API contract).
+    pub(crate) fn of(e: &anyhow::Error) -> Option<Self> {
+        e.chain()
+            .find_map(|cause| match cause.downcast_ref::<WebsocketError>()? {
+                WebsocketError::Handshake(msg) if msg.contains("HTTP error: 429") => {
+                    Some(Self::Throttled)
+                }
+                WebsocketError::Handshake(msg) if msg.contains("HTTP error: 418") => {
+                    Some(Self::Banned)
+                }
+                _ => None,
+            })
+    }
+
+    /// The wait the refusal starts a cooldown for. The SDK drops the handshake's `Retry-After`,
+    /// so a throttle names none, and the default cooldown applies; a ban lasts at least
+    /// [`MIN_IP_BAN`], and connecting sooner would be refused, and could lengthen it.
+    pub(crate) fn retry_after(self) -> Option<Duration> {
+        match self {
+            Self::Throttled => None,
+            Self::Banned => Some(MIN_IP_BAN),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1204,6 +1301,66 @@ impl ExponentialBackoff {
         );
         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         true
+    }
+
+    /// Decide, after an account stream's connect failed or its connection ended, whether to try
+    /// again.
+    ///
+    /// A rate-limit cooldown longer than a request sleeps through ends the stream at once, rather
+    /// than spend the budget against a venue that refuses every attempt. Otherwise this spends one
+    /// attempt and its backoff. A shorter cooldown is left for
+    /// [`RateLimitTracker::before_stream_connect`] to wait out, which spends no attempt.
+    ///
+    /// # Errors
+    /// The reason the stream ends: [`StreamTerminationReason::RateLimited`] for such a cooldown,
+    /// or [`StreamTerminationReason::ReconnectBudgetExhausted`], with `last_error`, once no
+    /// attempt is left.
+    pub(crate) async fn retry_or_end(
+        &mut self,
+        rate_limiter: &RateLimitTracker,
+        last_error: impl FnOnce() -> String,
+    ) -> Result<(), StreamTerminationReason> {
+        if let Some(remaining) = rate_limiter.too_long_to_wait() {
+            return Err(end_for_cooldown(remaining));
+        }
+        if self.wait().await {
+            return Ok(());
+        }
+        error!(
+            attempts = self.attempt,
+            "Binance account stream: max reconnect attempts exhausted, stream terminating"
+        );
+        Err(StreamTerminationReason::ReconnectBudgetExhausted {
+            attempts: self.attempts(),
+            last_error: last_error(),
+        })
+    }
+}
+
+/// What a reconnect budget spent on dropped connections reports as its last error: a heartbeat
+/// timeout, or the venue closing the connection or failing it.
+pub(crate) fn disconnect_error(heartbeat_timed_out: bool) -> String {
+    if heartbeat_timed_out {
+        format!("heartbeat timeout ({HEARTBEAT_TIMEOUT_SECS}s)")
+    } else {
+        "WebSocket disconnected (server close/error)".to_string()
+    }
+}
+
+/// Whether a cooldown with `remaining` left is longer than a request, or a stream's connect, sleeps
+/// through: [`MAX_COOLDOWN_SLEEP`].
+fn too_long_to_sleep(remaining: Duration) -> bool {
+    remaining > MAX_COOLDOWN_SLEEP
+}
+
+/// End an account stream for a rate-limit cooldown with `remaining` left.
+fn end_for_cooldown(remaining: Duration) -> StreamTerminationReason {
+    warn!(
+        retry_after_secs = remaining.as_secs(),
+        "Binance account stream ending: the rate-limit cooldown outlasts what it waits through"
+    );
+    StreamTerminationReason::RateLimited {
+        retry_after: remaining,
     }
 }
 
@@ -3685,21 +3842,25 @@ pub(crate) fn classify_ws_order_error(
     e: &anyhow::Error,
     instrument: &InstrumentNameExchange,
 ) -> Option<UnindexedOrderError> {
+    ws_response_failure(e).map(|failure| order_error_from(failure, instrument))
+}
+
+/// Classify `e` when it is a WS-API [`WebsocketError::ResponseError`], the venue answering a
+/// request with a status of 400 or more; `None` for any other error. `downcast_ref` also finds it
+/// beneath context layers.
+fn ws_response_failure(e: &anyhow::Error) -> Option<RequestFailure> {
     match e.downcast_ref::<WebsocketError>()? {
         // The typed error's own `Display`, not `e`'s: a context layer would hide the code.
         response @ WebsocketError::ResponseError {
             code, retry_after, ..
-        } => Some(order_error_from(
-            classify_ws_response_error(
-                *code,
-                // A ban that has already lifted, by the local clock, names no wait: the default
-                // cooldown applies, as it does to a refusal that named none.
-                retry_after
-                    .map(|until_ms| wait_until_epoch_ms(until_ms, unix_ms()))
-                    .filter(|wait| !wait.is_zero()),
-                response.to_string(),
-            ),
-            instrument,
+        } => Some(classify_ws_response_error(
+            *code,
+            // A ban that has already lifted, by the local clock, names no wait: the default
+            // cooldown applies, as it does to a refusal that named none.
+            retry_after
+                .map(|until_ms| wait_until_epoch_ms(until_ms, unix_ms()))
+                .filter(|wait| !wait.is_zero()),
+            response.to_string(),
         )),
         _ => None,
     }
@@ -5517,6 +5678,161 @@ mod tests {
     }
 
     #[test]
+    fn a_dropped_connection_names_its_cause() {
+        assert_eq!(disconnect_error(true), "heartbeat timeout (30s)");
+        assert_eq!(
+            disconnect_error(false),
+            "WebSocket disconnected (server close/error)"
+        );
+    }
+
+    /// A reconnect facing a cooldown longer than a request sleeps through ends the stream at once,
+    /// spending no attempt and no time, and so does a connect that finds it.
+    #[tokio::test(start_paused = true)]
+    async fn a_reconnect_ends_at_once_on_a_cooldown_too_long_to_wait_through() {
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        tracker.on_rate_limited(Some(Duration::from_secs(60)));
+        let mut backoff = ExponentialBackoff::new();
+        let started = tokio::time::Instant::now();
+        let ended = StreamTerminationReason::RateLimited {
+            retry_after: Duration::from_secs(60),
+        };
+
+        let reason = backoff
+            .retry_or_end(&tracker, || unreachable!("the budget is not spent"))
+            .await;
+        assert_eq!(reason, Err(ended.clone()));
+        assert_eq!(tracker.before_stream_connect().await, Err(ended));
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert_eq!(backoff.attempts(), 0);
+    }
+
+    /// A cooldown short enough to sleep through is waited out before the connect, and that wait
+    /// spends no attempt: only the failure that preceded it does.
+    #[tokio::test(start_paused = true)]
+    async fn a_short_cooldown_is_waited_out_without_spending_an_attempt() {
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        tracker.on_rate_limited(Some(Duration::from_secs(5)));
+        let mut backoff = ExponentialBackoff::new();
+        let started = tokio::time::Instant::now();
+
+        assert_eq!(backoff.retry_or_end(&tracker, String::new).await, Ok(()));
+        assert_eq!(started.elapsed(), Duration::from_millis(INITIAL_BACKOFF_MS));
+        assert_eq!(tracker.before_stream_connect().await, Ok(()));
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        assert_eq!(backoff.attempts(), 1);
+    }
+
+    /// A refusal that names no wait starts the default cooldown, which is waited out, so
+    /// refusals that keep coming spend the budget and end the stream on it, not on the cooldown.
+    #[tokio::test(start_paused = true)]
+    async fn refusals_naming_no_wait_spend_the_budget() {
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        let mut backoff = ExponentialBackoff::new();
+        let reason = loop {
+            assert_eq!(tracker.before_stream_connect().await, Ok(()));
+            tracker.on_rate_limited(None);
+            if let Err(reason) = backoff
+                .retry_or_end(&tracker, || "refused".to_string())
+                .await
+            {
+                break reason;
+            }
+        };
+
+        assert_eq!(
+            reason,
+            StreamTerminationReason::ReconnectBudgetExhausted {
+                attempts: MAX_RECONNECT_ATTEMPTS,
+                last_error: "refused".to_string(),
+            }
+        );
+    }
+
+    /// A refused handshake and a WS-API rate-limit response start a cooldown: a 429 the default,
+    /// a 418 Binance's shortest ban, and a response as long as the ban it names. Any other failure
+    /// starts none.
+    #[tokio::test]
+    async fn only_a_rate_limit_refusal_of_a_stream_connect_starts_a_cooldown() {
+        let handshake = |msg: &str| anyhow::Error::new(WebsocketError::Handshake(msg.into()));
+        let response = |code, retry_after| {
+            anyhow::Error::new(WebsocketError::ResponseError {
+                code,
+                message: "refused".to_string(),
+                retry_after,
+            })
+            .context("subscribing")
+        };
+        let about = |tracker: &RateLimitTracker, wait: Duration| {
+            tracker
+                .cooldown_remaining()
+                .is_some_and(|left| left <= wait && left > wait - Duration::from_secs(5))
+        };
+
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        assert!(!tracker.on_stream_refused(&handshake("HTTP error: 503 Service Unavailable")));
+        let unrelated = response(-2010, None);
+        assert!(!tracker.on_stream_refused(&unrelated));
+        assert!(!tracker.on_stream_refused(&anyhow::anyhow!("connection reset")));
+        assert_eq!(tracker.cooldown_remaining(), None);
+
+        assert!(tracker.on_stream_refused(&handshake("HTTP error: 429 Too Many Requests")));
+        let default = Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS);
+        assert!(
+            about(&tracker, default),
+            "{:?}",
+            tracker.cooldown_remaining()
+        );
+
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        assert!(tracker.on_stream_refused(&handshake("HTTP error: 418 I'm a teapot")));
+        assert!(
+            about(&tracker, MIN_IP_BAN),
+            "{:?}",
+            tracker.cooldown_remaining()
+        );
+
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        let until = i64::try_from(unix_ms()).unwrap() + 120_000;
+        assert!(tracker.on_stream_refused(&response(-1003, Some(until))));
+        let ban = Duration::from_millis(120_000 + CLOCK_SKEW_SLACK_MS);
+        assert!(about(&tracker, ban), "{:?}", tracker.cooldown_remaining());
+    }
+
+    /// Opening a stream during a long cooldown fails unsent with the time left, and a refusal is
+    /// reported with the cooldown it started; any other failure as the caller makes it.
+    #[tokio::test]
+    async fn opening_a_stream_reports_a_rate_limit_with_the_cooldown_left() {
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        let socket = |e: &anyhow::Error| {
+            UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
+        };
+        let other = anyhow::anyhow!("connection reset");
+        assert_eq!(tracker.stream_open_error(&other, socket), socket(&other));
+        assert_eq!(tracker.before_stream_open().await, Ok(()));
+
+        let refused = anyhow::Error::new(WebsocketError::Handshake(
+            "HTTP error: 429 Too Many Requests".into(),
+        ));
+        let error = tracker.stream_open_error(&refused, socket);
+        assert!(
+            error
+                .retry_after()
+                .is_some_and(|wait| wait > Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS - 5)),
+            "{error:?}"
+        );
+
+        tracker.on_rate_limited(Some(Duration::from_secs(60)));
+        let error = tracker.before_stream_open().await.unwrap_err();
+        assert!(
+            error
+                .retry_after()
+                .is_some_and(|wait| wait > Duration::from_secs(55)),
+            "{error:?}"
+        );
+    }
+
+    #[test]
     fn a_ws_response_without_an_error_body_is_read_by_its_status() {
         // With no error object the SDK reports the HTTP status as `code`, "Unknown error" as text.
         let err = classify_ws(503, "Unknown error");
@@ -6024,28 +6340,33 @@ mod tests {
         assert!(!waits(&tracker, RequestKind::Query).await);
     }
 
-    /// A handshake Binance refused with 429 or 418 is a rate limit; other failures are not.
+    /// A handshake Binance refused with 429 is a throttle and with 418 a ban, which waits out
+    /// Binance's shortest; other failures are neither.
     #[test]
     fn handshake_rate_limit_is_recognised() {
         let handshake = |msg: &str| anyhow::Error::new(WebsocketError::Handshake(msg.into()));
-        assert!(is_handshake_rate_limit(&handshake(
-            "HTTP error: 429 Too Many Requests"
-        )));
-        assert!(is_handshake_rate_limit(&handshake(
-            "HTTP error: 418 I'm a teapot"
-        )));
-        assert!(is_handshake_rate_limit(
-            &handshake("HTTP error: 429 Too Many Requests").context("connecting")
-        ));
-        assert!(!is_handshake_rate_limit(&handshake(
-            "HTTP error: 503 Service Unavailable"
-        )));
-        assert!(!is_handshake_rate_limit(&anyhow::Error::new(
-            WebsocketError::Timeout
-        )));
-        assert!(!is_handshake_rate_limit(&anyhow::anyhow!(
-            "HTTP error: 429 Too Many Requests"
-        )));
+        let throttled = HandshakeRefusal::of(&handshake("HTTP error: 429 Too Many Requests"));
+        assert_eq!(throttled, Some(HandshakeRefusal::Throttled));
+        assert_eq!(HandshakeRefusal::Throttled.retry_after(), None);
+        let banned = HandshakeRefusal::of(&handshake("HTTP error: 418 I'm a teapot"));
+        assert_eq!(banned, Some(HandshakeRefusal::Banned));
+        assert_eq!(
+            HandshakeRefusal::Banned.retry_after(),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            HandshakeRefusal::of(
+                &handshake("HTTP error: 429 Too Many Requests").context("connecting")
+            ),
+            Some(HandshakeRefusal::Throttled)
+        );
+        for other in [
+            handshake("HTTP error: 503 Service Unavailable"),
+            anyhow::Error::new(WebsocketError::Timeout),
+            anyhow::anyhow!("HTTP error: 429 Too Many Requests"),
+        ] {
+            assert_eq!(HandshakeRefusal::of(&other), None, "{other:#}");
+        }
     }
 
     /// What placing an order reports, by the response's status: an order that ended in the

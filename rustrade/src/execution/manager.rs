@@ -128,6 +128,10 @@ where
     /// attempt is yielded as an [`AccountEventKind::ReinitFailed`], with no further
     /// `Reconnecting`. Whether to stop waiting is the caller's decision.
     ///
+    /// An attempt the venue refused for a rate limit, with a wait it named
+    /// ([`AccountStreamInitError::retry_after`]), is not followed by another until that wait has
+    /// passed, even when the backoff is shorter.
+    ///
     /// # Errors
     /// [`ExecutionError::Config`] if `client` and `indexer` are for different exchanges, and
     /// [`ExecutionError::AccountStreamInit`] if the first attempt to initialise the AccountStream
@@ -190,11 +194,18 @@ where
 
         // Boxed so the manager can poll it inline in `run`'s `select!` -- see `account_stream`.
         // A failed re-init is sent in-band, in order with the account events, so the consumer can
-        // tell a reconnect that keeps failing from one still in its backoff.
+        // tell a reconnect that keeps failing from one still in its backoff. One the venue refused
+        // for a rate limit is not retried before the wait it named, which also outlasts a stream
+        // that ended for one (`StreamTerminationReason::RateLimited`): retrying sooner fails unsent
+        // at best, and lengthens a ban at worst.
         let exchange = indexer.map.exchange.key;
         let account_stream = Box::pin(
             account_stream
-                .with_reconnect_backoff_reporting(reconnect_policy, stream_key)
+                .with_reconnect_backoff_reporting_hinted(
+                    reconnect_policy,
+                    stream_key,
+                    AccountStreamInitError::retry_after,
+                )
                 .with_reconnection_events_reporting(
                     indexer.map.exchange.value,
                     move |ReinitFailure { attempt, error }| AccountEvent {
@@ -862,6 +873,8 @@ mod tests {
         fail_on: &'static [usize],
         open_from: usize,
         attempts: Arc<std::sync::atomic::AtomicUsize>,
+        /// When set, a failing attempt is a rate-limit refusal naming this wait, not a timeout.
+        rate_limited_for: Option<std::time::Duration>,
     }
 
     impl ExecutionClient for FlakyAccountClient {
@@ -891,9 +904,10 @@ mod tests {
                 .attempts
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if self.fail_on.contains(&attempt) {
-                Err(UnindexedClientError::Connectivity(
-                    ConnectivityError::Timeout,
-                ))
+                Err(match self.rate_limited_for {
+                    Some(wait) => UnindexedClientError::Api(ApiError::rate_limited(Some(wait))),
+                    None => UnindexedClientError::Connectivity(ConnectivityError::Timeout),
+                })
             } else if attempt < self.open_from {
                 Ok(futures::stream::empty().boxed())
             } else {
@@ -1013,6 +1027,62 @@ mod tests {
                 reinit_failed(1),
                 snapshot(),
             ]
+        );
+    }
+
+    /// A re-init the venue refused for a rate limit is not retried before the wait it named,
+    /// although the backoff is 1 ms.
+    #[tokio::test]
+    async fn a_rate_limited_reinit_waits_out_the_venues_wait() {
+        let wait = std::time::Duration::from_millis(300);
+        let Ok(manager) = init_flaky(FlakyAccountClient {
+            fail_on: &[1],
+            open_from: 2,
+            rate_limited_for: Some(wait),
+            ..FlakyAccountClient::default()
+        })
+        .await
+        else {
+            panic!("the first attempt succeeds, so init should too");
+        };
+        let mut events = manager.account_stream;
+        let mut next = async || {
+            let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), events.next()).await
+            else {
+                panic!("the stream yields within the test's budget, and does not end");
+            };
+            event
+        };
+
+        assert!(matches!(
+            next().await,
+            AccountStreamEvent::Item(AccountEvent {
+                kind: AccountEventKind::Snapshot(_),
+                ..
+            })
+        ));
+        assert!(matches!(next().await, AccountStreamEvent::Reconnecting(_)));
+        // Before the refused attempt is made, so the wait it starts cannot begin earlier.
+        let refused = std::time::Instant::now();
+        match next().await {
+            AccountStreamEvent::Item(AccountEvent {
+                kind: AccountEventKind::ReinitFailed(failure),
+                ..
+            }) => assert_eq!(failure.error.retry_after(), Some(wait)),
+            other => panic!("expected the refused re-init, got {other:?}"),
+        }
+        assert!(matches!(
+            next().await,
+            AccountStreamEvent::Item(AccountEvent {
+                kind: AccountEventKind::Snapshot(_),
+                ..
+            })
+        ));
+        assert!(
+            refused.elapsed() >= wait,
+            "re-initialised after {:?}, before the venue's {wait:?}",
+            refused.elapsed()
         );
     }
 

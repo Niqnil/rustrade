@@ -135,7 +135,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     from minutes to days.
   - **Behaviour:** every refusal pauses the client's REST calls, orders and cancels for that wait,
     or 10 s when Binance named none (or a zero wait), the last refusal of a retried call included.
-    The account stream's connects do not wait for it. Before, the pause was a
+    The account stream honours it too (see the entry under Fixed, #639). Before, the pause was a
     fixed 1–4 s backoff, and the last refusal set none.
   - **Behaviour:** a request facing more than 10 s of that pause is not sent. It fails at once
     with `ApiError::RateLimit` carrying the time left. Before, every REST call slept through the
@@ -193,6 +193,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unless it reaches a worker only after the caller's `disconnect`.
 
 ### Fixed
+
+- **A Binance account stream no longer reconnects into a rate-limit ban** (`rustrade-execution`,
+  `binance` feature; `rustrade-data`; `rustrade`; #639).
+  - **Behaviour:** the `BinanceSpot` and `BinanceMargin` account streams, cross and isolated, no
+    longer open or reconnect during the client's rate-limit cooldown. One of 10 s or less is
+    waited out without spending a reconnect attempt. A longer one ends a running stream at once
+    with the new `StreamTerminationReason::RateLimited { retry_after }`, the time left, and fails
+    an `account_stream` call with `ApiError::RateLimit` carrying it, unsent. Before, each
+    reconnect during a ban was refused and spent an attempt, so the stream ended with
+    `ReconnectBudgetExhausted` after about 3 minutes, and each attempt could lengthen the ban.
+  - **Behaviour:** a stream's handshake refused with 429 or 418, or a user-data subscribe refused
+    for a rate limit (`-1003`), starts the cooldown, as an order's refusal does, so REST calls and
+    orders back off too. A subscribe refusal's ban time is honoured. A refused handshake names no
+    wait (the SDK drops its `Retry-After`), so a 429 starts the 10 s default and a 418, an IP ban,
+    Binance's shortest ban, 2 minutes. The same applies to `BinanceSpot`'s order session: a 418
+    on its handshake used to start the 10 s default.
+  - **Behaviour:** `ExecutionManager` re-opens an ended account stream no sooner than the
+    `retry_after` its failed attempt carried, even when its backoff policy is shorter. New
+    `ReconnectingStream::with_reconnect_backoff_reporting_hinted` takes that wait from each
+    failure; `with_reconnect_backoff_reporting` is unchanged.
+  - New `ClientError::retry_after` and `AccountStreamInitError::retry_after`.
 
 - **The simulated venue ignores a price sent with a market order** (`rustrade-execution`).
   `RequestOpen::price` is documented as `None` for a market order, but nothing enforced it. A

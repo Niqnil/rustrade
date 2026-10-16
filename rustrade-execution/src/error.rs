@@ -129,6 +129,16 @@ impl<AssetKey, InstrumentKey> ClientError<AssetKey, InstrumentKey> {
             Self::TruncatedSnapshot { .. } => false,
         }
     }
+
+    /// The venue's minimum wait before a retry: `Some` only for an
+    /// [`Api::RateLimit`](ApiError::RateLimit) whose venue sent a hint the client could read. See
+    /// [`ApiError::retry_after`].
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Api(error) => error.retry_after(),
+            _ => None,
+        }
+    }
 }
 
 /// Represents all connectivity-centric errors.
@@ -719,6 +729,27 @@ pub enum StreamTerminationReason {
     /// lagged past the buffer). The consumer is responsible for any re-establishment.
     #[error("unrecoverable stream error: {0}")]
     Error(String),
+
+    /// The venue is refusing this client for exceeding its rate limits, for longer than the
+    /// stream waits through in place.
+    ///
+    /// Emitted by venues that reconnect internally (Binance spot/margin) when a reconnect faces a
+    /// rate-limit cooldown, or a ban, with more than a few seconds left. The stream ends at once
+    /// rather than spend its reconnect budget against a venue that refuses every attempt, and
+    /// reconnects that would lengthen a ban. `retry_after` is how long the cooldown had left: the
+    /// earliest the consumer should re-establish the stream. Opening it sooner fails with
+    /// [`ApiError::RateLimit`], unsent.
+    ///
+    /// Nothing that happens on the account until the stream is re-established reaches the
+    /// consumer through this stream, as after any other termination: re-sync from the new
+    /// stream's snapshot, and read fills of the gap with a trades query. An
+    /// `ExecutionManager` re-opens the stream itself, no sooner than `retry_after`, and reports
+    /// each refused attempt as a `ReinitFailed` carrying the time left.
+    #[error("rate-limited by the venue; retry after {retry_after:?}")]
+    RateLimited {
+        /// How long the venue's cooldown had left when the stream ended.
+        retry_after: Duration,
+    },
 }
 
 /// Type alias for an [`AccountStreamInitError`] that is keyed on [`AssetNameExchange`] and
@@ -739,6 +770,18 @@ pub enum AccountStreamInitError<AssetKey = AssetIndex, InstrumentKey = Instrumen
     /// not resolve on retry while the venue keeps reporting it.
     #[error("IndexError: {0}")]
     Index(#[from] IndexError),
+}
+
+impl<AssetKey, InstrumentKey> AccountStreamInitError<AssetKey, InstrumentKey> {
+    /// The venue's minimum wait before the next attempt: `Some` only for a client's
+    /// [`Api::RateLimit`](ApiError::RateLimit) whose venue sent a hint the client could read. See
+    /// [`ClientError::retry_after`].
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Client(error) => error.retry_after(),
+            Self::Index(_) => None,
+        }
+    }
 }
 
 /// A failed attempt to re-initialise an account stream after it ended.
@@ -794,6 +837,42 @@ mod tests {
 
         let other: UnindexedApiError = ApiError::Unauthenticated("bad key".to_string());
         assert_eq!(other.retry_after(), None);
+    }
+
+    #[test]
+    fn a_client_or_init_error_reads_the_wait_of_its_rate_limit() {
+        let wait = Some(Duration::from_secs(7));
+        let hinted = UnindexedClientError::Api(ApiError::rate_limited(wait));
+        assert_eq!(hinted.retry_after(), wait);
+        assert_eq!(
+            UnindexedAccountStreamInitError::Client(hinted).retry_after(),
+            wait
+        );
+
+        let unhinted = UnindexedClientError::Api(ApiError::rate_limited(None));
+        assert_eq!(unhinted.retry_after(), None);
+        let socket = UnindexedClientError::Connectivity(ConnectivityError::Timeout);
+        assert_eq!(socket.retry_after(), None);
+        assert_eq!(
+            UnindexedAccountStreamInitError::Client(socket).retry_after(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_rate_limited_termination_shows_and_round_trips_its_wait() {
+        let reason = StreamTerminationReason::RateLimited {
+            retry_after: Duration::from_secs(120),
+        };
+        assert_eq!(
+            reason.to_string(),
+            "rate-limited by the venue; retry after 120s"
+        );
+        let json = serde_json::to_string(&reason).unwrap();
+        assert_eq!(
+            serde_json::from_str::<StreamTerminationReason>(&json).unwrap(),
+            reason
+        );
     }
 
     #[test]
