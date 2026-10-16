@@ -83,7 +83,9 @@ pub struct SimVenue {
     /// [`SimExecutionBuilder::add_venue_with_start`]: the `Engine` must be seeded with exactly
     /// these. `None` for a venue built from its configuration alone.
     ///
-    /// [`SimStepper`] checks the `Engine` against them on its first call.
+    /// [`SimStepper`] checks the `Engine` against them on its first call. Public like every field
+    /// here, but setting it by hand changes only what that check expects, not what the venue
+    /// holds: build from a [`SimStart`] instead.
     pub position_seeds: Option<Vec<PositionSeed>>,
 }
 
@@ -580,7 +582,8 @@ where
     ) -> Self {
         Self {
             source: futures::StreamExt::peekable(source),
-            core: SimCore::new(venues, clock, DEFAULT_FEEDBACK_LIMIT).unwrap_or_else(fault),
+            core: SimCore::new(venues, clock, DEFAULT_FEEDBACK_LIMIT)
+                .unwrap_or_else(panic_on_fault),
             error: None,
             source_done: false,
             drain_signalled: false,
@@ -647,7 +650,7 @@ where
         loop {
             // Everything the Engine emitted while processing the previous event is already queued
             // (its requests are sent synchronously inside `process`), so this observes it in full.
-            if core.drain_requests().unwrap_or_else(fault) == RequestDrain::Abandon {
+            if core.drain_requests().unwrap_or_else(panic_on_fault) == RequestDrain::Abandon {
                 core.abandon();
                 *this.terminated = true;
                 return Poll::Ready(None);
@@ -701,7 +704,7 @@ where
                     return Poll::Ready(None);
                 }
 
-                match core.pop().unwrap_or_else(fault) {
+                match core.pop().unwrap_or_else(panic_on_fault) {
                     Step::Emitted(event) => return Poll::Ready(Some(event)),
                     // A venue acted, or was woken at its own deadline. Nothing to emit, and what it
                     // produced is now queued, so the next iteration weighs that against the source
@@ -722,7 +725,8 @@ where
                     // order the `Engine` sends in reaction to the tick at `T` must be matched
                     // against the market as of `T`, not `T-1`. Returning first and routing on the
                     // next poll would reverse that at zero latency.
-                    core.route_source(&timed.value).unwrap_or_else(fault);
+                    core.route_source(&timed.value)
+                        .unwrap_or_else(panic_on_fault);
 
                     Poll::Ready(Some(timed.value))
                 }
@@ -742,6 +746,9 @@ where
 ///
 /// [`SimRunner`] panics with it, as its `# Panics` says. [`SimStepper`] returns it as
 /// [`SimStepError::Misconfigured`].
+///
+/// Its message names no driver: each reporter prefixes its own name, so the message reads as a
+/// sentence whose subject is the driver that met it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SimFault(String);
 
@@ -752,8 +759,9 @@ impl std::fmt::Display for SimFault {
 }
 
 /// How [`SimRunner`] reports a [`SimFault`]: a panic carrying its message, as it always has.
-fn fault<T>(fault: SimFault) -> T {
-    panic!("{fault}")
+#[cold]
+fn panic_on_fault<T>(reason: SimFault) -> T {
+    panic!("SimRunner {reason}")
 }
 
 /// The venues, the queue and the bookkeeping [`SimRunner`] and [`SimStepper`] share.
@@ -1119,7 +1127,7 @@ fn drain_requests(
                         .order_request(&request)
                         .map_err(|error| {
                             SimFault(format!(
-                                "SimRunner received open request for non-configured key: {error}"
+                                "received open request for non-configured key: {error}"
                             ))
                         })?
                         .into_owned_instrument(),
@@ -1129,7 +1137,7 @@ fn drain_requests(
                         .order_request(&request)
                         .map_err(|error| {
                             SimFault(format!(
-                                "SimRunner received cancel request for non-configured key: {error}"
+                                "received cancel request for non-configured key: {error}"
                             ))
                         })?
                         .into_owned_instrument(),
@@ -1186,7 +1194,7 @@ fn act(
 ) -> Result<bool, SimFault> {
     let slot = venues.get_mut(&exchange).ok_or_else(|| {
         SimFault(format!(
-            "SimRunner scheduled an action for an unregistered venue: {exchange}"
+            "scheduled an action for an unregistered venue: {exchange}"
         ))
     })?;
 
@@ -1247,7 +1255,7 @@ fn checked_offset(
 ) -> Result<DateTime<Utc>, SimFault> {
     time.checked_add_signed(offset).ok_or_else(|| {
         SimFault(format!(
-            "SimRunner cannot represent the simulated time of {what}: {time} + {offset}"
+            "cannot represent the simulated time of {what}: {time} + {offset}"
         ))
     })
 }
@@ -1366,7 +1374,7 @@ fn step<MarketKind>(
 
     let slot = venues.get(&exchange).ok_or_else(|| {
         SimFault(format!(
-            "SimRunner scheduled an event for an unregistered venue: {exchange}"
+            "scheduled an event for an unregistered venue: {exchange}"
         ))
     })?;
 
@@ -1385,7 +1393,7 @@ fn step<MarketKind>(
 
             let key = slot.indexer.order_key(key).map_err(|error| {
                 SimFault(format!(
-                    "SimRunner venue returned an open response for a non-configured key: {error}"
+                    "venue returned an open response for a non-configured key: {error}"
                 ))
             })?;
             let state = slot.indexer.order_state(state);
@@ -1409,7 +1417,7 @@ fn step<MarketKind>(
                 .order_response_cancel(response)
                 .map_err(|error| {
                     SimFault(format!(
-                        "SimRunner venue returned an unindexable cancel response: {error}"
+                        "venue returned an unindexable cancel response: {error}"
                     ))
                 })?;
 
@@ -1436,7 +1444,7 @@ fn index_account_event<MarketKind>(
 ) -> Result<EngineEvent<MarketKind>, SimFault> {
     let event = indexer.account_event(event).map_err(|error| {
         SimFault(format!(
-            "SimRunner venue produced an unindexable AccountEvent: {error}"
+            "venue produced an unindexable AccountEvent: {error}"
         ))
     })?;
 

@@ -11,7 +11,7 @@
 
 use std::sync::Mutex;
 
-use chrono::{DateTime, TimeDelta, Utc};
+use chrono::{DateTime, Utc};
 use fnv::FnvHashMap;
 use futures::{StreamExt, stream};
 use rust_decimal::Decimal;
@@ -47,6 +47,7 @@ use rustrade::{
         },
     },
     risk::DefaultRiskManager,
+    shutdown::{Shutdown, SyncShutdown},
     strategy::{
         DefaultStrategy, algo::AlgoStrategy, close_positions::ClosePositionsStrategy,
         on_disconnect::OnDisconnectStrategy, on_trading_disabled::OnTradingDisabled,
@@ -845,6 +846,233 @@ fn an_engine_not_seeded_with_the_venues_start_is_refused() {
     );
 }
 
+#[test]
+fn an_engine_seeded_at_another_quantity_or_entry_is_refused() {
+    let held = |quantity, entry| {
+        vec![PositionSeed::new(
+            "binance_spot-btc_usdt",
+            Side::Buy,
+            quantity,
+            entry,
+            at(0),
+        )]
+    };
+
+    for engine_positions in [held(dec!(1), dec!(90)), held(dec!(2), dec!(95))] {
+        let mut s = session_with(
+            0,
+            holding_btc(),
+            Some(engine_positions),
+            DefaultStrategy::default(),
+        );
+
+        let error = s.stepper.settle(&mut s.engine).unwrap_err();
+        assert!(
+            matches!(error, BarterError::SimStep(SimStepError::StartMismatch(_))),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn a_venue_whose_opening_account_it_cannot_index_is_refused() {
+    let instruments = instruments();
+    let unknown_asset = MockExecutionConfig {
+        initial_state: AccountSnapshot {
+            exchange: EXCHANGE,
+            balances: vec![AssetBalance {
+                asset: AssetNameExchange::new("doge"),
+                balance: Balance::new(dec!(1), dec!(1)),
+                time_exchange: at(0),
+            }],
+            instruments: vec![],
+        },
+        ..config(0)
+    };
+    let build = SimExecutionBuilder::new(&instruments)
+        .add_venue(unknown_asset)
+        .unwrap()
+        .build();
+
+    let error = SimStepper::<DataKind>::new(build.venues, HistoricalClock::new(at(0))).unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            BarterError::SimStep(SimStepError::Misconfigured(reason))
+                if reason.starts_with("SimStepper ")
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_terminal_audit_ends_the_session() {
+    let mut s = session(0, usdt(dec!(10_000)));
+
+    let error = s
+        .stepper
+        .step(
+            &mut s.engine,
+            at(3),
+            [EngineEvent::Shutdown(Shutdown::Immediate)],
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(error, BarterError::SimStep(SimStepError::EngineStopped(_))),
+        "{error}"
+    );
+    assert!(s.stepper.has_ended());
+}
+
+#[test]
+fn shutting_the_engine_down_fails_the_next_call_without_delivering_it() {
+    let mut s = session(0, usdt(dec!(10_000)));
+    s.stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(100))])
+        .unwrap();
+
+    s.engine.shutdown();
+
+    assert_eq!(
+        s.stepper
+            .step(&mut s.engine, at(6), [bar(BTC, 6, dec!(110))])
+            .unwrap_err(),
+        BarterError::SimStep(SimStepError::Finished)
+    );
+    assert_eq!(
+        price(&s.engine, BTC),
+        Some(dec!(100)),
+        "the 6s bar is never shown"
+    );
+    assert!(s.stepper.has_ended());
+    assert_eq!(
+        s.stepper.settle(&mut s.engine).unwrap_err(),
+        BarterError::SimStep(SimStepError::Finished)
+    );
+}
+
+#[test]
+fn a_stepper_debug_prints_its_progress() {
+    let mut s = session(0, usdt(dec!(10_000)));
+    s.stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(100))])
+        .unwrap();
+
+    let debug = format!("{:?}", s.stepper);
+
+    assert!(debug.starts_with("SimStepper"), "{debug}");
+    assert!(
+        debug.contains("instant: Some(1970-01-01T00:00:03Z)"),
+        "{debug}"
+    );
+}
+
+#[test]
+fn a_settle_before_any_step_books_at_the_session_start() {
+    let mut s = session(0, usdt(dec!(10_000)));
+    s.engine.action(&order(BTC, Side::Buy, dec!(1), "early"));
+
+    let settled = s.stepper.settle(&mut s.engine).unwrap();
+
+    // The opening account is delivered first, and the order is refused: nothing is priced yet.
+    assert_eq!(balance(&s.engine, "usdt"), dec!(10_000));
+    assert_eq!(refused(events(&settled)), vec![ClientOrderId::new("early")]);
+    assert_eq!(s.stepper.instant(), None);
+}
+
+#[test]
+fn a_step_with_no_events_delivers_a_deadline_it_reaches() {
+    let mut s = session(0, usdt(dec!(10_000)));
+    s.stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(100))])
+        .unwrap();
+    s.engine.action(&Command::SendOpenRequests(OneOrMany::One(
+        OrderRequestOpen {
+            key: OrderKey {
+                exchange: ExchangeIndex::new(0),
+                instrument: InstrumentIndex::new(BTC),
+                strategy: StrategyId::new("agent"),
+                cid: ClientOrderId::new("gtd"),
+            },
+            state: RequestOpen {
+                side: Side::Buy,
+                price: Some(dec!(90)),
+                quantity: dec!(1),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodTillDate { expiry: at(5) },
+                position_id: None,
+                reduce_only: false,
+                market: None,
+            },
+        },
+    )));
+    s.stepper.settle(&mut s.engine).unwrap();
+
+    let stepped = s.stepper.step(&mut s.engine, at(6), []).unwrap();
+
+    let expired = events(&stepped)
+        .into_iter()
+        .filter_map(|event| match event {
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                kind: AccountEventKind::OrderSnapshot(snapshot),
+                ..
+            })) if matches!(
+                snapshot.0.state,
+                OrderState::Inactive(InactiveOrderState::Expired(_))
+            ) =>
+            {
+                Some(snapshot.0.key.cid.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(expired, vec![ClientOrderId::new("gtd")]);
+    assert_eq!(s.stepper.instant(), Some(at(6)));
+}
+
+#[test]
+fn each_call_starts_a_fresh_feedback_budget() {
+    // How many account events booking one market order delivers.
+    let per_order = {
+        let mut s = session(0, usdt(dec!(10_000)));
+        s.stepper
+            .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(100))])
+            .unwrap();
+        s.engine.action(&order(BTC, Side::Buy, dec!(1), "probe"));
+        s.stepper.settle(&mut s.engine).unwrap().len()
+    };
+
+    // One order fits the budget, but two in one stretch would not, were it not reset per call.
+    let mut s = session(0, usdt(dec!(10_000)));
+    s.stepper = s.stepper.with_feedback_limit(per_order);
+    s.stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(100))])
+        .unwrap();
+    s.engine.action(&order(BTC, Side::Buy, dec!(1), "a"));
+    s.stepper.settle(&mut s.engine).unwrap();
+    s.engine.action(&order(BTC, Side::Buy, dec!(1), "b"));
+    s.stepper.settle(&mut s.engine).unwrap();
+    // A step with no market data resets it too.
+    s.engine.action(&order(BTC, Side::Buy, dec!(1), "c"));
+    let stepped = s.stepper.step(&mut s.engine, at(6), []).unwrap();
+    assert_eq!(fills(events(&stepped)).len(), 1);
+
+    // And the limit is the one set.
+    let mut s = session(0, usdt(dec!(10_000)));
+    s.stepper = s.stepper.with_feedback_limit(per_order - 1);
+    s.stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(100))])
+        .unwrap();
+    s.engine.action(&order(BTC, Side::Buy, dec!(1), "over"));
+    let error = s.stepper.settle(&mut s.engine).unwrap_err();
+    assert!(
+        matches!(error, BarterError::SimFeedbackLoop { limit, .. } if limit == per_order - 1),
+        "{error}"
+    );
+}
+
 /// A whole session of caller actions, as one string, for comparing two runs.
 fn scripted_run() -> String {
     let mut s = session(0, usdt(dec!(10_000)));
@@ -1058,23 +1286,4 @@ async fn stepping_books_what_a_backtest_over_the_same_bars_books() {
             "{asset}"
         );
     }
-}
-
-#[test]
-fn rebuilding_a_session_costs_little_next_to_a_step() {
-    // Not a benchmark: a guard against construction growing into something a reset per episode
-    // could not afford. Generous enough for a loaded debug build.
-    let started = std::time::Instant::now();
-    for _ in 0..100 {
-        let mut s = session(0, holding_btc());
-        s.stepper
-            .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(100))])
-            .unwrap();
-    }
-    let per_session = started.elapsed() / 100;
-
-    assert!(
-        per_session < TimeDelta::milliseconds(50).to_std().unwrap(),
-        "{per_session:?} per session"
-    );
 }

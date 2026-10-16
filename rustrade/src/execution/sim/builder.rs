@@ -144,9 +144,19 @@ impl<'a> SimExecutionBuilder<'a> {
     ///
     /// Otherwise exactly [`add_venue`](Self::add_venue), whose latency, errors and panics apply.
     pub fn add_venue_with_options(
+        self,
+        config: MockExecutionConfig,
+        options: SimVenueOptions,
+    ) -> Result<Self, BarterError> {
+        self.insert_venue(config, options, None)
+    }
+
+    /// Add the venue `config` mocks, recording `position_seeds` as the positions it starts with.
+    fn insert_venue(
         mut self,
         config: MockExecutionConfig,
         options: SimVenueOptions,
+        position_seeds: Option<Vec<PositionSeed>>,
     ) -> Result<Self, BarterError> {
         let SimVenueOptions {
             holding_costs,
@@ -202,7 +212,7 @@ impl<'a> SimExecutionBuilder<'a> {
             request_rx: execution_rx,
             to_venue: leg,
             from_venue: leg,
-            position_seeds: None,
+            position_seeds,
         };
 
         self.venues.insert(index, venue);
@@ -250,16 +260,7 @@ impl<'a> SimExecutionBuilder<'a> {
         )?;
         config.initial_state = initial_state;
 
-        let mut builder = self.add_venue_with_options(config, options)?;
-        if let Some(slot) = builder
-            .venues
-            .values_mut()
-            .find(|slot| slot.venue.exchange == exchange)
-        {
-            slot.position_seeds = Some(seeds);
-        }
-
-        Ok(builder)
+        self.insert_venue(config, options, Some(seeds))
     }
 
     /// Consume this builder, returning the venues and the [`MultiExchangeTxMap`] to hand the

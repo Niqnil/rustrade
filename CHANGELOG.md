@@ -24,7 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     at the current instant, so they fill against the bar just delivered before the next one
     exists. It can be called several times at one instant, each call seeing the previous fills.
   - `finish(&mut engine)` ends the session as a backtest ends. Dropping a stepper without it is
-    safe.
+    safe. Shutting the `Engine` down instead abandons what is still scheduled, and the call that
+    observes it fails with `SimStepError::Finished`.
   - At zero latency an order fills against the bar it was sent after, which the rustdoc calls an
     optimistic idealisation. With latency, a delayed fill lands in the first step that reaches it.
     A market order on an instrument with no bar at the current instant fills at its last price,
@@ -44,8 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `EngineStateBuilder::positions`, so the two sides cannot disagree. A reset is a rebuild from
     the same `SimStart`.
   - It is refused with a `SimStartError` (`BarterError::SimStart`) for a spot short, an
-    instrument the venue does not trade, two positions in one instrument, a base balance that
-    contradicts a spot position, or a configuration that already carries an `initial_state`.
+    instrument the venue does not trade, two positions in one instrument, a negative balance, a
+    base balance that contradicts a spot position, or a configuration that already carries an
+    `initial_state`.
   - **Breaking:** `SimVenue` has a new public field, `position_seeds`, and `BarterError` has two
     new variants.
 

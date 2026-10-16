@@ -53,8 +53,8 @@ use thiserror::Error;
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, Constructor)]
 pub struct SimStart {
     /// What the account holds in each asset, apart from the base asset a spot position holds,
-    /// which [`positions`](Self::positions) credits. Each asset at most once. An asset the venue
-    /// trades that is not listed opens at zero.
+    /// which [`positions`](Self::positions) credits. Each asset at most once, and none negative.
+    /// An asset the venue trades that is not listed opens at zero.
     ///
     /// Listing a spot position's base asset here as well is allowed only at the quantity the
     /// position holds, so the two cannot disagree.
@@ -98,6 +98,12 @@ pub enum SimStartError {
     /// An asset is listed more than once in [`SimStart::balances`].
     #[error("SimStart lists {asset} more than once")]
     DuplicateBalance { asset: AssetNameExchange },
+    /// A balance in [`SimStart::balances`] is negative: a spot account cannot owe an asset.
+    #[error("SimStart lists {asset} at {total}; a balance cannot be negative")]
+    NegativeBalance {
+        asset: AssetNameExchange,
+        total: Decimal,
+    },
     /// A position names an instrument the venue does not trade.
     #[error("SimStart position in {instrument}, which {exchange} does not trade")]
     UnknownInstrument {
@@ -142,6 +148,9 @@ impl SimStart {
     ) -> Result<(UnindexedAccountSnapshot, Vec<PositionSeed>), SimStartError> {
         let mut balances = FnvIndexMap::<AssetNameExchange, Decimal>::default();
         for StartBalance { asset, total } in self.balances {
+            if total < Decimal::ZERO {
+                return Err(SimStartError::NegativeBalance { asset, total });
+            }
             if balances.insert(asset.clone(), total).is_some() {
                 return Err(SimStartError::DuplicateBalance { asset });
             }
@@ -452,6 +461,19 @@ mod tests {
             SimStartError::DuplicateBalance {
                 asset: AssetNameExchange::new("usdt")
             }
+        );
+        assert_eq!(
+            refused(SimStart::new(vec![usdt(dec!(-1))], vec![])),
+            SimStartError::NegativeBalance {
+                asset: AssetNameExchange::new("usdt"),
+                total: dec!(-1),
+            }
+        );
+        // An empty balance is not a negative one.
+        assert!(
+            SimStart::new(vec![usdt(dec!(0))], vec![])
+                .resolve(EXCHANGE, &instruments)
+                .is_ok()
         );
         assert_eq!(
             refused(SimStart::new(vec![], vec![btc(), btc()])),

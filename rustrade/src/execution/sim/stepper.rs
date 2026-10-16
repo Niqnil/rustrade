@@ -143,7 +143,12 @@ pub type StepAudit<GlobalData, InstrumentData, Strategy, Risk, MarketKind> = <Si
 /// orders, and everything still scheduled is delivered. A deadline after the last instant is
 /// never reached. Dropping a stepper without finishing it is also fine: nothing was spawned, so
 /// nothing is left running.
-#[derive(Debug)]
+///
+/// Shutting the `Engine` down instead, with [`SyncShutdown::shutdown`], abandons everything still
+/// scheduled, as it does for a backtest, and the call that observes it fails with
+/// [`SimStepError::Finished`].
+///
+/// [`SyncShutdown::shutdown`]: crate::shutdown::SyncShutdown::shutdown
 pub struct SimStepper<MarketKind>
 where
     MarketKind: VenueMarketUpdate,
@@ -158,10 +163,26 @@ where
     ended: Option<Ended>,
 }
 
+/// Manual because a derive would demand `MarketKind: Debug`, as on `SimCore`.
+impl<MarketKind> std::fmt::Debug for SimStepper<MarketKind>
+where
+    MarketKind: VenueMarketUpdate,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimStepper")
+            .field("core", &self.core)
+            .field("session_start", &self.session_start)
+            .field("instant", &self.instant)
+            .field("checked", &self.checked)
+            .field("ended", &self.ended)
+            .finish()
+    }
+}
+
 /// Why a [`SimStepper`] takes no further steps.
 #[derive(Debug)]
 enum Ended {
-    /// [`SimStepper::finish`] ran, or the `Engine` asked its venues to shut down.
+    /// [`SimStepper::finish`] ran.
     Finished,
     /// A call failed with this error, which every later call returns.
     Failed(BarterError),
@@ -199,8 +220,8 @@ pub enum SimStepError {
     /// The `Engine` reported a terminal audit, such as an unrecoverable error, and stopped.
     #[error("the Engine stopped: {0}")]
     EngineStopped(String),
-    /// The session already ended with [`SimStepper::finish`], or the `Engine` shut its venues
-    /// down.
+    /// The session already ended with [`SimStepper::finish`], or the `Engine` was shut down,
+    /// abandoning everything still scheduled.
     #[error("the simulation has finished")]
     Finished,
 }
@@ -306,7 +327,7 @@ where
             // Stable, so events of one class keep the caller's order.
             batch.sort_by_key(source_class);
 
-            let mut audits = Vec::new();
+            let mut audits = Vec::with_capacity(batch.len());
             this.run(
                 engine,
                 &mut VecDeque::from(batch),
@@ -331,7 +352,7 @@ where
     /// reaches its arrival instead.
     ///
     /// # Errors
-    /// Every call returns, after which the stepper takes no further steps:
+    /// Any of these ends the session:
     /// - [`SimStepError::WrongEngine`] if `engine` was not built with this stepper's clock, and
     ///   [`SimStepError::StartMismatch`] if its positions on the venues' instruments differ from
     ///   the venues' [`SimStart`](super::SimStart). Both are checked on the first call only.
@@ -340,8 +361,8 @@ where
     /// - [`SimStepError::EngineStopped`] if the `Engine` reports a terminal audit.
     /// - [`SimStepError::Misconfigured`] if a venue produces an event its index cannot translate,
     ///   or a simulated instant overflows.
-    /// - [`SimStepError::Finished`] after [`finish`](Self::finish), and the original error after
-    ///   any failed call.
+    /// - [`SimStepError::Finished`] after [`finish`](Self::finish), or once the `Engine` has been
+    ///   shut down, and the original error after any failed call.
     pub fn settle<GlobalData, InstrumentData, Strategy, Risk>(
         &mut self,
         engine: &mut SimEngine<GlobalData, InstrumentData, Strategy, Risk>,
@@ -462,10 +483,11 @@ where
 
             // Everything the Engine sent while processing the previous event is already queued
             // (its requests are sent synchronously inside `process`), so this observes it in full.
+            // Sent by `SyncShutdown::shutdown`, between calls or from a strategy hook within one.
+            // Either way the session is over, and an `Ok` would claim this call's events delivered.
             if self.core.drain_requests().map_err(misconfigured)? == RequestDrain::Abandon {
                 self.core.abandon();
-                self.ended = Some(Ended::Finished);
-                return Ok(());
+                return Err(SimStepError::Finished.into());
             }
 
             let queue_leads = match (batch.front(), until) {
@@ -595,8 +617,8 @@ fn check_start<GlobalData, InstrumentData>(
 }
 
 /// How a [`SimStepper`] reports a [`SimFault`], which [`SimRunner`](super::SimRunner) panics on.
-fn misconfigured(fault: SimFault) -> BarterError {
-    SimStepError::Misconfigured(fault.to_string()).into()
+fn misconfigured(reason: SimFault) -> BarterError {
+    SimStepError::Misconfigured(format!("SimStepper {reason}")).into()
 }
 
 /// A `SimStepper` and the `Engine` it drives can be held in a map and moved between threads.
