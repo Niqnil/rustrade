@@ -308,8 +308,10 @@ user of the library would need it in the same form. If so, it belongs here.
   types, honours its rate limits and bans, and reads what it reports about margin, borrowing and
   delistings. Venue-specific code is expected here, as long as it describes the venue rather than
   deciding for the caller.
-- **The engine's accounting:** positions, PnL, fees and the trading summary, computed the same way
-  for every venue.
+- **The engine's accounting:** positions, PnL, fees and the trading summary, computed from the
+  generic types, whichever venue they came from.
+- **The hooks a policy plugs into:** for example the engine's `RiskManager`, which filters order
+  requests, and its trading state, which can disable trading.
 - **Simulation:** simulated venues, fill, fee and holding-cost models, and backtesting. These are
   configurable rather than tuned to one consumer.
 - **Market data as the source sends it,** including option greeks that a venue or data provider
@@ -320,13 +322,17 @@ user of the library would need it in the same form. If so, it belongs here.
 - Trading strategy, signals and position sizing.
 - Per-trade decisions, such as when to borrow or repay, and which margin mode or account an order
   goes through.
-- Risk limits and safety checks, and when to reconnect, retry or halt.
+- The rules and values of risk limits and safety checks.
+- What to do once the library gives up: whether to resume a stream that has ended, retry a failed
+  request or halt. The library's own reconnects and retries are bounded, and it reports when they
+  run out.
 - When to trade: gating orders by trading hours or a market calendar.
 - Computing greeks and other analytics from market data.
 
 The library should make a policy possible without choosing it. It exposes what a consumer needs to
 decide, such as a `retry_after`, a stream's termination reason or a venue notice, and leaves the
-decision to the consumer.
+decision to the consumer. When a venue rule needs a threshold, make it a documented default the
+caller can override, or expose what the caller needs to decide around it.
 
 ## Questions?
 
