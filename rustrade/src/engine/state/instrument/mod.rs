@@ -1969,7 +1969,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                 "fill moves no holding and opens no position; any fee is charged to the tear \
                  sheet's unattributed fees"
             );
-            // A fill with nothing to charge changes no PnL, so it is no point in the drawdowns.
+            // A fill with nothing to charge changes no PnL, so it adds no drawdown sample.
             if !fee.is_zero() {
                 self.tear_sheet
                     .record_fee_unattributed(fee, effective_trade.time_exchange);
