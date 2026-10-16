@@ -1307,6 +1307,16 @@ impl ExponentialBackoff {
     }
 }
 
+/// What a reconnect budget spent on dropped connections reports as its last error: a heartbeat
+/// timeout, or the venue closing the connection or failing it.
+pub(crate) fn disconnect_error(heartbeat_timed_out: bool) -> String {
+    if heartbeat_timed_out {
+        format!("heartbeat timeout ({HEARTBEAT_TIMEOUT_SECS}s)")
+    } else {
+        "WebSocket disconnected (server close/error)".to_string()
+    }
+}
+
 /// End an account stream for a rate-limit cooldown with `remaining` left.
 fn end_for_cooldown(remaining: Duration) -> StreamTerminationReason {
     warn!(
@@ -5629,6 +5639,15 @@ mod tests {
             }),
             &InstrumentNameExchange::new("BTCUSDT"),
         )
+    }
+
+    #[test]
+    fn a_dropped_connection_names_its_cause() {
+        assert_eq!(disconnect_error(true), "heartbeat timeout (30s)");
+        assert_eq!(
+            disconnect_error(false),
+            "WebSocket disconnected (server close/error)"
+        );
     }
 
     /// A reconnect facing a cooldown longer than a request sleeps through ends the stream at once,

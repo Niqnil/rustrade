@@ -45,10 +45,11 @@ use super::shared::{
     UnsubscribeOnDrop, UserDataFrame, WeightPool, binance_filled_qty, classify_order_kind_tif,
     classify_rest_query_error, classify_ws_order_error, convert_ended_order,
     convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
-    dedup_key_from_event, drop_after, frame_excerpt, gap_failed, gap_time, is_duplicate,
-    is_handshake_rate_limit, is_unknown_order, log_unhandled_event, log_unrecognised_frame,
-    new_dedup_cache, parse_user_data_frame, placed_order_state, recovered_order_cids,
-    recovered_order_totals, response_decode_error, rest_call_with_retry, trailing_params, unix_ms,
+    dedup_key_from_event, disconnect_error, drop_after, frame_excerpt, gap_failed, gap_time,
+    is_duplicate, is_handshake_rate_limit, is_unknown_order, log_unhandled_event,
+    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
+    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
+    trailing_params, unix_ms,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -1952,12 +1953,8 @@ async fn connection_manager(
         }
         // Surrender after repeated reconnects: the most recent failure is the disconnect that
         // triggered this round (ConsumerDropped already broke out above).
-        let last_error = || match reason {
-            DisconnectReason::HeartbeatTimeout => {
-                format!("heartbeat timeout ({HEARTBEAT_TIMEOUT_SECS}s)")
-            }
-            _ => "WebSocket disconnected (server close/error)".to_string(),
-        };
+        let heartbeat_timed_out = matches!(reason, DisconnectReason::HeartbeatTimeout);
+        let last_error = || disconnect_error(heartbeat_timed_out);
         if let Err(reason) = backoff.retry_or_end(&rate_limiter, last_error).await {
             emit_stream_terminated(&tx, ExchangeId::BinanceSpot, reason);
             break;
