@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-16
+
 ### Added
 
 - **Step a simulation from outside, one instant at a time** (`rustrade`, #626).
@@ -191,6 +193,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A shutdown `ibapi` or TWS/Gateway causes, such as reconnection given up or the API session
   ended, still reaches the stream as a `DataError::Socket` per subscription, logged at ERROR,
   unless it reaches a worker only after the caller's `disconnect`.
+
+- **The IBKR rustdoc states what a fill's fees include** (`rustrade-execution`, feature `ibkr`,
+  #619). A fill's `Trade::fees` is the commission IB reports for its execution, unchanged. That
+  figure includes the regulatory fees IB passes through and any tax IB charges on the commission,
+  such as GST. Taxes IB bills separately from commissions, such as stamp duty or a financial
+  transaction tax, are not known to be included.
 
 ### Fixed
 
