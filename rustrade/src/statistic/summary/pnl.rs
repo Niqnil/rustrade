@@ -29,7 +29,7 @@ use tracing::warn;
 ///   - Can be denominated in any chosen asset for cross-instrument aggregation
 #[derive(Debug, Clone, PartialEq, PartialOrd, Default, Deserialize, Serialize)]
 pub struct PnLReturns {
-    /// Raw PnL, net of carry.
+    /// Raw PnL, net of carry and of [`Self::fees_unattributed`].
     ///
     /// For Instrument PnL, this is most likely denominated in "quote asset" units. For example,
     /// btc_usdt  spot PnL would be in usdt. However, in some derivative cases the
@@ -253,6 +253,25 @@ mod tests {
         returns.update_from_fee_unattributed(dec!(1));
         assert_eq!(returns.pnl_raw, dec!(-1));
         assert_eq!(returns.fees_unattributed, Decimal::MAX);
+    }
+
+    #[test]
+    fn test_a_summary_serialised_before_fees_unattributed_loads_with_zero() {
+        let mut value = serde_json::to_value(PnLReturns {
+            pnl_raw: dec!(5),
+            fees_unattributed: dec!(2),
+            ..Default::default()
+        })
+        .unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("fees_unattributed")
+            .unwrap();
+
+        let loaded: PnLReturns = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.pnl_raw, dec!(5));
+        assert_eq!(loaded.fees_unattributed, Decimal::ZERO);
     }
 
     #[test]

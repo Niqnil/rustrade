@@ -434,3 +434,27 @@ impl TearSheetGenerator {
         *self = Self::init(time_engine_start);
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+mod tests {
+    use super::*;
+    use crate::statistic::time::Annual365;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn a_tear_sheet_serialised_before_fees_unattributed_loads_with_zero() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fee_unattributed(dec!(2), DateTime::<Utc>::MIN_UTC);
+        let mut value = serde_json::to_value(generator.generate(Decimal::ZERO, Annual365)).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("fees_unattributed")
+            .unwrap();
+
+        let loaded: TearSheet<Annual365> = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.pnl, dec!(-2));
+        assert_eq!(loaded.fees_unattributed, Decimal::ZERO);
+    }
+}

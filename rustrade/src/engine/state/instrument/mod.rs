@@ -1966,11 +1966,14 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                 %position_id,
                 fees = %effective_trade.fees.fees,
                 fee_quote = %fee,
-                "fill moves no holding and opens no position; its fee is charged to the tear \
+                "fill moves no holding and opens no position; any fee is charged to the tear \
                  sheet's unattributed fees"
             );
-            self.tear_sheet
-                .record_fee_unattributed(fee, effective_trade.time_exchange);
+            // A fill with nothing to charge changes no PnL, so it is no point in the drawdowns.
+            if !fee.is_zero() {
+                self.tear_sheet
+                    .record_fee_unattributed(fee, effective_trade.time_exchange);
+            }
             None
         } else {
             self.position
@@ -4260,6 +4263,29 @@ mod tests {
         assert_eq!(state.tear_sheet.pnl_returns.total.count, Decimal::ONE);
         assert_eq!(state.tear_sheet.pnl_returns.total.sum, dec!(0.1));
         assert_eq!(state.tear_sheet.pnl_returns.losses.count, Decimal::ZERO);
+    }
+
+    /// A fill of zero quantity is booked the same way whatever its fee's asset: here a quote fee,
+    /// which nets nothing from the holding. One with no fee changes no PnL and moves no clock.
+    #[test]
+    fn a_zero_quantity_fill_from_flat_charges_its_fee_to_the_tear_sheet() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+
+        let (exited, warnings) = count_warnings(|| {
+            state.update_from_trade(&fill_charging(Side::Buy, Decimal::ZERO, quote, dec!(0.02)))
+        });
+        assert!(exited.is_none());
+        assert!(netting_position(&state).is_none());
+        assert_eq!(warnings, 1);
+        assert_eq!(state.tear_sheet.pnl_returns.fees_unattributed, dec!(2));
+
+        let before = state.tear_sheet.clone();
+        let mut free = fill_charging(Side::Buy, Decimal::ZERO, quote, Decimal::ZERO);
+        free.time_exchange = TIME + chrono::TimeDelta::days(1);
+        let (_, warnings) = count_warnings(|| state.update_from_trade(&free));
+        assert_eq!(warnings, 1);
+        assert_eq!(state.tear_sheet, before);
     }
 
     /// The unattributed fee is the whole fee PnL would have charged a position: the venue's
