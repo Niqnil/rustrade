@@ -206,6 +206,32 @@ pub(crate) struct PreparedSplit {
     remainder: Decimal,
 }
 
+/// What [`PositionManager::update_from_trade`] or
+/// [`update_from_trade_with_id`](PositionManager::update_from_trade_with_id) did with a fill.
+///
+/// `#[must_use]`: an [`Unapplied`](Self::Unapplied) fill carries a fee that reached no PnL, and
+/// only the caller can book it. `#[non_exhaustive]`: more outcomes may be told apart later.
+#[must_use = "an unapplied fill carries a fee that reached no PnL; book it or drop it explicitly"]
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TradeOutcome<AssetKey, InstrumentKey = InstrumentIndex> {
+    /// The fill moved a position: it opened, changed, closed or flipped one, and its fees were
+    /// charged to that position's PnL. `exited` is the position it closed, if any; a flip closes
+    /// one and opens another.
+    Applied {
+        exited: Option<PositionExited<AssetKey, InstrumentKey>>,
+    },
+    /// The fill moves no holding, its quantity being zero, and its slot held no position, so it
+    /// opened none. No position carries `fees`, the fill's fees as given, so they reached no PnL.
+    ///
+    /// The engine reaches this with a spot buy from flat whose base-asset fee takes all it
+    /// bought, once the fee is netted from its quantity.
+    /// [`InstrumentState::update_from_trade`](crate::engine::state::instrument::InstrumentState::update_from_trade)
+    /// charges the fee's quote equivalent to its tear sheet's
+    /// [`fees_unattributed`](crate::statistic::summary::instrument::TearSheet::fees_unattributed).
+    Unapplied { fees: AssetFees<AssetKey> },
+}
+
 /// Manages open positions for a single instrument.
 ///
 /// Supports two OMS modes (configurable at construction):
@@ -262,11 +288,14 @@ impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, Instrumen
     /// # Arguments
     /// * `trade` - The trade to process
     /// * `contract_size` - Contract multiplier for derivatives (1 for spot, 100 for standard options)
+    ///
+    /// Returns what was done with the fill, as
+    /// [`update_from_trade_with_id`](Self::update_from_trade_with_id) does.
     pub fn update_from_trade(
         &mut self,
         trade: &Trade<AssetKey, InstrumentKey>,
         contract_size: Decimal,
-    ) -> Option<PositionExited<AssetKey, InstrumentKey>>
+    ) -> TradeOutcome<AssetKey, InstrumentKey>
     where
         InstrumentKey: Debug + Clone + PartialEq,
     {
@@ -296,20 +325,19 @@ impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, Instrumen
     /// For contract expiry settlement the caller must set fees to `Decimal::ZERO` (exchange
     /// settlement commission, if any, is not modelled and must be tracked separately).
     ///
-    /// # A fill of zero quantity
+    /// # Returns
     ///
-    /// On an open position it is applied like any other fill, so its fee is charged to that
-    /// position's PnL. On an empty slot it opens no position and returns `None`, so its fee reaches
-    /// no PnL here, and is logged at `warn!`. The caller that wants it counted must charge it
-    /// elsewhere, as
-    /// [`InstrumentState::update_from_trade`](crate::engine::state::instrument::InstrumentState::update_from_trade)
-    /// does to its tear sheet.
+    /// [`TradeOutcome::Applied`] for a fill that moved a position, with the position it closed, if
+    /// any. A fill of zero quantity on an open position is applied like any other, so its fee is
+    /// charged to that position's PnL. On an empty slot it opens no position, and the result is
+    /// [`TradeOutcome::Unapplied`] with its fees, which reached no PnL: booking them is the
+    /// caller's. Nothing is logged here.
     pub fn update_from_trade_with_id(
         &mut self,
         trade: &Trade<AssetKey, InstrumentKey>,
         position_id: &PositionId,
         contract_size: Decimal,
-    ) -> Option<PositionExited<AssetKey, InstrumentKey>>
+    ) -> TradeOutcome<AssetKey, InstrumentKey>
     where
         InstrumentKey: Debug + Clone + PartialEq,
     {
@@ -324,17 +352,12 @@ impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, Instrumen
                 position.update_from_trade(trade)
             }
             // A fill that moves nothing opens nothing: a spot fill whose base fee equals its
-            // quantity, once the fee is netted. Its fee has no position to be charged to. The
-            // engine's own path books it to the tear sheet before reaching here; see the doc.
+            // quantity, once the fee is netted. No position carries its fee, so it goes back to
+            // the caller.
             None if trade.quantity.is_zero() => {
-                warn!(
-                    instrument = ?trade.instrument,
-                    order_id = %trade.order_id,
-                    fees = %trade.fees.fees,
-                    "fill of zero quantity on a flat position slot opens no position, so its fee \
-                     reaches no position's PnL"
-                );
-                (None, None)
+                return TradeOutcome::Unapplied {
+                    fees: trade.fees.clone(),
+                };
             }
             None => {
                 // New position — set contract_size before any PnL calculations.
@@ -373,7 +396,7 @@ impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, Instrumen
             self.positions.insert(position_id.clone(), pos);
         }
 
-        closed
+        TradeOutcome::Applied { exited: closed }
     }
 }
 
@@ -2312,6 +2335,46 @@ mod tests {
 
         // fees_quote is None ⇒ the 2 BNB are left out, not subtracted as 2 USDT: 1_000.
         assert_eq!(position.pnl_unrealised, dec!(1000.0));
+    }
+
+    /// A fill of zero quantity on an empty slot opens nothing and hands its fees back, since no
+    /// position carries them. On an open position it is applied, and its fee charged there.
+    #[test]
+    fn a_zero_quantity_fill_on_an_empty_slot_is_unapplied() {
+        let base_time = DateTime::<Utc>::MIN_UTC;
+        let mut manager =
+            PositionManager::<QuoteAsset, InstrumentNameInternal>::new(OmsMode::Netting);
+
+        let empty = trade(base_time, Side::Buy, 100.0, 0.0, 2.0);
+        assert_eq!(
+            manager.update_from_trade(&empty, Decimal::ONE),
+            TradeOutcome::Unapplied {
+                fees: empty.fees.clone()
+            }
+        );
+        assert!(manager.positions.is_empty());
+
+        let open = trade(base_time, Side::Buy, 100.0, 1.0, 0.0);
+        assert_eq!(
+            manager.update_from_trade(&open, Decimal::ONE),
+            TradeOutcome::Applied { exited: None }
+        );
+        assert_eq!(
+            manager.update_from_trade(&empty, Decimal::ONE),
+            TradeOutcome::Applied { exited: None }
+        );
+        let position = &manager.positions[&PositionId::NETTING];
+        assert_eq!(position.quantity_abs, dec!(1));
+        assert_eq!(position.pnl_realised, dec!(-2));
+
+        let close = trade(base_time, Side::Sell, 110.0, 1.0, 0.0);
+        let TradeOutcome::Applied {
+            exited: Some(exited),
+        } = manager.update_from_trade(&close, Decimal::ONE)
+        else {
+            panic!("the sell closes the position");
+        };
+        assert_eq!(exited.pnl_realised, dec!(8));
     }
 
     #[test]

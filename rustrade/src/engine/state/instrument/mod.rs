@@ -6,7 +6,7 @@ use crate::{
             order::{Orders, manager::OrderManager},
             position::{
                 CarryUpdate, OmsMode, PnlUnrealisedUpdate, PositionExited, PositionManager,
-                PreparedSplit, SplitError, SplitRoundingPolicy, fee_in_quote,
+                PreparedSplit, SplitError, SplitRoundingPolicy, TradeOutcome, fee_in_quote,
             },
         },
     },
@@ -27,7 +27,7 @@ use rustrade_execution::{
         state::{ActiveOrderState, InactiveOrderState, OrderState},
     },
     position::PositionReport,
-    trade::{Trade, TradeOrigin},
+    trade::{AssetFees, Trade, TradeOrigin},
 };
 use rustrade_instrument::{
     Keyed, Side, Underlying,
@@ -1491,6 +1491,33 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         self.tear_sheet.record_fill_forced();
     }
 
+    /// Log a fill that applied to no position, and charge its fees' quote equivalent to the tear
+    /// sheet's unattributed fees. See the base-asset fee section of [`Self::update_from_trade`].
+    fn record_fee_unattributed(
+        &mut self,
+        trade: &Trade<AssetKey, InstrumentKey>,
+        position_id: &PositionId,
+        fees: &AssetFees<AssetKey>,
+    ) where
+        InstrumentKey: Debug,
+    {
+        let fee = fee_in_quote(fees);
+        warn!(
+            instrument = ?trade.instrument,
+            order_id = %trade.order_id,
+            %position_id,
+            fees = %fees.fees,
+            fee_quote = %fee,
+            "fill moves no holding and opens no position; any fee is charged to the tear sheet's \
+             unattributed fees"
+        );
+        // A fill with nothing to charge changes no PnL, so it adds no drawdown sample.
+        if !fee.is_zero() {
+            self.tear_sheet
+                .record_fee_unattributed(fee, trade.time_exchange);
+        }
+    }
+
     /// Which leg of a venue settlement an orderless `origin` is on this instrument, or `None` for
     /// a fill of an order. See the settlement fills section of [`Self::update_from_trade`].
     fn settlement_leg(&self, origin: TradeOrigin) -> Option<SettlementLeg> {
@@ -1954,31 +1981,19 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         // Pass contract_size so PnL is computed with the correct multiplier.
         //
         // A fill that moves no holding on an empty slot opens no position, so no position can
-        // carry its fee: the tear sheet does. Checked here rather than left to the
-        // `PositionManager`, which has no tear sheet and only logs it.
-        let exited = if effective_trade.quantity.is_zero()
-            && !self.position.positions.contains_key(&position_id)
-        {
-            let fee = fee_in_quote(&effective_trade.fees);
-            warn!(
-                instrument = ?effective_trade.instrument,
-                order_id = %effective_trade.order_id,
-                %position_id,
-                fees = %effective_trade.fees.fees,
-                fee_quote = %fee,
-                "fill moves no holding and opens no position; any fee is charged to the tear \
-                 sheet's unattributed fees"
-            );
-            // A fill with nothing to charge changes no PnL, so it adds no drawdown sample.
-            if !fee.is_zero() {
-                self.tear_sheet
-                    .record_fee_unattributed(fee, effective_trade.time_exchange);
+        // carry its fee: the tear sheet does.
+        let exited = match self.position.update_from_trade_with_id(
+            effective_trade,
+            &position_id,
+            contract_size,
+        ) {
+            TradeOutcome::Applied { exited } => {
+                exited.inspect(|closed| self.tear_sheet.update_from_position(closed))
             }
-            None
-        } else {
-            self.position
-                .update_from_trade_with_id(effective_trade, &position_id, contract_size)
-                .inspect(|closed| self.tear_sheet.update_from_position(closed))
+            TradeOutcome::Unapplied { fees } => {
+                self.record_fee_unattributed(effective_trade, &position_id, &fees);
+                None
+            }
         };
 
         // Step 4: Cleanup — remove CID→PositionId entries for the closed position,

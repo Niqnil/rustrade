@@ -197,8 +197,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     instrument's tear sheet, in a new field `TearSheet::fees_unattributed` (also on `PnLReturns`),
     with a WARN. `TearSheet::pnl` and the PnL drawdowns include it; the returns, ratios, win rate
     and profit factor, which are per closed position, do not. A consumer that totals PnL from
-    `PositionExit` events alone does not see it. `PositionManager::update_from_trade_with_id`,
-    which has no tear sheet, still only logs it.
+    `PositionExit` events alone does not see it.
+  - **Breaking:** `PositionManager::update_from_trade` and `update_from_trade_with_id` return a
+    `#[must_use]` `TradeOutcome` instead of `Option<PositionExited>`: `Applied { exited }` for a
+    fill that moved a position, or `Unapplied { fees }` for one that opened none, whose fees reached
+    no PnL and are the caller's to book. Match `Applied { exited: Some(..) }` where the old code
+    matched `Some(..)`. The manager no longer logs such a fill.
   - Only the fee the venue reported is netted. A `FeeModelConfig` fee the engine adds is in quote
     and reaches PnL alone.
   - **Breaking:** `InstrumentState::update_from_trade`, `update_from_order_snapshot` and
