@@ -36,7 +36,7 @@ use rustrade::{
                 data::{DefaultInstrumentMarketData, InstrumentDataState},
                 filter::InstrumentFilter,
             },
-            position::{OmsMode, PositionId, PositionManager},
+            position::{OmsMode, PositionId, PositionManager, TradeOutcome},
             trading::TradingState,
         },
     },
@@ -252,7 +252,10 @@ fn the_venue_ledger_and_the_engine_position_agree_fill_by_fill() {
 
     for (side, quantity, price) in fills {
         let trade = fill(&mut venue, side, quantity, price);
-        if let Some(exited) = engine.update_from_trade(&trade, contract_size()) {
+        if let TradeOutcome::Applied {
+            exited: Some(exited),
+        } = engine.update_from_trade(&trade, contract_size())
+        {
             realised += exited.pnl_realised;
         }
 

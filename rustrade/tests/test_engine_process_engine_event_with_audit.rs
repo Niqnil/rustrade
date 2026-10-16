@@ -2768,6 +2768,74 @@ fn open_position_via_trade(
     engine.process(event);
 }
 
+/// Live engine vs audit-replica parity for a spot buy from flat whose base-asset fee takes all
+/// it bought. It opens no position, and its fee is charged to the tear sheet's unattributed fees;
+/// the replica, which replays the fill through the same state update, must agree.
+#[test]
+fn test_unattributed_fee_replica_parity() {
+    use rustrade::engine::audit::{
+        AuditTick, EngineAudit, context::EngineContext, state_replica::StateReplicaManager,
+    };
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+    let base = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0))
+        .instrument
+        .underlying
+        .base;
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: engine.state.clone(),
+        context: EngineContext {
+            time: STARTING_TIMESTAMP,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
+
+    let fill = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new("all-fee"),
+            OrderId::new("all-fee"),
+            InstrumentIndex(0),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, 1),
+            Side::Buy,
+            dec!(100),
+            dec!(0.5),
+            None,
+            AssetFees::new(base, dec!(0.5), Some(dec!(50))),
+        )),
+    }));
+    let audit_tick = process_with_audit(&mut engine, fill.clone());
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => audit.outputs.clone(),
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    replica_manager.update_from_event(fill, &outputs);
+
+    let live_instrument = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let replica_instrument = replica_manager
+        .replica_engine_state()
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+
+    assert!(live_instrument.position.positions.is_empty());
+    assert_eq!(
+        live_instrument.tear_sheet.pnl_returns.fees_unattributed,
+        dec!(50)
+    );
+    assert_eq!(replica_instrument, live_instrument);
+}
+
 /// Live engine vs audit-replica parity for a `CorporateAction` reverse split under `Floor`,
 /// across multiple positions (Hedging) — one surviving, one floored to zero.
 ///
