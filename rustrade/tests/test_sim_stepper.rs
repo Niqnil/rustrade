@@ -900,7 +900,7 @@ fn a_venue_whose_opening_account_it_cannot_index_is_refused() {
         matches!(
             &error,
             BarterError::SimStep(SimStepError::Misconfigured(reason))
-                if reason.starts_with("SimStepper ")
+                if reason.starts_with("SimStepper venue produced an unindexable AccountEvent")
         ),
         "{error}"
     );
@@ -951,6 +951,98 @@ fn shutting_the_engine_down_fails_the_next_call_without_delivering_it() {
         s.stepper.settle(&mut s.engine).unwrap_err(),
         BarterError::SimStep(SimStepError::Finished)
     );
+
+    // `settle` and `finish` observe it the same way.
+    for finish in [false, true] {
+        let mut s = session(0, usdt(dec!(10_000)));
+        s.engine.shutdown();
+        let result = match finish {
+            false => s.stepper.settle(&mut s.engine),
+            true => s.stepper.finish(&mut s.engine),
+        };
+        assert_eq!(
+            result.unwrap_err(),
+            BarterError::SimStep(SimStepError::Finished)
+        );
+    }
+}
+
+#[test]
+fn a_shutdown_from_a_strategy_hook_fails_the_call_it_happens_in() {
+    let mut s = session_with(0, usdt(dec!(10_000)), None, ShutsDownWhenDisabled);
+
+    let error = s
+        .stepper
+        .step(
+            &mut s.engine,
+            at(3),
+            [
+                bar(BTC, 3, dec!(100)),
+                EngineEvent::TradingStateUpdate(TradingState::Disabled),
+            ],
+        )
+        .unwrap_err();
+
+    // The trading state update is auxiliary, so it goes first, and the bar after it is never shown.
+    assert_eq!(error, BarterError::SimStep(SimStepError::Finished));
+    assert_eq!(price(&s.engine, BTC), None);
+    assert!(s.stepper.has_ended());
+}
+
+/// Trades nothing, and shuts the `Engine` down when trading is disabled.
+#[derive(Debug, Default)]
+struct ShutsDownWhenDisabled;
+
+impl AlgoStrategy for ShutsDownWhenDisabled {
+    type State = State;
+
+    fn generate_algo_orders(
+        &self,
+        _state: &Self::State,
+    ) -> (
+        impl IntoIterator<Item = OrderRequestCancel<ExchangeIndex, InstrumentIndex>>,
+        impl IntoIterator<Item = OrderRequestOpen<ExchangeIndex, InstrumentIndex>>,
+    ) {
+        (std::iter::empty(), std::iter::empty())
+    }
+}
+
+impl ClosePositionsStrategy for ShutsDownWhenDisabled {
+    type State = State;
+
+    fn close_positions_requests<'a>(
+        &'a self,
+        _state: &'a Self::State,
+        _filter: &'a InstrumentFilter,
+    ) -> (
+        impl IntoIterator<Item = OrderRequestCancel<ExchangeIndex, InstrumentIndex>> + 'a,
+        impl IntoIterator<Item = OrderRequestOpen<ExchangeIndex, InstrumentIndex>> + 'a,
+    )
+    where
+        ExchangeIndex: 'a,
+        AssetIndex: 'a,
+        InstrumentIndex: 'a,
+    {
+        (std::iter::empty(), std::iter::empty())
+    }
+}
+
+impl OnDisconnectStrategy<HistoricalClock, State, MultiExchangeTxMap, DefaultRiskManager<State>>
+    for ShutsDownWhenDisabled
+{
+    type OnDisconnect = ();
+
+    fn on_disconnect(_: &mut TestEngine<Self>, _: ExchangeId) -> Self::OnDisconnect {}
+}
+
+impl OnTradingDisabled<HistoricalClock, State, MultiExchangeTxMap, DefaultRiskManager<State>>
+    for ShutsDownWhenDisabled
+{
+    type OnTradingDisabled = ();
+
+    fn on_trading_disabled(engine: &mut TestEngine<Self>) -> Self::OnTradingDisabled {
+        engine.shutdown();
+    }
 }
 
 #[test]
