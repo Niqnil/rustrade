@@ -56,6 +56,16 @@
 //! does not document whether they accrue in `AccruedCash` or when they post. Fills carry none of
 //! these charges, so PnL computed from them excludes them too.
 //!
+//! # Fill fees
+//!
+//! A fill's [`Trade::fees`](crate::trade::Trade::fees) is the `commission` of the
+//! `CommissionReport` IB sends for its execution, in that report's currency, unchanged. That
+//! figure includes the regulatory fees IB passes through and any tax IB charges on the commission
+//! itself, such as GST. Taxes IB bills separately from commissions, such as stamp duty or a
+//! financial transaction tax, are not known to be included, so on markets that levy them `fees`
+//! may understate what a fill cost. An execution whose report IB did not send has a zero fee in
+//! [`UNKNOWN_FEE_ASSET`](execution::UNKNOWN_FEE_ASSET).
+//!
 //! # Shortability
 //!
 //! [`ShortabilityClient`](crate::client::ShortabilityClient) reads what IB says about lending a
@@ -3200,7 +3210,8 @@ impl ExecutionClient for IbkrClient {
     ///   IB's permanent id for its order. An execution in a contract this client has not
     ///   registered is skipped either way.
     /// - Each trade's fees come from the commission report IB sends with its
-    ///   execution. An execution whose report IB did not send is returned with a zero
+    ///   execution (see [Fill fees](crate::client::ibkr#fill-fees) for what that figure includes).
+    ///   An execution whose report IB did not send is returned with a zero
     ///   fee in [`UNKNOWN_FEE_ASSET`](execution::UNKNOWN_FEE_ASSET), with a warning.
     /// - Trades are returned in `time_exchange` order, then by id. A corrected execution keeps the
     ///   position of its first revision.
