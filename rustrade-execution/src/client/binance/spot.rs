@@ -14,11 +14,12 @@
 //   duplicate processing after reconnect + fill recovery
 // - Rate limit handling: detects HTTP 429/418 and Binance -1003/-1015, reads the wait
 //   Binance sends with them (REST Retry-After, WS-API retryAfter) into
-//   ApiError::RateLimit's retry_after, and holds every request (REST and WS API) back
-//   for that wait. Short waits are slept through and REST retried with exponential
-//   backoff; a request facing a longer one, such as a 418 ban, fails at once with the
-//   time left. Separately, pauses REST queries until the next minute once responses
-//   report >= 90% of the request-weight limit used
+//   ApiError::RateLimit's retry_after, and holds every REST call, order and cancel back
+//   for that wait (the account stream's own connects do not check it). Short waits are
+//   slept through and REST retried with exponential backoff; a request facing a longer
+//   one, such as a 418 ban, fails at once with the time left. Separately, pauses REST
+//   queries until the next minute once responses report >= 90% of the request-weight
+//   limit used
 // - Reconnection: account_stream auto-reconnects on WS disconnect/error with
 //   exponential backoff (1s → 30s, max 10 attempts)
 // - Heartbeat monitoring: tracks WS activity via AtomicBool flag; forces reconnect
@@ -289,7 +290,9 @@ impl WsApiUnavailable {
     fn into_order_error(self) -> UnindexedOrderError {
         match self {
             Self::RateLimited { msg, retry_after } => {
-                warn!(%msg, "BinanceSpot WS-API rate-limited, request not sent");
+                // debug! not warn!: during a ban every order and cancel lands here, and the
+                // refusal that started the cooldown already warned (`on_rate_limited`).
+                debug!(%msg, "BinanceSpot WS-API rate-limited, request not sent");
                 UnindexedOrderError::Rejected(ApiError::rate_limited(retry_after))
             }
             Self::Connect(msg) => UnindexedOrderError::Connectivity(ConnectivityError::Socket(msg)),
@@ -311,13 +314,14 @@ impl WsApiUnavailable {
 /// about a minute longer. A reconnect's fill recovery does not wait for it either, since a pause
 /// could outlast the recovery's 30 s and delay its fills to a retry.
 ///
-/// After Binance answers with a rate-limit error, every request, REST or WebSocket API, waits
-/// out a cooldown as long as Binance asked (REST's `Retry-After`, the WebSocket API's
+/// After Binance answers with a rate-limit error, every REST call, order and cancel waits out a
+/// cooldown as long as Binance asked (REST's `Retry-After`, the WebSocket API's
 /// `retryAfter`), or 10 s when it named no wait. A request facing more than 10 s of it is not
 /// sent: it fails at once with [`ApiError::RateLimit`] carrying the time left, rather than hanging
 /// through a ban that can last days. A REST 418 (an IP ban) is never retried in place. The
 /// WebSocket API names the end of a ban as a time on Binance's clock, which the client measures
-/// against the local clock, plus 1 s, so keep the host's clock synchronised.
+/// against the local clock, plus 1 s, so keep the host's clock synchronised. The account stream's
+/// connects and reconnects do not wait out the cooldown.
 ///
 /// # Fills of other clients' orders
 /// The account stream, fill recovery and `fetch_trades` report every fill on the account, whoever
@@ -448,6 +452,7 @@ impl BinanceSpot {
             Ok(Ok(ws)) => ws,
             Ok(Err(e)) if is_handshake_rate_limit(&e) => {
                 // The SDK reports a refused handshake as text, without its `Retry-After`.
+                warn!(error = %format!("{e:#}"), "Binance refused the WS-API handshake");
                 self.rate_limiter.on_rate_limited(None);
                 return Err(WsApiUnavailable::RateLimited {
                     msg: format!("{e:#}"),

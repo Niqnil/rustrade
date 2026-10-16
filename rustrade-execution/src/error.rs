@@ -234,8 +234,9 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     ///   own retries are exhausted.
     /// - **Binance:** from a REST 429's or 418's `Retry-After`, or the time a WebSocket API
     ///   refusal's `retryAfter` names, measured against the local clock. Uncapped, since a ban can
-    ///   last days. A request the client held back unsent, because an earlier refusal's wait had
-    ///   longer left than the client sleeps through, reports the time left.
+    ///   last days, so add it to an `Instant` with `checked_add`. A request the client held back
+    ///   unsent, because an earlier refusal's wait had longer left than the client sleeps
+    ///   through, reports the time left.
     /// - **Hyperliquid:** never: its SDK keeps no headers, and Hyperliquid documents no hint.
     ///
     /// A venue ban (Binance's HTTP 418) is reported the same way: its hint, when readable, says

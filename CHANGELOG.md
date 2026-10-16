@@ -91,8 +91,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     lifts. That time is on Binance's clock and is measured against the local one, plus 1 s of
     slack, since the SDK does not expose Binance's own time. The wait is not capped: a ban lasts
     from minutes to days.
-  - **Behaviour:** every refusal pauses all of the client's requests for that wait, or 10 s when
-    Binance named none, the last refusal of a retried call included. Before, the pause was a
+  - **Behaviour:** every refusal pauses the client's REST calls, orders and cancels for that wait,
+    or 10 s when Binance named none (or a zero wait), the last refusal of a retried call included.
+    The account stream's connects do not wait for it. Before, the pause was a
     fixed 1–4 s backoff, and the last refusal set none.
   - **Behaviour:** a request facing more than 10 s of that pause is not sent. It fails at once
     with `ApiError::RateLimit` carrying the time left. Before, every REST call slept through the

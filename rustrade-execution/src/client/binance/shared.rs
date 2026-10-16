@@ -1087,9 +1087,11 @@ pub(crate) struct CooldownActive {
 
 /// The wait Binance sent with a REST rate-limit refusal (`Retry-After`, in seconds), as
 /// `binance-sdk` reports it on a 429 or 418. `None` for any other error, or a refusal without the
-/// header.
+/// header. A zero wait is read as none, so the refusal still starts the default cooldown rather
+/// than inviting an immediate retry.
 fn rest_retry_after(ce: &ConnectorError) -> Option<Duration> {
     ce.retry_after()
+        .filter(|&secs| secs > 0)
         .map(|secs| Duration::from_secs(u64::from(secs)))
 }
 
@@ -3690,7 +3692,11 @@ pub(crate) fn classify_ws_order_error(
         } => Some(order_error_from(
             classify_ws_response_error(
                 *code,
-                retry_after.map(|until_ms| wait_until_epoch_ms(until_ms, unix_ms())),
+                // A ban that has already lifted, by the local clock, names no wait: the default
+                // cooldown applies, as it does to a refusal that named none.
+                retry_after
+                    .map(|until_ms| wait_until_epoch_ms(until_ms, unix_ms()))
+                    .filter(|wait| !wait.is_zero()),
                 response.to_string(),
             ),
             instrument,
@@ -5838,6 +5844,11 @@ mod tests {
 
             let err = classify_ws_with_retry_after(code, None);
             assert_eq!(order_retry_after(&err), Some(None), "{code}");
+
+            // A ban that has lifted, slack included, names no wait.
+            let past = epoch_in(0) - i64::try_from(CLOCK_SKEW_SLACK_MS).unwrap() - 1_000;
+            let err = classify_ws_with_retry_after(code, Some(past));
+            assert_eq!(order_retry_after(&err), Some(None), "{code}");
         }
     }
 
@@ -5871,7 +5882,12 @@ mod tests {
                 }
             }
         };
-        for (sent, expected) in [(Some(120), Some(Duration::from_secs(120))), (None, None)] {
+        // A zero wait names none.
+        for (sent, expected) in [
+            (Some(120), Some(Duration::from_secs(120))),
+            (Some(0), None),
+            (None, None),
+        ] {
             for banned in [false, true] {
                 let order = classify_err(refusal(banned, sent));
                 assert_eq!(order_retry_after(&order), Some(expected), "{order:?}");
