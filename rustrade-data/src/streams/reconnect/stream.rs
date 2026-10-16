@@ -4,7 +4,7 @@ use futures::{Stream, future::Either, stream};
 use futures_util::StreamExt;
 use rustrade_integration::channel::Tx;
 use serde::{Deserialize, Serialize};
-use std::{convert, fmt::Debug, future, future::Future};
+use std::{convert, fmt::Debug, future, future::Future, time::Duration};
 use tracing::{error, info, warn};
 
 /// Utilities for handling a continually reconnecting [`Stream`] initialised via the
@@ -38,6 +38,9 @@ where
     ///
     /// A failure is yielded as soon as it happens; the backoff then runs before the next attempt.
     /// [`ReinitFailure::attempt`] counts consecutive failures, and resets when an attempt succeeds.
+    ///
+    /// To also honour a wait the source of a failure asked for, such as a venue's rate-limit
+    /// hint, use [`with_reconnect_backoff_reporting_hinted`](Self::with_reconnect_backoff_reporting_hinted).
     fn with_reconnect_backoff_reporting<St, InitError>(
         self,
         policy: ReconnectionBackoffPolicy,
@@ -47,6 +50,29 @@ where
         Self: Stream<Item = Result<St, InitError>>,
         St: Stream,
         InitError: Debug,
+    {
+        self.with_reconnect_backoff_reporting_hinted(policy, stream_key, |_| None)
+    }
+
+    /// As [`with_reconnect_backoff_reporting`](Self::with_reconnect_backoff_reporting), but the
+    /// next attempt after a failure is held back for at least the wait `retry_after` reads from
+    /// it: the longer of that wait and the backoff. A failure whose wait is `None` waits the
+    /// backoff alone.
+    ///
+    /// The hint does not change the backoff, which grows with each consecutive failure as usual.
+    /// It is a floor for one wait, so an attempt is never made before the source said it could
+    /// succeed, nor sooner than the policy allows.
+    fn with_reconnect_backoff_reporting_hinted<St, InitError, FnRetryAfter>(
+        self,
+        policy: ReconnectionBackoffPolicy,
+        stream_key: StreamKey,
+        retry_after: FnRetryAfter,
+    ) -> impl Stream<Item = Result<St, ReinitFailure<InitError>>>
+    where
+        Self: Stream<Item = Result<St, InitError>>,
+        St: Stream,
+        InitError: Debug,
+        FnRetryAfter: Fn(&InitError) -> Option<Duration>,
     {
         self.enumerate()
             .scan(
@@ -61,14 +87,16 @@ where
                             }
                             Err(error) => {
                                 let consecutive = state.record_failure();
+                                let hint = retry_after(&error);
                                 warn!(
                                     attempt,
                                     consecutive,
                                     ?stream_key,
                                     ?error,
+                                    ?hint,
                                     "failed to re-initialise Stream"
                                 );
-                                let backoff = state.generate_sleep_future();
+                                let backoff = state.generate_sleep_future(hint);
                                 state.multiply_backoff();
                                 let failure = ReinitFailure {
                                     attempt: consecutive,
@@ -303,9 +331,10 @@ impl ReconnectionState {
         self.backoff_ms_current = next_capped;
     }
 
-    fn generate_sleep_future(&self) -> tokio::time::Sleep {
-        let sleep_duration = std::time::Duration::from_millis(self.backoff_ms_current);
-        tokio::time::sleep(sleep_duration)
+    /// The wait before the next attempt: the current backoff, or `at_least` when that is longer.
+    fn generate_sleep_future(&self, at_least: Option<Duration>) -> tokio::time::Sleep {
+        let backoff = Duration::from_millis(self.backoff_ms_current);
+        tokio::time::sleep(at_least.map_or(backoff, |hint| hint.max(backoff)))
     }
 }
 
@@ -373,6 +402,33 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_millis(100));
         assert!(results.next().await.unwrap().is_ok());
         assert_eq!(started.elapsed(), Duration::from_millis(300));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_hinted_wait_longer_than_the_backoff_holds_the_next_attempt_back() {
+        // "wait" asks for 500 ms; "short" for 50 ms, under the backoff; "none" for nothing.
+        let hint = |error: &&str| match *error {
+            "wait" => Some(Duration::from_millis(500)),
+            "short" => Some(Duration::from_millis(50)),
+            _ => None,
+        };
+        let started = Instant::now();
+        let mut results = Box::pin(
+            stream::iter([Err("wait"), Err("none"), Err("short"), ok(&[1])])
+                .with_reconnect_backoff_reporting_hinted(POLICY, key(), hint),
+        );
+
+        assert!(results.next().await.unwrap().is_err());
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        // The hint outlasts the 100 ms backoff, so it sets the wait.
+        assert!(results.next().await.unwrap().is_err());
+        assert_eq!(started.elapsed(), Duration::from_millis(500));
+        // The hint did not stop the backoff growing: 200 ms now.
+        assert!(results.next().await.unwrap().is_err());
+        assert_eq!(started.elapsed(), Duration::from_millis(700));
+        // A hint shorter than the 400 ms backoff does not shorten it.
+        assert!(results.next().await.unwrap().is_ok());
+        assert_eq!(started.elapsed(), Duration::from_millis(1_100));
     }
 
     #[tokio::test(start_paused = true)]

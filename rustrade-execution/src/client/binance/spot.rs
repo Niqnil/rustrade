@@ -62,10 +62,7 @@ use crate::{
         },
     },
     emit_stream_terminated,
-    error::{
-        ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
-        UnindexedOrderError,
-    },
+    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
     order::{
         Order, OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
@@ -320,8 +317,16 @@ impl WsApiUnavailable {
 /// sent: it fails at once with [`ApiError::RateLimit`] carrying the time left, rather than hanging
 /// through a ban that can last days. A REST 418 (an IP ban) is never retried in place. The
 /// WebSocket API names the end of a ban as a time on Binance's clock, which the client measures
-/// against the local clock, plus 1 s, so keep the host's clock synchronised. The account stream's
-/// connects and reconnects do not wait out the cooldown.
+/// against the local clock, plus 1 s, so keep the host's clock synchronised.
+///
+/// The account stream follows the same rule. It does not open, or reconnect, during a cooldown:
+/// it waits out one of 10 s or less, without spending a reconnect attempt, and a longer one fails
+/// the open with [`ApiError::RateLimit`], unsent, or ends a running stream with
+/// [`StreamTerminationReason::RateLimited`](crate::error::StreamTerminationReason::RateLimited),
+/// carrying the time left. A handshake or user-data subscribe Binance refuses for a rate limit
+/// starts a cooldown, as an order's refusal does. A refused handshake names no wait, so it starts
+/// the 10 s default, and handshakes refused that way spend the reconnect budget as any failure
+/// does.
 ///
 /// # Fills of other clients' orders
 /// The account stream, fill recovery and `fetch_trades` report every fill on the account, whoever
@@ -976,11 +981,16 @@ impl ExecutionClient for BinanceSpot {
             instruments.iter().find(|i| i.name().len() > 23)
         );
 
+        // Not during a rate-limit cooldown: connecting would be refused, and could lengthen a ban.
+        self.rate_limiter.before_stream_open().await?;
+
         // Verify initial connection succeeds before returning the stream.
         // This lets the caller distinguish "can't connect at all" from "connected
         // but later disconnected" (the latter is handled by auto-reconnect).
         let initial_ws = ws_handle.connect().await.map_err(|e| {
-            UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
+            self.rate_limiter.stream_open_error(&e, |e| {
+                UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
+            })
         })?;
         // Closed if this future is dropped before the manager takes it over.
         let initial_ws = DisconnectOnDrop::new(initial_ws, ACCOUNT_STREAM_WS);
@@ -1008,7 +1018,9 @@ impl ExecutionClient for BinanceSpot {
                     }
                     Ok(Ok(())) => {}
                 }
-                return Err(UnindexedClientError::Internal(e.to_string()));
+                return Err(self
+                    .rate_limiter
+                    .stream_open_error(&e, |e| UnindexedClientError::Internal(e.to_string())));
             }
         }
 
@@ -1636,6 +1648,7 @@ async fn connect_and_subscribe(
 /// Terminates when:
 /// - The consumer drops the stream (receiver side of `tx` is closed)
 /// - Max reconnect attempts are exhausted
+/// - A reconnect faces a rate-limit cooldown longer than it waits through
 ///
 /// # Panics
 ///
@@ -1672,31 +1685,35 @@ async fn connection_manager(
         // --- Connect (skip on first iteration if initial_ws was provided) ---
         let ws = match current_ws.take() {
             Some(ws) => ws,
-            None => match connect_and_subscribe(&ws_handle).await {
-                // backoff is NOT reset here — resetting on TCP-connect success
-                // would lock retry intervals at INITIAL_BACKOFF_MS forever when the
-                // server closes within the first heartbeat window (auth rejection,
-                // server-side close). Reset is deferred to the monitor loop after the
-                // first heartbeat interval survives (proven-stable connection).
-                Ok(ws) => ws,
-                Err(e) => {
-                    error!(%e, "BinanceSpot WS connect/subscribe failed");
-                    if !backoff.wait().await {
-                        error!("BinanceSpot max reconnect attempts exhausted");
-                        // Signal terminal stream death in-band before tx drops.
-                        emit_stream_terminated(
-                            &tx,
-                            ExchangeId::BinanceSpot,
-                            StreamTerminationReason::ReconnectBudgetExhausted {
-                                attempts: backoff.attempts(),
-                                last_error: e.to_string(),
-                            },
-                        );
-                        break;
-                    }
-                    continue;
+            None => {
+                // Not during a rate-limit cooldown: a short one is waited out without spending an
+                // attempt, and a longer one ends the stream, since a connect would be refused.
+                if let Err(reason) = rate_limiter.before_stream_connect().await {
+                    emit_stream_terminated(&tx, ExchangeId::BinanceSpot, reason);
+                    break;
                 }
-            },
+                match connect_and_subscribe(&ws_handle).await {
+                    // backoff is NOT reset here — resetting on TCP-connect success
+                    // would lock retry intervals at INITIAL_BACKOFF_MS forever when the
+                    // server closes within the first heartbeat window (auth rejection,
+                    // server-side close). Reset is deferred to the monitor loop after the
+                    // first heartbeat interval survives (proven-stable connection).
+                    Ok(ws) => ws,
+                    Err(e) => {
+                        error!(%e, "BinanceSpot WS connect/subscribe failed");
+                        // A rate-limit refusal starts a cooldown, so REST and orders back off too.
+                        rate_limiter.on_stream_refused(&e);
+                        if let Err(reason) =
+                            backoff.retry_or_end(&rate_limiter, || e.to_string()).await
+                        {
+                            // Signal terminal stream death in-band before tx drops.
+                            emit_stream_terminated(&tx, ExchangeId::BinanceSpot, reason);
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
         };
         info!("BinanceSpot account_stream connected and subscribed");
 
@@ -1933,24 +1950,16 @@ async fn connection_manager(
             debug!("BinanceSpot connection manager exiting");
             break;
         }
-        if !backoff.wait().await {
-            error!("BinanceSpot max reconnect attempts exhausted, stream terminating");
-            // Surrender after repeated reconnects: the most recent failure is the disconnect
-            // that triggered this round (ConsumerDropped already broke out above).
-            let last_error = match reason {
-                DisconnectReason::HeartbeatTimeout => {
-                    format!("heartbeat timeout ({HEARTBEAT_TIMEOUT_SECS}s)")
-                }
-                _ => "WebSocket disconnected (server close/error)".to_string(),
-            };
-            emit_stream_terminated(
-                &tx,
-                ExchangeId::BinanceSpot,
-                StreamTerminationReason::ReconnectBudgetExhausted {
-                    attempts: backoff.attempts(),
-                    last_error,
-                },
-            );
+        // Surrender after repeated reconnects: the most recent failure is the disconnect that
+        // triggered this round (ConsumerDropped already broke out above).
+        let last_error = || match reason {
+            DisconnectReason::HeartbeatTimeout => {
+                format!("heartbeat timeout ({HEARTBEAT_TIMEOUT_SECS}s)")
+            }
+            _ => "WebSocket disconnected (server close/error)".to_string(),
+        };
+        if let Err(reason) = backoff.retry_or_end(&rate_limiter, last_error).await {
+            emit_stream_terminated(&tx, ExchangeId::BinanceSpot, reason);
             break;
         }
     }
@@ -2518,6 +2527,7 @@ mod tests {
     use super::*;
     use crate::client::binance::shared::*;
     use crate::client::dedup::{DedupEventKind, DedupKey};
+    use crate::error::StreamTerminationReason;
     use crate::order::{TrailingOffsetType, id::ClientOrderId};
     use binance_sdk::common::errors::WebsocketError;
     use smol_str::SmolStr;
@@ -5156,6 +5166,147 @@ mod tests {
         assert_rate_limited_for(&state, TWO_MINUTE_BAN);
         assert_cooldown_about(&client, TWO_MINUTE_BAN);
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// A WS-API answer accepting a user-data subscription.
+    fn subscribed(request: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": request["id"],
+            "status": 200,
+            "result": { "subscriptionId": 0 },
+        })
+    }
+
+    /// The error opening an account stream failed with, which must be a rate limit, and its wait.
+    fn rate_limited_wait<T>(opened: Result<T, UnindexedClientError>) -> Option<Duration> {
+        match opened {
+            Err(UnindexedClientError::Api(api @ ApiError::RateLimit { .. })) => api.retry_after(),
+            Err(other) => panic!("expected a rate limit, got {other:?}"),
+            Ok(_) => panic!("expected the open to fail"),
+        }
+    }
+
+    /// Opening the account stream during a cooldown too long to sleep through fails with the time
+    /// left, and sends nothing.
+    #[tokio::test]
+    async fn opening_the_account_stream_during_a_long_cooldown_fails_unsent() {
+        let (url, requests) = ws_api_answering(subscribed).await;
+        let client = client_with_ws_api(url);
+        client
+            .rate_limiter
+            .on_rate_limited(Some(Duration::from_secs(60)));
+
+        let wait = rate_limited_wait(client.account_stream(&[], &[]).await);
+
+        assert!(
+            wait.is_some_and(
+                |wait| wait <= Duration::from_secs(60) && wait > Duration::from_secs(55)
+            ),
+            "{wait:?}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+
+    /// A user-data subscribe the WS API refuses with a ban fails with the ban's wait, and holds
+    /// every later request back for it.
+    #[tokio::test]
+    async fn a_ban_on_the_account_stream_subscribe_starts_its_cooldown() {
+        let (url, _) = ws_api_answering(banned_for_two_minutes).await;
+        let client = client_with_ws_api(url);
+
+        let wait = rate_limited_wait(client.account_stream(&[], &[]).await);
+
+        assert!(
+            wait.is_some_and(
+                |wait| wait <= TWO_MINUTE_BAN && wait > TWO_MINUTE_BAN - Duration::from_secs(5)
+            ),
+            "{wait:?}"
+        );
+        assert_cooldown_about(&client, TWO_MINUTE_BAN);
+    }
+
+    /// An account-stream handshake Binance refuses with 429 starts a cooldown, and the open fails
+    /// as a rate limit.
+    #[tokio::test]
+    async fn a_refused_account_stream_handshake_starts_a_cooldown() {
+        use tokio_tungstenite::tungstenite::http;
+
+        let url = ws_server(|stream| async move {
+            // tungstenite's handshake callback fixes the error type to a whole HTTP response.
+            #[allow(clippy::result_large_err)]
+            let refuse = |_: &http::Request<()>, _| {
+                Err(http::Response::builder()
+                    .status(http::StatusCode::IM_A_TEAPOT)
+                    .body(None)
+                    .unwrap())
+            };
+            let _ = tokio_tungstenite::accept_hdr_async(stream, refuse).await;
+        })
+        .await;
+        let client = client_with_ws_api(url);
+
+        rate_limited_wait(client.account_stream(&[], &[]).await);
+
+        assert_cooldown_about(&client, Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS));
+    }
+
+    /// A connection that drops while a long cooldown is active ends the stream at once with the
+    /// time left, rather than reconnecting into the ban: no second subscribe is sent.
+    #[tokio::test]
+    async fn a_drop_during_a_long_cooldown_ends_the_account_stream_rate_limited() {
+        use futures::{SinkExt as _, StreamExt as _};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let subscribes = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let url = ws_server({
+            let subscribes = Arc::clone(&subscribes);
+            move |stream| {
+                let subscribes = Arc::clone(&subscribes);
+                async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    // Answer the subscribe, then drop the connection shortly after.
+                    while let Some(Ok(message)) = ws.next().await {
+                        let Message::Text(text) = message else {
+                            continue;
+                        };
+                        subscribes.fetch_add(1, Ordering::SeqCst);
+                        let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        let answer = subscribed(&request).to_string();
+                        if ws.send(Message::text(answer)).await.is_err() {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        let _ = ws.close(None).await;
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        let client = client_with_ws_api(url);
+        let mut stream = client.account_stream(&[], &[]).await.unwrap();
+        client
+            .rate_limiter
+            .on_rate_limited(Some(Duration::from_secs(60)));
+
+        let event = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the stream ends at once, without backing off")
+            .expect("it reports why before it ends");
+
+        match event.kind {
+            AccountEventKind::StreamTerminated(StreamTerminationReason::RateLimited {
+                retry_after,
+            }) => assert!(
+                retry_after <= Duration::from_secs(60) && retry_after > Duration::from_secs(55),
+                "{retry_after:?}"
+            ),
+            other => panic!("expected a rate-limited termination, got {other:?}"),
+        }
+        assert!(stream.next().await.is_none(), "the stream has ended");
+        assert_eq!(subscribes.load(Ordering::SeqCst), 1);
     }
 
     /// A cancel that waited on another's handshake, which Binance refused, is not sent and opens

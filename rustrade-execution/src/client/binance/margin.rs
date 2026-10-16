@@ -91,9 +91,7 @@ use crate::{
         },
     },
     emit_stream_terminated,
-    error::{
-        ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
-    },
+    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError},
     order::{
         Order, OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
@@ -108,6 +106,7 @@ use binance_sdk::{
     common::{
         config::{ConfigurationRestApi, ConfigurationWebsocketApi},
         constants::{MARGIN_TRADING_REST_API_PROD_URL, SPOT_WS_API_PROD_URL},
+        errors::WebsocketError,
         models::WebsocketEvent,
         websocket::{
             SendWebsocketMessageResult, WebsocketApi as WsApiBase, WebsocketMessageSendOptions,
@@ -452,6 +451,14 @@ impl BinanceMarginConfig {
 /// its `Retry-After` asked, or 10 s without one. A call facing more than 10 s of it is not sent:
 /// it fails at once with [`ApiError::RateLimit`] carrying the time left, rather than hanging
 /// through a ban that can last days. A 418 (an IP ban) is never retried in place.
+///
+/// The account stream follows the same rule. It does not open, or reconnect, during a cooldown:
+/// it waits out one of 10 s or less, without spending a reconnect attempt, and a longer one fails
+/// the open with [`ApiError::RateLimit`], unsent, or ends a running stream with
+/// [`StreamTerminationReason::RateLimited`](crate::error::StreamTerminationReason::RateLimited),
+/// carrying the time left. A connect or subscribe Binance refuses for a rate limit starts a
+/// cooldown, as a REST refusal does. A refused handshake names no wait, so it starts the 10 s
+/// default, and handshakes refused that way spend the reconnect budget as any failure does.
 ///
 /// # One client per engine (`ExchangeId`)
 /// All emitted events — cross and isolated alike — are stamped [`ExchangeId::BinanceMargin`], and
@@ -1455,7 +1462,9 @@ impl ExecutionClient for BinanceMargin {
             )
             .await
             .map_err(|e| {
-                UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
+                rate_limiter.stream_open_error(&e, |e| {
+                    UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
+                })
             })?;
 
             tokio::spawn(isolated_connection_manager(
@@ -1490,7 +1499,9 @@ impl ExecutionClient for BinanceMargin {
             let initial_token =
                 acquire_user_listen_token(&rest_config, &rate_limiter, None).await?;
             let initial_ws = connect_margin_ws(&ws_config).await.map_err(|e| {
-                UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
+                rate_limiter.stream_open_error(&e, |e| {
+                    UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
+                })
             })?;
 
             // The risk data stream runs beside the manager, for the margin notices it carries, in
@@ -2084,8 +2095,15 @@ async fn subscribe_listen_token(ws: &Arc<WsApiBase>, token: &str) -> anyhow::Res
         WebsocketMessageSendOptions::new(),
     )
     .await
-    .map_err(|e| anyhow::anyhow!("userDataStream.subscribe.listenToken failed: {e}"))?;
+    .map_err(subscribe_error)?;
     Ok(())
+}
+
+/// A failed `userDataStream.subscribe.listenToken`, keeping the SDK's error beneath the message so
+/// a rate-limit refusal can still be told apart ([`RateLimitTracker::on_stream_refused`]).
+fn subscribe_error(e: WebsocketError) -> anyhow::Error {
+    let message = format!("userDataStream.subscribe.listenToken failed: {e}");
+    anyhow::Error::new(e).context(message)
 }
 
 /// Subscribe over an existing WS-API connection and return the ack's `subscriptionId` (isolated).
@@ -2124,7 +2142,7 @@ async fn subscribe_listen_token_capture(
             WebsocketMessageSendOptions::new(),
         )
         .await
-        .map_err(|e| anyhow::anyhow!("userDataStream.subscribe.listenToken failed: {e}"))?;
+        .map_err(subscribe_error)?;
     let ack = match result {
         SendWebsocketMessageResult::Single(resp) => resp.data()?,
         // The subscribe is a single request; defensively take the first if the SDK ever batches.
@@ -2796,7 +2814,8 @@ fn open_reconnect_recovery(
 /// Reconnect loop: acquire token → connect → register listener → subscribe → stream events → on
 /// disconnect/heartbeat-timeout/token-expiry → backoff → fill recovery → reconnect. The `tx`
 /// channel persists across reconnections so the consumer sees a seamless stream. Terminates when
-/// the consumer drops the stream or max reconnect attempts are exhausted.
+/// the consumer drops the stream, max reconnect attempts are exhausted, or a reconnect faces a
+/// rate-limit cooldown longer than it waits through.
 #[allow(
     clippy::cognitive_complexity,
     reason = "inherent reconnect-loop complexity (token + connect + subscribe + callback + recovery \
@@ -2835,25 +2854,28 @@ async fn margin_connection_manager(
         // --- Token: reuse the verified/previous token, else acquire a fresh one ---
         let token = match current_token.take() {
             Some(t) => t,
-            None => match acquire_user_listen_token(&rest_config, &rate_limiter, None).await {
-                Ok(t) => t,
-                Err(e) => {
-                    error!(%e, "BinanceMargin userListenToken acquisition failed");
-                    if !backoff.wait().await {
-                        error!("BinanceMargin max reconnect attempts exhausted");
-                        emit_stream_terminated(
-                            &tx,
-                            ExchangeId::BinanceMargin,
-                            StreamTerminationReason::ReconnectBudgetExhausted {
-                                attempts: backoff.attempts(),
-                                last_error: e.to_string(),
-                            },
-                        );
-                        break;
-                    }
-                    continue;
+            None => {
+                // Not during a rate-limit cooldown: a short one is waited out without spending an
+                // attempt, and a longer one ends the stream, since a reconnect would be refused.
+                if let Err(reason) = rate_limiter.before_stream_connect().await {
+                    emit_stream_terminated(&tx, ExchangeId::BinanceMargin, reason);
+                    break;
                 }
-            },
+                // A rate-limit refusal of the token request starts the cooldown itself.
+                match acquire_user_listen_token(&rest_config, &rate_limiter, None).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!(%e, "BinanceMargin userListenToken acquisition failed");
+                        if let Err(reason) =
+                            backoff.retry_or_end(&rate_limiter, || e.to_string()).await
+                        {
+                            emit_stream_terminated(&tx, ExchangeId::BinanceMargin, reason);
+                            break;
+                        }
+                        continue;
+                    }
+                }
+            }
         };
 
         // --- Connect (skip if holding a verified initial connection) ---
@@ -2863,16 +2885,10 @@ async fn margin_connection_manager(
                 Ok(ws) => ws,
                 Err(e) => {
                     error!(%e, "BinanceMargin WS connect failed");
-                    if !backoff.wait().await {
-                        error!("BinanceMargin max reconnect attempts exhausted");
-                        emit_stream_terminated(
-                            &tx,
-                            ExchangeId::BinanceMargin,
-                            StreamTerminationReason::ReconnectBudgetExhausted {
-                                attempts: backoff.attempts(),
-                                last_error: e.to_string(),
-                            },
-                        );
+                    rate_limiter.on_stream_refused(&e);
+                    if let Err(reason) = backoff.retry_or_end(&rate_limiter, || e.to_string()).await
+                    {
+                        emit_stream_terminated(&tx, ExchangeId::BinanceMargin, reason);
                         break;
                     }
                     continue;
@@ -2904,17 +2920,10 @@ async fn margin_connection_manager(
             if let Err(de) = ws.disconnect().await {
                 warn!(%de, "BinanceMargin failed to disconnect after subscribe failure");
             }
+            rate_limiter.on_stream_refused(&e);
             // token left consumed → next iteration acquires a fresh one (auth/expiry-safe).
-            if !backoff.wait().await {
-                error!("BinanceMargin max reconnect attempts exhausted");
-                emit_stream_terminated(
-                    &tx,
-                    ExchangeId::BinanceMargin,
-                    StreamTerminationReason::ReconnectBudgetExhausted {
-                        attempts: backoff.attempts(),
-                        last_error: e.to_string(),
-                    },
-                );
+            if let Err(reason) = backoff.retry_or_end(&rate_limiter, || e.to_string()).await {
+                emit_stream_terminated(&tx, ExchangeId::BinanceMargin, reason);
                 break;
             }
             continue;
@@ -3066,25 +3075,19 @@ async fn margin_connection_manager(
 
         // A planned token refresh is not a failure — reconnect immediately (no backoff). Both
         // `current_token` and `current_ws` are already None, forcing a fresh token + connection.
-        if !matches!(reason, DisconnectReason::TokenRefresh) && !backoff.wait().await {
-            error!("BinanceMargin max reconnect attempts exhausted, stream terminating");
+        if !matches!(reason, DisconnectReason::TokenRefresh) {
             // reason here is Signal or HeartbeatTimeout (TokenRefresh is guarded above,
             // ConsumerDropped already broke out earlier).
-            let last_error = match reason {
+            let last_error = || match reason {
                 DisconnectReason::HeartbeatTimeout => {
                     format!("heartbeat timeout ({HEARTBEAT_TIMEOUT_SECS}s)")
                 }
                 _ => "WebSocket disconnected (server close/error)".to_string(),
             };
-            emit_stream_terminated(
-                &tx,
-                ExchangeId::BinanceMargin,
-                StreamTerminationReason::ReconnectBudgetExhausted {
-                    attempts: backoff.attempts(),
-                    last_error,
-                },
-            );
-            break;
+            if let Err(reason) = backoff.retry_or_end(&rate_limiter, last_error).await {
+                emit_stream_terminated(&tx, ExchangeId::BinanceMargin, reason);
+                break;
+            }
         }
     }
 }
@@ -3324,6 +3327,11 @@ async fn isolated_connection_manager(
             // Verified initial connection from account_stream — used as-is on the first pass.
             Some(live) => live,
             None => {
+                // Not during a rate-limit cooldown, as on cross.
+                if let Err(reason) = rate_limiter.before_stream_connect().await {
+                    emit_stream_terminated(&tx, ExchangeId::BinanceMargin, reason);
+                    break;
+                }
                 // Reconnect: re-acquire all N tokens (they cluster; a planned refresh re-acquires the
                 // whole set) then connect a fresh socket and re-subscribe all N.
                 let tokens = match acquire_all_isolated_tokens(
@@ -3336,16 +3344,10 @@ async fn isolated_connection_manager(
                     Ok(t) => t,
                     Err(e) => {
                         error!(%e, "BinanceMargin isolated userListenToken acquisition failed");
-                        if !backoff.wait().await {
-                            error!("BinanceMargin isolated max reconnect attempts exhausted");
-                            emit_stream_terminated(
-                                &tx,
-                                ExchangeId::BinanceMargin,
-                                StreamTerminationReason::ReconnectBudgetExhausted {
-                                    attempts: backoff.attempts(),
-                                    last_error: e.to_string(),
-                                },
-                            );
+                        if let Err(reason) =
+                            backoff.retry_or_end(&rate_limiter, || e.to_string()).await
+                        {
+                            emit_stream_terminated(&tx, ExchangeId::BinanceMargin, reason);
                             break;
                         }
                         continue;
@@ -3364,16 +3366,11 @@ async fn isolated_connection_manager(
                     Ok(live) => live,
                     Err(e) => {
                         error!(%e, "BinanceMargin isolated connect/subscribe failed");
-                        if !backoff.wait().await {
-                            error!("BinanceMargin isolated max reconnect attempts exhausted");
-                            emit_stream_terminated(
-                                &tx,
-                                ExchangeId::BinanceMargin,
-                                StreamTerminationReason::ReconnectBudgetExhausted {
-                                    attempts: backoff.attempts(),
-                                    last_error: e.to_string(),
-                                },
-                            );
+                        rate_limiter.on_stream_refused(&e);
+                        if let Err(reason) =
+                            backoff.retry_or_end(&rate_limiter, || e.to_string()).await
+                        {
+                            emit_stream_terminated(&tx, ExchangeId::BinanceMargin, reason);
                             break;
                         }
                         continue;
@@ -3519,25 +3516,19 @@ async fn isolated_connection_manager(
 
         // A planned token refresh is not a failure — reconnect immediately (no backoff); `current`
         // is already None, forcing fresh tokens + a fresh connection next iteration.
-        if !matches!(reason, DisconnectReason::TokenRefresh) && !backoff.wait().await {
-            error!("BinanceMargin isolated max reconnect attempts exhausted, stream terminating");
+        if !matches!(reason, DisconnectReason::TokenRefresh) {
             // reason here is Signal or HeartbeatTimeout (TokenRefresh guarded above,
             // ConsumerDropped already broke out earlier).
-            let last_error = match reason {
+            let last_error = || match reason {
                 DisconnectReason::HeartbeatTimeout => {
                     format!("heartbeat timeout ({HEARTBEAT_TIMEOUT_SECS}s)")
                 }
                 _ => "WebSocket disconnected (server close/error)".to_string(),
             };
-            emit_stream_terminated(
-                &tx,
-                ExchangeId::BinanceMargin,
-                StreamTerminationReason::ReconnectBudgetExhausted {
-                    attempts: backoff.attempts(),
-                    last_error,
-                },
-            );
-            break;
+            if let Err(reason) = backoff.retry_or_end(&rate_limiter, last_error).await {
+                emit_stream_terminated(&tx, ExchangeId::BinanceMargin, reason);
+                break;
+            }
         }
     }
 }
@@ -4520,10 +4511,38 @@ fn convert_order_kind_tif_margin(
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
-    use crate::client::binance::shared::convert_open_order;
+    use crate::client::binance::shared::{convert_open_order, unix_ms};
     use crate::notice::{AccountNotice, NoticeKind};
     use crate::order::state::ActiveOrderState;
     use binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner;
+
+    /// A listen-token subscribe the WS API refuses with a ban keeps the SDK's error beneath its
+    /// message, so the refusal starts the cooldown, as long as the ban it names.
+    #[tokio::test]
+    async fn a_banned_listen_token_subscribe_starts_the_cooldown() {
+        let until = i64::try_from(unix_ms()).unwrap() + 120_000;
+        let error = subscribe_error(WebsocketError::ResponseError {
+            code: -1003,
+            message: "Way too much request weight used".to_string(),
+            retry_after: Some(until),
+        });
+        assert!(
+            error
+                .to_string()
+                .starts_with("userDataStream.subscribe.listenToken failed: "),
+            "{error}"
+        );
+        let tracker = RateLimitTracker::new(WeightPool::Sapi);
+
+        assert!(tracker.on_stream_refused(&error));
+        assert!(
+            tracker
+                .cooldown_remaining()
+                .is_some_and(|left| left > Duration::from_secs(115)),
+            "{:?}",
+            tracker.cooldown_remaining()
+        );
+    }
 
     /// The connection both margin managers open is closed when dropped, as when a manager is
     /// aborted with its stream: binance-sdk keeps a socket open until it is disconnected.
