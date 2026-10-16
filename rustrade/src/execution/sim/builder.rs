@@ -1,10 +1,10 @@
 use crate::{
-    engine::execution_tx::MultiExchangeTxMap,
+    engine::{execution_tx::MultiExchangeTxMap, state::position::PositionSeed},
     error::BarterError,
     execution::{
         builder::{generate_mock_exchange_instruments, validate_supported_instrument_kinds},
         request::ExecutionRequest,
-        sim::SimVenue,
+        sim::{SimStart, SimStartError, SimVenue},
     },
 };
 use chrono::TimeDelta;
@@ -202,11 +202,64 @@ impl<'a> SimExecutionBuilder<'a> {
             request_rx: execution_rx,
             to_venue: leg,
             from_venue: leg,
+            position_seeds: None,
         };
 
         self.venues.insert(index, venue);
 
         Ok(self)
+    }
+
+    /// Adds a [`SimulatedVenue`] for the exchange `config` mocks, starting from `start`: its
+    /// opening account is derived from `start`, and so are the positions the `Engine` must be
+    /// seeded with, which [`SimExecutionBuild::position_seeds`] returns. See [`SimStart`] for how
+    /// each side is derived.
+    ///
+    /// Otherwise exactly [`add_venue_with_options`](Self::add_venue_with_options).
+    ///
+    /// # Errors
+    /// Those of [`add_venue`](Self::add_venue), and [`BarterError::SimStart`] if `start` cannot
+    /// be held by this venue — see [`SimStartError`],
+    /// including when `config.initial_state` is not empty, since there would then be two
+    /// starting states.
+    ///
+    /// [`SimStart`]: crate::execution::sim::SimStart
+    pub fn add_venue_with_start(
+        self,
+        mut config: MockExecutionConfig,
+        options: SimVenueOptions,
+        start: SimStart,
+    ) -> Result<Self, BarterError> {
+        let exchange = config.mocked_exchange;
+
+        if !config.initial_state.balances.is_empty() || !config.initial_state.instruments.is_empty()
+        {
+            return Err(SimStartError::InitialStateNotEmpty { exchange }.into());
+        }
+
+        // Before the projection below, which panics on a kind it cannot model.
+        validate_supported_instrument_kinds(
+            self.instruments,
+            exchange,
+            <MockExecution<fn() -> chrono::DateTime<chrono::Utc>> as ExecutionClient>::SUPPORTED_KINDS,
+        )?;
+
+        let (initial_state, seeds) = start.resolve(
+            exchange,
+            &generate_mock_exchange_instruments(self.instruments, exchange),
+        )?;
+        config.initial_state = initial_state;
+
+        let mut builder = self.add_venue_with_options(config, options)?;
+        if let Some(slot) = builder
+            .venues
+            .values_mut()
+            .find(|slot| slot.venue.exchange == exchange)
+        {
+            slot.position_seeds = Some(seeds);
+        }
+
+        Ok(builder)
     }
 
     /// Consume this builder, returning the venues and the [`MultiExchangeTxMap`] to hand the
@@ -258,4 +311,23 @@ pub struct SimExecutionBuild {
     pub execution_tx_map: MultiExchangeTxMap,
     /// One entry per configured simulated venue, keyed by [`ExchangeIndex`].
     pub venues: FnvIndexMap<ExchangeIndex, SimVenue>,
+}
+
+impl SimExecutionBuild {
+    /// Every position the venues were started with by a
+    /// [`SimStart`], for [`EngineStateBuilder::positions`], so
+    /// the `Engine` starts holding what the venues hold.
+    ///
+    /// Empty when no venue was added with
+    /// [`add_venue_with_start`](SimExecutionBuilder::add_venue_with_start).
+    ///
+    /// [`EngineStateBuilder::positions`]: crate::engine::state::builder::EngineStateBuilder::positions
+    pub fn position_seeds(&self) -> Vec<PositionSeed> {
+        self.venues
+            .values()
+            .filter_map(|slot| slot.position_seeds.as_ref())
+            .flatten()
+            .cloned()
+            .collect()
+    }
 }

@@ -102,6 +102,11 @@ impl HistoricalClock {
             })),
         }
     }
+
+    /// Whether `self` and `other` are clones of one clock, so advancing either advances both.
+    pub(crate) fn is_shared_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
 }
 
 impl EngineClock for HistoricalClock {

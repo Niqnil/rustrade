@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Step a simulation from outside, one instant at a time** (`rustrade`, #626).
+  - New `SimStepper`, a synchronous driver for the simulated venues for gym-style loops: feed a
+    bar, observe the `Engine`, act, feed the next. It drives the same venues in the same order as
+    `SimRunner` does for a backtest, through the same `Engine` booking path. Every call is a plain
+    synchronous call that spawns nothing, so it can run inside `spawn_blocking`. A `SimStepper` is
+    `Send` and holds no global or thread-local state, so many can run in one process.
+  - `step(&mut engine, time, events)` takes every event at one instant. It books the requests
+    the `Engine` sent since the previous call, delivers what came due in between, hands the bars
+    to the venues (resting orders are matched against them), and returns once every fill,
+    rejection and balance update due at the instant is in the `Engine`'s state. It returns the
+    `Engine`'s audit of each event. An instant may carry bars for only some instruments.
+  - `settle(&mut engine)` books orders sent after a step, for example through `Engine::action`,
+    at the current instant, so they fill against the bar just delivered before the next one
+    exists. It can be called several times at one instant, each call seeing the previous fills.
+  - `finish(&mut engine)` ends the session as a backtest ends. Dropping a stepper without it is
+    safe.
+  - At zero latency an order fills against the bar it was sent after, which the rustdoc calls an
+    optimistic idealisation. With latency, a delayed fill lands in the first step that reaches it.
+    A market order on an instrument with no bar at the current instant fills at its last price,
+    a documented gap between simulation and trading (#643 proposes an opt-in alternative).
+  - Every failure is an `Err`, never a panic, including the misconfigurations `SimRunner` panics
+    on, and any `Err` ends the session: later calls return it again. New `SimStepError`, and
+    `BarterError::SimStep`. The first call checks that the `Engine` was built with the stepper's
+    clock and holds the positions its venues were started with.
+  - New `SimEngine` and `StepAudit` type aliases name the `Engine` a stepper drives and what each
+    call returns. New example `sim_stepper`.
+- **One starting state for a simulated venue and its `Engine`** (`rustrade`, #626).
+  - New `SimStart`: cash balances plus positions held at an entry price. New
+    `SimExecutionBuilder::add_venue_with_start` derives the venue's opening account from it: a
+    spot long credits its base asset, and a CFD position is held at its entry price. An asset the
+    venue trades that the start does not list opens at zero. New
+    `SimExecutionBuild::position_seeds` returns the positions for
+    `EngineStateBuilder::positions`, so the two sides cannot disagree. A reset is a rebuild from
+    the same `SimStart`.
+  - It is refused with a `SimStartError` (`BarterError::SimStart`) for a spot short, an
+    instrument the venue does not trade, two positions in one instrument, a base balance that
+    contradicts a spot position, or a configuration that already carries an `initial_state`.
+  - **Breaking:** `SimVenue` has a new public field, `position_seeds`, and `BarterError` has two
+    new variants.
+
 - **Slippage on the simulated venue, and custom fill models** (`rustrade-execution`, `rustrade`,
   #625).
   - New `MockExecutionConfig::slippage`, a `SlippageConfig`. It moves every taker fill against the
