@@ -63,9 +63,10 @@
 //! figure includes the regulatory fees IB passes through and any tax IB charges on the commission
 //! itself, such as GST. Taxes IB bills separately from commissions, such as stamp duty or a
 //! financial transaction tax, are not known to be included, so on markets that levy them `fees`
-//! may understate what a fill cost. A commission that is not a finite number, which IB should
-//! never send, becomes a zero fee, logged at WARN. An execution whose report IB did not send has a
-//! zero fee in [`UNKNOWN_FEE_ASSET`](execution::UNKNOWN_FEE_ASSET).
+//! may understate what a fill cost. A commission that is not a finite number, or is too large
+//! for a `Decimal`, becomes a zero fee, logged at WARN; IB should never send one for a real fill.
+//! An execution whose report IB did not send has a zero fee in
+//! [`UNKNOWN_FEE_ASSET`](execution::UNKNOWN_FEE_ASSET).
 //!
 //! # Shortability
 //!
