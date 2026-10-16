@@ -471,7 +471,8 @@ where
             let queue_leads = match (batch.front(), until) {
                 (Some(event), Until::Instant(time)) => self.core.leads((time, source_class(event))),
                 (None, Until::Instant(time)) => self.core.due_by(time),
-                (_, Until::Drained) => !self.core.is_idle(),
+                // Until the queue pops empty, which ends the run below.
+                (_, Until::Drained) => true,
             };
 
             if queue_leads {

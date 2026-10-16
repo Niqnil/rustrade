@@ -377,6 +377,21 @@ mod tests {
     }
 
     #[test]
+    fn a_cfd_settled_in_its_own_asset_opens_that_asset_at_zero() {
+        let mut cfd = instrument(EXCHANGE, "spx500", "usdt");
+        cfd.kind = InstrumentKind::Cfd(CfdContract {
+            contract_size: dec!(1),
+            settlement_asset: rustrade_instrument::asset::Asset::new_from_exchange("usd"),
+        });
+        let instruments =
+            generate_mock_exchange_instruments(&IndexedInstruments::new([cfd]), EXCHANGE);
+
+        let (snapshot, _) = SimStart::default().resolve(EXCHANGE, &instruments).unwrap();
+
+        assert_eq!(balance(&snapshot, "usd"), Some(Decimal::ZERO));
+    }
+
+    #[test]
     fn spot_longs_sharing_a_base_asset_sum_into_one_balance() {
         let mut instruments = venue_instruments();
         let btc_eth = generate_mock_exchange_instruments(

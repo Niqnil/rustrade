@@ -888,11 +888,6 @@ where
             .is_some_and(|Reverse(next)| next.time <= time)
     }
 
-    /// Whether anything at all is still queued.
-    pub(crate) fn is_idle(&self) -> bool {
-        self.pending.is_empty()
-    }
-
     /// Whether emitting the queue's head would exceed the feedback budget. See [`check_feedback`].
     pub(crate) fn check_feedback(&self) -> Option<BarterError> {
         check_feedback(
@@ -1876,6 +1871,47 @@ mod tests {
     /// Besides seeding balances and instruments it is what marks the venue's account connection
     /// healthy — `ConnectivityStates::update_from_account_event` flips on *any* account event — and
     /// an `Engine` that never sees one waits on it forever.
+    /// A request the venue's index cannot translate would otherwise be dropped unanswered, so it
+    /// stops the run, naming the key.
+    #[tokio::test]
+    #[should_panic(expected = "SimRunner received open request for non-configured key")]
+    async fn a_request_for_a_key_the_venue_does_not_index_panics_naming_it() {
+        let mut harness = Harness::new(0, vec![market(10, dec!(100))]);
+        assert_eq!(harness.next().await, Some("snapshot"));
+
+        harness.send(ExecutionRequest::Open(OrderRequestOpen {
+            key: OrderKey {
+                exchange: harness.exchange,
+                instrument: InstrumentIndex::new(7),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new("unindexed"),
+            },
+            state: RequestOpen {
+                side: Side::Buy,
+                price: None,
+                quantity: dec!(0.01),
+                kind: OrderKind::Market,
+                time_in_force: TimeInForce::ImmediateOrCancel,
+                position_id: None,
+                reduce_only: false,
+                market: None,
+            },
+        }));
+
+        harness.next().await;
+    }
+
+    #[test]
+    fn debug_shows_the_queue_without_requiring_debug_of_the_source() {
+        let harness = Harness::new(0, vec![market(10, dec!(100))]);
+
+        let debug = format!("{:?}", harness.runner);
+
+        assert!(debug.contains("SimRunner"), "{debug}");
+        assert!(debug.contains("SimCore"), "{debug}");
+        assert!(debug.contains("pending"), "{debug}");
+    }
+
     #[tokio::test]
     async fn venue_snapshots_are_emitted_before_any_source_event() {
         let mut harness = Harness::new(0, vec![market(10, dec!(100))]);

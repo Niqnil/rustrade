@@ -17,7 +17,7 @@ use futures::{StreamExt, stream};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use rustrade::{
-    EngineEvent, Timed,
+    EngineEvent, SplitRoundingPolicy, Timed,
     engine::{
         Engine,
         audit::EngineAudit,
@@ -42,8 +42,8 @@ use rustrade::{
     execution::{
         AccountStreamEvent,
         sim::{
-            SimEngine, SimExecutionBuild, SimExecutionBuilder, SimRunner, SimStart, SimStepError,
-            SimStepper, SimVenueOptions, StartBalance,
+            SimEngine, SimExecutionBuild, SimExecutionBuilder, SimRunner, SimStart, SimStartError,
+            SimStepError, SimStepper, SimVenueOptions, StartBalance,
         },
     },
     risk::DefaultRiskManager,
@@ -58,7 +58,8 @@ use rustrade_data::{
     subscription::candle::Candle,
 };
 use rustrade_execution::{
-    AccountEvent, AccountEventKind, AccountSnapshot,
+    AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
+    balance::{AssetBalance, Balance},
     client::mock::MockExecutionConfig,
     order::{
         OrderKey, OrderKind, TimeInForce,
@@ -70,11 +71,13 @@ use rustrade_execution::{
 use rustrade_instrument::{
     Side,
     asset::{AssetIndex, name::AssetNameExchange},
+    corporate_action::{CorporateActionKind, SplitRatio},
     exchange::{ExchangeId, ExchangeIndex},
     index::IndexedInstruments,
     instrument::{
         InstrumentIndex,
         kind::{InstrumentKind, cfd::CfdContract},
+        name::InstrumentNameExchange,
     },
     test_utils::instrument,
 };
@@ -318,10 +321,14 @@ fn price<Strategy>(engine: &TestEngine<Strategy>, instrument: usize) -> Option<D
 #[test]
 fn an_order_sent_after_a_step_fills_at_that_bars_close_before_the_next_bar_exists() {
     let mut s = session(0, usdt(dec!(10_000)));
+    assert_eq!(s.stepper.instant(), None);
+    assert_eq!(s.stepper.venues().len(), 1);
 
     s.stepper
         .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(100))])
         .unwrap();
+    assert_eq!(s.stepper.instant(), Some(at(3)));
+    assert!(!s.stepper.has_ended());
     // A candle moves the Engine's mark, which a caller values its portfolio at.
     assert_eq!(price(&s.engine, BTC), Some(dec!(100)));
 
@@ -638,6 +645,90 @@ fn an_error_ends_the_session_and_every_later_call_returns_it() {
     );
     assert_eq!(s.stepper.settle(&mut s.engine).unwrap_err(), not_later);
     assert!(s.stepper.has_ended());
+}
+
+#[test]
+fn the_first_step_may_open_the_session_but_no_step_may_go_back() {
+    let mut s = session(0, usdt(dec!(10_000)));
+    s.stepper
+        .step(&mut s.engine, at(0), [bar(BTC, 0, dec!(100))])
+        .unwrap();
+
+    let mut s = session(0, usdt(dec!(10_000)));
+    s.stepper
+        .step(&mut s.engine, at(6), [bar(BTC, 6, dec!(100))])
+        .unwrap();
+    assert_eq!(
+        s.stepper
+            .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(100))])
+            .unwrap_err(),
+        BarterError::SimStep(SimStepError::NotLater {
+            time: at(3),
+            previous: at(6),
+        })
+    );
+}
+
+#[test]
+fn a_corporate_action_effective_at_another_instant_is_refused() {
+    let mut s = session(0, usdt(dec!(10_000)));
+    let split = EngineEvent::CorporateAction {
+        id: "split".into(),
+        instrument: InstrumentIndex::new(BTC),
+        kind: CorporateActionKind::StockSplit {
+            ratio: SplitRatio::new(dec!(2)).unwrap(),
+        },
+        policy: SplitRoundingPolicy::Fractional,
+        effective_time: at(4),
+    };
+
+    assert_eq!(
+        s.stepper.step(&mut s.engine, at(3), [split]).unwrap_err(),
+        BarterError::SimStep(SimStepError::OffInstant {
+            time: at(3),
+            found: at(4),
+        })
+    );
+}
+
+#[test]
+fn a_start_is_refused_for_a_configuration_that_already_has_an_opening_account() {
+    let instruments = instruments();
+    let with_balance = MockExecutionConfig {
+        initial_state: AccountSnapshot {
+            exchange: EXCHANGE,
+            balances: vec![AssetBalance {
+                asset: AssetNameExchange::new("usdt"),
+                balance: Balance::new(dec!(1), dec!(1)),
+                time_exchange: at(0),
+            }],
+            instruments: vec![],
+        },
+        ..config(0)
+    };
+    let with_instrument = MockExecutionConfig {
+        initial_state: AccountSnapshot {
+            exchange: EXCHANGE,
+            balances: vec![],
+            instruments: vec![InstrumentAccountSnapshot {
+                instrument: InstrumentNameExchange::new("btc_usdt"),
+                orders: vec![],
+                orders_complete: false,
+                position: Default::default(),
+                isolated: None,
+            }],
+        },
+        ..config(0)
+    };
+
+    for config in [with_balance, with_instrument] {
+        assert_eq!(
+            SimExecutionBuilder::new(&instruments)
+                .add_venue_with_start(config, SimVenueOptions::default(), usdt(dec!(1)))
+                .unwrap_err(),
+            BarterError::SimStart(SimStartError::InitialStateNotEmpty { exchange: EXCHANGE })
+        );
+    }
 }
 
 #[test]
