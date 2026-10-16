@@ -80,10 +80,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     first opened, through its scheduled renewal, and completed a reconnect that was pending when
     the disconnect was called. The reopened socket stayed open, idle, for the life of the
     process.
-  - The SDK's rate-limit errors now carry Binance's requested wait. `BinanceSpot` and
-    `BinanceMargin` do not read it yet: `ApiError::RateLimit`'s `retry_after` is still `None` for
-    Binance.
+  - The SDK's rate-limit errors now carry Binance's requested wait, which `BinanceSpot` and
+    `BinanceMargin` now read (see the entry below).
   - Support for signed WebSocket streams, which the `binance` feature does not use.
+
+- **Binance reports and honours the wait it sends with a rate limit** (`rustrade-execution`,
+  `binance` feature, #590).
+  - `ApiError::RateLimit`'s `retry_after` is now filled for `BinanceSpot` and `BinanceMargin`: from
+    a REST 429's or 418's `Retry-After`, or from the WebSocket API's `retryAfter`, the time a ban
+    lifts. That time is on Binance's clock and is measured against the local one, plus 1 s of
+    slack, since the SDK does not expose Binance's own time. The wait is not capped: a ban lasts
+    from minutes to days.
+  - **Behaviour:** every refusal pauses the client's REST calls, orders and cancels for that wait,
+    or 10 s when Binance named none (or a zero wait), the last refusal of a retried call included.
+    The account stream's connects do not wait for it. Before, the pause was a
+    fixed 1–4 s backoff, and the last refusal set none.
+  - **Behaviour:** a request facing more than 10 s of that pause is not sent. It fails at once
+    with `ApiError::RateLimit` carrying the time left. Before, every REST call slept through the
+    pause, which is harmless at 10 s but would hang it for the length of a ban.
+  - **Behaviour:** `BinanceSpot` orders and cancels on an open WebSocket API session honour the
+    pause too. Before, only opening a session checked it, so each order sent during a ban
+    lengthened it.
+  - **Behaviour:** a REST call is retried in place no sooner than Binance's wait, and not at all
+    on a 418 (an IP ban) or when the wait is over 10 s.
+  - Callers that retry on `RateLimit` should wait `retry_after()` when it is `Some`. The check of
+    how orders ended while disconnected already does.
 
 - **Breaking: balances carry accrued interest, and IBKR reports one balance per currency it
   holds** (`rustrade-execution`, #561).

@@ -448,7 +448,10 @@ impl BinanceMarginConfig {
 /// after a reconnect, can therefore take up to about a minute longer. A reconnect's fill recovery
 /// and its `userListenToken` request do not wait for it either, since a pause could outlast the
 /// recovery's 30 s and delay its fills to a retry. The per-UID `/sapi` limit is not tracked.
-/// After Binance answers with a rate-limit error, every REST call waits out a cooldown.
+/// After Binance answers with a rate-limit error, every REST call waits out a cooldown as long as
+/// its `Retry-After` asked, or 10 s without one. A call facing more than 10 s of it is not sent:
+/// it fails at once with [`ApiError::RateLimit`] carrying the time left, rather than hanging
+/// through a ban that can last days. A 418 (an IP ban) is never retried in place.
 ///
 /// # One client per engine (`ExchangeId`)
 /// All emitted events — cross and isolated alike — are stamped [`ExchangeId::BinanceMargin`], and
@@ -2596,8 +2599,8 @@ fn register_user_data_listener(
 /// whole recovery; it is then retried, and given up once it has failed every retry.
 ///
 /// Fills forwarded before the deadline stay delivered. Its reads are [`RequestKind::Essential`]:
-/// they wait out a rate-limit cooldown but not the pause near the weight limit, which could
-/// outlast the budget.
+/// they wait out a short rate-limit cooldown, and fail at once on a longer one, but not the pause
+/// near the weight limit, which could outlast the budget.
 async fn recover_margin_fills(
     rest: &Arc<RestApi>,
     rate_limiter: &Arc<RateLimitTracker>,
@@ -7266,7 +7269,8 @@ mod tests {
                 tracker.wait_if_blocked(RequestKind::Order),
             )
             .await
-            .expect("orders never wait on the pause");
+            .expect("orders never wait on the pause")
+            .expect("no cooldown too long to sleep through");
         }
     }
 
