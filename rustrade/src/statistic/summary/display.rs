@@ -180,6 +180,9 @@ where
         });
         self.add_instrument_metric_row(&mut table, "PnL", |ts| format!("{:.2}", ts.pnl));
         self.add_instrument_metric_row(&mut table, "Carry", |ts| format!("{:.2}", ts.carry));
+        self.add_instrument_metric_row(&mut table, "Unattributed Fees", |ts| {
+            format!("{:.2}", ts.fees_unattributed)
+        });
         self.add_instrument_metric_row(&mut table, &format!("Return {interval}"), |ts| {
             format_percentage(ts.pnl_return.value, 2)
         });
@@ -463,6 +466,29 @@ mod tests {
 
         assert!(!summary.has_split_positions());
         assert_eq!(summary.split_position_notice(), None);
+    }
+
+    /// The instrument table shows the fees no position carried, and a PnL that includes them.
+    #[test]
+    fn instrument_table_shows_unattributed_fees_within_pnl() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fee_unattributed(dec!(12.5), DateTime::<Utc>::MIN_UTC);
+        let mut summary = summary_with_fallback(0, 0, None);
+        summary.instruments.insert(
+            InstrumentNameInternal::new("btc_usdt"),
+            generator.generate(Decimal::ZERO, Annual365),
+        );
+
+        let rendered = summary.instrument_table().to_string();
+        let row = |label: &str| {
+            rendered
+                .lines()
+                .find(|line| line.contains(label))
+                .unwrap_or_else(|| panic!("no {label} row in:\n{rendered}"))
+                .to_owned()
+        };
+        assert!(row("Unattributed Fees").contains("12.50"));
+        assert!(row("PnL").contains("-12.50"));
     }
 
     #[test]

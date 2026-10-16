@@ -191,8 +191,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     a remainder below one lot. Rounding a close to the lot step is the strategy's concern. A
     spot-margin short closed by a buy keeps the fee as a residual short.
   - A base fee larger than the fill's quantity moves the holding the other way. A fill that nets
-    to zero charges its fee to the open position. From flat it opens no position, with a WARN, as
-    does any fill of zero quantity, which used to open an empty position.
+    to zero charges its fee to the open position. From flat it opens no position, as does any fill
+    of zero quantity, which used to open an empty position.
+  - **Breaking:** such a fill's fee is still counted. Its quote equivalent is charged to the
+    instrument's tear sheet, in a new field `TearSheet::fees_unattributed` (also on `PnLReturns`),
+    with a WARN. `TearSheet::pnl` and the PnL drawdowns include it; the returns, ratios, win rate
+    and profit factor, which are per closed position, do not. A consumer that totals PnL from
+    `PositionExit` events alone does not see it. `PositionManager::update_from_trade_with_id`,
+    which has no tear sheet, still only logs it.
   - Only the fee the venue reported is netted. A `FeeModelConfig` fee the engine adds is in quote
     and reaches PnL alone.
   - **Breaking:** `InstrumentState::update_from_trade`, `update_from_order_snapshot` and

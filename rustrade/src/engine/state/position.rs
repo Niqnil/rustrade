@@ -295,6 +295,15 @@ impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, Instrumen
     /// The caller is responsible for ensuring the fee value is correct before calling.
     /// For contract expiry settlement the caller must set fees to `Decimal::ZERO` (exchange
     /// settlement commission, if any, is not modelled and must be tracked separately).
+    ///
+    /// # A fill of zero quantity
+    ///
+    /// On an open position it is applied like any other fill, so its fee is charged to that
+    /// position's PnL. On an empty slot it opens no position and returns `None`, so its fee reaches
+    /// no PnL here, and is logged at `warn!`. The caller that wants it counted must charge it
+    /// elsewhere, as
+    /// [`InstrumentState::update_from_trade`](crate::engine::state::instrument::InstrumentState::update_from_trade)
+    /// does to its tear sheet.
     pub fn update_from_trade_with_id(
         &mut self,
         trade: &Trade<AssetKey, InstrumentKey>,
@@ -315,7 +324,8 @@ impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, Instrumen
                 position.update_from_trade(trade)
             }
             // A fill that moves nothing opens nothing: a spot fill whose base fee equals its
-            // quantity, once the fee is netted. Its fee has no position to be charged to.
+            // quantity, once the fee is netted. Its fee has no position to be charged to. The
+            // engine's own path books it to the tear sheet before reaching here; see the doc.
             None if trade.quantity.is_zero() => {
                 warn!(
                     instrument = ?trade.instrument,
@@ -1602,7 +1612,7 @@ pub fn calculate_pnl_unrealised(
 /// BNB on a `BTCUSDT` fill, or one the indexer zeroed because its asset was not in the map. Its
 /// raw amount is in another asset, so subtracting it from quote-denominated PnL would mix units.
 /// Converting it needs a price the position does not have.
-fn fee_in_quote<AssetKey>(fees: &AssetFees<AssetKey>) -> Decimal {
+pub(crate) fn fee_in_quote<AssetKey>(fees: &AssetFees<AssetKey>) -> Decimal {
     fees.fees_quote.unwrap_or(Decimal::ZERO)
 }
 

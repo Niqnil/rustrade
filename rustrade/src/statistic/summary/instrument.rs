@@ -36,8 +36,9 @@ pub const MAX_FALLBACK_POSITIONS: usize = 16;
 #[derive(Debug, Clone, PartialEq, PartialOrd, Deserialize, Serialize)]
 pub struct TearSheet<Interval> {
     /// PnL of the closed positions, net of carry: each one's realised PnL plus its
-    /// [`carry`](PositionExited::carry). The returns, ratios and drawdowns below are computed from
-    /// the same net figures.
+    /// [`carry`](PositionExited::carry), less [`Self::fees_unattributed`]. The drawdowns below
+    /// follow this total. The returns and ratios are computed per closed position from the same
+    /// net figures, so they leave the unattributed fees out.
     pub pnl: Decimal,
 
     /// Carry of the closed positions, already included in `pnl`: funding, interest and borrow
@@ -46,6 +47,17 @@ pub struct TearSheet<Interval> {
     /// `#[serde(default)]` so tear sheets serialised before this field existed still load.
     #[serde(default)]
     pub carry: Decimal,
+
+    /// Fees of fills that opened no position, already subtracted from `pnl`: positive = paid.
+    /// In the instrument's quote asset, as each fee's quote equivalent.
+    ///
+    /// A spot buy from flat whose base-asset fee takes all it bought is one: it moves no holding,
+    /// so no position carries its fee. See
+    /// [`PnLReturns::fees_unattributed`](super::pnl::PnLReturns::fees_unattributed).
+    ///
+    /// `#[serde(default)]` so tear sheets serialised before this field existed still load.
+    #[serde(default)]
+    pub fees_unattributed: Decimal,
 
     pub pnl_return: RateOfReturn<Interval>,
     pub sharpe_ratio: SharpeRatio<Interval>,
@@ -302,8 +314,23 @@ impl TearSheetGenerator {
         &mut self,
         position: &PositionExited<AssetKey, InstrumentKey>,
     ) {
-        self.time_engine_now = position.time_exit;
         self.pnl_returns.update(position);
+        self.record_pnl_at(position.time_exit);
+    }
+
+    /// Charge the fee of a fill that opened no position, so it reaches
+    /// [`TearSheet::pnl`] and the drawdowns but no per-position statistic. `fee` is the fee's
+    /// quote equivalent, positive = paid; `time` is the fill's.
+    ///
+    /// See [`TearSheet::fees_unattributed`].
+    pub fn record_fee_unattributed(&mut self, fee: Decimal, time: DateTime<Utc>) {
+        self.pnl_returns.update_from_fee_unattributed(fee);
+        self.record_pnl_at(time);
+    }
+
+    /// Advance the clock to `time`, and feed the drawdowns the PnL total as it now stands.
+    fn record_pnl_at(&mut self, time: DateTime<Utc>) {
+        self.time_engine_now = time;
 
         if let Some(next_drawdown) = self
             .pnl_drawdown
@@ -383,6 +410,7 @@ impl TearSheetGenerator {
             calmar_ratio,
             pnl: self.pnl_returns.pnl_raw,
             carry: self.pnl_returns.carry,
+            fees_unattributed: self.pnl_returns.fees_unattributed,
             pnl_return,
             pnl_drawdown: current_pnl_drawdown,
             pnl_drawdown_mean,

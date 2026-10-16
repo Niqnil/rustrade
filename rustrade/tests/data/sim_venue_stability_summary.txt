@@ -7,6 +7,7 @@ TradingSummary {
         ): TearSheet {
             pnl: 0,
             carry: 0,
+            fees_unattributed: 0,
             pnl_return: RateOfReturn {
                 value: 0,
                 interval: Daily,
@@ -43,6 +44,7 @@ TradingSummary {
         ): TearSheet {
             pnl: 0,
             carry: 0,
+            fees_unattributed: 0,
             pnl_return: RateOfReturn {
                 value: 0,
                 interval: Daily,
@@ -79,6 +81,7 @@ TradingSummary {
         ): TearSheet {
             pnl: 0,
             carry: 0,
+            fees_unattributed: 0,
             pnl_return: RateOfReturn {
                 value: 0,
                 interval: Daily,
