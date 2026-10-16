@@ -81,16 +81,23 @@ fn test_instrument() -> InstrumentNameExchange {
 /// price too far from it with `-1013`, and a fixed price drifts out of range as the market moves.
 /// On BTCUSDT a sell price must lie within 0.8× to 2× of it.
 async fn average_price(instrument: &InstrumentNameExchange) -> Decimal {
-    let body = reqwest::get(format!(
-        "https://testnet.binance.vision/api/v3/avgPrice?symbol={instrument}"
-    ))
-    .await
-    .expect("avgPrice request failed")
-    .error_for_status()
-    .expect("avgPrice returned an error status")
-    .json::<serde_json::Value>()
-    .await
-    .expect("avgPrice body is not JSON");
+    // Bounded, so a stalled connection fails the test rather than hanging it.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("reqwest client");
+    let body = client
+        .get(format!(
+            "https://testnet.binance.vision/api/v3/avgPrice?symbol={instrument}"
+        ))
+        .send()
+        .await
+        .expect("avgPrice request failed")
+        .error_for_status()
+        .expect("avgPrice returned an error status")
+        .json::<serde_json::Value>()
+        .await
+        .expect("avgPrice body is not JSON");
 
     body["price"]
         .as_str()
