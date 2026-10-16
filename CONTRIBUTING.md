@@ -159,9 +159,10 @@ Only the mutated crate's own tests run against each mutant. A mutant in `rustrad
 that only a test in `rustrade` would catch is therefore reported as missed.
 
 CI's `cargo mutants` job runs it on the lines each PR changes. The job is informational, so
-it stays green when a mutant is missed. The job summary lists every missed mutant, and the
-first few are also annotated on their lines in the PR's diff (GitHub caps how many annotations
-a job shows). For each one, either:
+it stays green when a mutant is missed. It is split into shards that each test a share of the
+mutants. Each shard's job summary lists the mutants it missed, and the first few are also
+annotated on their lines in the PR's diff (GitHub caps how many annotations a job shows). For
+each one, either:
 
 - **add a test that fails on the mutant**, or
 - **explain in the PR why it is equivalent**: the change cannot alter anything observable, for

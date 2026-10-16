@@ -312,19 +312,28 @@ jobs:
   # Mutation-tests the lines this PR changes. cargo-mutants alters each one (a `<` to `<=`, a
   # function body to `Default::default()`, ...) and reruns the tests of the mutated crate; a mutant
   # they still pass on marks behaviour no test in that crate pins. cargo-mutants itself annotates
-  # missed mutants on their lines when it runs under GitHub Actions, and the job summary lists
-  # them all.
+  # missed mutants on their lines when it runs under GitHub Actions, and each shard's job summary
+  # lists all of its own.
   #
   # Informational: not a required check, and a missed mutant or a timeout leaves it green. It fails
   # only when the run itself does, for example when the tests already fail without any mutation.
   # See CONTRIBUTING.md, "Mutation testing".
+  #
+  # The mutants are split across parallel shards, each a job of its own. A job tests one mutant at
+  # a time, at roughly 30 s each (more on a slow runner), after about 5 minutes of setup, so on a
+  # slow runner a single job ran out of time at about 60. Three shards fit about 180 even there.
+  # Each shard repeats the setup, so add one only when diffs outgrow that.
   mutants:
-    name: cargo mutants
+    name: cargo mutants (shard ${{ matrix.shard }}/${{ strategy.job-total }})
     needs: [fmt, check]
     # Only a PR has a diff to scope the run to. The rest is `test`'s gate.
     if: ${{ github.event_name == 'pull_request' && !cancelled() && needs.fmt.result == 'success' && needs.check.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]  # cargo-mutants numbers shards from 0
     # Must match `test`'s `env` exactly. The cache restored below is `test`'s, and rust-cache hashes
     # `CARGO_*` variables into its key, so any difference here misses it.
     env:
@@ -396,6 +405,9 @@ jobs:
       #   built the cache under.
       # - The targets go in `--cargo-arg`, not after `--`: cargo-mutants passes trailing arguments
       #   to the test phase only, and its build phase would then link every example too.
+      # - `--shard` takes this job's share of the mutants. Round-robin deals them out one at a time,
+      #   so the slow ones, which cluster (a mutant that makes a wait loop spin times out, and so
+      #   do its neighbours on the same line), spread across the shards.
       # - `timeout` interrupts the run with time left in the job, so a large PR still gets a summary
       #   of the mutants tested so far. cargo-mutants records each outcome as it lands.
       - name: Run cargo mutants
@@ -406,6 +418,7 @@ jobs:
           timeout --signal=INT --kill-after=2m 40m \
             cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" --in-place --profile=test \
               --cargo-arg=--locked --cargo-arg=--lib --cargo-arg=--bins --cargo-arg=--tests \
+              --shard "${{ matrix.shard }}/${{ strategy.job-total }}" --sharding round-robin \
               --output "$RUNNER_TEMP" \
             || status=$?
           # 2: a mutant was missed. 3: a mutant timed out. 124: the run was cut short. 137: it was
@@ -427,7 +440,7 @@ jobs:
           out="$RUNNER_TEMP/mutants.out"
           count() { if [ -f "$out/$1.txt" ]; then wc -l < "$out/$1.txt"; else echo 0; fi; }
           {
-            echo "### Mutation testing"
+            echo "### Mutation testing, shard ${{ matrix.shard }}/${{ strategy.job-total }}"
             if [ "$OUTCOME" != success ]; then
               echo "The run failed, so any counts below are partial: see the \`Run cargo mutants\` log."
             fi
@@ -435,6 +448,11 @@ jobs:
               if [ "$OUTCOME" = success ]; then
                 echo "No mutants: the diff touches no code cargo-mutants can mutate."
               fi
+              exit 0
+            fi
+            # A shard dealt no mutants still writes its (empty) list and exits 0.
+            if [ -f "$out/mutants.json" ] && [ "$(jq length "$out/mutants.json")" = 0 ]; then
+              echo "No mutants in this shard: the diff has too few to give every shard one."
               exit 0
             fi
             echo "| Caught | Missed | Timed out | Unviable |"
