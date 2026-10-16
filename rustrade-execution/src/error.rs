@@ -739,6 +739,12 @@ pub enum StreamTerminationReason {
     /// reconnects that would lengthen a ban. `retry_after` is how long the cooldown had left: the
     /// earliest the consumer should re-establish the stream. Opening it sooner fails with
     /// [`ApiError::RateLimit`], unsent.
+    ///
+    /// Nothing that happens on the account until the stream is re-established reaches the
+    /// consumer through this stream, as after any other termination: re-sync from the new
+    /// stream's snapshot, and read fills of the gap with a trades query. An
+    /// `ExecutionManager` re-opens the stream itself, no sooner than `retry_after`, and reports
+    /// each refused attempt as a `ReinitFailed` carrying the time left.
     #[error("rate-limited by the venue; retry after {retry_after:?}")]
     RateLimited {
         /// How long the venue's cooldown had left when the stream ended.

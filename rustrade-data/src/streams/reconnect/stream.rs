@@ -61,7 +61,8 @@ where
     ///
     /// The hint does not change the backoff, which grows with each consecutive failure as usual.
     /// It is a floor for one wait, so an attempt is never made before the source said it could
-    /// succeed, nor sooner than the policy allows.
+    /// succeed, nor sooner than the policy allows. It is not capped: a caller that wants a limit
+    /// clamps the wait in `retry_after`.
     fn with_reconnect_backoff_reporting_hinted<St, InitError, FnRetryAfter>(
         self,
         policy: ReconnectionBackoffPolicy,

@@ -855,7 +855,7 @@ impl RateLimitTracker {
             };
             let now = tokio::time::Instant::now();
             if let Some(remaining) = blocked_until.map(|until| until.saturating_duration_since(now))
-                && remaining > MAX_COOLDOWN_SLEEP
+                && too_long_to_sleep(remaining)
             {
                 return Err(CooldownActive { remaining });
             }
@@ -948,7 +948,7 @@ impl RateLimitTracker {
         } else {
             return false;
         };
-        warn!(error = %format!("{e:#}"), "Binance refused an account-stream connect for a rate limit");
+        warn!(error = %format_args!("{e:#}"), "Binance refused an account-stream connect for a rate limit");
         self.on_rate_limited(retry_after);
         true
     }
@@ -997,7 +997,7 @@ impl RateLimitTracker {
     /// How long the cooldown has left, when that is longer than a request sleeps through.
     fn too_long_to_wait(&self) -> Option<Duration> {
         self.cooldown_remaining()
-            .filter(|remaining| *remaining > MAX_COOLDOWN_SLEEP)
+            .filter(|remaining| too_long_to_sleep(*remaining))
     }
 
     /// Record the weight a successful REST response reports as used, for a request sent at
@@ -1315,6 +1315,12 @@ pub(crate) fn disconnect_error(heartbeat_timed_out: bool) -> String {
     } else {
         "WebSocket disconnected (server close/error)".to_string()
     }
+}
+
+/// Whether a cooldown with `remaining` left is longer than a request, or a stream's connect, sleeps
+/// through: [`MAX_COOLDOWN_SLEEP`].
+fn too_long_to_sleep(remaining: Duration) -> bool {
+    remaining > MAX_COOLDOWN_SLEEP
 }
 
 /// End an account stream for a rate-limit cooldown with `remaining` left.

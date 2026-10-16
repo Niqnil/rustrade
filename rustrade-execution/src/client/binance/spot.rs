@@ -5263,7 +5263,8 @@ mod tests {
                     let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
                         return;
                     };
-                    // Answer the subscribe, then drop the connection shortly after.
+                    // Answer the subscribe, then drop the connection once the test has started
+                    // the cooldown.
                     while let Some(Ok(message)) = ws.next().await {
                         let Message::Text(text) = message else {
                             continue;
@@ -5274,7 +5275,7 @@ mod tests {
                         if ws.send(Message::text(answer)).await.is_err() {
                             return;
                         }
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
                         let _ = ws.close(None).await;
                         return;
                     }
@@ -5335,9 +5336,10 @@ mod tests {
                         {
                             return;
                         }
-                        // The first connection drops shortly after; the second stays.
+                        // The first connection drops shortly after, once the test has started
+                        // the cooldown; the second stays.
                         if subscribed_at.lock().len() == 1 {
-                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            tokio::time::sleep(Duration::from_millis(500)).await;
                             let _ = ws.close(None).await;
                             return;
                         }
@@ -5349,8 +5351,9 @@ mod tests {
         let client = client_with_ws_api(url);
         let _stream = client.account_stream(&[], &[]).await.unwrap();
         let cooldown = Duration::from_secs(3);
-        client.rate_limiter.on_rate_limited(Some(cooldown));
+        // Before the cooldown starts, so the bound cannot be later than its end.
         let cooled = tokio::time::Instant::now() + cooldown;
+        client.rate_limiter.on_rate_limited(Some(cooldown));
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while subscribed_at.lock().len() < 2 {

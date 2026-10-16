@@ -1063,6 +1063,8 @@ mod tests {
             })
         ));
         assert!(matches!(next().await, AccountStreamEvent::Reconnecting(_)));
+        // Before the refused attempt is made, so the wait it starts cannot begin earlier.
+        let refused = std::time::Instant::now();
         match next().await {
             AccountStreamEvent::Item(AccountEvent {
                 kind: AccountEventKind::ReinitFailed(failure),
@@ -1070,7 +1072,6 @@ mod tests {
             }) => assert_eq!(failure.error.retry_after(), Some(wait)),
             other => panic!("expected the refused re-init, got {other:?}"),
         }
-        let refused = std::time::Instant::now();
         assert!(matches!(
             next().await,
             AccountStreamEvent::Item(AccountEvent {

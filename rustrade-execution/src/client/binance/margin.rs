@@ -1453,6 +1453,9 @@ impl ExecutionClient for BinanceMargin {
             // all before returning so connect-or-any-subscribe failure → Err (nothing spawned),
             // preserving cross's "can't-start vs started-then-dropped" distinction.
             let tokens = acquire_all_isolated_tokens(&rest_config, &rate_limiter, &symbols).await?;
+            // The token requests waited out a cooldown; one a concurrent refusal started since
+            // must not be connected into either.
+            rate_limiter.before_stream_open().await?;
             let live = isolated_connect_and_subscribe(
                 &ws_config,
                 &tx,
@@ -1499,6 +1502,8 @@ impl ExecutionClient for BinanceMargin {
             // attaches), so early pushed events are not missed.
             let initial_token =
                 acquire_user_listen_token(&rest_config, &rate_limiter, None).await?;
+            // As on isolated: not into a cooldown started since the token request.
+            rate_limiter.before_stream_open().await?;
             let initial_ws = connect_margin_ws(&ws_config).await.map_err(|e| {
                 rate_limiter.stream_open_error(&e, |e| {
                     UnindexedClientError::Connectivity(ConnectivityError::Socket(e.to_string()))
@@ -4779,7 +4784,8 @@ mod tests {
     /// with the time left: no second subscribe is sent.
     #[tokio::test]
     async fn a_drop_during_a_long_cooldown_ends_the_isolated_margin_stream_rate_limited() {
-        let rig = ManagerRig::new(subscribed, Some(Duration::from_millis(200))).await;
+        // The drop comes once the test has started the cooldown.
+        let rig = ManagerRig::new(subscribed, Some(Duration::from_secs(1))).await;
         let mut events = rig.isolated().await;
         rig.rate_limiter
             .on_rate_limited(Some(Duration::from_secs(60)));
