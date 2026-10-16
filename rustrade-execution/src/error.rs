@@ -232,8 +232,10 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// read it, and is not permission to retry at once. Which clients fill it:
     /// - **Alpaca:** from a 429's `Retry-After`, or else `X-RateLimit-Reset`, once the client's
     ///   own retries are exhausted.
-    /// - **Binance:** never, for now: the client does not yet read the wait `binance-sdk` reports
-    ///   with its rate-limit errors.
+    /// - **Binance:** from a REST 429's or 418's `Retry-After`, or the time a WebSocket API
+    ///   refusal's `retryAfter` names, measured against the local clock. Uncapped, since a ban can
+    ///   last days. A request the client held back unsent, because an earlier refusal's wait had
+    ///   longer left than the client sleeps through, reports the time left.
     /// - **Hyperliquid:** never: its SDK keeps no headers, and Hyperliquid documents no hint.
     ///
     /// A venue ban (Binance's HTTP 418) is reported the same way: its hint, when readable, says

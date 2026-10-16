@@ -541,10 +541,17 @@ const _: () = assert!(
     BINANCE_MAX_TRADES <= i32::MAX as usize,
     "BINANCE_MAX_TRADES overflows i32"
 );
-/// Default delay when rate-limited (exponential backoff). Binance sends `Retry-After` on a 429 or
-/// 418, and `binance-sdk` reports it with its rate-limit errors, but neither this delay nor
-/// [`ApiError::RateLimit`]'s `retry_after` reads it yet.
+/// Cooldown after a rate-limit refusal that carried no wait. Binance sends one with most: REST's
+/// `Retry-After` on a 429 or 418, and the WS API's `retryAfter`. A WAF 403 and a refused
+/// WebSocket handshake carry none the client can read.
 pub(crate) const DEFAULT_RATE_LIMIT_DELAY_SECS: u64 = 10;
+/// The longest rate-limit cooldown a request sleeps through before it is sent. A request facing a
+/// longer one fails at once with [`CooldownActive`], reported as [`ApiError::RateLimit`] with the
+/// time left, rather than hanging for a ban that can last days.
+///
+/// Equal to [`DEFAULT_RATE_LIMIT_DELAY_SECS`], so only a wait Binance sent can exceed it: without
+/// one, every cooldown is slept through.
+const MAX_COOLDOWN_SLEEP: Duration = Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS);
 /// Maximum number of REST retry attempts on rate-limit errors.
 pub(crate) const MAX_RATE_LIMIT_RETRIES: u32 = 3;
 
@@ -747,9 +754,10 @@ pub(crate) const SAPI_IP_WEIGHT_PER_MINUTE: u32 = 12_000;
 /// Used weight, as a percentage of the per-minute limit, at which queries pause until the next
 /// minute. Orders and cancels keep the remainder.
 const WEIGHT_PAUSE_PERCENT: u64 = 90;
-/// Added to the wait for the next minute to cover clock skew between this host and Binance, whose
-/// weight counters reset on its own minute boundary.
-const MINUTE_BOUNDARY_SLACK_MS: u64 = 1_000;
+/// Added to a wait that ends at a time on Binance's clock, to cover skew between this host's clock
+/// and Binance's: the next minute, when its weight counters reset, and the end of a ban the WS API
+/// reports (see [`wait_until_epoch_ms`]).
+pub(crate) const CLOCK_SKEW_SLACK_MS: u64 = 1_000;
 
 /// The Binance per-minute request-weight pool a [`RateLimitTracker`] follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -797,7 +805,10 @@ struct Deadlines {
 /// Tracks rate-limit state across REST API calls.
 ///
 /// Two waits, both shared by clones of the client (which share one `Arc<RateLimitTracker>`):
-/// - a cooldown after Binance answered with a rate-limit error, which every request honours;
+/// - a cooldown after Binance answered with a rate-limit error, which every request honours. It
+///   lasts as long as Binance asked, uncapped: a ban lasts from minutes to days, and a request
+///   sent inside one lengthens it. A request sleeps through at most [`MAX_COOLDOWN_SLEEP`] of it,
+///   and fails with [`CooldownActive`] when more is left;
 /// - a pause until the next minute once the weight used reaches [`WEIGHT_PAUSE_PERCENT`] of the
 ///   per-minute limit, which only [`RequestKind::Query`] requests honour, so the weight left
 ///   stays free for orders, cancels and [`RequestKind::Essential`] reads. The weight used comes
@@ -823,24 +834,35 @@ impl RateLimitTracker {
 
     /// Sleep until the waits `kind` honours have passed. Returns immediately if none is active.
     ///
+    /// # Errors
+    ///
+    /// [`CooldownActive`], at once or after sleeping, when the rate-limit cooldown has more than
+    /// [`MAX_COOLDOWN_SLEEP`] left: the request must not be sent.
+    ///
     /// Loops after waking to re-check the deadline: another task may have extended it while this
     /// task was sleeping.
-    pub(crate) async fn wait_if_blocked(&self, kind: RequestKind) {
+    pub(crate) async fn wait_if_blocked(&self, kind: RequestKind) -> Result<(), CooldownActive> {
         loop {
-            let deadline = {
+            let (blocked_until, deadline) = {
                 let deadlines = self.deadlines.lock();
-                match kind {
+                let deadline = match kind {
                     RequestKind::Order | RequestKind::Essential => deadlines.blocked_until,
                     // `None` orders below `Some`, so this is whichever deadline is later.
                     RequestKind::Query => deadlines.blocked_until.max(deadlines.throttled_until),
-                }
+                };
+                (deadlines.blocked_until, deadline)
             };
+            let now = tokio::time::Instant::now();
+            if let Some(remaining) = blocked_until.map(|until| until.saturating_duration_since(now))
+                && remaining > MAX_COOLDOWN_SLEEP
+            {
+                return Err(CooldownActive { remaining });
+            }
             match deadline {
-                None => return,
+                None => return Ok(()),
                 Some(until) => {
-                    let now = tokio::time::Instant::now();
                     if until <= now {
-                        return;
+                        return Ok(());
                     }
                     // debug! not warn! — on_rate_limited and observe_used_weight already log
                     // the event; multiple concurrent callers all waiting during recover_fills
@@ -868,16 +890,25 @@ impl RateLimitTracker {
         extend_deadline(&mut self.deadlines.lock().throttled_until, now, pause);
     }
 
-    /// Whether a rate-limit cooldown is active now.
-    pub(crate) fn is_blocked(&self) -> bool {
+    /// How long the rate-limit cooldown has left, or `None` when none is active.
+    pub(crate) fn cooldown_remaining(&self) -> Option<Duration> {
         let now = tokio::time::Instant::now();
         self.deadlines
             .lock()
             .blocked_until
-            .is_some_and(|until| until > now)
+            .map(|until| until.saturating_duration_since(now))
+            .filter(|remaining| !remaining.is_zero())
     }
 
-    /// Record a rate-limit event. Extends the cooldown if a longer one is already active.
+    /// Whether a rate-limit cooldown is active now.
+    #[cfg(test)]
+    pub(crate) fn is_blocked(&self) -> bool {
+        self.cooldown_remaining().is_some()
+    }
+
+    /// Record a rate-limit refusal: hold every request back for `retry_after`, the wait Binance
+    /// sent, or [`DEFAULT_RATE_LIMIT_DELAY_SECS`] when it sent none. Extends the cooldown if a
+    /// longer one is already active.
     ///
     /// # Panics
     ///
@@ -1008,7 +1039,12 @@ fn extend_deadline(
     delay: Duration,
 ) -> bool {
     let was_active = deadline.is_some_and(|until| until > now);
-    let new_deadline = now + delay;
+    // A wait read from Binance is not bounded, and one past the clock's range would panic on
+    // `+`. The longest a REST `Retry-After` can carry, `u32::MAX` seconds (~136 years), stands
+    // in for it: the cooldown still outlasts the process.
+    let new_deadline = now
+        .checked_add(delay)
+        .unwrap_or_else(|| now + Duration::from_secs(u64::from(u32::MAX)));
     *deadline = Some(deadline.map_or(new_deadline, |existing| existing.max(new_deadline)));
     was_active
 }
@@ -1030,11 +1066,46 @@ pub(crate) fn unix_ms() -> u128 {
 /// How long queries pause, observed at `now_ms`, for a request sent at `sent_ms` (both Unix
 /// milliseconds): until just after the UTC minute it was sent in ends, or `None` once it has.
 fn pause_after(sent_ms: u128, now_ms: u128) -> Option<Duration> {
-    let resume_ms = sent_ms - sent_ms % 60_000 + 60_000 + u128::from(MINUTE_BOUNDARY_SLACK_MS);
+    let resume_ms = sent_ms - sent_ms % 60_000 + 60_000 + u128::from(CLOCK_SKEW_SLACK_MS);
     let remaining_ms = resume_ms.checked_sub(now_ms).filter(|&ms| ms > 0)?;
     // At most a minute plus the slack, so it fits in a u64.
     #[allow(clippy::cast_possible_truncation)]
     Some(Duration::from_millis(remaining_ms as u64))
+}
+
+/// A request held back unsent: the rate-limit cooldown has more than [`MAX_COOLDOWN_SLEEP`] left.
+///
+/// [`rest_call_with_retry`] returns it inside its `anyhow::Error`, and
+/// [`classify_rest_query_error`] and [`classify_rest_order_error`] report it as
+/// [`ApiError::RateLimit`] with `remaining` as the wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("Binance rate-limit cooldown active for {remaining:?} more; request not sent")]
+pub(crate) struct CooldownActive {
+    /// How long the cooldown has left.
+    pub(crate) remaining: Duration,
+}
+
+/// The wait Binance sent with a REST rate-limit refusal (`Retry-After`, in seconds), as
+/// `binance-sdk` reports it on a 429 or 418. `None` for any other error, or a refusal without the
+/// header.
+fn rest_retry_after(ce: &ConnectorError) -> Option<Duration> {
+    ce.retry_after()
+        .map(|secs| Duration::from_secs(u64::from(secs)))
+}
+
+/// The wait until `until_ms`, the Unix-millisecond time a WS-API refusal's `retryAfter` says a ban
+/// or limit lifts, observed at `now_ms` (from [`unix_ms`]): until [`CLOCK_SKEW_SLACK_MS`] after
+/// it, or zero once that has passed.
+///
+/// `until_ms` is on Binance's clock and `now_ms` on this host's. Binance also sends its own time
+/// with the refusal, which would cancel the skew, but `binance-sdk` does not expose it. A local
+/// clock ahead of Binance's by more than the slack shortens the wait, and a request sent before
+/// the ban lifts lengthens it.
+fn wait_until_epoch_ms(until_ms: i64, now_ms: u128) -> Duration {
+    // A negative time is already past.
+    let resume_ms = u128::try_from(until_ms).unwrap_or(0) + u128::from(CLOCK_SKEW_SLACK_MS);
+    let wait_ms = resume_ms.saturating_sub(now_ms);
+    Duration::from_millis(u64::try_from(wait_ms).unwrap_or(u64::MAX))
 }
 
 /// Check if an anyhow::Error from binance-sdk REST is a rate-limit error.
@@ -2976,6 +3047,8 @@ fn parse_binance_query_rejection(
 /// Pass `instrument` when the request named a single instrument, so a `-1121` invalid-symbol
 /// rejection can say which.
 ///
+/// - [`CooldownActive`] (held back unsent) → [`ApiError::RateLimit`], with the cooldown's time
+///   left as the wait.
 /// - The SDK's [`ParamBuildError`] (a request builder missing a required field) is a bug in this
 ///   client → [`UnindexedClientError::Internal`].
 /// - A [`ConnectorError`] is classified by [`classify_connector_error`], and a venue rejection by
@@ -2992,12 +3065,17 @@ pub(crate) fn classify_rest_query_error(
     e: &anyhow::Error,
     instrument: Option<&InstrumentNameExchange>,
 ) -> UnindexedClientError {
+    if let Some(cooldown) = e.downcast_ref::<CooldownActive>() {
+        return UnindexedClientError::Api(ApiError::rate_limited(Some(cooldown.remaining)));
+    }
     if let Some(build) = e.downcast_ref::<ParamBuildError>() {
         return UnindexedClientError::Internal(format!("building Binance request: {build}"));
     }
     if let Some(ce) = e.downcast_ref::<ConnectorError>() {
         return match classify_connector_error(ce) {
-            RequestFailure::RateLimited => UnindexedClientError::Api(ApiError::rate_limited(None)),
+            RequestFailure::RateLimited(retry_after) => {
+                UnindexedClientError::Api(ApiError::rate_limited(retry_after))
+            }
             RequestFailure::Unauthenticated(msg) => {
                 UnindexedClientError::Api(ApiError::Unauthenticated(msg))
             }
@@ -3057,6 +3135,19 @@ pub(crate) fn response_decode_error(e: ConnectorError) -> UnindexedClientError {
 /// Waits first for the rate-limit waits `kind` honours (see [`RateLimitTracker`]), and records
 /// the weight a successful response reports as used, which can pause later queries.
 ///
+/// A rate-limit refusal ([`is_rate_limit_error`]) is retried in place, up to
+/// [`MAX_RATE_LIMIT_RETRIES`] times, after the longer of an exponential backoff (1 s, 2 s, 4 s)
+/// and the wait Binance sent, so long as that is at most [`MAX_COOLDOWN_SLEEP`]. A 418 ban is
+/// never retried in place: a request sent inside a ban lengthens it. Every refusal pauses all
+/// requests on the shared [`RateLimitTracker`]; one returned to the caller pauses them for the
+/// wait Binance sent, or [`DEFAULT_RATE_LIMIT_DELAY_SECS`] without one.
+///
+/// # Errors
+///
+/// The SDK's error from the last attempt, or [`CooldownActive`] when a cooldown too long to sleep
+/// through held the request back unsent. Map either with [`classify_rest_query_error`] or
+/// [`classify_rest_order_error`].
+///
 /// Generic over the SDK `RestApi` type (`R`) so it serves both the spot
 /// (`binance_sdk::spot::rest_api::RestApi`) and margin
 /// (`binance_sdk::margin_trading::rest_api::RestApi`) clients — the helper never touches
@@ -3078,32 +3169,44 @@ where
     // rather than as a confusing error at the call sites' `Box::pin(async move ...)`.
     R: Send + Sync,
 {
-    // on the last iteration (attempt == MAX_RATE_LIMIT_RETRIES) the rate-limit
-    // guard `attempt < MAX_RATE_LIMIT_RETRIES` is false, so a rate-limit error falls
-    // through to the catch-all `Err(e) => return Err(e)` arm. All three match arms
-    // return on the last iteration, so the post-loop unreachable!() is a runtime
-    // safety net — the loop body always returns before exhaustion.
+    // On the last iteration (attempt == MAX_RATE_LIMIT_RETRIES) a rate-limit error is not
+    // retried, so every match arm returns. The post-loop unreachable!() is a runtime safety
+    // net — the loop body always returns before exhaustion.
     for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
-        rate_limiter.wait_if_blocked(kind).await;
+        rate_limiter.wait_if_blocked(kind).await?;
         let sent_ms = unix_ms();
         match make_call(Arc::clone(rest)).await {
             Ok(response) => {
                 rate_limiter.observe_rest(&response, sent_ms);
                 return Ok(response);
             }
-            Err(e) if is_rate_limit_error(&e) && attempt < MAX_RATE_LIMIT_RETRIES => {
-                // exponential delay starting at 1s (not DEFAULT_RATE_LIMIT_DELAY_SECS=10s).
-                // The retry loop uses an aggressive initial delay to recover quickly from
-                // transient bursts. DEFAULT_RATE_LIMIT_DELAY_SECS is for the externally-set
-                // "blocked" state (e.g. Retry-After header), not for per-call retries.
-                let delay = Duration::from_secs(2u64.saturating_pow(attempt).min(30));
-                warn!(
-                    attempt = attempt.saturating_add(1),
-                    max = MAX_RATE_LIMIT_RETRIES,
-                    delay_secs = delay.as_secs(),
-                    "Binance REST rate-limited, retrying"
-                );
-                rate_limiter.on_rate_limited(Some(delay));
+            Err(e) if is_rate_limit_error(&e) => {
+                let refusal = e.downcast_ref::<ConnectorError>();
+                let venue_wait = refusal.and_then(rest_retry_after);
+                let banned = matches!(refusal, Some(ConnectorError::RateLimitBanError { .. }));
+                // An exponential backoff starting at 1 s recovers quickly from a transient burst,
+                // but never sooner than Binance asked.
+                let backoff = Duration::from_secs(2u64.saturating_pow(attempt).min(30));
+                let delay = venue_wait.map_or(backoff, |wait| wait.max(backoff));
+                if attempt < MAX_RATE_LIMIT_RETRIES && !banned && delay <= MAX_COOLDOWN_SLEEP {
+                    warn!(
+                        attempt = attempt.saturating_add(1),
+                        max = MAX_RATE_LIMIT_RETRIES,
+                        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        "Binance REST rate-limited, retrying"
+                    );
+                    rate_limiter.on_rate_limited(Some(delay));
+                } else {
+                    warn!(
+                        attempt = attempt.saturating_add(1),
+                        banned,
+                        venue_wait_ms = venue_wait
+                            .map(|wait| u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)),
+                        "Binance REST rate-limited, not retrying"
+                    );
+                    rate_limiter.on_rate_limited(venue_wait);
+                    return Err(e);
+                }
             }
             Err(e) => return Err(e),
         }
@@ -3414,8 +3517,9 @@ pub(crate) fn trailing_params(
 /// which rustrade error that is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RequestFailure {
-    /// HTTP 429 or 418 (throttled or IP-banned), or a 403 that is not an auth failure.
-    RateLimited,
+    /// HTTP 429 or 418 (throttled or IP-banned), a WS-API `-1003`/`-1015`, or a 403 that is not
+    /// an auth failure. Carries the wait Binance sent, measured from when it was read.
+    RateLimited(Option<Duration>),
     /// HTTP 401, or a 403 that is an auth failure. Carries the message with the Binance code
     /// spliced in.
     Unauthenticated(String),
@@ -3445,14 +3549,14 @@ fn is_waf_block(msg: &str) -> bool {
 fn classify_forbidden(msg: String) -> RequestFailure {
     if is_waf_block(&msg) {
         // `RateLimited` carries no message, so log the body it replaces. A CDN's 403 body is a
-        // full HTML page: log only its start.
+        // full HTML page: log only its start. A 403 carries no wait.
         const LOG_EXCERPT_CHARS: usize = 256;
         let excerpt = msg
             .char_indices()
             .nth(LOG_EXCERPT_CHARS)
             .map_or(msg.as_str(), |(end, _)| &msg[..end]);
         warn!(body = %excerpt, "Binance answered 403 (WAF limit); reporting RateLimit");
-        RequestFailure::RateLimited
+        RequestFailure::RateLimited(None)
     } else {
         RequestFailure::Unauthenticated(msg)
     }
@@ -3460,15 +3564,21 @@ fn classify_forbidden(msg: String) -> RequestFailure {
 
 /// Classify a binance-sdk WS-API [`WebsocketError::ResponseError`]: the venue answered a request
 /// with a status of 400 or more. `msg` is the error's `Display`, which already carries `code`.
+/// `retry_after` is the wait its `retryAfter` asked for (see [`wait_until_epoch_ms`]).
 ///
-/// A negative `code` is Binance's own error code, for a code-first parser. When the response had
-/// no error object, the SDK falls back to the HTTP status as `code` (and `"Unknown error"` as
-/// the message), so a non-negative `code` is read as a status, as the REST path reads one:
-/// 429/418 → rate-limited, 401 → unauthenticated, 403 → [`classify_forbidden`], 5xx →
-/// transport (the venue failed it; the status of any order is unknown).
-fn classify_ws_response_error(code: i64, msg: String) -> RequestFailure {
+/// A negative `code` is Binance's own error code: `-1003`/`-1015` → rate-limited, which is how
+/// Binance reports a throttle or a ban on the WS API; anything else goes to a code-first parser.
+/// When the response had no error object, the SDK falls back to the HTTP status as `code` (and
+/// `"Unknown error"` as the message), so a non-negative `code` is read as a status, as the REST
+/// path reads one: 429/418 → rate-limited, 401 → unauthenticated, 403 → [`classify_forbidden`],
+/// 5xx → transport (the venue failed it; the status of any order is unknown).
+fn classify_ws_response_error(
+    code: i64,
+    retry_after: Option<Duration>,
+    msg: String,
+) -> RequestFailure {
     match code {
-        429 | 418 => RequestFailure::RateLimited,
+        429 | 418 | -1003 | -1015 => RequestFailure::RateLimited(retry_after),
         401 => RequestFailure::Unauthenticated(msg),
         403 => classify_forbidden(msg),
         500..=599 => RequestFailure::Transport(msg),
@@ -3484,7 +3594,7 @@ fn classify_ws_response_error(code: i64, msg: String) -> RequestFailure {
 fn classify_connector_error(ce: &ConnectorError) -> RequestFailure {
     match ce {
         ConnectorError::TooManyRequestsError { .. } | ConnectorError::RateLimitBanError { .. } => {
-            RequestFailure::RateLimited
+            RequestFailure::RateLimited(rest_retry_after(ce))
         }
         // Splice the code in so callers can tell auth-failure subtypes apart (e.g. -2014
         // invalid key vs -2015 IP/permission).
@@ -3535,8 +3645,11 @@ fn classify_connector_error(ce: &ConnectorError) -> RequestFailure {
 /// it with [`classify_connector_error`], and map a venue rejection with
 /// [`parse_binance_order_rejection`].
 ///
-/// - 401 → [`ApiError::Unauthenticated`]; 429/418 → [`ApiError::RateLimit`]; 403 →
-///   `Unauthenticated` when it is an auth failure, else `RateLimit` (Binance's WAF limit).
+/// - [`CooldownActive`] (held back unsent) → [`ApiError::RateLimit`], with the cooldown's time
+///   left as the wait.
+/// - 401 → [`ApiError::Unauthenticated`]; 429/418 → [`ApiError::RateLimit`], with Binance's
+///   `Retry-After` as the wait; 403 → `Unauthenticated` when it is an auth failure, else
+///   `RateLimit` (Binance's WAF limit), with no wait.
 /// - 400/404 / other client errors that carry a Binance code → mapped by code/text; a venue
 ///   failure code → [`OrderError::Connectivity`].
 /// - Network/server failures (and the SDK's codeless transport/decode wrappers — failed HTTP
@@ -3546,6 +3659,9 @@ pub(crate) fn classify_rest_order_error(
     e: &anyhow::Error,
     instrument: &InstrumentNameExchange,
 ) -> OrderError<AssetNameExchange, InstrumentNameExchange> {
+    if let Some(cooldown) = e.downcast_ref::<CooldownActive>() {
+        return OrderError::Rejected(ApiError::rate_limited(Some(cooldown.remaining)));
+    }
     let Some(ce) = e.downcast_ref::<ConnectorError>() else {
         // Not an SDK ConnectorError — treat as opaque transport failure.
         return OrderError::Connectivity(ConnectivityError::Socket(format!("{e:#}")));
@@ -3569,8 +3685,14 @@ pub(crate) fn classify_ws_order_error(
 ) -> Option<UnindexedOrderError> {
     match e.downcast_ref::<WebsocketError>()? {
         // The typed error's own `Display`, not `e`'s: a context layer would hide the code.
-        response @ WebsocketError::ResponseError { code, .. } => Some(order_error_from(
-            classify_ws_response_error(*code, response.to_string()),
+        response @ WebsocketError::ResponseError {
+            code, retry_after, ..
+        } => Some(order_error_from(
+            classify_ws_response_error(
+                *code,
+                retry_after.map(|until_ms| wait_until_epoch_ms(until_ms, unix_ms())),
+                response.to_string(),
+            ),
             instrument,
         )),
         _ => None,
@@ -3583,7 +3705,9 @@ fn order_error_from(
     instrument: &InstrumentNameExchange,
 ) -> UnindexedOrderError {
     match failure {
-        RequestFailure::RateLimited => OrderError::Rejected(ApiError::rate_limited(None)),
+        RequestFailure::RateLimited(retry_after) => {
+            OrderError::Rejected(ApiError::rate_limited(retry_after))
+        }
         RequestFailure::Unauthenticated(msg) => {
             OrderError::Rejected(ApiError::Unauthenticated(msg))
         }
@@ -3593,8 +3717,10 @@ fn order_error_from(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use futures::FutureExt as _;
 
     /// A connection that counts its closes, and whose close never finishes while `stall` is set.
     #[derive(Clone, Default)]
@@ -5488,7 +5614,7 @@ mod tests {
     #[test]
     fn pause_after_ends_just_past_the_send_minute() {
         let minute = 29_000_000 * 60_000_u128;
-        let slack = MINUTE_BOUNDARY_SLACK_MS;
+        let slack = CLOCK_SKEW_SLACK_MS;
         let ms = |ms: u64| Some(Duration::from_millis(ms));
         assert_eq!(
             pause_after(minute + 15_000, minute + 15_000),
@@ -5519,7 +5645,7 @@ mod tests {
             "a pause is not a rate-limit cooldown"
         );
 
-        tokio::time::advance(Duration::from_millis(60_000 + MINUTE_BOUNDARY_SLACK_MS)).await;
+        tokio::time::advance(Duration::from_millis(60_000 + CLOCK_SKEW_SLACK_MS)).await;
         assert!(!waits(&tracker, RequestKind::Query).await, "the pause ends");
     }
 
@@ -5549,6 +5675,278 @@ mod tests {
         tokio::time::advance(Duration::from_secs(5)).await;
         assert!(!tracker.is_blocked());
         assert!(!waits(&tracker, RequestKind::Order).await);
+    }
+
+    /// A cooldown of at most `MAX_COOLDOWN_SLEEP` is slept through; one longer fails at once,
+    /// for every kind, with the time left.
+    #[tokio::test]
+    async fn a_cooldown_longer_than_the_sleep_limit_fails_at_once() {
+        tokio::time::pause();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        tracker.on_rate_limited(Some(MAX_COOLDOWN_SLEEP));
+        assert!(waits(&tracker, RequestKind::Order).await, "at the limit");
+
+        let longer = MAX_COOLDOWN_SLEEP + Duration::from_millis(1);
+        tracker.on_rate_limited(Some(longer));
+        for kind in [
+            RequestKind::Order,
+            RequestKind::Query,
+            RequestKind::Essential,
+        ] {
+            assert_eq!(
+                tracker.wait_if_blocked(kind).now_or_never(),
+                Some(Err(CooldownActive { remaining: longer })),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(tracker.cooldown_remaining(), Some(longer));
+    }
+
+    /// A request sleeping through a short cooldown fails once another refusal extends it past
+    /// the limit, rather than sleeping through the longer one.
+    #[tokio::test]
+    async fn a_cooldown_extended_past_the_limit_while_sleeping_fails() {
+        tokio::time::pause();
+        let tracker = Arc::new(RateLimitTracker::new(WeightPool::Spot));
+        tracker.on_rate_limited(Some(Duration::from_secs(5)));
+        let waiter = tokio::spawn({
+            let tracker = Arc::clone(&tracker);
+            async move { tracker.wait_if_blocked(RequestKind::Order).await }
+        });
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tracker.on_rate_limited(Some(Duration::from_secs(120)));
+        tokio::time::advance(Duration::from_secs(4)).await;
+
+        // The timer wakes the sleeper up to a millisecond late.
+        let remaining = waiter.await.unwrap().unwrap_err().remaining;
+        assert!(
+            remaining <= Duration::from_secs(116)
+                && remaining >= Duration::from_secs(116) - Duration::from_millis(1),
+            "{remaining:?}"
+        );
+    }
+
+    /// A weight pause longer than the cooldown limit is slept through: it is not a refusal.
+    #[tokio::test]
+    async fn a_long_weight_pause_is_slept_through() {
+        tokio::time::pause();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        tracker.throttle(Duration::from_secs(30));
+        assert!(waits(&tracker, RequestKind::Query).await);
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert_eq!(
+            tracker.wait_if_blocked(RequestKind::Query).now_or_never(),
+            Some(Ok(()))
+        );
+    }
+
+    /// A wait beyond the clock's range does not panic, and blocks every request.
+    #[tokio::test]
+    async fn a_wait_beyond_the_clock_range_blocks_without_panicking() {
+        tokio::time::pause();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        tracker.on_rate_limited(Some(Duration::MAX));
+        assert_eq!(
+            tracker.cooldown_remaining(),
+            Some(Duration::from_secs(u64::from(u32::MAX)))
+        );
+        assert!(
+            tracker
+                .wait_if_blocked(RequestKind::Order)
+                .now_or_never()
+                .is_some_and(|waited| waited.is_err())
+        );
+    }
+
+    #[tokio::test]
+    async fn cooldown_remaining_reports_none_outside_a_cooldown() {
+        tokio::time::pause();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        assert_eq!(tracker.cooldown_remaining(), None);
+        tracker.on_rate_limited(None);
+        assert_eq!(
+            tracker.cooldown_remaining(),
+            Some(Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS))
+        );
+        tokio::time::advance(Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS)).await;
+        assert_eq!(tracker.cooldown_remaining(), None);
+    }
+
+    /// The wait runs to the slack past the time Binance named, and is zero once that has passed.
+    #[test]
+    fn wait_until_epoch_ms_runs_to_the_slack_past_the_time() {
+        let now = 1_700_000_000_000_u128;
+        let at = |offset: i128| i64::try_from(now.cast_signed() + offset).unwrap();
+        let ms = Duration::from_millis;
+        assert_eq!(
+            wait_until_epoch_ms(at(60_000), now),
+            ms(60_000 + CLOCK_SKEW_SLACK_MS)
+        );
+        assert_eq!(wait_until_epoch_ms(at(0), now), ms(CLOCK_SKEW_SLACK_MS));
+        assert_eq!(
+            wait_until_epoch_ms(at(-400), now),
+            ms(CLOCK_SKEW_SLACK_MS - 400)
+        );
+        let slack = i128::from(CLOCK_SKEW_SLACK_MS);
+        assert_eq!(wait_until_epoch_ms(at(-slack), now), Duration::ZERO);
+        assert_eq!(wait_until_epoch_ms(at(-60_000), now), Duration::ZERO);
+        assert_eq!(wait_until_epoch_ms(-1, now), Duration::ZERO);
+        assert_eq!(
+            wait_until_epoch_ms(i64::MAX, 0),
+            ms(i64::MAX.cast_unsigned() + CLOCK_SKEW_SLACK_MS)
+        );
+    }
+
+    /// A WS-API ban epoch `ms` from now.
+    fn epoch_in(ms: u64) -> i64 {
+        i64::try_from(unix_ms()).unwrap() + i64::try_from(ms).unwrap()
+    }
+
+    fn classify_ws_with_retry_after(code: i64, retry_after: Option<i64>) -> UnindexedOrderError {
+        classify_ws_order_error(
+            &anyhow::Error::new(WebsocketError::ResponseError {
+                code,
+                message: "Way too much request weight used; IP banned.".to_string(),
+                retry_after,
+            }),
+            &InstrumentNameExchange::new("BTCUSDT"),
+        )
+        .expect("a ResponseError is a venue response")
+    }
+
+    /// The wait a rate-limit refusal reports, or `None` for any other error.
+    fn order_retry_after(err: &UnindexedOrderError) -> Option<Option<Duration>> {
+        match err {
+            OrderError::Rejected(api @ ApiError::RateLimit { .. }) => Some(api.retry_after()),
+            _ => None,
+        }
+    }
+
+    /// A WS-API throttle or ban reports the wait until its `retryAfter`, plus the slack.
+    #[test]
+    fn a_ws_api_rate_limit_reports_the_wait_until_retry_after() {
+        for code in [-1003, -1015, 429, 418] {
+            let err = classify_ws_with_retry_after(code, Some(epoch_in(120_000)));
+            let wait = order_retry_after(&err)
+                .flatten()
+                .unwrap_or_else(|| panic!("{code}: got {err:?}"));
+            let expected = Duration::from_millis(120_000 + CLOCK_SKEW_SLACK_MS);
+            assert!(
+                wait <= expected && wait > expected - Duration::from_secs(5),
+                "{code}: {wait:?}"
+            );
+
+            let err = classify_ws_with_retry_after(code, None);
+            assert_eq!(order_retry_after(&err), Some(None), "{code}");
+        }
+    }
+
+    /// A `retryAfter` on any other refusal does not make it a rate limit.
+    #[test]
+    fn a_retry_after_on_another_refusal_is_not_a_rate_limit() {
+        let err = classify_ws_with_retry_after(-2010, Some(epoch_in(60_000)));
+        assert!(
+            matches!(err, OrderError::Rejected(ApiError::OrderRejected(_))),
+            "got {err:?}"
+        );
+    }
+
+    /// REST's `Retry-After`, in seconds, is the wait on a 429 and a 418, for orders and queries.
+    #[test]
+    fn a_rest_rate_limit_reports_its_retry_after() {
+        let refusal = |banned: bool, retry_after| {
+            let msg = "Too many requests.".to_string();
+            let code = Some(-1003);
+            if banned {
+                ConnectorError::RateLimitBanError {
+                    msg,
+                    code,
+                    retry_after,
+                }
+            } else {
+                ConnectorError::TooManyRequestsError {
+                    msg,
+                    code,
+                    retry_after,
+                }
+            }
+        };
+        for (sent, expected) in [(Some(120), Some(Duration::from_secs(120))), (None, None)] {
+            for banned in [false, true] {
+                let order = classify_err(refusal(banned, sent));
+                assert_eq!(order_retry_after(&order), Some(expected), "{order:?}");
+                let query = classify_query(refusal(banned, sent));
+                assert!(
+                    matches!(
+                        &query,
+                        UnindexedClientError::Api(api @ ApiError::RateLimit { .. })
+                            if api.retry_after() == expected
+                    ),
+                    "{query:?}"
+                );
+            }
+        }
+    }
+
+    /// A throttle without a wait is retried after each backoff until the retries run out. The
+    /// last refusal is returned, and holds every request back for the default cooldown.
+    #[tokio::test]
+    async fn a_throttle_is_retried_until_the_retries_run_out() {
+        tokio::time::pause();
+        let tracker = RateLimitTracker::new(WeightPool::Spot);
+        let started = tokio::time::Instant::now();
+        let mut calls = 0_u32;
+        let result =
+            rest_call_with_retry::<(), ()>(&Arc::new(()), &tracker, RequestKind::Query, |_| {
+                calls += 1;
+                Box::pin(async {
+                    Err(anyhow::Error::new(ConnectorError::TooManyRequestsError {
+                        msg: "Too much request weight used.".to_string(),
+                        code: Some(-1003),
+                        retry_after: None,
+                    }))
+                })
+            })
+            .await;
+
+        assert_eq!(calls, MAX_RATE_LIMIT_RETRIES + 1);
+        let error = result.err().expect("every attempt was refused");
+        assert!(
+            matches!(
+                error.downcast_ref::<ConnectorError>(),
+                Some(ConnectorError::TooManyRequestsError { .. })
+            ),
+            "{error:?}"
+        );
+        // Each of the three sleeps wakes up to a millisecond late.
+        let backoffs = Duration::from_secs(1 + 2 + 4);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= backoffs && elapsed <= backoffs + Duration::from_millis(3),
+            "{elapsed:?}"
+        );
+        assert_eq!(
+            tracker.cooldown_remaining(),
+            Some(Duration::from_secs(DEFAULT_RATE_LIMIT_DELAY_SECS))
+        );
+    }
+
+    /// A request held back by a cooldown reports the time left as its wait.
+    #[test]
+    fn a_held_back_request_reports_the_cooldown_left() {
+        let remaining = Duration::from_secs(42);
+        let held = || anyhow::Error::new(CooldownActive { remaining });
+        let order = classify_rest_order_error(&held(), &InstrumentNameExchange::new("BTCUSDT"));
+        assert_eq!(order_retry_after(&order), Some(Some(remaining)));
+        let query = classify_rest_query_error(&held(), None);
+        assert!(
+            matches!(
+                &query,
+                UnindexedClientError::Api(api @ ApiError::RateLimit { .. })
+                    if api.retry_after() == Some(remaining)
+            ),
+            "{query:?}"
+        );
     }
 
     /// A WS-API response replaces the default limit, so the same usage can cross the threshold
