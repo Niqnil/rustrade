@@ -74,6 +74,36 @@ fn test_instrument() -> InstrumentNameExchange {
     "BTCUSDT".into()
 }
 
+/// Testnet's average price of `instrument` over the last few minutes, which Binance's
+/// `PERCENT_PRICE_BY_SIDE` filter measures every order price against.
+///
+/// Trigger and limit prices are derived from it rather than hard-coded: the filter refuses a
+/// price too far from it with `-1013`, and a fixed price drifts out of range as the market moves.
+/// On BTCUSDT a sell price must lie within 0.8× to 2× of it.
+async fn average_price(instrument: &InstrumentNameExchange) -> Decimal {
+    let body = reqwest::get(format!(
+        "https://testnet.binance.vision/api/v3/avgPrice?symbol={instrument}"
+    ))
+    .await
+    .expect("avgPrice request failed")
+    .error_for_status()
+    .expect("avgPrice returned an error status")
+    .json::<serde_json::Value>()
+    .await
+    .expect("avgPrice body is not JSON");
+
+    body["price"]
+        .as_str()
+        .expect("avgPrice body has no price")
+        .parse()
+        .expect("avgPrice price is not a decimal")
+}
+
+/// `average` scaled by `factor`, on BTCUSDT's 0.01 price tick.
+fn price_at(average: Decimal, factor: Decimal) -> Decimal {
+    (average * factor).round_dp(2)
+}
+
 // ============================================================================
 // Connection Tests
 // ============================================================================
@@ -127,15 +157,14 @@ async fn test_stop_order() {
         cid: cid.clone(),
     };
 
-    // Place STOP_LOSS order: sell BTC when price drops to $50,000
-    // This won't trigger since testnet BTC is around $100k
+    // Place STOP_LOSS order: sell BTC when price drops 10% below its average, which won't
+    // trigger while the order rests.
+    let trigger_price = price_at(average_price(&instrument).await, dec!(0.9));
     let request = RequestOpen {
         side: Side::Sell,
         price: None, // Market order when triggered
         quantity: dec!(0.001),
-        kind: OrderKind::Stop {
-            trigger_price: dec!(50000),
-        },
+        kind: OrderKind::Stop { trigger_price },
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
@@ -147,7 +176,7 @@ async fn test_stop_order() {
         state: request,
     };
 
-    println!("Placing Stop order: SELL 0.001 BTC @ market when price <= $50,000");
+    println!("Placing Stop order: SELL 0.001 BTC @ market when price <= ${trigger_price}");
 
     let response = client.open_order(open_request).await;
 
@@ -218,14 +247,16 @@ async fn test_stop_limit_order() {
         cid: cid.clone(),
     };
 
-    // Place STOP_LOSS_LIMIT order: sell BTC at limit $49,900 when price drops to $50,000
+    // Place STOP_LOSS_LIMIT order: sell BTC at a limit just under its trigger, 10% below the
+    // average price.
+    let average = average_price(&instrument).await;
+    let trigger_price = price_at(average, dec!(0.9));
+    let limit_price = price_at(average, dec!(0.89));
     let request = RequestOpen {
         side: Side::Sell,
-        price: Some(dec!(49900)), // Limit price after trigger
+        price: Some(limit_price), // Limit price after trigger
         quantity: dec!(0.001),
-        kind: OrderKind::StopLimit {
-            trigger_price: dec!(50000),
-        },
+        kind: OrderKind::StopLimit { trigger_price },
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
@@ -237,7 +268,9 @@ async fn test_stop_limit_order() {
         state: request,
     };
 
-    println!("Placing StopLimit order: SELL 0.001 BTC @ $49,900 when price <= $50,000");
+    println!(
+        "Placing StopLimit order: SELL 0.001 BTC @ ${limit_price} when price <= ${trigger_price}"
+    );
 
     let response = client.open_order(open_request).await;
 
@@ -292,15 +325,14 @@ async fn test_take_profit_order() {
         cid: cid.clone(),
     };
 
-    // Place TAKE_PROFIT order: sell BTC when price rises to $110,000
-    // Must be within PERCENT_PRICE_BY_SIDE filter (typically ~10% from current price)
+    // Place TAKE_PROFIT order: sell BTC when price rises 10% above its average, which won't
+    // trigger while the order rests.
+    let trigger_price = price_at(average_price(&instrument).await, dec!(1.1));
     let request = RequestOpen {
         side: Side::Sell,
         price: None,
         quantity: dec!(0.001),
-        kind: OrderKind::TakeProfit {
-            trigger_price: dec!(110000),
-        },
+        kind: OrderKind::TakeProfit { trigger_price },
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
@@ -312,7 +344,7 @@ async fn test_take_profit_order() {
         state: request,
     };
 
-    println!("Placing TakeProfit order: SELL 0.001 BTC @ market when price >= $110,000");
+    println!("Placing TakeProfit order: SELL 0.001 BTC @ market when price >= ${trigger_price}");
 
     let response = client.open_order(open_request).await;
 
@@ -367,15 +399,16 @@ async fn test_take_profit_limit_order() {
         cid: cid.clone(),
     };
 
-    // Place TAKE_PROFIT_LIMIT order
-    // Must be within PERCENT_PRICE_BY_SIDE filter (typically ~10% from current price)
+    // Place TAKE_PROFIT_LIMIT order: sell BTC at a limit just under its trigger, 10% above the
+    // average price.
+    let average = average_price(&instrument).await;
+    let trigger_price = price_at(average, dec!(1.1));
+    let limit_price = price_at(average, dec!(1.09));
     let request = RequestOpen {
         side: Side::Sell,
-        price: Some(dec!(109000)), // Limit price
+        price: Some(limit_price), // Limit price
         quantity: dec!(0.001),
-        kind: OrderKind::TakeProfitLimit {
-            trigger_price: dec!(110000),
-        },
+        kind: OrderKind::TakeProfitLimit { trigger_price },
         time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
         position_id: None,
         reduce_only: false,
@@ -387,7 +420,10 @@ async fn test_take_profit_limit_order() {
         state: request,
     };
 
-    println!("Placing TakeProfitLimit order: SELL 0.001 BTC @ $109,000 when price >= $110,000");
+    println!(
+        "Placing TakeProfitLimit order: SELL 0.001 BTC @ ${limit_price} when price >= \
+         ${trigger_price}"
+    );
 
     let response = client.open_order(open_request).await;
 
