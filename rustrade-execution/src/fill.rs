@@ -202,10 +202,13 @@ impl FillModel for SimFillConfig {
 /// When a simulated venue fills a market order, as [`MockExecutionConfig::market_order_timing`]
 /// selects. Defaults to [`OnArrival`](Self::OnArrival).
 ///
+/// `#[non_exhaustive]`: other rules for when a held order is released may be added.
+///
 /// [`MockExecutionConfig::market_order_timing`]: crate::client::mock::MockExecutionConfig::market_order_timing
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
 )]
+#[non_exhaustive]
 pub enum MarketOrderTiming {
     /// Fill the moment the order reaches the venue, against the market it holds then.
     ///
@@ -252,7 +255,10 @@ pub enum MarketOrderTiming {
 
 /// Which price of the next bar fills a market order held for it. See
 /// [`MarketOrderTiming::NextBar`].
+///
+/// `#[non_exhaustive]`: other reference prices may be added.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[non_exhaustive]
 pub enum NextBarPrice {
     /// The next bar's open: the first price the market traded at after the order was sent. The
     /// realistic choice.

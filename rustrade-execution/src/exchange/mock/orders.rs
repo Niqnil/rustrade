@@ -230,12 +230,16 @@ impl OpenOrders {
     ///
     /// # Errors
     /// [`AlreadyResting`], as for [`insert`](Self::insert), leaving the book exactly as it was.
+    ///
+    /// # Panics
+    /// Panics if `order` carries a price. A priced order is queued for matching, which a held one
+    /// must never be, and would leave the held index out of step with the book.
     pub fn hold(
         &mut self,
         order: OpenOrder,
         reservation: Option<Reservation>,
     ) -> Result<(), AlreadyResting> {
-        debug_assert!(
+        assert!(
             order.price.is_none(),
             "held order {} carries a price, so it belongs on the price-time queues",
             order.key.cid

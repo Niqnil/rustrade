@@ -2140,10 +2140,12 @@ impl SimulatedVenue {
             time_exchange,
             Decimal::ZERO,
         );
+        // Held with no price whatever the request carried: a price on a market order is ignored,
+        // and one kept here would queue the order to be matched as a limit.
         let order = Order {
             key: request.key,
             side: request.state.side,
-            price: request.state.price,
+            price: None,
             quantity: request.state.quantity,
             kind: request.state.kind,
             time_in_force: request.state.time_in_force,
@@ -9855,6 +9857,93 @@ mod tests {
             feed_bar(&mut venue, 2, ohlc("102", "110", "98", "108")).is_empty(),
             "the next bar has nothing left to fill"
         );
+    }
+
+    /// A price on a held market order is ignored, as on arrival: the order is held priceless, so
+    /// a tick through that price cannot match it as a limit, and a cancel leaves nothing held.
+    #[test]
+    fn a_held_market_order_carrying_a_price_is_held_without_it() {
+        let mut venue = venue_holding(NextBarPrice::Open, "10000");
+        let request = priced_market_order(Side::Buy, "200", None);
+        let key = request.key.clone();
+
+        let outcome = venue.open_order(request);
+        assert_eq!(rested_open(&outcome).filled_quantity, Decimal::ZERO);
+        assert_eq!(outcome.response.price, None, "reported as it is held");
+        assert_eq!(venue.orders_open(&[])[0].price, None);
+
+        let ticked = venue.apply_market(
+            &instrument_name(),
+            traded("150"),
+            MarketDepth::UNKNOWN,
+            None,
+            time(2),
+        );
+        assert!(
+            ticked.is_empty(),
+            "a tick below the stray price matches nothing: {ticked:?}"
+        );
+
+        let cancelled = venue.cancel_order(OrderEvent {
+            key,
+            state: RequestCancel { id: None },
+        });
+        assert!(cancelled.response.state.is_ok());
+        assert!(!venue.holds_for_next_bar(&instrument_name()));
+    }
+
+    /// A held order whose deadline the bar reaches is retired by the sweep before the bar can
+    /// release it, and leaves the held index with it.
+    #[test]
+    fn a_held_order_whose_deadline_the_bar_reaches_expires_unfilled() {
+        let mut venue = venue_holding(NextBarPrice::Open, "10000");
+        let _ = venue.open_order(market_order(
+            "gtd",
+            Side::Buy,
+            "1",
+            TimeInForce::GoodTillDate { expiry: time(2) },
+        ));
+
+        let events = feed_bar(&mut venue, 2, ohlc("102", "110", "98", "108"));
+
+        assert_eq!(
+            events.len(),
+            2,
+            "the released hold, then the order: {events:?}"
+        );
+        assert!(
+            matches!(
+                order_of(&events[1]).state,
+                OrderState::Inactive(InactiveOrderState::Expired(_))
+            ),
+            "{:?}",
+            order_of(&events[1]).state
+        );
+        assert!(venue.trades(time(0)).is_empty());
+        assert_eq!(free_quote(&venue), d("10000"));
+        assert!(!venue.holds_for_next_bar(&instrument_name()));
+    }
+
+    /// A held spot sell holds the base it would deliver, and the bar settles exactly that.
+    #[test]
+    fn a_held_spot_sell_holds_the_base_it_would_deliver() {
+        let mut venue = venue_holding(NextBarPrice::Open, "10000");
+        let free_base = |venue: &SimulatedVenue| venue.balances(&[base()])[0].balance.free;
+
+        let _ = venue.open_order(market_order(
+            "sell",
+            Side::Sell,
+            "1",
+            TimeInForce::ImmediateOrCancel,
+        ));
+        assert_eq!(free_base(&venue), d("9"));
+        assert_eq!(total_base(&venue), d("10"), "and nothing delivered yet");
+
+        let events = feed_bar(&mut venue, 2, ohlc("102", "110", "98", "108"));
+
+        assert_eq!(trade_of(&events[2]).price, d("102"));
+        assert_eq!(total_base(&venue), d("9"));
+        assert_eq!(free_base(&venue), d("9"));
     }
 
     #[test]

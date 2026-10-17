@@ -1077,6 +1077,7 @@ where
     /// Discard everything still scheduled: the run is over without being drained.
     pub(crate) fn abandon(&mut self) {
         self.pending = BinaryHeap::new();
+        self.deferred = None;
     }
 }
 
@@ -3306,6 +3307,45 @@ mod tests {
                 "balance",
                 "order",
                 "market",
+                "balance",
+                "balance",
+                "trade",
+                "order",
+                "market",
+                "after_drain"
+            ],
+        );
+        assert_eq!(trade_prices(&events), vec![dec!(102)]);
+    }
+
+    /// The same candle sent twice is one bar, so its repeat releases nothing: an order sent on the
+    /// first waits for the bar after it.
+    #[tokio::test]
+    async fn a_repeated_candle_does_not_release_a_held_market_order() {
+        let mut harness = Harness::with_config(
+            next_bar_config(0),
+            vec![
+                candle(10, [dec!(95), dec!(105), dec!(90), dec!(100)]),
+                candle(10, [dec!(95), dec!(105), dec!(90), dec!(100)]),
+                candle(20, [dec!(102), dec!(110), dec!(98), dec!(108)]),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        harness.send_open(dec!(100));
+
+        let events = harness.rest_events().await;
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec![
+                "balance",
+                "order",
+                // The repeat, shown at once with nothing filled...
+                "market",
+                // ...and the fill the next bar released, before that bar.
                 "balance",
                 "balance",
                 "trade",

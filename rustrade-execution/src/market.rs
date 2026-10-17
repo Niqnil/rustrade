@@ -92,10 +92,11 @@ impl MarketSnapshot {
 /// [`MarketOrderTiming::NextBar`](crate::fill::MarketOrderTiming::NextBar).
 ///
 /// No volume and no period: a venue does not need either to price a fill, and a bar's instant is
-/// the observation's own, given beside it.
-#[derive(
-    Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Default, Deserialize, Serialize,
-)]
+/// the observation's own, given beside it. The four prices are taken as given: nothing checks that
+/// `low` and `high` bound the other two.
+///
+/// No `Default`: a bar of four zero prices is not a bar any market printed.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct MarketBar {
     /// The first price of the bar's period.
     pub open: Decimal,

@@ -41,13 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **`SimulatedVenue::apply_market` takes the bar an observation carries** (`rustrade-execution`).
-  Its new `bar: Option<MarketBar>` argument comes before `time_exchange`. Pass `None` from a feed
-  without bars, which keeps today's behaviour.
-- **`MockExecutionConfig` has a new public field, `market_order_timing`, and
-  `VenueInstrumentMarket` one, `bar`**, which a struct literal must set
-  (`rustrade-execution`). `market_order_timing` is `#[serde(default)]`, so a serialised
-  configuration without it still loads.
+- **Breaking:** `SimulatedVenue::apply_market` takes the bar an observation carries
+  (`rustrade-execution`). Its new `bar: Option<MarketBar>` argument comes before
+  `time_exchange`. Pass `None` from a feed without bars, which keeps today's behaviour.
+- **Breaking:** `MockExecutionConfig` has a new field, `market_order_timing`, so a struct literal
+  or a `MockExecutionConfig::new` call must supply it, and `VenueInstrumentMarket` has a new
+  public field, `bar` (`rustrade-execution`). A serialised configuration without
+  `market_order_timing` still loads, as `OnArrival`.
 
 ## [0.12.1] - 2026-10-17
 
