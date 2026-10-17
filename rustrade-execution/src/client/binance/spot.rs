@@ -325,8 +325,9 @@ impl WsApiUnavailable {
 /// [`StreamTerminationReason::RateLimited`](crate::error::StreamTerminationReason::RateLimited),
 /// carrying the time left. A handshake or user-data subscribe Binance refuses for a rate limit
 /// starts a cooldown, as an order's refusal does. A refused handshake names no wait, so a 429 starts
-/// the 10 s default, and handshakes refused that way spend the reconnect budget as any failure
-/// does; a 418, an IP ban, starts Binance's shortest ban, 2 minutes, and so ends the stream.
+/// the 10 s default, and handshakes refused that way spend the
+/// [reconnect budget](super#account-stream-reconnection) as any failure does; a 418, an IP ban,
+/// starts Binance's shortest ban, 2 minutes, and so ends the stream.
 ///
 /// # Fills of other clients' orders
 /// The account stream, fill recovery and `fetch_trades` report every fill on the account, whoever
@@ -874,6 +875,12 @@ impl ExecutionClient for BinanceSpot {
     }
 
     /// Returns a live stream of account events (fills, order updates, balance changes).
+    ///
+    /// # Reconnection
+    ///
+    /// The stream reconnects by itself, and ends once 10 reconnects in a row have failed or a
+    /// rate-limit cooldown outlasts what it waits through. See the
+    /// [module docs](super#account-stream-reconnection).
     ///
     /// # Startup Race Window
     ///

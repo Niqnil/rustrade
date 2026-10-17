@@ -1639,6 +1639,26 @@ impl ExecutionClient for AlpacaClient {
 
     /// Returns a live stream of account events (fills, order updates).
     ///
+    /// # Reconnection
+    ///
+    /// The stream reconnects by itself when the server closes the connection, the connection
+    /// fails, or it carries nothing for a 35 s heartbeat window. Each reconnect recovers the fills
+    /// and order endings the stream missed (see below).
+    ///
+    /// - **Attempts.** A dropped connection, and each reconnect that fails after it, spends one
+    ///   attempt: a wait, then a reconnect. A reconnect fails when its connect, authentication or
+    ///   `trade_updates` subscribe fails. The waits double from 1 s up to 30 s: 1, 2, 4, 8, 16,
+    ///   then 30 s.
+    /// - **Reset.** A connection still receiving after 35 s up clears the attempts spent before
+    ///   it, so only failures in a row count. A connection the server accepts and closes sooner
+    ///   counts as a failed reconnect.
+    /// - **Giving up.** Once 10 reconnects in a row have failed, after about three minutes of
+    ///   waiting in all, the stream ends with [`AccountEventKind::StreamTerminated`] carrying
+    ///   [`ReconnectBudgetExhausted`](crate::error::StreamTerminationReason::ReconnectBudgetExhausted)
+    ///   and the last failure. Credentials rejected on every reconnect end it this way too.
+    /// - **Opening is not retried.** A failed `account_stream` call returns its error. Whether and
+    ///   when to try again is the caller's decision, as it is after the stream ends.
+    ///
     /// # Startup race window
     ///
     /// Fills arriving between `account_snapshot` and this method being called by the
@@ -6285,6 +6305,16 @@ mod tests {
             is_duplicate_fill(&cache, None, SmolStr::new("ord-1:4")),
             "with an id first, then without one"
         );
+    }
+
+    /// `account_stream`'s rustdoc states the reconnect budget, its backoff and the heartbeat
+    /// window as numbers. Change these only together with those docs.
+    #[test]
+    fn the_reconnect_budget_is_as_documented() {
+        assert_eq!(MAX_RECONNECT_ATTEMPTS, 10);
+        assert_eq!(INITIAL_BACKOFF_MS, 1_000);
+        assert_eq!(MAX_BACKOFF_MS, 30_000);
+        assert_eq!(HEARTBEAT_TIMEOUT_SECS, 35);
     }
 
     #[tokio::test]

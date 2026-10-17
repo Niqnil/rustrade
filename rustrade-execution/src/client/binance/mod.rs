@@ -22,6 +22,34 @@
 //! order id each fill's order was placed with, so orders placed outside the engine under ids
 //! of their own, such as with a prefix, can be recognised by their fills.
 //!
+//! # Account stream reconnection
+//!
+//! Both clients' account streams reconnect by themselves, with the same budget, when the
+//! connection drops or carries nothing for a 30 s heartbeat window. Each reconnect recovers the
+//! fills and order endings the stream missed (see each client's `account_stream`).
+//!
+//! - **Attempts.** A dropped connection, and each reconnect that fails after it, spends one
+//!   attempt: a wait, then a reconnect. A reconnect fails when its connect, its user-data
+//!   subscribe, or for [`BinanceMargin`] its listen-token request fails. The waits double from 1 s
+//!   up to 30 s: 1, 2, 4, 8, 16, then 30 s.
+//! - **Reset.** A connection that stays up for 30 s clears the attempts spent before it, so only
+//!   failures in a row count. A connection the venue accepts and drops sooner counts as a failed
+//!   reconnect.
+//! - **Giving up.** Once 10 reconnects in a row have failed, after about three minutes of waiting
+//!   in all, the stream ends with
+//!   [`AccountEventKind::StreamTerminated`](crate::AccountEventKind::StreamTerminated) carrying
+//!   [`ReconnectBudgetExhausted`](crate::error::StreamTerminationReason::ReconnectBudgetExhausted)
+//!   and the last failure.
+//! - **Rate limits.** A reconnect is never attempted during a rate-limit cooldown. A cooldown of
+//!   10 s or less is waited out without spending an attempt. A longer one ends the stream at once
+//!   with [`RateLimited`](crate::error::StreamTerminationReason::RateLimited), carrying the time
+//!   left. See each client's "Rate limits" docs.
+//! - **Opening is not retried.** A failed `account_stream` call returns its error. Whether and
+//!   when to try again is the caller's decision, as it is after the stream ends.
+//!
+//! [`BinanceMargin`] also reconnects shortly before its listen token expires. That planned
+//! reconnect spends no attempt.
+//!
 //! # Logging: `binance_sdk` writes request credentials at `DEBUG`
 //!
 //! Both clients run on the `binance-sdk` crate, whose WebSocket API client logs every outgoing

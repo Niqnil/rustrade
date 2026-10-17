@@ -459,8 +459,9 @@ impl BinanceMarginConfig {
 /// [`StreamTerminationReason::RateLimited`](crate::error::StreamTerminationReason::RateLimited),
 /// carrying the time left. A connect or subscribe Binance refuses for a rate limit starts a
 /// cooldown, as a REST refusal does. A refused handshake names no wait, so a 429 starts the 10 s
-/// default, and handshakes refused that way spend the reconnect budget as any failure does; a 418,
-/// an IP ban, starts Binance's shortest ban, 2 minutes, and so ends the stream.
+/// default, and handshakes refused that way spend the
+/// [reconnect budget](super#account-stream-reconnection) as any failure does; a 418, an IP ban,
+/// starts Binance's shortest ban, 2 minutes, and so ends the stream.
 ///
 /// # One client per engine (`ExchangeId`)
 /// All emitted events — cross and isolated alike — are stamped [`ExchangeId::BinanceMargin`], and
@@ -1272,7 +1273,8 @@ impl ExecutionClient for BinanceMargin {
     /// live with auto-reconnect, exponential backoff, heartbeat monitoring, and fill recovery
     /// (mirroring [`BinanceSpot`](super::spot::BinanceSpot)). The token is re-acquired and
     /// re-subscribed before its ~24h expiry — there is **no** listen-key keepalive (that API is
-    /// retired).
+    /// retired). The stream ends once 10 reconnects in a row have failed or a rate-limit cooldown
+    /// outlasts what it waits through: see the [module docs](super#account-stream-reconnection).
     ///
     /// As on spot, each instrument's gap after a reconnect is kept until its fills are forwarded:
     /// a gap whose read failed or timed out is retried after 1, 2, 4, 8 and 16 minutes, connected

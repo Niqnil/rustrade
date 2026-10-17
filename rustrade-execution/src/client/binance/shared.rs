@@ -3889,6 +3889,18 @@ mod tests {
     use super::*;
     use futures::FutureExt as _;
 
+    /// The module docs and both clients' rustdoc state the reconnect budget, its backoff, the
+    /// heartbeat window and the longest cooldown waited through as numbers. Change these only
+    /// together with those docs.
+    #[test]
+    fn the_reconnect_budget_is_as_documented() {
+        assert_eq!(MAX_RECONNECT_ATTEMPTS, 10);
+        assert_eq!(INITIAL_BACKOFF_MS, 1_000);
+        assert_eq!(MAX_BACKOFF_MS, 30_000);
+        assert_eq!(HEARTBEAT_TIMEOUT_SECS, 30);
+        assert_eq!(MAX_COOLDOWN_SLEEP, Duration::from_secs(10));
+    }
+
     /// A connection that counts its closes, and whose close never finishes while `stall` is set.
     #[derive(Clone, Default)]
     struct CountingWs {
