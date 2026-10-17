@@ -4,10 +4,15 @@
 //!
 //! | Connector | Reconnect | Dedup | Fill Recovery | Ended-order Recovery | Heartbeat | Cancel answers once |
 //! |-----------|-----------|-------|---------------|----------------------|-----------|---------------------|
-//! | [`binance`] | Auto (1s→30s backoff) | 10k LRU | REST after reconnect | REST after reconnect | 30s | cancelled |
-//! | [`alpaca`] | Auto (1s→30s backoff) | 2k LRU | REST after reconnect | REST after reconnect | 35s | accepted |
+//! | [`binance`] | Auto (1s→30s backoff, 10 tries) | 10k LRU | REST after reconnect | REST after reconnect | 30s | cancelled |
+//! | [`alpaca`] | Auto (1s→30s backoff, 10 tries) | 2k LRU | REST after reconnect | REST after reconnect | 35s | accepted |
 //! | [`ibkr`] | ibapi-managed | 10k LRU, fills only | Executions request after reconnect | None | N/A | submitted |
-//! | [`hyperliquid`] | SDK-managed | 10k LRU, fills only | Venue snapshot on resubscribe | REST after reconnect | SDK-managed | cancelled |
+//! | [`hyperliquid`] | SDK-managed (every 1s, no limit) | 10k LRU, fills only | Venue snapshot on resubscribe | REST after reconnect | SDK-managed | cancelled |
+//!
+//! "Reconnect" is how the account stream comes back after its connection drops, and when it gives
+//! up: Binance and Alpaca end the stream once 10 reconnects in a row have failed (see
+//! [`binance`](binance#account-stream-reconnection) and
+//! [`AlpacaClient`](alpaca::AlpacaClient)'s `account_stream`).
 //!
 //! "Ended-order Recovery" is whether a reconnect reports how an order the client held as live
 //! ended while the stream was down, and only those clients implement [`OrderStatusClient`]. The

@@ -31,11 +31,18 @@
 //!
 //! | Responsibility | Implementation |
 //! |----------------|----------------|
-//! | **Reconnection** | `InfoClient::with_reconnect()` handles WebSocket reconnection automatically |
+//! | **Reconnection** | `InfoClient::with_reconnect()` handles WebSocket reconnection automatically, every 1 s with no limit on attempts (see below) |
 //! | **Heartbeat** | SDK manages WebSocket ping/pong internally |
 //! | **Deduplication** | This client's own, on the fills and funding payments. See below and [Funding](self#funding). |
 //! | **Fill recovery** | Only the recent fills the venue's `userFills` snapshot redelivers on each resubscription — use [`ExecutionClient::fetch_trades`] for older ones |
 //! | **Ended-order recovery** | This client's own, after each reconnect: see [`HyperliquidClient`]'s `account_stream` and [`OrderStatusClient`] |
+//!
+//! The SDK's reconnection has no limit, so a lost connection never ends the account stream: the
+//! SDK (`hyperliquid_rust_sdk` 0.6) retries it once a second until it succeeds, and this client
+//! sets no budget of its own. The stream ends, with
+//! [`StreamTerminated`](crate::AccountEventKind::StreamTerminated) carrying
+//! [`StreamTerminationReason::Error`], only if the SDK closes a subscription's channel. Giving up
+//! on a venue that stays unreachable is the caller's decision.
 //!
 //! **Caller responsibilities**:
 //! - If fill recovery is critical, monitor for reconnection events and call `fetch_trades()`
