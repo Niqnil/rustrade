@@ -105,8 +105,12 @@ mod tests {
         Duration::from_millis(ms)
     }
 
+    /// The delays left in `budget`, capped so that a budget which never runs out fails the
+    /// test's assertion instead of exhausting memory.
     fn delays(budget: &mut ReconnectBudget) -> Vec<Duration> {
-        std::iter::from_fn(|| budget.next_delay()).collect()
+        std::iter::from_fn(|| budget.next_delay())
+            .take(100)
+            .collect()
     }
 
     /// Binance's module docs and Alpaca's `account_stream` rustdoc state the budget as numbers.
