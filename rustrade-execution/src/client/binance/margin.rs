@@ -2245,9 +2245,10 @@ enum FrameOutcome {
 /// Each text frame is either an RPC response (`{ "id", "status", "result", … }` — e.g. the
 /// subscribe ack) or a pushed user-data event wrapped as `{ "subscriptionId", "event": { "e", … } }`.
 /// Returns [`FrameOutcome::Response`] for a response, and otherwise whether the exchange signalled
-/// stream termination (a reconnect trigger). Unrecognised frames are ignored and logged by [`log_unrecognised_frame`] (throttled `warn`); event types with
-/// no arm are ignored and logged by [`log_unhandled_event`] (throttled `warn`), so a renamed event
-/// is seen rather than dropped silently. Deserialization of a known event type is defensive: a
+/// stream termination (a reconnect trigger). Unrecognised frames are ignored and logged by
+/// [`log_unrecognised_frame`] (throttled `warn`); event types with no arm are ignored and logged
+/// by [`log_unhandled_event`] (throttled `warn`), so a renamed event is seen rather than dropped
+/// silently. Deserialization of a known event type is defensive: a
 /// mismatch is logged and the event dropped (observable), never silently mis-parsed.
 ///
 /// Two arms differ between cross and isolated, and are delegated: the `outboundAccountPosition`
@@ -2523,8 +2524,8 @@ fn route_isolated_account_position(
 /// `InstrumentBalanceUpdate` via [`route_isolated_account_position`]) and `notice_instrument`
 /// ([`cross_notice_instrument`]; [`isolated_notice_instrument`]). Returns the subscription,
 /// which the caller unsubscribes on disconnect; dropping it unsubscribes too. `heartbeat_flag` is
-/// shared with the caller's monitor loop (set on every pushed frame and ping, not on responses); `signal_tx` fires
-/// once on a terminal condition (consumer-drop, socket error/close, or exchange
+/// shared with the caller's monitor loop (set on every pushed frame and ping, not on responses);
+/// `signal_tx` fires once on a terminal condition (consumer-drop, socket error/close, or exchange
 /// `eventStreamTerminated`). Each event `known` learns from updates it before it is sent.
 fn register_user_data_listener(
     ws: &Arc<WsApiBase>,
@@ -3511,6 +3512,7 @@ async fn isolated_connection_manager(
                             continue;
                         }
                         if in_grace {
+                            // The grace, with no reset (see the cross manager).
                             continue;
                         }
                         warn!("BinanceMargin isolated heartbeat timeout ({}s), will attempt reconnect", HEARTBEAT_TIMEOUT_SECS);
@@ -6096,12 +6098,22 @@ mod tests {
         serde_json::json!({ "subscriptionId": 1, "event": event }).to_string()
     }
 
+    fn cross_outcome(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> FrameOutcome {
+        convert_margin_user_data_events_with(
+            frame,
+            buf,
+            &mut cross_account_position_handler,
+            &mut cross_notice_instrument,
+        )
+    }
+
+    /// An RPC response (e.g. the subscribe ack) carries a top-level `id` and is not user data,
+    /// so it yields no events and is not activity for the heartbeat.
     #[test]
     fn margin_ws_rpc_ack_yields_no_events() {
-        // An RPC response (e.g. the subscribe ack) carries a top-level `id` and is not user data.
         let frame = serde_json::json!({ "id": "abc", "status": 200, "result": {} }).to_string();
         let mut buf = Vec::new();
-        assert!(!convert_margin_user_data_events(&frame, &mut buf));
+        assert_eq!(cross_outcome(&frame, &mut buf), FrameOutcome::Response);
         assert!(buf.is_empty());
     }
 
@@ -6114,7 +6126,11 @@ mod tests {
             r#"{"subscriptionId":1,"event":{"E":1}}"#,
         ] {
             let mut buf = Vec::new();
-            assert!(!convert_margin_user_data_events(frame, &mut buf), "{frame}");
+            assert_eq!(
+                cross_outcome(frame, &mut buf),
+                FrameOutcome::Pushed { terminated: false },
+                "{frame}"
+            );
             assert!(buf.is_empty(), "{frame}");
         }
     }
