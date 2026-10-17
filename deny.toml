@@ -37,6 +37,20 @@ ignore = [
     # (paupino/rust-decimal#819) or moves to rkyv >=0.8.17.
     { id = "RUSTSEC-2026-0235", reason = "rkyv is an unenabled optional dep of rust_decimal; never compiled in this workspace" },
 
+    # zip 0.6.6 archive-extraction advisories of 2026-10-09/10 (SUID/SGID bits kept, symlink
+    # targets and permissions not confined to the destination). Same class as rkyv above: an
+    # *unenabled optional* dependency, two levels deep. The lockfile path is ethers 2.0.14 ->
+    # ethers-solc (optional, behind ethers' `solc` feature) -> svm-rs 0.3.5 (optional, behind
+    # ethers-solc's `svm-solc` feature) -> zip. Neither feature is enabled by us or by
+    # hyperliquid_rust_sdk, so `cargo tree -i zip --workspace --all-features --target all` finds no
+    # path, cargo deny does not flag it, and only cargo audit's lockfile read does. No bump is
+    # available to us: the fix is in zip >=9.0.0, and ethers 2.0.14 is ethers' last release. Drop
+    # these entries once neither hyperliquid_rust_sdk nor our own `hyperliquid` feature depends on
+    # ethers 2.0, which takes zip out of Cargo.lock.
+    { id = "RUSTSEC-2026-0367", reason = "zip is an unenabled optional dep (ethers -> ethers-solc -> svm-rs); never compiled in this workspace" },
+    { id = "RUSTSEC-2026-0368", reason = "zip is an unenabled optional dep (ethers -> ethers-solc -> svm-rs); never compiled in this workspace" },
+    { id = "RUSTSEC-2026-0369", reason = "zip is an unenabled optional dep (ethers -> ethers-solc -> svm-rs); never compiled in this workspace" },
+
     # hyperliquid_rust_sdk transitive dependencies (no direct control)
     { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained; transitive via hyperliquid_rust_sdk" },
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; transitive via hyperliquid_rust_sdk" },
