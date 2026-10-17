@@ -46,6 +46,7 @@ pub(crate) use crate::client::dedup::{
 use crate::client::order_recovery::{
     GAP_RETRY_BASE_SECS, GapFailure, MAX_GAP_RETRIES, PendingFills,
 };
+use crate::client::reconnect_budget::ReconnectBudget;
 use binance_sdk::common::{
     errors::{ConnectorError, WebsocketError},
     models::{Interval, ParamBuildError, RateLimitType, RestApiResponse, WebsocketApiRateLimit},
@@ -266,12 +267,6 @@ impl Drop for UnsubscribeOnDrop {
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Initial backoff delay for reconnection attempts.
-pub(crate) const INITIAL_BACKOFF_MS: u64 = 1_000;
-/// Maximum backoff delay (cap for exponential growth).
-pub(crate) const MAX_BACKOFF_MS: u64 = 30_000;
-/// Maximum number of consecutive reconnect attempts before giving up.
-pub(crate) const MAX_RECONNECT_ATTEMPTS: u32 = 10;
 /// If no WS activity (messages, ping, pong) for this duration, force reconnect.
 pub(crate) const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
 // Compile-time guard: reconnect sites cast this to i64 (`chrono::Duration::seconds`); ensure it
@@ -1250,91 +1245,40 @@ impl HandshakeRefusal {
 }
 
 // ---------------------------------------------------------------------------
-// Exponential backoff
+// Reconnect budget
 // ---------------------------------------------------------------------------
 
-pub(crate) struct ExponentialBackoff {
-    attempt: u32,
-    max_attempts: u32,
-    initial_ms: u64,
-    max_ms: u64,
-}
-
-impl ExponentialBackoff {
-    pub(crate) fn new() -> Self {
-        Self {
-            attempt: 0,
-            max_attempts: MAX_RECONNECT_ATTEMPTS,
-            initial_ms: INITIAL_BACKOFF_MS,
-            max_ms: MAX_BACKOFF_MS,
-        }
+/// Decide, after an account stream's connect failed or its connection ended, whether to try
+/// again.
+///
+/// A rate-limit cooldown longer than a request sleeps through ends the stream at once, rather
+/// than spend the budget against a venue that refuses every attempt. Otherwise this spends one
+/// attempt and its backoff. A shorter cooldown is left for
+/// [`RateLimitTracker::before_stream_connect`] to wait out, which spends no attempt.
+///
+/// # Errors
+/// The reason the stream ends: [`StreamTerminationReason::RateLimited`] for such a cooldown,
+/// or [`StreamTerminationReason::ReconnectBudgetExhausted`], with `last_error`, once no
+/// attempt is left.
+pub(crate) async fn retry_or_end(
+    budget: &mut ReconnectBudget,
+    rate_limiter: &RateLimitTracker,
+    last_error: impl FnOnce() -> String,
+) -> Result<(), StreamTerminationReason> {
+    if let Some(remaining) = rate_limiter.too_long_to_wait() {
+        return Err(end_for_cooldown(remaining));
     }
-
-    pub(crate) fn reset(&mut self) {
-        self.attempt = 0;
+    if budget.wait().await {
+        return Ok(());
     }
-
-    /// Number of reconnect attempts consumed so far.
-    ///
-    /// After [`wait`](Self::wait) has returned `false` this equals `max_attempts` — i.e. the
-    /// number of attempts made before the budget was exhausted. Used to populate
-    /// [`crate::error::StreamTerminationReason::ReconnectBudgetExhausted`].
-    pub(crate) fn attempts(&self) -> u32 {
-        self.attempt
-    }
-
-    /// Wait for the current backoff duration. Returns `false` if max attempts exhausted.
-    pub(crate) async fn wait(&mut self) -> bool {
-        if self.attempt >= self.max_attempts {
-            return false;
-        }
-        let delay_ms = self
-            .initial_ms
-            .saturating_mul(2u64.saturating_pow(self.attempt))
-            .min(self.max_ms);
-        self.attempt += 1;
-        debug!(
-            attempt = self.attempt,
-            max = self.max_attempts,
-            delay_ms,
-            "Binance reconnect backoff"
-        );
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        true
-    }
-
-    /// Decide, after an account stream's connect failed or its connection ended, whether to try
-    /// again.
-    ///
-    /// A rate-limit cooldown longer than a request sleeps through ends the stream at once, rather
-    /// than spend the budget against a venue that refuses every attempt. Otherwise this spends one
-    /// attempt and its backoff. A shorter cooldown is left for
-    /// [`RateLimitTracker::before_stream_connect`] to wait out, which spends no attempt.
-    ///
-    /// # Errors
-    /// The reason the stream ends: [`StreamTerminationReason::RateLimited`] for such a cooldown,
-    /// or [`StreamTerminationReason::ReconnectBudgetExhausted`], with `last_error`, once no
-    /// attempt is left.
-    pub(crate) async fn retry_or_end(
-        &mut self,
-        rate_limiter: &RateLimitTracker,
-        last_error: impl FnOnce() -> String,
-    ) -> Result<(), StreamTerminationReason> {
-        if let Some(remaining) = rate_limiter.too_long_to_wait() {
-            return Err(end_for_cooldown(remaining));
-        }
-        if self.wait().await {
-            return Ok(());
-        }
-        error!(
-            attempts = self.attempt,
-            "Binance account stream: max reconnect attempts exhausted, stream terminating"
-        );
-        Err(StreamTerminationReason::ReconnectBudgetExhausted {
-            attempts: self.attempts(),
-            last_error: last_error(),
-        })
-    }
+    error!(
+        attempts = budget.attempts(),
+        "Binance account stream: max reconnect attempts exhausted, stream terminating"
+    );
+    Err(StreamTerminationReason::ReconnectBudgetExhausted {
+        attempts: budget.attempts(),
+        last_error: last_error(),
+    })
 }
 
 /// What a reconnect budget spent on dropped connections reports as its last error: a heartbeat
@@ -3887,16 +3831,14 @@ fn order_error_from(
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use crate::client::reconnect_budget::BackoffLimits;
     use futures::FutureExt as _;
 
-    /// The module docs and both clients' rustdoc state the reconnect budget, its backoff, the
-    /// heartbeat window and the longest cooldown waited through as numbers. Change these only
-    /// together with those docs.
+    /// The module docs and both clients' rustdoc state the heartbeat window and the longest
+    /// cooldown waited through as numbers. Change these only together with those docs. The
+    /// reconnect budget's own numbers are pinned in `client::reconnect_budget`.
     #[test]
-    fn the_reconnect_budget_is_as_documented() {
-        assert_eq!(MAX_RECONNECT_ATTEMPTS, 10);
-        assert_eq!(INITIAL_BACKOFF_MS, 1_000);
-        assert_eq!(MAX_BACKOFF_MS, 30_000);
+    fn the_heartbeat_and_cooldown_are_as_documented() {
         assert_eq!(HEARTBEAT_TIMEOUT_SECS, 30);
         assert_eq!(MAX_COOLDOWN_SLEEP, Duration::from_secs(10));
     }
@@ -5704,19 +5646,20 @@ mod tests {
     async fn a_reconnect_ends_at_once_on_a_cooldown_too_long_to_wait_through() {
         let tracker = RateLimitTracker::new(WeightPool::Spot);
         tracker.on_rate_limited(Some(Duration::from_secs(60)));
-        let mut backoff = ExponentialBackoff::new();
+        let mut budget = ReconnectBudget::new("Binance", BackoffLimits::ACCOUNT_STREAM);
         let started = tokio::time::Instant::now();
         let ended = StreamTerminationReason::RateLimited {
             retry_after: Duration::from_secs(60),
         };
 
-        let reason = backoff
-            .retry_or_end(&tracker, || unreachable!("the budget is not spent"))
-            .await;
+        let reason = retry_or_end(&mut budget, &tracker, || {
+            unreachable!("the budget is not spent")
+        })
+        .await;
         assert_eq!(reason, Err(ended.clone()));
         assert_eq!(tracker.before_stream_connect().await, Err(ended));
         assert_eq!(started.elapsed(), Duration::ZERO);
-        assert_eq!(backoff.attempts(), 0);
+        assert_eq!(budget.attempts(), 0);
     }
 
     /// A cooldown short enough to sleep through is waited out before the connect, and that wait
@@ -5725,14 +5668,17 @@ mod tests {
     async fn a_short_cooldown_is_waited_out_without_spending_an_attempt() {
         let tracker = RateLimitTracker::new(WeightPool::Spot);
         tracker.on_rate_limited(Some(Duration::from_secs(5)));
-        let mut backoff = ExponentialBackoff::new();
+        let mut budget = ReconnectBudget::new("Binance", BackoffLimits::ACCOUNT_STREAM);
         let started = tokio::time::Instant::now();
 
-        assert_eq!(backoff.retry_or_end(&tracker, String::new).await, Ok(()));
-        assert_eq!(started.elapsed(), Duration::from_millis(INITIAL_BACKOFF_MS));
+        assert_eq!(
+            retry_or_end(&mut budget, &tracker, String::new).await,
+            Ok(())
+        );
+        assert_eq!(started.elapsed(), BackoffLimits::ACCOUNT_STREAM.initial);
         assert_eq!(tracker.before_stream_connect().await, Ok(()));
         assert_eq!(started.elapsed(), Duration::from_secs(5));
-        assert_eq!(backoff.attempts(), 1);
+        assert_eq!(budget.attempts(), 1);
     }
 
     /// A refusal that names no wait starts the default cooldown, which is waited out, so
@@ -5740,13 +5686,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn refusals_naming_no_wait_spend_the_budget() {
         let tracker = RateLimitTracker::new(WeightPool::Spot);
-        let mut backoff = ExponentialBackoff::new();
+        let mut budget = ReconnectBudget::new("Binance", BackoffLimits::ACCOUNT_STREAM);
         let reason = loop {
             assert_eq!(tracker.before_stream_connect().await, Ok(()));
             tracker.on_rate_limited(None);
-            if let Err(reason) = backoff
-                .retry_or_end(&tracker, || "refused".to_string())
-                .await
+            if let Err(reason) = retry_or_end(&mut budget, &tracker, || "refused".to_string()).await
             {
                 break reason;
             }
@@ -5755,7 +5699,7 @@ mod tests {
         assert_eq!(
             reason,
             StreamTerminationReason::ReconnectBudgetExhausted {
-                attempts: MAX_RECONNECT_ATTEMPTS,
+                attempts: BackoffLimits::ACCOUNT_STREAM.max_attempts,
                 last_error: "refused".to_string(),
             }
         );
@@ -6558,7 +6502,8 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 pub(super) mod test_ws_api {
-    use super::{HEARTBEAT_TIMEOUT_SECS, INITIAL_BACKOFF_MS};
+    use super::HEARTBEAT_TIMEOUT_SECS;
+    use crate::client::reconnect_budget::BackoffLimits;
     use futures::{SinkExt as _, StreamExt as _};
     use parking_lot::Mutex;
     use std::{sync::Arc, time::Duration};
@@ -6687,12 +6632,12 @@ pub(super) mod test_ws_api {
         let at = requests_until(requests, 4, label).await;
         let escalated = at[2] - at[1];
         assert!(
-            escalated >= Duration::from_millis(2 * INITIAL_BACKOFF_MS),
+            escalated >= 2 * BackoffLimits::ACCOUNT_STREAM.initial,
             "{label}: reconnected {escalated:?} after a dropped connection"
         );
         let after_stable = (at[3] - at[2]).saturating_sub(STABLE);
         assert!(
-            after_stable < Duration::from_millis(3 * INITIAL_BACKOFF_MS),
+            after_stable < 3 * BackoffLimits::ACCOUNT_STREAM.initial,
             "{label}: reconnected {after_stable:?} after a pinged connection"
         );
     }
@@ -6707,7 +6652,7 @@ pub(super) mod test_ws_api {
         let at = requests_until(requests, 3, label).await;
         let after_silent = (at[2] - at[1]).saturating_sub(STABLE);
         assert!(
-            after_silent >= Duration::from_millis(2 * INITIAL_BACKOFF_MS),
+            after_silent >= 2 * BackoffLimits::ACCOUNT_STREAM.initial,
             "{label}: reconnected {after_silent:?} after a silent connection"
         );
     }

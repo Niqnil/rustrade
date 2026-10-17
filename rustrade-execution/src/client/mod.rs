@@ -95,6 +95,10 @@ pub(crate) mod dedup;
 ))]
 pub(crate) mod order_recovery;
 
+// The account streams' reconnect budget. Gated on the clients that use it, like `dedup`.
+#[cfg(any(feature = "alpaca", feature = "binance"))]
+pub(crate) mod reconnect_budget;
+
 // Alpaca ExecutionClient implementation (options, equities, crypto — single unified API)
 #[cfg(feature = "alpaca")]
 pub mod alpaca;
