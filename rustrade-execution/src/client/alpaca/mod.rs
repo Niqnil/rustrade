@@ -2887,8 +2887,8 @@ async fn paginate_activities<A: PagedActivity>(
 ///
 /// Terminates when the consumer drops the stream or max reconnect attempts are
 /// exhausted.
-#[allow(clippy::cognitive_complexity)] // the inner select! loop owns `ws` and mutates `backoff` —
-// extracting to a function requires threading 4 non-Clone values (ws, tx, dedup, backoff)
+#[allow(clippy::cognitive_complexity)] // the inner select! loop owns `ws` and mutates `budget` —
+// extracting to a function requires threading 4 non-Clone values (ws, tx, dedup, budget)
 // through the call, which adds more complexity than it removes
 async fn connection_manager(
     tx: mpsc::UnboundedSender<UnindexedAccountEvent>,
@@ -9188,12 +9188,19 @@ mod tests {
                 panic!("the stream ended without reporting why");
             };
             let AccountEventKind::StreamTerminated(
-                StreamTerminationReason::ReconnectBudgetExhausted { attempts, .. },
+                StreamTerminationReason::ReconnectBudgetExhausted {
+                    attempts,
+                    last_error,
+                },
             ) = event.kind
             else {
                 panic!("unexpected event: {event:?}");
             };
             assert_eq!(attempts, BackoffLimits::ACCOUNT_STREAM.max_attempts);
+            assert!(
+                !last_error.is_empty(),
+                "the last connect failure is reported"
+            );
             // 1 + 2 + 4 + 8 + 16 s, then 30 s for each of the five attempts left.
             assert!(
                 started.elapsed() >= Duration::from_secs(181),

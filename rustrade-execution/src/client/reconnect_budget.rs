@@ -66,7 +66,7 @@ impl ReconnectBudget {
 
     /// Spend one attempt and return the wait before it, or `None`, spending nothing, once every
     /// attempt is spent.
-    pub(crate) fn next_delay(&mut self) -> Option<Duration> {
+    fn next_delay(&mut self) -> Option<Duration> {
         if self.attempt >= self.limits.max_attempts {
             return None;
         }
