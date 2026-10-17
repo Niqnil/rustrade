@@ -44,6 +44,8 @@
 //! | `test_historical_connection` | Connect to IB for historical data |
 //! | `test_historical_from_shared_client` | Use shared ibapi client |
 //! | `test_market_stream_connection` | Initialize market stream |
+//! | `test_market_stream_disconnect_while_subscribing` | `disconnect` right after `init` ends the stream with no error |
+//! | `test_market_stream_disconnect_while_running` | `disconnect` of running subscriptions ends the stream with no error |
 //! | `test_market_stream_unregistered_contract` | Verify rejection for unknown contract |
 //! | `test_contract_resolution` | Resolve contract details |
 //!
@@ -618,6 +620,101 @@ async fn test_market_stream_connection() {
     );
 
     println!("Market stream initialized successfully");
+}
+
+fn disconnect_test_stream(client_id_offset: i32) -> IbkrMarketStream<String> {
+    let config = IbkrStreamConfig {
+        host: "127.0.0.1".to_string(),
+        port: test_port(),
+        client_id: test_client_id_base() + client_id_offset,
+    };
+
+    let registry = ContractRegistry::new();
+    registry.register_by_name_only("AAPL".into(), aapl_contract());
+    let registry = Arc::new(registry);
+
+    // Two workers, so the stream ends only once both have exited.
+    let subscriptions = vec![
+        IbkrSubscription {
+            instrument: "AAPL".into(),
+            key: "AAPL".to_string(),
+            kind: IbkrSubscriptionKind::Quotes,
+        },
+        IbkrSubscription {
+            instrument: "AAPL".into(),
+            key: "AAPL".to_string(),
+            kind: IbkrSubscriptionKind::Trades,
+        },
+    ];
+
+    IbkrMarketStream::init(config, registry, subscriptions).expect("stream init failed")
+}
+
+/// Read the stream to its end after `disconnect`, failing on any error item or if it never ends.
+async fn assert_ends_cleanly(stream: &mut IbkrMarketStream<String>) {
+    let drained = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut events = 0;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(_) => events += 1,
+                Err(e) => panic!("error item after the caller's own disconnect: {e:?}"),
+            }
+        }
+        events
+    })
+    .await;
+    match drained {
+        Ok(events) => println!("Stream ended cleanly after disconnect ({events} events read)"),
+        Err(_) => panic!("stream did not end within 10s of disconnect"),
+    }
+}
+
+/// Tier 0: Connection Only (FREE)
+///
+/// `disconnect` right after `init`, while the workers may still be sending their subscriptions:
+/// `ibapi` refuses those with `ConnectionReset`, and the stream must still end with no error.
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_market_stream_disconnect_while_subscribing() {
+    init_logging();
+
+    let mut stream = disconnect_test_stream(15);
+    stream.disconnect();
+    assert_ends_cleanly(&mut stream).await;
+}
+
+/// Tier 0: Connection Only (FREE)
+///
+/// `disconnect` once the subscriptions are running: `ibapi` ends them with `Shutdown`, and the
+/// stream must end with no error. Whatever arrives before the call, data or an error such as a
+/// missing market data permission, is read and set aside first.
+#[serial]
+#[tokio::test]
+#[ignore]
+async fn test_market_stream_disconnect_while_running() {
+    init_logging();
+
+    let mut stream = disconnect_test_stream(16);
+    let mut before = 0;
+    let ended_early = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(item) = stream.next().await {
+            if let Err(e) = item {
+                println!("Before disconnect: {e:?}");
+            }
+            before += 1;
+        }
+    })
+    .await
+    .is_ok();
+    assert!(
+        !ended_early,
+        "every subscription ended before disconnect ({before} items), so nothing was left to test"
+    );
+    println!("{before} items before disconnect");
+
+    stream.disconnect();
+    assert_ends_cleanly(&mut stream).await;
 }
 
 /// Tier 1: US Real-Time Non-Consolidated (FREE with IBKR Pro)

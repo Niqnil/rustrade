@@ -124,7 +124,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install mold linker
-        uses: rui314/setup-mold@10ca16bf91dc22e05ebdc935cad9c75ea248f621  # v1
+        uses: rui314/setup-mold@da13e0b42e392e3a45d1215033a2270b849d7d36  # v1
         with:
           mold-version: ${{ env.MOLD_VERSION }}
 
@@ -189,7 +189,7 @@ jobs:
           df -h /
 
       - name: Install mold linker
-        uses: rui314/setup-mold@10ca16bf91dc22e05ebdc935cad9c75ea248f621  # v1
+        uses: rui314/setup-mold@da13e0b42e392e3a45d1215033a2270b849d7d36  # v1
         with:
           mold-version: ${{ env.MOLD_VERSION }}
 
@@ -245,7 +245,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install mold linker  # Required for proc-macro linking on cache miss
-        uses: rui314/setup-mold@10ca16bf91dc22e05ebdc935cad9c75ea248f621  # v1
+        uses: rui314/setup-mold@da13e0b42e392e3a45d1215033a2270b849d7d36  # v1
         with:
           mold-version: ${{ env.MOLD_VERSION }}
 
@@ -272,7 +272,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install mold linker  # Required for proc-macro linking on cache miss
-        uses: rui314/setup-mold@10ca16bf91dc22e05ebdc935cad9c75ea248f621  # v1
+        uses: rui314/setup-mold@da13e0b42e392e3a45d1215033a2270b849d7d36  # v1
         with:
           mold-version: ${{ env.MOLD_VERSION }}
 
@@ -309,6 +309,165 @@ jobs:
             -D rustdoc::invalid_html_tags
         run: cargo doc --locked --workspace --all-features --no-deps --document-private-items
 
+  # Mutation-tests the lines this PR changes. cargo-mutants alters each one (a `<` to `<=`, a
+  # function body to `Default::default()`, ...) and reruns the tests of the mutated crate; a mutant
+  # they still pass on marks behaviour no test in that crate pins. cargo-mutants itself annotates
+  # missed mutants on their lines when it runs under GitHub Actions, and each shard's job summary
+  # lists all of its own.
+  #
+  # Informational: not a required check, and a missed mutant or a timeout leaves it green. It fails
+  # only when the run itself does, for example when the tests already fail without any mutation.
+  # See CONTRIBUTING.md, "Mutation testing".
+  #
+  # The mutants are split across parallel shards, each a job of its own. A job tests one mutant at
+  # a time, at roughly 30 s each (more on a slow runner), after about 5 minutes of setup, so on a
+  # slow runner a single job ran out of time at about 60. Three shards fit about 180 even there.
+  # Each shard repeats the setup, so add one only when diffs outgrow that.
+  mutants:
+    name: cargo mutants (shard ${{ matrix.shard }}/${{ strategy.job-total }})
+    needs: [fmt, check]
+    # Only a PR has a diff to scope the run to. The rest is `test`'s gate.
+    if: ${{ github.event_name == 'pull_request' && !cancelled() && needs.fmt.result == 'success' && needs.check.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]  # cargo-mutants numbers shards from 0
+    # Must match `test`'s `env` exactly. The cache restored below is `test`'s, and rust-cache hashes
+    # `CARGO_*` variables into its key, so any difference here misses it.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      # Depth 2 fetches the base branch tip, the test merge commit's first parent; see `changes`.
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 2
+
+      # cargo-mutants mutates only the sources of library and binary targets, never `tests/`,
+      # `examples/` or `benches/`, so a PR that changes no `src/` has nothing to mutate and every
+      # step below skips. The diff is cut to the same files: a binary file, a mode change or a rename
+      # elsewhere could otherwise make it unparseable. In a pathspec `*` also matches `/`, so this
+      # covers nested modules. The `HEAD^2` check is the same guard as in `changes`.
+      - name: Extract the PR's diff
+        id: diff
+        run: |
+          git rev-parse --verify --quiet HEAD^2 > /dev/null
+          git diff --no-renames HEAD^1 HEAD -- '*/src/*.rs' > "$RUNNER_TEMP/pr.diff"
+          if [ -s "$RUNNER_TEMP/pr.diff" ]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+            echo "No crate source changed: nothing to mutate" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Free disk space  # As in `test`, which builds the same targets
+        if: steps.diff.outputs.rust == 'true'
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
+          df -h /
+
+      - name: Install mold linker
+        if: steps.diff.outputs.rust == 'true'
+        uses: rui314/setup-mold@da13e0b42e392e3a45d1215033a2270b849d7d36  # v1
+        with:
+          mold-version: ${{ env.MOLD_VERSION }}
+
+      - name: Install stable toolchain
+        if: steps.diff.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+
+      # `test`'s cache, restored read-only. This job runs only on PRs, and a PR run can save a cache
+      # only to its own ref, so a cache of this job's own would start cold on every new PR. `test`
+      # saves one on every push to `develop`, and this job takes no share of the cache quota.
+      #
+      # The reuse is partial. cargo-mutants builds with `--package=<mutated crate>`, not
+      # `--workspace`, which unifies some dependencies' features differently, so each run first
+      # rebuilds those: 84 crates for `rustrade-execution` and 95 for `rustrade`, measured locally.
+      # `--test-workspace` would hit the cache in full, but then every mutant rebuilds and tests
+      # every crate that depends on its own.
+      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
+        if: steps.diff.outputs.rust == 'true'
+        with:
+          shared-key: "rustrade-ci-test"
+          save-if: false
+
+      # Compiled on every run, since the cache above is never saved.
+      - name: Install cargo-mutants
+        if: steps.diff.outputs.rust == 'true'
+        run: cargo install --locked cargo-mutants@27.1.0
+
+      # - `--in-place` mutates this checkout rather than a copy, so the build reuses the restored
+      #   `target/` without copying it. That runs one mutant at a time, and is safe only because the
+      #   runner is discarded afterwards: never pass it locally.
+      # - `--profile=test` replaces `.cargo/mutants.toml`'s local-only profile with the one `test`
+      #   built the cache under.
+      # - The targets go in `--cargo-arg`, not after `--`: cargo-mutants passes trailing arguments
+      #   to the test phase only, and its build phase would then link every example too.
+      # - `--shard` takes this job's share of the mutants. Round-robin deals them out one at a time,
+      #   so the slow ones, which cluster (a mutant that makes a wait loop spin times out, and so
+      #   do its neighbours on the same line), spread across the shards.
+      # - `timeout` interrupts the run with time left in the job, so a large PR still gets a summary
+      #   of the mutants tested so far. cargo-mutants records each outcome as it lands.
+      - name: Run cargo mutants
+        id: mutants
+        if: steps.diff.outputs.rust == 'true'
+        run: |
+          status=0
+          timeout --signal=INT --kill-after=2m 40m \
+            cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" --in-place --profile=test \
+              --cargo-arg=--locked --cargo-arg=--lib --cargo-arg=--bins --cargo-arg=--tests \
+              --shard "${{ matrix.shard }}/${{ strategy.job-total }}" --sharding round-robin \
+              --output "$RUNNER_TEMP" \
+            || status=$?
+          # 2: a mutant was missed. 3: a mutant timed out. 124: the run was cut short. 137: it was
+          # killed, normally after ignoring the interrupt, though the OOM killer exits the same
+          # way. Each is a result for the summary to report, not a failure of the job.
+          case $status in
+            0) ;;
+            2|3) echo "cargo-mutants exited $status: see the summary" ;;
+            124|137) echo "Stopped early (exit $status): the summary covers the mutants tested so far" \
+                   | tee -a "$GITHUB_STEP_SUMMARY" ;;
+            *) exit "$status" ;;
+          esac
+
+      - name: Summary
+        if: ${{ !cancelled() && steps.diff.outputs.rust == 'true' }}
+        env:
+          OUTCOME: ${{ steps.mutants.outcome }}
+        run: |
+          out="$RUNNER_TEMP/mutants.out"
+          count() { if [ -f "$out/$1.txt" ]; then wc -l < "$out/$1.txt"; else echo 0; fi; }
+          {
+            echo "### Mutation testing, shard ${{ matrix.shard }}/${{ strategy.job-total }}"
+            if [ "$OUTCOME" != success ]; then
+              echo "The run failed, so any counts below are partial: see the \`Run cargo mutants\` log."
+            fi
+            if [ ! -d "$out" ]; then
+              if [ "$OUTCOME" = success ]; then
+                echo "No mutants: the diff touches no code cargo-mutants can mutate."
+              fi
+              exit 0
+            fi
+            # A shard dealt no mutants still writes its (empty) list and exits 0.
+            if [ -f "$out/mutants.json" ] && [ "$(jq length "$out/mutants.json")" = 0 ]; then
+              echo "No mutants in this shard: the diff has too few to give every shard one."
+              exit 0
+            fi
+            echo "| Caught | Missed | Timed out | Unviable |"
+            echo "|---|---|---|---|"
+            echo "| $(count caught) | $(count missed) | $(count timeout) | $(count unviable) |"
+            if [ -s "$out/missed.txt" ]; then
+              echo
+              echo "Missed: add a test that fails on the mutant, or explain in the PR why it is"
+              echo "equivalent to the original."
+              echo '```'
+              cat "$out/missed.txt"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   audit:
     name: cargo audit
     needs: changes
@@ -336,7 +495,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           # Synced with deny.toml [advisories.ignore] - see that file for full justifications
-          ignore: RUSTSEC-2026-0235,RUSTSEC-2025-0057,RUSTSEC-2024-0384,RUSTSEC-2025-0009,RUSTSEC-2025-0010,RUSTSEC-2025-0134,RUSTSEC-2026-0098,RUSTSEC-2026-0099,RUSTSEC-2026-0104,RUSTSEC-2026-0258
+          ignore: RUSTSEC-2026-0235,RUSTSEC-2025-0057,RUSTSEC-2024-0384,RUSTSEC-2025-0009,RUSTSEC-2025-0010,RUSTSEC-2025-0134,RUSTSEC-2026-0098,RUSTSEC-2026-0099,RUSTSEC-2026-0104,RUSTSEC-2026-0258,RUSTSEC-2026-0346,RUSTSEC-2026-0349
 
   deny:
     name: cargo deny

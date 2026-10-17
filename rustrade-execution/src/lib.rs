@@ -86,7 +86,8 @@ pub mod error;
 pub mod exchange;
 pub mod fee;
 pub use fee::{
-    FeeModel, FeeModelConfig, Liquidity, PerContractFeeModel, PercentageFeeModel, ZeroFeeModel,
+    FeeModel, FeeModelConfig, Liquidity, PerContractFeeModel, PercentageFeeModel, SpotFeeAsset,
+    ZeroFeeModel,
 };
 pub mod fill;
 pub use fill::{
@@ -109,7 +110,9 @@ pub use notice::{AccountNotice, NoticeKind};
 pub mod order;
 pub mod position;
 pub mod shortability;
+pub mod slippage;
 pub use shortability::{Shortability, ShortabilityProvider, ShortabilityTable};
+pub use slippage::{SlippageConfig, SlippageConfigError};
 pub mod trade;
 
 /// Convenient type alias for an [`AccountEvent`] keyed with [`ExchangeId`],
@@ -230,13 +233,13 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// stream update. Debt totals remain as fresh as the last [`BalanceSnapshot`](Self::BalanceSnapshot).
     BalanceStreamUpdate(Snapshot<AssetBalanceUpdate<AssetKey>>),
 
-    /// Live per-instrument isolated-margin balance update (`free`/`locked` per side).
+    /// Live per-instrument isolated-margin balance update (`free`/`locked` of one asset of a pair).
     ///
     /// The stream counterpart of [`InstrumentAccountSnapshot::isolated`] for venues with per-pair
     /// isolated sub-accounts (e.g. Binance isolated margin). Carries a point-in-time `free`/`locked`
-    /// **snapshot** for the pair's `base` and `quote` assets — NOT a delta — keyed by instrument
-    /// rather than asset, because isolated balances are per-`(pair, asset)` and cannot be folded
-    /// into the asset-keyed balance state without collision (see [`InstrumentBalanceUpdate`]).
+    /// **snapshot** of one of the pair's assets — NOT a delta — keyed by instrument as well as
+    /// asset, because isolated balances are per-`(pair, asset)` and cannot be folded into the
+    /// asset-keyed balance state without collision (see [`InstrumentBalanceUpdate`]).
     ///
     /// The engine deliberately does **not** store this (the per-asset balance state is informational
     /// only and the engine never reads it for sizing/gating); a consumer reads it off the account
@@ -470,20 +473,25 @@ pub struct IsolatedMarginRisk {
 /// Live per-instrument isolated-margin balance update payload (the
 /// [`AccountEventKind::InstrumentBalanceUpdate`] counterpart of [`IsolatedInstrumentState`]).
 ///
-/// Carries a point-in-time `free`/`locked` **snapshot** for the pair's `base` and `quote` assets —
-/// NOT a delta — keyed by instrument. Structurally analogous to [`AssetBalanceUpdate`] but
-/// per-instrument: it carries no debt, so applying it keeps `free`/`locked` live while preserving
-/// any known per-asset debt (use [`Balance::apply_stream_update`](balance::Balance::apply_stream_update)).
+/// Carries a point-in-time `free`/`locked` **snapshot** of one asset (the pair's base or its
+/// quote) in the pair's isolated sub-account — NOT a delta. It is the per-instrument counterpart of
+/// [`AccountEventKind::BalanceStreamUpdate`]: one event per asset, so a venue frame that lists only
+/// the asset that changed yields one event, and a frame listing both yields two. Apply each one
+/// to the `(instrument, asset)` it names and leave the pair's other asset as it was. Which side
+/// it is follows from comparing [`AssetBalanceUpdate::asset`] with the instrument's base and
+/// quote. The two events from one frame share a `time_exchange` but arrive separately, so a
+/// consumer can see one side updated before the other.
+///
+/// It carries no debt, so applying it keeps `free`/`locked` live while preserving any known
+/// per-asset debt (use [`Balance::apply_stream_update`](balance::Balance::apply_stream_update)).
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize, Constructor,
 )]
 pub struct InstrumentBalanceUpdate<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// Instrument (isolated pair) the update applies to.
     pub instrument: InstrumentKey,
-    /// Base-asset `free`/`locked` update for the pair's isolated sub-account.
-    pub base: AssetBalanceUpdate<AssetKey>,
-    /// Quote-asset `free`/`locked` update for the pair's isolated sub-account.
-    pub quote: AssetBalanceUpdate<AssetKey>,
+    /// `free`/`locked` of one of the pair's assets in its isolated sub-account.
+    pub balance: AssetBalanceUpdate<AssetKey>,
 }
 
 impl<ExchangeKey, AssetKey, InstrumentKey> AccountSnapshot<ExchangeKey, AssetKey, InstrumentKey> {

@@ -20,11 +20,11 @@ categories = ["finance", "simulation"]
 
 [workspace.dependencies]
 # Rustrade Ecosystem
-rustrade-integration = { path = "./rustrade-integration", version = "0.11.0" }
-rustrade-instrument = { path = "./rustrade-instrument", version = "0.11.0" }
-rustrade-data = { path = "./rustrade-data", version = "0.11.0" }
-rustrade-execution = { path = "./rustrade-execution", version = "0.11.0" }
-rustrade-macro = { path = "./rustrade-macro", version = "0.11.0" }
+rustrade-integration = { path = "./rustrade-integration", version = "0.12.0" }
+rustrade-instrument = { path = "./rustrade-instrument", version = "0.12.0" }
+rustrade-data = { path = "./rustrade-data", version = "0.12.0" }
+rustrade-execution = { path = "./rustrade-execution", version = "0.12.0" }
+rustrade-macro = { path = "./rustrade-macro", version = "0.12.0" }
 
 # Logging
 tracing = { version = "0.1.41" }
@@ -93,3 +93,9 @@ prost = { version = "0.14.3" }
 temp-env = { version = "0.3" }
 serial_test = { version = "4.0" }
 tempfile = { version = "3" }
+
+# For cargo-mutants (see `.cargo/mutants.toml`), which rebuilds the mutated crate and its dependents
+# once per mutant. Debug info is much of each rebuild's cost, and a mutant's outcome never needs it.
+[profile.mutants]
+inherits = "test"
+debug = "none"

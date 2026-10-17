@@ -7,6 +7,346 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-10-16
+
+### Added
+
+- **Step a simulation from outside, one instant at a time** (`rustrade`, #626).
+  - New `SimStepper`, a synchronous driver for the simulated venues for gym-style loops: feed a
+    bar, observe the `Engine`, act, feed the next. It drives the same venues in the same order as
+    `SimRunner` does for a backtest, through the same `Engine` booking path. Every call is a plain
+    synchronous call that spawns nothing, so it can run inside `spawn_blocking`. A `SimStepper` is
+    `Send` and holds no global or thread-local state, so many can run in one process.
+  - `step(&mut engine, time, events)` takes every event at one instant. It books the requests
+    the `Engine` sent since the previous call, delivers what came due in between, hands the bars
+    to the venues (resting orders are matched against them), and returns once every fill,
+    rejection and balance update due at the instant is in the `Engine`'s state. It returns the
+    `Engine`'s audit of each event. An instant may carry bars for only some instruments.
+  - `settle(&mut engine)` books orders sent after a step, for example through `Engine::action`,
+    at the current instant, so they fill against the bar just delivered before the next one
+    exists. It can be called several times at one instant, each call seeing the previous fills.
+  - `finish(&mut engine)` ends the session as a backtest ends. Dropping a stepper without it is
+    safe. Shutting the `Engine` down instead abandons what is still scheduled, and the call that
+    observes it fails with `SimStepError::Finished`.
+  - At zero latency an order fills against the bar it was sent after, which the rustdoc calls an
+    optimistic idealisation. With latency, a delayed fill lands in the first step that reaches it.
+    A market order on an instrument with no bar at the current instant fills at its last price,
+    a documented gap between simulation and trading (#643 proposes an opt-in alternative).
+  - Every failure is an `Err`, never a panic, including the misconfigurations `SimRunner` panics
+    on, and any `Err` ends the session: later calls return it again. New `SimStepError`, and
+    `BarterError::SimStep`. The first call checks that the `Engine` was built with the stepper's
+    clock and holds the positions its venues were started with.
+  - New `SimEngine` and `StepAudit` type aliases name the `Engine` a stepper drives and what each
+    call returns. New example `sim_stepper`.
+- **One starting state for a simulated venue and its `Engine`** (`rustrade`, #626).
+  - New `SimStart`: cash balances plus positions held at an entry price. New
+    `SimExecutionBuilder::add_venue_with_start` derives the venue's opening account from it: a
+    spot long credits its base asset, and a CFD position is held at its entry price. An asset the
+    venue trades that the start does not list opens at zero. New
+    `SimExecutionBuild::position_seeds` returns the positions for
+    `EngineStateBuilder::positions`, so the two sides cannot disagree. A reset is a rebuild from
+    the same `SimStart`.
+  - It is refused with a `SimStartError` (`BarterError::SimStart`) for a spot short, an
+    instrument the venue does not trade, two positions in one instrument, a negative balance, a
+    base balance that contradicts a spot position, or a configuration that already carries an
+    `initial_state`.
+  - **Breaking:** `SimVenue` has a new public field, `position_seeds`, and `BarterError` has two
+    new variants.
+
+- **Slippage on the simulated venue, and custom fill models** (`rustrade-execution`, `rustrade`,
+  #625).
+  - New `MockExecutionConfig::slippage`, a `SlippageConfig`. It moves every taker fill against the
+    order, as a fraction of the price the fill model gave: a buy at `price × (1 + s)`, a sell at
+    `price × (1 − s)`. `SlippageConfig::fixed(rate)` uses one rate for every fill.
+    `SlippageConfig::uniform(low, high, seed)` draws a fresh rate for each fill, uniformly from
+    `[low, high]`, from its own generator seeded by `seed`, so a run is reproducible from its
+    seed. The default, `SlippageConfig::none()`, leaves prices as they were.
+  - It applies after any fill model, before a limit order's clamp, so a limit order is never
+    filled past its limit. A resting order that the market reaches still fills at its own limit,
+    unslipped. A slipped fill is not capped at the bar's or the book's range.
+  - Rates must satisfy `0 ≤ low ≤ high < 1`. The constructors and deserialisation refuse anything
+    else with a `SlippageConfigError`.
+  - One draw per fill that trades. An order that is refused, cancelled on arrival or rests
+    without trading takes none, and a range of one rate makes no draw. The generator is
+    xoshiro256++, which `rand` documents as portable. A drawn rate is rounded to 12 decimal
+    places and kept within the range.
+  - A custom `FillModel` can now be plugged in, with `SimulatedVenue::with_fill_model` or
+    `SimVenueOptions::with_fill_model` (`rustrade`). `FillContext` gains `quantity`, the order's
+    quantity, so a model can price by size. A custom model is not part of the serialisable
+    configuration, so the async `MockExchange` driver, which builds its venue from that
+    configuration, cannot take one.
+  - **Breaking:** `MockExecutionConfig` has a new field, so a struct literal or a
+    `MockExecutionConfig::new` call must supply it. A serialised config without it still loads,
+    as no slippage. `FillContext::new` takes the quantity. `FillModel` now requires
+    `Debug + Send + Sync`. `SimulatedVenue::fill_model` is no longer a public field: set it with
+    `with_fill_model`.
+  - `FillModel`'s rustdoc now says that the venue may call it more than once per order, so it
+    must be a pure function of its context. It also says that a taker fill at the market as it
+    stands, on bars the close just seen, is optimistic rather than look-ahead.
+
+- **The simulated venue can charge a spot buy's fee in the base it receives**
+  (`rustrade-execution`).
+  - New `MockExecutionConfig::spot_fee_asset`, a `SpotFeeAsset`, beside `fee_model`, and the
+    matching `SimulatedVenue::spot_fee_asset`. It says which asset a spot fill's fee is charged in;
+    the amount still comes from the fee model. `Quote`, the default, charges it in quote on both
+    sides, as before. `Received` charges a buy's fee in base, out of the quantity it receives,
+    converted at the fill price, and a sell's in quote, out of its proceeds. That is Binance
+    spot's default with BNB fee payment turned off. The fill reports the fee in the asset charged.
+  - A fill whose fee exceeds what it receives, which only a large per-unit fee on a small fill can
+    produce, takes the excess from that asset's balance and is refused, or cancelled if it was
+    resting, when the balance cannot cover it. A buy at a price that is not positive is charged in
+    quote.
+  - **Breaking:** `MockExecutionConfig` has a new field, so a struct literal or a
+    `MockExecutionConfig::new` call must supply it. A serialised config without it still loads,
+    as `Quote`.
+
+- **`Shortability::delisting_at`: when the venue will stop lending an instrument or trading it on
+  margin** (`rustrade-execution`, #608).
+  - A new optional field, with `with_delisting_at`. A short still open at that time may be closed
+    by the venue. A time already passed means the instrument is no longer shortable.
+  - `BinanceMargin::fetch_shortability` reads Binance's margin delisting schedule
+    (`/sapi/v1/margin/delist-schedule`). On cross margin, a pair is delisted with the first of
+    its base and quote assets; on isolated margin, by its own symbol. A pair whose delisting time
+    has passed is now `shortable: false`. Before, it read shortable until Binance cleared its
+    flags. The query now costs 202 of Binance's per-IP request weight on cross margin and 211 on
+    isolated, up from 102 and 111.
+  - `SimulatedVenue::with_shortability` refuses a short with `NotShortable` from the
+    provider's `delisting_at` on, even if the provider still says the instrument is shortable.
+  - `AlpacaClient` and `IbkrClient` leave it unknown: neither venue reports one.
+
+### Changed
+
+- **`binance-sdk` 74.1.1 → 75.0.0** (`rustrade-execution`, `binance` feature). The three
+  `binance_sdk::common` internals the margin user-data stream couples to were re-verified before
+  merge, and hold: `send_message` and `send_request` are unchanged, and the event emitter still
+  runs each callback sequentially. The SDK changes that reach the compiled code:
+  - A disconnected WebSocket connection stays closed. 74.1.1 reopened it about 23 hours after it
+    first opened, through its scheduled renewal, and completed a reconnect that was pending when
+    the disconnect was called. The reopened socket stayed open, idle, for the life of the
+    process.
+  - The SDK's rate-limit errors now carry Binance's requested wait, which `BinanceSpot` and
+    `BinanceMargin` now read (see the entry below).
+  - Support for signed WebSocket streams, which the `binance` feature does not use.
+
+- **Binance reports and honours the wait it sends with a rate limit** (`rustrade-execution`,
+  `binance` feature, #590).
+  - `ApiError::RateLimit`'s `retry_after` is now filled for `BinanceSpot` and `BinanceMargin`: from
+    a REST 429's or 418's `Retry-After`, or from the WebSocket API's `retryAfter`, the time a ban
+    lifts. That time is on Binance's clock and is measured against the local one, plus 1 s of
+    slack, since the SDK does not expose Binance's own time. The wait is not capped: a ban lasts
+    from minutes to days.
+  - **Behaviour:** every refusal pauses the client's REST calls, orders and cancels for that wait,
+    or 10 s when Binance named none (or a zero wait), the last refusal of a retried call included.
+    The account stream honours it too (see the entry under Fixed, #639). Before, the pause was a
+    fixed 1–4 s backoff, and the last refusal set none.
+  - **Behaviour:** a request facing more than 10 s of that pause is not sent. It fails at once
+    with `ApiError::RateLimit` carrying the time left. Before, every REST call slept through the
+    pause, which is harmless at 10 s but would hang it for the length of a ban.
+  - **Behaviour:** `BinanceSpot` orders and cancels on an open WebSocket API session honour the
+    pause too. Before, only opening a session checked it, so each order sent during a ban
+    lengthened it.
+  - **Behaviour:** a REST call is retried in place no sooner than Binance's wait, and not at all
+    on a 418 (an IP ban) or when the wait is over 10 s.
+  - Callers that retry on `RateLimit` should wait `retry_after()` when it is `Some`. The check of
+    how orders ended while disconnected already does.
+
+- **Breaking: balances carry accrued interest, and IBKR reports one balance per currency it
+  holds** (`rustrade-execution`, #561).
+  - **Breaking:** `Balance` gains `accrued: Option<Decimal>`: carry the venue has accrued and not
+    yet posted to `total`, signed positive when the account will receive it, so the cash the
+    account will hold once it posts is `total + accrued`. `None` means the venue reports none. It
+    is kept, like margin debt, when a stream update is applied (`Balance::apply_stream_update`),
+    and a stored balance without it still loads. `Balance` is now `#[non_exhaustive]`: build it
+    with `Balance::new` or `Balance::new_margin`, plus the new `with_accrued`, and match it with
+    `..`. Later fields will not break that code.
+  - **Breaking in behaviour:** `IbkrClient` read balances from the account summary in base
+    currency only. It reported one balance, named for the base currency, that already included the
+    other currencies converted into it. It now reads IB's per-currency ledger, so each currency the
+    account holds is its own balance, in that currency. Code that took the single balance as
+    the whole account's cash must now convert and sum the currencies itself.
+  - IBKR's `total` is a currency's `TotalCashBalance` (else `CashBalance`), and `accrued` its
+    `AccruedCash`: interest accrued this month, posted to cash at the month's end or early in the
+    next. IB does not document whether stock borrow fees accrue in it. `free` is `total`, capped at
+    the account's `AvailableFunds` converted into the currency. It used to be `AvailableFunds`
+    itself, which can exceed `total`. IB reports `AvailableFunds` for the whole account only, so
+    every currency is capped by the same funds. With several accounts, each currency is summed
+    over them, each account capped by its own funds first. Without a rate to convert the funds,
+    `free` is `total`, logged at WARN.
+
+- **`ibapi` 5.0.0 → 5.1.0** (`rustrade-execution`, `rustrade-data`, `rustrade-instrument`, feature
+  `ibkr`). The bytes sent for every order are unchanged. Two changes reach the compiled code:
+  - `disconnect` on `IbkrClient`, `IbkrMarketStream` and `IbkrHistoricalData` now closes the TCP
+    connection even while clones of the client or their subscriptions are still alive. Before,
+    `ibapi` shut down only the read side and kept the connection open until the last clone was
+    dropped, so TWS/Gateway refused a reconnect under the same client ID with error 326 until then.
+    The ID is now freed once TWS/Gateway has processed the close, which can take a moment, so a
+    reconnect right after `disconnect` may need a retry. The rustdoc said to drop every clone
+    first; it no longer does.
+  - An IBKR historical bar request whose response closes before IB's end marker is now a
+    `DataError::Socket` instead of a silently complete set of bars.
+
+- **`IbkrMarketStream` ends cleanly after its own `disconnect`** (`rustrade-data`, feature
+  `ibkr`). Each subscription used to end with a `DataError::Socket` carrying `ibapi`'s shutdown
+  error, logged at ERROR, even when the caller had asked for the close. A consumer that treats a
+  stream error as a reason to reconnect would reconnect a stream it had just closed. After
+  `disconnect` the stream now ends with `None` once its workers exit, logged at DEBUG.
+  A shutdown `ibapi` or TWS/Gateway causes, such as reconnection given up or the API session
+  ended, still reaches the stream as a `DataError::Socket` per subscription, logged at ERROR,
+  unless it reaches a worker only after the caller's `disconnect`.
+
+- **The IBKR rustdoc states what a fill's fees include** (`rustrade-execution`, feature `ibkr`,
+  #619). A fill's `Trade::fees` is the commission IB reports for its execution, unchanged. That
+  figure includes the regulatory fees IB passes through and any tax IB charges on the commission,
+  such as GST. Taxes IB bills separately from commissions, such as stamp duty or a financial
+  transaction tax, are not known to be included.
+
+### Fixed
+
+- **A Binance account stream no longer reconnects into a rate-limit ban** (`rustrade-execution`,
+  `binance` feature; `rustrade-data`; `rustrade`; #639).
+  - **Behaviour:** the `BinanceSpot` and `BinanceMargin` account streams, cross and isolated, no
+    longer open or reconnect during the client's rate-limit cooldown. One of 10 s or less is
+    waited out without spending a reconnect attempt. A longer one ends a running stream at once
+    with the new `StreamTerminationReason::RateLimited { retry_after }`, the time left, and fails
+    an `account_stream` call with `ApiError::RateLimit` carrying it, unsent. Before, each
+    reconnect during a ban was refused and spent an attempt, so the stream ended with
+    `ReconnectBudgetExhausted` after about 3 minutes, and each attempt could lengthen the ban.
+  - **Behaviour:** a stream's handshake refused with 429 or 418, or a user-data subscribe refused
+    for a rate limit (`-1003`), starts the cooldown, as an order's refusal does, so REST calls and
+    orders back off too. A subscribe refusal's ban time is honoured. A refused handshake names no
+    wait (the SDK drops its `Retry-After`), so a 429 starts the 10 s default and a 418, an IP ban,
+    Binance's shortest ban, 2 minutes. The same applies to `BinanceSpot`'s order session: a 418
+    on its handshake used to start the 10 s default.
+  - **Behaviour:** `ExecutionManager` re-opens an ended account stream no sooner than the
+    `retry_after` its failed attempt carried, even when its backoff policy is shorter. New
+    `ReconnectingStream::with_reconnect_backoff_reporting_hinted` takes that wait from each
+    failure; `with_reconnect_backoff_reporting` is unchanged.
+  - New `ClientError::retry_after` and `AccountStreamInitError::retry_after`.
+
+- **The simulated venue ignores a price sent with a market order** (`rustrade-execution`).
+  `RequestOpen::price` is documented as `None` for a market order, but nothing enforced it. A
+  market order that carried a price anyway was filled at that price when the venue had no market
+  to price it from, instead of being rejected as unpriceable. Only a limit order's price now
+  prices or bounds a fill, as with the live clients that accept market orders (Binance spot and
+  margin, IBKR, Alpaca), which drop such a price.
+
+- **A dropped Binance stream or client closes its WebSocket connection** (`rustrade-execution`,
+  feature `binance`).
+  - Dropping a `BinanceSpot` or `BinanceMargin` account stream aborted its connection task, and
+    binance-sdk keeps each socket open in background tasks that answer the server's pings until
+    it is disconnected. So the socket stayed open, and the account's user-data subscription live,
+    for as long as the Tokio runtime ran. The spot client's order session was never closed
+    either.
+  - A connection is now closed when its owner is dropped or aborted, in fill recovery, a
+    reconnect or a backoff alike. The account stream's socket closes when the stream is dropped,
+    and the spot order session closes when the last clone of its `BinanceSpot` is dropped. The
+    close runs in the background on the current runtime, and a failure is logged at WARN. A
+    connection dropped outside a Tokio runtime cannot be closed; that is logged at WARN too.
+  - A dropped account stream also stops its event callback. It used to run for the life of the
+    runtime, holding the stream's state.
+  - A closed connection stays closed, now that binance-sdk 75.0.0 (see Changed) no longer
+    reconnects it.
+
+- **A spot position nets a fee paid in its base asset** (`rustrade`).
+  - **Breaking in behaviour:** a spot fill whose fee the venue charged in the instrument's base
+    asset moved the engine's position by its full quantity, so the position held more than the
+    account did. Binance spot takes a buy's fee out of the base it delivers unless BNB pays it, so
+    every such long was overstated by its fee, and a full-size close, `ClosePositions` included,
+    asked to sell more than the account held. On a `Spot` instrument, spot margin included, the
+    position now moves by the fill's signed quantity less the fee, on either side: a buy of 1 with
+    a fee of 0.001 in base holds 0.999. A rebate adds to it. PnL is still charged the fee's quote
+    equivalent, so a round trip's realised PnL is what the account made.
+  - Derivatives are unchanged: their positions count contracts, and an inverse contract pays its
+    fees in the settlement coin. So is a fee in quote or in a third asset such as BNB.
+  - The holding is exact, not lot-sized, so a full-size close on a venue with a lot step can leave
+    a remainder below one lot. Rounding a close to the lot step is the strategy's concern. A
+    spot-margin short closed by a buy keeps the fee as a residual short.
+  - A base fee larger than the fill's quantity moves the holding the other way. A fill that nets
+    to zero charges its fee to the open position. From flat it opens no position, as does any fill
+    of zero quantity, which used to open an empty position.
+  - **Breaking:** such a fill's fee is still counted. Its quote equivalent is charged to the
+    instrument's tear sheet, in a new field `TearSheet::fees_unattributed` (also on `PnLReturns`),
+    with a WARN. `TearSheet::pnl` and the PnL drawdowns include it; the returns, ratios, win rate
+    and profit factor, which are per closed position, do not. A consumer that totals PnL from
+    `PositionExit` events alone does not see it.
+  - **Breaking:** `PositionManager::update_from_trade` and `update_from_trade_with_id` return a
+    `#[must_use]` `TradeOutcome` instead of `Option<PositionExited>`: `Applied { exited }` for a
+    fill that moved a position, or `Unapplied { fees }` for one that opened none, whose fees reached
+    no PnL and are the caller's to book. Match `Applied { exited: Some(..) }` where the old code
+    matched `Some(..)`. The manager no longer logs such a fill.
+  - Only the fee the venue reported is netted. A `FeeModelConfig` fee the engine adds is in quote
+    and reaches PnL alone.
+  - **Breaking:** `InstrumentState::update_from_trade`, `update_from_order_snapshot` and
+    `update_from_account_snapshot` now require `AssetKey: PartialEq`.
+
+- **Binance isolated margin reports a balance frame that lists one asset** (`rustrade-execution`,
+  feature `binance`).
+  - Binance's isolated `outboundAccountPosition` lists only the assets whose balance changed, so a
+    frame can carry the pair's base or its quote alone. `InstrumentBalanceUpdate` required both,
+    and such a frame was dropped with a WARN, leaving that side's live `free`/`locked` stale until
+    the next REST snapshot.
+  - **Breaking:** `InstrumentBalanceUpdate` now carries one asset, `{ instrument, balance }`, in
+    place of `base` and `quote`, like `BalanceStreamUpdate` on the cross path. A frame yields one
+    event per listed asset of the pair: one or two. Apply each to the `(instrument, asset)` it
+    names and keep the pair's other asset as it was. To tell base from quote, compare
+    `balance.asset` with the instrument's base and quote.
+  - An asset on the frame that is neither the pair's base nor its quote is skipped at DEBUG; it
+    was skipped silently before. A frame listing none of the pair's assets yields no event.
+    An entry with an unparseable `free`/`locked` is skipped with a WARN and no longer drops the
+    pair's other asset.
+
+- **The simulated venue credits what a spot fill receives** (`rustrade-execution`).
+  - **Breaking in behaviour:** `SimulatedVenue` debited the asset a spot fill paid with and
+    never credited the one it received. A buy took quote and delivered no base, and a sell took
+    base and paid no proceeds. So its spot balances tracked cash committed rather than holdings,
+    and anything valued from them, such as a backtest's per-asset balances and their drawdowns,
+    was wrong after the first fill. A buy now credits the base it bought, and a sell credits its
+    proceeds in quote.
+  - **Breaking in behaviour:** the fee is charged in quote on both sides: on top of what a buy
+    pays, and out of what a sell receives. A sell used to pay its fee in base, converted at the
+    fill price, while its `Trade` reported the fee in quote. The base a fill moves is now exactly
+    its quantity, which is what the engine's position counts. A per-unit fee
+    (`PerContractFeeModel`) on a spot sell is now charged as quote. A sell whose fee exceeds its
+    proceeds takes the excess from quote, and is refused, or cancelled if it was resting, when
+    quote cannot cover it.
+  - **Breaking in behaviour:** a spot fill reports `[paid balance, received balance, trade]`,
+    one restatement per asset it moved, where it reported `[balance, trade]`. A resting fill
+    then reports its terminal order, as before.
+  - The asset a fill receives is created at zero if the account never held it, so a backtest
+    needs to fund only what its orders pay with.
+  - **Breaking:** `AccountState::commit` takes the fill's credit as an `Option<&Credit>`, where it
+    took a `Decimal` paid back into the paying asset. `Credit` is either `PaidBack`, what a CFD
+    close pays back into the asset the order paid with, or a `Delivery` in another asset, what a
+    spot fill receives. `commit` returns `Committed`: the paid balance, and the received one for a
+    delivery. New `AccountState::deliver`, unchecked like `charge`. `BalanceInsufficient` gains the
+    `asset` that was short and is no longer `Copy`.
+
+- **A fill is no longer dropped because its fee asset is unknown** (`rustrade-execution`,
+  `rustrade-instrument`, `rustrade`).
+  - `AccountEventIndexer` failed a whole trade when its fee asset was not in the instrument map,
+    and the engine's account stream dropped it. The engine then held a position the venue did
+    not. This hit every Binance spot fill with "pay fees with BNB" turned on, and every fill with
+    the `"UNKNOWN"` fee placeholder (IBKR with no commission report, Binance with no
+    `commissionAsset`).
+  - Such a trade is now kept with its fee zeroed: `0` in the instrument's quote asset, with
+    `fees_quote: None`. A WARN names the fee's asset and amount.
+  - New `IndexedInstrumentsBuilder::add_asset` registers an asset that no instrument implies,
+    such as BNB, so its fees and balances index for real. Before, there was no way to register
+    one, so a BNB balance update was dropped too. The engine keeps its balance and values
+    nothing in it.
+  - **Breaking in behaviour:** a fee with no quote equivalent (`fees_quote: None`: a third-party
+    asset such as BNB, or a zeroed one) is now left out of `Position` PnL, realised and unrealised.
+    Before, its raw amount, in another asset, was subtracted from quote PnL. The raw amount stays
+    in `fees_enter` / `fees_exit`. PnL therefore overstates a position whose fees were paid in a
+    third asset, by those fees, until the consumer prices them (#620). The simulated venue charges
+    fees in quote, so a backtest counts them (#621).
+  - **Breaking in behaviour:** a position's `fees_enter.fees_quote` / `fees_exit.fees_quote` total
+    is now the sum of the quote equivalents its fees had, the figure PnL charged. It is `None`
+    only while no fee had one. Before, one fee without a quote equivalent made the total `None`.
+    That also made the unrealised PnL's exit-fee estimate drop every entry fee.
+  - A `FeeModelConfig` fee now reaches PnL on a fill whose own fee has no quote equivalent. Before,
+    it was dropped there.
+
 ## [0.11.0] - 2026-10-12
 
 ### Added
@@ -614,10 +954,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Breaking:** `STOP_LOSS_LIMIT` and `TAKE_PROFIT_LIMIT` orders, which these listings returned as
   `Limit` orders, are no longer in them.
   - Binance margin accepts a `trailingDelta` on every conditional type (`STOP_LOSS`,
-    `STOP_LOSS_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`), but its REST order queries, as
-    binance-sdk models them, do not report one (#541). A conditional row could therefore be a fixed
-    or a trailing order, so `fetch_open_orders` and `account_snapshot` now leave it out, with a
-    warning. `account_snapshot` reports such a listing incomplete; `fetch_open_orders` returns no
+    `STOP_LOSS_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`), and the REST order queries the client
+    reads (`openOrders` and `order`) do not report it: Binance returns neither `trailingDelta` nor
+    `trailingTime` there (#541). A conditional row could therefore be a fixed or a trailing order,
+    so `fetch_open_orders` and `account_snapshot` now leave it out, with a warning.
+    `account_snapshot` reports such a listing incomplete; `fetch_open_orders` returns no
     completeness flag, so there only the warning shows it. `STOP_LOSS` and `TAKE_PROFIT` rows were
     already left out.
   - The account stream reports these orders in full.

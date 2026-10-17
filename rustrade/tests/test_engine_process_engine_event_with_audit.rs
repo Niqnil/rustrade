@@ -2768,6 +2768,74 @@ fn open_position_via_trade(
     engine.process(event);
 }
 
+/// Live engine vs audit-replica parity for a spot buy from flat whose base-asset fee takes all
+/// it bought. It opens no position, and its fee is charged to the tear sheet's unattributed fees;
+/// the replica, which replays the fill through the same state update, must agree.
+#[test]
+fn test_unattributed_fee_replica_parity() {
+    use rustrade::engine::audit::{
+        AuditTick, EngineAudit, context::EngineContext, state_replica::StateReplicaManager,
+    };
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+    let base = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0))
+        .instrument
+        .underlying
+        .base;
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: engine.state.clone(),
+        context: EngineContext {
+            time: STARTING_TIMESTAMP,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica_manager = StateReplicaManager::new(seed_tick, dummy_updates);
+
+    let fill = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new("all-fee"),
+            OrderId::new("all-fee"),
+            InstrumentIndex(0),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, 1),
+            Side::Buy,
+            dec!(100),
+            dec!(0.5),
+            None,
+            AssetFees::new(base, dec!(0.5), Some(dec!(50))),
+        )),
+    }));
+    let audit_tick = process_with_audit(&mut engine, fill.clone());
+    let outputs = match &audit_tick.event {
+        EngineAudit::Process(audit) => audit.outputs.clone(),
+        _ => panic!("expected EngineAudit::Process"),
+    };
+    replica_manager.update_from_event(fill, &outputs);
+
+    let live_instrument = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    let replica_instrument = replica_manager
+        .replica_engine_state()
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+
+    assert!(live_instrument.position.positions.is_empty());
+    assert_eq!(
+        live_instrument.tear_sheet.pnl_returns.fees_unattributed,
+        dec!(50)
+    );
+    assert_eq!(replica_instrument, live_instrument);
+}
+
 /// Live engine vs audit-replica parity for a `CorporateAction` reverse split under `Floor`,
 /// across multiple positions (Hedging) — one surviving, one floored to zero.
 ///
@@ -5626,6 +5694,51 @@ fn test_fee_model_per_contract_augments_trade_fees() {
     // fees_enter should reflect the PerContract commission (0.65 per contract × 1 contract).
     assert_eq!(pos.fees_enter.fees, dec!(0.65));
     // pnl_realised starts negative equal to fees paid.
+    assert_eq!(pos.pnl_realised, dec!(-0.65));
+}
+
+/// A fill whose own fee has no quote equivalent (`fees_quote: None`: a fee in a third asset, or
+/// one the indexer zeroed because its asset was unmapped) still gets the fee model's quote fee
+/// charged to PnL.
+#[test]
+fn test_fee_model_charges_a_fill_whose_fee_has_no_quote_equivalent() {
+    let (execution_tx, _) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    engine
+        .state
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(0))
+        .fee_model = FeeModelConfig::PerContract(PerContractFeeModel {
+        commission_per_contract: dec!(0.65),
+    });
+
+    let event = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new("fee-test-trade"),
+            gen_order_id(0),
+            InstrumentIndex(0),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, 1),
+            Side::Buy,
+            dec!(1_000),
+            dec!(1),
+            None,
+            // As the indexer zeroes a fee whose asset is not in its map.
+            AssetFees::new(AssetIndex(1), Decimal::ZERO, None),
+        )),
+    }));
+    engine.process(event);
+
+    let pos = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0))
+        .position
+        .positions
+        .get(&PositionId::NETTING)
+        .expect("position should be open");
+    assert_eq!(pos.fees_enter.fees_quote, Some(dec!(0.65)));
     assert_eq!(pos.pnl_realised, dec!(-0.65));
 }
 

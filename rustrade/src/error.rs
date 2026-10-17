@@ -1,6 +1,9 @@
 use crate::{
     engine::{in_flight::InFlightDeadlineError, state::position::PositionSeedError},
-    execution::error::ExecutionError,
+    execution::{
+        error::ExecutionError,
+        sim::{SimStartError, SimStepError},
+    },
 };
 use chrono::{DateTime, Utc};
 use rustrade_data::error::DataError;
@@ -115,6 +118,20 @@ pub enum BarterError {
     /// See [`BacktestMarketData`](Self::BacktestMarketData) — new variants belong at the end.
     #[error("in-flight deadline: {0}")]
     InFlightDeadline(#[from] InFlightDeadlineError),
+    /// A [`SimStart`](crate::execution::sim::SimStart) could not be applied to a simulated venue
+    /// — see [`SimStartError`].
+    ///
+    /// # Appended deliberately
+    /// See [`BacktestMarketData`](Self::BacktestMarketData) — new variants belong at the end.
+    #[error("simulation start: {0}")]
+    SimStart(#[from] SimStartError),
+    /// A [`SimStepper`](crate::execution::sim::SimStepper) could not take a step — see
+    /// [`SimStepError`].
+    ///
+    /// # Appended deliberately
+    /// See [`BacktestMarketData`](Self::BacktestMarketData) — new variants belong at the end.
+    #[error("simulation step: {0}")]
+    SimStep(#[from] SimStepError),
 }
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
 #[error("RxDropped")]

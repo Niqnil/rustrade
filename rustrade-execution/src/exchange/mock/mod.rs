@@ -376,7 +376,7 @@ pub(crate) mod fixtures {
         InstrumentAccountSnapshot, UnindexedAccountSnapshot,
         balance::{AssetBalance, Balance},
         client::mock::MockExecutionConfig,
-        fee::FeeModelConfig,
+        fee::{FeeModelConfig, SpotFeeAsset},
         fill::SimFillConfig,
         market::MarketSnapshot,
         order::{
@@ -455,6 +455,8 @@ pub(crate) mod fixtures {
             0, // latency_ms
             fee_model,
             fill_model,
+            SpotFeeAsset::default(),
+            crate::slippage::SlippageConfig::default(),
         )
     }
 
@@ -485,6 +487,8 @@ pub(crate) mod fixtures {
             0, // latency_ms
             FeeModelConfig::default(),
             SimFillConfig::default(),
+            SpotFeeAsset::default(),
+            crate::slippage::SlippageConfig::default(),
         )
     }
 
@@ -756,14 +760,17 @@ mod tests {
             );
         }
 
+        // Each fill also restates the base it received; this test pins the quote it paid with.
         let balances = std::iter::from_fn(|| events.try_recv().ok())
             .filter_map(|event| match event.kind {
-                AccountEventKind::BalanceSnapshot(snapshot) => Some(snapshot.0.balance.total),
+                AccountEventKind::BalanceSnapshot(snapshot) if snapshot.0.asset == quote() => {
+                    Some(snapshot.0.balance.total)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
 
-        // One balance snapshot per fill, each debiting the quote asset by the same notional.
+        // One quote snapshot per fill, each debiting the quote asset by the same notional.
         let expected = (1..=FILLS)
             .map(|nth| d(usdt_start) - d(DEBIT_PER_FILL) * Decimal::from(nth))
             .collect::<Vec<_>>();
@@ -772,6 +779,39 @@ mod tests {
             balances, expected,
             "balance snapshots must reach the client in the order the venue booked them"
         );
+    }
+
+    /// The async driver builds its venue from the configuration, slippage included.
+    #[tokio::test]
+    async fn the_driver_fills_at_the_configured_slippage() {
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (event_tx, mut events) = broadcast::channel(16);
+        let config = MockExecutionConfig {
+            slippage: crate::slippage::SlippageConfig::fixed(d("0.01")).unwrap(),
+            ..spot_config("100", "10000000", FeeModelConfig::default())
+        };
+        let exchange = MockExchange::new(config, request_rx, event_tx, spot_instruments());
+        let driver = tokio::spawn(exchange.run());
+
+        let (response_tx, response_rx) = oneshot::channel();
+        request_tx
+            .send(MockExchangeRequest::open_order(
+                Utc::now(),
+                response_tx,
+                buy_request("0.01", market_prices("50000")),
+            ))
+            .unwrap();
+        response_rx.await.expect("the open is answered");
+        drop(request_tx);
+        driver.await.unwrap();
+
+        let prices = std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|event| match event.kind {
+                AccountEventKind::Trade(trade) => Some(trade.price),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prices, vec![d("50500")], "50,000 bought 1% above");
     }
 
     /// A cancel is rejected by the venue, and the driver answers the channel it was asked on.
@@ -840,7 +880,7 @@ mod tests {
 
         assert_eq!(
             kinds,
-            ["balance", "trade", "order"],
+            ["balance", "balance", "trade", "order"],
             "the fill's events must all precede the sweep, which for a seeded order — held with \
              no reservation — owes only its terminal snapshot"
         );

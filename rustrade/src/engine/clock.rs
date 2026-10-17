@@ -102,6 +102,11 @@ impl HistoricalClock {
             })),
         }
     }
+
+    /// Whether `self` and `other` are clones of one clock, so advancing either advances both.
+    pub(crate) fn is_shared_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
 }
 
 impl EngineClock for HistoricalClock {
@@ -192,8 +197,8 @@ impl<MarketEventKind: Debug> TimeExchange for EngineEvent<MarketEventKind> {
                 AccountEventKind::BalanceStreamUpdate(update) => Some(update.0.time_exchange),
                 AccountEventKind::InstrumentBalanceUpdate(update) => {
                     // Per-pair isolated balance update — advance on its event time, consistent with
-                    // its asset-keyed sibling `BalanceStreamUpdate` (base/quote share the frame's time).
-                    Some(update.base.time_exchange)
+                    // its asset-keyed sibling `BalanceStreamUpdate`.
+                    Some(update.balance.time_exchange)
                 }
                 AccountEventKind::OrderSnapshot(order) => order.0.state.time_exchange(),
                 AccountEventKind::OrderCancelled(response) => response

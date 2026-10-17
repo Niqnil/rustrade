@@ -36,7 +36,7 @@ use rustrade::{
                 data::{DefaultInstrumentMarketData, InstrumentDataState},
                 filter::InstrumentFilter,
             },
-            position::{OmsMode, PositionId, PositionManager},
+            position::{OmsMode, PositionId, PositionManager, TradeOutcome},
             trading::TradingState,
         },
     },
@@ -61,7 +61,7 @@ use rustrade_execution::{
     client::mock::MockExecutionConfig,
     exchange::mock::SimulatedVenue,
     fee::{FeeModelConfig, PercentageFeeModel},
-    fill::SimFillConfig,
+    fill::{FillContext, FillModel, SimFillConfig},
     holding_cost::{FundingModel, RateSeries},
     market::MarketSnapshot,
     order::{
@@ -70,6 +70,7 @@ use rustrade_execution::{
         request::{OrderRequestCancel, OrderRequestOpen, RequestOpen},
     },
     shortability::{Shortability, ShortabilityTable},
+    slippage::SlippageConfig,
     trade::Trade,
 };
 use rustrade_instrument::{
@@ -122,6 +123,8 @@ fn mock_config(usd_balance: Decimal, fee_model: FeeModelConfig) -> MockExecution
         latency_ms: 0,
         fee_model,
         fill_model: SimFillConfig::default(),
+        spot_fee_asset: Default::default(),
+        slippage: Default::default(),
     }
 }
 
@@ -249,7 +252,10 @@ fn the_venue_ledger_and_the_engine_position_agree_fill_by_fill() {
 
     for (side, quantity, price) in fills {
         let trade = fill(&mut venue, side, quantity, price);
-        if let Some(exited) = engine.update_from_trade(&trade, contract_size()) {
+        if let TradeOutcome::Applied {
+            exited: Some(exited),
+        } = engine.update_from_trade(&trade, contract_size())
+        {
             realised += exited.pnl_realised;
         }
 
@@ -436,6 +442,16 @@ async fn try_round_trip(
     margin: Decimal,
     venue_options: FnvHashMap<ExchangeId, SimVenueOptions>,
 ) -> Result<BacktestResult<Daily, BacktestState>, BarterError> {
+    try_round_trip_slipped(opening, margin, venue_options, SlippageConfig::none()).await
+}
+
+/// [`try_round_trip`] on a venue moving every fill against the order by `slippage`.
+async fn try_round_trip_slipped(
+    opening: Side,
+    margin: Decimal,
+    venue_options: FnvHashMap<ExchangeId, SimVenueOptions>,
+    slippage: SlippageConfig,
+) -> Result<BacktestResult<Daily, BacktestState>, BarterError> {
     let mut cfd = instrument(EXCHANGE, "spx500", "usd");
     cfd.kind = InstrumentKind::Cfd(CfdContract {
         contract_size: contract_size(),
@@ -477,10 +493,10 @@ async fn try_round_trip(
     let args_constant = Arc::new(BacktestArgsConstant {
         instruments,
         venue_options,
-        executions: vec![ExecutionConfig::Mock(mock_config(
-            margin,
-            FeeModelConfig::default(),
-        ))],
+        executions: vec![ExecutionConfig::Mock(MockExecutionConfig {
+            slippage,
+            ..mock_config(margin, FeeModelConfig::default())
+        })],
         market_data: MarketDataInMemory::new(Arc::new(market_events)),
         summary_interval: Daily,
         engine_state,
@@ -563,6 +579,80 @@ async fn a_backtest_charges_a_held_cfd_its_funding_and_the_engine_carries_it() {
         .expect("one instrument traded");
     assert_eq!(tear_sheet.carry, dec!(-12.75));
     assert_eq!(tear_sheet.pnl, dec!(5_000) - dec!(12.75));
+}
+
+/// Prices every fill 10 above the last trade, whichever way it trades.
+#[derive(Debug)]
+struct TenAbove;
+
+impl FillModel for TenAbove {
+    fn fill_price(&self, fill: &FillContext<'_>) -> Option<Decimal> {
+        fill.market.last_price.map(|last| last + dec!(10))
+    }
+}
+
+/// 1% slippage opens the long at 5,050 and closes it at 5,148, so it makes 1 × 25 × 98 rather
+/// than 1 × 25 × 200. A fill model handed in through the options prices first, and is slipped
+/// in turn: 5,010 × 1.01 = 5,060.1 in, 5,210 × 0.99 = 5,157.9 out, 1 × 25 × 97.8. The venue's
+/// balance and the engine's PnL agree on both.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backtest_fills_at_slipped_prices_and_through_a_custom_fill_model() {
+    let margin = dec!(200_000);
+    let slippage = SlippageConfig::fixed(dec!(0.01)).unwrap();
+
+    let slipped = try_round_trip_slipped(Side::Buy, margin, FnvHashMap::default(), slippage)
+        .await
+        .expect("a slipped round trip must complete");
+    assert_eq!(usd_end(&slipped).total, margin + dec!(2_450));
+    assert_eq!(
+        slipped
+            .summary
+            .trading_summary
+            .instruments
+            .values()
+            .next()
+            .unwrap()
+            .pnl,
+        dec!(2_450)
+    );
+
+    let options = FnvHashMap::from_iter([(
+        EXCHANGE,
+        SimVenueOptions::default().with_fill_model(Arc::new(TenAbove)),
+    )]);
+    let custom = try_round_trip_slipped(Side::Buy, margin, options, slippage)
+        .await
+        .expect("a round trip through a custom fill model must complete");
+    assert_eq!(usd_end(&custom).total, margin + dec!(2_445));
+    assert_eq!(
+        custom
+            .summary
+            .trading_summary
+            .instruments
+            .values()
+            .next()
+            .unwrap()
+            .pnl,
+        dec!(2_445)
+    );
+
+    // A short is slipped the other way: sold at 4,950, bought back at 5,252, so it loses
+    // 1 × 25 × 302.
+    let short = try_round_trip_slipped(Side::Sell, margin, FnvHashMap::default(), slippage)
+        .await
+        .expect("a slipped short round trip must complete");
+    assert_eq!(usd_end(&short).total, margin - dec!(7_550));
+    assert_eq!(
+        short
+            .summary
+            .trading_summary
+            .instruments
+            .values()
+            .next()
+            .unwrap()
+            .pnl,
+        dec!(-7_550)
+    );
 }
 
 fn open_positions(result: &BacktestResult<Daily, BacktestState>) -> usize {

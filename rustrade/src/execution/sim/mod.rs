@@ -1,6 +1,9 @@
 use crate::{
     EngineEvent, Timed,
-    engine::clock::{EngineClock, HistoricalClock},
+    engine::{
+        clock::{EngineClock, HistoricalClock},
+        state::position::PositionSeed,
+    },
     error::BarterError,
     execution::{AccountStreamEvent, request::ExecutionRequest},
     shutdown::Shutdown,
@@ -38,9 +41,15 @@ use tracing::info;
 /// Builds the execution half of a deterministic simulation.
 pub mod builder;
 pub mod market;
+/// One starting state for a simulated venue and the `Engine` trading on it.
+pub mod start;
+/// Drives a simulation from outside, one instant at a time.
+pub mod stepper;
 
 pub use builder::{SimExecutionBuild, SimExecutionBuilder, SimVenueOptions};
 pub use market::VenueMarketUpdate;
+pub use start::{SimStart, SimStartError, StartBalance};
+pub use stepper::{SimEngine, SimStepError, SimStepper, StepAudit};
 
 /// One simulated venue and everything needed to drive it deterministically.
 ///
@@ -70,6 +79,14 @@ pub struct SimVenue {
     pub to_venue: TimeDelta,
     /// Simulated delay from the venue acting to the `Engine` observing the result.
     pub from_venue: TimeDelta,
+    /// The positions this venue was started with, when it was built from a [`SimStart`] by
+    /// [`SimExecutionBuilder::add_venue_with_start`]: the `Engine` must be seeded with exactly
+    /// these. `None` for a venue built from its configuration alone.
+    ///
+    /// [`SimStepper`] checks the `Engine` against them on its first call. Public like every field
+    /// here, but setting it by hand changes only what that check expects, not what the venue
+    /// holds: build from a [`SimStart`] instead.
+    pub position_seeds: Option<Vec<PositionSeed>>,
 }
 
 /// What a venue owes, erased to one type so differently-typed responses can share one queue.
@@ -111,7 +128,7 @@ enum Action {
 /// grow the queue by one entry per change, for as long as the furthest deadline: a strategy
 /// re-placing a week-long good-till-date quote on every tick would hold one per tick for a week.
 #[derive(Debug)]
-struct Wakeups {
+pub(crate) struct Wakeups {
     /// The earliest wake-up queued for each venue and not yet popped.
     queued: FnvHashMap<ExchangeIndex, DateTime<Utc>>,
     /// The session start. A deadline before it — a seeded order that had already expired — is
@@ -479,38 +496,15 @@ where
 {
     #[pin]
     source: futures::stream::Peekable<Source>,
-    venues: FnvIndexMap<ExchangeIndex, SimVenue>,
-    pending: BinaryHeap<Reverse<ScheduledEvent>>,
-    /// Monotone across every venue, so two venues booking at one instant still pop in booking
-    /// order rather than an arbitrary one.
-    seq: u64,
-    /// The `Engine`'s clock, shared. Read to stamp each request with the simulated instant the
-    /// `Engine` issued it at — the same instant the async client path reads.
-    clock: HistoricalClock,
-    /// Initial per-venue account snapshots, emitted before anything else.
-    seeding: VecDeque<EngineEvent<MarketKind>>,
-    /// Ceiling on `since_source`. See [`SimRunner::with_feedback_limit`].
-    feedback_limit: usize,
-    /// Account deliverables emitted since the last source event or venue wake-up, or since the
-    /// source was exhausted.
-    ///
-    /// The seeding snapshots are not charged against it: they are bounded by the venue count and
-    /// precede any feedback there could be.
-    since_source: usize,
+    /// The venues and their queue, shared in shape with [`SimStepper`], which drives the same core
+    /// from a caller's loop instead of from a source.
+    core: SimCore<MarketKind>,
     /// Why the run was abandoned, if it was. Read through [`SimRunner::error`].
     error: Option<BarterError>,
     source_done: bool,
     /// Latch: [`Shutdown::AfterDrain`] is emitted exactly once, when the source is exhausted.
     drain_signalled: bool,
     terminated: bool,
-    /// Per-instrument market state, folded from the source and handed to the venues trading it.
-    ///
-    /// Keyed by instrument rather than by venue because the market is a property of the instrument:
-    /// two venues trading it see one market, and folding the stream once is both cheaper and the
-    /// only way they cannot disagree.
-    market: FnvHashMap<InstrumentIndex, MarketKind::State>,
-    /// Each venue's queued wake-up for its own next deadline.
-    wakeups: Wakeups,
 }
 
 /// Manual because [`futures::stream::Peekable`] is [`Debug`] only when its `Source` is, and
@@ -523,13 +517,7 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SimRunner")
             .field("source", &"Peekable<Source>")
-            .field("venues", &self.venues.keys().collect::<Vec<_>>())
-            .field("pending", &self.pending.len())
-            .field("seq", &self.seq)
-            .field("clock", &self.clock)
-            .field("seeding", &self.seeding.len())
-            .field("feedback_limit", &self.feedback_limit)
-            .field("since_source", &self.since_source)
+            .field("core", &self.core)
             .field("error", &self.error)
             .field("source_done", &self.source_done)
             .field("drain_signalled", &self.drain_signalled)
@@ -592,47 +580,14 @@ where
         source: Source,
         clock: HistoricalClock,
     ) -> Self {
-        let time_engine_start = clock.time();
-
-        let seeding = venues
-            .values()
-            .map(|slot| {
-                let mut snapshot = slot.venue.account_snapshot();
-                for balance in &mut snapshot.balances {
-                    balance.time_exchange = time_engine_start;
-                }
-
-                let snapshot = UnindexedAccountEvent {
-                    exchange: slot.venue.exchange,
-                    kind: AccountEventKind::Snapshot(snapshot),
-                };
-
-                index_account_event(&slot.indexer, snapshot)
-            })
-            .collect();
-
-        let mut pending = BinaryHeap::new();
-        let mut seq = 0;
-        let mut wakeups = Wakeups::new(time_engine_start);
-        for (exchange, slot) in &venues {
-            wakeups.arm(&mut pending, &mut seq, *exchange, &slot.venue);
-        }
-
         Self {
             source: futures::StreamExt::peekable(source),
-            venues,
-            pending,
-            seq,
-            clock,
-            seeding,
-            feedback_limit: DEFAULT_FEEDBACK_LIMIT,
-            since_source: 0,
+            core: SimCore::new(venues, clock, DEFAULT_FEEDBACK_LIMIT)
+                .unwrap_or_else(panic_on_fault),
             error: None,
             source_done: false,
             drain_signalled: false,
             terminated: false,
-            market: FnvHashMap::default(),
-            wakeups,
         }
     }
 
@@ -650,7 +605,7 @@ where
     /// has no limit at which it terminates — so a run hitting even a large limit is otherwise
     /// reporting the configuration described in [`BarterError::SimFeedbackLoop`].
     pub fn with_feedback_limit(mut self, limit: usize) -> Self {
-        self.feedback_limit = limit;
+        self.core.feedback_limit = limit;
         self
     }
 
@@ -668,7 +623,7 @@ where
 
     /// The venues this runner drove, for inspection once a run has ended.
     pub fn venues(&self) -> &FnvIndexMap<ExchangeIndex, SimVenue> {
-        &self.venues
+        &self.core.venues
     }
 }
 
@@ -681,23 +636,22 @@ where
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
+        let core = this.core;
 
         if *this.terminated {
             return Poll::Ready(None);
         }
 
         // Venues are seeded before any source event, so the Engine starts from a known account.
-        if let Some(event) = this.seeding.pop_front() {
+        if let Some(event) = core.seeding.pop_front() {
             return Poll::Ready(Some(event));
         }
 
         loop {
             // Everything the Engine emitted while processing the previous event is already queued
             // (its requests are sent synchronously inside `process`), so this observes it in full.
-            if drain_requests(this.venues, this.pending, this.seq, this.clock)
-                == RequestDrain::Abandon
-            {
-                *this.pending = BinaryHeap::new();
+            if core.drain_requests().unwrap_or_else(panic_on_fault) == RequestDrain::Abandon {
+                core.abandon();
                 *this.terminated = true;
                 return Poll::Ready(None);
             }
@@ -717,7 +671,7 @@ where
                     // The drain is a fresh stretch with no source events left to reset the budget,
                     // so it gets its own. Exceeding it means the Engine is still generating, which
                     // `AfterDrain` was just sent to stop.
-                    *this.since_source = 0;
+                    core.since_source = 0;
                     return Poll::Ready(Some(EngineEvent::Shutdown(Shutdown::AfterDrain)));
                 }
 
@@ -731,47 +685,31 @@ where
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(None) => {
                         *this.source_done = true;
-                        this.wakeups.stop();
+                        core.wakeups.stop();
                         continue;
                     }
                     Poll::Ready(Some(timed)) => (timed.time, source_class(&timed.value)),
                 };
 
-                this.pending
-                    .peek()
-                    .is_some_and(|Reverse(next)| (next.time, next.class) <= ordering)
+                core.leads(ordering)
             };
 
             if queue_leads {
                 // Checked before popping, so the diagnostic can name the event that would have been
                 // emitted rather than one already gone.
-                if let Some(error) = check_feedback(
-                    this.venues,
-                    this.pending,
-                    *this.since_source,
-                    *this.feedback_limit,
-                ) {
+                if let Some(error) = core.check_feedback() {
                     *this.error = Some(error);
-                    *this.pending = BinaryHeap::new();
+                    core.abandon();
                     *this.terminated = true;
                     return Poll::Ready(None);
                 }
 
-                match step(this.venues, this.pending, this.seq, this.wakeups) {
-                    Step::Emitted(event) => {
-                        *this.since_source += 1;
-                        return Poll::Ready(Some(event));
-                    }
-                    // A venue acted. Nothing to emit, and what it produced is now queued, so the
-                    // next iteration weighs that against the source exactly as it did this one.
-                    Step::Acted => continue,
-                    // A venue was woken at its own deadline, which moved simulated time forward
-                    // as a source event does, so what it produces starts a fresh budget. A gap in
-                    // the source spanning many charges is not a feedback cycle.
-                    Step::Woken => {
-                        *this.since_source = 0;
-                        continue;
-                    }
+                match core.pop().unwrap_or_else(panic_on_fault) {
+                    Step::Emitted(event) => return Poll::Ready(Some(event)),
+                    // A venue acted, or was woken at its own deadline. Nothing to emit, and what it
+                    // produced is now queued, so the next iteration weighs that against the source
+                    // exactly as it did this one.
+                    Step::Acted | Step::Woken => continue,
                     // Nothing left owed and no source to draw from: the run is over.
                     Step::Empty => {
                         *this.terminated = true;
@@ -783,32 +721,232 @@ where
             // The peeked item is buffered, so this returns it synchronously.
             return match this.source.as_mut().poll_next(cx) {
                 Poll::Ready(Some(timed)) => {
-                    // A source event is the only thing that proves simulated time is advancing.
-                    *this.since_source = 0;
-
                     // Routed BEFORE the event is returned, which is the whole ordering rule: an
                     // order the `Engine` sends in reaction to the tick at `T` must be matched
                     // against the market as of `T`, not `T-1`. Returning first and routing on the
                     // next poll would reverse that at zero latency.
-                    route_market(
-                        this.venues,
-                        this.market,
-                        this.pending,
-                        this.seq,
-                        this.wakeups,
-                        &timed.value,
-                    );
+                    core.route_source(&timed.value)
+                        .unwrap_or_else(panic_on_fault);
 
                     Poll::Ready(Some(timed.value))
                 }
                 Poll::Ready(None) => {
                     *this.source_done = true;
-                    this.wakeups.stop();
+                    core.wakeups.stop();
                     continue;
                 }
                 Poll::Pending => Poll::Pending,
             };
         }
+    }
+}
+
+/// A simulation misconfigured in a way that would otherwise silently drop or misplace an event:
+/// a key absent from a venue's own index, or a simulated instant [`DateTime<Utc>`] cannot hold.
+///
+/// [`SimRunner`] panics with it, as its `# Panics` says. [`SimStepper`] returns it as
+/// [`SimStepError::Misconfigured`].
+///
+/// Its message names no driver: each reporter prefixes its own name, so the message reads as a
+/// sentence whose subject is the driver that met it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SimFault(String);
+
+impl std::fmt::Display for SimFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// How [`SimRunner`] reports a [`SimFault`]: a panic carrying its message, as it always has.
+#[cold]
+fn panic_on_fault<T>(reason: SimFault) -> T {
+    panic!("SimRunner {reason}")
+}
+
+/// The venues, the queue and the bookkeeping [`SimRunner`] and [`SimStepper`] share.
+///
+/// What differs between the two is only where the next source event comes from, and how the end of
+/// the available input is known: [`SimRunner`] peeks a `Stream`, while [`SimStepper`] is handed one
+/// instant's events and told that nothing more is due at it. Everything that decides what a venue
+/// does and in what order the `Engine` is shown it lives here, so the two cannot drift apart.
+pub(crate) struct SimCore<MarketKind>
+where
+    MarketKind: VenueMarketUpdate,
+{
+    pub(crate) venues: FnvIndexMap<ExchangeIndex, SimVenue>,
+    pending: BinaryHeap<Reverse<ScheduledEvent>>,
+    /// Monotone across every venue, so two venues booking at one instant still pop in booking
+    /// order rather than an arbitrary one.
+    seq: u64,
+    /// The `Engine`'s clock, shared. Read to stamp each request with the simulated instant the
+    /// `Engine` issued it at — the same instant the async client path reads.
+    clock: HistoricalClock,
+    /// Initial per-venue account snapshots, emitted before anything else.
+    pub(crate) seeding: VecDeque<EngineEvent<MarketKind>>,
+    /// Ceiling on `since_source`. See [`SimRunner::with_feedback_limit`].
+    pub(crate) feedback_limit: usize,
+    /// Account deliverables emitted since the last source event or venue wake-up, or since the
+    /// source was exhausted.
+    ///
+    /// The seeding snapshots are not charged against it: they are bounded by the venue count and
+    /// precede any feedback there could be.
+    pub(crate) since_source: usize,
+    /// Per-instrument market state, folded from the source and handed to the venues trading it.
+    ///
+    /// Keyed by instrument rather than by venue because the market is a property of the instrument:
+    /// two venues trading it see one market, and folding the stream once is both cheaper and the
+    /// only way they cannot disagree.
+    market: FnvHashMap<InstrumentIndex, MarketKind::State>,
+    /// Each venue's queued wake-up for its own next deadline.
+    pub(crate) wakeups: Wakeups,
+}
+
+/// Manual because a derive would demand `MarketKind: Debug`, which the queued events need only to
+/// be counted, not printed.
+impl<MarketKind> std::fmt::Debug for SimCore<MarketKind>
+where
+    MarketKind: VenueMarketUpdate,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimCore")
+            .field("venues", &self.venues.keys().collect::<Vec<_>>())
+            .field("pending", &self.pending.len())
+            .field("seq", &self.seq)
+            .field("clock", &self.clock)
+            .field("seeding", &self.seeding.len())
+            .field("feedback_limit", &self.feedback_limit)
+            .field("since_source", &self.since_source)
+            .finish()
+    }
+}
+
+impl<MarketKind> SimCore<MarketKind>
+where
+    MarketKind: VenueMarketUpdate,
+{
+    /// Queue each venue's seeding snapshot, stamped at `clock`'s instant, and each venue's first
+    /// deadline. See [`SimRunner::new`].
+    pub(crate) fn new(
+        venues: FnvIndexMap<ExchangeIndex, SimVenue>,
+        clock: HistoricalClock,
+        feedback_limit: usize,
+    ) -> Result<Self, SimFault> {
+        let time_engine_start = clock.time();
+
+        let seeding = venues
+            .values()
+            .map(|slot| {
+                let mut snapshot = slot.venue.account_snapshot();
+                for balance in &mut snapshot.balances {
+                    balance.time_exchange = time_engine_start;
+                }
+
+                let snapshot = UnindexedAccountEvent {
+                    exchange: slot.venue.exchange,
+                    kind: AccountEventKind::Snapshot(snapshot),
+                };
+
+                index_account_event(&slot.indexer, snapshot)
+            })
+            .collect::<Result<_, _>>()?;
+
+        let mut pending = BinaryHeap::new();
+        let mut seq = 0;
+        let mut wakeups = Wakeups::new(time_engine_start);
+        for (exchange, slot) in &venues {
+            wakeups.arm(&mut pending, &mut seq, *exchange, &slot.venue);
+        }
+
+        Ok(Self {
+            venues,
+            pending,
+            seq,
+            clock,
+            seeding,
+            feedback_limit,
+            since_source: 0,
+            market: FnvHashMap::default(),
+            wakeups,
+        })
+    }
+
+    /// Queue every request the `Engine` has issued since the last drain. See [`drain_requests`].
+    pub(crate) fn drain_requests(&mut self) -> Result<RequestDrain, SimFault> {
+        drain_requests(
+            &mut self.venues,
+            &mut self.pending,
+            &mut self.seq,
+            &self.clock,
+        )
+    }
+
+    /// Whether the queue's earliest entry comes due at or before `ordering`, the `(time, class)` of
+    /// the next source event.
+    pub(crate) fn leads(&self, ordering: (DateTime<Utc>, u8)) -> bool {
+        self.pending
+            .peek()
+            .is_some_and(|Reverse(next)| (next.time, next.class) <= ordering)
+    }
+
+    /// Whether the queue's earliest entry comes due at or before `time`.
+    pub(crate) fn due_by(&self, time: DateTime<Utc>) -> bool {
+        self.pending
+            .peek()
+            .is_some_and(|Reverse(next)| next.time <= time)
+    }
+
+    /// Whether emitting the queue's head would exceed the feedback budget. See [`check_feedback`].
+    pub(crate) fn check_feedback(&self) -> Option<BarterError> {
+        check_feedback(
+            &self.venues,
+            &self.pending,
+            self.since_source,
+            self.feedback_limit,
+        )
+    }
+
+    /// Pop the queue's head, charging an emitted deliverable to the feedback budget and starting a
+    /// fresh one when a venue is woken at its own deadline. See [`step`].
+    pub(crate) fn pop(&mut self) -> Result<Step<MarketKind>, SimFault> {
+        let popped = step(
+            &mut self.venues,
+            &mut self.pending,
+            &mut self.seq,
+            &mut self.wakeups,
+        )?;
+
+        match &popped {
+            Step::Emitted(_) => self.since_source += 1,
+            // A venue was woken at its own deadline, which moved simulated time forward as a source
+            // event does, so what it produces starts a fresh budget. A gap in the source spanning
+            // many charges is not a feedback cycle.
+            Step::Woken => self.since_source = 0,
+            Step::Acted | Step::Empty => {}
+        }
+
+        Ok(popped)
+    }
+
+    /// Account for a source event about to be shown to the `Engine`: it starts a fresh feedback
+    /// budget, and its market data reaches the venues first. See [`route_market`].
+    pub(crate) fn route_source(&mut self, event: &EngineEvent<MarketKind>) -> Result<(), SimFault> {
+        // A source event is the only thing that proves simulated time is advancing.
+        self.since_source = 0;
+
+        route_market(
+            &mut self.venues,
+            &mut self.market,
+            &mut self.pending,
+            &mut self.seq,
+            &mut self.wakeups,
+            event,
+        )
+    }
+
+    /// Discard everything still scheduled: the run is over without being drained.
+    pub(crate) fn abandon(&mut self) {
+        self.pending = BinaryHeap::new();
     }
 }
 
@@ -837,11 +975,12 @@ fn route_market<MarketKind>(
     seq: &mut u64,
     wakeups: &mut Wakeups,
     event: &EngineEvent<MarketKind>,
-) where
+) -> Result<(), SimFault>
+where
     MarketKind: VenueMarketUpdate,
 {
     let EngineEvent::Market(MarketStreamEvent::Item(event)) = event else {
-        return;
+        return Ok(());
     };
 
     let state = market.entry(event.instrument).or_default();
@@ -878,10 +1017,12 @@ fn route_market<MarketKind>(
             event.time_exchange,
             slot.from_venue,
             "a resting fill arriving at the Engine",
-        );
+        )?;
 
         schedule_events(pending, seq, *exchange, delivers, fills);
     }
+
+    Ok(())
 }
 
 /// Decide whether emitting another account deliverable would exceed the feedback budget.
@@ -934,7 +1075,7 @@ where
 
 /// Whether a drain observed a request that abandons everything still scheduled.
 #[derive(Debug, PartialEq, Eq)]
-enum RequestDrain {
+pub(crate) enum RequestDrain {
     Continue,
     Abandon,
 }
@@ -961,7 +1102,7 @@ fn drain_requests(
     pending: &mut BinaryHeap<Reverse<ScheduledEvent>>,
     seq: &mut u64,
     clock: &HistoricalClock,
-) -> RequestDrain {
+) -> Result<RequestDrain, SimFault> {
     let now = clock.time();
     let mut drain = RequestDrain::Continue;
 
@@ -969,7 +1110,7 @@ fn drain_requests(
         while let Ok(request) = slot.request_rx.rx.try_recv() {
             // One arrival instant per request, so the venue's ledger and the events describing it
             // agree on when it happened.
-            let arrives = checked_offset(now, slot.to_venue, "a request arriving at the venue");
+            let arrives = checked_offset(now, slot.to_venue, "a request arriving at the venue")?;
 
             let action = match request {
                 // This runner already owes the Engine every scheduled deliverable and ends only
@@ -984,21 +1125,21 @@ fn drain_requests(
                 ExecutionRequest::Open(request) => Action::Open(
                     slot.indexer
                         .order_request(&request)
-                        .unwrap_or_else(|error| {
-                            panic!(
-                                "SimRunner received open request for non-configured key: {error}"
-                            )
-                        })
+                        .map_err(|error| {
+                            SimFault(format!(
+                                "received open request for non-configured key: {error}"
+                            ))
+                        })?
                         .into_owned_instrument(),
                 ),
                 ExecutionRequest::Cancel(request) => Action::Cancel(
                     slot.indexer
                         .order_request(&request)
-                        .unwrap_or_else(|error| {
-                            panic!(
-                                "SimRunner received cancel request for non-configured key: {error}"
-                            )
-                        })
+                        .map_err(|error| {
+                            SimFault(format!(
+                                "received cancel request for non-configured key: {error}"
+                            ))
+                        })?
                         .into_owned_instrument(),
                 ),
             };
@@ -1014,7 +1155,7 @@ fn drain_requests(
         }
     }
 
-    drain
+    Ok(drain)
 }
 
 /// Run one request against its venue, scheduling everything that comes back.
@@ -1037,8 +1178,8 @@ fn drain_requests(
 ///
 /// Returns whether a wake-up moved the venue's clock.
 ///
-/// # Panics
-/// Panics if `exchange` is not registered, or if a simulated timestamp overflows — see
+/// # Errors
+/// A [`SimFault`] if `exchange` is not registered, or if a simulated timestamp overflows — see
 /// [`SimRunner`]'s `# Panics`.
 ///
 /// [`TimeInForce::GoodTillDate`]: rustrade_execution::order::TimeInForce::GoodTillDate
@@ -1050,21 +1191,23 @@ fn act(
     exchange: ExchangeIndex,
     time: DateTime<Utc>,
     action: Action,
-) -> bool {
-    let slot = venues.get_mut(&exchange).unwrap_or_else(|| {
-        panic!("SimRunner scheduled an action for an unregistered venue: {exchange}")
-    });
+) -> Result<bool, SimFault> {
+    let slot = venues.get_mut(&exchange).ok_or_else(|| {
+        SimFault(format!(
+            "scheduled an action for an unregistered venue: {exchange}"
+        ))
+    })?;
 
     let woken = matches!(action, Action::Wake);
     if woken && !wakeups.take(exchange, time) {
-        return false;
+        return Ok(false);
     }
 
     let delivers = checked_offset(
         time,
         slot.from_venue,
         "a venue response arriving at the Engine",
-    );
+    )?;
 
     schedule_events(
         pending,
@@ -1096,7 +1239,7 @@ fn act(
     }
 
     wakeups.arm(pending, seq, exchange, &slot.venue);
-    woken
+    Ok(woken)
 }
 
 /// Apply a simulated latency offset, refusing to schedule an event before its own cause.
@@ -1105,9 +1248,15 @@ fn act(
 /// or before the request that provoked it — an ordering the rest of this type guarantees cannot
 /// happen. A timestamp that cannot absorb a millisecond offset is a corrupt dataset, so it is
 /// reported rather than absorbed.
-fn checked_offset(time: DateTime<Utc>, offset: TimeDelta, what: &str) -> DateTime<Utc> {
-    time.checked_add_signed(offset).unwrap_or_else(|| {
-        panic!("SimRunner cannot represent the simulated time of {what}: {time} + {offset}")
+fn checked_offset(
+    time: DateTime<Utc>,
+    offset: TimeDelta,
+    what: &str,
+) -> Result<DateTime<Utc>, SimFault> {
+    time.checked_add_signed(offset).ok_or_else(|| {
+        SimFault(format!(
+            "cannot represent the simulated time of {what}: {time} + {offset}"
+        ))
     })
 }
 
@@ -1177,7 +1326,7 @@ fn schedule_events(
 // `Poll::Ready(Some(event))` immediately re-materialises, and charge a heap allocation for every
 // event a run emits.
 #[allow(clippy::large_enum_variant)]
-enum Step<MarketKind> {
+pub(crate) enum Step<MarketKind> {
     /// A deliverable was popped and indexed.
     Emitted(EngineEvent<MarketKind>),
     /// An action was popped and run against its venue. Nothing to emit; poll again.
@@ -1191,15 +1340,15 @@ enum Step<MarketKind> {
 
 /// Pop the earliest queue entry: emit it if the `Engine` is owed it, run it if a venue is.
 ///
-/// # Panics
-/// Panics if the entry's venue is absent, or if a deliverable's keys are absent from that venue's
-/// index — see [`SimRunner`]'s `# Panics`.
+/// # Errors
+/// A [`SimFault`] if the entry's venue is absent, or if a deliverable's keys are absent from that
+/// venue's index — see [`SimRunner`]'s `# Panics`.
 fn step<MarketKind>(
     venues: &mut FnvIndexMap<ExchangeIndex, SimVenue>,
     pending: &mut BinaryHeap<Reverse<ScheduledEvent>>,
     seq: &mut u64,
     wakeups: &mut Wakeups,
-) -> Step<MarketKind> {
+) -> Result<Step<MarketKind>, SimFault> {
     let Some(Reverse(ScheduledEvent {
         time,
         class: _,
@@ -1208,25 +1357,29 @@ fn step<MarketKind>(
         payload,
     })) = pending.pop()
     else {
-        return Step::Empty;
+        return Ok(Step::Empty);
     };
 
     let payload = match payload {
         Payload::Act(action) => {
-            return match act(venues, pending, seq, wakeups, exchange, time, action) {
-                true => Step::Woken,
-                false => Step::Acted,
-            };
+            return Ok(
+                match act(venues, pending, seq, wakeups, exchange, time, action)? {
+                    true => Step::Woken,
+                    false => Step::Acted,
+                },
+            );
         }
         Payload::Deliver(payload) => payload,
     };
 
-    let slot = venues.get(&exchange).unwrap_or_else(|| {
-        panic!("SimRunner scheduled an event for an unregistered venue: {exchange}")
-    });
+    let slot = venues.get(&exchange).ok_or_else(|| {
+        SimFault(format!(
+            "scheduled an event for an unregistered venue: {exchange}"
+        ))
+    })?;
 
-    Step::Emitted(match payload {
-        Deliverable::Account(event) => index_account_event(&slot.indexer, event),
+    Ok(Step::Emitted(match payload {
+        Deliverable::Account(event) => index_account_event(&slot.indexer, event)?,
         Deliverable::OpenResponse(order) => {
             let Order {
                 key,
@@ -1238,11 +1391,11 @@ fn step<MarketKind>(
                 state,
             } = order;
 
-            let key = slot.indexer.order_key(key).unwrap_or_else(|error| {
-                panic!(
-                    "SimRunner venue returned an open response for a non-configured key: {error}"
-                )
-            });
+            let key = slot.indexer.order_key(key).map_err(|error| {
+                SimFault(format!(
+                    "venue returned an open response for a non-configured key: {error}"
+                ))
+            })?;
             let state = slot.indexer.order_state(state);
 
             EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
@@ -1262,36 +1415,40 @@ fn step<MarketKind>(
             let response = slot
                 .indexer
                 .order_response_cancel(response)
-                .unwrap_or_else(|error| {
-                    panic!("SimRunner venue returned an unindexable cancel response: {error}")
-                });
+                .map_err(|error| {
+                    SimFault(format!(
+                        "venue returned an unindexable cancel response: {error}"
+                    ))
+                })?;
 
             EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
                 exchange: response.key.exchange,
                 kind: AccountEventKind::OrderCancelled(response),
             }))
         }
-    })
+    }))
 }
 
 /// Index one venue account event for the `Engine`.
 ///
-/// # Panics
-/// Panics if the event references an exchange, asset or instrument absent from this venue's own
-/// index. Every one of them came from the [`IndexedInstruments`] this index was built from, so a
-/// failure is a misconfiguration rather than a venue reporting something unexpected — and dropping
-/// the event instead would silently lose a fill.
+/// # Errors
+/// A [`SimFault`] if the event references an exchange, asset or instrument absent from this
+/// venue's own index. Every one of them came from the [`IndexedInstruments`] this index was built
+/// from, so a failure is a misconfiguration rather than a venue reporting something unexpected —
+/// and dropping the event instead would silently lose a fill.
 ///
 /// [`IndexedInstruments`]: rustrade_instrument::index::IndexedInstruments
 fn index_account_event<MarketKind>(
     indexer: &AccountEventIndexer,
     event: UnindexedAccountEvent,
-) -> EngineEvent<MarketKind> {
-    let event = indexer.account_event(event).unwrap_or_else(|error| {
-        panic!("SimRunner venue produced an unindexable AccountEvent: {error}")
-    });
+) -> Result<EngineEvent<MarketKind>, SimFault> {
+    let event = indexer.account_event(event).map_err(|error| {
+        SimFault(format!(
+            "venue produced an unindexable AccountEvent: {error}"
+        ))
+    })?;
 
-    EngineEvent::Account(AccountStreamEvent::Item(event))
+    Ok(EngineEvent::Account(AccountStreamEvent::Item(event)))
 }
 
 /// Log a one-line summary of what each venue booked, for a run's post-mortem.
@@ -1372,6 +1529,8 @@ mod tests {
             latency_ms,
             fee_model: Default::default(),
             fill_model: Default::default(),
+            spot_fee_asset: Default::default(),
+            slippage: Default::default(),
         }
     }
 
@@ -1720,6 +1879,47 @@ mod tests {
     /// Besides seeding balances and instruments it is what marks the venue's account connection
     /// healthy — `ConnectivityStates::update_from_account_event` flips on *any* account event — and
     /// an `Engine` that never sees one waits on it forever.
+    /// A request the venue's index cannot translate would otherwise be dropped unanswered, so it
+    /// stops the run, naming the key.
+    #[tokio::test]
+    #[should_panic(expected = "SimRunner received open request for non-configured key")]
+    async fn a_request_for_a_key_the_venue_does_not_index_panics_naming_it() {
+        let mut harness = Harness::new(0, vec![market(10, dec!(100))]);
+        assert_eq!(harness.next().await, Some("snapshot"));
+
+        harness.send(ExecutionRequest::Open(OrderRequestOpen {
+            key: OrderKey {
+                exchange: harness.exchange,
+                instrument: InstrumentIndex::new(7),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new("unindexed"),
+            },
+            state: RequestOpen {
+                side: Side::Buy,
+                price: None,
+                quantity: dec!(0.01),
+                kind: OrderKind::Market,
+                time_in_force: TimeInForce::ImmediateOrCancel,
+                position_id: None,
+                reduce_only: false,
+                market: None,
+            },
+        }));
+
+        harness.next().await;
+    }
+
+    #[test]
+    fn debug_shows_the_queue_without_requiring_debug_of_the_source() {
+        let harness = Harness::new(0, vec![market(10, dec!(100))]);
+
+        let debug = format!("{:?}", harness.runner);
+
+        assert!(debug.contains("SimRunner"), "{debug}");
+        assert!(debug.contains("SimCore"), "{debug}");
+        assert!(debug.contains("pending"), "{debug}");
+    }
+
     #[tokio::test]
     async fn venue_snapshots_are_emitted_before_any_source_event() {
         let mut harness = Harness::new(0, vec![market(10, dec!(100))]);
@@ -1748,7 +1948,14 @@ mod tests {
 
         assert_eq!(
             harness.rest().await,
-            vec!["balance", "trade", "order", "market", "after_drain"],
+            vec![
+                "balance",
+                "balance",
+                "trade",
+                "order",
+                "market",
+                "after_drain"
+            ],
             "the whole fill precedes the second event at instant 10"
         );
     }
@@ -1770,7 +1977,15 @@ mod tests {
 
         assert_eq!(
             harness.rest().await,
-            vec!["aux", "balance", "trade", "order", "market", "after_drain"],
+            vec![
+                "aux",
+                "balance",
+                "balance",
+                "trade",
+                "order",
+                "market",
+                "after_drain"
+            ],
             "the aux event at instant 10 leads the fill scheduled at instant 10"
         );
     }
@@ -1805,6 +2020,7 @@ mod tests {
             run(0).await,
             vec![
                 "balance",
+                "balance",
                 "trade",
                 "order",
                 "market",
@@ -1820,6 +2036,7 @@ mod tests {
             run(200).await,
             vec![
                 "market",
+                "balance",
                 "balance",
                 "trade",
                 "order",
@@ -1849,7 +2066,7 @@ mod tests {
 
         assert_eq!(
             harness.rest().await,
-            vec!["after_drain", "balance", "trade", "order"],
+            vec!["after_drain", "balance", "balance", "trade", "order"],
             "the Engine is told to stop first, then everything owed is delivered"
         );
     }
@@ -1908,13 +2125,14 @@ mod tests {
     ///
     /// Each delivered account event provokes another order whose outcome is stamped at the same
     /// instant, so it outranks every later source event: simulated time stops and the queue grows
-    /// without bound. The limit is lowered here to make the runaway three events long instead of
-    /// ten thousand; `a_strategy_trading_on_its_own_fills_is_reported_rather_than_hung` covers the
-    /// same condition end to end at the real default.
+    /// without bound. The limit is lowered here to make the runaway four events long, one spot
+    /// fill, instead of ten thousand. The test
+    /// `a_strategy_trading_on_its_own_fills_is_reported_rather_than_hung` covers the same
+    /// condition end to end at the real default.
     #[tokio::test]
     async fn the_feedback_limit_reports_a_zero_delay_cycle_rather_than_emitting_forever() {
         let mut harness = Harness::new(0, vec![market(10, dec!(100)), market(20, dec!(100))]);
-        harness.runner = harness.runner.with_feedback_limit(3);
+        harness.runner = harness.runner.with_feedback_limit(4);
 
         assert_eq!(harness.next().await, Some("snapshot"));
         assert_eq!(harness.next().await, Some("market"));
@@ -1926,7 +2144,7 @@ mod tests {
 
         assert_eq!(
             harness.rest().await,
-            vec!["balance", "trade", "order"],
+            vec!["balance", "balance", "trade", "order"],
             "exactly `limit` account events are emitted with no source event between them"
         );
 
@@ -1936,7 +2154,7 @@ mod tests {
             Some(&BarterError::SimFeedbackLoop {
                 exchange: EXCHANGE,
                 time: at(10),
-                limit: 3,
+                limit: 4,
             }),
             "the report names the venue and the instant simulated time stopped at"
         );
@@ -1954,14 +2172,15 @@ mod tests {
                 market(30, dec!(100)),
             ],
         );
-        harness.runner = harness.runner.with_feedback_limit(3);
+        harness.runner = harness.runner.with_feedback_limit(4);
 
         assert_eq!(harness.next().await, Some("snapshot"));
         assert_eq!(harness.next().await, Some("market"));
 
-        // Three deliverables at instant 10 — exactly the budget, and no more.
+        // Four deliverables at instant 10 — exactly the budget, and no more.
         harness.clock.advance_to(at(10));
         harness.send_open(dec!(100));
+        assert_eq!(harness.next().await, Some("balance"));
         assert_eq!(harness.next().await, Some("balance"));
         assert_eq!(harness.next().await, Some("trade"));
         assert_eq!(harness.next().await, Some("order"));
@@ -1973,7 +2192,14 @@ mod tests {
 
         assert_eq!(
             harness.rest().await,
-            vec!["balance", "trade", "order", "market", "after_drain"],
+            vec![
+                "balance",
+                "balance",
+                "trade",
+                "order",
+                "market",
+                "after_drain"
+            ],
             "a second full fill is delivered, so the budget was reset rather than accumulated"
         );
         assert_eq!(harness.runner.error(), None);
@@ -2130,6 +2356,7 @@ mod tests {
                 "market",
                 // ...and only then the fill it caused, trade before terminal order.
                 "balance",
+                "balance",
                 "trade",
                 "order",
                 "market",
@@ -2169,6 +2396,7 @@ mod tests {
                 "order", //
                 "market",
                 "balance",
+                "balance",
                 "trade",
                 "order", //
                 "market",
@@ -2206,6 +2434,7 @@ mod tests {
                 "order", //
                 "aux",
                 "market",
+                "balance",
                 "balance",
                 "trade",
                 "order", //
@@ -2247,6 +2476,7 @@ mod tests {
                 // event at 550 and before the one at 700. Two legs would have put it at 700.
                 "market",
                 "market",
+                "balance",
                 "balance",
                 "trade",
                 "order", //
@@ -2392,9 +2622,9 @@ mod tests {
         }
 
         assert!(
-            harness.runner.pending.len() <= 1,
+            harness.runner.core.pending.len() <= 1,
             "one wake-up at most, not one per order: {}",
-            harness.runner.pending.len()
+            harness.runner.core.pending.len()
         );
     }
 
@@ -2552,6 +2782,7 @@ mod tests {
             vec![
                 "market", //
                 "balance",
+                "balance",
                 "trade",
                 "order", //
                 "market",
@@ -2605,6 +2836,7 @@ mod tests {
                 "balance",
                 "order", //
                 // And the tick that followed it onto the book crossed it, also visible at 210.
+                "balance",
                 "balance",
                 "trade",
                 "order", //
@@ -2660,6 +2892,7 @@ mod tests {
             vec![
                 // The tick at 340 crosses the resting order; the fill is visible at 440.
                 "market",
+                "balance",
                 "balance",
                 "trade",
                 "order",

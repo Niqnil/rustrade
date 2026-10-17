@@ -74,7 +74,7 @@ impl ShortabilityClient for IbkrClient {
     /// reports as a working order, not a rejection), and may never find them. So `shortable`
     /// says a short sale may be tried, not that shares are on hand.
     ///
-    /// `fee_rate` is unknown: IB reports no borrow fee to the API.
+    /// `fee_rate` is unknown: IB reports no borrow fee to the API. `delisting_at` is unknown too.
     ///
     /// The request is read until both ticks have arrived, or for
     /// [`IbkrConfig::shortability_timeout`](super::IbkrConfig::shortability_timeout) (10 s by

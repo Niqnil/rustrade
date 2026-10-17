@@ -38,7 +38,8 @@ it to report the orders that ended while the stream was down.
 
 **Shortability** means the client implements `ShortabilityClient::fetch_shortability`, which asks
 the venue whether it would lend an instrument for a short sale: whether it is shortable and easy to
-borrow, how much the venue has to lend, and the borrow fee, each where the venue says. The answer
+borrow, how much the venue has to lend, the borrow fee, and when the venue will stop lending it
+(Binance margin reports its delisting schedule), each where the venue says. The answer
 is advisory, so a short sale must still handle `ApiError::BorrowRejected`. **BorrowCapacity** means
 the client implements `BorrowCapacityClient::fetch_borrow_capacity`, which reports how much more of
 the asset an order on a given side would borrow this account can borrow now, and its limit. Each

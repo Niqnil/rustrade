@@ -17,7 +17,7 @@ use rustrade::{
                 filter::InstrumentFilter,
             },
             order::in_flight_recorder::InFlightRequestRecorder,
-            position::{PositionId, PositionManager},
+            position::{PositionId, PositionManager, TradeOutcome},
             trading::TradingState,
         },
     },
@@ -46,6 +46,7 @@ use rustrade_execution::{
         id::{ClientOrderId, StrategyId},
         request::{OrderRequestCancel, OrderRequestOpen},
     },
+    trade::Trade,
 };
 use rustrade_instrument::{
     asset::AssetIndex,
@@ -95,6 +96,24 @@ impl StrategyCustomInstrumentData {
         Self {
             tear: TearSheetGenerator::init(time_engine_start),
             position: PositionManager::default(),
+        }
+    }
+
+    /// Apply a fill to this strategy's positions, and fold what it did into its tear sheet.
+    fn apply_trade(&mut self, trade: &Trade<AssetIndex, InstrumentIndex>, contract_size: Decimal) {
+        match self.position.update_from_trade(trade, contract_size) {
+            TradeOutcome::Applied { exited } => {
+                if let Some(closed) = exited {
+                    self.tear.update_from_position(&closed);
+                }
+            }
+            // A fill that moved nothing opened no position, so no position carries its fee. Book
+            // its quote equivalent here, as the engine's own tear sheet does.
+            TradeOutcome::Unapplied { fees } => self
+                .tear
+                .record_fee_unattributed(fees.fees_quote.unwrap_or_default(), trade.time_exchange),
+            // `TradeOutcome` is non-exhaustive: an outcome added later lands here until handled.
+            outcome => debug!(?outcome, "trade outcome this example does not handle"),
         }
     }
 }
@@ -283,17 +302,11 @@ impl Processor<&AccountEvent> for MultiStrategyCustomInstrumentData {
         let contract_size = rust_decimal::Decimal::ONE;
 
         if trade.strategy == StrategyA::ID {
-            self.strategy_a
-                .position
-                .update_from_trade(trade, contract_size)
-                .inspect(|closed| self.strategy_a.tear.update_from_position(closed));
+            self.strategy_a.apply_trade(trade, contract_size);
         }
 
         if trade.strategy == StrategyB::ID {
-            self.strategy_b
-                .position
-                .update_from_trade(trade, contract_size)
-                .inspect(|closed| self.strategy_b.tear.update_from_position(closed));
+            self.strategy_b.apply_trade(trade, contract_size);
         }
     }
 }

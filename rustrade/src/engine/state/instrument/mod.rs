@@ -6,7 +6,7 @@ use crate::{
             order::{Orders, manager::OrderManager},
             position::{
                 CarryUpdate, OmsMode, PnlUnrealisedUpdate, PositionExited, PositionManager,
-                PreparedSplit, SplitError, SplitRoundingPolicy,
+                PreparedSplit, SplitError, SplitRoundingPolicy, TradeOutcome, fee_in_quote,
             },
         },
     },
@@ -27,10 +27,10 @@ use rustrade_execution::{
         state::{ActiveOrderState, InactiveOrderState, OrderState},
     },
     position::PositionReport,
-    trade::{Trade, TradeOrigin},
+    trade::{AssetFees, Trade, TradeOrigin},
 };
 use rustrade_instrument::{
-    Keyed, Side,
+    Keyed, Side, Underlying,
     asset::{AssetIndex, name::AssetNameExchange},
     corporate_action::SplitRatio,
     exchange::{ExchangeId, ExchangeIndex},
@@ -855,7 +855,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// `exchange` — the identity match shared by the kind-specific predicates above, with no
     /// [`InstrumentKind`] constraint of its own.
     ///
-    /// Both `base` AND `quote` are matched: [`Underlying`](rustrade_instrument::Underlying)
+    /// Both `base` AND `quote` are matched: [`Underlying`]
     /// is a full pair identity, so without the quote filter a BTC/USDT action would also reach
     /// BTC/USDC instruments.
     fn is_on_underlying(&self, base: &AssetKey, quote: &AssetKey, exchange: &ExchangeKey) -> bool
@@ -922,7 +922,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ) where
         ExchangeKey: Debug + Clone,
         InstrumentKey: Debug + Clone + PartialEq,
-        AssetKey: Debug + Clone,
+        AssetKey: Debug + Clone + PartialEq,
     {
         for order in &snapshot.orders {
             // PositionExited from deferred fill replay is not propagated here: the
@@ -1143,7 +1143,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ) -> Option<PositionExited<AssetKey, InstrumentKey>>
     where
         ExchangeKey: Debug + Clone,
-        AssetKey: Debug + Clone,
+        AssetKey: Debug + Clone + PartialEq,
         InstrumentKey: Debug + Clone + PartialEq,
     {
         // Count a rejected open before anything downstream consumes the snapshot. This is the
@@ -1491,6 +1491,33 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         self.tear_sheet.record_fill_forced();
     }
 
+    /// Log a fill that applied to no position, and charge its fees' quote equivalent to the tear
+    /// sheet's unattributed fees. See the base-asset fee section of [`Self::update_from_trade`].
+    fn record_fee_unattributed(
+        &mut self,
+        trade: &Trade<AssetKey, InstrumentKey>,
+        position_id: &PositionId,
+        fees: &AssetFees<AssetKey>,
+    ) where
+        InstrumentKey: Debug,
+    {
+        let fee = fee_in_quote(fees);
+        warn!(
+            instrument = ?trade.instrument,
+            order_id = %trade.order_id,
+            %position_id,
+            fees = %fees.fees,
+            fee_quote = %fee,
+            "fill moves no holding and opens no position; any fee is charged to the tear sheet's \
+             unattributed fees"
+        );
+        // A fill with nothing to charge changes no PnL, so it adds no drawdown sample.
+        if !fee.is_zero() {
+            self.tear_sheet
+                .record_fee_unattributed(fee, trade.time_exchange);
+        }
+    }
+
     /// Which leg of a venue settlement an orderless `origin` is on this instrument, or `None` for
     /// a fill of an order. See the settlement fills section of [`Self::update_from_trade`].
     fn settlement_leg(&self, origin: TradeOrigin) -> Option<SettlementLeg> {
@@ -1595,6 +1622,38 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// and both counters are summed onto
     /// [`TradingSummary`](crate::statistic::summary::TradingSummary) for the session.
     ///
+    /// # A spot fee in the base asset
+    ///
+    /// On an [`InstrumentKind::Spot`] instrument, spot margin included, a fee the venue charged in
+    /// the instrument's base asset leaves the account in base, so the position moves by the
+    /// fill's signed quantity less the fee: a buy of `q` with a base fee `f` holds `q − f`, and a
+    /// sell delivers `q + f`. A negative fee, a rebate, adds to the holding. PnL is still charged
+    /// the fee's quote equivalent, its `fees_quote`, so a round trip's realised PnL is what the
+    /// account made. Binance spot charges a buy's fee in base unless BNB pays it, so without this
+    /// a long would be overstated by its fee, and a full-size close would ask to sell more than
+    /// the account holds.
+    ///
+    /// - **What the position then holds is exact, not lot-sized.** A buy of 1 with a 0.1 % fee
+    ///   holds 0.999. A venue sells only whole multiples of its lot step, so a full-size close can
+    ///   leave a remainder below one lot that it will not sell. Rounding a close to the lot step,
+    ///   and the dust it leaves, is the strategy's concern.
+    /// - **A spot-margin short closed by a buy** keeps the fee as a residual short, since the fee
+    ///   came out of the base that was to repay the loan. Buying more than the debt to cover the
+    ///   fee leaves a long of the excess less the fee, once the excess is the larger.
+    /// - **A fee larger than the fill's quantity** moves the holding the other way: a buy whose
+    ///   base fee exceeds its quantity sells the difference. A fee equal to it moves nothing: it is
+    ///   charged to the open position's PnL. From flat it opens no position, so its quote
+    ///   equivalent is charged to the instrument's tear sheet instead, as
+    ///   [`TearSheet::fees_unattributed`](crate::statistic::summary::instrument::TearSheet::fees_unattributed),
+    ///   which its PnL includes, and logged at `warn!`. Any other fill that moves no holding on an
+    ///   empty position slot is booked the same way.
+    /// - **Not a derivative.** A derivative's position is counted in contracts, and an inverse
+    ///   contract pays its fees in the settlement coin, so a fee there never changes the quantity.
+    ///   Nor is a fee in quote or a third asset, such as BNB.
+    /// - **Only the fee the venue reported.** A fee from this state's own fee model is in quote,
+    ///   so it reaches PnL alone.
+    /// - **Not a capped settlement fill** (see below), which closes the whole position it reduces.
+    ///
     /// # Forced fills
     ///
     /// A fill of any [`TradeOrigin`] is applied the same way: the position really changed. One the
@@ -1640,7 +1699,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         trade: &Trade<AssetKey, InstrumentKey>,
     ) -> Option<PositionExited<AssetKey, InstrumentKey>>
     where
-        AssetKey: Debug + Clone,
+        AssetKey: Debug + Clone + PartialEq,
         InstrumentKey: Debug + Clone + PartialEq,
     {
         // Before routing, which can return early. Only a fill of origin `Order` is ever queued for
@@ -1887,21 +1946,55 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         } else {
             let mut with_fee = trade.clone();
             with_fee.fees.fees += computed_fee;
-            // computed_fee is in quote terms; add to fees_quote if available
-            with_fee.fees.fees_quote = trade.fees.fees_quote.map(|fq| fq + computed_fee);
+            // computed_fee is in quote terms, so it adds to the quote equivalent PnL charges even
+            // when the venue's own fee has none (a fee in a third asset, or one the indexer zeroed).
+            with_fee.fees.fees_quote =
+                Some(trade.fees.fees_quote.unwrap_or(Decimal::ZERO) + computed_fee);
             augmented = with_fee;
             &augmented
         };
+
+        // Step 2b: Net a fee paid in the base asset from a spot fill's quantity, so the position
+        // is what the account holds. Not for a capped settlement fill, which already closes the
+        // whole position it reduces: netting would flip it by the fee, and its excess is reported
+        // as unallocated.
+        //
+        // Only the fee the venue reported is netted, read from `trade`. What the engine's fee model
+        // added in step 2 is a quote amount, summed into the same field whatever its asset.
+        let netted = match capped_settlement {
+            None => base_fee_move(trade, &self.instrument.kind, &self.instrument.underlying).map(
+                |(side, quantity)| {
+                    let mut netted = effective_trade.clone();
+                    netted.side = side;
+                    netted.quantity = quantity;
+                    netted
+                },
+            ),
+            Some(_) => None,
+        };
+        let effective_trade = netted.as_ref().unwrap_or(effective_trade);
 
         // Step 3: Update the position.
         //
         // Pass &position_id (not owned) so callers avoid one SmolStr heap-allocation
         // per fill in Hedging mode with UUID-length PositionIds (PERF-3).
         // Pass contract_size so PnL is computed with the correct multiplier.
-        let exited = self
-            .position
-            .update_from_trade_with_id(effective_trade, &position_id, contract_size)
-            .inspect(|closed| self.tear_sheet.update_from_position(closed));
+        //
+        // A fill that moves no holding on an empty slot opens no position, so no position can
+        // carry its fee: the tear sheet does.
+        let exited = match self.position.update_from_trade_with_id(
+            effective_trade,
+            &position_id,
+            contract_size,
+        ) {
+            TradeOutcome::Applied { exited } => {
+                exited.inspect(|closed| self.tear_sheet.update_from_position(closed))
+            }
+            TradeOutcome::Unapplied { fees } => {
+                self.record_fee_unattributed(effective_trade, &position_id, &fees);
+                None
+            }
+        };
 
         // Step 4: Cleanup — remove CID→PositionId entries for the closed position,
         // but only for CIDs no longer tracked in orders.0.
@@ -2159,6 +2252,47 @@ impl std::fmt::Display for SettlementFillUnplaced {
             }
         }
     }
+}
+
+/// The side and quantity of the holding `trade` moves, when it is a spot fill whose fee the venue
+/// charged in the instrument's base asset; `None` otherwise.
+///
+/// The fee leaves the account in base, on either side, so the holding moves by the signed
+/// quantity less the fee: a buy of `q` with a base fee `f` holds `q − f`, and a sell delivers
+/// `q + f`. A negative fee, a rebate, adds to it. The result's side is the sign of that move, so
+/// a fee larger than a buy's quantity sells, and a move of zero keeps the fill's side with a
+/// quantity of zero. The caller keeps the fill's price and fees, so PnL is charged the fee's quote
+/// equivalent while the netted quantity carries the fill's price: buying `q − f` at `p` and
+/// paying `f × p` costs `q × p`, what the fill paid.
+///
+/// Spot only, spot margin included. A derivative's position is counted in contracts, and an
+/// inverse contract pays its fees in the settlement coin, so a fee there is not a holding.
+fn base_fee_move<AssetKey, InstrumentKey>(
+    trade: &Trade<AssetKey, InstrumentKey>,
+    kind: &InstrumentKind<AssetKey>,
+    underlying: &Underlying<AssetKey>,
+) -> Option<(Side, Decimal)>
+where
+    AssetKey: PartialEq,
+{
+    if !matches!(kind, InstrumentKind::Spot)
+        || trade.fees.asset != underlying.base
+        || trade.fees.fees.is_zero()
+    {
+        return None;
+    }
+
+    let signed = match trade.side {
+        Side::Buy => trade.quantity.abs(),
+        Side::Sell => -trade.quantity.abs(),
+    } - trade.fees.fees;
+
+    let side = match signed.cmp(&Decimal::ZERO) {
+        std::cmp::Ordering::Greater => Side::Buy,
+        std::cmp::Ordering::Less => Side::Sell,
+        std::cmp::Ordering::Equal => trade.side,
+    };
+    Some((side, signed.abs()))
 }
 
 /// `trade` cut to `held`, keeping its sign, with its fees cut in proportion. `held` is less than
@@ -3951,5 +4085,315 @@ mod tests {
             state.position.positions[&PositionId::NETTING].carry,
             Decimal::ZERO
         );
+    }
+
+    // --- A spot fee in the base asset is netted from the position ------------------------------
+
+    /// A fill at 100 whose venue charged `fee` in `asset`, with its quote equivalent at that price.
+    fn fill_charging(
+        side: Side,
+        quantity: Decimal,
+        asset: AssetIndex,
+        fee: Decimal,
+    ) -> Trade<AssetIndex, InstrumentIndex> {
+        let mut trade = fill(OrderId::new("venue"), side, quantity);
+        trade.fees = AssetFees {
+            asset,
+            fees: fee,
+            fees_quote: Some(fee * trade.price),
+        };
+        trade
+    }
+
+    fn netting_position(
+        state: &InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex>,
+    ) -> Option<&crate::engine::state::position::Position<AssetIndex, InstrumentIndex>> {
+        state.position.positions.get(&PositionId::NETTING)
+    }
+
+    /// A buy whose fee is taken from the base it receives holds its quantity less the fee, and
+    /// PnL is still charged the fee's quote equivalent.
+    #[test]
+    fn a_spot_buy_holds_its_quantity_less_a_base_fee() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let base = state.instrument.underlying.base;
+
+        assert!(
+            state
+                .update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(0.001)))
+                .is_none()
+        );
+
+        let position = netting_position(&state).unwrap();
+        assert_eq!(position.side, Side::Buy);
+        assert_eq!(position.quantity_abs, dec!(0.999));
+        assert_eq!(position.price_entry_average, dec!(100));
+        assert_eq!(position.pnl_realised, dec!(-0.1));
+        assert_eq!(position.fees_enter.fees, dec!(0.001));
+        assert_eq!(position.fees_enter.fees_quote, Some(dec!(0.1)));
+    }
+
+    /// Selling the netted holding closes the position exactly, and its realised PnL is the
+    /// account's: 100 paid for 0.999 held, sold at 110 for 109.89.
+    #[test]
+    fn selling_a_netted_holding_closes_it_with_the_accounts_pnl() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let (base, quote) = (
+            state.instrument.underlying.base,
+            state.instrument.underlying.quote,
+        );
+        let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(0.001)));
+
+        let mut close = fill_charging(Side::Sell, dec!(0.999), quote, Decimal::ZERO);
+        close.price = dec!(110);
+        let exited = state
+            .update_from_trade(&close)
+            .expect("the sell closes the holding");
+
+        assert_eq!(exited.pnl_realised, dec!(9.89));
+        assert!(netting_position(&state).is_none());
+    }
+
+    /// A sell whose fee is taken in base delivers its quantity plus the fee.
+    #[test]
+    fn a_spot_sell_with_a_base_fee_delivers_its_quantity_plus_the_fee() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let base = state.instrument.underlying.base;
+        let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(2), base, Decimal::ZERO));
+
+        let _ = state.update_from_trade(&fill_charging(Side::Sell, dec!(1), base, dec!(0.01)));
+
+        let position = netting_position(&state).unwrap();
+        assert_eq!(position.side, Side::Buy);
+        assert_eq!(position.quantity_abs, dec!(0.99));
+        assert_eq!(position.pnl_realised, dec!(-1));
+    }
+
+    /// A negative base fee, a rebate, adds to the holding on either side. Inverting the fee's
+    /// sign is a known bug class in other libraries, so both sides are pinned.
+    #[test]
+    fn a_base_fee_rebate_adds_to_the_holding() {
+        let mut buy = instrument_state(OmsMode::Netting);
+        let base = buy.instrument.underlying.base;
+        let _ = buy.update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(-0.001)));
+        let position = netting_position(&buy).unwrap();
+        assert_eq!(
+            (position.side, position.quantity_abs),
+            (Side::Buy, dec!(1.001))
+        );
+        assert_eq!(position.pnl_realised, dec!(0.1));
+
+        let mut sell = instrument_state(OmsMode::Netting);
+        let _ = sell.update_from_trade(&fill_charging(Side::Sell, dec!(1), base, dec!(-0.001)));
+        let position = netting_position(&sell).unwrap();
+        assert_eq!(
+            (position.side, position.quantity_abs),
+            (Side::Sell, dec!(0.999))
+        );
+    }
+
+    /// A base fee larger than a buy's quantity takes more base than the buy received, so the fill
+    /// moves the holding down: from flat, it opens a short of the difference.
+    #[test]
+    fn a_base_fee_larger_than_a_buy_sells_the_difference() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let base = state.instrument.underlying.base;
+
+        let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(0.001), base, dec!(0.003)));
+
+        let position = netting_position(&state).unwrap();
+        assert_eq!(
+            (position.side, position.quantity_abs),
+            (Side::Sell, dec!(0.002))
+        );
+        assert_eq!(position.pnl_realised, dec!(-0.3));
+    }
+
+    /// A base fee equal to a buy's quantity moves no holding. It charges the fee to a position
+    /// that is open, and from flat opens none and charges the tear sheet instead.
+    #[test]
+    fn a_base_fee_equal_to_a_buy_moves_no_holding() {
+        let mut flat = instrument_state(OmsMode::Netting);
+        let base = flat.instrument.underlying.base;
+        let (exited, warnings) = count_warnings(|| {
+            flat.update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(1)))
+        });
+        assert!(exited.is_none());
+        assert!(netting_position(&flat).is_none());
+        assert_eq!(warnings, 1);
+        assert_eq!(flat.tear_sheet.pnl_returns.fees_unattributed, dec!(100));
+        assert_eq!(flat.tear_sheet.pnl_returns.pnl_raw, dec!(-100));
+
+        let mut held = instrument_state(OmsMode::Netting);
+        let _ = held.update_from_trade(&fill_charging(Side::Buy, dec!(2), base, Decimal::ZERO));
+        let _ = held.update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(1)));
+        let position = netting_position(&held).unwrap();
+        assert_eq!(position.quantity_abs, dec!(2));
+        assert_eq!(position.pnl_realised, dec!(-100));
+        assert_eq!(held.tear_sheet.pnl_returns.fees_unattributed, Decimal::ZERO);
+
+        let mut short = instrument_state(OmsMode::Netting);
+        let _ = short.update_from_trade(&fill_charging(Side::Sell, dec!(2), base, Decimal::ZERO));
+        let _ = short.update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(1)));
+        let position = netting_position(&short).unwrap();
+        assert_eq!(
+            (position.side, position.quantity_abs),
+            (Side::Sell, dec!(2))
+        );
+        assert_eq!(position.pnl_realised, dec!(-100));
+        assert_eq!(
+            short.tear_sheet.pnl_returns.fees_unattributed,
+            Decimal::ZERO
+        );
+    }
+
+    /// The fee of a fill that opens no position reaches the tear sheet's PnL and its drawdown,
+    /// but no per-position statistic: it is no round trip.
+    #[test]
+    fn an_unattributed_fee_reaches_the_tear_sheet_pnl_but_not_its_returns() {
+        use crate::statistic::time::Annual365;
+
+        let mut state = instrument_state(OmsMode::Netting);
+        let (base, quote) = (
+            state.instrument.underlying.base,
+            state.instrument.underlying.quote,
+        );
+        // A round trip that makes 10, then a buy from flat whose base fee takes all of it.
+        let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(1), quote, Decimal::ZERO));
+        let mut close = fill_charging(Side::Sell, dec!(1), quote, Decimal::ZERO);
+        close.price = dec!(110);
+        assert!(state.update_from_trade(&close).is_some());
+        let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(0.05), base, dec!(0.05)));
+
+        let sheet = state.tear_sheet.generate(Decimal::ZERO, Annual365);
+        assert_eq!(sheet.pnl, dec!(5));
+        assert_eq!(sheet.fees_unattributed, dec!(5));
+        assert_eq!(sheet.carry, Decimal::ZERO);
+        // The PnL total fell from its peak of 10 to 5.
+        assert_eq!(
+            sheet.pnl_drawdown.map(|drawdown| drawdown.value),
+            Some(dec!(0.5))
+        );
+        // One round trip, a win of 10 % on 100.
+        assert_eq!(state.tear_sheet.pnl_returns.total.count, Decimal::ONE);
+        assert_eq!(state.tear_sheet.pnl_returns.total.sum, dec!(0.1));
+        assert_eq!(state.tear_sheet.pnl_returns.losses.count, Decimal::ZERO);
+    }
+
+    /// A fill of zero quantity is booked the same way whatever its fee's asset: here a quote fee,
+    /// which nets nothing from the holding. One with no fee changes no PnL and moves no clock.
+    #[test]
+    fn a_zero_quantity_fill_from_flat_charges_its_fee_to_the_tear_sheet() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+
+        let (exited, warnings) = count_warnings(|| {
+            state.update_from_trade(&fill_charging(Side::Buy, Decimal::ZERO, quote, dec!(0.02)))
+        });
+        assert!(exited.is_none());
+        assert!(netting_position(&state).is_none());
+        assert_eq!(warnings, 1);
+        assert_eq!(state.tear_sheet.pnl_returns.fees_unattributed, dec!(2));
+
+        let before = state.tear_sheet.clone();
+        let mut free = fill_charging(Side::Buy, Decimal::ZERO, quote, Decimal::ZERO);
+        free.time_exchange = TIME + chrono::TimeDelta::days(1);
+        let (_, warnings) = count_warnings(|| state.update_from_trade(&free));
+        assert_eq!(warnings, 1);
+        assert_eq!(state.tear_sheet, before);
+    }
+
+    /// The unattributed fee is the whole fee PnL would have charged a position: the venue's
+    /// base fee at the fill's price, plus what this state's own fee model adds in quote.
+    #[test]
+    fn an_unattributed_fee_includes_the_engine_fee_model_fee() {
+        use rustrade_execution::PercentageFeeModel;
+
+        let mut state = instrument_state(OmsMode::Netting);
+        let base = state.instrument.underlying.base;
+        // 1 % of a notional of 100.
+        state.fee_model = FeeModelConfig::Percentage(PercentageFeeModel::new(dec!(0.01)));
+
+        let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(1)));
+        assert!(netting_position(&state).is_none());
+        assert_eq!(state.tear_sheet.pnl_returns.fees_unattributed, dec!(101));
+        assert_eq!(state.tear_sheet.pnl_returns.pnl_raw, dec!(-101));
+    }
+
+    /// In `OmsMode::Hedging` the check is per slot: a fill that moves nothing on the empty slot it
+    /// routes to charges the tear sheet, even while another slot holds a position.
+    #[test]
+    fn a_hedging_fill_that_moves_nothing_on_an_empty_slot_charges_the_tear_sheet() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let base = state.instrument.underlying.base;
+        let mut open = fill_charging(Side::Buy, dec!(2), base, Decimal::ZERO);
+        open.order_id = OrderId::new("open");
+        let _ = state.update_from_trade(&open);
+
+        let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(1)));
+
+        assert_eq!(state.position.positions.len(), 1);
+        let position = &state.position.positions[&PositionId::new("open")];
+        assert_eq!(position.pnl_realised, Decimal::ZERO);
+        assert_eq!(state.tear_sheet.pnl_returns.fees_unattributed, dec!(100));
+    }
+
+    /// The engine's own fee model prices a fee in quote and adds it to the fill's fee, whatever
+    /// asset the venue charged in. Only the venue's base fee is netted from the holding; the
+    /// model's fee reaches PnL alone.
+    #[test]
+    fn an_engine_fee_model_fee_is_not_netted_as_base() {
+        use rustrade_execution::PercentageFeeModel;
+
+        let mut state = instrument_state(OmsMode::Netting);
+        let base = state.instrument.underlying.base;
+        // 1 % of a notional of 100.
+        state.fee_model = FeeModelConfig::Percentage(PercentageFeeModel::new(dec!(0.01)));
+
+        let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(0.001)));
+        let position = netting_position(&state).unwrap();
+        assert_eq!(position.quantity_abs, dec!(0.999));
+        assert_eq!(position.pnl_realised, dec!(-1.1));
+
+        let mut zero_venue_fee = instrument_state(OmsMode::Netting);
+        zero_venue_fee.fee_model = state.fee_model;
+        let _ = zero_venue_fee.update_from_trade(&fill_charging(
+            Side::Buy,
+            dec!(1),
+            base,
+            Decimal::ZERO,
+        ));
+        let position = netting_position(&zero_venue_fee).unwrap();
+        assert_eq!(position.quantity_abs, dec!(1));
+        assert_eq!(position.pnl_realised, dec!(-1));
+    }
+
+    /// Only a fee in the base asset is a change in the holding. One in quote, or in a third asset
+    /// such as BNB, leaves the quantity as traded.
+    #[test]
+    fn a_fee_in_the_quote_or_a_third_asset_is_not_netted() {
+        let probe = instrument_state(OmsMode::Netting);
+        let quote = probe.instrument.underlying.quote;
+        for asset in [quote, AssetIndex(99)] {
+            let mut state = instrument_state(OmsMode::Netting);
+            let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(1), asset, dec!(0.1)));
+            assert_eq!(netting_position(&state).unwrap().quantity_abs, dec!(1));
+        }
+    }
+
+    /// A derivative's position is counted in contracts, so a fee in its base asset is not netted.
+    #[test]
+    fn a_derivative_fee_in_the_base_asset_is_not_netted() {
+        use rustrade_instrument::instrument::kind::perpetual::PerpetualContract;
+
+        let mut state = instrument_state(OmsMode::Netting);
+        let base = state.instrument.underlying.base;
+        state.instrument.kind = InstrumentKind::Perpetual(PerpetualContract {
+            contract_size: Decimal::ONE,
+            settlement_asset: base,
+        });
+
+        let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(0.001)));
+        assert_eq!(netting_position(&state).unwrap().quantity_abs, dec!(1));
     }
 }

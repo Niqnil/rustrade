@@ -7,11 +7,11 @@ use crate::{
     client::mock::MockExecutionConfig,
     error::{ApiError, BorrowReject, BorrowRejectReason, UnindexedApiError, UnindexedOrderError},
     exchange::mock::{
-        account::{AccountState, Debit},
+        account::{AccountState, Committed, Credit, Debit, Delivery},
         orders::{AlreadyResting, OpenOrder, Reservation, RestingOrder},
     },
-    fee::{FeeModel, FeeModelConfig, Liquidity},
-    fill::{FillContext, FillModel, SimFillConfig},
+    fee::{FeeModel, FeeModelConfig, Liquidity, SpotFeeAsset},
+    fill::{FillContext, FillModel},
     holding_cost::{HeldPosition, HoldingCostModel},
     market::{MarketDepth, MarketSnapshot},
     order::{
@@ -22,6 +22,7 @@ use crate::{
     },
     position::{Position, PositionReport},
     shortability::ShortabilityProvider,
+    slippage::Slippage,
     trade::{AssetFees, Trade, TradeId, TradeOrigin},
 };
 use chrono::{DateTime, Utc};
@@ -124,6 +125,28 @@ pub enum VenueRegime {
 /// `# How a CFD is accounted`. Both carry the instrument's `contract_size` into the notional and
 /// the fee, so this ledger and the engine's position accounting cannot disagree by that multiplier.
 ///
+/// # How a spot fill is accounted
+/// A spot fill exchanges the two assets. Which asset its fee is charged in is
+/// [`spot_fee_asset`](Self::spot_fee_asset), a [`SpotFeeAsset`] rule; the amount comes from
+/// [`fee_model`](Self::fee_model), priced in quote. Under the default,
+/// [`SpotFeeAsset::Quote`], the fee is charged in quote on both sides:
+/// - **A buy** pays `price × quantity` plus the fee in quote, and receives `quantity` of base.
+/// - **A sell** delivers `quantity` of base, and receives `price × quantity` less the fee in quote.
+///
+/// Under [`SpotFeeAsset::Received`], a sell is the same, and **a buy** pays `price × quantity` in
+/// quote and receives `quantity` less the fee in base, the quote fee divided by the price. A fill
+/// at a price that is not positive cannot be converted, so its fee is in quote.
+///
+/// A fill whose fee exceeds what it receives, which only a flat per-unit fee on a near-worthless
+/// fill can produce, takes the excess from the balance of the asset it receives, and is refused
+/// if that cannot cover it.
+///
+/// The fee the fill reports in [`Trade::fees`] is the one the ledger charged, in the asset it
+/// charged. So the base a fill moves is its quantity less any fee it reports in base, and the
+/// engine's position, which nets a base fee from a spot quantity, agrees with this ledger's base
+/// balance. A fill restates both balances it moved, the one it paid with first, before the
+/// [`Trade`].
+///
 /// # How a CFD is accounted
 /// This venue keeps one net position per CFD instrument, in contracts, and splits every fill
 /// against it: the part that opposes the position **closes** it, and the rest **opens** one. A
@@ -189,7 +212,8 @@ pub enum VenueRegime {
 /// about every order that would open or increase one, at the venue's clock, and refuses it with
 /// [`ApiError::BorrowRejected`] for the first of these that applies:
 /// - [`NotShortable`](BorrowRejectReason::NotShortable): the provider says the instrument is not
-///   shortable.
+///   shortable, or that it is delisted at or before the venue's clock
+///   ([`Shortability::delisting_at`](crate::shortability::Shortability::delisting_at)).
 /// - [`InventoryUnavailable`](BorrowRejectReason::InventoryUnavailable): the short would exceed
 ///   what the provider says is available. That is the lender's total, so the account's own short
 ///   counts against it, and so does every resting sell, as if it had filled. The refusal carries
@@ -211,10 +235,11 @@ pub enum VenueRegime {
 ///
 /// # ⚠️ Caller obligations and known limitations
 /// - **Fund the quote asset of every instrument traded.** Every debit is quote-denominated except a
-///   spot sell, which debits base. A missing balance is a **panic**, not an error: the balances are
-///   this venue's own fixture, so an absent one is a mis-specified test rather than a runtime
-///   condition. A CFD settling in an account currency that is not the quote asset still needs the
-///   **quote** asset funded — see below.
+///   spot sell, which debits base, and the excess fee of a fill whose fee exceeds what it receives
+///   (see `# How a spot fill is accounted`). A missing balance to debit is a **panic**, not an error: the
+///   balances are this venue's own fixture, so an absent one is a mis-specified test rather than a
+///   runtime condition. A CFD settling in an account currency that is not the quote asset still
+///   needs the **quote** asset funded — see below.
 /// - **`CfdContract::settlement_asset` is not settled in.** A CFD routinely cash-settles in an
 ///   account currency that is not the quote asset (a GBP account trading a USD-quoted index), which
 ///   requires a quote→settlement conversion rate. This venue has no rate source and will not invent
@@ -222,10 +247,9 @@ pub enum VenueRegime {
 ///   field is carried on the instrument so its description stays faithful, and the engine's own
 ///   `InstrumentKind` — not this copy — drives PnL. A backtest whose result depends on the
 ///   settlement currency needs a real execution client.
-/// - **A spot fill debits the paying asset and does not credit the received one.** A spot buy
-///   debits quote without crediting base, and a spot sell the reverse. Spot balances therefore
-///   track cash committed, not portfolio value; position-derived statistics come from the engine.
-///   A CFD close does credit, because its proceeds are the same asset its margin was posted in.
+/// - **The asset a spot fill receives is created at zero if the account never held it,** so only
+///   the paying asset of a first order needs funding. A sell of base the account holds none of is
+///   still a missing balance, since it is a debit.
 /// - **Which order kinds are accepted depends on the [`VenueRegime`].** [`OrderKind::Market`]
 ///   always; [`OrderKind::Limit`] only on a [`MarketDriven`](VenueRegime::MarketDriven) venue;
 ///   every other kind never.
@@ -272,13 +296,15 @@ pub enum VenueRegime {
 /// distinguish.
 ///
 /// Given that market, the three cases are:
-/// - **A market order**, and **a limit order marketable on arrival** — priced by the [`FillModel`].
-///   A limit order is then *clamped* to its own limit: a buy never fills above it, a sell never
-///   below. Both are charged [`Liquidity::Taker`].
+/// - **A market order**, and **a limit order marketable on arrival** — priced by the [`FillModel`],
+///   then moved against the order by the configured
+///   [`slippage`](crate::client::mock::MockExecutionConfig::slippage). A limit order is then
+///   *clamped* to its own limit: a buy never fills above it, a sell never below. Both are charged
+///   [`Liquidity::Taker`].
 /// - **A resting limit order** — fills at its own limit price exactly, and never reaches the
-///   [`FillModel`]. Deriving a better price from the book would credit price improvement no resting
-///   order can obtain: a maker is paid the price it quoted, and improvement accrues to the
-///   aggressor that crossed it. Charged [`Liquidity::Maker`].
+///   [`FillModel`] or the slippage. Deriving a better price from the book would credit price
+///   improvement no resting order can obtain: a maker is paid the price it quoted, and improvement
+///   accrues to the aggressor that crossed it. Charged [`Liquidity::Maker`].
 ///
 /// The marketable and resting rules agree exactly at the crossing point — an order arriving when
 /// `best_ask == limit` fills at the limit either way — and diverge only where the order genuinely
@@ -399,15 +425,28 @@ pub enum VenueRegime {
 /// one was going to — so a CFD fill is costed again when it fills: its hold is released and the
 /// fill settled afresh, still as one balance restatement. If the account can no longer afford it,
 /// the order is **cancelled** rather than filled, as a venue re-checking margin at fill time would
-/// cancel it. That includes an order a configured `initial_state` seeded, which for spot would be
-/// a panic.
+/// cancel it. That includes an order a configured `initial_state` seeded, which for an ordinary
+/// spot order would be a panic.
+///
+/// A resting spot order holds what it pays with, and nothing for a fee that comes out of what it
+/// receives. A fill whose fee exceeds what it receives takes the excess from the asset it receives,
+/// so it is costed afresh when it fills, as a CFD order is, and cancelled, seeded or not, if that
+/// asset cannot cover the excess.
 ///
 /// [`AccountState::commit`]: crate::exchange::mock::account::AccountState::commit
 #[derive(Debug)]
 pub struct SimulatedVenue {
     pub exchange: ExchangeId,
     pub fee_model: FeeModelConfig,
-    pub fill_model: SimFillConfig,
+    /// Which asset a spot fill's fee is charged in. See `# How a spot fill is accounted`.
+    pub spot_fee_asset: SpotFeeAsset,
+    /// Prices each taker fill. Built from the configuration's
+    /// [`fill_model`](MockExecutionConfig::fill_model) unless replaced by
+    /// [`with_fill_model`](Self::with_fill_model).
+    fill_model: Arc<dyn FillModel>,
+    /// Moves each taker fill against the order, from its own seeded stream. Private: the stream's
+    /// position is what makes a run reproducible from its seed, so nothing else may draw from it.
+    slippage: Slippage,
     pub instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
     pub account: AccountState,
     /// This venue's own view of each instrument it trades, as of the last
@@ -536,7 +575,9 @@ impl SimulatedVenue {
         Self {
             exchange: config.mocked_exchange,
             fee_model: config.fee_model,
-            fill_model: config.fill_model,
+            spot_fee_asset: config.spot_fee_asset,
+            fill_model: Arc::new(config.fill_model),
+            slippage: Slippage::new(config.slippage),
             instruments,
             account,
             market: FnvHashMap::default(),
@@ -566,6 +607,23 @@ impl SimulatedVenue {
     pub fn with_holding_costs(mut self, models: Vec<Arc<dyn HoldingCostModel>>) -> Self {
         self.holding_costs = models;
         self.refresh_next_charge();
+        self
+    }
+
+    /// This venue, pricing each taker fill with `model` rather than the configured
+    /// [`fill_model`](MockExecutionConfig::fill_model).
+    ///
+    /// The way to plug in a model of your own, such as a size-aware impact model reading
+    /// [`FillContext::quantity`]. The configured
+    /// [`slippage`](MockExecutionConfig::slippage) still applies to whatever price it returns. See
+    /// [`FillModel`] for what an implementation must uphold.
+    ///
+    /// The model is not part of the configuration, so a serialised configuration no longer says
+    /// what priced the fills: its `fill_model` is unused. A venue that `MockExchange` drives is
+    /// built from its configuration alone, so it takes no custom model.
+    #[must_use]
+    pub fn with_fill_model(mut self, model: Arc<dyn FillModel>) -> Self {
+        self.fill_model = model;
         self
     }
 
@@ -1003,7 +1061,7 @@ impl SimulatedVenue {
             ),
         };
 
-        let mut events = Vec::with_capacity(crossing.len() * 3);
+        let mut events = Vec::with_capacity(crossing.len() * 4);
 
         for (cid, limit) in crossing {
             // Collected from this same book with nothing in between, so this always finds it.
@@ -1038,19 +1096,14 @@ impl SimulatedVenue {
                 Liquidity::Maker,
             );
 
-            let balance = match self.settle_resting(
-                &order,
-                reservation,
-                &settlement,
-                &terms,
-                time_exchange,
-            ) {
-                RestingSettlement::Settled(balance) => balance,
-                RestingSettlement::Unaffordable { released } => {
-                    events.extend(self.cancel_unaffordable(order, released, time_exchange));
-                    continue;
-                }
-            };
+            let committed =
+                match self.settle_resting(&order, reservation, &settlement, time_exchange) {
+                    RestingSettlement::Settled(committed) => committed,
+                    RestingSettlement::Unaffordable { released } => {
+                        events.extend(self.cancel_unaffordable(order, released, time_exchange));
+                        continue;
+                    }
+                };
 
             self.record_fill(
                 &terms,
@@ -1110,7 +1163,7 @@ impl SimulatedVenue {
             self.account.ack_filled(filled.clone());
             let filled = filled.map_state(OrderState::fully_filled);
 
-            events.push(self.build_account_event(Snapshot(balance)));
+            self.push_committed(&mut events, committed);
             events.push(self.build_account_event(trade));
             events.push(self.build_account_event(Snapshot(filled)));
         }
@@ -1118,7 +1171,8 @@ impl SimulatedVenue {
         events
     }
 
-    /// Moves the balance one resting fill pays with, and returns the restatement it owes.
+    /// Moves the balances one resting fill pays with and receives, and returns the restatements it
+    /// owes.
     ///
     /// # A cash-settled fill is costed again when it fills
     /// What a CFD order holds was computed against the position when it rested, and the position
@@ -1127,33 +1181,28 @@ impl SimulatedVenue {
     /// afresh, as one ledger move with one restatement. If the account can no longer afford it,
     /// the result is [`RestingSettlement::Unaffordable`] and the order is cancelled, as a venue
     /// re-checking margin at fill time would cancel it, rather than filled with balance the account
-    /// does not have.
+    /// does not have. A spot fill whose fee exceeds what it receives is the same: its hold covers
+    /// what it pays with, not the excess fee taken from the asset it receives, so it is checked
+    /// afresh.
     ///
     /// # Panics
     /// Panics if a spot order the venue holds nothing against cannot be afforded when it fills —
-    /// see this type's caller obligations on `initial_state`.
+    /// see this type's caller obligations on `initial_state` — unless its fee exceeds what it
+    /// receives, which is checked afresh and cancelled like a CFD order.
     fn settle_resting(
         &mut self,
         order: &OpenOrder,
         reservation: Option<Reservation>,
         settlement: &Settlement,
-        terms: &InstrumentTerms,
         time_exchange: DateTime<Utc>,
     ) -> RestingSettlement {
-        if terms.cash_settled {
-            let released = reservation.map(|Reservation { asset, amount }| {
-                self.account.release(&asset, amount, time_exchange)
-            });
-
-            return match self.account.commit(
-                &settlement.settled(),
-                settlement.credit,
-                time_exchange,
-            ) {
-                Ok(balance) => RestingSettlement::Settled(balance),
-                Err(_) => RestingSettlement::Unaffordable { released },
-            };
-        }
+        let delivery = match &settlement.credit {
+            Credit::Delivery(delivery) if !delivery.amount.is_sign_negative() => delivery,
+            // A cash-settled fill, or a spot fill whose fee exceeds what it receives.
+            Credit::PaidBack(_) | Credit::Delivery(_) => {
+                return self.settle_resting_afresh(reservation, settlement, time_exchange);
+            }
+        };
 
         let Some(Reservation { asset, amount }) = reservation else {
             // Seeded by a configured `initial_state`, so nothing is held against it and the fill
@@ -1161,7 +1210,11 @@ impl SimulatedVenue {
             // class as an absent balance, and gets the same treatment.
             return RestingSettlement::Settled(
                 self.account
-                    .commit(&settlement.settled(), Decimal::ZERO, time_exchange)
+                    .commit(
+                        &settlement.settled(),
+                        Some(&settlement.credit),
+                        time_exchange,
+                    )
                     .unwrap_or_else(|insufficient| {
                         panic!(
                             "SimulatedVenue cannot afford the fill of resting order {}, which was \
@@ -1169,7 +1222,7 @@ impl SimulatedVenue {
                              required",
                             order.key.cid,
                             insufficient.free,
-                            settlement.asset,
+                            insufficient.asset,
                             insufficient.required
                         )
                     }),
@@ -1177,7 +1230,7 @@ impl SimulatedVenue {
         };
 
         // Reserve exactly what will be settled, then settle exactly what was reserved: the client
-        // sees one balance restatement per fill, and never a balance the account did not hold.
+        // sees one balance restatement per asset, and never a balance the account did not hold.
         // Both sides are the unfilled remainder, priced at the order's own limit as the maker --
         // `rest_order` holds for it and this settles it, so the two agree by construction rather
         // than by two formulas coinciding. Only spot reaches this: what a spot fill costs does not
@@ -1192,7 +1245,43 @@ impl SimulatedVenue {
             settlement.asset
         );
 
-        RestingSettlement::Settled(self.account.settle(&asset, amount, time_exchange))
+        let paid = self.account.settle(&asset, amount, time_exchange);
+        let received = self.account.deliver(delivery, time_exchange);
+        RestingSettlement::Settled(Committed {
+            paid,
+            received: Some(received),
+        })
+    }
+
+    /// Releases a resting fill's hold and settles the fill afresh, restating each asset it moved
+    /// once, or reports it unaffordable. See [`settle_resting`](Self::settle_resting).
+    fn settle_resting_afresh(
+        &mut self,
+        reservation: Option<Reservation>,
+        settlement: &Settlement,
+        time_exchange: DateTime<Utc>,
+    ) -> RestingSettlement {
+        let released = reservation.map(|Reservation { asset, amount }| {
+            self.account.release(&asset, amount, time_exchange)
+        });
+
+        match self.account.commit(
+            &settlement.settled(),
+            Some(&settlement.credit),
+            time_exchange,
+        ) {
+            Ok(committed) => RestingSettlement::Settled(committed),
+            Err(_) => RestingSettlement::Unaffordable { released },
+        }
+    }
+
+    /// Appends the balances one commitment restated, the asset paid with first.
+    fn push_committed(&self, events: &mut Vec<UnindexedAccountEvent>, committed: Committed) {
+        let Committed { paid, received } = committed;
+        events.push(self.build_account_event(Snapshot(paid)));
+        if let Some(received) = received {
+            events.push(self.build_account_event(Snapshot(received)));
+        }
     }
 
     /// Cancels a resting order whose fill the account can no longer afford, and reports it.
@@ -1307,14 +1396,15 @@ impl SimulatedVenue {
     /// Books an open against the ledger and reports everything it owes the client.
     ///
     /// The venue books its own fill: the `Trade` is acknowledged into the ledger here, so a driver
-    /// cannot forget to. A filled open reports `[balance, trade]`, mirroring a real venue where the
-    /// trade is booked before the order can be reported `FullyFilled`; an open that rests reports
-    /// `[balance]` alone -- the reservation now held against it -- and no trade, because nothing
-    /// traded.
+    /// cannot forget to. A filled open reports `[balance, trade]` -- `[paid, received, trade]` for
+    /// spot, which moves two assets -- mirroring a real venue where the trade is booked before the
+    /// order can be reported `FullyFilled`; an open that rests reports `[balance]` alone -- the
+    /// reservation now held against it -- and no trade, because nothing traded.
     ///
-    /// A Market order carries no limit price, so the venue prices it from whichever market its
-    /// [`VenueRegime`] gives it -- its own on a [`MarketDriven`](VenueRegime::MarketDriven) venue,
-    /// and [`RequestOpen::market`](crate::order::request::RequestOpen::market) on a
+    /// A Market order has no limit price, and any price it carries is ignored, so the venue prices
+    /// it from whichever market its [`VenueRegime`] gives it -- its own on a
+    /// [`MarketDriven`](VenueRegime::MarketDriven) venue, and
+    /// [`RequestOpen::market`](crate::order::request::RequestOpen::market) on a
     /// [`RequestPriced`](VenueRegime::RequestPriced) one. A Limit order is always judged and priced
     /// against this venue's own market; see the type's `# How an order is priced`.
     pub fn open_order(
@@ -1330,10 +1420,12 @@ impl SimulatedVenue {
         // the ledger moved. All that is left is to package it in the order a driver must deliver
         // it: the balance that pays for a fill before the fill that spent it.
         let events = match notifications {
-            Some(OpenOrderNotifications::Filled { balance, trade }) => vec![
-                self.build_account_event(balance),
-                self.build_account_event(trade),
-            ],
+            Some(OpenOrderNotifications::Filled { committed, trade }) => {
+                let mut events = Vec::with_capacity(3);
+                self.push_committed(&mut events, committed);
+                events.push(self.build_account_event(trade));
+                events
+            }
             // Already on the book: `open_order_inner` put it there, holding the reservation this
             // balance restates.
             Some(OpenOrderNotifications::Rested { balance }) => {
@@ -1740,6 +1832,18 @@ impl SimulatedVenue {
         let exchange = request.key.exchange;
         let shortability = provider.shortability(instrument, now);
 
+        if let Some(delisting_at) = shortability.delisting_at
+            && delisting_at <= now
+        {
+            return Err(ApiError::BorrowRejected(BorrowReject::new(
+                BorrowRejectReason::NotShortable,
+                None,
+                format!(
+                    "{instrument} cannot be sold short on {exchange} at {now}: it is delisted at \
+                     {delisting_at}"
+                ),
+            )));
+        }
         if shortability.shortable == Some(false) {
             return Err(ApiError::BorrowRejected(BorrowReject::new(
                 BorrowRejectReason::NotShortable,
@@ -1776,7 +1880,11 @@ impl SimulatedVenue {
                     .is_some_and(|limit| crosses(Side::Sell, limit, market)),
                 _ => self
                     .fill_model
-                    .fill_price(&FillContext::new(Side::Sell, market))
+                    .fill_price(&FillContext::new(
+                        Side::Sell,
+                        request.state.quantity,
+                        market,
+                    ))
                     .is_some(),
             })
         };
@@ -1926,16 +2034,27 @@ impl SimulatedVenue {
         let market_supplied = market.is_some();
         let market = market.unwrap_or_default();
 
+        // Only a limit order's price is a limit. Any other kind's is ignored, as the live clients
+        // ignore a price sent with a market order: it neither prices the fill nor bounds it.
+        let limit = match request.state.kind {
+            OrderKind::Limit => request.state.price,
+            _ => None,
+        };
+
         // The order's own price is deliberately NOT handed to the model. A limit constrains the
         // result, not the pricing: a model reads the book and returns where a taker prints, and
         // this venue is what bounds that by the order's terms. See `FillModel`'s contract.
-        let maybe_fill_price = self
+        let maybe_reference = self
             .fill_model
-            .fill_price(&FillContext::new(request.state.side, &market))
-            // For `OrderKind::Market` this is `.or(None)`, since a market order carries no price.
-            // For a marketable limit it is the last resort that makes the rejection below
-            // unreachable: an order whose limit the market crossed necessarily has one.
-            .or(request.state.price);
+            .fill_price(&FillContext::new(
+                request.state.side,
+                request.state.quantity,
+                &market,
+            ))
+            // For a market order this is `.or(None)`, whatever price it carries. For a marketable
+            // limit it is the last resort that makes the rejection below unreachable: an order
+            // whose limit the market crossed necessarily has one.
+            .or(limit);
 
         // No price anywhere. Ordinary user data -- a cold start, a thin instrument, a subscription
         // that was never made, or a caller that supplied no snapshot at all -- not a violated
@@ -1948,7 +2067,7 @@ impl SimulatedVenue {
         //
         // The two causes get different messages because they have different fixes: an absent
         // snapshot is a wiring problem in the caller, an empty one is a timing problem in the data.
-        let Some(fill_price) = maybe_fill_price else {
+        let Some(reference) = maybe_reference else {
             let cause = if market_supplied {
                 "no market price available yet"
             } else {
@@ -1965,18 +2084,6 @@ impl SimulatedVenue {
                 ),
                 None,
             );
-        };
-
-        // The clamp, and the only place a limit price bounds a fill. A taker crossing the spread
-        // can be filled better than its limit but never worse, so a buy never prints above it and
-        // a sell never below. Applied here rather than inside the model because it is a property of
-        // the order's terms, not of how the market is read.
-        let fill_price = match request.state.price {
-            Some(limit) if request.state.kind == OrderKind::Limit => match request.state.side {
-                Side::Buy => fill_price.min(limit),
-                Side::Sell => fill_price.max(limit),
-            },
-            _ => fill_price,
         };
 
         let time_exchange = self.time_exchange();
@@ -2002,6 +2109,23 @@ impl SimulatedVenue {
                 }
             };
         }
+
+        // Slipped only now that the order is known to trade, so the stream advances exactly once
+        // per fill, and an order that is cancelled or rests whole takes no draw. One the ledger
+        // refuses below hands its draw back, which needs the stream as it was.
+        let slippage_before = self.slippage.clone();
+        let fill_price = self.slippage.apply(side, reference);
+
+        // The clamp, and the only place a limit price bounds a fill. A taker crossing the spread
+        // can be filled better than its limit but never worse, so a buy never prints above it and
+        // a sell never below. Applied here rather than inside the model because it is a property of
+        // the order's terms, not of how the market is read, and after the slippage so that no
+        // rate, however large, fills an order past its limit.
+        let fill_price = match (limit, side) {
+            (Some(limit), Side::Buy) => fill_price.min(limit),
+            (Some(limit), Side::Sell) => fill_price.max(limit),
+            (None, _) => fill_price,
+        };
 
         // Marketable on arrival, so this fill takes liquidity and is charged the taker rate.
         let position = self.net_position(terms, &request.key.instrument);
@@ -2038,14 +2162,20 @@ impl SimulatedVenue {
             None => fill.settled(),
         };
 
-        let balance = match self.account.commit(&debit, fill.credit, time_exchange) {
-            Ok(balance) => balance,
+        let committed = match self
+            .account
+            .commit(&debit, Some(&fill.credit), time_exchange)
+        {
+            Ok(committed) => committed,
             Err(insufficient) => {
+                // Refused, so it never traded: the next fill draws the rate it would have drawn had
+                // this order never been sent.
+                self.slippage = slippage_before;
                 return (
                     build_open_order_err_response(
                         request,
                         ApiError::BalanceInsufficient(
-                            Some(debit.asset),
+                            Some(insufficient.asset),
                             format!(
                                 "Available Balance: {}, Required Balance inc. fees: {}",
                                 insufficient.free, insufficient.required
@@ -2113,10 +2243,7 @@ impl SimulatedVenue {
                 time_in_force: request.state.time_in_force,
                 state,
             },
-            Some(OpenOrderNotifications::Filled {
-                balance: Snapshot(balance),
-                trade,
-            }),
+            Some(OpenOrderNotifications::Filled { committed, trade }),
         )
     }
 
@@ -2186,9 +2313,9 @@ impl SimulatedVenue {
                 OrderState::fully_filled(filled)
             }
 
-            // A market order carries no price, so its remainder has nothing to rest at and retires
-            // carrying what did trade -- which is what `Cancelled::filled_quantity` is for, and the
-            // first time this venue makes it non-zero.
+            // A market order has no limit price, so its remainder has nothing to rest at and
+            // retires carrying what did trade -- which is what `Cancelled::filled_quantity` is for,
+            // and the first time this venue makes it non-zero.
             None => {
                 let cancelled = Cancelled {
                     id: order_id,
@@ -2257,10 +2384,10 @@ impl SimulatedVenue {
     ///
     /// The reservation is what the fill will settle, computed once here and settled unchanged --
     /// never a conservative over-estimate. A conservative reservation would have to be released and
-    /// re-debited on the fill, and [`AccountState::commit`]'s contract is that an arrival produces
-    /// exactly **one** balance restatement; the extra ones would report balances the account never
-    /// held, and [`Balance::used`](crate::balance::Balance::used) would misreport for the order's
-    /// whole life.
+    /// re-debited on the fill, and [`AccountState::commit`]'s contract is that an arrival restates
+    /// each asset it moves exactly **once**; the extra restatements would report balances the
+    /// account never held, and [`Balance::used`](crate::balance::Balance::used) would misreport
+    /// for the order's whole life.
     ///
     /// [`AccountState::commit`]: crate::exchange::mock::account::AccountState::commit
     fn rest_order(
@@ -2289,15 +2416,16 @@ impl SimulatedVenue {
         let balance_snapshot =
             match self
                 .account
-                .commit(&settlement.reserved(), Decimal::ZERO, time_exchange)
+                .commit(&settlement.reserved(), None, time_exchange)
             {
-                Ok(balance_snapshot) => balance_snapshot,
+                // Nothing traded, so nothing is delivered: the one balance is the hold.
+                Ok(Committed { paid, .. }) => paid,
                 Err(insufficient) => {
                     return (
                         build_open_order_err_response(
                             request,
                             ApiError::BalanceInsufficient(
-                                Some(settlement.asset),
+                                Some(insufficient.asset),
                                 format!(
                                     "Available Balance: {}, Required Balance inc. fees: {}",
                                     insufficient.free, insufficient.required
@@ -2488,45 +2616,52 @@ impl SimulatedVenue {
             return Settlement {
                 asset: terms.underlying.quote.clone(),
                 amount: open_margin + fees_quote + shortfall,
-                credit,
+                credit: Credit::PaidBack(credit),
                 fees,
             };
         }
 
+        // A spot fill exchanges the two assets. Its fee comes out of what a sell receives, in quote,
+        // and under `SpotFeeAsset::Quote` on top of what a buy pays, so the base it moves is exactly
+        // its quantity. Under `Received` a buy's fee comes out of the base it receives instead,
+        // converted at the fill price. That base fee is what the engine nets from its position, so
+        // the two still agree. The fee each fill reports is the one charged, in the asset charged.
+        let notional = price * quantity * terms.contract_size;
         match side {
-            Side::Buy => Settlement {
-                asset: terms.underlying.quote.clone(),
-                amount: price * quantity * terms.contract_size + fees_quote,
-                credit: Decimal::ZERO,
-                fees,
-            },
-            Side::Sell => {
-                // Selling a spot instrument delivers the base asset, so the debit is denominated in
-                // base and the quote-denominated fee is converted at `price`.
-                //
-                // Note: for `PerContractFeeModel` this conversion is nonsensical (a flat commission
-                // divided by a price). Only `Spot` reaches this branch -- a cash-settled kind is
-                // handled above and never debits base -- and a per-contract commission on a spot
-                // instrument is already a modelling error, so this stays an assert rather than a
-                // conversion this mock pretends to do correctly.
-                debug_assert!(
-                    !matches!(self.fee_model, FeeModelConfig::PerContract(_)),
-                    "PerContractFeeModel produces nonsensical base-denominated fees on the spot \
-                     sell path"
-                );
-                let fees_base = if price.is_zero() {
-                    Decimal::ZERO
-                } else {
-                    fees_quote / price
-                };
-
+            Side::Buy
+                if self.spot_fee_asset == SpotFeeAsset::Received
+                    && price > Decimal::ZERO
+                    && !fees_quote.is_zero() =>
+            {
+                let fee_base = fees_quote / price;
                 Settlement {
-                    asset: terms.underlying.base.clone(),
-                    amount: quantity + fees_base,
-                    credit: Decimal::ZERO,
-                    fees,
+                    asset: terms.underlying.quote.clone(),
+                    amount: notional,
+                    credit: Credit::Delivery(Delivery {
+                        asset: terms.underlying.base.clone(),
+                        amount: quantity - fee_base,
+                    }),
+                    fees: AssetFees::new(terms.underlying.base.clone(), fee_base, Some(fees_quote)),
                 }
             }
+            Side::Buy => Settlement {
+                asset: terms.underlying.quote.clone(),
+                amount: notional + fees_quote,
+                credit: Credit::Delivery(Delivery {
+                    asset: terms.underlying.base.clone(),
+                    amount: quantity,
+                }),
+                fees,
+            },
+            Side::Sell => Settlement {
+                asset: terms.underlying.base.clone(),
+                amount: quantity,
+                credit: Credit::Delivery(Delivery {
+                    asset: terms.underlying.quote.clone(),
+                    amount: notional - fees_quote,
+                }),
+                fees,
+            },
         }
     }
 
@@ -2884,7 +3019,7 @@ fn disposition(
 /// derived at the two call sites that can reach it. Carrying the limit price *here* rather than
 /// re-reading [`RequestOpen::price`](crate::order::request::RequestOpen::price) is what makes
 /// "rest what is left" unrepresentable for an order that has nowhere to rest it: a market order
-/// carries no price, so it cannot construct [`Rest`](Self::Rest) at all.
+/// has no limit price, so it cannot construct [`Rest`](Self::Rest) at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Remainder {
     /// Joins the book at this limit and waits to be crossed.
@@ -2933,11 +3068,12 @@ where
 /// missing trade is not an absent field: a rested open has a balance and *no* trade, and nothing
 /// about it is incomplete.
 ///
-/// # One arrival owes one balance
+/// # One arrival restates each asset once
 /// Including the arrival that both settles a fill and holds against the remainder it leaves
 /// resting. Those are one event at the venue and one commitment in the ledger
-/// ([`AccountState::commit`]), so they restate the balance once — see that method for why an
-/// intermediate would report a balance the account never held.
+/// ([`AccountState::commit`]), so they restate the asset paid with once, and a spot fill the asset
+/// it received once more — see that method for why an intermediate would report a balance the
+/// account never held.
 ///
 /// [`AccountState::commit`]: crate::exchange::mock::account::AccountState::commit
 // `large_enum_variant`: boxing the `Trade` would trade one move of ~300 bytes for a heap
@@ -2947,9 +3083,9 @@ where
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum OpenOrderNotifications {
-    /// The open filled on arrival: the balance it paid with, and the trade it printed.
+    /// The open filled on arrival: the balances it moved, and the trade it printed.
     Filled {
-        balance: Snapshot<AssetBalance<AssetNameExchange>>,
+        committed: Committed,
         trade: Trade<AssetNameExchange, InstrumentNameExchange>,
     },
     /// The open rests on the book: the balance now held against it, and nothing traded.
@@ -2972,9 +3108,11 @@ struct InstrumentTerms {
 /// What settling one resting fill came to.
 #[derive(Debug)]
 enum RestingSettlement {
-    /// The fill settled, restating this balance.
-    Settled(AssetBalance<AssetNameExchange>),
-    /// A cash-settled fill the account can no longer afford, so the order is cancelled instead.
+    /// The fill settled, restating these balances.
+    Settled(Committed),
+    /// A fill the account can no longer afford, so the order is cancelled instead: a cash-settled
+    /// one, or a spot fill whose fee exceeds what it receives by more than that asset's balance
+    /// holds.
     /// Carries the balance its released hold restated, if it held anything.
     Unaffordable {
         released: Option<AssetBalance<AssetNameExchange>>,
@@ -2991,30 +3129,35 @@ struct Fill {
     price: Decimal,
 }
 
-/// What one order pays with, how much of it, the fee inside that amount, and what it pays back.
+/// What one order pays with, how much of it, the fee charged, and what the fill gives back.
 #[derive(Debug, Clone)]
 struct Settlement {
     /// Quote for a buy or a CFD, base for a spot sell.
     asset: AssetNameExchange,
-    /// Denominated in [`asset`](Self::asset), inclusive of the fee.
+    /// Denominated in [`asset`](Self::asset), inclusive of any fee charged in it.
     amount: Decimal,
-    /// Paid back into [`asset`](Self::asset) by the fill: the margin and realised PnL of the
-    /// part of a CFD fill that closes a position. Zero for a spot fill, and for a CFD fill that
-    /// closes nothing.
-    credit: Decimal,
-    /// Always quote-denominated, whatever [`asset`](Self::asset) is.
+    /// What the fill gives the account. For a CFD, the margin and realised PnL of the part that
+    /// closes a position, [paid back](Credit::PaidBack) into [`asset`](Self::asset). For spot, a
+    /// [delivery](Credit::Delivery) in the other asset: the base a buy receives, or the quote a
+    /// sell receives, net of any fee charged in it.
+    credit: Credit,
+    /// In the asset the fee is charged in: quote, or base for a buy under
+    /// [`SpotFeeAsset::Received`]. Its `fees_quote` is always the quote fee.
     fees: AssetFees<AssetNameExchange>,
 }
 
 impl Settlement {
     /// What must be held for this settlement while the order it belongs to is still working.
     ///
-    /// The amount net of what the fill will pay back, and never negative. An order that only
-    /// reduces a CFD position is paid more by its fill than it costs, so it holds nothing: the
-    /// account that opened a position with all of its balance can still close it. Spot pays
-    /// nothing back, so this is its whole amount.
+    /// The amount net of what the fill will pay back into the asset held, and never negative. An
+    /// order that only reduces a CFD position is paid more by its fill than it costs, so it holds
+    /// nothing: the account that opened a position with all of its balance can still close it. A
+    /// spot fill pays back in the other asset, which funds nothing, so this is its whole amount.
     fn requirement(&self) -> Decimal {
-        (self.amount - self.credit).max(Decimal::ZERO)
+        match &self.credit {
+            Credit::PaidBack(credit) => (self.amount - credit).max(Decimal::ZERO),
+            Credit::Delivery(_) => self.amount,
+        }
     }
 
     /// The whole of this settlement leaves the account, because the whole of it traded.
@@ -3161,8 +3304,8 @@ mod tests {
             fixtures::*,
             orders::{OpenOrders, as_open},
         },
-        fee::PercentageFeeModel,
-        fill::BidAskFillModel,
+        fee::{PerContractFeeModel, PercentageFeeModel},
+        fill::{BidAskFillModel, SimFillConfig},
         holding_cost::{
             AccrualDays, BorrowFeeModel, DailyAccrual, DayCount, FinancingModel, FinancingRates,
             FundingModel, HoldingCharge, RateSeries, WeekendsOnly,
@@ -3174,6 +3317,7 @@ mod tests {
             state::{ActiveOrderState, InactiveOrderState},
         },
         shortability::{Shortability, ShortabilityTable},
+        slippage::SlippageConfig,
     };
     use chrono::{NaiveTime, TimeDelta};
     use rustrade_instrument::{
@@ -3318,20 +3462,43 @@ mod tests {
         }
     }
 
-    /// The trade a filled open owes its client, which must follow the balance.
-    fn filled_trade(outcome: &OpenOutcome) -> &Trade<AssetNameExchange, InstrumentNameExchange> {
+    /// The balance a filled spot open received, which follows the one it paid with.
+    fn filled_received(outcome: &OpenOutcome) -> &AssetBalance<AssetNameExchange> {
         match outcome.events.get(1).map(|event| &event.kind) {
-            Some(AccountEventKind::Trade(trade)) => trade,
-            other => panic!("a filled open must emit its trade after its balance, got: {other:?}"),
+            Some(AccountEventKind::BalanceSnapshot(balance)) => &balance.0,
+            other => panic!("a filled spot open must emit what it received second, got: {other:?}"),
         }
+    }
+
+    /// The trade a filled open owes its client, which must follow every balance it moved.
+    fn filled_trade(outcome: &OpenOutcome) -> &Trade<AssetNameExchange, InstrumentNameExchange> {
+        let Some(at) = outcome
+            .events
+            .iter()
+            .position(|event| matches!(event.kind, AccountEventKind::Trade(_)))
+        else {
+            panic!(
+                "a filled open must emit its trade, got: {:?}",
+                outcome.events
+            );
+        };
+        assert!(
+            at > 0
+                && outcome.events[..at]
+                    .iter()
+                    .all(|event| matches!(event.kind, AccountEventKind::BalanceSnapshot(_))),
+            "a filled open must emit its balances before its trade, got: {:?}",
+            outcome.events
+        );
+        trade_of(&outcome.events[at])
     }
 
     /// The venue's ordering obligation, asserted without any transport in the way.
     ///
-    /// Two separate claims, because a driver needs both: each fill reports `[balance, trade]`, and
-    /// successive fills report strictly decreasing balances. A balance here is an absolute
-    /// restatement rather than a delta, so a driver that reorders them does not merely reorder
-    /// history — it leaves the client holding the wrong number.
+    /// Two separate claims, because a driver needs both: each fill reports its balances before its
+    /// trade, and successive fills report strictly decreasing balances. A balance here is an
+    /// absolute restatement rather than a delta, so a driver that reorders them does not merely
+    /// reorder history — it leaves the client holding the wrong number.
     #[test]
     fn a_filled_open_reports_its_balance_before_its_trade_and_debits_monotonically() {
         const FILLS: usize = 4;
@@ -3344,14 +3511,16 @@ mod tests {
 
             assert_eq!(
                 outcome.events.len(),
-                2,
-                "a fill owes exactly one balance and one trade"
+                3,
+                "a spot fill owes the balance it paid with, the one it received, and one trade"
             );
-            // Both accessors assert their own position, so reaching here is the order assertion.
+            // The accessors assert their own positions, so reaching here is the order assertion.
             let balance = filled_balance(&outcome);
+            let received = filled_received(&outcome);
             let trade = filled_trade(&outcome);
 
             assert_eq!(balance.asset, quote(), "a spot buy debits quote");
+            assert_eq!(received.asset, base(), "and credits base");
             assert_eq!(trade.price, d("50000"));
             balances.push(balance.balance.total);
         }
@@ -3378,7 +3547,7 @@ mod tests {
         let before = venue.time_exchange();
 
         let outcome = venue.open_order(buy_request("0.01", market_prices("50000")));
-        assert_eq!(outcome.events.len(), 2, "the fill must owe events");
+        assert_eq!(outcome.events.len(), 3, "the fill must owe events");
 
         // Nothing has delivered `outcome`, yet the ledger already reflects it.
         let trades = venue.trades(before);
@@ -3887,6 +4056,8 @@ mod tests {
             0,
             FeeModelConfig::default(),
             SimFillConfig::default(),
+            SpotFeeAsset::default(),
+            crate::slippage::SlippageConfig::default(),
         );
         let mut venue = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
         assert_eq!(cfd_position(&venue), Some((d("-1"), Some(d("5000")))));
@@ -3924,6 +4095,8 @@ mod tests {
             0,
             FeeModelConfig::default(),
             SimFillConfig::default(),
+            SpotFeeAsset::default(),
+            crate::slippage::SlippageConfig::default(),
         );
         let _ = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
     }
@@ -4138,7 +4311,7 @@ mod tests {
     }
 
     #[test]
-    fn sell_order_decrements_base_balance_not_quote() {
+    fn sell_order_decrements_base_and_credits_quote_proceeds() {
         let mut venue = make_venue("1.0", "10000");
         let initial_usdt = d("10000");
 
@@ -4149,7 +4322,17 @@ mod tests {
             "sell should succeed: {:?}",
             outcome.response.state
         );
-        assert_eq!(outcome.events.len(), 2, "a successful sell must notify");
+        assert_eq!(outcome.events.len(), 3, "a successful sell must notify");
+        assert_eq!(
+            filled_balance(&outcome).asset,
+            base(),
+            "a sell pays with base"
+        );
+        assert_eq!(
+            filled_received(&outcome).asset,
+            quote(),
+            "and receives quote"
+        );
 
         // Base (BTC) must be decremented by the quantity sold.
         let btc = venue.account.balance_mut(&base()).unwrap();
@@ -4159,11 +4342,12 @@ mod tests {
             "base balance should decrease by quantity sold"
         );
 
-        // Quote (USDT) must be unchanged (fees = 0 in this test).
+        // Quote (USDT) is credited the proceeds: 0.5 * 50000, with no fee in this test.
         let usdt = venue.account.balance_mut(&quote()).unwrap();
         assert_eq!(
-            usdt.balance.free, initial_usdt,
-            "quote balance should be unchanged on sell"
+            usdt.balance.free,
+            initial_usdt + d("25000"),
+            "quote balance should rise by the proceeds"
         );
     }
 
@@ -4267,7 +4451,7 @@ mod tests {
     #[test]
     fn bid_ask_fill_model_fills_at_ask_price_and_deducts_correct_balance() {
         let mut venue = make_venue("0", "10000"); // 0 BTC, 10 000 USDT
-        venue.fill_model = SimFillConfig::BidAsk(BidAskFillModel);
+        venue.fill_model = Arc::new(SimFillConfig::BidAsk(BidAskFillModel));
 
         let market = Some(MarketSnapshot {
             best_bid: Some(d("99.5")),
@@ -4298,6 +4482,348 @@ mod tests {
             usdt.balance.free,
             d("9899.5"),
             "quote balance must decrease by fill_price * qty"
+        );
+    }
+
+    // --- Slippage ---
+
+    /// A funded spot config moving every taker fill by `slippage`.
+    fn slipped_config(slippage: SlippageConfig) -> MockExecutionConfig {
+        MockExecutionConfig {
+            slippage,
+            ..spot_config("10", "1000000", FeeModelConfig::default())
+        }
+    }
+
+    fn last(price: &str) -> Option<MarketSnapshot> {
+        Some(MarketSnapshot {
+            last_price: Some(d(price)),
+            ..MarketSnapshot::default()
+        })
+    }
+
+    fn uniform(seed: u64) -> SlippageConfig {
+        SlippageConfig::uniform(d("0.01"), d("0.025"), seed).unwrap()
+    }
+
+    #[test]
+    fn a_fixed_slippage_moves_a_market_fill_against_the_order_and_settles_that_price() {
+        let config = slipped_config(SlippageConfig::fixed(d("0.01")).unwrap());
+        let mut venue = SimulatedVenue::new(&config, spot_instruments());
+
+        let bought = venue.open_order(buy_request("2", last("100")));
+        assert_eq!(filled_trade(&bought).price, d("101"), "a buy pays 1% above");
+        assert_eq!(
+            venue.account.balance_mut(&quote()).unwrap().balance.free,
+            d("999798"),
+            "the quote debited is the slipped price times the quantity"
+        );
+
+        let sold = venue.open_order(sell_request("2", last("100")));
+        assert_eq!(
+            filled_trade(&sold).price,
+            d("99"),
+            "a sell receives 1% below"
+        );
+        assert_eq!(
+            venue.account.balance_mut(&quote()).unwrap().balance.free,
+            d("999996"),
+            "the round trip cost the 1% on each side"
+        );
+    }
+
+    /// The clamp comes after the slippage, so no rate fills a limit order past its own limit.
+    #[test]
+    fn a_slipped_marketable_limit_never_fills_past_its_limit() {
+        let fill = |rate: &str, side: Side, limit: &str| {
+            let config = slipped_config(SlippageConfig::fixed(d(rate)).unwrap());
+            let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+            advance(&mut venue, time(1));
+            let fed = venue.apply_market(
+                &instrument_name(),
+                book("49000", "49100"),
+                MarketDepth::UNKNOWN,
+                time(1),
+            );
+            assert!(fed.is_empty(), "an empty book fills nothing");
+            let outcome = venue.open_order(limit_request("cid", side, "1", limit, gtc()));
+            filled_trade(&outcome).price
+        };
+
+        assert_eq!(
+            fill("0.01", Side::Buy, "49200"),
+            d("49200"),
+            "49591 slipped, clamped to the limit"
+        );
+        assert_eq!(
+            fill("0.01", Side::Sell, "48800"),
+            d("48800"),
+            "48510 slipped, clamped to the limit"
+        );
+        assert_eq!(
+            fill("0.001", Side::Buy, "49200"),
+            d("49149.1"),
+            "inside the limit, the slipped price stands"
+        );
+    }
+
+    /// A resting order is the maker, so it fills at its own limit and leaves the stream alone.
+    #[test]
+    fn a_resting_fill_is_not_slipped_and_takes_no_draw() {
+        let config = MockExecutionConfig {
+            slippage: uniform(5),
+            ..spot_config("10", "1000000", maker_taker_fee())
+        };
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+        advance(&mut venue, time(1));
+        let fed = venue.apply_market(
+            &instrument_name(),
+            book("49000", "49100"),
+            MarketDepth::UNKNOWN,
+            time(1),
+        );
+        assert!(fed.is_empty(), "an empty book fills nothing");
+        let rested = venue.open_order(limit_request("resting", Side::Buy, "1", "48000", gtc()));
+        rested_open(&rested);
+        assert_eq!(
+            venue.slippage,
+            Slippage::new(config.slippage),
+            "resting drew nothing"
+        );
+
+        advance(&mut venue, time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("47800", "47900"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
+        assert_eq!(trade_of(&events[2]).price, d("48000"));
+        assert_eq!(
+            venue.slippage,
+            Slippage::new(config.slippage),
+            "the maker's fill drew nothing"
+        );
+    }
+
+    /// A marketable order the book has no size for trades nothing, whether it then rests or is
+    /// cancelled, so it takes no draw.
+    #[test]
+    fn an_order_the_book_cannot_fill_takes_no_draw() {
+        let config = slipped_config(uniform(3));
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+        advance(&mut venue, time(1));
+        let fed = venue.apply_market(
+            &instrument_name(),
+            book("47800", "47900"),
+            MarketDepth::new(Some(d("1")), Some(Decimal::ZERO)),
+            time(1),
+        );
+        assert!(fed.is_empty(), "an empty book fills nothing");
+
+        let rested = venue.open_order(limit_request("rests", Side::Buy, "1", "48000", gtc()));
+        assert_eq!(rested_open(&rested).filled_quantity, Decimal::ZERO);
+        let cancelled = venue.open_order(limit_request(
+            "cancels",
+            Side::Buy,
+            "1",
+            "48000",
+            TimeInForce::ImmediateOrCancel,
+        ));
+        assert!(
+            matches!(
+                cancelled.response.state,
+                OrderState::Inactive(InactiveOrderState::Cancelled(_))
+            ),
+            "{:?}",
+            cancelled.response.state
+        );
+
+        assert_eq!(venue.slippage, Slippage::new(config.slippage));
+    }
+
+    /// A funded spot venue on a book offering `depth`, moving every taker fill by `slippage`.
+    fn slipped_venue_offering(
+        usdt: &str,
+        slippage: SlippageConfig,
+        depth: MarketDepth,
+    ) -> SimulatedVenue {
+        let config = MockExecutionConfig {
+            slippage,
+            ..spot_config("10", usdt, FeeModelConfig::default())
+        };
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+        advance(&mut venue, time(1));
+        let fed = venue.apply_market(&instrument_name(), book("47800", "47900"), depth, time(1));
+        assert!(fed.is_empty(), "an empty book fills nothing");
+        venue
+    }
+
+    /// The book fills 1 of 3: that fill is slipped, with one draw, and the remainder rests at the
+    /// order's own limit.
+    #[test]
+    fn a_part_filled_order_is_slipped_once_and_rests_the_rest_at_its_limit() {
+        let mut venue = slipped_venue_offering("1000000", uniform(8), sized("1"));
+        let mut expected = Slippage::new(uniform(8));
+        let price = expected.apply(Side::Buy, d("47900"));
+
+        let outcome = venue.open_order(limit_request("part", Side::Buy, "3", "50000", gtc()));
+        let trade = filled_trade(&outcome);
+        assert_eq!((trade.quantity, trade.price), (d("1"), price));
+        assert_eq!(rested_open(&outcome).filled_quantity, d("1"));
+        assert_eq!(venue.slippage, expected, "one fill, one draw");
+        assert_eq!(
+            venue
+                .account
+                .orders()
+                .resting(&instrument_name(), Side::Buy)
+                .map(|order| order.price)
+                .collect::<Vec<_>>(),
+            vec![Some(d("50000"))],
+            "the remainder rests at its limit, unslipped"
+        );
+    }
+
+    /// A fill-or-kill the book can only part fill trades nothing, so it takes no draw.
+    #[test]
+    fn a_killed_order_takes_no_draw() {
+        let mut venue = slipped_venue_offering("1000000", uniform(8), sized("1"));
+        let outcome = venue.open_order(limit_request(
+            "kill",
+            Side::Buy,
+            "3",
+            "50000",
+            TimeInForce::FillOrKill,
+        ));
+        assert!(
+            matches!(
+                outcome.response.state,
+                OrderState::Inactive(InactiveOrderState::Cancelled(_))
+            ),
+            "{:?}",
+            outcome.response.state
+        );
+        assert_eq!(venue.slippage, Slippage::new(uniform(8)));
+    }
+
+    /// The fill is affordable, its remainder's hold is not: refused whole, and the draw handed back.
+    #[test]
+    fn a_part_filled_order_refused_for_its_hold_hands_back_its_draw() {
+        let mut venue = slipped_venue_offering("60000", uniform(8), sized("1"));
+        let outcome = venue.open_order(limit_request("split", Side::Buy, "3", "50000", gtc()));
+        assert!(
+            matches!(
+                outcome.response.state,
+                OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                    ApiError::BalanceInsufficient(..)
+                )))
+            ),
+            "{:?}",
+            outcome.response.state
+        );
+        assert_eq!(venue.slippage, Slippage::new(uniform(8)));
+    }
+
+    /// An order the ledger refuses never traded, so the next fill gets the rate it would have got
+    /// had the refused order never been sent.
+    #[test]
+    fn a_refused_order_hands_back_its_draw() {
+        let config = slipped_config(uniform(11));
+        let mut venue = SimulatedVenue::new(&config, spot_instruments());
+
+        let refused = venue.open_order(buy_request("1000000", last("100")));
+        assert!(
+            matches!(
+                refused.response.state,
+                OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                    ApiError::BalanceInsufficient(..)
+                )))
+            ),
+            "{:?}",
+            refused.response.state
+        );
+        assert_eq!(venue.slippage, Slippage::new(config.slippage));
+
+        let mut fresh = SimulatedVenue::new(&config, spot_instruments());
+        assert_eq!(
+            filled_trade(&venue.open_order(buy_request("1", last("100")))).price,
+            filled_trade(&fresh.open_order(buy_request("1", last("100")))).price,
+        );
+    }
+
+    /// The prices of a sequence of fills, alternating buys and sells, on a venue built from
+    /// `config`.
+    fn slipped_prices(config: &MockExecutionConfig) -> Vec<Decimal> {
+        let mut venue = SimulatedVenue::new(config, spot_instruments());
+        (0..20)
+            .map(|i| {
+                let request = if i % 2 == 0 {
+                    buy_request("0.1", last("100"))
+                } else {
+                    sell_request("0.1", last("100"))
+                };
+                filled_trade(&venue.open_order(request)).price
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_seeded_venue_reproduces_its_prices_within_the_range() {
+        let prices = slipped_prices(&slipped_config(uniform(42)));
+        assert_eq!(prices, slipped_prices(&slipped_config(uniform(42))));
+        assert_ne!(prices, slipped_prices(&slipped_config(uniform(43))));
+
+        for (i, price) in prices.iter().enumerate() {
+            // Buys pay 1% to 2.5% above 100, sells receive 1% to 2.5% below.
+            let (low, high) = if i % 2 == 0 {
+                (d("101"), d("102.5"))
+            } else {
+                (d("97.5"), d("99"))
+            };
+            assert!(
+                low <= *price && *price <= high,
+                "fill {i} at {price} outside [{low}, {high}]"
+            );
+        }
+    }
+
+    /// A zero rate never draws and never multiplies, so it is the unslipped price exactly, scale
+    /// included.
+    #[test]
+    fn a_zero_rate_is_identical_to_no_slippage() {
+        let none = slipped_prices(&slipped_config(SlippageConfig::none()));
+        let zero = slipped_prices(&slipped_config(
+            SlippageConfig::uniform(Decimal::ZERO, Decimal::ZERO, 42).unwrap(),
+        ));
+        assert_eq!(
+            none.iter().map(Decimal::to_string).collect::<Vec<_>>(),
+            zero.iter().map(Decimal::to_string).collect::<Vec<_>>()
+        );
+    }
+
+    /// Prices a fill one unit of price above the last trade for each unit of quantity.
+    #[derive(Debug)]
+    struct SizeImpact;
+
+    impl FillModel for SizeImpact {
+        fn fill_price(&self, fill: &FillContext<'_>) -> Option<Decimal> {
+            fill.market.last_price.map(|last| last + fill.quantity)
+        }
+    }
+
+    /// A custom model prices from the order's quantity, and the configured slippage still
+    /// applies to what it returns.
+    #[test]
+    fn a_custom_fill_model_sees_the_quantity_and_is_still_slipped() {
+        let config = slipped_config(SlippageConfig::fixed(d("0.01")).unwrap());
+        let mut venue =
+            SimulatedVenue::new(&config, spot_instruments()).with_fill_model(Arc::new(SizeImpact));
+
+        let outcome = venue.open_order(buy_request("3", last("100")));
+        assert_eq!(
+            filled_trade(&outcome).price,
+            d("104.03"),
+            "(100 + 3) x 1.01"
         );
     }
 
@@ -4343,9 +4869,8 @@ mod tests {
 
         // Sell 1 BTC at price 100 USDT
         // Notional = 1 * 100 = 100 USDT
-        // Fee (quote) = 100 * 0.001 = 0.1 USDT
-        // Fee (base) = 0.1 / 100 = 0.001 BTC
-        // Total base deducted = 1 + 0.001 = 1.001 BTC
+        // Fee (quote) = 100 * 0.001 = 0.1 USDT, out of the proceeds
+        // Base deducted = 1 BTC; quote credited = 100 - 0.1 = 99.9 USDT
         let outcome = venue.open_order(sell_request("1", market_prices("100")));
 
         assert!(
@@ -4361,13 +4886,403 @@ mod tests {
             "trade fee must be 0.1 USDT"
         );
 
-        // Base balance: 10 - 1.001 = 8.999
+        // Base balance: 10 - 1 = 9, so the base moved equals the quantity the engine counts
         let btc = venue.account.balance_mut(&base()).unwrap();
         assert_eq!(
             btc.balance.free,
-            d("8.999"),
-            "base balance must decrease by quantity + fee_in_base"
+            d("9"),
+            "base balance must decrease by the quantity alone"
         );
+
+        // Quote balance: 0 + 100 - 0.1 = 99.9, so the fee charged is the fee reported
+        let usdt = venue.account.balance_mut(&quote()).unwrap();
+        assert_eq!(
+            usdt.balance.free,
+            d("99.9"),
+            "quote balance must rise by the proceeds less the fee"
+        );
+    }
+
+    /// A spot fill exchanges the two assets: a round trip gives back the base it bought, and the
+    /// quote moves by the price difference less both fees, which is what the engine books as
+    /// realised PnL. Before a spot fill credited what it received, the base never arrived and the
+    /// sell's proceeds never left.
+    #[test]
+    fn a_spot_round_trip_returns_the_base_and_moves_quote_by_pnl_less_fees() {
+        // 0.1% fee rate
+        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel::new(d("0.001")));
+        let mut venue = make_venue_with_fee("0", "1000", fee_model);
+
+        let buy = venue.open_order(buy_request("1", market_prices("100")));
+        // 1000 - (100 + 0.1 fee)
+        assert_eq!(
+            filled_balance(&buy).balance,
+            Balance::new(d("899.9"), d("899.9"))
+        );
+        assert_eq!(filled_received(&buy).balance, Balance::new(d("1"), d("1")));
+
+        let sell = venue.open_order(sell_request("1", market_prices("110")));
+        assert_eq!(filled_balance(&sell).balance, Balance::new(d("0"), d("0")));
+        // 899.9 + (110 - 0.11 fee)
+        assert_eq!(
+            filled_received(&sell).balance,
+            Balance::new(d("1009.79"), d("1009.79"))
+        );
+
+        let fees = filled_trade(&buy).fees.fees + filled_trade(&sell).fees.fees;
+        assert_eq!(
+            d("1009.79") - d("1000"),
+            d("10") - fees,
+            "quote moves by the realised PnL less the fees the trades report"
+        );
+    }
+
+    /// The asset a fill receives is created at zero if the account never held it, so a backtest
+    /// funds only what its first order pays with.
+    #[test]
+    fn a_buy_creates_the_base_balance_the_account_never_held() {
+        let mut venue = SimulatedVenue::new(
+            &config_from_balances(vec![funded(quote(), d("1000"))], FeeModelConfig::default()),
+            spot_instruments(),
+        );
+
+        let buy = venue.open_order(buy_request("2", market_prices("100")));
+        let received = filled_received(&buy);
+        assert_eq!(received.asset, base());
+        assert_eq!(received.balance, Balance::new(d("2"), d("2")));
+
+        let sell = venue.open_order(sell_request("2", market_prices("100")));
+        assert!(
+            sell.response.state.is_accepted(),
+            "the base the buy received can be sold: {:?}",
+            sell.response.state
+        );
+        assert_eq!(filled_balance(&sell).balance, Balance::new(d("0"), d("0")));
+        assert_eq!(
+            filled_received(&sell).balance,
+            Balance::new(d("1000"), d("1000"))
+        );
+    }
+
+    /// A per-unit commission, as a broker charges on shares, is a quote amount, so a sell pays it
+    /// out of its proceeds rather than in base converted at the price.
+    #[test]
+    fn a_per_unit_commission_on_a_spot_sell_comes_out_of_the_proceeds() {
+        let fee_model = FeeModelConfig::PerContract(PerContractFeeModel {
+            commission_per_contract: d("0.5"),
+        });
+        let mut venue = make_venue_with_fee("10", "0", fee_model);
+
+        let sell = venue.open_order(sell_request("2", market_prices("100")));
+
+        assert_eq!(filled_trade(&sell).fees.fees, d("1"));
+        assert_eq!(filled_balance(&sell).balance, Balance::new(d("8"), d("8")));
+        assert_eq!(
+            filled_received(&sell).balance,
+            Balance::new(d("199"), d("199"))
+        );
+    }
+
+    /// A sell whose fee exceeds its proceeds takes the excess from quote, and is refused with
+    /// nothing moved when quote cannot cover it.
+    #[test]
+    fn a_sell_whose_fee_exceeds_its_proceeds_needs_the_excess_in_quote() {
+        let fee_model = FeeModelConfig::PerContract(PerContractFeeModel {
+            commission_per_contract: d("2"),
+        });
+
+        // Proceeds 1 * 1 = 1, fee 2: the sell owes 1 quote on top of the base it delivers.
+        let mut short_of_quote = make_venue_with_fee("10", "0", fee_model);
+        let refused = short_of_quote.open_order(sell_request("1", market_prices("1")));
+        match refused.response.state {
+            OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                ApiError::BalanceInsufficient(Some(asset), _),
+            ))) => assert_eq!(asset, quote(), "the asset short is quote, not base"),
+            other => panic!("expected BalanceInsufficient, got: {other:?}"),
+        }
+        assert!(refused.events.is_empty(), "a refusal moves nothing");
+        assert_eq!(
+            short_of_quote.account.balance_mut(&base()).unwrap().balance,
+            Balance::new(d("10"), d("10"))
+        );
+
+        let mut covered = make_venue_with_fee("10", "5", fee_model);
+        let filled = covered.open_order(sell_request("1", market_prices("1")));
+        assert_eq!(
+            filled_balance(&filled).balance,
+            Balance::new(d("9"), d("9"))
+        );
+        assert_eq!(
+            filled_received(&filled).balance,
+            Balance::new(d("4"), d("4"))
+        );
+    }
+
+    /// The same sell resting: its hold is the base it delivers, so when it crosses with quote
+    /// unable to cover the excess fee it is cancelled, releasing the base, rather than filled.
+    #[test]
+    fn a_resting_sell_whose_fee_exceeds_its_proceeds_is_cancelled_when_quote_cannot_cover() {
+        let fee_model = FeeModelConfig::PerContract(PerContractFeeModel {
+            commission_per_contract: d("2"),
+        });
+        let mut venue = make_market_venue_with("10", "0", fee_model, SimFillConfig::default());
+        advance(&mut venue, time(1));
+        assert!(
+            venue
+                .apply_market(
+                    &instrument_name(),
+                    book("0.5", "0.6"),
+                    MarketDepth::UNKNOWN,
+                    time(1)
+                )
+                .is_empty()
+        );
+
+        let rested = venue.open_order(limit_request("s", Side::Sell, "1", "1", gtc()));
+        assert_eq!(rested.events.len(), 1, "a 0.5 bid does not reach 1");
+        assert_eq!(
+            balance_of(&rested.events[0]).balance,
+            Balance::new(d("10"), d("9"))
+        );
+
+        advance(&mut venue, time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("1.1", "1.2"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
+
+        let [released, cancelled] = events.as_slice() else {
+            panic!("expected the released hold, then the cancel: {events:?}");
+        };
+        assert_eq!(balance_of(released).balance, Balance::new(d("10"), d("10")));
+        assert!(
+            matches!(
+                order_of(cancelled).state,
+                OrderState::Inactive(InactiveOrderState::Cancelled(_))
+            ),
+            "{:?}",
+            order_of(cancelled).state
+        );
+        assert!(venue.trades(time(0)).is_empty(), "nothing traded");
+    }
+
+    /// When quote can cover the excess fee, the same resting sell fills: its base hold is released
+    /// and the fill settled afresh, still restating each asset once.
+    #[test]
+    fn a_resting_sell_whose_fee_exceeds_its_proceeds_fills_when_quote_covers_it() {
+        let fee_model = FeeModelConfig::PerContract(PerContractFeeModel {
+            commission_per_contract: d("2"),
+        });
+        let mut venue = make_market_venue_with("10", "5", fee_model, SimFillConfig::default());
+        advance(&mut venue, time(1));
+        assert!(
+            venue
+                .apply_market(
+                    &instrument_name(),
+                    book("0.5", "0.6"),
+                    MarketDepth::UNKNOWN,
+                    time(1)
+                )
+                .is_empty()
+        );
+        let rested = venue.open_order(limit_request("s", Side::Sell, "1", "1", gtc()));
+        assert_eq!(rested.events.len(), 1, "a 0.5 bid does not reach 1");
+
+        advance(&mut venue, time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("1.1", "1.2"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
+
+        assert_eq!(
+            events.len(),
+            4,
+            "the base paid, the quote received, the trade, then the terminal order"
+        );
+        assert_eq!(balance_of(&events[0]).balance, Balance::new(d("9"), d("9")));
+        // 5 + proceeds of 1 - the fee of 2.
+        assert_eq!(balance_of(&events[1]).balance, Balance::new(d("4"), d("4")));
+        assert_eq!(trade_of(&events[2]).fees.fees, d("2"));
+        assert!(
+            matches!(
+                order_of(&events[3]).state,
+                OrderState::Inactive(InactiveOrderState::FullyFilled(_))
+            ),
+            "{:?}",
+            order_of(&events[3]).state
+        );
+    }
+
+    // --- SpotFeeAsset::Received: a buy's fee comes out of the base it receives -----------------
+
+    fn received(mut venue: SimulatedVenue) -> SimulatedVenue {
+        venue.spot_fee_asset = SpotFeeAsset::Received;
+        venue
+    }
+
+    /// A buy pays its notional alone, and receives its quantity less the fee converted to base at
+    /// the fill price. The fill reports that base fee, with the quote fee it came from.
+    #[test]
+    fn received_takes_a_buys_fee_from_the_base_it_receives() {
+        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel::new(d("0.001")));
+        let mut venue = received(make_venue_with_fee("0", "10000", fee_model));
+
+        // Notional 10 * 100 = 1000, fee 1 quote = 0.01 base.
+        let outcome = venue.open_order(buy_request("10", market_prices("100")));
+
+        assert_eq!(
+            filled_balance(&outcome).balance,
+            Balance::new(d("9000"), d("9000"))
+        );
+        assert_eq!(filled_received(&outcome).asset, base());
+        assert_eq!(
+            filled_received(&outcome).balance,
+            Balance::new(d("9.99"), d("9.99"))
+        );
+        assert_eq!(
+            filled_trade(&outcome).fees,
+            AssetFees::new(base(), d("0.01"), Some(d("1")))
+        );
+    }
+
+    /// A sell's fee is in quote, out of its proceeds, under either rule.
+    #[test]
+    fn received_takes_a_sells_fee_from_its_proceeds() {
+        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel::new(d("0.001")));
+        let mut venue = received(make_venue_with_fee("10", "0", fee_model));
+
+        let outcome = venue.open_order(sell_request("1", market_prices("100")));
+
+        assert_eq!(
+            filled_balance(&outcome).balance,
+            Balance::new(d("9"), d("9"))
+        );
+        assert_eq!(
+            filled_received(&outcome).balance,
+            Balance::new(d("99.9"), d("99.9"))
+        );
+        assert_eq!(
+            filled_trade(&outcome).fees,
+            AssetFees::new(quote(), d("0.1"), Some(d("0.1")))
+        );
+    }
+
+    /// A buy whose base fee exceeds its quantity takes the excess from base, and is refused with
+    /// nothing moved when base cannot cover it.
+    #[test]
+    fn a_received_buy_whose_fee_exceeds_its_quantity_needs_the_excess_in_base() {
+        let fee_model = FeeModelConfig::PerContract(PerContractFeeModel {
+            commission_per_contract: d("2"),
+        });
+
+        // Notional 1 * 1 = 1, fee 2 quote = 2 base: the buy owes 1 base on top of the 1 it receives.
+        let mut short_of_base = received(make_venue_with_fee("0", "10", fee_model));
+        let refused = short_of_base.open_order(buy_request("1", market_prices("1")));
+        match refused.response.state {
+            OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                ApiError::BalanceInsufficient(Some(asset), _),
+            ))) => assert_eq!(asset, base(), "the asset short is base, not quote"),
+            other => panic!("expected BalanceInsufficient, got: {other:?}"),
+        }
+        assert!(refused.events.is_empty(), "a refusal moves nothing");
+        assert_eq!(
+            short_of_base.account.balance_mut(&quote()).unwrap().balance,
+            Balance::new(d("10"), d("10"))
+        );
+
+        let mut covered = received(make_venue_with_fee("5", "10", fee_model));
+        let filled = covered.open_order(buy_request("1", market_prices("1")));
+        assert_eq!(
+            filled_balance(&filled).balance,
+            Balance::new(d("9"), d("9"))
+        );
+        assert_eq!(
+            filled_received(&filled).balance,
+            Balance::new(d("4"), d("4"))
+        );
+    }
+
+    /// A resting buy holds its notional alone, since its fee comes out of the base it receives,
+    /// and its fill settles exactly what it held.
+    #[test]
+    fn a_resting_received_buy_holds_only_its_notional() {
+        let fee_model = FeeModelConfig::Percentage(PercentageFeeModel::new(d("0.001")));
+        let mut venue = received(make_market_venue_with(
+            "0",
+            "10000",
+            fee_model,
+            SimFillConfig::default(),
+        ));
+        advance(&mut venue, time(1));
+        assert!(
+            venue
+                .apply_market(
+                    &instrument_name(),
+                    book("101", "102"),
+                    MarketDepth::UNKNOWN,
+                    time(1)
+                )
+                .is_empty()
+        );
+
+        let rested = venue.open_order(limit_request("b", Side::Buy, "10", "100", gtc()));
+        assert_eq!(rested.events.len(), 1, "a 102 ask does not reach 100");
+        assert_eq!(
+            balance_of(&rested.events[0]).balance,
+            Balance::new(d("10000"), d("9000"))
+        );
+
+        advance(&mut venue, time(2));
+        let events = venue.apply_market(
+            &instrument_name(),
+            book("98", "99"),
+            MarketDepth::UNKNOWN,
+            time(2),
+        );
+
+        assert_eq!(
+            events.len(),
+            4,
+            "the quote paid, the base received, the trade, then the terminal order"
+        );
+        assert_eq!(
+            balance_of(&events[0]).balance,
+            Balance::new(d("9000"), d("9000"))
+        );
+        assert_eq!(
+            balance_of(&events[1]).balance,
+            Balance::new(d("9.99"), d("9.99"))
+        );
+        assert_eq!(
+            trade_of(&events[2]).fees,
+            AssetFees::new(base(), d("0.01"), Some(d("1")))
+        );
+    }
+
+    /// A fee cannot be converted to base at a price that is not positive, so such a buy is
+    /// charged in quote, as under the default rule.
+    #[test]
+    fn a_received_buy_at_a_zero_price_is_charged_in_quote() {
+        let fee_model = FeeModelConfig::PerContract(PerContractFeeModel {
+            commission_per_contract: d("1"),
+        });
+        let mut venue = received(make_venue_with_fee("0", "10", fee_model));
+
+        let outcome = venue.open_order(buy_request("1", market_prices("0")));
+
+        assert_eq!(
+            filled_balance(&outcome).balance,
+            Balance::new(d("9"), d("9"))
+        );
+        assert_eq!(
+            filled_received(&outcome).balance,
+            Balance::new(d("1"), d("1"))
+        );
+        assert_eq!(filled_trade(&outcome).fees.asset, quote());
     }
 
     #[test]
@@ -4405,7 +5320,7 @@ mod tests {
 
     /// A Market order the venue cannot price is rejected, not panicked on.
     ///
-    /// A Market order carries no limit price of its own to fall back on, so with no usable
+    /// A Market order has no limit price of its own to fall back on, so with no usable
     /// snapshot there is no price anywhere. This used to hit an `expect`. Because the async driver
     /// runs as a spawned task, that killed the exchange, dropped the request receiver, and turned
     /// every later order into `ExchangeOffline` -- so a backtest ran to completion over the whole
@@ -4441,6 +5356,78 @@ mod tests {
                 usd.balance.free,
                 d("10000000"),
                 "a rejected order must not move the balance (market={market:?})"
+            );
+        }
+    }
+
+    /// A market order carrying a price, as `RequestOpen::price` documents it should not.
+    fn priced_market_order(
+        side: Side,
+        price: &str,
+        market: Option<MarketSnapshot>,
+    ) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
+        let mut request = request(instrument_name(), side, "1", market);
+        request.state.price = Some(d(price));
+        request
+    }
+
+    /// A price on a market order is ignored, as the live clients ignore it, so it is no fallback:
+    /// with nothing to price from, the order is still unpriceable rather than filled at the price
+    /// its sender happened to stamp.
+    ///
+    /// Both regimes can reach the fallback: a request-priced venue sent no usable snapshot, and a
+    /// market-driven venue never fed the instrument.
+    #[test]
+    fn a_market_order_is_never_filled_at_a_price_it_carries() {
+        let mut market_driven = make_market_venue("10", "10000000");
+        advance(&mut market_driven, time(1));
+
+        let cases = [
+            ("request-priced", make_venue("10", "10000000"), None),
+            (
+                "request-priced",
+                make_venue("10", "10000000"),
+                Some(MarketSnapshot::default()),
+            ),
+            ("market-driven", market_driven, None),
+        ];
+
+        for (regime, mut venue, market) in cases {
+            let outcome = venue.open_order(priced_market_order(Side::Buy, "1", market));
+
+            assert!(
+                matches!(
+                    outcome.response.state,
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(
+                        UnindexedOrderError::Rejected(ApiError::OrderRejected(_))
+                    ))
+                ),
+                "expected the unpriceable rejection, got {:?} ({regime}, market={market:?})",
+                outcome.response.state
+            );
+            assert!(
+                outcome.events.is_empty(),
+                "nothing filled ({regime}, market={market:?})"
+            );
+        }
+    }
+
+    /// Nor does a price on a market order bound its fill, as a limit would.
+    #[test]
+    fn a_market_order_is_not_clamped_by_a_price_it_carries() {
+        for (side, stray) in [(Side::Buy, "90"), (Side::Sell, "110")] {
+            let mut venue = make_venue("10", "10000000");
+            let market = Some(MarketSnapshot {
+                last_price: Some(d("100")),
+                ..MarketSnapshot::default()
+            });
+
+            let outcome = venue.open_order(priced_market_order(side, stray, market));
+
+            assert_eq!(
+                filled_trade(&outcome).price,
+                d("100"),
+                "a {side:?} fills at the market, not clamped to its stray {stray}"
             );
         }
     }
@@ -4762,7 +5749,7 @@ mod tests {
     #[test]
     fn a_limit_order_is_rejected_before_a_fill_model_is_consulted() {
         let mut venue = make_venue("100", "10000000");
-        venue.fill_model = SimFillConfig::Midpoint(crate::fill::MidpointFillModel);
+        venue.fill_model = Arc::new(SimFillConfig::Midpoint(crate::fill::MidpointFillModel));
 
         let mut request = buy_request("1", market_prices("50000"));
         request.state.kind = OrderKind::Limit;
@@ -4874,11 +5861,11 @@ mod tests {
 
         assert_eq!(
             events.len(),
-            3,
-            "one filled order owes a balance, a trade and a terminal order snapshot"
+            4,
+            "one filled spot order owes two balances, a trade and a terminal order snapshot"
         );
 
-        let trade = trade_of(&events[1]);
+        let trade = trade_of(&events[2]);
         assert_eq!(
             trade.price,
             d("48000"),
@@ -4892,7 +5879,7 @@ mod tests {
         );
 
         assert_eq!(
-            filled_price(order_of(&events[2])),
+            filled_price(order_of(&events[3])),
             d("48000"),
             "the terminal snapshot reports the same price as the trade"
         );
@@ -4912,20 +5899,25 @@ mod tests {
             time(2),
         );
 
-        assert!(
-            matches!(events[0].kind, AccountEventKind::BalanceSnapshot(_)),
-            "the balance the fill paid with comes first, got: {:?}",
-            events[0].kind
+        assert_eq!(
+            balance_of(&events[0]).asset,
+            quote(),
+            "the balance the fill paid with comes first"
+        );
+        assert_eq!(
+            balance_of(&events[1]).asset,
+            base(),
+            "then the balance it received"
         );
         assert!(
-            matches!(events[1].kind, AccountEventKind::Trade(_)),
+            matches!(events[2].kind, AccountEventKind::Trade(_)),
             "then the trade, got: {:?}",
-            events[1].kind
+            events[2].kind
         );
         assert!(
-            matches!(events[2].kind, AccountEventKind::OrderSnapshot(_)),
+            matches!(events[3].kind, AccountEventKind::OrderSnapshot(_)),
             "and only then the order it terminated, got: {:?}",
-            events[2].kind
+            events[3].kind
         );
     }
 
@@ -4945,11 +5937,11 @@ mod tests {
 
         assert!(
             matches!(
-                order_of(&events[2]).state,
+                order_of(&events[3]).state,
                 OrderState::Inactive(InactiveOrderState::FullyFilled(_))
             ),
             "got: {:?}",
-            order_of(&events[2]).state
+            order_of(&events[3]).state
         );
         assert!(
             venue.orders_open(&[]).is_empty(),
@@ -4957,8 +5949,8 @@ mod tests {
         );
     }
 
-    /// Reserve exactly what will be settled: the client sees one balance restatement per fill, and
-    /// never a balance the account did not hold.
+    /// Reserve exactly what will be settled: the client sees one restatement per asset a fill
+    /// moves, and never a balance the account did not hold.
     #[test]
     fn a_resting_order_settles_exactly_what_it_reserved() {
         let (mut venue, _) = venue_resting_one_buy("48000");
@@ -5050,11 +6042,11 @@ mod tests {
 
         assert_eq!(
             events.len(),
-            3,
-            "one filled order owes a balance, a trade and a terminal order snapshot"
+            4,
+            "one filled spot order owes two balances, a trade and a terminal order snapshot"
         );
 
-        let trade = trade_of(&events[1]);
+        let trade = trade_of(&events[2]);
         assert_eq!(
             trade.quantity,
             d("0.6"),
@@ -5103,7 +6095,7 @@ mod tests {
             time(2),
         );
 
-        let filled = match &order_of(&events[2]).state {
+        let filled = match &order_of(&events[3]).state {
             OrderState::Inactive(InactiveOrderState::FullyFilled(filled)) => filled,
             other => panic!("expected a fully filled order, got: {other:?}"),
         };
@@ -5170,9 +6162,9 @@ mod tests {
             time(2),
         );
 
-        assert_eq!(events.len(), 3);
+        assert_eq!(events.len(), 4);
         assert_eq!(
-            trade_of(&events[1]).quantity,
+            trade_of(&events[2]).quantity,
             d("0.6"),
             "the cross prints the remainder that was held for"
         );
@@ -5262,8 +6254,12 @@ mod tests {
         // Willing to pay 48000; the offer is 47900, so it prints at the offer.
         let outcome = venue.open_order(limit_request("taker", Side::Buy, "1", "48000", gtc()));
 
-        assert_eq!(outcome.events.len(), 2, "a filled open owes balance, trade");
-        let trade = trade_of(&outcome.events[1]);
+        assert_eq!(
+            outcome.events.len(),
+            3,
+            "a filled open owes both balances, then the trade"
+        );
+        let trade = filled_trade(&outcome);
         assert_eq!(
             trade.price,
             d("47900"),
@@ -5314,7 +6310,7 @@ mod tests {
         let outcome = venue.open_order(limit_request("clamped", Side::Buy, "1", "47100", gtc()));
 
         assert_eq!(
-            trade_of(&outcome.events[1]).price,
+            filled_trade(&outcome).price,
             d("47100"),
             "the model priced it at 48000, which the order never agreed to pay"
         );
@@ -5346,7 +6342,7 @@ mod tests {
                 .is_empty()
         );
         let on_arrival = aggressor.open_order(limit_request("a", Side::Buy, "1", limit, gtc()));
-        let arrival_price = trade_of(&on_arrival.events[1]).price;
+        let arrival_price = filled_trade(&on_arrival).price;
 
         // Rule 2: rested first, crossed later by a book that reaches exactly the same price.
         let mut maker = make_market_venue_with(
@@ -5375,7 +6371,7 @@ mod tests {
             MarketDepth::UNKNOWN,
             time(2),
         );
-        let resting_price = trade_of(&resting_events[1]).price;
+        let resting_price = trade_of(&resting_events[2]).price;
 
         assert_eq!(
             arrival_price,
@@ -5473,8 +6469,8 @@ mod tests {
             time(2),
         );
 
-        assert_eq!(events.len(), 3, "a print through the limit fills it");
-        assert_eq!(trade_of(&events[1]).price, d("48000"));
+        assert_eq!(events.len(), 4, "a print through the limit fills it");
+        assert_eq!(trade_of(&events[2]).price, d("48000"));
     }
 
     /// A price between the two sides of a book crosses neither, so a supplied book is never
@@ -5536,11 +6532,15 @@ mod tests {
             time(2),
         );
 
-        assert_eq!(trade_of(&events[1]).price, d("48000"), "at its own limit");
+        assert_eq!(trade_of(&events[2]).price, d("48000"), "at its own limit");
         let balance = balance_of(&events[0]);
         assert_eq!(balance.asset, base());
-        // 1 BTC delivered, plus the quote fee converted at the limit: 9.6 / 48000.
-        assert_eq!(balance.balance.total, d("10") - d("1") - d("0.0002"));
+        // 1 BTC delivered, and nothing more: the fee is charged in quote.
+        assert_eq!(balance.balance.total, d("10") - d("1"));
+        let received = balance_of(&events[1]);
+        assert_eq!(received.asset, quote());
+        // 1 BTC at its 48000 limit, less the 2bp maker fee of 9.6.
+        assert_eq!(received.balance.total, d("1000000") + d("48000") - d("9.6"));
     }
 
     /// A maker rebate is a negative fee, so the amount held is less than the notional and settling
@@ -5585,7 +6585,7 @@ mod tests {
             d("1000000") - held,
             "and exactly that less is settled, so the rebate is kept"
         );
-        assert_eq!(trade_of(&events[1]).fees.fees, d("-4.8"));
+        assert_eq!(trade_of(&events[2]).fees.fees, d("-4.8"));
     }
 
     /// An order the account cannot afford never reaches the book, and the ledger is untouched.
@@ -5674,7 +6674,7 @@ mod tests {
             MarketDepth::UNKNOWN,
             time(2),
         );
-        assert_eq!(events.len(), 3, "the order filled first");
+        assert_eq!(events.len(), 4, "the order filled first");
 
         let outcome = venue.cancel_order(OrderEvent {
             key: OrderKey {
@@ -6490,8 +7490,12 @@ mod tests {
 
         let outcome = venue.open_order(buy_request("1", None));
 
-        assert_eq!(outcome.events.len(), 2, "a fill owes balance, then trade");
-        let trade = trade_of(&outcome.events[1]);
+        assert_eq!(
+            outcome.events.len(),
+            3,
+            "a fill owes both balances, then the trade"
+        );
+        let trade = filled_trade(&outcome);
         assert_eq!(
             trade.quantity,
             d("0.4"),
@@ -6536,7 +7540,7 @@ mod tests {
         ));
 
         assert_eq!(
-            trade_of(&ioc.events[1]).quantity,
+            filled_trade(&ioc).quantity,
             d("0.4"),
             "immediate-or-cancel keeps what the book could give it"
         );
@@ -6565,11 +7569,11 @@ mod tests {
 
         assert_eq!(
             outcome.events.len(),
-            2,
-            "one arrival restates one balance and prints one trade, even settling and holding at \
-             once"
+            3,
+            "one arrival restates each asset once and prints one trade, even settling and holding \
+             at once"
         );
-        let trade = trade_of(&outcome.events[1]);
+        let trade = filled_trade(&outcome);
         assert_eq!(trade.quantity, d("0.4"));
         assert_eq!(
             trade.price,
@@ -6594,6 +7598,39 @@ mod tests {
         );
     }
 
+    /// The sell side of the same arrival: it pays with base and receives quote, so the base it
+    /// settles and the base it holds for the remainder are one commitment, and the quote it
+    /// receives for the part that traded funds neither.
+    #[test]
+    fn a_capped_spot_sell_settles_and_holds_base_and_receives_quote_for_what_traded() {
+        let mut venue = venue_offering(sized("0.4"));
+
+        let outcome = venue.open_order(limit_request("split", Side::Sell, "1", "47700", gtc()));
+
+        assert_eq!(
+            outcome.events.len(),
+            3,
+            "the base paid, the quote received, then the trade"
+        );
+        let trade = filled_trade(&outcome);
+        assert_eq!(trade.quantity, d("0.4"));
+        assert_eq!(trade.price, d("47800"), "the part that traded took the bid");
+
+        // 0.4 delivered, 0.6 held for the remainder resting at its 47700 limit.
+        let paid = filled_balance(&outcome);
+        assert_eq!(paid.asset, base());
+        assert_eq!(paid.balance, Balance::new(d("9.6"), d("9")));
+
+        // 0.4 at 47800 is 19120, less the 10bp taker fee of 19.12.
+        let received = filled_received(&outcome);
+        assert_eq!(received.asset, quote());
+        assert_eq!(
+            received.balance,
+            Balance::new(d("1019100.88"), d("1019100.88"))
+        );
+        assert_eq!(rested_open(&outcome).quantity_remaining(d("1")), d("0.6"));
+    }
+
     /// An order that fills in part, rests, and is later crossed settles exactly the remainder --
     /// twice in total, summing to the original, with no third restatement.
     #[test]
@@ -6601,7 +7638,7 @@ mod tests {
         let mut venue = venue_offering(sized("0.4"));
 
         let arrival = venue.open_order(limit_request("split", Side::Buy, "1", "48000", gtc()));
-        let taker = trade_of(&arrival.events[1]).clone();
+        let taker = filled_trade(&arrival).clone();
 
         // The market reaches what is resting.
         let fills = venue.apply_market(
@@ -6610,8 +7647,12 @@ mod tests {
             MarketDepth::UNKNOWN,
             time(2),
         );
-        assert_eq!(fills.len(), 3, "a resting fill owes balance, trade, order");
-        let maker = trade_of(&fills[1]);
+        assert_eq!(
+            fills.len(),
+            4,
+            "a resting fill owes both balances, the trade, the order"
+        );
+        let maker = trade_of(&fills[2]);
 
         assert_eq!(maker.quantity, d("0.6"), "only the remainder crosses");
         assert_eq!(
@@ -6656,7 +7697,7 @@ mod tests {
             "48000",
             TimeInForce::ImmediateOrCancel,
         ));
-        assert_eq!(trade_of(&first.events[1]).quantity, d("0.6"));
+        assert_eq!(filled_trade(&first).quantity, d("0.6"));
 
         let second = venue.open_order(limit_request(
             "second",
@@ -6666,7 +7707,7 @@ mod tests {
             TimeInForce::ImmediateOrCancel,
         ));
         assert_eq!(
-            trade_of(&second.events[1]).quantity,
+            filled_trade(&second).quantity,
             d("0.4"),
             "the offer was displayed once, so the two of them share it"
         );
@@ -6696,7 +7737,7 @@ mod tests {
             "48000",
             TimeInForce::ImmediateOrCancel,
         ));
-        assert_eq!(trade_of(&taken.events[1]).quantity, d("0.6"));
+        assert_eq!(filled_trade(&taken).quantity, d("0.6"));
 
         assert!(
             venue
@@ -6717,7 +7758,7 @@ mod tests {
             TimeInForce::ImmediateOrCancel,
         ));
         assert_eq!(
-            trade_of(&after.events[1]).quantity,
+            filled_trade(&after).quantity,
             d("1"),
             "the fresh observation offers a whole unit again"
         );
@@ -6737,7 +7778,7 @@ mod tests {
         ));
 
         assert_eq!(
-            trade_of(&outcome.events[1]).quantity,
+            filled_trade(&outcome).quantity,
             d("5"),
             "an absent size caps nothing, however large the order"
         );
@@ -6771,7 +7812,7 @@ mod tests {
         let affordable =
             uncapped.open_order(limit_request("whole", Side::Buy, "1", "48000", gtc()));
         assert_eq!(
-            trade_of(&affordable.events[1]).quantity,
+            filled_trade(&affordable).quantity,
             d("1"),
             "uncapped, this very order is affordable and fills outright"
         );
@@ -7105,8 +8146,8 @@ mod tests {
         );
         assert_eq!(
             events.len(),
-            6,
-            "two fills, each a balance, a trade and an order"
+            8,
+            "two fills, each two balances, a trade and an order"
         );
 
         let ended = venue.orders_ended(&[key_of("resting"), key_of("part_filled")]);
@@ -7722,6 +8763,30 @@ mod tests {
         assert!(venue.orders_open(&[]).is_empty());
     }
 
+    /// A delisting time at or before the clock refuses the short even when the provider still
+    /// calls the instrument shortable; one still ahead does not.
+    #[test]
+    fn a_short_at_or_after_the_delisting_time_is_refused_and_one_before_it_is_not() {
+        let delisted = Shortability::new()
+            .with_shortable(true)
+            .with_delisting_at(time(1));
+        let mut venue = make_cfd_venue_lending(lending(delisted));
+
+        let outcome = open_cfd(&mut venue, Side::Sell, "1");
+
+        let reject = borrow_rejection(&outcome);
+        assert_eq!(reject.reason, BorrowRejectReason::NotShortable);
+        assert!(reject.message.contains("delisted"), "{}", reject.message);
+        assert_eq!(cfd_position(&venue), None);
+
+        let ahead = Shortability::new()
+            .with_shortable(true)
+            .with_delisting_at(time(2));
+        let mut venue = make_cfd_venue_lending(lending(ahead));
+        cfd_market_fill(&mut venue, Side::Sell, "1");
+        assert!(cfd_position(&venue).is_some(), "not delisted yet");
+    }
+
     #[test]
     fn a_buy_and_a_sell_that_only_reduces_a_long_are_never_refused() {
         let mut venue = make_cfd_venue_lending(lending(Shortability::new().with_shortable(false)));
@@ -7880,7 +8945,7 @@ mod tests {
                 time(0),
                 time(10),
             ));
-        venue.fill_model = SimFillConfig::Midpoint(crate::fill::MidpointFillModel);
+        venue.fill_model = Arc::new(SimFillConfig::Midpoint(crate::fill::MidpointFillModel));
 
         let outcome = open_cfd(&mut venue, Side::Sell, "1");
 
@@ -7940,7 +9005,7 @@ mod tests {
     /// judges a bid it could not fill against.
     #[test]
     fn a_restricted_short_with_no_price_is_refused_as_unpriceable() {
-        let reason_of = |fill_model, market| {
+        let reason_of = |fill_model: SimFillConfig, market| {
             let mut venue = make_cfd_venue("10000000", FeeModelConfig::default())
                 .with_shortability(Arc::new(
                     ShortabilityTable::new().with_short_sale_restriction(
@@ -7949,7 +9014,7 @@ mod tests {
                         time(10),
                     ),
                 ));
-            venue.fill_model = fill_model;
+            venue.fill_model = Arc::new(fill_model);
             advance(&mut venue, time(1));
             match venue
                 .open_order(cfd_request(Side::Sell, "1", market))

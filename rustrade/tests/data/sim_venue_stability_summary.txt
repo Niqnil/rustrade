@@ -7,6 +7,7 @@ TradingSummary {
         ): TearSheet {
             pnl: 0,
             carry: 0,
+            fees_unattributed: 0,
             pnl_return: RateOfReturn {
                 value: 0,
                 interval: Daily,
@@ -43,6 +44,7 @@ TradingSummary {
         ): TearSheet {
             pnl: 0,
             carry: 0,
+            fees_unattributed: 0,
             pnl_return: RateOfReturn {
                 value: 0,
                 interval: Daily,
@@ -79,6 +81,7 @@ TradingSummary {
         ): TearSheet {
             pnl: 0,
             carry: 0,
+            fees_unattributed: 0,
             pnl_return: RateOfReturn {
                 value: 0,
                 interval: Daily,
@@ -120,9 +123,10 @@ TradingSummary {
         }: TearSheetAsset {
             balance_end: Some(
                 Balance {
-                    total: 0.1,
-                    free: 0.1,
+                    total: 0.11329000,
+                    free: 0.11329000,
                     margin: None,
+                    accrued: None,
                 },
             ),
             drawdown: None,
@@ -137,9 +141,10 @@ TradingSummary {
         }: TearSheetAsset {
             balance_end: Some(
                 Balance {
-                    total: 1,
-                    free: 1,
+                    total: 1.013,
+                    free: 1.013,
                     margin: None,
+                    accrued: None,
                 },
             ),
             drawdown: None,
@@ -154,9 +159,10 @@ TradingSummary {
         }: TearSheetAsset {
             balance_end: Some(
                 Balance {
-                    total: 10,
-                    free: 10,
+                    total: 10.013,
+                    free: 10.013,
                     margin: None,
+                    accrued: None,
                 },
             ),
             drawdown: None,
@@ -171,30 +177,31 @@ TradingSummary {
         }: TearSheetAsset {
             balance_end: Some(
                 Balance {
-                    total: 8687.581287327198174975737838,
-                    free: 8687.581287327198174975737838,
+                    total: 8752.620955751240570565507677,
+                    free: 8752.620955751240570565507677,
                     margin: None,
+                    accrued: None,
                 },
             ),
             drawdown: Some(
                 Drawdown {
-                    value: 0.1312418712672801825024262162,
+                    value: 0.1247379044248759429434492323,
                     time_start: 2025-03-25T23:07:00.715Z,
-                    time_end: 2025-03-25T23:08:24.199491154Z,
+                    time_end: 2025-03-25T23:08:24.199258219Z,
                 },
             ),
             drawdown_mean: Some(
                 MeanDrawdown {
-                    mean_drawdown: 0.1312418712672801825024262162,
+                    mean_drawdown: 0.1247379044248759429434492323,
                     mean_drawdown_ms: 83484,
                 },
             ),
             drawdown_max: Some(
                 MaxDrawdown(
                     Drawdown {
-                        value: 0.1312418712672801825024262162,
+                        value: 0.1247379044248759429434492323,
                         time_start: 2025-03-25T23:07:00.715Z,
-                        time_end: 2025-03-25T23:08:24.199491154Z,
+                        time_end: 2025-03-25T23:08:24.199258219Z,
                     },
                 ),
             ),

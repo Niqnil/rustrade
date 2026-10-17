@@ -20,7 +20,10 @@ use crate::{
                 filter::InstrumentFilter,
             },
             order::{Orders, in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
-            position::{Position, PositionDrift, PositionExited, PositionId, SplitRoundingPolicy},
+            position::{
+                Position, PositionDrift, PositionExited, PositionId, SplitRoundingPolicy,
+                TradeOutcome,
+            },
             trading::TradingState,
         },
     },
@@ -806,11 +809,12 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 "settlement trade must carry zero fees before update_from_trade_with_id"
             );
             let contract_size = instrument_state.instrument.kind.contract_size();
-            if let Some(exit) = instrument_state.position.update_from_trade_with_id(
-                &settlement_trade,
-                &pos_id,
-                contract_size,
-            ) {
+            // A settlement closes an open position and carries no fee, so nothing here is left
+            // unapplied with a fee to book.
+            if let TradeOutcome::Applied { exited: Some(exit) } = instrument_state
+                .position
+                .update_from_trade_with_id(&settlement_trade, &pos_id, contract_size)
+            {
                 instrument_state.tear_sheet.update_from_position(&exit);
                 exited.push(EngineOutput::PositionExit(exit));
             }

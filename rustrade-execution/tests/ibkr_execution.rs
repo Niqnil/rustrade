@@ -67,6 +67,9 @@
 //! | `test_place_moo_order_premarket` | Market-on-Open (timing-sensitive) |
 //! | `test_place_loo_order_premarket` | Limit-on-Open (timing-sensitive) |
 //! | `test_orders_found_by_client_order_id_across_a_restart` | Snapshot orders, adoption after a restart, ended-order lookup |
+//! | `test_account_values_raw` | Print every account summary tag and account update value, and the positions. Asserts nothing |
+//! | `test_open_paper_short` | Sell `IBKR_SHORT_QTY` (default 100) of `IBKR_SHORT_SYMBOL` (default AAPL) at market. Regular trading hours only |
+//! | `test_close_paper_short` | Buy the same back at market. Regular trading hours only |
 //!
 //! ## Tier 1: Market Data
 //!
@@ -83,8 +86,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)] // Integration tests: panics are the correct failure mode
 
 use ibapi::{
+    accounts::{AccountSummaryResult, AccountSummaryTags, AccountUpdate, types::AccountId},
     contracts::{Contract, Currency, Exchange, SecurityType, Symbol},
     market_data::{MarketDataType, realtime::generic_tick},
+    subscriptions::SubscriptionItem,
 };
 use rust_decimal_macros::dec;
 use rustrade_execution::{
@@ -366,8 +371,14 @@ async fn test_fetch_balances() {
     println!("Fetched {} balance(s)", balances.len());
     for balance in &balances {
         println!(
-            "  {}: total={}, free={}",
-            balance.asset, balance.balance.total, balance.balance.free
+            "  {}: total={}, free={}, accrued={:?}",
+            balance.asset, balance.balance.total, balance.balance.free, balance.balance.accrued
+        );
+        // One balance per currency held: the ledger's BASE row is a conversion, not a currency.
+        assert_ne!(balance.asset.as_ref(), "BASE", "{balance:?}");
+        assert!(
+            balance.balance.free <= balance.balance.total,
+            "free is capped at total: {balance:?}"
         );
     }
 }
@@ -1928,11 +1939,9 @@ async fn test_orders_found_by_client_order_id_across_a_restart() {
     };
     assert_eq!(cancelled.filled_quantity, Some(rust_decimal::Decimal::ZERO));
 
-    // A restart: a new client under the same API client id, which has never seen the order. The
-    // socket closes only when the last handle to the client goes, and IB then takes a moment to
-    // release the id.
+    // A restart: a new client under the same API client id, which has never seen the order.
+    // `disconnect` closes the socket, and IB then takes a moment to release the id.
     client.disconnect();
-    drop(client);
     let mut restarted = Err(String::new());
     for _ in 0..15 {
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -2011,6 +2020,163 @@ async fn test_orders_found_by_client_order_id_across_a_restart() {
             .expect("fetch_ended_orders failed")
             .is_empty()
     );
+}
+
+// ============================================================================
+// Account Value Tests — Tier 0: Paper Account Only (FREE)
+// ============================================================================
+
+/// Print every item `next` (a subscription's `next_timeout`) hands out until `is_end` says the
+/// listing is complete, or it falls silent for 10 s.
+fn print_until_end<T: std::fmt::Debug>(
+    label: &str,
+    next: impl Fn(Duration) -> Option<Result<SubscriptionItem<T>, ibapi::Error>>,
+    is_end: impl Fn(&T) -> bool,
+) {
+    while let Some(item) = next(Duration::from_secs(10)) {
+        match item {
+            Ok(SubscriptionItem::Data(data)) if is_end(&data) => return,
+            Ok(item) => println!("{label}: {item:?}"),
+            Err(e) => {
+                println!("{label}: error {e}");
+                return;
+            }
+        }
+    }
+    println!("{label}: no end of the listing within 10 s");
+}
+
+/// Prints every tag IB's account summary sends, `$LEDGER:ALL` included, then every value and
+/// position the account updates send, so which source carries which figure, and its sign, can be
+/// read off. Asserts nothing.
+#[test]
+#[ignore]
+#[serial]
+fn test_account_values_raw() {
+    init_logging();
+
+    let config = test_config(27);
+    let client = ibapi::client::blocking::Client::connect(
+        &format!("{}:{}", config.host, config.port),
+        config.client_id,
+    )
+    .expect("connection failed");
+    let account = AccountId(config.account);
+
+    let summary = client
+        .account_summary(&"All".into(), AccountSummaryTags::ALL)
+        .expect("account_summary failed");
+    print_until_end(
+        "summary",
+        |wait| summary.next_timeout(wait),
+        |item| matches!(item, AccountSummaryResult::End),
+    );
+    summary.cancel();
+
+    let updates = client
+        .account_updates(&account)
+        .expect("account_updates failed");
+    print_until_end(
+        "update",
+        |wait| updates.next_timeout(wait),
+        |item| matches!(item, AccountUpdate::End),
+    );
+    updates.cancel();
+}
+
+/// The stock and quantity [`test_open_paper_short`] and [`test_close_paper_short`] trade.
+fn paper_short() -> (String, rust_decimal::Decimal) {
+    let symbol = std::env::var("IBKR_SHORT_SYMBOL").unwrap_or_else(|_| "AAPL".to_string());
+    let quantity = std::env::var("IBKR_SHORT_QTY")
+        .map(|qty| qty.parse().expect("IBKR_SHORT_QTY is not a number"))
+        .unwrap_or(dec!(100));
+    (symbol, quantity)
+}
+
+/// Place a market order for the [`paper_short`] stock, then print the position once IB has had a
+/// few seconds to fill it.
+async fn fill_paper_short_order(side: Side, client_id_offset: i32) {
+    init_logging();
+
+    let (symbol, quantity) = paper_short();
+    let config = test_config(client_id_offset).with_contracts(vec![ContractConfig {
+        name: symbol.clone(),
+        symbol: symbol.clone(),
+        security_type: "STK".to_string(),
+        exchange: "SMART".to_string(),
+        currency: "USD".to_string(),
+        last_trade_date: None,
+        strike: None,
+        right: None,
+    }]);
+    let client = connect_client(config).await.expect("connection failed");
+    let instrument = InstrumentNameExchange::from(symbol.as_str());
+    let strategy = StrategyId::new("paper-short");
+
+    let response = client
+        .open_order(rustrade_execution::order::OrderEvent {
+            key: OrderKey {
+                exchange: ExchangeId::Ibkr,
+                instrument: &instrument,
+                strategy: strategy.clone(),
+                cid: ClientOrderId::new(format!(
+                    "paper-short-{side:?}-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis()
+                )),
+            },
+            state: RequestOpen {
+                side,
+                price: None,
+                quantity,
+                kind: OrderKind::Market,
+                time_in_force: TimeInForce::GoodUntilEndOfDay,
+                position_id: None,
+                reduce_only: false,
+                market: None,
+            },
+        })
+        .await;
+    println!(
+        "{side:?} {quantity} {symbol} at market: {:?}",
+        response.state
+    );
+    assert!(
+        matches!(response.state, OrderState::Active(_)),
+        "{:?}",
+        response.state
+    );
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let snapshot = client
+        .account_snapshot(&[], std::slice::from_ref(&instrument))
+        .await
+        .expect("account_snapshot failed");
+    for instrument in &snapshot.instruments {
+        println!(
+            "{}: position {:?}",
+            instrument.instrument, instrument.position
+        );
+    }
+}
+
+/// Opens a short to hold overnight, so `AccruedCash` can be watched with
+/// [`test_account_values_raw`]. Close it with [`test_close_paper_short`].
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_open_paper_short() {
+    fill_paper_short_order(Side::Sell, 28).await;
+}
+
+/// Closes the short [`test_open_paper_short`] opened.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_close_paper_short() {
+    fill_paper_short_order(Side::Buy, 29).await;
 }
 
 // ============================================================================

@@ -11,8 +11,12 @@ use tracing::warn;
 /// Every figure is net of carry: a closed position counts as its
 /// [`pnl_realised_net`](PositionExited::pnl_realised_net), realised PnL plus carry.
 ///
+/// Raw PnL also counts the fees of fills that opened no position (see
+/// [`Self::fees_unattributed`]). They are a cost of trading the instrument, but belong to no round
+/// trip, so the per-position return statistics leave them out.
+///
 /// Includes tracking of:
-/// - Raw PnL, and the carry included in it.
+/// - Raw PnL, and the carry and unattributed fees included in it.
 /// - Statistical summaries of returns for all closed positions (wins and losses combined)
 /// - Statistical summaries of returns for all losing closed positions (useful for downside risk analysis).
 ///
@@ -25,7 +29,7 @@ use tracing::warn;
 ///   - Can be denominated in any chosen asset for cross-instrument aggregation
 #[derive(Debug, Clone, PartialEq, PartialOrd, Default, Deserialize, Serialize)]
 pub struct PnLReturns {
-    /// Raw PnL, net of carry.
+    /// Raw PnL, net of carry and of [`Self::fees_unattributed`].
     ///
     /// For Instrument PnL, this is most likely denominated in "quote asset" units. For example,
     /// btc_usdt  spot PnL would be in usdt. However, in some derivative cases the
@@ -41,6 +45,18 @@ pub struct PnLReturns {
     /// `#[serde(default)]` so a summary serialised before this field existed still loads.
     #[serde(default)]
     pub carry: Decimal,
+
+    /// Fees of fills that opened no position, already subtracted from `pnl_raw`: positive =
+    /// paid, negative = a rebate received. Each is the fee's quote equivalent, as a position's
+    /// PnL counts one.
+    ///
+    /// A spot buy from flat whose fee the venue took from the base asset it bought, all of it,
+    /// moves no holding, so it has no position to charge the fee to. See
+    /// [`InstrumentState::update_from_trade`](crate::engine::state::instrument::InstrumentState::update_from_trade).
+    ///
+    /// `#[serde(default)]` so a summary serialised before this field existed still loads.
+    #[serde(default)]
+    pub fees_unattributed: Decimal,
 
     /// PnL returns statistical summary for wins and losses.
     pub total: DataSetSummary,
@@ -112,6 +128,30 @@ impl PnLReturns {
             self.losses.update(pnl_return)
         }
     }
+
+    /// Charge a fee that no position carries to raw PnL, and add it to
+    /// [`Self::fees_unattributed`]. `fee` is the fee's quote equivalent, positive = paid.
+    ///
+    /// The return statistics are left alone: the fee belongs to no round trip. Checked as
+    /// [`Self::update`] is: each total holds its last-good value on overflow and emits a `warn!`.
+    pub fn update_from_fee_unattributed(&mut self, fee: Decimal) {
+        match self.pnl_raw.checked_sub(fee) {
+            Some(new_total) => self.pnl_raw = new_total,
+            None => warn!(
+                pnl_raw_held = %self.pnl_raw,
+                fee = %fee,
+                "pnl_raw accumulation overflowed Decimal; holding last-good value"
+            ),
+        }
+        match self.fees_unattributed.checked_add(fee) {
+            Some(new_total) => self.fees_unattributed = new_total,
+            None => warn!(
+                fees_unattributed_held = %self.fees_unattributed,
+                fee = %fee,
+                "fees_unattributed accumulation overflowed Decimal; holding last-good value"
+            ),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -177,6 +217,61 @@ mod tests {
         assert_eq!(returns.total.count, dec!(2));
         assert_eq!(returns.total.sum, dec!(0.08));
         assert_eq!(returns.losses.count, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_unattributed_fee_reaches_pnl_raw_but_no_return() {
+        // A fee paid with no position is a cost in raw PnL, and a rebate a gain, but neither is a
+        // round trip, so no return sample is recorded for it.
+        let mut returns = PnLReturns::default();
+        returns.update(&exited(dec!(10), dec!(100), dec!(1)));
+        returns.update_from_fee_unattributed(dec!(3));
+        returns.update_from_fee_unattributed(dec!(-1));
+
+        assert_eq!(returns.pnl_raw, dec!(8));
+        assert_eq!(returns.fees_unattributed, dec!(2));
+        assert_eq!(returns.carry, Decimal::ZERO);
+        assert_eq!(returns.total.count, Decimal::ONE);
+        assert_eq!(returns.total.sum, dec!(0.1));
+    }
+
+    #[test]
+    fn test_unattributed_fee_holds_each_total_on_overflow() {
+        // Each total holds its last-good value on its own overflow, and the other still moves.
+        let mut returns = PnLReturns {
+            pnl_raw: Decimal::MIN,
+            ..Default::default()
+        };
+        returns.update_from_fee_unattributed(dec!(1));
+        assert_eq!(returns.pnl_raw, Decimal::MIN);
+        assert_eq!(returns.fees_unattributed, dec!(1));
+
+        let mut returns = PnLReturns {
+            fees_unattributed: Decimal::MAX,
+            ..Default::default()
+        };
+        returns.update_from_fee_unattributed(dec!(1));
+        assert_eq!(returns.pnl_raw, dec!(-1));
+        assert_eq!(returns.fees_unattributed, Decimal::MAX);
+    }
+
+    #[test]
+    fn test_a_summary_serialised_before_fees_unattributed_loads_with_zero() {
+        let mut value = serde_json::to_value(PnLReturns {
+            pnl_raw: dec!(5),
+            fees_unattributed: dec!(2),
+            ..Default::default()
+        })
+        .unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("fees_unattributed")
+            .unwrap();
+
+        let loaded: PnLReturns = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.pnl_raw, dec!(5));
+        assert_eq!(loaded.fees_unattributed, Decimal::ZERO);
     }
 
     #[test]

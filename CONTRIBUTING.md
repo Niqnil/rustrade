@@ -147,6 +147,52 @@ Both halves matter. Without `--features <provider>` the test file's contents are
 out and the binary holds no tests at all; without `-- --ignored` the `#[ignore]` markers
 mean none of them run. Either omission produces a green run that asserted nothing.
 
+### Mutation testing
+
+Passing tests show that the code runs, not that the tests would notice if it changed.
+[cargo-mutants](https://mutants.rs) checks that: it makes small changes to the code (`<` to
+`<=`, `&&` to `||`, a function body replaced with `Default::default()`) and reruns the tests
+against each one. A change the tests catch is a *caught* mutant. A change they still pass on
+is a *missed* mutant: behaviour that no test pins.
+
+Only the mutated crate's own tests run against each mutant. A mutant in `rustrade-execution`
+that only a test in `rustrade` would catch is therefore reported as missed.
+
+CI's `cargo mutants` job runs it on the lines each PR changes. The job is informational, so
+it stays green when a mutant is missed. It is split into shards that each test a share of the
+mutants. Each shard's job summary lists the mutants it missed, and the first few are also
+annotated on their lines in the PR's diff (GitHub caps how many annotations a job shows). For
+each one, either:
+
+- **add a test that fails on the mutant**, or
+- **explain in the PR why it is equivalent**: the change cannot alter anything observable, for
+  example `<` against `<=` where the two operands can never be equal, or
+- **name the test in another crate that catches it**.
+
+To run the same check locally, on your committed changes:
+
+```bash
+cargo install --locked cargo-mutants@27.1.0
+git diff --no-renames origin/develop... -- '*/src/*.rs' > "${TMPDIR:-/tmp}/pr.diff"
+cargo mutants --in-diff "${TMPDIR:-/tmp}/pr.diff" \
+  --cargo-arg=--lib --cargo-arg=--bins --cargo-arg=--tests
+```
+
+`.cargo/mutants.toml` supplies the rest: `--all-features`, so that feature-gated code is built
+and tested rather than reported as missed, and the `mutants` profile, which builds without
+debug info. Results land in `mutants.out/`, with the missed mutants in `missed.txt`.
+
+- cargo-mutants copies the source tree into a temporary directory for each build, which needs
+  free space in `$TMPDIR`. If `/tmp` is a small RAM-backed filesystem, point `TMPDIR` at a
+  directory on disk.
+- The diff must match the working tree. Commit or stash any further edits to the files it
+  touches first, or cargo-mutants refuses to run.
+- To narrow a run, mutate one crate with `-p <crate>`. With it, replacing `--cargo-arg=--tests`
+  with `--cargo-arg=--test=<file>` runs that one integration test file in place of all of them
+  (the crate's unit tests still run).
+- Never pass `--in-place` locally. CI uses it on a throwaway runner, but it mutates your working
+  tree, and a run that is killed part-way can leave a mutant in it.
+
 ## Changelog & Versioning
 
 We follow [Keep a Changelog](https://keepachangelog.com/) and [Semantic Versioning](https://semver.org/).
@@ -248,14 +294,45 @@ We use a **two-PR flow** so `develop` and `main` stay in sync — the version bu
    # fix the cause, then re-tag and re-push as in step 5
    ```
 
-## What NOT to Contribute
+## Scope: Library or Downstream
 
-This is a generic trading engine library. The following belong in downstream consumers, not here:
+rustrade is a general-purpose trading library. It draws the line between **mechanism** and
+**policy**. The library delivers events correctly and models each venue faithfully. The decisions
+a trading system makes with them belong to that system. To place a change, ask whether a different
+user of the library would need it in the same form. If so, it belongs here.
 
-- Trading strategy
-- Exchange-specific business logic (margin routing, position tracking)
-- Greeks computation
-- Market hours logic
+**In the library:**
+
+- **Venue adapters, including each venue's own rules where correct delivery needs them.** An
+  adapter translates the venue's orders, fills, balances, positions and errors into the generic
+  types, honours its rate limits and bans, and reads what it reports about margin, borrowing and
+  delistings. Venue-specific code is expected here, as long as it describes the venue rather than
+  deciding for the caller.
+- **The engine's accounting:** positions, PnL, fees and the trading summary, computed from the
+  generic types, whichever venue they came from.
+- **The hooks a policy plugs into:** for example the engine's `RiskManager`, which filters order
+  requests, and its trading state, which can disable trading.
+- **Simulation:** simulated venues, fill, fee and holding-cost models, and backtesting. These are
+  configurable rather than tuned to one consumer.
+- **Market data as the source sends it,** including option greeks that a venue or data provider
+  computes.
+
+**Downstream, in the consumer:**
+
+- Trading strategy, signals and position sizing.
+- Per-trade decisions, such as when to borrow or repay, and which margin mode or account an order
+  goes through.
+- The rules and values of risk limits and safety checks.
+- What to do when a stream ends or a request fails: whether to resume, retry or halt. Each
+  component documents its own reconnects and retries, and when, if ever, it gives up.
+- When to trade: gating orders by trading hours or a market calendar.
+- Computing greeks and other analytics from market data.
+
+The library should make a policy possible without choosing it. It exposes what a consumer needs to
+decide, such as a `retry_after`, a stream's termination reason or a venue notice, and leaves the
+decision to the consumer. When a venue rule needs a threshold, make it a documented default the
+caller can override, or end the operation and report what the caller needs, such as how long to
+wait.
 
 ## Questions?
 

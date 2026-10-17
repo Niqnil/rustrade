@@ -1,10 +1,10 @@
 use crate::{
-    engine::execution_tx::MultiExchangeTxMap,
+    engine::{execution_tx::MultiExchangeTxMap, state::position::PositionSeed},
     error::BarterError,
     execution::{
         builder::{generate_mock_exchange_instruments, validate_supported_instrument_kinds},
         request::ExecutionRequest,
-        sim::SimVenue,
+        sim::{SimStart, SimStartError, SimVenue},
     },
 };
 use chrono::TimeDelta;
@@ -15,6 +15,7 @@ use rustrade_execution::{
         mock::{MockExecution, MockExecutionConfig},
     },
     exchange::mock::SimulatedVenue,
+    fill::FillModel,
     holding_cost::HoldingCostModel,
     indexer::AccountEventIndexer,
     map::generate_execution_instrument_map,
@@ -48,6 +49,12 @@ pub struct SimVenueOptions {
     /// What the venue may lend for a CFD short, and when a short-sale restriction is in effect —
     /// see [`SimulatedVenue::with_shortability`]. `None` lends without limit.
     pub shortability: Option<Arc<dyn ShortabilityProvider>>,
+    /// Prices each taker fill in place of the configuration's
+    /// [`fill_model`](MockExecutionConfig::fill_model) — see
+    /// [`SimulatedVenue::with_fill_model`]. `None` uses the configured one. The configured
+    /// [`slippage`](MockExecutionConfig::slippage) applies to either. Like every option here, it
+    /// is not part of the serialisable configuration.
+    pub fill_model: Option<Arc<dyn FillModel>>,
 }
 
 impl SimVenueOptions {
@@ -62,6 +69,14 @@ impl SimVenueOptions {
     #[must_use]
     pub fn with_shortability(mut self, provider: Arc<dyn ShortabilityProvider>) -> Self {
         self.shortability = Some(provider);
+        self
+    }
+
+    /// These options, pricing each taker fill with `model` — see [`FillModel`] for what an
+    /// implementation must uphold.
+    #[must_use]
+    pub fn with_fill_model(mut self, model: Arc<dyn FillModel>) -> Self {
+        self.fill_model = Some(model);
         self
     }
 }
@@ -129,13 +144,24 @@ impl<'a> SimExecutionBuilder<'a> {
     ///
     /// Otherwise exactly [`add_venue`](Self::add_venue), whose latency, errors and panics apply.
     pub fn add_venue_with_options(
+        self,
+        config: MockExecutionConfig,
+        options: SimVenueOptions,
+    ) -> Result<Self, BarterError> {
+        self.insert_venue(config, options, None)
+    }
+
+    /// Add the venue `config` mocks, recording `position_seeds` as the positions it starts with.
+    fn insert_venue(
         mut self,
         config: MockExecutionConfig,
         options: SimVenueOptions,
+        position_seeds: Option<Vec<PositionSeed>>,
     ) -> Result<Self, BarterError> {
         let SimVenueOptions {
             holding_costs,
             shortability,
+            fill_model,
         } = options;
 
         let exchange = config.mocked_exchange;
@@ -176,6 +202,9 @@ impl<'a> SimExecutionBuilder<'a> {
         if let Some(provider) = shortability {
             venue = venue.with_shortability(provider);
         }
+        if let Some(model) = fill_model {
+            venue = venue.with_fill_model(model);
+        }
 
         let venue = SimVenue {
             venue,
@@ -183,11 +212,55 @@ impl<'a> SimExecutionBuilder<'a> {
             request_rx: execution_rx,
             to_venue: leg,
             from_venue: leg,
+            position_seeds,
         };
 
         self.venues.insert(index, venue);
 
         Ok(self)
+    }
+
+    /// Adds a [`SimulatedVenue`] for the exchange `config` mocks, starting from `start`: its
+    /// opening account is derived from `start`, and so are the positions the `Engine` must be
+    /// seeded with, which [`SimExecutionBuild::position_seeds`] returns. See [`SimStart`] for how
+    /// each side is derived.
+    ///
+    /// Otherwise exactly [`add_venue_with_options`](Self::add_venue_with_options).
+    ///
+    /// # Errors
+    /// Those of [`add_venue`](Self::add_venue), and [`BarterError::SimStart`] if `start` cannot
+    /// be held by this venue — see [`SimStartError`],
+    /// including when `config.initial_state` is not empty, since there would then be two
+    /// starting states.
+    ///
+    /// [`SimStart`]: crate::execution::sim::SimStart
+    pub fn add_venue_with_start(
+        self,
+        mut config: MockExecutionConfig,
+        options: SimVenueOptions,
+        start: SimStart,
+    ) -> Result<Self, BarterError> {
+        let exchange = config.mocked_exchange;
+
+        if !config.initial_state.balances.is_empty() || !config.initial_state.instruments.is_empty()
+        {
+            return Err(SimStartError::InitialStateNotEmpty { exchange }.into());
+        }
+
+        // Before the projection below, which panics on a kind it cannot model.
+        validate_supported_instrument_kinds(
+            self.instruments,
+            exchange,
+            <MockExecution<fn() -> chrono::DateTime<chrono::Utc>> as ExecutionClient>::SUPPORTED_KINDS,
+        )?;
+
+        let (initial_state, seeds) = start.resolve(
+            exchange,
+            &generate_mock_exchange_instruments(self.instruments, exchange),
+        )?;
+        config.initial_state = initial_state;
+
+        self.insert_venue(config, options, Some(seeds))
     }
 
     /// Consume this builder, returning the venues and the [`MultiExchangeTxMap`] to hand the
@@ -239,4 +312,23 @@ pub struct SimExecutionBuild {
     pub execution_tx_map: MultiExchangeTxMap,
     /// One entry per configured simulated venue, keyed by [`ExchangeIndex`].
     pub venues: FnvIndexMap<ExchangeIndex, SimVenue>,
+}
+
+impl SimExecutionBuild {
+    /// Every position the venues were started with by a
+    /// [`SimStart`], for [`EngineStateBuilder::positions`], so
+    /// the `Engine` starts holding what the venues hold.
+    ///
+    /// Empty when no venue was added with
+    /// [`add_venue_with_start`](SimExecutionBuilder::add_venue_with_start).
+    ///
+    /// [`EngineStateBuilder::positions`]: crate::engine::state::builder::EngineStateBuilder::positions
+    pub fn position_seeds(&self) -> Vec<PositionSeed> {
+        self.venues
+            .values()
+            .filter_map(|slot| slot.position_seeds.as_ref())
+            .flatten()
+            .cloned()
+            .collect()
+    }
 }
