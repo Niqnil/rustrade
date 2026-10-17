@@ -2936,10 +2936,9 @@ async fn margin_connection_manager(
             continue;
         }
         info!("BinanceMargin account_stream connected and subscribed");
-        // Reaching a live, subscribed connection clears any prior failure count so only *consecutive*
-        // failures exhaust the reconnect budget — a clean rotation or a transient blip that recovers
-        // shouldn't leave the backoff counter inflated for the next genuine failure.
-        backoff.reset();
+        // backoff is NOT reset here: a venue that accepts each connection and drops it at once
+        // would then be retried at INITIAL_BACKOFF_MS forever, never exhausting the budget. The
+        // monitor loop resets it once the connection survives a heartbeat window, as spot's does.
 
         // Absolute deadline (not a per-iteration relative sleep) so heartbeat ticks that `continue`
         // the monitor loop don't keep restarting the renewal timer.
@@ -3033,9 +3032,9 @@ async fn margin_connection_manager(
                     }
                     () = tokio::time::sleep(Duration::from_secs(HEARTBEAT_TIMEOUT_SECS)) => {
                         if heartbeat_flag.swap(false, Ordering::AcqRel) {
-                            // Backoff is already cleared post-subscribe (see backoff.reset() above);
-                            // the monitor loop is only entered on a live connection, so a heartbeat
-                            // tick never sees a non-zero count. Just consume the flag and keep waiting.
+                            // The connection is proven stable for a heartbeat window: clear the
+                            // failures before it, so only consecutive ones exhaust the budget.
+                            backoff.reset();
                             continue;
                         }
                         warn!("BinanceMargin heartbeat timeout ({}s), will attempt reconnect", HEARTBEAT_TIMEOUT_SECS);
@@ -3386,9 +3385,8 @@ async fn isolated_connection_manager(
             symbols = symbols.len(),
             "BinanceMargin isolated account_stream connected and subscribed"
         );
-        // Reaching a live, subscribed connection clears any prior failure count (see the cross
-        // manager) so only *consecutive* failures exhaust the reconnect budget.
-        backoff.reset();
+        // backoff is NOT reset here, but once the connection survives a heartbeat window (see the
+        // cross manager).
 
         // Absolute deadline (not a per-iteration relative sleep) so heartbeat ticks that `continue`
         // the monitor loop don't keep restarting the renewal timer. Earliest token expiry drives it.
@@ -3474,6 +3472,8 @@ async fn isolated_connection_manager(
                     }
                     () = tokio::time::sleep(Duration::from_secs(HEARTBEAT_TIMEOUT_SECS)) => {
                         if heartbeat_flag.swap(false, Ordering::AcqRel) {
+                            // Proven stable for a heartbeat window (see the cross manager).
+                            backoff.reset();
                             continue;
                         }
                         warn!("BinanceMargin isolated heartbeat timeout ({}s), will attempt reconnect", HEARTBEAT_TIMEOUT_SECS);
@@ -4545,8 +4545,8 @@ mod tests {
     }
 
     /// What the margin managers need, wired to local servers: a WS API that answers every request
-    /// with `answer` and, when `close_after` is set, closes each connection that long after its
-    /// first answer; and a REST API that hands out listen tokens and nothing else.
+    /// with `answer` and closes the `n`th connection (from 0) `close_after(n)` after its first
+    /// answer, when that is `Some`; and a REST API that hands out listen tokens and nothing else.
     struct ManagerRig {
         ws_config: ConfigurationWebsocketApi,
         rest_config: Arc<ConfigurationRestApi>,
@@ -4560,7 +4560,7 @@ mod tests {
     impl ManagerRig {
         async fn new(
             answer: fn(&serde_json::Value) -> serde_json::Value,
-            close_after: Option<Duration>,
+            close_after: fn(usize) -> Option<Duration>,
         ) -> Self {
             use futures::{SinkExt as _, StreamExt as _};
             use tokio_tungstenite::tungstenite::Message;
@@ -4570,8 +4570,10 @@ mod tests {
             let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
             let seen = Arc::clone(&requests);
             tokio::spawn(async move {
+                let mut connections = 0..;
                 while let Ok((stream, _)) = listener.accept().await {
                     let seen = Arc::clone(&seen);
+                    let close_after = connections.next().and_then(close_after);
                     tokio::spawn(async move {
                         let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
                             return;
@@ -4743,7 +4745,7 @@ mod tests {
     /// at once with the ban's wait instead of reconnecting into it.
     #[tokio::test]
     async fn a_banned_subscribe_ends_the_cross_margin_stream_rate_limited() {
-        let rig = ManagerRig::new(banned_for_two_minutes, None).await;
+        let rig = ManagerRig::new(banned_for_two_minutes, |_| None).await;
         let mut events = rig.cross().await;
 
         let wait = rate_limited_end(&mut events).await;
@@ -4756,7 +4758,7 @@ mod tests {
     /// is recognised and starts the ban's cooldown.
     #[tokio::test]
     async fn a_banned_isolated_subscribe_is_recognised_as_a_refusal() {
-        let rig = ManagerRig::new(banned_for_two_minutes, None).await;
+        let rig = ManagerRig::new(banned_for_two_minutes, |_| None).await;
         let (tx, _rx) = mpsc::unbounded_channel();
         let symbol = InstrumentNameExchange::new("BTCUSDT");
 
@@ -4786,7 +4788,7 @@ mod tests {
     #[tokio::test]
     async fn a_drop_during_a_long_cooldown_ends_the_isolated_margin_stream_rate_limited() {
         // The drop comes once the test has started the cooldown.
-        let rig = ManagerRig::new(subscribed, Some(Duration::from_secs(1))).await;
+        let rig = ManagerRig::new(subscribed, |_| Some(Duration::from_secs(1))).await;
         let mut events = rig.isolated().await;
         rig.rate_limiter
             .on_rate_limited(Some(Duration::from_secs(60)));
@@ -4802,7 +4804,7 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_margin_connection_backs_off_before_reconnecting() {
         for isolated in [false, true] {
-            let rig = ManagerRig::new(subscribed, Some(Duration::from_millis(100))).await;
+            let rig = ManagerRig::new(subscribed, |_| Some(Duration::from_millis(100))).await;
             let _events = if isolated {
                 rig.isolated().await
             } else {
@@ -4826,6 +4828,59 @@ mod tests {
                 "isolated {isolated}: reconnected {between:?} after the first subscribe"
             );
         }
+    }
+
+    /// Both managers clear their reconnect failures only once a connection outlives a heartbeat
+    /// window. A connection the venue accepts and drops at once is a failure like any other, so
+    /// the waits between such reconnects grow, and a venue doing so to every connection exhausts
+    /// the budget.
+    #[tokio::test]
+    async fn a_margin_reconnect_budget_resets_only_once_a_connection_proves_stable() {
+        // The third connection outlives the first heartbeat tick; the fourth stays open.
+        const STABLE: Duration = Duration::from_secs(HEARTBEAT_TIMEOUT_SECS + 3);
+        fn lifetimes(n: usize) -> Option<Duration> {
+            match n {
+                0 | 1 => Some(Duration::from_millis(100)),
+                2 => Some(STABLE),
+                _ => None,
+            }
+        }
+
+        async fn run(isolated: bool) {
+            let rig = ManagerRig::new(subscribed, lifetimes).await;
+            let _events = if isolated {
+                rig.isolated().await
+            } else {
+                rig.cross().await
+            };
+
+            let deadline = tokio::time::Instant::now() + STABLE + Duration::from_secs(15);
+            while rig.requests.lock().len() < 4 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "isolated {isolated}: {} subscribes",
+                    rig.requests.lock().len()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            let requests = rig.requests.lock();
+            // Not reset by the second connection's subscribe: its drop waits the second backoff.
+            let escalated = requests[2] - requests[1];
+            assert!(
+                escalated >= Duration::from_millis(2 * INITIAL_BACKOFF_MS),
+                "isolated {isolated}: reconnected {escalated:?} after a dropped connection"
+            );
+            // Reset by the third connection's heartbeat tick: its drop waits the first backoff
+            // again, not the third (4 s).
+            let after_stable = requests[3] - requests[2] - STABLE;
+            assert!(
+                after_stable < Duration::from_millis(3 * INITIAL_BACKOFF_MS),
+                "isolated {isolated}: reconnected {after_stable:?} after a stable connection"
+            );
+        }
+
+        tokio::join!(run(false), run(true));
     }
 
     /// The connection both margin managers open is closed when dropped, as when a manager is

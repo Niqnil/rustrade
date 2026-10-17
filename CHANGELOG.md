@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A venue that accepts each connection and drops it now exhausts the account stream's
+  reconnect budget** (`rustrade-execution`).
+  - `BinanceMargin`, cross and isolated, and `AlpacaClient` cleared their reconnect failures as
+    soon as a connection was set up. Against a venue that accepts each connection and drops it
+    straight away, the stream reconnected every second without end and never reported a
+    `StreamTerminated`.
+  - They now clear the failures only once a connection has stayed up for a heartbeat window, as
+    `BinanceSpot` already did: 30 s on Binance, 35 s on Alpaca. A connection dropped sooner
+    counts as a failed reconnect, so the waits grow and the stream ends with
+    `ReconnectBudgetExhausted` once 10 reconnects in a row have failed.
+  - The rustdoc now states each client's reconnect budget, backoff and how the stream ends. It
+    also says that Hyperliquid's SDK retries a lost connection every second without limit, so a
+    lost connection never ends that client's stream.
+
 ## [0.12.0] - 2026-10-16
 
 ### Added
