@@ -25,16 +25,19 @@
 //! # Account stream reconnection
 //!
 //! Both clients' account streams reconnect by themselves, with the same budget, when the
-//! connection drops or carries nothing for a 30 s heartbeat window. Each reconnect recovers the
-//! fills and order endings the stream missed (see each client's `account_stream`).
+//! connection drops or goes silent. The heartbeat is checked every 30 s: a check that finds no
+//! frame or ping since the last one reconnects, except the first check on each connection, which
+//! is a grace. Silence is therefore noticed after 30 to 60 s. Each reconnect recovers the fills
+//! and order endings the stream missed (see each client's `account_stream`).
 //!
 //! - **Attempts.** A dropped connection, and each reconnect that fails after it, spends one
 //!   attempt: a wait, then a reconnect. A reconnect fails when its connect, its user-data
 //!   subscribe, or for [`BinanceMargin`] its listen-token request fails. The waits double from 1 s
 //!   up to 30 s: 1, 2, 4, 8, 16, then 30 s.
-//! - **Reset.** A connection that stays up for 30 s clears the attempts spent before it, so only
-//!   failures in a row count. A connection the venue accepts and drops sooner counts as a failed
-//!   reconnect.
+//! - **Reset.** A heartbeat check that finds a frame or ping clears the attempts spent before it,
+//!   so only failures in a row count. A connection the venue accepts and then drops or leaves
+//!   silent before such a check counts as a failed reconnect. The answer to the subscribe is not
+//!   a frame for this purpose.
 //! - **Giving up.** Once 10 reconnects in a row have failed, after about three minutes of waiting
 //!   in all, the stream ends with
 //!   [`AccountEventKind::StreamTerminated`](crate::AccountEventKind::StreamTerminated) carrying

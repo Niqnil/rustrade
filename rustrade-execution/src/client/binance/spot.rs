@@ -1734,10 +1734,10 @@ async fn connection_manager(
         // recovered fills.
         let (signal_tx, signal_rx) = oneshot::channel::<()>();
         let mut signal_tx_opt = Some(signal_tx);
-        // start as true — grants the connection one full heartbeat window before
-        // requiring activity. A slow first ping from Binance would otherwise trigger a
-        // false-positive timeout and unnecessary reconnect on the very first check.
-        let heartbeat_flag = Arc::new(AtomicBool::new(true));
+        // Set by every frame and ping. Starts false: only one of those proves the connection
+        // stable. The monitor loop grants the first window a grace instead, so a slow first
+        // ping from Binance does not trigger a false-positive timeout.
+        let heartbeat_flag = Arc::new(AtomicBool::new(false));
         let hb_callback = heartbeat_flag.clone();
         let dedup_callback = dedup.clone();
         let known_callback = known.clone();
@@ -1887,6 +1887,8 @@ async fn connection_manager(
                 }
             };
             tokio::pin!(retry_gaps);
+            // The first window is a grace: a slow first ping is not a heartbeat timeout.
+            let mut grace = true;
             loop {
                 tokio::select! {
                     // Biased: a consumer drop is terminal and wins; the gap retry is polled last.
@@ -1906,11 +1908,17 @@ async fn connection_manager(
                         // is a no-op here since no other thread reads the `false` we
                         // write back — but AcqRel is the semantically correct ordering
                         // for a read-modify-write and protects against future readers.
+                        let in_grace = std::mem::take(&mut grace);
                         if heartbeat_flag.swap(false, Ordering::AcqRel) {
                             // Activity detected: connection is proven stable for one full
                             // heartbeat window — safe to reset reconnect backoff so a
                             // stable connection doesn't carry over prior failure counts.
                             backoff.reset();
+                            continue;
+                        }
+                        if in_grace {
+                            // Not a timeout yet, but no reset either: a venue that accepts the
+                            // connection and stays silent spends the budget.
                             continue;
                         }
                         warn!("BinanceSpot heartbeat timeout ({}s), will attempt reconnect", HEARTBEAT_TIMEOUT_SECS);
@@ -5379,6 +5387,31 @@ mod tests {
 
         // The backoff's first wait is a second: the cooldown, not the backoff, set the time.
         assert!(subscribed_at.lock()[1] >= cooled);
+    }
+
+    /// The stream clears its reconnect failures only on a heartbeat tick that saw a frame or
+    /// ping. A connection Binance accepts and drops at once is a failure like any other, and so is
+    /// one that stays silent past the first tick, so a venue doing either to every connection
+    /// exhausts the budget.
+    #[tokio::test]
+    async fn the_reconnect_budget_resets_only_once_a_connection_proves_stable() {
+        async fn run(pinging: bool) {
+            let lifetime = if pinging {
+                test_ws_api::dropped_then_pinging
+            } else {
+                test_ws_api::dropped_then_silent
+            };
+            let (url, requests) = test_ws_api::serve(subscribed, lifetime).await;
+            let client = client_with_ws_api(url);
+            let _stream = client.account_stream(&[], &[]).await.unwrap();
+            if pinging {
+                test_ws_api::assert_reset_once_pinged(&requests, "spot").await;
+            } else {
+                test_ws_api::assert_no_reset_when_silent(&requests, "spot").await;
+            }
+        }
+
+        tokio::join!(run(true), run(false));
     }
 
     /// A cancel that waited on another's handshake, which Binance refused, is not sent and opens

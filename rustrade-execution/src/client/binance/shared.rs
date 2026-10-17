@@ -6552,3 +6552,163 @@ mod tests {
         assert_eq!(avg(Some("not-a-number"), dec!(4)), None);
     }
 }
+
+/// A local WS API for the account-stream managers' tests, and the reconnect-budget checks spot and
+/// margin share.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+pub(super) mod test_ws_api {
+    use super::{HEARTBEAT_TIMEOUT_SECS, INITIAL_BACKOFF_MS};
+    use futures::{SinkExt as _, StreamExt as _};
+    use parking_lot::Mutex;
+    use std::{sync::Arc, time::Duration};
+    use tokio::time::Instant;
+    use tokio_tungstenite::tungstenite::Message;
+
+    /// How the server treats a connection after its first answer.
+    #[derive(Debug, Clone, Copy)]
+    pub(in crate::client::binance) enum Lifetime {
+        /// Stays open, answering every request.
+        Open,
+        /// Closes after this long, sending nothing meanwhile.
+        Silent(Duration),
+        /// Closes after this long, pinging every second meanwhile.
+        Pinging(Duration),
+    }
+
+    /// Starts a WS API answering every request with `answer`, whose `n`th connection (from 0)
+    /// lives `lifetime(n)` after its first answer. Returns its `ws://` URL, and when each request
+    /// arrived.
+    pub(in crate::client::binance) async fn serve(
+        answer: fn(&serde_json::Value) -> serde_json::Value,
+        lifetime: fn(usize) -> Lifetime,
+    ) -> (String, Arc<Mutex<Vec<Instant>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&requests);
+        tokio::spawn(async move {
+            let mut connections = 0..;
+            while let Ok((stream, _)) = listener.accept().await {
+                let seen = Arc::clone(&seen);
+                let lifetime = connections.next().map_or(Lifetime::Open, lifetime);
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    while let Some(Ok(message)) = ws.next().await {
+                        let Message::Text(text) = message else {
+                            continue;
+                        };
+                        seen.lock().push(Instant::now());
+                        let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        if ws
+                            .send(Message::text(answer(&request).to_string()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        let (after, pinging) = match lifetime {
+                            Lifetime::Open => continue,
+                            Lifetime::Silent(after) => (after, false),
+                            Lifetime::Pinging(after) => (after, true),
+                        };
+                        let closes = tokio::time::sleep(after);
+                        tokio::pin!(closes);
+                        let mut pings = tokio::time::interval(Duration::from_secs(1));
+                        loop {
+                            tokio::select! {
+                                () = &mut closes => break,
+                                _ = pings.tick(), if pinging => {
+                                    if ws.send(Message::Ping(Default::default())).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        let _ = ws.close(None).await;
+                        return;
+                    }
+                });
+            }
+        });
+        (url, requests)
+    }
+
+    /// How long a stable connection lives: past the heartbeat tick that proves it.
+    pub(in crate::client::binance) const STABLE: Duration =
+        Duration::from_secs(HEARTBEAT_TIMEOUT_SECS + 3);
+
+    /// Two connections dropped at once, then one that pings past the heartbeat tick, then one that
+    /// stays.
+    pub(in crate::client::binance) fn dropped_then_pinging(n: usize) -> Lifetime {
+        match n {
+            0 | 1 => Lifetime::Silent(Duration::from_millis(100)),
+            2 => Lifetime::Pinging(STABLE),
+            _ => Lifetime::Open,
+        }
+    }
+
+    /// A connection dropped at once, then one silent past the heartbeat tick, then one that stays.
+    pub(in crate::client::binance) fn dropped_then_silent(n: usize) -> Lifetime {
+        match n {
+            0 => Lifetime::Silent(Duration::from_millis(100)),
+            1 => Lifetime::Silent(STABLE),
+            _ => Lifetime::Open,
+        }
+    }
+
+    /// Waits for the `count`th request, and returns when each arrived.
+    async fn requests_until(
+        requests: &Mutex<Vec<Instant>>,
+        count: usize,
+        label: &str,
+    ) -> Vec<Instant> {
+        let deadline = Instant::now() + 2 * STABLE + Duration::from_secs(15);
+        while requests.lock().len() < count {
+            assert!(
+                Instant::now() < deadline,
+                "{label}: {} requests",
+                requests.lock().len()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        requests.lock().clone()
+    }
+
+    /// Checks a manager serving [`dropped_then_pinging`]: the subscribe on the second dropped
+    /// connection does not clear the budget, so its drop waits the second backoff; the pinged
+    /// connection's heartbeat tick does, so its drop waits the first again, not the third (4 s).
+    pub(in crate::client::binance) async fn assert_reset_once_pinged(
+        requests: &Mutex<Vec<Instant>>,
+        label: &str,
+    ) {
+        let at = requests_until(requests, 4, label).await;
+        let escalated = at[2] - at[1];
+        assert!(
+            escalated >= Duration::from_millis(2 * INITIAL_BACKOFF_MS),
+            "{label}: reconnected {escalated:?} after a dropped connection"
+        );
+        let after_stable = (at[3] - at[2]).saturating_sub(STABLE);
+        assert!(
+            after_stable < Duration::from_millis(3 * INITIAL_BACKOFF_MS),
+            "{label}: reconnected {after_stable:?} after a pinged connection"
+        );
+    }
+
+    /// Checks a manager serving [`dropped_then_silent`]: a connection that outlives the first
+    /// heartbeat tick with nothing received does not clear the budget, so its drop waits the
+    /// second backoff.
+    pub(in crate::client::binance) async fn assert_no_reset_when_silent(
+        requests: &Mutex<Vec<Instant>>,
+        label: &str,
+    ) {
+        let at = requests_until(requests, 3, label).await;
+        let after_silent = (at[2] - at[1]).saturating_sub(STABLE);
+        assert!(
+            after_silent >= Duration::from_millis(2 * INITIAL_BACKOFF_MS),
+            "{label}: reconnected {after_silent:?} after a silent connection"
+        );
+    }
+}
