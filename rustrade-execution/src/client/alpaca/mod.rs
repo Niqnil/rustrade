@@ -457,6 +457,10 @@ pub struct AlpacaConfig {
     /// Test-only: override the REST base URL (e.g., to point at a wiremock server).
     #[cfg(test)]
     pub base_url_override: Option<String>,
+    /// Test-only: override the WebSocket URL (e.g., to point at a local server).
+    #[cfg(test)]
+    #[serde(skip)]
+    ws_url_override: Option<String>,
 }
 
 /// Serde default for [`AlpacaConfig::paper`]: an absent `paper` field deserializes to the **safe**
@@ -494,6 +498,8 @@ impl AlpacaConfig {
             paper: true,
             #[cfg(test)]
             base_url_override: None,
+            #[cfg(test)]
+            ws_url_override: None,
         }
     }
 
@@ -508,6 +514,8 @@ impl AlpacaConfig {
             paper: false,
             #[cfg(test)]
             base_url_override: None,
+            #[cfg(test)]
+            ws_url_override: None,
         }
     }
 
@@ -571,6 +579,7 @@ impl AlpacaConfig {
             secret_key,
             paper: true,
             base_url_override: Some(base_url),
+            ws_url_override: None,
         }
     }
 
@@ -600,6 +609,16 @@ impl AlpacaConfig {
         } else {
             "wss://api.alpaca.markets/stream"
         }
+    }
+
+    /// The URL the account stream connects to: [`ws_url`](Self::ws_url), or in test builds
+    /// `ws_url_override` when set.
+    fn stream_url(&self) -> &str {
+        #[cfg(test)]
+        if let Some(ref url) = self.ws_url_override {
+            return url.as_str();
+        }
+        self.ws_url()
     }
 }
 
@@ -1619,6 +1638,26 @@ impl ExecutionClient for AlpacaClient {
     }
 
     /// Returns a live stream of account events (fills, order updates).
+    ///
+    /// # Reconnection
+    ///
+    /// The stream reconnects by itself when the server closes the connection, the connection
+    /// fails, or it carries nothing for a 35 s heartbeat window. Each reconnect recovers the fills
+    /// and order endings the stream missed (see below).
+    ///
+    /// - **Attempts.** A dropped connection, and each reconnect that fails after it, spends one
+    ///   attempt: a wait, then a reconnect. A reconnect fails when its connect, authentication or
+    ///   `trade_updates` subscribe fails. The waits double from 1 s up to 30 s: 1, 2, 4, 8, 16,
+    ///   then 30 s.
+    /// - **Reset.** A connection still receiving after 35 s up clears the attempts spent before
+    ///   it, so only failures in a row count. A connection the server accepts and closes sooner
+    ///   counts as a failed reconnect.
+    /// - **Giving up.** Once 10 reconnects in a row have failed, after about three minutes of
+    ///   waiting in all, the stream ends with [`AccountEventKind::StreamTerminated`] carrying
+    ///   [`ReconnectBudgetExhausted`](crate::error::StreamTerminationReason::ReconnectBudgetExhausted)
+    ///   and the last failure. Credentials rejected on every reconnect end it this way too.
+    /// - **Opening is not retried.** A failed `account_stream` call returns its error. Whether and
+    ///   when to try again is the caller's decision, as it is after the stream ends.
     ///
     /// # Startup race window
     ///
@@ -2951,17 +2990,10 @@ async fn connection_manager(
             },
         };
         info!("Alpaca account_stream connected and subscribed");
-        // Session established — reset backoff regardless of whether any text events
-        // arrive. Without this, a heartbeat-only session (Pings only, no trade_updates)
-        // would never call process_ws_text and therefore never reset the counter,
-        // causing the next disconnect to exhaust the reconnect budget faster than expected.
-        //
-        // Edge case: if the server accepts the WS handshake and immediately closes the
-        // connection (fast-accept-close loop), backoff resets on every iteration, causing
-        // all MAX_RECONNECT_ATTEMPTS attempts to run at INITIAL_BACKOFF_MS rather than
-        // escalating. This is accepted behaviour for this pathological server scenario —
-        // the 10-attempt budget still provides ~10 s of protection before giving up.
-        backoff.reset();
+        // backoff is NOT reset here: a server that accepts each handshake and closes the
+        // connection at once would then be retried at INITIAL_BACKOFF_MS forever, never
+        // exhausting the budget. The stream loop resets it on a frame received once the connection
+        // has lasted a heartbeat window.
 
         // --- Fill recovery after reconnect ---
         // Runs before the event loop so live events arriving during recovery are
@@ -3007,6 +3039,9 @@ async fn connection_manager(
         let mut last_message_time = Utc::now();
         let heartbeat = tokio::time::sleep(Duration::from_secs(HEARTBEAT_TIMEOUT_SECS));
         tokio::pin!(heartbeat);
+        // A connection still receiving a heartbeat window after the stream loop starts is proven
+        // stable: the failures before it are cleared, so only consecutive ones exhaust the budget.
+        let stable_from = tokio::time::Instant::now() + Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
 
         // How the orders held as live ended: checked alongside the stream, so it is read, and a
         // disconnect seen, from the start. Fill recovery has finished or given up above, so the
@@ -3016,16 +3051,21 @@ async fn connection_manager(
             run_order_checks(&http, &rate_limiter, &config, &known, &mut unchecked, &tx);
         tokio::pin!(order_checks);
 
-        // Resets the rolling heartbeat deadline and records the wall-clock receive time.
+        // Resets the rolling heartbeat deadline, records the wall-clock receive time, and clears
+        // the backoff once the connection is proven stable.
         // Pin<&mut Sleep> cannot be passed to a regular function, so a macro avoids
-        // repeating the same two-line block across every message-bearing select! arm.
+        // repeating the same block across every message-bearing select! arm.
         // NOTE: must be defined AFTER the variables it captures for macro hygiene.
         macro_rules! reset_heartbeat {
             () => {
-                heartbeat.as_mut().reset(
-                    tokio::time::Instant::now() + Duration::from_secs(HEARTBEAT_TIMEOUT_SECS),
-                );
+                let now = tokio::time::Instant::now();
+                heartbeat
+                    .as_mut()
+                    .reset(now + Duration::from_secs(HEARTBEAT_TIMEOUT_SECS));
                 last_message_time = Utc::now();
+                if now >= stable_from {
+                    backoff.reset();
+                }
             };
         }
         // Distinguishes why the inner stream loop exited so the terminal emit below can report a
@@ -3046,14 +3086,14 @@ async fn connection_manager(
                             reset_heartbeat!();
                         }
                         Some(Ok(WsMessage::Text(text))) => {
-                            process_ws_text(text.as_str(), &tx, &dedup, &known, &mut backoff);
+                            process_ws_text(text.as_str(), &tx, &dedup, &known);
                             reset_heartbeat!();
                         }
                         Some(Ok(WsMessage::Binary(bytes))) => {
                             // Alpaca paper trading sends binary-framed JSON.
                             match std::str::from_utf8(&bytes) {
                                 Ok(text) => {
-                                    process_ws_text(text, &tx, &dedup, &known, &mut backoff);
+                                    process_ws_text(text, &tx, &dedup, &known);
                                     // Only reset heartbeat for valid UTF-8 frames that may carry
                                     // real events. A corrupt binary frame (e.g. from a proxy)
                                     // must not keep the watchdog from firing.
@@ -3084,7 +3124,6 @@ async fn connection_manager(
                         "Alpaca heartbeat timeout, reconnecting"
                     );
                     // Heartbeat timeout is a failure — do NOT reset backoff here.
-                    // Backoff resets on successful event receipt in process_ws_text.
                     break DisconnectReason::HeartbeatTimeout;
                 }
                 _ = tx.closed() => {
@@ -3159,7 +3198,7 @@ enum HandshakeError {
 ///
 /// On auth or subscribe failure the connection is closed cleanly.
 async fn connect_and_subscribe(config: &AlpacaConfig) -> Result<WebSocket, UnindexedClientError> {
-    let url = config.ws_url();
+    let url = config.stream_url();
     debug!(%url, "Alpaca: connecting to WebSocket");
 
     let mut ws = rustrade_integration::protocol::websocket::connect(url)
@@ -3375,7 +3414,6 @@ fn process_ws_text(
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: &SharedDedupCache,
     known: &SharedKnownLiveOrders,
-    backoff: &mut ExponentialBackoff,
 ) {
     let msg: AlpacaStreamMessage<'_> = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -3388,10 +3426,6 @@ fn process_ws_text(
             return;
         }
     };
-
-    // Any successfully-parsed frame proves the connection is alive — reset backoff here
-    // so that unrecognised event types (pending_cancel, replaced, etc.) also reset it.
-    backoff.reset();
 
     match msg.stream.as_str() {
         "trade_updates" => {
@@ -6273,6 +6307,16 @@ mod tests {
         );
     }
 
+    /// `account_stream`'s rustdoc states the reconnect budget, its backoff and the heartbeat
+    /// window as numbers. Change these only together with those docs.
+    #[test]
+    fn the_reconnect_budget_is_as_documented() {
+        assert_eq!(MAX_RECONNECT_ATTEMPTS, 10);
+        assert_eq!(INITIAL_BACKOFF_MS, 1_000);
+        assert_eq!(MAX_BACKOFF_MS, 30_000);
+        assert_eq!(HEARTBEAT_TIMEOUT_SECS, 35);
+    }
+
     #[tokio::test]
     async fn test_exponential_backoff_progression_and_exhaustion() {
         tokio::time::pause();
@@ -7532,13 +7576,12 @@ mod tests {
     fn process_ws_text_rejected_event_without_filled_qty_is_not_dropped() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let dedup = new_dedup_cache();
-        let mut backoff = ExponentialBackoff::new();
 
         // Minimal rejected-event JSON — no `filled_qty` field in the order object.
         let json = r#"{"stream":"trade_updates","data":{"event":"rejected","order":{"id":"test-rej-id","client_order_id":"test-cid","symbol":"AAPL","qty":"10","side":"buy","type":"limit","time_in_force":"day","limit_price":"100.00","status":"rejected"}}}"#;
 
         let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
-        process_ws_text(json, &tx, &dedup, &known, &mut backoff);
+        process_ws_text(json, &tx, &dedup, &known);
 
         // The event must NOT be silently dropped — an OrderCancelled must be emitted.
         let event = rx.try_recv()
@@ -7571,13 +7614,7 @@ mod tests {
         for (field, expected) in cases {
             let (tx, mut rx) = mpsc::unbounded_channel();
             let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
-            process_ws_text(
-                &frame(field),
-                &tx,
-                &new_dedup_cache(),
-                &known,
-                &mut ExponentialBackoff::new(),
-            );
+            process_ws_text(&frame(field), &tx, &new_dedup_cache(), &known);
             let Ok(UnindexedAccountEvent {
                 kind: AccountEventKind::Trade(trade),
                 ..
@@ -7602,9 +7639,8 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let dedup = new_dedup_cache();
         let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
-        let mut backoff = ExponentialBackoff::new();
         for frame in frames {
-            process_ws_text(frame, &tx, &dedup, &known, &mut backoff);
+            process_ws_text(frame, &tx, &dedup, &known);
         }
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
     }
@@ -9095,6 +9131,122 @@ mod tests {
             v
         }
 
+        /// The manager clears its reconnect failures only once a connection outlives a heartbeat
+        /// window. A connection the server accepts and closes at once is a failure like any
+        /// other, so the waits between such reconnects grow, and a server doing so to every
+        /// connection exhausts the budget.
+        #[tokio::test]
+        async fn the_reconnect_budget_resets_only_once_a_connection_proves_stable() {
+            use futures::{SinkExt as _, StreamExt as _};
+            use tokio_tungstenite::tungstenite::Message;
+
+            // The third connection receives pings past the heartbeat window; the fourth stays open.
+            const STABLE: Duration = Duration::from_secs(HEARTBEAT_TIMEOUT_SECS + 3);
+            let lifetime = |n: usize| match n {
+                0 | 1 => Some(Duration::from_millis(100)),
+                2 => Some(STABLE),
+                _ => None,
+            };
+
+            // A WS server that authorises and acknowledges the listen, pings every second so the
+            // heartbeat holds, and closes the `n`th connection `lifetime(n)` after its listen.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let ws_url = format!("ws://{}", listener.local_addr().unwrap());
+            let listens = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let seen = Arc::clone(&listens);
+            tokio::spawn(async move {
+                let mut connections = 0..;
+                while let Ok((stream, _)) = listener.accept().await {
+                    let seen = Arc::clone(&seen);
+                    let lifetime = connections.next().and_then(lifetime);
+                    tokio::spawn(async move {
+                        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                            return;
+                        };
+                        for answer in [
+                            r#"{"stream":"authorization","data":{"status":"authorized","action":"authenticate"}}"#,
+                            r#"{"stream":"listening","data":{"streams":["trade_updates"]}}"#,
+                        ] {
+                            let Some(Ok(_)) = ws.next().await else {
+                                return;
+                            };
+                            if ws.send(Message::text(answer)).await.is_err() {
+                                return;
+                            }
+                        }
+                        seen.lock().push(tokio::time::Instant::now());
+                        let closes = async {
+                            match lifetime {
+                                Some(after) => tokio::time::sleep(after).await,
+                                None => std::future::pending().await,
+                            }
+                        };
+                        tokio::pin!(closes);
+                        let mut pings = tokio::time::interval(Duration::from_secs(1));
+                        loop {
+                            tokio::select! {
+                                () = &mut closes => {
+                                    let _ = ws.close(None).await;
+                                    return;
+                                }
+                                _ = pings.tick() => {
+                                    if ws.send(Message::Ping(Default::default())).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                message = ws.next() => {
+                                    if !matches!(message, Some(Ok(_))) {
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+            // REST answers nothing, so each reconnect's recovery fails at once.
+            let server = MockServer::start().await;
+            let mut config =
+                AlpacaConfig::with_base_url("key".into(), "secret".into(), server.uri());
+            config.ws_url_override = Some(ws_url);
+            let (tx, _rx) = mpsc::unbounded_channel();
+            tokio::spawn(connection_manager(
+                tx,
+                new_dedup_cache(),
+                Arc::new(config),
+                reqwest::Client::new(),
+                Arc::new(RateLimitTracker::new()),
+                KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
+                Vec::new(),
+                None,
+            ));
+
+            let deadline = tokio::time::Instant::now() + STABLE + Duration::from_secs(15);
+            while listens.lock().len() < 4 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{} connections",
+                    listens.lock().len()
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            let listens = listens.lock();
+            // Not reset by the second connection's handshake: its close waits the second backoff.
+            let escalated = listens[2] - listens[1];
+            assert!(
+                escalated >= Duration::from_millis(2 * INITIAL_BACKOFF_MS),
+                "reconnected {escalated:?} after a closed connection"
+            );
+            // Reset by the third connection's stability timer: its close waits the first backoff
+            // again, not the third (4 s).
+            let after_stable = listens[3] - listens[2] - STABLE;
+            assert!(
+                after_stable < Duration::from_millis(3 * INITIAL_BACKOFF_MS),
+                "reconnected {after_stable:?} after a stable connection"
+            );
+        }
+
         /// Serve `activities` from a mock and run `recover_fills` against it, returning every
         /// event it forwarded.
         async fn drive_recover_fills_with(
@@ -10507,7 +10659,6 @@ mod tests {
                 &tx,
                 &dedup,
                 &known,
-                &mut ExponentialBackoff::new(),
             );
 
             drive_recover_fills_with(
@@ -11192,7 +11343,6 @@ mod tests {
             let (tx, mut rx) = mpsc::unbounded_channel();
             let dedup = new_dedup_cache();
             let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
-            let mut backoff = ExponentialBackoff::new();
             let frame = |event: &str, filled: &str| {
                 format!(
                     r#"{{"stream":"trade_updates","data":{{"event":"{event}","order":{{"id":"id-a","client_order_id":"a","symbol":"SPY","qty":"2","filled_qty":"{filled}","side":"buy","type":"limit","time_in_force":"gtc","limit_price":"100","status":"{event}"}}}}}}"#
@@ -11200,19 +11350,13 @@ mod tests {
             };
             let cid = ClientOrderId::new("a");
 
-            process_ws_text(&frame("new", "0"), &tx, &dedup, &known, &mut backoff);
+            process_ws_text(&frame("new", "0"), &tx, &dedup, &known);
             assert!(known.lock().contains(&cid), "acknowledged");
 
-            process_ws_text(
-                &frame("done_for_day", "1"),
-                &tx,
-                &dedup,
-                &known,
-                &mut backoff,
-            );
+            process_ws_text(&frame("done_for_day", "1"), &tx, &dedup, &known);
             assert!(known.lock().contains(&cid), "done for the day is not ended");
 
-            process_ws_text(&frame("canceled", "1"), &tx, &dedup, &known, &mut backoff);
+            process_ws_text(&frame("canceled", "1"), &tx, &dedup, &known);
             assert!(!known.lock().contains(&cid), "cancelled");
 
             let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();

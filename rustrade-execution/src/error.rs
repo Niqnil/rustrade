@@ -710,9 +710,9 @@ pub enum StreamTerminationReason {
     /// A venue with built-in reconnection exhausted its retry budget and gave up.
     ///
     /// Emitted by venues that reconnect internally (e.g. Binance spot/margin, Alpaca) once the
-    /// final attempt fails. `last_error` is the most recent underlying failure; `attempts` is the
-    /// number of reconnects tried before surrendering. The stream will not recover on its own —
-    /// the consumer must re-establish it.
+    /// final attempt fails. Each client documents its budget. `last_error` is the most recent
+    /// underlying failure; `attempts` is the number of reconnects tried before surrendering. The
+    /// stream will not recover on its own — the consumer must re-establish it.
     #[error("reconnect budget exhausted after {attempts} attempts: {last_error}")]
     ReconnectBudgetExhausted {
         /// Number of reconnect attempts made before giving up.
@@ -724,9 +724,10 @@ pub enum StreamTerminationReason {
     /// The stream ended on an unrecoverable error with no automatic recovery.
     ///
     /// Emitted by venues without library-managed reconnection — e.g. IBKR (the underlying
-    /// subscription errored and the client does not retry), Hyperliquid (the SDK's internal
-    /// reconnection gave up and closed the channel), or the mock exchange (its broadcast stream
-    /// lagged past the buffer). The consumer is responsible for any re-establishment.
+    /// subscription errored and the client does not retry), Hyperliquid (the SDK closed the
+    /// subscription's channel; its own reconnection never gives up), or the mock exchange (its
+    /// broadcast stream lagged past the buffer). The consumer is responsible for any
+    /// re-establishment.
     #[error("unrecoverable stream error: {0}")]
     Error(String),
 

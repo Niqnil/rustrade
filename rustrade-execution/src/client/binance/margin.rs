@@ -459,8 +459,9 @@ impl BinanceMarginConfig {
 /// [`StreamTerminationReason::RateLimited`](crate::error::StreamTerminationReason::RateLimited),
 /// carrying the time left. A connect or subscribe Binance refuses for a rate limit starts a
 /// cooldown, as a REST refusal does. A refused handshake names no wait, so a 429 starts the 10 s
-/// default, and handshakes refused that way spend the reconnect budget as any failure does; a 418,
-/// an IP ban, starts Binance's shortest ban, 2 minutes, and so ends the stream.
+/// default, and handshakes refused that way spend the
+/// [reconnect budget](super#account-stream-reconnection) as any failure does; a 418, an IP ban,
+/// starts Binance's shortest ban, 2 minutes, and so ends the stream.
 ///
 /// # One client per engine (`ExchangeId`)
 /// All emitted events — cross and isolated alike — are stamped [`ExchangeId::BinanceMargin`], and
@@ -1272,7 +1273,8 @@ impl ExecutionClient for BinanceMargin {
     /// live with auto-reconnect, exponential backoff, heartbeat monitoring, and fill recovery
     /// (mirroring [`BinanceSpot`](super::spot::BinanceSpot)). The token is re-acquired and
     /// re-subscribed before its ~24h expiry — there is **no** listen-key keepalive (that API is
-    /// retired).
+    /// retired). The stream ends once 10 reconnects in a row have failed or a rate-limit cooldown
+    /// outlasts what it waits through: see the [module docs](super#account-stream-reconnection).
     ///
     /// As on spot, each instrument's gap after a reconnect is kept until its fills are forwarded:
     /// a gap whose read failed or timed out is retried after 1, 2, 4, 8 and 16 minutes, connected
@@ -2218,22 +2220,35 @@ fn isolated_notice_instrument(
 /// two-arg form (they do not route balances per-instrument).
 #[cfg(test)]
 fn convert_margin_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> bool {
-    convert_margin_user_data_events_with(
-        frame,
-        buf,
-        &mut cross_account_position_handler,
-        &mut cross_notice_instrument,
+    matches!(
+        convert_margin_user_data_events_with(
+            frame,
+            buf,
+            &mut cross_account_position_handler,
+            &mut cross_notice_instrument,
+        ),
+        FrameOutcome::Pushed { terminated: true }
     )
+}
+
+/// What [`convert_margin_user_data_events_with`] found a frame to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameOutcome {
+    /// An RPC response: the venue answering a request, such as the subscribe.
+    Response,
+    /// A frame the venue pushed; `terminated` when it signalled stream termination.
+    Pushed { terminated: bool },
 }
 
 /// Frame discrimination for the WS-API user-data delivery, as observed live.
 ///
 /// Each text frame is either an RPC response (`{ "id", "status", "result", … }` — e.g. the
 /// subscribe ack) or a pushed user-data event wrapped as `{ "subscriptionId", "event": { "e", … } }`.
-/// Returns `true` if the exchange signalled stream termination (a reconnect trigger). Unrecognised
-/// frames are ignored and logged by [`log_unrecognised_frame`] (throttled `warn`); event types with
-/// no arm are ignored and logged by [`log_unhandled_event`] (throttled `warn`), so a renamed event
-/// is seen rather than dropped silently. Deserialization of a known event type is defensive: a
+/// Returns [`FrameOutcome::Response`] for a response, and otherwise whether the exchange signalled
+/// stream termination (a reconnect trigger). Unrecognised frames are ignored and logged by
+/// [`log_unrecognised_frame`] (throttled `warn`); event types with no arm are ignored and logged
+/// by [`log_unhandled_event`] (throttled `warn`), so a renamed event is seen rather than dropped
+/// silently. Deserialization of a known event type is defensive: a
 /// mismatch is logged and the event dropped (observable), never silently mis-parsed.
 ///
 /// Two arms differ between cross and isolated, and are delegated: the `outboundAccountPosition`
@@ -2251,10 +2266,10 @@ fn convert_margin_user_data_events_with(
         &mut Vec<UnindexedAccountEvent>,
     ),
     notice_instrument: &mut impl FnMut(Option<i64>) -> Option<InstrumentNameExchange>,
-) -> bool {
+) -> FrameOutcome {
     let (subscription_id, event_type, event_raw) = match parse_user_data_frame(frame) {
         // RPC responses (subscribe ack, errors): not a user-data event.
-        UserDataFrame::Response => return false,
+        UserDataFrame::Response => return FrameOutcome::Response,
         UserDataFrame::Event {
             subscription_id,
             event_type,
@@ -2263,10 +2278,10 @@ fn convert_margin_user_data_events_with(
         UserDataFrame::Unrecognised => {
             static SEEN: AtomicU64 = AtomicU64::new(0);
             log_unrecognised_frame("BinanceMargin", &SEEN, frame);
-            return false;
+            return FrameOutcome::Pushed { terminated: false };
         }
     };
-    match event_type {
+    let terminated = match event_type {
         "executionReport" => {
             // Single typed pass straight from the raw inner slice — no intermediate DOM, and only
             // the matched branch deserializes its payload.
@@ -2362,7 +2377,8 @@ fn convert_margin_user_data_events_with(
             log_unhandled_event("BinanceMargin", &SEEN, other, event_raw);
             false
         }
-    }
+    };
+    FrameOutcome::Pushed { terminated }
 }
 
 /// Convert a margin `outboundAccountPosition` to `BalanceStreamUpdate` events (one per asset).
@@ -2508,8 +2524,8 @@ fn route_isolated_account_position(
 /// `InstrumentBalanceUpdate` via [`route_isolated_account_position`]) and `notice_instrument`
 /// ([`cross_notice_instrument`]; [`isolated_notice_instrument`]). Returns the subscription,
 /// which the caller unsubscribes on disconnect; dropping it unsubscribes too. `heartbeat_flag` is
-/// shared with the caller's monitor loop (set on every inbound frame/ping); `signal_tx` fires
-/// once on a terminal condition (consumer-drop, socket error/close, or exchange
+/// shared with the caller's monitor loop (set on every pushed frame and ping, not on responses);
+/// `signal_tx` fires once on a terminal condition (consumer-drop, socket error/close, or exchange
 /// `eventStreamTerminated`). Each event `known` learns from updates it before it is sent.
 fn register_user_data_listener(
     ws: &Arc<WsApiBase>,
@@ -2540,15 +2556,22 @@ fn register_user_data_listener(
         let Some(ref sender) = event_tx else { return };
         match event {
             WebsocketEvent::Message(json_str) => {
-                heartbeat_flag.store(true, Ordering::Release);
                 // Frame parsing (including skipping non-JSON frames) happens inside the converter,
                 // which parses borrowed slices rather than a full DOM (hot path).
-                let terminated = convert_margin_user_data_events_with(
+                let terminated = match convert_margin_user_data_events_with(
                     &json_str,
                     &mut event_buf,
                     &mut handle_position,
                     &mut notice_instrument,
-                );
+                ) {
+                    // The listener is registered before subscribing, so it also sees the
+                    // subscribe's answer. That proves only the connect, not a live stream.
+                    FrameOutcome::Response => return,
+                    FrameOutcome::Pushed { terminated } => {
+                        heartbeat_flag.store(true, Ordering::Release);
+                        terminated
+                    }
+                };
                 for ev in event_buf.drain(..) {
                     if let Some(key) = dedup_key_from_event(&ev)
                         && is_duplicate(&dedup, key)
@@ -2905,8 +2928,9 @@ async fn margin_connection_manager(
 
         // --- Register the event listener BEFORE subscribing so no pushed event is missed ---
         let (signal_tx, signal_rx) = oneshot::channel::<()>();
-        // start true — grant one full heartbeat window before requiring activity.
-        let heartbeat_flag = Arc::new(AtomicBool::new(true));
+        // Set by every frame and ping. Starts false: only one of those proves the connection
+        // stable; the first window's grace is the monitor loop's.
+        let heartbeat_flag = Arc::new(AtomicBool::new(false));
         // Cross is account-wide: balance frames become asset-keyed BalanceStreamUpdates (no
         // per-instrument routing). The shared dispatch/dedup/heartbeat logic lives in the helper.
         let subscription = register_user_data_listener(
@@ -2936,10 +2960,9 @@ async fn margin_connection_manager(
             continue;
         }
         info!("BinanceMargin account_stream connected and subscribed");
-        // Reaching a live, subscribed connection clears any prior failure count so only *consecutive*
-        // failures exhaust the reconnect budget — a clean rotation or a transient blip that recovers
-        // shouldn't leave the backoff counter inflated for the next genuine failure.
-        backoff.reset();
+        // backoff is NOT reset here: a venue that accepts each connection and drops it at once
+        // would then be retried at INITIAL_BACKOFF_MS forever, never exhausting the budget. The
+        // monitor loop resets it once the connection survives a heartbeat window, as spot's does.
 
         // Absolute deadline (not a per-iteration relative sleep) so heartbeat ticks that `continue`
         // the monitor loop don't keep restarting the renewal timer.
@@ -3014,6 +3037,8 @@ async fn margin_connection_manager(
                 }
             };
             tokio::pin!(retry_gaps);
+            // The first window is a grace: a slow first ping is not a heartbeat timeout.
+            let mut grace = true;
             loop {
                 tokio::select! {
                     // Biased: a consumer drop is terminal and must win over a simultaneously-ready
@@ -3032,10 +3057,16 @@ async fn margin_connection_manager(
                         break DisconnectReason::TokenRefresh;
                     }
                     () = tokio::time::sleep(Duration::from_secs(HEARTBEAT_TIMEOUT_SECS)) => {
+                        let in_grace = std::mem::take(&mut grace);
                         if heartbeat_flag.swap(false, Ordering::AcqRel) {
-                            // Backoff is already cleared post-subscribe (see backoff.reset() above);
-                            // the monitor loop is only entered on a live connection, so a heartbeat
-                            // tick never sees a non-zero count. Just consume the flag and keep waiting.
+                            // A frame or ping in this window proves the connection stable: clear
+                            // the failures before it, so only consecutive ones exhaust the budget.
+                            backoff.reset();
+                            continue;
+                        }
+                        if in_grace {
+                            // Not a timeout yet, but no reset either: a venue that accepts the
+                            // connection and stays silent spends the budget.
                             continue;
                         }
                         warn!("BinanceMargin heartbeat timeout ({}s), will attempt reconnect", HEARTBEAT_TIMEOUT_SECS);
@@ -3216,8 +3247,8 @@ async fn isolated_connect_and_subscribe(
         HashMap::<i64, InstrumentNameExchange>::with_capacity(tokens.len()),
     ));
     let (signal_tx, signal_rx) = oneshot::channel::<()>();
-    // start true — grant one full heartbeat window before requiring activity.
-    let heartbeat_flag = Arc::new(AtomicBool::new(true));
+    // Starts false, as the cross manager's does.
+    let heartbeat_flag = Arc::new(AtomicBool::new(false));
 
     let handle_position = {
         let sub_map = sub_map.clone();
@@ -3386,9 +3417,8 @@ async fn isolated_connection_manager(
             symbols = symbols.len(),
             "BinanceMargin isolated account_stream connected and subscribed"
         );
-        // Reaching a live, subscribed connection clears any prior failure count (see the cross
-        // manager) so only *consecutive* failures exhaust the reconnect budget.
-        backoff.reset();
+        // backoff is NOT reset here, but once the connection survives a heartbeat window (see the
+        // cross manager).
 
         // Absolute deadline (not a per-iteration relative sleep) so heartbeat ticks that `continue`
         // the monitor loop don't keep restarting the renewal timer. Earliest token expiry drives it.
@@ -3457,6 +3487,8 @@ async fn isolated_connection_manager(
                 }
             };
             tokio::pin!(retry_gaps);
+            // The first window is a grace: a slow first ping is not a heartbeat timeout.
+            let mut grace = true;
             loop {
                 tokio::select! {
                     biased;
@@ -3473,7 +3505,14 @@ async fn isolated_connection_manager(
                         break DisconnectReason::TokenRefresh;
                     }
                     () = tokio::time::sleep(Duration::from_secs(HEARTBEAT_TIMEOUT_SECS)) => {
+                        let in_grace = std::mem::take(&mut grace);
                         if heartbeat_flag.swap(false, Ordering::AcqRel) {
+                            // Proven stable (see the cross manager).
+                            backoff.reset();
+                            continue;
+                        }
+                        if in_grace {
+                            // The grace, with no reset (see the cross manager).
                             continue;
                         }
                         warn!("BinanceMargin isolated heartbeat timeout ({}s), will attempt reconnect", HEARTBEAT_TIMEOUT_SECS);
@@ -4510,7 +4549,11 @@ fn convert_order_kind_tif_margin(
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
-    use crate::client::binance::shared::{INITIAL_BACKOFF_MS, convert_open_order, unix_ms};
+    use crate::client::binance::shared::{
+        INITIAL_BACKOFF_MS, convert_open_order,
+        test_ws_api::{self, Lifetime},
+        unix_ms,
+    };
     use crate::error::StreamTerminationReason;
     use crate::notice::{AccountNotice, NoticeKind};
     use crate::order::state::ActiveOrderState;
@@ -4545,8 +4588,8 @@ mod tests {
     }
 
     /// What the margin managers need, wired to local servers: a WS API that answers every request
-    /// with `answer` and, when `close_after` is set, closes each connection that long after its
-    /// first answer; and a REST API that hands out listen tokens and nothing else.
+    /// with `answer` and whose `n`th connection (from 0) lives `lifetime(n)` after its first answer
+    /// (see [`test_ws_api::serve`]); and a REST API that hands out listen tokens and nothing else.
     struct ManagerRig {
         ws_config: ConfigurationWebsocketApi,
         rest_config: Arc<ConfigurationRestApi>,
@@ -4560,41 +4603,9 @@ mod tests {
     impl ManagerRig {
         async fn new(
             answer: fn(&serde_json::Value) -> serde_json::Value,
-            close_after: Option<Duration>,
+            lifetime: fn(usize) -> Lifetime,
         ) -> Self {
-            use futures::{SinkExt as _, StreamExt as _};
-            use tokio_tungstenite::tungstenite::Message;
-
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let ws_url = format!("ws://{}", listener.local_addr().unwrap());
-            let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
-            let seen = Arc::clone(&requests);
-            tokio::spawn(async move {
-                while let Ok((stream, _)) = listener.accept().await {
-                    let seen = Arc::clone(&seen);
-                    tokio::spawn(async move {
-                        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
-                            return;
-                        };
-                        while let Some(Ok(message)) = ws.next().await {
-                            let Message::Text(text) = message else {
-                                continue;
-                            };
-                            seen.lock().push(tokio::time::Instant::now());
-                            let request: serde_json::Value = serde_json::from_str(&text).unwrap();
-                            let response = answer(&request).to_string();
-                            if ws.send(Message::text(response)).await.is_err() {
-                                return;
-                            }
-                            if let Some(after) = close_after {
-                                tokio::time::sleep(after).await;
-                                let _ = ws.close(None).await;
-                                return;
-                            }
-                        }
-                    });
-                }
-            });
+            let (ws_url, requests) = test_ws_api::serve(answer, lifetime).await;
 
             let rest_server = wiremock::MockServer::start().await;
             wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -4743,7 +4754,7 @@ mod tests {
     /// at once with the ban's wait instead of reconnecting into it.
     #[tokio::test]
     async fn a_banned_subscribe_ends_the_cross_margin_stream_rate_limited() {
-        let rig = ManagerRig::new(banned_for_two_minutes, None).await;
+        let rig = ManagerRig::new(banned_for_two_minutes, |_| Lifetime::Open).await;
         let mut events = rig.cross().await;
 
         let wait = rate_limited_end(&mut events).await;
@@ -4756,7 +4767,7 @@ mod tests {
     /// is recognised and starts the ban's cooldown.
     #[tokio::test]
     async fn a_banned_isolated_subscribe_is_recognised_as_a_refusal() {
-        let rig = ManagerRig::new(banned_for_two_minutes, None).await;
+        let rig = ManagerRig::new(banned_for_two_minutes, |_| Lifetime::Open).await;
         let (tx, _rx) = mpsc::unbounded_channel();
         let symbol = InstrumentNameExchange::new("BTCUSDT");
 
@@ -4786,7 +4797,7 @@ mod tests {
     #[tokio::test]
     async fn a_drop_during_a_long_cooldown_ends_the_isolated_margin_stream_rate_limited() {
         // The drop comes once the test has started the cooldown.
-        let rig = ManagerRig::new(subscribed, Some(Duration::from_secs(1))).await;
+        let rig = ManagerRig::new(subscribed, |_| Lifetime::Silent(Duration::from_secs(1))).await;
         let mut events = rig.isolated().await;
         rig.rate_limiter
             .on_rate_limited(Some(Duration::from_secs(60)));
@@ -4802,7 +4813,8 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_margin_connection_backs_off_before_reconnecting() {
         for isolated in [false, true] {
-            let rig = ManagerRig::new(subscribed, Some(Duration::from_millis(100))).await;
+            let rig =
+                ManagerRig::new(subscribed, |_| Lifetime::Silent(Duration::from_millis(100))).await;
             let _events = if isolated {
                 rig.isolated().await
             } else {
@@ -4826,6 +4838,40 @@ mod tests {
                 "isolated {isolated}: reconnected {between:?} after the first subscribe"
             );
         }
+    }
+
+    /// Both managers clear their reconnect failures only on a heartbeat tick that saw a frame or
+    /// ping. A connection the venue accepts and drops at once is a failure like any other, and so
+    /// is one that stays silent past the first tick, so a venue doing either to every connection
+    /// exhausts the budget.
+    #[tokio::test]
+    async fn a_margin_reconnect_budget_resets_only_once_a_connection_proves_stable() {
+        async fn run(isolated: bool, pinging: bool) {
+            let lifetime = if pinging {
+                test_ws_api::dropped_then_pinging
+            } else {
+                test_ws_api::dropped_then_silent
+            };
+            let rig = ManagerRig::new(subscribed, lifetime).await;
+            let _events = if isolated {
+                rig.isolated().await
+            } else {
+                rig.cross().await
+            };
+            let label = format!("isolated {isolated}");
+            if pinging {
+                test_ws_api::assert_reset_once_pinged(&rig.requests, &label).await;
+            } else {
+                test_ws_api::assert_no_reset_when_silent(&rig.requests, &label).await;
+            }
+        }
+
+        tokio::join!(
+            run(false, true),
+            run(true, true),
+            run(false, false),
+            run(true, false)
+        );
     }
 
     /// The connection both margin managers open is closed when dropped, as when a manager is
@@ -6052,12 +6098,22 @@ mod tests {
         serde_json::json!({ "subscriptionId": 1, "event": event }).to_string()
     }
 
+    fn cross_outcome(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> FrameOutcome {
+        convert_margin_user_data_events_with(
+            frame,
+            buf,
+            &mut cross_account_position_handler,
+            &mut cross_notice_instrument,
+        )
+    }
+
+    /// An RPC response (e.g. the subscribe ack) carries a top-level `id` and is not user data,
+    /// so it yields no events and is not activity for the heartbeat.
     #[test]
     fn margin_ws_rpc_ack_yields_no_events() {
-        // An RPC response (e.g. the subscribe ack) carries a top-level `id` and is not user data.
         let frame = serde_json::json!({ "id": "abc", "status": 200, "result": {} }).to_string();
         let mut buf = Vec::new();
-        assert!(!convert_margin_user_data_events(&frame, &mut buf));
+        assert_eq!(cross_outcome(&frame, &mut buf), FrameOutcome::Response);
         assert!(buf.is_empty());
     }
 
@@ -6070,7 +6126,11 @@ mod tests {
             r#"{"subscriptionId":1,"event":{"E":1}}"#,
         ] {
             let mut buf = Vec::new();
-            assert!(!convert_margin_user_data_events(frame, &mut buf), "{frame}");
+            assert_eq!(
+                cross_outcome(frame, &mut buf),
+                FrameOutcome::Pushed { terminated: false },
+                "{frame}"
+            );
             assert!(buf.is_empty(), "{frame}");
         }
     }
@@ -6803,12 +6863,15 @@ mod tests {
                 subscription_id,
                 documented_margin_level_change("MARGIN_LEVEL_STATUS_CHANGE"),
             );
-            assert!(!convert_margin_user_data_events_with(
-                &frame,
-                &mut buf,
-                &mut cross_account_position_handler,
-                &mut |id| isolated_notice_instrument(id, &sub_map),
-            ));
+            assert_eq!(
+                convert_margin_user_data_events_with(
+                    &frame,
+                    &mut buf,
+                    &mut cross_account_position_handler,
+                    &mut |id| isolated_notice_instrument(id, &sub_map),
+                ),
+                FrameOutcome::Pushed { terminated: false }
+            );
             only_notice(&buf).instrument.clone()
         };
 
@@ -6893,12 +6956,15 @@ mod tests {
             }),
         );
         let mut buf = Vec::new();
-        assert!(!convert_margin_user_data_events_with(
-            &frame,
-            &mut buf,
-            &mut handler,
-            &mut cross_notice_instrument,
-        ));
+        assert_eq!(
+            convert_margin_user_data_events_with(
+                &frame,
+                &mut buf,
+                &mut handler,
+                &mut cross_notice_instrument,
+            ),
+            FrameOutcome::Pushed { terminated: false }
+        );
         // One InstrumentBalanceUpdate per asset, in frame order — crucially NOT the asset-keyed
         // BalanceStreamUpdate (which would corrupt AssetStates).
         assert_eq!(
@@ -6936,12 +7002,15 @@ mod tests {
             }),
         );
         let mut buf = Vec::new();
-        assert!(!convert_margin_user_data_events_with(
-            &frame,
-            &mut buf,
-            &mut handler,
-            &mut cross_notice_instrument,
-        ));
+        assert_eq!(
+            convert_margin_user_data_events_with(
+                &frame,
+                &mut buf,
+                &mut handler,
+                &mut cross_notice_instrument,
+            ),
+            FrameOutcome::Pushed { terminated: false }
+        );
         assert!(buf.is_empty(), "unmapped subscriptionId frame is dropped");
     }
 
@@ -6968,12 +7037,15 @@ mod tests {
                 }),
             );
             let mut buf = Vec::new();
-            assert!(!convert_margin_user_data_events_with(
-                &frame,
-                &mut buf,
-                &mut handler,
-                &mut cross_notice_instrument,
-            ));
+            assert_eq!(
+                convert_margin_user_data_events_with(
+                    &frame,
+                    &mut buf,
+                    &mut handler,
+                    &mut cross_notice_instrument,
+                ),
+                FrameOutcome::Pushed { terminated: false }
+            );
             assert_eq!(
                 isolated_balances(&buf),
                 vec![("BTCUSDT", listed, free, Decimal::ZERO)],
@@ -7004,12 +7076,15 @@ mod tests {
             }),
         );
         let mut buf = Vec::new();
-        assert!(!convert_margin_user_data_events_with(
-            &mixed,
-            &mut buf,
-            &mut handler,
-            &mut cross_notice_instrument,
-        ));
+        assert_eq!(
+            convert_margin_user_data_events_with(
+                &mixed,
+                &mut buf,
+                &mut handler,
+                &mut cross_notice_instrument,
+            ),
+            FrameOutcome::Pushed { terminated: false }
+        );
         assert_eq!(
             isolated_balances(&buf),
             vec![("BTCUSDT", "USDT", Decimal::from(20), Decimal::ONE)]
@@ -7023,12 +7098,15 @@ mod tests {
             }),
         );
         let mut buf = Vec::new();
-        assert!(!convert_margin_user_data_events_with(
-            &stray_only,
-            &mut buf,
-            &mut handler,
-            &mut cross_notice_instrument,
-        ));
+        assert_eq!(
+            convert_margin_user_data_events_with(
+                &stray_only,
+                &mut buf,
+                &mut handler,
+                &mut cross_notice_instrument,
+            ),
+            FrameOutcome::Pushed { terminated: false }
+        );
         assert!(buf.is_empty(), "no asset of the pair → nothing emitted");
     }
 
@@ -7053,12 +7131,15 @@ mod tests {
             }),
         );
         let mut buf = Vec::new();
-        assert!(!convert_margin_user_data_events_with(
-            &frame,
-            &mut buf,
-            &mut handler,
-            &mut cross_notice_instrument,
-        ));
+        assert_eq!(
+            convert_margin_user_data_events_with(
+                &frame,
+                &mut buf,
+                &mut handler,
+                &mut cross_notice_instrument,
+            ),
+            FrameOutcome::Pushed { terminated: false }
+        );
         assert_eq!(
             isolated_balances(&buf),
             vec![("BTCUSDT", "USDT", Decimal::from(20), Decimal::ONE)]
@@ -7084,12 +7165,15 @@ mod tests {
             }),
         );
         let mut buf = Vec::new();
-        assert!(!convert_margin_user_data_events_with(
-            &frame,
-            &mut buf,
-            &mut handler,
-            &mut cross_notice_instrument,
-        ));
+        assert_eq!(
+            convert_margin_user_data_events_with(
+                &frame,
+                &mut buf,
+                &mut handler,
+                &mut cross_notice_instrument,
+            ),
+            FrameOutcome::Pushed { terminated: false }
+        );
         assert_eq!(buf.len(), 2, "the execution and its order snapshot");
         match &buf[0].kind {
             AccountEventKind::Trade(t) => assert_eq!(t.instrument.name().as_str(), "BTCUSDT"),
