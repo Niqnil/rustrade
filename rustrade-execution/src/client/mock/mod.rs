@@ -8,7 +8,7 @@ use crate::{
     },
     exchange::mock::request::MockExchangeRequest,
     fee::{FeeModelConfig, SpotFeeAsset},
-    fill::SimFillConfig,
+    fill::{MarketOrderTiming, SimFillConfig},
     order::{
         Order, OrderKey, UnindexedInactiveOrder, UnindexedOrderKey,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
@@ -65,6 +65,14 @@ pub struct MockExecutionConfig {
     /// to and how.
     #[serde(default)]
     pub slippage: SlippageConfig,
+    /// When the mock exchange fills a market order.
+    ///
+    /// Defaults to [`MarketOrderTiming::OnArrival`]: against the market the venue holds when the
+    /// order arrives, which on bar data is the close of the bar the sender has just seen.
+    /// [`MarketOrderTiming::NextBar`] holds it for the instrument's next bar instead, and needs a
+    /// driver that feeds the venue bars, as `SimRunner` does on a candle feed.
+    #[serde(default)]
+    pub market_order_timing: MarketOrderTiming,
 }
 
 #[derive(Debug, Constructor)]

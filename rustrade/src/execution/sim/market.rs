@@ -6,7 +6,7 @@ use crate::engine::{
 };
 use rust_decimal::Decimal;
 use rustrade_data::event::{DataKind, MarketEvent};
-use rustrade_execution::market::{MarketDepth, MarketSnapshot};
+use rustrade_execution::market::{MarketBar, MarketDepth, MarketSnapshot};
 use rustrade_instrument::instrument::InstrumentIndex;
 use std::fmt::Debug;
 
@@ -61,6 +61,25 @@ pub trait VenueMarketUpdate: Sized {
     fn depth(_state: &Self::State) -> MarketDepth {
         MarketDepth::UNKNOWN
     }
+
+    /// The completed bar `event` carries, if folding it into `state` takes it as a new bar, or
+    /// `None` for any other event.
+    ///
+    /// Asked **before** [`apply`](Self::apply) folds `event` in, because only the state as it was
+    /// can say whether the bar is new. What releases a market order a venue holds for the
+    /// instrument's next bar under [`MarketOrderTiming::NextBar`], so a bar the fold will refuse
+    /// or has already seen must answer `None`: a candle closing after its own event's instant, or
+    /// one sent a second time, is not a next bar.
+    ///
+    /// # Default body
+    ///
+    /// `None`: a kind with no bars. A venue configured for `NextBar` then rejects every market
+    /// order, naming the setting, rather than holding orders that nothing would ever release.
+    ///
+    /// [`MarketOrderTiming::NextBar`]: rustrade_execution::fill::MarketOrderTiming::NextBar
+    fn bar(_state: &Self::State, _event: &MarketEvent<InstrumentIndex, Self>) -> Option<MarketBar> {
+        None
+    }
 }
 
 impl VenueMarketUpdate for DataKind {
@@ -103,6 +122,19 @@ impl VenueMarketUpdate for DataKind {
         }
 
         MarketDepth::new(sized(state.l1.best_bid), sized(state.l1.best_ask))
+    }
+
+    /// A [`Candle`](DataKind::Candle) the state will keep, as the bar it describes.
+    ///
+    /// Decided by the same rule the `Processor` keeps a candle by, so a candle it drops — one
+    /// closing after its event's instant, or no newer than the one held — releases nothing.
+    fn bar(state: &Self::State, event: &MarketEvent<InstrumentIndex, Self>) -> Option<MarketBar> {
+        let DataKind::Candle(candle) = &event.kind else {
+            return None;
+        };
+        state
+            .takes_candle(candle, event.time_exchange)
+            .then(|| MarketBar::new(candle.open, candle.high, candle.low, candle.close))
     }
 }
 
@@ -181,6 +213,41 @@ mod tests {
         assert_eq!(
             <DataKind as VenueMarketUpdate>::depth(&DefaultInstrumentMarketData::default()),
             MarketDepth::UNKNOWN
+        );
+    }
+
+    /// A kind that carries a last price and no bars, implementing only what it must.
+    #[derive(Debug)]
+    struct LastPrice(Decimal);
+
+    impl VenueMarketUpdate for LastPrice {
+        type State = Option<Decimal>;
+
+        fn apply(state: &mut Self::State, event: &MarketEvent<InstrumentIndex, Self>) {
+            *state = Some(event.kind.0);
+        }
+
+        fn snapshot(state: &Self::State) -> MarketSnapshot {
+            MarketSnapshot::from_last_price(*state)
+        }
+    }
+
+    /// A kind without bars reports none, so a venue holding market orders for the next bar
+    /// refuses them rather than holding them for a bar this kind can never deliver.
+    #[test]
+    fn a_kind_without_bars_reports_no_bar() {
+        let event = MarketEvent {
+            time_exchange: DateTime::<Utc>::MIN_UTC,
+            time_received: DateTime::<Utc>::MIN_UTC,
+            exchange: rustrade_instrument::exchange::ExchangeId::Simulated,
+            instrument: InstrumentIndex::new(0),
+            kind: LastPrice(dec!(100)),
+        };
+
+        assert_eq!(<LastPrice as VenueMarketUpdate>::bar(&None, &event), None);
+        assert_eq!(
+            <LastPrice as VenueMarketUpdate>::bar(&Some(dec!(99)), &event),
+            None
         );
     }
 }

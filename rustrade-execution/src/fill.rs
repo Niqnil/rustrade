@@ -1,4 +1,4 @@
-use crate::market::MarketSnapshot;
+use crate::market::{MarketBar, MarketSnapshot};
 use rust_decimal::Decimal;
 use rustrade_instrument::Side;
 use serde::{Deserialize, Serialize};
@@ -199,10 +199,123 @@ impl FillModel for SimFillConfig {
     }
 }
 
+/// When a simulated venue fills a market order, as [`MockExecutionConfig::market_order_timing`]
+/// selects. Defaults to [`OnArrival`](Self::OnArrival).
+///
+/// [`MockExecutionConfig::market_order_timing`]: crate::client::mock::MockExecutionConfig::market_order_timing
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
+)]
+pub enum MarketOrderTiming {
+    /// Fill the moment the order reaches the venue, against the market it holds then.
+    ///
+    /// On a bar feed with no latency, that market is the close of the bar the sender has just
+    /// seen: the order trades at exactly the price it decided on, with no time to react, no
+    /// spread crossed and no impact. A common convention, and an optimistic one — a strategy can
+    /// come to depend on it. [`NextBar`](Self::NextBar) is the pessimistic comparison.
+    #[default]
+    OnArrival,
+
+    /// Hold the order until its instrument's next bar, and fill it at that bar's price.
+    ///
+    /// For bar data only: the venue must be fed bars, through the `bar` argument of
+    /// [`SimulatedVenue::apply_market`](crate::exchange::mock::SimulatedVenue::apply_market).
+    /// Anything else fails visibly rather than falling back:
+    /// - a market order on an instrument the venue has never been fed a bar for is rejected, naming
+    ///   this setting. That includes every market order on a
+    ///   [`RequestPriced`](crate::exchange::mock::venue::VenueRegime::RequestPriced) venue, which
+    ///   has no feed at all;
+    /// - a tick or quote between two bars moves the market but does not release a held order.
+    ///
+    /// # While it is held
+    /// The order is accepted as `Open`, so a cancel takes it back as it would a resting order. The
+    /// venue holds what the order would cost at its current price, as it holds a limit order's
+    /// cost at its limit, so two held orders cannot both spend one balance. An order the account
+    /// cannot cover at that price is refused on arrival, as it is under
+    /// [`OnArrival`](Self::OnArrival).
+    ///
+    /// # When the next bar arrives
+    /// The hold is released and the order filled as a taker, at the reference price
+    /// [`NextBarPrice`] picks, priced by the venue's [`FillModel`] and moved by its slippage like
+    /// any other taker fill. The fill is costed afresh, and an order the account can no longer
+    /// afford is cancelled and reported. Its time in force decides the rest as on arrival:
+    /// immediate-or-cancel keeps what the bar's size allows and cancels the remainder,
+    /// fill-or-kill trades all of it or nothing. The fill is stamped at the bar's instant.
+    ///
+    /// # When the data ends first
+    /// An order still held when its driver runs out of data is retired as expired, filled
+    /// nothing, so every accepted order is answered.
+    ///
+    /// Only market orders are held. A limit order rests and matches as it always does.
+    NextBar(NextBarPrice),
+}
+
+/// Which price of the next bar fills a market order held for it. See
+/// [`MarketOrderTiming::NextBar`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+pub enum NextBarPrice {
+    /// The next bar's open: the first price the market traded at after the order was sent. The
+    /// realistic choice.
+    Open,
+
+    /// The next bar's worst price for the order: its high for a buy, its low for a sell.
+    ///
+    /// A deliberately **pessimistic bound**, not a model. A market order fills near the start of
+    /// the next bar, not at its extreme, so this overstates the cost of trading, and the more so
+    /// the longer or more volatile the bar. Its use is as a stress test: a strategy that still
+    /// makes money under it does not owe its edge to fill quality. It already charges more than
+    /// any slippage would, so combining it with slippage counts the same cost twice.
+    AdverseExtreme,
+}
+
+impl NextBarPrice {
+    /// The reference price `bar` gives an order on `side`.
+    pub fn reference(self, side: Side, bar: &MarketBar) -> Decimal {
+        match (self, side) {
+            (Self::Open, _) => bar.open,
+            (Self::AdverseExtreme, Side::Buy) => bar.high,
+            (Self::AdverseExtreme, Side::Sell) => bar.low,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_next_bar_price_is_its_open_or_its_worst_for_the_side() {
+        let bar = MarketBar::new(d("100"), d("110"), d("90"), d("105"));
+
+        assert_eq!(NextBarPrice::Open.reference(Side::Buy, &bar), d("100"));
+        assert_eq!(NextBarPrice::Open.reference(Side::Sell, &bar), d("100"));
+        assert_eq!(
+            NextBarPrice::AdverseExtreme.reference(Side::Buy, &bar),
+            d("110")
+        );
+        assert_eq!(
+            NextBarPrice::AdverseExtreme.reference(Side::Sell, &bar),
+            d("90")
+        );
+    }
+
+    #[test]
+    fn market_order_timing_defaults_to_on_arrival_and_round_trips() {
+        assert_eq!(MarketOrderTiming::default(), MarketOrderTiming::OnArrival);
+
+        for timing in [
+            MarketOrderTiming::OnArrival,
+            MarketOrderTiming::NextBar(NextBarPrice::Open),
+            MarketOrderTiming::NextBar(NextBarPrice::AdverseExtreme),
+        ] {
+            let json = serde_json::to_string(&timing).unwrap();
+            assert_eq!(
+                serde_json::from_str::<MarketOrderTiming>(&json).unwrap(),
+                timing
+            );
+        }
+    }
 
     fn d(s: &str) -> Decimal {
         s.parse().unwrap()

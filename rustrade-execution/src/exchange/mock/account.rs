@@ -99,6 +99,29 @@ impl AccountState {
         Ok(())
     }
 
+    /// Holds `order`, a market order, for its instrument's next bar with `reservation` held
+    /// against it, unless an order is already resting under its [`ClientOrderId`]. Forgets how an
+    /// earlier order under the id ended, as [`book`](Self::book) does.
+    ///
+    /// # Errors
+    /// [`AlreadyResting`], as for [`book`](Self::book). See [`OpenOrders::hold`].
+    pub fn hold(
+        &mut self,
+        order: OpenOrder,
+        reservation: Option<Reservation>,
+    ) -> Result<(), AlreadyResting> {
+        let cid = order.key.cid.clone();
+        self.orders_open.hold(order, reservation)?;
+        self.forget_ended(&cid);
+        Ok(())
+    }
+
+    /// The orders held for `instrument`'s next bar, earliest arrival first, no longer held. See
+    /// [`OpenOrders::take_held`].
+    pub fn take_held(&mut self, instrument: &InstrumentNameExchange) -> Vec<ClientOrderId> {
+        self.orders_open.take_held(instrument)
+    }
+
     /// Drops what the ledgers remember of how an order under `cid` ended, so that the order about
     /// to be recorded under it is the only one they hold.
     fn forget_ended(&mut self, cid: &ClientOrderId) {

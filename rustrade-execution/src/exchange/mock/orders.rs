@@ -116,7 +116,11 @@ impl QueuePosition {
 /// An order resting without a limit price cannot be ranked against one, and is not a thing a venue
 /// holds: an order with no price to wait at has nothing to wait for. Such an order is kept in the
 /// map — a snapshot must report everything the account holds — but is absent from the queues, so
-/// matching can never reach it. It can only arrive through a configured `initial_state`.
+/// matching can never reach it. It arrives one of two ways:
+/// - through a configured `initial_state`, and then nothing matches it, ever;
+/// - through [`hold`](Self::hold): a market order the venue is holding for its instrument's next
+///   bar. Those are kept in a fourth index, per instrument and in arrival order, which
+///   [`take_held`](Self::take_held) empties when that bar arrives.
 ///
 /// # Why a third index for deadlines
 ///
@@ -153,6 +157,9 @@ pub struct OpenOrders {
     /// orders, since [`by_id`](Self::by_id) is keyed by it, so the pair is already total — and
     /// therefore a sweep's order is reproducible between runs.
     expiries: BTreeSet<(DateTime<Utc>, ClientOrderId)>,
+    /// Market orders held for each instrument's next bar, earliest arrival first — see the type's
+    /// note on orders with no price. Values are keys into [`by_id`](Self::by_id).
+    held: FnvHashMap<InstrumentNameExchange, Vec<ClientOrderId>>,
     /// Monotone across every instrument, so insertion order is total even across queues.
     seq: u64,
 }
@@ -214,6 +221,58 @@ impl OpenOrders {
         Ok(())
     }
 
+    /// Holds `order`, a market order with no price, for its instrument's next bar, with
+    /// `reservation` held against it.
+    ///
+    /// Kept in the map like any open order, so a snapshot reports it and a cancel finds it, and
+    /// queued behind every order already held on its instrument. Matching never reaches it: only
+    /// [`take_held`](Self::take_held) does.
+    ///
+    /// # Errors
+    /// [`AlreadyResting`], as for [`insert`](Self::insert), leaving the book exactly as it was.
+    pub fn hold(
+        &mut self,
+        order: OpenOrder,
+        reservation: Option<Reservation>,
+    ) -> Result<(), AlreadyResting> {
+        debug_assert!(
+            order.price.is_none(),
+            "held order {} carries a price, so it belongs on the price-time queues",
+            order.key.cid
+        );
+
+        let instrument = order.key.instrument.clone();
+        let cid = order.key.cid.clone();
+        self.insert(order, reservation)?;
+        self.held.entry(instrument).or_default().push(cid);
+        Ok(())
+    }
+
+    /// Whether any order is held for `instrument`'s next bar.
+    pub fn holds(&self, instrument: &InstrumentNameExchange) -> bool {
+        self.held.contains_key(instrument)
+    }
+
+    /// The orders held for `instrument`'s next bar, earliest arrival first, no longer held.
+    ///
+    /// Each stays in the map until its caller [`remove`](Self::remove)s it, which is what lets the
+    /// caller take its reservation with it.
+    pub fn take_held(&mut self, instrument: &InstrumentNameExchange) -> Vec<ClientOrderId> {
+        self.held.remove(instrument).unwrap_or_default()
+    }
+
+    /// Every order held for a next bar, on any instrument: by instrument, then earliest arrival
+    /// first. A total order, so whatever a caller does with them happens in the same order on
+    /// every run.
+    pub fn held(&self) -> Vec<ClientOrderId> {
+        let mut instruments = self.held.keys().collect::<Vec<_>>();
+        instruments.sort_unstable();
+        instruments
+            .into_iter()
+            .flat_map(|instrument| self.held[instrument].iter().cloned())
+            .collect()
+    }
+
     /// Whether an order is resting under `cid`.
     pub fn contains(&self, cid: &ClientOrderId) -> bool {
         self.by_id.contains_key(cid)
@@ -252,6 +311,7 @@ impl OpenOrders {
     /// Takes `order` out of every index that ranks it, leaving [`by_id`](Self::by_id) to its caller.
     fn unindex(&mut self, order: &OpenOrder) {
         self.dequeue(order);
+        self.unhold(order);
 
         if let Some(expiry) = deadline_of(order) {
             self.expiries.remove(&(expiry, order.key.cid.clone()));
@@ -295,6 +355,24 @@ impl OpenOrders {
             // `by_id` and `queues` are written only together, so a queued id is always present.
             .filter_map(|cid| self.by_id.get(cid))
             .map(|resting| &resting.order)
+    }
+
+    /// Takes `order` out of the held index, if it is still there.
+    ///
+    /// Only an order with no price can be held, and a held one has left the index already when
+    /// [`take_held`](Self::take_held) handed it out, so this finds something only for a held order
+    /// cancelled or expired before its bar.
+    fn unhold(&mut self, order: &OpenOrder) {
+        if order.price.is_some() {
+            return;
+        }
+        let Some(held) = self.held.get_mut(&order.key.instrument) else {
+            return;
+        };
+        held.retain(|cid| *cid != order.key.cid);
+        if held.is_empty() {
+            self.held.remove(&order.key.instrument);
+        }
     }
 
     fn dequeue(&mut self, order: &OpenOrder) {
@@ -678,5 +756,73 @@ mod tests {
         let mut all = cids(Vec::leak(open.iter().cloned().collect::<Vec<_>>()).iter());
         all.sort();
         assert_eq!(all, ["a", "b", "c"]);
+    }
+
+    fn market(cid: &str, instrument: &str, millis: i64) -> OpenOrder {
+        let mut order = order(cid, Side::Buy, None, millis);
+        order.key.instrument = InstrumentNameExchange::new(instrument);
+        order.kind = OrderKind::Market;
+        order
+    }
+
+    fn ids(cids: Vec<ClientOrderId>) -> Vec<String> {
+        cids.into_iter().map(|cid| cid.0.to_string()).collect()
+    }
+
+    #[test]
+    fn held_orders_are_handed_out_once_per_instrument_in_arrival_order() {
+        let mut open = OpenOrders::default();
+        for order in [
+            market("b1", "eth_usdt", 1_000),
+            market("a1", "btc_usdt", 2_000),
+            market("b2", "eth_usdt", 3_000),
+        ] {
+            open.hold(order, None).unwrap();
+        }
+
+        assert!(open.holds(&InstrumentNameExchange::new("eth_usdt")));
+        assert_eq!(
+            ids(open.held()),
+            ["a1", "b1", "b2"],
+            "by instrument, then earliest arrival first"
+        );
+        assert_eq!(open.len(), 3, "a snapshot reports what is held");
+        assert!(
+            resting_cids(&open, Side::Buy).is_empty(),
+            "and matching never reaches it"
+        );
+
+        let eth = InstrumentNameExchange::new("eth_usdt");
+        assert_eq!(ids(open.take_held(&eth)), ["b1", "b2"]);
+        assert!(!open.holds(&eth));
+        assert!(open.take_held(&eth).is_empty(), "handed out once");
+        assert_eq!(open.len(), 3, "still in the map until removed");
+    }
+
+    #[test]
+    fn removing_a_held_order_stops_it_being_held() {
+        let mut open = OpenOrders::default();
+        open.hold(market("gone", "btc_usdt", 1_000), None).unwrap();
+        open.hold(market("kept", "btc_usdt", 2_000), None).unwrap();
+
+        assert!(open.remove(&ClientOrderId::new("gone")).is_some());
+        assert_eq!(ids(open.held()), ["kept"]);
+
+        assert!(open.remove(&ClientOrderId::new("kept")).is_some());
+        assert!(
+            !open.holds(&InstrumentNameExchange::new("btc_usdt")),
+            "an instrument with nothing left held holds nothing"
+        );
+    }
+
+    #[test]
+    fn a_held_order_under_a_resting_id_is_refused_and_nothing_changes() {
+        let mut open = book([order("taken", Side::Buy, Some(dec!(100)), 1_000)]);
+
+        let refused = open.hold(market("taken", "btc_usdt", 2_000), None);
+
+        assert!(refused.is_err());
+        assert!(open.held().is_empty());
+        assert_eq!(resting_cids(&open, Side::Buy), ["taken"]);
     }
 }

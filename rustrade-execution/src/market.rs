@@ -83,6 +83,42 @@ impl MarketSnapshot {
     }
 }
 
+/// The prices of one completed bar (candle): what traded first, highest, lowest and last over its
+/// period.
+///
+/// Carried **alongside** a [`MarketSnapshot`], like [`MarketDepth`], and only by a feed that has
+/// bars. A snapshot says where the market is now. A bar also says where it went over the period
+/// it covers, which is what a venue holding a market order for the next bar prices it from — see
+/// [`MarketOrderTiming::NextBar`](crate::fill::MarketOrderTiming::NextBar).
+///
+/// No volume and no period: a venue does not need either to price a fill, and a bar's instant is
+/// the observation's own, given beside it.
+#[derive(
+    Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Default, Deserialize, Serialize,
+)]
+pub struct MarketBar {
+    /// The first price of the bar's period.
+    pub open: Decimal,
+    /// The highest price of the bar's period.
+    pub high: Decimal,
+    /// The lowest price of the bar's period.
+    pub low: Decimal,
+    /// The last price of the bar's period.
+    pub close: Decimal,
+}
+
+impl MarketBar {
+    /// Construct a `MarketBar` from its four prices.
+    pub fn new(open: Decimal, high: Decimal, low: Decimal, close: Decimal) -> Self {
+        Self {
+            open,
+            high,
+            low,
+            close,
+        }
+    }
+}
+
 /// How much is on offer at each side's best price, where the feed says.
 ///
 /// Carried **alongside** a [`MarketSnapshot`] rather than inside it. A snapshot is the view a

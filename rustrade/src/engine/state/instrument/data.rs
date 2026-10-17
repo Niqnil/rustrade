@@ -133,6 +133,18 @@ pub struct DefaultInstrumentMarketData {
     pub candle: Option<Candle>,
 }
 
+impl DefaultInstrumentMarketData {
+    /// Whether processing `candle`, on an event stamped `time_exchange`, keeps it as this
+    /// instrument's newest candle: it has closed by its own instant, and closes after the candle
+    /// held. See the [`Processor`] impl, which applies exactly this.
+    pub(crate) fn takes_candle(&self, candle: &Candle, time_exchange: DateTime<Utc>) -> bool {
+        candle.close_time <= time_exchange
+            && self
+                .candle
+                .is_none_or(|current| current.close_time < candle.close_time)
+    }
+}
+
 impl InstrumentDataState for DefaultInstrumentMarketData {
     type MarketEventKind = DataKind;
 
@@ -364,10 +376,7 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
                              the running total for the process"
                         );
                     }
-                } else if self
-                    .candle
-                    .is_none_or(|current| current.close_time < candle.close_time)
-                {
+                } else if self.takes_candle(candle, event.time_exchange) {
                     self.candle = Some(*candle);
                 }
             }
@@ -833,6 +842,18 @@ mod tests {
         data.process(&event(at(20), candle(at(20), dec!(999))));
 
         assert_eq!(data.candle.unwrap().close_time, at(30));
+        assert_eq!(data.price(), Some(dec!(300)));
+    }
+
+    /// A candle closing when the one held closed is no newer, so the first stays: the same
+    /// candle sent twice is one bar, not two.
+    #[test]
+    fn candle_closing_with_the_stored_candle_does_not_replace_it() {
+        let mut data = DefaultInstrumentMarketData::default();
+        data.process(&event(at(30), candle(at(30), dec!(300))));
+        data.process(&event(at(30), candle(at(30), dec!(999))));
+
+        assert_eq!(data.candle.unwrap().close, dec!(300));
         assert_eq!(data.price(), Some(dec!(300)));
     }
 
