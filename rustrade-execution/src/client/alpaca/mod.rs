@@ -456,7 +456,8 @@ pub struct AlpacaConfig {
     pub paper: bool,
     /// Test-only: override the REST base URL (e.g., to point at a wiremock server).
     #[cfg(test)]
-    pub base_url_override: Option<String>,
+    #[serde(skip)]
+    base_url_override: Option<String>,
     /// Test-only: override the WebSocket URL (e.g., to point at a local server).
     #[cfg(test)]
     #[serde(skip)]
@@ -5755,6 +5756,22 @@ mod tests {
 
         assert!(!cfg.paper);
         assert_eq!(cfg.rest_base_url(), "https://api.alpaca.markets");
+    }
+
+    #[test]
+    fn test_alpaca_config_deserialize_rejects_test_url_overrides() {
+        for key in ["base_url_override", "ws_url_override"] {
+            let json = format!(
+                r#"{{"api_key": "my_key", "secret_key": "my_secret", "{key}": "http://127.0.0.1:1"}}"#
+            );
+            let Err(err) = serde_json::from_str::<AlpacaConfig>(&json) else {
+                panic!("a config with `{key}` must not deserialize");
+            };
+            assert!(
+                err.to_string().contains(&format!("unknown field `{key}`")),
+                "unexpected error for `{key}`: {err}"
+            );
+        }
     }
 
     #[test]
