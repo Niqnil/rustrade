@@ -838,21 +838,28 @@ pub struct InstrumentState<
     ///
     /// Recorded by `InFlightRequestRecorder::record_in_flight_open`, since neither an [`Order`]
     /// nor a venue's report of one carries the flag. `cleanup_routing_tables` moves an order that
-    /// leaves [`Self::orders`] to [`Self::retired_reduce_only`]. An order this state did not send,
-    /// such as one restored from a venue snapshot after a restart, is never in it.
+    /// leaves [`Self::orders`] to [`Self::retired_reduce_only_orders`], in the order they were
+    /// sent. An order this state did not send, such as one restored from a venue snapshot after a
+    /// restart, is never in it.
     #[serde(default)]
-    pub reduce_only: FnvHashSet<ClientOrderId>,
+    pub reduce_only_orders: FnvIndexSet<ClientOrderId>,
 
-    /// The reduce-only orders that have left [`Self::orders`], so a fill arriving after its
-    /// order's terminal snapshot is still cut. As [`Self::retired_routing`] does for routing, it
+    /// The reduce-only orders that have left [`Self::orders`], each with its venue order id once
+    /// known, so a fill arriving after its order's terminal snapshot is still cut, whether it names
+    /// its client order id or only the venue's. As [`Self::retired_routing`] does for routing, it
     /// keeps the last [`MAX_RETIRED_ROUTING`] retirements, oldest evicted first; a late fill of an
     /// order evicted from it is applied in full.
+    ///
+    /// The venue order id is taken from [`Self::exchange_id_to_cid`] when `cleanup_routing_tables`
+    /// prunes the order's entry there, which for an order filled on its acknowledgement is the
+    /// cleanup after its retirement rather than the one at it. It stays `None` for an order the
+    /// venue never acknowledged.
     ///
     /// Kept under both OMS modes, unlike [`Self::retired_routing`]: a netting position can be
     /// flipped too. A new order sent under a client order id in it removes it, so the flag of an
     /// earlier order does not outlive its id's reuse.
     #[serde(default)]
-    pub retired_reduce_only: FnvIndexSet<ClientOrderId>,
+    pub retired_reduce_only_orders: FnvIndexMap<ClientOrderId, Option<OrderId>>,
 
     /// The orders that were `Open` when this instrument's account stream last began to
     /// resynchronise, each with the venue order it was: the only orders the next account snapshot
@@ -1151,16 +1158,17 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             }
         }
 
-        // Both modes: a reduce-only fill can flip a netting position too.
-        if !self.reduce_only.is_empty() {
+        // Both modes: a reduce-only fill can flip a netting position too. Retired in the order
+        // sent, so which retirement is evicted first does not depend on hashing.
+        if !self.reduce_only_orders.is_empty() {
             let retired: Vec<ClientOrderId> = self
-                .reduce_only
+                .reduce_only_orders
                 .iter()
                 .filter(|cid| !self.orders.0.contains_key(*cid))
                 .cloned()
                 .collect();
             for cid in retired {
-                self.reduce_only.remove(&cid);
+                self.reduce_only_orders.shift_remove(&cid);
                 self.insert_retired_reduce_only(cid);
             }
         }
@@ -1170,8 +1178,15 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                 .retain(|cid, _| self.orders.0.contains_key(cid));
         }
         if !self.exchange_id_to_cid.is_empty() {
-            self.exchange_id_to_cid
-                .retain(|_, cid| self.orders.0.contains_key(cid));
+            // A retired reduce-only order keeps the venue order id pruned here, so a late fill
+            // naming only that id still finds the order.
+            self.exchange_id_to_cid.retain(|exchange_id, cid| {
+                let tracked = self.orders.0.contains_key(cid);
+                if !tracked && let Some(venue_id) = self.retired_reduce_only_orders.get_mut(cid) {
+                    *venue_id = Some(exchange_id.clone());
+                }
+                tracked
+            });
         }
     }
 
@@ -1202,12 +1217,15 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         self.retired_routing.insert(exchange_id, position_id);
     }
 
-    /// Record a retired reduce-only order, evicting the oldest at [`MAX_RETIRED_ROUTING`].
+    /// Record a retired reduce-only order, its venue order id not yet known, evicting the oldest
+    /// at [`MAX_RETIRED_ROUTING`].
     fn insert_retired_reduce_only(&mut self, cid: ClientOrderId) {
-        let at_capacity = !self.retired_reduce_only.contains(&cid)
-            && self.retired_reduce_only.len() >= MAX_RETIRED_ROUTING;
+        let at_capacity = !self.retired_reduce_only_orders.contains_key(&cid)
+            && self.retired_reduce_only_orders.len() >= MAX_RETIRED_ROUTING;
 
-        if at_capacity && let Some(evicted) = self.retired_reduce_only.shift_remove_index(0) {
+        if at_capacity
+            && let Some((evicted, _)) = self.retired_reduce_only_orders.shift_remove_index(0)
+        {
             debug!(
                 evicted_cid = %evicted,
                 capacity = MAX_RETIRED_ROUTING,
@@ -1216,33 +1234,46 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             );
         }
 
-        self.retired_reduce_only.insert(cid);
+        self.retired_reduce_only_orders.entry(cid).or_insert(None);
     }
 
     /// Record that the open `cid` is being sent, reduce-only or not. A reused `cid` drops the
-    /// flag an earlier order under it left in [`Self::retired_reduce_only`].
+    /// flag an earlier order under it left, live or retired.
     pub(crate) fn record_reduce_only(&mut self, cid: &ClientOrderId, reduce_only: bool) {
-        self.retired_reduce_only.shift_remove(cid);
+        self.retired_reduce_only_orders.shift_remove(cid);
         if reduce_only {
-            self.reduce_only.insert(cid.clone());
+            self.reduce_only_orders.insert(cid.clone());
+        } else {
+            self.reduce_only_orders.shift_remove(cid);
         }
     }
 
     /// The client order id of the reduce-only order `trade` is a fill of, if it is one: found by
-    /// the fill's [`Trade::client_order_id`], or failing that by its venue order id while the
-    /// order is tracked.
+    /// the fill's [`Trade::client_order_id`], or failing that by its venue order id, among the
+    /// tracked orders first and then the retired reduce-only ones.
     fn reduce_only_order<'a>(
         &'a self,
         trade: &'a Trade<AssetKey, InstrumentKey>,
     ) -> Option<&'a ClientOrderId> {
-        if self.reduce_only.is_empty() && self.retired_reduce_only.is_empty() {
+        if self.reduce_only_orders.is_empty() && self.retired_reduce_only_orders.is_empty() {
             return None;
         }
-        let cid = trade
-            .client_order_id
-            .as_ref()
-            .or_else(|| self.tracked_order_cid(&trade.order_id))?;
-        (self.reduce_only.contains(cid) || self.retired_reduce_only.contains(cid)).then_some(cid)
+        let is_reduce_only = |cid: &ClientOrderId| {
+            self.reduce_only_orders.contains(cid)
+                || self.retired_reduce_only_orders.contains_key(cid)
+        };
+        if let Some(cid) = &trade.client_order_id {
+            return is_reduce_only(cid).then_some(cid);
+        }
+        // A tracked order outranks a retired one under the same venue order id, as in routing.
+        if let Some(cid) = self.tracked_order_cid(&trade.order_id) {
+            return is_reduce_only(cid).then_some(cid);
+        }
+        // At most `MAX_RETIRED_ROUTING` entries, scanned only for a fill naming no client order id
+        // and no tracked order.
+        self.retired_reduce_only_orders
+            .iter()
+            .find_map(|(cid, venue_id)| (venue_id.as_ref() == Some(&trade.order_id)).then_some(cid))
     }
 
     /// The client order id of the tracked order the venue knows as `order_id`: O(1) through the
@@ -1271,8 +1302,8 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         self.retired_routing.clear();
         self.position_ids.clear();
         self.pending_fills.clear();
-        self.reduce_only.clear();
-        self.retired_reduce_only.clear();
+        self.reduce_only_orders.clear();
+        self.retired_reduce_only_orders.clear();
     }
 
     /// Updates the instrument state from an [`Order`] snapshot.
@@ -2037,9 +2068,9 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// A fill of an order sent with
     /// [`RequestOpen::reduce_only`](rustrade_execution::order::request::RequestOpen::reduce_only)
     /// never grows or flips the position it is routed to, whatever the venue did with the flag.
-    /// Once a base fee is netted, as above, a fill larger than the opposite position is cut so the
-    /// position lands flat, and a fill against a flat position or one on its own side is applied
-    /// to none. A margin repayment sized to cover interest, for one, is larger than the short it
+    /// After any base fee is netted, as above, a fill larger than the opposite position is cut so
+    /// the position lands flat, and a fill against a flat position or one on its own side is
+    /// applied to none. A margin repayment sized to cover interest, for one, is larger than the short it
     /// closes.
     /// - The part cut off, the excess, is applied to no position. Its value at the fill's price is
     ///   reported, not charged to PnL: the account still holds it, or the venue spent it.
@@ -2055,13 +2086,14 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ///   and returned in [`FillsApplied::capped`], which the `Engine` emits as
     ///   [`EngineOutput::ReduceOnlyCapped`](crate::engine::EngineOutput::ReduceOnlyCapped).
     ///
-    /// The flag comes from the request recorded in flight (see [`Self::reduce_only`]). A fill
-    /// finds its order by [`Trade::client_order_id`], or failing that by the venue's order id
-    /// while the order is tracked. A fill that reaches neither is applied in full: one whose
-    /// venue names no client order id and that arrives before the order is acknowledged, or after
-    /// it retired, such as one read back from a venue's trade history. So is a fill of an order
-    /// this state did not send, such as one restored from a venue snapshot after a restart, and a
-    /// late fill of a reduce-only order more than [`MAX_RETIRED_ROUTING`] retirements old.
+    /// The flag comes from the request recorded in flight (see [`Self::reduce_only_orders`]). A
+    /// fill finds its order by [`Trade::client_order_id`], or failing that by the venue's order
+    /// id, while the order is tracked or after it retired (see
+    /// [`Self::retired_reduce_only_orders`]). A fill that reaches neither is applied in full: one
+    /// whose venue names no client order id and that arrives before the order is acknowledged.
+    /// So is a fill of an order this state did not send, such as one restored from a venue
+    /// snapshot after a restart, and a late fill of a reduce-only order more than
+    /// [`MAX_RETIRED_ROUTING`] retirements old.
     ///
     /// [`Trade::holding_move`] is this rule too.
     ///
@@ -2401,10 +2433,11 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             }
             Some(_) => None,
         };
-        let (effective_trade, capped) = match &moved {
-            Some((netted, capped)) => (netted, capped.clone()),
-            None => (effective_trade, None),
+        let (netted, capped) = match moved {
+            Some((netted, capped)) => (Some(netted), capped),
+            None => (None, None),
         };
+        let effective_trade = netted.as_ref().unwrap_or(effective_trade);
 
         // Step 3: Update the position.
         //
@@ -2537,8 +2570,8 @@ where
         pending_fills: _,
         exchange_id_to_cid: _,
         retired_routing: _,
-        reduce_only: _,
-        retired_reduce_only: _,
+        reduce_only_orders: _,
+        retired_reduce_only_orders: _,
         orders_open_at_resync: _,
     } = state;
 
@@ -2625,8 +2658,8 @@ where
                         pending_fills: Vec::new(),
                         exchange_id_to_cid: FnvHashMap::default(),
                         retired_routing: FnvIndexMap::default(),
-                        reduce_only: FnvHashSet::default(),
-                        retired_reduce_only: FnvIndexSet::default(),
+                        reduce_only_orders: FnvIndexSet::default(),
+                        retired_reduce_only_orders: FnvIndexMap::default(),
                         orders_open_at_resync: FnvHashMap::default(),
                     },
                 )
@@ -2711,7 +2744,7 @@ mod tests {
         order::{
             OrderKind, TimeInForce,
             id::{ClientOrderId, OrderId, PositionId, StrategyId, VenueOrderId},
-            state::{CancelInFlight, Cancelled, Open, OpenInFlight},
+            state::{CancelInFlight, Cancelled, Filled, Open, OpenInFlight},
         },
         trade::{AssetFees, Trade, TradeId},
     };
@@ -5261,48 +5294,152 @@ mod tests {
         assert!(netting_position(&state).is_none());
     }
 
-    /// A fill arriving after its reduce-only order retired is still cut when it names its client
-    /// order id. One that does not can no longer find the order, and is applied whole.
+    /// A fill arriving after its reduce-only order retired is still cut, whether it names its
+    /// client order id or only the venue's order id.
     #[test]
-    fn a_late_fill_of_a_retired_reduce_only_order_is_cut_by_its_client_order_id() {
+    fn a_late_fill_of_a_retired_reduce_only_order_is_cut() {
         let (cid, exchange_id) = (ClientOrderId::new("close"), OrderId::new("ex-close"));
         let retired = || {
             let mut state = instrument_state(OmsMode::Netting);
             let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
             send_order(&mut state, &cid, &exchange_id, true);
             cancel_order(&mut state, &cid, &exchange_id);
-            assert!(state.reduce_only.is_empty());
-            assert!(state.retired_reduce_only.contains(&cid));
+            assert!(state.reduce_only_orders.is_empty());
+            assert!(state.exchange_id_to_cid.is_empty());
+            assert_eq!(
+                state.retired_reduce_only_orders.get(&cid),
+                Some(&Some(exchange_id.clone()))
+            );
             state
         };
 
-        let mut state = retired();
         let named = fill(exchange_id.clone(), Side::Buy, dec!(3)).with_client_order_id(cid.clone());
-        assert_eq!(state.update_from_trade(&named).capped.len(), 1);
-        assert!(netting_position(&state).is_none());
-
-        let mut state = retired();
         let unnamed = fill(exchange_id.clone(), Side::Buy, dec!(3));
-        assert!(state.update_from_trade(&unnamed).capped.is_empty());
+        for late in [named, unnamed] {
+            let mut state = retired();
+            let applied = state.update_from_trade(&late);
+            assert_eq!(applied.capped.len(), 1, "{:?}", late.client_order_id);
+            assert_eq!(applied.capped[0].client_order_id, Some(cid.clone()));
+            assert!(netting_position(&state).is_none());
+        }
+    }
+
+    /// An order filled on its acknowledgement retires before its venue order id is indexed, so
+    /// the id is kept when a later cleanup prunes the entry restored for it. A late fill naming
+    /// only that id is then still cut.
+    #[test]
+    fn a_late_fill_of_a_reduce_only_order_filled_on_ack_is_cut_by_its_venue_order_id() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
+        let (cid, exchange_id) = (ClientOrderId::new("close"), OrderId::new("ex-close"));
+        send_in_flight(&mut state, &cid, true);
+        state.update_from_order_snapshot(Snapshot(&order(
+            cid.clone(),
+            OrderState::fully_filled(Filled::new(exchange_id.clone(), TIME, dec!(1), None)),
+        )));
+        assert_eq!(state.retired_reduce_only_orders.get(&cid), Some(&None));
+
+        // Any later order update prunes the restored index entry.
+        send_order(
+            &mut state,
+            &ClientOrderId::new("other"),
+            &OrderId::new("ex-other"),
+            false,
+        );
+        assert!(!state.exchange_id_to_cid.contains_key(&exchange_id));
+        assert_eq!(
+            state.retired_reduce_only_orders.get(&cid),
+            Some(&Some(exchange_id.clone()))
+        );
+
+        let applied = state.update_from_trade(&fill(exchange_id, Side::Buy, dec!(3)));
+
+        assert_eq!(applied.capped.len(), 1);
+        assert!(netting_position(&state).is_none());
+    }
+
+    /// A tracked order outranks a retired reduce-only one under the same venue order id.
+    #[test]
+    fn a_tracked_order_outranks_a_retired_reduce_only_one_under_the_same_venue_order_id() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
+        let exchange_id = OrderId::new("ex-shared");
+        let gone = ClientOrderId::new("gone");
+        send_order(&mut state, &gone, &exchange_id, true);
+        cancel_order(&mut state, &gone, &exchange_id);
+        send_order(&mut state, &ClientOrderId::new("live"), &exchange_id, false);
+
+        let applied = state.update_from_trade(&fill(exchange_id, Side::Buy, dec!(3)));
+
+        assert!(applied.capped.is_empty());
         let position = netting_position(&state).unwrap();
         assert_eq!((position.side, position.quantity_abs), (Side::Buy, dec!(2)));
     }
 
-    /// A client order id reused for an order not sent reduce-only drops the flag the retired one
-    /// left, so the new order's fills are not cut.
+    /// A client order id reused for an order not sent reduce-only drops the flag the earlier one
+    /// left, whether that order retired or is still tracked, so the new order's fills are not cut.
     #[test]
-    fn a_client_order_id_reused_for_another_order_drops_its_retired_flag() {
-        let mut state = instrument_state(OmsMode::Netting);
-        let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
+    fn a_client_order_id_reused_for_another_order_drops_its_flag() {
         let cid = ClientOrderId::new("reused");
-        send_order(&mut state, &cid, &OrderId::new("ex-1"), true);
-        cancel_order(&mut state, &cid, &OrderId::new("ex-1"));
+        for retire_first in [true, false] {
+            let mut state = instrument_state(OmsMode::Netting);
+            let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
+            send_order(&mut state, &cid, &OrderId::new("ex-1"), true);
+            if retire_first {
+                cancel_order(&mut state, &cid, &OrderId::new("ex-1"));
+            }
 
-        send_order(&mut state, &cid, &OrderId::new("ex-2"), false);
+            send_order(&mut state, &cid, &OrderId::new("ex-2"), false);
 
-        assert!(!state.retired_reduce_only.contains(&cid));
-        let applied = state.update_from_trade(&fill(OrderId::new("ex-2"), Side::Buy, dec!(3)));
-        assert!(applied.capped.is_empty());
+            assert!(!state.reduce_only_orders.contains(&cid), "{retire_first}");
+            assert!(
+                !state.retired_reduce_only_orders.contains_key(&cid),
+                "{retire_first}"
+            );
+            let applied = state.update_from_trade(&fill(OrderId::new("ex-2"), Side::Buy, dec!(3)));
+            assert!(applied.capped.is_empty(), "{retire_first}");
+        }
+    }
+
+    /// Reduce-only orders leaving together retire in the order they were sent, so which is
+    /// evicted first at capacity does not depend on hashing.
+    #[test]
+    fn reduce_only_orders_retire_in_the_order_sent() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let cids: Vec<ClientOrderId> = (0..16)
+            .map(|i| ClientOrderId::new(format!("cid-{i}")))
+            .collect();
+        for cid in &cids {
+            send_in_flight(&mut state, cid, true);
+        }
+
+        state.orders.0.clear();
+        state.cleanup_routing_tables();
+
+        assert!(state.reduce_only_orders.is_empty());
+        assert!(
+            state.retired_reduce_only_orders.keys().eq(cids.iter()),
+            "{:?}",
+            state.retired_reduce_only_orders.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A state serialised before the reduce-only fields existed loads with none recorded.
+    #[test]
+    fn a_state_serialised_without_the_reduce_only_fields_loads() {
+        let mut state = instrument_state(OmsMode::Netting);
+        send_in_flight(&mut state, &ClientOrderId::new("close"), true);
+        let mut value = serde_json::to_value(&state).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        fields.remove("reduce_only_orders").unwrap();
+        fields.remove("retired_reduce_only_orders").unwrap();
+
+        let loaded: InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex> =
+            serde_json::from_value(value).unwrap();
+
+        assert!(loaded.reduce_only_orders.is_empty());
+        assert!(loaded.retired_reduce_only_orders.is_empty());
+        assert_eq!(loaded.orders, state.orders);
     }
 
     #[test]
@@ -5322,12 +5459,12 @@ mod tests {
             cancel_order(&mut state, cid, oid);
         }
 
-        assert_eq!(state.retired_reduce_only.len(), MAX_RETIRED_ROUTING);
-        assert!(!state.retired_reduce_only.contains(&ids[0].0));
+        assert_eq!(state.retired_reduce_only_orders.len(), MAX_RETIRED_ROUTING);
+        assert!(!state.retired_reduce_only_orders.contains_key(&ids[0].0));
         assert!(
             state
-                .retired_reduce_only
-                .contains(&ids[MAX_RETIRED_ROUTING].0)
+                .retired_reduce_only_orders
+                .contains_key(&ids[MAX_RETIRED_ROUTING].0)
         );
     }
 
@@ -5493,11 +5630,12 @@ mod tests {
             &ClientOrderId::new("gone"),
             &OrderId::new("ex-gone"),
         );
-        assert!(!state.reduce_only.is_empty() && !state.retired_reduce_only.is_empty());
+        assert!(!state.reduce_only_orders.is_empty());
+        assert!(!state.retired_reduce_only_orders.is_empty());
 
         state.clear_order_routing();
 
-        assert!(state.reduce_only.is_empty());
-        assert!(state.retired_reduce_only.is_empty());
+        assert!(state.reduce_only_orders.is_empty());
+        assert!(state.retired_reduce_only_orders.is_empty());
     }
 }

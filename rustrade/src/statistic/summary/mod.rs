@@ -477,6 +477,48 @@ mod tests {
         );
     }
 
+    /// Every session counter sums its own tear-sheet counter, each set to a distinct value here so
+    /// that one summed into another's slot shows.
+    #[test]
+    fn generate_sums_each_counter_into_its_own_total() {
+        let mut instruments = FnvIndexMap::default();
+        for (name, base) in [("btc_usdt", 1usize), ("eth_usdt", 100)] {
+            let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+            generator.orders_opened = base;
+            generator.orders_rejected = 2 * base;
+            generator.fills_routed_by_fallback = 3 * base;
+            generator.fills_unmatched = 4 * base;
+            generator.fills_forced = 5 * base;
+            generator.fills_unallocated = 6 * base;
+            generator.fills_dust = 7 * base;
+            generator.fills_reduce_only_capped = 8 * base;
+            instruments.insert(InstrumentNameInternal::new(name), generator);
+        }
+
+        let summary = TradingSummaryGenerator::new(
+            dec!(0),
+            DateTime::<Utc>::MIN_UTC,
+            DateTime::<Utc>::MIN_UTC,
+            instruments,
+            FnvIndexMap::default(),
+        )
+        .generate(Annual365);
+
+        assert_eq!(
+            [
+                summary.orders_opened,
+                summary.orders_rejected,
+                summary.fills_routed_by_fallback,
+                summary.fills_unmatched,
+                summary.fills_forced,
+                summary.fills_unallocated,
+                summary.fills_dust,
+                summary.fills_reduce_only_capped,
+            ],
+            [101, 202, 303, 404, 505, 606, 707, 808]
+        );
+    }
+
     /// `has_split_positions` keys off the split counter alone. An account traded from elsewhere
     /// produces unmatched fills during correct operation, and flagging those would raise the alarm
     /// on a healthy session.

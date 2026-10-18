@@ -82,16 +82,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `EngineOutput::ReduceOnlyCapped`.
 
   The engine knows an order is reduce-only from the request it sent, and finds a fill's order by
-  `Trade::client_order_id`, or by the venue's order id while the order is tracked. A fill that
-  names no client order id and arrives before its order is acknowledged, or after it retired, is
-  still applied in full. So is a fill of an order the engine did not send in this session.
+  `Trade::client_order_id`, or by the venue's order id, while the order is tracked and for its
+  last 64 retirements per instrument. A fill that names no client order id and arrives before
+  its order is acknowledged is still applied in full. So is a fill of an order the engine did not
+  send in this session.
 - **Breaking:** `InstrumentState::update_from_trade`, `InstrumentState::update_from_order_snapshot`
   and `EngineState::update_from_account` return a `FillsApplied`, the position a fill closed plus
   the reduce-only fills cut, instead of an `Option<PositionExited>` (`rustrade`, #661). Read the
   old value from `FillsApplied::exited`. `UpdateFromAccountOutput::PositionExit` is replaced by
   `UpdateFromAccountOutput::FillsApplied`.
-- **Breaking:** `InstrumentState` has new public fields, `reduce_only` and
-  `retired_reduce_only`, so a struct literal must supply them (`rustrade`, #661). Serialised
+- **Breaking:** `InstrumentState` has new public fields, `reduce_only_orders` and
+  `retired_reduce_only_orders`, so a struct literal must supply them (`rustrade`, #661). Serialised
   states without them still load.
 - **Breaking:** `SimulatedVenue::apply_market` takes the bar an observation carries
   (`rustrade-execution`). Its new `bar: Option<MarketBar>` argument comes before
