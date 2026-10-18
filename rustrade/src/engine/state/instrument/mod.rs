@@ -1518,6 +1518,66 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         }
     }
 
+    /// `netted`, a spot fill with its base-asset fee netted from its quantity, moved so the
+    /// position at `position_id` lands on the instrument's quantity step, rounded toward zero.
+    /// Unchanged when the instrument has no step, or the position already lands on it. See the
+    /// base-asset fee section of [`Self::update_from_trade`].
+    fn floor_to_quantity_step(
+        &mut self,
+        mut netted: Trade<AssetKey, InstrumentKey>,
+        position_id: &PositionId,
+    ) -> Trade<AssetKey, InstrumentKey>
+    where
+        AssetKey: PartialEq,
+        InstrumentKey: Debug,
+    {
+        let Some(step) = self.instrument.quantity_step() else {
+            return netted;
+        };
+
+        let held = self
+            .position
+            .positions
+            .get(position_id)
+            .map_or(Decimal::ZERO, |position| {
+                signed(position.side, position.quantity_abs)
+            });
+        let holds = held + signed(netted.side, netted.quantity);
+        // `%` keeps the dividend's sign, so this rounds the holding toward zero on either side.
+        let remainder = holds % step;
+        if remainder.is_zero() {
+            return netted;
+        }
+
+        (netted.side, netted.quantity) = unsigned(holds - remainder - held, netted.side);
+
+        // A long's remainder is base the account holds but cannot sell: written off at the fill's
+        // price, as a fee of the fill, so the fill's PnL still totals what it paid. A short's is
+        // base still owed on the loan: the position books it bought back at the fill's price,
+        // which values the debt at that price, so nothing is written off.
+        let written_off = if remainder.is_sign_positive() {
+            let value = remainder * netted.price;
+            netted.fees.fees += remainder;
+            netted.fees.fees_quote = Some(netted.fees.fees_quote.unwrap_or(Decimal::ZERO) + value);
+            value
+        } else {
+            Decimal::ZERO
+        };
+
+        info!(
+            instrument = ?netted.instrument,
+            order_id = %netted.order_id,
+            %position_id,
+            %step,
+            %remainder,
+            %written_off,
+            "base-asset fee left the holding off the quantity step: position rounded toward zero, \
+             the remainder left in the balance"
+        );
+        self.tear_sheet.record_fill_dust(written_off);
+        netted
+    }
+
     /// Which leg of a venue settlement an orderless `origin` is on this instrument, or `None` for
     /// a fill of an order. See the settlement fills section of [`Self::update_from_trade`].
     fn settlement_leg(&self, origin: TradeOrigin) -> Option<SettlementLeg> {
@@ -1633,13 +1693,26 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// a long would be overstated by its fee, and a full-size close would ask to sell more than
     /// the account holds.
     ///
-    /// - **What the position then holds is exact, not lot-sized.** A buy of 1 with a 0.1 % fee
-    ///   holds 0.999. A venue sells only whole multiples of its lot step, so a full-size close can
-    ///   leave a remainder below one lot that it will not sell. Rounding a close to the lot step,
-    ///   and the dust it leaves, is the strategy's concern.
+    /// - **The position is rounded toward zero to the quantity step.** A venue sells only whole
+    ///   multiples of its step, so a position off the step could never be closed to flat. When
+    ///   [`Instrument::quantity_step`] gives a step, the position the fill leaves is rounded toward
+    ///   zero to it, and the remainder, less than one step, is left out of the position, in the
+    ///   account's balance. A buy of 1 with a 0.1 % fee and a step of 0.01 holds 0.999, and the
+    ///   position books 0.99. The fill is logged at INFO and counted on
+    ///   [`TearSheet::fills_dust`](crate::statistic::summary::instrument::TearSheet::fills_dust).
+    ///   - A long's remainder is written off: its value at the fill's price is added to the fill's
+    ///     fee, so PnL still totals what the fill paid, and is summed on
+    ///     [`TearSheet::dust`](crate::statistic::summary::instrument::TearSheet::dust).
+    ///   - A short's remainder is base still owed on the loan. The position books it bought back
+    ///     at the fill's price, which values the debt at that price, so nothing is written off.
+    ///   - Without a step, the position holds the exact quantity, 0.999 above, and a full-size
+    ///     close can leave a remainder the venue will not sell.
+    ///   - Each fill's remainder is rounded away on its own, so the balance can gather more than
+    ///     one step of them over many fills, which no position holds.
     /// - **A spot-margin short closed by a buy** keeps the fee as a residual short, since the fee
-    ///   came out of the base that was to repay the loan. Buying more than the debt to cover the
-    ///   fee leaves a long of the excess less the fee, once the excess is the larger.
+    ///   came out of the base that was to repay the loan. With a step, a residual below one step
+    ///   is rounded away, as above, and the position closes. Buying more than the debt to cover
+    ///   the fee leaves a long of the excess less the fee, once the excess is the larger.
     /// - **A fee larger than the fill's quantity** moves the holding the other way: a buy whose
     ///   base fee exceeds its quantity sells the difference. A fee equal to it moves nothing: it is
     ///   charged to the open position's PnL. From flat it opens no position, so its quote
@@ -1972,6 +2045,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             ),
             Some(_) => None,
         };
+        let netted = netted.map(|netted| self.floor_to_quantity_step(netted, &position_id));
         let effective_trade = netted.as_ref().unwrap_or(effective_trade);
 
         // Step 3: Update the position.
@@ -2282,17 +2356,27 @@ where
         return None;
     }
 
-    let signed = match trade.side {
-        Side::Buy => trade.quantity.abs(),
-        Side::Sell => -trade.quantity.abs(),
-    } - trade.fees.fees;
+    let moved = signed(trade.side, trade.quantity.abs()) - trade.fees.fees;
+    Some(unsigned(moved, trade.side))
+}
 
-    let side = match signed.cmp(&Decimal::ZERO) {
+/// `quantity` with the sign of `side`: positive for a buy, or for a long position.
+fn signed(side: Side, quantity: Decimal) -> Decimal {
+    match side {
+        Side::Buy => quantity,
+        Side::Sell => -quantity,
+    }
+}
+
+/// The side and size of a signed move: a buy if positive, a sell if negative, and `at_zero`
+/// with a size of zero if it moves nothing.
+fn unsigned(moved: Decimal, at_zero: Side) -> (Side, Decimal) {
+    let side = match moved.cmp(&Decimal::ZERO) {
         std::cmp::Ordering::Greater => Side::Buy,
         std::cmp::Ordering::Less => Side::Sell,
-        std::cmp::Ordering::Equal => trade.side,
+        std::cmp::Ordering::Equal => at_zero,
     };
-    Some((side, signed.abs()))
+    (side, moved.abs())
 }
 
 /// `trade` cut to `held`, keeping its sign, with its fees cut in proportion. `held` is less than
@@ -2332,7 +2416,13 @@ mod tests {
         },
         trade::{AssetFees, Trade, TradeId},
     };
-    use rustrade_instrument::test_utils::instrument as test_instrument;
+    use rustrade_instrument::{
+        instrument::spec::{
+            InstrumentSpec, InstrumentSpecNotional, InstrumentSpecPrice, InstrumentSpecQuantity,
+            OrderQuantityUnits,
+        },
+        test_utils::instrument as test_instrument,
+    };
 
     /// When a test's in-flight request was sent; no test here depends on its value.
     const TIME_SENT: DateTime<Utc> = DateTime::<Utc>::MIN_UTC;
@@ -4395,5 +4485,218 @@ mod tests {
 
         let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(0.001)));
         assert_eq!(netting_position(&state).unwrap().quantity_abs, dec!(1));
+    }
+
+    // --- A base-fee-netted spot position is rounded toward zero to the quantity step ------------
+
+    /// `state` with a spec counting quantities in `unit`, given the base asset, in steps of `step`.
+    fn with_quantity_step(
+        mut state: InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex>,
+        unit: impl FnOnce(AssetIndex) -> OrderQuantityUnits<AssetIndex>,
+        step: Decimal,
+    ) -> InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex> {
+        let unit = unit(state.instrument.underlying.base);
+        state.instrument.spec = Some(InstrumentSpec::new(
+            InstrumentSpecPrice::new(dec!(0.01), dec!(0.01)),
+            InstrumentSpecQuantity::new(unit, step, step),
+            InstrumentSpecNotional::new(Decimal::ZERO),
+        ));
+        state
+    }
+
+    /// The harness instrument, netting, with a base-asset step of 0.01.
+    fn stepped_state() -> InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex> {
+        with_quantity_step(
+            instrument_state(OmsMode::Netting),
+            OrderQuantityUnits::Asset,
+            dec!(0.01),
+        )
+    }
+
+    /// A buy of 1 with a base fee of 0.001 holds 0.999. The position books 0.99, what a close can
+    /// sell, and the 0.009 left over is written off at the fill's price as part of its fee.
+    #[test]
+    fn a_base_fee_netted_position_is_rounded_toward_zero_to_the_step() {
+        let mut state = stepped_state();
+        let base = state.instrument.underlying.base;
+
+        let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(0.001)));
+
+        let position = netting_position(&state).unwrap();
+        assert_eq!(position.side, Side::Buy);
+        assert_eq!(position.quantity_abs, dec!(0.99));
+        assert_eq!(position.price_entry_average, dec!(100));
+        // The fee of 0.001 plus the 0.009 written off: what the fill paid less what it booked.
+        assert_eq!(position.fees_enter.fees, dec!(0.01));
+        assert_eq!(position.fees_enter.fees_quote, Some(dec!(1)));
+        assert_eq!(position.pnl_realised, dec!(-1));
+        assert_eq!(state.tear_sheet.fills_dust, 1);
+        assert_eq!(state.tear_sheet.dust, dec!(0.9));
+    }
+
+    /// Selling the rounded position closes it exactly, and its PnL is what the account made with
+    /// the dust written off: 100 paid, 0.99 sold at 110 for 108.9, and 0.009 left unsellable.
+    #[test]
+    fn a_full_close_of_a_rounded_position_lands_flat() {
+        use crate::statistic::time::Annual365;
+
+        let mut state = stepped_state();
+        let (base, quote) = (
+            state.instrument.underlying.base,
+            state.instrument.underlying.quote,
+        );
+        let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(0.001)));
+
+        let mut close = fill_charging(Side::Sell, dec!(0.99), quote, Decimal::ZERO);
+        close.price = dec!(110);
+        let exited = state
+            .update_from_trade(&close)
+            .expect("the sell closes the position");
+
+        assert_eq!(exited.pnl_realised, dec!(8.9));
+        assert!(netting_position(&state).is_none());
+        let sheet = state.tear_sheet.generate(Decimal::ZERO, Annual365);
+        assert_eq!(sheet.pnl, dec!(8.9));
+        assert_eq!((sheet.fills_dust, sheet.dust), (1, dec!(0.9)));
+    }
+
+    /// It is the position that is rounded, not the fill's move. A sell of 1 with a base fee of
+    /// 0.001 from 2 leaves 0.999: rounding the move of 1.001 would book 1, more than the account
+    /// holds, so the position books 0.99 and the sell moves it by 1.01.
+    #[test]
+    fn a_sell_with_a_base_fee_rounds_the_position_not_the_move() {
+        let mut state = stepped_state();
+        let base = state.instrument.underlying.base;
+        let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(2), base, Decimal::ZERO));
+
+        let _ = state.update_from_trade(&fill_charging(Side::Sell, dec!(1), base, dec!(0.001)));
+
+        let position = netting_position(&state).unwrap();
+        assert_eq!(
+            (position.side, position.quantity_abs),
+            (Side::Buy, dec!(0.99))
+        );
+        assert_eq!(position.pnl_realised, dec!(-1));
+        assert_eq!(state.tear_sheet.dust, dec!(0.9));
+    }
+
+    /// A position already off the step, from before the instrument had one, is rounded at the
+    /// next netting: 0.999 plus a netted 0.999 is 1.998, which books 1.99.
+    #[test]
+    fn a_position_already_off_the_step_is_rounded_at_the_next_netting() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let base = state.instrument.underlying.base;
+        let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(0.001)));
+        let mut state = with_quantity_step(state, OrderQuantityUnits::Asset, dec!(0.01));
+
+        let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(0.001)));
+
+        assert_eq!(netting_position(&state).unwrap().quantity_abs, dec!(1.99));
+        assert_eq!(state.tear_sheet.dust, dec!(0.8));
+    }
+
+    /// A short bought back in full with a base fee still owes the fee. Rounded toward zero, the
+    /// position closes, booking that debt bought back at the fill's price, so nothing is written
+    /// off: the fill's PnL is its fee alone.
+    #[test]
+    fn a_short_bought_back_with_a_base_fee_lands_flat_with_nothing_written_off() {
+        let mut state = stepped_state();
+        let (base, quote) = (
+            state.instrument.underlying.base,
+            state.instrument.underlying.quote,
+        );
+        let _ = state.update_from_trade(&fill_charging(Side::Sell, dec!(1), quote, Decimal::ZERO));
+
+        let exited = state
+            .update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(0.001)))
+            .expect("the buy closes the short");
+
+        assert_eq!(exited.pnl_realised, dec!(-0.1));
+        assert!(netting_position(&state).is_none());
+        assert_eq!(
+            (state.tear_sheet.fills_dust, state.tear_sheet.dust),
+            (1, Decimal::ZERO)
+        );
+    }
+
+    /// A buy that holds less than one step once its fee is netted books nothing. From flat it
+    /// opens no position, so the tear sheet's unattributed fees take all the fill paid.
+    #[test]
+    fn a_buy_holding_less_than_a_step_from_flat_charges_all_it_paid_to_the_tear_sheet() {
+        let mut state = stepped_state();
+        let base = state.instrument.underlying.base;
+
+        let (exited, warnings) = count_warnings(|| {
+            state.update_from_trade(&fill_charging(Side::Buy, dec!(0.01), base, dec!(0.00001)))
+        });
+
+        assert!(exited.is_none());
+        assert!(netting_position(&state).is_none());
+        assert_eq!(warnings, 1);
+        assert_eq!(state.tear_sheet.pnl_returns.fees_unattributed, dec!(1));
+        assert_eq!(
+            (state.tear_sheet.fills_dust, state.tear_sheet.dust),
+            (1, dec!(0.999))
+        );
+    }
+
+    /// A netted holding already on the step books as it is, with no dust.
+    #[test]
+    fn a_netted_holding_on_the_step_leaves_no_dust() {
+        let mut state = stepped_state();
+        let base = state.instrument.underlying.base;
+
+        let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(0.01)));
+
+        let position = netting_position(&state).unwrap();
+        assert_eq!(position.quantity_abs, dec!(0.99));
+        assert_eq!(position.fees_enter.fees_quote, Some(dec!(1)));
+        assert_eq!(
+            (state.tear_sheet.fills_dust, state.tear_sheet.dust),
+            (0, Decimal::ZERO)
+        );
+    }
+
+    /// A spec whose quantity is in quote gives no step for a position, so the holding stays exact.
+    #[test]
+    fn a_step_in_quote_leaves_the_netted_holding_exact() {
+        let mut state = with_quantity_step(
+            instrument_state(OmsMode::Netting),
+            |_| OrderQuantityUnits::Quote,
+            dec!(0.01),
+        );
+        let base = state.instrument.underlying.base;
+
+        let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(0.001)));
+
+        assert_eq!(netting_position(&state).unwrap().quantity_abs, dec!(0.999));
+        assert_eq!(state.tear_sheet.fills_dust, 0);
+    }
+
+    /// In `OmsMode::Hedging` the position rounded is the one the fill routes to.
+    #[test]
+    fn a_hedging_fill_rounds_the_position_it_routes_to() {
+        let mut state = with_quantity_step(
+            instrument_state(OmsMode::Hedging),
+            OrderQuantityUnits::Asset,
+            dec!(0.01),
+        );
+        let base = state.instrument.underlying.base;
+        let mut open = fill_charging(Side::Buy, dec!(2), base, Decimal::ZERO);
+        open.order_id = OrderId::new("open");
+        let _ = state.update_from_trade(&open);
+
+        let mut other = fill_charging(Side::Buy, dec!(1), base, dec!(0.001));
+        other.order_id = OrderId::new("other");
+        let _ = state.update_from_trade(&other);
+
+        assert_eq!(
+            state.position.positions[&PositionId::new("open")].quantity_abs,
+            dec!(2)
+        );
+        assert_eq!(
+            state.position.positions[&PositionId::new("other")].quantity_abs,
+            dec!(0.99)
+        );
     }
 }

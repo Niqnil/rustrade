@@ -183,6 +183,9 @@ where
         self.add_instrument_metric_row(&mut table, "Unattributed Fees", |ts| {
             format!("{:.2}", ts.fees_unattributed)
         });
+        self.add_instrument_metric_row(&mut table, "Dust Written Off", |ts| {
+            format!("{:.2}", ts.dust)
+        });
         self.add_instrument_metric_row(&mut table, &format!("Return {interval}"), |ts| {
             format_percentage(ts.pnl_return.value, 2)
         });
@@ -376,6 +379,7 @@ mod tests {
             fills_unmatched: 0,
             fills_forced: 0,
             fills_unallocated: 0,
+            fills_dust: 0,
         }
     }
 
@@ -436,6 +440,7 @@ mod tests {
             fills_unmatched,
             fills_forced: 0,
             fills_unallocated: 0,
+            fills_dust: 0,
         }
     }
 

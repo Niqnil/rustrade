@@ -23,6 +23,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use rust_decimal::Decimal;
 use rustrade_execution::order::id::PositionId;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 /// How many distinct fallback-keyed [`PositionId`]s a tear sheet retains.
 ///
@@ -58,6 +59,18 @@ pub struct TearSheet<Interval> {
     /// `#[serde(default)]` so tear sheets serialised before this field existed still load.
     #[serde(default)]
     pub fees_unattributed: Decimal,
+
+    /// Value written off as dust, in the instrument's quote asset, positive = lost: the part of a
+    /// long's holding below the quantity step that base-fee netting left out of the position,
+    /// valued at the fill's price. See [`Self::fills_dust`].
+    ///
+    /// Charged as a fee of the fill that left it, so it reaches `pnl` with that fill's position
+    /// once the position closes, or at once through [`Self::fees_unattributed`] when the fill
+    /// opened no position. Reported apart so the cost of the step can be read on its own.
+    ///
+    /// `#[serde(default)]` so tear sheets serialised before this field existed still load.
+    #[serde(default)]
+    pub dust: Decimal,
 
     pub pnl_return: RateOfReturn<Interval>,
     pub sharpe_ratio: SharpeRatio<Interval>,
@@ -138,6 +151,17 @@ pub struct TearSheet<Interval> {
     #[serde(default)]
     pub fills_unallocated: usize,
 
+    /// Spot fills whose base-asset fee left the holding off the instrument's quantity step, so
+    /// the position was rounded toward zero to the step and the remainder left out of it.
+    ///
+    /// The remainder stays in the account's balance, too small for the venue to sell. A long's
+    /// is written off, its value in [`Self::dust`]. A short's is base still owed on the loan,
+    /// booked as bought back at the fill's price, so nothing is written off. Each is logged at
+    /// INFO. See the base-asset fee section of
+    /// [`InstrumentState::update_from_trade`](crate::engine::state::instrument::InstrumentState::update_from_trade).
+    #[serde(default)]
+    pub fills_dust: usize,
+
     /// Why the first fill of either kind above could not be routed.
     ///
     /// Shared by both counters, for the same reason [`Self::first_rejection_reason`] exists: the
@@ -202,6 +226,14 @@ pub struct TearSheetGenerator {
     #[serde(default)]
     pub fills_unallocated: usize,
 
+    /// Fills whose base-fee netting left dust out of the position. See [`TearSheet::fills_dust`].
+    #[serde(default)]
+    pub fills_dust: usize,
+
+    /// Value written off as dust. See [`TearSheet::dust`].
+    #[serde(default)]
+    pub dust: Decimal,
+
     /// First unroutable-fill detail seen. See [`TearSheet::first_fallback_detail`].
     #[serde(default)]
     pub first_fallback_detail: Option<String>,
@@ -228,6 +260,8 @@ impl TearSheetGenerator {
             fills_unmatched: 0,
             fills_forced: 0,
             fills_unallocated: 0,
+            fills_dust: 0,
+            dust: Decimal::ZERO,
             first_fallback_detail: None,
             fallback_positions: Vec::new(),
         }
@@ -283,6 +317,23 @@ impl TearSheetGenerator {
     /// [`TearSheet::fills_unallocated`].
     pub fn record_fill_unallocated(&mut self) {
         self.fills_unallocated = self.fills_unallocated.saturating_add(1);
+    }
+
+    /// Record a fill whose base-fee netting left dust out of the position, and the value written
+    /// off for it: positive for a long's, zero for a short's. See [`TearSheet::fills_dust`].
+    ///
+    /// Only counted here: the value is already charged as the fill's fee. Holds its last-good
+    /// total on overflow and emits a `warn!`, as the PnL totals do.
+    pub fn record_fill_dust(&mut self, written_off: Decimal) {
+        self.fills_dust = self.fills_dust.saturating_add(1);
+        match self.dust.checked_add(written_off) {
+            Some(new_total) => self.dust = new_total,
+            None => warn!(
+                dust_held = %self.dust,
+                written_off = %written_off,
+                "dust accumulation overflowed Decimal; holding last-good value"
+            ),
+        }
     }
 
     /// Note the position a fallback routing opened, and the reason if it is the first one.
@@ -411,6 +462,7 @@ impl TearSheetGenerator {
             pnl: self.pnl_returns.pnl_raw,
             carry: self.pnl_returns.carry,
             fees_unattributed: self.pnl_returns.fees_unattributed,
+            dust: self.dust,
             pnl_return,
             pnl_drawdown: current_pnl_drawdown,
             pnl_drawdown_mean,
@@ -424,6 +476,7 @@ impl TearSheetGenerator {
             fills_unmatched: self.fills_unmatched,
             fills_forced: self.fills_forced,
             fills_unallocated: self.fills_unallocated,
+            fills_dust: self.fills_dust,
             first_fallback_detail: self.first_fallback_detail.clone(),
             fallback_positions: self.fallback_positions.clone(),
         }

@@ -14,6 +14,7 @@ use crate::{
     },
 };
 use derive_more::{Constructor, Display};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::fmt::Formatter;
 
@@ -194,6 +195,35 @@ impl<ExchangeKey, AssetKey> Instrument<ExchangeKey, AssetKey> {
             .unwrap_or(&self.name_exchange)
     }
 
+    /// The step a position in this `Instrument`, and an order closing it, is sized in: the
+    /// [`InstrumentSpec`]'s quantity increment, when the spec counts quantities in the unit a
+    /// position is counted in. `None` otherwise.
+    ///
+    /// A position is counted in the base asset on [`InstrumentKind::Spot`], and in contracts on a
+    /// derivative. So the spec's unit must be [`OrderQuantityUnits::Asset`] of the base asset on
+    /// spot, and [`OrderQuantityUnits::Contract`] on a derivative. A derivative whose contract is
+    /// one unit of its base (`contract_size` 1) accepts the base asset too, since the two units
+    /// are then the same. A step in [`OrderQuantityUnits::Quote`], in another asset, or not above
+    /// zero says nothing about a position's quantity, so it gives `None`, as no spec does.
+    pub fn quantity_step(&self) -> Option<Decimal>
+    where
+        AssetKey: PartialEq,
+    {
+        let quantity = &self.spec.as_ref()?.quantity;
+        let counts_positions = match (&self.kind, &quantity.unit) {
+            (InstrumentKind::Spot, OrderQuantityUnits::Asset(asset)) => {
+                *asset == self.underlying.base
+            }
+            (InstrumentKind::Spot, OrderQuantityUnits::Contract) => false,
+            (_, OrderQuantityUnits::Contract) => true,
+            (kind, OrderQuantityUnits::Asset(asset)) => {
+                kind.contract_size() == Decimal::ONE && *asset == self.underlying.base
+            }
+            (_, OrderQuantityUnits::Quote) => false,
+        };
+        (counts_positions && quantity.increment > Decimal::ZERO).then_some(quantity.increment)
+    }
+
     /// Map this Instruments `ExchangeKey` to a new key, using the provided lookup closure.
     ///
     /// The closure is applied to the execution `exchange` **and** to any [`DataVenue`]s exchange,
@@ -348,7 +378,7 @@ mod tests {
         exchange::ExchangeId,
         instrument::spec::{InstrumentSpecNotional, InstrumentSpecPrice},
     };
-    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
 
     /// An `AAPL` traded on one venue, optionally priced by another.
     fn instrument(data_venue: Option<DataVenue<ExchangeId>>) -> Instrument<ExchangeId, Asset> {
@@ -517,5 +547,99 @@ mod tests {
             serde_json::from_str::<Instrument<ExchangeId, Asset>>(&json).expect("must deserialise");
 
         assert_eq!(round_tripped, instrument);
+    }
+
+    /// `instrument(None)` with a spec whose quantity is counted in `unit` in steps of `increment`.
+    fn with_quantity_spec(
+        mut instrument: Instrument<ExchangeId, Asset>,
+        unit: OrderQuantityUnits<Asset>,
+        increment: Decimal,
+    ) -> Instrument<ExchangeId, Asset> {
+        instrument.spec = Some(InstrumentSpec::new(
+            InstrumentSpecPrice::new(dec!(0.01), dec!(0.01)),
+            InstrumentSpecQuantity::new(unit, increment, increment),
+            InstrumentSpecNotional::new(Decimal::ONE),
+        ));
+        instrument
+    }
+
+    /// `instrument(None)` as a perpetual of `contract_size` base units per contract.
+    fn perpetual(contract_size: Decimal) -> Instrument<ExchangeId, Asset> {
+        let mut instrument = instrument(None);
+        instrument.kind = InstrumentKind::Perpetual(PerpetualContract {
+            contract_size,
+            settlement_asset: Asset::new_from_exchange("usd"),
+        });
+        instrument
+    }
+
+    #[test]
+    fn quantity_step_is_the_spot_increment_in_the_base_asset() {
+        let aapl = Asset::new_from_exchange("aapl");
+        let spot = with_quantity_spec(
+            instrument(None),
+            OrderQuantityUnits::Asset(aapl),
+            dec!(0.01),
+        );
+
+        assert_eq!(spot.quantity_step(), Some(dec!(0.01)));
+    }
+
+    #[test]
+    fn quantity_step_is_none_without_a_spec() {
+        assert_eq!(instrument(None).quantity_step(), None);
+    }
+
+    #[test]
+    fn quantity_step_is_none_when_the_spec_is_not_in_the_unit_a_position_is_counted_in() {
+        let base = || OrderQuantityUnits::Asset(Asset::new_from_exchange("aapl"));
+        let other = OrderQuantityUnits::Asset(Asset::new_from_exchange("aapl_lot"));
+        let cases = [
+            ("spot in quote", instrument(None), OrderQuantityUnits::Quote),
+            ("spot in another asset", instrument(None), other),
+            (
+                "spot in contracts",
+                instrument(None),
+                OrderQuantityUnits::Contract,
+            ),
+            (
+                "perpetual in quote",
+                perpetual(Decimal::ONE),
+                OrderQuantityUnits::Quote,
+            ),
+            ("perpetual of 100 in base", perpetual(dec!(100)), base()),
+        ];
+
+        for (case, instrument, unit) in cases {
+            let instrument = with_quantity_spec(instrument, unit, dec!(0.01));
+            assert_eq!(instrument.quantity_step(), None, "{case}");
+        }
+    }
+
+    #[test]
+    fn quantity_step_of_a_derivative_is_in_contracts_or_a_one_unit_contract_s_base() {
+        let in_contracts = with_quantity_spec(
+            perpetual(dec!(100)),
+            OrderQuantityUnits::Contract,
+            Decimal::ONE,
+        );
+        let in_base = with_quantity_spec(
+            perpetual(Decimal::ONE),
+            OrderQuantityUnits::Asset(Asset::new_from_exchange("aapl")),
+            dec!(0.001),
+        );
+
+        assert_eq!(in_contracts.quantity_step(), Some(Decimal::ONE));
+        assert_eq!(in_base.quantity_step(), Some(dec!(0.001)));
+    }
+
+    #[test]
+    fn quantity_step_is_none_unless_the_increment_is_above_zero() {
+        let aapl = || OrderQuantityUnits::Asset(Asset::new_from_exchange("aapl"));
+
+        for increment in [Decimal::ZERO, dec!(-0.01)] {
+            let instrument = with_quantity_spec(instrument(None), aapl(), increment);
+            assert_eq!(instrument.quantity_step(), None, "increment {increment}");
+        }
     }
 }

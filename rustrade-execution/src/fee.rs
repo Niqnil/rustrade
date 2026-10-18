@@ -221,10 +221,11 @@ impl Default for FeeModelConfig {
 /// Under `Received`, a buy receives its quantity less the fee, and the engine nets a base fee from
 /// a spot position (see `rustrade`'s `InstrumentState::update_from_trade`), so the two stay equal.
 /// The holding is then not a round number: a buy of 1 with a 0.1 % fee holds 0.999. A live venue
-/// sells only whole multiples of its lot step, so a full-size close there can leave a remainder
-/// below one lot, which only that venue's own dust conversion can clear. Rounding a close to the
-/// lot step is the strategy's to do. This venue has no lot step, so a close here sells the whole
-/// holding.
+/// sells only whole multiples of its lot step, so when the instrument's spec gives a quantity
+/// step, the engine rounds the position toward zero to it and leaves the remainder in the balance,
+/// where only the venue's own dust conversion can clear it. This venue has no lot step: it fills
+/// whatever quantity it is sent, so a close of the rounded position leaves the same remainder
+/// here as live.
 ///
 /// A flat fee on a tiny buy can exceed the quantity it receives. The excess is then taken from the
 /// base balance, and the order is refused if that cannot cover it, as a sell whose fee exceeds its

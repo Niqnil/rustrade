@@ -99,6 +99,13 @@ pub struct TradingSummary<Interval> {
     /// [`TearSheet::fills_unallocated`](instrument::TearSheet::fills_unallocated).
     #[serde(default)]
     pub fills_unallocated: usize,
+
+    /// Spot fills this session whose base-asset fee left dust out of the position, summed over
+    /// every instrument. Routine where a venue charges fees in the base asset; each instrument's
+    /// value written off is its [`TearSheet::dust`](instrument::TearSheet::dust). See
+    /// [`TearSheet::fills_dust`](instrument::TearSheet::fills_dust).
+    #[serde(default)]
+    pub fills_dust: usize,
 }
 
 impl<Interval> TradingSummary<Interval> {
@@ -275,9 +282,10 @@ impl TradingSummaryGenerator {
             fills_unmatched,
             fills_forced,
             fills_unallocated,
+            fills_dust,
         ) = self.instruments.values().fold(
-            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize),
-            |(opened, rejected, fallback, unmatched, forced, unallocated), generator| {
+            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize),
+            |(opened, rejected, fallback, unmatched, forced, unallocated, dust), generator| {
                 (
                     opened.saturating_add(generator.orders_opened),
                     rejected.saturating_add(generator.orders_rejected),
@@ -285,6 +293,7 @@ impl TradingSummaryGenerator {
                     unmatched.saturating_add(generator.fills_unmatched),
                     forced.saturating_add(generator.fills_forced),
                     unallocated.saturating_add(generator.fills_unallocated),
+                    dust.saturating_add(generator.fills_dust),
                 )
             },
         );
@@ -301,6 +310,7 @@ impl TradingSummaryGenerator {
             fills_unmatched,
             fills_forced,
             fills_unallocated,
+            fills_dust,
         }
     }
 }
