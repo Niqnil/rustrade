@@ -118,9 +118,10 @@ impl QueuePosition {
 /// map — a snapshot must report everything the account holds — but is absent from the queues, so
 /// matching can never reach it. It arrives one of two ways:
 /// - through a configured `initial_state`, and then nothing matches it, ever;
-/// - through [`hold`](Self::hold): a market order the venue is holding for its instrument's next
-///   bar. Those are kept in a fourth index, per instrument and in arrival order, which
-///   [`take_held`](Self::take_held) empties when that bar arrives.
+/// - through [`hold`](Self::hold): a market order the venue is holding until its instrument's
+///   next bar, or its next fresh observation. Those are kept in a fourth index, per instrument and
+///   in arrival order, which [`take_held`](Self::take_held) empties when what they wait for
+///   arrives.
 ///
 /// # Why a third index for deadlines
 ///
@@ -157,7 +158,7 @@ pub struct OpenOrders {
     /// orders, since [`by_id`](Self::by_id) is keyed by it, so the pair is already total — and
     /// therefore a sweep's order is reproducible between runs.
     expiries: BTreeSet<(DateTime<Utc>, ClientOrderId)>,
-    /// Market orders held for each instrument's next bar, earliest arrival first — see the type's
+    /// Market orders held on each instrument, earliest arrival first — see the type's
     /// note on orders with no price. Values are keys into [`by_id`](Self::by_id).
     held: FnvHashMap<InstrumentNameExchange, Vec<ClientOrderId>>,
     /// Monotone across every instrument, so insertion order is total even across queues.
@@ -221,7 +222,7 @@ impl OpenOrders {
         Ok(())
     }
 
-    /// Holds `order`, a market order with no price, for its instrument's next bar, with
+    /// Holds `order`, a market order with no price, until its venue releases it, with
     /// `reservation` held against it.
     ///
     /// Kept in the map like any open order, so a snapshot reports it and a cancel finds it, and
@@ -252,12 +253,20 @@ impl OpenOrders {
         Ok(())
     }
 
-    /// Whether any order is held for `instrument`'s next bar.
+    /// Whether any order is held on `instrument`.
     pub fn holds(&self, instrument: &InstrumentNameExchange) -> bool {
         self.held.contains_key(instrument)
     }
 
-    /// The orders held for `instrument`'s next bar, earliest arrival first, no longer held.
+    /// The orders held on `instrument`, earliest arrival first, still held.
+    ///
+    /// For a caller that releases some of them and leaves the rest waiting: it
+    /// [`remove`](Self::remove)s those it releases, which takes them out of the hold too.
+    pub fn held_on(&self, instrument: &InstrumentNameExchange) -> &[ClientOrderId] {
+        self.held.get(instrument).map_or(&[], Vec::as_slice)
+    }
+
+    /// The orders held on `instrument`, earliest arrival first, no longer held.
     ///
     /// Each stays in the map until its caller [`remove`](Self::remove)s it, which is what lets the
     /// caller take its reservation with it.
@@ -265,7 +274,7 @@ impl OpenOrders {
         self.held.remove(instrument).unwrap_or_default()
     }
 
-    /// Every order held for a next bar, on any instrument: by instrument, then earliest arrival
+    /// Every order held, on any instrument: by instrument, then earliest arrival
     /// first. A total order, so whatever a caller does with them happens in the same order on
     /// every run.
     pub fn held(&self) -> Vec<ClientOrderId> {

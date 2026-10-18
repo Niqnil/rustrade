@@ -771,6 +771,7 @@ mod tests {
             spot_fee_asset: Default::default(),
             slippage: Default::default(),
             market_order_timing: Default::default(),
+            stale_market: Default::default(),
         }
     }
 
