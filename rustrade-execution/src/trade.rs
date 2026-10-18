@@ -271,8 +271,8 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
     ///   call this for a settlement fill, such as a liquidation, that matches none of its orders
     ///   and is larger than the position it reduces: it cuts that fill to the position, unnetted,
     ///   so the position lands flat, and reports the excess. A mirror that matches the engine does
-    ///   the same rather than calling this. With one position per instrument, every fill is
-    ///   netted.
+    ///   the same rather than calling this. With one position per instrument
+    ///   (`OmsMode::Netting`), the engine never caps a fill, so this applies to every fill.
     pub fn holding_move<ExchangeKey>(
         &self,
         instrument: &Instrument<ExchangeKey, AssetKey>,
