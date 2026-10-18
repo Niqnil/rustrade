@@ -2359,6 +2359,10 @@ mod tests {
             }),
             "the report names the venue and the instant simulated time stopped at"
         );
+        assert!(
+            harness.runner.core.pending.is_empty(),
+            "the second fill, still owed when the run was abandoned, is discarded with it"
+        );
     }
 
     /// A source event resets the budget, so a strategy that trades steadily is not mistaken for a
