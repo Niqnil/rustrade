@@ -183,6 +183,9 @@ where
         self.add_instrument_metric_row(&mut table, "Unattributed Fees", |ts| {
             format!("{:.2}", ts.fees_unattributed)
         });
+        self.add_instrument_metric_row(&mut table, "Dust Written Off", |ts| {
+            format!("{:.2}", ts.dust)
+        });
         self.add_instrument_metric_row(&mut table, &format!("Return {interval}"), |ts| {
             format_percentage(ts.pnl_return.value, 2)
         });
@@ -376,6 +379,7 @@ mod tests {
             fills_unmatched: 0,
             fills_forced: 0,
             fills_unallocated: 0,
+            fills_dust: 0,
         }
     }
 
@@ -436,6 +440,7 @@ mod tests {
             fills_unmatched,
             fills_forced: 0,
             fills_unallocated: 0,
+            fills_dust: 0,
         }
     }
 
@@ -489,6 +494,25 @@ mod tests {
         };
         assert!(row("Unattributed Fees").contains("12.50"));
         assert!(row("PnL").contains("-12.50"));
+    }
+
+    /// The instrument table shows the value of the dust written off.
+    #[test]
+    fn instrument_table_shows_dust_written_off() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fill_dust(dec!(0.9));
+        let mut summary = summary_with_fallback(0, 0, None);
+        summary.instruments.insert(
+            InstrumentNameInternal::new("btc_usdt"),
+            generator.generate(Decimal::ZERO, Annual365),
+        );
+
+        let rendered = summary.instrument_table().to_string();
+        let row = rendered
+            .lines()
+            .find(|line| line.contains("Dust Written Off"))
+            .unwrap_or_else(|| panic!("no Dust Written Off row in:\n{rendered}"));
+        assert!(row.contains("0.90"));
     }
 
     #[test]

@@ -38,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the engine's instrument state drops, such as a lookahead candle or one already seen, releases
     nothing.
   - New `SimulatedVenue::holds_for_next_bar` and `SimulatedVenue::expire_held`, for drivers.
+- `Instrument::quantity_step` (`rustrade-instrument`, #659): the step a position and its closing
+  order are sized in. It is the spec's quantity increment, when the spec counts quantities in the
+  unit a position is counted in: the base asset on spot, contracts on a derivative.
+- Tear sheets count dust (`rustrade`, #659). `TearSheet::fills_dust` counts the fills whose
+  base-asset fee left a remainder below the quantity step out of the position, and
+  `TearSheet::dust` is the value written off for them. `TradingSummary::fills_dust` sums the count
+  over the session, and the instrument table shows a "Dust Written Off" row.
 
 ### Changed
 
@@ -48,6 +55,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or a `MockExecutionConfig::new` call must supply it, and `VenueInstrumentMarket` has a new
   public field, `bar` (`rustrade-execution`). A serialised configuration without
   `market_order_timing` still loads, as `OnArrival`.
+- **Breaking:** `build_ioc_market_order_to_close_position` takes the instrument's quantity step
+  and returns an `Option` (`rustrade`, #659). It rounds the close toward zero to the step, and
+  returns `None` for a position smaller than one step, which no order can close. Pass
+  `instrument.quantity_step()`, or `None` to send the exact quantity as before.
+  `close_open_positions_with_market_orders` passes the step, and logs a position below one step
+  at WARN instead of sending an order for it.
+- **Breaking:** `TearSheet`, `TearSheetGenerator` and `TradingSummary` have new public fields for
+  dust (see Added), so a struct literal must supply them (`rustrade`). Serialised ones without
+  them still load.
+
+### Fixed
+
+- **A spot position netted for a base-asset fee could never close to flat** (`rustrade`, #659).
+  A buy of `q` with a base fee `f` holds `q − f`, which is usually off the venue's quantity step,
+  so a full close left a remainder the venue would not sell and the position stayed open. When the
+  instrument has a quantity step, the engine now rounds such a position toward zero to the step.
+  The remainder stays in the account's balance, out of the position:
+  - A long's remainder is written off at the fill's price as part of the fill's fee, so PnL still
+    totals what the fill paid.
+  - A short's remainder is base still owed on the loan. The position books it as bought back at
+    the fill's price, so nothing is written off.
+  - Each such fill is logged at INFO and counted on the tear sheet.
+
+  Remainders are rounded off fill by fill, so the balance can gather more than one step of them
+  over many fills. An instrument without a step in the position's unit keeps the exact quantity.
 
 ## [0.12.1] - 2026-10-17
 
