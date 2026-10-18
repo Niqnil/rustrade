@@ -45,6 +45,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   base-asset fee left a remainder below the quantity step out of the position, and
   `TearSheet::dust` is the value written off for them. `TradingSummary::fills_dust` sums the count
   over the session, and the instrument table shows a "Dust Written Off" row.
+- `Trade::holding_move` (`rustrade-execution`, #660): how a spot fill whose fee is in the base
+  asset moves the position it applies to. It nets the fee from the fill's quantity, then rounds
+  the resulting position toward zero to `Instrument::quantity_step`, and returns the move as a
+  `HoldingMove` (side, quantity, and the `dust` rounded off). It takes the instrument and the
+  position before the fill, signed. The engine applies such fills with it, so a component that
+  mirrors positions outside the engine, such as an execution client's ledger of forwarded fills,
+  can call it and agree with the engine.
+- `round_toward_zero_to_step` (`rustrade-instrument`): a quantity rounded toward zero to a whole
+  multiple of a step, the rounding the engine and `build_ioc_market_order_to_close_position`
+  apply.
 
 ### Changed
 

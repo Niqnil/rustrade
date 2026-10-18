@@ -1,9 +1,6 @@
 use crate::engine::state::{
     EngineState,
-    instrument::{
-        InstrumentState, data::InstrumentDataState, filter::InstrumentFilter,
-        round_toward_zero_to_step,
-    },
+    instrument::{InstrumentState, data::InstrumentDataState, filter::InstrumentFilter},
     position::Position,
 };
 use rust_decimal::Decimal;
@@ -13,7 +10,10 @@ use rustrade_execution::order::{
     request::{OrderRequestCancel, OrderRequestOpen, RequestOpen},
 };
 use rustrade_instrument::{
-    Side, asset::AssetIndex, exchange::ExchangeIndex, instrument::InstrumentIndex,
+    Side,
+    asset::AssetIndex,
+    exchange::ExchangeIndex,
+    instrument::{InstrumentIndex, round_toward_zero_to_step},
 };
 use tracing::warn;
 
