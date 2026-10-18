@@ -78,6 +78,11 @@ pub struct RequestOpen {
     ///
     /// Exchanges that infer intent from positions (Binance, Deribit) may map this to
     /// their `reduceOnly` parameter or ignore it entirely.
+    ///
+    /// The `rustrade` engine enforces it on fills, whatever the venue did with it: a fill of a
+    /// reduce-only order never grows or flips the engine's position. A fill larger than the
+    /// opposite position is cut so the position lands flat, and the excess is reported rather
+    /// than applied. See [`Trade::holding_move`](crate::trade::Trade::holding_move).
     #[serde(default)]
     pub reduce_only: bool,
 

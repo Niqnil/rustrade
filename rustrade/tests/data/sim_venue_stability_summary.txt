@@ -9,6 +9,7 @@ TradingSummary {
             carry: 0,
             fees_unattributed: 0,
             dust: 0,
+            reduce_only_excess: 0,
             pnl_return: RateOfReturn {
                 value: 0,
                 interval: Daily,
@@ -38,6 +39,7 @@ TradingSummary {
             fills_forced: 0,
             fills_unallocated: 0,
             fills_dust: 0,
+            fills_reduce_only_capped: 0,
             first_fallback_detail: None,
             fallback_positions: [],
         },
@@ -48,6 +50,7 @@ TradingSummary {
             carry: 0,
             fees_unattributed: 0,
             dust: 0,
+            reduce_only_excess: 0,
             pnl_return: RateOfReturn {
                 value: 0,
                 interval: Daily,
@@ -77,6 +80,7 @@ TradingSummary {
             fills_forced: 0,
             fills_unallocated: 0,
             fills_dust: 0,
+            fills_reduce_only_capped: 0,
             first_fallback_detail: None,
             fallback_positions: [],
         },
@@ -87,6 +91,7 @@ TradingSummary {
             carry: 0,
             fees_unattributed: 0,
             dust: 0,
+            reduce_only_excess: 0,
             pnl_return: RateOfReturn {
                 value: 0,
                 interval: Daily,
@@ -116,6 +121,7 @@ TradingSummary {
             fills_forced: 0,
             fills_unallocated: 0,
             fills_dust: 0,
+            fills_reduce_only_capped: 0,
             first_fallback_detail: None,
             fallback_positions: [],
         },
@@ -221,4 +227,5 @@ TradingSummary {
     fills_forced: 0,
     fills_unallocated: 0,
     fills_dust: 0,
+    fills_reduce_only_capped: 0,
 }

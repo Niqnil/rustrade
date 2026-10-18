@@ -106,6 +106,14 @@ pub struct TradingSummary<Interval> {
     /// [`TearSheet::fills_dust`](instrument::TearSheet::fills_dust).
     #[serde(default)]
     pub fills_dust: usize,
+
+    /// Fills of reduce-only orders this session that the engine cut so they would not grow or
+    /// flip a position, summed over every instrument. Routine for an order sized above its
+    /// position on purpose; each instrument's excess value is its
+    /// [`TearSheet::reduce_only_excess`](instrument::TearSheet::reduce_only_excess). See
+    /// [`TearSheet::fills_reduce_only_capped`](instrument::TearSheet::fills_reduce_only_capped).
+    #[serde(default)]
+    pub fills_reduce_only_capped: usize,
 }
 
 impl<Interval> TradingSummary<Interval> {
@@ -283,9 +291,13 @@ impl TradingSummaryGenerator {
             fills_forced,
             fills_unallocated,
             fills_dust,
+            fills_reduce_only_capped,
         ) = self.instruments.values().fold(
-            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize),
-            |(opened, rejected, fallback, unmatched, forced, unallocated, dust), generator| {
+            (
+                0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize,
+            ),
+            |(opened, rejected, fallback, unmatched, forced, unallocated, dust, capped),
+             generator| {
                 (
                     opened.saturating_add(generator.orders_opened),
                     rejected.saturating_add(generator.orders_rejected),
@@ -294,6 +306,7 @@ impl TradingSummaryGenerator {
                     forced.saturating_add(generator.fills_forced),
                     unallocated.saturating_add(generator.fills_unallocated),
                     dust.saturating_add(generator.fills_dust),
+                    capped.saturating_add(generator.fills_reduce_only_capped),
                 )
             },
         );
@@ -311,6 +324,7 @@ impl TradingSummaryGenerator {
             fills_forced,
             fills_unallocated,
             fills_dust,
+            fills_reduce_only_capped,
         }
     }
 }

@@ -45,19 +45,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   base-asset fee left a remainder below the quantity step out of the position, and
   `TearSheet::dust` is the value written off for them. `TradingSummary::fills_dust` sums the count
   over the session, and the instrument table shows a "Dust Written Off" row.
-- `Trade::holding_move` (`rustrade-execution`, #660): how a spot fill whose fee is in the base
-  asset moves the position it applies to. It nets the fee from the fill's quantity, then rounds
-  the resulting position toward zero to `Instrument::quantity_step`, and returns the move as a
-  `HoldingMove` (side, quantity, and the `dust` rounded off). It takes the instrument and the
-  position before the fill, signed. The engine applies such fills with it, so a component that
-  mirrors positions outside the engine, such as an execution client's ledger of forwarded fills,
-  can call it and agree with the engine.
+- `Trade::holding_move` (`rustrade-execution`, #660, #661): how a fill moves the position it
+  applies to, when that is not by its own side and quantity. It nets a spot fill's fee in the base
+  asset from its quantity, cuts a reduce-only fill so it neither grows nor flips the position,
+  then, if the move was not cut, rounds the resulting position toward zero to
+  `Instrument::quantity_step`. It returns the move as a `HoldingMove`: side, quantity, the `dust`
+  rounded off, and the `excess` cut off. It takes the instrument, the position before the fill,
+  signed, and whether the fill's order was reduce-only. The engine applies fills with it, so a
+  component that mirrors positions outside the engine, such as an execution client's ledger of
+  forwarded fills, can call it and agree with the engine.
+- Reporting for reduce-only fills the engine cuts (`rustrade`, #661; see Changed):
+  - `EngineOutput::ReduceOnlyCapped`, carrying a `ReduceOnlyCapped`: the fill's trade and order
+    ids, its position, the position before the fill, the excess, the excess's value and the fee
+    charged to the tear sheet for it.
+  - `TearSheet::fills_reduce_only_capped` counts the cut fills, and
+    `TearSheet::reduce_only_excess` sums the excess's value. `TradingSummary` sums the count over
+    the session, and the instrument table shows a "Reduce-Only Excess" row.
+  - `EngineState::replay_account`: `update_from_account` for a replica of the engine's state,
+    told which fills the engine cut. `StateReplicaManager` uses it, so it cuts the same fills.
 - `round_toward_zero_to_step` (`rustrade-instrument`): a quantity rounded toward zero to a whole
   multiple of a step, the rounding the engine and `build_ioc_market_order_to_close_position`
   apply.
 
 ### Changed
 
+- **The engine enforces `RequestOpen::reduce_only` on fills** (`rustrade`, #661). It used to apply
+  every fill in full, so a reduce-only fill larger than the position it reduced flipped it and
+  left a small position on the other side. A margin repayment sized to cover interest does that
+  every time. Now, once a base-asset fee is netted:
+  - A reduce-only fill larger than the opposite position is cut so the position lands flat. One
+    against a flat position, or one on its own side, is applied to none.
+  - The excess is applied to no position. Its value is reported, not charged to PnL.
+  - The fill's fees are split in proportion: the position is charged the share of the move it
+    took, and the tear sheet's unattributed fees the excess's share.
+  - Each such fill is logged at WARN, counted on the tear sheet and emitted as
+    `EngineOutput::ReduceOnlyCapped`.
+
+  The engine knows an order is reduce-only from the request it sent, and finds a fill's order by
+  `Trade::client_order_id`, or by the venue's order id while the order is tracked. A fill that
+  names no client order id and arrives before its order is acknowledged, or after it retired, is
+  still applied in full. So is a fill of an order the engine did not send in this session.
+- **Breaking:** `InstrumentState::update_from_trade`, `InstrumentState::update_from_order_snapshot`
+  and `EngineState::update_from_account` return a `FillsApplied`, the position a fill closed plus
+  the reduce-only fills cut, instead of an `Option<PositionExited>` (`rustrade`, #661). Read the
+  old value from `FillsApplied::exited`. `UpdateFromAccountOutput::PositionExit` is replaced by
+  `UpdateFromAccountOutput::FillsApplied`.
+- **Breaking:** `InstrumentState` has new public fields, `reduce_only` and
+  `retired_reduce_only`, so a struct literal must supply them (`rustrade`, #661). Serialised
+  states without them still load.
 - **Breaking:** `SimulatedVenue::apply_market` takes the bar an observation carries
   (`rustrade-execution`). Its new `bar: Option<MarketBar>` argument comes before
   `time_exchange`. Pass `None` from a feed without bars, which keeps today's behaviour.
@@ -72,8 +107,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `close_open_positions_with_market_orders` passes the step, and logs a position below one step
   at WARN instead of sending an order for it.
 - **Breaking:** `TearSheet`, `TearSheetGenerator` and `TradingSummary` have new public fields for
-  dust (see Added), so a struct literal must supply them (`rustrade`). Serialised ones without
-  them still load.
+  dust and for reduce-only fills cut (see Added), so a struct literal must supply them
+  (`rustrade`). Serialised ones without them still load.
 
 ### Fixed
 

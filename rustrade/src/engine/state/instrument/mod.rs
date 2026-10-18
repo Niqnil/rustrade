@@ -27,7 +27,7 @@ use rustrade_execution::{
         state::{ActiveOrderState, InactiveOrderState, OrderState},
     },
     position::PositionReport,
-    trade::{AssetFees, Trade, TradeOrigin},
+    trade::{AssetFees, Trade, TradeId, TradeOrigin},
 };
 use rustrade_instrument::{
     Keyed, Side,
@@ -41,7 +41,7 @@ use rustrade_instrument::{
         name::{InstrumentNameExchange, InstrumentNameInternal},
     },
 };
-use rustrade_integration::collection::{FnvIndexMap, snapshot::Snapshot};
+use rustrade_integration::collection::{FnvIndexMap, FnvIndexSet, snapshot::Snapshot};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::fmt::Debug;
@@ -570,6 +570,68 @@ pub enum ExpiryHandling {
     Venue,
 }
 
+/// A reduce-only order's fill the engine cut so it would not grow or flip the position it
+/// reduces, or applied none of, because the position was flat or on the fill's side. See the
+/// reduce-only fills section of [`InstrumentState::update_from_trade`].
+///
+/// Carried by [`EngineOutput::ReduceOnlyCapped`](crate::engine::EngineOutput::ReduceOnlyCapped).
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub struct ReduceOnlyCapped<InstrumentKey = InstrumentIndex> {
+    /// The instrument the fill is on.
+    pub instrument: InstrumentKey,
+    /// The fill, as the venue identified it.
+    pub trade_id: TradeId,
+    /// The venue's id of the fill's order.
+    pub order_id: OrderId,
+    /// The client order id the engine matched the fill's order by, when it matched one. A replica
+    /// told the fill is reduce-only, rather than finding its order, may have none.
+    pub client_order_id: Option<ClientOrderId>,
+    /// The position the fill was routed to.
+    pub position_id: PositionId,
+    /// The position before the fill, signed: positive for a long, negative for a short, zero for
+    /// none.
+    pub held: Decimal,
+    /// The part of the fill's move no position took, signed as a move is: positive for a buy.
+    /// See [`HoldingMove::excess`](rustrade_execution::trade::HoldingMove::excess).
+    pub excess: Decimal,
+    /// The excess valued at the fill's price, in quote. Reported, not charged to PnL.
+    pub excess_value: Decimal,
+    /// The quote equivalent of the excess's share of the fill's fees, charged to the tear sheet's
+    /// [`fees_unattributed`](crate::statistic::summary::instrument::TearSheet::fees_unattributed).
+    pub fees_unattributed: Decimal,
+}
+
+/// What applying the fills of one account event did to an instrument's positions.
+///
+/// Returned by [`InstrumentState::update_from_trade`] for one fill, and by
+/// [`InstrumentState::update_from_order_snapshot`] for the fills it replays.
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub struct FillsApplied<AssetKey, InstrumentKey = InstrumentIndex> {
+    /// The position a fill closed, if any. Of fills replayed together, only the last one's: see
+    /// [`InstrumentState::update_from_order_snapshot`].
+    pub exited: Option<PositionExited<AssetKey, InstrumentKey>>,
+    /// Each reduce-only fill the engine cut or applied none of, in the order applied.
+    pub capped: Vec<ReduceOnlyCapped<InstrumentKey>>,
+}
+
+impl<AssetKey, InstrumentKey> Default for FillsApplied<AssetKey, InstrumentKey> {
+    fn default() -> Self {
+        Self {
+            exited: None,
+            capped: Vec::new(),
+        }
+    }
+}
+
+impl<AssetKey, InstrumentKey> FillsApplied<AssetKey, InstrumentKey> {
+    /// `true` if no fill closed a position and none was capped.
+    pub fn is_empty(&self) -> bool {
+        self.exited.is_none() && self.capped.is_empty()
+    }
+}
+
 /// Represents the current state of an instrument, including its [`Position`](super::position::Position), [`Orders`], and
 /// user provided instrument data.
 ///
@@ -769,6 +831,28 @@ pub struct InstrumentState<
     /// as it did before this field existed.
     #[serde(default = "FnvIndexMap::default")]
     pub retired_routing: FnvIndexMap<OrderId, PositionId>,
+
+    /// The orders tracked in [`Self::orders`] that were sent with
+    /// [`RequestOpen::reduce_only`](rustrade_execution::order::request::RequestOpen::reduce_only)
+    /// set, whose fills [`Self::update_from_trade`] never lets grow or flip a position.
+    ///
+    /// Recorded by `InFlightRequestRecorder::record_in_flight_open`, since neither an [`Order`]
+    /// nor a venue's report of one carries the flag. `cleanup_routing_tables` moves an order that
+    /// leaves [`Self::orders`] to [`Self::retired_reduce_only`]. An order this state did not send,
+    /// such as one restored from a venue snapshot after a restart, is never in it.
+    #[serde(default)]
+    pub reduce_only: FnvHashSet<ClientOrderId>,
+
+    /// The reduce-only orders that have left [`Self::orders`], so a fill arriving after its
+    /// order's terminal snapshot is still cut. As [`Self::retired_routing`] does for routing, it
+    /// keeps the last [`MAX_RETIRED_ROUTING`] retirements, oldest evicted first; a late fill of an
+    /// order evicted from it is applied in full.
+    ///
+    /// Kept under both OMS modes, unlike [`Self::retired_routing`]: a netting position can be
+    /// flipped too. A new order sent under a client order id in it removes it, so the flag of an
+    /// earlier order does not outlive its id's reuse.
+    #[serde(default)]
+    pub retired_reduce_only: FnvIndexSet<ClientOrderId>,
 
     /// The orders that were `Open` when this instrument's account stream last began to
     /// resynchronise, each with the venue order it was: the only orders the next account snapshot
@@ -1067,6 +1151,20 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             }
         }
 
+        // Both modes: a reduce-only fill can flip a netting position too.
+        if !self.reduce_only.is_empty() {
+            let retired: Vec<ClientOrderId> = self
+                .reduce_only
+                .iter()
+                .filter(|cid| !self.orders.0.contains_key(*cid))
+                .cloned()
+                .collect();
+            for cid in retired {
+                self.reduce_only.remove(&cid);
+                self.insert_retired_reduce_only(cid);
+            }
+        }
+
         if !self.position_ids.is_empty() {
             self.position_ids
                 .retain(|cid, _| self.orders.0.contains_key(cid));
@@ -1104,11 +1202,85 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         self.retired_routing.insert(exchange_id, position_id);
     }
 
+    /// Record a retired reduce-only order, evicting the oldest at [`MAX_RETIRED_ROUTING`].
+    fn insert_retired_reduce_only(&mut self, cid: ClientOrderId) {
+        let at_capacity = !self.retired_reduce_only.contains(&cid)
+            && self.retired_reduce_only.len() >= MAX_RETIRED_ROUTING;
+
+        if at_capacity && let Some(evicted) = self.retired_reduce_only.shift_remove_index(0) {
+            debug!(
+                evicted_cid = %evicted,
+                capacity = MAX_RETIRED_ROUTING,
+                "Retired reduce-only orders at capacity — evicting oldest retirement. A late fill \
+                 for the evicted order would now be applied in full."
+            );
+        }
+
+        self.retired_reduce_only.insert(cid);
+    }
+
+    /// Record that the open `cid` is being sent, reduce-only or not. A reused `cid` drops the
+    /// flag an earlier order under it left in [`Self::retired_reduce_only`].
+    pub(crate) fn record_reduce_only(&mut self, cid: &ClientOrderId, reduce_only: bool) {
+        self.retired_reduce_only.shift_remove(cid);
+        if reduce_only {
+            self.reduce_only.insert(cid.clone());
+        }
+    }
+
+    /// The client order id of the reduce-only order `trade` is a fill of, if it is one: found by
+    /// the fill's [`Trade::client_order_id`], or failing that by its venue order id while the
+    /// order is tracked.
+    fn reduce_only_order<'a>(
+        &'a self,
+        trade: &'a Trade<AssetKey, InstrumentKey>,
+    ) -> Option<&'a ClientOrderId> {
+        if self.reduce_only.is_empty() && self.retired_reduce_only.is_empty() {
+            return None;
+        }
+        let cid = trade
+            .client_order_id
+            .as_ref()
+            .or_else(|| self.tracked_order_cid(&trade.order_id))?;
+        (self.reduce_only.contains(cid) || self.retired_reduce_only.contains(cid)).then_some(cid)
+    }
+
+    /// The client order id of the tracked order the venue knows as `order_id`: O(1) through the
+    /// reverse index, which is maintained in both OMS modes, or failing that by a scan of the
+    /// `Open` orders, for one acknowledged but not yet indexed, or whose index entry a prune
+    /// removed.
+    fn tracked_order_cid(&self, order_id: &OrderId) -> Option<&ClientOrderId> {
+        self.exchange_id_to_cid.get(order_id).or_else(|| {
+            self.orders
+                .0
+                .iter()
+                .find_map(|(cid, order)| match &order.state {
+                    ActiveOrderState::Open(open) if open.id.assigned() == Some(order_id) => {
+                        Some(cid)
+                    }
+                    _ => None,
+                })
+        })
+    }
+
+    /// Drop all order routing: what lets a fill find its order's position and reduce-only flag,
+    /// and the fills waiting on an ack. For when the orders it routes for are dropped wholesale,
+    /// as at expiry.
+    pub(crate) fn clear_order_routing(&mut self) {
+        self.exchange_id_to_cid.clear();
+        self.retired_routing.clear();
+        self.position_ids.clear();
+        self.pending_fills.clear();
+        self.reduce_only.clear();
+        self.retired_reduce_only.clear();
+    }
+
     /// Updates the instrument state from an [`Order`] snapshot.
     ///
-    /// Returns a [`PositionExited`] if a deferred fill (queued during a fill-before-ack
-    /// race in `OmsMode::Hedging`) closes a position when replayed on this ack transition.
-    /// Callers must propagate this value to the engine's output path.
+    /// Returns what the fills it replays did, when a deferred fill (queued during a
+    /// fill-before-ack race in `OmsMode::Hedging`) is replayed on this ack transition: the
+    /// [`PositionExited`] one closes, and each reduce-only fill capped. Callers must propagate
+    /// these to the engine's output path.
     ///
     /// # Known limitation — single exit per deferred replay
     ///
@@ -1140,7 +1312,22 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     pub fn update_from_order_snapshot(
         &mut self,
         order: Snapshot<&Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>>,
-    ) -> Option<PositionExited<AssetKey, InstrumentKey>>
+    ) -> FillsApplied<AssetKey, InstrumentKey>
+    where
+        ExchangeKey: Debug + Clone,
+        AssetKey: Debug + Clone + PartialEq,
+        InstrumentKey: Debug + Clone + PartialEq,
+    {
+        self.replay_order_snapshot(order, &[])
+    }
+
+    /// [`Self::update_from_order_snapshot`], with the fills in `reduce_only_fills` taken as
+    /// reduce-only when it replays them. See [`Self::replay_trade`].
+    pub(crate) fn replay_order_snapshot(
+        &mut self,
+        order: Snapshot<&Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>>,
+        reduce_only_fills: &[TradeId],
+    ) -> FillsApplied<AssetKey, InstrumentKey>
     where
         ExchangeKey: Debug + Clone,
         AssetKey: Debug + Clone + PartialEq,
@@ -1279,14 +1466,16 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                     .collect();
                 self.pending_fills.retain(|f| f.order_id != exchange_id);
 
-                let mut deferred_exit = None;
+                let mut applied = FillsApplied::default();
                 for fill in deferred {
                     debug!(
                         order_id = %fill.order_id,
                         "Replaying deferred fill after order ack"
                     );
-                    if let Some(exited) = self.update_from_trade(&fill) {
-                        if deferred_exit.is_some() {
+                    let replayed = self.replay_trade(&fill, reduce_only_fills);
+                    applied.capped.extend(replayed.capped);
+                    if let Some(exited) = replayed.exited {
+                        if applied.exited.is_some() {
                             // Known limitation: only the last PositionExited from a
                             // deferred replay is returned. If multiple fills each close
                             // a separate position, earlier exits are applied to the tear
@@ -1297,7 +1486,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                                  only the final exit event will be returned to the caller"
                             );
                         }
-                        deferred_exit = Some(exited);
+                        applied.exited = Some(exited);
                     }
                 }
 
@@ -1308,11 +1497,11 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                 // the normal post-ack path. Prune it explicitly here.
                 self.cleanup_routing_tables();
 
-                return deferred_exit;
+                return applied;
             }
         }
 
-        None
+        FillsApplied::default()
     }
 
     /// Updates the instrument state from an
@@ -1518,23 +1707,29 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         }
     }
 
-    /// `effective`, a spot fill whose venue-reported `trade` carries a fee in the base asset,
-    /// moved as [`Trade::holding_move`] says for the position at `position_id`, as it stands
-    /// before the fill. `None` for any other fill. See the base-asset fee section of
-    /// [`Self::update_from_trade`].
+    /// `effective`, moved as [`Trade::holding_move`] says for the position at `position_id`, as
+    /// it stands before the fill, with the cut it reports if a `reduce_only` fill is cut. `None`
+    /// for a fill that moves the position by its own side and quantity. See the base-asset fee
+    /// and reduce-only sections of [`Self::update_from_trade`].
     ///
     /// Two copies of one fill, because the move nets only the fee the venue reported, read from
     /// `trade`, while the fill booked keeps everything else of `effective`, the fee this state's
     /// fee model added included.
     ///
     /// When the move rounds the position to the quantity step, it also adds a long's remainder
-    /// to the fill's fee, logs the fill at INFO and counts it on the tear sheet.
-    fn net_base_fee(
+    /// to the fill's fee, logs the fill at INFO and counts it on the tear sheet. When it cuts a
+    /// reduce-only fill, it keeps on the fill the share of its fees that the move is of the
+    /// netted move, charges the rest to the tear sheet, logs the fill at WARN and counts it.
+    fn move_holding(
         &mut self,
         trade: &Trade<AssetKey, InstrumentKey>,
         effective: &Trade<AssetKey, InstrumentKey>,
         position_id: &PositionId,
-    ) -> Option<Trade<AssetKey, InstrumentKey>>
+        reduce_only: bool,
+    ) -> Option<(
+        Trade<AssetKey, InstrumentKey>,
+        Option<ReduceOnlyCapped<InstrumentKey>>,
+    )>
     where
         AssetKey: Clone + PartialEq,
         InstrumentKey: Clone + Debug,
@@ -1546,13 +1741,19 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             .map_or(Decimal::ZERO, |position| {
                 signed(position.side, position.quantity_abs)
             });
-        let moved = trade.holding_move(&self.instrument, held)?;
+        let moved = trade.holding_move(&self.instrument, held, reduce_only)?;
 
         let mut netted = effective.clone();
         netted.side = moved.side;
         netted.quantity = moved.quantity;
+
+        if !moved.excess.is_zero() {
+            let capped =
+                self.book_reduce_only_cut(trade, &mut netted, position_id, held, moved.excess);
+            return Some((netted, Some(capped)));
+        }
         if moved.dust.is_zero() {
-            return Some(netted);
+            return Some((netted, None));
         }
 
         // A long's remainder is base the account holds but cannot sell: written off at the fill's
@@ -1582,7 +1783,98 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
              the remainder left in the balance"
         );
         self.tear_sheet.record_fill_dust(written_off);
-        Some(netted)
+        Some((netted, None))
+    }
+
+    /// Book a reduce-only fill that [`Trade::holding_move`] cut by `excess`: keep on `netted`,
+    /// already moved, the share of its fees that its move is of the netted move, charge the rest
+    /// to the tear sheet's unattributed fees, and log and count the cut.
+    fn book_reduce_only_cut(
+        &mut self,
+        trade: &Trade<AssetKey, InstrumentKey>,
+        netted: &mut Trade<AssetKey, InstrumentKey>,
+        position_id: &PositionId,
+        held: Decimal,
+        excess: Decimal,
+    ) -> ReduceOnlyCapped<InstrumentKey>
+    where
+        AssetKey: Clone,
+        InstrumentKey: Clone + Debug,
+    {
+        // The move and the excess together are the netted move, which is not zero when cut.
+        // Multiplied before dividing, so a share that is exact comes out exact.
+        let whole = netted.quantity + excess.abs();
+        let kept = |fee: Decimal| fee * netted.quantity / whole;
+        let charged = fee_in_quote(&netted.fees);
+        netted.fees.fees = kept(netted.fees.fees);
+        netted.fees.fees_quote = netted.fees.fees_quote.map(kept);
+        // The rest of what PnL is charged, by subtraction, so the two shares add up to it exactly.
+        let fees_unattributed = charged - fee_in_quote(&netted.fees);
+        if !fees_unattributed.is_zero() {
+            self.tear_sheet
+                .record_fee_unattributed(fees_unattributed, trade.time_exchange);
+        }
+
+        let excess_value = excess.abs() * trade.price * self.instrument.kind.contract_size();
+        let client_order_id = self
+            .reduce_only_order(trade)
+            .or(trade.client_order_id.as_ref())
+            .cloned();
+        warn!(
+            instrument = ?trade.instrument,
+            order_id = %trade.order_id,
+            cid = ?client_order_id,
+            %position_id,
+            side = %trade.side,
+            quantity = %trade.quantity,
+            %held,
+            applied = %netted.quantity,
+            %excess,
+            %excess_value,
+            fee_quote_unattributed = %fees_unattributed,
+            "reduce-only fill would grow or flip the position it reduces: cut to land the \
+             position flat, or applied to none; the excess is applied to no position"
+        );
+        self.tear_sheet.record_fill_reduce_only_capped(excess_value);
+
+        ReduceOnlyCapped {
+            instrument: trade.instrument.clone(),
+            trade_id: trade.id.clone(),
+            order_id: trade.order_id.clone(),
+            client_order_id,
+            position_id: position_id.clone(),
+            held,
+            excess,
+            excess_value,
+            fees_unattributed,
+        }
+    }
+
+    /// Apply `trade`, as booked, to the position at `position_id`, and fold the position it
+    /// closes, if any, into the tear sheet. A fill that moves no holding on an empty slot opens no
+    /// position, so its fees are charged to the tear sheet instead.
+    fn apply_to_position(
+        &mut self,
+        trade: &Trade<AssetKey, InstrumentKey>,
+        position_id: &PositionId,
+        contract_size: Decimal,
+    ) -> Option<PositionExited<AssetKey, InstrumentKey>>
+    where
+        AssetKey: Debug + Clone,
+        InstrumentKey: Debug + Clone + PartialEq,
+    {
+        match self
+            .position
+            .update_from_trade_with_id(trade, position_id, contract_size)
+        {
+            TradeOutcome::Applied { exited } => {
+                exited.inspect(|closed| self.tear_sheet.update_from_position(closed))
+            }
+            TradeOutcome::Unapplied { fees } => {
+                self.record_fee_unattributed(trade, position_id, &fees);
+                None
+            }
+        }
     }
 
     /// Which leg of a venue settlement an orderless `origin` is on this instrument, or `None` for
@@ -1721,7 +2013,8 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// - **A spot-margin short closed by a buy** keeps the fee as a residual short, since the fee
     ///   came out of the base that was to repay the loan. With a step, a residual below one step
     ///   is rounded away, as above, and the position closes. Buying more than the debt to cover
-    ///   the fee leaves a long of the excess less the fee, once the excess is the larger.
+    ///   the fee leaves a long of the excess less the fee, once the excess is the larger, unless
+    ///   the buy is reduce-only (below).
     /// - **A fee larger than the fill's quantity** moves the holding the other way: a buy whose
     ///   base fee exceeds its quantity sells the difference. A fee equal to it moves nothing: it is
     ///   charged to the open position's PnL. From flat it opens no position, so its quote
@@ -1738,6 +2031,39 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ///
     /// [`Trade::holding_move`] is this rule, as a function a component mirroring positions
     /// outside the engine can call to agree with it.
+    ///
+    /// # Reduce-only fills
+    ///
+    /// A fill of an order sent with
+    /// [`RequestOpen::reduce_only`](rustrade_execution::order::request::RequestOpen::reduce_only)
+    /// never grows or flips the position it is routed to, whatever the venue did with the flag.
+    /// Once a base fee is netted, as above, a fill larger than the opposite position is cut so the
+    /// position lands flat, and a fill against a flat position or one on its own side is applied
+    /// to none. A margin repayment sized to cover interest, for one, is larger than the short it
+    /// closes.
+    /// - The part cut off, the excess, is applied to no position. Its value at the fill's price is
+    ///   reported, not charged to PnL: the account still holds it, or the venue spent it.
+    /// - The fill's fees are split in proportion. The position is charged the share of the move it
+    ///   took, and the tear sheet's
+    ///   [`fees_unattributed`](crate::statistic::summary::instrument::TearSheet::fees_unattributed)
+    ///   the excess's share.
+    /// - A cut position is not rounded to the quantity step: flat is on any step.
+    /// - The fill is logged at WARN, counted on
+    ///   [`TearSheet::fills_reduce_only_capped`](crate::statistic::summary::instrument::TearSheet::fills_reduce_only_capped)
+    ///   with its excess's value summed on
+    ///   [`TearSheet::reduce_only_excess`](crate::statistic::summary::instrument::TearSheet::reduce_only_excess),
+    ///   and returned in [`FillsApplied::capped`], which the `Engine` emits as
+    ///   [`EngineOutput::ReduceOnlyCapped`](crate::engine::EngineOutput::ReduceOnlyCapped).
+    ///
+    /// The flag comes from the request recorded in flight (see [`Self::reduce_only`]). A fill
+    /// finds its order by [`Trade::client_order_id`], or failing that by the venue's order id
+    /// while the order is tracked. A fill that reaches neither is applied in full: one whose
+    /// venue names no client order id and that arrives before the order is acknowledged, or after
+    /// it retired, such as one read back from a venue's trade history. So is a fill of an order
+    /// this state did not send, such as one restored from a venue snapshot after a restart, and a
+    /// late fill of a reduce-only order more than [`MAX_RETIRED_ROUTING`] retirements old.
+    ///
+    /// [`Trade::holding_move`] is this rule too.
     ///
     /// # Forced fills
     ///
@@ -1782,7 +2108,25 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     pub fn update_from_trade(
         &mut self,
         trade: &Trade<AssetKey, InstrumentKey>,
-    ) -> Option<PositionExited<AssetKey, InstrumentKey>>
+    ) -> FillsApplied<AssetKey, InstrumentKey>
+    where
+        AssetKey: Debug + Clone + PartialEq,
+        InstrumentKey: Debug + Clone + PartialEq,
+    {
+        self.replay_trade(trade, &[])
+    }
+
+    /// [`Self::update_from_trade`], with `trade` taken as reduce-only if `reduce_only_fills` names
+    /// it, whether or not this state finds its order. For a replica of the engine's state, which
+    /// records no requests in flight and so cannot find the flag: it passes the fills the engine's
+    /// [`EngineOutput::ReduceOnlyCapped`](crate::engine::EngineOutput::ReduceOnlyCapped) outputs
+    /// named for the event. A fill the engine applied whole moves the position the same whether
+    /// taken as reduce-only or not, so naming only the capped ones is enough.
+    pub(crate) fn replay_trade(
+        &mut self,
+        trade: &Trade<AssetKey, InstrumentKey>,
+        reduce_only_fills: &[TradeId],
+    ) -> FillsApplied<AssetKey, InstrumentKey>
     where
         AssetKey: Debug + Clone + PartialEq,
         InstrumentKey: Debug + Clone + PartialEq,
@@ -1919,7 +2263,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                                          race) — queuing for replay after ack"
                                     );
                                     self.pending_fills.push(trade.clone());
-                                    return None;
+                                    return FillsApplied::default();
                                 }
 
                                 let placed = self
@@ -1961,7 +2305,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                                                  position; reconcile positions"
                                             );
                                             self.tear_sheet.record_fill_unallocated();
-                                            return None;
+                                            return FillsApplied::default();
                                         }
                                     };
                                     if trade.quantity.abs() > held {
@@ -2046,11 +2390,21 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         //
         // Only the fee the venue reported is netted, read from `trade`. What the engine's fee model
         // added in step 2 is a quote amount, summed into the same field whatever its asset.
-        let netted = match capped_settlement {
-            None => self.net_base_fee(trade, effective_trade, &position_id),
+        //
+        // A reduce-only fill is also cut here so it neither grows nor flips the position. A
+        // settlement fill is of no order of this engine's, so it is never reduce-only.
+        let moved = match capped_settlement {
+            None => {
+                let reduce_only = reduce_only_fills.contains(&trade.id)
+                    || self.reduce_only_order(trade).is_some();
+                self.move_holding(trade, effective_trade, &position_id, reduce_only)
+            }
             Some(_) => None,
         };
-        let effective_trade = netted.as_ref().unwrap_or(effective_trade);
+        let (effective_trade, capped) = match &moved {
+            Some((netted, capped)) => (netted, capped.clone()),
+            None => (effective_trade, None),
+        };
 
         // Step 3: Update the position.
         //
@@ -2060,18 +2414,14 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         //
         // A fill that moves no holding on an empty slot opens no position, so no position can
         // carry its fee: the tear sheet does.
-        let exited = match self.position.update_from_trade_with_id(
-            effective_trade,
-            &position_id,
-            contract_size,
-        ) {
-            TradeOutcome::Applied { exited } => {
-                exited.inspect(|closed| self.tear_sheet.update_from_position(closed))
-            }
-            TradeOutcome::Unapplied { fees } => {
-                self.record_fee_unattributed(effective_trade, &position_id, &fees);
-                None
-            }
+        //
+        // A reduce-only fill cut to nothing touches no position: its fees are already charged to
+        // the tear sheet.
+        let applies_nothing = capped.is_some() && effective_trade.quantity.is_zero();
+        let exited = if applies_nothing {
+            None
+        } else {
+            self.apply_to_position(effective_trade, &position_id, contract_size)
         };
 
         // Step 4: Cleanup — remove CID→PositionId entries for the closed position,
@@ -2099,26 +2449,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         // `None` means the venue does not, and the order's state must still be learned from a
         // snapshot or a reconciliation fetch.
         if let Some(reported) = trade.order_filled_quantity {
-            // O(1) through the reverse index, which is maintained in both OMS modes. The scan is
-            // the same fallback step 1 uses: an order acknowledged but not yet indexed, or one
-            // whose index entry a prune removed.
-            let cid = self
-                .exchange_id_to_cid
-                .get(&trade.order_id)
-                .cloned()
-                .or_else(|| {
-                    self.orders
-                        .0
-                        .iter()
-                        .find_map(|(cid, order)| match &order.state {
-                            ActiveOrderState::Open(open)
-                                if open.id.assigned() == Some(&trade.order_id) =>
-                            {
-                                Some(cid.clone())
-                            }
-                            _ => None,
-                        })
-                });
+            let cid = self.tracked_order_cid(&trade.order_id).cloned();
 
             if let Some(cid) = cid
                 && self
@@ -2131,7 +2462,10 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             }
         }
 
-        exited
+        FillsApplied {
+            exited,
+            capped: capped.into_iter().collect(),
+        }
     }
 
     /// Updates the instrument state based on a new market event.
@@ -2203,6 +2537,8 @@ where
         pending_fills: _,
         exchange_id_to_cid: _,
         retired_routing: _,
+        reduce_only: _,
+        retired_reduce_only: _,
         orders_open_at_resync: _,
     } = state;
 
@@ -2289,6 +2625,8 @@ where
                         pending_fills: Vec::new(),
                         exchange_id_to_cid: FnvHashMap::default(),
                         retired_routing: FnvIndexMap::default(),
+                        reduce_only: FnvHashSet::default(),
+                        retired_reduce_only: FnvIndexSet::default(),
                         orders_open_at_resync: FnvHashMap::default(),
                     },
                 )
@@ -2952,7 +3290,9 @@ mod tests {
     fn a_hedged_forced_fill_reduces_the_one_position_on_the_side_it_closes() {
         let mut state = hedged_positions(&[("long", dec!(5))], &[("short", dec!(3))]);
 
-        let exited = state.update_from_trade(&liquidation(Side::Sell, dec!(2)));
+        let exited = state
+            .update_from_trade(&liquidation(Side::Sell, dec!(2)))
+            .exited;
 
         assert!(exited.is_none());
         assert_eq!(held(&state, "long"), Some(dec!(3)));
@@ -2967,7 +3307,8 @@ mod tests {
 
         // A forced buy reduces the short, and the venue naming that side changes nothing.
         let exited = state
-            .update_from_trade(&liquidation(Side::Buy, dec!(3)).with_position_side(Side::Sell));
+            .update_from_trade(&liquidation(Side::Buy, dec!(3)).with_position_side(Side::Sell))
+            .exited;
 
         assert!(exited.is_some(), "the short is closed");
         assert_eq!(held(&state, "short"), None);
@@ -2983,7 +3324,9 @@ mod tests {
             let mut state = hedged_positions(longs, &[("short", dec!(3))]);
             let before = state.position.positions.clone();
 
-            let exited = state.update_from_trade(&liquidation(Side::Sell, dec!(1)));
+            let exited = state
+                .update_from_trade(&liquidation(Side::Sell, dec!(1)))
+                .exited;
 
             assert!(exited.is_none());
             assert_eq!(state.position.positions, before, "{} longs", longs.len());
@@ -3034,7 +3377,9 @@ mod tests {
     fn a_hedged_forced_fill_with_a_negative_quantity_is_capped_by_its_size() {
         let mut state = hedged_positions(&[("long", dec!(2))], &[]);
 
-        let exited = state.update_from_trade(&liquidation(Side::Sell, dec!(-5)));
+        let exited = state
+            .update_from_trade(&liquidation(Side::Sell, dec!(-5)))
+            .exited;
 
         let Some(exited) = exited else {
             panic!("the long is closed");
@@ -3054,7 +3399,7 @@ mod tests {
         forced.fees.fees = dec!(10);
         forced.fees.fees_quote = Some(dec!(10));
 
-        let exited = state.update_from_trade(&forced);
+        let exited = state.update_from_trade(&forced).exited;
 
         let Some(exited) = exited else {
             panic!("the long is closed");
@@ -3070,7 +3415,9 @@ mod tests {
         // Likewise a forced buy larger than the short it reduces.
         let mut state = hedged_positions(&[], &[("short", dec!(1))]);
 
-        let exited = state.update_from_trade(&liquidation(Side::Buy, dec!(3)));
+        let exited = state
+            .update_from_trade(&liquidation(Side::Buy, dec!(3)))
+            .exited;
 
         assert_eq!(
             exited.map(|exited| exited.position_id),
@@ -3115,7 +3462,9 @@ mod tests {
                 &[("short", dec!(1))],
             ));
 
-            let exited = state.update_from_trade(&venue_fill(origin, Side::Sell, dec!(2)));
+            let exited = state
+                .update_from_trade(&venue_fill(origin, Side::Sell, dec!(2)))
+                .exited;
 
             assert!(exited.is_some(), "{origin}: the long is closed");
             assert_eq!(held(&state, "long"), None, "{origin}");
@@ -3156,8 +3505,9 @@ mod tests {
     fn a_hedged_share_leg_reduces_the_one_position_on_the_side_it_closes() {
         let mut state = hedged_positions(&[("stock", dec!(100))], &[]);
 
-        let exited =
-            state.update_from_trade(&venue_fill(TradeOrigin::Assignment, Side::Sell, dec!(100)));
+        let exited = state
+            .update_from_trade(&venue_fill(TradeOrigin::Assignment, Side::Sell, dec!(100)))
+            .exited;
 
         assert!(exited.is_some(), "the shares held are delivered");
         assert!(state.position.positions.is_empty());
@@ -3220,10 +3570,12 @@ mod tests {
         );
         assert_eq!(state.tear_sheet.fills_forced, 0);
 
-        let exited = state.update_from_trade(
-            &fill(OrderId::new("liquidation"), Side::Sell, dec!(5))
-                .with_origin(TradeOrigin::Liquidation),
-        );
+        let exited = state
+            .update_from_trade(
+                &fill(OrderId::new("liquidation"), Side::Sell, dec!(5))
+                    .with_origin(TradeOrigin::Liquidation),
+            )
+            .exited;
 
         assert!(exited.is_some(), "the liquidation closed the position");
         assert!(open_position_ids(&state).is_empty());
@@ -4036,6 +4388,7 @@ mod tests {
         assert!(
             state
                 .update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)))
+                .exited
                 .is_none()
         );
 
@@ -4056,6 +4409,7 @@ mod tests {
 
         let exited = state
             .update_from_trade(&fill(OrderId::new("close"), Side::Buy, dec!(1)))
+            .exited
             .expect("a fill for the whole quantity exits the position");
         assert_eq!(exited.carry, dec!(-1.5));
         assert_eq!(exited.pnl_realised_net(), Some(dec!(-1.5)));
@@ -4172,6 +4526,7 @@ mod tests {
         assert!(
             state
                 .update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(0.001)))
+                .exited
                 .is_none()
         );
 
@@ -4199,6 +4554,7 @@ mod tests {
         close.price = dec!(110);
         let exited = state
             .update_from_trade(&close)
+            .exited
             .expect("the sell closes the holding");
 
         assert_eq!(exited.pnl_realised, dec!(9.89));
@@ -4266,10 +4622,10 @@ mod tests {
     fn a_base_fee_equal_to_a_buy_moves_no_holding() {
         let mut flat = instrument_state(OmsMode::Netting);
         let base = flat.instrument.underlying.base;
-        let (exited, warnings) = count_warnings(|| {
+        let (applied, warnings) = count_warnings(|| {
             flat.update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(1)))
         });
-        assert!(exited.is_none());
+        assert!(applied.exited.is_none());
         assert!(netting_position(&flat).is_none());
         assert_eq!(warnings, 1);
         assert_eq!(flat.tear_sheet.pnl_returns.fees_unattributed, dec!(100));
@@ -4313,7 +4669,7 @@ mod tests {
         let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(1), quote, Decimal::ZERO));
         let mut close = fill_charging(Side::Sell, dec!(1), quote, Decimal::ZERO);
         close.price = dec!(110);
-        assert!(state.update_from_trade(&close).is_some());
+        assert!(state.update_from_trade(&close).exited.is_some());
         let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(0.05), base, dec!(0.05)));
 
         let sheet = state.tear_sheet.generate(Decimal::ZERO, Annual365);
@@ -4338,10 +4694,10 @@ mod tests {
         let mut state = instrument_state(OmsMode::Netting);
         let quote = state.instrument.underlying.quote;
 
-        let (exited, warnings) = count_warnings(|| {
+        let (applied, warnings) = count_warnings(|| {
             state.update_from_trade(&fill_charging(Side::Buy, Decimal::ZERO, quote, dec!(0.02)))
         });
-        assert!(exited.is_none());
+        assert!(applied.exited.is_none());
         assert!(netting_position(&state).is_none());
         assert_eq!(warnings, 1);
         assert_eq!(state.tear_sheet.pnl_returns.fees_unattributed, dec!(2));
@@ -4512,6 +4868,7 @@ mod tests {
         close.price = dec!(110);
         let exited = state
             .update_from_trade(&close)
+            .exited
             .expect("the sell closes the position");
 
         assert_eq!(exited.pnl_realised, dec!(8.9));
@@ -4570,6 +4927,7 @@ mod tests {
 
         let exited = state
             .update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(0.001)))
+            .exited
             .expect("the buy closes the short");
 
         assert_eq!(exited.pnl_realised, dec!(-0.1));
@@ -4587,11 +4945,11 @@ mod tests {
         let mut state = stepped_state();
         let base = state.instrument.underlying.base;
 
-        let (exited, warnings) = count_warnings(|| {
+        let (applied, warnings) = count_warnings(|| {
             state.update_from_trade(&fill_charging(Side::Buy, dec!(0.01), base, dec!(0.00001)))
         });
 
-        assert!(exited.is_none());
+        assert!(applied.exited.is_none());
         assert!(netting_position(&state).is_none());
         assert_eq!(warnings, 1);
         assert_eq!(state.tear_sheet.pnl_returns.fees_unattributed, dec!(1));
@@ -4676,6 +5034,7 @@ mod tests {
 
         let exited = state
             .update_from_trade(&fill_charging(Side::Buy, dec!(1.01), base, dec!(0.001)))
+            .exited
             .expect("the buy closes the short");
 
         assert_eq!(exited.pnl_realised, dec!(-0.5));
@@ -4711,5 +5070,434 @@ mod tests {
             (state.tear_sheet.fills_dust, state.tear_sheet.dust),
             (1, Decimal::ZERO)
         );
+    }
+
+    // --- A reduce-only fill never grows or flips the position -----------------------------------
+
+    /// Send `cid` as an open, reduce-only or not, and rest it at the exchange as `exchange_id`: as
+    /// the engine records an open request in flight, then a venue acknowledges it.
+    fn send_order(
+        state: &mut InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex>,
+        cid: &ClientOrderId,
+        exchange_id: &OrderId,
+        reduce_only: bool,
+    ) {
+        send_in_flight(state, cid, reduce_only);
+        state.update_from_order_snapshot(Snapshot(&order(
+            cid.clone(),
+            OrderState::active(Open::new(
+                VenueOrderId::Assigned(exchange_id.clone()),
+                TIME,
+                Decimal::ZERO,
+            )),
+        )));
+    }
+
+    /// Record `cid` as an open in flight, reduce-only or not, as `record_in_flight_open` does.
+    fn send_in_flight(
+        state: &mut InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex>,
+        cid: &ClientOrderId,
+        reduce_only: bool,
+    ) {
+        state.update_from_order_snapshot(Snapshot(&order(
+            cid.clone(),
+            OrderState::active(OpenInFlight::new(TIME_SENT)),
+        )));
+        state.record_reduce_only(cid, reduce_only);
+    }
+
+    /// `trade` charged `fee` in `asset`, worth `fee_quote`.
+    fn charged(
+        mut trade: Trade<AssetIndex, InstrumentIndex>,
+        asset: AssetIndex,
+        fee: Decimal,
+        fee_quote: Decimal,
+    ) -> Trade<AssetIndex, InstrumentIndex> {
+        trade.fees = AssetFees {
+            asset,
+            fees: fee,
+            fees_quote: Some(fee_quote),
+        };
+        trade
+    }
+
+    /// A repayment buy sized above the short it closes: its base fee is netted first, then the
+    /// move is cut at the short. The short closes flat, the excess is reported, and the fee is
+    /// split between the position and the tear sheet in proportion.
+    #[test]
+    fn a_reduce_only_fill_larger_than_the_short_is_cut_to_land_it_flat() {
+        let mut state = stepped_state();
+        let base = state.instrument.underlying.base;
+        let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(10)));
+        let (cid, exchange_id) = (ClientOrderId::new("repay"), OrderId::new("ex-repay"));
+        send_order(&mut state, &cid, &exchange_id, true);
+
+        let repay = charged(
+            fill(exchange_id.clone(), Side::Buy, dec!(10.5)),
+            base,
+            dec!(0.01),
+            dec!(1),
+        );
+        let applied = state.update_from_trade(&repay);
+
+        let exited = applied.exited.expect("the short closes");
+        assert!(netting_position(&state).is_none());
+        let kept = dec!(1) * dec!(10) / dec!(10.49);
+        assert_eq!(exited.fees_exit.fees_quote, Some(kept));
+        assert_eq!(
+            applied.capped,
+            vec![ReduceOnlyCapped {
+                instrument: InstrumentIndex(0),
+                trade_id: repay.id.clone(),
+                order_id: exchange_id,
+                client_order_id: Some(cid),
+                position_id: PositionId::NETTING,
+                held: dec!(-10),
+                excess: dec!(0.49),
+                excess_value: dec!(49),
+                fees_unattributed: dec!(1) - kept,
+            }]
+        );
+        assert_eq!(state.tear_sheet.fills_reduce_only_capped, 1);
+        assert_eq!(state.tear_sheet.reduce_only_excess, dec!(49));
+        assert_eq!(
+            state.tear_sheet.pnl_returns.fees_unattributed,
+            dec!(1) - kept
+        );
+        // Flat is on the step: nothing is rounded off.
+        assert_eq!(state.tear_sheet.fills_dust, 0);
+    }
+
+    /// A reduce-only fill against a flat position, or one on its own side, is applied to none.
+    /// Its whole fee goes to the tear sheet, and the position is left as it was.
+    #[test]
+    fn a_reduce_only_fill_that_reduces_nothing_applies_nothing() {
+        for held in [Decimal::ZERO, dec!(1)] {
+            let mut state = instrument_state(OmsMode::Netting);
+            let quote = state.instrument.underlying.quote;
+            if !held.is_zero() {
+                let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Buy, held));
+            }
+            let before = state.position.clone();
+            let exchange_id = OrderId::new("ex-close");
+            send_order(&mut state, &ClientOrderId::new("close"), &exchange_id, true);
+
+            let applied = state.update_from_trade(&charged(
+                fill(exchange_id, Side::Buy, dec!(2)),
+                quote,
+                dec!(0.2),
+                dec!(0.2),
+            ));
+
+            assert!(applied.exited.is_none(), "held {held}");
+            let [capped] = applied.capped.as_slice() else {
+                panic!("held {held}: one cut, got {:?}", applied.capped);
+            };
+            assert_eq!(
+                (capped.held, capped.excess, capped.fees_unattributed),
+                (held, dec!(2), dec!(0.2)),
+                "held {held}"
+            );
+            assert_eq!(state.position, before, "held {held}");
+            assert_eq!(state.tear_sheet.fills_reduce_only_capped, 1, "held {held}");
+            assert_eq!(
+                state.tear_sheet.pnl_returns.fees_unattributed,
+                dec!(0.2),
+                "held {held}"
+            );
+        }
+    }
+
+    /// A reduce-only fill the position takes whole is applied as any other fill, and reported as
+    /// nothing.
+    #[test]
+    fn a_reduce_only_fill_the_position_takes_is_applied_whole() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(2)));
+        let exchange_id = OrderId::new("ex-close");
+        send_order(&mut state, &ClientOrderId::new("close"), &exchange_id, true);
+
+        let applied = state.update_from_trade(&fill(exchange_id, Side::Buy, dec!(1)));
+
+        assert!(applied.is_empty());
+        let position = netting_position(&state).unwrap();
+        assert_eq!(
+            (position.side, position.quantity_abs),
+            (Side::Sell, dec!(1))
+        );
+        assert_eq!(state.tear_sheet.fills_reduce_only_capped, 0);
+    }
+
+    /// An order not sent reduce-only flips the position as before.
+    #[test]
+    fn a_fill_of_an_order_not_sent_reduce_only_is_not_cut() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
+        let exchange_id = OrderId::new("ex-buy");
+        send_order(&mut state, &ClientOrderId::new("buy"), &exchange_id, false);
+
+        let applied = state.update_from_trade(&fill(exchange_id, Side::Buy, dec!(3)));
+
+        assert!(applied.capped.is_empty());
+        let position = netting_position(&state).unwrap();
+        assert_eq!((position.side, position.quantity_abs), (Side::Buy, dec!(2)));
+    }
+
+    /// A fill that names its client order id is cut before the venue acknowledges the order,
+    /// when no venue order id can find it.
+    #[test]
+    fn a_reduce_only_fill_naming_its_client_order_id_is_cut_before_the_ack() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
+        let cid = ClientOrderId::new("close");
+        send_in_flight(&mut state, &cid, true);
+
+        let applied = state.update_from_trade(
+            &fill(OrderId::new("ex-close"), Side::Buy, dec!(3)).with_client_order_id(cid.clone()),
+        );
+
+        assert_eq!(applied.capped.len(), 1);
+        assert_eq!(applied.capped[0].client_order_id, Some(cid));
+        assert!(netting_position(&state).is_none());
+    }
+
+    /// A fill arriving after its reduce-only order retired is still cut when it names its client
+    /// order id. One that does not can no longer find the order, and is applied whole.
+    #[test]
+    fn a_late_fill_of_a_retired_reduce_only_order_is_cut_by_its_client_order_id() {
+        let (cid, exchange_id) = (ClientOrderId::new("close"), OrderId::new("ex-close"));
+        let retired = || {
+            let mut state = instrument_state(OmsMode::Netting);
+            let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
+            send_order(&mut state, &cid, &exchange_id, true);
+            cancel_order(&mut state, &cid, &exchange_id);
+            assert!(state.reduce_only.is_empty());
+            assert!(state.retired_reduce_only.contains(&cid));
+            state
+        };
+
+        let mut state = retired();
+        let named = fill(exchange_id.clone(), Side::Buy, dec!(3)).with_client_order_id(cid.clone());
+        assert_eq!(state.update_from_trade(&named).capped.len(), 1);
+        assert!(netting_position(&state).is_none());
+
+        let mut state = retired();
+        let unnamed = fill(exchange_id.clone(), Side::Buy, dec!(3));
+        assert!(state.update_from_trade(&unnamed).capped.is_empty());
+        let position = netting_position(&state).unwrap();
+        assert_eq!((position.side, position.quantity_abs), (Side::Buy, dec!(2)));
+    }
+
+    /// A client order id reused for an order not sent reduce-only drops the flag the retired one
+    /// left, so the new order's fills are not cut.
+    #[test]
+    fn a_client_order_id_reused_for_another_order_drops_its_retired_flag() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
+        let cid = ClientOrderId::new("reused");
+        send_order(&mut state, &cid, &OrderId::new("ex-1"), true);
+        cancel_order(&mut state, &cid, &OrderId::new("ex-1"));
+
+        send_order(&mut state, &cid, &OrderId::new("ex-2"), false);
+
+        assert!(!state.retired_reduce_only.contains(&cid));
+        let applied = state.update_from_trade(&fill(OrderId::new("ex-2"), Side::Buy, dec!(3)));
+        assert!(applied.capped.is_empty());
+    }
+
+    #[test]
+    fn retired_reduce_only_orders_evict_the_oldest_at_capacity() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let ids: Vec<(ClientOrderId, OrderId)> = (0..=MAX_RETIRED_ROUTING)
+            .map(|i| {
+                (
+                    ClientOrderId::new(format!("cid-{i}")),
+                    OrderId::new(format!("oid-{i}")),
+                )
+            })
+            .collect();
+
+        for (cid, oid) in &ids {
+            send_order(&mut state, cid, oid, true);
+            cancel_order(&mut state, cid, oid);
+        }
+
+        assert_eq!(state.retired_reduce_only.len(), MAX_RETIRED_ROUTING);
+        assert!(!state.retired_reduce_only.contains(&ids[0].0));
+        assert!(
+            state
+                .retired_reduce_only
+                .contains(&ids[MAX_RETIRED_ROUTING].0)
+        );
+    }
+
+    /// In a hedged account the cut is against the position the order is routed to.
+    #[test]
+    fn a_hedged_reduce_only_fill_is_cut_at_its_routed_position() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let position_id = PositionId::new("pos-1");
+        let (open_cid, open_oid) = (ClientOrderId::new("open"), OrderId::new("ex-open"));
+        rest_order_at_exchange(&mut state, &open_cid, &open_oid, Some(&position_id));
+        let _ = state.update_from_trade(&fill(open_oid, Side::Sell, dec!(2)));
+        let (cid, exchange_id) = (ClientOrderId::new("close"), OrderId::new("ex-close"));
+        state.position_ids.insert(cid.clone(), position_id.clone());
+        send_order(&mut state, &cid, &exchange_id, true);
+
+        let applied = state.update_from_trade(&fill(exchange_id, Side::Buy, dec!(3)));
+
+        assert_eq!(
+            applied.exited.map(|exited| exited.position_id),
+            Some(position_id.clone())
+        );
+        assert_eq!(applied.capped.len(), 1);
+        assert_eq!(
+            (
+                applied.capped[0].position_id.clone(),
+                applied.capped[0].excess
+            ),
+            (position_id, dec!(1))
+        );
+        assert!(state.position.positions.is_empty());
+    }
+
+    /// A fill queued before its order's ack is cut when the ack replays it, and the cut is
+    /// returned with the replay.
+    #[test]
+    fn a_queued_reduce_only_fill_is_cut_when_replayed() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let position_id = PositionId::new("pos-1");
+        let (open_cid, open_oid) = (ClientOrderId::new("open"), OrderId::new("ex-open"));
+        rest_order_at_exchange(&mut state, &open_cid, &open_oid, Some(&position_id));
+        let _ = state.update_from_trade(&fill(open_oid, Side::Sell, dec!(2)));
+        let (cid, exchange_id) = (ClientOrderId::new("close"), OrderId::new("ex-close"));
+        send_in_flight(&mut state, &cid, true);
+        state.position_ids.insert(cid.clone(), position_id.clone());
+        assert!(
+            state
+                .update_from_trade(&fill(exchange_id.clone(), Side::Buy, dec!(3)))
+                .is_empty()
+        );
+        assert_eq!(state.pending_fills.len(), 1);
+
+        let applied = state.update_from_order_snapshot(Snapshot(&order(
+            cid,
+            OrderState::active(Open::new(
+                VenueOrderId::Assigned(exchange_id),
+                TIME,
+                Decimal::ZERO,
+            )),
+        )));
+
+        assert_eq!(
+            applied.exited.map(|exited| exited.position_id),
+            Some(position_id)
+        );
+        assert_eq!(applied.capped.len(), 1);
+        assert!(state.position.positions.is_empty());
+    }
+
+    /// A replica, which records no request in flight, cuts a fill it is told is reduce-only, and
+    /// only that fill.
+    #[test]
+    fn a_replayed_fill_named_reduce_only_is_cut_without_its_order() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
+        let named = fill(OrderId::new("ex-close"), Side::Buy, dec!(3));
+        let mut other = named.clone();
+        other.id = TradeId::new("other");
+
+        let applied = state.replay_trade(&named, &[TradeId::new("unrelated"), named.id.clone()]);
+
+        assert_eq!(applied.capped.len(), 1);
+        assert_eq!(applied.capped[0].client_order_id, None);
+        assert!(netting_position(&state).is_none());
+        assert!(
+            state
+                .replay_trade(&other, std::slice::from_ref(&named.id))
+                .capped
+                .is_empty()
+        );
+        let position = netting_position(&state).unwrap();
+        assert_eq!((position.side, position.quantity_abs), (Side::Buy, dec!(3)));
+    }
+
+    /// The excess of a contract fill is valued by its contract size.
+    #[test]
+    fn a_reduce_only_contract_fill_values_its_excess_by_the_contract_size() {
+        let mut state = instrument_state(OmsMode::Netting);
+        state.instrument.kind = InstrumentKind::Perpetual(
+            rustrade_instrument::instrument::kind::perpetual::PerpetualContract {
+                contract_size: dec!(10),
+                settlement_asset: state.instrument.underlying.quote,
+            },
+        );
+        let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
+        let exchange_id = OrderId::new("ex-close");
+        send_order(&mut state, &ClientOrderId::new("close"), &exchange_id, true);
+
+        let applied = state.update_from_trade(&fill(exchange_id, Side::Buy, dec!(3)));
+
+        assert_eq!(applied.capped[0].excess, dec!(2));
+        // Two contracts of ten at 100.
+        assert_eq!(applied.capped[0].excess_value, dec!(2000));
+    }
+
+    /// An order the reverse index has lost is still found by its venue order id among the open
+    /// orders, and only that order: a fill of a plain order is not taken for a reduce-only one.
+    #[test]
+    fn a_reduce_only_order_missing_from_the_reverse_index_is_found_by_its_venue_order_id() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
+        let (reduce_only, plain) = (OrderId::new("ex-reduce"), OrderId::new("ex-plain"));
+        send_order(
+            &mut state,
+            &ClientOrderId::new("reduce"),
+            &reduce_only,
+            true,
+        );
+        send_order(&mut state, &ClientOrderId::new("plain"), &plain, false);
+        state.exchange_id_to_cid.clear();
+
+        // Both fills are larger than the position, so taking either order for the other shows.
+        let applied = state.update_from_trade(&fill(plain, Side::Buy, dec!(3)));
+        assert!(applied.capped.is_empty());
+        let position = netting_position(&state).unwrap();
+        assert_eq!((position.side, position.quantity_abs), (Side::Buy, dec!(2)));
+
+        let applied = state.update_from_trade(&fill(reduce_only, Side::Sell, dec!(3)));
+        assert_eq!(
+            applied.capped[0].client_order_id,
+            Some(ClientOrderId::new("reduce"))
+        );
+        assert!(netting_position(&state).is_none());
+    }
+
+    /// Clearing order routing, as at expiry, drops the reduce-only flags too.
+    #[test]
+    fn clearing_order_routing_drops_the_reduce_only_flags() {
+        let mut state = instrument_state(OmsMode::Netting);
+        send_order(
+            &mut state,
+            &ClientOrderId::new("live"),
+            &OrderId::new("ex-live"),
+            true,
+        );
+        send_order(
+            &mut state,
+            &ClientOrderId::new("gone"),
+            &OrderId::new("ex-gone"),
+            true,
+        );
+        cancel_order(
+            &mut state,
+            &ClientOrderId::new("gone"),
+            &OrderId::new("ex-gone"),
+        );
+        assert!(!state.reduce_only.is_empty() && !state.retired_reduce_only.is_empty());
+
+        state.clear_order_routing();
+
+        assert!(state.reduce_only.is_empty());
+        assert!(state.retired_reduce_only.is_empty());
     }
 }
