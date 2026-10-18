@@ -5424,6 +5424,36 @@ mod tests {
         );
     }
 
+    /// The reduce-only orders, live and retired with or without a venue order id, survive a
+    /// round trip through JSON.
+    #[test]
+    fn the_reduce_only_orders_round_trip_through_json() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let (acked, exchange_id) = (ClientOrderId::new("acked"), OrderId::new("ex-acked"));
+        send_order(&mut state, &acked, &exchange_id, true);
+        cancel_order(&mut state, &acked, &exchange_id);
+        let unacked = ClientOrderId::new("unacked");
+        send_in_flight(&mut state, &unacked, true);
+        // Cancelled straight out of flight: no acknowledgement ever indexed its venue order id.
+        cancel_order(&mut state, &unacked, &OrderId::new("ex-unacked"));
+        send_in_flight(&mut state, &ClientOrderId::new("live"), true);
+        assert_eq!(
+            state.retired_reduce_only_orders.get(&acked),
+            Some(&Some(exchange_id))
+        );
+        assert_eq!(state.retired_reduce_only_orders.get(&unacked), Some(&None));
+        assert_eq!(state.reduce_only_orders.len(), 1);
+
+        let loaded: InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex> =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+
+        assert_eq!(loaded.reduce_only_orders, state.reduce_only_orders);
+        assert_eq!(
+            loaded.retired_reduce_only_orders,
+            state.retired_reduce_only_orders
+        );
+    }
+
     /// A state serialised before the reduce-only fields existed loads with none recorded.
     #[test]
     fn a_state_serialised_without_the_reduce_only_fields_loads() {
