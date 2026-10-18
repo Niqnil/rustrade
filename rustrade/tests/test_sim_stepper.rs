@@ -62,6 +62,7 @@ use rustrade_execution::{
     AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
     balance::{AssetBalance, Balance},
     client::mock::MockExecutionConfig,
+    fill::{MarketOrderTiming, NextBarPrice},
     order::{
         OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, StrategyId},
@@ -123,6 +124,7 @@ fn config(latency_ms: u64) -> MockExecutionConfig {
         fill_model: Default::default(),
         spot_fee_asset: Default::default(),
         slippage: Default::default(),
+        market_order_timing: Default::default(),
     }
 }
 
@@ -135,6 +137,11 @@ fn usdt(total: Decimal) -> SimStart {
 
 /// A one-second candle on `instrument` closing at `secs`, at `close`, stamped at its close.
 fn bar(instrument: usize, secs: i64, close: Decimal) -> EngineEvent<DataKind> {
+    bar_from(instrument, secs, close, close)
+}
+
+/// A one-second candle on `instrument` closing at `secs` that opened at `open`.
+fn bar_from(instrument: usize, secs: i64, open: Decimal, close: Decimal) -> EngineEvent<DataKind> {
     EngineEvent::Market(MarketStreamEvent::Item(MarketEvent {
         time_exchange: at(secs),
         time_received: at(secs),
@@ -142,9 +149,9 @@ fn bar(instrument: usize, secs: i64, close: Decimal) -> EngineEvent<DataKind> {
         instrument: InstrumentIndex::new(instrument),
         kind: DataKind::Candle(Candle {
             close_time: at(secs),
-            open: close,
-            high: close,
-            low: close,
+            open,
+            high: open.max(close),
+            low: open.min(close),
             close,
             volume: Some(dec!(10)),
             trade_count: Some(5),
@@ -187,9 +194,19 @@ fn session_with<Strategy>(
     engine_positions: Option<Vec<PositionSeed>>,
     strategy: Strategy,
 ) -> Session<Strategy> {
+    session_configured(config(latency_ms), start, engine_positions, strategy)
+}
+
+/// [`session_with`], for a venue configured by `config`.
+fn session_configured<Strategy>(
+    config: MockExecutionConfig,
+    start: SimStart,
+    engine_positions: Option<Vec<PositionSeed>>,
+    strategy: Strategy,
+) -> Session<Strategy> {
     let instruments = instruments();
     let build = SimExecutionBuilder::new(&instruments)
-        .add_venue_with_start(config(latency_ms), SimVenueOptions::default(), start)
+        .add_venue_with_start(config, SimVenueOptions::default(), start)
         .unwrap()
         .build();
     let seeds = engine_positions.unwrap_or_else(|| build.position_seeds());
@@ -597,6 +614,111 @@ fn latency_delays_a_fill_to_the_first_step_that_reaches_it() {
         )]
     );
     assert!(matches!(next.last(), Some(EngineEvent::Market(_))));
+}
+
+/// A session whose venue holds each market order for its instrument's next bar.
+fn next_bar_session(start: SimStart) -> Session<DefaultStrategy<State>> {
+    let config = MockExecutionConfig {
+        market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
+        ..config(0)
+    };
+    session_configured(config, start, None, DefaultStrategy::default())
+}
+
+#[test]
+fn under_next_bar_an_order_fills_at_the_next_bars_open_before_that_bar_is_shown() {
+    let mut s = next_bar_session(usdt(dec!(10_000)));
+    s.stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(100))])
+        .unwrap();
+
+    s.engine.action(&order(BTC, Side::Buy, dec!(2), "next"));
+    let settled = s.stepper.settle(&mut s.engine).unwrap();
+    assert!(
+        fills(events(&settled)).is_empty(),
+        "held for the next bar, so nothing fills at the close it was sent after"
+    );
+    assert!(refused(events(&settled)).is_empty());
+    assert_eq!(position(&s.engine, BTC), None);
+
+    let stepped = s
+        .stepper
+        .step(
+            &mut s.engine,
+            at(4),
+            [bar_from(BTC, 4, dec!(102), dec!(105))],
+        )
+        .unwrap();
+    let stepped = events(&stepped);
+
+    assert_eq!(
+        fills(stepped.iter().copied()),
+        vec![(
+            InstrumentIndex::new(BTC),
+            Side::Buy,
+            dec!(102),
+            dec!(2),
+            at(4)
+        )],
+        "filled at the next bar's open, stamped at that bar"
+    );
+    let trade_at = stepped
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                    kind: AccountEventKind::Trade(_),
+                    ..
+                }))
+            )
+        })
+        .unwrap();
+    let bar_at = stepped
+        .iter()
+        .position(|event| matches!(event, EngineEvent::Market(_)))
+        .unwrap();
+    assert!(
+        trade_at < bar_at,
+        "the Engine sees the bar with the fill it released already booked"
+    );
+    assert_eq!(
+        position(&s.engine, BTC),
+        Some((Side::Buy, dec!(2), dec!(102)))
+    );
+    assert_eq!(balance(&s.engine, "usdt"), dec!(9796));
+}
+
+#[test]
+fn under_next_bar_finish_expires_an_order_still_held() {
+    let mut s = next_bar_session(usdt(dec!(10_000)));
+    s.stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(100))])
+        .unwrap();
+    s.engine.action(&order(BTC, Side::Buy, dec!(1), "held"));
+    s.stepper.settle(&mut s.engine).unwrap();
+
+    let finished = s.stepper.finish(&mut s.engine).unwrap();
+
+    assert!(fills(events(&finished)).is_empty());
+    assert!(
+        events(&finished).iter().any(|event| matches!(
+            event,
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                kind: AccountEventKind::OrderSnapshot(snapshot),
+                ..
+            })) if snapshot.0.key.cid == ClientOrderId::new("held")
+                && matches!(snapshot.0.state, OrderState::Inactive(InactiveOrderState::Expired(_)))
+        )),
+        "the order is answered as expired: {:?}",
+        events(&finished)
+    );
+    assert_eq!(
+        balance(&s.engine, "usdt"),
+        dec!(10_000),
+        "and its hold released"
+    );
+    assert!(s.stepper.has_ended());
 }
 
 #[test]

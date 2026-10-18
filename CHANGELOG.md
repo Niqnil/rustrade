@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in next-bar fills for market orders on the simulated venue** (`rustrade-execution`,
+  `rustrade`, #627).
+  - New `MockExecutionConfig::market_order_timing`. The default, `MarketOrderTiming::OnArrival`,
+    is today's behaviour: on a bar feed with no latency, a market order fills at the close of the
+    bar its sender has just seen. That is a common convention and an optimistic one.
+  - `MarketOrderTiming::NextBar(NextBarPrice)` holds a market order until its instrument's next
+    bar and fills it at that bar's `Open`. `AdverseExtreme` fills at the bar's high for a buy and
+    its low for a sell. That is a deliberately pessimistic bound for stress tests, so don't
+    combine it with slippage. The bar's price goes through the venue's `FillModel` and slippage,
+    as for any taker fill.
+  - While it is held, the order is accepted as open and can be cancelled. The venue holds its cost
+    at the current price, recosts the fill at the bar, and cancels the order if the account can no
+    longer afford it. Immediate-or-cancel and fill-or-kill apply when the bar fills it. Only a bar
+    releases a held order: a trade or quote does not. An order still held when the data ends is
+    retired as expired.
+  - Bar data only. A market order on an instrument the venue has never been fed a bar for is
+    rejected with a reason naming the setting. So is every market order on a venue with no market
+    feed, such as `MockExchange`'s. Limit orders are unchanged.
+  - `SimRunner` and `SimStepper` show the `Engine` a held order's fill **before** the bar that
+    filled it, together with every other account event that bar caused, so the strategy sees the
+    bar with its fill already booked. With latency back from the venue, the fill arrives after the
+    bar, as any delayed fill does.
+  - New `MarketBar` (open, high, low, close) in `rustrade_execution::market`, and
+    `VenueInstrumentMarket::bar`, the latest bar a venue was fed.
+  - New `VenueMarketUpdate::bar`. It supplies the bar an event carries, and is asked before the
+    event is folded in. It defaults to `None`, and `DataKind` implements it for candles. A candle
+    the engine's instrument state drops, such as a lookahead candle or one already seen, releases
+    nothing.
+  - New `SimulatedVenue::holds_for_next_bar` and `SimulatedVenue::expire_held`, for drivers.
+
+### Changed
+
+- **Breaking:** `SimulatedVenue::apply_market` takes the bar an observation carries
+  (`rustrade-execution`). Its new `bar: Option<MarketBar>` argument comes before
+  `time_exchange`. Pass `None` from a feed without bars, which keeps today's behaviour.
+- **Breaking:** `MockExecutionConfig` has a new field, `market_order_timing`, so a struct literal
+  or a `MockExecutionConfig::new` call must supply it, and `VenueInstrumentMarket` has a new
+  public field, `bar` (`rustrade-execution`). A serialised configuration without
+  `market_order_timing` still loads, as `OnArrival`.
+
 ## [0.12.1] - 2026-10-17
 
 ### Fixed

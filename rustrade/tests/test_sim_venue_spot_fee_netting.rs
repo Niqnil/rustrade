@@ -132,6 +132,7 @@ fn venue(fee_model: FeeModelConfig, spot_fee_asset: SpotFeeAsset) -> SimulatedVe
         fill_model: SimFillConfig::default(),
         spot_fee_asset,
         slippage: Default::default(),
+        market_order_timing: Default::default(),
     };
     let spot = Instrument {
         exchange: EXCHANGE,

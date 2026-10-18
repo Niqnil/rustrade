@@ -83,6 +83,9 @@ pub type StepAudit<GlobalData, InstrumentData, Strategy, Risk, MarketKind> = <Si
 ///    and the venues' own deadlines (order expiries, holding costs).
 /// 3. Hands the instant's market data to the venues, which match resting orders against it, and
 ///    shows each event to the `Engine`. Auxiliary events at the instant go first, then market data.
+///    A bar that fills a market order held for it is shown after that fill, as on
+///    [`SimRunner`](super::SimRunner): see `A bar that fills a held market order` in its
+///    `# Ordering contract`.
 /// 4. Delivers every fill, rejection and balance update due at the instant, including those for
 ///    orders the `Engine`'s strategy sent in reply to this instant's events.
 ///
@@ -111,6 +114,15 @@ pub type StepAudit<GlobalData, InstrumentData, Strategy, Risk, MarketKind> = <Si
 /// A policy can learn to exploit it. Slippage
 /// ([`MockExecutionConfig::slippage`](rustrade_execution::client::mock::MockExecutionConfig))
 /// raises the cost of trading, but does not remove the information advantage.
+///
+/// [`MockExecutionConfig::market_order_timing`] removes it. Under
+/// [`MarketOrderTiming::NextBar`] a market order sent after the instant `T` is held, and a
+/// [`settle`](Self::settle) returns with it open. The next step whose bar is for that instrument
+/// fills it at that bar's open, or at its worst price as a stress bound, and shows the `Engine` the
+/// fill before the bar. An order still held at [`finish`](Self::finish) is answered as expired.
+///
+/// [`MockExecutionConfig::market_order_timing`]: rustrade_execution::client::mock::MockExecutionConfig::market_order_timing
+/// [`MarketOrderTiming::NextBar`]: rustrade_execution::fill::MarketOrderTiming::NextBar
 ///
 /// # Latency
 /// With a non-zero `latency_ms`, a request reaches its venue `to_venue` after it was sent, and its
@@ -490,7 +502,16 @@ where
                 return Err(SimStepError::Finished.into());
             }
 
+            // A bar held back behind the fill it released, once that fill is out: it came before
+            // the rest of the batch.
+            if let Some(event) = self.core.take_deferred() {
+                process(engine, event, audits)?;
+                continue;
+            }
+
             let queue_leads = match (batch.front(), until) {
+                // Not yet due, so what is due before it is in the queue.
+                _ if self.core.has_deferred() => true,
                 (Some(event), Until::Instant(time)) => self.core.leads((time, source_class(event))),
                 (None, Until::Instant(time)) => self.core.due_by(time),
                 // Until the queue pops empty, which ends the run below.
@@ -507,19 +528,31 @@ where
                 match self.core.pop().map_err(misconfigured)? {
                     Step::Emitted(event) => process(engine, event, audits)?,
                     Step::Acted | Step::Woken => {}
-                    Step::Empty => return Ok(()),
+                    // Drained, once every market order still held for a bar that will never
+                    // come is answered.
+                    Step::Empty => {
+                        if matches!(until, Until::Drained)
+                            && self.core.expire_held().map_err(misconfigured)?
+                        {
+                            continue;
+                        }
+                        return Ok(());
+                    }
                 }
                 continue;
             }
 
-            let Some(event) = batch.pop_front() else {
+            // A drain carries no batch: the queue leads it until it pops empty, above.
+            let (Some(event), Until::Instant(time)) = (batch.pop_front(), until) else {
                 return Ok(());
             };
 
             // Routed before the Engine sees the event, so an order it sends in reply is matched
-            // against the market as of this instant.
-            self.core.route_source(&event).map_err(misconfigured)?;
-            process(engine, event, audits)?;
+            // against the market as of this instant. A bar that released a held market order is
+            // held back instead, and shown once its fill is out.
+            if let Some(event) = self.core.route_source(time, event).map_err(misconfigured)? {
+                process(engine, event, audits)?;
+            }
         }
     }
 }

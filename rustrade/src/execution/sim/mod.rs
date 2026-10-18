@@ -412,6 +412,29 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// Claims 3 and 4 together are the contract for a tick-caused fill: booked at `T`, marked at `T`,
 /// and never delivered before its own cause.
 ///
+/// ## A bar that fills a held market order
+///
+/// The one exception to claim 3. Under
+/// [`MarketOrderTiming::NextBar`](rustrade_execution::fill::MarketOrderTiming::NextBar) a venue
+/// holds a market order for its instrument's next bar and fills it at that bar's price. A bar is
+/// stamped at its close, but the order traded at its start, so the fill happened **before** the
+/// event that reports it. This runner therefore holds back a bar that releases a held order until
+/// everything due no later than it has been shown, and only then shows the bar:
+///
+/// - At `from_venue = 0` the fill is due at the bar's own instant, and as an account event it
+///   precedes the bar. The `Engine` sees the bar with its order already filled, and marks the
+///   position the fill opened to that bar's close, as claim 4 promises a tick-caused fill.
+/// - Every other account event that bar produced goes with it, resting fills included, since a
+///   venue's balances are restatements that must arrive in the order the venue booked them.
+/// - With a delay back from the venue, the fill is due after the bar and is shown after it, as any
+///   delayed fill is.
+/// - An order the `Engine` sends in reply to such a fill, before it is shown the bar, still reaches
+///   a venue whose market is already that bar's. The bar is stamped at its close, so the venue has
+///   no earlier market of that bar to book it against. A market order is held for the bar after;
+///   a limit order is judged against the close.
+///
+/// A bar that releases nothing, and every event that is not a bar, is shown at once, as always.
+///
 /// # A venue's own deadlines
 /// A venue has things to do at instants nobody requested: an order reaching its
 /// [`TimeInForce::GoodTillDate`](rustrade_execution::order::TimeInForce::GoodTillDate) deadline,
@@ -454,7 +477,10 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// no request is ever accepted and then dropped.
 ///
 /// A fill booked against the final source event is still always delivered, so ending a run cannot
-/// cut the ledgers short. The [`ExecutionRequest::Drain`] the `Engine` sends in reply is therefore
+/// cut the ledgers short. A market order a venue still holds for a next bar that never came is
+/// retired as expired once everything else is delivered, and that is delivered too, so an order
+/// this runner accepted always has an end. The [`ExecutionRequest::Drain`] the `Engine` sends in
+/// reply is therefore
 /// a no-op here: this runner, not the execution side, owns the moment a simulated run ends.
 /// [`ExecutionRequest::Shutdown`] abandons whatever is still scheduled, matching its documented
 /// meaning — including any request that has not yet reached its venue, which is therefore never
@@ -656,11 +682,20 @@ where
                 return Poll::Ready(None);
             }
 
+            // A bar held back behind the fill it released, once that fill is out: it came before
+            // anything the source has yet to give.
+            if let Some(event) = core.take_deferred() {
+                return Poll::Ready(Some(event));
+            }
+
             // Whether the queue's earliest entry comes due at or before the source's next event.
             // No longer only a question about account events: an entry may be a request its venue
             // has yet to act on, which has to be weighed against the source for the same reason —
             // it is due at an instant, and the market as of that instant is what it acts against.
-            let queue_leads = if *this.source_done {
+            let queue_leads = if core.has_deferred() {
+                // Not yet due, so what is due before it is in the queue.
+                true
+            } else if *this.source_done {
                 // Ask the Engine to stop generating *before* draining what it is already owed.
                 // Doing so is what bounds the drain: the Engine suppresses further algo orders on
                 // this event, so nothing new is booked while the queue empties. Suppressing at the
@@ -710,8 +745,12 @@ where
                     // produced is now queued, so the next iteration weighs that against the source
                     // exactly as it did this one.
                     Step::Acted | Step::Woken => continue,
-                    // Nothing left owed and no source to draw from: the run is over.
+                    // Nothing left owed and no source to draw from: the run is over, once every
+                    // market order still held for a bar that will never come is answered.
                     Step::Empty => {
+                        if core.expire_held().unwrap_or_else(panic_on_fault) {
+                            continue;
+                        }
                         *this.terminated = true;
                         return Poll::Ready(None);
                     }
@@ -725,10 +764,15 @@ where
                     // order the `Engine` sends in reaction to the tick at `T` must be matched
                     // against the market as of `T`, not `T-1`. Returning first and routing on the
                     // next poll would reverse that at zero latency.
-                    core.route_source(&timed.value)
-                        .unwrap_or_else(panic_on_fault);
-
-                    Poll::Ready(Some(timed.value))
+                    match core
+                        .route_source(timed.time, timed.value)
+                        .unwrap_or_else(panic_on_fault)
+                    {
+                        Some(event) => Poll::Ready(Some(event)),
+                        // Held back behind the fill it released, which the next iteration
+                        // delivers first.
+                        None => continue,
+                    }
                 }
                 Poll::Ready(None) => {
                     *this.source_done = true;
@@ -756,6 +800,16 @@ impl std::fmt::Display for SimFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
+}
+
+/// When a source event just routed to the venues is shown to the `Engine`. See [`route_market`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Routed {
+    /// At once, as every event always was.
+    Now,
+    /// After everything due at or before it in the queue: a bar that released a held market
+    /// order, whose fill is due no later than the bar at `from_venue = 0`.
+    AfterReleased,
 }
 
 /// How [`SimRunner`] reports a [`SimFault`]: a panic carrying its message, as it always has.
@@ -800,6 +854,10 @@ where
     market: FnvHashMap<InstrumentIndex, MarketKind::State>,
     /// Each venue's queued wake-up for its own next deadline.
     pub(crate) wakeups: Wakeups,
+    /// A source event already routed to the venues and not yet shown to the `Engine`, because it
+    /// released a held market order whose fill must be shown first, with the `(time, class)` it
+    /// is ordered by. See [`Routed::AfterReleased`].
+    deferred: Option<((DateTime<Utc>, u8), EngineEvent<MarketKind>)>,
 }
 
 /// Manual because a derive would demand `MarketKind: Debug`, which the queued events need only to
@@ -868,6 +926,7 @@ where
             since_source: 0,
             market: FnvHashMap::default(),
             wakeups,
+            deferred: None,
         })
     }
 
@@ -930,23 +989,95 @@ where
 
     /// Account for a source event about to be shown to the `Engine`: it starts a fresh feedback
     /// budget, and its market data reaches the venues first. See [`route_market`].
-    pub(crate) fn route_source(&mut self, event: &EngineEvent<MarketKind>) -> Result<(), SimFault> {
+    ///
+    /// Returns the event when it is to be shown now, and `None` when it was held back behind what
+    /// it released, to be shown by [`take_deferred`](Self::take_deferred).
+    pub(crate) fn route_source(
+        &mut self,
+        time: DateTime<Utc>,
+        event: EngineEvent<MarketKind>,
+    ) -> Result<Option<EngineEvent<MarketKind>>, SimFault> {
         // A source event is the only thing that proves simulated time is advancing.
         self.since_source = 0;
 
-        route_market(
+        let routed = route_market(
             &mut self.venues,
             &mut self.market,
             &mut self.pending,
             &mut self.seq,
             &mut self.wakeups,
-            event,
-        )
+            &event,
+        )?;
+
+        Ok(match routed {
+            Routed::Now => Some(event),
+            Routed::AfterReleased => {
+                debug_assert!(
+                    self.deferred.is_none(),
+                    "a second source event was routed while one was still held back"
+                );
+                self.deferred = Some(((time, source_class(&event)), event));
+                None
+            }
+        })
+    }
+
+    /// The source event held back behind what it released, once nothing in the queue is due
+    /// before it, or `None`. See [`Routed::AfterReleased`].
+    ///
+    /// The caller shows it to the `Engine` before drawing anything else from its source: it came
+    /// first, and it is due no later than the next.
+    pub(crate) fn take_deferred(&mut self) -> Option<EngineEvent<MarketKind>> {
+        let (ordering, _) = self.deferred.as_ref()?;
+        if self.leads(*ordering) {
+            return None;
+        }
+        self.deferred.take().map(|(_, event)| event)
+    }
+
+    /// Whether a source event is held back. While one is, the queue leads the source.
+    pub(crate) fn has_deferred(&self) -> bool {
+        self.deferred.is_some()
+    }
+
+    /// Retires every market order a venue still holds for a next bar, now that no bar is left to
+    /// release it, and schedules what that owes. Returns whether anything was scheduled.
+    ///
+    /// Stamped at the latest instant the run reached, the `Engine`'s clock or the venue's own, and
+    /// delivered one `from_venue` leg later, as anything else a venue does unrequested is.
+    pub(crate) fn expire_held(&mut self) -> Result<bool, SimFault> {
+        let now = self.clock.time();
+        let mut scheduled = false;
+
+        for (exchange, slot) in self.venues.iter_mut() {
+            let time = now.max(slot.venue.time_exchange());
+            let events = slot.venue.expire_held(time);
+            if events.is_empty() {
+                continue;
+            }
+
+            let delivers = checked_offset(
+                time,
+                slot.from_venue,
+                "a held market order expiring at the end of the data",
+            )?;
+            schedule_events(
+                &mut self.pending,
+                &mut self.seq,
+                *exchange,
+                delivers,
+                events,
+            );
+            scheduled = true;
+        }
+
+        Ok(scheduled)
     }
 
     /// Discard everything still scheduled: the run is over without being drained.
     pub(crate) fn abandon(&mut self) {
         self.pending = BinaryHeap::new();
+        self.deferred = None;
     }
 }
 
@@ -968,6 +1099,13 @@ where
 /// model a round trip that never happened, and at `from_venue = 0` the fill is delivered
 /// immediately after the tick that caused it, which is what marks the position it opens to that
 /// tick's price.
+///
+/// # A bar that releases a held market order is shown after what it released
+/// Returns [`Routed::AfterReleased`] when the event is a bar that releases a market order a venue
+/// was holding for it — see [`MarketOrderTiming::NextBar`] — and [`Routed::Now`] otherwise. See
+/// `A bar that fills a held market order` in [`SimRunner`]'s `# Ordering contract`.
+///
+/// [`MarketOrderTiming::NextBar`]: rustrade_execution::fill::MarketOrderTiming::NextBar
 fn route_market<MarketKind>(
     venues: &mut FnvIndexMap<ExchangeIndex, SimVenue>,
     market: &mut FnvHashMap<InstrumentIndex, MarketKind::State>,
@@ -975,18 +1113,22 @@ fn route_market<MarketKind>(
     seq: &mut u64,
     wakeups: &mut Wakeups,
     event: &EngineEvent<MarketKind>,
-) -> Result<(), SimFault>
+) -> Result<Routed, SimFault>
 where
     MarketKind: VenueMarketUpdate,
 {
     let EngineEvent::Market(MarketStreamEvent::Item(event)) = event else {
-        return Ok(());
+        return Ok(Routed::Now);
     };
 
     let state = market.entry(event.instrument).or_default();
+    // Asked before the fold, which is the only point at which the state can say whether the bar is
+    // new.
+    let bar = MarketKind::bar(state, event);
     MarketKind::apply(state, event);
     let snapshot = MarketKind::snapshot(state);
     let depth = MarketKind::depth(state);
+    let mut routed = Routed::Now;
 
     for (exchange, slot) in venues.iter_mut() {
         // `Err` means this venue does not trade the instrument, which is ordinary on a multi-venue
@@ -1001,9 +1143,12 @@ where
 
         // Cloned because `apply_market` keys on the owned name; the map borrow ends here.
         let name = name.clone();
+        if bar.is_some() && slot.venue.holds_for_next_bar(&name) {
+            routed = Routed::AfterReleased;
+        }
         let fills = slot
             .venue
-            .apply_market(&name, snapshot, depth, event.time_exchange);
+            .apply_market(&name, snapshot, depth, bar, event.time_exchange);
 
         // A fill can open or close a position, and the venue's first market starts its clock, so
         // either can move its next deadline.
@@ -1022,7 +1167,7 @@ where
         schedule_events(pending, seq, *exchange, delivers, fills);
     }
 
-    Ok(())
+    Ok(routed)
 }
 
 /// Decide whether emitting another account deliverable would exceed the feedback budget.
@@ -1476,18 +1621,20 @@ mod tests {
     use rustrade_data::{
         event::{DataKind, MarketEvent},
         streams::consumer::MarketStreamEvent,
-        subscription::trade::PublicTrade,
+        subscription::{candle::Candle, trade::PublicTrade},
     };
     use rustrade_execution::{
         AccountSnapshot,
         balance::{AssetBalance, Balance},
         client::mock::MockExecutionConfig,
         exchange::mock::VenueInstrumentMarket,
+        fill::{MarketOrderTiming, NextBarPrice},
         market::MarketSnapshot,
         order::{
             OrderKey, OrderKind, TimeInForce,
             id::{ClientOrderId, StrategyId},
             request::{OrderRequestCancel, OrderRequestOpen, RequestCancel, RequestOpen},
+            state::{InactiveOrderState, OrderState},
         },
     };
     use rustrade_instrument::{
@@ -1531,6 +1678,7 @@ mod tests {
             fill_model: Default::default(),
             spot_fee_asset: Default::default(),
             slippage: Default::default(),
+            market_order_timing: Default::default(),
         }
     }
 
@@ -1551,6 +1699,52 @@ mod tests {
             })),
             at(millis),
         )
+    }
+
+    /// A candle closing at `millis`, as every in-tree candle producer stamps one.
+    fn candle(millis: i64, [open, high, low, close]: [Decimal; 4]) -> Timed<EngineEvent<DataKind>> {
+        Timed::new(
+            EngineEvent::Market(MarketStreamEvent::Item(MarketEvent {
+                time_exchange: at(millis),
+                time_received: at(millis),
+                exchange: EXCHANGE,
+                instrument: instrument_key(),
+                kind: DataKind::Candle(Candle {
+                    close_time: at(millis),
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume: Some(dec!(1)),
+                    trade_count: None,
+                }),
+            })),
+            at(millis),
+        )
+    }
+
+    /// The fixture's configuration, holding each market order for its instrument's next bar and
+    /// filling it at that bar's open.
+    fn next_bar_config(latency_ms: u64) -> MockExecutionConfig {
+        MockExecutionConfig {
+            market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
+            ..config(latency_ms)
+        }
+    }
+
+    /// The state the last order snapshot in `events` reports.
+    fn last_order_state(events: &[EngineEvent<DataKind>]) -> &OrderState {
+        events
+            .iter()
+            .rev()
+            .find_map(|event| match event {
+                EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                    kind: AccountEventKind::OrderSnapshot(order),
+                    ..
+                })) => Some(&order.0.state),
+                _ => None,
+            })
+            .expect("the run reported an order")
     }
 
     /// An auxiliary (class 0) source event at `millis`.
@@ -1594,6 +1788,13 @@ mod tests {
 
     impl Harness {
         fn new(latency_ms: u64, source: Vec<Timed<EngineEvent<DataKind>>>) -> Self {
+            Self::with_config(config(latency_ms), source)
+        }
+
+        fn with_config(
+            config: MockExecutionConfig,
+            source: Vec<Timed<EngineEvent<DataKind>>>,
+        ) -> Self {
             let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
             assert_eq!(
                 instruments.instruments()[0].key,
@@ -1605,7 +1806,7 @@ mod tests {
                 execution_tx_map,
                 venues,
             } = SimExecutionBuilder::new(&instruments)
-                .add_venue(config(latency_ms))
+                .add_venue(config)
                 .unwrap()
                 .build();
 
@@ -2157,6 +2358,10 @@ mod tests {
                 limit: 4,
             }),
             "the report names the venue and the instant simulated time stopped at"
+        );
+        assert!(
+            harness.runner.core.pending.is_empty(),
+            "the second fill, still owed when the run was abandoned, is discarded with it"
         );
     }
 
@@ -2961,6 +3166,236 @@ mod tests {
             fill_price_at(200).await,
             dec!(110),
             "a 100ms outbound leg carries the order over the tick at 50, and it pays that market"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Market orders held for their instrument's next bar.
+    // ---------------------------------------------------------------------------------------
+
+    /// The fill a bar releases reaches the `Engine` before the bar does, so the strategy sees the
+    /// bar with its order already filled, and the position the fill opened is marked to that bar.
+    #[tokio::test]
+    async fn a_bar_that_fills_a_held_market_order_is_shown_after_the_fill() {
+        let mut harness = Harness::with_config(
+            next_bar_config(0),
+            vec![
+                candle(10, [dec!(95), dec!(105), dec!(90), dec!(100)]),
+                candle(20, [dec!(102), dec!(110), dec!(98), dec!(108)]),
+                candle(30, [dec!(108), dec!(112), dec!(106), dec!(111)]),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        harness.send_open(dec!(100));
+
+        let events = harness.rest_events().await;
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec![
+                // The hold, then the response saying the order is working.
+                "balance",
+                "order",
+                // The fill the bar at 20 released, before that bar...
+                "balance",
+                "balance",
+                "trade",
+                "order",
+                // ...which follows it.
+                "market",
+                "market",
+                "after_drain"
+            ],
+        );
+        assert_eq!(
+            trade_prices(&events),
+            vec![dec!(102)],
+            "filled at the open of the bar after the one it was sent on"
+        );
+    }
+
+    /// With a delay back from the venue, the fill is shown when it arrives: after its bar, as any
+    /// fill delayed past an event is.
+    #[tokio::test]
+    async fn a_delayed_fill_of_a_held_market_order_follows_its_bar() {
+        let mut harness = Harness::with_config(
+            next_bar_config(10),
+            vec![
+                candle(10, [dec!(95), dec!(105), dec!(90), dec!(100)]),
+                candle(20, [dec!(102), dec!(110), dec!(98), dec!(108)]),
+                candle(30, [dec!(108), dec!(112), dec!(106), dec!(111)]),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        harness.send_open(dec!(100));
+
+        assert_eq!(
+            harness.rest().await,
+            vec![
+                // Booked at 15, answered at 20, ahead of the bar at 20 by class.
+                "balance",
+                "order",
+                "market",
+                // Released by the bar at 20, delivered at 25.
+                "balance",
+                "balance",
+                "trade",
+                "order",
+                "market",
+                "after_drain"
+            ],
+        );
+    }
+
+    /// A market order still held when the source ends is answered as expired, so no request the
+    /// runner accepted is left without an end.
+    #[tokio::test]
+    async fn a_market_order_still_held_when_the_data_ends_is_expired() {
+        let mut harness = Harness::with_config(
+            next_bar_config(0),
+            vec![candle(10, [dec!(95), dec!(105), dec!(90), dec!(100)])],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        harness.send_open(dec!(100));
+
+        let events = harness.rest_events().await;
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec!["after_drain", "balance", "order", "balance", "order"],
+        );
+        assert!(
+            matches!(
+                last_order_state(&events),
+                OrderState::Inactive(InactiveOrderState::Expired(_))
+            ),
+            "{:?}",
+            last_order_state(&events)
+        );
+        assert!(trade_prices(&events).is_empty());
+    }
+
+    /// A trade between two bars moves the market but releases nothing, so its event is shown at
+    /// once, as every event without a held order is.
+    #[tokio::test]
+    async fn a_trade_between_bars_does_not_release_a_held_market_order() {
+        let mut harness = Harness::with_config(
+            next_bar_config(0),
+            vec![
+                candle(10, [dec!(95), dec!(105), dec!(90), dec!(100)]),
+                market(15, dec!(101)),
+                candle(20, [dec!(102), dec!(110), dec!(98), dec!(108)]),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        harness.send_open(dec!(100));
+
+        let events = harness.rest_events().await;
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec![
+                "balance",
+                "order",
+                "market",
+                "balance",
+                "balance",
+                "trade",
+                "order",
+                "market",
+                "after_drain"
+            ],
+        );
+        assert_eq!(trade_prices(&events), vec![dec!(102)]);
+    }
+
+    /// The same candle sent twice is one bar, so its repeat releases nothing: an order sent on the
+    /// first waits for the bar after it.
+    #[tokio::test]
+    async fn a_repeated_candle_does_not_release_a_held_market_order() {
+        let mut harness = Harness::with_config(
+            next_bar_config(0),
+            vec![
+                candle(10, [dec!(95), dec!(105), dec!(90), dec!(100)]),
+                candle(10, [dec!(95), dec!(105), dec!(90), dec!(100)]),
+                candle(20, [dec!(102), dec!(110), dec!(98), dec!(108)]),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        harness.send_open(dec!(100));
+
+        let events = harness.rest_events().await;
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec![
+                "balance",
+                "order",
+                // The repeat, shown at once with nothing filled...
+                "market",
+                // ...and the fill the next bar released, before that bar.
+                "balance",
+                "balance",
+                "trade",
+                "order",
+                "market",
+                "after_drain"
+            ],
+        );
+        assert_eq!(trade_prices(&events), vec![dec!(102)]);
+    }
+
+    /// A bar that releases no held market order is shown before the resting fill it causes, as a
+    /// tick is: only a bar that released one is held back behind it.
+    #[tokio::test]
+    async fn a_bar_that_releases_nothing_is_shown_before_the_resting_fill_it_causes() {
+        let mut harness = Harness::new(
+            0,
+            vec![
+                candle(10, [dec!(200), dec!(210), dec!(195), dec!(200)]),
+                candle(20, [dec!(95), dec!(100), dec!(85), dec!(90)]),
+                candle(30, [dec!(200), dec!(210), dec!(195), dec!(200)]),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        // 200 closed, so a bid at 100 is not marketable and rests.
+        harness.clock.advance_to(at(10));
+        harness.send_limit(dec!(100));
+
+        assert_eq!(
+            harness.rest().await,
+            vec![
+                "balance",
+                "order",
+                // The bar closing at 90, which crosses the bid...
+                "market",
+                // ...and only then the fill it caused.
+                "balance",
+                "balance",
+                "trade",
+                "order",
+                "market",
+                "after_drain"
+            ],
         );
     }
 }
