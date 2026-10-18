@@ -484,10 +484,10 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 ///
 /// A fill booked against the final source event is still always delivered, so ending a run cannot
 /// cut the ledgers short. A market order a venue still holds for a next bar, or a fresh
-/// observation, that never came is retired as expired once everything else is delivered, and that is delivered too, so an order
-/// this runner accepted always has an end. The [`ExecutionRequest::Drain`] the `Engine` sends in
-/// reply is therefore
-/// a no-op here: this runner, not the execution side, owns the moment a simulated run ends.
+/// observation, that never came is retired as expired once everything else is delivered, and that
+/// is delivered too, so an order this runner accepted always has an end. The
+/// [`ExecutionRequest::Drain`] the `Engine` sends in reply is therefore a no-op here: this runner,
+/// not the execution side, owns the moment a simulated run ends.
 /// [`ExecutionRequest::Shutdown`] abandons whatever is still scheduled, matching its documented
 /// meaning — including any request that has not yet reached its venue, which is therefore never
 /// booked at all rather than booked and then left unreported.
@@ -1047,7 +1047,8 @@ where
     }
 
     /// Retires every market order a venue still holds for a next bar or a fresh observation, now
-    /// that nothing is left to release it, and schedules what that owes. Returns whether anything was scheduled.
+    /// that nothing is left to release it, and schedules what that owes. Returns whether anything
+    /// was scheduled.
     ///
     /// Stamped at the latest instant the run reached, the `Engine`'s clock or the venue's own, and
     /// delivered one `from_venue` leg later, as anything else a venue does unrequested is.

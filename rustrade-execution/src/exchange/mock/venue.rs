@@ -37,7 +37,7 @@ use rustrade_instrument::{
 };
 use rustrade_integration::collection::snapshot::Snapshot;
 use smol_str::ToSmolStr;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tracing::warn;
 
 /// Everything one request obliges a driver to deliver, in the order it must deliver it.
@@ -1077,10 +1077,9 @@ impl SimulatedVenue {
             MarketOrderTiming::NextBar(price) => {
                 if let Some(bar) = bar {
                     if self.bar_releases(&observation) {
-                        events.append(&mut self.release_held(
+                        events.append(&mut self.release(
                             instrument,
-                            &bar,
-                            price,
+                            Release::Bar(&bar, price),
                             time_exchange,
                         ));
                     } else {
@@ -1091,8 +1090,14 @@ impl SimulatedVenue {
             }
             MarketOrderTiming::OnArrival => {
                 events.append(&mut self.match_resting(instrument, snapshot, time_exchange));
-                if fresh {
-                    events.append(&mut self.release_waiting(instrument, &snapshot, time_exchange));
+                // Only `Wait` holds an order under `OnArrival`, so no other policy has one to look
+                // up.
+                if fresh && matches!(self.stale_market, StaleMarketPolicy::Wait { .. }) {
+                    events.append(&mut self.release(
+                        instrument,
+                        Release::Market(&snapshot),
+                        time_exchange,
+                    ));
                 }
             }
         }
@@ -1288,31 +1293,9 @@ impl SimulatedVenue {
         events
     }
 
-    /// Fills every market order held on `instrument` for this bar, earliest arrival first, at the
-    /// bar's `price` — see [`MarketOrderTiming::NextBar`].
-    fn release_held(
-        &mut self,
-        instrument: &InstrumentNameExchange,
-        bar: &MarketBar,
-        price: NextBarPrice,
-        time_exchange: DateTime<Utc>,
-    ) -> Vec<UnindexedAccountEvent> {
-        self.release(instrument, Release::Bar(bar, price), time_exchange)
-    }
-
-    /// Fills every market order waiting on `instrument` for a fresh observation, earliest arrival
-    /// first, against `market`, the one that observation left — see [`StaleMarketPolicy::Wait`].
-    fn release_waiting(
-        &mut self,
-        instrument: &InstrumentNameExchange,
-        market: &MarketSnapshot,
-        time_exchange: DateTime<Utc>,
-    ) -> Vec<UnindexedAccountEvent> {
-        self.release(instrument, Release::Market(market), time_exchange)
-    }
-
     /// Fills every market order held on `instrument`, earliest arrival first, priced from
-    /// `release`.
+    /// `release`: the bar it was held for under [`MarketOrderTiming::NextBar`], or the market a
+    /// fresh observation left under [`StaleMarketPolicy::Wait`].
     fn release(
         &mut self,
         instrument: &InstrumentNameExchange,
@@ -1425,14 +1408,14 @@ impl SimulatedVenue {
             return self.cancel_unfilled(order, released, time_exchange);
         };
 
-        // What the bar has to give this order, which is all of it wherever no size is known --
-        // as on every candle feed.
+        // What the releasing observation has to give this order, which is all of it wherever no
+        // size is known -- as on every candle feed.
         let filled_quantity = match self.depth_available(&order.key.instrument, side) {
             Some(available) => quantity.min(available),
             None => quantity,
         };
-        // Its time in force decides what becomes of a part the bar cannot fill, as on arrival: a
-        // deadline already reached was swept before this bar released anything.
+        // Its time in force decides what becomes of a part the observation cannot fill, as on
+        // arrival: a deadline already reached was swept before it released anything.
         let kill = order.time_in_force == TimeInForce::FillOrKill;
         if filled_quantity <= Decimal::ZERO || (filled_quantity < quantity && kill) {
             let released = reservation.map(|Reservation { asset, amount }| {
@@ -1470,8 +1453,8 @@ impl SimulatedVenue {
         };
         let trade = self.print_fill(terms, &order, fill, settlement.fees, time_exchange);
 
-        // Filled outright, or cancelled carrying what the bar's size allowed: a market order has no
-        // limit to rest a remainder at, as on arrival.
+        // Filled outright, or cancelled carrying what the observation's size allowed: a market
+        // order has no limit to rest a remainder at, as on arrival.
         let terminal = if filled_quantity == quantity {
             let filled = Order {
                 key: order.key,
@@ -2240,7 +2223,7 @@ impl SimulatedVenue {
     fn market_age(
         &self,
         instrument: &InstrumentNameExchange,
-        max_age: std::time::Duration,
+        max_age: Duration,
         now: DateTime<Utc>,
     ) -> MarketAge {
         if self.regime == VenueRegime::RequestPriced {
@@ -10241,7 +10224,7 @@ mod tests {
     // Market orders on a stale market.
     // ---------------------------------------------------------------------------------------
 
-    fn stale_config(max_age: std::time::Duration) -> MockExecutionConfig {
+    fn stale_config(max_age: Duration) -> MockExecutionConfig {
         MockExecutionConfig {
             stale_market: StaleMarketPolicy::Wait { max_age },
             ..spot_config("10", "10000", FeeModelConfig::default())
@@ -10249,7 +10232,7 @@ mod tests {
     }
 
     /// Ten seconds: a market last observed fresh at `time(1)` is stale from `time(12)`.
-    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(10);
+    const MAX_AGE: Duration = Duration::from_secs(10);
 
     /// A venue waiting out markets more than [`MAX_AGE`] old, fed a trade at 100 at `time(1)`.
     fn venue_waiting() -> SimulatedVenue {
@@ -10488,10 +10471,8 @@ mod tests {
 
     #[test]
     fn a_max_age_longer_than_any_run_never_makes_a_market_stale() {
-        let mut venue = SimulatedVenue::new_market_driven(
-            &stale_config(std::time::Duration::MAX),
-            spot_instruments(),
-        );
+        let mut venue =
+            SimulatedVenue::new_market_driven(&stale_config(Duration::MAX), spot_instruments());
         advance(&mut venue, time(1));
         assert!(observe(&mut venue, 1, traded("100")).is_empty());
         advance(&mut venue, time(1_000_000));

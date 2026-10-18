@@ -58,11 +58,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Turn it on for bar feeds, with a `max_age` a little over the bar interval. It stays off by
     default because the venue cannot know a feed's bar interval, and a quiet quote book is still
     a book. Market orders only: a marketable limit order still fills against the market the venue
-    holds. A venue with no market feed rejects every market order under the policy.
+    holds. A venue with no market feed, such as `MockExchange`'s, rejects every market order
+    under the policy.
   - New `MarketObservation` in `rustrade_execution::market`: what a driver feeds
     `SimulatedVenue::apply_market` (see Changed). Its `fresh` flag is what the policy measures
     from.
-  - New `VenueMarketUpdate::fresh`, asked before an event is folded in. It defaults to `true`.
+  - New `VenueMarketUpdate::fresh`, asked before an event is folded in. It defaults to `true`, so
+    a custom kind that supplies bars should override it.
     `DataKind` answers `true` for a trade, an L1 book or a candle the engine's instrument state
     keeps, unless the candle reports zero volume or zero trades. An unknown volume counts as
     fresh. L2 depth, liquidations and greeks are never fresh.

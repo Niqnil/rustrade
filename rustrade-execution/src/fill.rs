@@ -2,7 +2,7 @@ use crate::market::{MarketBar, MarketSnapshot};
 use rust_decimal::Decimal;
 use rustrade_instrument::Side;
 use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
+use std::{fmt::Debug, time::Duration};
 
 /// Everything a [`FillModel`] may price from.
 ///
@@ -357,12 +357,18 @@ pub enum StaleMarketPolicy {
     /// as above.
     ///
     /// # Needs a market feed
-    /// A venue with no market feed has nothing to measure an age from, so it rejects every market
-    /// order, naming this policy. That includes every market order on a
-    /// [`RequestPriced`](crate::exchange::mock::venue::VenueRegime::RequestPriced) venue.
+    /// A [`RequestPriced`](crate::exchange::mock::venue::VenueRegime::RequestPriced) venue, the
+    /// kind `MockExchange` drives, has no market feed to measure an age from, so it rejects every
+    /// market order, naming this policy. On a venue that is fed a market, an instrument it has
+    /// never been fed has no price at all, and its market orders are rejected as unpriced, as
+    /// above.
+    ///
+    /// # Serialised
+    /// `max_age` is a [`Duration`], so it serialises as seconds and nanoseconds:
+    /// `{"Wait":{"max_age":{"secs":90,"nanos":0}}}`.
     Wait {
         /// How old the last fresh observation may be for a market order to fill on arrival.
-        max_age: std::time::Duration,
+        max_age: Duration,
     },
 }
 
@@ -419,12 +425,16 @@ mod tests {
     fn stale_market_policy_defaults_to_off_and_round_trips() {
         assert_eq!(StaleMarketPolicy::default(), StaleMarketPolicy::Off);
 
-        for policy in [
-            StaleMarketPolicy::Off,
-            StaleMarketPolicy::Wait {
-                max_age: std::time::Duration::from_secs(90),
-            },
-        ] {
+        let wait = StaleMarketPolicy::Wait {
+            max_age: Duration::from_secs(90),
+        };
+        assert_eq!(
+            serde_json::to_string(&wait).unwrap(),
+            r#"{"Wait":{"max_age":{"secs":90,"nanos":0}}}"#,
+            "the shape the rustdoc promises a configuration file"
+        );
+
+        for policy in [StaleMarketPolicy::Off, wait] {
             let json = serde_json::to_string(&policy).unwrap();
             assert_eq!(
                 serde_json::from_str::<StaleMarketPolicy>(&json).unwrap(),

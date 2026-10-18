@@ -76,6 +76,10 @@ pub trait VenueMarketUpdate: Sized {
     /// `None`: a kind with no bars. A venue configured for `NextBar` then rejects every market
     /// order, naming the setting, rather than holding orders that nothing would ever release.
     ///
+    /// A kind that supplies bars should also override [`fresh`](Self::fresh), whose default
+    /// takes every event as fresh: a bar that carries the previous close forward with nothing
+    /// traded in it would otherwise count as a live market.
+    ///
     /// [`MarketOrderTiming::NextBar`]: rustrade_execution::fill::MarketOrderTiming::NextBar
     fn bar(_state: &Self::State, _event: &MarketEvent<InstrumentIndex, Self>) -> Option<MarketBar> {
         None
@@ -91,7 +95,8 @@ pub trait VenueMarketUpdate: Sized {
     /// # Default body
     ///
     /// `true`: every event of a kind that says nothing more is taken as a live observation, so
-    /// such a market is never stale while events keep arriving.
+    /// such a market is never stale while events keep arriving. Right for a kind whose every event
+    /// is a trade or a quote; a kind with bars that can be gap-filled must override it.
     ///
     /// [`MarketObservation::fresh`]: rustrade_execution::market::MarketObservation::fresh
     /// [`StaleMarketPolicy::Wait`]: rustrade_execution::fill::StaleMarketPolicy::Wait
