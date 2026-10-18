@@ -266,8 +266,11 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
     ///   back at the fill's price, so nothing is added.
     /// - **Only the fee the venue reported** is netted. A fee the caller computes itself, as the
     ///   engine's fee model does, is in quote, and reaches PnL alone.
-    /// - **A fill the engine caps first.** A settlement fill larger than the position it reduces
-    ///   is cut to that position by the engine, and is not netted.
+    /// - **A settlement fill larger than its position.** The engine does not call this for a
+    ///   settlement fill, such as a liquidation, that matches none of its orders and is larger
+    ///   than the position it reduces: it cuts that fill to the position, unnetted, so the
+    ///   position lands flat, and reports the excess. A mirror that matches the engine does the
+    ///   same rather than calling this.
     pub fn holding_move<ExchangeKey>(
         &self,
         instrument: &Instrument<ExchangeKey, AssetKey>,

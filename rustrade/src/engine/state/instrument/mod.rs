@@ -1519,8 +1519,13 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     }
 
     /// `effective`, a spot fill whose venue-reported `trade` carries a fee in the base asset,
-    /// moved as [`Trade::holding_move`] says for the position at `position_id`. `None` for any
-    /// other fill. See the base-asset fee section of [`Self::update_from_trade`].
+    /// moved as [`Trade::holding_move`] says for the position at `position_id`, as it stands
+    /// before the fill. `None` for any other fill. See the base-asset fee section of
+    /// [`Self::update_from_trade`].
+    ///
+    /// Two copies of one fill, because the move nets only the fee the venue reported, read from
+    /// `trade`, while the fill booked keeps everything else of `effective`, the fee this state's
+    /// fee model added included.
     ///
     /// When the move rounds the position to the quantity step, it also adds a long's remainder
     /// to the fill's fee, logs the fill at INFO and counts it on the tear sheet.
@@ -1569,7 +1574,8 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             instrument = ?netted.instrument,
             order_id = %netted.order_id,
             %position_id,
-            step = ?self.instrument.quantity_step(),
+            // Dust is only ever rounded off to a step, so there is one here.
+            step = %self.instrument.quantity_step().unwrap_or_default(),
             remainder = %moved.dust,
             %written_off,
             "base-asset fee left the holding off the quantity step: position rounded toward zero, \
