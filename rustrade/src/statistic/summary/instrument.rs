@@ -510,4 +510,28 @@ mod tests {
         assert_eq!(loaded.pnl, dec!(-2));
         assert_eq!(loaded.fees_unattributed, Decimal::ZERO);
     }
+
+    #[test]
+    fn a_tear_sheet_serialised_before_dust_loads_with_zero() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fill_dust(dec!(0.9));
+        let mut value = serde_json::to_value(generator.generate(Decimal::ZERO, Annual365)).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        fields.remove("dust").unwrap();
+        fields.remove("fills_dust").unwrap();
+
+        let loaded: TearSheet<Annual365> = serde_json::from_value(value).unwrap();
+        assert_eq!((loaded.fills_dust, loaded.dust), (0, Decimal::ZERO));
+    }
+
+    /// A dust total that would overflow holds its last-good value, and the fill is still counted.
+    #[test]
+    fn dust_holds_its_last_good_total_on_overflow() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fill_dust(Decimal::MAX);
+
+        generator.record_fill_dust(Decimal::ONE);
+
+        assert_eq!((generator.fills_dust, generator.dust), (2, Decimal::MAX));
+    }
 }

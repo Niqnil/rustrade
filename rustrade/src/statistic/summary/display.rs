@@ -496,6 +496,25 @@ mod tests {
         assert!(row("PnL").contains("-12.50"));
     }
 
+    /// The instrument table shows the value of the dust written off.
+    #[test]
+    fn instrument_table_shows_dust_written_off() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fill_dust(dec!(0.9));
+        let mut summary = summary_with_fallback(0, 0, None);
+        summary.instruments.insert(
+            InstrumentNameInternal::new("btc_usdt"),
+            generator.generate(Decimal::ZERO, Annual365),
+        );
+
+        let rendered = summary.instrument_table().to_string();
+        let row = rendered
+            .lines()
+            .find(|line| line.contains("Dust Written Off"))
+            .unwrap_or_else(|| panic!("no Dust Written Off row in:\n{rendered}"));
+        assert!(row.contains("0.90"));
+    }
+
     #[test]
     fn a_clean_session_raises_no_banner() {
         let summary = summary_with_fallback(0, 0, None);

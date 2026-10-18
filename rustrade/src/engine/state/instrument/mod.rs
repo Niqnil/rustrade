@@ -1522,6 +1522,9 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// position at `position_id` lands on the instrument's quantity step, rounded toward zero.
     /// Unchanged when the instrument has no step, or the position already lands on it. See the
     /// base-asset fee section of [`Self::update_from_trade`].
+    ///
+    /// When it rounds, it also adds a long's remainder to the fill's fee, logs the fill at INFO
+    /// and counts it on the tear sheet.
     fn floor_to_quantity_step(
         &mut self,
         mut netted: Trade<AssetKey, InstrumentKey>,
@@ -1543,13 +1546,13 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                 signed(position.side, position.quantity_abs)
             });
         let holds = held + signed(netted.side, netted.quantity);
-        // `%` keeps the dividend's sign, so this rounds the holding toward zero on either side.
-        let remainder = holds % step;
+        let rounded = round_toward_zero_to_step(holds, step);
+        let remainder = holds - rounded;
         if remainder.is_zero() {
             return netted;
         }
 
-        (netted.side, netted.quantity) = unsigned(holds - remainder - held, netted.side);
+        (netted.side, netted.quantity) = unsigned(rounded - held, netted.side);
 
         // A long's remainder is base the account holds but cannot sell: written off at the fill's
         // price, as a fee of the fill, so the fill's PnL still totals what it paid. A short's is
@@ -1558,6 +1561,8 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         let written_off = if remainder.is_sign_positive() {
             let value = remainder * netted.price;
             netted.fees.fees += remainder;
+            // The value is in quote terms, so it adds to the quote equivalent PnL charges even
+            // when the base fee itself has none (one the indexer zeroed).
             netted.fees.fees_quote = Some(netted.fees.fees_quote.unwrap_or(Decimal::ZERO) + value);
             value
         } else {
@@ -1705,6 +1710,8 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ///     [`TearSheet::dust`](crate::statistic::summary::instrument::TearSheet::dust).
     ///   - A short's remainder is base still owed on the loan. The position books it bought back
     ///     at the fill's price, which values the debt at that price, so nothing is written off.
+    ///     A remainder this fill's fee did not create, as from a short already off the step, is
+    ///     booked bought back the same way, though the fill paid nothing for it.
     ///   - Without a step, the position holds the exact quantity, 0.999 above, and a full-size
     ///     close can leave a remainder the venue will not sell.
     ///   - Each fill's remainder is rounded away on its own, so the balance can gather more than
@@ -2358,6 +2365,16 @@ where
 
     let moved = signed(trade.side, trade.quantity.abs()) - trade.fees.fees;
     Some(unsigned(moved, trade.side))
+}
+
+/// `quantity` rounded toward zero to a whole multiple of `step`, on either side of zero. A
+/// `step` not above zero leaves it as it is.
+pub(crate) fn round_toward_zero_to_step(quantity: Decimal, step: Decimal) -> Decimal {
+    if step <= Decimal::ZERO {
+        return quantity;
+    }
+    // `%` keeps the dividend's sign, so the remainder always lies between `quantity` and zero.
+    quantity - quantity % step
 }
 
 /// `quantity` with the sign of `side`: positive for a buy, or for a long position.
@@ -4697,6 +4714,58 @@ mod tests {
         assert_eq!(
             state.position.positions[&PositionId::new("other")].quantity_abs,
             dec!(0.99)
+        );
+    }
+
+    /// A buy with a base fee that flips a short rounds the long it opens. From a short of 0.5, a
+    /// buy of 1.01 with a fee of 0.001 holds 0.509: the position books a long of 0.5, a move of 1,
+    /// and the fee with the 0.009 written off is split between the two halves.
+    #[test]
+    fn a_base_fee_netted_flip_rounds_the_position_it_opens() {
+        let mut state = stepped_state();
+        let (base, quote) = (
+            state.instrument.underlying.base,
+            state.instrument.underlying.quote,
+        );
+        let _ =
+            state.update_from_trade(&fill_charging(Side::Sell, dec!(0.5), quote, Decimal::ZERO));
+
+        let exited = state
+            .update_from_trade(&fill_charging(Side::Buy, dec!(1.01), base, dec!(0.001)))
+            .expect("the buy closes the short");
+
+        assert_eq!(exited.pnl_realised, dec!(-0.5));
+        let position = netting_position(&state).unwrap();
+        assert_eq!(
+            (position.side, position.quantity_abs),
+            (Side::Buy, dec!(0.5))
+        );
+        assert_eq!(position.fees_enter.fees_quote, Some(dec!(0.5)));
+        assert_eq!(
+            (state.tear_sheet.fills_dust, state.tear_sheet.dust),
+            (1, dec!(0.9))
+        );
+    }
+
+    /// A sell with a base fee from flat opens a short of what it sold, rounded toward zero. The
+    /// fee is base still owed on the loan, so nothing is written off and the fee is as charged.
+    #[test]
+    fn a_sell_with_a_base_fee_opening_a_short_writes_nothing_off() {
+        let mut state = stepped_state();
+        let base = state.instrument.underlying.base;
+
+        let _ = state.update_from_trade(&fill_charging(Side::Sell, dec!(1), base, dec!(0.001)));
+
+        let position = netting_position(&state).unwrap();
+        assert_eq!(
+            (position.side, position.quantity_abs),
+            (Side::Sell, dec!(1))
+        );
+        assert_eq!(position.fees_enter.fees, dec!(0.001));
+        assert_eq!(position.fees_enter.fees_quote, Some(dec!(0.1)));
+        assert_eq!(
+            (state.tear_sheet.fills_dust, state.tear_sheet.dust),
+            (1, Decimal::ZERO)
         );
     }
 }

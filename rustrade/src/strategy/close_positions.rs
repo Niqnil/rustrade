@@ -1,6 +1,9 @@
 use crate::engine::state::{
     EngineState,
-    instrument::{InstrumentState, data::InstrumentDataState, filter::InstrumentFilter},
+    instrument::{
+        InstrumentState, data::InstrumentDataState, filter::InstrumentFilter,
+        round_toward_zero_to_step,
+    },
     position::Position,
 };
 use rust_decimal::Decimal;
@@ -94,12 +97,12 @@ where
             // Generate one closing order per open position.
             // In Netting mode there is at most one position; in Hedging mode there may be N.
             // Each order carries the PositionId so hedging-mode fills route to the right slot.
+            let step = state.instrument.quantity_step();
             state
                 .position
                 .positions
                 .iter()
                 .filter_map(move |(pos_id, position)| {
-                    let step = state.instrument.quantity_step();
                     let Some(mut req) = build_ioc_market_order_to_close_position(
                         state.instrument.exchange,
                         position,
@@ -131,8 +134,13 @@ where
 /// For example, if [`Position`] is LONG by 100, build a market order request to sell 100.
 ///
 /// A venue fills only whole multiples of its quantity step, so pass the instrument's
-/// [`quantity_step`](rustrade_instrument::instrument::Instrument::quantity_step). `None` sends the
-/// position's exact quantity, which a venue may reject or round when it is off the step.
+/// [`quantity_step`](rustrade_instrument::instrument::Instrument::quantity_step). `None`, or a
+/// step not above zero, sends the position's exact quantity, which a venue may reject or round
+/// when it is off the step.
+///
+/// Rounding a short's close toward zero leaves any part of its debt below one step unpaid, and
+/// the position open by that much. The engine keeps a position netted with a base-asset fee on
+/// the step, so this happens only to a position that came off it some other way.
 ///
 /// Returns `None`, without calling `gen_cid`, when the rounded quantity is zero: a position
 /// smaller than one step, which no order can close. The caller decides how to report it.
@@ -147,10 +155,9 @@ where
     ExchangeKey: Clone,
     InstrumentKey: Clone,
 {
-    let quantity = match quantity_step {
-        Some(step) => position.quantity_abs - position.quantity_abs % step,
-        None => position.quantity_abs,
-    };
+    let quantity = quantity_step.map_or(position.quantity_abs, |step| {
+        round_toward_zero_to_step(position.quantity_abs, step)
+    });
     if quantity.is_zero() {
         return None;
     }
@@ -232,6 +239,16 @@ mod tests {
         let request = close(&long(dec!(0.999)), None).unwrap();
 
         assert_eq!(request.state.quantity, dec!(0.999));
+    }
+
+    /// A step not above zero is no step: the close sends the exact quantity rather than panic.
+    #[test]
+    fn a_close_with_a_step_not_above_zero_sends_the_exact_quantity() {
+        for step in [Decimal::ZERO, dec!(-0.01)] {
+            let request = close(&long(dec!(0.999)), Some(step)).unwrap();
+
+            assert_eq!(request.state.quantity, dec!(0.999));
+        }
     }
 
     /// The naive strategy rounds each close to its instrument's step, and sends none for a
