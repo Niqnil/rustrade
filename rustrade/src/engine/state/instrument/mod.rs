@@ -30,7 +30,7 @@ use rustrade_execution::{
     trade::{AssetFees, Trade, TradeOrigin},
 };
 use rustrade_instrument::{
-    Keyed, Side, Underlying,
+    Keyed, Side,
     asset::{AssetIndex, name::AssetNameExchange},
     corporate_action::SplitRatio,
     exchange::{ExchangeId, ExchangeIndex},
@@ -855,7 +855,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// `exchange` — the identity match shared by the kind-specific predicates above, with no
     /// [`InstrumentKind`] constraint of its own.
     ///
-    /// Both `base` AND `quote` are matched: [`Underlying`]
+    /// Both `base` AND `quote` are matched: [`Underlying`](rustrade_instrument::Underlying)
     /// is a full pair identity, so without the quote filter a BTC/USDT action would also reach
     /// BTC/USDC instruments.
     fn is_on_underlying(&self, base: &AssetKey, quote: &AssetKey, exchange: &ExchangeKey) -> bool
@@ -1518,26 +1518,27 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         }
     }
 
-    /// `netted`, a spot fill with its base-asset fee netted from its quantity, moved so the
-    /// position at `position_id` lands on the instrument's quantity step, rounded toward zero.
-    /// Unchanged when the instrument has no step, or the position already lands on it. See the
-    /// base-asset fee section of [`Self::update_from_trade`].
+    /// `effective`, a spot fill whose venue-reported `trade` carries a fee in the base asset,
+    /// moved as [`Trade::holding_move`] says for the position at `position_id`, as it stands
+    /// before the fill. `None` for any other fill. See the base-asset fee section of
+    /// [`Self::update_from_trade`].
     ///
-    /// When it rounds, it also adds a long's remainder to the fill's fee, logs the fill at INFO
-    /// and counts it on the tear sheet.
-    fn floor_to_quantity_step(
+    /// Two copies of one fill, because the move nets only the fee the venue reported, read from
+    /// `trade`, while the fill booked keeps everything else of `effective`, the fee this state's
+    /// fee model added included.
+    ///
+    /// When the move rounds the position to the quantity step, it also adds a long's remainder
+    /// to the fill's fee, logs the fill at INFO and counts it on the tear sheet.
+    fn net_base_fee(
         &mut self,
-        mut netted: Trade<AssetKey, InstrumentKey>,
+        trade: &Trade<AssetKey, InstrumentKey>,
+        effective: &Trade<AssetKey, InstrumentKey>,
         position_id: &PositionId,
-    ) -> Trade<AssetKey, InstrumentKey>
+    ) -> Option<Trade<AssetKey, InstrumentKey>>
     where
-        AssetKey: PartialEq,
-        InstrumentKey: Debug,
+        AssetKey: Clone + PartialEq,
+        InstrumentKey: Clone + Debug,
     {
-        let Some(step) = self.instrument.quantity_step() else {
-            return netted;
-        };
-
         let held = self
             .position
             .positions
@@ -1545,22 +1546,22 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             .map_or(Decimal::ZERO, |position| {
                 signed(position.side, position.quantity_abs)
             });
-        let holds = held + signed(netted.side, netted.quantity);
-        let rounded = round_toward_zero_to_step(holds, step);
-        let remainder = holds - rounded;
-        if remainder.is_zero() {
-            return netted;
-        }
+        let moved = trade.holding_move(&self.instrument, held)?;
 
-        (netted.side, netted.quantity) = unsigned(rounded - held, netted.side);
+        let mut netted = effective.clone();
+        netted.side = moved.side;
+        netted.quantity = moved.quantity;
+        if moved.dust.is_zero() {
+            return Some(netted);
+        }
 
         // A long's remainder is base the account holds but cannot sell: written off at the fill's
         // price, as a fee of the fill, so the fill's PnL still totals what it paid. A short's is
         // base still owed on the loan: the position books it bought back at the fill's price,
         // which values the debt at that price, so nothing is written off.
-        let written_off = if remainder.is_sign_positive() {
-            let value = remainder * netted.price;
-            netted.fees.fees += remainder;
+        let written_off = if moved.dust.is_sign_positive() {
+            let value = moved.dust * netted.price;
+            netted.fees.fees += moved.dust;
             // The value is in quote terms, so it adds to the quote equivalent PnL charges even
             // when the base fee itself has none (one the indexer zeroed).
             netted.fees.fees_quote = Some(netted.fees.fees_quote.unwrap_or(Decimal::ZERO) + value);
@@ -1573,14 +1574,15 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             instrument = ?netted.instrument,
             order_id = %netted.order_id,
             %position_id,
-            %step,
-            %remainder,
+            // Dust is only ever rounded off to a step, so there is one here.
+            step = %self.instrument.quantity_step().unwrap_or_default(),
+            remainder = %moved.dust,
             %written_off,
             "base-asset fee left the holding off the quantity step: position rounded toward zero, \
              the remainder left in the balance"
         );
         self.tear_sheet.record_fill_dust(written_off);
-        netted
+        Some(netted)
     }
 
     /// Which leg of a venue settlement an orderless `origin` is on this instrument, or `None` for
@@ -1733,6 +1735,9 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// - **Only the fee the venue reported.** A fee from this state's own fee model is in quote,
     ///   so it reaches PnL alone.
     /// - **Not a capped settlement fill** (see below), which closes the whole position it reduces.
+    ///
+    /// [`Trade::holding_move`] is this rule, as a function a component mirroring positions
+    /// outside the engine can call to agree with it.
     ///
     /// # Forced fills
     ///
@@ -2042,17 +2047,9 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         // Only the fee the venue reported is netted, read from `trade`. What the engine's fee model
         // added in step 2 is a quote amount, summed into the same field whatever its asset.
         let netted = match capped_settlement {
-            None => base_fee_move(trade, &self.instrument.kind, &self.instrument.underlying).map(
-                |(side, quantity)| {
-                    let mut netted = effective_trade.clone();
-                    netted.side = side;
-                    netted.quantity = quantity;
-                    netted
-                },
-            ),
+            None => self.net_base_fee(trade, effective_trade, &position_id),
             Some(_) => None,
         };
-        let netted = netted.map(|netted| self.floor_to_quantity_step(netted, &position_id));
         let effective_trade = netted.as_ref().unwrap_or(effective_trade);
 
         // Step 3: Update the position.
@@ -2335,65 +2332,12 @@ impl std::fmt::Display for SettlementFillUnplaced {
     }
 }
 
-/// The side and quantity of the holding `trade` moves, when it is a spot fill whose fee the venue
-/// charged in the instrument's base asset; `None` otherwise.
-///
-/// The fee leaves the account in base, on either side, so the holding moves by the signed
-/// quantity less the fee: a buy of `q` with a base fee `f` holds `q − f`, and a sell delivers
-/// `q + f`. A negative fee, a rebate, adds to it. The result's side is the sign of that move, so
-/// a fee larger than a buy's quantity sells, and a move of zero keeps the fill's side with a
-/// quantity of zero. The caller keeps the fill's price and fees, so PnL is charged the fee's quote
-/// equivalent while the netted quantity carries the fill's price: buying `q − f` at `p` and
-/// paying `f × p` costs `q × p`, what the fill paid.
-///
-/// Spot only, spot margin included. A derivative's position is counted in contracts, and an
-/// inverse contract pays its fees in the settlement coin, so a fee there is not a holding.
-fn base_fee_move<AssetKey, InstrumentKey>(
-    trade: &Trade<AssetKey, InstrumentKey>,
-    kind: &InstrumentKind<AssetKey>,
-    underlying: &Underlying<AssetKey>,
-) -> Option<(Side, Decimal)>
-where
-    AssetKey: PartialEq,
-{
-    if !matches!(kind, InstrumentKind::Spot)
-        || trade.fees.asset != underlying.base
-        || trade.fees.fees.is_zero()
-    {
-        return None;
-    }
-
-    let moved = signed(trade.side, trade.quantity.abs()) - trade.fees.fees;
-    Some(unsigned(moved, trade.side))
-}
-
-/// `quantity` rounded toward zero to a whole multiple of `step`, on either side of zero. A
-/// `step` not above zero leaves it as it is.
-pub(crate) fn round_toward_zero_to_step(quantity: Decimal, step: Decimal) -> Decimal {
-    if step <= Decimal::ZERO {
-        return quantity;
-    }
-    // `%` keeps the dividend's sign, so the remainder always lies between `quantity` and zero.
-    quantity - quantity % step
-}
-
 /// `quantity` with the sign of `side`: positive for a buy, or for a long position.
 fn signed(side: Side, quantity: Decimal) -> Decimal {
     match side {
         Side::Buy => quantity,
         Side::Sell => -quantity,
     }
-}
-
-/// The side and size of a signed move: a buy if positive, a sell if negative, and `at_zero`
-/// with a size of zero if it moves nothing.
-fn unsigned(moved: Decimal, at_zero: Side) -> (Side, Decimal) {
-    let side = match moved.cmp(&Decimal::ZERO) {
-        std::cmp::Ordering::Greater => Side::Buy,
-        std::cmp::Ordering::Less => Side::Sell,
-        std::cmp::Ordering::Equal => at_zero,
-    };
-    (side, moved.abs())
 }
 
 /// `trade` cut to `held`, keeping its sign, with its fees cut in proportion. `held` is less than

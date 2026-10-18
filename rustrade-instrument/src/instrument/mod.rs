@@ -205,6 +205,8 @@ impl<ExchangeKey, AssetKey> Instrument<ExchangeKey, AssetKey> {
     /// one unit of its base (`contract_size` 1) accepts the base asset too, since the two units
     /// are then the same. A step in [`OrderQuantityUnits::Quote`], in another asset, or not above
     /// zero says nothing about a position's quantity, so it gives `None`, as no spec does.
+    ///
+    /// Round a quantity to it with [`round_toward_zero_to_step`].
     pub fn quantity_step(&self) -> Option<Decimal>
     where
         AssetKey: PartialEq,
@@ -358,6 +360,19 @@ impl<ExchangeKey, AssetKey> Instrument<ExchangeKey, AssetKey> {
             data_venue,
         })
     }
+}
+
+/// `quantity` rounded toward zero to a whole multiple of `step`, on either side of zero. A
+/// `step` not above zero leaves it as it is.
+///
+/// Toward zero shrinks a quantity's size whatever its sign, so a long and a short of the same size
+/// round to the same size: `1.019` and `-1.019` in steps of `0.01` give `1.01` and `-1.01`.
+pub fn round_toward_zero_to_step(quantity: Decimal, step: Decimal) -> Decimal {
+    if step <= Decimal::ZERO {
+        return quantity;
+    }
+    // `%` keeps the dividend's sign, so the remainder always lies between `quantity` and zero.
+    quantity - quantity % step
 }
 
 impl<ExchangeKey> From<&Instrument<ExchangeKey, Asset>> for MarketDataInstrument {
@@ -640,6 +655,37 @@ mod tests {
         for increment in [Decimal::ZERO, dec!(-0.01)] {
             let instrument = with_quantity_spec(instrument(None), aapl(), increment);
             assert_eq!(instrument.quantity_step(), None, "increment {increment}");
+        }
+    }
+
+    #[test]
+    fn round_toward_zero_to_step_shrinks_either_sign_to_a_whole_step() {
+        let cases = [
+            (dec!(1.019), dec!(1.01)),
+            (dec!(-1.019), dec!(-1.01)),
+            (dec!(1.01), dec!(1.01)),
+            (dec!(0.009), Decimal::ZERO),
+            (dec!(-0.009), Decimal::ZERO),
+            (Decimal::ZERO, Decimal::ZERO),
+        ];
+
+        for (quantity, rounded) in cases {
+            assert_eq!(
+                round_toward_zero_to_step(quantity, dec!(0.01)),
+                rounded,
+                "{quantity}"
+            );
+        }
+    }
+
+    #[test]
+    fn round_toward_zero_to_step_leaves_the_quantity_unless_the_step_is_above_zero() {
+        for step in [Decimal::ZERO, dec!(-0.01)] {
+            assert_eq!(
+                round_toward_zero_to_step(dec!(1.019), step),
+                dec!(1.019),
+                "step {step}"
+            );
         }
     }
 }
