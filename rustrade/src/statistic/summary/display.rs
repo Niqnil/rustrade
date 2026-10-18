@@ -186,6 +186,9 @@ where
         self.add_instrument_metric_row(&mut table, "Dust Written Off", |ts| {
             format!("{:.2}", ts.dust)
         });
+        self.add_instrument_metric_row(&mut table, "Reduce-Only Excess", |ts| {
+            format!("{:.2}", ts.reduce_only_excess)
+        });
         self.add_instrument_metric_row(&mut table, &format!("Return {interval}"), |ts| {
             format_percentage(ts.pnl_return.value, 2)
         });
@@ -380,6 +383,7 @@ mod tests {
             fills_forced: 0,
             fills_unallocated: 0,
             fills_dust: 0,
+            fills_reduce_only_capped: 0,
         }
     }
 
@@ -441,6 +445,7 @@ mod tests {
             fills_forced: 0,
             fills_unallocated: 0,
             fills_dust: 0,
+            fills_reduce_only_capped: 0,
         }
     }
 
@@ -513,6 +518,25 @@ mod tests {
             .find(|line| line.contains("Dust Written Off"))
             .unwrap_or_else(|| panic!("no Dust Written Off row in:\n{rendered}"));
         assert!(row.contains("0.90"));
+    }
+
+    /// The instrument table shows the value of the reduce-only fills' excess.
+    #[test]
+    fn instrument_table_shows_reduce_only_excess() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fill_reduce_only_capped(dec!(49));
+        let mut summary = summary_with_fallback(0, 0, None);
+        summary.instruments.insert(
+            InstrumentNameInternal::new("btc_usdt"),
+            generator.generate(Decimal::ZERO, Annual365),
+        );
+
+        let rendered = summary.instrument_table().to_string();
+        let row = rendered
+            .lines()
+            .find(|line| line.contains("Reduce-Only Excess"))
+            .unwrap_or_else(|| panic!("no Reduce-Only Excess row in:\n{rendered}"));
+        assert!(row.contains("49.00"));
     }
 
     #[test]

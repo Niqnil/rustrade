@@ -14,7 +14,7 @@ use crate::{
 use rustrade_integration::collection::none_one_or_many::NoneOneOrMany;
 // (used by `update_from_event` to inspect the live engine's outputs)
 use rustrade_data::{event::MarketEvent, streams::consumer::MarketStreamEvent};
-use rustrade_execution::AccountEvent;
+use rustrade_execution::{AccountEvent, trade::TradeId};
 use rustrade_instrument::{
     corporate_action::CorporateActionKind,
     instrument::{InstrumentIndex, kind::InstrumentKind},
@@ -40,6 +40,10 @@ pub const AUDIT_REPLICA_STATE_UPDATE_SPAN_NAME: &str = "audit_replica_state_upda
 /// engine has just opened and still show as open an order the engine is cancelling. It catches up
 /// from the venue's answer on the account stream: an active order snapshot inserts an order it
 /// does not hold, and a cancel confirmation or fill updates it as on the live engine.
+///
+/// Nor does it learn which orders were sent reduce-only. It cuts a reduce-only fill as the
+/// engine did because the engine's [`EngineOutput::ReduceOnlyCapped`] output names each fill it
+/// cut.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct StateReplicaManager<State, Updates> {
     pub meta_start: EngineMeta,
@@ -151,6 +155,11 @@ where
     ///   Deferred fill replay (`update_from_order_snapshot`) also runs here, keeping the
     ///   replica's `pending_fills` in sync without needing the live engine's outputs.
     ///
+    /// - **`Trade`** (via `Account` arm): replayed like `OrderSnapshot`, with one input taken
+    ///   from `outputs`: the fills the live engine cut as reduce-only, which its
+    ///   `ReduceOnlyCapped` outputs name. Whether an order was reduce-only is known only from the
+    ///   request the engine sent, which the replica does not record (see the type's docs).
+    ///
     /// - **`ContractExpiry`**: consults `outputs` from the live engine rather than replaying
     ///   the event. This is necessary because `process_contract_expiry` is *conditional*: it
     ///   declines to settle (emitting `ContractExpiryNotSettled` and no exits) when the event names
@@ -201,8 +210,19 @@ where
                         .replica_engine_state_mut()
                         .update_from_account_reconnecting(&exchange);
                 }
+                // The fills the live engine cut as reduce-only: the replica records no request in
+                // flight, so it cannot find the flag itself (see `replay_account`).
                 AccountStreamEvent::Item(event) => {
-                    self.replica_engine_state_mut().update_from_account(&event);
+                    let reduce_only_fills: Vec<TradeId> = outputs
+                        .iter()
+                        .filter_map(|output| match output {
+                            EngineOutput::ReduceOnlyCapped(capped) => Some(capped.trade_id.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    let _applied = self
+                        .replica_engine_state_mut()
+                        .replay_account(&event, &reduce_only_fills);
                 }
             },
             EngineEvent::Market(event) => match event {
@@ -280,19 +300,13 @@ where
                     // orders arrive async in the live engine (and are processed benignly),
                     // but the replica doesn't need to process them.
                     instrument_state.orders.clear();
-                    instrument_state.exchange_id_to_cid.clear();
-                    instrument_state.retired_routing.clear();
-                    instrument_state.position_ids.clear();
-                    instrument_state.pending_fills.clear();
+                    instrument_state.clear_order_routing();
                     instrument_state.expiration_processed = true;
                 } else if instrument_state.position.positions.is_empty()
                     || instrument_state.expiry_handling == ExpiryHandling::Venue
                 {
                     instrument_state.orders.clear();
-                    instrument_state.exchange_id_to_cid.clear();
-                    instrument_state.retired_routing.clear();
-                    instrument_state.position_ids.clear();
-                    instrument_state.pending_fills.clear();
+                    instrument_state.clear_order_routing();
                     instrument_state.expiration_processed = true;
                 }
             }

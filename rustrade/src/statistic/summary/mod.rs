@@ -106,6 +106,14 @@ pub struct TradingSummary<Interval> {
     /// [`TearSheet::fills_dust`](instrument::TearSheet::fills_dust).
     #[serde(default)]
     pub fills_dust: usize,
+
+    /// Fills of reduce-only orders this session that the engine cut so they would not grow or
+    /// flip a position, summed over every instrument. Routine for an order sized above its
+    /// position on purpose; each instrument's excess value is its
+    /// [`TearSheet::reduce_only_excess`](instrument::TearSheet::reduce_only_excess). See
+    /// [`TearSheet::fills_reduce_only_capped`](instrument::TearSheet::fills_reduce_only_capped).
+    #[serde(default)]
+    pub fills_reduce_only_capped: usize,
 }
 
 impl<Interval> TradingSummary<Interval> {
@@ -283,9 +291,13 @@ impl TradingSummaryGenerator {
             fills_forced,
             fills_unallocated,
             fills_dust,
+            fills_reduce_only_capped,
         ) = self.instruments.values().fold(
-            (0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize),
-            |(opened, rejected, fallback, unmatched, forced, unallocated, dust), generator| {
+            (
+                0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize,
+            ),
+            |(opened, rejected, fallback, unmatched, forced, unallocated, dust, capped),
+             generator| {
                 (
                     opened.saturating_add(generator.orders_opened),
                     rejected.saturating_add(generator.orders_rejected),
@@ -294,6 +306,7 @@ impl TradingSummaryGenerator {
                     forced.saturating_add(generator.fills_forced),
                     unallocated.saturating_add(generator.fills_unallocated),
                     dust.saturating_add(generator.fills_dust),
+                    capped.saturating_add(generator.fills_reduce_only_capped),
                 )
             },
         );
@@ -311,6 +324,7 @@ impl TradingSummaryGenerator {
             fills_forced,
             fills_unallocated,
             fills_dust,
+            fills_reduce_only_capped,
         }
     }
 }
@@ -460,6 +474,48 @@ mod tests {
         assert!(
             summary.has_split_positions(),
             "a split on any instrument is a split for the session"
+        );
+    }
+
+    /// Every session counter sums its own tear-sheet counter, each set to a distinct value here so
+    /// that one summed into another's slot shows.
+    #[test]
+    fn generate_sums_each_counter_into_its_own_total() {
+        let mut instruments = FnvIndexMap::default();
+        for (name, base) in [("btc_usdt", 1usize), ("eth_usdt", 100)] {
+            let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+            generator.orders_opened = base;
+            generator.orders_rejected = 2 * base;
+            generator.fills_routed_by_fallback = 3 * base;
+            generator.fills_unmatched = 4 * base;
+            generator.fills_forced = 5 * base;
+            generator.fills_unallocated = 6 * base;
+            generator.fills_dust = 7 * base;
+            generator.fills_reduce_only_capped = 8 * base;
+            instruments.insert(InstrumentNameInternal::new(name), generator);
+        }
+
+        let summary = TradingSummaryGenerator::new(
+            dec!(0),
+            DateTime::<Utc>::MIN_UTC,
+            DateTime::<Utc>::MIN_UTC,
+            instruments,
+            FnvIndexMap::default(),
+        )
+        .generate(Annual365);
+
+        assert_eq!(
+            [
+                summary.orders_opened,
+                summary.orders_rejected,
+                summary.fills_routed_by_fallback,
+                summary.fills_unmatched,
+                summary.fills_forced,
+                summary.fills_unallocated,
+                summary.fills_dust,
+                summary.fills_reduce_only_capped,
+            ],
+            [101, 202, 303, 404, 505, 606, 707, 808]
         );
     }
 

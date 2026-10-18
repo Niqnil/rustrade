@@ -244,7 +244,7 @@ fn run(fee_model: FeeModelConfig, spot_fee_asset: SpotFeeAsset, seed: u64) -> Ru
                     }
                 }
             }
-            if let Some(exited) = engine.update_from_account(&event) {
+            if let Some(exited) = engine.update_from_account(&event).exited {
                 realised_exited += exited.pnl_realised;
             }
         }

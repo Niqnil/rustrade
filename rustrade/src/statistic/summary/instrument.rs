@@ -72,6 +72,18 @@ pub struct TearSheet<Interval> {
     #[serde(default)]
     pub dust: Decimal,
 
+    /// The excess of reduce-only fills the engine cut, valued at each fill's price, in the
+    /// instrument's quote asset, as a size: the part of each fill no position took. See
+    /// [`Self::fills_reduce_only_capped`].
+    ///
+    /// Reported only, not charged to `pnl`: the account still holds the excess, or the venue
+    /// spent it, as on a margin repayment sized to cover interest, and only the caller knows
+    /// which.
+    ///
+    /// `#[serde(default)]` so tear sheets serialised before this field existed still load.
+    #[serde(default)]
+    pub reduce_only_excess: Decimal,
+
     pub pnl_return: RateOfReturn<Interval>,
     pub sharpe_ratio: SharpeRatio<Interval>,
     pub sortino_ratio: SortinoRatio<Interval>,
@@ -162,6 +174,18 @@ pub struct TearSheet<Interval> {
     #[serde(default)]
     pub fills_dust: usize,
 
+    /// Fills of reduce-only orders the engine cut so they would not grow or flip the position
+    /// they reduce, or applied none of, because the position was flat or on the fill's side.
+    ///
+    /// The excess is applied to no position, its value summed in [`Self::reduce_only_excess`],
+    /// and its share of the fill's fees charged to [`Self::fees_unattributed`]. Each is logged at
+    /// WARN. Unlike [`Self::fills_unallocated`], this is no sign the engine's positions differ
+    /// from the venue's: an order sized above its position on purpose, such as a margin
+    /// repayment covering interest, is cut every time. See the reduce-only section of
+    /// [`InstrumentState::update_from_trade`](crate::engine::state::instrument::InstrumentState::update_from_trade).
+    #[serde(default)]
+    pub fills_reduce_only_capped: usize,
+
     /// Why the first fill of either kind above could not be routed.
     ///
     /// Shared by both counters, for the same reason [`Self::first_rejection_reason`] exists: the
@@ -234,6 +258,14 @@ pub struct TearSheetGenerator {
     #[serde(default)]
     pub dust: Decimal,
 
+    /// Reduce-only fills cut. See [`TearSheet::fills_reduce_only_capped`].
+    #[serde(default)]
+    pub fills_reduce_only_capped: usize,
+
+    /// Value of the reduce-only fills' excess. See [`TearSheet::reduce_only_excess`].
+    #[serde(default)]
+    pub reduce_only_excess: Decimal,
+
     /// First unroutable-fill detail seen. See [`TearSheet::first_fallback_detail`].
     #[serde(default)]
     pub first_fallback_detail: Option<String>,
@@ -262,6 +294,8 @@ impl TearSheetGenerator {
             fills_unallocated: 0,
             fills_dust: 0,
             dust: Decimal::ZERO,
+            fills_reduce_only_capped: 0,
+            reduce_only_excess: Decimal::ZERO,
             first_fallback_detail: None,
             fallback_positions: Vec::new(),
         }
@@ -332,6 +366,22 @@ impl TearSheetGenerator {
                 dust_held = %self.dust,
                 written_off = %written_off,
                 "dust accumulation overflowed Decimal; holding last-good value"
+            ),
+        }
+    }
+
+    /// Record a reduce-only fill the engine cut, and its excess's value, as a size. See
+    /// [`TearSheet::fills_reduce_only_capped`].
+    ///
+    /// Holds its last-good total on overflow and emits a `warn!`, as the PnL totals do.
+    pub fn record_fill_reduce_only_capped(&mut self, excess_value: Decimal) {
+        self.fills_reduce_only_capped = self.fills_reduce_only_capped.saturating_add(1);
+        match self.reduce_only_excess.checked_add(excess_value) {
+            Some(new_total) => self.reduce_only_excess = new_total,
+            None => warn!(
+                reduce_only_excess_held = %self.reduce_only_excess,
+                excess_value = %excess_value,
+                "reduce-only excess accumulation overflowed Decimal; holding last-good value"
             ),
         }
     }
@@ -463,6 +513,7 @@ impl TearSheetGenerator {
             carry: self.pnl_returns.carry,
             fees_unattributed: self.pnl_returns.fees_unattributed,
             dust: self.dust,
+            reduce_only_excess: self.reduce_only_excess,
             pnl_return,
             pnl_drawdown: current_pnl_drawdown,
             pnl_drawdown_mean,
@@ -477,6 +528,7 @@ impl TearSheetGenerator {
             fills_forced: self.fills_forced,
             fills_unallocated: self.fills_unallocated,
             fills_dust: self.fills_dust,
+            fills_reduce_only_capped: self.fills_reduce_only_capped,
             first_fallback_detail: self.first_fallback_detail.clone(),
             fallback_positions: self.fallback_positions.clone(),
         }
@@ -522,6 +574,40 @@ mod tests {
 
         let loaded: TearSheet<Annual365> = serde_json::from_value(value).unwrap();
         assert_eq!((loaded.fills_dust, loaded.dust), (0, Decimal::ZERO));
+    }
+
+    #[test]
+    fn a_tear_sheet_serialised_before_reduce_only_excess_loads_with_zero() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fill_reduce_only_capped(dec!(49));
+        let mut value = serde_json::to_value(generator.generate(Decimal::ZERO, Annual365)).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        fields.remove("reduce_only_excess").unwrap();
+        fields.remove("fills_reduce_only_capped").unwrap();
+
+        let loaded: TearSheet<Annual365> = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            (loaded.fills_reduce_only_capped, loaded.reduce_only_excess),
+            (0, Decimal::ZERO)
+        );
+    }
+
+    /// A reduce-only excess total that would overflow holds its last-good value, and the fill is
+    /// still counted.
+    #[test]
+    fn reduce_only_excess_holds_its_last_good_total_on_overflow() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fill_reduce_only_capped(Decimal::MAX);
+
+        generator.record_fill_reduce_only_capped(Decimal::ONE);
+
+        assert_eq!(
+            (
+                generator.fills_reduce_only_capped,
+                generator.reduce_only_excess
+            ),
+            (2, Decimal::MAX)
+        );
     }
 
     /// A dust total that would overflow holds its last-good value, and the fill is still counted.
