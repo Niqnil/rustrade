@@ -441,21 +441,7 @@ impl AccountState {
         time_exchange: DateTime<Utc>,
     ) -> AssetBalance<AssetNameExchange> {
         let lends = self.lends();
-        let margin = self.margin.map(|_| MarginDetails::default());
-        let balance = match self.balances.get_mut(&delivery.asset) {
-            Some(balance) => balance,
-            None => self
-                .balances
-                .entry(delivery.asset.clone())
-                .or_insert_with(|| AssetBalance {
-                    asset: delivery.asset.clone(),
-                    balance: Balance {
-                        margin,
-                        ..Balance::new(Decimal::ZERO, Decimal::ZERO)
-                    },
-                    time_exchange,
-                }),
-        };
+        let balance = self.balance_or_open(&delivery.asset, time_exchange);
 
         balance.balance.total += delivery.amount;
         balance.balance.free += delivery.amount;
@@ -507,15 +493,38 @@ impl AccountState {
         balance.clone()
     }
 
-    /// Lends `amount` of `asset`: `total` and `free` rise by it, and so does the loan.
-    fn borrow(&mut self, asset: &AssetNameExchange, amount: Decimal) {
-        let balance = &mut self.balance_expect(asset).balance;
+    /// Lends `amount` of `asset`: `total` and `free` rise by it, and so does the loan. An asset the
+    /// account has never held is opened at zero first, as a delivery opens one.
+    fn borrow(&mut self, asset: &AssetNameExchange, amount: Decimal, time_exchange: DateTime<Utc>) {
+        let balance = &mut self.balance_or_open(asset, time_exchange).balance;
         balance.total += amount;
         balance.free += amount;
         balance
             .margin
             .get_or_insert_with(MarginDetails::default)
             .borrowed += amount;
+    }
+
+    /// `asset`'s balance, opened at zero if the account has never held it, reporting a loan from
+    /// the start on a margin account.
+    fn balance_or_open(
+        &mut self,
+        asset: &AssetNameExchange,
+        time_exchange: DateTime<Utc>,
+    ) -> &mut AssetBalance<AssetNameExchange> {
+        let margin = self.margin.map(|_| MarginDetails::default());
+        // `SmolStr` clones without allocating for an asset name, so the entry API costs nothing
+        // on the common path where the balance exists.
+        self.balances
+            .entry(asset.clone())
+            .or_insert_with(|| AssetBalance {
+                asset: asset.clone(),
+                balance: Balance {
+                    margin,
+                    ..Balance::new(Decimal::ZERO, Decimal::ZERO)
+                },
+                time_exchange,
+            })
     }
 
     /// Commits one arriving order's whole ledger effect, or none of it.
@@ -563,7 +572,9 @@ impl AccountState {
     /// On an account that [`lends`](Self::lends), a requirement `free` and the credit do not cover
     /// borrows the shortfall of the paying asset, if it is at most `borrowable`, the most the
     /// venue will lend of it now. The loan is taken with the rest of the arrival, or not at all.
-    /// [`Committed::borrowed`] says how much was lent. A cash account ignores `borrowable`.
+    /// [`Committed::borrowed`] says how much was lent. A paying asset the account has never held
+    /// has nothing free, and is opened when the loan is taken. A cash account ignores
+    /// `borrowable`, and a negative one lends nothing.
     ///
     /// # Errors
     /// [`BalanceInsufficient`], naming the asset short, if `free` plus a credit into the paying
@@ -572,8 +583,9 @@ impl AccountState {
     /// asset's `free`. The ledger is left untouched.
     ///
     /// # Panics
-    /// Panics if the paying asset has no balance — see [`reserve`](Self::reserve). Debug-asserts
-    /// that a [`PaidBack`](Credit::PaidBack) credit is not negative.
+    /// Panics if the paying asset has no balance and the arrival borrows none of it — see
+    /// [`reserve`](Self::reserve). Debug-asserts that a [`PaidBack`](Credit::PaidBack) credit is
+    /// not negative.
     pub fn commit(
         &mut self,
         debit: &Debit,
@@ -596,10 +608,14 @@ impl AccountState {
 
         // Asked for as one requirement, so a refusal refuses the arrival rather than half of it.
         // A margin account lends the shortfall, within what the venue allows.
+        // A margin account borrows even an asset it has never held, which it opens on lending.
         let required = debit.settled + debit.reserved;
-        let free = self.balance_expect(&debit.asset).balance.free;
-        let shortfall = required - (free + funding);
         let lends = self.lends();
+        let free = match lends {
+            true => self.free(&debit.asset),
+            false => self.balance_expect(&debit.asset).balance.free,
+        };
+        let shortfall = required - (free + funding);
         let borrowed = match shortfall > Decimal::ZERO {
             false => Decimal::ZERO,
             true if lends && shortfall <= borrowable => shortfall,
@@ -632,7 +648,7 @@ impl AccountState {
 
         // Applied only now that every requirement is covered, so a refusal moves nothing.
         if !borrowed.is_zero() {
-            self.borrow(&debit.asset, borrowed);
+            self.borrow(&debit.asset, borrowed, time_exchange);
         }
         if !funding.is_zero() {
             let balance = self.balance_expect(&debit.asset);

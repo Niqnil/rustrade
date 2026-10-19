@@ -103,8 +103,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A `SpotMarginConfig` makes the venue a cross margin account. Under
     `MarginSideEffect::AutoBorrowRepay` it lends an order the shortfall, and only the shortfall,
     of the asset it pays with: base for a sell, quote for a buy. It lends when it accepts the
-    order, so a resting limit order or a held market order is lent its shortfall at once. An order
-    that is cancelled or expires unfilled repays what it borrowed.
+    order, so a resting limit order or a held market order is lent its shortfall at once, and an
+    asset the account has never held is opened with the loan. An order that is cancelled or
+    expires unfilled repays what it borrowed, and a held order that fills for less than was held
+    repays the part of its loan it no longer needs.
   - Whatever a fill delivers into an asset the account owes repays that loan, interest first, then
     principal, and only the rest becomes free. A buy delivers its quantity less any fee charged
     in base, so a buy of exactly what is owed, with a base fee, leaves a fee-sized loan.

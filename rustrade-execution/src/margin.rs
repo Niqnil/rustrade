@@ -55,8 +55,10 @@ pub enum MarginSideEffect {
 /// balance borrows the shortfall, and only the shortfall, of the asset it pays with: base for a
 /// sell, quote for a buy. It borrows when the venue accepts the order, as Binance does, so a
 /// resting limit order or a held market order is lent its shortfall at once, and the venue holds
-/// it against the order as it holds any other balance. An order that is cancelled or expires
-/// before it fills repays what it borrowed, interest first. One that fills in part and rests the
+/// it against the order as it holds any other balance. An asset the account has never held is
+/// opened with the loan. An order that is cancelled or expires before it fills repays what it
+/// borrowed, interest first, and a held market order that fills for less than was held repays the
+/// part of its loan it no longer needs. One that fills in part and rests the
 /// remainder pays for the part that filled with the account's own balance first, so the loan is
 /// held against the remainder and repaid if the remainder is cancelled.
 ///
@@ -98,8 +100,9 @@ pub enum MarginSideEffect {
 /// - **Per-asset borrow limits and the venue's lending pool.** Only the leverage limit applies.
 /// - **Interest.** No interest is charged on a loan by this configuration alone.
 ///
-/// The constructors refuse a `max_leverage` below one, and so does deserialising one, so a
-/// configuration that exists is one the venue can apply.
+/// [`new`](Self::new) refuses a `max_leverage` below one, and so does deserialising one, so a
+/// configuration that exists is one the venue can apply. Serialised, `max_leverage` is a decimal
+/// string (`"3"`), as the crate writes decimals elsewhere, so no precision is lost to a float.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(try_from = "SpotMarginRepr", into = "SpotMarginRepr")]
 pub struct SpotMarginConfig(SpotMarginRepr);
@@ -144,7 +147,8 @@ impl SpotMarginConfig {
         &self.0.valuation_asset
     }
 
-    /// The most the account's debt may be, as a multiple of its equity, plus one.
+    /// The most the account may hold, as a multiple of its equity: its debt may reach
+    /// `max_leverage − 1` times its equity.
     pub fn max_leverage(&self) -> Decimal {
         self.0.max_leverage
     }
@@ -174,6 +178,7 @@ impl From<SpotMarginConfig> for SpotMarginRepr {
 
 /// Why a [`SpotMarginConfig`] was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
 pub enum SpotMarginConfigError {
     /// A `max_leverage` below one, which would allow less than the account's own equity.
     #[error("spot margin max_leverage {0} is below 1; a leverage of 1 lends nothing")]
