@@ -267,8 +267,8 @@ pub enum VenueRegime {
 ///   (see `# How a spot fill is accounted`). A missing balance to debit is a **panic**, not an error: the
 ///   balances are this venue's own fixture, so an absent one is a mis-specified test rather than a
 ///   runtime condition. A margin account that lends the debit is the exception: it opens the
-///   balance with the loan (see `# Spot margin`). A CFD settling in an account currency that is not the quote asset still
-///   needs the **quote** asset funded — see below.
+///   balance with the loan (see `# Spot margin`). A CFD settling in an account currency that is
+///   not the quote asset still needs the **quote** asset funded — see below.
 /// - **`CfdContract::settlement_asset` is not settled in.** A CFD routinely cash-settles in an
 ///   account currency that is not the quote asset (a GBP account trading a USD-quoted index), which
 ///   requires a quote→settlement conversion rate. This venue has no rate source and will not invent
@@ -11311,6 +11311,10 @@ mod tests {
         assert_eq!(
             balance_of(&events[0]).balance,
             Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("20"), Decimal::ZERO)
+        );
+        assert_eq!(
+            balance_of(&events[1]).balance,
+            Balance::new_margin(d("1.5"), d("1.5"), Decimal::ZERO, Decimal::ZERO)
         );
         assert_eq!(trade_of(&events[2]).price, d("80"));
     }
