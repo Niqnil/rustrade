@@ -37,6 +37,10 @@ pub struct Reservation {
     /// rested without trading, and the remainder alone for one the book filled in part before it
     /// rested, or one a configured `initial_state` seeded already part-filled.
     pub amount: Decimal,
+    /// How much of [`amount`](Self::amount) a margin account lent the order when it was placed,
+    /// repaid if the order ends unfilled. Zero on a cash account, and for an order the account
+    /// could pay for itself.
+    pub borrowed: Decimal,
 }
 
 /// One resting order, and whatever the venue is holding against it.
@@ -622,6 +626,7 @@ mod tests {
         let held = Reservation {
             asset: AssetNameExchange::new("usdt"),
             amount: dec!(98),
+            borrowed: Decimal::ZERO,
         };
 
         let Err(AlreadyResting(refused)) = open.insert(

@@ -104,6 +104,8 @@ pub use holding_cost::{
 };
 pub mod indexer;
 pub mod map;
+pub mod margin;
+pub use margin::{MarginSideEffect, SpotMarginConfig, SpotMarginConfigError};
 pub mod market;
 pub use market::{MarketBar, MarketDepth, MarketObservation, MarketSnapshot};
 pub mod notice;

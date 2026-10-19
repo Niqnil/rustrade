@@ -1,9 +1,10 @@
 use crate::{
     UnindexedAccountSnapshot,
-    balance::{AssetBalance, Balance},
+    balance::{AssetBalance, Balance, MarginDetails},
     exchange::mock::orders::{
         AlreadyResting, OpenOrder, OpenOrders, Reservation, RestingOrder, as_open,
     },
+    margin::MarginSideEffect,
     order::{
         Order, UnindexedInactiveOrder,
         id::ClientOrderId,
@@ -41,6 +42,9 @@ pub struct AccountState {
     /// in [`trades`](Self::trades). Grows with the run, like `trades` and `orders_cancelled`.
     orders_expired: FnvHashMap<ClientOrderId, Order<ExchangeId, InstrumentNameExchange, Expired>>,
     trades: Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
+    /// The policy of a margin account, or `None` for a cash account, which reports no loans and
+    /// borrows nothing. Set by [`enable_margin`](Self::enable_margin).
+    margin: Option<MarginSideEffect>,
 }
 
 impl AccountState {
@@ -60,7 +64,37 @@ impl AccountState {
             orders_filled: FnvHashMap::default(),
             orders_expired: FnvHashMap::default(),
             trades,
+            margin: None,
         }
+    }
+
+    /// Makes this a margin account applying `side_effect`: every balance reports its loan, and
+    /// under [`MarginSideEffect::AutoBorrowRepay`] the account borrows what an arrival lacks and
+    /// repays its loans from what it receives — see
+    /// [`SpotMarginConfig`](crate::margin::SpotMarginConfig).
+    ///
+    /// A balance that already reports a loan, as one seeded from a live margin account does, keeps
+    /// it; every other balance starts owing nothing.
+    pub fn enable_margin(&mut self, side_effect: MarginSideEffect) {
+        self.margin = Some(side_effect);
+        for balance in self.balances.values_mut() {
+            balance
+                .balance
+                .margin
+                .get_or_insert_with(MarginDetails::default);
+        }
+    }
+
+    /// Whether this account borrows what an arrival lacks and repays loans from what it receives.
+    pub fn lends(&self) -> bool {
+        self.margin == Some(MarginSideEffect::AutoBorrowRepay)
+    }
+
+    /// The free balance of `asset`, zero for an asset the account has never held.
+    pub fn free(&self, asset: &AssetNameExchange) -> Decimal {
+        self.balances
+            .get(asset)
+            .map_or(Decimal::ZERO, |balance| balance.balance.free)
     }
 
     /// This account's open orders, indexed for lookup and ordered for matching.
@@ -288,6 +322,7 @@ impl AccountState {
                 asset: asset.clone(),
                 free: balance.balance.free,
                 required: amount,
+                borrowable: None,
             });
         }
 
@@ -397,28 +432,99 @@ impl AccountState {
     /// **Unchecked**, like [`charge`](Self::charge): a negative delivery larger than `free` takes
     /// `free` below zero rather than being refused. [`commit`](Self::commit) is the checked path,
     /// and a fill that can be refused goes through it.
+    ///
+    /// On an account that [`lends`](Self::lends), what is delivered into an asset the account owes
+    /// repays that loan first, interest then principal, and only the rest is added to `free`.
     pub fn deliver(
         &mut self,
         delivery: &Delivery,
         time_exchange: DateTime<Utc>,
     ) -> AssetBalance<AssetNameExchange> {
-        let balance = match self.balances.get_mut(&delivery.asset) {
-            Some(balance) => balance,
-            None => self
-                .balances
-                .entry(delivery.asset.clone())
-                .or_insert_with(|| AssetBalance {
-                    asset: delivery.asset.clone(),
-                    balance: Balance::new(Decimal::ZERO, Decimal::ZERO),
-                    time_exchange,
-                }),
-        };
+        let lends = self.lends();
+        let balance = self.balance_or_open(&delivery.asset, time_exchange);
 
         balance.balance.total += delivery.amount;
         balance.balance.free += delivery.amount;
+        if lends {
+            repay(&mut balance.balance, delivery.amount);
+        }
         balance.time_exchange = time_exchange;
 
         balance.clone()
+    }
+
+    /// Gives `reservation` back to `free`, as [`release`](Self::release) does, then repays the
+    /// loan its order took when it was placed out of what came back, interest first.
+    ///
+    /// What a cancelled, expired or rejected order does to the balance held against it on a margin
+    /// account, which repays an unused loan when the order it was taken for ends. A reservation
+    /// that borrowed nothing is simply released.
+    ///
+    /// # Panics
+    /// As [`release`](Self::release).
+    pub fn release_reservation(
+        &mut self,
+        reservation: &Reservation,
+        time_exchange: DateTime<Utc>,
+    ) -> AssetBalance<AssetNameExchange> {
+        let released = self.release(&reservation.asset, reservation.amount, time_exchange);
+        match reservation.borrowed.is_zero() {
+            true => released,
+            false => self.repay_loan(&reservation.asset, reservation.borrowed, time_exchange),
+        }
+    }
+
+    /// Repays up to `amount` of `asset`'s loan out of its free balance, interest first, and never
+    /// more than `free` holds.
+    ///
+    /// # Panics
+    /// Panics if `asset` has no balance — see [`reserve`](Self::reserve).
+    pub fn repay_loan(
+        &mut self,
+        asset: &AssetNameExchange,
+        amount: Decimal,
+        time_exchange: DateTime<Utc>,
+    ) -> AssetBalance<AssetNameExchange> {
+        let balance = self.balance_expect(asset);
+        let available = amount.min(balance.balance.free);
+        repay(&mut balance.balance, available);
+        balance.time_exchange = time_exchange;
+
+        balance.clone()
+    }
+
+    /// Lends `amount` of `asset`: `total` and `free` rise by it, and so does the loan. An asset the
+    /// account has never held is opened at zero first, as a delivery opens one.
+    fn borrow(&mut self, asset: &AssetNameExchange, amount: Decimal, time_exchange: DateTime<Utc>) {
+        let balance = &mut self.balance_or_open(asset, time_exchange).balance;
+        balance.total += amount;
+        balance.free += amount;
+        balance
+            .margin
+            .get_or_insert_with(MarginDetails::default)
+            .borrowed += amount;
+    }
+
+    /// `asset`'s balance, opened at zero if the account has never held it, reporting a loan from
+    /// the start on a margin account.
+    fn balance_or_open(
+        &mut self,
+        asset: &AssetNameExchange,
+        time_exchange: DateTime<Utc>,
+    ) -> &mut AssetBalance<AssetNameExchange> {
+        let margin = self.margin.map(|_| MarginDetails::default());
+        // `SmolStr` clones without allocating for an asset name, so the entry API costs nothing
+        // on the common path where the balance exists.
+        self.balances
+            .entry(asset.clone())
+            .or_insert_with(|| AssetBalance {
+                asset: asset.clone(),
+                balance: Balance {
+                    margin,
+                    ..Balance::new(Decimal::ZERO, Decimal::ZERO)
+                },
+                time_exchange,
+            })
     }
 
     /// Commits one arriving order's whole ledger effect, or none of it.
@@ -462,19 +568,29 @@ impl AccountState {
     /// leaves the ledger exactly as it was. `None` is an arrival with nothing to pay back: an
     /// order that rests having traded nothing.
     ///
+    /// # What a margin account lends
+    /// On an account that [`lends`](Self::lends), a requirement `free` and the credit do not cover
+    /// borrows the shortfall of the paying asset, if it is at most `borrowable`, the most the
+    /// venue will lend of it now. The loan is taken with the rest of the arrival, or not at all.
+    /// [`Committed::borrowed`] says how much was lent. A paying asset the account has never held
+    /// has nothing free, and is opened when the loan is taken. A cash account ignores
+    /// `borrowable`, and a negative one lends nothing.
+    ///
     /// # Errors
     /// [`BalanceInsufficient`], naming the asset short, if `free` plus a credit into the paying
-    /// asset does not cover [`settled`](Debit::settled) + [`reserved`](Debit::reserved), or if a
-    /// negative credit into another asset exceeds that asset's `free`. The ledger is left
-    /// untouched.
+    /// asset, plus what may be borrowed, does not cover [`settled`](Debit::settled) +
+    /// [`reserved`](Debit::reserved), or if a negative credit into another asset exceeds that
+    /// asset's `free`. The ledger is left untouched.
     ///
     /// # Panics
-    /// Panics if the paying asset has no balance — see [`reserve`](Self::reserve). Debug-asserts
-    /// that a [`PaidBack`](Credit::PaidBack) credit is not negative.
+    /// Panics if the paying asset has no balance and the arrival borrows none of it — see
+    /// [`reserve`](Self::reserve). Debug-asserts that a [`PaidBack`](Credit::PaidBack) credit is
+    /// not negative.
     pub fn commit(
         &mut self,
         debit: &Debit,
         credit: Option<&Credit>,
+        borrowable: Decimal,
         time_exchange: DateTime<Utc>,
     ) -> Result<Committed, BalanceInsufficient> {
         let (funding, delivery) = match credit {
@@ -491,15 +607,27 @@ impl AccountState {
         };
 
         // Asked for as one requirement, so a refusal refuses the arrival rather than half of it.
+        // A margin account lends the shortfall, within what the venue allows.
+        // A margin account borrows even an asset it has never held, which it opens on lending.
         let required = debit.settled + debit.reserved;
-        let free = self.balance_expect(&debit.asset).balance.free;
-        if free + funding < required {
-            return Err(BalanceInsufficient {
-                asset: debit.asset.clone(),
-                free: free + funding,
-                required,
-            });
-        }
+        let lends = self.lends();
+        let free = match lends {
+            true => self.free(&debit.asset),
+            false => self.balance_expect(&debit.asset).balance.free,
+        };
+        let shortfall = required - (free + funding);
+        let borrowed = match shortfall > Decimal::ZERO {
+            false => Decimal::ZERO,
+            true if lends && shortfall <= borrowable => shortfall,
+            true => {
+                return Err(BalanceInsufficient {
+                    asset: debit.asset.clone(),
+                    free: free + funding,
+                    required,
+                    borrowable: lends.then_some(borrowable.max(Decimal::ZERO)),
+                });
+            }
+        };
 
         // A delivery that takes rather than gives -- a fill whose fee exceeds what it receives --
         // must be covered before anything moves too. An asset never held has nothing free.
@@ -513,11 +641,15 @@ impl AccountState {
                     asset: delivery.asset.clone(),
                     free,
                     required: -delivery.amount,
+                    borrowable: None,
                 });
             }
         }
 
         // Applied only now that every requirement is covered, so a refusal moves nothing.
+        if !borrowed.is_zero() {
+            self.borrow(&debit.asset, borrowed, time_exchange);
+        }
         if !funding.is_zero() {
             let balance = self.balance_expect(&debit.asset);
             balance.balance.total += funding;
@@ -531,7 +663,11 @@ impl AccountState {
         let paid = self.settle(&debit.asset, debit.settled, time_exchange);
         let received = delivery.map(|delivery| self.deliver(delivery, time_exchange));
 
-        Ok(Committed { paid, received })
+        Ok(Committed {
+            paid,
+            received,
+            borrowed,
+        })
     }
 
     #[allow(clippy::expect_used)] // Documented panic: an absent balance is a mis-specified fixture.
@@ -543,6 +679,25 @@ impl AccountState {
             .get_mut(asset)
             .expect("SimulatedVenue has Balance for all configured Instrument assets")
     }
+}
+
+/// Repays up to `available` of `balance`'s loan, interest first, then principal, out of its
+/// `total` and `free`, and returns how much it repaid. Repays nothing from a `available` that is
+/// not positive, or from a balance that owes nothing.
+fn repay(balance: &mut Balance, available: Decimal) -> Decimal {
+    let Some(margin) = balance.margin.as_mut() else {
+        return Decimal::ZERO;
+    };
+    let available = available.max(Decimal::ZERO);
+    let interest = margin.interest.min(available);
+    let principal = margin.borrowed.min(available - interest);
+    margin.interest -= interest;
+    margin.borrowed -= principal;
+
+    let repaid = interest + principal;
+    balance.total -= repaid;
+    balance.free -= repaid;
+    repaid
 }
 
 /// What one arriving order does to one asset's balance, as a single commitment.
@@ -606,6 +761,8 @@ pub struct Committed {
     /// The asset a spot fill delivered, which is never the one paid with. `None` for an arrival
     /// that moved one asset: a CFD fill, or an order that rests having traded nothing.
     pub received: Option<AssetBalance<AssetNameExchange>>,
+    /// How much of the paying asset a margin account lent the arrival. Zero when it lent nothing.
+    pub borrowed: Decimal,
 }
 
 /// A ledger operation asked for more of an asset than `free` covers.
@@ -620,6 +777,9 @@ pub struct BalanceInsufficient {
     pub free: Decimal,
     /// Amount the operation asked for.
     pub required: Decimal,
+    /// How much of the asset a margin account would have lent, or `None` when the account lends
+    /// nothing, as a cash account does.
+    pub borrowable: Option<Decimal>,
 }
 
 /// An account snapshot lists one [`ClientOrderId`] more than once among the orders it seeds.
@@ -703,6 +863,7 @@ impl TryFrom<UnindexedAccountSnapshot> for AccountState {
             orders_filled: FnvHashMap::default(),
             orders_expired: FnvHashMap::default(),
             trades: vec![],
+            margin: None,
         })
     }
 }
@@ -755,7 +916,12 @@ mod tests {
 
         let credit = Credit::PaidBack(dec!(200));
 
-        let Ok(committed) = account.commit(&debit, Some(&credit), DateTime::<Utc>::MIN_UTC) else {
+        let Ok(committed) = account.commit(
+            &debit,
+            Some(&credit),
+            Decimal::ZERO,
+            DateTime::<Utc>::MIN_UTC,
+        ) else {
             panic!("100 free plus a 200 credit covers 290");
         };
 
@@ -779,8 +945,12 @@ mod tests {
 
         let credit = Credit::PaidBack(dec!(200));
 
-        let Err(insufficient) = account.commit(&debit, Some(&credit), DateTime::<Utc>::MIN_UTC)
-        else {
+        let Err(insufficient) = account.commit(
+            &debit,
+            Some(&credit),
+            Decimal::ZERO,
+            DateTime::<Utc>::MIN_UTC,
+        ) else {
             panic!("100 free plus a 200 credit does not cover 310");
         };
 
@@ -790,6 +960,7 @@ mod tests {
                 asset: usd(),
                 free: dec!(300),
                 required: dec!(310),
+                borrowable: None,
             }
         );
         assert_eq!(usd_balance(&account), Balance::new(dec!(100), dec!(100)));
@@ -821,7 +992,12 @@ mod tests {
             amount: dec!(2),
         });
 
-        let Ok(committed) = account.commit(&debit, Some(&credit), DateTime::<Utc>::MIN_UTC) else {
+        let Ok(committed) = account.commit(
+            &debit,
+            Some(&credit),
+            Decimal::ZERO,
+            DateTime::<Utc>::MIN_UTC,
+        ) else {
             panic!("100 free covers 100");
         };
 
@@ -851,8 +1027,12 @@ mod tests {
             amount: dec!(1000),
         });
 
-        let Err(insufficient) = account.commit(&debit, Some(&credit), DateTime::<Utc>::MIN_UTC)
-        else {
+        let Err(insufficient) = account.commit(
+            &debit,
+            Some(&credit),
+            Decimal::ZERO,
+            DateTime::<Utc>::MIN_UTC,
+        ) else {
             panic!("100 free does not cover 101, whatever another asset is credited");
         };
 
@@ -862,6 +1042,7 @@ mod tests {
                 asset: usd(),
                 free: dec!(100),
                 required: dec!(101),
+                borrowable: None,
             }
         );
         assert_eq!(usd_balance(&account), Balance::new(dec!(100), dec!(100)));
@@ -895,8 +1076,12 @@ mod tests {
             amount: dec!(-4),
         });
 
-        let Err(insufficient) = account.commit(&debit, Some(&short), DateTime::<Utc>::MIN_UTC)
-        else {
+        let Err(insufficient) = account.commit(
+            &debit,
+            Some(&short),
+            Decimal::ZERO,
+            DateTime::<Utc>::MIN_UTC,
+        ) else {
             panic!("3 usd free does not cover a 4 usd excess fee");
         };
         assert_eq!(
@@ -905,6 +1090,7 @@ mod tests {
                 asset: usd(),
                 free: dec!(3),
                 required: dec!(4),
+                borrowable: None,
             }
         );
         assert_eq!(
@@ -917,7 +1103,12 @@ mod tests {
             asset: usd(),
             amount: dec!(-2),
         });
-        let Ok(committed) = account.commit(&debit, Some(&covered), DateTime::<Utc>::MIN_UTC) else {
+        let Ok(committed) = account.commit(
+            &debit,
+            Some(&covered),
+            Decimal::ZERO,
+            DateTime::<Utc>::MIN_UTC,
+        ) else {
             panic!("3 usd free covers a 2 usd excess fee");
         };
         assert_eq!(committed.paid.balance, Balance::new(dec!(0), dec!(0)));

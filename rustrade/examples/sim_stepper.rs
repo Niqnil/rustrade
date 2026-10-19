@@ -155,6 +155,7 @@ fn episode(
                 slippage: Default::default(),
                 market_order_timing: Default::default(),
                 stale_market: Default::default(),
+                spot_margin: None,
             },
             SimVenueOptions::default(),
             start,

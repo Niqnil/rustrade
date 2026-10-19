@@ -147,7 +147,7 @@ use rustrade_instrument::{
     exchange::ExchangeId,
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use smol_str::{SmolStr, format_smolstr};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -165,36 +165,9 @@ use tracing::{debug, error, info, trace, warn};
 // Margin sideEffectType
 // ---------------------------------------------------------------------------
 
-/// Margin `sideEffectType` borrow/repay policy, fixed once per [`BinanceMargin`] client.
-///
-/// Only the two *intent-agnostic* modes are exposed as client-level variants. The borrow-vs-repay
-/// decision derives from open/close direction — position state the library deliberately does not
-/// track — so the venue is left to infer it from the account's loan state. The per-order modes
-/// (`MARGIN_BUY` / `AUTO_REPAY`) are intentionally **not** modelled here; they belong to a future
-/// generic per-order `RequestOpen::margin_effect` field that all margin adapters would map, added
-/// only when a venue with genuine per-order borrow intent (e.g. another CEX margin) appears.
-/// Mixed borrow appetite on a single venue today means running two clients (one per mode).
-///
-/// The `Serialize`/`Deserialize` wire form is the config-file value (`"auto_borrow_repay"` /
-/// `"no_borrow"`); this is distinct from the Binance API value returned by
-/// [`as_binance_str`](Self::as_binance_str) (`"AUTO_BORROW_REPAY"` / `"NO_SIDE_EFFECT"`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MarginSideEffect {
-    /// `AUTO_BORROW_REPAY` — the venue borrows on entry and repays on close as needed.
-    ///
-    /// # Warning
-    /// This is the default because it makes shorting work out of the box, but it means a
-    /// **mis-sized order silently takes on debt**: an order larger than the free balance borrows
-    /// the shortfall without any further opt-in (same footgun class as `RequestOpen::reduce_only`).
-    /// Use [`MarginSideEffect::NoBorrow`] for a client that must never silently borrow.
-    #[default]
-    AutoBorrowRepay,
-    /// `NO_SIDE_EFFECT` — never borrow or repay; orders that would require borrowing are rejected
-    /// by the venue. The conservative opt-out from the [`AutoBorrowRepay`](Self::AutoBorrowRepay)
-    /// silent-borrow behaviour.
-    NoBorrow,
-}
+// The borrow and repay policy, fixed once per `BinanceMargin` client. Defined venue-agnostically in
+// `crate::margin`, which the simulated venue shares, and re-exported here from where it began.
+pub use crate::margin::MarginSideEffect;
 
 impl MarginSideEffect {
     /// The Binance `sideEffectType` wire string for this policy.

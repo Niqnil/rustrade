@@ -459,6 +459,7 @@ pub(crate) mod fixtures {
             crate::slippage::SlippageConfig::default(),
             crate::fill::MarketOrderTiming::default(),
             crate::fill::StaleMarketPolicy::default(),
+            None,
         )
     }
 
@@ -493,6 +494,7 @@ pub(crate) mod fixtures {
             crate::slippage::SlippageConfig::default(),
             crate::fill::MarketOrderTiming::default(),
             crate::fill::StaleMarketPolicy::default(),
+            None,
         )
     }
 

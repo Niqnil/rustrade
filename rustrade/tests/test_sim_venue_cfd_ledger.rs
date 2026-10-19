@@ -127,6 +127,7 @@ fn mock_config(usd_balance: Decimal, fee_model: FeeModelConfig) -> MockExecution
         slippage: Default::default(),
         market_order_timing: Default::default(),
         stale_market: Default::default(),
+        spot_margin: None,
     }
 }
 
