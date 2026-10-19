@@ -1323,8 +1323,8 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// flip positions (quantity crossing zero) multiple times, only the last
     /// `PositionExited` is returned; earlier exits are silently dropped. This edge
     /// case requires position flips, which are documented as undefined behaviour in
-    /// `OmsMode::Hedging`. NautilusTrader similarly emits single `PositionClosed`
-    /// events per state transition rather than batching multiple closes.
+    /// `OmsMode::Hedging`, so [`FillsApplied::exited`] stays a single value rather than
+    /// a list that only that unsupported case could fill.
     ///
     /// # Late fills in `OmsMode::Hedging`
     ///
