@@ -131,12 +131,21 @@ pub type StepAudit<GlobalData, InstrumentData, Strategy, Risk, MarketKind> = <Si
 /// instant reaches it, before that step's market data.
 ///
 /// # A market order on an instrument with no event at this instant
-/// A venue keeps each instrument's last market. A market order on an instrument with no event at
-/// the current instant is therefore filled at that instrument's last price, however old, and one
-/// on an instrument that has never had a market is rejected. A real order would instead trade
-/// against the book as it is now, or be refused if the market is closed or halted. This gap
-/// between simulation and trading is known, and is the caller's to avoid, for example by sending
-/// orders only for instruments that had an event at this instant.
+/// A venue keeps each instrument's last market. By default, a market order on an instrument with
+/// no event at the current instant is therefore filled at that instrument's last price, however
+/// old, and one on an instrument that has never had a market is rejected. A real order would
+/// instead trade against the book as it is now, or be refused if the market is closed or halted.
+///
+/// [`MockExecutionConfig::stale_market`] closes that gap on a bar feed. Under
+/// [`StaleMarketPolicy::Wait`] a market order on an instrument last observed fresh longer ago than
+/// its `max_age` is held, and a [`settle`](Self::settle) returns with it open. The next step with
+/// a fresh observation of that instrument fills it at the market that observation leaves, and
+/// shows the `Engine` the fill after it. An immediate-or-cancel market order is rejected instead.
+/// Without the policy, the gap is the caller's to avoid, for example by sending orders only for
+/// instruments that had an event at this instant.
+///
+/// [`MockExecutionConfig::stale_market`]: rustrade_execution::client::mock::MockExecutionConfig::stale_market
+/// [`StaleMarketPolicy::Wait`]: rustrade_execution::fill::StaleMarketPolicy::Wait
 ///
 /// [`AccountEventKind::Trade`]: rustrade_execution::AccountEventKind::Trade
 /// [`AccountEventKind::OrderSnapshot`]: rustrade_execution::AccountEventKind::OrderSnapshot

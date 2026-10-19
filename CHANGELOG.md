@@ -37,7 +37,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     event is folded in. It defaults to `None`, and `DataKind` implements it for candles. A candle
     the engine's instrument state drops, such as a lookahead candle or one already seen, releases
     nothing.
-  - New `SimulatedVenue::holds_for_next_bar` and `SimulatedVenue::expire_held`, for drivers.
+  - New `SimulatedVenue::fills_ahead_of` and `SimulatedVenue::expire_held`, for drivers.
+- **Opt-in stale-market policy for market orders on the simulated venue** (`rustrade-execution`,
+  `rustrade`, #643).
+  - New `MockExecutionConfig::stale_market`. The default, `StaleMarketPolicy::Off`, is today's
+    behaviour: a market order fills against the last market the venue was fed, however old. On a
+    bar feed, a market order on an instrument with no bar at the current instant fills at the
+    close of its last bar, which may be hours or a weekend old.
+  - `StaleMarketPolicy::Wait { max_age }` measures each instrument's market from its last fresh
+    observation: a trade, a quote, or a bar something traded in. A bar reported with zero volume
+    or zero trades, as a feed that fills gaps produces, still moves the price but not that
+    instant. A market order arriving when that observation is more than `max_age` old waits,
+    accepted as open with its cost held, and fills on the instrument's next fresh observation as
+    if it had just arrived: at a trade's or quote's price, or a bar's close, after the resting
+    fills that observation caused. Only an observation of that instrument releases it.
+  - An immediate-or-cancel or fill-or-kill market order on a stale market is rejected, with a
+    reason naming the policy. That includes the immediate-or-cancel orders that close positions.
+  - With `MarketOrderTiming::NextBar`, a bar reported with zero volume releases nothing, and
+    cancels the immediate-or-cancel and fill-or-kill orders held for it.
+  - Turn it on for bar feeds, with a `max_age` a little over the bar interval. It stays off by
+    default because the venue cannot know a feed's bar interval, and a quiet quote book is still
+    a book. Market orders only: a marketable limit order still fills against the market the venue
+    holds. A venue with no market feed, such as `MockExchange`'s, rejects every market order
+    under the policy.
+  - New `MarketObservation` in `rustrade_execution::market`: what a driver feeds
+    `SimulatedVenue::apply_market` (see Changed). Its `fresh` flag is what the policy measures
+    from.
+  - New `VenueMarketUpdate::fresh`, asked before an event is folded in. It defaults to `true`, so
+    a custom kind that supplies bars should override it.
+    `DataKind` answers `true` for a trade, an L1 book or a candle the engine's instrument state
+    keeps, unless the candle reports zero volume or zero trades. An unknown volume counts as
+    fresh. L2 depth, liquidations and greeks are never fresh.
+  - New `VenueInstrumentMarket::fresh_at`, the instant of the instrument's last fresh observation.
 - `Instrument::quantity_step` (`rustrade-instrument`, #659): the step a position and its closing
   order are sized in. It is the spec's quantity increment, when the spec counts quantities in the
   unit a position is counted in: the base asset on spot, contracts on a derivative.
@@ -94,13 +125,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking:** `InstrumentState` has new public fields, `reduce_only_orders` and
   `retired_reduce_only_orders`, so a struct literal must supply them (`rustrade`, #661). Serialised
   states without them still load.
-- **Breaking:** `SimulatedVenue::apply_market` takes the bar an observation carries
-  (`rustrade-execution`). Its new `bar: Option<MarketBar>` argument comes before
-  `time_exchange`. Pass `None` from a feed without bars, which keeps today's behaviour.
-- **Breaking:** `MockExecutionConfig` has a new field, `market_order_timing`, so a struct literal
-  or a `MockExecutionConfig::new` call must supply it, and `VenueInstrumentMarket` has a new
-  public field, `bar` (`rustrade-execution`). A serialised configuration without
-  `market_order_timing` still loads, as `OnArrival`.
+- **Breaking:** `SimulatedVenue::apply_market` takes a `MarketObservation` in place of its
+  `snapshot` and `depth` arguments: `apply_market(instrument, observation, time_exchange)`
+  (`rustrade-execution`, #627, #643). Build one with `MarketObservation::new(snapshot)`, adding
+  `with_depth`, `with_bar` and `with_fresh` as the feed allows. `new` alone keeps today's
+  behaviour.
+- **Breaking:** `MockExecutionConfig` has new fields, `market_order_timing` and `stale_market`, so
+  a struct literal or a `MockExecutionConfig::new` call must supply them, and
+  `VenueInstrumentMarket` has new public fields, `bar` and `fresh_at` (`rustrade-execution`). A
+  serialised configuration without them still loads, as `OnArrival` and `Off`.
 - **Breaking:** `build_ioc_market_order_to_close_position` takes the instrument's quantity step
   and returns an `Option` (`rustrade`, #659). It rounds the close toward zero to the step, and
   returns `None` for a position smaller than one step, which no order can close. Pass

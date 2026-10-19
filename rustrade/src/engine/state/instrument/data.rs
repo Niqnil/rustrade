@@ -143,6 +143,20 @@ impl DefaultInstrumentMarketData {
                 .candle
                 .is_none_or(|current| current.close_time < candle.close_time)
     }
+
+    /// Whether processing a trade on an event stamped `time_exchange` keeps it as this
+    /// instrument's last traded price: it is newer than the one held. See the [`Processor`] impl.
+    pub(crate) fn takes_trade(&self, time_exchange: DateTime<Utc>) -> bool {
+        self.last_traded_price
+            .as_ref()
+            .is_none_or(|price| price.time < time_exchange)
+    }
+
+    /// Whether processing `l1` replaces this instrument's book: it was updated after the one held.
+    /// See the [`Processor`] impl.
+    pub(crate) fn takes_l1(&self, l1: &OrderBookL1) -> bool {
+        self.l1.last_update_time < l1.last_update_time
+    }
 }
 
 impl InstrumentDataState for DefaultInstrumentMarketData {
@@ -301,11 +315,7 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
     fn process(&mut self, event: &MarketEvent<InstrumentKey, DataKind>) -> Self::Audit {
         match &event.kind {
             DataKind::Trade(trade) => {
-                if self
-                    .last_traded_price
-                    .as_ref()
-                    .is_none_or(|price| price.time < event.time_exchange)
-                {
+                if self.takes_trade(event.time_exchange) {
                     self.last_traded_price
                         .replace(Timed::new(trade.price, event.time_exchange));
                 }
@@ -320,7 +330,7 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
             // this field against a trade's venue stamp. It still orders books against each other
             // here, which is sound — one connector's books all carry the same clock.
             DataKind::OrderBookL1(l1) => {
-                if self.l1.last_update_time < l1.last_update_time {
+                if self.takes_l1(l1) {
                     self.l1 = l1.clone()
                 }
             }

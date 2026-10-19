@@ -62,7 +62,7 @@ use rustrade_execution::{
     AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
     balance::{AssetBalance, Balance},
     client::mock::MockExecutionConfig,
-    fill::{MarketOrderTiming, NextBarPrice},
+    fill::{MarketOrderTiming, NextBarPrice, StaleMarketPolicy},
     order::{
         OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, StrategyId},
@@ -125,6 +125,7 @@ fn config(latency_ms: u64) -> MockExecutionConfig {
         spot_fee_asset: Default::default(),
         slippage: Default::default(),
         market_order_timing: Default::default(),
+        stale_market: Default::default(),
     }
 }
 
@@ -160,6 +161,23 @@ fn bar_from(instrument: usize, secs: i64, open: Decimal, close: Decimal) -> Engi
 }
 
 fn order(instrument: usize, side: Side, quantity: Decimal, cid: &str) -> Command {
+    order_working(
+        instrument,
+        side,
+        quantity,
+        cid,
+        TimeInForce::ImmediateOrCancel,
+    )
+}
+
+/// A market order working for `time_in_force`.
+fn order_working(
+    instrument: usize,
+    side: Side,
+    quantity: Decimal,
+    cid: &str,
+    time_in_force: TimeInForce,
+) -> Command {
     Command::SendOpenRequests(OneOrMany::One(OrderRequestOpen {
         key: OrderKey {
             exchange: ExchangeIndex::new(0),
@@ -172,7 +190,7 @@ fn order(instrument: usize, side: Side, quantity: Decimal, cid: &str) -> Command
             price: None,
             quantity,
             kind: OrderKind::Market,
-            time_in_force: TimeInForce::ImmediateOrCancel,
+            time_in_force,
             position_id: None,
             reduce_only: false,
             market: None,
@@ -687,6 +705,86 @@ fn under_next_bar_an_order_fills_at_the_next_bars_open_before_that_bar_is_shown(
         Some((Side::Buy, dec!(2), dec!(102)))
     );
     assert_eq!(balance(&s.engine, "usdt"), dec!(9796));
+}
+
+/// A session whose venue holds a market order on a market not observed fresh within a second.
+fn stale_wait_session(start: SimStart) -> Session<DefaultStrategy<State>> {
+    let config = MockExecutionConfig {
+        stale_market: StaleMarketPolicy::Wait {
+            max_age: std::time::Duration::from_secs(1),
+        },
+        ..config(0)
+    };
+    session_configured(config, start, None, DefaultStrategy::default())
+}
+
+/// A stale-wait session that saw a btc bar at 3s and an eth bar at 6s, so btc's market is stale.
+fn stale_btc_session() -> Session<DefaultStrategy<State>> {
+    let mut s = stale_wait_session(usdt(dec!(10_000)));
+    s.stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(100))])
+        .unwrap();
+    s.stepper
+        .step(&mut s.engine, at(6), [bar(ETH, 6, dec!(50))])
+        .unwrap();
+    s
+}
+
+#[test]
+fn under_stale_wait_an_order_on_a_stale_market_fills_after_the_next_fresh_bar() {
+    let mut s = stale_btc_session();
+
+    s.engine.action(&order_working(
+        BTC,
+        Side::Buy,
+        dec!(2),
+        "waiting",
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    ));
+    let settled = s.stepper.settle(&mut s.engine).unwrap();
+    assert!(
+        fills(events(&settled)).is_empty(),
+        "waiting, so nothing fills at the 3s close"
+    );
+    assert!(refused(events(&settled)).is_empty());
+    assert_eq!(position(&s.engine, BTC), None);
+
+    let stepped = s
+        .stepper
+        .step(&mut s.engine, at(7), [bar(BTC, 7, dec!(104))])
+        .unwrap();
+    let stepped = events(&stepped);
+
+    assert_eq!(
+        fills(stepped.iter().copied()),
+        vec![(
+            InstrumentIndex::new(BTC),
+            Side::Buy,
+            dec!(104),
+            dec!(2),
+            at(7)
+        )],
+        "filled at the fresh bar's close, stamped at it"
+    );
+    assert!(
+        matches!(stepped.first(), Some(EngineEvent::Market(_))),
+        "the Engine sees the bar before the fill it released: {stepped:?}"
+    );
+    assert_eq!(
+        position(&s.engine, BTC),
+        Some((Side::Buy, dec!(2), dec!(104)))
+    );
+}
+
+#[test]
+fn under_stale_wait_an_immediate_order_on_a_stale_market_is_refused() {
+    let mut s = stale_btc_session();
+
+    s.engine.action(&order(BTC, Side::Buy, dec!(2), "now"));
+    let settled = s.stepper.settle(&mut s.engine).unwrap();
+
+    assert_eq!(refused(events(&settled)), vec![ClientOrderId::new("now")]);
+    assert_eq!(balance(&s.engine, "usdt"), dec!(10_000));
 }
 
 #[test]

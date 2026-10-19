@@ -16,6 +16,7 @@ use rustrade_execution::{
     AccountEvent, AccountEventKind, UnindexedAccountEvent,
     exchange::mock::{SimulatedVenue, VenueOutcome},
     indexer::AccountEventIndexer,
+    market::MarketObservation,
     order::{
         Order,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
@@ -435,6 +436,11 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 ///
 /// A bar that releases nothing, and every event that is not a bar, is shown at once, as always.
 ///
+/// A market order a venue holds on a stale market under
+/// [`StaleMarketPolicy::Wait`](rustrade_execution::fill::StaleMarketPolicy::Wait) is no exception
+/// either. The next fresh observation releases it, but fills it at the market that observation
+/// leaves, so the fill follows the observation as a resting fill does.
+///
 /// # A venue's own deadlines
 /// A venue has things to do at instants nobody requested: an order reaching its
 /// [`TimeInForce::GoodTillDate`](rustrade_execution::order::TimeInForce::GoodTillDate) deadline,
@@ -477,11 +483,11 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// no request is ever accepted and then dropped.
 ///
 /// A fill booked against the final source event is still always delivered, so ending a run cannot
-/// cut the ledgers short. A market order a venue still holds for a next bar that never came is
-/// retired as expired once everything else is delivered, and that is delivered too, so an order
-/// this runner accepted always has an end. The [`ExecutionRequest::Drain`] the `Engine` sends in
-/// reply is therefore
-/// a no-op here: this runner, not the execution side, owns the moment a simulated run ends.
+/// cut the ledgers short. A market order a venue still holds for a next bar, or a fresh
+/// observation, that never came is retired as expired once everything else is delivered, and that
+/// is delivered too, so an order this runner accepted always has an end. The
+/// [`ExecutionRequest::Drain`] the `Engine` sends in reply is therefore a no-op here: this runner,
+/// not the execution side, owns the moment a simulated run ends.
 /// [`ExecutionRequest::Shutdown`] abandons whatever is still scheduled, matching its documented
 /// meaning — including any request that has not yet reached its venue, which is therefore never
 /// booked at all rather than booked and then left unreported.
@@ -1040,8 +1046,9 @@ where
         self.deferred.is_some()
     }
 
-    /// Retires every market order a venue still holds for a next bar, now that no bar is left to
-    /// release it, and schedules what that owes. Returns whether anything was scheduled.
+    /// Retires every market order a venue still holds for a next bar or a fresh observation, now
+    /// that nothing is left to release it, and schedules what that owes. Returns whether anything
+    /// was scheduled.
     ///
     /// Stamped at the latest instant the run reached, the `Engine`'s clock or the venue's own, and
     /// delivered one `from_venue` leg later, as anything else a venue does unrequested is.
@@ -1123,11 +1130,14 @@ where
 
     let state = market.entry(event.instrument).or_default();
     // Asked before the fold, which is the only point at which the state can say whether the bar is
-    // new.
+    // new, or whether it takes the event at all.
     let bar = MarketKind::bar(state, event);
+    let fresh = MarketKind::fresh(state, event);
     MarketKind::apply(state, event);
-    let snapshot = MarketKind::snapshot(state);
-    let depth = MarketKind::depth(state);
+    let observation = MarketObservation::new(MarketKind::snapshot(state))
+        .with_depth(MarketKind::depth(state))
+        .with_bar(bar)
+        .with_fresh(fresh);
     let mut routed = Routed::Now;
 
     for (exchange, slot) in venues.iter_mut() {
@@ -1143,12 +1153,12 @@ where
 
         // Cloned because `apply_market` keys on the owned name; the map borrow ends here.
         let name = name.clone();
-        if bar.is_some() && slot.venue.holds_for_next_bar(&name) {
+        if slot.venue.fills_ahead_of(&name, &observation) {
             routed = Routed::AfterReleased;
         }
         let fills = slot
             .venue
-            .apply_market(&name, snapshot, depth, bar, event.time_exchange);
+            .apply_market(&name, observation, event.time_exchange);
 
         // A fill can open or close a position, and the venue's first market starts its clock, so
         // either can move its next deadline.
@@ -1628,7 +1638,7 @@ mod tests {
         balance::{AssetBalance, Balance},
         client::mock::MockExecutionConfig,
         exchange::mock::VenueInstrumentMarket,
-        fill::{MarketOrderTiming, NextBarPrice},
+        fill::{MarketOrderTiming, NextBarPrice, StaleMarketPolicy},
         market::MarketSnapshot,
         order::{
             OrderKey, OrderKind, TimeInForce,
@@ -1679,6 +1689,7 @@ mod tests {
             spot_fee_asset: Default::default(),
             slippage: Default::default(),
             market_order_timing: Default::default(),
+            stale_market: Default::default(),
         }
     }
 
@@ -1702,7 +1713,16 @@ mod tests {
     }
 
     /// A candle closing at `millis`, as every in-tree candle producer stamps one.
-    fn candle(millis: i64, [open, high, low, close]: [Decimal; 4]) -> Timed<EngineEvent<DataKind>> {
+    fn candle(millis: i64, ohlc: [Decimal; 4]) -> Timed<EngineEvent<DataKind>> {
+        candle_with_volume(millis, ohlc, dec!(1))
+    }
+
+    /// A candle closing at `millis` with `volume` traded in it.
+    fn candle_with_volume(
+        millis: i64,
+        [open, high, low, close]: [Decimal; 4],
+        volume: Decimal,
+    ) -> Timed<EngineEvent<DataKind>> {
         Timed::new(
             EngineEvent::Market(MarketStreamEvent::Item(MarketEvent {
                 time_exchange: at(millis),
@@ -1715,7 +1735,7 @@ mod tests {
                     high,
                     low,
                     close,
-                    volume: Some(dec!(1)),
+                    volume: Some(volume),
                     trade_count: None,
                 }),
             })),
@@ -1729,6 +1749,17 @@ mod tests {
         MockExecutionConfig {
             market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
             ..config(latency_ms)
+        }
+    }
+
+    /// The fixture's configuration, holding a market order on a market not observed fresh within
+    /// 5ms for its next fresh observation.
+    fn stale_wait_config() -> MockExecutionConfig {
+        MockExecutionConfig {
+            stale_market: StaleMarketPolicy::Wait {
+                max_age: std::time::Duration::from_millis(5),
+            },
+            ..config(0)
         }
     }
 
@@ -1840,6 +1871,11 @@ mod tests {
         /// which prices the fill from its own book — so `price` is what the strategy was looking
         /// at, not what it will pay.
         fn send_open(&self, price: Decimal) {
+            self.send_market(price, TimeInForce::ImmediateOrCancel);
+        }
+
+        /// Queue a market buy working for `time_in_force`, sent having seen `price`.
+        fn send_market(&self, price: Decimal, time_in_force: TimeInForce) {
             self.send(ExecutionRequest::Open(OrderRequestOpen {
                 key: OrderKey {
                     exchange: self.exchange,
@@ -1853,7 +1889,7 @@ mod tests {
                     price: None,
                     quantity: dec!(0.01),
                     kind: OrderKind::Market,
-                    time_in_force: TimeInForce::ImmediateOrCancel,
+                    time_in_force,
                     position_id: None,
                     reduce_only: false,
                     market: Some(MarketSnapshot::new(None, None, Some(price))),
@@ -3251,6 +3287,93 @@ mod tests {
                 "market",
                 "after_drain"
             ],
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Market orders on a stale market.
+    // ---------------------------------------------------------------------------------------
+
+    /// A market order sent after a bar that carried the price forward with nothing traded waits
+    /// for the next bar something traded in, and is filled at its close after that bar is shown,
+    /// as a resting order that bar crossed would be.
+    #[tokio::test]
+    async fn a_market_order_on_a_stale_market_fills_after_the_next_fresh_bar() {
+        let mut harness = Harness::with_config(
+            stale_wait_config(),
+            vec![
+                candle(10, [dec!(95), dec!(105), dec!(90), dec!(100)]),
+                candle_with_volume(20, [dec!(100); 4], Decimal::ZERO),
+                candle(30, [dec!(102), dec!(110), dec!(98), dec!(108)]),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(20));
+        harness.send_market(
+            dec!(100),
+            TimeInForce::GoodUntilCancelled { post_only: false },
+        );
+
+        let events = harness.rest_events().await;
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec![
+                // The hold, then the response saying the order is working.
+                "balance",
+                "order",
+                // The fresh bar at 30, the last the source has...
+                "market",
+                "after_drain",
+                // ...then the fill it released, which follows it as a resting fill would.
+                "balance",
+                "balance",
+                "trade",
+                "order",
+            ],
+        );
+        assert_eq!(
+            trade_prices(&events),
+            vec![dec!(108)],
+            "filled at the fresh bar's close, not at the stale 100"
+        );
+    }
+
+    /// An immediate-or-cancel market order on a stale market is refused at once rather than
+    /// waiting.
+    #[tokio::test]
+    async fn an_immediate_market_order_on_a_stale_market_is_rejected() {
+        let mut harness = Harness::with_config(
+            stale_wait_config(),
+            vec![
+                candle(10, [dec!(95), dec!(105), dec!(90), dec!(100)]),
+                candle_with_volume(20, [dec!(100); 4], Decimal::ZERO),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(20));
+        harness.send_open(dec!(100));
+
+        let events = harness.rest_events().await;
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            // Sent after the source's last event, so answered once it has ended.
+            vec!["after_drain", "order"],
+        );
+        assert!(
+            matches!(
+                last_order_state(&events),
+                OrderState::Inactive(InactiveOrderState::OpenFailed(_))
+            ),
+            "{:?}",
+            last_order_state(&events)
         );
     }
 

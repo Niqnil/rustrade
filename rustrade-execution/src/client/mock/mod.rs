@@ -8,7 +8,7 @@ use crate::{
     },
     exchange::mock::request::MockExchangeRequest,
     fee::{FeeModelConfig, SpotFeeAsset},
-    fill::{MarketOrderTiming, SimFillConfig},
+    fill::{MarketOrderTiming, SimFillConfig, StaleMarketPolicy},
     order::{
         Order, OrderKey, UnindexedInactiveOrder, UnindexedOrderKey,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
@@ -73,6 +73,14 @@ pub struct MockExecutionConfig {
     /// driver that feeds the venue bars, as `SimRunner` does on a candle feed.
     #[serde(default)]
     pub market_order_timing: MarketOrderTiming,
+    /// What the mock exchange does with a market order when the instrument's market is stale.
+    ///
+    /// Defaults to [`StaleMarketPolicy::Off`]: it fills against the market it holds, however old.
+    /// [`StaleMarketPolicy::Wait`] makes a market order on an instrument with no fresh observation
+    /// within an age wait for the next one, and needs a driver that feeds the venue a market, as
+    /// `SimRunner` does.
+    #[serde(default)]
+    pub stale_market: StaleMarketPolicy,
 }
 
 #[derive(Debug, Constructor)]

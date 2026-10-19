@@ -76,9 +76,32 @@ pub trait VenueMarketUpdate: Sized {
     /// `None`: a kind with no bars. A venue configured for `NextBar` then rejects every market
     /// order, naming the setting, rather than holding orders that nothing would ever release.
     ///
+    /// A kind that supplies bars should also override [`fresh`](Self::fresh), whose default
+    /// takes every event as fresh: a bar that carries the previous close forward with nothing
+    /// traded in it would otherwise count as a live market.
+    ///
     /// [`MarketOrderTiming::NextBar`]: rustrade_execution::fill::MarketOrderTiming::NextBar
     fn bar(_state: &Self::State, _event: &MarketEvent<InstrumentIndex, Self>) -> Option<MarketBar> {
         None
+    }
+
+    /// Whether `event` shows the market trading or quoting: a trade, a quote, or a bar something
+    /// traded in — see [`MarketObservation::fresh`].
+    ///
+    /// Asked **before** [`apply`](Self::apply) folds `event` in, as [`bar`](Self::bar) is. What a
+    /// venue measures a market's age from under [`StaleMarketPolicy::Wait`], so an event the
+    /// fold refuses or ignores, or one that only carries a price forward, must answer `false`.
+    ///
+    /// # Default body
+    ///
+    /// `true`: every event of a kind that says nothing more is taken as a live observation, so
+    /// such a market is never stale while events keep arriving. Right for a kind whose every event
+    /// is a trade or a quote; a kind with bars that can be gap-filled must override it.
+    ///
+    /// [`MarketObservation::fresh`]: rustrade_execution::market::MarketObservation::fresh
+    /// [`StaleMarketPolicy::Wait`]: rustrade_execution::fill::StaleMarketPolicy::Wait
+    fn fresh(_state: &Self::State, _event: &MarketEvent<InstrumentIndex, Self>) -> bool {
+        true
     }
 }
 
@@ -135,6 +158,27 @@ impl VenueMarketUpdate for DataKind {
         state
             .takes_candle(candle, event.time_exchange)
             .then(|| MarketBar::new(candle.open, candle.high, candle.low, candle.close))
+    }
+
+    /// A trade or an L1 book the state will keep, or a candle it will keep unless the candle
+    /// reports that nothing traded in it.
+    ///
+    /// A candle reporting zero volume or zero trades is what a feed that fills gaps produces: the
+    /// previous close carried forward. One reporting neither is fresh, since some feeds (spot FX)
+    /// report no volume at all, and an unknown volume is not a zero one.
+    ///
+    /// L2 depth, liquidations and greeks are never fresh: the state prices from none of them.
+    fn fresh(state: &Self::State, event: &MarketEvent<InstrumentIndex, Self>) -> bool {
+        match &event.kind {
+            DataKind::Trade(_) => state.takes_trade(event.time_exchange),
+            DataKind::OrderBookL1(l1) => state.takes_l1(l1),
+            DataKind::Candle(candle) => {
+                state.takes_candle(candle, event.time_exchange)
+                    && candle.volume != Some(Decimal::ZERO)
+                    && candle.trade_count != Some(0)
+            }
+            DataKind::OrderBook(_) | DataKind::Liquidation(_) | DataKind::OptionGreeks(_) => false,
+        }
     }
 }
 
@@ -216,6 +260,131 @@ mod tests {
         );
     }
 
+    fn event(at: i64, kind: DataKind) -> MarketEvent<InstrumentIndex, DataKind> {
+        MarketEvent {
+            time_exchange: instant(at),
+            time_received: instant(at),
+            exchange: rustrade_instrument::exchange::ExchangeId::Simulated,
+            instrument: InstrumentIndex::new(0),
+            kind,
+        }
+    }
+
+    fn instant(seconds: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(1_700_000_000 + seconds, 0).unwrap()
+    }
+
+    fn trade(price: Decimal) -> DataKind {
+        DataKind::Trade(rustrade_data::subscription::trade::PublicTrade {
+            id: "1".into(),
+            price,
+            amount: dec!(1),
+            side: None,
+        })
+    }
+
+    fn l1(at: i64) -> DataKind {
+        DataKind::OrderBookL1(OrderBookL1 {
+            last_update_time: instant(at),
+            best_bid: Some(Level::new(dec!(99), dec!(1))),
+            best_ask: Some(Level::new(dec!(101), dec!(1))),
+        })
+    }
+
+    fn candle(close_at: i64, volume: Option<Decimal>, trade_count: Option<u64>) -> DataKind {
+        DataKind::Candle(rustrade_data::subscription::candle::Candle {
+            close_time: instant(close_at),
+            open: dec!(100),
+            high: dec!(100),
+            low: dec!(100),
+            close: dec!(100),
+            volume,
+            trade_count,
+        })
+    }
+
+    /// Whether `event` is fresh to `state`, then `state` with it folded in.
+    fn fresh(
+        state: &mut DefaultInstrumentMarketData,
+        event: MarketEvent<InstrumentIndex, DataKind>,
+    ) -> bool {
+        let fresh = <DataKind as VenueMarketUpdate>::fresh(state, &event);
+        <DataKind as VenueMarketUpdate>::apply(state, &event);
+        fresh
+    }
+
+    #[test]
+    fn a_trade_or_a_quote_is_fresh_unless_the_state_already_holds_a_newer_one() {
+        let mut state = DefaultInstrumentMarketData::default();
+        assert!(fresh(&mut state, event(2, trade(dec!(100)))));
+        assert!(!fresh(&mut state, event(2, trade(dec!(101)))), "no newer");
+        assert!(!fresh(&mut state, event(1, trade(dec!(101)))), "older");
+
+        assert!(fresh(&mut state, event(2, l1(2))));
+        assert!(!fresh(&mut state, event(3, l1(2))), "the same book again");
+        assert!(fresh(&mut state, event(3, l1(3))));
+    }
+
+    #[test]
+    fn a_candle_is_fresh_unless_it_reports_that_nothing_traded_in_it() {
+        for (volume, trade_count, expected) in [
+            (Some(dec!(5)), Some(3), true),
+            (None, None, true),
+            (Some(dec!(5)), None, true),
+            (None, Some(3), true),
+            (Some(Decimal::ZERO), None, false),
+            (None, Some(0), false),
+            (Some(Decimal::ZERO), Some(0), false),
+        ] {
+            let mut state = DefaultInstrumentMarketData::default();
+            assert_eq!(
+                fresh(&mut state, event(1, candle(1, volume, trade_count))),
+                expected,
+                "volume {volume:?}, trade count {trade_count:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_candle_the_state_refuses_is_not_fresh() {
+        let mut state = DefaultInstrumentMarketData::default();
+        assert!(
+            !fresh(&mut state, event(1, candle(2, Some(dec!(5)), None))),
+            "closes after its event"
+        );
+        assert!(fresh(&mut state, event(2, candle(2, Some(dec!(5)), None))));
+        assert!(
+            !fresh(&mut state, event(3, candle(2, Some(dec!(5)), None))),
+            "seen already"
+        );
+    }
+
+    #[test]
+    fn depth_liquidations_and_greeks_are_never_fresh() {
+        let mut state = DefaultInstrumentMarketData::default();
+        let liquidation =
+            DataKind::Liquidation(rustrade_data::subscription::liquidation::Liquidation {
+                side: rustrade_instrument::Side::Sell,
+                price: dec!(90),
+                quantity: dec!(1),
+                time: instant(1),
+            });
+        assert!(!fresh(&mut state, event(1, liquidation)));
+        assert!(!fresh(
+            &mut state,
+            event(
+                1,
+                DataKind::OrderBook(rustrade_data::subscription::book::OrderBookEvent::Snapshot(
+                    Default::default()
+                ))
+            )
+        ));
+        assert!(!fresh(
+            &mut state,
+            event(1, DataKind::OptionGreeks(Default::default()))
+        ));
+    }
+
     /// A kind that carries a last price and no bars, implementing only what it must.
     #[derive(Debug)]
     struct LastPrice(Decimal);
@@ -249,5 +418,20 @@ mod tests {
             <LastPrice as VenueMarketUpdate>::bar(&Some(dec!(99)), &event),
             None
         );
+    }
+
+    /// A kind that says nothing about freshness is taken as live on every event, so a venue never
+    /// finds its market stale while its events keep arriving.
+    #[test]
+    fn a_kind_that_says_nothing_about_freshness_is_always_fresh() {
+        let event = MarketEvent {
+            time_exchange: DateTime::<Utc>::MIN_UTC,
+            time_received: DateTime::<Utc>::MIN_UTC,
+            exchange: rustrade_instrument::exchange::ExchangeId::Simulated,
+            instrument: InstrumentIndex::new(0),
+            kind: LastPrice(dec!(100)),
+        };
+
+        assert!(<LastPrice as VenueMarketUpdate>::fresh(&None, &event));
     }
 }
