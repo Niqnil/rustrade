@@ -97,9 +97,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `round_toward_zero_to_step` (`rustrade-instrument`): a quantity rounded toward zero to a whole
   multiple of a step, the rounding the engine and `build_ioc_market_order_to_close_position`
   apply.
+- **Opt-in spot margin on the simulated venue** (`rustrade-execution`, #623).
+  - New `MockExecutionConfig::spot_margin`. The default, `None`, is today's cash account: a spot
+    order is paid for with what the account holds, so a sell of base it lacks is refused.
+  - A `SpotMarginConfig` makes the venue a cross margin account. Under
+    `MarginSideEffect::AutoBorrowRepay` it lends an order the shortfall, and only the shortfall,
+    of the asset it pays with: base for a sell, quote for a buy. It lends when it accepts the
+    order, so a resting limit order or a held market order is lent its shortfall at once. An order
+    that is cancelled or expires unfilled repays what it borrowed.
+  - Whatever a fill delivers into an asset the account owes repays that loan, interest first, then
+    principal, and only the rest becomes free. A buy delivers its quantity less any fee charged
+    in base, so a buy of exactly what is owed, with a base fee, leaves a fee-sized loan.
+  - A borrow is allowed while the account's debt stays within `max_leverage − 1` times its
+    equity, both valued in a configured valuation asset at the mid or last price of an instrument
+    on the venue that pairs each asset with it. An asset the venue cannot value, or prices at
+    zero, counts as no equity and is not lent, and a debt it cannot value stops it lending. An order needing more is rejected as unaffordable, with a reason that
+    says how much the venue would lend.
+  - Every balance reports its loan in `Balance::margin`, as Binance's margin account does, and the
+    account's holding of an asset is its `total` less what it owes.
+    `MarginSideEffect::NoBorrow` reports loans but lends and repays nothing.
+  - Not modelled: liquidation, isolated margin, per-asset borrow limits and the venue's lending
+    pool. No interest is charged yet. CFD orders are not lent their margin.
 
 ### Changed
 
+- **`MarginSideEffect` is venue-agnostic** (`rustrade-execution`, #623). It moves to
+  `rustrade_execution::margin`, where the simulated venue's spot margin uses it too, and is still
+  re-exported from `client::binance`. It now derives `PartialOrd`, `Ord` and `Hash`.
 - **The engine enforces `RequestOpen::reduce_only` on fills** (`rustrade`, #661). It used to apply
   every fill in full, so a reduce-only fill larger than the position it reduced flipped it and
   left a small position on the other side. A margin repayment sized to cover interest does that
@@ -130,10 +154,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`rustrade-execution`, #627, #643). Build one with `MarketObservation::new(snapshot)`, adding
   `with_depth`, `with_bar` and `with_fresh` as the feed allows. `new` alone keeps today's
   behaviour.
-- **Breaking:** `MockExecutionConfig` has new fields, `market_order_timing` and `stale_market`, so
-  a struct literal or a `MockExecutionConfig::new` call must supply them, and
+- **Breaking:** `MockExecutionConfig` has new fields, `market_order_timing`, `stale_market` and
+  `spot_margin`, so a struct literal or a `MockExecutionConfig::new` call must supply them, and
   `VenueInstrumentMarket` has new public fields, `bar` and `fresh_at` (`rustrade-execution`). A
-  serialised configuration without them still loads, as `OnArrival` and `Off`.
+  serialised configuration without them still loads, as `OnArrival`, `Off` and `None`.
+- **Breaking:** the simulated venue's ledger types carry loans (`rustrade-execution`, #623):
+  `AccountState::commit` takes the most it may lend, `Committed` has a new `borrowed` field,
+  `Reservation` a new `borrowed` field, and `BalanceInsufficient` a new `borrowable` field, so a
+  struct literal must supply them.
 - **Breaking:** `build_ioc_market_order_to_close_position` takes the instrument's quantity step
   and returns an `Option` (`rustrade`, #659). It rounds the close toward zero to the step, and
   returns `None` for a position smaller than one step, which no order can close. Pass

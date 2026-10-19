@@ -9,6 +9,7 @@ use crate::{
     exchange::mock::request::MockExchangeRequest,
     fee::{FeeModelConfig, SpotFeeAsset},
     fill::{MarketOrderTiming, SimFillConfig, StaleMarketPolicy},
+    margin::SpotMarginConfig,
     order::{
         Order, OrderKey, UnindexedInactiveOrder, UnindexedOrderKey,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
@@ -81,6 +82,15 @@ pub struct MockExecutionConfig {
     /// `SimRunner` does.
     #[serde(default)]
     pub stale_market: StaleMarketPolicy,
+    /// Whether the mock exchange lends a spot order what the account lacks, as a margin account
+    /// does.
+    ///
+    /// Defaults to `None`: a cash account, whose spot orders are paid for with what it holds, and
+    /// whose balances report no loans. A [`SpotMarginConfig`] makes it a cross margin account that
+    /// borrows and repays under its [`MarginSideEffect`](crate::margin::MarginSideEffect), up to a
+    /// leverage limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spot_margin: Option<SpotMarginConfig>,
 }
 
 #[derive(Debug, Constructor)]
