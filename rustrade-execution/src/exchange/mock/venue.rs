@@ -12789,13 +12789,13 @@ mod tests {
             AssetFees::new(bnb(), d("0.06"), Some(d("37.5")))
         );
 
-        // Both, `BNBUSDT` at a last price of 600 coming first: 0.0625 BNB.
+        // Both: `BNBUSDT`, at a last price of 600, is first by name though fed first. 0.0625 BNB.
         let mut instruments = fee_asset_instruments();
         instruments.insert(usdt_bnb.name_exchange.clone(), usdt_bnb);
         let mut venue = SimulatedVenue::new_market_driven(&fee_asset_config("1"), instruments);
         advance(&mut venue, time(1));
-        feed(&mut venue, "USDTBNB", "0.0016");
         feed(&mut venue, "BNBUSDT", "600");
+        feed(&mut venue, "USDTBNB", "0.0016");
         feed(&mut venue, "BTCUSDT", "50000");
         let outcome = venue.open_order(buy_request("1", None));
         assert_eq!(
