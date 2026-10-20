@@ -193,7 +193,9 @@ pub struct TearSheet<Interval> {
     /// pairing the fee asset with the quote, when the engine has one with a price. Each fill
     /// counted here was reported in an
     /// [`EngineOutput::FeeConversion`](crate::engine::EngineOutput::FeeConversion) saying why.
-    /// A non-zero count means `pnl` is gross of those fees. See
+    /// A non-zero count means `pnl` is gross of those fees. A fill is counted when it arrives,
+    /// valued with the prices held then, including one held for its order's acknowledgement
+    /// before it reaches a position. See
     /// [`EngineState::update_from_account`](crate::engine::state::EngineState::update_from_account).
     #[serde(default)]
     pub fills_fee_unconverted: usize,

@@ -6,6 +6,7 @@ use rustrade_instrument::{
     instrument::{InstrumentIndex, kind::InstrumentKind},
 };
 use serde::{Deserialize, Serialize};
+use std::fmt::{Debug, Display};
 use tracing::{debug, info};
 
 /// A fill's fee charged in a third asset, neither the instrument's base nor its quote, and how
@@ -21,7 +22,7 @@ use tracing::{debug, info};
 /// such fill, whether it was converted or not.
 #[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
-pub struct FeeConversion<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
+pub struct FeeConversion<AssetKey, InstrumentKey = InstrumentIndex> {
     /// The instrument the fill is on.
     pub instrument: InstrumentKey,
     /// The fill, as the venue identified it.
@@ -60,7 +61,11 @@ pub enum FeeConversionOutcome<InstrumentKey = InstrumentIndex> {
     },
 }
 
-impl FeeConversion {
+impl<AssetKey, InstrumentKey> FeeConversion<AssetKey, InstrumentKey>
+where
+    AssetKey: Display,
+    InstrumentKey: Display + Debug,
+{
     /// Logs the conversion: at DEBUG when the fee was valued, at INFO when it was left out of PnL.
     /// The output and the tear sheet's count are the signal a caller acts on, so a run that pays
     /// every fee in an asset it cannot price logs no WARN per fill.
@@ -102,11 +107,30 @@ impl<InstrumentKey> FeeConversionOutcome<InstrumentKey> {
     }
 }
 
-/// What valuing one fill's third-asset fee gave: the quote equivalent to apply the fill with, and
-/// the record to report, if any.
-pub(crate) struct ValuedFee {
-    pub(crate) fees_quote: Option<Decimal>,
-    pub(crate) conversion: Option<FeeConversion>,
+/// What valuing one fill's third-asset fee gave.
+pub(crate) enum ValuedFee {
+    /// A zero fee, worth zero whatever the price, and not reported.
+    Zero,
+    /// A fee valued, or not, with the record to report.
+    Reported(FeeConversion<AssetIndex>),
+}
+
+impl ValuedFee {
+    /// The quote equivalent to apply the fill with.
+    pub(crate) fn fees_quote(&self) -> Option<Decimal> {
+        match self {
+            Self::Zero => Some(Decimal::ZERO),
+            Self::Reported(conversion) => conversion.outcome.fees_quote(),
+        }
+    }
+
+    /// The record to report, if any.
+    pub(crate) fn into_conversion(self) -> Option<FeeConversion<AssetIndex>> {
+        match self {
+            Self::Zero => None,
+            Self::Reported(conversion) => Some(conversion),
+        }
+    }
 }
 
 impl<InstrumentData> InstrumentStates<InstrumentData>
@@ -133,10 +157,7 @@ where
         }
 
         if fee.fees.is_zero() {
-            return Some(ValuedFee {
-                fees_quote: Some(Decimal::ZERO),
-                conversion: None,
-            });
+            return Some(ValuedFee::Zero);
         }
 
         let outcome = match self.fee_asset_pricing(fee.asset, underlying.quote) {
@@ -153,22 +174,19 @@ where
             }
         };
 
-        Some(ValuedFee {
-            fees_quote: outcome.fees_quote(),
-            conversion: Some(FeeConversion {
-                instrument: trade.instrument,
-                trade_id: trade.id.clone(),
-                asset: fee.asset,
-                fees: fee.fees,
-                outcome,
-            }),
-        })
+        Some(ValuedFee::Reported(FeeConversion {
+            instrument: trade.instrument,
+            trade_id: trade.id.clone(),
+            asset: fee.asset,
+            fees: fee.fees,
+            outcome,
+        }))
     }
 
     /// The spot instrument that prices `asset` in `quote`, and what one unit of `asset` is worth
     /// in `quote` by it, if it has a positive price: an instrument of `asset` in `quote`, or the
     /// reciprocal of one of `quote` in `asset`. Of several, the lowest [`InstrumentIndex`], so the
-    /// choice is the same on every run.
+    /// choice is the same on every run, even when that one has no price and another has.
     ///
     /// Assets are indexed per exchange, so only an instrument on the fill's own exchange matches.
     fn fee_asset_pricing(
@@ -195,9 +213,10 @@ where
                     .data
                     .price()
                     .filter(|price| *price > Decimal::ZERO)
-                    .and_then(|price| match inverted {
-                        true => Decimal::ONE.checked_div(price),
-                        false => Some(price),
+                    .map(|price| match inverted {
+                        // The reciprocal of the smallest positive `Decimal`, 1e-28, still fits.
+                        true => Decimal::ONE / price,
+                        false => price,
                     });
                 Some((state.key, price))
             })

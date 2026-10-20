@@ -337,9 +337,10 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     /// - **The price** is [`InstrumentDataState::price`] of a spot instrument pairing the fee
     ///   asset with the fill's quote asset: `BNBUSDT` for a BNB fee on `BTCUSDT`, or the
     ///   reciprocal of a `USDTBNB`. Assets are indexed per exchange, so only an instrument on the
-    ///   fill's exchange matches. Of several, the lowest
-    ///   [`InstrumentIndex`] is used. The price is the one held when the fill is applied, however
-    ///   old. Cross rates through a third asset (BNB to BTC to USDT) are not used.
+    ///   fill's exchange matches. Of several, the lowest [`InstrumentIndex`] is used, even while
+    ///   it has no price and another has, so the choice never depends on which data arrived
+    ///   first. The price is the one held when the fill is applied, however old. Cross rates
+    ///   through a third asset (BNB to BTC to USDT) are not used.
     /// - **With a positive price,** `fees_quote` is the fee times that price, and the fill counts
     ///   it in PnL as it would a fee in quote.
     /// - **Without one,** for want of the instrument or of a price, `fees_quote` stays `None` and
@@ -455,13 +456,15 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
             AccountEventKind::Trade(trade) => {
                 // Valued before the fill is applied, with the prices held when it arrives, so a
                 // fill queued for replay keeps the value it had then.
-                let valued = self.instruments.value_third_asset_fee(trade);
-                let valued_trade = valued.as_ref().map(|valued| {
-                    let mut trade = trade.clone();
-                    trade.fees.fees_quote = valued.fees_quote;
-                    trade
-                });
-                let conversion = valued.and_then(|valued| valued.conversion);
+                let (valued_trade, conversion) = match self.instruments.value_third_asset_fee(trade)
+                {
+                    Some(valued) => {
+                        let mut valued_trade = trade.clone();
+                        valued_trade.fees.fees_quote = valued.fees_quote();
+                        (Some(valued_trade), valued.into_conversion())
+                    }
+                    None => (None, None),
+                };
                 let trade = valued_trade.as_ref().unwrap_or(trade);
 
                 let instrument_state = self.instruments.instrument_index_mut(&trade.instrument);
