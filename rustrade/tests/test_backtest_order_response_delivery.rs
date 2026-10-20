@@ -344,6 +344,7 @@ fn args_constant()
             market_order_timing: Default::default(),
             stale_market: Default::default(),
             spot_margin: None,
+            fee_asset: None,
         })],
         market_data: MarketDataInMemory::new(Arc::new(market_events)),
         summary_interval: Daily,

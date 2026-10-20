@@ -135,6 +135,7 @@ fn venue(spot_fee_asset: SpotFeeAsset) -> SimulatedVenue {
         market_order_timing: Default::default(),
         stale_market: Default::default(),
         spot_margin: Some(SpotMarginConfig::new(quote(), dec!(3)).unwrap()),
+        fee_asset: None,
     };
     let spot = Instrument {
         exchange: EXCHANGE,

@@ -114,7 +114,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `TearSheet::fills_fee_unconverted` counts the fills whose fee was left out of PnL, and
     `TradingSummary::fills_fee_unconverted` sums it over the session.
   - Only the fee is valued. The fee asset's balance is not, since the engine keeps no equity
-    across assets. The simulated venue still charges no fee in a third asset.
+    across assets. The simulated venue can charge fees in a third asset too (see the next entry).
+- **Opt-in fees in a third asset on the simulated venue** (`rustrade-execution`, #621), as
+  Binance's "pay fees with BNB" charges them.
+  - New `MockExecutionConfig::fee_asset`, a `FeeAssetConfig` of an asset and a discount
+    (`FeeAssetConfig::new(asset, discount)`, `0.25` for a quarter off; a discount outside 0 to 1
+    is refused, including when deserialised). The default, `None`, is today's behaviour.
+  - A spot fill's fee is the fee model's fee in quote, less the discount, converted at the venue's
+    price for the asset in the fill's quote: the mid, else the last price, of a spot instrument the
+    venue trades pairing the two, in either direction. It is taken from the asset's free balance
+    when the fill settles, apart from the two assets the fill exchanges, which then move free of
+    fee. The fill reports its fee in that asset, as a live venue does, and restates its balance.
+    Nothing is reserved for it while an order rests.
+  - The fill falls back to the undiscounted fee under `spot_fee_asset`, whole, when the asset's
+    free balance is short of the fee, the venue has no price for it, the instrument trades the
+    asset itself (`BNBUSDT`, `ETHBNB`, which a live venue discounts too), the fill is a CFD's, or
+    its fee is zero or negative. A margin account never lends the asset for a fee.
+  - The account-event indexer gives such a fee no quote equivalent, as a live one, so a backtest
+    counts it in PnL exactly when the engine prices the asset (see the entry above), as live.
 - `round_toward_zero_to_step` (`rustrade-instrument`): a quantity rounded toward zero to a whole
   multiple of a step, the rounding the engine and `build_ioc_market_order_to_close_position`
   apply.
@@ -206,10 +223,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`rustrade-execution`, #627, #643). Build one with `MarketObservation::new(snapshot)`, adding
   `with_depth`, `with_bar` and `with_fresh` as the feed allows. `new` alone keeps today's
   behaviour.
-- **Breaking:** `MockExecutionConfig` has new fields, `market_order_timing`, `stale_market` and
-  `spot_margin`, so a struct literal or a `MockExecutionConfig::new` call must supply them, and
-  `VenueInstrumentMarket` has new public fields, `bar` and `fresh_at` (`rustrade-execution`). A
-  serialised configuration without them still loads, as `OnArrival`, `Off` and `None`.
+- **Breaking:** `MockExecutionConfig` has new fields, `market_order_timing`, `stale_market`,
+  `spot_margin` and `fee_asset`, so a struct literal or a `MockExecutionConfig::new` call must
+  supply them, and `VenueInstrumentMarket` has new public fields, `bar` and `fresh_at`
+  (`rustrade-execution`). A serialised configuration without them still loads, as `OnArrival`,
+  `Off`, `None` and `None`.
 - **Breaking:** the simulated venue's ledger types carry loans (`rustrade-execution`, #623):
   `AccountState::commit` takes the most it may lend, `Committed` has a new `borrowed` field,
   `Reservation` a new `borrowed` field, and `BalanceInsufficient` a new `borrowable` field, so a

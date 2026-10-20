@@ -1,5 +1,7 @@
 use rust_decimal::Decimal;
+use rustrade_instrument::asset::name::AssetNameExchange;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// Which side of the trade a fill was on: the one that supplied liquidity, or the one that took it.
 ///
@@ -232,7 +234,10 @@ impl Default for FeeModelConfig {
 /// proceeds takes the excess from quote. A fill at a price that is not positive cannot be
 /// converted, so it is charged in quote under either rule.
 ///
-/// `#[non_exhaustive]`: a rule that charges a third asset, such as BNB, may be added.
+/// A fee charged in a third asset, such as BNB, is set apart from this rule, by
+/// [`FeeAssetConfig`]. Where it does not apply, this rule does.
+///
+/// `#[non_exhaustive]`: further rules may be added.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
 )]
@@ -245,6 +250,93 @@ pub enum SpotFeeAsset {
     /// The fee is in the asset the fill receives: base out of a buy's quantity, quote out of a
     /// sell's proceeds.
     Received,
+}
+
+/// A third asset the simulated venue charges spot fees in, at a discount, while the account
+/// holds enough of it: Binance's "pay fees with BNB".
+///
+/// # What a fill pays
+/// The fee is the [`FeeModelConfig`]'s fee in quote, less [`discount`](Self::discount), converted
+/// to the fee asset at the venue's price for it: the mid, else the last price, of a spot
+/// instrument on the venue pairing the fee asset with the fill's quote asset, in either direction
+/// (`BNB/USDT`, or the reciprocal of `USDT/BNB`). Of several, the one first by name. It is taken
+/// from the fee asset's free balance when the fill settles, apart from what the fill exchanges,
+/// and the fill reports it in the fee asset, as a live venue does. Nothing is reserved for it
+/// while an order rests, since a venue does not hold the fee asset for open orders.
+///
+/// # When it falls back
+/// The fill is charged as without this setting, the undiscounted fee under the venue's
+/// [`SpotFeeAsset`] rule, when any of these holds:
+/// - the fee asset's free balance is short of the fee: the whole fee falls back, none of it is
+///   split. A margin account does not lend the fee asset for a fee.
+/// - the venue holds no positive price for the fee asset in the fill's quote. A venue with no
+///   market feed holds none.
+/// - the instrument is the fee asset's own, its base or its quote (`BNB/USDT`, `ETH/BNB`). A live
+///   venue discounts those too; this one does not.
+/// - the fill is cash-settled (a CFD), or its fee is zero or negative.
+///
+/// A fill's fee asset says which happened. With an engine that prices the fee asset, PnL counts a
+/// fee charged in it; otherwise a backtest leaves it out, as a live run does.
+///
+/// [`new`](Self::new) refuses a discount outside zero to one, and so does deserialising one.
+/// Serialised, the discount is a decimal string (`"0.25"`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(try_from = "FeeAssetRepr", into = "FeeAssetRepr")]
+pub struct FeeAssetConfig(FeeAssetRepr);
+
+/// The serialised form of a [`FeeAssetConfig`], before validation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+struct FeeAssetRepr {
+    asset: AssetNameExchange,
+    #[serde(with = "rust_decimal::serde::str")]
+    discount: Decimal,
+}
+
+impl FeeAssetConfig {
+    /// Fees charged in `asset`, at `discount` off the fee model's fee: `0.25` for a quarter off.
+    ///
+    /// # Errors
+    /// Returns [`FeeAssetConfigError`] if `discount` is below zero or above one.
+    pub fn new(asset: AssetNameExchange, discount: Decimal) -> Result<Self, FeeAssetConfigError> {
+        Self::try_from(FeeAssetRepr { asset, discount })
+    }
+
+    /// The asset fees are charged in.
+    pub fn asset(&self) -> &AssetNameExchange {
+        &self.0.asset
+    }
+
+    /// The fraction taken off the fee model's fee: zero for none, one for no fee at all.
+    pub fn discount(&self) -> Decimal {
+        self.0.discount
+    }
+}
+
+impl TryFrom<FeeAssetRepr> for FeeAssetConfig {
+    type Error = FeeAssetConfigError;
+
+    fn try_from(repr: FeeAssetRepr) -> Result<Self, Self::Error> {
+        if repr.discount < Decimal::ZERO || repr.discount > Decimal::ONE {
+            return Err(FeeAssetConfigError::DiscountOutOfRange(repr.discount));
+        }
+        Ok(Self(repr))
+    }
+}
+
+impl From<FeeAssetConfig> for FeeAssetRepr {
+    fn from(config: FeeAssetConfig) -> Self {
+        config.0
+    }
+}
+
+/// Why a [`FeeAssetConfig`] was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum FeeAssetConfigError {
+    /// A discount below zero, which would charge more than the fee model, or above one, which
+    /// would pay the account for trading.
+    #[error("fee asset discount {0} is outside 0 to 1")]
+    DiscountOutOfRange(Decimal),
 }
 
 impl FeeModel for FeeModelConfig {
@@ -529,5 +621,36 @@ mod tests {
             serde_json::from_str::<PercentageFeeModel>(&json).expect("must round-trip"),
             model
         );
+    }
+
+    #[test]
+    fn a_fee_asset_discount_must_lie_between_zero_and_one() {
+        let bnb = || AssetNameExchange::new("BNB");
+        for discount in ["0", "0.25", "1"] {
+            let config = FeeAssetConfig::new(bnb(), d(discount)).unwrap();
+            assert_eq!((config.asset(), config.discount()), (&bnb(), d(discount)));
+        }
+        for discount in ["-0.01", "1.01"] {
+            assert_eq!(
+                FeeAssetConfig::new(bnb(), d(discount)),
+                Err(FeeAssetConfigError::DiscountOutOfRange(d(discount)))
+            );
+        }
+    }
+
+    /// The discount serialises as a decimal string, and deserialising refuses one out of range.
+    #[test]
+    fn a_fee_asset_config_round_trips_and_refuses_an_invalid_discount() {
+        let config = FeeAssetConfig::new(AssetNameExchange::new("BNB"), d("0.25")).unwrap();
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(json, r#"{"asset":"BNB","discount":"0.25"}"#);
+        assert_eq!(
+            serde_json::from_str::<FeeAssetConfig>(&json).unwrap(),
+            config
+        );
+
+        let error = serde_json::from_str::<FeeAssetConfig>(r#"{"asset":"BNB","discount":"2"}"#)
+            .unwrap_err();
+        assert!(error.to_string().contains("outside 0 to 1"), "{error}");
     }
 }

@@ -773,6 +773,7 @@ mod tests {
             market_order_timing: Default::default(),
             stale_market: Default::default(),
             spot_margin: None,
+            fee_asset: None,
         }
     }
 
