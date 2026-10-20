@@ -12680,6 +12680,290 @@ mod tests {
         );
     }
 
+    /// On an instrument quoting in the fee asset the venue charges as without the setting too:
+    /// the fee is undiscounted, in quote, which is the fee asset, under the `SpotFeeAsset` rule.
+    #[test]
+    fn a_fill_on_an_instrument_quoted_in_the_fee_asset_falls_back() {
+        let mut instruments = fee_asset_instruments();
+        let eth_bnb = spot_instrument("ETHBNB", "ETH", "BNB");
+        instruments.insert(eth_bnb.name_exchange.clone(), eth_bnb);
+        let eth = || AssetNameExchange::new("ETH");
+        let config = MockExecutionConfig {
+            fee_asset: Some(FeeAssetConfig::new(bnb(), d("0.25")).unwrap()),
+            ..config_from_balances(
+                vec![
+                    funded(base(), d("10")),
+                    funded(quote(), d("100000")),
+                    funded(bnb(), d("10")),
+                    funded(eth(), d("1")),
+                ],
+                maker_taker_fee(),
+            )
+        };
+
+        for (side, eth_after, bnb_after) in [
+            // 0.5 BNB plus 0.0005 on top.
+            (Side::Buy, "2", "9.4995"),
+            // 0.5 BNB less 0.0005 out of it.
+            (Side::Sell, "0", "10.4995"),
+        ] {
+            let mut venue = SimulatedVenue::new_market_driven(&config, instruments.clone());
+            advance(&mut venue, time(1));
+            assert!(
+                venue
+                    .apply_market(
+                        &InstrumentNameExchange::new("ETHBNB"),
+                        MarketObservation::new(traded("0.5")),
+                        time(1)
+                    )
+                    .is_empty()
+            );
+            let mut request = match side {
+                Side::Buy => buy_request("1", None),
+                Side::Sell => sell_request("1", None),
+            };
+            request.key.instrument = InstrumentNameExchange::new("ETHBNB");
+
+            let outcome = venue.open_order(request);
+
+            // 0.5 × 10bp, undiscounted.
+            assert_eq!(
+                filled_trade(&outcome).fees,
+                AssetFees::new(bnb(), d("0.0005"), Some(d("0.0005"))),
+                "{side:?}"
+            );
+            assert_eq!(balance_now(&venue, eth()).total, d(eth_after), "{side:?}");
+            assert_eq!(balance_now(&venue, bnb()).total, d(bnb_after), "{side:?}");
+        }
+    }
+
+    /// A maker rebate is a negative fee, which stays in quote: the venue pays no rebate in the
+    /// fee asset.
+    #[test]
+    fn a_negative_fee_is_paid_without_the_fee_asset() {
+        let rebate =
+            FeeModelConfig::Percentage(PercentageFeeModel::maker_taker(d("-0.0001"), d("-0.0001")));
+        let config = MockExecutionConfig {
+            fee_model: rebate,
+            ..fee_asset_config("1")
+        };
+        let mut venue = fee_asset_venue_from(&config, true);
+
+        let outcome = venue.open_order(buy_request("1", None));
+
+        assert_eq!(
+            filled_trade(&outcome).fees,
+            AssetFees::new(quote(), d("-5"), Some(d("-5")))
+        );
+        assert_eq!(balance_now(&venue, quote()).total, d("50005"));
+        assert_eq!(balance_now(&venue, bnb()), Balance::new(d("1"), d("1")));
+    }
+
+    /// `USDTBNB` at a last price of 0.0016 prices BNB at its reciprocal, 625, and of two pairs
+    /// pricing it, the one first by name is used.
+    #[test]
+    fn the_fee_asset_is_priced_by_a_reciprocal_pair_or_the_pair_first_by_name() {
+        let usdt_bnb = spot_instrument("USDTBNB", "USDT", "BNB");
+        let feed = |venue: &mut SimulatedVenue, name: &str, price: &str| {
+            assert!(
+                venue
+                    .apply_market(
+                        &InstrumentNameExchange::new(name),
+                        MarketObservation::new(traded(price)),
+                        time(1)
+                    )
+                    .is_empty()
+            );
+        };
+
+        // Only `USDTBNB`: 37.50 at 625 is 0.06 BNB.
+        let mut instruments = spot_instruments();
+        instruments.insert(usdt_bnb.name_exchange.clone(), usdt_bnb.clone());
+        let mut venue = SimulatedVenue::new_market_driven(&fee_asset_config("1"), instruments);
+        advance(&mut venue, time(1));
+        feed(&mut venue, "USDTBNB", "0.0016");
+        feed(&mut venue, "BTCUSDT", "50000");
+        let outcome = venue.open_order(buy_request("1", None));
+        assert_eq!(
+            filled_trade(&outcome).fees,
+            AssetFees::new(bnb(), d("0.06"), Some(d("37.5")))
+        );
+
+        // Both, `BNBUSDT` at a last price of 600 coming first: 0.0625 BNB.
+        let mut instruments = fee_asset_instruments();
+        instruments.insert(usdt_bnb.name_exchange.clone(), usdt_bnb);
+        let mut venue = SimulatedVenue::new_market_driven(&fee_asset_config("1"), instruments);
+        advance(&mut venue, time(1));
+        feed(&mut venue, "USDTBNB", "0.0016");
+        feed(&mut venue, "BNBUSDT", "600");
+        feed(&mut venue, "BTCUSDT", "50000");
+        let outcome = venue.open_order(buy_request("1", None));
+        assert_eq!(
+            filled_trade(&outcome).fees,
+            AssetFees::new(bnb(), d("0.0625"), Some(d("37.5")))
+        );
+    }
+
+    /// A marketable buy that fills half against the offer and rests the rest pays the filled
+    /// half's fee in BNB, and holds the resting half's fee as the fallback would charge it.
+    #[test]
+    fn a_partly_filled_order_pays_its_fill_in_the_fee_asset_and_holds_the_rest_in_quote() {
+        let mut venue = fee_asset_venue("1");
+        assert!(
+            venue
+                .apply_market(
+                    &instrument_name(),
+                    MarketObservation::new(book("49000", "49100"))
+                        .with_depth(MarketDepth::new(None, Some(d("0.5")))),
+                    time(1),
+                )
+                .is_empty()
+        );
+
+        let outcome = venue.open_order(limit_request("part", Side::Buy, "1", "49100", gtc()));
+
+        assert_eq!(rested_open(&outcome).filled_quantity, d("0.5"));
+        // 24,550 × 10bp, a quarter off, at 600.
+        assert_eq!(
+            filled_trade(&outcome).fees,
+            AssetFees::new(bnb(), d("0.0306875"), Some(d("18.4125")))
+        );
+        // 24,550 paid, and 24,550 plus the maker fee of 4.91 held for the resting half.
+        assert_eq!(
+            balance_now(&venue, quote()),
+            Balance::new(d("75450"), d("50895.09"))
+        );
+        assert_eq!(
+            balance_now(&venue, bnb()),
+            Balance::new(d("0.9693125"), d("0.9693125"))
+        );
+    }
+
+    /// 10,000 USDT on a 3× margin account, BTC flat, paying fees in BNB and charged hourly on
+    /// USDT loans, `BTCUSDT` at 50,000 and BNB at 600.
+    fn fee_asset_margin_venue(bnb: &str) -> SimulatedVenue {
+        let config = MockExecutionConfig {
+            spot_margin: Some(SpotMarginConfig::new(quote(), d("3")).unwrap()),
+            fee_asset: Some(FeeAssetConfig::new(self::bnb(), d("0.25")).unwrap()),
+            ..config_from_balances(
+                vec![
+                    funded(base(), Decimal::ZERO),
+                    funded(quote(), d("10000")),
+                    funded(self::bnb(), d(bnb)),
+                ],
+                maker_taker_fee(),
+            )
+        };
+        fee_asset_venue_from(&config, true).with_margin_interest(Arc::new(hourly_interest(quote())))
+    }
+
+    /// A buy of 0.3 BTC borrows the 5,000 USDT it pays beyond the account's own, and no more,
+    /// since its fee is paid in BNB. The BNB restates after the fill's own balances, and the
+    /// interest on the loan is reported after all three.
+    #[test]
+    fn a_margin_buy_paying_in_the_fee_asset_borrows_only_its_notional() {
+        let mut venue = fee_asset_margin_venue("1");
+
+        let outcome = venue.open_order(buy_request("0.3", None));
+
+        // 15,000 × 10bp, a quarter off, at 600.
+        assert_eq!(
+            filled_trade(&outcome).fees,
+            AssetFees::new(bnb(), d("0.01875"), Some(d("11.25")))
+        );
+        let paid = balance_of(&outcome.events[0]);
+        assert_eq!(paid.asset, quote());
+        assert_eq!(
+            paid.balance.margin.map(|margin| margin.borrowed),
+            Some(d("5000"))
+        );
+        assert_eq!(balance_of(&outcome.events[1]).asset, base());
+        assert_eq!(
+            *balance_of(&outcome.events[2]),
+            AssetBalance::new(
+                bnb(),
+                Balance::new_margin(d("0.98125"), d("0.98125"), d("0"), d("0")),
+                time(1)
+            )
+        );
+        // 5,000 at 0.01% for the hour.
+        assert_eq!(
+            *cash_flow_of(&outcome.events[3]),
+            interest_flow(quote(), "5000", "0.5", time(1), "0")
+        );
+    }
+
+    /// With no BNB, the fee falls back to quote, which the venue lends with the notional; it
+    /// never lends BNB for a fee.
+    #[test]
+    fn a_margin_account_short_of_the_fee_asset_borrows_the_fallback_fee_not_the_fee_asset() {
+        let mut venue = fee_asset_margin_venue("0");
+
+        let outcome = venue.open_order(buy_request("0.3", None));
+
+        assert_eq!(
+            filled_trade(&outcome).fees,
+            AssetFees::new(quote(), d("15"), Some(d("15")))
+        );
+        assert_eq!(
+            balance_now(&venue, quote())
+                .margin
+                .map(|margin| margin.borrowed),
+            Some(d("5015"))
+        );
+        assert_eq!(
+            balance_now(&venue, bnb()),
+            Balance::new_margin(d("0"), d("0"), d("0"), d("0"))
+        );
+    }
+
+    /// A resting buy borrows for its notional and its fallback fee. Filled with the fee paid in
+    /// BNB, it repays the part of the loan the fee no longer needs, interest first.
+    #[test]
+    fn a_resting_margin_fill_paying_in_the_fee_asset_repays_the_fee_it_borrowed() {
+        let mut venue = fee_asset_margin_venue("1");
+        assert!(
+            venue
+                .apply_market(
+                    &instrument_name(),
+                    MarketObservation::new(book("49000", "49100")),
+                    time(1)
+                )
+                .is_empty()
+        );
+        let outcome = venue.open_order(limit_request("resting", Side::Buy, "0.3", "49000", gtc()));
+        // 14,700 plus the maker fee of 2.94, beyond the 10,000 held, and an hour's interest on it.
+        assert_eq!(
+            filled_balance(&outcome).balance,
+            Balance::new_margin(d("14702.94"), d("0"), d("4702.94"), d("0.470294"))
+        );
+
+        let events = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("48900", "48950")),
+            time(2),
+        );
+
+        // 2.94, a quarter off, at 600.
+        let trade = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                AccountEventKind::Trade(trade) => Some(trade),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            trade.fees,
+            AssetFees::new(bnb(), d("0.003675"), Some(d("2.205")))
+        );
+        // The 2.94 no longer needed repays the 0.470294 of interest, then 2.469706 of the loan.
+        assert_eq!(
+            balance_now(&venue, quote()),
+            Balance::new_margin(d("0"), d("0"), d("4700.470294"), d("0"))
+        );
+        assert_eq!(balance_now(&venue, bnb()).total, d("0.996325"));
+    }
+
     /// A CFD fill is cash-settled, so its fee stays in quote even with the fee asset priced.
     #[test]
     fn a_cfd_fill_is_charged_without_the_fee_asset() {

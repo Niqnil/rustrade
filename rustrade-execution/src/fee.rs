@@ -264,6 +264,9 @@ pub enum SpotFeeAsset {
 /// and the fill reports it in the fee asset, as a live venue does. Nothing is reserved for it
 /// while an order rests, since a venue does not hold the fee asset for open orders.
 ///
+/// The fee is not rounded to the fee asset's precision, which this venue does not know, so it
+/// can differ from a live venue's in its last decimals.
+///
 /// # When it falls back
 /// The fill is charged as without this setting, the undiscounted fee under the venue's
 /// [`SpotFeeAsset`] rule, when any of these holds:
