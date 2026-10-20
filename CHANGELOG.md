@@ -118,8 +118,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Every balance reports its loan in `Balance::margin`, as Binance's margin account does, and the
     account's holding of an asset is its `total` less what it owes.
     `MarginSideEffect::NoBorrow` reports loans but lends and repays nothing.
+  - **Margin interest**, opt-in through `SimVenueOptions::margin_interest` or
+    `SimulatedVenue::with_margin_interest`, which take a `MarginInterestModel`. The venue charges
+    each loan when it is taken, on the amount lent, stamped when the order is accepted, and at
+    each of the model's boundaries while principal is owed in the asset, on that principal.
+    Interest earns no interest. Each charge is added to the loan's interest, which a fill repays
+    first, and is reported after the balance it restates as a `CashFlowKind::MarginInterest` in
+    the borrowed asset, with no instrument. `SimRunner` wakes the venue for each boundary. The
+    builder refuses a model for a venue without `spot_margin`.
+  - `PeriodicMarginInterest` is the built-in model: one period at borrow, then one at each whole
+    period since the Unix epoch (on the hour, for an hourly period), at an annualised rate per
+    asset from a `RateSeries` on a `DayCount` basis, each charge rounded up to the asset's unit
+    (`1e-8` by default). `InterestSchedule::AtBorrowOnly` charges the borrow alone. A venue's
+    daily rate is an annual rate of `daily × 365` on `DayCount::Act365`.
   - Not modelled: liquidation, isolated margin, per-asset borrow limits and the venue's lending
-    pool. No interest is charged yet. CFD orders are not lent their margin.
+    pool. CFD orders are not lent their margin.
+- `DayCount::accrue_span` (`rustrade-execution`): an annual amount accrued over a span of time,
+  such as an hour's interest.
 
 ### Changed
 

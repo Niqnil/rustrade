@@ -237,13 +237,30 @@ impl DayCount {
     /// Divided last, so an amount the basis divides exactly comes out exact rather than carrying
     /// the rounding of a non-terminating year fraction such as `1 / 360`.
     pub fn accrue(self, annual: Decimal, days: u32) -> Decimal {
-        let basis = match self {
+        annual * Decimal::from(days) / self.basis()
+    }
+
+    /// What `span` of `annual`, a whole year's amount, comes to on this basis:
+    /// `annual × span / (basis × 1 day)`, for a charge over a period shorter than a day, such as
+    /// an hour's margin interest.
+    ///
+    /// Divided last, as [`accrue`](Self::accrue) is. A negative `span` accrues a negative amount.
+    pub fn accrue_span(self, annual: Decimal, span: TimeDelta) -> Decimal {
+        let seconds =
+            Decimal::from(span.num_seconds()) + Decimal::new(i64::from(span.subsec_nanos()), 9);
+        annual * seconds / (self.basis() * Decimal::from(SECONDS_PER_DAY))
+    }
+
+    /// The days a full year's rate is charged over.
+    fn basis(self) -> Decimal {
+        match self {
             Self::Act360 => Decimal::from(360),
             Self::Act365 => Decimal::from(365),
-        };
-        annual * Decimal::from(days) / basis
+        }
     }
 }
+
+const SECONDS_PER_DAY: i64 = 86_400;
 
 /// Which dates a market settles on.
 ///
@@ -412,6 +429,19 @@ impl<Tz: TimeZone> DailyAccrual<Tz> {
     }
 }
 
+/// The first whole multiple of `interval` since the Unix epoch strictly after `after`, or `None`
+/// if it is out of range. `after` on a boundary steps to the next one.
+pub(crate) fn next_whole_interval(
+    interval: TimeDelta,
+    after: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let since_epoch = after - DateTime::UNIX_EPOCH;
+    let interval_ns = interval.num_nanoseconds()?;
+    let elapsed_ns = since_epoch.num_nanoseconds()?;
+    let next = elapsed_ns.div_euclid(interval_ns).checked_add(1)?;
+    DateTime::UNIX_EPOCH.checked_add_signed(TimeDelta::nanoseconds(next.checked_mul(interval_ns)?))
+}
+
 fn next_date(date: NaiveDate) -> NaiveDate {
     date.succ_opt()
         .unwrap_or_else(|| panic!("DailyAccrual ran past the last representable date"))
@@ -483,14 +513,7 @@ impl HoldingCostModel for FundingModel {
         if !self.rates.contains_key(instrument) {
             return None;
         }
-
-        // Whole intervals since the epoch, so `after` on a boundary steps to the next one.
-        let since_epoch = after - DateTime::UNIX_EPOCH;
-        let interval_ns = self.interval.num_nanoseconds()?;
-        let elapsed_ns = since_epoch.num_nanoseconds()?;
-        let next = elapsed_ns.div_euclid(interval_ns).checked_add(1)?;
-        DateTime::UNIX_EPOCH
-            .checked_add_signed(TimeDelta::nanoseconds(next.checked_mul(interval_ns)?))
+        next_whole_interval(self.interval, after)
     }
 
     fn charge(
@@ -760,6 +783,21 @@ mod tests {
         assert!(
             error.to_string().contains("strictly ascending"),
             "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_span_accrues_its_fraction_of_a_year_to_the_nanosecond() {
+        // A year's amount of one per second on Act360, so a span accrues its length in seconds.
+        let annual = Decimal::from(360 * SECONDS_PER_DAY);
+
+        assert_eq!(
+            DayCount::Act360.accrue_span(annual, TimeDelta::milliseconds(1500)),
+            dec!(1.5)
+        );
+        assert_eq!(
+            DayCount::Act365.accrue_span(dec!(365), TimeDelta::hours(36)),
+            dec!(1.5)
         );
     }
 

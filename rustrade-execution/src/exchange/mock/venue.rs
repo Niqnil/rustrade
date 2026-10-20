@@ -3,7 +3,7 @@
 use crate::{
     AccountEventKind, InstrumentAccountSnapshot, UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::AssetBalance,
-    cash_flow::{CashFlow, CashFlowId},
+    cash_flow::{CashFlow, CashFlowId, CashFlowKind},
     client::mock::MockExecutionConfig,
     error::{ApiError, BorrowReject, BorrowRejectReason, UnindexedApiError, UnindexedOrderError},
     exchange::mock::{
@@ -13,7 +13,7 @@ use crate::{
     fee::{FeeModel, FeeModelConfig, Liquidity, SpotFeeAsset},
     fill::{FillContext, FillModel, MarketOrderTiming, NextBarPrice, StaleMarketPolicy},
     holding_cost::{HeldPosition, HoldingCostModel},
-    margin::SpotMarginConfig,
+    margin::{InterestDue, MarginInterestModel, SpotMarginConfig},
     market::{MarketBar, MarketDepth, MarketObservation, MarketSnapshot},
     order::{
         Order, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrder, UnindexedOrderKey,
@@ -172,6 +172,23 @@ pub enum VenueRegime {
 /// a fill delivers. Every balance then reports its loan in [`Balance::margin`], and the account's
 /// holding of an asset is its `total` less what it owes. See
 /// [`SpotMarginConfig`] for how much it lends and what it does not model.
+///
+/// Its loans are free unless it is given a [`MarginInterestModel`] through
+/// [`with_margin_interest`](Self::with_margin_interest). Then each loan is charged when it is
+/// taken, and at each of the model's boundaries while principal is owed in its asset:
+/// - **At borrow**, on the amount lent, stamped at the instant the order was accepted. The
+///   balance the order restates includes the interest, and an
+///   [`AccountEventKind::CashFlow`] reporting it follows that order's balances.
+/// - **At a boundary**, on the principal owed across it, as `[balance, cash flow]` stamped at the
+///   boundary, when a driver moves the clock to or past it, as for holding costs (see
+///   `# Holding costs`). A loan taken at a boundary's instant is charged at borrow, not again at
+///   that boundary.
+///
+/// The interest is added to the loan, so `total` and `free` are unchanged and what a fill
+/// delivers repays it first. Each cash flow is a
+/// [`CashFlowKind::MarginInterest`], in the borrowed asset, negative, with no instrument, since a
+/// cross margin loan belongs to the account rather than to a position. A venue that books such
+/// interest at the start of its hour stamps it earlier than this venue does.
 ///
 /// [`Balance::margin`]: crate::balance::Balance::margin
 ///
@@ -526,8 +543,8 @@ pub struct SimulatedVenue {
     /// [`with_holding_costs`](Self::with_holding_costs), and then fixed: swapping a model under
     /// a position mid-run would leave its charges to date priced by one and the rest by another.
     holding_costs: Vec<Arc<dyn HoldingCostModel>>,
-    /// The instant up to which every holding-cost boundary has been charged, or `None` before
-    /// this venue's clock first moved.
+    /// The instant up to which every holding-cost and interest boundary has been charged, or
+    /// `None` before this venue's clock first moved.
     ///
     /// A boundary is charged when the clock first reaches it and never again, which is what makes
     /// a charge idempotent however often the clock is moved to one instant. It starts unset
@@ -562,6 +579,19 @@ pub struct SimulatedVenue {
     /// What this venue lends a spot order, or `None` for a cash account. Fixed at construction
     /// from [`MockExecutionConfig::spot_margin`]: turning it off would strand the loans it made.
     spot_margin: Option<SpotMarginConfig>,
+    /// What this venue's loans cost in interest. `None` unless set by
+    /// [`with_margin_interest`](Self::with_margin_interest), and then fixed, for the same reason
+    /// as [`holding_costs`](Self::holding_costs).
+    margin_interest: Option<Arc<dyn MarginInterestModel>>,
+    /// The earliest interest boundary after [`accrued_through`](Self::accrued_through) of any
+    /// asset the account owes principal in, or `None` if there is none.
+    ///
+    /// Cached, like [`next_charge`](Self::next_charge), and recomputed when a boundary is charged
+    /// or when [`AccountState::loans_changed`] says which assets owe principal may have changed.
+    next_interest: Option<DateTime<Utc>>,
+    /// The [`AccountState::loans_changed`] count [`next_interest`](Self::next_interest) was
+    /// computed at.
+    next_interest_loans: u64,
 }
 
 impl SimulatedVenue {
@@ -643,6 +673,9 @@ impl SimulatedVenue {
             market_order_timing: config.market_order_timing,
             stale_market: config.stale_market,
             spot_margin: config.spot_margin.clone(),
+            margin_interest: None,
+            next_interest: None,
+            next_interest_loans: 0,
         }
     }
 
@@ -657,6 +690,27 @@ impl SimulatedVenue {
     pub fn with_holding_costs(mut self, models: Vec<Arc<dyn HoldingCostModel>>) -> Self {
         self.holding_costs = models;
         self.refresh_next_charge();
+        self
+    }
+
+    /// This venue, charging interest on its spot margin loans as `model` says.
+    ///
+    /// Each loan is charged when it is taken, on the amount lent, and at each of the model's
+    /// boundaries while the account owes principal in its asset, on that principal, as described
+    /// on [`MarginInterestModel`]. See the type's `# Spot margin` for how a charge is reported.
+    ///
+    /// # Panics
+    /// If this venue has no [`MockExecutionConfig::spot_margin`]: a cash account takes no loans,
+    /// so a model given to one would silently charge nothing.
+    #[must_use]
+    pub fn with_margin_interest(mut self, model: Arc<dyn MarginInterestModel>) -> Self {
+        assert!(
+            self.spot_margin.is_some(),
+            "SimulatedVenue given a margin interest model without MockExecutionConfig::spot_margin: \
+             a cash account takes no loans to charge"
+        );
+        self.margin_interest = Some(model);
+        self.refresh_next_interest();
         self
     }
 
@@ -688,18 +742,23 @@ impl SimulatedVenue {
     }
 
     /// The next instant at which this venue has something to do of its own accord: an open order
-    /// reaching its deadline, or a holding-cost boundary of a position it holds.
+    /// reaching its deadline, a holding-cost boundary of a position it holds, or an interest
+    /// boundary of a loan it made.
     ///
     /// For a driver with a timeline of its own, such as `SimRunner`, which moves the clock to this
     /// instant so that an expiry or a charge happens when it is due rather than when the next
     /// market event or request happens to arrive. `None` when nothing is due.
     ///
     /// Recompute it after anything that moves this venue: an order, a fill, or the clock. A
-    /// holding-cost boundary is reported only once the venue's clock has first moved, since that is
-    /// where charging starts.
+    /// holding-cost or interest boundary is reported only once the venue's clock has first moved,
+    /// since that is where charging starts.
     pub fn next_deadline(&self) -> Option<DateTime<Utc>> {
         let expiry = self.account.orders().next_expiry();
-        expiry.into_iter().chain(self.next_charge).min()
+        expiry
+            .into_iter()
+            .chain(self.next_charge)
+            .chain(self.next_interest)
+            .min()
     }
 
     /// Recomputes [`next_charge`](Self::next_charge) from the positions held now.
@@ -714,6 +773,29 @@ impl SimulatedVenue {
                 })
                 .min()
         });
+    }
+
+    /// Recomputes [`next_interest`](Self::next_interest) from the loans owed now.
+    fn refresh_next_interest(&mut self) {
+        self.next_interest_loans = self.account.loans_changed();
+        let Some(model) = self.margin_interest.as_deref() else {
+            return;
+        };
+        self.next_interest = self.accrued_through.and_then(|after| {
+            self.account
+                .loans()
+                .filter_map(|(asset, _)| next_interest_boundary(model, asset, after))
+                .min()
+        });
+    }
+
+    /// Recomputes [`next_interest`](Self::next_interest) if the assets owing principal may have
+    /// changed since it was last computed. Called at the end of every input that can lend or
+    /// repay.
+    fn refresh_next_interest_if_loans_changed(&mut self) {
+        if self.account.loans_changed() != self.next_interest_loans {
+            self.refresh_next_interest();
+        }
     }
 
     /// Which price source this venue has, and so which order kinds it accepts.
@@ -755,10 +837,11 @@ impl SimulatedVenue {
     /// eaten the expiries, leaving its client holding orders the venue no longer has and a balance
     /// it has already released.
     ///
-    /// # And the holding costs it reached
-    /// Every holding-cost boundary between the previous instant and this one is charged first, in
-    /// time order, each as `[balance, cash flow]` stamped at its boundary — see the type's
-    /// `# Holding costs`. They precede the expiries, which are stamped at `time_exchange`.
+    /// # And the holding costs and interest it reached
+    /// Every holding-cost and interest boundary between the previous instant and this one is
+    /// charged first, in time order, each as `[balance, cash flow]` stamped at its boundary — see
+    /// the type's `# Holding costs` and `# Spot margin`. They precede the expiries, which are
+    /// stamped at `time_exchange`.
     #[must_use]
     pub fn advance_time(&mut self, time_exchange: DateTime<Utc>) -> Vec<UnindexedAccountEvent> {
         // Charged before the balances are restamped, so each restatement it emits keeps its own
@@ -767,63 +850,154 @@ impl SimulatedVenue {
         self.time_exchange_latest = time_exchange;
         self.account.update_time_exchange(time_exchange);
         events.append(&mut self.sweep_expired(time_exchange));
+        self.refresh_next_interest_if_loans_changed();
         events
     }
 
-    /// Charges every holding-cost boundary in `(accrued_through, now]` against the position held
-    /// across it, returning `[balance, cash flow]` per charge, in boundary then instrument then
-    /// model order.
+    /// Charges every holding-cost and interest boundary in `(accrued_through, now]`, the first
+    /// against the position held across it and the second against the principal owed across it,
+    /// returning `[balance, cash flow]` per charge. In boundary order, and at one boundary the
+    /// holding costs, by instrument then model, before the interest, by asset.
     ///
-    /// The positions cannot have changed since `accrued_through`: this venue's state moves only on
-    /// its inputs, and each input charges what is due before it fills anything. So the position
-    /// held now is the one held across every boundary being charged, and a gap of several
-    /// boundaries is caught up exactly.
+    /// The positions and the principal owed cannot have changed since `accrued_through`: this
+    /// venue's state moves only on its inputs, and each input charges what is due before it fills
+    /// anything. So what is held and owed now is what was held and owed across every boundary
+    /// being charged, and a gap of several boundaries is caught up exactly. Interest charged at
+    /// one boundary is not principal, so it does not change what the next one charges.
     ///
     /// # Panics
-    /// If a model returns a boundary that is not after the instant it was asked from — see
-    /// [`HoldingCostModel`]'s contract.
+    /// If a model returns a boundary that is not after the instant it was asked from, or a
+    /// negative interest — see the contracts of [`HoldingCostModel`] and [`MarginInterestModel`].
     fn accrue(&mut self, now: DateTime<Utc>) -> Vec<UnindexedAccountEvent> {
         let after = match self.accrued_through {
             // The clock's first move: charging starts here.
             None => {
                 self.accrued_through = Some(now);
                 self.refresh_next_charge();
+                self.refresh_next_interest();
                 return Vec::new();
             }
             Some(after) if now <= after => return Vec::new(),
             Some(after) => after,
         };
+        // Every input refreshes this as it ends, but the ledger is public, so one changed since is
+        // caught here, while the cache is still computed from `after`.
+        self.refresh_next_interest_if_loans_changed();
         self.accrued_through = Some(now);
 
         // Nothing falls in `(after, now]`, so the first boundary after `now` is still the first
-        // after `after`, and the cache stays right.
-        if self.next_charge.is_none_or(|due| now < due) {
+        // after `after`, and the caches stay right.
+        let falls = |next: Option<DateTime<Utc>>| next.is_some_and(|due| due <= now);
+        if !falls(self.next_charge) && !falls(self.next_interest) {
             return Vec::new();
         }
 
         let mut due = Vec::new();
         for instrument in self.positions.keys() {
             for (index, model) in self.holding_costs.iter().enumerate() {
-                let mut from = after;
-                while let Some(boundary) = next_boundary(model.as_ref(), instrument, from) {
-                    if boundary > now {
-                        break;
-                    }
-                    due.push((boundary, instrument.clone(), index));
-                    from = boundary;
-                }
+                let boundaries = boundaries_through(after, now, |from| {
+                    next_boundary(model.as_ref(), instrument, from)
+                });
+                due.extend(
+                    boundaries.map(|boundary| (boundary, Due::Holding(instrument.clone(), index))),
+                );
             }
         }
-        // Positions are hashed, so their iteration order is arbitrary: sorted, so one run's
-        // charges arrive in the same order as another's.
+        if let Some(model) = self.margin_interest.as_deref() {
+            for (asset, _) in self.account.loans() {
+                let boundaries = boundaries_through(after, now, |from| {
+                    next_interest_boundary(model, asset, from)
+                });
+                due.extend(boundaries.map(|boundary| (boundary, Due::Interest(asset.clone()))));
+            }
+        }
+        // Positions and balances are hashed, so their iteration order is arbitrary: sorted, so
+        // one run's charges arrive in the same order as another's.
         due.sort_unstable();
 
         let mut events = Vec::with_capacity(due.len() * 2);
-        for (boundary, instrument, index) in due {
-            self.charge_holding_cost(boundary, &instrument, index, &mut events);
+        for (boundary, due) in due {
+            match due {
+                Due::Holding(instrument, index) => {
+                    self.charge_holding_cost(boundary, &instrument, index, &mut events);
+                }
+                Due::Interest(asset) => {
+                    self.charge_interest_boundary(boundary, &asset, &mut events);
+                }
+            }
         }
         self.refresh_next_charge();
+        self.refresh_next_interest();
         events
+    }
+
+    /// Charges the interest on the principal of `asset` owed across `boundary`, pushing
+    /// `[balance, cash flow]` onto `events`, or nothing if the model charges nothing.
+    fn charge_interest_boundary(
+        &mut self,
+        boundary: DateTime<Utc>,
+        asset: &AssetNameExchange,
+        events: &mut Vec<UnindexedAccountEvent>,
+    ) {
+        let principal = self
+            .account
+            .loans()
+            .find_map(|(owed, principal)| (owed == asset).then_some(principal));
+        let Some(principal) = principal else {
+            return;
+        };
+        if let Some((balance, flow)) =
+            self.charge_interest(asset, principal, InterestDue::Boundary(boundary))
+        {
+            events.push(self.build_account_event(Snapshot(balance)));
+            events.push(self.build_account_event(AccountEventKind::CashFlow(flow)));
+        }
+    }
+
+    /// Charges a loan of `principal` of `asset` what the interest model says is `due`, returning
+    /// the restated balance and the cash flow that reports the charge, stamped when it was due.
+    /// `None` when there is no model, or it charges nothing.
+    ///
+    /// # Panics
+    /// If the model charges a negative interest — see [`MarginInterestModel`]'s contract.
+    fn charge_interest(
+        &mut self,
+        asset: &AssetNameExchange,
+        principal: Decimal,
+        due: InterestDue,
+    ) -> Option<(
+        AssetBalance<AssetNameExchange>,
+        CashFlow<AssetNameExchange, InstrumentNameExchange>,
+    )> {
+        let model = self.margin_interest.as_deref()?;
+        let charge = model.charge(asset, principal, due)?;
+        assert!(
+            !charge.interest.is_sign_negative(),
+            "MarginInterestModel {model:?} charged negative interest {} on {principal} {asset} \
+             due {due:?}",
+            charge.interest
+        );
+        if charge.interest.is_zero() {
+            return None;
+        }
+
+        let time = due.time();
+        let balance = self.account.charge_interest(asset, charge.interest, time);
+        let id = CashFlowId::new(self.cash_flow_sequence.to_smolstr());
+        self.cash_flow_sequence += 1;
+
+        let flow = CashFlow::new(
+            CashFlowKind::MarginInterest {
+                rate: charge.rate,
+                principal: Some(principal),
+            },
+            asset.clone(),
+            -charge.interest,
+            None,
+            time,
+            Some(id),
+        );
+        Some((balance, flow))
     }
 
     /// Charges one model's cost of the position in `instrument` at `boundary`, pushing
@@ -1227,6 +1401,7 @@ impl SimulatedVenue {
                 }
             }
         }
+        self.refresh_next_interest_if_loans_changed();
         events
     }
 
@@ -1271,6 +1446,7 @@ impl SimulatedVenue {
                 events.extend(self.retire_expired(resting, time_exchange));
             }
         }
+        self.refresh_next_interest_if_loans_changed();
         events
     }
 
@@ -1707,10 +1883,8 @@ impl SimulatedVenue {
             // class as an absent balance, and gets the same treatment, unless a margin account
             // lends what it lacks.
             let debit = settlement.settled();
-            let borrowable = self.borrowable(&debit, terms, None);
             return RestingSettlement::Settled(
-                self.account
-                    .commit(&debit, Some(&settlement.credit), borrowable, time_exchange)
+                self.commit(&debit, Some(&settlement.credit), terms, None, time_exchange)
                     .unwrap_or_else(|insufficient| {
                         panic!(
                             "SimulatedVenue cannot afford the fill of resting order {}, which was \
@@ -1744,11 +1918,11 @@ impl SimulatedVenue {
         // A loan taken when the order was placed stays owed: it paid for this fill.
         let paid = self.account.settle(&asset, amount, time_exchange);
         let received = self.account.deliver(delivery, time_exchange);
-        RestingSettlement::Settled(Committed {
+        RestingSettlement::Settled(Commitment::from(Committed {
             paid,
             received: Some(received),
             borrowed: Decimal::ZERO,
-        })
+        }))
     }
 
     /// Releases a resting fill's hold and settles the fill afresh, restating each asset it moved
@@ -1773,25 +1947,21 @@ impl SimulatedVenue {
         });
 
         let debit = settlement.settled();
-        let borrowable = self.borrowable(&debit, terms, None);
-        match self
-            .account
-            .commit(&debit, Some(&settlement.credit), borrowable, time_exchange)
-        {
-            Ok(mut committed) => {
+        match self.commit(&debit, Some(&settlement.credit), terms, None, time_exchange) {
+            Ok(mut commitment) => {
                 // A fill that cost less than was held needs less of the loan; the account's own
                 // funds pay first, so the unused loan is the smaller of the loan and the surplus.
                 if let Some((reservation, _)) = released {
                     let surplus = reservation.amount - (debit.settled + debit.reserved);
                     let unused = reservation.borrowed.min(surplus);
                     if unused > Decimal::ZERO {
-                        debug_assert_eq!(committed.paid.asset, reservation.asset);
-                        committed.paid =
+                        debug_assert_eq!(commitment.committed.paid.asset, reservation.asset);
+                        commitment.committed.paid =
                             self.account
                                 .repay_loan(&reservation.asset, unused, time_exchange);
                     }
                 }
-                RestingSettlement::Settled(committed)
+                RestingSettlement::Settled(commitment)
             }
             Err(_) => RestingSettlement::Unaffordable {
                 released: released.map(|(reservation, balance)| {
@@ -1808,13 +1978,60 @@ impl SimulatedVenue {
         }
     }
 
-    /// Appends the balances one commitment restated, the asset paid with first.
-    fn push_committed(&self, events: &mut Vec<UnindexedAccountEvent>, committed: Committed) {
-        let Committed { paid, received, .. } = committed;
+    /// Appends the balances one commitment restated, the asset paid with first, then the cash
+    /// flow reporting the interest charged on its loan.
+    fn push_committed(&self, events: &mut Vec<UnindexedAccountEvent>, commitment: Commitment) {
+        let Commitment {
+            committed: Committed { paid, received, .. },
+            interest,
+        } = commitment;
         events.push(self.build_account_event(Snapshot(paid)));
         if let Some(received) = received {
             events.push(self.build_account_event(Snapshot(received)));
         }
+        if let Some(interest) = interest {
+            events.push(self.build_account_event(AccountEventKind::CashFlow(*interest)));
+        }
+    }
+
+    /// Commits one arrival's whole ledger effect through [`AccountState::commit`], lending what
+    /// [`borrowable`](Self::borrowable) allows, then charges interest on whatever it lent.
+    ///
+    /// The interest is charged at `time_exchange` on the amount lent, so the restated
+    /// [`Committed::paid`] includes it, and [`Commitment::interest`] reports it.
+    ///
+    /// # Errors
+    /// As [`AccountState::commit`]: the ledger is left untouched and nothing is charged.
+    fn commit(
+        &mut self,
+        debit: &Debit,
+        credit: Option<&Credit>,
+        terms: &InstrumentTerms,
+        market: Option<&MarketSnapshot>,
+        time_exchange: DateTime<Utc>,
+    ) -> Result<Commitment, BalanceInsufficient> {
+        let borrowable = self.borrowable(debit, terms, market);
+        let mut committed = self
+            .account
+            .commit(debit, credit, borrowable, time_exchange)?;
+
+        let interest = match committed.borrowed > Decimal::ZERO {
+            true => self
+                .charge_interest(
+                    &debit.asset,
+                    committed.borrowed,
+                    InterestDue::Borrow(time_exchange),
+                )
+                .map(|(balance, flow)| {
+                    committed.paid = balance;
+                    Box::new(flow)
+                }),
+            false => None,
+        };
+        Ok(Commitment {
+            committed,
+            interest,
+        })
     }
 
     /// Cancels an order the venue held and will not fill, and reports it: a resting order whose
@@ -1954,19 +2171,24 @@ impl SimulatedVenue {
         // the ledger moved. All that is left is to package it in the order a driver must deliver
         // it: the balance that pays for a fill before the fill that spent it.
         let events = match notifications {
-            Some(OpenOrderNotifications::Filled { committed, trade }) => {
+            Some(OpenOrderNotifications::Filled { commitment, trade }) => {
                 let mut events = Vec::with_capacity(3);
-                self.push_committed(&mut events, committed);
+                self.push_committed(&mut events, commitment);
                 events.push(self.build_account_event(trade));
                 events
             }
             // Already on the book: `open_order_inner` put it there, holding the reservation this
             // balance restates.
-            Some(OpenOrderNotifications::Rested { balance }) => {
-                vec![self.build_account_event(balance)]
+            Some(OpenOrderNotifications::Rested { balance, interest }) => {
+                let mut events = vec![self.build_account_event(balance)];
+                if let Some(interest) = interest {
+                    events.push(self.build_account_event(AccountEventKind::CashFlow(*interest)));
+                }
+                events
             }
             None => Vec::new(),
         };
+        self.refresh_next_interest_if_loans_changed();
 
         VenueOutcome { events, response }
     }
@@ -2014,6 +2236,7 @@ impl SimulatedVenue {
             }
             None => Vec::new(),
         };
+        self.refresh_next_interest_if_loans_changed();
 
         let cancelled = Cancelled {
             id: order.state.id.or_client_id(&order.key.cid),
@@ -2497,17 +2720,19 @@ impl SimulatedVenue {
         );
 
         let debit = settlement.reserved();
-        let borrowable = self.borrowable(&debit, terms, market.as_ref());
-        let (balance, borrowed) = match self.account.commit(&debit, None, borrowable, time_exchange)
-        {
-            Ok(Committed { paid, borrowed, .. }) => (paid, borrowed),
-            Err(insufficient) => {
-                return (
-                    build_open_order_err_response(request, insufficient_error(insufficient)),
-                    None,
-                );
-            }
-        };
+        let (balance, borrowed, interest) =
+            match self.commit(&debit, None, terms, market.as_ref(), time_exchange) {
+                Ok(Commitment {
+                    committed: Committed { paid, borrowed, .. },
+                    interest,
+                }) => (paid, borrowed, interest),
+                Err(insufficient) => {
+                    return (
+                        build_open_order_err_response(request, insufficient_error(insufficient)),
+                        None,
+                    );
+                }
+            };
 
         let open = Open::new(
             VenueOrderId::Assigned(self.order_id_sequence_fetch_add()),
@@ -2542,6 +2767,7 @@ impl SimulatedVenue {
             order.map_state(OrderState::active),
             Some(OpenOrderNotifications::Rested {
                 balance: Snapshot(balance),
+                interest,
             }),
         )
     }
@@ -2917,23 +3143,24 @@ impl SimulatedVenue {
             None => fill.settled(),
         };
 
-        let borrowable = self.borrowable(&debit, terms, Some(&market));
-        let committed =
-            match self
-                .account
-                .commit(&debit, Some(&fill.credit), borrowable, time_exchange)
-            {
-                Ok(committed) => committed,
-                Err(insufficient) => {
-                    // Refused, so it never traded: the next fill draws the rate it would have drawn had
-                    // this order never been sent.
-                    self.slippage = slippage_before;
-                    return (
-                        build_open_order_err_response(request, insufficient_error(insufficient)),
-                        None,
-                    );
-                }
-            };
+        let commitment = match self.commit(
+            &debit,
+            Some(&fill.credit),
+            terms,
+            Some(&market),
+            time_exchange,
+        ) {
+            Ok(commitment) => commitment,
+            Err(insufficient) => {
+                // Refused, so it never traded: the next fill draws the rate it would have drawn had
+                // this order never been sent.
+                self.slippage = slippage_before;
+                return (
+                    build_open_order_err_response(request, insufficient_error(insufficient)),
+                    None,
+                );
+            }
+        };
 
         // Taken off the book only now that it is paid for, so a refused order consumes nothing.
         self.consume_depth(&request.key.instrument, side, filled_quantity);
@@ -2978,7 +3205,7 @@ impl SimulatedVenue {
                 price: fill_price,
             },
             held,
-            committed.borrowed,
+            commitment.committed.borrowed,
             time_exchange,
         );
 
@@ -2992,7 +3219,7 @@ impl SimulatedVenue {
                 time_in_force: request.state.time_in_force,
                 state,
             },
-            Some(OpenOrderNotifications::Filled { committed, trade }),
+            Some(OpenOrderNotifications::Filled { commitment, trade }),
         )
     }
 
@@ -3171,11 +3398,13 @@ impl SimulatedVenue {
         let market = self
             .market(&request.key.instrument)
             .map(|market| market.snapshot);
-        let borrowable = self.borrowable(&debit, terms, market.as_ref());
-        let (balance_snapshot, borrowed) =
-            match self.account.commit(&debit, None, borrowable, time_exchange) {
+        let (balance_snapshot, borrowed, interest) =
+            match self.commit(&debit, None, terms, market.as_ref(), time_exchange) {
                 // Nothing traded, so nothing is delivered: the one balance is the hold.
-                Ok(Committed { paid, borrowed, .. }) => (paid, borrowed),
+                Ok(Commitment {
+                    committed: Committed { paid, borrowed, .. },
+                    interest,
+                }) => (paid, borrowed, interest),
                 Err(insufficient) => {
                     return (
                         build_open_order_err_response(request, insufficient_error(insufficient)),
@@ -3223,6 +3452,7 @@ impl SimulatedVenue {
             order_response,
             Some(OpenOrderNotifications::Rested {
                 balance: Snapshot(balance_snapshot),
+                interest,
             }),
         )
     }
@@ -3537,6 +3767,44 @@ fn next_boundary(
          after {after}"
     );
     Some(boundary)
+}
+
+/// `model`'s first interest boundary for `asset` after `after`, checked against its contract.
+///
+/// # Panics
+/// If the boundary is not after `after` — see [`MarginInterestModel`]'s contract.
+fn next_interest_boundary(
+    model: &dyn MarginInterestModel,
+    asset: &AssetNameExchange,
+    after: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let boundary = model.next_boundary(asset, after)?;
+    assert!(
+        boundary > after,
+        "MarginInterestModel {model:?} returned boundary {boundary} for {asset}, which is not \
+         after {after}"
+    );
+    Some(boundary)
+}
+
+/// Every boundary in `(after, through]`, each found from the one before by `next`.
+fn boundaries_through(
+    after: DateTime<Utc>,
+    through: DateTime<Utc>,
+    mut next: impl FnMut(DateTime<Utc>) -> Option<DateTime<Utc>>,
+) -> impl Iterator<Item = DateTime<Utc>> {
+    std::iter::successors(next(after), move |&boundary| next(boundary))
+        .take_while(move |&boundary| boundary <= through)
+}
+
+/// One charge that falls due at a boundary, ordered so a run's charges at one instant arrive in
+/// the same order every time: holding costs first, then interest.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Due {
+    /// The holding cost of the position in an instrument, by the index of its model.
+    Holding(InstrumentNameExchange, usize),
+    /// The interest on the principal owed in an asset.
+    Interest(AssetNameExchange),
 }
 
 /// The net positions an `initial_state` opens a venue with: one for each cash-settled instrument
@@ -3886,13 +4154,38 @@ where
 enum OpenOrderNotifications {
     /// The open filled on arrival: the balances it moved, and the trade it printed.
     Filled {
-        committed: Committed,
+        commitment: Commitment,
         trade: Trade<AssetNameExchange, InstrumentNameExchange>,
     },
-    /// The open rests on the book: the balance now held against it, and nothing traded.
+    /// The open rests on the book, or is held for its bar: the balance now held against it, the
+    /// interest charged on what a margin account lent it, and nothing traded.
     Rested {
         balance: Snapshot<AssetBalance<AssetNameExchange>>,
+        interest: Option<Box<CashFlow<AssetNameExchange, InstrumentNameExchange>>>,
     },
+}
+
+/// What one arrival committed on this venue: the balances the ledger restated, and the interest
+/// charged on what a margin account lent it, if any.
+#[derive(Debug)]
+struct Commitment {
+    committed: Committed,
+    /// The cash flow reporting the interest charged on [`Committed::borrowed`] when it was lent,
+    /// which [`Committed::paid`] already includes.
+    ///
+    /// Boxed because only a borrowing arrival on a margin account charges one: an unboxed flow
+    /// would more than double every commitment, and every [`RestingSettlement`] carrying one, to
+    /// serve the rare arrival that has it.
+    interest: Option<Box<CashFlow<AssetNameExchange, InstrumentNameExchange>>>,
+}
+
+impl From<Committed> for Commitment {
+    fn from(committed: Committed) -> Self {
+        Self {
+            committed,
+            interest: None,
+        }
+    }
 }
 
 /// The instrument facts one order's settlement is computed from.
@@ -3910,7 +4203,7 @@ struct InstrumentTerms {
 #[derive(Debug)]
 enum RestingSettlement {
     /// The fill settled, restating these balances.
-    Settled(Committed),
+    Settled(Commitment),
     /// A fill the account can no longer afford, so the order is cancelled instead: a cash-settled
     /// one, or a spot fill whose fee exceeds what it receives by more than that asset's balance
     /// holds.
@@ -4111,7 +4404,7 @@ mod tests {
             AccrualDays, BorrowFeeModel, DailyAccrual, DayCount, FinancingModel, FinancingRates,
             FundingModel, HoldingCharge, RateSeries, WeekendsOnly,
         },
-        margin::MarginSideEffect,
+        margin::{InterestCharge, InterestSchedule, MarginSideEffect, PeriodicMarginInterest},
         order::{
             OrderEvent, OrderKey, TimeInForce,
             id::{ClientOrderId, StrategyId},
@@ -4271,7 +4564,8 @@ mod tests {
         }
     }
 
-    /// The trade a filled open owes its client, which must follow every balance it moved.
+    /// The trade a filled open owes its client, which must follow every balance it moved, and the
+    /// interest charged on what it borrowed.
     fn filled_trade(outcome: &OpenOutcome) -> &Trade<AssetNameExchange, InstrumentNameExchange> {
         let Some(at) = outcome
             .events
@@ -4285,9 +4579,10 @@ mod tests {
         };
         assert!(
             at > 0
-                && outcome.events[..at]
-                    .iter()
-                    .all(|event| matches!(event.kind, AccountEventKind::BalanceSnapshot(_))),
+                && outcome.events[..at].iter().all(|event| matches!(
+                    event.kind,
+                    AccountEventKind::BalanceSnapshot(_) | AccountEventKind::CashFlow(_)
+                )),
             "a filled open must emit its balances before its trade, got: {:?}",
             outcome.events
         );
@@ -6945,7 +7240,7 @@ mod tests {
         }
 
         match notifications {
-            Some(OpenOrderNotifications::Rested { balance }) => assert_eq!(
+            Some(OpenOrderNotifications::Rested { balance, .. }) => assert_eq!(
                 balance.0.balance.free,
                 d("1000000") - d("28805.76"),
                 "0.6 at 48000 plus 2bp maker is held; 48009.6 would hold against the 0.4 that has \
@@ -11486,5 +11781,352 @@ mod tests {
             "{}",
             insufficient_reason(&outcome)
         );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Margin interest: charged when a loan is taken, then at each boundary while it is open.
+    // ---------------------------------------------------------------------------------------
+
+    /// 87.6% a year on the Act365 basis is exactly 0.01% an hour.
+    const HOURLY_BASIS_POINT: &str = "0.876";
+
+    /// Hourly interest on loans of `asset` at [`HOURLY_BASIS_POINT`].
+    fn hourly_interest(asset: AssetNameExchange) -> PeriodicMarginInterest {
+        PeriodicMarginInterest::new(TimeDelta::hours(1), DayCount::Act365)
+            .with_rates(asset, RateSeries::constant(d(HOURLY_BASIS_POINT)))
+    }
+
+    /// The cash flow reporting `interest` charged on `principal` of `asset` at `time`.
+    fn interest_flow(
+        asset: AssetNameExchange,
+        principal: &str,
+        interest: &str,
+        time: DateTime<Utc>,
+        id: &str,
+    ) -> CashFlow<AssetNameExchange, InstrumentNameExchange> {
+        CashFlow::new(
+            CashFlowKind::MarginInterest {
+                rate: Some(d(HOURLY_BASIS_POINT)),
+                principal: Some(d(principal)),
+            },
+            asset,
+            -d(interest),
+            None,
+            time,
+            Some(CashFlowId::new(id)),
+        )
+    }
+
+    fn cash_flow_of(
+        event: &UnindexedAccountEvent,
+    ) -> &CashFlow<AssetNameExchange, InstrumentNameExchange> {
+        match &event.kind {
+            AccountEventKind::CashFlow(flow) => flow,
+            other => panic!("expected a cash flow, got: {other:?}"),
+        }
+    }
+
+    /// A request-priced margin venue holding 0.25 BTC, charged hourly on BTC loans, which has
+    /// just sold 1 BTC at 50,000, borrowing 0.75, at `time(1)`.
+    fn margin_venue_short_btc() -> SimulatedVenue {
+        let mut venue = margin_venue("0.25", "100000", "3")
+            .with_margin_interest(Arc::new(hourly_interest(base())));
+        advance(&mut venue, time(1));
+        venue.open_order(sell_request("1", market_prices("50000")));
+        venue
+    }
+
+    #[test]
+    fn a_sell_that_borrows_is_charged_a_period_of_interest_reported_after_its_balances() {
+        let mut venue = margin_venue("0.25", "100000", "3")
+            .with_margin_interest(Arc::new(hourly_interest(base())));
+        advance(&mut venue, time(1));
+
+        let outcome = venue.open_order(sell_request("1", market_prices("50000")));
+
+        assert_eq!(
+            filled_balance(&outcome).balance,
+            Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("0.75"), d("0.000075")),
+            "the interest is added to the loan, leaving total and free as they were"
+        );
+        assert_eq!(
+            *cash_flow_of(&outcome.events[2]),
+            interest_flow(base(), "0.75", "0.000075", time(1), "0"),
+            "charged on the amount lent, stamped at the borrow, after both balances"
+        );
+        assert_eq!(filled_trade(&outcome).quantity, d("1"));
+    }
+
+    #[test]
+    fn a_loan_is_charged_on_its_principal_at_each_boundary_and_never_on_its_interest() {
+        let mut venue = margin_venue_short_btc();
+        assert_eq!(venue.next_deadline(), Some(boundary(0)));
+
+        let events = venue.advance_time(boundary(1) + TimeDelta::seconds(1));
+        let charged = charges(&events);
+
+        assert_eq!(charged.len(), 2);
+        assert_eq!(
+            charged[0].0.balance,
+            Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("0.75"), d("0.00015"))
+        );
+        assert_eq!(charged[0].0.time_exchange, boundary(0));
+        assert_eq!(
+            *charged[0].1,
+            interest_flow(base(), "0.75", "0.000075", boundary(0), "1")
+        );
+        assert_eq!(
+            charged[1].0.balance,
+            Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("0.75"), d("0.000225"))
+        );
+        assert_eq!(
+            *charged[1].1,
+            interest_flow(base(), "0.75", "0.000075", boundary(1), "2")
+        );
+        assert_eq!(venue.next_deadline(), Some(boundary(2)));
+    }
+
+    #[test]
+    fn a_loan_repaid_before_a_boundary_is_not_charged_there() {
+        let mut venue = margin_venue_short_btc();
+
+        // 0.76 BTC repays the 0.000075 interest, then the 0.75 principal, leaving 0.009925 free.
+        let outcome = venue.open_order(buy_request("0.76", market_prices("50000")));
+        assert_eq!(
+            filled_received(&outcome).balance,
+            Balance::new_margin(d("0.009925"), d("0.009925"), Decimal::ZERO, Decimal::ZERO)
+        );
+
+        assert_eq!(venue.next_deadline(), None);
+        assert!(venue.advance_time(boundary(1)).is_empty());
+    }
+
+    #[test]
+    fn a_resting_sell_is_charged_when_placed_and_its_cancel_repays_interest_first() {
+        let mut venue = margin_market_venue("0", "100000")
+            .with_margin_interest(Arc::new(hourly_interest(base())));
+
+        let outcome = venue.open_order(limit_request("rest", Side::Sell, "1", "50000", gtc()));
+        assert_eq!(
+            balance_of(&outcome.events[0]).balance,
+            Balance::new_margin(d("1"), Decimal::ZERO, d("1"), d("0.0001"))
+        );
+        assert_eq!(
+            *cash_flow_of(&outcome.events[1]),
+            interest_flow(base(), "1", "0.0001", time(1), "0")
+        );
+
+        let cancelled = venue.cancel_order(OrderRequestCancel {
+            key: limit_request("rest", Side::Sell, "1", "50000", gtc()).key,
+            state: RequestCancel { id: None },
+        });
+        assert_eq!(
+            balance_of(&cancelled.events[0]).balance,
+            Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("0.0001"), Decimal::ZERO),
+            "the released base repays the interest first, so as much principal stays owed"
+        );
+        assert_eq!(venue.next_deadline(), Some(boundary(0)));
+    }
+
+    #[test]
+    fn a_held_buy_is_charged_when_accepted_and_again_on_what_its_bar_borrows_more() {
+        let mut venue =
+            margin_venue_holding().with_margin_interest(Arc::new(hourly_interest(quote())));
+
+        // 150 at the close of 100: 50 borrowed, charged 0.005.
+        let outcome = venue.open_order(market_order("held", Side::Buy, "1.5", gtc()));
+        assert_eq!(
+            balance_of(&outcome.events[0]).balance,
+            Balance::new_margin(d("150"), Decimal::ZERO, d("50"), d("0.005"))
+        );
+        assert_eq!(
+            *cash_flow_of(&outcome.events[1]),
+            interest_flow(quote(), "50", "0.005", time(1), "0")
+        );
+
+        // 180 at an open of 120: 30 more borrowed, charged 0.003.
+        let events = feed_bar(&mut venue, 2, ohlc("120", "121", "119", "120"));
+        assert_eq!(
+            balance_of(&events[0]).balance,
+            Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("80"), d("0.008"))
+        );
+        assert_eq!(
+            cash_flow_of(&events[2]).amount,
+            d("-0.003"),
+            "after both balances"
+        );
+        assert_eq!(trade_of(&events[3]).price, d("120"));
+    }
+
+    #[test]
+    fn a_held_buy_whose_bar_repays_its_whole_loan_owes_no_more_boundaries() {
+        // A zero rate charges nothing at the borrow, so the loan is exactly what was lent.
+        let free_loans = PeriodicMarginInterest::new(TimeDelta::hours(1), DayCount::Act365)
+            .with_rates(quote(), RateSeries::constant(Decimal::ZERO));
+        let mut venue = margin_venue_holding().with_margin_interest(Arc::new(free_loans));
+
+        // 150 at the close of 100: 50 borrowed.
+        venue.open_order(market_order("held", Side::Buy, "1.5", gtc()));
+        assert_eq!(venue.next_deadline(), Some(boundary(0)));
+
+        // 90 at an open of 60: the 100 the account had pays for all of it, so all 50 is repaid.
+        let events = feed_bar(&mut venue, 2, ohlc("60", "61", "59", "60"));
+        assert_eq!(
+            balance_of(&events[0]).balance,
+            Balance::new_margin(d("10"), d("10"), Decimal::ZERO, Decimal::ZERO)
+        );
+        assert_eq!(venue.next_deadline(), None);
+    }
+
+    #[test]
+    fn a_seeded_loan_is_charged_at_boundaries_from_the_clock_s_first_move_only() {
+        let config = MockExecutionConfig {
+            spot_margin: Some(SpotMarginConfig::new(quote(), d("3")).unwrap()),
+            ..config_from_balances(
+                vec![
+                    AssetBalance::new(
+                        base(),
+                        Balance::new_margin(d("0.5"), d("0.5"), d("0.5"), Decimal::ZERO),
+                        Utc::now(),
+                    ),
+                    funded(quote(), d("100000")),
+                ],
+                FeeModelConfig::default(),
+            )
+        };
+        let mut venue = SimulatedVenue::new(&config, spot_instruments())
+            .with_margin_interest(Arc::new(hourly_interest(base())));
+        assert_eq!(
+            venue.next_deadline(),
+            None,
+            "charging starts when the clock moves"
+        );
+
+        advance(&mut venue, time(1));
+        assert_eq!(venue.next_deadline(), Some(boundary(0)));
+
+        let events = venue.advance_time(boundary(0));
+        assert_eq!(
+            *charges(&events)[0].1,
+            interest_flow(base(), "0.5", "0.00005", boundary(0), "0")
+        );
+    }
+
+    #[test]
+    fn at_borrow_only_charges_the_borrow_and_no_boundary() {
+        let mut venue = margin_venue("0.25", "100000", "3").with_margin_interest(Arc::new(
+            hourly_interest(base()).with_schedule(InterestSchedule::AtBorrowOnly),
+        ));
+        advance(&mut venue, time(1));
+
+        let outcome = venue.open_order(sell_request("1", market_prices("50000")));
+
+        assert_eq!(
+            filled_balance(&outcome).balance.margin.unwrap().interest,
+            d("0.000075")
+        );
+        assert_eq!(venue.next_deadline(), None);
+        assert!(venue.advance_time(boundary(3)).is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "without MockExecutionConfig::spot_margin")]
+    fn a_cash_venue_given_an_interest_model_panics() {
+        let _ = make_venue("1", "100000").with_margin_interest(Arc::new(hourly_interest(base())));
+    }
+
+    /// A model that breaks its contract: `boundary` returns the instant it is asked from, and
+    /// `charge` refunds a satoshi.
+    #[derive(Debug)]
+    struct Misbehaving;
+
+    impl MarginInterestModel for Misbehaving {
+        fn next_boundary(
+            &self,
+            _: &AssetNameExchange,
+            after: DateTime<Utc>,
+        ) -> Option<DateTime<Utc>> {
+            Some(after)
+        }
+
+        fn charge(
+            &self,
+            _: &AssetNameExchange,
+            _: Decimal,
+            _: InterestDue,
+        ) -> Option<InterestCharge> {
+            Some(InterestCharge::new(d("-0.00000001"), None))
+        }
+    }
+
+    /// A model charging a satoshi at every borrow, whatever was lent, and at no boundary.
+    #[derive(Debug)]
+    struct FlatAtBorrow;
+
+    impl MarginInterestModel for FlatAtBorrow {
+        fn next_boundary(&self, _: &AssetNameExchange, _: DateTime<Utc>) -> Option<DateTime<Utc>> {
+            None
+        }
+
+        fn charge(
+            &self,
+            _: &AssetNameExchange,
+            _: Decimal,
+            due: InterestDue,
+        ) -> Option<InterestCharge> {
+            matches!(due, InterestDue::Borrow(_))
+                .then(|| InterestCharge::new(d("0.00000001"), None))
+        }
+    }
+
+    #[test]
+    fn an_order_that_borrows_nothing_is_not_asked_about_interest() {
+        let mut venue =
+            margin_venue("0.25", "100000", "3").with_margin_interest(Arc::new(FlatAtBorrow));
+        advance(&mut venue, time(1));
+
+        let outcome = venue.open_order(sell_request("0.1", market_prices("50000")));
+
+        assert_eq!(filled_trade(&outcome).quantity, d("0.1"));
+        assert!(
+            !outcome
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, AccountEventKind::CashFlow(_))),
+            "0.1 of the 0.25 held lends nothing, so nothing is charged"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "charged negative interest")]
+    fn a_model_charging_negative_interest_panics() {
+        let mut venue =
+            margin_venue("0.25", "100000", "3").with_margin_interest(Arc::new(Misbehaving));
+        advance(&mut venue, time(1));
+
+        let _ = venue.open_order(sell_request("1", market_prices("50000")));
+    }
+
+    #[test]
+    #[should_panic(expected = "which is not after")]
+    fn a_model_whose_boundary_is_not_after_the_instant_asked_panics() {
+        let config = MockExecutionConfig {
+            spot_margin: Some(SpotMarginConfig::new(quote(), d("3")).unwrap()),
+            ..config_from_balances(
+                vec![
+                    AssetBalance::new(
+                        base(),
+                        Balance::new_margin(d("0.5"), d("0.5"), d("0.5"), Decimal::ZERO),
+                        Utc::now(),
+                    ),
+                    funded(quote(), d("100000")),
+                ],
+                FeeModelConfig::default(),
+            )
+        };
+        let mut venue = SimulatedVenue::new(&config, spot_instruments())
+            .with_margin_interest(Arc::new(Misbehaving));
+
+        let _ = venue.advance_time(time(1));
     }
 }
