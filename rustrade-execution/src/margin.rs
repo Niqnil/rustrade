@@ -198,8 +198,7 @@ pub enum SpotMarginConfigError {
 /// The simulated venue asks for a charge on each loan its spot margin takes
 /// ([`InterestDue::Borrow`], on the amount just lent), and, through
 /// [`next_boundary`](Self::next_boundary), at each boundary its clock reaches while the account
-/// owes the asset ([`InterestDue::Boundary`], on the principal owed across it). The principal it
-/// asks about is always positive: an order that lends nothing is not charged. Each charge is
+/// owes the asset ([`InterestDue::Boundary`], on the principal owed when it falls). Each charge is
 /// added to the asset's loan as interest, which the account repays before principal, and is
 /// reported as a [`CashFlowKind::MarginInterest`](crate::cash_flow::CashFlowKind::MarginInterest)
 /// in the borrowed asset.
@@ -214,6 +213,9 @@ pub enum SpotMarginConfigError {
 ///   never paid out. The venue **panics** on a negative one.
 /// - Both methods must be pure functions of their arguments: the venue may ask for the same
 ///   boundary more than once, and charges it once.
+///
+/// In return, the venue asks [`charge`](Self::charge) only about a positive `principal`: an order
+/// that lends nothing, and an asset that owes nothing, is never charged.
 ///
 /// `Send + Sync` because a venue holds its model behind an `Arc`, so that one model, and the
 /// rate history it carries, can be shared by every run of a backtest sweep without being copied.
@@ -241,7 +243,7 @@ pub trait MarginInterestModel: Debug + Send + Sync {
 pub enum InterestDue {
     /// The loan was taken at this instant, and the principal is the amount just lent.
     Borrow(DateTime<Utc>),
-    /// A boundary the model named, and the principal is what the account owed across it.
+    /// A boundary the model named, and the principal is what the account owed when it fell.
     Boundary(DateTime<Utc>),
 }
 
@@ -260,7 +262,9 @@ impl InterestDue {
 pub struct InterestCharge {
     /// The interest owed, in the borrowed asset. Never negative; zero charges nothing.
     pub interest: Decimal,
-    /// The rate it was charged at, as the model quotes it, reported as the cash flow's `rate`.
+    /// The rate it was charged at, reported as the cash flow's `rate` and used for nothing else,
+    /// so a model may quote it annualised or per its own period. [`PeriodicMarginInterest`]
+    /// reports the annualised rate.
     pub rate: Option<Decimal>,
 }
 
@@ -276,6 +280,7 @@ impl InterestCharge {
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum InterestSchedule {
     /// One period when the loan is taken, then one at every boundary while it is open.
     #[default]
@@ -290,7 +295,9 @@ pub enum InterestSchedule {
 /// - **When.** One period when a loan is taken, whenever in the period that is, then one at every
 ///   boundary while the loan is open, unless [`InterestSchedule::AtBorrowOnly`]. Boundaries fall
 ///   at whole multiples of the period since the Unix epoch, so an hourly period charges on the
-///   hour, UTC.
+///   hour, UTC. Each charge pays in advance for the period it falls in: the one a borrow is taken
+///   in, or the one a boundary begins. So a loan repaid mid-period has already paid for that
+///   period, and one repaid just before a boundary is not charged there.
 /// - **How much.** `principal × rate × period / basis`, where the rate is annualised, read from
 ///   the asset's [`RateSeries`] at the instant charged, and the basis is the [`DayCount`]'s year.
 ///   Each charge is rounded **up** to the asset's unit, `1e-8` unless set by
@@ -335,8 +342,15 @@ impl PeriodicMarginInterest {
     }
 
     /// Charges a loan of `asset` at the annualised rates in `rates`.
+    ///
+    /// # Panics
+    /// If any rate in `rates` is negative: a borrower is never paid interest, so a negative rate is
+    /// a fault in the data, refused here rather than when the venue first charges it.
     #[must_use]
     pub fn with_rates(mut self, asset: AssetNameExchange, rates: RateSeries) -> Self {
+        if let Some(rate) = rates.rates().find(|rate| *rate < Decimal::ZERO) {
+            panic!("PeriodicMarginInterest rate for {asset} must not be negative, got {rate}");
+        }
         self.rates.insert(asset, rates);
         self
     }
@@ -562,5 +576,30 @@ mod tests {
     #[should_panic(expected = "unit for btc must be positive")]
     fn a_unit_that_is_not_positive_panics() {
         let _ = hourly_btc(dec!(0.01)).with_unit(btc(), Decimal::ZERO);
+    }
+
+    #[test]
+    #[should_panic(expected = "rate for btc must not be negative, got -0.01")]
+    fn a_negative_rate_anywhere_in_the_series_panics() {
+        let rates = RateSeries::new(vec![
+            (utc("2026-10-01T00:00:00Z"), dec!(0.02)),
+            (utc("2026-10-02T00:00:00Z"), dec!(-0.01)),
+        ])
+        .unwrap();
+        let _ = PeriodicMarginInterest::new(TimeDelta::hours(1), DayCount::Act365)
+            .with_rates(btc(), rates);
+    }
+
+    #[test]
+    fn a_zero_rate_is_accepted_and_charges_nothing() {
+        let model = hourly_btc(Decimal::ZERO);
+
+        let charge = model.charge(
+            &btc(),
+            dec!(1),
+            InterestDue::Borrow(utc("2026-10-15T01:00:00Z")),
+        );
+
+        assert_eq!(charge.map(|charge| charge.interest), Some(Decimal::ZERO));
     }
 }

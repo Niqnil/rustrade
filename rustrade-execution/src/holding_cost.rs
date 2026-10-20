@@ -201,6 +201,11 @@ impl RateSeries {
         let after = self.points.partition_point(|(start, _)| *start <= time);
         after.checked_sub(1).map(|index| self.points[index].1)
     }
+
+    /// Every rate in the series, in time order.
+    pub(crate) fn rates(&self) -> impl Iterator<Item = Decimal> + '_ {
+        self.points.iter().map(|(_, rate)| *rate)
+    }
 }
 
 /// A [`RateSeries`] was given instants that are not strictly ascending.

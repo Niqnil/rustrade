@@ -80,7 +80,9 @@ pub enum CashFlowKind {
     },
     /// Interest on borrowed cash or assets.
     MarginInterest {
-        /// The interest rate charged, per the venue's own period.
+        /// The interest rate charged, as its source quotes it: per the venue's own period from a
+        /// live venue (daily from Binance), annualised from the simulated venue's
+        /// [`PeriodicMarginInterest`](crate::margin::PeriodicMarginInterest).
         rate: Option<Decimal>,
         /// The amount borrowed that the interest was charged on.
         principal: Option<Decimal>,

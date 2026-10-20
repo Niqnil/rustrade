@@ -129,8 +129,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `PeriodicMarginInterest` is the built-in model: one period at borrow, then one at each whole
     period since the Unix epoch (on the hour, for an hourly period), at an annualised rate per
     asset from a `RateSeries` on a `DayCount` basis, each charge rounded up to the asset's unit
-    (`1e-8` by default). `InterestSchedule::AtBorrowOnly` charges the borrow alone. A venue's
-    daily rate is an annual rate of `daily × 365` on `DayCount::Act365`.
+    (`1e-8` by default). Each charge pays in advance for the period it falls in. A negative rate
+    is refused when the rates are given. `InterestSchedule::AtBorrowOnly` charges the borrow
+    alone. A venue's daily rate is an annual rate of `daily × 365` on `DayCount::Act365`.
   - Not modelled: liquidation, isolated margin, per-asset borrow limits and the venue's lending
     pool. CFD orders are not lent their margin.
 - `DayCount::accrue_span` (`rustrade-execution`): an annual amount accrued over a span of time,

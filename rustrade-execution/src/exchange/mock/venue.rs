@@ -179,7 +179,7 @@ pub enum VenueRegime {
 /// - **At borrow**, on the amount lent, stamped at the instant the order was accepted. The
 ///   balance the order restates includes the interest, and an
 ///   [`AccountEventKind::CashFlow`] reporting it follows that order's balances.
-/// - **At a boundary**, on the principal owed across it, as `[balance, cash flow]` stamped at the
+/// - **At a boundary**, on the principal owed when it falls, as `[balance, cash flow]` stamped at the
 ///   boundary, when a driver moves the clock to or past it, as for holding costs (see
 ///   `# Holding costs`). A loan taken at a boundary's instant is charged at borrow, not again at
 ///   that boundary.
@@ -842,6 +842,11 @@ impl SimulatedVenue {
     /// charged first, in time order, each as `[balance, cash flow]` stamped at its boundary — see
     /// the type's `# Holding costs` and `# Spot margin`. They precede the expiries, which are
     /// stamped at `time_exchange`.
+    ///
+    /// # Panics
+    /// If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract (a
+    /// boundary not after the instant it was asked from, or a negative interest), on the input
+    /// that first reaches it.
     #[must_use]
     pub fn advance_time(&mut self, time_exchange: DateTime<Utc>) -> Vec<UnindexedAccountEvent> {
         // Charged before the balances are restamped, so each restatement it emits keeps its own
@@ -855,7 +860,7 @@ impl SimulatedVenue {
     }
 
     /// Charges every holding-cost and interest boundary in `(accrued_through, now]`, the first
-    /// against the position held across it and the second against the principal owed across it,
+    /// against the position held across it and the second against the principal owed when it falls,
     /// returning `[balance, cash flow]` per charge. In boundary order, and at one boundary the
     /// holding costs, by instrument then model, before the interest, by asset.
     ///
@@ -904,11 +909,13 @@ impl SimulatedVenue {
             }
         }
         if let Some(model) = self.margin_interest.as_deref() {
-            for (asset, _) in self.account.loans() {
+            for (asset, principal) in self.account.loans() {
                 let boundaries = boundaries_through(after, now, |from| {
                     next_interest_boundary(model, asset, from)
                 });
-                due.extend(boundaries.map(|boundary| (boundary, Due::Interest(asset.clone()))));
+                due.extend(
+                    boundaries.map(|boundary| (boundary, Due::Interest(asset.clone(), principal))),
+                );
             }
         }
         // Positions and balances are hashed, so their iteration order is arbitrary: sorted, so
@@ -921,8 +928,8 @@ impl SimulatedVenue {
                 Due::Holding(instrument, index) => {
                     self.charge_holding_cost(boundary, &instrument, index, &mut events);
                 }
-                Due::Interest(asset) => {
-                    self.charge_interest_boundary(boundary, &asset, &mut events);
+                Due::Interest(asset, principal) => {
+                    self.charge_interest_boundary(boundary, &asset, principal, &mut events);
                 }
             }
         }
@@ -931,21 +938,15 @@ impl SimulatedVenue {
         events
     }
 
-    /// Charges the interest on the principal of `asset` owed across `boundary`, pushing
+    /// Charges the interest on `principal` of `asset`, owed when `boundary` falls, pushing
     /// `[balance, cash flow]` onto `events`, or nothing if the model charges nothing.
     fn charge_interest_boundary(
         &mut self,
         boundary: DateTime<Utc>,
         asset: &AssetNameExchange,
+        principal: Decimal,
         events: &mut Vec<UnindexedAccountEvent>,
     ) {
-        let principal = self
-            .account
-            .loans()
-            .find_map(|(owed, principal)| (owed == asset).then_some(principal));
-        let Some(principal) = principal else {
-            return;
-        };
         if let Some((balance, flow)) =
             self.charge_interest(asset, principal, InterestDue::Boundary(boundary))
         {
@@ -972,7 +973,7 @@ impl SimulatedVenue {
         let model = self.margin_interest.as_deref()?;
         let charge = model.charge(asset, principal, due)?;
         assert!(
-            !charge.interest.is_sign_negative(),
+            charge.interest >= Decimal::ZERO,
             "MarginInterestModel {model:?} charged negative interest {} on {principal} {asset} \
              due {due:?}",
             charge.interest
@@ -1342,6 +1343,11 @@ impl SimulatedVenue {
     ///
     /// `#[must_use]` because a driver that applies the market and drops the result has silently
     /// eaten the fills, leaving its client holding an order the venue no longer has.
+    ///
+    /// # Panics
+    /// If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract (a
+    /// boundary not after the instant it was asked from, or a negative interest), on the input
+    /// that first reaches it.
     #[must_use]
     pub fn apply_market(
         &mut self,
@@ -2158,6 +2164,11 @@ impl SimulatedVenue {
     /// [`RequestOpen::market`](crate::order::request::RequestOpen::market) on a
     /// [`RequestPriced`](VenueRegime::RequestPriced) one. A Limit order is always judged and priced
     /// against this venue's own market; see the type's `# How an order is priced`.
+    ///
+    /// # Panics
+    /// If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract (a
+    /// boundary not after the instant it was asked from, or a negative interest), on the input
+    /// that first reaches it.
     pub fn open_order(
         &mut self,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
@@ -3803,8 +3814,9 @@ fn boundaries_through(
 enum Due {
     /// The holding cost of the position in an instrument, by the index of its model.
     Holding(InstrumentNameExchange, usize),
-    /// The interest on the principal owed in an asset.
-    Interest(AssetNameExchange),
+    /// The interest on the principal owed in an asset, with that principal: charging interest
+    /// does not change it, so it holds for every boundary of one accrual.
+    Interest(AssetNameExchange, Decimal),
 }
 
 /// The net positions an `initial_state` opens a venue with: one for each cash-settled instrument
@@ -11899,6 +11911,42 @@ mod tests {
 
         assert_eq!(venue.next_deadline(), None);
         assert!(venue.advance_time(boundary(1)).is_empty());
+    }
+
+    #[test]
+    fn a_boundary_charges_the_principal_left_after_a_partial_repay() {
+        let mut venue = margin_venue_short_btc();
+
+        // 0.5 BTC repays the 0.000075 interest, then 0.499925 of the 0.75 principal.
+        venue.open_order(buy_request("0.5", market_prices("50000")));
+
+        let events = venue.advance_time(boundary(0));
+        assert_eq!(
+            *charges(&events)[0].1,
+            interest_flow(base(), "0.250075", "0.00002501", boundary(0), "1"),
+            "0.250075 at 0.01% is 0.0000250075, rounded up to the satoshi"
+        );
+    }
+
+    #[test]
+    fn a_loan_taken_at_a_boundary_s_instant_is_charged_there_only_at_borrow() {
+        let mut venue = margin_venue("0.25", "100000", "3")
+            .with_margin_interest(Arc::new(hourly_interest(base())));
+        advance(&mut venue, time(1));
+        advance(&mut venue, boundary(0));
+
+        let outcome = venue.open_order(sell_request("1", market_prices("50000")));
+        assert_eq!(
+            *cash_flow_of(&outcome.events[2]),
+            interest_flow(base(), "0.75", "0.000075", boundary(0), "0")
+        );
+
+        assert!(
+            venue
+                .advance_time(boundary(0) + TimeDelta::seconds(1))
+                .is_empty()
+        );
+        assert_eq!(venue.next_deadline(), Some(boundary(1)));
     }
 
     #[test]
