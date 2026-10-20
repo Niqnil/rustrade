@@ -11,10 +11,15 @@
 //! - the account's PnL marked at the last price, its quote change plus its net base at that
 //!   price, equals the engine's realised plus unrealised PnL before exit fees, and
 //! - the base balance the engine holds reports the loan the venue does.
+//!
+//! With margin interest, the clock moves between fills, so loans are charged at borrow and at the
+//! hourly boundaries the clock crosses. The engine leaves account-level interest out of its
+//! position and PnL, so the venue's net base falls short of the engine's position, and the
+//! account's PnL short of the engine's, by exactly the base interest charged, valued at the mark.
 
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use rustrade::engine::state::{
@@ -22,12 +27,13 @@ use rustrade::engine::state::{
     position::PositionId,
 };
 use rustrade_execution::{
-    AccountSnapshot, SpotFeeAsset, SpotMarginConfig,
+    AccountEventKind, AccountSnapshot, PeriodicMarginInterest, SpotFeeAsset, SpotMarginConfig,
     balance::{AssetBalance, Balance, MarginDetails},
     client::mock::MockExecutionConfig,
     exchange::mock::SimulatedVenue,
     fee::{FeeModelConfig, PercentageFeeModel},
     fill::SimFillConfig,
+    holding_cost::{DayCount, RateSeries},
     indexer::AccountEventIndexer,
     map::generate_execution_instrument_map,
     market::MarketSnapshot,
@@ -47,7 +53,12 @@ use rustrade_instrument::{
 };
 
 const EXCHANGE: ExchangeId = ExchangeId::BinanceSpot;
-const TIME: DateTime<Utc> = DateTime::<Utc>::MIN_UTC;
+/// The run's start, on a whole hour, so interest boundaries fall on the hour from it.
+const TIME: DateTime<Utc> = DateTime::UNIX_EPOCH;
+
+/// How far the clock moves before each fill: not a divisor of an hour, so fills land at
+/// different points of the hour and some fall between boundaries the clock crosses.
+const STEP: TimeDelta = TimeDelta::minutes(25);
 
 /// No base, so the first sell borrows, and enough quote that leverage 3 lends every random sell.
 const INITIAL_QUOTE: Decimal = dec!(100_000_000);
@@ -96,6 +107,13 @@ fn funded(asset: AssetNameExchange, amount: Decimal) -> AssetBalance<AssetNameEx
         balance: Balance::new(amount, amount),
         time_exchange: TIME,
     }
+}
+
+/// Hourly interest on base loans at 87.6% a year, exactly 0.01% an hour, so every charge on the
+/// quantities traded is exact.
+fn hourly_interest() -> PeriodicMarginInterest {
+    PeriodicMarginInterest::new(TimeDelta::hours(1), DayCount::Act365)
+        .with_rates(base(), RateSeries::constant(dec!(0.876)))
 }
 
 fn venue(spot_fee_asset: SpotFeeAsset) -> SimulatedVenue {
@@ -167,9 +185,35 @@ fn balance_now(venue: &SimulatedVenue, asset: AssetNameExchange) -> Balance {
     venue.balances(&[asset]).remove(0).balance
 }
 
+/// What one run did.
+struct Run {
+    borrows: usize,
+    repays: usize,
+    /// The base interest charged at borrow and at boundaries.
+    interest: Decimal,
+    /// How many boundaries charged interest.
+    boundary_charges: usize,
+}
+
+/// The base interest the margin-interest cash flows among `events` charged, and how many there
+/// were.
+fn base_interest<'a>(
+    events: impl IntoIterator<Item = &'a rustrade_execution::UnindexedAccountEvent>,
+) -> (Decimal, usize) {
+    events
+        .into_iter()
+        .filter_map(|event| match &event.kind {
+            AccountEventKind::CashFlow(flow) if flow.asset == base() => Some(-flow.amount),
+            _ => None,
+        })
+        .fold((Decimal::ZERO, 0), |(sum, count), charged| {
+            (sum + charged, count + 1)
+        })
+}
+
 /// Runs one seeded sequence of market fills, checking the venue against the engine after each,
-/// and returns how many fills borrowed and how many repaid.
-fn run(spot_fee_asset: SpotFeeAsset, seed: u64) -> (usize, usize) {
+/// with `interest` charged on the venue's loans if given.
+fn run(spot_fee_asset: SpotFeeAsset, seed: u64, interest: Option<PeriodicMarginInterest>) -> Run {
     let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
     let indexer = AccountEventIndexer::new(Arc::new(
         generate_execution_instrument_map(&instruments, EXCHANGE).unwrap(),
@@ -188,14 +232,31 @@ fn run(spot_fee_asset: SpotFeeAsset, seed: u64) -> (usize, usize) {
         .base;
 
     let mut venue = venue(spot_fee_asset);
+    if let Some(model) = interest {
+        venue = venue.with_margin_interest(Arc::new(model));
+    }
     let mut rng = Rng(seed);
     let mut realised_exited = Decimal::ZERO;
-    let (mut borrows, mut repays) = (0, 0);
+    let mut run = Run {
+        borrows: 0,
+        repays: 0,
+        interest: Decimal::ZERO,
+        boundary_charges: 0,
+    };
+    let mut time = TIME;
+    // The clock's first move, from which boundaries are charged.
+    assert!(venue.advance_time(time).is_empty());
 
     for step in 0..FILLS_PER_RUN {
         let side = rng.pick(&[Side::Buy, Side::Sell]);
         let quantity = rng.pick(&QUANTITIES);
         let price = rng.pick(&PRICES);
+
+        time += STEP;
+        let charged = venue.advance_time(time);
+        let (at_boundaries, count) = base_interest(&charged);
+        run.interest += at_boundaries;
+        run.boundary_charges += count;
 
         let owed_before = balance_now(&venue, base()).margin.unwrap().borrowed;
         let outcome = venue.open_order(market_order(side, quantity, price));
@@ -205,10 +266,11 @@ fn run(spot_fee_asset: SpotFeeAsset, seed: u64) -> (usize, usize) {
             outcome.response.state
         );
         let owed_after = balance_now(&venue, base()).margin.unwrap().borrowed;
-        borrows += usize::from(owed_after > owed_before);
-        repays += usize::from(owed_after < owed_before);
+        run.borrows += usize::from(owed_after > owed_before);
+        run.repays += usize::from(owed_after < owed_before);
+        run.interest += base_interest(&outcome.events).0;
 
-        for event in outcome.events {
+        for event in charged.into_iter().chain(outcome.events) {
             let event = indexer.account_event(event).unwrap();
             if let Some(exited) = engine.update_from_account(&event).exited {
                 realised_exited += exited.pnl_realised;
@@ -235,9 +297,12 @@ fn run(spot_fee_asset: SpotFeeAsset, seed: u64) -> (usize, usize) {
         let MarginDetails { borrowed, interest } = venue_base.margin.unwrap();
         let net_base = venue_base.total - borrowed - interest;
         assert_eq!(
-            net_base, held,
+            net_base + run.interest,
+            held,
             "step {step} ({spot_fee_asset:?}): after {side:?} {quantity} @ {price}, the account \
-             holds {net_base} net of its loan but the engine holds {held}"
+             holds {net_base} net of its loan, and was charged {} interest, but the engine holds \
+             {held}",
+            run.interest
         );
         assert!(
             venue_base.total.is_zero() || borrowed.is_zero(),
@@ -246,7 +311,7 @@ fn run(spot_fee_asset: SpotFeeAsset, seed: u64) -> (usize, usize) {
         );
 
         let account_pnl = balance_now(&venue, quote()).total - INITIAL_QUOTE + net_base * price;
-        let engine_pnl = realised_exited + pnl_open;
+        let engine_pnl = realised_exited + pnl_open - run.interest * price;
         assert!(
             (account_pnl - engine_pnl).abs() <= PNL_TOLERANCE,
             "step {step} ({spot_fee_asset:?}): the account made {account_pnl} marked at \
@@ -265,17 +330,27 @@ fn run(spot_fee_asset: SpotFeeAsset, seed: u64) -> (usize, usize) {
         );
     }
 
-    (borrows, repays)
+    run
 }
 
 /// The default charges every fee in quote, so the base a fill moves is its quantity.
 #[test]
 fn under_quote_fees_a_margin_account_and_the_engine_agree_fill_by_fill() {
     for seed in [1, 7, 42] {
-        let (borrows, repays) = run(SpotFeeAsset::Quote, seed);
+        let Run {
+            borrows,
+            repays,
+            interest,
+            ..
+        } = run(SpotFeeAsset::Quote, seed, None);
         assert!(
             borrows > 0 && repays > 0,
             "seed {seed}: {borrows} borrows, {repays} repays"
+        );
+        assert_eq!(
+            interest,
+            Decimal::ZERO,
+            "seed {seed}: no model, no interest"
         );
     }
 }
@@ -285,10 +360,34 @@ fn under_quote_fees_a_margin_account_and_the_engine_agree_fill_by_fill() {
 #[test]
 fn under_received_fees_a_margin_account_and_the_engine_agree_fill_by_fill() {
     for seed in [1, 7, 42] {
-        let (borrows, repays) = run(SpotFeeAsset::Received, seed);
+        let Run {
+            borrows, repays, ..
+        } = run(SpotFeeAsset::Received, seed, None);
         assert!(
             borrows > 0 && repays > 0,
             "seed {seed}: {borrows} borrows, {repays} repays"
         );
+    }
+}
+
+/// Interest at borrow and at each hour the clock crosses moves the account away from the
+/// engine by exactly what it charged, under either fee asset.
+#[test]
+fn with_margin_interest_a_margin_account_and_the_engine_differ_by_exactly_the_interest() {
+    for spot_fee_asset in [SpotFeeAsset::Quote, SpotFeeAsset::Received] {
+        for seed in [1, 7, 42] {
+            let Run {
+                borrows,
+                repays,
+                interest,
+                boundary_charges,
+            } = run(spot_fee_asset, seed, Some(hourly_interest()));
+            assert!(
+                borrows > 0 && repays > 0 && boundary_charges > 0,
+                "seed {seed} ({spot_fee_asset:?}): {borrows} borrows, {repays} repays, \
+                 {boundary_charges} boundary charges"
+            );
+            assert!(interest > Decimal::ZERO);
+        }
     }
 }

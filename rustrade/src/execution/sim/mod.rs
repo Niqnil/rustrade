@@ -444,7 +444,8 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 /// # A venue's own deadlines
 /// A venue has things to do at instants nobody requested: an order reaching its
 /// [`TimeInForce::GoodTillDate`](rustrade_execution::order::TimeInForce::GoodTillDate) deadline,
-/// and a held position reaching a holding-cost boundary (see [`SimVenueOptions`]). This runner
+/// a held position reaching a holding-cost boundary, and a loan reaching an interest boundary
+/// (see [`SimVenueOptions`]). This runner
 /// reads each venue's [`SimulatedVenue::next_deadline`] after anything that can move it — an
 /// action, or a market event routed to the venue — and queues one venue-bound action at that
 /// instant, which moves the venue's clock there. So an expiry or a charge happens at its own
@@ -1634,11 +1635,12 @@ mod tests {
         subscription::{candle::Candle, trade::PublicTrade},
     };
     use rustrade_execution::{
-        AccountSnapshot,
+        AccountSnapshot, PeriodicMarginInterest, SpotMarginConfig,
         balance::{AssetBalance, Balance},
         client::mock::MockExecutionConfig,
         exchange::mock::VenueInstrumentMarket,
         fill::{MarketOrderTiming, NextBarPrice, StaleMarketPolicy},
+        holding_cost::DayCount,
         market::MarketSnapshot,
         order::{
             OrderKey, OrderKind, TimeInForce,
@@ -1652,6 +1654,7 @@ mod tests {
         instrument::InstrumentIndex, test_utils::instrument,
     };
     use rustrade_integration::channel::Tx;
+    use std::sync::Arc;
 
     const EXCHANGE: ExchangeId = ExchangeId::BinanceSpot;
 
@@ -2445,6 +2448,35 @@ mod tests {
             "a second full fill is delivered, so the budget was reset rather than accumulated"
         );
         assert_eq!(harness.runner.error(), None);
+    }
+
+    /// A margin interest model on a venue that takes no loans would charge nothing, silently, so
+    /// the builder refuses it.
+    #[test]
+    fn a_venue_charging_margin_interest_without_spot_margin_is_refused() {
+        let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
+        let options = SimVenueOptions::default().with_margin_interest(Arc::new(
+            PeriodicMarginInterest::new(TimeDelta::hours(1), DayCount::Act365),
+        ));
+
+        let refused = SimExecutionBuilder::new(&instruments)
+            .add_venue_with_options(config(0), options.clone());
+        assert!(
+            matches!(&refused, Err(BarterError::ExecutionBuilder(reason)) if reason.contains("no spot_margin")),
+            "{refused:?}"
+        );
+
+        let margin = MockExecutionConfig {
+            spot_margin: Some(
+                SpotMarginConfig::new(AssetNameExchange::new("usdt"), dec!(3)).unwrap(),
+            ),
+            ..config(0)
+        };
+        assert!(
+            SimExecutionBuilder::new(&instruments)
+                .add_venue_with_options(margin, options)
+                .is_ok()
+        );
     }
 
     /// A configured opening balance stamped before the session start must not arrive behind the

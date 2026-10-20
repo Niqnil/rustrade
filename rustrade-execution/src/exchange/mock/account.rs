@@ -45,6 +45,9 @@ pub struct AccountState {
     /// The policy of a margin account, or `None` for a cash account, which reports no loans and
     /// borrows nothing. Set by [`enable_margin`](Self::enable_margin).
     margin: Option<MarginSideEffect>,
+    /// Counts each time an asset's principal opened from zero or was repaid to zero. Read through
+    /// [`loans_changed`](Self::loans_changed).
+    loans_changed: u64,
 }
 
 impl AccountState {
@@ -65,6 +68,7 @@ impl AccountState {
             orders_expired: FnvHashMap::default(),
             trades,
             margin: None,
+            loans_changed: 0,
         }
     }
 
@@ -95,6 +99,46 @@ impl AccountState {
         self.balances
             .get(asset)
             .map_or(Decimal::ZERO, |balance| balance.balance.free)
+    }
+
+    /// Each asset this account owes principal in, with the principal owed.
+    pub fn loans(&self) -> impl Iterator<Item = (&AssetNameExchange, Decimal)> + '_ {
+        self.balances.iter().filter_map(|(asset, balance)| {
+            let borrowed = balance.balance.margin?.borrowed;
+            (borrowed > Decimal::ZERO).then_some((asset, borrowed))
+        })
+    }
+
+    /// A count that changes whenever the set of assets in [`loans`](Self::loans) may have: each
+    /// time an asset's principal opens from zero or is repaid to zero.
+    ///
+    /// For a caller that caches something derived from that set, such as when interest next falls
+    /// due, and would otherwise recompute it after every operation.
+    pub fn loans_changed(&self) -> u64 {
+        self.loans_changed
+    }
+
+    /// Adds `interest` to the interest `asset`'s loan owes, leaving `total` and `free` as they
+    /// are: interest is owed to the lender, and repaid before principal.
+    ///
+    /// # Panics
+    /// Panics if `asset` has no balance — see [`reserve`](Self::reserve). A loan opens its
+    /// balance, so an asset with a loan to charge always has one.
+    pub fn charge_interest(
+        &mut self,
+        asset: &AssetNameExchange,
+        interest: Decimal,
+        time_exchange: DateTime<Utc>,
+    ) -> AssetBalance<AssetNameExchange> {
+        let balance = self.balance_expect(asset);
+        balance
+            .balance
+            .margin
+            .get_or_insert_with(MarginDetails::default)
+            .interest += interest;
+        balance.time_exchange = time_exchange;
+
+        balance.clone()
     }
 
     /// This account's open orders, indexed for lookup and ordered for matching.
@@ -445,12 +489,12 @@ impl AccountState {
 
         balance.balance.total += delivery.amount;
         balance.balance.free += delivery.amount;
-        if lends {
-            repay(&mut balance.balance, delivery.amount);
-        }
+        let cleared = lends && repay(&mut balance.balance, delivery.amount);
         balance.time_exchange = time_exchange;
 
-        balance.clone()
+        let balance = balance.clone();
+        self.loans_changed += u64::from(cleared);
+        balance
     }
 
     /// Gives `reservation` back to `free`, as [`release`](Self::release) does, then repays the
@@ -487,10 +531,12 @@ impl AccountState {
     ) -> AssetBalance<AssetNameExchange> {
         let balance = self.balance_expect(asset);
         let available = amount.min(balance.balance.free);
-        repay(&mut balance.balance, available);
+        let cleared = repay(&mut balance.balance, available);
         balance.time_exchange = time_exchange;
 
-        balance.clone()
+        let balance = balance.clone();
+        self.loans_changed += u64::from(cleared);
+        balance
     }
 
     /// Lends `amount` of `asset`: `total` and `free` rise by it, and so does the loan. An asset the
@@ -499,10 +545,11 @@ impl AccountState {
         let balance = &mut self.balance_or_open(asset, time_exchange).balance;
         balance.total += amount;
         balance.free += amount;
-        balance
-            .margin
-            .get_or_insert_with(MarginDetails::default)
-            .borrowed += amount;
+        let margin = balance.margin.get_or_insert_with(MarginDetails::default);
+        let opened = margin.borrowed.is_zero();
+        margin.borrowed += amount;
+
+        self.loans_changed += u64::from(opened);
     }
 
     /// `asset`'s balance, opened at zero if the account has never held it, reporting a loan from
@@ -682,11 +729,11 @@ impl AccountState {
 }
 
 /// Repays up to `available` of `balance`'s loan, interest first, then principal, out of its
-/// `total` and `free`, and returns how much it repaid. Repays nothing from a `available` that is
-/// not positive, or from a balance that owes nothing.
-fn repay(balance: &mut Balance, available: Decimal) -> Decimal {
+/// `total` and `free`, and returns whether that repaid the last of its principal. Repays nothing
+/// from a `available` that is not positive, or from a balance that owes nothing.
+fn repay(balance: &mut Balance, available: Decimal) -> bool {
     let Some(margin) = balance.margin.as_mut() else {
-        return Decimal::ZERO;
+        return false;
     };
     let available = available.max(Decimal::ZERO);
     let interest = margin.interest.min(available);
@@ -697,7 +744,7 @@ fn repay(balance: &mut Balance, available: Decimal) -> Decimal {
     let repaid = interest + principal;
     balance.total -= repaid;
     balance.free -= repaid;
-    repaid
+    principal > Decimal::ZERO && margin.borrowed.is_zero()
 }
 
 /// What one arriving order does to one asset's balance, as a single commitment.
@@ -864,6 +911,7 @@ impl TryFrom<UnindexedAccountSnapshot> for AccountState {
             orders_expired: FnvHashMap::default(),
             trades: vec![],
             margin: None,
+            loans_changed: 0,
         })
     }
 }
@@ -1193,5 +1241,54 @@ mod tests {
             panic!("a filled order is not seeded");
         };
         assert!(account.orders().contains(&ClientOrderId::new("x")));
+    }
+
+    /// A margin account owing 30 usd of principal and 1 of interest out of 100 held, as one seeded
+    /// from a live margin account does: no loan has opened through it, so its count starts at zero.
+    fn account_owing_usd() -> AccountState {
+        let owing = AssetBalance::new(
+            usd(),
+            Balance::new_margin(dec!(100), dec!(100), dec!(30), dec!(1)),
+            DateTime::<Utc>::MIN_UTC,
+        );
+        let mut account = AccountState::new(
+            FnvHashMap::from_iter([(usd(), owing)]),
+            OpenOrders::default(),
+            FnvHashMap::default(),
+            vec![],
+        );
+        account.enable_margin(MarginSideEffect::AutoBorrowRepay);
+        account
+    }
+
+    #[test]
+    fn the_loan_count_changes_only_when_a_principal_is_repaid_to_zero() {
+        let mut account = account_owing_usd();
+        let at = DateTime::<Utc>::MIN_UTC;
+
+        account.deliver(
+            &Delivery {
+                asset: btc(),
+                amount: dec!(1),
+            },
+            at,
+        );
+        assert_eq!(
+            account.loans_changed(),
+            0,
+            "a delivery into an asset owing nothing repays no loan"
+        );
+
+        // The 1 interest, then 10 of the principal.
+        account.repay_loan(&usd(), dec!(11), at);
+        assert_eq!(
+            account.loans_changed(),
+            0,
+            "20 of the principal is still owed"
+        );
+
+        account.repay_loan(&usd(), dec!(20), at);
+        assert_eq!(account.loans_changed(), 1);
+        assert_eq!(account.loans().count(), 0);
     }
 }
