@@ -619,14 +619,16 @@ pub struct AssetFees<AssetKey> {
     /// Fee value in quote currency when computable.
     /// - `Some(fees)` if fee asset == quote asset
     /// - `Some(fees * price)` if fee asset == base asset (computed by indexer)
-    /// - `None` if fee asset is third-party (e.g., BNB), which needs external price data. Also
-    ///   `None` when the indexer zeroed a fee whose asset was not in its map (see
+    /// - `None` if fee asset is third-party (e.g., BNB), which needs a price the indexer does not
+    ///   have. The `rustrade` engine fills it in when it prices that asset, before applying the
+    ///   fill (see its `EngineState::update_from_account`). Also `None` when the indexer zeroed a
+    ///   fee whose asset was not in its map (see
     ///   [`AccountEventIndexer::trade`](crate::indexer::AccountEventIndexer::trade)).
     ///
     /// The engine's position PnL counts only this quote equivalent. A fee with `None` is left
-    /// out of PnL, and its raw [`fees`](Self::fees) stays recorded on the position. A consumer that
-    /// wants it counted prices it. On a position's running fee totals, this is the sum of the
-    /// quote equivalents its fees had, and `None` only while none had one.
+    /// out of PnL, and its raw [`fees`](Self::fees) stays recorded on the position. On a
+    /// position's running fee totals, this is the sum of the quote equivalents its fees had, and
+    /// `None` only while none had one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fees_quote: Option<Decimal>,
 }

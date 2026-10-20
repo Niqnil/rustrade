@@ -41,6 +41,9 @@ pub mod connectivity;
 /// Instrument-level state and associated state management logic.
 pub mod instrument;
 
+/// Fees charged in a third asset, and how the engine values them in quote.
+pub mod fee;
+
 /// Defines a synchronous `OrderManager` that tracks the lifecycle of exchange orders.
 pub mod order;
 
@@ -320,8 +323,41 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     /// Updates the internal state from an `AccountEvent`.
     ///
     /// Returns what the event's fills did to positions: the
-    /// [`PositionExited`](position::PositionExited) one closed, and each reduce-only fill cut
-    /// (see [`InstrumentState::update_from_trade`](instrument::InstrumentState::update_from_trade)).
+    /// [`PositionExited`](position::PositionExited) one closed, each reduce-only fill cut
+    /// (see [`InstrumentState::update_from_trade`](instrument::InstrumentState::update_from_trade)),
+    /// and how a fee in a third asset was valued (below).
+    ///
+    /// # A fee charged in a third asset
+    /// A fill's fee can be charged in an asset that is neither the instrument's base nor its
+    /// quote, such as BNB on a `BTCUSDT` fill with Binance's "pay fees with BNB" on. The execution
+    /// indexer gives such a fee no quote equivalent
+    /// ([`AssetFees::fees_quote`](rustrade_execution::trade::AssetFees::fees_quote) is `None`), so
+    /// PnL would leave it out. Before applying the fill, this method values it in quote when it
+    /// can:
+    /// - **The price** is [`InstrumentDataState::price`] of a spot instrument pairing the fee
+    ///   asset with the fill's quote asset: `BNBUSDT` for a BNB fee on `BTCUSDT`, or the
+    ///   reciprocal of a `USDTBNB`. Assets are indexed per exchange, so only an instrument on the
+    ///   fill's exchange matches. Of several, the lowest [`InstrumentIndex`] is used, even while
+    ///   it has no price and another has, so the choice never depends on which data arrived
+    ///   first. The price is the one held when the fill is applied, however old. Cross rates
+    ///   through a third asset (BNB to BTC to USDT) are not used.
+    /// - **With a positive price,** `fees_quote` is the fee times that price, and the fill counts
+    ///   it in PnL as it would a fee in quote.
+    /// - **Without one,** for want of the instrument or of a price, `fees_quote` stays `None` and
+    ///   the fee is left out of PnL. The fill is applied all the same, and counted on the
+    ///   instrument's
+    ///   [`TearSheet::fills_fee_unconverted`](crate::statistic::summary::instrument::TearSheet::fills_fee_unconverted).
+    ///
+    /// Either way the returned [`FillsApplied::fee_conversion`] records it: the pricing instrument
+    /// and the price, or why there was none. The `Engine` emits it as
+    /// [`EngineOutput::FeeConversion`](crate::engine::EngineOutput::FeeConversion). A zero fee
+    /// needs no price, so it is valued at zero and not recorded. A fee already given a quote
+    /// equivalent is kept as it is.
+    ///
+    /// To have fees valued, subscribe the pricing instrument's market data. Only the fee is
+    /// valued: the fee asset's balance is not, since the engine keeps no equity across assets.
+    /// Only this method values fees. [`InstrumentState::update_from_trade`](instrument::InstrumentState::update_from_trade),
+    /// called directly, applies the fill's fee as it finds it.
     ///
     /// This method:
     /// - Sets the account [`ConnectivityState`](connectivity::ConnectivityState) to
@@ -334,7 +370,7 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     pub fn update_from_account(&mut self, event: &AccountEvent) -> FillsApplied<AssetIndex>
     where
         GlobalData: for<'a> Processor<&'a AccountEvent>,
-        InstrumentData: for<'a> Processor<&'a AccountEvent>,
+        InstrumentData: InstrumentDataState,
     {
         self.replay_account(event, &[])
     }
@@ -354,7 +390,7 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     ) -> FillsApplied<AssetIndex>
     where
         GlobalData: for<'a> Processor<&'a AccountEvent>,
-        InstrumentData: for<'a> Processor<&'a AccountEvent>,
+        InstrumentData: InstrumentDataState,
     {
         // Set exchange account connectivity to Healthy if it was Reconnecting. A failed re-init
         // or an ended stream reports on the link without showing it is up, so neither counts.
@@ -418,10 +454,31 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                 FillsApplied::default()
             }
             AccountEventKind::Trade(trade) => {
+                // Valued before the fill is applied, with the prices held when it arrives, so a
+                // fill queued for replay keeps the value it had then.
+                let (valued_trade, conversion) = match self.instruments.value_third_asset_fee(trade)
+                {
+                    Some(valued) => {
+                        let mut valued_trade = trade.clone();
+                        valued_trade.fees.fees_quote = valued.fees_quote();
+                        (Some(valued_trade), valued.into_conversion())
+                    }
+                    None => (None, None),
+                };
+                let trade = valued_trade.as_ref().unwrap_or(trade);
+
                 let instrument_state = self.instruments.instrument_index_mut(&trade.instrument);
+                if let Some(conversion) = &conversion {
+                    conversion.log();
+                    if conversion.outcome.fees_quote().is_none() {
+                        instrument_state.tear_sheet.record_fill_fee_unconverted();
+                    }
+                }
 
                 instrument_state.data.process(event);
-                instrument_state.replay_trade(trade, reduce_only_fills)
+                let mut applied = instrument_state.replay_trade(trade, reduce_only_fills);
+                applied.fee_conversion = conversion;
+                applied
             }
             AccountEventKind::StreamTerminated(reason) => {
                 // Observe stream death rather than silently dropping it. The engine does not own

@@ -186,6 +186,20 @@ pub struct TearSheet<Interval> {
     #[serde(default)]
     pub fills_reduce_only_capped: usize,
 
+    /// Fills whose fee was charged in a third asset, neither the instrument's base nor its quote,
+    /// that the engine could not value in quote, so their fees are left out of `pnl`.
+    ///
+    /// A fee such as BNB on a `BTCUSDT` fill is valued with the price of a spot instrument
+    /// pairing the fee asset with the quote, when the engine has one with a price. Each fill
+    /// counted here was reported in an
+    /// [`EngineOutput::FeeConversion`](crate::engine::EngineOutput::FeeConversion) saying why.
+    /// A non-zero count means `pnl` is gross of those fees. A fill is counted when it arrives,
+    /// valued with the prices held then, including one held for its order's acknowledgement
+    /// before it reaches a position. See
+    /// [`EngineState::update_from_account`](crate::engine::state::EngineState::update_from_account).
+    #[serde(default)]
+    pub fills_fee_unconverted: usize,
+
     /// Why the first fill of either kind above could not be routed.
     ///
     /// Shared by both counters, for the same reason [`Self::first_rejection_reason`] exists: the
@@ -266,6 +280,10 @@ pub struct TearSheetGenerator {
     #[serde(default)]
     pub reduce_only_excess: Decimal,
 
+    /// Fills whose third-asset fee was left out of PnL. See [`TearSheet::fills_fee_unconverted`].
+    #[serde(default)]
+    pub fills_fee_unconverted: usize,
+
     /// First unroutable-fill detail seen. See [`TearSheet::first_fallback_detail`].
     #[serde(default)]
     pub first_fallback_detail: Option<String>,
@@ -296,6 +314,7 @@ impl TearSheetGenerator {
             dust: Decimal::ZERO,
             fills_reduce_only_capped: 0,
             reduce_only_excess: Decimal::ZERO,
+            fills_fee_unconverted: 0,
             first_fallback_detail: None,
             fallback_positions: Vec::new(),
         }
@@ -368,6 +387,12 @@ impl TearSheetGenerator {
                 "dust accumulation overflowed Decimal; holding last-good value"
             ),
         }
+    }
+
+    /// Record a fill whose third-asset fee the engine could not value in quote. See
+    /// [`TearSheet::fills_fee_unconverted`].
+    pub fn record_fill_fee_unconverted(&mut self) {
+        self.fills_fee_unconverted = self.fills_fee_unconverted.saturating_add(1);
     }
 
     /// Record a reduce-only fill the engine cut, and its excess's value, as a size. See
@@ -529,6 +554,7 @@ impl TearSheetGenerator {
             fills_unallocated: self.fills_unallocated,
             fills_dust: self.fills_dust,
             fills_reduce_only_capped: self.fills_reduce_only_capped,
+            fills_fee_unconverted: self.fills_fee_unconverted,
             first_fallback_detail: self.first_fallback_detail.clone(),
             fallback_positions: self.fallback_positions.clone(),
         }
@@ -574,6 +600,22 @@ mod tests {
 
         let loaded: TearSheet<Annual365> = serde_json::from_value(value).unwrap();
         assert_eq!((loaded.fills_dust, loaded.dust), (0, Decimal::ZERO));
+    }
+
+    #[test]
+    fn a_tear_sheet_serialised_before_fills_fee_unconverted_loads_with_zero() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fill_fee_unconverted();
+        let mut value = serde_json::to_value(generator.generate(Decimal::ZERO, Annual365)).unwrap();
+        assert_eq!(value["fills_fee_unconverted"], 1);
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("fills_fee_unconverted")
+            .unwrap();
+
+        let loaded: TearSheet<Annual365> = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.fills_fee_unconverted, 0);
     }
 
     #[test]

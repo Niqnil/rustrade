@@ -15,6 +15,7 @@ use crate::{
         state::{
             EngineState,
             connectivity::UntrackedExchange,
+            fee::FeeConversion,
             instrument::{
                 ExpiryHandling, FillsApplied, OptionSplitPlan, ReduceOnlyCapped,
                 data::InstrumentDataState, filter::InstrumentFilter,
@@ -406,7 +407,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         event: &AccountStreamEvent,
     ) -> UpdateFromAccountOutput<Strategy::OnDisconnect>
     where
-        InstrumentData: for<'a> Processor<&'a AccountEvent>,
+        InstrumentData: InstrumentDataState,
         GlobalData: for<'a> Processor<&'a AccountEvent>,
         Strategy: OnDisconnectStrategy<Clock, EngineState<GlobalData, InstrumentData>, ExecutionTxs, Risk>,
     {
@@ -1903,6 +1904,18 @@ pub enum EngineOutput<
     /// [`StateReplicaManager`](crate::engine::audit::state_replica::StateReplicaManager) reads it
     /// to cut the same fill, since a replica cannot know an order was reduce-only.
     ReduceOnlyCapped(ReduceOnlyCapped<InstrumentKey>),
+
+    /// A fill whose fee was charged in a third asset, neither the instrument's base nor its quote,
+    /// and how the engine valued that fee in quote: the pricing instrument and price, or why it
+    /// could not. See [`FeeConversion`] and
+    /// [`EngineState::update_from_account`](crate::engine::state::EngineState::update_from_account).
+    ///
+    /// One per such fill, converted or not, emitted for the account event whose fill it was,
+    /// before any [`ReduceOnlyCapped`](Self::ReduceOnlyCapped) or
+    /// [`PositionExit`](Self::PositionExit) for that fill. A fill with no fee, or one in base or
+    /// quote, emits none. An unconverted fill is also counted on
+    /// [`TearSheet::fills_fee_unconverted`](crate::statistic::summary::instrument::TearSheet::fills_fee_unconverted).
+    FeeConversion(FeeConversion<AssetIndex, InstrumentKey>),
 }
 
 /// A single resting order captured in an [`EngineOutput::OpenOrdersAtSplit`] observable.
@@ -2100,9 +2113,11 @@ pub enum UpdateFromAccountOutput<OnDisconnect, InstrumentKey = InstrumentIndex> 
     None,
     OnDisconnect(OnDisconnect),
 
-    /// The event's fills closed a position, or the engine cut a reduce-only fill. Never empty.
-    /// Each becomes an [`EngineOutput`]: [`ReduceOnlyCapped`](EngineOutput::ReduceOnlyCapped)
-    /// for each cut, then [`PositionExit`](EngineOutput::PositionExit).
+    /// The event's fills closed a position, the engine cut a reduce-only fill, or it valued a
+    /// third-asset fee. Never empty. Each becomes an [`EngineOutput`]:
+    /// [`FeeConversion`](EngineOutput::FeeConversion), then
+    /// [`ReduceOnlyCapped`](EngineOutput::ReduceOnlyCapped) for each cut, then
+    /// [`PositionExit`](EngineOutput::PositionExit).
     FillsApplied(FillsApplied<AssetIndex, InstrumentKey>),
 
     /// The event named an exchange the engine does not track; nothing was updated, and

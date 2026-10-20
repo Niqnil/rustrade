@@ -384,6 +384,7 @@ mod tests {
             fills_unallocated: 0,
             fills_dust: 0,
             fills_reduce_only_capped: 0,
+            fills_fee_unconverted: 0,
         }
     }
 
@@ -446,6 +447,7 @@ mod tests {
             fills_unallocated: 0,
             fills_dust: 0,
             fills_reduce_only_capped: 0,
+            fills_fee_unconverted: 0,
         }
     }
 

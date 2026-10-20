@@ -94,6 +94,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the session, and the instrument table shows a "Reduce-Only Excess" row.
   - `EngineState::replay_account`: `update_from_account` for a replica of the engine's state,
     told which fills the engine cut. `StateReplicaManager` uses it, so it cuts the same fills.
+- **The engine values a fee charged in a third asset** (`rustrade`, #620). A fill's fee in an
+  asset that is neither the instrument's base nor its quote, such as BNB on a `BTCUSDT` fill with
+  Binance's "pay fees with BNB" on, has no quote equivalent from the execution indexer, so PnL
+  left it out. `EngineState::update_from_account` now values it before applying the fill:
+  - **The price** is that of a spot instrument the engine trades or prices pairing the fee asset
+    with the fill's quote asset, on the fill's exchange: `BNBUSDT`, or the reciprocal of a
+    `USDTBNB`. Of several, the lowest `InstrumentIndex` is used. It is the price held when the
+    fill is applied. Cross rates through a third asset are not used.
+  - **With a positive price,** the fee's `fees_quote` is its amount times that price, and PnL
+    counts it as it counts a fee in quote. Subscribe the pricing instrument's market data to have
+    fees valued.
+  - **Without one,** the fee is left out of PnL as before, and the fill is still applied.
+  - **Every such fill is reported** as `EngineOutput::FeeConversion`, carrying a `FeeConversion`:
+    the fill's instrument and trade id, the fee asset and amount, and a `FeeConversionOutcome`,
+    `Converted` with the pricing instrument, the price and the quote value, or `NoPricingInstrument`
+    or `NoPrice`. It is emitted before the fill's `ReduceOnlyCapped` or `PositionExit`, and is also
+    on `FillsApplied::fee_conversion`. A zero fee is valued at zero and not reported.
+  - `TearSheet::fills_fee_unconverted` counts the fills whose fee was left out of PnL, and
+    `TradingSummary::fills_fee_unconverted` sums it over the session.
+  - Only the fee is valued. The fee asset's balance is not, since the engine keeps no equity
+    across assets. The simulated venue still charges no fee in a third asset.
 - `round_toward_zero_to_step` (`rustrade-instrument`): a quantity rounded toward zero to a whole
   multiple of a step, the rounding the engine and `build_ioc_market_order_to_close_position`
   apply.
@@ -200,8 +221,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `close_open_positions_with_market_orders` passes the step, and logs a position below one step
   at WARN instead of sending an order for it.
 - **Breaking:** `TearSheet`, `TearSheetGenerator` and `TradingSummary` have new public fields for
-  dust and for reduce-only fills cut (see Added), so a struct literal must supply them
-  (`rustrade`). Serialised ones without them still load.
+  dust, for reduce-only fills cut and for third-asset fees left unconverted (see Added), so a
+  struct literal must supply them (`rustrade`). Serialised ones without them still load.
+- **Breaking in behaviour:** PnL now counts a third-asset fee the engine can price (`rustrade`,
+  #620; see Added). A run paying fees in BNB with `BNBUSDT` market data reports lower PnL than
+  before, by those fees.
+- **Breaking:** `EngineState::update_from_account`, `EngineState::replay_account` and
+  `Engine::update_from_account_stream` require `InstrumentData: InstrumentDataState`, where they
+  required only that it process account events (`rustrade`, #620). They read the price of the
+  instrument that values a third-asset fee.
 
 ### Fixed
 
