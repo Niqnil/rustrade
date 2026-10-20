@@ -7258,6 +7258,28 @@ mod tests {
         .expect("the seeded order is Open")
     }
 
+    /// A seeded order holds nothing, so an account that cannot pay for its fill is a mis-specified
+    /// fixture, and the venue says so rather than cancelling the order as unaffordable.
+    #[test]
+    #[should_panic(expected = "cannot afford the fill of resting order part_filled")]
+    fn a_seeded_order_the_account_cannot_afford_panics_when_it_fills() {
+        let mut venue = make_market_venue("10", "100");
+        advance(&mut venue, time(1));
+        assert!(
+            venue
+                .account
+                .book(seeded_part_filled("48000", "1", "0"), None)
+                .is_ok()
+        );
+
+        advance(&mut venue, time(2));
+        let _ = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("47800", "47900")),
+            time(2),
+        );
+    }
+
     /// An order that reached the book part-filled trades only the rest of it.
     ///
     /// Settling and printing its whole quantity would charge the ledger a second time for a
