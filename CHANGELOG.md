@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-20
+
 ### Added
 
 - **Opt-in next-bar fills for market orders on the simulated venue** (`rustrade-execution`,
@@ -85,6 +87,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   signed, and whether the fill's order was reduce-only. The engine applies fills with it, so a
   component that mirrors positions outside the engine, such as an execution client's ledger of
   forwarded fills, can call it and agree with the engine.
+- `round_toward_zero_to_step` (`rustrade-instrument`, #660): a quantity rounded toward zero to a
+  whole multiple of a step, the rounding the engine and `build_ioc_market_order_to_close_position`
+  apply.
 - Reporting for reduce-only fills the engine cuts (`rustrade`, #661; see Changed):
   - `EngineOutput::ReduceOnlyCapped`, carrying a `ReduceOnlyCapped`: the fill's trade and order
     ids, its position, the position before the fill, the excess, the excess's value and the fee
@@ -132,9 +137,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     its fee is zero or negative. A margin account never lends the asset for a fee.
   - The account-event indexer gives such a fee no quote equivalent, as a live one, so a backtest
     counts it in PnL exactly when the engine prices the asset (see the entry above), as live.
-- `round_toward_zero_to_step` (`rustrade-instrument`): a quantity rounded toward zero to a whole
-  multiple of a step, the rounding the engine and `build_ioc_market_order_to_close_position`
-  apply.
 - **Opt-in spot margin on the simulated venue** (`rustrade-execution`, #623).
   - New `MockExecutionConfig::spot_margin`. The default, `None`, is today's cash account: a spot
     order is paid for with what the account holds, so a sell of base it lacks is refused.
@@ -151,8 +153,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A borrow is allowed while the account's debt stays within `max_leverage − 1` times its
     equity, both valued in a configured valuation asset at the mid or last price of an instrument
     on the venue that pairs each asset with it. An asset the venue cannot value, or prices at
-    zero, counts as no equity and is not lent, and a debt it cannot value stops it lending. An order needing more is rejected as unaffordable, with a reason that
-    says how much the venue would lend.
+    zero, counts as no equity and is not lent, and a debt it cannot value stops it lending. An
+    order needing more is rejected as unaffordable, with a reason that says how much the venue
+    would lend.
   - Every balance reports its loan in `Balance::margin`, as Binance's margin account does, and the
     account's holding of an asset is its `total` less what it owes.
     `MarginSideEffect::NoBorrow` reports loans but lends and repays nothing.
@@ -193,10 +196,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`MarginSideEffect` is venue-agnostic** (`rustrade-execution`, #623). It moves to
   `rustrade_execution::margin`, where the simulated venue's spot margin uses it too, and is still
   re-exported from `client::binance`. It now derives `PartialOrd`, `Ord` and `Hash`.
-- **The engine enforces `RequestOpen::reduce_only` on fills** (`rustrade`, #661). It used to apply
-  every fill in full, so a reduce-only fill larger than the position it reduced flipped it and
-  left a small position on the other side. A margin repayment sized to cover interest does that
-  every time. Now, once a base-asset fee is netted:
+- **Breaking in behaviour:** the engine enforces `RequestOpen::reduce_only` on fills (`rustrade`,
+  #661). It used to apply every fill in full, so a reduce-only fill larger than the position it
+  reduced flipped it and left a small position on the other side. A margin repayment sized to
+  cover interest does that every time. Now, once a base-asset fee is netted:
   - A reduce-only fill larger than the opposite position is cut so the position lands flat. One
     against a flat position, or one on its own side, is applied to none.
   - The excess is applied to no position. Its value is reported, not charged to PnL.
@@ -261,6 +264,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A short's remainder is base still owed on the loan. The position books it as bought back at
     the fill's price, so nothing is written off.
   - Each such fill is logged at INFO and counted on the tear sheet.
+  - **Breaking in behaviour:** such a position is now smaller by its remainder than in earlier
+    releases, and a long's remainder is a cost in its PnL instead of part of the position.
 
   Remainders are rounded off fill by fill, so the balance can gather more than one step of them
   over many fills. An instrument without a step in the position's unit keeps the exact quantity.
