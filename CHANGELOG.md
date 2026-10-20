@@ -128,14 +128,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hold. The SDK changes that reach the compiled code:
   - A disconnected and dropped WebSocket connection is now freed. 75.0.0 kept two background tasks
     and the connection's state alive for good, one set for each spot order session reopened and
-    each spot or margin account stream reconnected, so a long-running process accumulated them. A
-    new test pins that no task is left behind, which also pins that a closed connection stays
-    closed.
+    each spot or margin account stream reconnected, so a long-running process accumulated them.
+    New tests pin that no task is left behind, whether the connection is disconnected or only
+    dropped, which also pins that a closed connection stays closed.
   - Dropping an SDK connection without disconnecting it now closes its socket, without waiting
     for pending requests. The clients still disconnect a connection they drop, which waits for
     them.
   - An error on a connection that a scheduled renewal has already replaced no longer starts a
-    second reconnect.
+    second reconnect. A renewed connection that fails now reconnects; 75.0.0 left it closed.
 - **`MarginSideEffect` is venue-agnostic** (`rustrade-execution`, #623). It moves to
   `rustrade_execution::margin`, where the simulated venue's spot margin uses it too, and is still
   re-exported from `client::binance`. It now derives `PartialOrd`, `Ord` and `Hash`.

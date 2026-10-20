@@ -161,7 +161,7 @@ impl BinanceWsConnection for Arc<binance_sdk::common::websocket::WebsocketApi> {
 /// Dropping this guard spawns that disconnect on the current Tokio runtime. binance-sdk bounds
 /// it: up to 30 s to drain pending requests, and 30 s overall. A failure is logged at WARN.
 /// Dropped outside a runtime, it cannot spawn, and logs a WARN instead; the SDK's own drop then
-/// sends the Close frame. A runtime that is shutting down drops the spawned task unrun, and its
+/// sends the Close frame once the last handle to the connection goes. A runtime that is shutting down drops the spawned task unrun, and its
 /// sockets close with it. [`disconnect`](Self::disconnect) closes the connection in place and
 /// reports the result. Wrap a connection only once it has connected: disconnecting one that never
 /// did makes binance-sdk log a WARN.
@@ -229,7 +229,8 @@ impl<W: BinanceWsConnection> Drop for DisconnectOnDrop<W> {
             Err(_) => warn!(
                 connection = label,
                 "Binance WebSocket connection dropped outside a Tokio runtime: it cannot be \
-                 disconnected, so binance-sdk's own drop closes it without draining pending requests"
+                 disconnected, so binance-sdk closes it once its last handle drops, without \
+                 draining pending requests"
             ),
         }
     }
@@ -3925,28 +3926,52 @@ mod tests {
         );
     }
 
-    /// binance-sdk frees a connection once it is disconnected and dropped. Before 76.0.0 its
-    /// reconnect and renewal loops kept it alive, leaking two tasks for each order session
-    /// reopened and each account stream reconnected. With no task left, nothing can reopen the
-    /// connection either, so this also pins that a disconnected connection stays closed.
-    #[tokio::test]
-    async fn a_disconnected_connection_leaves_no_task_behind() {
-        fn alive() -> usize {
-            tokio::runtime::Handle::current()
-                .metrics()
-                .num_alive_tasks()
-        }
+    /// Live tasks on the current runtime.
+    fn alive() -> usize {
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+    }
+
+    /// A WS-API config for a local server that accepts every connection and answers nothing.
+    async fn local_ws_api_config() -> binance_sdk::common::config::ConfigurationWebsocketApi {
         let (url, _) = super::test_ws_api::serve(
             |_| serde_json::Value::Null,
             |_| super::test_ws_api::Lifetime::Open,
         )
         .await;
-        let config = binance_sdk::common::config::ConfigurationWebsocketApi::builder()
+        binance_sdk::common::config::ConfigurationWebsocketApi::builder()
             .api_key("key")
             .api_secret("secret")
             .ws_url(url)
             .build()
-            .unwrap();
+            .unwrap()
+    }
+
+    /// Asserts the live tasks fall back to `before`. The server ends its side of each connection
+    /// once the close reaches it, so this waits up to 5 s.
+    async fn assert_tasks_return_to(before: usize) {
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+            while alive() > before {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "tasks left behind: {} of {before}",
+            alive()
+        );
+        assert_eq!(alive(), before);
+    }
+
+    /// binance-sdk frees a connection once it is disconnected and dropped. Before 76.0.0 its
+    /// reconnect and renewal loops kept it alive, leaking two tasks for each order session
+    /// reopened and each account stream reconnected. With no task left, none is left that could
+    /// reopen the connection either, so this also pins that a disconnected connection stays closed.
+    #[tokio::test]
+    async fn a_disconnected_connection_leaves_no_task_behind() {
+        let config = local_ws_api_config().await;
         let before = alive();
 
         // The spot order session, and the common-layer connection the margin account stream uses.
@@ -3965,12 +3990,37 @@ mod tests {
             .await
             .unwrap();
 
-        // The server ends its side of each connection once the close reaches it.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while alive() > before && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert_eq!(alive(), before, "tasks left behind");
+        assert_tasks_return_to(before).await;
+    }
+
+    /// A connection dropped without being disconnected is freed too: a guard dropped unclosed,
+    /// as when a connection manager is aborted with its stream, and a bare SDK connection whose
+    /// event callback was never unsubscribed.
+    #[tokio::test]
+    async fn a_dropped_connection_leaves_no_task_behind() {
+        let config = local_ws_api_config().await;
+        let before = alive();
+
+        let session = binance_sdk::spot::SpotWsApi::from_config(config.clone())
+            .connect()
+            .await
+            .unwrap();
+        drop(DisconnectOnDrop::new(session, "spot"));
+        let stream = binance_sdk::common::websocket::WebsocketApi::new(config, vec![]);
+        Arc::clone(&stream).connect().await.unwrap();
+        let callback_state = Arc::new(());
+        let held = Arc::clone(&callback_state);
+        let _subscription = stream.common.events.subscribe(move |_| {
+            let _ = &held;
+        });
+        drop(stream);
+
+        assert_tasks_return_to(before).await;
+        assert_eq!(
+            Arc::strong_count(&callback_state),
+            1,
+            "the callback was dropped"
+        );
     }
 
     /// Outside a runtime the guard cannot spawn the close; it logs instead of panicking.
