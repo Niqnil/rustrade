@@ -114,6 +114,13 @@ pub struct TradingSummary<Interval> {
     /// [`TearSheet::fills_reduce_only_capped`](instrument::TearSheet::fills_reduce_only_capped).
     #[serde(default)]
     pub fills_reduce_only_capped: usize,
+
+    /// Fills this session whose fee was charged in a third asset the engine could not value in
+    /// quote, summed over every instrument. Non-zero means the PnL in this summary is gross of
+    /// those fees. See
+    /// [`TearSheet::fills_fee_unconverted`](instrument::TearSheet::fills_fee_unconverted).
+    #[serde(default)]
+    pub fills_fee_unconverted: usize,
 }
 
 impl<Interval> TradingSummary<Interval> {
@@ -283,33 +290,12 @@ impl TradingSummaryGenerator {
             .map(|generator| generator.basis)
             .unwrap_or_default();
 
-        let (
-            orders_opened,
-            orders_rejected,
-            fills_routed_by_fallback,
-            fills_unmatched,
-            fills_forced,
-            fills_unallocated,
-            fills_dust,
-            fills_reduce_only_capped,
-        ) = self.instruments.values().fold(
-            (
-                0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize, 0usize,
-            ),
-            |(opened, rejected, fallback, unmatched, forced, unallocated, dust, capped),
-             generator| {
-                (
-                    opened.saturating_add(generator.orders_opened),
-                    rejected.saturating_add(generator.orders_rejected),
-                    fallback.saturating_add(generator.fills_routed_by_fallback),
-                    unmatched.saturating_add(generator.fills_unmatched),
-                    forced.saturating_add(generator.fills_forced),
-                    unallocated.saturating_add(generator.fills_unallocated),
-                    dust.saturating_add(generator.fills_dust),
-                    capped.saturating_add(generator.fills_reduce_only_capped),
-                )
-            },
-        );
+        // Each session counter sums its own tear-sheet counter over every instrument.
+        let total = |counter: fn(&TearSheetGenerator) -> usize| {
+            self.instruments.values().fold(0usize, |sum, generator| {
+                sum.saturating_add(counter(generator))
+            })
+        };
 
         TradingSummary {
             time_engine_start: self.time_engine_start,
@@ -317,14 +303,15 @@ impl TradingSummaryGenerator {
             instruments,
             assets,
             basis,
-            orders_opened,
-            orders_rejected,
-            fills_routed_by_fallback,
-            fills_unmatched,
-            fills_forced,
-            fills_unallocated,
-            fills_dust,
-            fills_reduce_only_capped,
+            orders_opened: total(|g| g.orders_opened),
+            orders_rejected: total(|g| g.orders_rejected),
+            fills_routed_by_fallback: total(|g| g.fills_routed_by_fallback),
+            fills_unmatched: total(|g| g.fills_unmatched),
+            fills_forced: total(|g| g.fills_forced),
+            fills_unallocated: total(|g| g.fills_unallocated),
+            fills_dust: total(|g| g.fills_dust),
+            fills_reduce_only_capped: total(|g| g.fills_reduce_only_capped),
+            fills_fee_unconverted: total(|g| g.fills_fee_unconverted),
         }
     }
 }
@@ -492,6 +479,7 @@ mod tests {
             generator.fills_unallocated = 6 * base;
             generator.fills_dust = 7 * base;
             generator.fills_reduce_only_capped = 8 * base;
+            generator.fills_fee_unconverted = 9 * base;
             instruments.insert(InstrumentNameInternal::new(name), generator);
         }
 
@@ -514,8 +502,9 @@ mod tests {
                 summary.fills_unallocated,
                 summary.fills_dust,
                 summary.fills_reduce_only_capped,
+                summary.fills_fee_unconverted,
             ],
-            [101, 202, 303, 404, 505, 606, 707, 808]
+            [101, 202, 303, 404, 505, 606, 707, 808, 909]
         );
     }
 

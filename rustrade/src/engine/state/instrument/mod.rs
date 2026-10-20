@@ -2,6 +2,7 @@ use crate::{
     engine::{
         UnsupportedCorporateActionReason,
         state::{
+            fee::FeeConversion,
             instrument::{data::InstrumentDataState, filter::InstrumentFilter},
             order::{Orders, manager::OrderManager},
             position::{
@@ -614,6 +615,10 @@ pub struct FillsApplied<AssetKey, InstrumentKey = InstrumentIndex> {
     pub exited: Option<PositionExited<AssetKey, InstrumentKey>>,
     /// Each reduce-only fill the engine cut or applied none of, in the order applied.
     pub capped: Vec<ReduceOnlyCapped<InstrumentKey>>,
+    /// How the engine valued the fee of a fill charged in a third asset, when the event was such a
+    /// fill. Set only by [`EngineState::update_from_account`](crate::engine::state::EngineState::update_from_account),
+    /// which does the valuing, never by this type's own methods.
+    pub fee_conversion: Option<FeeConversion<AssetKey, InstrumentKey>>,
 }
 
 impl<AssetKey, InstrumentKey> Default for FillsApplied<AssetKey, InstrumentKey> {
@@ -621,14 +626,15 @@ impl<AssetKey, InstrumentKey> Default for FillsApplied<AssetKey, InstrumentKey> 
         Self {
             exited: None,
             capped: Vec::new(),
+            fee_conversion: None,
         }
     }
 }
 
 impl<AssetKey, InstrumentKey> FillsApplied<AssetKey, InstrumentKey> {
-    /// `true` if no fill closed a position and none was capped.
+    /// `true` if no fill closed a position, none was capped, and no third-asset fee was valued.
     pub fn is_empty(&self) -> bool {
-        self.exited.is_none() && self.capped.is_empty()
+        self.exited.is_none() && self.capped.is_empty() && self.fee_conversion.is_none()
     }
 }
 
@@ -2498,6 +2504,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         FillsApplied {
             exited,
             capped: capped.into_iter().collect(),
+            fee_conversion: None,
         }
     }
 
