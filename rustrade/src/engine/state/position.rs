@@ -665,8 +665,9 @@ pub enum PositionSeedError {
 /// is left out of both PnL figures, and its raw amount stays in
 /// [`fees_enter`](Position::fees_enter) / [`fees_exit`](Position::fees_exit). So PnL overstates
 /// the result of a position whose third-asset fees the engine could not price, by those fees. The
-/// simulated venue never charges a fee in a third asset, so a backtest counts fees that a live run
-/// paying them in one counts only when it prices them.
+/// simulated venue charges fees in a third asset only when configured to (its
+/// `MockExecutionConfig::fee_asset`), and then reports them as a live venue does, so a backtest
+/// and a live run count them alike.
 ///
 /// A position's quantity is the sum of its fills' quantities, as they reach it. A spot fill whose
 /// fee is in the base asset reaches it with the fee already netted, by

@@ -7,7 +7,7 @@ use crate::{
         UnindexedOrderError,
     },
     exchange::mock::request::MockExchangeRequest,
-    fee::{FeeModelConfig, SpotFeeAsset},
+    fee::{FeeAssetConfig, FeeModelConfig, SpotFeeAsset},
     fill::{MarketOrderTiming, SimFillConfig, StaleMarketPolicy},
     margin::SpotMarginConfig,
     order::{
@@ -91,6 +91,13 @@ pub struct MockExecutionConfig {
     /// leverage limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spot_margin: Option<SpotMarginConfig>,
+    /// A third asset the mock exchange charges spot fees in, at a discount, while the account
+    /// holds enough of it, as Binance's "pay fees with BNB" does.
+    ///
+    /// Defaults to `None`: every fee is charged under [`spot_fee_asset`](Self::spot_fee_asset).
+    /// See [`FeeAssetConfig`] for what a fill pays and when it falls back to that rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_asset: Option<FeeAssetConfig>,
 }
 
 #[derive(Debug, Constructor)]

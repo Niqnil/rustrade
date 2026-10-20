@@ -86,8 +86,8 @@ pub mod error;
 pub mod exchange;
 pub mod fee;
 pub use fee::{
-    FeeModel, FeeModelConfig, Liquidity, PerContractFeeModel, PercentageFeeModel, SpotFeeAsset,
-    ZeroFeeModel,
+    FeeAssetConfig, FeeAssetConfigError, FeeModel, FeeModelConfig, Liquidity, PerContractFeeModel,
+    PercentageFeeModel, SpotFeeAsset, ZeroFeeModel,
 };
 pub mod fill;
 pub use fill::{
