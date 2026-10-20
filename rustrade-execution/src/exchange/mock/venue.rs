@@ -701,7 +701,9 @@ impl SimulatedVenue {
     ///
     /// # Panics
     /// If this venue has no [`MockExecutionConfig::spot_margin`]: a cash account takes no loans,
-    /// so a model given to one would silently charge nothing.
+    /// so a model given to one would silently charge nothing. Or if `model` breaks its contract
+    /// with a boundary not after the instant it was asked from, for a loan the account already
+    /// owes.
     #[must_use]
     pub fn with_margin_interest(mut self, model: Arc<dyn MarginInterestModel>) -> Self {
         assert!(
@@ -844,9 +846,8 @@ impl SimulatedVenue {
     /// stamped at `time_exchange`.
     ///
     /// # Panics
-    /// If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract (a
-    /// boundary not after the instant it was asked from, or a negative interest), on the input
-    /// that first reaches it.
+    /// If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract: a
+    /// boundary not after the instant it was asked from, or a negative interest.
     #[must_use]
     pub fn advance_time(&mut self, time_exchange: DateTime<Utc>) -> Vec<UnindexedAccountEvent> {
         // Charged before the balances are restamped, so each restatement it emits keeps its own
@@ -1345,9 +1346,8 @@ impl SimulatedVenue {
     /// eaten the fills, leaving its client holding an order the venue no longer has.
     ///
     /// # Panics
-    /// If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract (a
-    /// boundary not after the instant it was asked from, or a negative interest), on the input
-    /// that first reaches it.
+    /// If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract: a
+    /// boundary not after the instant it was asked from, or a negative interest.
     #[must_use]
     pub fn apply_market(
         &mut self,
@@ -1442,6 +1442,10 @@ impl SimulatedVenue {
     /// order the events are `[balance, order]`, the released hold then the terminal [`Expired`]
     /// snapshot, as [`advance_time`](Self::advance_time) reports a deadline it reached. Pass the
     /// last instant of the run: this moves no clock and charges no holding cost.
+    ///
+    /// # Panics
+    /// If the configured [`MarginInterestModel`] breaks its contract with a boundary not after the
+    /// instant it was asked from, when the venue next looks for one after a loan is repaid.
     #[must_use]
     pub fn expire_held(&mut self, time_exchange: DateTime<Utc>) -> Vec<UnindexedAccountEvent> {
         let held = self.account.orders().held();
@@ -2166,9 +2170,8 @@ impl SimulatedVenue {
     /// against this venue's own market; see the type's `# How an order is priced`.
     ///
     /// # Panics
-    /// If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract (a
-    /// boundary not after the instant it was asked from, or a negative interest), on the input
-    /// that first reaches it.
+    /// If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract: a
+    /// boundary not after the instant it was asked from, or a negative interest.
     pub fn open_order(
         &mut self,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
@@ -2219,6 +2222,10 @@ impl SimulatedVenue {
     /// [`ApiError::OrderAlreadyFullyFilled`] is what tells the caller to reconcile against the fill
     /// rather than retry. An order cancelled twice gets [`ApiError::OrderAlreadyCancelled`], and
     /// only an id this venue has never booked is rejected as unknown.
+    ///
+    /// # Panics
+    /// If the configured [`MarginInterestModel`] breaks its contract with a boundary not after the
+    /// instant it was asked from, when the venue next looks for one after a loan is repaid.
     pub fn cancel_order(
         &mut self,
         request: OrderRequestCancel<ExchangeId, InstrumentNameExchange>,
