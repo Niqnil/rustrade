@@ -91,10 +91,10 @@ use tracing::{debug, error, info, trace, warn};
 /// account_stream. `abort()` cancels the task at its next `.await`: in fill recovery, a
 /// reconnect, a backoff or the monitor loop. The manager therefore holds every connection that
 /// has finished connecting in a [`DisconnectOnDrop`], whose drop closes the socket, and its event
-/// subscription in an [`UnsubscribeOnDrop`]. Without them the socket would stay open, since
-/// binance-sdk keeps it in detached tasks that answer the server's pings, and the subscription's
-/// callback task would never end. An abort during the SDK's own connect, before it returns the
-/// connection, is not covered.
+/// subscription in an [`UnsubscribeOnDrop`]. Without them, binance-sdk's own drop would still
+/// close the socket, but would abandon any request in flight, and the subscription's callback
+/// task would outlive the stream until the SDK freed the connection. An abort during the SDK's own
+/// connect, before it returns the connection, is not covered.
 pub(crate) struct AbortOnDropStream<S> {
     inner: S,
     handle: tokio::task::JoinHandle<()>,
@@ -152,17 +152,19 @@ impl BinanceWsConnection for Arc<binance_sdk::common::websocket::WebsocketApi> {
 /// Owns a connected binance-sdk WebSocket connection and closes it when dropped.
 ///
 /// binance-sdk reads and writes each socket in detached tasks, which keep it open and answer the
-/// server's pings until `disconnect()` is called. Dropping the SDK's handle does not close it. So
-/// a connection whose owner is dropped or aborted before it disconnects, such as a connection
-/// manager aborted with its stream, would stay open for the life of the runtime.
+/// server's pings until it is closed. Dropping the SDK's last handle only sends a Close frame: it
+/// abandons any request still pending, and reports nothing. `disconnect()` drains pending
+/// requests first and returns the result. So a connection whose owner is dropped or aborted
+/// before it disconnects, such as a connection manager aborted with its stream, still closes the
+/// orderly way.
 ///
 /// Dropping this guard spawns that disconnect on the current Tokio runtime. binance-sdk bounds
 /// it: up to 30 s to drain pending requests, and 30 s overall. A failure is logged at WARN.
-/// Dropped outside a runtime, it cannot spawn, and logs a WARN instead; the socket's tasks then
-/// end with the runtime that runs them. A runtime that is shutting down drops the spawned task
-/// unrun, and its sockets close with it. [`disconnect`](Self::disconnect) closes the connection
-/// in place and reports the result. Wrap a connection only once it has connected: disconnecting
-/// one that never did makes binance-sdk log a WARN.
+/// Dropped outside a runtime, it cannot spawn, and logs a WARN instead; the SDK's own drop then
+/// sends the Close frame. A runtime that is shutting down drops the spawned task unrun, and its
+/// sockets close with it. [`disconnect`](Self::disconnect) closes the connection in place and
+/// reports the result. Wrap a connection only once it has connected: disconnecting one that never
+/// did makes binance-sdk log a WARN.
 ///
 /// A disconnected connection stays closed: once `disconnect()` is called on it, binance-sdk skips
 /// its own reconnect and its 23 h renewal, including a reconnect already pending at that point.
@@ -227,7 +229,7 @@ impl<W: BinanceWsConnection> Drop for DisconnectOnDrop<W> {
             Err(_) => warn!(
                 connection = label,
                 "Binance WebSocket connection dropped outside a Tokio runtime: it cannot be \
-                 closed, and stays open until the runtime running it shuts down"
+                 disconnected, so binance-sdk's own drop closes it without draining pending requests"
             ),
         }
     }
@@ -235,11 +237,11 @@ impl<W: BinanceWsConnection> Drop for DisconnectOnDrop<W> {
 
 /// A binance-sdk WebSocket event subscription, unsubscribed when dropped.
 ///
-/// binance-sdk runs each subscription's callback in its own task, which ends only on
-/// [`Subscription::unsubscribe`]: the SDK keeps the event channel's senders alive for good, even
-/// after the connection is disconnected and every handle to it dropped. A subscription dropped
-/// without unsubscribing, as by a connection manager aborted with its stream, would leak that task
-/// and everything its callback holds.
+/// binance-sdk runs each subscription's callback in its own task, which ends on
+/// [`Subscription::unsubscribe`], or once the last handle to the connection is dropped and the SDK
+/// frees its event channel. A subscription dropped without unsubscribing, as by a connection
+/// manager aborted with its stream, would keep that task and everything its callback holds alive
+/// until then, and for good if anything else still holds the connection.
 pub(crate) struct UnsubscribeOnDrop(Option<Subscription>);
 
 impl UnsubscribeOnDrop {
@@ -3900,8 +3902,8 @@ mod tests {
         assert_eq!(ws.closes().await, 2);
     }
 
-    /// binance-sdk ends a subscription's callback task only on unsubscribe, even with the
-    /// connection gone, so the guard unsubscribes when dropped.
+    /// While its event emitter lives, binance-sdk ends a subscription's callback task only on
+    /// unsubscribe, so the guard unsubscribes when dropped.
     #[tokio::test]
     async fn a_dropped_subscription_guard_stops_its_callback() {
         let emitter = binance_sdk::common::websocket::WebsocketEventEmitter::new();
@@ -3921,6 +3923,54 @@ mod tests {
             1,
             "the callback was dropped"
         );
+    }
+
+    /// binance-sdk frees a connection once it is disconnected and dropped. Before 76.0.0 its
+    /// reconnect and renewal loops kept it alive, leaking two tasks for each order session
+    /// reopened and each account stream reconnected. With no task left, nothing can reopen the
+    /// connection either, so this also pins that a disconnected connection stays closed.
+    #[tokio::test]
+    async fn a_disconnected_connection_leaves_no_task_behind() {
+        fn alive() -> usize {
+            tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks()
+        }
+        let (url, _) = super::test_ws_api::serve(
+            |_| serde_json::Value::Null,
+            |_| super::test_ws_api::Lifetime::Open,
+        )
+        .await;
+        let config = binance_sdk::common::config::ConfigurationWebsocketApi::builder()
+            .api_key("key")
+            .api_secret("secret")
+            .ws_url(url)
+            .build()
+            .unwrap();
+        let before = alive();
+
+        // The spot order session, and the common-layer connection the margin account stream uses.
+        let session = binance_sdk::spot::SpotWsApi::from_config(config.clone())
+            .connect()
+            .await
+            .unwrap();
+        DisconnectOnDrop::new(session, "spot")
+            .disconnect()
+            .await
+            .unwrap();
+        let stream = binance_sdk::common::websocket::WebsocketApi::new(config, vec![]);
+        Arc::clone(&stream).connect().await.unwrap();
+        DisconnectOnDrop::new(stream, "margin")
+            .disconnect()
+            .await
+            .unwrap();
+
+        // The server ends its side of each connection once the close reaches it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while alive() > before && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(alive(), before, "tasks left behind");
     }
 
     /// Outside a runtime the guard cannot spawn the close; it logs instead of panicking.
