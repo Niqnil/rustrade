@@ -5740,12 +5740,11 @@ mod tests {
         (url, closed_rx)
     }
 
-    /// Dropping the account stream closes its WebSocket connection. binance-sdk keeps a socket
-    /// open in detached tasks until it is disconnected, so aborting the manager alone left it open.
-    /// Dropped at once, the manager has not started and holds the connection as its argument;
-    /// dropped later, it holds it in its loop, and its event callback runs. The stream's state is
-    /// released either way: the callback holds the client's known-live orders, and binance-sdk
-    /// stops the callback only when it is unsubscribed.
+    /// Dropping the account stream closes its WebSocket connection. Dropped at once, the manager
+    /// has not started and holds the connection as its argument; dropped later, it holds it in its
+    /// loop, and its event callback runs. The stream's state is released either way: the callback
+    /// holds the client's known-live orders, and is unsubscribed when the stream drops, rather than
+    /// whenever binance-sdk frees the connection.
     #[tokio::test]
     async fn dropping_the_account_stream_closes_its_connection() {
         for running in [Duration::ZERO, Duration::from_millis(100)] {

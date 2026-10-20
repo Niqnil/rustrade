@@ -379,13 +379,14 @@ ibapi=5.1.0  # 2026-10-13 | Financial protocol, community-maintained, no officia
 #
 # NOT VERIFIABLE OFF-GATEWAY: the #[ignore]d ibkr integration tests do not run in CI. Nothing has exercised 5.1.0's
 # socket-level disconnect or the stricter historical fetch against a real gateway.
-binance-sdk=75.0.0  # 2026-10-16 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
+binance-sdk=76.0.0  # 2026-10-20 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
 #   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
 #   3. common::utils::send_request                        — signature + HMAC signing + X-MBX-APIKEY header (hand-rolled `userListenToken` POST; SDK binds no endpoint for it)
 # Since 75.0.0, ALSO re-verify that a disconnected connection stays closed (DisconnectOnDrop's rustdoc relies
-# on it, and no test in this repo pins it): a `WebsocketApi` connected to a local WS server, `disconnect()`ed,
-# then 24 h of paused Tokio time, must see exactly one handshake (74.1.1 saw two: binance-connector-rust#110).
+# on it). Since 76.0.0 a test pins it: `a_disconnected_connection_leaves_no_task_behind` (client/binance/
+# shared.rs) disconnects a spot session and a margin connection on a local WS server and requires every SDK
+# task to end, which leaves nothing that could reopen them (74.1.1 reopened one: binance-connector-rust#110).
 # Background: legacy margin listen-key user-data API retired 2026-02-20; SDK binds only the dead endpoint, so the live `userListenToken` flow is hand-rolled atop these internals.
 #
 # Re-verified against the vendored =69.1.0 source on 2026-09-14 (60.0.0 -> 69.1.0, nine majors). All 3 still hold,
@@ -752,6 +753,51 @@ binance-sdk=75.0.0  # 2026-10-16 | Exchange SDK, signing/IO. PINNED: margin user
 # adds an empty `cms` only. Our Cargo.lock delta is binance-sdk's version + checksum alone. CONSUMER-SIDE API
 # CHURN: the new `retry_after` fields break 7 test constructions of these error variants (none in non-test
 # code, which matches them with `..`).
+#
+# Re-verified against the =76.0.0 crates.io source on 2026-10-20 (75.0.0 -> 76.0.0). .crate sha256
+# fc3775b17824b332c27c53a0581c12a2d99d16593790416fd6476e856998d171 matches the index; publisher unchanged
+# (solutionsGH); published from git 0b42b7b12b7d32e3f1d162c4607ea617293e655f.
+# In common/, only websocket.rs (md5 a48f328a00905cbd318cdd2d296fae5d) and utils.rs
+# (4c38d24ccfc21be1a892c2698b3bbd21) changed; spot/websocket_api, spot/rest_api and margin_trading are
+# byte-identical to 75.0.0. All 3 internals HOLD:
+#   1. `send_message` (websocket.rs:1896) has the same signature, and no hunk touches it;
+#      WebsocketMessageSendOptions (:1660) still exactly with_api_key / is_signed / is_session_logon /
+#      is_session_logout. Both margin call sites (margin.rs:2077, :2124) still pass `::new()`.
+#   2. `WebsocketEventEmitter::subscribe` (websocket.rs:133-148) untouched: one task, one unbounded channel,
+#      sequential `while let Some(event) = rx.recv().await { callback(event) }`; registered at margin.rs:2528.
+#   3. `send_request` (utils.rs:983-991) untouched, 7 args; the utils.rs diff is a new additive stream-key
+#      helper (`replace_websocket_streams_placeholders_preserve_case`) and its tests. The hand-rolled
+#      `userListenToken` POST (margin.rs:1988) passes the same 7 args.
+# What changed in common/websocket.rs, and why it matters to us:
+#   - Fixes binance-connector-rust#111 (our #641), the leak recorded as NOT FIXED above: the reconnect and
+#     renewal loops hold a `Weak<WebsocketCommon>` and upgrade it per entry, so they end once the last
+#     handle drops; the connection handler is held weakly (`WeakHandler`, :211); the writer task exits after
+#     sending Close. A closed, dropped client now leaves no task behind. Pinned by our
+#     `a_disconnected_connection_leaves_no_task_behind` (client/binance/shared.rs), which fails on 75.0.0
+#     with 4 tasks left (2 per client: the spot order session and the margin common-layer connection), and
+#     `a_dropped_connection_leaves_no_task_behind` (dropped without disconnecting, a callback left
+#     subscribed).
+#   - NEW: `impl Drop for WebsocketApi` (:1723) and `WebsocketStreams` (:2334) call `close_on_drop` (:1489),
+#     which marks each connection close-initiated and sends a Close frame without draining pending requests.
+#     DisconnectOnDrop still disconnects first (draining, result logged), so it stays; its rustdoc now says
+#     what it adds over the SDK's drop.
+#   - Reconnect decisions move into `begin_reconnect` (`ReconnectDisposition`): an error on a connection
+#     already replaced by a renewal is ignored rather than scheduling a second reconnect, and
+#     `WebsocketEvent::Error` is no longer emitted for it. A renewed connection that fails now reconnects
+#     (75.0.0's guards all required `!is_renewal`, leaving it closed).
+#   - A disconnected connection stays closed: `init_connect` still skips a renewal or pending reconnect once
+#     close-initiated, and `begin_reconnect` rejects one. Our leak tests above also cover this now: with no
+#     task left, none is left that could reopen the socket, so the paused-time handshake check is no longer
+#     needed.
+# Outside common/: generated changes in stocks, alpha, cms, derivatives, gift_card and w3w_prediction, none
+# compiled under `spot` + `margin_trading`; spot/websocket_streams adds one blank line in a test.
+# Security: PASS. `unsafe` is the same 10 test-only blocks in utils.rs (all after `#[cfg(test)]` at :1436);
+# build.rs identical; no hosts added or removed (new `ws://` URLs are local test servers); no new env,
+# filesystem, process, signing or encoded-blob sites; the new log lines carry connection ids and reasons
+# only. Both standing caveats carry forward unchanged (the full signed WS API request at DEBUG, now
+# websocket.rs:1931; the UA env read).
+# Dependency surface: Cargo.toml differs only in `version`. Our Cargo.lock delta is binance-sdk's version +
+# checksum alone. CONSUMER-SIDE API CHURN: NONE.
 quick-xml  # 2026-07-08 | New direct dep (XML parsing of broker Flex statements). Reviewed @ 0.41.0: #![forbid(unsafe_code)] crate-wide, zero net-new transitive deps (serde+memchr only, both already in tree), no RUSTSEC advisories, de-facto-standard parser. Not pinned — any version bump still needs review.
 #   Re-reviewed @ 0.42.0 (2026-09-16), the review this entry's "any version bump still needs
 #   review" mandates. All four properties recorded at 0.41.0 re-verified and still hold:
