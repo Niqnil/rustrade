@@ -547,10 +547,13 @@ pub enum OrderError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     #[error("order rejected: {0}")]
     Rejected(#[from] ApiError<AssetKey, InstrumentKey>),
 
-    /// The order type is not supported by this connector.
+    /// The order type is not supported by this connector, or the venue refused it as a type it
+    /// does not take for this account or instrument.
     ///
-    /// Non-transient — the connector does not support this order type (e.g.,
-    /// trailing stop orders on a connector that only supports market/limit).
+    /// Non-transient — place a different order type. A connector usually returns this without
+    /// sending the request (e.g., trailing stop orders on a connector that only supports
+    /// market/limit); when the venue's own refusal says so, it can also come back after the round
+    /// trip.
     #[error("unsupported order type: {0}")]
     UnsupportedOrderType(String),
 

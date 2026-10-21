@@ -366,9 +366,17 @@ impl BinanceMarginConfig {
 /// points. An activation price is sent as `stopPrice`. Absolute offsets and `TrailingStopLimit`
 /// return [`OrderError::UnsupportedOrderType`]. See [`open_order`](Self::open_order).
 ///
+/// The account mode matters for `TrailingStop`. A **cross** account refuses a trailing
+/// `STOP_LOSS` with `-3111` ("Trailing stop order only supports limit type"), which this client
+/// returns as [`OrderError::UnsupportedOrderType`]; an isolated account has accepted it.
+/// `TrailingStopFixedLimit` is accepted on both, so it is the form to place on a cross account.
+/// The client does not refuse a `TrailingStop` unsent: Binance's answer decides, so the client
+/// carries no per-mode rule that could fall out of date.
+///
 /// # Conditional orders read back over REST
-/// Binance margin accepts a `trailingDelta` on every conditional type (`STOP_LOSS`,
-/// `STOP_LOSS_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`), and the REST order queries this client
+/// Binance margin accepts a `trailingDelta` on its conditional types (`STOP_LOSS`,
+/// `STOP_LOSS_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`), though a cross account refuses a
+/// trailing `STOP_LOSS` (see "Trailing stops" above), and the REST order queries this client
 /// reads (`openOrders` and `order`) do not report it: Binance returns neither `trailingDelta` nor
 /// `trailingTime` there (#541). A trailing order placed without an activation price reads
 /// `stopPrice` `"0"`. A conditional order read over REST could therefore be a fixed or a trailing
@@ -717,6 +725,9 @@ impl ExecutionClient for BinanceMargin {
     ///   positive whole number of basis points returns [`OrderError::InvalidPrecision`] (see the
     ///   type-level docs). A non-positive activation price, or a `TrailingStopFixedLimit` without
     ///   a positive `price`, is refused unsent as [`OrderError::Rejected`].
+    /// - A **cross** account refuses the `STOP_LOSS` form of a `TrailingStop` with `-3111`, which
+    ///   comes back as [`OrderError::UnsupportedOrderType`] after the round trip. Place a
+    ///   `TrailingStopFixedLimit` there instead: it is accepted on both account modes.
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
@@ -959,6 +970,14 @@ impl ExecutionClient for BinanceMargin {
     /// and would collide in the asset-keyed model. The instrument set is the effective isolated set
     /// (`isolated_symbols`, or `instruments ∩ isolated_symbols` with out-of-set instruments skipped);
     /// each instrument's open orders and isolated balances are fetched over that same set.
+    ///
+    /// # Known limitation: balances can lag a fill
+    /// Binance's REST account view can trail its matching engine. A cross account read straight
+    /// after a fill has returned the pre-trade balances, and was current about 2 s later. A caller
+    /// that needs post-fill balances should apply the
+    /// [`account_stream`](Self::account_stream)'s balance events, or read again after a short
+    /// delay. The client adds no retry or delay of its own: when and how to reconcile is the
+    /// caller's policy.
     async fn account_snapshot(
         &self,
         assets: &[AssetNameExchange],
@@ -1034,6 +1053,10 @@ impl ExecutionClient for BinanceMargin {
     /// asset-keyed return type cannot carry them without collision — they are surfaced per-instrument
     /// via [`account_snapshot`](Self::account_snapshot)'s [`InstrumentAccountSnapshot::isolated`]
     /// instead.
+    ///
+    /// Reads the same REST account view as [`account_snapshot`](Self::account_snapshot), so its
+    /// known limitation applies: balances read straight after a fill can still be the pre-trade
+    /// ones.
     async fn fetch_balances(
         &self,
         assets: &[AssetNameExchange],
@@ -8385,6 +8408,48 @@ mod tests {
                 ))
             ),
             "{refused:?}"
+        );
+    }
+
+    /// A cross account refuses a trailing `STOP_LOSS` with `-3111`. The order fails as
+    /// [`OrderError::UnsupportedOrderType`] with the venue's message, after one request, so a
+    /// caller can tell it from other refusals and place a `TrailingStopFixedLimit` instead.
+    #[tokio::test]
+    async fn a_cross_refusal_of_a_trailing_stop_is_an_unsupported_order_type() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "code": -3111,
+                    "msg": "Trailing stop order only supports limit type.",
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = margin_client_at(&server, false);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+        let mut request = margin_open_request(&btcusdt, "trailing");
+        request.state.side = Side::Sell;
+        request.state.price = None;
+        request.state.kind = OrderKind::TrailingStop {
+            offset: Decimal::from(25),
+            offset_type: TrailingOffsetType::BasisPoints,
+            activation_price: None,
+        };
+
+        let refused = client.open_order(request).await;
+
+        let OrderState::Inactive(crate::order::state::InactiveOrderState::OpenFailed(
+            OrderError::UnsupportedOrderType(msg),
+        )) = &refused.state
+        else {
+            panic!("expected UnsupportedOrderType: {refused:?}");
+        };
+        assert!(
+            msg.contains("-3111") && msg.contains("only supports limit type"),
+            "{msg}"
         );
     }
 

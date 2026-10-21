@@ -3090,16 +3090,25 @@ pub(crate) fn parse_binance_api_error(
 ///
 /// A venue failure ([`has_venue_failure_code`]) → [`OrderError::Connectivity`]: the order may
 /// or may not have reached the matching engine, and reporting a definitive rejection for one that
-/// executed would leave the caller blind to a fill. Everything else is a rejection, mapped by
-/// [`parse_binance_api_error`]. The venue-failure check comes first on purpose: should a message
-/// ever carry both a venue-failure code and an auth or throttle marker, "status unknown" is the
-/// label that cannot hide a fill.
+/// executed would leave the caller blind to a fill. The venue-failure check comes first on
+/// purpose: should a message ever carry both a venue-failure code and an auth or throttle marker,
+/// "status unknown" is the label that cannot hide a fill.
+///
+/// `-3111` (TRAILING_STOP_LIMIT_ONLY, "Trailing stop order only supports limit type") →
+/// [`OrderError::UnsupportedOrderType`]: the venue does not take this order type here, so the
+/// caller can place another one (a trailing stop-limit) instead. A cross margin account answers
+/// a trailing `STOP_LOSS` this way. Binance lists the code, with this one meaning, among its
+/// margin (SAPI) errors.
+///
+/// Everything else is a rejection, mapped by [`parse_binance_api_error`].
 pub(crate) fn parse_binance_order_rejection(
     msg: String,
     instrument: &InstrumentNameExchange,
 ) -> UnindexedOrderError {
     if has_venue_failure_code(&msg) {
         OrderError::Connectivity(ConnectivityError::Socket(msg))
+    } else if contains_error_code(&msg, "-3111") {
+        OrderError::UnsupportedOrderType(msg)
     } else {
         OrderError::Rejected(parse_binance_api_error(msg, instrument))
     }
@@ -5649,6 +5658,34 @@ mod tests {
                 "WS API {code}: got {ws:?}"
             );
         }
+    }
+
+    /// A cross margin account refuses a trailing `STOP_LOSS` with `-3111`. The venue does not
+    /// take that order type, so it is [`OrderError::UnsupportedOrderType`] carrying the venue's
+    /// message, over REST (the code spliced into the message) and over the WS API alike, and a
+    /// retry cannot cure it.
+    #[test]
+    fn a_trailing_stop_limit_only_refusal_is_an_unsupported_order_type() {
+        let msg = "Trailing stop order only supports limit type.";
+        let rest = classify_err(ConnectorError::BadRequestError {
+            msg: msg.to_string(),
+            code: Some(-3111),
+        });
+        assert_eq!(
+            rest,
+            OrderError::UnsupportedOrderType(format!("-3111 {msg}"))
+        );
+        assert!(!rest.is_transient());
+
+        let ws = classify_ws(-3111, msg);
+        assert!(
+            matches!(
+                &ws,
+                Some(OrderError::UnsupportedOrderType(text))
+                    if text.contains("-3111") && text.contains(msg)
+            ),
+            "WS API: got {ws:?}"
+        );
     }
 
     /// The margin account's own collateral running short is a shortfall, not a refused borrow,
