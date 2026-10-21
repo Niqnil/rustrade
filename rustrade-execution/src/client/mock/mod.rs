@@ -7,8 +7,9 @@ use crate::{
         UnindexedOrderError,
     },
     exchange::mock::request::MockExchangeRequest,
-    fee::{FeeModelConfig, SpotFeeAsset},
-    fill::SimFillConfig,
+    fee::{FeeAssetConfig, FeeModelConfig, SpotFeeAsset},
+    fill::{MarketOrderTiming, SimFillConfig, StaleMarketPolicy},
+    margin::SpotMarginConfig,
     order::{
         Order, OrderKey, UnindexedInactiveOrder, UnindexedOrderKey,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
@@ -65,6 +66,38 @@ pub struct MockExecutionConfig {
     /// to and how.
     #[serde(default)]
     pub slippage: SlippageConfig,
+    /// When the mock exchange fills a market order.
+    ///
+    /// Defaults to [`MarketOrderTiming::OnArrival`]: against the market the venue holds when the
+    /// order arrives, which on bar data is the close of the bar the sender has just seen.
+    /// [`MarketOrderTiming::NextBar`] holds it for the instrument's next bar instead, and needs a
+    /// driver that feeds the venue bars, as `SimRunner` does on a candle feed.
+    #[serde(default)]
+    pub market_order_timing: MarketOrderTiming,
+    /// What the mock exchange does with a market order when the instrument's market is stale.
+    ///
+    /// Defaults to [`StaleMarketPolicy::Off`]: it fills against the market it holds, however old.
+    /// [`StaleMarketPolicy::Wait`] makes a market order on an instrument with no fresh observation
+    /// within an age wait for the next one, and needs a driver that feeds the venue a market, as
+    /// `SimRunner` does.
+    #[serde(default)]
+    pub stale_market: StaleMarketPolicy,
+    /// Whether the mock exchange lends a spot order what the account lacks, as a margin account
+    /// does.
+    ///
+    /// Defaults to `None`: a cash account, whose spot orders are paid for with what it holds, and
+    /// whose balances report no loans. A [`SpotMarginConfig`] makes it a cross margin account that
+    /// borrows and repays under its [`MarginSideEffect`](crate::margin::MarginSideEffect), up to a
+    /// leverage limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spot_margin: Option<SpotMarginConfig>,
+    /// A third asset the mock exchange charges spot fees in, at a discount, while the account
+    /// holds enough of it, as Binance's "pay fees with BNB" does.
+    ///
+    /// Defaults to `None`: every fee is charged under [`spot_fee_asset`](Self::spot_fee_asset).
+    /// See [`FeeAssetConfig`] for what a fill pays and when it falls back to that rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fee_asset: Option<FeeAssetConfig>,
 }
 
 #[derive(Debug, Constructor)]

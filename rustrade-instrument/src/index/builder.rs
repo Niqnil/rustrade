@@ -113,8 +113,9 @@ impl IndexedInstrumentsBuilder {
     /// index like any other, and the engine keeps a balance for it.
     ///
     /// A fee charged in such an asset is neither the instrument's base nor its quote, so the
-    /// execution indexer gives it no quote equivalent (`AssetFees::fees_quote` is `None`). How
-    /// that fee and the asset's balance are valued is up to the consumer.
+    /// execution indexer gives it no quote equivalent (`AssetFees::fees_quote` is `None`). The
+    /// `rustrade` engine values the fee when it also has a spot instrument pairing the asset with
+    /// the fill's quote, such as `BNBUSDT`, with a price. The asset's balance is not valued.
     ///
     /// Pass the venue that holds the balance, the **execution** venue. An asset registers balance
     /// state on its exchange, so registering one on a data-only venue seeds a balance that venue

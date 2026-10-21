@@ -8063,3 +8063,264 @@ fn test_in_flight_deadline_reflags_once_after_restore() {
     let audit = process_with_audit(&mut restored, market_event_trade(4, 0, dec!(50_000)));
     assert!(in_flight_overdue(audit).is_empty(), "and only once");
 }
+
+/// A reduce-only order's fill larger than the short it closes is cut, and the engine emits the
+/// cut before the exit it causes. The audit replica, which never records the order request, cuts
+/// the same fill from that output, so its positions and PnL stay the engine's.
+#[test]
+fn test_reduce_only_fill_is_cut_and_the_replica_cuts_it_too() {
+    use rustrade::engine::audit::{context::EngineContext, state_replica::StateReplicaManager};
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+    let instrument = InstrumentIndex(0);
+    // A short of 1, opened by no order of the engine's.
+    process_with_audit(
+        &mut engine,
+        account_event_trade(0, 1, Side::Sell, 20_000.0, 1.0),
+    );
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: engine.state.clone(),
+        context: EngineContext {
+            time: STARTING_TIMESTAMP,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica = StateReplicaManager::new(seed_tick, dummy_updates);
+
+    let mut repay = open_request(instrument, "repay");
+    repay.state.reduce_only = true;
+    repay.state.quantity = dec!(1.5);
+    process_live_and_replica!(
+        &mut engine,
+        replica,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(repay)))
+    );
+
+    let fill = Trade::new(
+        gen_trade_id(0),
+        gen_order_id(0),
+        instrument,
+        strategy_id(),
+        time_plus_days(STARTING_TIMESTAMP, 2),
+        Side::Buy,
+        dec!(20_000),
+        dec!(1.5),
+        None,
+        asset_fees(0, dec!(30)),
+    )
+    .with_client_order_id(ClientOrderId::new("repay"));
+    let outputs = process_live_and_replica!(
+        &mut engine,
+        replica,
+        EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+            exchange: ExchangeIndex(0),
+            kind: AccountEventKind::Trade(fill),
+        }))
+    );
+
+    let outputs: Vec<_> = outputs.into_iter().collect();
+    let [
+        EngineOutput::ReduceOnlyCapped(capped),
+        EngineOutput::PositionExit(exited),
+    ] = outputs.as_slice()
+    else {
+        panic!("expected the cut, then the exit; got {outputs:?}");
+    };
+    assert_eq!(capped.client_order_id, Some(ClientOrderId::new("repay")));
+    assert_eq!(
+        (capped.held, capped.excess, capped.excess_value),
+        (dec!(-1), dec!(0.5), dec!(10_000))
+    );
+    // The fee of 30 is split by the move of 1 out of 1.5.
+    assert_eq!(capped.fees_unattributed, dec!(10));
+    assert_eq!(exited.fees_exit.fees_quote, Some(dec!(20)));
+
+    let live = engine.state.instruments.instrument_index(&instrument);
+    assert!(live.position.positions.is_empty());
+    let mirrored = replica
+        .replica_engine_state()
+        .instruments
+        .instrument_index(&instrument);
+    assert_eq!(mirrored.position, live.position);
+    assert_eq!(mirrored.tear_sheet.pnl_returns, live.tear_sheet.pnl_returns);
+    assert_eq!(
+        (
+            mirrored.tear_sheet.fills_reduce_only_capped,
+            mirrored.tear_sheet.reduce_only_excess
+        ),
+        (1, dec!(10_000))
+    );
+}
+
+/// A fill on `ETHBTC` whose fee is charged in USDT, a third asset there.
+fn ethbtc_fill_with_usdt_fee(
+    id: &str,
+    order_id: &str,
+    time_plus: u64,
+    side: Side,
+    price: Decimal,
+) -> EngineEvent<DataKind> {
+    EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::Trade(Trade::new(
+            TradeId::new(id),
+            OrderId::new(order_id),
+            InstrumentIndex(1),
+            strategy_id(),
+            time_plus_days(STARTING_TIMESTAMP, time_plus),
+            side,
+            price,
+            dec!(1),
+            None,
+            AssetFees::new(quote_asset_index(0), dec!(10), None),
+        )),
+    }))
+}
+
+/// A USDT fee on an `ETHBTC` fill is valued at the reciprocal of `BTCUSDT`'s price, reported
+/// before the exit it reaches, and the audit replica, which replays the fill against the same
+/// market data, values it the same.
+#[test]
+fn test_third_asset_fee_is_valued_reported_and_mirrored_by_the_replica() {
+    use rustrade::engine::{
+        audit::{context::EngineContext, state_replica::StateReplicaManager},
+        state::fee::FeeConversionOutcome,
+    };
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: engine.state.clone(),
+        context: EngineContext {
+            time: STARTING_TIMESTAMP,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica = StateReplicaManager::new(seed_tick, dummy_updates);
+
+    process_live_and_replica!(&mut engine, replica, market_event_trade(1, 0, dec!(50_000)));
+    let outputs: Vec<_> = process_live_and_replica!(
+        &mut engine,
+        replica,
+        ethbtc_fill_with_usdt_fee("enter", "enter", 2, Side::Buy, dec!(0.05))
+    )
+    .into_iter()
+    .collect();
+    let [EngineOutput::FeeConversion(entered)] = outputs.as_slice() else {
+        panic!("expected one fee conversion; got {outputs:?}");
+    };
+    assert_eq!(
+        entered.outcome,
+        FeeConversionOutcome::Converted {
+            pricing_instrument: InstrumentIndex(0),
+            price: dec!(0.00002),
+            fees_quote: dec!(0.0002),
+        }
+    );
+
+    let outputs: Vec<_> = process_live_and_replica!(
+        &mut engine,
+        replica,
+        ethbtc_fill_with_usdt_fee("exit", "exit", 3, Side::Sell, dec!(0.06))
+    )
+    .into_iter()
+    .collect();
+    let [
+        EngineOutput::FeeConversion(exit_fee),
+        EngineOutput::PositionExit(exited),
+    ] = outputs.as_slice()
+    else {
+        panic!("expected the fee conversion, then the exit; got {outputs:?}");
+    };
+    assert_eq!(exit_fee.trade_id, TradeId::new("exit"));
+    // 0.01 BTC gained, less two fees of 10 USDT at 0.00002 BTC each.
+    assert_eq!(exited.pnl_realised, dec!(0.0096));
+
+    let live = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(1));
+    let mirrored = replica
+        .replica_engine_state()
+        .instruments
+        .instrument_index(&InstrumentIndex(1));
+    assert_eq!(mirrored, live);
+}
+
+/// A fill that arrives before its order's ack is valued on arrival and reported then, and keeps
+/// that value when the ack replays it, though the price has moved since.
+#[test]
+fn test_hedging_pending_fill_keeps_the_fee_value_it_arrived_with() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine_with_oms(TradingState::Disabled, execution_tx, OmsMode::Hedging);
+    let cid = ClientOrderId::new("cid-pending");
+    let position_id = PositionId::new("leg-pending");
+    let mut request = open_request(InstrumentIndex(1), "cid-pending");
+    request.state.price = Some(dec!(0.05));
+    request.state.position_id = Some(position_id.clone());
+    engine.process(EngineEvent::Command(Command::SendOpenRequests(
+        OneOrMany::One(request),
+    )));
+
+    process_with_audit(&mut engine, market_event_trade(1, 0, dec!(50_000)));
+    let audit = process_with_audit(
+        &mut engine,
+        ethbtc_fill_with_usdt_fee("fill", "exch-pending", 2, Side::Buy, dec!(0.05)),
+    );
+    let EngineAudit::Process(audit) = audit.event else {
+        panic!("expected EngineAudit::Process");
+    };
+    let outputs: Vec<_> = audit.outputs.into_iter().collect();
+    let [EngineOutput::FeeConversion(conversion)] = outputs.as_slice() else {
+        panic!("expected the fee conversion on arrival; got {outputs:?}");
+    };
+    assert_eq!(conversion.outcome.fees_quote(), Some(dec!(0.0002)));
+    assert_eq!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(1))
+            .pending_fills
+            .len(),
+        1,
+        "the fill waits for its ack"
+    );
+
+    process_with_audit(&mut engine, market_event_trade(3, 0, dec!(40_000)));
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+            exchange: ExchangeIndex(0),
+            kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+                key: OrderKey {
+                    exchange: ExchangeIndex(0),
+                    instrument: InstrumentIndex(1),
+                    strategy: strategy_id(),
+                    cid,
+                },
+                side: Side::Buy,
+                price: Some(dec!(0.05)),
+                quantity: dec!(1),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                state: OrderState::active(Open {
+                    id: VenueOrderId::Assigned(OrderId::new("exch-pending")),
+                    time_exchange: time_plus_days(STARTING_TIMESTAMP, 3),
+                    filled_quantity: dec!(0),
+                }),
+            })),
+        })),
+    );
+
+    let position = &engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(1))
+        .position
+        .positions[&position_id];
+    assert_eq!(position.fees_enter.fees_quote, Some(dec!(0.0002)));
+}

@@ -53,6 +53,7 @@ use crate::{
             KnownLiveOrders, NoPendingFills, OpenListing, OrderLookup, SharedKnownLiveOrders,
             UncheckedOrders, fetch_ended_by_key, recover_ended_orders,
         },
+        reconnect_budget::{BackoffLimits, ReconnectBudget},
     },
     emit_stream_terminated,
     error::{
@@ -102,9 +103,6 @@ use tracing::{debug, error, info, trace, warn};
 // Constants
 // ---------------------------------------------------------------------------
 
-const INITIAL_BACKOFF_MS: u64 = 1_000;
-const MAX_BACKOFF_MS: u64 = 30_000;
-const MAX_RECONNECT_ATTEMPTS: u32 = 10;
 /// If no WS activity for this long, force reconnect.
 const HEARTBEAT_TIMEOUT_SECS: u64 = 35;
 /// Timeout for fill recovery REST queries after reconnect.
@@ -290,61 +288,6 @@ impl RateLimitTracker {
 }
 
 // ---------------------------------------------------------------------------
-// Exponential backoff
-// ---------------------------------------------------------------------------
-
-struct ExponentialBackoff {
-    attempt: u32,
-    max_attempts: u32,
-    initial_ms: u64,
-    max_ms: u64,
-}
-
-impl ExponentialBackoff {
-    fn new() -> Self {
-        Self {
-            attempt: 0,
-            max_attempts: MAX_RECONNECT_ATTEMPTS,
-            initial_ms: INITIAL_BACKOFF_MS,
-            max_ms: MAX_BACKOFF_MS,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.attempt = 0;
-    }
-
-    /// Number of reconnect attempts consumed so far.
-    ///
-    /// After [`wait`](Self::wait) has returned `false` this equals `max_attempts` — the number of
-    /// attempts made before the budget was exhausted. Used to populate
-    /// [`StreamTerminationReason::ReconnectBudgetExhausted`].
-    fn attempts(&self) -> u32 {
-        self.attempt
-    }
-
-    /// Waits for the current backoff duration. Returns `false` if max attempts exhausted.
-    async fn wait(&mut self) -> bool {
-        if self.attempt >= self.max_attempts {
-            return false;
-        }
-        let delay_ms = self
-            .initial_ms
-            .saturating_mul(2u64.saturating_pow(self.attempt))
-            .min(self.max_ms);
-        self.attempt += 1;
-        debug!(
-            attempt = self.attempt,
-            max = self.max_attempts,
-            delay_ms,
-            "Alpaca reconnect backoff"
-        );
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        true
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Dedup cache
 // ---------------------------------------------------------------------------
 
@@ -456,7 +399,8 @@ pub struct AlpacaConfig {
     pub paper: bool,
     /// Test-only: override the REST base URL (e.g., to point at a wiremock server).
     #[cfg(test)]
-    pub base_url_override: Option<String>,
+    #[serde(skip)]
+    base_url_override: Option<String>,
     /// Test-only: override the WebSocket URL (e.g., to point at a local server).
     #[cfg(test)]
     #[serde(skip)]
@@ -2944,8 +2888,8 @@ async fn paginate_activities<A: PagedActivity>(
 ///
 /// Terminates when the consumer drops the stream or max reconnect attempts are
 /// exhausted.
-#[allow(clippy::cognitive_complexity)] // the inner select! loop owns `ws` and mutates `backoff` —
-// extracting to a function requires threading 4 non-Clone values (ws, tx, dedup, backoff)
+#[allow(clippy::cognitive_complexity)] // the inner select! loop owns `ws` and mutates `budget` —
+// extracting to a function requires threading 4 non-Clone values (ws, tx, dedup, budget)
 // through the call, which adds more complexity than it removes
 async fn connection_manager(
     tx: mpsc::UnboundedSender<UnindexedAccountEvent>,
@@ -2957,7 +2901,7 @@ async fn connection_manager(
     instruments: Vec<InstrumentNameExchange>,
     initial_ws: Option<WebSocket>,
 ) {
-    let mut backoff = ExponentialBackoff::new();
+    let mut budget = ReconnectBudget::new("Alpaca", BackoffLimits::ACCOUNT_STREAM);
     let mut disconnect_time: Option<DateTime<Utc>> = None;
     // Instruments whose known-live orders a reconnect has yet to check: checked after the fills,
     // and retried on a timer while connected, once due.
@@ -2972,14 +2916,14 @@ async fn connection_manager(
                 Ok(ws) => ws,
                 Err(e) => {
                     error!(%e, "Alpaca WS connect/subscribe failed");
-                    if !backoff.wait().await {
+                    if !budget.wait().await {
                         error!("Alpaca max reconnect attempts exhausted");
                         // Signal terminal stream death in-band before tx drops.
                         emit_stream_terminated(
                             &tx,
                             ExchangeId::AlpacaBroker,
                             StreamTerminationReason::ReconnectBudgetExhausted {
-                                attempts: backoff.attempts(),
+                                attempts: budget.attempts(),
                                 last_error: e.to_string(),
                             },
                         );
@@ -2990,8 +2934,8 @@ async fn connection_manager(
             },
         };
         info!("Alpaca account_stream connected and subscribed");
-        // backoff is NOT reset here: a server that accepts each handshake and closes the
-        // connection at once would then be retried at INITIAL_BACKOFF_MS forever, never
+        // the budget is NOT reset here: a server that accepts each handshake and closes the
+        // connection at once would then be retried at the first backoff wait forever, never
         // exhausting the budget. The stream loop resets it on a frame received once the connection
         // has lasted a heartbeat window.
 
@@ -3064,7 +3008,7 @@ async fn connection_manager(
                     .reset(now + Duration::from_secs(HEARTBEAT_TIMEOUT_SECS));
                 last_message_time = Utc::now();
                 if now >= stable_from {
-                    backoff.reset();
+                    budget.reset();
                 }
             };
         }
@@ -3155,7 +3099,7 @@ async fn connection_manager(
             // so it would be a no-op; see emit_stream_terminated docs).
             break;
         }
-        if !backoff.wait().await {
+        if !budget.wait().await {
             error!("Alpaca max reconnect attempts exhausted, stream terminating");
             // Surrender after repeated reconnects: report the failure that triggered this round
             // (consumer-drop already broke out via `break 'outer`).
@@ -3171,7 +3115,7 @@ async fn connection_manager(
                 &tx,
                 ExchangeId::AlpacaBroker,
                 StreamTerminationReason::ReconnectBudgetExhausted {
-                    attempts: backoff.attempts(),
+                    attempts: budget.attempts(),
                     last_error,
                 },
             );
@@ -5758,6 +5702,22 @@ mod tests {
     }
 
     #[test]
+    fn test_alpaca_config_deserialize_rejects_test_url_overrides() {
+        for key in ["base_url_override", "ws_url_override"] {
+            let json = format!(
+                r#"{{"api_key": "my_key", "secret_key": "my_secret", "{key}": "http://127.0.0.1:1"}}"#
+            );
+            let Err(err) = serde_json::from_str::<AlpacaConfig>(&json) else {
+                panic!("a config with `{key}` must not deserialize");
+            };
+            assert!(
+                err.to_string().contains(&format!("unknown field `{key}`")),
+                "unexpected error for `{key}`: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn test_alpaca_config_urls() {
         let paper = AlpacaConfig::paper("k".into(), "s".into());
         assert!(paper.rest_base_url().contains("paper-api"));
@@ -6307,42 +6267,11 @@ mod tests {
         );
     }
 
-    /// `account_stream`'s rustdoc states the reconnect budget, its backoff and the heartbeat
-    /// window as numbers. Change these only together with those docs.
+    /// `account_stream`'s rustdoc states the heartbeat window as a number. Change it only together
+    /// with those docs. The reconnect budget's own numbers are pinned in `client::reconnect_budget`.
     #[test]
-    fn the_reconnect_budget_is_as_documented() {
-        assert_eq!(MAX_RECONNECT_ATTEMPTS, 10);
-        assert_eq!(INITIAL_BACKOFF_MS, 1_000);
-        assert_eq!(MAX_BACKOFF_MS, 30_000);
+    fn the_heartbeat_window_is_as_documented() {
         assert_eq!(HEARTBEAT_TIMEOUT_SECS, 35);
-    }
-
-    #[tokio::test]
-    async fn test_exponential_backoff_progression_and_exhaustion() {
-        tokio::time::pause();
-
-        let mut b = ExponentialBackoff::new();
-
-        // First wait should succeed and increment attempt.
-        assert!(b.wait().await, "first wait should return true");
-        assert_eq!(b.attempt, 1);
-
-        // Drain remaining attempts.
-        while b.wait().await {}
-
-        // Attempt counter saturates at max_attempts.
-        assert_eq!(b.attempt, MAX_RECONNECT_ATTEMPTS);
-
-        // Once exhausted, wait returns false immediately without sleeping.
-        assert!(!b.wait().await, "exhausted backoff should return false");
-
-        // reset() restores attempt to 0.
-        b.reset();
-        assert_eq!(b.attempt, 0);
-
-        // After reset, wait works again.
-        assert!(b.wait().await, "wait should succeed after reset");
-        assert_eq!(b.attempt, 1);
     }
 
     #[test]
@@ -9235,16 +9164,67 @@ mod tests {
             // Not reset by the second connection's handshake: its close waits the second backoff.
             let escalated = listens[2] - listens[1];
             assert!(
-                escalated >= Duration::from_millis(2 * INITIAL_BACKOFF_MS),
+                escalated >= 2 * BackoffLimits::ACCOUNT_STREAM.initial,
                 "reconnected {escalated:?} after a closed connection"
             );
             // Reset by the third connection's stability timer: its close waits the first backoff
             // again, not the third (4 s).
             let after_stable = listens[3] - listens[2] - STABLE;
             assert!(
-                after_stable < Duration::from_millis(3 * INITIAL_BACKOFF_MS),
+                after_stable < 3 * BackoffLimits::ACCOUNT_STREAM.initial,
                 "reconnected {after_stable:?} after a stable connection"
             );
+        }
+
+        /// A reconnect whose connects all fail waits out every backoff and only then ends the
+        /// stream, reporting the whole budget as spent.
+        #[tokio::test(start_paused = true)]
+        async fn failed_connects_end_the_stream_once_the_budget_is_spent() {
+            // A port nothing listens on, so every connect fails.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let ws_url = format!("ws://{}", listener.local_addr().unwrap());
+            drop(listener);
+            let mut config = AlpacaConfig::paper("key".into(), "secret".into());
+            config.ws_url_override = Some(ws_url);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let started = tokio::time::Instant::now();
+
+            connection_manager(
+                tx,
+                new_dedup_cache(),
+                Arc::new(config),
+                reqwest::Client::new(),
+                Arc::new(RateLimitTracker::new()),
+                KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
+                Vec::new(),
+                None,
+            )
+            .await;
+
+            let Ok(event) = rx.try_recv() else {
+                panic!("the stream ended without reporting why");
+            };
+            let AccountEventKind::StreamTerminated(
+                StreamTerminationReason::ReconnectBudgetExhausted {
+                    attempts,
+                    last_error,
+                },
+            ) = event.kind
+            else {
+                panic!("unexpected event: {event:?}");
+            };
+            assert_eq!(attempts, BackoffLimits::ACCOUNT_STREAM.max_attempts);
+            assert!(
+                !last_error.is_empty(),
+                "the last connect failure is reported"
+            );
+            // 1 + 2 + 4 + 8 + 16 s, then 30 s for each of the five attempts left.
+            assert!(
+                started.elapsed() >= Duration::from_secs(181),
+                "{:?}",
+                started.elapsed()
+            );
+            assert!(rx.try_recv().is_err(), "nothing follows the termination");
         }
 
         /// Serve `activities` from a mock and run `recover_fills` against it, returning every

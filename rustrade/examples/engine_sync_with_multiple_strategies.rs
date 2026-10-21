@@ -171,10 +171,11 @@ impl ClosePositionsStrategy for MultiStrategy {
                     .position
                     .positions
                     .get(&PositionId::NETTING)
-                    .map(|position_a| {
+                    .and_then(|position_a| {
                         build_ioc_market_order_to_close_position(
                             state.instrument.exchange,
                             position_a,
+                            state.instrument.quantity_step(),
                             StrategyA::ID,
                             ClientOrderId::random,
                         )
@@ -187,10 +188,11 @@ impl ClosePositionsStrategy for MultiStrategy {
                     .position
                     .positions
                     .get(&PositionId::NETTING)
-                    .map(|position_b| {
+                    .and_then(|position_b| {
                         build_ioc_market_order_to_close_position(
                             state.instrument.exchange,
                             position_b,
+                            state.instrument.quantity_step(),
                             StrategyB::ID,
                             ClientOrderId::random,
                         )

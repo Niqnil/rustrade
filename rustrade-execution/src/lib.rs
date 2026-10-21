@@ -86,12 +86,13 @@ pub mod error;
 pub mod exchange;
 pub mod fee;
 pub use fee::{
-    FeeModel, FeeModelConfig, Liquidity, PerContractFeeModel, PercentageFeeModel, SpotFeeAsset,
-    ZeroFeeModel,
+    FeeAssetConfig, FeeAssetConfigError, FeeModel, FeeModelConfig, Liquidity, PerContractFeeModel,
+    PercentageFeeModel, SpotFeeAsset, ZeroFeeModel,
 };
 pub mod fill;
 pub use fill::{
-    BidAskFillModel, FillContext, FillModel, LastPriceFillModel, MidpointFillModel, SimFillConfig,
+    BidAskFillModel, FillContext, FillModel, LastPriceFillModel, MarketOrderTiming,
+    MidpointFillModel, NextBarPrice, SimFillConfig,
 };
 pub mod fill_recovery;
 pub use fill_recovery::{FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope};
@@ -103,8 +104,13 @@ pub use holding_cost::{
 };
 pub mod indexer;
 pub mod map;
+pub mod margin;
+pub use margin::{
+    InterestCharge, InterestDue, InterestSchedule, MarginInterestModel, MarginSideEffect,
+    PeriodicMarginInterest, SpotMarginConfig, SpotMarginConfigError,
+};
 pub mod market;
-pub use market::{MarketDepth, MarketSnapshot};
+pub use market::{MarketBar, MarketDepth, MarketObservation, MarketSnapshot};
 pub mod notice;
 pub use notice::{AccountNotice, NoticeKind};
 pub mod order;

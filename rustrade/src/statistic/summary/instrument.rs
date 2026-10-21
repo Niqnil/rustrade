@@ -23,6 +23,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use rust_decimal::Decimal;
 use rustrade_execution::order::id::PositionId;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 /// How many distinct fallback-keyed [`PositionId`]s a tear sheet retains.
 ///
@@ -58,6 +59,30 @@ pub struct TearSheet<Interval> {
     /// `#[serde(default)]` so tear sheets serialised before this field existed still load.
     #[serde(default)]
     pub fees_unattributed: Decimal,
+
+    /// Value written off as dust, in the instrument's quote asset, positive = lost: the part of a
+    /// long's holding below the quantity step that base-fee netting left out of the position,
+    /// valued at the fill's price. See [`Self::fills_dust`].
+    ///
+    /// Charged as a fee of the fill that left it, so it reaches `pnl` with that fill's position
+    /// once the position closes, or at once through [`Self::fees_unattributed`] when the fill
+    /// opened no position. Reported apart so the cost of the step can be read on its own.
+    ///
+    /// `#[serde(default)]` so tear sheets serialised before this field existed still load.
+    #[serde(default)]
+    pub dust: Decimal,
+
+    /// The excess of reduce-only fills the engine cut, valued at each fill's price, in the
+    /// instrument's quote asset, as a size: the part of each fill no position took. See
+    /// [`Self::fills_reduce_only_capped`].
+    ///
+    /// Reported only, not charged to `pnl`: the account still holds the excess, or the venue
+    /// spent it, as on a margin repayment sized to cover interest, and only the caller knows
+    /// which.
+    ///
+    /// `#[serde(default)]` so tear sheets serialised before this field existed still load.
+    #[serde(default)]
+    pub reduce_only_excess: Decimal,
 
     pub pnl_return: RateOfReturn<Interval>,
     pub sharpe_ratio: SharpeRatio<Interval>,
@@ -138,6 +163,43 @@ pub struct TearSheet<Interval> {
     #[serde(default)]
     pub fills_unallocated: usize,
 
+    /// Spot fills whose base-asset fee left the holding off the instrument's quantity step, so
+    /// the position was rounded toward zero to the step and the remainder left out of it.
+    ///
+    /// The remainder stays in the account's balance, too small for the venue to sell. A long's
+    /// is written off, its value in [`Self::dust`]. A short's is base still owed on the loan,
+    /// booked as bought back at the fill's price, so nothing is written off. Each is logged at
+    /// INFO. See the base-asset fee section of
+    /// [`InstrumentState::update_from_trade`](crate::engine::state::instrument::InstrumentState::update_from_trade).
+    #[serde(default)]
+    pub fills_dust: usize,
+
+    /// Fills of reduce-only orders the engine cut so they would not grow or flip the position
+    /// they reduce, or applied none of, because the position was flat or on the fill's side.
+    ///
+    /// The excess is applied to no position, its value summed in [`Self::reduce_only_excess`],
+    /// and its share of the fill's fees charged to [`Self::fees_unattributed`]. Each is logged at
+    /// WARN. Unlike [`Self::fills_unallocated`], this is no sign the engine's positions differ
+    /// from the venue's: an order sized above its position on purpose, such as a margin
+    /// repayment covering interest, is cut every time. See the reduce-only section of
+    /// [`InstrumentState::update_from_trade`](crate::engine::state::instrument::InstrumentState::update_from_trade).
+    #[serde(default)]
+    pub fills_reduce_only_capped: usize,
+
+    /// Fills whose fee was charged in a third asset, neither the instrument's base nor its quote,
+    /// that the engine could not value in quote, so their fees are left out of `pnl`.
+    ///
+    /// A fee such as BNB on a `BTCUSDT` fill is valued with the price of a spot instrument
+    /// pairing the fee asset with the quote, when the engine has one with a price. Each fill
+    /// counted here was reported in an
+    /// [`EngineOutput::FeeConversion`](crate::engine::EngineOutput::FeeConversion) saying why.
+    /// A non-zero count means `pnl` is gross of those fees. A fill is counted when it arrives,
+    /// valued with the prices held then, including one held for its order's acknowledgement
+    /// before it reaches a position. See
+    /// [`EngineState::update_from_account`](crate::engine::state::EngineState::update_from_account).
+    #[serde(default)]
+    pub fills_fee_unconverted: usize,
+
     /// Why the first fill of either kind above could not be routed.
     ///
     /// Shared by both counters, for the same reason [`Self::first_rejection_reason`] exists: the
@@ -202,6 +264,26 @@ pub struct TearSheetGenerator {
     #[serde(default)]
     pub fills_unallocated: usize,
 
+    /// Fills whose base-fee netting left dust out of the position. See [`TearSheet::fills_dust`].
+    #[serde(default)]
+    pub fills_dust: usize,
+
+    /// Value written off as dust. See [`TearSheet::dust`].
+    #[serde(default)]
+    pub dust: Decimal,
+
+    /// Reduce-only fills cut. See [`TearSheet::fills_reduce_only_capped`].
+    #[serde(default)]
+    pub fills_reduce_only_capped: usize,
+
+    /// Value of the reduce-only fills' excess. See [`TearSheet::reduce_only_excess`].
+    #[serde(default)]
+    pub reduce_only_excess: Decimal,
+
+    /// Fills whose third-asset fee was left out of PnL. See [`TearSheet::fills_fee_unconverted`].
+    #[serde(default)]
+    pub fills_fee_unconverted: usize,
+
     /// First unroutable-fill detail seen. See [`TearSheet::first_fallback_detail`].
     #[serde(default)]
     pub first_fallback_detail: Option<String>,
@@ -228,6 +310,11 @@ impl TearSheetGenerator {
             fills_unmatched: 0,
             fills_forced: 0,
             fills_unallocated: 0,
+            fills_dust: 0,
+            dust: Decimal::ZERO,
+            fills_reduce_only_capped: 0,
+            reduce_only_excess: Decimal::ZERO,
+            fills_fee_unconverted: 0,
             first_fallback_detail: None,
             fallback_positions: Vec::new(),
         }
@@ -283,6 +370,45 @@ impl TearSheetGenerator {
     /// [`TearSheet::fills_unallocated`].
     pub fn record_fill_unallocated(&mut self) {
         self.fills_unallocated = self.fills_unallocated.saturating_add(1);
+    }
+
+    /// Record a fill whose base-fee netting left dust out of the position, and the value written
+    /// off for it: positive for a long's, zero for a short's. See [`TearSheet::fills_dust`].
+    ///
+    /// Only counted here: the value is already charged as the fill's fee. Holds its last-good
+    /// total on overflow and emits a `warn!`, as the PnL totals do.
+    pub fn record_fill_dust(&mut self, written_off: Decimal) {
+        self.fills_dust = self.fills_dust.saturating_add(1);
+        match self.dust.checked_add(written_off) {
+            Some(new_total) => self.dust = new_total,
+            None => warn!(
+                dust_held = %self.dust,
+                written_off = %written_off,
+                "dust accumulation overflowed Decimal; holding last-good value"
+            ),
+        }
+    }
+
+    /// Record a fill whose third-asset fee the engine could not value in quote. See
+    /// [`TearSheet::fills_fee_unconverted`].
+    pub fn record_fill_fee_unconverted(&mut self) {
+        self.fills_fee_unconverted = self.fills_fee_unconverted.saturating_add(1);
+    }
+
+    /// Record a reduce-only fill the engine cut, and its excess's value, as a size. See
+    /// [`TearSheet::fills_reduce_only_capped`].
+    ///
+    /// Holds its last-good total on overflow and emits a `warn!`, as the PnL totals do.
+    pub fn record_fill_reduce_only_capped(&mut self, excess_value: Decimal) {
+        self.fills_reduce_only_capped = self.fills_reduce_only_capped.saturating_add(1);
+        match self.reduce_only_excess.checked_add(excess_value) {
+            Some(new_total) => self.reduce_only_excess = new_total,
+            None => warn!(
+                reduce_only_excess_held = %self.reduce_only_excess,
+                excess_value = %excess_value,
+                "reduce-only excess accumulation overflowed Decimal; holding last-good value"
+            ),
+        }
     }
 
     /// Note the position a fallback routing opened, and the reason if it is the first one.
@@ -411,6 +537,8 @@ impl TearSheetGenerator {
             pnl: self.pnl_returns.pnl_raw,
             carry: self.pnl_returns.carry,
             fees_unattributed: self.pnl_returns.fees_unattributed,
+            dust: self.dust,
+            reduce_only_excess: self.reduce_only_excess,
             pnl_return,
             pnl_drawdown: current_pnl_drawdown,
             pnl_drawdown_mean,
@@ -424,6 +552,9 @@ impl TearSheetGenerator {
             fills_unmatched: self.fills_unmatched,
             fills_forced: self.fills_forced,
             fills_unallocated: self.fills_unallocated,
+            fills_dust: self.fills_dust,
+            fills_reduce_only_capped: self.fills_reduce_only_capped,
+            fills_fee_unconverted: self.fills_fee_unconverted,
             first_fallback_detail: self.first_fallback_detail.clone(),
             fallback_positions: self.fallback_positions.clone(),
         }
@@ -456,5 +587,79 @@ mod tests {
         let loaded: TearSheet<Annual365> = serde_json::from_value(value).unwrap();
         assert_eq!(loaded.pnl, dec!(-2));
         assert_eq!(loaded.fees_unattributed, Decimal::ZERO);
+    }
+
+    #[test]
+    fn a_tear_sheet_serialised_before_dust_loads_with_zero() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fill_dust(dec!(0.9));
+        let mut value = serde_json::to_value(generator.generate(Decimal::ZERO, Annual365)).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        fields.remove("dust").unwrap();
+        fields.remove("fills_dust").unwrap();
+
+        let loaded: TearSheet<Annual365> = serde_json::from_value(value).unwrap();
+        assert_eq!((loaded.fills_dust, loaded.dust), (0, Decimal::ZERO));
+    }
+
+    #[test]
+    fn a_tear_sheet_serialised_before_fills_fee_unconverted_loads_with_zero() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fill_fee_unconverted();
+        let mut value = serde_json::to_value(generator.generate(Decimal::ZERO, Annual365)).unwrap();
+        assert_eq!(value["fills_fee_unconverted"], 1);
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("fills_fee_unconverted")
+            .unwrap();
+
+        let loaded: TearSheet<Annual365> = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.fills_fee_unconverted, 0);
+    }
+
+    #[test]
+    fn a_tear_sheet_serialised_before_reduce_only_excess_loads_with_zero() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fill_reduce_only_capped(dec!(49));
+        let mut value = serde_json::to_value(generator.generate(Decimal::ZERO, Annual365)).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        fields.remove("reduce_only_excess").unwrap();
+        fields.remove("fills_reduce_only_capped").unwrap();
+
+        let loaded: TearSheet<Annual365> = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            (loaded.fills_reduce_only_capped, loaded.reduce_only_excess),
+            (0, Decimal::ZERO)
+        );
+    }
+
+    /// A reduce-only excess total that would overflow holds its last-good value, and the fill is
+    /// still counted.
+    #[test]
+    fn reduce_only_excess_holds_its_last_good_total_on_overflow() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fill_reduce_only_capped(Decimal::MAX);
+
+        generator.record_fill_reduce_only_capped(Decimal::ONE);
+
+        assert_eq!(
+            (
+                generator.fills_reduce_only_capped,
+                generator.reduce_only_excess
+            ),
+            (2, Decimal::MAX)
+        );
+    }
+
+    /// A dust total that would overflow holds its last-good value, and the fill is still counted.
+    #[test]
+    fn dust_holds_its_last_good_total_on_overflow() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fill_dust(Decimal::MAX);
+
+        generator.record_fill_dust(Decimal::ONE);
+
+        assert_eq!((generator.fills_dust, generator.dust), (2, Decimal::MAX));
     }
 }

@@ -5,10 +5,10 @@ use crate::engine::{
         builder::EngineStateBuilder,
         connectivity::{ConnectivityStates, UntrackedExchange},
         instrument::{
-            InstrumentStates, data::InstrumentDataState, filter::InstrumentFilter,
+            FillsApplied, InstrumentStates, data::InstrumentDataState, filter::InstrumentFilter,
             generate_unindexed_instrument_account_snapshot,
         },
-        position::{PositionDrift, PositionExited},
+        position::PositionDrift,
         trading::TradingState,
     },
 };
@@ -17,7 +17,7 @@ use fnv::FnvHashMap;
 use rustrade_data::event::MarketEvent;
 use rustrade_execution::{
     AccountEvent, AccountEventKind, AccountSnapshot, UnindexedAccountSnapshot,
-    balance::AssetBalance, market::MarketSnapshot, order::id::ClientOrderId,
+    balance::AssetBalance, market::MarketSnapshot, order::id::ClientOrderId, trade::TradeId,
 };
 use rustrade_instrument::{
     Keyed,
@@ -40,6 +40,9 @@ pub mod connectivity;
 
 /// Instrument-level state and associated state management logic.
 pub mod instrument;
+
+/// Fees charged in a third asset, and how the engine values them in quote.
+pub mod fee;
 
 /// Defines a synchronous `OrderManager` that tracks the lifecycle of exchange orders.
 pub mod order;
@@ -319,7 +322,42 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
 
     /// Updates the internal state from an `AccountEvent`.
     ///
-    /// If the `AccountEvent` results in a new [`PositionExited`], that is returned.
+    /// Returns what the event's fills did to positions: the
+    /// [`PositionExited`](position::PositionExited) one closed, each reduce-only fill cut
+    /// (see [`InstrumentState::update_from_trade`](instrument::InstrumentState::update_from_trade)),
+    /// and how a fee in a third asset was valued (below).
+    ///
+    /// # A fee charged in a third asset
+    /// A fill's fee can be charged in an asset that is neither the instrument's base nor its
+    /// quote, such as BNB on a `BTCUSDT` fill with Binance's "pay fees with BNB" on. The execution
+    /// indexer gives such a fee no quote equivalent
+    /// ([`AssetFees::fees_quote`](rustrade_execution::trade::AssetFees::fees_quote) is `None`), so
+    /// PnL would leave it out. Before applying the fill, this method values it in quote when it
+    /// can:
+    /// - **The price** is [`InstrumentDataState::price`] of a spot instrument pairing the fee
+    ///   asset with the fill's quote asset: `BNBUSDT` for a BNB fee on `BTCUSDT`, or the
+    ///   reciprocal of a `USDTBNB`. Assets are indexed per exchange, so only an instrument on the
+    ///   fill's exchange matches. Of several, the lowest [`InstrumentIndex`] is used, even while
+    ///   it has no price and another has, so the choice never depends on which data arrived
+    ///   first. The price is the one held when the fill is applied, however old. Cross rates
+    ///   through a third asset (BNB to BTC to USDT) are not used.
+    /// - **With a positive price,** `fees_quote` is the fee times that price, and the fill counts
+    ///   it in PnL as it would a fee in quote.
+    /// - **Without one,** for want of the instrument or of a price, `fees_quote` stays `None` and
+    ///   the fee is left out of PnL. The fill is applied all the same, and counted on the
+    ///   instrument's
+    ///   [`TearSheet::fills_fee_unconverted`](crate::statistic::summary::instrument::TearSheet::fills_fee_unconverted).
+    ///
+    /// Either way the returned [`FillsApplied::fee_conversion`] records it: the pricing instrument
+    /// and the price, or why there was none. The `Engine` emits it as
+    /// [`EngineOutput::FeeConversion`](crate::engine::EngineOutput::FeeConversion). A zero fee
+    /// needs no price, so it is valued at zero and not recorded. A fee already given a quote
+    /// equivalent is kept as it is.
+    ///
+    /// To have fees valued, subscribe the pricing instrument's market data. Only the fee is
+    /// valued: the fee asset's balance is not, since the engine keeps no equity across assets.
+    /// Only this method values fees. [`InstrumentState::update_from_trade`](instrument::InstrumentState::update_from_trade),
+    /// called directly, applies the fill's fee as it finds it.
     ///
     /// This method:
     /// - Sets the account [`ConnectivityState`](connectivity::ConnectivityState) to
@@ -329,13 +367,30 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     ///   without showing it is up.
     /// - Updates the `GlobalData` with the `AccountEvent`.
     /// - Updates the associated `AssetStates` and `InstrumentStates` with the `AccountEvent`.
-    pub fn update_from_account(
-        &mut self,
-        event: &AccountEvent,
-    ) -> Option<PositionExited<AssetIndex>>
+    pub fn update_from_account(&mut self, event: &AccountEvent) -> FillsApplied<AssetIndex>
     where
         GlobalData: for<'a> Processor<&'a AccountEvent>,
-        InstrumentData: for<'a> Processor<&'a AccountEvent>,
+        InstrumentData: InstrumentDataState,
+    {
+        self.replay_account(event, &[])
+    }
+
+    /// [`Self::update_from_account`] for an event the `Engine` already processed, as a replica
+    /// of its state does, taking the fills `reduce_only_fills` names as reduce-only.
+    ///
+    /// A replica records no requests in flight, so it cannot tell a reduce-only order's fill from
+    /// another. Pass the [`ReduceOnlyCapped::trade_id`](instrument::ReduceOnlyCapped::trade_id)
+    /// of every [`EngineOutput::ReduceOnlyCapped`](crate::engine::EngineOutput::ReduceOnlyCapped)
+    /// the `Engine` emitted for this event, and the replica cuts those fills as the `Engine` did.
+    /// [`StateReplicaManager`](crate::engine::audit::state_replica::StateReplicaManager) does so.
+    pub fn replay_account(
+        &mut self,
+        event: &AccountEvent,
+        reduce_only_fills: &[TradeId],
+    ) -> FillsApplied<AssetIndex>
+    where
+        GlobalData: for<'a> Processor<&'a AccountEvent>,
+        InstrumentData: InstrumentDataState,
     {
         // Set exchange account connectivity to Healthy if it was Reconnecting. A failed re-init
         // or an ended stream reports on the link without showing it is up, so neither counts.
@@ -361,19 +416,19 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                     instrument_state.update_from_account_snapshot(instrument);
                     instrument_state.data.process(event);
                 }
-                None
+                FillsApplied::default()
             }
             AccountEventKind::BalanceSnapshot(balance) => {
                 self.assets
                     .asset_index_mut(&balance.0.asset)
                     .update_from_balance(balance.as_ref());
-                None
+                FillsApplied::default()
             }
             AccountEventKind::BalanceStreamUpdate(update) => {
                 self.assets
                     .asset_index_mut(&update.0.asset)
                     .apply_balance_update(update.as_ref());
-                None
+                FillsApplied::default()
             }
             AccountEventKind::OrderSnapshot(order) => {
                 let instrument_state = self
@@ -384,9 +439,10 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                 // race in OmsMode::Hedging). update_from_trade side effects (tearsheet,
                 // position removal) are correct regardless; this ensures the output event
                 // also reaches EngineOutput::PositionExit consumers.
-                let exited = instrument_state.update_from_order_snapshot(order.as_ref());
+                let applied =
+                    instrument_state.replay_order_snapshot(order.as_ref(), reduce_only_fills);
                 instrument_state.data.process(event);
-                exited
+                applied
             }
             AccountEventKind::OrderCancelled(response) => {
                 let instrument_state = self
@@ -395,13 +451,34 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
 
                 instrument_state.update_from_cancel_response(response);
                 instrument_state.data.process(event);
-                None
+                FillsApplied::default()
             }
             AccountEventKind::Trade(trade) => {
+                // Valued before the fill is applied, with the prices held when it arrives, so a
+                // fill queued for replay keeps the value it had then.
+                let (valued_trade, conversion) = match self.instruments.value_third_asset_fee(trade)
+                {
+                    Some(valued) => {
+                        let mut valued_trade = trade.clone();
+                        valued_trade.fees.fees_quote = valued.fees_quote();
+                        (Some(valued_trade), valued.into_conversion())
+                    }
+                    None => (None, None),
+                };
+                let trade = valued_trade.as_ref().unwrap_or(trade);
+
                 let instrument_state = self.instruments.instrument_index_mut(&trade.instrument);
+                if let Some(conversion) = &conversion {
+                    conversion.log();
+                    if conversion.outcome.fees_quote().is_none() {
+                        instrument_state.tear_sheet.record_fill_fee_unconverted();
+                    }
+                }
 
                 instrument_state.data.process(event);
-                instrument_state.update_from_trade(trade)
+                let mut applied = instrument_state.replay_trade(trade, reduce_only_fills);
+                applied.fee_conversion = conversion;
+                applied
             }
             AccountEventKind::StreamTerminated(reason) => {
                 // Observe stream death rather than silently dropping it. The engine does not own
@@ -412,7 +489,7 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                     %reason,
                     "account event stream terminated — no further account events will arrive on it",
                 );
-                None
+                FillsApplied::default()
             }
             AccountEventKind::FillRecoveryGaveUp(gap) => {
                 // Fills in the span may never arrive, so positions and orders may be stale. What to
@@ -427,7 +504,7 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                     reason = %gap.reason,
                     "account stream fill recovery gave up — fills in this span may be missing",
                 );
-                None
+                FillsApplied::default()
             }
             AccountEventKind::ReinitFailed(failure) => {
                 // The account link is still down, so state may be going stale. Whether to keep
@@ -438,7 +515,7 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                     error = %failure.error,
                     "account stream re-initialisation failed — retrying with backoff",
                 );
-                None
+                FillsApplied::default()
             }
             AccountEventKind::TradeAmended(amendment) => {
                 // The amended trade was applied as first reported, so positions and PnL built on
@@ -453,7 +530,7 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                     kind = ?amendment.kind,
                     "venue amended a trade it reported earlier — state built on that trade is stale",
                 );
-                None
+                FillsApplied::default()
             }
             AccountEventKind::CashFlow(flow) => {
                 // The venue's balances already include what it has posted, so a flow is applied
@@ -475,7 +552,7 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                         "account-level cash flow received — not applied to positions or balances",
                     ),
                 }
-                None
+                FillsApplied::default()
             }
             AccountEventKind::Notice(notice) => {
                 // Reported, not acted on: what to do about a margin call or liquidation is the
@@ -503,9 +580,9 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                         "venue reported a change in the account's margin state",
                     );
                 }
-                None
+                FillsApplied::default()
             }
-            _ => None,
+            _ => FillsApplied::default(),
         };
 
         // Update any user provided GlobalData State
@@ -691,7 +768,7 @@ mod tests {
             )),
         );
 
-        assert_eq!(state.update_from_account(&event), None);
+        assert_eq!(state.update_from_account(&event), FillsApplied::default());
         assert_eq!(state.assets, before.assets);
         assert_eq!(state.instruments, before.instruments);
         assert_eq!(state.trading, before.trading);
@@ -743,7 +820,7 @@ mod tests {
             )),
         );
         for event in [&reinit_failed, &terminated] {
-            assert_eq!(state.update_from_account(event), None);
+            assert_eq!(state.update_from_account(event), FillsApplied::default());
             assert_eq!(account_health(&state), Health::Reconnecting, "{event:?}");
         }
         assert_eq!(state.assets, before.assets);
@@ -760,7 +837,10 @@ mod tests {
                 FillRecoveryFailure::TimedOut { timeout_secs: 30 },
             )),
         );
-        assert_eq!(state.update_from_account(&from_live_stream), None);
+        assert_eq!(
+            state.update_from_account(&from_live_stream),
+            FillsApplied::default()
+        );
         assert_eq!(account_health(&state), Health::Healthy);
     }
 
@@ -798,7 +878,7 @@ mod tests {
             )),
         );
 
-        assert_eq!(state.update_from_account(&event), None);
+        assert_eq!(state.update_from_account(&event), FillsApplied::default());
         assert_eq!(state.assets, before.assets);
         assert_eq!(state.instruments, before.instruments);
         assert_eq!(state.trading, before.trading);
@@ -838,7 +918,11 @@ mod tests {
                     SmolStr::new("STATUS"),
                 )),
             );
-            assert_eq!(state.update_from_account(&event), None, "{kind}");
+            assert_eq!(
+                state.update_from_account(&event),
+                FillsApplied::default(),
+                "{kind}"
+            );
         }
         assert_eq!(state.assets, before.assets);
         assert_eq!(state.instruments, before.instruments);
@@ -895,13 +979,16 @@ mod tests {
         };
 
         let before = state.clone();
-        assert_eq!(state.update_from_account(&flow(None)), None);
+        assert_eq!(
+            state.update_from_account(&flow(None)),
+            FillsApplied::default()
+        );
         assert_eq!(state.assets, before.assets);
         assert_eq!(state.instruments, before.instruments);
 
         assert_eq!(
             state.update_from_account(&flow(Some(InstrumentIndex::new(0)))),
-            None
+            FillsApplied::default()
         );
         assert_eq!(state.assets, before.assets);
         let positions = &state

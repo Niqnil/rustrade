@@ -19,6 +19,7 @@ use rustrade_execution::{
     holding_cost::HoldingCostModel,
     indexer::AccountEventIndexer,
     map::generate_execution_instrument_map,
+    margin::MarginInterestModel,
     shortability::ShortabilityProvider,
 };
 use rustrade_instrument::{
@@ -55,6 +56,11 @@ pub struct SimVenueOptions {
     /// [`slippage`](MockExecutionConfig::slippage) applies to either. Like every option here, it
     /// is not part of the serialisable configuration.
     pub fill_model: Option<Arc<dyn FillModel>>,
+    /// What the venue's spot margin loans cost in interest — see
+    /// [`SimulatedVenue::with_margin_interest`]. `None` charges none. Needs
+    /// [`MockExecutionConfig::spot_margin`]: without it the venue takes no loans, and adding the
+    /// venue is refused.
+    pub margin_interest: Option<Arc<dyn MarginInterestModel>>,
 }
 
 impl SimVenueOptions {
@@ -77,6 +83,14 @@ impl SimVenueOptions {
     #[must_use]
     pub fn with_fill_model(mut self, model: Arc<dyn FillModel>) -> Self {
         self.fill_model = Some(model);
+        self
+    }
+
+    /// These options, charging interest on the venue's spot margin loans as `model` says — see
+    /// [`MarginInterestModel`].
+    #[must_use]
+    pub fn with_margin_interest(mut self, model: Arc<dyn MarginInterestModel>) -> Self {
+        self.margin_interest = Some(model);
         self
     }
 }
@@ -143,6 +157,11 @@ impl<'a> SimExecutionBuilder<'a> {
     /// to it — see [`SimVenueOptions`].
     ///
     /// Otherwise exactly [`add_venue`](Self::add_venue), whose latency, errors and panics apply.
+    ///
+    /// # Errors
+    /// Also returns [`BarterError::ExecutionBuilder`] if `options` carries a
+    /// [`margin_interest`](SimVenueOptions::margin_interest) model while `config` has no
+    /// [`spot_margin`](MockExecutionConfig::spot_margin).
     pub fn add_venue_with_options(
         self,
         config: MockExecutionConfig,
@@ -162,9 +181,17 @@ impl<'a> SimExecutionBuilder<'a> {
             holding_costs,
             shortability,
             fill_model,
+            margin_interest,
         } = options;
 
         let exchange = config.mocked_exchange;
+
+        if margin_interest.is_some() && config.spot_margin.is_none() {
+            return Err(BarterError::ExecutionBuilder(format!(
+                "simulated venue {exchange} has a margin interest model but no spot_margin: a \
+                 cash account takes no loans to charge"
+            )));
+        }
 
         validate_supported_instrument_kinds(
             self.instruments,
@@ -204,6 +231,9 @@ impl<'a> SimExecutionBuilder<'a> {
         }
         if let Some(model) = fill_model {
             venue = venue.with_fill_model(model);
+        }
+        if let Some(model) = margin_interest {
+            venue = venue.with_margin_interest(model);
         }
 
         let venue = SimVenue {

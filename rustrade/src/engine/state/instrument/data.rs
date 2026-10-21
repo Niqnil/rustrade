@@ -133,6 +133,32 @@ pub struct DefaultInstrumentMarketData {
     pub candle: Option<Candle>,
 }
 
+impl DefaultInstrumentMarketData {
+    /// Whether processing `candle`, on an event stamped `time_exchange`, keeps it as this
+    /// instrument's newest candle: it has closed by its own instant, and closes after the candle
+    /// held. See the [`Processor`] impl, which applies exactly this.
+    pub(crate) fn takes_candle(&self, candle: &Candle, time_exchange: DateTime<Utc>) -> bool {
+        candle.close_time <= time_exchange
+            && self
+                .candle
+                .is_none_or(|current| current.close_time < candle.close_time)
+    }
+
+    /// Whether processing a trade on an event stamped `time_exchange` keeps it as this
+    /// instrument's last traded price: it is newer than the one held. See the [`Processor`] impl.
+    pub(crate) fn takes_trade(&self, time_exchange: DateTime<Utc>) -> bool {
+        self.last_traded_price
+            .as_ref()
+            .is_none_or(|price| price.time < time_exchange)
+    }
+
+    /// Whether processing `l1` replaces this instrument's book: it was updated after the one held.
+    /// See the [`Processor`] impl.
+    pub(crate) fn takes_l1(&self, l1: &OrderBookL1) -> bool {
+        self.l1.last_update_time < l1.last_update_time
+    }
+}
+
 impl InstrumentDataState for DefaultInstrumentMarketData {
     type MarketEventKind = DataKind;
 
@@ -289,11 +315,7 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
     fn process(&mut self, event: &MarketEvent<InstrumentKey, DataKind>) -> Self::Audit {
         match &event.kind {
             DataKind::Trade(trade) => {
-                if self
-                    .last_traded_price
-                    .as_ref()
-                    .is_none_or(|price| price.time < event.time_exchange)
-                {
+                if self.takes_trade(event.time_exchange) {
                     self.last_traded_price
                         .replace(Timed::new(trade.price, event.time_exchange));
                 }
@@ -308,7 +330,7 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
             // this field against a trade's venue stamp. It still orders books against each other
             // here, which is sound — one connector's books all carry the same clock.
             DataKind::OrderBookL1(l1) => {
-                if self.l1.last_update_time < l1.last_update_time {
+                if self.takes_l1(l1) {
                     self.l1 = l1.clone()
                 }
             }
@@ -364,10 +386,7 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
                              the running total for the process"
                         );
                     }
-                } else if self
-                    .candle
-                    .is_none_or(|current| current.close_time < candle.close_time)
-                {
+                } else if self.takes_candle(candle, event.time_exchange) {
                     self.candle = Some(*candle);
                 }
             }
@@ -833,6 +852,18 @@ mod tests {
         data.process(&event(at(20), candle(at(20), dec!(999))));
 
         assert_eq!(data.candle.unwrap().close_time, at(30));
+        assert_eq!(data.price(), Some(dec!(300)));
+    }
+
+    /// A candle closing when the one held closed is no newer, so the first stays: the same
+    /// candle sent twice is one bar, not two.
+    #[test]
+    fn candle_closing_with_the_stored_candle_does_not_replace_it() {
+        let mut data = DefaultInstrumentMarketData::default();
+        data.process(&event(at(30), candle(at(30), dec!(300))));
+        data.process(&event(at(30), candle(at(30), dec!(999))));
+
+        assert_eq!(data.candle.unwrap().close, dec!(300));
         assert_eq!(data.price(), Some(dec!(300)));
     }
 

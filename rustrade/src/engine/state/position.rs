@@ -659,12 +659,15 @@ pub enum PositionSeedError {
 /// [`SimulatedVenue`](rustrade_execution::exchange::mock::SimulatedVenue)).
 ///
 /// A fill's fee reaches PnL only as its quote equivalent,
-/// [`AssetFees::fees_quote`]. A fee in a third asset, such as BNB on a `BTCUSDT` fill, has none,
-/// so it is left out of both PnL figures. Its raw amount stays in
+/// [`AssetFees::fees_quote`]. A fee in a third asset, such as BNB on a `BTCUSDT` fill, gets one
+/// only when the engine prices that asset, see
+/// [`EngineState::update_from_account`](super::EngineState::update_from_account). Without one it
+/// is left out of both PnL figures, and its raw amount stays in
 /// [`fees_enter`](Position::fees_enter) / [`fees_exit`](Position::fees_exit). So PnL overstates
-/// the result of a position whose fees were paid in a third asset, by those fees, until a consumer
-/// prices them. The simulated venue never charges a fee in a third asset, so a backtest counts
-/// fees that a live run paying them in one does not.
+/// the result of a position whose third-asset fees the engine could not price, by those fees. The
+/// simulated venue charges fees in a third asset only when configured to (its
+/// `MockExecutionConfig::fee_asset`), and then reports them as a live venue does, so a backtest
+/// and a live run count them alike.
 ///
 /// A position's quantity is the sum of its fills' quantities, as they reach it. A spot fill whose
 /// fee is in the base asset reaches it with the fee already netted, by
@@ -1632,9 +1635,10 @@ pub fn calculate_pnl_unrealised(
 /// [`AssetFees::fees_quote`].
 ///
 /// A fee with no quote equivalent (`None`) is left out. That is a fee in a third asset, such as
-/// BNB on a `BTCUSDT` fill, or one the indexer zeroed because its asset was not in the map. Its
-/// raw amount is in another asset, so subtracting it from quote-denominated PnL would mix units.
-/// Converting it needs a price the position does not have.
+/// BNB on a `BTCUSDT` fill, that the engine could not price, or one the indexer zeroed because its
+/// asset was not in the map. Its raw amount is in another asset, so subtracting it from
+/// quote-denominated PnL would mix units. The position has no price to convert it with; the
+/// engine converts it before the fill reaches the position when it has one.
 pub(crate) fn fee_in_quote<AssetKey>(fees: &AssetFees<AssetKey>) -> Decimal {
     fees.fees_quote.unwrap_or(Decimal::ZERO)
 }

@@ -457,6 +457,10 @@ pub(crate) mod fixtures {
             fill_model,
             SpotFeeAsset::default(),
             crate::slippage::SlippageConfig::default(),
+            crate::fill::MarketOrderTiming::default(),
+            crate::fill::StaleMarketPolicy::default(),
+            None,
+            None,
         )
     }
 
@@ -489,6 +493,10 @@ pub(crate) mod fixtures {
             SimFillConfig::default(),
             SpotFeeAsset::default(),
             crate::slippage::SlippageConfig::default(),
+            crate::fill::MarketOrderTiming::default(),
+            crate::fill::StaleMarketPolicy::default(),
+            None,
+            None,
         )
     }
 

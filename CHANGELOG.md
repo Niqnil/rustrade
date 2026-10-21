@@ -7,6 +7,269 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-20
+
+### Added
+
+- **Opt-in next-bar fills for market orders on the simulated venue** (`rustrade-execution`,
+  `rustrade`, #627).
+  - New `MockExecutionConfig::market_order_timing`. The default, `MarketOrderTiming::OnArrival`,
+    is today's behaviour: on a bar feed with no latency, a market order fills at the close of the
+    bar its sender has just seen. That is a common convention and an optimistic one.
+  - `MarketOrderTiming::NextBar(NextBarPrice)` holds a market order until its instrument's next
+    bar and fills it at that bar's `Open`. `AdverseExtreme` fills at the bar's high for a buy and
+    its low for a sell. That is a deliberately pessimistic bound for stress tests, so don't
+    combine it with slippage. The bar's price goes through the venue's `FillModel` and slippage,
+    as for any taker fill.
+  - While it is held, the order is accepted as open and can be cancelled. The venue holds its cost
+    at the current price, recosts the fill at the bar, and cancels the order if the account can no
+    longer afford it. Immediate-or-cancel and fill-or-kill apply when the bar fills it. Only a bar
+    releases a held order: a trade or quote does not. An order still held when the data ends is
+    retired as expired.
+  - Bar data only. A market order on an instrument the venue has never been fed a bar for is
+    rejected with a reason naming the setting. So is every market order on a venue with no market
+    feed, such as `MockExchange`'s. Limit orders are unchanged.
+  - `SimRunner` and `SimStepper` show the `Engine` a held order's fill **before** the bar that
+    filled it, together with every other account event that bar caused, so the strategy sees the
+    bar with its fill already booked. With latency back from the venue, the fill arrives after the
+    bar, as any delayed fill does.
+  - New `MarketBar` (open, high, low, close) in `rustrade_execution::market`, and
+    `VenueInstrumentMarket::bar`, the latest bar a venue was fed.
+  - New `VenueMarketUpdate::bar`. It supplies the bar an event carries, and is asked before the
+    event is folded in. It defaults to `None`, and `DataKind` implements it for candles. A candle
+    the engine's instrument state drops, such as a lookahead candle or one already seen, releases
+    nothing.
+  - New `SimulatedVenue::fills_ahead_of` and `SimulatedVenue::expire_held`, for drivers.
+- **Opt-in stale-market policy for market orders on the simulated venue** (`rustrade-execution`,
+  `rustrade`, #643).
+  - New `MockExecutionConfig::stale_market`. The default, `StaleMarketPolicy::Off`, is today's
+    behaviour: a market order fills against the last market the venue was fed, however old. On a
+    bar feed, a market order on an instrument with no bar at the current instant fills at the
+    close of its last bar, which may be hours or a weekend old.
+  - `StaleMarketPolicy::Wait { max_age }` measures each instrument's market from its last fresh
+    observation: a trade, a quote, or a bar something traded in. A bar reported with zero volume
+    or zero trades, as a feed that fills gaps produces, still moves the price but not that
+    instant. A market order arriving when that observation is more than `max_age` old waits,
+    accepted as open with its cost held, and fills on the instrument's next fresh observation as
+    if it had just arrived: at a trade's or quote's price, or a bar's close, after the resting
+    fills that observation caused. Only an observation of that instrument releases it.
+  - An immediate-or-cancel or fill-or-kill market order on a stale market is rejected, with a
+    reason naming the policy. That includes the immediate-or-cancel orders that close positions.
+  - With `MarketOrderTiming::NextBar`, a bar reported with zero volume releases nothing, and
+    cancels the immediate-or-cancel and fill-or-kill orders held for it.
+  - Turn it on for bar feeds, with a `max_age` a little over the bar interval. It stays off by
+    default because the venue cannot know a feed's bar interval, and a quiet quote book is still
+    a book. Market orders only: a marketable limit order still fills against the market the venue
+    holds. A venue with no market feed, such as `MockExchange`'s, rejects every market order
+    under the policy.
+  - New `MarketObservation` in `rustrade_execution::market`: what a driver feeds
+    `SimulatedVenue::apply_market` (see Changed). Its `fresh` flag is what the policy measures
+    from.
+  - New `VenueMarketUpdate::fresh`, asked before an event is folded in. It defaults to `true`, so
+    a custom kind that supplies bars should override it.
+    `DataKind` answers `true` for a trade, an L1 book or a candle the engine's instrument state
+    keeps, unless the candle reports zero volume or zero trades. An unknown volume counts as
+    fresh. L2 depth, liquidations and greeks are never fresh.
+  - New `VenueInstrumentMarket::fresh_at`, the instant of the instrument's last fresh observation.
+- `Instrument::quantity_step` (`rustrade-instrument`, #659): the step a position and its closing
+  order are sized in. It is the spec's quantity increment, when the spec counts quantities in the
+  unit a position is counted in: the base asset on spot, contracts on a derivative.
+- Tear sheets count dust (`rustrade`, #659). `TearSheet::fills_dust` counts the fills whose
+  base-asset fee left a remainder below the quantity step out of the position, and
+  `TearSheet::dust` is the value written off for them. `TradingSummary::fills_dust` sums the count
+  over the session, and the instrument table shows a "Dust Written Off" row.
+- `Trade::holding_move` (`rustrade-execution`, #660, #661): how a fill moves the position it
+  applies to, when that is not by its own side and quantity. It nets a spot fill's fee in the base
+  asset from its quantity, cuts a reduce-only fill so it neither grows nor flips the position,
+  then, if the move was not cut, rounds the resulting position toward zero to
+  `Instrument::quantity_step`. It returns the move as a `HoldingMove`: side, quantity, the `dust`
+  rounded off, and the `excess` cut off. It takes the instrument, the position before the fill,
+  signed, and whether the fill's order was reduce-only. The engine applies fills with it, so a
+  component that mirrors positions outside the engine, such as an execution client's ledger of
+  forwarded fills, can call it and agree with the engine.
+- `round_toward_zero_to_step` (`rustrade-instrument`, #660): a quantity rounded toward zero to a
+  whole multiple of a step, the rounding the engine and `build_ioc_market_order_to_close_position`
+  apply.
+- Reporting for reduce-only fills the engine cuts (`rustrade`, #661; see Changed):
+  - `EngineOutput::ReduceOnlyCapped`, carrying a `ReduceOnlyCapped`: the fill's trade and order
+    ids, its position, the position before the fill, the excess, the excess's value and the fee
+    charged to the tear sheet for it.
+  - `TearSheet::fills_reduce_only_capped` counts the cut fills, and
+    `TearSheet::reduce_only_excess` sums the excess's value. `TradingSummary` sums the count over
+    the session, and the instrument table shows a "Reduce-Only Excess" row.
+  - `EngineState::replay_account`: `update_from_account` for a replica of the engine's state,
+    told which fills the engine cut. `StateReplicaManager` uses it, so it cuts the same fills.
+- **The engine values a fee charged in a third asset** (`rustrade`, #620). A fill's fee in an
+  asset that is neither the instrument's base nor its quote, such as BNB on a `BTCUSDT` fill with
+  Binance's "pay fees with BNB" on, has no quote equivalent from the execution indexer, so PnL
+  left it out. `EngineState::update_from_account` now values it before applying the fill:
+  - **The price** is that of a spot instrument the engine trades or prices pairing the fee asset
+    with the fill's quote asset, on the fill's exchange: `BNBUSDT`, or the reciprocal of a
+    `USDTBNB`. Of several, the lowest `InstrumentIndex` is used. It is the price held when the
+    fill is applied. Cross rates through a third asset are not used.
+  - **With a positive price,** the fee's `fees_quote` is its amount times that price, and PnL
+    counts it as it counts a fee in quote. Subscribe the pricing instrument's market data to have
+    fees valued.
+  - **Without one,** the fee is left out of PnL as before, and the fill is still applied.
+  - **Every such fill is reported** as `EngineOutput::FeeConversion`, carrying a `FeeConversion`:
+    the fill's instrument and trade id, the fee asset and amount, and a `FeeConversionOutcome`,
+    `Converted` with the pricing instrument, the price and the quote value, or `NoPricingInstrument`
+    or `NoPrice`. It is emitted before the fill's `ReduceOnlyCapped` or `PositionExit`, and is also
+    on `FillsApplied::fee_conversion`. A zero fee is valued at zero and not reported.
+  - `TearSheet::fills_fee_unconverted` counts the fills whose fee was left out of PnL, and
+    `TradingSummary::fills_fee_unconverted` sums it over the session.
+  - Only the fee is valued. The fee asset's balance is not, since the engine keeps no equity
+    across assets. The simulated venue can charge fees in a third asset too (see the next entry).
+- **Opt-in fees in a third asset on the simulated venue** (`rustrade-execution`, #621), as
+  Binance's "pay fees with BNB" charges them.
+  - New `MockExecutionConfig::fee_asset`, a `FeeAssetConfig` of an asset and a discount
+    (`FeeAssetConfig::new(asset, discount)`, `0.25` for a quarter off; a discount outside 0 to 1
+    is refused, including when deserialised). The default, `None`, is today's behaviour.
+  - A spot fill's fee is the fee model's fee in quote, less the discount, converted at the venue's
+    price for the asset in the fill's quote: the mid, else the last price, of a spot instrument the
+    venue trades pairing the two, in either direction. It is taken from the asset's free balance
+    when the fill settles, apart from the two assets the fill exchanges, which then move free of
+    fee. The fill reports its fee in that asset, as a live venue does, and restates its balance.
+    Nothing is reserved for it while an order rests.
+  - The fill falls back to the undiscounted fee under `spot_fee_asset`, whole, when the asset's
+    free balance is short of the fee, the venue has no price for it, the instrument trades the
+    asset itself (`BNBUSDT`, `ETHBNB`, which a live venue discounts too), the fill is a CFD's, or
+    its fee is zero or negative. A margin account never lends the asset for a fee.
+  - The account-event indexer gives such a fee no quote equivalent, as a live one, so a backtest
+    counts it in PnL exactly when the engine prices the asset (see the entry above), as live.
+- **Opt-in spot margin on the simulated venue** (`rustrade-execution`, #623).
+  - New `MockExecutionConfig::spot_margin`. The default, `None`, is today's cash account: a spot
+    order is paid for with what the account holds, so a sell of base it lacks is refused.
+  - A `SpotMarginConfig` makes the venue a cross margin account. Under
+    `MarginSideEffect::AutoBorrowRepay` it lends an order the shortfall, and only the shortfall,
+    of the asset it pays with: base for a sell, quote for a buy. It lends when it accepts the
+    order, so a resting limit order or a held market order is lent its shortfall at once, and an
+    asset the account has never held is opened with the loan. An order that is cancelled or
+    expires unfilled repays what it borrowed, and a held order that fills for less than was held
+    repays the part of its loan it no longer needs.
+  - Whatever a fill delivers into an asset the account owes repays that loan, interest first, then
+    principal, and only the rest becomes free. A buy delivers its quantity less any fee charged
+    in base, so a buy of exactly what is owed, with a base fee, leaves a fee-sized loan.
+  - A borrow is allowed while the account's debt stays within `max_leverage − 1` times its
+    equity, both valued in a configured valuation asset at the mid or last price of an instrument
+    on the venue that pairs each asset with it. An asset the venue cannot value, or prices at
+    zero, counts as no equity and is not lent, and a debt it cannot value stops it lending. An
+    order needing more is rejected as unaffordable, with a reason that says how much the venue
+    would lend.
+  - Every balance reports its loan in `Balance::margin`, as Binance's margin account does, and the
+    account's holding of an asset is its `total` less what it owes.
+    `MarginSideEffect::NoBorrow` reports loans but lends and repays nothing.
+  - **Margin interest**, opt-in through `SimVenueOptions::margin_interest` or
+    `SimulatedVenue::with_margin_interest`, which take a `MarginInterestModel`. The venue charges
+    each loan when it is taken, on the amount lent, stamped when the order is accepted, and at
+    each of the model's boundaries while principal is owed in the asset, on that principal.
+    Interest earns no interest. Each charge is added to the loan's interest, which a fill repays
+    first, and is reported after the balance it restates as a `CashFlowKind::MarginInterest` in
+    the borrowed asset, with no instrument. `SimRunner` wakes the venue for each boundary. The
+    builder refuses a model for a venue without `spot_margin`.
+  - `PeriodicMarginInterest` is the built-in model: one period at borrow, then one at each whole
+    period since the Unix epoch (on the hour, for an hourly period), at an annualised rate per
+    asset from a `RateSeries` on a `DayCount` basis, each charge rounded up to the asset's unit
+    (`1e-8` by default). Each charge pays in advance for the period it falls in. A negative rate
+    is refused when the rates are given. `InterestSchedule::AtBorrowOnly` charges the borrow
+    alone. A venue's daily rate is an annual rate of `daily × 365` on `DayCount::Act365`.
+  - Not modelled: liquidation, isolated margin, per-asset borrow limits and the venue's lending
+    pool. CFD orders are not lent their margin.
+- `DayCount::accrue_span` (`rustrade-execution`): an annual amount accrued over a span of time,
+  such as an hour's interest.
+
+### Changed
+
+- **`binance-sdk` 75.0.0 → 76.0.0** (`rustrade-execution`, `binance` feature, #641). The three
+  `binance_sdk::common` internals the margin user-data stream couples to were re-verified, and
+  hold. The SDK changes that reach the compiled code:
+  - A disconnected and dropped WebSocket connection is now freed. 75.0.0 kept two background tasks
+    and the connection's state alive for good, one set for each spot order session reopened and
+    each spot or margin account stream reconnected, so a long-running process accumulated them.
+    New tests pin that no task is left behind, whether the connection is disconnected or only
+    dropped, which also pins that a closed connection stays closed.
+  - Dropping an SDK connection without disconnecting it now closes its socket, without waiting
+    for pending requests. The clients still disconnect a connection they drop, which waits for
+    them.
+  - An error on a connection that a scheduled renewal has already replaced no longer starts a
+    second reconnect. A renewed connection that fails now reconnects; 75.0.0 left it closed.
+- **`MarginSideEffect` is venue-agnostic** (`rustrade-execution`, #623). It moves to
+  `rustrade_execution::margin`, where the simulated venue's spot margin uses it too, and is still
+  re-exported from `client::binance`. It now derives `PartialOrd`, `Ord` and `Hash`.
+- **Breaking in behaviour:** the engine enforces `RequestOpen::reduce_only` on fills (`rustrade`,
+  #661). It used to apply every fill in full, so a reduce-only fill larger than the position it
+  reduced flipped it and left a small position on the other side. A margin repayment sized to
+  cover interest does that every time. Now, once a base-asset fee is netted:
+  - A reduce-only fill larger than the opposite position is cut so the position lands flat. One
+    against a flat position, or one on its own side, is applied to none.
+  - The excess is applied to no position. Its value is reported, not charged to PnL.
+  - The fill's fees are split in proportion: the position is charged the share of the move it
+    took, and the tear sheet's unattributed fees the excess's share.
+  - Each such fill is logged at WARN, counted on the tear sheet and emitted as
+    `EngineOutput::ReduceOnlyCapped`.
+
+  The engine knows an order is reduce-only from the request it sent, and finds a fill's order by
+  `Trade::client_order_id`, or by the venue's order id, while the order is tracked and for its
+  last 64 retirements per instrument. A fill that names no client order id and arrives before
+  its order is acknowledged is still applied in full. So is a fill of an order the engine did not
+  send in this session.
+- **Breaking:** `InstrumentState::update_from_trade`, `InstrumentState::update_from_order_snapshot`
+  and `EngineState::update_from_account` return a `FillsApplied`, the position a fill closed plus
+  the reduce-only fills cut, instead of an `Option<PositionExited>` (`rustrade`, #661). Read the
+  old value from `FillsApplied::exited`. `UpdateFromAccountOutput::PositionExit` is replaced by
+  `UpdateFromAccountOutput::FillsApplied`.
+- **Breaking:** `InstrumentState` has new public fields, `reduce_only_orders` and
+  `retired_reduce_only_orders`, so a struct literal must supply them (`rustrade`, #661). Serialised
+  states without them still load.
+- **Breaking:** `SimulatedVenue::apply_market` takes a `MarketObservation` in place of its
+  `snapshot` and `depth` arguments: `apply_market(instrument, observation, time_exchange)`
+  (`rustrade-execution`, #627, #643). Build one with `MarketObservation::new(snapshot)`, adding
+  `with_depth`, `with_bar` and `with_fresh` as the feed allows. `new` alone keeps today's
+  behaviour.
+- **Breaking:** `MockExecutionConfig` has new fields, `market_order_timing`, `stale_market`,
+  `spot_margin` and `fee_asset`, so a struct literal or a `MockExecutionConfig::new` call must
+  supply them, and `VenueInstrumentMarket` has new public fields, `bar` and `fresh_at`
+  (`rustrade-execution`). A serialised configuration without them still loads, as `OnArrival`,
+  `Off`, `None` and `None`.
+- **Breaking:** the simulated venue's ledger types carry loans (`rustrade-execution`, #623):
+  `AccountState::commit` takes the most it may lend, `Committed` has a new `borrowed` field,
+  `Reservation` a new `borrowed` field, and `BalanceInsufficient` a new `borrowable` field, so a
+  struct literal must supply them.
+- **Breaking:** `build_ioc_market_order_to_close_position` takes the instrument's quantity step
+  and returns an `Option` (`rustrade`, #659). It rounds the close toward zero to the step, and
+  returns `None` for a position smaller than one step, which no order can close. Pass
+  `instrument.quantity_step()`, or `None` to send the exact quantity as before.
+  `close_open_positions_with_market_orders` passes the step, and logs a position below one step
+  at WARN instead of sending an order for it.
+- **Breaking:** `TearSheet`, `TearSheetGenerator` and `TradingSummary` have new public fields for
+  dust, for reduce-only fills cut and for third-asset fees left unconverted (see Added), so a
+  struct literal must supply them (`rustrade`). Serialised ones without them still load.
+- **Breaking in behaviour:** PnL now counts a third-asset fee the engine can price (`rustrade`,
+  #620; see Added). A run paying fees in BNB with `BNBUSDT` market data reports lower PnL than
+  before, by those fees.
+- **Breaking:** `EngineState::update_from_account`, `EngineState::replay_account` and
+  `Engine::update_from_account_stream` require `InstrumentData: InstrumentDataState`, where they
+  required only that it process account events (`rustrade`, #620). They read the price of the
+  instrument that values a third-asset fee.
+
+### Fixed
+
+- **A spot position netted for a base-asset fee could never close to flat** (`rustrade`, #659).
+  A buy of `q` with a base fee `f` holds `q − f`, which is usually off the venue's quantity step,
+  so a full close left a remainder the venue would not sell and the position stayed open. When the
+  instrument has a quantity step, the engine now rounds such a position toward zero to the step.
+  The remainder stays in the account's balance, out of the position:
+  - A long's remainder is written off at the fill's price as part of the fill's fee, so PnL still
+    totals what the fill paid.
+  - A short's remainder is base still owed on the loan. The position books it as bought back at
+    the fill's price, so nothing is written off.
+  - Each such fill is logged at INFO and counted on the tear sheet.
+  - **Breaking in behaviour:** such a position is now smaller by its remainder than in earlier
+    releases, and a long's remainder is a cost in its PnL instead of part of the position.
+
+  Remainders are rounded off fill by fill, so the balance can gather more than one step of them
+  over many fills. An instrument without a step in the position's unit keeps the exact quantity.
+
 ## [0.12.1] - 2026-10-17
 
 ### Fixed

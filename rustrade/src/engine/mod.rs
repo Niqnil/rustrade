@@ -15,9 +15,10 @@ use crate::{
         state::{
             EngineState,
             connectivity::UntrackedExchange,
+            fee::FeeConversion,
             instrument::{
-                ExpiryHandling, OptionSplitPlan, data::InstrumentDataState,
-                filter::InstrumentFilter,
+                ExpiryHandling, FillsApplied, OptionSplitPlan, ReduceOnlyCapped,
+                data::InstrumentDataState, filter::InstrumentFilter,
             },
             order::{Orders, in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
             position::{
@@ -406,7 +407,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         event: &AccountStreamEvent,
     ) -> UpdateFromAccountOutput<Strategy::OnDisconnect>
     where
-        InstrumentData: for<'a> Processor<&'a AccountEvent>,
+        InstrumentData: InstrumentDataState,
         GlobalData: for<'a> Processor<&'a AccountEvent>,
         Strategy: OnDisconnectStrategy<Clock, EngineState<GlobalData, InstrumentData>, ExecutionTxs, Risk>,
     {
@@ -425,8 +426,9 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             AccountStreamEvent::Item(event) => {
                 // Never taken for a snapshot, whose arm yields no exit, so the drift check below
                 // always runs for one.
-                if let Some(exited) = self.state.update_from_account(event) {
-                    return UpdateFromAccountOutput::PositionExit(exited);
+                let applied = self.state.update_from_account(event);
+                if !applied.is_empty() {
+                    return UpdateFromAccountOutput::FillsApplied(applied);
                 }
                 let AccountEventKind::Snapshot(snapshot) = &event.kind else {
                     return UpdateFromAccountOutput::None;
@@ -633,12 +635,9 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             }
             instrument_state.expiration_processed = true;
             instrument_state.orders.clear();
-            instrument_state.exchange_id_to_cid.clear();
-            instrument_state.retired_routing.clear();
-            instrument_state.position_ids.clear();
-            // Clear pending_fills even when no positions exist — a fill-before-ack race
+            // Pending fills too, even when no positions exist — a fill-before-ack race
             // that was in progress at expiry should not accumulate orphaned fills.
-            instrument_state.pending_fills.clear();
+            instrument_state.clear_order_routing();
             return vec![];
         }
 
@@ -830,13 +829,10 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         let instrument_state = self.state.instruments.instrument_index_mut(key);
         instrument_state.expiration_processed = true;
         instrument_state.orders.clear();
-        instrument_state.exchange_id_to_cid.clear();
-        instrument_state.retired_routing.clear();
-        instrument_state.position_ids.clear();
-        // Clear any fills buffered in a fill-before-ack race that was in progress at
+        // Pending fills too: any buffered in a fill-before-ack race that was in progress at
         // expiry. Without this, orphaned pending_fills accumulate across expiry cycles
         // in a long-running engine with persisted state.
-        instrument_state.pending_fills.clear();
+        instrument_state.clear_order_routing();
 
         exited
     }
@@ -1896,6 +1892,30 @@ pub enum EngineOutput<
     /// the engine, by a manual order, a liquidation or an expiry the engine did not see. Deciding
     /// between them, and what to do, is the caller's.
     PositionDrift(PositionDrift<InstrumentKey>),
+
+    /// A reduce-only order's fill the engine cut so it would not grow or flip the position it
+    /// reduces, or applied none of. See the reduce-only section of
+    /// [`InstrumentState::update_from_trade`](crate::engine::state::instrument::InstrumentState::update_from_trade).
+    ///
+    /// Emitted for the account event whose fill it was, before any
+    /// [`PositionExit`](Self::PositionExit) that fill caused, and only when the cut acted: a
+    /// reduce-only fill its position took whole emits nothing.
+    ///
+    /// [`StateReplicaManager`](crate::engine::audit::state_replica::StateReplicaManager) reads it
+    /// to cut the same fill, since a replica cannot know an order was reduce-only.
+    ReduceOnlyCapped(ReduceOnlyCapped<InstrumentKey>),
+
+    /// A fill whose fee was charged in a third asset, neither the instrument's base nor its quote,
+    /// and how the engine valued that fee in quote: the pricing instrument and price, or why it
+    /// could not. See [`FeeConversion`] and
+    /// [`EngineState::update_from_account`](crate::engine::state::EngineState::update_from_account).
+    ///
+    /// One per such fill, converted or not, emitted for the account event whose fill it was,
+    /// before any [`ReduceOnlyCapped`](Self::ReduceOnlyCapped) or
+    /// [`PositionExit`](Self::PositionExit) for that fill. A fill with no fee, or one in base or
+    /// quote, emits none. An unconverted fill is also counted on
+    /// [`TearSheet::fills_fee_unconverted`](crate::statistic::summary::instrument::TearSheet::fills_fee_unconverted).
+    FeeConversion(FeeConversion<AssetIndex, InstrumentKey>),
 }
 
 /// A single resting order captured in an [`EngineOutput::OpenOrdersAtSplit`] observable.
@@ -2092,7 +2112,13 @@ pub enum UpdateTradingStateOutput<OnTradingDisabled> {
 pub enum UpdateFromAccountOutput<OnDisconnect, InstrumentKey = InstrumentIndex> {
     None,
     OnDisconnect(OnDisconnect),
-    PositionExit(PositionExited<AssetIndex, InstrumentKey>),
+
+    /// The event's fills closed a position, the engine cut a reduce-only fill, or it valued a
+    /// third-asset fee. Never empty. Each becomes an [`EngineOutput`]:
+    /// [`FeeConversion`](EngineOutput::FeeConversion), then
+    /// [`ReduceOnlyCapped`](EngineOutput::ReduceOnlyCapped) for each cut, then
+    /// [`PositionExit`](EngineOutput::PositionExit).
+    FillsApplied(FillsApplied<AssetIndex, InstrumentKey>),
 
     /// The event named an exchange the engine does not track; nothing was updated, and
     /// `on_disconnect` was **not** called. See [`UntrackedExchange`].

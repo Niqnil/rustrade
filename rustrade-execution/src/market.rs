@@ -83,6 +83,106 @@ impl MarketSnapshot {
     }
 }
 
+/// The prices of one completed bar (candle): what traded first, highest, lowest and last over its
+/// period.
+///
+/// Carried **alongside** a [`MarketSnapshot`], like [`MarketDepth`], and only by a feed that has
+/// bars. A snapshot says where the market is now. A bar also says where it went over the period
+/// it covers, which is what a venue holding a market order for the next bar prices it from — see
+/// [`MarketOrderTiming::NextBar`](crate::fill::MarketOrderTiming::NextBar).
+///
+/// No volume and no period: a venue does not need either to price a fill, and a bar's instant is
+/// the observation's own, given beside it. The four prices are taken as given: nothing checks that
+/// `low` and `high` bound the other two.
+///
+/// No `Default`: a bar of four zero prices is not a bar any market printed.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub struct MarketBar {
+    /// The first price of the bar's period.
+    pub open: Decimal,
+    /// The highest price of the bar's period.
+    pub high: Decimal,
+    /// The lowest price of the bar's period.
+    pub low: Decimal,
+    /// The last price of the bar's period.
+    pub close: Decimal,
+}
+
+impl MarketBar {
+    /// Construct a `MarketBar` from its four prices.
+    pub fn new(open: Decimal, high: Decimal, low: Decimal, close: Decimal) -> Self {
+        Self {
+            open,
+            high,
+            low,
+            close,
+        }
+    }
+}
+
+/// One observation of one instrument's market, as a driver feeds it to a simulated venue through
+/// [`SimulatedVenue::apply_market`](crate::exchange::mock::SimulatedVenue::apply_market).
+///
+/// Only [`snapshot`](Self::snapshot) is required. Everything else describes what the feed knows
+/// beyond it, and defaults to "nothing more": no size, no bar, and a live observation. Built
+/// with [`new`](Self::new) and the `with_` methods.
+///
+/// `#[non_exhaustive]`: what a feed can tell a venue grows, and each addition arrives as a new
+/// field with a default rather than as a new argument every driver must pass.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarketObservation {
+    /// The market as it now stands. See [`MarketSnapshot`].
+    pub snapshot: MarketSnapshot,
+
+    /// How much is on offer at each side of [`snapshot`](Self::snapshot). See [`MarketDepth`].
+    pub depth: MarketDepth,
+
+    /// The completed bar this observation carries, from a feed that has bars, and `None` from
+    /// every other observation. See [`MarketBar`].
+    pub bar: Option<MarketBar>,
+
+    /// Whether this observation shows the market trading or quoting: a trade, a quote, or a bar
+    /// something traded in.
+    ///
+    /// `false` for an observation that only carries a price forward: a bar reported with zero
+    /// volume, as a feed that fills gaps produces, or an event that is not a price at all. Such an
+    /// observation still moves the price the venue holds, but it is not evidence that anyone could
+    /// trade at it, which is what a venue's
+    /// [`StaleMarketPolicy`](crate::fill::StaleMarketPolicy) measures a market's age from.
+    pub fresh: bool,
+}
+
+impl MarketObservation {
+    /// A fresh observation of `snapshot`, with no size information and no bar.
+    pub fn new(snapshot: MarketSnapshot) -> Self {
+        Self {
+            snapshot,
+            depth: MarketDepth::UNKNOWN,
+            bar: None,
+            fresh: true,
+        }
+    }
+
+    /// This observation, reporting `depth` as the size on offer.
+    #[must_use]
+    pub fn with_depth(self, depth: MarketDepth) -> Self {
+        Self { depth, ..self }
+    }
+
+    /// This observation, carrying `bar`, or no bar for `None`.
+    #[must_use]
+    pub fn with_bar(self, bar: Option<MarketBar>) -> Self {
+        Self { bar, ..self }
+    }
+
+    /// This observation, fresh or not. See [`fresh`](Self::fresh).
+    #[must_use]
+    pub fn with_fresh(self, fresh: bool) -> Self {
+        Self { fresh, ..self }
+    }
+}
+
 /// How much is on offer at each side's best price, where the feed says.
 ///
 /// Carried **alongside** a [`MarketSnapshot`] rather than inside it. A snapshot is the view a
@@ -175,6 +275,37 @@ mod tests {
         assert!(!MarketSnapshot::from_last_price(Some(dec!(100))).is_empty());
         assert!(!MarketSnapshot::new(Some(dec!(99)), None, None).is_empty());
         assert!(!MarketSnapshot::new(None, Some(dec!(101)), None).is_empty());
+    }
+
+    #[test]
+    fn an_observation_is_fresh_with_no_size_and_no_bar_until_told_otherwise() {
+        let snapshot = MarketSnapshot::from_last_price(Some(dec!(100)));
+        let observation = MarketObservation::new(snapshot);
+        assert_eq!(
+            (
+                observation.snapshot,
+                observation.depth,
+                observation.bar,
+                observation.fresh
+            ),
+            (snapshot, MarketDepth::UNKNOWN, None, true)
+        );
+
+        let depth = MarketDepth::new(Some(dec!(1)), Some(dec!(2)));
+        let bar = MarketBar::new(dec!(99), dec!(101), dec!(98), dec!(100));
+        let observation = observation
+            .with_depth(depth)
+            .with_bar(Some(bar))
+            .with_fresh(false);
+        assert_eq!(
+            (
+                observation.snapshot,
+                observation.depth,
+                observation.bar,
+                observation.fresh
+            ),
+            (snapshot, depth, Some(bar), false)
+        );
     }
 
     #[test]

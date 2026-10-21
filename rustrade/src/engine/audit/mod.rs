@@ -251,7 +251,20 @@ impl<Event, OnTradingDisabled, OnDisconnect>
             UpdateFromAccountOutput::OnDisconnect(disconnect) => {
                 Self::with_output(event, EngineOutput::AccountDisconnect(disconnect))
             }
-            UpdateFromAccountOutput::PositionExit(position) => Self::with_output(event, position),
+            UpdateFromAccountOutput::FillsApplied(applied) => applied
+                .fee_conversion
+                .map(EngineOutput::FeeConversion)
+                .into_iter()
+                .chain(
+                    applied
+                        .capped
+                        .into_iter()
+                        .map(EngineOutput::ReduceOnlyCapped),
+                )
+                .chain(applied.exited.map(EngineOutput::PositionExit))
+                .fold(Self::with_event(event), |audit, output| {
+                    audit.add_output(output)
+                }),
             UpdateFromAccountOutput::UntrackedExchange(untracked) => {
                 Self::with_output(event, EngineOutput::UntrackedExchange(untracked))
             }

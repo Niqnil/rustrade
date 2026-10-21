@@ -2,7 +2,11 @@ use crate::order::id::{ClientOrderId, OrderId, StrategyId};
 use chrono::{DateTime, Utc};
 use derive_more::{Constructor, From};
 use rust_decimal::Decimal;
-use rustrade_instrument::{Side, asset::QuoteAsset};
+use rustrade_instrument::{
+    Side,
+    asset::QuoteAsset,
+    instrument::{Instrument, kind::InstrumentKind, round_toward_zero_to_step},
+};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::fmt::{Display, Formatter};
@@ -218,6 +222,173 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
     pub fn value_quote(&self) -> Decimal {
         self.price * self.quantity.abs()
     }
+
+    /// How this fill moves the position it applies to, when that is not by its own
+    /// [`side`](Self::side) and [`quantity`](Self::quantity): a spot fill whose fee the venue
+    /// charged in `instrument`'s base asset, or a `reduce_only` fill that would grow or flip the
+    /// position. `None` otherwise: the fill then moves the position by its own side and quantity.
+    ///
+    /// The `rustrade` engine applies every fill with this function. A component that mirrors
+    /// positions outside the engine, such as a ledger of the fills an execution client forwarded,
+    /// agrees with the engine by calling it too.
+    ///
+    /// `held` is the position the fill applies to, as it stands before the fill, signed: positive
+    /// for a long, negative for a short, zero for none. In an account holding a long and a short
+    /// at once, it is the one position the fill is routed to. `reduce_only` is whether the fill's
+    /// order was sent to reduce a position only, as
+    /// [`RequestOpen::reduce_only`](crate::order::request::RequestOpen::reduce_only) says.
+    ///
+    /// # The rule
+    ///
+    /// In this order:
+    ///
+    /// - **The fee is netted.** It leaves the account in base on either side, so the holding moves
+    ///   by the fill's signed quantity less the fee: a buy of `q` with a base fee `f` holds
+    ///   `q − f`, and a sell delivers `q + f`. A negative fee, a rebate, adds to it. Only on a
+    ///   spot instrument, spot margin included. A derivative's position is counted in contracts,
+    ///   and an inverse contract pays its fees in the settlement coin, so a fee there never
+    ///   changes the quantity. A fee in quote or a third asset, such as BNB, and a fee of zero
+    ///   are not netted.
+    /// - **A reduce-only move never grows or flips the position.** With `reduce_only`, a netted
+    ///   move larger than the opposite position `held` is cut to land it flat, and one that does
+    ///   not reduce it at all, because `held` is zero or on the move's side, moves nothing. What
+    ///   is cut off is [`HoldingMove::excess`]. A cut move is not rounded below: flat is on any
+    ///   step, and a position the fill left as it was is not the fill's to round. This applies to
+    ///   any instrument kind.
+    /// - **The position is rounded toward zero to the step.** Only when the fee was netted and
+    ///   the move not cut. When [`Instrument::quantity_step`] gives a step, the position the fill
+    ///   leaves, `held` plus the netted move, is rounded toward zero to a whole multiple of it, and
+    ///   the move is what lands the position there. A venue sells only whole steps, so a position
+    ///   off the step could never be closed to flat. It is the position that is rounded, not the
+    ///   move: a sell of 1 with a fee of 0.001 from a long of 2, in steps of 0.01, leaves 0.999, so
+    ///   the position is 0.99 and the move a sell of 1.01. What is rounded off is
+    ///   [`HoldingMove::dust`]. A `held` already off the step is rounded too, so the dust can
+    ///   include a remainder this fill did not create. Without a step, the dust is zero.
+    /// - **The move's side is its sign.** A fee larger than a buy's quantity sells the difference.
+    ///   A move of zero keeps the netted move's side, which is the fill's own unless the fee
+    ///   reversed it, with a quantity of zero.
+    ///
+    /// # What it leaves to the caller
+    ///
+    /// - **The price and the fee.** The netted quantity keeps the fill's price, so PnL is charged
+    ///   the fee's quote equivalent, its `fees_quote`: buying `q − f` at `p` and paying `f × p`
+    ///   costs `q × p`, what the fill paid. The engine also adds the value of a long's dust, at
+    ///   the fill's price, to the fill's fee, since the account holds that base but cannot sell
+    ///   it. A short's dust is base still owed on the loan, which the position books as bought
+    ///   back at the fill's price, so nothing is added.
+    /// - **Only the fee the venue reported** is netted. A fee the caller computes itself, as the
+    ///   engine's fee model does, is in quote, and reaches PnL alone.
+    /// - **The excess and its share of the fee.** No position takes the excess: the account
+    ///   holds it, or the venue spent it, as on a margin repayment sized to cover interest. The
+    ///   engine charges the position the share of the fill's fees that the move is of the netted
+    ///   move, and the rest to its tear sheet as fees no position carries. It reports the excess
+    ///   without charging its value to PnL.
+    /// - **A settlement fill larger than its position, in a hedged account.** Where an account
+    ///   can hold a long and a short at once (the engine's `OmsMode::Hedging`), the engine does not
+    ///   call this for a settlement fill, such as a liquidation, that matches none of its orders
+    ///   and is larger than the position it reduces: it cuts that fill to the position, unnetted,
+    ///   so the position lands flat, and reports the excess. A mirror that matches the engine does
+    ///   the same rather than calling this. Such a fill is of no order of the engine's, so it is
+    ///   never reduce-only. With one position per instrument (`OmsMode::Netting`), the engine
+    ///   never cuts a settlement fill, so this applies to every fill.
+    pub fn holding_move<ExchangeKey>(
+        &self,
+        instrument: &Instrument<ExchangeKey, AssetKey>,
+        held: Decimal,
+        reduce_only: bool,
+    ) -> Option<HoldingMove>
+    where
+        AssetKey: PartialEq,
+    {
+        let base_fee = matches!(instrument.kind, InstrumentKind::Spot)
+            && self.fees.asset == instrument.underlying.base
+            && !self.fees.fees.is_zero();
+        let netted = signed(self.side, self.quantity.abs())
+            - if base_fee {
+                self.fees.fees
+            } else {
+                Decimal::ZERO
+            };
+        let (netted_side, _) = unsigned(netted, self.side);
+
+        if reduce_only && let Some(moved) = reduced_by(held, netted) {
+            let (side, quantity) = unsigned(moved, netted_side);
+            return Some(HoldingMove {
+                side,
+                quantity,
+                dust: Decimal::ZERO,
+                excess: netted - moved,
+            });
+        }
+        if !base_fee {
+            return None;
+        }
+
+        let holds = held + netted;
+        let rounded = instrument
+            .quantity_step()
+            .map_or(holds, |step| round_toward_zero_to_step(holds, step));
+        let (side, quantity) = unsigned(rounded - held, netted_side);
+        Some(HoldingMove {
+            side,
+            quantity,
+            dust: holds - rounded,
+            excess: Decimal::ZERO,
+        })
+    }
+}
+
+/// How a fill moves the position it applies to, when that is not by its own side and quantity:
+/// see [`Trade::holding_move`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Deserialize, Serialize)]
+pub struct HoldingMove {
+    /// [`Side::Buy`] if the move adds to the position, [`Side::Sell`] if it takes from it.
+    pub side: Side,
+    /// The size of the move, never negative.
+    pub quantity: Decimal,
+    /// The part of the netted holding rounded off the position to land it on the quantity step,
+    /// signed as a position is, and less than one step in size. Positive is base the account holds
+    /// that a long does not count; negative is base still owed on a short's loan that the short
+    /// does not count. Zero without a step, or when the position lands on it.
+    ///
+    /// It stays in the account's balance. Each fill's is rounded off on its own, so the balance can
+    /// gather more than one step of it over many fills, which no position holds.
+    pub dust: Decimal,
+    /// The part of a reduce-only fill's netted move cut off so it does not grow or flip the
+    /// position, signed as a move is: positive for a buy. Zero unless the move was cut. No
+    /// position takes it.
+    pub excess: Decimal,
+}
+
+/// `quantity` with the sign of `side`: positive for a buy, or for a long position.
+fn signed(side: Side, quantity: Decimal) -> Decimal {
+    match side {
+        Side::Buy => quantity,
+        Side::Sell => -quantity,
+    }
+}
+
+/// The side and size of a signed move: a buy if positive, a sell if negative, and `at_zero`
+/// with a size of zero if it moves nothing.
+fn unsigned(moved: Decimal, at_zero: Side) -> (Side, Decimal) {
+    let side = match moved.cmp(&Decimal::ZERO) {
+        std::cmp::Ordering::Greater => Side::Buy,
+        std::cmp::Ordering::Less => Side::Sell,
+        std::cmp::Ordering::Equal => at_zero,
+    };
+    (side, moved.abs())
+}
+
+/// The part of a reduce-only signed move `moved` that the signed position `held` takes, when that is
+/// less than all of it: nothing unless the move reduces `held`, and no more than lands `held`
+/// flat. `None` when `held` takes all of it.
+fn reduced_by(held: Decimal, moved: Decimal) -> Option<Decimal> {
+    // Opposite signs reduce. A flat `held` has no sign to oppose, and a zero move takes nothing.
+    if held.cmp(&Decimal::ZERO) != moved.cmp(&Decimal::ZERO).reverse() {
+        return (!moved.is_zero()).then_some(Decimal::ZERO);
+    }
+    (moved.abs() > held.abs()).then_some(-held)
 }
 
 /// What one [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades) call
@@ -448,14 +619,16 @@ pub struct AssetFees<AssetKey> {
     /// Fee value in quote currency when computable.
     /// - `Some(fees)` if fee asset == quote asset
     /// - `Some(fees * price)` if fee asset == base asset (computed by indexer)
-    /// - `None` if fee asset is third-party (e.g., BNB), which needs external price data. Also
-    ///   `None` when the indexer zeroed a fee whose asset was not in its map (see
+    /// - `None` if fee asset is third-party (e.g., BNB), which needs a price the indexer does not
+    ///   have. The `rustrade` engine fills it in when it prices that asset, before applying the
+    ///   fill (see its `EngineState::update_from_account`). Also `None` when the indexer zeroed a
+    ///   fee whose asset was not in its map (see
     ///   [`AccountEventIndexer::trade`](crate::indexer::AccountEventIndexer::trade)).
     ///
     /// The engine's position PnL counts only this quote equivalent. A fee with `None` is left
-    /// out of PnL, and its raw [`fees`](Self::fees) stays recorded on the position. A consumer that
-    /// wants it counted prices it. On a position's running fee totals, this is the sum of the
-    /// quote equivalents its fees had, and `None` only while none had one.
+    /// out of PnL, and its raw [`fees`](Self::fees) stays recorded on the position. On a
+    /// position's running fee totals, this is the sum of the quote equivalents its fees had, and
+    /// `None` only while none had one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fees_quote: Option<Decimal>,
 }
@@ -506,8 +679,19 @@ impl<AssetKey> Default for AssetFees<Option<AssetKey>> {
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
     use rustrade_instrument::{
-        asset::name::AssetNameExchange, instrument::name::InstrumentNameExchange,
+        asset::{Asset, name::AssetNameExchange},
+        exchange::ExchangeId,
+        instrument::{
+            kind::perpetual::PerpetualContract,
+            name::InstrumentNameExchange,
+            spec::{
+                InstrumentSpec, InstrumentSpecNotional, InstrumentSpecPrice,
+                InstrumentSpecQuantity, OrderQuantityUnits,
+            },
+        },
+        test_utils,
     };
 
     fn trade() -> Trade<AssetNameExchange, InstrumentNameExchange> {
@@ -555,6 +739,323 @@ mod tests {
                 .to_string()
                 .ends_with(", origin: liquidation }")
         );
+    }
+
+    // --- holding_move ------------------------------------------------------------------------
+
+    /// A spot BTC/USDT instrument, with a quantity step in BTC when `step` is given.
+    fn btc_usdt(step: Option<Decimal>) -> Instrument<ExchangeId, Asset> {
+        let mut instrument = test_utils::instrument(ExchangeId::BinanceSpot, "btc", "usdt");
+        instrument.spec = step.map(|step| {
+            InstrumentSpec::new(
+                InstrumentSpecPrice::new(dec!(0.01), dec!(0.01)),
+                InstrumentSpecQuantity::new(
+                    OrderQuantityUnits::Asset(test_utils::asset("btc")),
+                    step,
+                    step,
+                ),
+                InstrumentSpecNotional::new(Decimal::ZERO),
+            )
+        });
+        instrument
+    }
+
+    /// A fill of `quantity` on `side`, charged `fee` in `fee_asset`.
+    fn fill(side: Side, quantity: Decimal, fee_asset: &str, fee: Decimal) -> Trade<Asset, ()> {
+        Trade::new(
+            TradeId::new("t-1"),
+            OrderId::new("o-1"),
+            (),
+            StrategyId::unknown(),
+            DateTime::<Utc>::MIN_UTC,
+            side,
+            dec!(100),
+            quantity,
+            None,
+            AssetFees::new(test_utils::asset(fee_asset), fee, None),
+        )
+    }
+
+    fn moved(side: Side, quantity: Decimal, dust: Decimal) -> Option<HoldingMove> {
+        Some(HoldingMove {
+            side,
+            quantity,
+            dust,
+            excess: Decimal::ZERO,
+        })
+    }
+
+    fn cut(side: Side, quantity: Decimal, excess: Decimal) -> Option<HoldingMove> {
+        Some(HoldingMove {
+            side,
+            quantity,
+            dust: Decimal::ZERO,
+            excess,
+        })
+    }
+
+    #[test]
+    fn holding_move_is_none_unless_a_spot_fill_pays_a_base_fee() {
+        let mut perpetual = btc_usdt(None);
+        perpetual.kind = InstrumentKind::Perpetual(PerpetualContract {
+            contract_size: Decimal::ONE,
+            settlement_asset: test_utils::asset("btc"),
+        });
+        let cases = [
+            (
+                "quote fee",
+                btc_usdt(None),
+                fill(Side::Buy, dec!(1), "usdt", dec!(0.1)),
+            ),
+            (
+                "third-asset fee",
+                btc_usdt(None),
+                fill(Side::Buy, dec!(1), "bnb", dec!(0.001)),
+            ),
+            (
+                "zero base fee",
+                btc_usdt(None),
+                fill(Side::Buy, dec!(1), "btc", Decimal::ZERO),
+            ),
+            (
+                "derivative",
+                perpetual,
+                fill(Side::Buy, dec!(1), "btc", dec!(0.001)),
+            ),
+        ];
+
+        for (case, instrument, fill) in cases {
+            assert_eq!(
+                fill.holding_move(&instrument, Decimal::ZERO, false),
+                None,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn holding_move_nets_a_base_fee_on_either_side() {
+        let spot = btc_usdt(None);
+        let cases = [
+            (
+                "buy holds less",
+                fill(Side::Buy, dec!(1), "btc", dec!(0.001)),
+                moved(Side::Buy, dec!(0.999), Decimal::ZERO),
+            ),
+            (
+                "sell delivers more",
+                fill(Side::Sell, dec!(1), "btc", dec!(0.001)),
+                moved(Side::Sell, dec!(1.001), Decimal::ZERO),
+            ),
+            (
+                "rebate adds",
+                fill(Side::Buy, dec!(1), "btc", dec!(-0.001)),
+                moved(Side::Buy, dec!(1.001), Decimal::ZERO),
+            ),
+            (
+                "fee above a buy sells",
+                fill(Side::Buy, dec!(0.001), "btc", dec!(0.003)),
+                moved(Side::Sell, dec!(0.002), Decimal::ZERO),
+            ),
+            (
+                "fee equal to a buy moves nothing",
+                fill(Side::Buy, dec!(0.001), "btc", dec!(0.001)),
+                moved(Side::Buy, Decimal::ZERO, Decimal::ZERO),
+            ),
+        ];
+
+        for (case, fill, expected) in cases {
+            assert_eq!(fill.holding_move(&spot, dec!(2), false), expected, "{case}");
+        }
+    }
+
+    /// The position `held` plus the netted move is what is rounded, toward zero, and the move is
+    /// what lands it there.
+    #[test]
+    fn holding_move_rounds_the_position_toward_zero_to_the_step() {
+        let spot = btc_usdt(Some(dec!(0.01)));
+        let cases = [
+            (
+                "buy from flat",
+                Decimal::ZERO,
+                fill(Side::Buy, dec!(1), "btc", dec!(0.001)),
+                moved(Side::Buy, dec!(0.99), dec!(0.009)),
+            ),
+            // Rounding the move of 1.001 instead would leave a long of 1, more than the 0.999 held.
+            (
+                "sell from a long",
+                dec!(2),
+                fill(Side::Sell, dec!(1), "btc", dec!(0.001)),
+                moved(Side::Sell, dec!(1.01), dec!(0.009)),
+            ),
+            // The fee leaves a short of 0.001, rounded away: base still owed, which no short counts.
+            (
+                "buy back a short",
+                dec!(-1),
+                fill(Side::Buy, dec!(1), "btc", dec!(0.001)),
+                moved(Side::Buy, dec!(1), dec!(-0.001)),
+            ),
+            (
+                "sell opening a short",
+                Decimal::ZERO,
+                fill(Side::Sell, dec!(1), "btc", dec!(0.001)),
+                moved(Side::Sell, dec!(1), dec!(-0.001)),
+            ),
+            (
+                "held off the step",
+                dec!(0.005),
+                fill(Side::Buy, dec!(1), "btc", dec!(0.001)),
+                moved(Side::Buy, dec!(0.995), dec!(0.004)),
+            ),
+            (
+                "lands on the step",
+                dec!(0.001),
+                fill(Side::Buy, dec!(1), "btc", dec!(0.001)),
+                moved(Side::Buy, dec!(0.999), Decimal::ZERO),
+            ),
+        ];
+
+        for (case, held, fill, expected) in cases {
+            assert_eq!(fill.holding_move(&spot, held, false), expected, "{case}");
+        }
+    }
+
+    /// A rounded move of zero keeps the netted move's side: the fill's own, unless the fee
+    /// reversed it.
+    #[test]
+    fn holding_move_rounded_to_nothing_keeps_the_netted_side() {
+        let spot = btc_usdt(Some(dec!(1)));
+        let cases = [
+            (
+                "buy",
+                dec!(1),
+                fill(Side::Buy, dec!(0.5), "btc", dec!(0.001)),
+                moved(Side::Buy, Decimal::ZERO, dec!(0.499)),
+            ),
+            (
+                "fee reverses the buy",
+                dec!(-1),
+                fill(Side::Buy, dec!(0.001), "btc", dec!(0.003)),
+                moved(Side::Sell, Decimal::ZERO, dec!(-0.002)),
+            ),
+        ];
+
+        for (case, held, fill, expected) in cases {
+            assert_eq!(fill.holding_move(&spot, held, false), expected, "{case}");
+        }
+    }
+
+    /// A reduce-only move larger than the opposite position is cut to land it flat; one that
+    /// reduces nothing moves nothing. Either way the cut is the excess, and nothing is rounded.
+    #[test]
+    fn holding_move_cuts_a_reduce_only_move_at_the_position() {
+        let spot = btc_usdt(Some(dec!(0.01)));
+        let cases = [
+            // A repayment buy sized above the short: netted to 10.49, cut at 10.
+            (
+                "buy past a short",
+                dec!(-10),
+                fill(Side::Buy, dec!(10.5), "btc", dec!(0.01)),
+                cut(Side::Buy, dec!(10), dec!(0.49)),
+            ),
+            (
+                "sell past a long",
+                dec!(1),
+                fill(Side::Sell, dec!(1.5), "usdt", dec!(0.1)),
+                cut(Side::Sell, dec!(1), dec!(-0.5)),
+            ),
+            (
+                "buy from flat",
+                Decimal::ZERO,
+                fill(Side::Buy, dec!(1), "usdt", dec!(0.1)),
+                cut(Side::Buy, Decimal::ZERO, dec!(1)),
+            ),
+            (
+                "buy onto a long",
+                dec!(1),
+                fill(Side::Buy, dec!(1), "btc", dec!(0.001)),
+                cut(Side::Buy, Decimal::ZERO, dec!(0.999)),
+            ),
+            // The fee reverses the buy into a sell, which a short does not reduce.
+            (
+                "fee reverses a buy onto a short",
+                dec!(-1),
+                fill(Side::Buy, dec!(0.001), "btc", dec!(0.003)),
+                cut(Side::Sell, Decimal::ZERO, dec!(-0.002)),
+            ),
+        ];
+
+        for (case, held, fill, expected) in cases {
+            assert_eq!(fill.holding_move(&spot, held, true), expected, "{case}");
+        }
+    }
+
+    /// A reduce-only move the position takes whole is moved as any other fill: rounded when its
+    /// base fee is netted, and `None` when it is not.
+    #[test]
+    fn holding_move_leaves_a_reduce_only_move_the_position_takes() {
+        let spot = btc_usdt(Some(dec!(0.01)));
+        let cases = [
+            (
+                "partial, base fee",
+                dec!(-2),
+                fill(Side::Buy, dec!(1), "btc", dec!(0.001)),
+                moved(Side::Buy, dec!(1), dec!(-0.001)),
+            ),
+            (
+                "to flat exactly, base fee",
+                dec!(-0.999),
+                fill(Side::Buy, dec!(1), "btc", dec!(0.001)),
+                moved(Side::Buy, dec!(0.999), Decimal::ZERO),
+            ),
+            (
+                "partial, rounded",
+                dec!(2),
+                fill(Side::Sell, dec!(1), "btc", dec!(0.001)),
+                moved(Side::Sell, dec!(1.01), dec!(0.009)),
+            ),
+            (
+                "to flat exactly, quote fee",
+                dec!(1),
+                fill(Side::Sell, dec!(1), "usdt", dec!(0.1)),
+                None,
+            ),
+            (
+                "fee equal to a buy moves nothing",
+                dec!(-1),
+                fill(Side::Buy, dec!(0.001), "btc", dec!(0.001)),
+                moved(Side::Buy, Decimal::ZERO, Decimal::ZERO),
+            ),
+            // Nothing to cut, so a short already off the step is still rounded.
+            (
+                "fee equal to a buy, held off the step",
+                dec!(-1.005),
+                fill(Side::Buy, dec!(0.001), "btc", dec!(0.001)),
+                moved(Side::Buy, dec!(0.005), dec!(-0.005)),
+            ),
+        ];
+
+        for (case, held, fill, expected) in cases {
+            assert_eq!(fill.holding_move(&spot, held, true), expected, "{case}");
+        }
+    }
+
+    /// The cut applies to any instrument kind, where no fee is netted.
+    #[test]
+    fn holding_move_cuts_a_reduce_only_derivative_fill() {
+        let mut perpetual = btc_usdt(None);
+        perpetual.kind = InstrumentKind::Perpetual(PerpetualContract {
+            contract_size: Decimal::ONE,
+            settlement_asset: test_utils::asset("btc"),
+        });
+        let fill = fill(Side::Buy, dec!(3), "btc", dec!(0.001));
+
+        assert_eq!(
+            fill.holding_move(&perpetual, dec!(-2), true),
+            cut(Side::Buy, dec!(2), dec!(1))
+        );
+        assert_eq!(fill.holding_move(&perpetual, dec!(-3), true), None);
+        assert_eq!(fill.holding_move(&perpetual, dec!(-2), false), None);
     }
 
     #[test]

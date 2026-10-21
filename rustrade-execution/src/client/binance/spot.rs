@@ -38,9 +38,9 @@
 
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
-    CONNECT_TIMEOUT_SECS, DisconnectOnDrop, ExecutionReport, ExponentialBackoff,
-    FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal, MyTradesFrom,
-    ORDER_EXECUTIONS_BUDGET, OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
+    CONNECT_TIMEOUT_SECS, DisconnectOnDrop, ExecutionReport, FILL_RECOVERY_TIMEOUT_SECS,
+    HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal, MyTradesFrom, ORDER_EXECUTIONS_BUDGET,
+    OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
     UnsubscribeOnDrop, UserDataFrame, WeightPool, binance_filled_qty, classify_order_kind_tif,
     classify_rest_query_error, classify_ws_order_error, convert_ended_order,
@@ -48,7 +48,7 @@ use super::shared::{
     dedup_key_from_event, disconnect_error, drop_after, frame_excerpt, gap_failed, gap_time,
     is_duplicate, is_unknown_order, log_unhandled_event, log_unrecognised_frame, new_dedup_cache,
     parse_user_data_frame, placed_order_state, recovered_order_cids, recovered_order_totals,
-    response_decode_error, rest_call_with_retry, trailing_params, unix_ms,
+    response_decode_error, rest_call_with_retry, retry_or_end, trailing_params, unix_ms,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -60,6 +60,7 @@ use crate::{
             KnownLiveOrders, OpenListing, OrderLookup, SharedKnownLiveOrders, UncheckedOrders,
             fetch_ended_by_key, recover_ended_orders,
         },
+        reconnect_budget::{BackoffLimits, ReconnectBudget},
     },
     emit_stream_terminated,
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
@@ -1683,7 +1684,7 @@ async fn connection_manager(
     instruments: Vec<InstrumentNameExchange>,
     initial_ws: Option<DisconnectOnDrop<WebsocketApi>>,
 ) {
-    let mut backoff = ExponentialBackoff::new();
+    let mut budget = ReconnectBudget::new("Binance", BackoffLimits::ACCOUNT_STREAM);
     let mut disconnect_time: Option<DateTime<Utc>> = None;
     // Gaps not yet recovered: read at reconnect, and retried on a timer while connected, once due.
     let mut unrecovered = UnrecoveredFills::default();
@@ -1703,8 +1704,8 @@ async fn connection_manager(
                     break;
                 }
                 match connect_and_subscribe(&ws_handle).await {
-                    // backoff is NOT reset here — resetting on TCP-connect success
-                    // would lock retry intervals at INITIAL_BACKOFF_MS forever when the
+                    // the budget is NOT reset here — resetting on TCP-connect success
+                    // would lock retry intervals at the first backoff wait forever when the
                     // server closes within the first heartbeat window (auth rejection,
                     // server-side close). Reset is deferred to the monitor loop after the
                     // first heartbeat interval survives (proven-stable connection).
@@ -1714,7 +1715,7 @@ async fn connection_manager(
                         // A rate-limit refusal starts a cooldown, so REST and orders back off too.
                         rate_limiter.on_stream_refused(&e);
                         if let Err(reason) =
-                            backoff.retry_or_end(&rate_limiter, || e.to_string()).await
+                            retry_or_end(&mut budget, &rate_limiter, || e.to_string()).await
                         {
                             // Signal terminal stream death in-band before tx drops.
                             emit_stream_terminated(&tx, ExchangeId::BinanceSpot, reason);
@@ -1911,9 +1912,9 @@ async fn connection_manager(
                         let in_grace = std::mem::take(&mut grace);
                         if heartbeat_flag.swap(false, Ordering::AcqRel) {
                             // Activity detected: connection is proven stable for one full
-                            // heartbeat window — safe to reset reconnect backoff so a
+                            // heartbeat window — safe to reset the reconnect budget so a
                             // stable connection doesn't carry over prior failure counts.
-                            backoff.reset();
+                            budget.reset();
                             continue;
                         }
                         if in_grace {
@@ -1972,7 +1973,7 @@ async fn connection_manager(
         // triggered this round (ConsumerDropped already broke out above).
         let heartbeat_timed_out = matches!(reason, DisconnectReason::HeartbeatTimeout);
         let last_error = || disconnect_error(heartbeat_timed_out);
-        if let Err(reason) = backoff.retry_or_end(&rate_limiter, last_error).await {
+        if let Err(reason) = retry_or_end(&mut budget, &rate_limiter, last_error).await {
             emit_stream_terminated(&tx, ExchangeId::BinanceSpot, reason);
             break;
         }
@@ -3424,38 +3425,6 @@ mod tests {
         let mut buf = Vec::new();
         convert_account_position(position, &mut buf);
         assert!(buf.is_empty(), "None B field should produce no events");
-    }
-
-    // Behavioral test — verify wait() exhaustion and reset
-    #[tokio::test]
-    async fn test_exponential_backoff_exhaustion() {
-        tokio::time::pause(); // auto-advances to next timer when all tasks are waiting
-        let mut backoff = ExponentialBackoff::new();
-
-        // All MAX_RECONNECT_ATTEMPTS calls should return true
-        for i in 0..MAX_RECONNECT_ATTEMPTS {
-            assert!(
-                backoff.wait().await,
-                "expected true on attempt {i} (before exhaustion)"
-            );
-        }
-
-        // The next call must return false (exhausted)
-        assert!(!backoff.wait().await, "expected false after max attempts");
-    }
-
-    #[tokio::test]
-    async fn test_exponential_backoff_reset() {
-        tokio::time::pause();
-        let mut backoff = ExponentialBackoff::new();
-
-        for _ in 0..MAX_RECONNECT_ATTEMPTS {
-            backoff.wait().await;
-        }
-        assert!(!backoff.wait().await, "should be exhausted");
-
-        backoff.reset();
-        assert!(backoff.wait().await, "should succeed again after reset");
     }
 
     // 7b: convert_execution_report round-trip tests
@@ -5771,12 +5740,11 @@ mod tests {
         (url, closed_rx)
     }
 
-    /// Dropping the account stream closes its WebSocket connection. binance-sdk keeps a socket
-    /// open in detached tasks until it is disconnected, so aborting the manager alone left it open.
-    /// Dropped at once, the manager has not started and holds the connection as its argument;
-    /// dropped later, it holds it in its loop, and its event callback runs. The stream's state is
-    /// released either way: the callback holds the client's known-live orders, and binance-sdk
-    /// stops the callback only when it is unsubscribed.
+    /// Dropping the account stream closes its WebSocket connection. Dropped at once, the manager
+    /// has not started and holds the connection as its argument; dropped later, it holds it in its
+    /// loop, and its event callback runs. The stream's state is released either way: the callback
+    /// holds the client's known-live orders, and is unsubscribed when the stream drops, rather than
+    /// whenever binance-sdk frees the connection.
     #[tokio::test]
     async fn dropping_the_account_stream_closes_its_connection() {
         for running in [Duration::ZERO, Duration::from_millis(100)] {

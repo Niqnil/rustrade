@@ -618,6 +618,7 @@ mod tests {
                 None,
                 AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
             ))
+            .exited
             .expect("a fill for the whole quantity exits the seeded position");
 
         assert_eq!(exited.position_id, PositionId::NETTING);
@@ -746,6 +747,7 @@ mod tests {
                 None,
                 AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
             ))
+            .exited
             .expect("a fill for the whole quantity exits the seeded position");
 
         assert_eq!(exited.pnl_realised, dec!(1_000));
@@ -782,6 +784,7 @@ mod tests {
                 None,
                 AssetFees::new(quote, dec!(3), Some(dec!(3))),
             ))
+            .exited
             .expect("a fill for the whole quantity exits the seeded position");
 
         // 0.5 * (52_000 - 50_000) = 1_000, less 5 entry and 3 exit fees.
@@ -862,7 +865,7 @@ mod tests {
         };
 
         let first = sell("fill_1", dec!(1));
-        assert!(spot.update_from_trade(&first).is_none());
+        assert!(spot.update_from_trade(&first).exited.is_none());
         assert_eq!(
             spot.position.positions[&PositionId::new("a")].quantity_abs,
             dec!(2)
@@ -871,6 +874,7 @@ mod tests {
         let second = sell("fill_2", dec!(2));
         let exited = spot
             .update_from_trade(&second)
+            .exited
             .expect("the remaining quantity closes slot a");
         assert_eq!(exited.position_id, PositionId::new("a"));
         assert_eq!(exited.pnl_realised, dec!(6_000));

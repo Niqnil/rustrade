@@ -46,6 +46,7 @@ pub(crate) use crate::client::dedup::{
 use crate::client::order_recovery::{
     GAP_RETRY_BASE_SECS, GapFailure, MAX_GAP_RETRIES, PendingFills,
 };
+use crate::client::reconnect_budget::ReconnectBudget;
 use binance_sdk::common::{
     errors::{ConnectorError, WebsocketError},
     models::{Interval, ParamBuildError, RateLimitType, RestApiResponse, WebsocketApiRateLimit},
@@ -90,10 +91,10 @@ use tracing::{debug, error, info, trace, warn};
 /// account_stream. `abort()` cancels the task at its next `.await`: in fill recovery, a
 /// reconnect, a backoff or the monitor loop. The manager therefore holds every connection that
 /// has finished connecting in a [`DisconnectOnDrop`], whose drop closes the socket, and its event
-/// subscription in an [`UnsubscribeOnDrop`]. Without them the socket would stay open, since
-/// binance-sdk keeps it in detached tasks that answer the server's pings, and the subscription's
-/// callback task would never end. An abort during the SDK's own connect, before it returns the
-/// connection, is not covered.
+/// subscription in an [`UnsubscribeOnDrop`]. Without them, binance-sdk's own drop would still
+/// close the socket, but would abandon any request in flight, and the subscription's callback
+/// task would outlive the stream until the SDK freed the connection. An abort during the SDK's own
+/// connect, before it returns the connection, is not covered.
 pub(crate) struct AbortOnDropStream<S> {
     inner: S,
     handle: tokio::task::JoinHandle<()>,
@@ -151,17 +152,19 @@ impl BinanceWsConnection for Arc<binance_sdk::common::websocket::WebsocketApi> {
 /// Owns a connected binance-sdk WebSocket connection and closes it when dropped.
 ///
 /// binance-sdk reads and writes each socket in detached tasks, which keep it open and answer the
-/// server's pings until `disconnect()` is called. Dropping the SDK's handle does not close it. So
-/// a connection whose owner is dropped or aborted before it disconnects, such as a connection
-/// manager aborted with its stream, would stay open for the life of the runtime.
+/// server's pings until it is closed. Dropping the SDK's last handle only sends a Close frame: it
+/// abandons any request still pending, and reports nothing. `disconnect()` drains pending
+/// requests first and returns the result. So a connection whose owner is dropped or aborted
+/// before it disconnects, such as a connection manager aborted with its stream, still closes the
+/// orderly way.
 ///
 /// Dropping this guard spawns that disconnect on the current Tokio runtime. binance-sdk bounds
 /// it: up to 30 s to drain pending requests, and 30 s overall. A failure is logged at WARN.
-/// Dropped outside a runtime, it cannot spawn, and logs a WARN instead; the socket's tasks then
-/// end with the runtime that runs them. A runtime that is shutting down drops the spawned task
-/// unrun, and its sockets close with it. [`disconnect`](Self::disconnect) closes the connection
-/// in place and reports the result. Wrap a connection only once it has connected: disconnecting
-/// one that never did makes binance-sdk log a WARN.
+/// Dropped outside a runtime, it cannot spawn, and logs a WARN instead; the SDK's own drop then
+/// sends the Close frame once the last handle to the connection goes. A runtime that is shutting down drops the spawned task unrun, and its
+/// sockets close with it. [`disconnect`](Self::disconnect) closes the connection in place and
+/// reports the result. Wrap a connection only once it has connected: disconnecting one that never
+/// did makes binance-sdk log a WARN.
 ///
 /// A disconnected connection stays closed: once `disconnect()` is called on it, binance-sdk skips
 /// its own reconnect and its 23 h renewal, including a reconnect already pending at that point.
@@ -226,7 +229,8 @@ impl<W: BinanceWsConnection> Drop for DisconnectOnDrop<W> {
             Err(_) => warn!(
                 connection = label,
                 "Binance WebSocket connection dropped outside a Tokio runtime: it cannot be \
-                 closed, and stays open until the runtime running it shuts down"
+                 disconnected, so binance-sdk closes it once its last handle drops, without \
+                 draining pending requests"
             ),
         }
     }
@@ -234,11 +238,11 @@ impl<W: BinanceWsConnection> Drop for DisconnectOnDrop<W> {
 
 /// A binance-sdk WebSocket event subscription, unsubscribed when dropped.
 ///
-/// binance-sdk runs each subscription's callback in its own task, which ends only on
-/// [`Subscription::unsubscribe`]: the SDK keeps the event channel's senders alive for good, even
-/// after the connection is disconnected and every handle to it dropped. A subscription dropped
-/// without unsubscribing, as by a connection manager aborted with its stream, would leak that task
-/// and everything its callback holds.
+/// binance-sdk runs each subscription's callback in its own task, which ends on
+/// [`Subscription::unsubscribe`], or once the last handle to the connection is dropped and the SDK
+/// frees its event channel. A subscription dropped without unsubscribing, as by a connection
+/// manager aborted with its stream, would keep that task and everything its callback holds alive
+/// until then, and for good if anything else still holds the connection.
 pub(crate) struct UnsubscribeOnDrop(Option<Subscription>);
 
 impl UnsubscribeOnDrop {
@@ -266,12 +270,6 @@ impl Drop for UnsubscribeOnDrop {
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Initial backoff delay for reconnection attempts.
-pub(crate) const INITIAL_BACKOFF_MS: u64 = 1_000;
-/// Maximum backoff delay (cap for exponential growth).
-pub(crate) const MAX_BACKOFF_MS: u64 = 30_000;
-/// Maximum number of consecutive reconnect attempts before giving up.
-pub(crate) const MAX_RECONNECT_ATTEMPTS: u32 = 10;
 /// If no WS activity (messages, ping, pong) for this duration, force reconnect.
 pub(crate) const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
 // Compile-time guard: reconnect sites cast this to i64 (`chrono::Duration::seconds`); ensure it
@@ -1250,91 +1248,40 @@ impl HandshakeRefusal {
 }
 
 // ---------------------------------------------------------------------------
-// Exponential backoff
+// Reconnect budget
 // ---------------------------------------------------------------------------
 
-pub(crate) struct ExponentialBackoff {
-    attempt: u32,
-    max_attempts: u32,
-    initial_ms: u64,
-    max_ms: u64,
-}
-
-impl ExponentialBackoff {
-    pub(crate) fn new() -> Self {
-        Self {
-            attempt: 0,
-            max_attempts: MAX_RECONNECT_ATTEMPTS,
-            initial_ms: INITIAL_BACKOFF_MS,
-            max_ms: MAX_BACKOFF_MS,
-        }
+/// Decide, after an account stream's connect failed or its connection ended, whether to try
+/// again.
+///
+/// A rate-limit cooldown longer than a request sleeps through ends the stream at once, rather
+/// than spend the budget against a venue that refuses every attempt. Otherwise this spends one
+/// attempt and its backoff. A shorter cooldown is left for
+/// [`RateLimitTracker::before_stream_connect`] to wait out, which spends no attempt.
+///
+/// # Errors
+/// The reason the stream ends: [`StreamTerminationReason::RateLimited`] for such a cooldown,
+/// or [`StreamTerminationReason::ReconnectBudgetExhausted`], with `last_error`, once no
+/// attempt is left.
+pub(crate) async fn retry_or_end(
+    budget: &mut ReconnectBudget,
+    rate_limiter: &RateLimitTracker,
+    last_error: impl FnOnce() -> String,
+) -> Result<(), StreamTerminationReason> {
+    if let Some(remaining) = rate_limiter.too_long_to_wait() {
+        return Err(end_for_cooldown(remaining));
     }
-
-    pub(crate) fn reset(&mut self) {
-        self.attempt = 0;
+    if budget.wait().await {
+        return Ok(());
     }
-
-    /// Number of reconnect attempts consumed so far.
-    ///
-    /// After [`wait`](Self::wait) has returned `false` this equals `max_attempts` — i.e. the
-    /// number of attempts made before the budget was exhausted. Used to populate
-    /// [`crate::error::StreamTerminationReason::ReconnectBudgetExhausted`].
-    pub(crate) fn attempts(&self) -> u32 {
-        self.attempt
-    }
-
-    /// Wait for the current backoff duration. Returns `false` if max attempts exhausted.
-    pub(crate) async fn wait(&mut self) -> bool {
-        if self.attempt >= self.max_attempts {
-            return false;
-        }
-        let delay_ms = self
-            .initial_ms
-            .saturating_mul(2u64.saturating_pow(self.attempt))
-            .min(self.max_ms);
-        self.attempt += 1;
-        debug!(
-            attempt = self.attempt,
-            max = self.max_attempts,
-            delay_ms,
-            "Binance reconnect backoff"
-        );
-        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        true
-    }
-
-    /// Decide, after an account stream's connect failed or its connection ended, whether to try
-    /// again.
-    ///
-    /// A rate-limit cooldown longer than a request sleeps through ends the stream at once, rather
-    /// than spend the budget against a venue that refuses every attempt. Otherwise this spends one
-    /// attempt and its backoff. A shorter cooldown is left for
-    /// [`RateLimitTracker::before_stream_connect`] to wait out, which spends no attempt.
-    ///
-    /// # Errors
-    /// The reason the stream ends: [`StreamTerminationReason::RateLimited`] for such a cooldown,
-    /// or [`StreamTerminationReason::ReconnectBudgetExhausted`], with `last_error`, once no
-    /// attempt is left.
-    pub(crate) async fn retry_or_end(
-        &mut self,
-        rate_limiter: &RateLimitTracker,
-        last_error: impl FnOnce() -> String,
-    ) -> Result<(), StreamTerminationReason> {
-        if let Some(remaining) = rate_limiter.too_long_to_wait() {
-            return Err(end_for_cooldown(remaining));
-        }
-        if self.wait().await {
-            return Ok(());
-        }
-        error!(
-            attempts = self.attempt,
-            "Binance account stream: max reconnect attempts exhausted, stream terminating"
-        );
-        Err(StreamTerminationReason::ReconnectBudgetExhausted {
-            attempts: self.attempts(),
-            last_error: last_error(),
-        })
-    }
+    error!(
+        attempts = budget.attempts(),
+        "Binance account stream: max reconnect attempts exhausted, stream terminating"
+    );
+    Err(StreamTerminationReason::ReconnectBudgetExhausted {
+        attempts: budget.attempts(),
+        last_error: last_error(),
+    })
 }
 
 /// What a reconnect budget spent on dropped connections reports as its last error: a heartbeat
@@ -3887,16 +3834,14 @@ fn order_error_from(
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use crate::client::reconnect_budget::BackoffLimits;
     use futures::FutureExt as _;
 
-    /// The module docs and both clients' rustdoc state the reconnect budget, its backoff, the
-    /// heartbeat window and the longest cooldown waited through as numbers. Change these only
-    /// together with those docs.
+    /// The module docs and both clients' rustdoc state the heartbeat window and the longest
+    /// cooldown waited through as numbers. Change these only together with those docs. The
+    /// reconnect budget's own numbers are pinned in `client::reconnect_budget`.
     #[test]
-    fn the_reconnect_budget_is_as_documented() {
-        assert_eq!(MAX_RECONNECT_ATTEMPTS, 10);
-        assert_eq!(INITIAL_BACKOFF_MS, 1_000);
-        assert_eq!(MAX_BACKOFF_MS, 30_000);
+    fn the_heartbeat_and_cooldown_are_as_documented() {
         assert_eq!(HEARTBEAT_TIMEOUT_SECS, 30);
         assert_eq!(MAX_COOLDOWN_SLEEP, Duration::from_secs(10));
     }
@@ -3958,8 +3903,8 @@ mod tests {
         assert_eq!(ws.closes().await, 2);
     }
 
-    /// binance-sdk ends a subscription's callback task only on unsubscribe, even with the
-    /// connection gone, so the guard unsubscribes when dropped.
+    /// While its event emitter lives, binance-sdk ends a subscription's callback task only on
+    /// unsubscribe, so the guard unsubscribes when dropped.
     #[tokio::test]
     async fn a_dropped_subscription_guard_stops_its_callback() {
         let emitter = binance_sdk::common::websocket::WebsocketEventEmitter::new();
@@ -3974,6 +3919,103 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
+        assert_eq!(
+            Arc::strong_count(&callback_state),
+            1,
+            "the callback was dropped"
+        );
+    }
+
+    /// Live tasks on the current runtime.
+    fn alive() -> usize {
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+    }
+
+    /// A WS-API config for a local server that accepts every connection and answers nothing.
+    async fn local_ws_api_config() -> binance_sdk::common::config::ConfigurationWebsocketApi {
+        let (url, _) = super::test_ws_api::serve(
+            |_| serde_json::Value::Null,
+            |_| super::test_ws_api::Lifetime::Open,
+        )
+        .await;
+        binance_sdk::common::config::ConfigurationWebsocketApi::builder()
+            .api_key("key")
+            .api_secret("secret")
+            .ws_url(url)
+            .build()
+            .unwrap()
+    }
+
+    /// Asserts the live tasks fall back to `before`. The server ends its side of each connection
+    /// once the close reaches it, so this waits up to 5 s.
+    async fn assert_tasks_return_to(before: usize) {
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+            while alive() > before {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            settled.is_ok(),
+            "tasks left behind: {} of {before}",
+            alive()
+        );
+        assert_eq!(alive(), before);
+    }
+
+    /// binance-sdk frees a connection once it is disconnected and dropped. Before 76.0.0 its
+    /// reconnect and renewal loops kept it alive, leaking two tasks for each order session
+    /// reopened and each account stream reconnected. With no task left, none is left that could
+    /// reopen the connection either, so this also pins that a disconnected connection stays closed.
+    #[tokio::test]
+    async fn a_disconnected_connection_leaves_no_task_behind() {
+        let config = local_ws_api_config().await;
+        let before = alive();
+
+        // The spot order session, and the common-layer connection the margin account stream uses.
+        let session = binance_sdk::spot::SpotWsApi::from_config(config.clone())
+            .connect()
+            .await
+            .unwrap();
+        DisconnectOnDrop::new(session, "spot")
+            .disconnect()
+            .await
+            .unwrap();
+        let stream = binance_sdk::common::websocket::WebsocketApi::new(config, vec![]);
+        Arc::clone(&stream).connect().await.unwrap();
+        DisconnectOnDrop::new(stream, "margin")
+            .disconnect()
+            .await
+            .unwrap();
+
+        assert_tasks_return_to(before).await;
+    }
+
+    /// A connection dropped without being disconnected is freed too: a guard dropped unclosed,
+    /// as when a connection manager is aborted with its stream, and a bare SDK connection whose
+    /// event callback was never unsubscribed.
+    #[tokio::test]
+    async fn a_dropped_connection_leaves_no_task_behind() {
+        let config = local_ws_api_config().await;
+        let before = alive();
+
+        let session = binance_sdk::spot::SpotWsApi::from_config(config.clone())
+            .connect()
+            .await
+            .unwrap();
+        drop(DisconnectOnDrop::new(session, "spot"));
+        let stream = binance_sdk::common::websocket::WebsocketApi::new(config, vec![]);
+        Arc::clone(&stream).connect().await.unwrap();
+        let callback_state = Arc::new(());
+        let held = Arc::clone(&callback_state);
+        let _subscription = stream.common.events.subscribe(move |_| {
+            let _ = &held;
+        });
+        drop(stream);
+
+        assert_tasks_return_to(before).await;
         assert_eq!(
             Arc::strong_count(&callback_state),
             1,
@@ -5704,19 +5746,20 @@ mod tests {
     async fn a_reconnect_ends_at_once_on_a_cooldown_too_long_to_wait_through() {
         let tracker = RateLimitTracker::new(WeightPool::Spot);
         tracker.on_rate_limited(Some(Duration::from_secs(60)));
-        let mut backoff = ExponentialBackoff::new();
+        let mut budget = ReconnectBudget::new("Binance", BackoffLimits::ACCOUNT_STREAM);
         let started = tokio::time::Instant::now();
         let ended = StreamTerminationReason::RateLimited {
             retry_after: Duration::from_secs(60),
         };
 
-        let reason = backoff
-            .retry_or_end(&tracker, || unreachable!("the budget is not spent"))
-            .await;
+        let reason = retry_or_end(&mut budget, &tracker, || {
+            unreachable!("the budget is not spent")
+        })
+        .await;
         assert_eq!(reason, Err(ended.clone()));
         assert_eq!(tracker.before_stream_connect().await, Err(ended));
         assert_eq!(started.elapsed(), Duration::ZERO);
-        assert_eq!(backoff.attempts(), 0);
+        assert_eq!(budget.attempts(), 0);
     }
 
     /// A cooldown short enough to sleep through is waited out before the connect, and that wait
@@ -5725,14 +5768,17 @@ mod tests {
     async fn a_short_cooldown_is_waited_out_without_spending_an_attempt() {
         let tracker = RateLimitTracker::new(WeightPool::Spot);
         tracker.on_rate_limited(Some(Duration::from_secs(5)));
-        let mut backoff = ExponentialBackoff::new();
+        let mut budget = ReconnectBudget::new("Binance", BackoffLimits::ACCOUNT_STREAM);
         let started = tokio::time::Instant::now();
 
-        assert_eq!(backoff.retry_or_end(&tracker, String::new).await, Ok(()));
-        assert_eq!(started.elapsed(), Duration::from_millis(INITIAL_BACKOFF_MS));
+        assert_eq!(
+            retry_or_end(&mut budget, &tracker, String::new).await,
+            Ok(())
+        );
+        assert_eq!(started.elapsed(), BackoffLimits::ACCOUNT_STREAM.initial);
         assert_eq!(tracker.before_stream_connect().await, Ok(()));
         assert_eq!(started.elapsed(), Duration::from_secs(5));
-        assert_eq!(backoff.attempts(), 1);
+        assert_eq!(budget.attempts(), 1);
     }
 
     /// A refusal that names no wait starts the default cooldown, which is waited out, so
@@ -5740,13 +5786,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn refusals_naming_no_wait_spend_the_budget() {
         let tracker = RateLimitTracker::new(WeightPool::Spot);
-        let mut backoff = ExponentialBackoff::new();
+        let mut budget = ReconnectBudget::new("Binance", BackoffLimits::ACCOUNT_STREAM);
         let reason = loop {
             assert_eq!(tracker.before_stream_connect().await, Ok(()));
             tracker.on_rate_limited(None);
-            if let Err(reason) = backoff
-                .retry_or_end(&tracker, || "refused".to_string())
-                .await
+            if let Err(reason) = retry_or_end(&mut budget, &tracker, || "refused".to_string()).await
             {
                 break reason;
             }
@@ -5755,7 +5799,7 @@ mod tests {
         assert_eq!(
             reason,
             StreamTerminationReason::ReconnectBudgetExhausted {
-                attempts: MAX_RECONNECT_ATTEMPTS,
+                attempts: BackoffLimits::ACCOUNT_STREAM.max_attempts,
                 last_error: "refused".to_string(),
             }
         );
@@ -6558,7 +6602,8 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 pub(super) mod test_ws_api {
-    use super::{HEARTBEAT_TIMEOUT_SECS, INITIAL_BACKOFF_MS};
+    use super::HEARTBEAT_TIMEOUT_SECS;
+    use crate::client::reconnect_budget::BackoffLimits;
     use futures::{SinkExt as _, StreamExt as _};
     use parking_lot::Mutex;
     use std::{sync::Arc, time::Duration};
@@ -6687,12 +6732,12 @@ pub(super) mod test_ws_api {
         let at = requests_until(requests, 4, label).await;
         let escalated = at[2] - at[1];
         assert!(
-            escalated >= Duration::from_millis(2 * INITIAL_BACKOFF_MS),
+            escalated >= 2 * BackoffLimits::ACCOUNT_STREAM.initial,
             "{label}: reconnected {escalated:?} after a dropped connection"
         );
         let after_stable = (at[3] - at[2]).saturating_sub(STABLE);
         assert!(
-            after_stable < Duration::from_millis(3 * INITIAL_BACKOFF_MS),
+            after_stable < 3 * BackoffLimits::ACCOUNT_STREAM.initial,
             "{label}: reconnected {after_stable:?} after a pinged connection"
         );
     }
@@ -6707,7 +6752,7 @@ pub(super) mod test_ws_api {
         let at = requests_until(requests, 3, label).await;
         let after_silent = (at[2] - at[1]).saturating_sub(STABLE);
         assert!(
-            after_silent >= Duration::from_millis(2 * INITIAL_BACKOFF_MS),
+            after_silent >= 2 * BackoffLimits::ACCOUNT_STREAM.initial,
             "{label}: reconnected {after_silent:?} after a silent connection"
         );
     }

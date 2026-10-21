@@ -770,6 +770,10 @@ mod tests {
             fill_model: Default::default(),
             spot_fee_asset: Default::default(),
             slippage: Default::default(),
+            market_order_timing: Default::default(),
+            stale_market: Default::default(),
+            spot_margin: None,
+            fee_asset: None,
         }
     }
 

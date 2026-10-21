@@ -65,18 +65,17 @@ use super::margin_risk::{
 };
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
-    CONNECT_TIMEOUT_SECS, DisconnectOnDrop, ExecutionReport, ExponentialBackoff,
-    FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET,
-    OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
-    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, TrailingOrderError, UnhandledEvents,
-    UnrecoveredFills, UnsubscribeOnDrop, UserDataFrame, WeightPool, binance_filled_qty,
-    classify_order_kind_tif, classify_rest_order_error, classify_rest_query_error,
-    convert_ended_order, convert_execution_report, convert_open_order_listing,
-    convert_open_order_owned_symbol, dedup_key_from_event, disconnect_error, drop_after,
-    frame_excerpt, gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
-    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
-    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
-    trailing_params,
+    CONNECT_TIMEOUT_SECS, DisconnectOnDrop, ExecutionReport, FILL_RECOVERY_TIMEOUT_SECS,
+    HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
+    PlacementResponse, RateLimitTracker, RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS,
+    SharedDedupCache, TrailingOrderError, UnhandledEvents, UnrecoveredFills, UnsubscribeOnDrop,
+    UserDataFrame, WeightPool, binance_filled_qty, classify_order_kind_tif,
+    classify_rest_order_error, classify_rest_query_error, convert_ended_order,
+    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
+    dedup_key_from_event, disconnect_error, drop_after, frame_excerpt, gap_failed, gap_time,
+    is_duplicate, is_unknown_order, log_unhandled_event, log_unrecognised_frame, new_dedup_cache,
+    parse_user_data_frame, placed_order_state, recovered_order_cids, recovered_order_totals,
+    response_decode_error, rest_call_with_retry, retry_or_end, trailing_params,
 };
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -90,6 +89,7 @@ use crate::{
             KnownLiveOrders, OpenListing, OrderLookup, SharedKnownLiveOrders, UncheckedOrders,
             fetch_ended_by_key, recover_ended_orders,
         },
+        reconnect_budget::{BackoffLimits, ReconnectBudget},
     },
     emit_stream_terminated,
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError},
@@ -147,7 +147,7 @@ use rustrade_instrument::{
     exchange::ExchangeId,
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use smol_str::{SmolStr, format_smolstr};
 use std::{
     collections::{BTreeMap, HashMap},
@@ -165,36 +165,9 @@ use tracing::{debug, error, info, trace, warn};
 // Margin sideEffectType
 // ---------------------------------------------------------------------------
 
-/// Margin `sideEffectType` borrow/repay policy, fixed once per [`BinanceMargin`] client.
-///
-/// Only the two *intent-agnostic* modes are exposed as client-level variants. The borrow-vs-repay
-/// decision derives from open/close direction — position state the library deliberately does not
-/// track — so the venue is left to infer it from the account's loan state. The per-order modes
-/// (`MARGIN_BUY` / `AUTO_REPAY`) are intentionally **not** modelled here; they belong to a future
-/// generic per-order `RequestOpen::margin_effect` field that all margin adapters would map, added
-/// only when a venue with genuine per-order borrow intent (e.g. another CEX margin) appears.
-/// Mixed borrow appetite on a single venue today means running two clients (one per mode).
-///
-/// The `Serialize`/`Deserialize` wire form is the config-file value (`"auto_borrow_repay"` /
-/// `"no_borrow"`); this is distinct from the Binance API value returned by
-/// [`as_binance_str`](Self::as_binance_str) (`"AUTO_BORROW_REPAY"` / `"NO_SIDE_EFFECT"`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MarginSideEffect {
-    /// `AUTO_BORROW_REPAY` — the venue borrows on entry and repays on close as needed.
-    ///
-    /// # Warning
-    /// This is the default because it makes shorting work out of the box, but it means a
-    /// **mis-sized order silently takes on debt**: an order larger than the free balance borrows
-    /// the shortfall without any further opt-in (same footgun class as `RequestOpen::reduce_only`).
-    /// Use [`MarginSideEffect::NoBorrow`] for a client that must never silently borrow.
-    #[default]
-    AutoBorrowRepay,
-    /// `NO_SIDE_EFFECT` — never borrow or repay; orders that would require borrowing are rejected
-    /// by the venue. The conservative opt-out from the [`AutoBorrowRepay`](Self::AutoBorrowRepay)
-    /// silent-borrow behaviour.
-    NoBorrow,
-}
+// The borrow and repay policy, fixed once per `BinanceMargin` client. Defined venue-agnostically in
+// `crate::margin`, which the simulated venue shares, and re-exported here from where it began.
+pub use crate::margin::MarginSideEffect;
 
 impl MarginSideEffect {
     /// The Binance `sideEffectType` wire string for this policy.
@@ -2550,7 +2523,7 @@ fn register_user_data_listener(
     let mut event_buf = Vec::with_capacity(32);
 
     // Safety — non-atomic Option::take() in the callback is safe: binance-sdk drives one spawned
-    // task per subscription, invoking the FnMut sequentially (verified =75.0.0; re-verify on SDK
+    // task per subscription, invoking the FnMut sequentially (verified =76.0.0; re-verify on SDK
     // upgrade). Same contract spot relies on.
     UnsubscribeOnDrop::new(ws.common.events.subscribe(move |event| {
         let Some(ref sender) = event_tx else { return };
@@ -2869,7 +2842,7 @@ async fn margin_connection_manager(
         ConsumerDropped,
     }
 
-    let mut backoff = ExponentialBackoff::new();
+    let mut budget = ReconnectBudget::new("Binance", BackoffLimits::ACCOUNT_STREAM);
     let mut disconnect_time: Option<DateTime<Utc>> = None;
     // Gaps not yet recovered: read at reconnect, and retried on a timer while connected, once due.
     let mut unrecovered = UnrecoveredFills::default();
@@ -2897,7 +2870,7 @@ async fn margin_connection_manager(
                     Err(e) => {
                         error!(%e, "BinanceMargin userListenToken acquisition failed");
                         if let Err(reason) =
-                            backoff.retry_or_end(&rate_limiter, || e.to_string()).await
+                            retry_or_end(&mut budget, &rate_limiter, || e.to_string()).await
                         {
                             emit_stream_terminated(&tx, ExchangeId::BinanceMargin, reason);
                             break;
@@ -2916,7 +2889,8 @@ async fn margin_connection_manager(
                 Err(e) => {
                     error!(%e, "BinanceMargin WS connect failed");
                     rate_limiter.on_stream_refused(&e);
-                    if let Err(reason) = backoff.retry_or_end(&rate_limiter, || e.to_string()).await
+                    if let Err(reason) =
+                        retry_or_end(&mut budget, &rate_limiter, || e.to_string()).await
                     {
                         emit_stream_terminated(&tx, ExchangeId::BinanceMargin, reason);
                         break;
@@ -2953,15 +2927,15 @@ async fn margin_connection_manager(
             }
             rate_limiter.on_stream_refused(&e);
             // token left consumed → next iteration acquires a fresh one (auth/expiry-safe).
-            if let Err(reason) = backoff.retry_or_end(&rate_limiter, || e.to_string()).await {
+            if let Err(reason) = retry_or_end(&mut budget, &rate_limiter, || e.to_string()).await {
                 emit_stream_terminated(&tx, ExchangeId::BinanceMargin, reason);
                 break;
             }
             continue;
         }
         info!("BinanceMargin account_stream connected and subscribed");
-        // backoff is NOT reset here: a venue that accepts each connection and drops it at once
-        // would then be retried at INITIAL_BACKOFF_MS forever, never exhausting the budget. The
+        // the budget is NOT reset here: a venue that accepts each connection and drops it at
+        // once would then be retried at the first backoff wait forever, never exhausting it. The
         // monitor loop resets it once the connection survives a heartbeat window, as spot's does.
 
         // Absolute deadline (not a per-iteration relative sleep) so heartbeat ticks that `continue`
@@ -3061,7 +3035,7 @@ async fn margin_connection_manager(
                         if heartbeat_flag.swap(false, Ordering::AcqRel) {
                             // A frame or ping in this window proves the connection stable: clear
                             // the failures before it, so only consecutive ones exhaust the budget.
-                            backoff.reset();
+                            budget.reset();
                             continue;
                         }
                         if in_grace {
@@ -3118,7 +3092,7 @@ async fn margin_connection_manager(
             // ConsumerDropped already broke out earlier).
             let heartbeat_timed_out = matches!(reason, DisconnectReason::HeartbeatTimeout);
             let last_error = || disconnect_error(heartbeat_timed_out);
-            if let Err(reason) = backoff.retry_or_end(&rate_limiter, last_error).await {
+            if let Err(reason) = retry_or_end(&mut budget, &rate_limiter, last_error).await {
                 emit_stream_terminated(&tx, ExchangeId::BinanceMargin, reason);
                 break;
             }
@@ -3341,7 +3315,7 @@ async fn isolated_connection_manager(
         ConsumerDropped,
     }
 
-    let mut backoff = ExponentialBackoff::new();
+    let mut budget = ReconnectBudget::new("Binance", BackoffLimits::ACCOUNT_STREAM);
     let mut disconnect_time: Option<DateTime<Utc>> = None;
     // Gaps not yet recovered: read at reconnect, and retried on a timer while connected, once due.
     let mut unrecovered = UnrecoveredFills::default();
@@ -3379,7 +3353,7 @@ async fn isolated_connection_manager(
                     Err(e) => {
                         error!(%e, "BinanceMargin isolated userListenToken acquisition failed");
                         if let Err(reason) =
-                            backoff.retry_or_end(&rate_limiter, || e.to_string()).await
+                            retry_or_end(&mut budget, &rate_limiter, || e.to_string()).await
                         {
                             emit_stream_terminated(&tx, ExchangeId::BinanceMargin, reason);
                             break;
@@ -3402,7 +3376,7 @@ async fn isolated_connection_manager(
                         error!(%e, "BinanceMargin isolated connect/subscribe failed");
                         rate_limiter.on_stream_refused(&e);
                         if let Err(reason) =
-                            backoff.retry_or_end(&rate_limiter, || e.to_string()).await
+                            retry_or_end(&mut budget, &rate_limiter, || e.to_string()).await
                         {
                             emit_stream_terminated(&tx, ExchangeId::BinanceMargin, reason);
                             break;
@@ -3417,7 +3391,7 @@ async fn isolated_connection_manager(
             symbols = symbols.len(),
             "BinanceMargin isolated account_stream connected and subscribed"
         );
-        // backoff is NOT reset here, but once the connection survives a heartbeat window (see the
+        // the budget is NOT reset here, but once the connection survives a heartbeat window (see the
         // cross manager).
 
         // Absolute deadline (not a per-iteration relative sleep) so heartbeat ticks that `continue`
@@ -3508,7 +3482,7 @@ async fn isolated_connection_manager(
                         let in_grace = std::mem::take(&mut grace);
                         if heartbeat_flag.swap(false, Ordering::AcqRel) {
                             // Proven stable (see the cross manager).
-                            backoff.reset();
+                            budget.reset();
                             continue;
                         }
                         if in_grace {
@@ -3563,7 +3537,7 @@ async fn isolated_connection_manager(
             // ConsumerDropped already broke out earlier).
             let heartbeat_timed_out = matches!(reason, DisconnectReason::HeartbeatTimeout);
             let last_error = || disconnect_error(heartbeat_timed_out);
-            if let Err(reason) = backoff.retry_or_end(&rate_limiter, last_error).await {
+            if let Err(reason) = retry_or_end(&mut budget, &rate_limiter, last_error).await {
                 emit_stream_terminated(&tx, ExchangeId::BinanceMargin, reason);
                 break;
             }
@@ -4550,7 +4524,7 @@ fn convert_order_kind_tif_margin(
 mod tests {
     use super::*;
     use crate::client::binance::shared::{
-        INITIAL_BACKOFF_MS, convert_open_order,
+        convert_open_order,
         test_ws_api::{self, Lifetime},
         unix_ms,
     };
@@ -4834,7 +4808,7 @@ mod tests {
             let between = requests[1] - requests[0];
             // The connection lasted 100 ms; the backoff's first wait is a second.
             assert!(
-                between >= Duration::from_millis(INITIAL_BACKOFF_MS),
+                between >= BackoffLimits::ACCOUNT_STREAM.initial,
                 "isolated {isolated}: reconnected {between:?} after the first subscribe"
             );
         }

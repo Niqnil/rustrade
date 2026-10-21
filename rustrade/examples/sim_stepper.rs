@@ -6,6 +6,8 @@
 //! The account opens holding 0.5 BTC bought at 60,000, plus 10,000 USDT. On each bar the "policy"
 //! below decides from the observed state, and its orders are filled at that bar's close before the
 //! next bar is fed. That same-bar fill is an optimistic idealisation: see `SimStepper`'s rustdoc.
+//! Setting `MockExecutionConfig::market_order_timing` to `MarketOrderTiming::NextBar` holds each
+//! order for the next bar instead, the pessimistic comparison.
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -151,6 +153,10 @@ fn episode(
                 fill_model: Default::default(),
                 spot_fee_asset: Default::default(),
                 slippage: Default::default(),
+                market_order_timing: Default::default(),
+                stale_market: Default::default(),
+                spot_margin: None,
+                fee_asset: None,
             },
             SimVenueOptions::default(),
             start,

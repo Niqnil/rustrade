@@ -62,6 +62,7 @@ use rustrade_execution::{
     AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
     balance::{AssetBalance, Balance},
     client::mock::MockExecutionConfig,
+    fill::{MarketOrderTiming, NextBarPrice, StaleMarketPolicy},
     order::{
         OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, StrategyId},
@@ -123,6 +124,10 @@ fn config(latency_ms: u64) -> MockExecutionConfig {
         fill_model: Default::default(),
         spot_fee_asset: Default::default(),
         slippage: Default::default(),
+        market_order_timing: Default::default(),
+        stale_market: Default::default(),
+        spot_margin: None,
+        fee_asset: None,
     }
 }
 
@@ -135,6 +140,11 @@ fn usdt(total: Decimal) -> SimStart {
 
 /// A one-second candle on `instrument` closing at `secs`, at `close`, stamped at its close.
 fn bar(instrument: usize, secs: i64, close: Decimal) -> EngineEvent<DataKind> {
+    bar_from(instrument, secs, close, close)
+}
+
+/// A one-second candle on `instrument` closing at `secs` that opened at `open`.
+fn bar_from(instrument: usize, secs: i64, open: Decimal, close: Decimal) -> EngineEvent<DataKind> {
     EngineEvent::Market(MarketStreamEvent::Item(MarketEvent {
         time_exchange: at(secs),
         time_received: at(secs),
@@ -142,9 +152,9 @@ fn bar(instrument: usize, secs: i64, close: Decimal) -> EngineEvent<DataKind> {
         instrument: InstrumentIndex::new(instrument),
         kind: DataKind::Candle(Candle {
             close_time: at(secs),
-            open: close,
-            high: close,
-            low: close,
+            open,
+            high: open.max(close),
+            low: open.min(close),
             close,
             volume: Some(dec!(10)),
             trade_count: Some(5),
@@ -153,6 +163,23 @@ fn bar(instrument: usize, secs: i64, close: Decimal) -> EngineEvent<DataKind> {
 }
 
 fn order(instrument: usize, side: Side, quantity: Decimal, cid: &str) -> Command {
+    order_working(
+        instrument,
+        side,
+        quantity,
+        cid,
+        TimeInForce::ImmediateOrCancel,
+    )
+}
+
+/// A market order working for `time_in_force`.
+fn order_working(
+    instrument: usize,
+    side: Side,
+    quantity: Decimal,
+    cid: &str,
+    time_in_force: TimeInForce,
+) -> Command {
     Command::SendOpenRequests(OneOrMany::One(OrderRequestOpen {
         key: OrderKey {
             exchange: ExchangeIndex::new(0),
@@ -165,7 +192,7 @@ fn order(instrument: usize, side: Side, quantity: Decimal, cid: &str) -> Command
             price: None,
             quantity,
             kind: OrderKind::Market,
-            time_in_force: TimeInForce::ImmediateOrCancel,
+            time_in_force,
             position_id: None,
             reduce_only: false,
             market: None,
@@ -187,9 +214,19 @@ fn session_with<Strategy>(
     engine_positions: Option<Vec<PositionSeed>>,
     strategy: Strategy,
 ) -> Session<Strategy> {
+    session_configured(config(latency_ms), start, engine_positions, strategy)
+}
+
+/// [`session_with`], for a venue configured by `config`.
+fn session_configured<Strategy>(
+    config: MockExecutionConfig,
+    start: SimStart,
+    engine_positions: Option<Vec<PositionSeed>>,
+    strategy: Strategy,
+) -> Session<Strategy> {
     let instruments = instruments();
     let build = SimExecutionBuilder::new(&instruments)
-        .add_venue_with_start(config(latency_ms), SimVenueOptions::default(), start)
+        .add_venue_with_start(config, SimVenueOptions::default(), start)
         .unwrap()
         .build();
     let seeds = engine_positions.unwrap_or_else(|| build.position_seeds());
@@ -597,6 +634,191 @@ fn latency_delays_a_fill_to_the_first_step_that_reaches_it() {
         )]
     );
     assert!(matches!(next.last(), Some(EngineEvent::Market(_))));
+}
+
+/// A session whose venue holds each market order for its instrument's next bar.
+fn next_bar_session(start: SimStart) -> Session<DefaultStrategy<State>> {
+    let config = MockExecutionConfig {
+        market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
+        ..config(0)
+    };
+    session_configured(config, start, None, DefaultStrategy::default())
+}
+
+#[test]
+fn under_next_bar_an_order_fills_at_the_next_bars_open_before_that_bar_is_shown() {
+    let mut s = next_bar_session(usdt(dec!(10_000)));
+    s.stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(100))])
+        .unwrap();
+
+    s.engine.action(&order(BTC, Side::Buy, dec!(2), "next"));
+    let settled = s.stepper.settle(&mut s.engine).unwrap();
+    assert!(
+        fills(events(&settled)).is_empty(),
+        "held for the next bar, so nothing fills at the close it was sent after"
+    );
+    assert!(refused(events(&settled)).is_empty());
+    assert_eq!(position(&s.engine, BTC), None);
+
+    let stepped = s
+        .stepper
+        .step(
+            &mut s.engine,
+            at(4),
+            [bar_from(BTC, 4, dec!(102), dec!(105))],
+        )
+        .unwrap();
+    let stepped = events(&stepped);
+
+    assert_eq!(
+        fills(stepped.iter().copied()),
+        vec![(
+            InstrumentIndex::new(BTC),
+            Side::Buy,
+            dec!(102),
+            dec!(2),
+            at(4)
+        )],
+        "filled at the next bar's open, stamped at that bar"
+    );
+    let trade_at = stepped
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                    kind: AccountEventKind::Trade(_),
+                    ..
+                }))
+            )
+        })
+        .unwrap();
+    let bar_at = stepped
+        .iter()
+        .position(|event| matches!(event, EngineEvent::Market(_)))
+        .unwrap();
+    assert!(
+        trade_at < bar_at,
+        "the Engine sees the bar with the fill it released already booked"
+    );
+    assert_eq!(
+        position(&s.engine, BTC),
+        Some((Side::Buy, dec!(2), dec!(102)))
+    );
+    assert_eq!(balance(&s.engine, "usdt"), dec!(9796));
+}
+
+/// A session whose venue holds a market order on a market not observed fresh within a second.
+fn stale_wait_session(start: SimStart) -> Session<DefaultStrategy<State>> {
+    let config = MockExecutionConfig {
+        stale_market: StaleMarketPolicy::Wait {
+            max_age: std::time::Duration::from_secs(1),
+        },
+        ..config(0)
+    };
+    session_configured(config, start, None, DefaultStrategy::default())
+}
+
+/// A stale-wait session that saw a btc bar at 3s and an eth bar at 6s, so btc's market is stale.
+fn stale_btc_session() -> Session<DefaultStrategy<State>> {
+    let mut s = stale_wait_session(usdt(dec!(10_000)));
+    s.stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(100))])
+        .unwrap();
+    s.stepper
+        .step(&mut s.engine, at(6), [bar(ETH, 6, dec!(50))])
+        .unwrap();
+    s
+}
+
+#[test]
+fn under_stale_wait_an_order_on_a_stale_market_fills_after_the_next_fresh_bar() {
+    let mut s = stale_btc_session();
+
+    s.engine.action(&order_working(
+        BTC,
+        Side::Buy,
+        dec!(2),
+        "waiting",
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    ));
+    let settled = s.stepper.settle(&mut s.engine).unwrap();
+    assert!(
+        fills(events(&settled)).is_empty(),
+        "waiting, so nothing fills at the 3s close"
+    );
+    assert!(refused(events(&settled)).is_empty());
+    assert_eq!(position(&s.engine, BTC), None);
+
+    let stepped = s
+        .stepper
+        .step(&mut s.engine, at(7), [bar(BTC, 7, dec!(104))])
+        .unwrap();
+    let stepped = events(&stepped);
+
+    assert_eq!(
+        fills(stepped.iter().copied()),
+        vec![(
+            InstrumentIndex::new(BTC),
+            Side::Buy,
+            dec!(104),
+            dec!(2),
+            at(7)
+        )],
+        "filled at the fresh bar's close, stamped at it"
+    );
+    assert!(
+        matches!(stepped.first(), Some(EngineEvent::Market(_))),
+        "the Engine sees the bar before the fill it released: {stepped:?}"
+    );
+    assert_eq!(
+        position(&s.engine, BTC),
+        Some((Side::Buy, dec!(2), dec!(104)))
+    );
+}
+
+#[test]
+fn under_stale_wait_an_immediate_order_on_a_stale_market_is_refused() {
+    let mut s = stale_btc_session();
+
+    s.engine.action(&order(BTC, Side::Buy, dec!(2), "now"));
+    let settled = s.stepper.settle(&mut s.engine).unwrap();
+
+    assert_eq!(refused(events(&settled)), vec![ClientOrderId::new("now")]);
+    assert_eq!(balance(&s.engine, "usdt"), dec!(10_000));
+}
+
+#[test]
+fn under_next_bar_finish_expires_an_order_still_held() {
+    let mut s = next_bar_session(usdt(dec!(10_000)));
+    s.stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(100))])
+        .unwrap();
+    s.engine.action(&order(BTC, Side::Buy, dec!(1), "held"));
+    s.stepper.settle(&mut s.engine).unwrap();
+
+    let finished = s.stepper.finish(&mut s.engine).unwrap();
+
+    assert!(fills(events(&finished)).is_empty());
+    assert!(
+        events(&finished).iter().any(|event| matches!(
+            event,
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                kind: AccountEventKind::OrderSnapshot(snapshot),
+                ..
+            })) if snapshot.0.key.cid == ClientOrderId::new("held")
+                && matches!(snapshot.0.state, OrderState::Inactive(InactiveOrderState::Expired(_)))
+        )),
+        "the order is answered as expired: {:?}",
+        events(&finished)
+    );
+    assert_eq!(
+        balance(&s.engine, "usdt"),
+        dec!(10_000),
+        "and its hold released"
+    );
+    assert!(s.stepper.has_ended());
 }
 
 #[test]

@@ -35,7 +35,8 @@ use std::fmt::{Display, Formatter};
 ///   `BinanceMargin::fetch_margin_interest` rather than streamed, with Binance's transaction id.
 ///   The caller drops what it has already read.
 /// - The simulated venue: whatever its configured
-///   [`HoldingCostModel`](crate::holding_cost::HoldingCostModel)s charge, each flow once, with an
+///   [`HoldingCostModel`](crate::holding_cost::HoldingCostModel)s and
+///   [`MarginInterestModel`](crate::margin::MarginInterestModel) charge, each flow once, with an
 ///   id from its own sequence.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, Constructor)]
@@ -79,7 +80,9 @@ pub enum CashFlowKind {
     },
     /// Interest on borrowed cash or assets.
     MarginInterest {
-        /// The interest rate charged, per the venue's own period.
+        /// The interest rate charged, as its source quotes it: per the venue's own period from a
+        /// live venue (daily from Binance), annualised from the simulated venue's
+        /// [`PeriodicMarginInterest`](crate::margin::PeriodicMarginInterest).
         rate: Option<Decimal>,
         /// The amount borrowed that the interest was charged on.
         principal: Option<Decimal>,

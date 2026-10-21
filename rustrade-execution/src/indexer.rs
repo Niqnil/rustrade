@@ -647,7 +647,8 @@ impl AccountEventIndexer {
     /// Computes `fees_quote` based on fee asset relationship to instrument:
     /// - Fee in quote asset: `fees_quote = Some(fees)`
     /// - Fee in base asset: `fees_quote = Some(fees * price)`
-    /// - Fee in third-party asset (e.g., BNB): `fees_quote = None`
+    /// - Fee in third-party asset (e.g., BNB): `fees_quote = None`, since the indexer holds no
+    ///   prices. The `rustrade` engine values it when it prices that asset.
     ///
     /// # A fee asset that is not in the map
     /// The trade is kept, with its fee zeroed: `fees` is `0` in the instrument's quote asset and

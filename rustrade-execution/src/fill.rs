@@ -1,8 +1,8 @@
-use crate::market::MarketSnapshot;
+use crate::market::{MarketBar, MarketSnapshot};
 use rust_decimal::Decimal;
 use rustrade_instrument::Side;
 use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
+use std::{fmt::Debug, time::Duration};
 
 /// Everything a [`FillModel`] may price from.
 ///
@@ -199,10 +199,249 @@ impl FillModel for SimFillConfig {
     }
 }
 
+/// When a simulated venue fills a market order, as [`MockExecutionConfig::market_order_timing`]
+/// selects. Defaults to [`OnArrival`](Self::OnArrival).
+///
+/// `#[non_exhaustive]`: other rules for when a held order is released may be added.
+///
+/// [`MockExecutionConfig::market_order_timing`]: crate::client::mock::MockExecutionConfig::market_order_timing
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
+)]
+#[non_exhaustive]
+pub enum MarketOrderTiming {
+    /// Fill the moment the order reaches the venue, against the market it holds then.
+    ///
+    /// On a bar feed with no latency, that market is the close of the bar the sender has just
+    /// seen: the order trades at exactly the price it decided on, with no time to react, no
+    /// spread crossed and no impact. A common convention, and an optimistic one — a strategy can
+    /// come to depend on it. [`NextBar`](Self::NextBar) is the pessimistic comparison.
+    #[default]
+    OnArrival,
+
+    /// Hold the order until its instrument's next bar, and fill it at that bar's price.
+    ///
+    /// For bar data only: the venue must be fed bars, through the `bar` argument of
+    /// [`SimulatedVenue::apply_market`](crate::exchange::mock::SimulatedVenue::apply_market).
+    /// Anything else fails visibly rather than falling back:
+    /// - a market order on an instrument the venue has never been fed a bar for is rejected, naming
+    ///   this setting. That includes every market order on a
+    ///   [`RequestPriced`](crate::exchange::mock::venue::VenueRegime::RequestPriced) venue, which
+    ///   has no feed at all;
+    /// - a tick or quote between two bars moves the market but does not release a held order.
+    ///
+    /// # While it is held
+    /// The order is accepted as `Open`, so a cancel takes it back as it would a resting order. The
+    /// venue holds what the order would cost at its current price, as it holds a limit order's
+    /// cost at its limit, so two held orders cannot both spend one balance. An order the account
+    /// cannot cover at that price is refused on arrival, as it is under
+    /// [`OnArrival`](Self::OnArrival).
+    ///
+    /// # When the next bar arrives
+    /// The hold is released and the order filled as a taker, at the reference price
+    /// [`NextBarPrice`] picks, priced by the venue's [`FillModel`] and moved by its slippage like
+    /// any other taker fill. The fill is costed afresh, and an order the account can no longer
+    /// afford is cancelled and reported. Its time in force decides the rest as on arrival:
+    /// immediate-or-cancel keeps what the bar's size allows and cancels the remainder,
+    /// fill-or-kill trades all of it or nothing. The fill is stamped at the bar's instant.
+    ///
+    /// # When the data ends first
+    /// An order still held when its driver runs out of data is retired as expired, filled
+    /// nothing, so every accepted order is answered.
+    ///
+    /// Only market orders are held. A limit order rests and matches as it always does.
+    ///
+    /// Any bar releases a held order, one reported with zero volume included. To have such a bar
+    /// release nothing, combine this with [`StaleMarketPolicy::Wait`].
+    NextBar(NextBarPrice),
+}
+
+/// Which price of the next bar fills a market order held for it. See
+/// [`MarketOrderTiming::NextBar`].
+///
+/// `#[non_exhaustive]`: other reference prices may be added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[non_exhaustive]
+pub enum NextBarPrice {
+    /// The next bar's open: the first price the market traded at after the order was sent. The
+    /// realistic choice.
+    Open,
+
+    /// The next bar's worst price for the order: its high for a buy, its low for a sell.
+    ///
+    /// A deliberately **pessimistic bound**, not a model. A market order fills near the start of
+    /// the next bar, not at its extreme, so this overstates the cost of trading, and the more so
+    /// the longer or more volatile the bar. Its use is as a stress test: a strategy that still
+    /// makes money under it does not owe its edge to fill quality. It already charges more than
+    /// any slippage would, so combining it with slippage counts the same cost twice.
+    AdverseExtreme,
+}
+
+/// What a simulated venue does with a market order when the instrument's market is stale, as
+/// [`MockExecutionConfig::stale_market`] selects. Defaults to [`Off`](Self::Off).
+///
+/// # The problem it addresses
+/// A venue fed a market keeps the last one it saw for each instrument, and by default fills a
+/// market order against it however old it is. On a bar feed, a market order on an instrument with
+/// no bar at the current instant therefore fills at the close of its last bar, which may be
+/// minutes, hours or a weekend old. A real order would not get that price: in a quiet market it
+/// trades against the book, and in an outage, a halt or a closed market it is refused or waits
+/// for the reopen, filling at a price that may have gapped. A bar that only carries the previous
+/// close forward, with zero volume, makes this worse: it looks recent, but nothing traded.
+///
+/// A venue cannot tell a quiet market from a dead feed or a halt by looking at bars, and this
+/// policy does not try to. It treats an old market as one nobody can trade in yet.
+///
+/// # When to turn it on, and why it is off by default
+/// Turn it on for bar feeds, with a `max_age` a little over the bar interval, so that only a
+/// market with a missing bar counts as stale. It stays off by default because a venue cannot know
+/// a feed's bar interval, and because on a quote or tick feed the book stays valid until it is
+/// replaced: a quiet book is still a book a market order can trade against.
+///
+/// `#[non_exhaustive]`: other actions on a stale market may be added.
+///
+/// [`MockExecutionConfig::stale_market`]: crate::client::mock::MockExecutionConfig::stale_market
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
+)]
+#[non_exhaustive]
+pub enum StaleMarketPolicy {
+    /// Fill a market order against the market the venue holds, however old.
+    #[default]
+    Off,
+
+    /// A market order arriving when the instrument's last fresh observation is more than
+    /// `max_age` old waits for the next one.
+    ///
+    /// # What is fresh
+    /// An observation the driver marks [`fresh`](crate::market::MarketObservation::fresh): a
+    /// trade, a quote, or a bar something traded in. A bar reported with zero volume still moves
+    /// the price the venue holds, but not the instant the market's age is measured from. An
+    /// observation exactly `max_age` old is still fresh, so a `max_age` of zero accepts an order
+    /// only at the instant of a fresh observation.
+    ///
+    /// An instrument whose venue has no price at all is not stale but unpriced, and its market
+    /// orders are rejected as they are without this policy.
+    ///
+    /// # What waits
+    /// Market orders only. The order is accepted as `Open` and held as
+    /// [`MarketOrderTiming::NextBar`] holds one: the venue holds what it would cost at the current
+    /// price, a cancel takes it back, and an order the account cannot cover at that price is
+    /// refused on arrival. An immediate-or-cancel or fill-or-kill market order is rejected
+    /// instead, with a reason naming this policy: it asked to trade now or not at all. That
+    /// includes the immediate-or-cancel orders an engine sends to close positions, so a strategy
+    /// closing out on a stale instrument has to try again once its market is fresh.
+    ///
+    /// A limit order that is marketable on arrival is not covered: it still fills against the
+    /// market the venue holds, however old.
+    ///
+    /// # When it fills
+    /// On the instrument's next fresh observation, as if it had arrived just after it: priced by
+    /// the venue's [`FillModel`] from the market that observation leaves, moved by its slippage,
+    /// and costed afresh, as any taker fill is. That is a trade's or quote's price, or a bar's
+    /// close. The fill is stamped at the observation's instant and follows the fills of orders
+    /// already resting, which the observation crossed first. An order the account can no longer
+    /// afford, or that the market cannot price, is cancelled and reported.
+    ///
+    /// Only an observation of that instrument releases a held order: a clock moving, or a fresh
+    /// observation of another instrument, never does. A deadline the order carries still retires
+    /// it, and an order still waiting when its driver runs out of data is retired as expired,
+    /// filled nothing.
+    ///
+    /// # With [`MarketOrderTiming::NextBar`]
+    /// Every market order already waits for its instrument's next bar and fills at that bar's
+    /// price, so a fresh market changes nothing. A bar reported with zero volume releases nothing:
+    /// the orders held for it wait for the next bar something traded in, except an
+    /// immediate-or-cancel or fill-or-kill order, which the bar cancels, since it had nothing to
+    /// trade. An immediate-or-cancel or fill-or-kill order arriving on a stale market is rejected,
+    /// as above.
+    ///
+    /// # Needs a market feed
+    /// A [`RequestPriced`](crate::exchange::mock::venue::VenueRegime::RequestPriced) venue, the
+    /// kind `MockExchange` drives, has no market feed to measure an age from, so it rejects every
+    /// market order, naming this policy. On a venue that is fed a market, an instrument it has
+    /// never been fed has no price at all, and its market orders are rejected as unpriced, as
+    /// above.
+    ///
+    /// # Serialised
+    /// `max_age` is a [`Duration`], so it serialises as seconds and nanoseconds:
+    /// `{"Wait":{"max_age":{"secs":90,"nanos":0}}}`.
+    Wait {
+        /// How old the last fresh observation may be for a market order to fill on arrival.
+        max_age: Duration,
+    },
+}
+
+impl NextBarPrice {
+    /// The reference price `bar` gives an order on `side`.
+    pub fn reference(self, side: Side, bar: &MarketBar) -> Decimal {
+        match (self, side) {
+            (Self::Open, _) => bar.open,
+            (Self::AdverseExtreme, Side::Buy) => bar.high,
+            (Self::AdverseExtreme, Side::Sell) => bar.low,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_next_bar_price_is_its_open_or_its_worst_for_the_side() {
+        let bar = MarketBar::new(d("100"), d("110"), d("90"), d("105"));
+
+        assert_eq!(NextBarPrice::Open.reference(Side::Buy, &bar), d("100"));
+        assert_eq!(NextBarPrice::Open.reference(Side::Sell, &bar), d("100"));
+        assert_eq!(
+            NextBarPrice::AdverseExtreme.reference(Side::Buy, &bar),
+            d("110")
+        );
+        assert_eq!(
+            NextBarPrice::AdverseExtreme.reference(Side::Sell, &bar),
+            d("90")
+        );
+    }
+
+    #[test]
+    fn market_order_timing_defaults_to_on_arrival_and_round_trips() {
+        assert_eq!(MarketOrderTiming::default(), MarketOrderTiming::OnArrival);
+
+        for timing in [
+            MarketOrderTiming::OnArrival,
+            MarketOrderTiming::NextBar(NextBarPrice::Open),
+            MarketOrderTiming::NextBar(NextBarPrice::AdverseExtreme),
+        ] {
+            let json = serde_json::to_string(&timing).unwrap();
+            assert_eq!(
+                serde_json::from_str::<MarketOrderTiming>(&json).unwrap(),
+                timing
+            );
+        }
+    }
+
+    #[test]
+    fn stale_market_policy_defaults_to_off_and_round_trips() {
+        assert_eq!(StaleMarketPolicy::default(), StaleMarketPolicy::Off);
+
+        let wait = StaleMarketPolicy::Wait {
+            max_age: Duration::from_secs(90),
+        };
+        assert_eq!(
+            serde_json::to_string(&wait).unwrap(),
+            r#"{"Wait":{"max_age":{"secs":90,"nanos":0}}}"#,
+            "the shape the rustdoc promises a configuration file"
+        );
+
+        for policy in [StaleMarketPolicy::Off, wait] {
+            let json = serde_json::to_string(&policy).unwrap();
+            assert_eq!(
+                serde_json::from_str::<StaleMarketPolicy>(&json).unwrap(),
+                policy
+            );
+        }
+    }
 
     fn d(s: &str) -> Decimal {
         s.parse().unwrap()
