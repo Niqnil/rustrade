@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ExecutionClient`'s rustdoc has a section on wrapping a client in a generic decorator
+  (`rustrade-execution`, #678), with a compiled example that delivers only some of an account's
+  fills.
+  - The wrapper takes the inner client's `EXCHANGE` and `SUPPORTED_KINDS`, so one wrapper serves
+    every venue client. It forwards every method, including the provided ones and the extension
+    traits.
+  - It must withhold a fill from `account_stream` and `fetch_trades` alike, by a rule both carry,
+    since not every venue reports `Trade::client_order_id` on `fetch_trades`.
+  - Two inner clients on one account deliver each fill twice.
+  - A fill that reaches the engine moves its positions even when it matches none of its orders,
+    so filtering belongs in the wrapper.
+
 ### Changed
 
 - **Breaking in behaviour:** a Binance margin `TrailingStop` that the venue refuses as an order

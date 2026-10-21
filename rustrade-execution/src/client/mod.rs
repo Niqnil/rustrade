@@ -147,6 +147,214 @@ impl<'a> ClientInstrument<'a> {
 // `+ Send` bounds on async method return types required for multi-threaded
 // Tokio runtime. This is a breaking change vs upstream — any `!Send` executor
 // implementation would fail to compile.
+/// A venue's account and order API, as the engine's `ExecutionManager` drives it.
+///
+/// # Wrapping a client
+///
+/// To add behaviour around a venue client without reimplementing it, wrap it in a generic
+/// decorator that implements `ExecutionClient` itself. Typical uses are choosing which fills on a
+/// shared account reach the engine, logging, and metrics.
+///
+/// - **Take the inner client's identity.** Set `const EXCHANGE: ExchangeId = C::EXCHANGE` and
+///   `SUPPORTED_KINDS = C::SUPPORTED_KINDS`. The `ExecutionManager` refuses a venue client whose
+///   `EXCHANGE` differs from its instrument map's exchange (only the `Mock` and `Simulated` ids
+///   are exempt), so one generic wrapper then serves every venue client.
+/// - **Forward every method, the provided ones included.** That is
+///   [`open_orders`](Self::open_orders), [`cancel_orders`](Self::cancel_orders) and
+///   [`validate_config`](Self::validate_config): left to the trait's defaults, they would bypass
+///   any batching or config check the inner client has. Implement the extension traits the inner
+///   client implements as well, with impls bounded on it:
+///   - [`BracketOrderClient`]
+///   - [`OrderStatusClient`]
+///   - [`ShortabilityClient`]
+///   - [`BorrowCapacityClient`]
+/// - **Withhold a fill from [`account_stream`](Self::account_stream) and
+///   [`fetch_trades`](Self::fetch_trades) alike, by the same rule.** One fill can reach the engine
+///   either way: live on the stream, or in a read made after a disconnect. A fill withheld from
+///   only one of them still reaches the engine once.
+///   - **Choose a key both paths carry.** [`Trade::client_order_id`] marks the orders a consumer
+///     placed, but not every venue reports it on `fetch_trades` (its rustdoc lists which do).
+///     Binance's is one that does not. A rule keyed on it has to decide what to do with a fill it
+///     cannot classify. Keeping it, as the example below does, delivers too much rather than too
+///     little: on such a venue every fill a `fetch_trades` read returns is kept, and only the
+///     stream is filtered. To withhold those fills as well, match them another way, such as by
+///     [`Trade::order_id`] against the orders the wrapper placed.
+///   - **Keep fills the venue forced** ([`TradeOrigin::is_forced`]). They moved the position,
+///     whoever placed the order.
+///   - **Leave `resume` alone.** Filtering a [`TradesRead`] keeps its `resume` as it was: it marks
+///     where the venue's read stopped, not which fills the wrapper kept.
+/// - **One inner client per engine.** A wrapper that owns one client counts as that one client.
+///   Two clients on one account whose account streams both reach one engine deliver every fill
+///   twice.
+/// - **Withhold here, not later.** The engine applies a fill that matches none of its orders too.
+///   In `OmsMode::Netting` it moves the netting position like any other fill, and the engine
+///   cannot tell it from a fill of its own. In `OmsMode::Hedging` an ordinary fill
+///   ([`TradeOrigin::Order`] or [`TradeOrigin::External`]) opens a position of its own, and a
+///   settlement fill is handled as [`InstrumentState::update_from_trade`] describes.
+///
+/// ```
+/// use chrono::{DateTime, Utc};
+/// use futures::{Stream, StreamExt, stream::BoxStream};
+/// use rustrade_execution::{
+///     AccountEventKind, UnindexedAccountEvent, UnindexedAccountSnapshot,
+///     balance::AssetBalance,
+///     client::{ClientInstrument, ExecutionClient},
+///     error::UnindexedClientError,
+///     order::{
+///         Order,
+///         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
+///         state::{Open, UnindexedOrderState},
+///     },
+///     trade::{Trade, TradesRead},
+/// };
+/// use rustrade_instrument::{
+///     asset::name::AssetNameExchange,
+///     exchange::ExchangeId,
+///     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
+/// };
+///
+/// /// Delivers the fills of orders whose client order id starts with `prefix`, fills whose
+/// /// client order id the venue did not report, and every fill the venue forced.
+/// ///
+/// /// Keeping a fill without a client order id is a choice: on a venue whose `fetch_trades`
+/// /// reports none, this filters the account stream only.
+/// #[derive(Debug, Clone)]
+/// pub struct OwnFills<C> {
+///     inner: C,
+///     prefix: String,
+/// }
+///
+/// #[derive(Debug, Clone)]
+/// pub struct OwnFillsConfig<Config> {
+///     pub inner: Config,
+///     pub prefix: String,
+/// }
+///
+/// fn keeps<AssetKey, InstrumentKey>(prefix: &str, trade: &Trade<AssetKey, InstrumentKey>) -> bool {
+///     trade.origin.is_forced()
+///         || trade
+///             .client_order_id
+///             .as_ref()
+///             .is_none_or(|cid| cid.0.starts_with(prefix))
+/// }
+///
+/// // `Sync` makes the wrapper's method futures `Send`, as the trait requires. `'static` lets the
+/// // filtered account stream be boxed.
+/// impl<C> ExecutionClient for OwnFills<C>
+/// where
+///     C: ExecutionClient + Sync,
+///     C::AccountStream: 'static,
+/// {
+///     const EXCHANGE: ExchangeId = C::EXCHANGE;
+///     const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] = C::SUPPORTED_KINDS;
+///     type Config = OwnFillsConfig<C::Config>;
+///     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;
+///
+///     fn validate_config(
+///         config: &Self::Config,
+///         instruments: &[ClientInstrument<'_>],
+///     ) -> Result<(), String> {
+///         C::validate_config(&config.inner, instruments)
+///     }
+///
+///     fn new(config: Self::Config) -> Self {
+///         Self {
+///             inner: C::new(config.inner),
+///             prefix: config.prefix,
+///         }
+///     }
+///
+///     async fn account_stream(
+///         &self,
+///         assets: &[AssetNameExchange],
+///         instruments: &[InstrumentNameExchange],
+///     ) -> Result<Self::AccountStream, UnindexedClientError> {
+///         let prefix = self.prefix.clone();
+///         let stream = self.inner.account_stream(assets, instruments).await?;
+///         Ok(stream
+///             .filter(move |event| {
+///                 let keep = match &event.kind {
+///                     AccountEventKind::Trade(trade) => keeps(&prefix, trade),
+///                     _ => true,
+///                 };
+///                 std::future::ready(keep)
+///             })
+///             .boxed())
+///     }
+///
+///     async fn fetch_trades(
+///         &self,
+///         start: DateTime<Utc>,
+///         end: DateTime<Utc>,
+///         instruments: &[InstrumentNameExchange],
+///     ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError> {
+///         let mut read = self.inner.fetch_trades(start, end, instruments).await?;
+///         read.trades.retain(|trade| keeps(&self.prefix, trade));
+///         Ok(read)
+///     }
+///
+///     // Everything else is forwarded unchanged.
+///
+///     async fn account_snapshot(
+///         &self,
+///         assets: &[AssetNameExchange],
+///         instruments: &[InstrumentNameExchange],
+///     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
+///         self.inner.account_snapshot(assets, instruments).await
+///     }
+///
+///     async fn cancel_order(
+///         &self,
+///         request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
+///     ) -> UnindexedOrderResponseCancel {
+///         self.inner.cancel_order(request).await
+///     }
+///
+///     fn cancel_orders<'a>(
+///         &self,
+///         requests: impl IntoIterator<Item = OrderRequestCancel<ExchangeId, &'a InstrumentNameExchange>>,
+///     ) -> impl Stream<Item = UnindexedOrderResponseCancel> + Send {
+///         self.inner.cancel_orders(requests)
+///     }
+///
+///     async fn open_order(
+///         &self,
+///         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
+///     ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+///         self.inner.open_order(request).await
+///     }
+///
+///     fn open_orders<'a>(
+///         &self,
+///         requests: impl IntoIterator<Item = OrderRequestOpen<ExchangeId, &'a InstrumentNameExchange>>,
+///     ) -> impl Stream<Item = Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> + Send
+///     {
+///         self.inner.open_orders(requests)
+///     }
+///
+///     async fn fetch_balances(
+///         &self,
+///         assets: &[AssetNameExchange],
+///     ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
+///         self.inner.fetch_balances(assets).await
+///     }
+///
+///     async fn fetch_open_orders(
+///         &self,
+///         instruments: &[InstrumentNameExchange],
+///     ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
+///         self.inner.fetch_open_orders(instruments).await
+///     }
+/// }
+/// ```
+///
+/// [`Trade::client_order_id`]: crate::trade::Trade::client_order_id
+/// [`Trade::order_id`]: crate::trade::Trade::order_id
+/// [`TradeOrigin::is_forced`]: crate::trade::TradeOrigin::is_forced
+/// [`TradeOrigin::Order`]: crate::trade::TradeOrigin::Order
+/// [`TradeOrigin::External`]: crate::trade::TradeOrigin::External
+/// [`TradesRead`]: crate::trade::TradesRead
+/// [`InstrumentState::update_from_trade`]: https://docs.rs/rustrade/latest/rustrade/engine/state/instrument/struct.InstrumentState.html#method.update_from_trade
 pub trait ExecutionClient
 where
     Self: Clone,
