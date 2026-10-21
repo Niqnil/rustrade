@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking in behaviour:** a Binance margin `TrailingStop` that the venue refuses as an order
+  type it does not take is now `OrderError::UnsupportedOrderType` (`rustrade-execution`,
+  `binance` feature, #682). A cross margin account answers a trailing `STOP_LOSS` with `-3111`
+  ("Trailing stop order only supports limit type"), which used to arrive as
+  `OrderError::Rejected(ApiError::OrderRejected(..))`. A caller that matched that refusal must
+  match the new variant. It carries the venue's message, and like before it is not transient.
+  - The client still sends the order and lets Binance decide, so an isolated account, which has
+    accepted the trailing market form, is unaffected. On a cross account, place a
+    `TrailingStopFixedLimit` (a `STOP_LOSS_LIMIT` with a `trailingDelta`): both account modes
+    accept it.
+  - `BinanceMargin`'s rustdoc said Binance margin accepts a `trailingDelta` on every conditional
+    type. It now says a cross account takes one on the limit types only, and its "Trailing stops"
+    section and `open_order` state the account-mode difference.
+  - `BinanceMargin::account_snapshot` and `fetch_balances` document a known limitation: balances
+    read over REST straight after a fill can still be the pre-trade ones (current about 2 s later
+    in a live check). Use the account stream's balance events, or read again after a short
+    delay. The client adds no retry or delay of its own.
+
 ## [0.13.0] - 2026-10-20
 
 ### Added
