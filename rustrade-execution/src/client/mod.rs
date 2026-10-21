@@ -156,9 +156,9 @@ impl<'a> ClientInstrument<'a> {
 /// shared account reach the engine, logging, and metrics.
 ///
 /// - **Take the inner client's identity.** Set `const EXCHANGE: ExchangeId = C::EXCHANGE` and
-///   `SUPPORTED_KINDS = C::SUPPORTED_KINDS`. The `ExecutionManager` refuses a client whose
-///   `EXCHANGE` differs from its instrument map's exchange, so one generic wrapper then serves
-///   every venue client.
+///   `SUPPORTED_KINDS = C::SUPPORTED_KINDS`. The `ExecutionManager` refuses a venue client whose
+///   `EXCHANGE` differs from its instrument map's exchange (only the `Mock` and `Simulated` ids
+///   are exempt), so one generic wrapper then serves every venue client.
 /// - **Forward every method, the provided ones included.** That is
 ///   [`open_orders`](Self::open_orders), [`cancel_orders`](Self::cancel_orders) and
 ///   [`validate_config`](Self::validate_config): left to the trait's defaults, they would bypass
@@ -174,9 +174,11 @@ impl<'a> ClientInstrument<'a> {
 ///   only one of them still reaches the engine once.
 ///   - **Choose a key both paths carry.** [`Trade::client_order_id`] marks the orders a consumer
 ///     placed, but not every venue reports it on `fetch_trades` (its rustdoc lists which do).
-///     Binance's is one that does not. A rule keyed on it must either keep a fill it cannot
-///     classify, or match that fill another way, such as by [`Trade::order_id`] against the orders
-///     the wrapper placed.
+///     Binance's is one that does not. A rule keyed on it has to decide what to do with a fill it
+///     cannot classify. Keeping it, as the example below does, delivers too much rather than too
+///     little: on such a venue every fill a `fetch_trades` read returns is kept, and only the
+///     stream is filtered. To withhold those fills as well, match them another way, such as by
+///     [`Trade::order_id`] against the orders the wrapper placed.
 ///   - **Keep fills the venue forced** ([`TradeOrigin::is_forced`]). They moved the position,
 ///     whoever placed the order.
 ///   - **Leave `resume` alone.** Filtering a [`TradesRead`] keeps its `resume` as it was: it marks
@@ -186,8 +188,9 @@ impl<'a> ClientInstrument<'a> {
 ///   twice.
 /// - **Withhold here, not later.** The engine applies a fill that matches none of its orders too.
 ///   In `OmsMode::Netting` it moves the netting position like any other fill, and the engine
-///   cannot tell it from a fill of its own. In `OmsMode::Hedging` it opens a position of its own.
-///   See [`InstrumentState::update_from_trade`].
+///   cannot tell it from a fill of its own. In `OmsMode::Hedging` an ordinary fill
+///   ([`TradeOrigin::Order`] or [`TradeOrigin::External`]) opens a position of its own, and a
+///   settlement fill is handled as [`InstrumentState::update_from_trade`] describes.
 ///
 /// ```
 /// use chrono::{DateTime, Utc};
@@ -212,6 +215,9 @@ impl<'a> ClientInstrument<'a> {
 ///
 /// /// Delivers the fills of orders whose client order id starts with `prefix`, fills whose
 /// /// client order id the venue did not report, and every fill the venue forced.
+/// ///
+/// /// Keeping a fill without a client order id is a choice: on a venue whose `fetch_trades`
+/// /// reports none, this filters the account stream only.
 /// #[derive(Debug, Clone)]
 /// pub struct OwnFills<C> {
 ///     inner: C,
@@ -232,6 +238,8 @@ impl<'a> ClientInstrument<'a> {
 ///             .is_none_or(|cid| cid.0.starts_with(prefix))
 /// }
 ///
+/// // `Sync` makes the wrapper's method futures `Send`, as the trait requires. `'static` lets the
+/// // filtered account stream be boxed.
 /// impl<C> ExecutionClient for OwnFills<C>
 /// where
 ///     C: ExecutionClient + Sync,
@@ -343,6 +351,8 @@ impl<'a> ClientInstrument<'a> {
 /// [`Trade::client_order_id`]: crate::trade::Trade::client_order_id
 /// [`Trade::order_id`]: crate::trade::Trade::order_id
 /// [`TradeOrigin::is_forced`]: crate::trade::TradeOrigin::is_forced
+/// [`TradeOrigin::Order`]: crate::trade::TradeOrigin::Order
+/// [`TradeOrigin::External`]: crate::trade::TradeOrigin::External
 /// [`TradesRead`]: crate::trade::TradesRead
 /// [`InstrumentState::update_from_trade`]: https://docs.rs/rustrade/latest/rustrade/engine/state/instrument/struct.InstrumentState.html#method.update_from_trade
 pub trait ExecutionClient
