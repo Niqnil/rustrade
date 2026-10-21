@@ -244,31 +244,44 @@ mod tests {
 
     #[test]
     fn with_methods_set_only_their_own_field() {
-        let market = MarketSnapshot::from_last_price(Some(dec!(100)));
+        // Every optional field away from its default, so a builder that reset another field
+        // would show.
+        let set = RequestOpen {
+            position_id: Some(PositionId::new("a")),
+            reduce_only: true,
+            market: Some(MarketSnapshot::from_last_price(Some(dec!(100)))),
+            ..limit()
+        };
 
-        let request = limit()
-            .with_position_id(PositionId::NETTING)
-            .with_reduce_only(true)
-            .with_market(market.clone());
-
-        assert_eq!(request.position_id, Some(PositionId::NETTING));
-        assert!(request.reduce_only);
-        assert_eq!(request.market, Some(market));
         assert_eq!(
+            set.clone().with_position_id(PositionId::new("b")),
             RequestOpen {
-                position_id: None,
+                position_id: Some(PositionId::new("b")),
+                ..set.clone()
+            }
+        );
+        assert_eq!(
+            set.clone().with_reduce_only(false),
+            RequestOpen {
                 reduce_only: false,
-                market: None,
-                ..request
-            },
-            limit()
+                ..set.clone()
+            }
+        );
+        let market = MarketSnapshot::from_last_price(Some(dec!(200)));
+        assert_eq!(
+            set.clone().with_market(market),
+            RequestOpen {
+                market: Some(market),
+                ..set
+            }
         );
 
-        assert!(
-            !limit()
-                .with_reduce_only(true)
-                .with_reduce_only(false)
-                .reduce_only
+        // And each sets its field from the default.
+        assert_eq!(
+            limit().with_position_id(PositionId::NETTING).position_id,
+            Some(PositionId::NETTING)
         );
+        assert!(limit().with_reduce_only(true).reduce_only);
+        assert_eq!(limit().with_market(market).market, Some(market));
     }
 }
