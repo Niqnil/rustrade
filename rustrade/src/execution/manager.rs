@@ -771,16 +771,13 @@ mod tests {
         let requests = futures::stream::iter([
             ExecutionRequest::Open(OrderRequestOpen {
                 key: key.clone(),
-                state: RequestOpen {
-                    side: Side::Sell,
-                    price: None,
-                    quantity: dec!(1),
-                    kind: OrderKind::Market,
-                    time_in_force: TimeInForce::ImmediateOrCancel,
-                    position_id: None,
-                    reduce_only: false,
-                    market: None,
-                },
+                state: RequestOpen::new(
+                    Side::Sell,
+                    None,
+                    dec!(1),
+                    OrderKind::Market,
+                    TimeInForce::ImmediateOrCancel,
+                ),
             }),
             ExecutionRequest::Cancel(OrderRequestCancel {
                 key: key.clone(),

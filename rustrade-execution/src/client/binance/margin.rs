@@ -8327,16 +8327,13 @@ mod tests {
                 StrategyId::new("strategy"),
                 ClientOrderId::new(cid),
             ),
-            state: crate::order::request::RequestOpen {
-                side: Side::Buy,
-                price: Some(Decimal::from(100)),
-                quantity: Decimal::TWO,
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                position_id: None,
-                reduce_only: false,
-                market: None,
-            },
+            state: crate::order::request::RequestOpen::new(
+                Side::Buy,
+                Some(Decimal::from(100)),
+                Decimal::TWO,
+                OrderKind::Limit,
+                TimeInForce::GoodUntilCancelled { post_only: false },
+            ),
         }
     }
 

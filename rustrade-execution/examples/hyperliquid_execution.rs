@@ -161,16 +161,13 @@ async fn main() {
 
     // Price must be within 80% of market price on Hyperliquid
     // BTC ~$95k, so $50k is ~47% below - safe limit
-    let request_open = RequestOpen {
-        side: Side::Buy,
-        price: Some(dec!(50000.0)),
-        quantity: dec!(0.001), // Minimum BTC size
-        kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request_open = RequestOpen::new(
+        Side::Buy,
+        Some(dec!(50000.0)),
+        dec!(0.001), // Minimum BTC size
+        OrderKind::Limit,
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = OrderEvent {
         key: order_key.clone(),

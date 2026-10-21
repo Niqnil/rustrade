@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `RequestOpen` is `#[non_exhaustive]` (`rustrade-execution`, #686), so a field can
+  be added to it later without breaking a caller. Outside the crate it can no longer be built with
+  a struct literal.
+  - Build one with `RequestOpen::new(side, price, quantity, kind, time_in_force)`, which leaves
+    `position_id` as `None`, `reduce_only` as `false` and `market` as `None`.
+  - Set those with `with_position_id`, `with_reduce_only` and `with_market`.
+  - The fields stay public, so reading them and assigning them on a request you hold still work.
 - **Breaking in behaviour:** a Binance margin `TrailingStop` that the venue refuses as an order
   type it does not take is now `OrderError::UnsupportedOrderType` (`rustrade-execution`,
   `binance` feature, #682). A cross margin account answers a trailing `STOP_LOSS` with `-3111`

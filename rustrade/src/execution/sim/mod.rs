@@ -1888,17 +1888,15 @@ mod tests {
                     strategy: StrategyId::new("test"),
                     cid: ClientOrderId::random(),
                 },
-                state: RequestOpen {
-                    side: Side::Buy,
+                state: RequestOpen::new(
+                    Side::Buy,
                     // `None` by construction for a Market order; the venue prices it from `market`.
-                    price: None,
-                    quantity: dec!(0.01),
-                    kind: OrderKind::Market,
+                    None,
+                    dec!(0.01),
+                    OrderKind::Market,
                     time_in_force,
-                    position_id: None,
-                    reduce_only: false,
-                    market: Some(MarketSnapshot::new(None, None, Some(price))),
-                },
+                )
+                .with_market(MarketSnapshot::new(None, None, Some(price))),
             }));
         }
 
@@ -1915,16 +1913,13 @@ mod tests {
                     strategy: StrategyId::new("test"),
                     cid: cid.clone(),
                 },
-                state: RequestOpen {
-                    side: Side::Buy,
-                    price: Some(price),
-                    quantity: dec!(0.01),
-                    kind: OrderKind::Limit,
-                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                    position_id: None,
-                    reduce_only: false,
-                    market: None,
-                },
+                state: RequestOpen::new(
+                    Side::Buy,
+                    Some(price),
+                    dec!(0.01),
+                    OrderKind::Limit,
+                    TimeInForce::GoodUntilCancelled { post_only: false },
+                ),
             }));
             cid
         }
@@ -1939,16 +1934,13 @@ mod tests {
                     strategy: StrategyId::new("test"),
                     cid: cid.clone(),
                 },
-                state: RequestOpen {
-                    side: Side::Buy,
-                    price: Some(price),
-                    quantity: dec!(0.01),
-                    kind: OrderKind::Limit,
-                    time_in_force: TimeInForce::GoodTillDate { expiry },
-                    position_id: None,
-                    reduce_only: false,
-                    market: None,
-                },
+                state: RequestOpen::new(
+                    Side::Buy,
+                    Some(price),
+                    dec!(0.01),
+                    OrderKind::Limit,
+                    TimeInForce::GoodTillDate { expiry },
+                ),
             }));
             cid
         }
@@ -2136,16 +2128,13 @@ mod tests {
                 strategy: StrategyId::new("test"),
                 cid: ClientOrderId::new("unindexed"),
             },
-            state: RequestOpen {
-                side: Side::Buy,
-                price: None,
-                quantity: dec!(0.01),
-                kind: OrderKind::Market,
-                time_in_force: TimeInForce::ImmediateOrCancel,
-                position_id: None,
-                reduce_only: false,
-                market: None,
-            },
+            state: RequestOpen::new(
+                Side::Buy,
+                None,
+                dec!(0.01),
+                OrderKind::Market,
+                TimeInForce::ImmediateOrCancel,
+            ),
         }));
 
         harness.next().await;

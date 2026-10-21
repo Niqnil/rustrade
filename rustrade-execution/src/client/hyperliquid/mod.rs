@@ -1803,16 +1803,13 @@ mod tests {
                         strategy: StrategyId::new("strategy"),
                         cid: ClientOrderId::uuid(),
                     },
-                    state: RequestOpen {
-                        side: Side::Buy,
+                    state: RequestOpen::new(
+                        Side::Buy,
                         price,
                         quantity,
                         kind,
-                        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                        position_id: None,
-                        reduce_only: false,
-                        market: None,
-                    },
+                        TimeInForce::GoodUntilCancelled { post_only: false },
+                    ),
                 })
                 .await
         }
@@ -2121,16 +2118,13 @@ mod tests {
                             strategy: StrategyId::new("strategy"),
                             cid: ClientOrderId::uuid(),
                         },
-                        state: RequestOpen {
-                            side: Side::Buy,
-                            price: Some(dec!(1)),
-                            quantity: dec!(1),
-                            kind: OrderKind::Limit,
-                            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                            position_id: None,
-                            reduce_only: false,
-                            market: None,
-                        },
+                        state: RequestOpen::new(
+                            Side::Buy,
+                            Some(dec!(1)),
+                            dec!(1),
+                            OrderKind::Limit,
+                            TimeInForce::GoodUntilCancelled { post_only: false },
+                        ),
                     })
                     .await;
                 let OrderState::Inactive(crate::order::state::InactiveOrderState::OpenFailed(

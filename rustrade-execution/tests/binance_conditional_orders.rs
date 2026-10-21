@@ -167,16 +167,13 @@ async fn test_stop_order() {
     // Place STOP_LOSS order: sell BTC when price drops 10% below its average, which won't
     // trigger while the order rests.
     let trigger_price = price_at(average_price(&instrument).await, dec!(0.9));
-    let request = RequestOpen {
-        side: Side::Sell,
-        price: None, // Market order when triggered
-        quantity: dec!(0.001),
-        kind: OrderKind::Stop { trigger_price },
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request = RequestOpen::new(
+        Side::Sell,
+        None, // Market order when triggered
+        dec!(0.001),
+        OrderKind::Stop { trigger_price },
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -259,16 +256,13 @@ async fn test_stop_limit_order() {
     let average = average_price(&instrument).await;
     let trigger_price = price_at(average, dec!(0.9));
     let limit_price = price_at(average, dec!(0.89));
-    let request = RequestOpen {
-        side: Side::Sell,
-        price: Some(limit_price), // Limit price after trigger
-        quantity: dec!(0.001),
-        kind: OrderKind::StopLimit { trigger_price },
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request = RequestOpen::new(
+        Side::Sell,
+        Some(limit_price), // Limit price after trigger
+        dec!(0.001),
+        OrderKind::StopLimit { trigger_price },
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -335,16 +329,13 @@ async fn test_take_profit_order() {
     // Place TAKE_PROFIT order: sell BTC when price rises 10% above its average, which won't
     // trigger while the order rests.
     let trigger_price = price_at(average_price(&instrument).await, dec!(1.1));
-    let request = RequestOpen {
-        side: Side::Sell,
-        price: None,
-        quantity: dec!(0.001),
-        kind: OrderKind::TakeProfit { trigger_price },
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request = RequestOpen::new(
+        Side::Sell,
+        None,
+        dec!(0.001),
+        OrderKind::TakeProfit { trigger_price },
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -411,16 +402,13 @@ async fn test_take_profit_limit_order() {
     let average = average_price(&instrument).await;
     let trigger_price = price_at(average, dec!(1.1));
     let limit_price = price_at(average, dec!(1.09));
-    let request = RequestOpen {
-        side: Side::Sell,
-        price: Some(limit_price), // Limit price
-        quantity: dec!(0.001),
-        kind: OrderKind::TakeProfitLimit { trigger_price },
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request = RequestOpen::new(
+        Side::Sell,
+        Some(limit_price), // Limit price
+        dec!(0.001),
+        OrderKind::TakeProfitLimit { trigger_price },
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -486,20 +474,17 @@ async fn test_trailing_stop_basis_points() {
     };
 
     // Place trailing stop with 100 basis points (1%) callback
-    let request = RequestOpen {
-        side: Side::Sell,
-        price: None,
-        quantity: dec!(0.001),
-        kind: OrderKind::TrailingStop {
+    let request = RequestOpen::new(
+        Side::Sell,
+        None,
+        dec!(0.001),
+        OrderKind::TrailingStop {
             offset: dec!(100), // 100 basis points = 1%
             offset_type: TrailingOffsetType::BasisPoints,
             activation_price: None,
         },
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -561,20 +546,17 @@ async fn test_trailing_stop_percentage() {
     };
 
     // Place trailing stop with 2% callback (specified as percentage)
-    let request = RequestOpen {
-        side: Side::Sell,
-        price: None,
-        quantity: dec!(0.001),
-        kind: OrderKind::TrailingStop {
+    let request = RequestOpen::new(
+        Side::Sell,
+        None,
+        dec!(0.001),
+        OrderKind::TrailingStop {
             offset: dec!(2), // 2% → converts to 200 basis points
             offset_type: TrailingOffsetType::Percentage,
             activation_price: None,
         },
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -639,20 +621,17 @@ async fn test_trailing_stop_absolute_rejected() {
     };
 
     // TrailingStop with Absolute offset should be rejected
-    let request = RequestOpen {
-        side: Side::Sell,
-        price: None,
-        quantity: dec!(0.001),
-        kind: OrderKind::TrailingStop {
+    let request = RequestOpen::new(
+        Side::Sell,
+        None,
+        dec!(0.001),
+        OrderKind::TrailingStop {
             offset: dec!(1000), // $1000 absolute offset - NOT SUPPORTED
             offset_type: TrailingOffsetType::Absolute,
             activation_price: None,
         },
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key,
@@ -699,21 +678,18 @@ async fn test_trailing_stop_limit_rejected() {
     };
 
     // TrailingStopLimit should be rejected (Binance doesn't support it)
-    let request = RequestOpen {
-        side: Side::Sell,
-        price: Some(dec!(99000)),
-        quantity: dec!(0.001),
-        kind: OrderKind::TrailingStopLimit {
+    let request = RequestOpen::new(
+        Side::Sell,
+        Some(dec!(99000)),
+        dec!(0.001),
+        OrderKind::TrailingStopLimit {
             offset: dec!(100),
             offset_type: TrailingOffsetType::BasisPoints,
             stop_price: dec!(98000),
             limit_offset: dec!(50),
         },
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key,

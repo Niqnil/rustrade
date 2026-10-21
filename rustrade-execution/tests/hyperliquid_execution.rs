@@ -358,16 +358,13 @@ async fn test_place_and_cancel_limit_order() {
 
     // Place a limit buy below market price (won't fill, but within 80% of market)
     // BTC ~$95k as of 2026, so $50k is ~47% below - within Hyperliquid's 80% limit
-    let request_open = RequestOpen {
-        side: Side::Buy,
-        price: Some(dec!(50000.0)),
-        quantity: dec!(0.001), // Minimum size
-        kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request_open = RequestOpen::new(
+        Side::Buy,
+        Some(dec!(50000.0)),
+        dec!(0.001), // Minimum size
+        OrderKind::Limit,
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -465,16 +462,13 @@ async fn test_fetch_ended_orders_reports_a_cancelled_order() {
     let response = client
         .open_order(rustrade_execution::order::OrderEvent {
             key: key.clone(),
-            state: RequestOpen {
-                side: Side::Buy,
-                price: Some(dec!(50000.0)),
-                quantity: dec!(0.001),
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                position_id: None,
-                reduce_only: false,
-                market: None,
-            },
+            state: RequestOpen::new(
+                Side::Buy,
+                Some(dec!(50000.0)),
+                dec!(0.001),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilCancelled { post_only: false },
+            ),
         })
         .await;
     let OrderState::Active(ActiveOrderState::Open(open)) = &response.state else {
@@ -553,16 +547,13 @@ async fn test_hip3_order_round_trip() {
     let response = client
         .open_order(rustrade_execution::order::OrderEvent {
             key: key.clone(),
-            state: RequestOpen {
-                side: Side::Buy,
-                price: Some(dec!(0.9)),
-                quantity: dec!(12),
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                position_id: None,
-                reduce_only: false,
-                market: None,
-            },
+            state: RequestOpen::new(
+                Side::Buy,
+                Some(dec!(0.9)),
+                dec!(12),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilCancelled { post_only: false },
+            ),
         })
         .await;
     let OrderState::Active(ActiveOrderState::Open(open)) = &response.state else {
@@ -664,18 +655,15 @@ async fn test_stop_order_requires_uuid_cid() {
     };
 
     // Place a Stop order with non-UUID cid
-    let request_open = RequestOpen {
-        side: Side::Sell,
-        price: None, // Market trigger - no limit price
-        quantity: dec!(0.001),
-        kind: OrderKind::Stop {
+    let request_open = RequestOpen::new(
+        Side::Sell,
+        None, // Market trigger - no limit price
+        dec!(0.001),
+        OrderKind::Stop {
             trigger_price: dec!(80000.0), // Stop below current price
         },
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key,
@@ -735,18 +723,15 @@ async fn test_place_and_cancel_stop_order() {
 
     // Place a Stop order (sell stop below market to avoid triggering)
     // BTC ~$95k, so $50k stop is well below market
-    let request_open = RequestOpen {
-        side: Side::Sell,
-        price: None, // Market trigger
-        quantity: dec!(0.001),
-        kind: OrderKind::Stop {
+    let request_open = RequestOpen::new(
+        Side::Sell,
+        None, // Market trigger
+        dec!(0.001),
+        OrderKind::Stop {
             trigger_price: dec!(50000.0),
         },
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -844,18 +829,15 @@ async fn test_place_and_cancel_take_profit_order() {
 
     // Place a TakeProfit order (sell TP above market to avoid triggering)
     // BTC ~$95k, so $150k TP is well above market
-    let request_open = RequestOpen {
-        side: Side::Sell,
-        price: None, // Market trigger
-        quantity: dec!(0.001),
-        kind: OrderKind::TakeProfit {
+    let request_open = RequestOpen::new(
+        Side::Sell,
+        None, // Market trigger
+        dec!(0.001),
+        OrderKind::TakeProfit {
             trigger_price: dec!(150000.0),
         },
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key,
@@ -930,20 +912,17 @@ async fn test_trailing_stop_unsupported() {
         cid: ClientOrderId::uuid(),
     };
 
-    let request_open = RequestOpen {
-        side: Side::Sell,
-        price: None,
-        quantity: dec!(0.001),
-        kind: OrderKind::TrailingStop {
+    let request_open = RequestOpen::new(
+        Side::Sell,
+        None,
+        dec!(0.001),
+        OrderKind::TrailingStop {
             offset: dec!(100.0),
             offset_type: rustrade_execution::order::TrailingOffsetType::Absolute,
             activation_price: None,
         },
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key,
@@ -1064,16 +1043,13 @@ async fn test_account_stream_with_order() {
     };
 
     // ETH ~$3500 as of 2026, so $2000 is ~43% below - within 80% limit
-    let request_open = RequestOpen {
-        side: Side::Buy,
-        price: Some(dec!(2000.0)),
-        quantity: dec!(0.01),
-        kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request_open = RequestOpen::new(
+        Side::Buy,
+        Some(dec!(2000.0)),
+        dec!(0.01),
+        OrderKind::Limit,
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key,
@@ -1170,16 +1146,13 @@ async fn test_order_is_reported_under_its_client_id() {
     let response = client
         .open_order(rustrade_execution::order::OrderEvent {
             key: key.clone(),
-            state: RequestOpen {
-                side: Side::Buy,
-                price: Some(dec!(1600.0)),
-                quantity: dec!(0.01),
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodUntilCancelled { post_only: true },
-                position_id: None,
-                reduce_only: false,
-                market: None,
-            },
+            state: RequestOpen::new(
+                Side::Buy,
+                Some(dec!(1600.0)),
+                dec!(0.01),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilCancelled { post_only: true },
+            ),
         })
         .await;
     let venue_id = match &response.state {
@@ -1430,16 +1403,13 @@ async fn test_boundary_precision_orders_rest() {
         let response = client
             .open_order(rustrade_execution::order::OrderEvent {
                 key: key.clone(),
-                state: RequestOpen {
+                state: RequestOpen::new(
                     side,
-                    price: Some(price),
+                    Some(price),
                     quantity,
-                    kind: OrderKind::Limit,
-                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                    position_id: None,
-                    reduce_only: false,
-                    market: None,
-                },
+                    OrderKind::Limit,
+                    TimeInForce::GoodUntilCancelled { post_only: false },
+                ),
             })
             .await;
         let OrderState::Active(ActiveOrderState::Open(open)) = &response.state else {

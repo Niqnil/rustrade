@@ -1613,16 +1613,13 @@ mod tests {
                         strategy: StrategyId::new("strategy"),
                         cid: ClientOrderId::uuid(),
                     },
-                    state: RequestOpen {
-                        side: Side::Buy,
-                        price: Some(price),
+                    state: RequestOpen::new(
+                        Side::Buy,
+                        Some(price),
                         quantity,
-                        kind: OrderKind::Limit,
-                        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                        position_id: None,
-                        reduce_only: false,
-                        market: None,
-                    },
+                        OrderKind::Limit,
+                        TimeInForce::GoodUntilCancelled { post_only: false },
+                    ),
                 })
                 .await
         }

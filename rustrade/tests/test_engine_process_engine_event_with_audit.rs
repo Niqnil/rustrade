@@ -180,18 +180,16 @@ fn test_engine_process_engine_event_with_audit() {
             strategy: strategy_id(),
             cid: gen_cid(0),
         },
-        state: RequestOpen {
-            side: Side::Buy,
-            kind: OrderKind::Market,
-            time_in_force: TimeInForce::ImmediateOrCancel,
-            price: None,
-            quantity: dec!(1),
-            position_id: None,
-            reduce_only: false,
-            // Stamped by the Engine as it emits the request: the last trade this instrument
-            // processed above, and no book because the feed carries trades only.
-            market: Some(MarketSnapshot::from_last_price(Some(dec!(10000)))),
-        },
+        state: RequestOpen::new(
+            Side::Buy,
+            None,
+            dec!(1),
+            OrderKind::Market,
+            TimeInForce::ImmediateOrCancel,
+        )
+        // Stamped by the Engine as it emits the request: the last trade this instrument
+        // processed above, and no book because the feed carries trades only.
+        .with_market(MarketSnapshot::from_last_price(Some(dec!(10000)))),
     };
     let eth_btc_buy_order = OrderRequestOpen {
         key: OrderKey {
@@ -200,16 +198,14 @@ fn test_engine_process_engine_event_with_audit() {
             strategy: strategy_id(),
             cid: gen_cid(1),
         },
-        state: RequestOpen {
-            side: Side::Buy,
-            kind: OrderKind::Market,
-            time_in_force: TimeInForce::ImmediateOrCancel,
-            price: None,
-            quantity: dec!(1),
-            position_id: None,
-            reduce_only: false,
-            market: Some(MarketSnapshot::from_last_price(Some(dec!(0.1)))),
-        },
+        state: RequestOpen::new(
+            Side::Buy,
+            None,
+            dec!(1),
+            OrderKind::Market,
+            TimeInForce::ImmediateOrCancel,
+        )
+        .with_market(MarketSnapshot::from_last_price(Some(dec!(0.1)))),
     };
     assert_eq!(
         audit.event,
@@ -391,17 +387,17 @@ fn test_engine_process_engine_event_with_audit() {
             // mode the PositionId is PositionId::NETTING whose inner value is "netting".
             cid: ClientOrderId::new("netting"),
         },
-        state: RequestOpen {
-            side: Side::Sell,
-            kind: OrderKind::Market,
-            time_in_force: TimeInForce::ImmediateOrCancel,
-            price: None,
-            quantity: dec!(1),
-            position_id: Some(PositionId::NETTING),
-            reduce_only: true, // closing position
-            // A close is stamped like any other open the Engine emits.
-            market: Some(MarketSnapshot::from_last_price(Some(dec!(20000)))),
-        },
+        state: RequestOpen::new(
+            Side::Sell,
+            None,
+            dec!(1),
+            OrderKind::Market,
+            TimeInForce::ImmediateOrCancel,
+        )
+        .with_position_id(PositionId::NETTING)
+        .with_reduce_only(true) // closing position
+        // A close is stamped like any other open the Engine emits.
+        .with_market(MarketSnapshot::from_last_price(Some(dec!(20000)))),
     };
     assert_eq!(
         audit.event,
@@ -554,18 +550,16 @@ fn test_engine_process_engine_event_with_audit() {
             strategy: strategy_id(),
             cid: gen_cid(1),
         },
-        state: RequestOpen {
-            side: Side::Sell,
-            kind: OrderKind::Limit,
-            time_in_force: TimeInForce::GoodUntilCancelled { post_only: true },
-            price: Some(dec!(0.05)),
-            quantity: dec!(1),
-            position_id: None,
-            reduce_only: true, // closing position
-            // The commanding caller supplies no market, as a caller outside the Engine cannot
-            // know what the Engine has processed. The Engine stamps its own before sending.
-            market: None,
-        },
+        state: RequestOpen::new(
+            Side::Sell,
+            Some(dec!(0.05)),
+            dec!(1),
+            OrderKind::Limit,
+            TimeInForce::GoodUntilCancelled { post_only: true },
+        )
+        // No market: a caller outside the Engine cannot know what the Engine has processed. The
+        // Engine stamps its own before sending.
+        .with_reduce_only(true), // closing position
     };
     // What the Engine actually sends: the same request, stamped with the market it observed as it
     // emitted it -- the last trade instrument 1 processed above, and no book because the feed
@@ -946,16 +940,13 @@ impl AlgoStrategy for TestBuyAndHoldStrategy {
                         strategy: self.id.clone(),
                         cid: gen_cid(state.key.index()),
                     },
-                    state: RequestOpen {
-                        side: Side::Buy,
-                        kind: OrderKind::Market,
-                        time_in_force: TimeInForce::ImmediateOrCancel,
-                        price: None, // Market orders don't have a limit price
-                        quantity: dec!(1),
-                        position_id: None,
-                        reduce_only: false,
-                        market: None,
-                    },
+                    state: RequestOpen::new(
+                        Side::Buy,
+                        None, // Market orders don't have a limit price
+                        dec!(1),
+                        OrderKind::Market,
+                        TimeInForce::ImmediateOrCancel,
+                    ),
                 })
             });
 
@@ -2319,16 +2310,13 @@ fn open_request(instrument: InstrumentIndex, cid: &str) -> OrderRequestOpen {
             strategy: strategy_id(),
             cid: ClientOrderId::new(cid),
         },
-        state: RequestOpen {
-            side: Side::Buy,
-            kind: OrderKind::Limit,
-            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-            price: Some(dec!(45_000)),
-            quantity: dec!(1),
-            position_id: None,
-            reduce_only: false,
-            market: None,
-        },
+        state: RequestOpen::new(
+            Side::Buy,
+            Some(dec!(45_000)),
+            dec!(1),
+            OrderKind::Limit,
+            TimeInForce::GoodUntilCancelled { post_only: false },
+        ),
     }
 }
 
@@ -4897,16 +4885,15 @@ fn send_open_order_with_position_id(
             strategy: strategy_id(),
             cid,
         },
-        state: RequestOpen {
+        state: RequestOpen::new(
             side,
-            kind: OrderKind::Limit,
-            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-            price: Some(price),
-            quantity: dec!(1),
-            position_id: Some(position_id),
-            reduce_only,
-            market: None,
-        },
+            Some(price),
+            dec!(1),
+            OrderKind::Limit,
+            TimeInForce::GoodUntilCancelled { post_only: false },
+        )
+        .with_position_id(position_id)
+        .with_reduce_only(reduce_only),
     };
     let event = EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(request)));
     engine.process(event);

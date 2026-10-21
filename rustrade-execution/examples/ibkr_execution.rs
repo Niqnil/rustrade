@@ -137,16 +137,13 @@ async fn main() {
         cid: order_cid.clone(),
     };
 
-    let request_open = RequestOpen {
-        side: Side::Buy,
-        price: Some(dec!(1.00)), // Very low price - won't fill
-        quantity: dec!(1),
-        kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodUntilEndOfDay,
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request_open = RequestOpen::new(
+        Side::Buy,
+        Some(dec!(1.00)), // Very low price - won't fill
+        dec!(1),
+        OrderKind::Limit,
+        TimeInForce::GoodUntilEndOfDay,
+    );
 
     let open_request = OrderEvent {
         key: order_key.clone(),

@@ -5126,16 +5126,13 @@ mod tests {
                 strategy: StrategyId::new("strategy"),
                 cid: ClientOrderId::new("cid"),
             },
-            state: crate::order::request::RequestOpen {
-                side: Side::Buy,
-                price: Some(Decimal::new(50_000, 0)),
-                quantity: Decimal::new(1, 3),
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                position_id: None,
-                reduce_only: false,
-                market: None,
-            },
+            state: crate::order::request::RequestOpen::new(
+                Side::Buy,
+                Some(Decimal::new(50_000, 0)),
+                Decimal::new(1, 3),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilCancelled { post_only: false },
+            ),
         };
 
         let order = client.open_order(request).await;

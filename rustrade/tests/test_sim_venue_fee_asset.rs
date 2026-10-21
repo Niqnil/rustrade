@@ -156,16 +156,13 @@ fn market_order(side: Side) -> OrderEvent<RequestOpen, ExchangeId, InstrumentNam
             strategy: StrategyId::new("test"),
             cid: ClientOrderId::random(),
         },
-        state: RequestOpen {
+        state: RequestOpen::new(
             side,
-            price: None,
-            quantity: dec!(1),
-            kind: OrderKind::Market,
-            time_in_force: TimeInForce::ImmediateOrCancel,
-            position_id: None,
-            reduce_only: false,
-            market: None,
-        },
+            None,
+            dec!(1),
+            OrderKind::Market,
+            TimeInForce::ImmediateOrCancel,
+        ),
     }
 }
 
