@@ -105,8 +105,12 @@ ignore = [
     #     enables its `rustls-tls-webpki-roots` feature; every path runs through the `hyperliquid`
     #     feature. Neither is used to verify a connection: reqwest 0.11 picks native-tls whenever its
     #     `default-tls` feature is on, which hyperliquid_rust_sdk's default reqwest turns on, and
-    #     neither that SDK nor this workspace asks for rustls; the SDK's WebSocket is native-tls, and
-    #     this workspace uses ethers only for signing and types, never its network clients.
+    #     neither that SDK nor this workspace asks for rustls. tokio-tungstenite 0.20 also gets its
+    #     rustls feature from ethers-providers, but the SDK connects with `connect_async` and no
+    #     connector, which uses native-tls whenever that crate's `native-tls` feature is on, as the
+    #     SDK turns it on. This workspace uses ethers only for signing and types, never its network
+    #     clients. That reasoning rests on the SDK keeping reqwest's default features and that
+    #     WebSocket call, so re-verify it on any hyperliquid_rust_sdk or ethers bump.
     # As with rustls above, an `id` ignore also silences these for the patched lines, so the
     # rustls-webpki and webpki-roots entries in `[bans] deny` below keep those lines at or above
     # their fixed releases. Drop both ignores, and those bans, once hyperliquid_rust_sdk and ethers
