@@ -93,6 +93,26 @@ ignore = [
     # hyperliquid_rust_sdk and ethers move off rustls 0.21.
     { id = "RUSTSEC-2026-0346", reason = "rustls 0.21 has no patched release; reached only via the hyperliquid feature; no custom ClientSessionStore" },
     { id = "RUSTSEC-2026-0349", reason = "rustls 0.21 has no patched release; reached only via the hyperliquid feature; 0.21 offers no post-quantum group to downgrade" },
+
+    # emSign distrust advisories of 2026-10-19/20: the bundled roots (webpki-roots, webpki-root-certs)
+    # still trust emSign ECC Root CA - G3, and rustls-webpki accepts paths through its distrusted
+    # intermediates, whose private keys are public. Two instances of each are in the lockfile:
+    #   * our own TLS stack (rustls 0.23 / tokio-tungstenite) -- FIXED, bumped to rustls-webpki
+    #     0.103.16, webpki-roots 1.0.10 and webpki-root-certs 1.0.10, so RUSTSEC-2026-0383 needs no
+    #     ignore.
+    #   * rustls-webpki 0.101.7 and webpki-roots 0.25.4, kept here. No patched release exists on
+    #     either line. Both sit under rustls 0.21, which reqwest 0.11 compiles in because ethers 2.0
+    #     enables its `rustls-tls-webpki-roots` feature; every path runs through the `hyperliquid`
+    #     feature. Neither is used to verify a connection: reqwest 0.11 picks native-tls whenever its
+    #     `default-tls` feature is on, which hyperliquid_rust_sdk's default reqwest turns on, and
+    #     neither that SDK nor this workspace asks for rustls; the SDK's WebSocket is native-tls, and
+    #     this workspace uses ethers only for signing and types, never its network clients.
+    # As with rustls above, an `id` ignore also silences these for the patched lines, so the
+    # rustls-webpki and webpki-roots entries in `[bans] deny` below keep those lines at or above
+    # their fixed releases. Drop both ignores, and those bans, once hyperliquid_rust_sdk and ethers
+    # move off rustls 0.21.
+    { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.25 has no patched release; reached only via the hyperliquid feature; that rustls 0.21 stack verifies no connection (reqwest 0.11 uses native-tls)" },
+    { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.101 has no patched release; reached only via the hyperliquid feature; that rustls 0.21 stack verifies no connection (reqwest 0.11 uses native-tls)" },
 ]
 
 # Licenses - strict permissive only
@@ -154,7 +174,7 @@ highlight = "all"
 # workspace-wide, so *any* future dependency pulling `parquet` with defaults re-admits the lot
 # silently. The four arrow entries below make `cargo deny` fail the moment it happens. If arrow
 # ever becomes a deliberate dependency, that is a tier-2 review, and removing those four lines is
-# how it is recorded. (The rustls entry after them is unrelated; its own comment explains it.)
+# how it is recorded. (The TLS entries after them are unrelated; their own comments explain them.)
 deny = [
     { name = "arrow" },
     { name = "arrow-array" },
@@ -166,6 +186,14 @@ deny = [
     # ban is what keeps the 0.23 line at or above its fixed release (0.23.46). 0.21 is outside the
     # range on purpose. Drop it together with those two ignores.
     { crate = "rustls:>=0.22, <0.23.46" },
+
+    # Likewise for RUSTSEC-2026-0382 (rustls-webpki) and RUSTSEC-2026-0381 (webpki-roots), ignored
+    # above by id for the unpatched 0.101 and 0.25 lines: these keep the 0.103 and 1.x lines at or
+    # above their fixed releases. 0.101 and 0.25 are outside the ranges on purpose, as is the
+    # webpki-roots 0.26.11 wrapper, which re-exports the 1.x roots. Drop them together with those
+    # two ignores.
+    { crate = "rustls-webpki:>=0.102, <0.103.16" },
+    { crate = "webpki-roots:>=1.0.0, <1.0.10" },
 ]
 
 # Sources - only allow crates.io
