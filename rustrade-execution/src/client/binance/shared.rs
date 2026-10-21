@@ -3090,16 +3090,17 @@ pub(crate) fn parse_binance_api_error(
 ///
 /// A venue failure ([`has_venue_failure_code`]) → [`OrderError::Connectivity`]: the order may
 /// or may not have reached the matching engine, and reporting a definitive rejection for one that
-/// executed would leave the caller blind to a fill. Everything else but `-3111` (below) is a
-/// rejection, mapped by [`parse_binance_api_error`]. The venue-failure check comes first on
+/// executed would leave the caller blind to a fill. The venue-failure check comes first on
 /// purpose: should a message ever carry both a venue-failure code and an auth or throttle marker,
 /// "status unknown" is the label that cannot hide a fill.
 ///
 /// `-3111` (TRAILING_STOP_LIMIT_ONLY, "Trailing stop order only supports limit type") →
 /// [`OrderError::UnsupportedOrderType`]: the venue does not take this order type here, so the
 /// caller can place another one (a trailing stop-limit) instead. A cross margin account answers
-/// a trailing `STOP_LOSS` this way. The code has no other meaning, and only the margin (SAPI)
-/// endpoints send `-3xxx` codes, so Spot never meets it.
+/// a trailing `STOP_LOSS` this way. Binance lists the code, with this one meaning, among its
+/// margin (SAPI) errors.
+///
+/// Everything else is a rejection, mapped by [`parse_binance_api_error`].
 pub(crate) fn parse_binance_order_rejection(
     msg: String,
     instrument: &InstrumentNameExchange,

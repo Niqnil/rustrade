@@ -375,8 +375,8 @@ impl BinanceMarginConfig {
 ///
 /// # Conditional orders read back over REST
 /// Binance margin accepts a `trailingDelta` on its conditional types (`STOP_LOSS`,
-/// `STOP_LOSS_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`), though a cross account takes it on the
-/// limit types only (see "Trailing stops" above), and the REST order queries this client
+/// `STOP_LOSS_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`), though a cross account refuses a
+/// trailing `STOP_LOSS` (see "Trailing stops" above), and the REST order queries this client
 /// reads (`openOrders` and `order`) do not report it: Binance returns neither `trailingDelta` nor
 /// `trailingTime` there (#541). A trailing order placed without an activation price reads
 /// `stopPrice` `"0"`. A conditional order read over REST could therefore be a fixed or a trailing
