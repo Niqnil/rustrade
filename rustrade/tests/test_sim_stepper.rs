@@ -187,16 +187,7 @@ fn order_working(
             strategy: StrategyId::new("agent"),
             cid: ClientOrderId::new(cid),
         },
-        state: RequestOpen {
-            side,
-            price: None,
-            quantity,
-            kind: OrderKind::Market,
-            time_in_force,
-            position_id: None,
-            reduce_only: false,
-            market: None,
-        },
+        state: RequestOpen::new(side, None, quantity, OrderKind::Market, time_in_force),
     }))
 }
 
@@ -1310,16 +1301,13 @@ fn a_step_with_no_events_delivers_a_deadline_it_reaches() {
                 strategy: StrategyId::new("agent"),
                 cid: ClientOrderId::new("gtd"),
             },
-            state: RequestOpen {
-                side: Side::Buy,
-                price: Some(dec!(90)),
-                quantity: dec!(1),
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodTillDate { expiry: at(5) },
-                position_id: None,
-                reduce_only: false,
-                market: None,
-            },
+            state: RequestOpen::new(
+                Side::Buy,
+                Some(dec!(90)),
+                dec!(1),
+                OrderKind::Limit,
+                TimeInForce::GoodTillDate { expiry: at(5) },
+            ),
         },
     )));
     s.stepper.settle(&mut s.engine).unwrap();
@@ -1470,16 +1458,13 @@ impl AlgoStrategy for EveryBar {
                         strategy: StrategyId::new("every-bar"),
                         cid: ClientOrderId::new(format!("{}-{}", instrument.key, bar.timestamp())),
                     },
-                    state: RequestOpen {
+                    state: RequestOpen::new(
                         side,
-                        price: None,
-                        quantity: dec!(1),
-                        kind: OrderKind::Market,
-                        time_in_force: TimeInForce::ImmediateOrCancel,
-                        position_id: None,
-                        reduce_only: false,
-                        market: None,
-                    },
+                        None,
+                        dec!(1),
+                        OrderKind::Market,
+                        TimeInForce::ImmediateOrCancel,
+                    ),
                 })
             })
             .collect::<Vec<_>>();

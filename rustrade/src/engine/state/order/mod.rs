@@ -1113,16 +1113,13 @@ mod tests {
                 strategy: StrategyId::unknown(),
                 cid,
             },
-            state: RequestOpen {
-                side: Side::Buy,
-                price: Some(dec!(1)),
-                quantity: dec!(1),
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodUntilEndOfDay,
-                position_id: None,
-                reduce_only: false,
-                market: None,
-            },
+            state: RequestOpen::new(
+                Side::Buy,
+                Some(dec!(1)),
+                dec!(1),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilEndOfDay,
+            ),
         }
     }
 

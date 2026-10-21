@@ -45,8 +45,13 @@ pub type UnindexedOrderResponseCancel =
 /// - On non-margin accounts: result in a 422 rejection from the exchange
 /// - On margin accounts: silently open a short position instead of closing the long
 ///
-/// The `close_open_positions_with_market_orders`
-/// helper sets this correctly. Direct `RequestOpen` construction must handle it manually.
+/// The `close_open_positions_with_market_orders` helper sets this correctly. A caller building
+/// its own closing request must set it with [`with_reduce_only`](Self::with_reduce_only).
+///
+/// `#[non_exhaustive]`, so a field can be added without breaking a caller. Outside this crate,
+/// build one with [`RequestOpen::new`] and the `with_*` methods, and change a copy by assigning
+/// its public fields.
+#[non_exhaustive]
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct RequestOpen {
     pub side: Side,
@@ -135,6 +140,58 @@ pub struct RequestOpen {
     pub market: Option<MarketSnapshot>,
 }
 
+impl RequestOpen {
+    /// A request with no [`position_id`](Self::position_id), not
+    /// [`reduce_only`](Self::reduce_only), and no [`market`](Self::market) snapshot. Set those
+    /// with the `with_*` methods.
+    pub fn new(
+        side: Side,
+        price: Option<Decimal>,
+        quantity: Decimal,
+        kind: OrderKind,
+        time_in_force: TimeInForce,
+    ) -> Self {
+        Self {
+            side,
+            price,
+            quantity,
+            kind,
+            time_in_force,
+            position_id: None,
+            reduce_only: false,
+            market: None,
+        }
+    }
+
+    /// This request with the [`position_id`](Self::position_id) it targets in
+    /// `OmsMode::Hedging`.
+    #[must_use]
+    pub fn with_position_id(self, position_id: PositionId) -> Self {
+        Self {
+            position_id: Some(position_id),
+            ..self
+        }
+    }
+
+    /// This request with its [`reduce_only`](Self::reduce_only) flag set to `reduce_only`.
+    #[must_use]
+    pub fn with_reduce_only(self, reduce_only: bool) -> Self {
+        Self {
+            reduce_only,
+            ..self
+        }
+    }
+
+    /// This request with the [`market`](Self::market) its sender observed when it created it.
+    #[must_use]
+    pub fn with_market(self, market: MarketSnapshot) -> Self {
+        Self {
+            market: Some(market),
+            ..self
+        }
+    }
+}
+
 #[derive(
     Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Default, Deserialize, Serialize, Constructor,
 )]
@@ -151,4 +208,80 @@ pub struct RequestCancel {
     /// Collapsing the last two into `None` would leave a client unable to tell "nothing to cancel"
     /// from "cancel by client id".
     pub id: Option<VenueOrderId>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    fn limit() -> RequestOpen {
+        RequestOpen::new(
+            Side::Sell,
+            Some(dec!(101)),
+            dec!(2),
+            OrderKind::Limit,
+            TimeInForce::GoodUntilCancelled { post_only: false },
+        )
+    }
+
+    #[test]
+    fn new_sets_the_given_fields_and_defaults_the_rest() {
+        let request = limit();
+
+        assert_eq!(request.side, Side::Sell);
+        assert_eq!(request.price, Some(dec!(101)));
+        assert_eq!(request.quantity, dec!(2));
+        assert_eq!(request.kind, OrderKind::Limit);
+        assert_eq!(
+            request.time_in_force,
+            TimeInForce::GoodUntilCancelled { post_only: false }
+        );
+        assert_eq!(request.position_id, None);
+        assert!(!request.reduce_only);
+        assert_eq!(request.market, None);
+    }
+
+    #[test]
+    fn with_methods_set_only_their_own_field() {
+        // Every optional field away from its default, so a builder that reset another field
+        // would show.
+        let set = RequestOpen {
+            position_id: Some(PositionId::new("a")),
+            reduce_only: true,
+            market: Some(MarketSnapshot::from_last_price(Some(dec!(100)))),
+            ..limit()
+        };
+
+        assert_eq!(
+            set.clone().with_position_id(PositionId::new("b")),
+            RequestOpen {
+                position_id: Some(PositionId::new("b")),
+                ..set.clone()
+            }
+        );
+        assert_eq!(
+            set.clone().with_reduce_only(false),
+            RequestOpen {
+                reduce_only: false,
+                ..set.clone()
+            }
+        );
+        let market = MarketSnapshot::from_last_price(Some(dec!(200)));
+        assert_eq!(
+            set.clone().with_market(market),
+            RequestOpen {
+                market: Some(market),
+                ..set
+            }
+        );
+
+        // And each sets its field from the default.
+        assert_eq!(
+            limit().with_position_id(PositionId::NETTING).position_id,
+            Some(PositionId::NETTING)
+        );
+        assert!(limit().with_reduce_only(true).reduce_only);
+        assert_eq!(limit().with_market(market).market, Some(market));
+    }
 }

@@ -596,14 +596,14 @@ pub(crate) mod fixtures {
                 cid: ClientOrderId::new("test-cid"),
             },
             state: RequestOpen {
-                side,
-                price: None, // Market orders don't have a limit price
-                quantity: d(quantity),
-                kind: OrderKind::Market,
-                time_in_force: TimeInForce::ImmediateOrCancel,
-                position_id: None,
-                reduce_only: false,
                 market,
+                ..RequestOpen::new(
+                    side,
+                    None, // Market orders don't have a limit price
+                    d(quantity),
+                    OrderKind::Market,
+                    TimeInForce::ImmediateOrCancel,
+                )
             },
         }
     }
@@ -645,16 +645,13 @@ pub(crate) mod fixtures {
                 strategy: StrategyId::new("test"),
                 cid: ClientOrderId::new(cid),
             },
-            state: RequestOpen {
+            state: RequestOpen::new(
                 side,
-                price: Some(d(price)),
-                quantity: d(quantity),
-                kind: OrderKind::Limit,
+                Some(d(price)),
+                d(quantity),
+                OrderKind::Limit,
                 time_in_force,
-                position_id: None,
-                reduce_only: false,
-                market: None,
-            },
+            ),
         }
     }
 

@@ -472,16 +472,13 @@ async fn test_place_and_cancel_limit_order() {
         cid: order_cid.clone(),
     };
 
-    let request_open = RequestOpen {
-        side: Side::Buy,
-        price: Some(dec!(1.00)),
-        quantity: dec!(1),
-        kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodUntilEndOfDay,
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request_open = RequestOpen::new(
+        Side::Buy,
+        Some(dec!(1.00)),
+        dec!(1),
+        OrderKind::Limit,
+        TimeInForce::GoodUntilEndOfDay,
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -668,16 +665,13 @@ async fn test_order_without_registered_contract() {
         cid: order_cid.clone(),
     };
 
-    let request_open = RequestOpen {
-        side: Side::Buy,
-        price: Some(dec!(100.00)),
-        quantity: dec!(1),
-        kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodUntilEndOfDay,
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request_open = RequestOpen::new(
+        Side::Buy,
+        Some(dec!(100.00)),
+        dec!(1),
+        OrderKind::Limit,
+        TimeInForce::GoodUntilEndOfDay,
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key,
@@ -770,16 +764,13 @@ async fn test_cancel_produces_cancelled_not_expired() {
         cid: order_cid.clone(),
     };
 
-    let request_open = RequestOpen {
-        side: Side::Buy,
-        price: Some(dec!(1.00)),
-        quantity: dec!(1),
-        kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodUntilEndOfDay, // DAY order - would be Expired if not cancelled
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request_open = RequestOpen::new(
+        Side::Buy,
+        Some(dec!(1.00)),
+        dec!(1),
+        OrderKind::Limit,
+        TimeInForce::GoodUntilEndOfDay, // DAY order - would be Expired if not cancelled
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -895,18 +886,15 @@ async fn test_place_and_cancel_stop_order() {
     };
 
     // Sell Stop at $0.01 trigger - won't trigger since AAPL >> $0.01
-    let request_open = RequestOpen {
-        side: Side::Sell,
-        price: None, // Stop orders have no limit price
-        quantity: dec!(1),
-        kind: OrderKind::Stop {
+    let request_open = RequestOpen::new(
+        Side::Sell,
+        None, // Stop orders have no limit price
+        dec!(1),
+        OrderKind::Stop {
             trigger_price: dec!(0.01),
         },
-        time_in_force: TimeInForce::GoodUntilEndOfDay,
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+        TimeInForce::GoodUntilEndOfDay,
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -989,18 +977,15 @@ async fn test_place_and_cancel_stop_limit_order() {
     };
 
     // Sell StopLimit: trigger at $0.01, limit at $0.01 - won't trigger
-    let request_open = RequestOpen {
-        side: Side::Sell,
-        price: Some(dec!(0.01)), // Limit price (used when stop triggers)
-        quantity: dec!(1),
-        kind: OrderKind::StopLimit {
+    let request_open = RequestOpen::new(
+        Side::Sell,
+        Some(dec!(0.01)), // Limit price (used when stop triggers)
+        dec!(1),
+        OrderKind::StopLimit {
             trigger_price: dec!(0.01),
         },
-        time_in_force: TimeInForce::GoodUntilEndOfDay,
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+        TimeInForce::GoodUntilEndOfDay,
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -1084,20 +1069,17 @@ async fn test_place_and_cancel_trailing_stop_percentage() {
     };
 
     // Sell TrailingStop with 50% percentage offset - won't trigger
-    let request_open = RequestOpen {
-        side: Side::Sell,
-        price: None, // Trailing stop orders have no limit price
-        quantity: dec!(1),
-        kind: OrderKind::TrailingStop {
+    let request_open = RequestOpen::new(
+        Side::Sell,
+        None, // Trailing stop orders have no limit price
+        dec!(1),
+        OrderKind::TrailingStop {
             offset: dec!(50), // 50% trailing offset
             offset_type: TrailingOffsetType::Percentage,
             activation_price: None,
         },
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -1189,16 +1171,13 @@ async fn place_and_cancel_trailing_stop_limit(
         stop_price: dec!(200),
         limit_offset: dec!(1), // Limit price = stop price - $1
     };
-    let request_open = RequestOpen {
-        side: Side::Sell,
-        price: None, // The limit follows from the stop and limit_offset
-        quantity: dec!(1),
+    let request_open = RequestOpen::new(
+        Side::Sell,
+        None, // The limit follows from the stop and limit_offset
+        dec!(1),
         kind,
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -1521,16 +1500,13 @@ async fn test_place_and_cancel_gtd_order() {
 
     // GTD order expiring tomorrow at 23:59:59 UTC
     let expiry = chrono::Utc::now() + chrono::Duration::days(1);
-    let request_open = RequestOpen {
-        side: Side::Buy,
-        price: Some(dec!(1.00)),
-        quantity: dec!(1),
-        kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodTillDate { expiry },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request_open = RequestOpen::new(
+        Side::Buy,
+        Some(dec!(1.00)),
+        dec!(1),
+        OrderKind::Limit,
+        TimeInForce::GoodTillDate { expiry },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -1617,16 +1593,13 @@ async fn test_place_moo_order_premarket() {
     };
 
     // Market-on-Open order - only valid during pre-market
-    let request_open = RequestOpen {
-        side: Side::Buy,
-        price: None, // Market orders have no limit price
-        quantity: dec!(1),
-        kind: OrderKind::Market,
-        time_in_force: TimeInForce::AtOpen,
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request_open = RequestOpen::new(
+        Side::Buy,
+        None, // Market orders have no limit price
+        dec!(1),
+        OrderKind::Market,
+        TimeInForce::AtOpen,
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -1709,16 +1682,13 @@ async fn test_place_loo_order_premarket() {
     };
 
     // Limit-on-Open at $1 - won't fill
-    let request_open = RequestOpen {
-        side: Side::Buy,
-        price: Some(dec!(1.00)),
-        quantity: dec!(1),
-        kind: OrderKind::Limit,
-        time_in_force: TimeInForce::AtOpen,
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request_open = RequestOpen::new(
+        Side::Buy,
+        Some(dec!(1.00)),
+        dec!(1),
+        OrderKind::Limit,
+        TimeInForce::AtOpen,
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -1816,16 +1786,13 @@ async fn test_orders_found_by_client_order_id_across_a_restart() {
                 strategy: strategy.clone(),
                 cid: ClientOrderId::new("ordre-\u{e9}"),
             },
-            state: RequestOpen {
-                side: Side::Buy,
-                price: Some(dec!(1.00)),
-                quantity: dec!(1),
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                position_id: None,
-                reduce_only: false,
-                market: None,
-            },
+            state: RequestOpen::new(
+                Side::Buy,
+                Some(dec!(1.00)),
+                dec!(1),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilCancelled { post_only: false },
+            ),
         })
         .await;
     assert!(
@@ -1845,16 +1812,13 @@ async fn test_orders_found_by_client_order_id_across_a_restart() {
                 strategy: strategy.clone(),
                 cid: cid.clone(),
             },
-            state: RequestOpen {
-                side: Side::Buy,
-                price: Some(dec!(1.00)),
-                quantity: dec!(1),
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                position_id: None,
-                reduce_only: false,
-                market: None,
-            },
+            state: RequestOpen::new(
+                Side::Buy,
+                Some(dec!(1.00)),
+                dec!(1),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilCancelled { post_only: false },
+            ),
         })
         .await;
     assert!(
@@ -1896,16 +1860,13 @@ async fn test_orders_found_by_client_order_id_across_a_restart() {
                 strategy: strategy.clone(),
                 cid: placed_here.clone(),
             },
-            state: RequestOpen {
-                side: Side::Buy,
-                price: Some(dec!(1.00)),
-                quantity: dec!(1),
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                position_id: None,
-                reduce_only: false,
-                market: None,
-            },
+            state: RequestOpen::new(
+                Side::Buy,
+                Some(dec!(1.00)),
+                dec!(1),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilCancelled { post_only: false },
+            ),
         })
         .await;
     assert!(
@@ -2127,16 +2088,13 @@ async fn fill_paper_short_order(side: Side, client_id_offset: i32) {
                         .as_millis()
                 )),
             },
-            state: RequestOpen {
+            state: RequestOpen::new(
                 side,
-                price: None,
+                None,
                 quantity,
-                kind: OrderKind::Market,
-                time_in_force: TimeInForce::GoodUntilEndOfDay,
-                position_id: None,
-                reduce_only: false,
-                market: None,
-            },
+                OrderKind::Market,
+                TimeInForce::GoodUntilEndOfDay,
+            ),
         })
         .await;
     println!(

@@ -319,16 +319,13 @@ async fn test_spot_place_and_cancel_limit_order() {
     // A limit buy below the market, so it rests, worth about $20 (above the $10 minimum)
     let price = resting_hype_price().await;
     let quantity = hype_quantity(dec!(20), price);
-    let request_open = RequestOpen {
-        side: Side::Buy,
-        price: Some(price),
+    let request_open = RequestOpen::new(
+        Side::Buy,
+        Some(price),
         quantity,
-        kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+        OrderKind::Limit,
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -408,16 +405,13 @@ async fn test_spot_minimum_notional_validation() {
 
     // An order worth about $5, below the $10 minimum, at a price the venue would otherwise accept
     let price = resting_hype_price().await;
-    let request_open = RequestOpen {
-        side: Side::Buy,
-        price: Some(price),
-        quantity: hype_quantity(dec!(5), price),
-        kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request_open = RequestOpen::new(
+        Side::Buy,
+        Some(price),
+        hype_quantity(dec!(5), price),
+        OrderKind::Limit,
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key,
@@ -540,16 +534,13 @@ async fn test_spot_account_stream_with_order() {
 
     // A limit buy below the market, so it rests, worth about $20 (above the $10 minimum)
     let price = resting_hype_price().await;
-    let request_open = RequestOpen {
-        side: Side::Buy,
-        price: Some(price),
-        quantity: hype_quantity(dec!(20), price),
-        kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request_open = RequestOpen::new(
+        Side::Buy,
+        Some(price),
+        hype_quantity(dec!(20), price),
+        OrderKind::Limit,
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key,

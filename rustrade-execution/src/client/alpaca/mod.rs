@@ -8565,16 +8565,14 @@ mod tests {
                     strategy: StrategyId::new("test-strategy"),
                     cid: ClientOrderId::new("test-cid"),
                 },
-                state: RequestOpen {
-                    side: Side::Sell,
-                    price: None,
-                    quantity: Decimal::new(10, 0),
-                    kind: OrderKind::Market,
-                    time_in_force: TimeInForce::ImmediateOrCancel,
-                    position_id: None,
-                    reduce_only: true, // This should map to SellToClose
-                    market: None,
-                },
+                state: RequestOpen::new(
+                    Side::Sell,
+                    None,
+                    Decimal::new(10, 0),
+                    OrderKind::Market,
+                    TimeInForce::ImmediateOrCancel,
+                )
+                .with_reduce_only(true), // This should map to SellToClose
             };
 
             // Call open_order (borrows instrument)
@@ -8662,16 +8660,14 @@ mod tests {
                     strategy: StrategyId::new("test-strategy"),
                     cid: ClientOrderId::new("test-cid"),
                 },
-                state: RequestOpen {
-                    side: Side::Buy,
-                    price: None,
-                    quantity: Decimal::new(10, 0),
-                    kind: OrderKind::Market,
-                    time_in_force: TimeInForce::ImmediateOrCancel,
-                    position_id: None,
-                    reduce_only: false, // This should map to BuyToOpen
-                    market: None,
-                },
+                // Not reduce_only: this should map to BuyToOpen
+                state: RequestOpen::new(
+                    Side::Buy,
+                    None,
+                    Decimal::new(10, 0),
+                    OrderKind::Market,
+                    TimeInForce::ImmediateOrCancel,
+                ),
             };
 
             let order = client.open_order(request).await;
@@ -8844,16 +8840,13 @@ mod tests {
                         strategy: StrategyId::new("test-strategy"),
                         cid: ClientOrderId::new("test-cid"),
                     },
-                    state: RequestOpen {
-                        side: Side::Buy,
-                        price: None,
-                        quantity: Decimal::new(10, 0),
-                        kind: OrderKind::Market,
-                        time_in_force: TimeInForce::ImmediateOrCancel,
-                        position_id: None,
-                        reduce_only: false,
-                        market: None,
-                    },
+                    state: RequestOpen::new(
+                        Side::Buy,
+                        None,
+                        Decimal::new(10, 0),
+                        OrderKind::Market,
+                        TimeInForce::ImmediateOrCancel,
+                    ),
                 })
                 .await;
 
@@ -8904,16 +8897,13 @@ mod tests {
                             strategy: StrategyId::new("test-strategy"),
                             cid: ClientOrderId::new("test-cid"),
                         },
-                        state: RequestOpen {
-                            side: Side::Sell,
-                            price: None,
-                            quantity: Decimal::new(10, 0),
-                            kind: OrderKind::Market,
-                            time_in_force: TimeInForce::ImmediateOrCancel,
-                            position_id: None,
-                            reduce_only: false,
-                            market: None,
-                        },
+                        state: RequestOpen::new(
+                            Side::Sell,
+                            None,
+                            Decimal::new(10, 0),
+                            OrderKind::Market,
+                            TimeInForce::ImmediateOrCancel,
+                        ),
                     })
                     .await
                     .state
@@ -11081,16 +11071,13 @@ mod tests {
                         StrategyId::new("strategy"),
                         ClientOrderId::new(cid),
                     ),
-                    state: RequestOpen {
-                        side: Side::Buy,
-                        price: Some(Decimal::ONE_HUNDRED),
-                        quantity: Decimal::TWO,
-                        kind: OrderKind::Limit,
-                        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                        position_id: None,
-                        reduce_only: false,
-                        market: None,
-                    },
+                    state: RequestOpen::new(
+                        Side::Buy,
+                        Some(Decimal::ONE_HUNDRED),
+                        Decimal::TWO,
+                        OrderKind::Limit,
+                        TimeInForce::GoodUntilCancelled { post_only: false },
+                    ),
                 };
                 client.open_order(request).await;
             }
@@ -11292,16 +11279,13 @@ mod tests {
                                 StrategyId::new("strategy"),
                                 ClientOrderId::new(cid),
                             ),
-                            state: RequestOpen {
-                                side: Side::Buy,
-                                price: Some(Decimal::ONE_HUNDRED),
-                                quantity: Decimal::TWO,
-                                kind: OrderKind::Limit,
+                            state: RequestOpen::new(
+                                Side::Buy,
+                                Some(Decimal::ONE_HUNDRED),
+                                Decimal::TWO,
+                                OrderKind::Limit,
                                 time_in_force,
-                                position_id: None,
-                                reduce_only: false,
-                                market: None,
-                            },
+                            ),
                         };
                         client.open_order(request).await.state
                     };
