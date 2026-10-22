@@ -67,7 +67,7 @@ futures = { workspace = true, optional = true }
 pin-project = { workspace = true, optional = true }
 
 # Data Structures
-indexmap = { workspace = true, optional = true }
+indexmap = { workspace = true, optional = true, features = ["serde"] }
 fnv = { workspace = true, optional = true }
 smol_str = { workspace = true, optional = true, features = ["serde"] }
 
