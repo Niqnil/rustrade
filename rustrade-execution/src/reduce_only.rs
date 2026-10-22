@@ -508,14 +508,13 @@ mod tests {
 
     #[test]
     fn a_loaded_book_keeps_its_bound_and_counts_its_live_reduce_only_orders() {
-        let retired: serde_json::Map<String, serde_json::Value> = (0..100)
-            .map(|i| (format!("c{i}"), serde_json::Value::Null))
-            .collect();
-        let json = serde_json::json!({
-            "live": {"l": {"reduce_only": true, "venue_id": null}, "c99": {"reduce_only": false, "venue_id": null}},
-            "retired": retired,
-        });
-        let mut book: ReduceOnlyBook = serde_json::from_value(json).unwrap();
+        // Built as text: `serde_json::Value` would sort the keys.
+        let retired: Vec<String> = (0..100).map(|i| format!(r#""c{i}":null"#)).collect();
+        let json = format!(
+            r#"{{"live":{{"l":{{"reduce_only":true,"venue_id":null}},"c99":{{"reduce_only":false,"venue_id":null}}}},"retired":{{{}}}}}"#,
+            retired.join(",")
+        );
+        let mut book: ReduceOnlyBook = serde_json::from_str(&json).unwrap();
         assert_eq!(book.retired.len(), ReduceOnlyBook::RETIRED_CAPACITY);
         assert!(book.retired.keys().next().is_some_and(|c| *c == cid("c35")));
         assert!(!book.retired.contains_key(&cid("c99")), "live wins");
