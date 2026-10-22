@@ -5751,6 +5751,15 @@ mod tests {
     }
 
     #[test]
+    fn client_debug_shows_mode_and_margin_effect_without_credentials() {
+        let debug = format!("{:?}", isolated_client(&["BTCUSDT"]));
+        assert!(debug.contains("BinanceMargin"));
+        assert!(debug.contains("is_isolated: true"));
+        assert!(debug.contains("margin_effect: NoSideEffect"));
+        assert!(!debug.contains("\"k\"") && !debug.contains("\"s\""));
+    }
+
+    #[test]
     fn isolated_assets_map_base_quote_and_risk() {
         // base: free 0.5 + locked 0.1 = total 0.6, borrowed 0.2 → net 0.4.
         // quote: free 1000 + locked 50 = total 1050, borrowed 300 → net 750.
