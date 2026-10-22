@@ -483,6 +483,23 @@ mod tests {
     }
 
     #[test]
+    fn is_empty_and_live_len_count_live_and_retired_orders() {
+        let mut book = ReduceOnlyBook::new();
+        assert_eq!((book.is_empty(), book.live_len()), (true, 0));
+        book.register(&cid("plain"), false);
+        book.register(&cid("ro"), true);
+        assert_eq!((book.is_empty(), book.live_len()), (false, 2), "live only");
+        book.retire(&cid("ro"));
+        assert_eq!((book.is_empty(), book.live_len()), (false, 1));
+        book.retire(&cid("plain"));
+        assert_eq!(
+            (book.is_empty(), book.live_len()),
+            (false, 0),
+            "retired only"
+        );
+    }
+
+    #[test]
     fn has_reduce_only_follows_the_orders_held() {
         let mut book = ReduceOnlyBook::new();
         assert!(!book.has_reduce_only());
