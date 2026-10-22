@@ -64,6 +64,7 @@ use crate::{
     },
     emit_stream_terminated,
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
+    margin::MarginEffect,
     order::{
         Order, OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
@@ -1226,6 +1227,23 @@ impl ExecutionClient for BinanceSpot {
             request.key.strategy.clone(),
             cid.clone(),
         );
+
+        // A spot account never borrows, so `NoSideEffect` is the one effect it honours.
+        if let Some(effect) = request
+            .state
+            .margin_effect
+            .filter(|effect| *effect != MarginEffect::NoSideEffect)
+        {
+            return Order {
+                key: order_key,
+                side,
+                price,
+                quantity,
+                kind,
+                time_in_force,
+                state: OrderState::inactive(OrderError::UnsupportedMarginEffect(effect)),
+            };
+        }
 
         let ws = match self.get_ws_api().await {
             Ok(ws) => ws,
@@ -2546,6 +2564,51 @@ mod tests {
     use crate::order::{TrailingOffsetType, id::ClientOrderId};
     use binance_sdk::common::errors::WebsocketError;
     use smol_str::SmolStr;
+
+    /// A spot account never borrows, so it honours `NoSideEffect` alone, and refuses a borrow or
+    /// a repay before it opens a connection.
+    #[tokio::test]
+    async fn open_order_refuses_a_borrow_or_repay_effect_unsent() {
+        use crate::{
+            client::ExecutionClient,
+            margin::MarginEffect,
+            order::{request::RequestOpen, state::InactiveOrderState},
+        };
+
+        let client = BinanceSpot::new(BinanceSpotConfig::testnet("key".into(), "secret".into()));
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+
+        for effect in [MarginEffect::Borrow, MarginEffect::Repay] {
+            let order = client
+                .open_order(OrderRequestOpen {
+                    key: OrderKey::new(
+                        ExchangeId::BinanceSpot,
+                        &instrument,
+                        StrategyId::new("strategy"),
+                        ClientOrderId::new("cid"),
+                    ),
+                    state: RequestOpen::new(
+                        Side::Buy,
+                        Some(Decimal::from(50_000)),
+                        Decimal::ONE,
+                        OrderKind::Limit,
+                        TimeInForce::GoodUntilCancelled { post_only: false },
+                    )
+                    .with_margin_effect(effect),
+                })
+                .await;
+
+            assert!(
+                matches!(
+                    order.state,
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(
+                        OrderError::UnsupportedMarginEffect(refused)
+                    )) if refused == effect
+                ),
+                "{order:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_binance_spot_config_new_uses_testnet_by_default() {

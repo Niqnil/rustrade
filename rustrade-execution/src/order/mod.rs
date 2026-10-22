@@ -381,6 +381,7 @@ where
                     position_id: _,
                     reduce_only: _, // used by adapters (e.g., Alpaca) to derive position_intent
                     market: _,      // decision-time provenance; not part of the resulting Order
+                    margin_effect: _, // an instruction to the venue; not part of the resulting Order
                 },
         } = request;
 

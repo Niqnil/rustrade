@@ -1635,7 +1635,7 @@ mod tests {
         subscription::{candle::Candle, trade::PublicTrade},
     };
     use rustrade_execution::{
-        AccountSnapshot, PeriodicMarginInterest, SpotMarginConfig,
+        AccountSnapshot, MarginEffect, PeriodicMarginInterest, SpotMarginConfig,
         balance::{AssetBalance, Balance},
         client::mock::MockExecutionConfig,
         exchange::mock::VenueInstrumentMarket,
@@ -2458,7 +2458,12 @@ mod tests {
 
         let margin = MockExecutionConfig {
             spot_margin: Some(
-                SpotMarginConfig::new(AssetNameExchange::new("usdt"), dec!(3)).unwrap(),
+                SpotMarginConfig::new(
+                    AssetNameExchange::new("usdt"),
+                    dec!(3),
+                    MarginEffect::Borrow,
+                )
+                .unwrap(),
             ),
             ..config(0)
         };

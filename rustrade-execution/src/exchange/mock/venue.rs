@@ -13,7 +13,7 @@ use crate::{
     fee::{FeeAssetConfig, FeeModel, FeeModelConfig, Liquidity, SpotFeeAsset},
     fill::{FillContext, FillModel, MarketOrderTiming, NextBarPrice, StaleMarketPolicy},
     holding_cost::{HeldPosition, HoldingCostModel},
-    margin::{InterestDue, MarginInterestModel, SpotMarginConfig},
+    margin::{InterestDue, MarginEffect, MarginInterestModel, SpotMarginConfig},
     market::{MarketBar, MarketDepth, MarketObservation, MarketSnapshot},
     order::{
         Order, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrder, UnindexedOrderKey,
@@ -174,10 +174,12 @@ pub enum VenueRegime {
 /// # Spot margin
 /// By default this venue is a cash account: a spot order must be paid for with what the account
 /// holds, so a sell of base it lacks is refused. Configured with
-/// [`MockExecutionConfig::spot_margin`], it is a cross margin account instead: it lends an order
-/// the shortfall of the asset it pays with when it accepts the order, holds the loan against it,
-/// repays an unused loan when the order ends unfilled, and repays loans, interest first, from what
-/// a fill delivers. Every balance then reports its loan in [`Balance::margin`], and the account's
+/// [`MockExecutionConfig::spot_margin`], it is a cross margin account instead. An order's
+/// [`MarginEffect`] (its request's, else the configuration's) decides what it does to the loans: a
+/// `Borrow` is lent the shortfall of the asset it pays with when the venue accepts it, and the
+/// venue holds the loan against it and repays it if the order ends unfilled; a `Repay` repays
+/// loans, interest first, from what its fill delivers; a `NoSideEffect` does neither. Every
+/// balance then reports its loan in [`Balance::margin`], and the account's
 /// holding of an asset is its `total` less what it owes. See
 /// [`SpotMarginConfig`] for how much it lends and what it does not model.
 ///
@@ -656,8 +658,8 @@ impl SimulatedVenue {
             Ok(account) => account,
             Err(error) => panic!("invalid MockExecutionConfig::initial_state: {error}"),
         };
-        if let Some(spot_margin) = &config.spot_margin {
-            account.enable_margin(spot_margin.side_effect());
+        if config.spot_margin.is_some() {
+            account.enable_margin();
         }
         let order_id_start = first_unseeded_order_id(&account);
 
@@ -1108,24 +1110,68 @@ impl SimulatedVenue {
         })
     }
 
+    /// The [`MarginEffect`] an order takes: `requested`, else the spot margin configuration's
+    /// default, and [`NoSideEffect`](MarginEffect::NoSideEffect) on a cash account, which neither
+    /// borrows nor repays.
+    fn margin_effect(&self, requested: Option<MarginEffect>) -> MarginEffect {
+        match &self.spot_margin {
+            Some(config) => requested.unwrap_or(config.margin_effect()),
+            None => MarginEffect::NoSideEffect,
+        }
+    }
+
+    /// Why an order carrying `requested` must be refused unsent, or `None` if this venue honours
+    /// it: a CFD never borrows or repays, so with spot margin on it takes `NoSideEffect` alone, and
+    /// a cash account takes `NoSideEffect` alone for the same reason.
+    fn refused_margin_effect(
+        &self,
+        requested: Option<MarginEffect>,
+        terms: &InstrumentTerms,
+    ) -> Option<MarginEffect> {
+        let borrows_here = self.spot_margin.is_some() && !terms.cash_settled;
+        requested.filter(|effect| !borrows_here && *effect != MarginEffect::NoSideEffect)
+    }
+
+    /// Gives `reservation` back to `free`, repaying the loan its order took when it was placed if
+    /// the spot margin configuration repays at cancel. See [`AccountState::release_reservation`].
+    fn release_reservation(
+        &mut self,
+        reservation: &Reservation,
+        time_exchange: DateTime<Utc>,
+    ) -> AssetBalance<AssetNameExchange> {
+        let repays = self.repays_at_cancel();
+        self.account
+            .release_reservation(reservation, repays, time_exchange)
+    }
+
+    /// Whether a loan its order no longer needs is repaid: the spot margin configuration's
+    /// [`auto_repay_at_cancel`](SpotMarginConfig::auto_repay_at_cancel).
+    fn repays_at_cancel(&self) -> bool {
+        self.spot_margin
+            .as_ref()
+            .is_some_and(SpotMarginConfig::auto_repay_at_cancel)
+    }
+
     /// The most a margin account may borrow of the asset `debit` pays with, for an arrival on an
     /// instrument with `terms`: see [`SpotMarginConfig`]'s `# How much it lends`.
     ///
-    /// Zero unless spot margin lends, the instrument is spot, and `free` falls short of the
-    /// debit, so a venue that lends nothing, or an order that needs no loan, values nothing.
+    /// Zero unless spot margin lends, the order's `effect` is [`Borrow`](MarginEffect::Borrow),
+    /// the instrument is spot, and `free` falls short of the debit, so a venue that lends nothing,
+    /// or an order that needs no loan, values nothing.
     /// `market` is the snapshot the order is priced from, used to value an asset on an instrument
     /// this venue holds no market for, as on a [`RequestPriced`](VenueRegime::RequestPriced)
     /// venue.
     fn borrowable(
         &self,
         debit: &Debit,
+        effect: MarginEffect,
         terms: &InstrumentTerms,
         market: Option<&MarketSnapshot>,
     ) -> Decimal {
         let Some(config) = self.spot_margin.as_ref() else {
             return Decimal::ZERO;
         };
-        if !self.account.lends()
+        if effect != MarginEffect::Borrow
             || terms.cash_settled
             || self.account.free(&debit.asset) >= debit.settled + debit.reserved
         {
@@ -1254,9 +1300,7 @@ impl SimulatedVenue {
         // an order retired against a balance that still holds its reservation. An order the venue
         // took nothing for releases nothing -- see `OpenOrders`.
         if let Some(reservation) = reservation {
-            let balance = self
-                .account
-                .release_reservation(&reservation, time_exchange);
+            let balance = self.release_reservation(&reservation, time_exchange);
             events.push(self.build_account_event(Snapshot(balance)));
         }
 
@@ -1683,10 +1727,8 @@ impl SimulatedVenue {
         for cid in immediate {
             // Collected from this same index with nothing in between, so this always finds it.
             if let Some(RestingOrder { order, reservation }) = self.account.remove_order(&cid) {
-                let released = reservation.map(|reservation| {
-                    self.account
-                        .release_reservation(&reservation, time_exchange)
-                });
+                let released = reservation
+                    .map(|reservation| self.release_reservation(&reservation, time_exchange));
                 events.extend(self.cancel_unfilled(order, released, time_exchange));
             }
         }
@@ -1733,10 +1775,8 @@ impl SimulatedVenue {
         // only the other side of the book, say. On arrival that order would be refused as
         // unpriceable; having been accepted, it is cancelled.
         let Some(reference) = reference else {
-            let released = reservation.map(|reservation| {
-                self.account
-                    .release_reservation(&reservation, time_exchange)
-            });
+            let released = reservation
+                .map(|reservation| self.release_reservation(&reservation, time_exchange));
             return self.cancel_unfilled(order, released, time_exchange);
         };
 
@@ -1750,10 +1790,8 @@ impl SimulatedVenue {
         // arrival: a deadline already reached was swept before it released anything.
         let kill = order.time_in_force == TimeInForce::FillOrKill;
         if filled_quantity <= Decimal::ZERO || (filled_quantity < quantity && kill) {
-            let released = reservation.map(|reservation| {
-                self.account
-                    .release_reservation(&reservation, time_exchange)
-            });
+            let released = reservation
+                .map(|reservation| self.release_reservation(&reservation, time_exchange));
             return self.cancel_unfilled(order, released, time_exchange);
         }
 
@@ -1906,6 +1944,11 @@ impl SimulatedVenue {
             }
         };
 
+        // An order seeded by `initial_state` holds nothing, and takes the venue's default effect.
+        let effect = reservation.as_ref().map_or_else(
+            || self.margin_effect(None),
+            |reservation| reservation.effect,
+        );
         let Some(Reservation { asset, amount, .. }) = reservation else {
             // Seeded by a configured `initial_state`, so nothing is held against it and the fill
             // debits now. An account that cannot cover it is a mis-specified fixture, in the same
@@ -1913,18 +1956,22 @@ impl SimulatedVenue {
             // lends what it lacks.
             let debit = settlement.settled();
             return RestingSettlement::Settled(
-                self.commit(&debit, Some(&settlement.credit), terms, None, time_exchange)
-                    .unwrap_or_else(|insufficient| {
-                        panic!(
-                            "SimulatedVenue cannot afford the fill of resting order {}, which was \
+                self.commit(
+                    &debit,
+                    Some(&settlement.credit),
+                    effect,
+                    terms,
+                    None,
+                    time_exchange,
+                )
+                .unwrap_or_else(|insufficient| {
+                    panic!(
+                        "SimulatedVenue cannot afford the fill of resting order {}, which was \
                              seeded by `initial_state` and so reserved nothing: {} of {} free, {} \
                              required",
-                            order.key.cid,
-                            insufficient.free,
-                            insufficient.asset,
-                            insufficient.required
-                        )
-                    }),
+                        order.key.cid, insufficient.free, insufficient.asset, insufficient.required
+                    )
+                }),
             );
         };
 
@@ -1946,7 +1993,7 @@ impl SimulatedVenue {
 
         // A loan taken when the order was placed stays owed: it paid for this fill.
         let paid = self.account.settle(&asset, amount, time_exchange);
-        let received = self.account.deliver(delivery, time_exchange);
+        let received = self.account.deliver(delivery, effect, time_exchange);
         RestingSettlement::Settled(Commitment::from(Committed {
             paid,
             received: Some(received),
@@ -1968,6 +2015,10 @@ impl SimulatedVenue {
         settlement: &Settlement,
         time_exchange: DateTime<Utc>,
     ) -> RestingSettlement {
+        let effect = reservation.as_ref().map_or_else(
+            || self.margin_effect(None),
+            |reservation| reservation.effect,
+        );
         let released = reservation.map(|reservation| {
             let balance =
                 self.account
@@ -1975,12 +2026,21 @@ impl SimulatedVenue {
             (reservation, balance)
         });
 
+        let repays_at_cancel = self.repays_at_cancel();
         let debit = settlement.settled();
-        match self.commit(&debit, Some(&settlement.credit), terms, None, time_exchange) {
+        match self.commit(
+            &debit,
+            Some(&settlement.credit),
+            effect,
+            terms,
+            None,
+            time_exchange,
+        ) {
             Ok(mut commitment) => {
                 // A fill that cost less than was held needs less of the loan; the account's own
                 // funds pay first, so the unused loan is the smaller of the loan and the surplus.
-                if let Some((reservation, _)) = released {
+                // It is repaid only if the venue repays what its orders no longer need.
+                if let Some((reservation, _)) = released.filter(|_| repays_at_cancel) {
                     let surplus = reservation.amount - (debit.settled + debit.reserved);
                     let unused = reservation.borrowed.min(surplus);
                     if unused > Decimal::ZERO {
@@ -1994,7 +2054,7 @@ impl SimulatedVenue {
             }
             Err(_) => RestingSettlement::Unaffordable {
                 released: released.map(|(reservation, balance)| {
-                    match reservation.borrowed.is_zero() {
+                    match !repays_at_cancel || reservation.borrowed.is_zero() {
                         true => balance,
                         false => self.account.repay_loan(
                             &reservation.asset,
@@ -2051,7 +2111,8 @@ impl SimulatedVenue {
     }
 
     /// Commits one arrival's whole ledger effect through [`AccountState::commit`], lending what
-    /// [`borrowable`](Self::borrowable) allows, then charges interest on whatever it lent.
+    /// [`borrowable`](Self::borrowable) allows to an order whose `effect` borrows, then charges
+    /// interest on whatever it lent.
     ///
     /// The interest is charged at `time_exchange` on the amount lent, so the restated
     /// [`Committed::paid`] includes it, and [`Commitment::interest`] reports it.
@@ -2062,14 +2123,15 @@ impl SimulatedVenue {
         &mut self,
         debit: &Debit,
         credit: Option<&Credit>,
+        effect: MarginEffect,
         terms: &InstrumentTerms,
         market: Option<&MarketSnapshot>,
         time_exchange: DateTime<Utc>,
     ) -> Result<Commitment, BalanceInsufficient> {
-        let borrowable = self.borrowable(debit, terms, market);
-        let mut committed = self
-            .account
-            .commit(debit, credit, borrowable, time_exchange)?;
+        let borrowable = self.borrowable(debit, effect, terms, market);
+        let mut committed =
+            self.account
+                .commit(debit, credit, effect, borrowable, time_exchange)?;
 
         let interest = match committed.borrowed > Decimal::ZERO {
             true => self
@@ -2294,9 +2356,7 @@ impl SimulatedVenue {
         // freed balance regardless of when a driver delivers the restatement.
         let events = match reservation {
             Some(reservation) => {
-                let balance = self
-                    .account
-                    .release_reservation(&reservation, time_exchange);
+                let balance = self.release_reservation(&reservation, time_exchange);
                 vec![self.build_account_event(Snapshot(balance))]
             }
             None => Vec::new(),
@@ -2524,6 +2584,18 @@ impl SimulatedVenue {
             Ok(terms) => terms,
             Err(error) => return (build_open_order_err_response(request, error), None),
         };
+
+        // Before anything touches the ledger: an effect this venue cannot honour is refused rather
+        // than placed without it, which would borrow, or not repay, against the caller's intent.
+        if let Some(effect) = self.refused_margin_effect(request.state.margin_effect, &terms) {
+            return (
+                build_open_order_err_response(
+                    request,
+                    UnindexedOrderError::UnsupportedMarginEffect(effect),
+                ),
+                None,
+            );
+        }
 
         // Before anything touches the ledger, and for every kind: see the type's note on client
         // order ids. It is also what makes a refused booking in `book_rested` unreachable.
@@ -2785,8 +2857,9 @@ impl SimulatedVenue {
         );
 
         let debit = settlement.reserved();
+        let effect = self.margin_effect(request.state.margin_effect);
         let (balance, borrowed, interest) =
-            match self.commit(&debit, None, terms, market.as_ref(), time_exchange) {
+            match self.commit(&debit, None, effect, terms, market.as_ref(), time_exchange) {
                 Ok(Commitment {
                     committed: Committed { paid, borrowed, .. },
                     interest,
@@ -2821,6 +2894,7 @@ impl SimulatedVenue {
             amount: settlement.requirement(),
             asset: settlement.asset,
             borrowed,
+            effect,
         };
         if let Err(AlreadyResting(refused)) = self.account.hold(order.clone(), Some(reservation)) {
             unreachable!(
@@ -3209,9 +3283,11 @@ impl SimulatedVenue {
             None => fill.settled(),
         };
 
+        let effect = self.margin_effect(request.state.margin_effect);
         let mut commitment = match self.commit(
             &debit,
             Some(&fill.credit),
+            effect,
             terms,
             Some(&market),
             time_exchange,
@@ -3333,6 +3409,7 @@ impl SimulatedVenue {
                         borrowed: borrowed.min(held.requirement()),
                         amount: held.requirement(),
                         asset: held.asset,
+                        effect: self.margin_effect(request.state.margin_effect),
                     },
                 );
 
@@ -3466,8 +3543,9 @@ impl SimulatedVenue {
         let market = self
             .market(&request.key.instrument)
             .map(|market| market.snapshot);
+        let effect = self.margin_effect(request.state.margin_effect);
         let (balance_snapshot, borrowed, interest) =
-            match self.commit(&debit, None, terms, market.as_ref(), time_exchange) {
+            match self.commit(&debit, None, effect, terms, market.as_ref(), time_exchange) {
                 // Nothing traded, so nothing is delivered: the one balance is the hold.
                 Ok(Commitment {
                     committed: Committed { paid, borrowed, .. },
@@ -3504,6 +3582,7 @@ impl SimulatedVenue {
                 amount: settlement.requirement(),
                 asset: settlement.asset,
                 borrowed,
+                effect,
             },
         );
 
@@ -4559,7 +4638,7 @@ mod tests {
             AccrualDays, BorrowFeeModel, DailyAccrual, DayCount, FinancingModel, FinancingRates,
             FundingModel, HoldingCharge, RateSeries, WeekendsOnly,
         },
-        margin::{InterestCharge, InterestSchedule, MarginSideEffect, PeriodicMarginInterest},
+        margin::{InterestCharge, InterestSchedule, MarginEffect, PeriodicMarginInterest},
         order::{
             OrderEvent, OrderKey, TimeInForce,
             id::{ClientOrderId, StrategyId},
@@ -11317,7 +11396,9 @@ mod tests {
 
     fn margin_config(btc: &str, usdt: &str, max_leverage: &str) -> MockExecutionConfig {
         MockExecutionConfig {
-            spot_margin: Some(SpotMarginConfig::new(quote(), d(max_leverage)).unwrap()),
+            spot_margin: Some(
+                SpotMarginConfig::new(quote(), d(max_leverage), MarginEffect::Borrow).unwrap(),
+            ),
             ..spot_config(btc, usdt, FeeModelConfig::default())
         }
     }
@@ -11397,7 +11478,9 @@ mod tests {
     #[test]
     fn a_margin_sell_of_base_the_account_never_held_borrows_it() {
         let config = MockExecutionConfig {
-            spot_margin: Some(SpotMarginConfig::new(quote(), d("3")).unwrap()),
+            spot_margin: Some(
+                SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap(),
+            ),
             ..config_from_balances(vec![funded(quote(), d("10000"))], FeeModelConfig::default())
         };
         let mut venue = SimulatedVenue::new(&config, spot_instruments());
@@ -11415,7 +11498,7 @@ mod tests {
     fn a_margin_buy_borrows_quote_valued_through_the_inverse_of_its_pair() {
         // Valued in BTC, so a USDT loan is valued at the inverse of BTCUSDT's price.
         let config = MockExecutionConfig {
-            spot_margin: Some(SpotMarginConfig::new(base(), d("2")).unwrap()),
+            spot_margin: Some(SpotMarginConfig::new(base(), d("2"), MarginEffect::Borrow).unwrap()),
             ..spot_config("1", "0", FeeModelConfig::default())
         };
         let mut venue = SimulatedVenue::new(&config, spot_instruments());
@@ -11439,7 +11522,9 @@ mod tests {
     #[test]
     fn a_margin_buy_repays_interest_then_principal_and_frees_the_rest() {
         let config = MockExecutionConfig {
-            spot_margin: Some(SpotMarginConfig::new(quote(), d("3")).unwrap()),
+            spot_margin: Some(
+                SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap(),
+            ),
             ..config_from_balances(
                 vec![
                     AssetBalance::new(
@@ -11454,7 +11539,10 @@ mod tests {
         };
         let mut venue = SimulatedVenue::new(&config, spot_instruments());
 
-        let outcome = venue.open_order(buy_request("1", market_prices("50000")));
+        let outcome = venue.open_order(with_effect(
+            buy_request("1", market_prices("50000")),
+            MarginEffect::Repay,
+        ));
 
         assert_eq!(
             filled_received(&outcome).balance,
@@ -11466,7 +11554,9 @@ mod tests {
     #[test]
     fn a_buy_smaller_than_the_debt_repays_interest_before_principal() {
         let config = MockExecutionConfig {
-            spot_margin: Some(SpotMarginConfig::new(quote(), d("3")).unwrap()),
+            spot_margin: Some(
+                SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap(),
+            ),
             ..config_from_balances(
                 vec![
                     AssetBalance::new(
@@ -11481,7 +11571,10 @@ mod tests {
         };
         let mut venue = SimulatedVenue::new(&config, spot_instruments());
 
-        let outcome = venue.open_order(buy_request("0.11", market_prices("50000")));
+        let outcome = venue.open_order(with_effect(
+            buy_request("0.11", market_prices("50000")),
+            MarginEffect::Repay,
+        ));
 
         assert_eq!(
             filled_received(&outcome).balance,
@@ -11547,12 +11640,10 @@ mod tests {
     }
 
     #[test]
-    fn no_borrow_lends_nothing_and_repays_nothing() {
+    fn no_side_effect_lends_nothing_and_repays_nothing() {
         let config = MockExecutionConfig {
             spot_margin: Some(
-                SpotMarginConfig::new(quote(), d("3"))
-                    .unwrap()
-                    .with_side_effect(MarginSideEffect::NoBorrow),
+                SpotMarginConfig::new(quote(), d("3"), MarginEffect::NoSideEffect).unwrap(),
             ),
             ..config_from_balances(
                 vec![
@@ -11588,7 +11679,8 @@ mod tests {
         // No instrument pairs BTC with EUR, so a BTC loan cannot be valued.
         let config = MockExecutionConfig {
             spot_margin: Some(
-                SpotMarginConfig::new(AssetNameExchange::new("EUR"), d("3")).unwrap(),
+                SpotMarginConfig::new(AssetNameExchange::new("EUR"), d("3"), MarginEffect::Borrow)
+                    .unwrap(),
             ),
             ..spot_config("0", "100000", FeeModelConfig::default())
         };
@@ -11605,7 +11697,7 @@ mod tests {
     #[test]
     fn a_cfd_order_is_not_lent_its_margin() {
         let config = MockExecutionConfig {
-            spot_margin: Some(SpotMarginConfig::new(usd(), d("3")).unwrap()),
+            spot_margin: Some(SpotMarginConfig::new(usd(), d("3"), MarginEffect::Borrow).unwrap()),
             ..config_from_balances(vec![funded(usd(), d("1000"))], FeeModelConfig::default())
         };
         let mut venue = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
@@ -11619,6 +11711,250 @@ mod tests {
         assert_eq!(
             balance_now(&venue, usd()),
             Balance::new_margin(d("1000"), d("1000"), Decimal::ZERO, Decimal::ZERO)
+        );
+    }
+
+    /// The error an order was refused with.
+    fn open_error(outcome: &OpenOutcome) -> &UnindexedOrderError {
+        match &outcome.response.state {
+            OrderState::Inactive(InactiveOrderState::OpenFailed(error)) => error,
+            other => panic!("expected the order to be refused, got: {other:?}"),
+        }
+    }
+
+    /// A margin account owing 0.75 BTC and 0.01 of interest on it, with `effect` as its default.
+    fn config_owing_base(effect: MarginEffect) -> MockExecutionConfig {
+        MockExecutionConfig {
+            spot_margin: Some(SpotMarginConfig::new(quote(), d("3"), effect).unwrap()),
+            ..config_from_balances(
+                vec![
+                    AssetBalance::new(
+                        base(),
+                        Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("0.75"), d("0.01")),
+                        Utc::now(),
+                    ),
+                    funded(quote(), d("100000")),
+                ],
+                FeeModelConfig::default(),
+            )
+        }
+    }
+
+    /// A fed venue for `config`, its book at 49,000 / 49,100.
+    fn market_venue_for(config: &MockExecutionConfig) -> SimulatedVenue {
+        let mut venue = SimulatedVenue::new_market_driven(config, spot_instruments());
+        advance(&mut venue, time(1));
+        assert!(
+            venue
+                .apply_market(
+                    &instrument_name(),
+                    MarketObservation::new(book("49000", "49100")),
+                    time(1),
+                )
+                .is_empty()
+        );
+        venue
+    }
+
+    #[test]
+    fn a_borrow_order_repays_nothing_from_what_it_receives() {
+        let mut venue =
+            SimulatedVenue::new(&config_owing_base(MarginEffect::Borrow), spot_instruments());
+
+        let outcome = venue.open_order(buy_request("1", market_prices("50000")));
+
+        assert_eq!(
+            filled_received(&outcome).balance,
+            Balance::new_margin(d("1"), d("1"), d("0.75"), d("0.01")),
+            "the bought base is free and the loan, interest included, is left owed"
+        );
+    }
+
+    #[test]
+    fn a_request_effect_overrides_the_configured_default() {
+        // A venue that borrows by default, told not to: the sell is refused as on a cash account.
+        let mut venue = margin_venue("0", "100000", "3");
+        let outcome = venue.open_order(with_effect(
+            sell_request("1", market_prices("50000")),
+            MarginEffect::NoSideEffect,
+        ));
+        assert!(
+            !insufficient_reason(&outcome).contains("Borrowable"),
+            "{}",
+            insufficient_reason(&outcome)
+        );
+
+        // A venue that borrows nothing by default, told to: the same sell borrows its base.
+        let config = MockExecutionConfig {
+            spot_margin: Some(
+                SpotMarginConfig::new(quote(), d("3"), MarginEffect::NoSideEffect).unwrap(),
+            ),
+            ..spot_config("0", "100000", FeeModelConfig::default())
+        };
+        let mut venue = SimulatedVenue::new(&config, spot_instruments());
+        let outcome = venue.open_order(with_effect(
+            sell_request("1", market_prices("50000")),
+            MarginEffect::Borrow,
+        ));
+        assert_eq!(
+            filled_balance(&outcome).balance,
+            Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("1"), Decimal::ZERO)
+        );
+    }
+
+    #[test]
+    fn a_repay_order_borrows_nothing() {
+        let mut venue = margin_venue("0.25", "100000", "3");
+
+        let outcome = venue.open_order(with_effect(
+            sell_request("1", market_prices("50000")),
+            MarginEffect::Repay,
+        ));
+
+        assert!(
+            !insufficient_reason(&outcome).contains("Borrowable"),
+            "{}",
+            insufficient_reason(&outcome)
+        );
+        assert_eq!(
+            balance_now(&venue, base()),
+            Balance::new_margin(d("0.25"), d("0.25"), Decimal::ZERO, Decimal::ZERO),
+            "a refused order borrows nothing"
+        );
+    }
+
+    #[test]
+    fn a_cfd_order_naming_a_borrow_or_repay_is_refused_unsent() {
+        let config = MockExecutionConfig {
+            spot_margin: Some(SpotMarginConfig::new(usd(), d("3"), MarginEffect::Borrow).unwrap()),
+            ..config_from_balances(vec![funded(usd(), d("1000"))], FeeModelConfig::default())
+        };
+        let mut venue = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
+
+        for effect in [MarginEffect::Borrow, MarginEffect::Repay] {
+            let outcome = venue.open_order(with_effect(
+                cfd_request(Side::Buy, "1", market_prices("5000")),
+                effect,
+            ));
+            assert_eq!(
+                open_error(&outcome),
+                &UnindexedOrderError::UnsupportedMarginEffect(effect)
+            );
+        }
+        assert_eq!(
+            balance_now(&venue, usd()),
+            Balance::new_margin(d("1000"), d("1000"), Decimal::ZERO, Decimal::ZERO),
+            "a refused order touches nothing"
+        );
+
+        // `NoSideEffect` is honoured: a CFD never borrows, so it is not refused for its effect
+        // whatever else the venue makes of it.
+        let outcome = venue.open_order(with_effect(
+            cfd_request(Side::Buy, "0.01", market_prices("5000")),
+            MarginEffect::NoSideEffect,
+        ));
+        assert!(
+            !matches!(
+                &outcome.response.state,
+                OrderState::Inactive(InactiveOrderState::OpenFailed(
+                    UnindexedOrderError::UnsupportedMarginEffect(_)
+                ))
+            ),
+            "{:?}",
+            outcome.response.state
+        );
+    }
+
+    #[test]
+    fn a_cash_venue_takes_no_effect_but_no_side_effect() {
+        let mut venue = make_venue("1", "100000");
+
+        for effect in [MarginEffect::Borrow, MarginEffect::Repay] {
+            let outcome = venue.open_order(with_effect(
+                sell_request("0.1", market_prices("50000")),
+                effect,
+            ));
+            assert_eq!(
+                open_error(&outcome),
+                &UnindexedOrderError::UnsupportedMarginEffect(effect)
+            );
+        }
+
+        let outcome = venue.open_order(with_effect(
+            sell_request("0.1", market_prices("50000")),
+            MarginEffect::NoSideEffect,
+        ));
+        assert_eq!(filled_trade(&outcome).quantity, d("0.1"));
+    }
+
+    #[test]
+    fn a_resting_order_repays_from_its_fill_as_it_was_placed_to() {
+        // The venue borrows by default, but this buy was placed to repay: its effect rides on the
+        // order, not on the configuration, so the fill that comes later repays the 0.76 owed.
+        let mut venue = market_venue_for(&config_owing_base(MarginEffect::Borrow));
+        let rested = venue.open_order(with_effect(
+            limit_request("rest", Side::Buy, "1", "49050", gtc()),
+            MarginEffect::Repay,
+        ));
+        assert_eq!(rested_open(&rested).filled_quantity, Decimal::ZERO);
+
+        let events = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("48900", "49000")),
+            time(2),
+        );
+
+        assert_eq!(
+            balance_of(&events[1]).balance,
+            Balance::new_margin(d("0.24"), d("0.24"), Decimal::ZERO, Decimal::ZERO),
+            "1 BTC repays 0.01 of interest and 0.75 of principal, leaving 0.24 free"
+        );
+    }
+
+    #[test]
+    fn a_resting_order_placed_to_borrow_repays_nothing_from_its_fill() {
+        let mut venue = market_venue_for(&config_owing_base(MarginEffect::Repay));
+        venue.open_order(with_effect(
+            limit_request("rest", Side::Buy, "1", "49050", gtc()),
+            MarginEffect::Borrow,
+        ));
+
+        let events = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("48900", "49000")),
+            time(2),
+        );
+
+        assert_eq!(
+            balance_of(&events[1]).balance,
+            Balance::new_margin(d("1"), d("1"), d("0.75"), d("0.01")),
+            "the loan is left owed although the venue's default would have repaid it"
+        );
+    }
+
+    #[test]
+    fn without_auto_repay_at_cancel_a_cancelled_order_leaves_its_loan_owed() {
+        let config = MockExecutionConfig {
+            spot_margin: Some(
+                SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow)
+                    .unwrap()
+                    .with_auto_repay_at_cancel(false),
+            ),
+            ..spot_config("0", "100000", FeeModelConfig::default())
+        };
+        let mut venue = market_venue_for(&config);
+        venue.open_order(limit_request("rest", Side::Sell, "1", "50000", gtc()));
+
+        let cancelled = venue.cancel_order(OrderRequestCancel {
+            key: limit_request("rest", Side::Sell, "1", "50000", gtc()).key,
+            state: RequestCancel { id: None },
+        });
+
+        assert!(cancelled.response.state.is_ok());
+        assert_eq!(
+            balance_of(&cancelled.events[0]).balance,
+            Balance::new_margin(d("1"), d("1"), d("1"), Decimal::ZERO),
+            "the released base is free again and the loan that paid for it stays owed"
         );
     }
 
@@ -11812,10 +12148,103 @@ mod tests {
         ));
     }
 
+    /// [`margin_venue_holding`], with `config` adjusted by `adjust`.
+    fn margin_venue_holding_with(
+        adjust: impl FnOnce(SpotMarginConfig) -> SpotMarginConfig,
+        effect: MarginEffect,
+    ) -> SimulatedVenue {
+        let mut config = MockExecutionConfig {
+            market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
+            ..margin_config("0", "100", "2")
+        };
+        config.spot_margin = Some(adjust(
+            SpotMarginConfig::new(quote(), d("2"), effect).unwrap(),
+        ));
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+        advance(&mut venue, time(1));
+        assert!(feed_bar(&mut venue, 1, ohlc("95", "105", "90", "100")).is_empty());
+        venue
+    }
+
+    #[test]
+    fn without_auto_repay_at_cancel_a_held_buy_costed_lower_keeps_the_loan_it_no_longer_needs() {
+        let mut venue = margin_venue_holding_with(
+            |config| config.with_auto_repay_at_cancel(false),
+            MarginEffect::Borrow,
+        );
+        venue.open_order(market_order("held", Side::Buy, "1.5", gtc()));
+
+        // 120 at an open of 80: 20 of the 50 loan is used, and the other 30 stays owed.
+        let events = feed_bar(&mut venue, 2, ohlc("80", "81", "79", "80"));
+
+        assert_eq!(
+            balance_of(&events[0]).balance,
+            Balance::new_margin(d("30"), d("30"), d("50"), Decimal::ZERO)
+        );
+    }
+
+    #[test]
+    fn without_auto_repay_at_cancel_a_held_buy_unaffordable_at_its_bar_keeps_its_loan() {
+        let mut venue = margin_venue_holding_with(
+            |config| config.with_auto_repay_at_cancel(false),
+            MarginEffect::Borrow,
+        );
+        venue.open_order(market_order("held", Side::Buy, "1.5", gtc()));
+
+        let events = feed_bar(&mut venue, 2, ohlc("250", "251", "249", "250"));
+
+        assert_eq!(
+            balance_of(&events[0]).balance,
+            Balance::new_margin(d("150"), d("150"), d("50"), Decimal::ZERO),
+            "the cancel gives the hold back and leaves the 50 the order borrowed owed"
+        );
+        assert!(matches!(
+            order_of(&events[1]).state,
+            OrderState::Inactive(InactiveOrderState::Cancelled(_))
+        ));
+    }
+
+    #[test]
+    fn without_auto_repay_at_cancel_a_held_sell_that_expires_keeps_its_loan() {
+        let mut venue = margin_venue_holding_with(
+            |config| config.with_auto_repay_at_cancel(false),
+            MarginEffect::Borrow,
+        );
+        venue.open_order(market_order("held", Side::Sell, "1", gtc()));
+
+        let events = venue.expire_held(time(2));
+
+        assert_eq!(
+            balance_of(&events[0]).balance,
+            Balance::new_margin(d("1"), d("1"), d("1"), Decimal::ZERO)
+        );
+    }
+
+    #[test]
+    fn a_held_buy_costed_afresh_at_its_bar_borrows_as_it_was_placed_to() {
+        // The venue borrows nothing by default, but this buy was placed to borrow: at its bar
+        // the fill is costed afresh, and the 30 more it needs is lent because of the effect it
+        // was placed with, not the configuration's.
+        let mut venue = margin_venue_holding_with(|config| config, MarginEffect::NoSideEffect);
+        let mut request = market_order("held", Side::Buy, "1.5", gtc());
+        request.state = request.state.with_margin_effect(MarginEffect::Borrow);
+        venue.open_order(request);
+
+        let events = feed_bar(&mut venue, 2, ohlc("120", "121", "119", "120"));
+
+        assert_eq!(
+            balance_of(&events[0]).balance,
+            Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("80"), Decimal::ZERO)
+        );
+        assert_eq!(trade_of(&events[2]).price, d("120"));
+    }
+
     /// A margin venue also holding `eth`, which no instrument values, owing `eth_owed` of it.
     fn margin_venue_with_eth(eth: &str, eth_owed: &str) -> SimulatedVenue {
         let config = MockExecutionConfig {
-            spot_margin: Some(SpotMarginConfig::new(quote(), d("2")).unwrap()),
+            spot_margin: Some(
+                SpotMarginConfig::new(quote(), d("2"), MarginEffect::Borrow).unwrap(),
+            ),
             ..config_from_balances(
                 vec![
                     funded(base(), Decimal::ZERO),
@@ -11860,7 +12289,9 @@ mod tests {
     #[test]
     fn interest_owed_counts_as_debt_against_what_the_venue_lends() {
         let config = MockExecutionConfig {
-            spot_margin: Some(SpotMarginConfig::new(quote(), d("2")).unwrap()),
+            spot_margin: Some(
+                SpotMarginConfig::new(quote(), d("2"), MarginEffect::Borrow).unwrap(),
+            ),
             ..config_from_balances(
                 vec![
                     AssetBalance::new(
@@ -11888,7 +12319,9 @@ mod tests {
     #[test]
     fn an_asset_a_margin_account_first_receives_reports_its_loan() {
         let config = MockExecutionConfig {
-            spot_margin: Some(SpotMarginConfig::new(quote(), d("3")).unwrap()),
+            spot_margin: Some(
+                SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap(),
+            ),
             ..config_from_balances(
                 vec![funded(quote(), d("100000"))],
                 FeeModelConfig::default(),
@@ -12070,7 +12503,10 @@ mod tests {
         let mut venue = margin_venue_short_btc();
 
         // 0.76 BTC repays the 0.000075 interest, then the 0.75 principal, leaving 0.009925 free.
-        let outcome = venue.open_order(buy_request("0.76", market_prices("50000")));
+        let outcome = venue.open_order(with_effect(
+            buy_request("0.76", market_prices("50000")),
+            MarginEffect::Repay,
+        ));
         assert_eq!(
             filled_received(&outcome).balance,
             Balance::new_margin(d("0.009925"), d("0.009925"), Decimal::ZERO, Decimal::ZERO)
@@ -12085,7 +12521,10 @@ mod tests {
         let mut venue = margin_venue_short_btc();
 
         // 0.5 BTC repays the 0.000075 interest, then 0.499925 of the 0.75 principal.
-        venue.open_order(buy_request("0.5", market_prices("50000")));
+        venue.open_order(with_effect(
+            buy_request("0.5", market_prices("50000")),
+            MarginEffect::Repay,
+        ));
 
         let events = venue.advance_time(boundary(0));
         assert_eq!(
@@ -12196,7 +12635,9 @@ mod tests {
     #[test]
     fn a_seeded_loan_is_charged_at_boundaries_from_the_clock_s_first_move_only() {
         let config = MockExecutionConfig {
-            spot_margin: Some(SpotMarginConfig::new(quote(), d("3")).unwrap()),
+            spot_margin: Some(
+                SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap(),
+            ),
             ..config_from_balances(
                 vec![
                     AssetBalance::new(
@@ -12326,7 +12767,9 @@ mod tests {
     #[should_panic(expected = "which is not after")]
     fn a_model_whose_boundary_is_not_after_the_instant_asked_panics() {
         let config = MockExecutionConfig {
-            spot_margin: Some(SpotMarginConfig::new(quote(), d("3")).unwrap()),
+            spot_margin: Some(
+                SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap(),
+            ),
             ..config_from_balances(
                 vec![
                     AssetBalance::new(
@@ -12865,7 +13308,9 @@ mod tests {
     /// USDT loans, `BTCUSDT` at 50,000 and BNB at 600.
     fn fee_asset_margin_venue(bnb: &str) -> SimulatedVenue {
         let config = MockExecutionConfig {
-            spot_margin: Some(SpotMarginConfig::new(quote(), d("3")).unwrap()),
+            spot_margin: Some(
+                SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap(),
+            ),
             fee_asset: Some(FeeAssetConfig::new(self::bnb(), d("0.25")).unwrap()),
             ..config_from_balances(
                 vec![

@@ -2869,6 +2869,20 @@ impl ExecutionClient for IbkrClient {
             cid: request.key.cid.clone(),
         };
 
+        // Margin is account-level at IBKR: no order flag borrows or repays, so no effect is
+        // honoured.
+        if let Some(effect) = request.state.margin_effect {
+            return Order {
+                key,
+                side: request.state.side,
+                price: request.state.price,
+                quantity: request.state.quantity,
+                kind: request.state.kind,
+                time_in_force: request.state.time_in_force,
+                state: OrderState::inactive(OrderError::UnsupportedMarginEffect(effect)),
+            };
+        }
+
         let contract = match self.contracts.get_contract(request.key.instrument) {
             Some(c) => c,
             None => {

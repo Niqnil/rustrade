@@ -1041,6 +1041,13 @@ impl ExecutionClient for HyperliquidClient {
             )))
         };
         let make_unsupported = |msg: String| make_inactive(OrderError::UnsupportedOrderType(msg));
+
+        // Hyperliquid has no order flag for borrowing, and under portfolio margin an order borrows
+        // implicitly when it falls short, so the client cannot promise either way: no effect,
+        // not even `NoSideEffect`, is honoured.
+        if let Some(effect) = request.state.margin_effect {
+            return make_inactive(OrderError::UnsupportedMarginEffect(effect));
+        }
         let make_invalid_instrument = |reason: String| {
             make_inactive(OrderError::Rejected(
                 crate::error::ApiError::InstrumentInvalid(request.key.instrument.clone(), reason),

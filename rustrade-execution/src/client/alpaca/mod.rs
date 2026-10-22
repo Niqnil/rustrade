@@ -2449,6 +2449,20 @@ impl AlpacaClient {
             cid.clone(),
         );
 
+        // Margin is account-level at Alpaca: no order flag borrows or repays, so no effect is
+        // honoured.
+        if let Some(effect) = request.state.margin_effect {
+            return Order {
+                key: order_key,
+                side,
+                price,
+                quantity,
+                kind,
+                time_in_force,
+                state: OrderState::inactive(OrderError::UnsupportedMarginEffect(effect)),
+            };
+        }
+
         // Validate time_in_force before building the request — reject post_only early.
         let tif_str = match map_time_in_force(time_in_force) {
             Ok(s) => s,
@@ -8502,6 +8516,68 @@ mod tests {
         }
 
         // --- L-2: open_order passes reduce_only through to position_intent ---
+
+        /// Margin is account-level at Alpaca, so a request naming a margin effect is refused
+        /// unsent, `NoSideEffect` included: nothing here can promise it.
+        #[tokio::test]
+        async fn open_order_refuses_every_margin_effect_without_sending() {
+            use crate::client::ExecutionClient;
+            use crate::error::OrderError;
+            use crate::margin::MarginEffect;
+            use crate::order::request::{OrderRequestOpen, RequestOpen};
+            use crate::order::state::InactiveOrderState;
+            use crate::order::{
+                OrderKey, OrderKind, TimeInForce,
+                id::{ClientOrderId, StrategyId},
+            };
+            use rust_decimal::Decimal;
+            use rustrade_instrument::Side;
+            use rustrade_instrument::exchange::ExchangeId;
+            use rustrade_instrument::instrument::name::InstrumentNameExchange;
+
+            let server = MockServer::start().await;
+            let client = client_for(&server);
+            let instrument = InstrumentNameExchange::new("AAPL");
+
+            for effect in [
+                MarginEffect::NoSideEffect,
+                MarginEffect::Borrow,
+                MarginEffect::Repay,
+            ] {
+                let order = client
+                    .open_order(OrderRequestOpen {
+                        key: OrderKey {
+                            exchange: ExchangeId::AlpacaBroker,
+                            instrument: &instrument,
+                            strategy: StrategyId::new("test-strategy"),
+                            cid: ClientOrderId::new("test-cid"),
+                        },
+                        state: RequestOpen::new(
+                            Side::Buy,
+                            None,
+                            Decimal::new(10, 0),
+                            OrderKind::Market,
+                            TimeInForce::ImmediateOrCancel,
+                        )
+                        .with_margin_effect(effect),
+                    })
+                    .await;
+
+                assert!(
+                    matches!(
+                        order.state,
+                        OrderState::Inactive(InactiveOrderState::OpenFailed(
+                            OrderError::UnsupportedMarginEffect(refused)
+                        )) if refused == effect
+                    ),
+                    "{order:?}"
+                );
+            }
+            assert!(
+                server.received_requests().await.unwrap().is_empty(),
+                "a refused order is never sent"
+            );
+        }
 
         /// Verifies that `open_order` correctly derives `position_intent` from
         /// `reduce_only` and `side`. This test exercises the full path:

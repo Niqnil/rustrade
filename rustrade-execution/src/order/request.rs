@@ -1,5 +1,6 @@
 use crate::{
     error::OrderError,
+    margin::MarginEffect,
     market::MarketSnapshot,
     order::{
         OrderEvent, OrderKind, TimeInForce,
@@ -138,6 +139,21 @@ pub struct RequestOpen {
     /// `#[serde(default)]` so requests serialised before this field existed still load.
     #[serde(default)]
     pub market: Option<MarketSnapshot>,
+
+    /// What this order does to a margin account's loans, or `None` to take the client's default.
+    ///
+    /// Only a margin client or a simulated venue with spot margin acts on a borrow or a repay; see
+    /// [`MarginEffect`] for the three values. A client that cannot honour a `Some` refuses the
+    /// order unsent with
+    /// [`OrderError::UnsupportedMarginEffect`]:
+    /// a cash or spot-only account takes `Some(NoSideEffect)` alone, and a client that cannot
+    /// promise it (account-level margin, or implicit borrowing as under Hyperliquid's portfolio
+    /// margin) takes no `Some` at all, `NoSideEffect` included. A caller that sets an effect on
+    /// every order must leave it `None` for those venues.
+    ///
+    /// `#[serde(default)]` so requests serialised before this field existed still load.
+    #[serde(default)]
+    pub margin_effect: Option<MarginEffect>,
 }
 
 impl RequestOpen {
@@ -160,6 +176,7 @@ impl RequestOpen {
             position_id: None,
             reduce_only: false,
             market: None,
+            margin_effect: None,
         }
     }
 
@@ -187,6 +204,16 @@ impl RequestOpen {
     pub fn with_market(self, market: MarketSnapshot) -> Self {
         Self {
             market: Some(market),
+            ..self
+        }
+    }
+
+    /// This request with its [`margin_effect`](Self::margin_effect) set to `margin_effect`,
+    /// instead of the client's default.
+    #[must_use]
+    pub fn with_margin_effect(self, margin_effect: MarginEffect) -> Self {
+        Self {
+            margin_effect: Some(margin_effect),
             ..self
         }
     }
@@ -240,6 +267,18 @@ mod tests {
         assert_eq!(request.position_id, None);
         assert!(!request.reduce_only);
         assert_eq!(request.market, None);
+        assert_eq!(request.margin_effect, None);
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)] // Test code: panics are the correct failure mode
+    fn a_request_serialised_without_a_margin_effect_still_loads() {
+        let mut json = serde_json::to_value(limit()).unwrap();
+        json.as_object_mut().unwrap().remove("margin_effect");
+
+        let request: RequestOpen = serde_json::from_value(json).unwrap();
+
+        assert_eq!(request.margin_effect, None);
     }
 
     #[test]
@@ -250,6 +289,7 @@ mod tests {
             position_id: Some(PositionId::new("a")),
             reduce_only: true,
             market: Some(MarketSnapshot::from_last_price(Some(dec!(100)))),
+            margin_effect: Some(MarginEffect::Borrow),
             ..limit()
         };
 
@@ -272,6 +312,13 @@ mod tests {
             set.clone().with_market(market),
             RequestOpen {
                 market: Some(market),
+                ..set.clone()
+            }
+        );
+        assert_eq!(
+            set.clone().with_margin_effect(MarginEffect::Repay),
+            RequestOpen {
+                margin_effect: Some(MarginEffect::Repay),
                 ..set
             }
         );
@@ -283,5 +330,11 @@ mod tests {
         );
         assert!(limit().with_reduce_only(true).reduce_only);
         assert_eq!(limit().with_market(market).market, Some(market));
+        assert_eq!(
+            limit()
+                .with_margin_effect(MarginEffect::Repay)
+                .margin_effect,
+            Some(MarginEffect::Repay)
+        );
     }
 }
