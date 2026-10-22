@@ -236,12 +236,8 @@ pub struct BinanceMarginConfig {
     /// Defaults to `true`, Binance's default. Binance suggests `false` for a strategy that places
     /// and cancels at high frequency: the repay is a request of its own. With it off, a cancelled
     /// order's loan stays owed until a [`MarginEffect::Repay`] order repays it.
-    #[serde(default = "default_auto_repay_at_cancel")]
+    #[serde(default = "crate::margin::default_auto_repay_at_cancel")]
     pub auto_repay_at_cancel: bool,
-}
-
-fn default_auto_repay_at_cancel() -> bool {
-    true
 }
 
 // custom Debug to avoid leaking credentials in logs
@@ -308,7 +304,7 @@ impl BinanceMarginConfig {
         )
     }
 
-    /// Convenience constructor for isolated margin: production endpoints, the default
+    /// Convenience constructor for isolated margin: production endpoints, the
     /// default [`MarginEffect::NoSideEffect`], and the given per-pair symbol universe (see
     /// [`isolated_symbols`](Self::isolated_symbols)).
     ///

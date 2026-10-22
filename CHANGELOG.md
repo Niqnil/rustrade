@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **A per-order margin effect** (`rustrade-execution`, `binance` feature, #107). A new
+- **A per-order margin effect** (`rustrade-execution`, #107). A new
   `MarginEffect { NoSideEffect, Borrow, Repay }` says what one order does to a margin account's
   loans, and `RequestOpen::margin_effect: Option<MarginEffect>` carries it, with a
   `with_margin_effect` builder. `None` takes the client's default.
@@ -55,13 +55,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `margin_effect` of `"auto_borrow_repay"` fails to parse.
   - `SpotMarginConfig::new(valuation_asset, max_leverage, margin_effect)` requires the effect,
     and the serialised field has no default, so an old configuration fails to parse instead of
-    changing meaning. `with_side_effect` and `side_effect()` are now `margin_effect()`.
+    changing meaning. `with_side_effect` is removed, and `side_effect()` is now
+    `margin_effect()`.
   - **No setting reproduces the old automatic repay.** The simulated venue used to repay a loan
     from whatever an order received. It now repays only for an order carrying
     `MarginEffect::Repay`, as on Binance: open with `Borrow`, close with `Repay`.
-  - `AccountState` (the simulated venue's ledger) takes the order's effect in `commit`, a flag in
-    `deliver` and `release_reservation`, and `enable_margin` takes nothing. `Reservation` has an
-    `effect` field.
+  - `MarginSideEffect::as_binance_str` and the `client::binance::MarginSideEffect` re-export are
+    gone.
+  - `AccountState` (the simulated venue's ledger) takes the order's effect in `commit` and
+    `deliver`, a flag in `release_reservation`, and `enable_margin` takes nothing. `lends()` is
+    removed. `Reservation` has an `effect` field.
   - `OrderError` has a new variant, `UnsupportedMarginEffect`.
   - `RequestOpen::new` leaves `margin_effect` as `None`.
 - **Breaking:** `RequestOpen` is `#[non_exhaustive]` (`rustrade-execution`, #686), so a field can

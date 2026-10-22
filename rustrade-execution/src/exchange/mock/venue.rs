@@ -1993,8 +1993,7 @@ impl SimulatedVenue {
 
         // A loan taken when the order was placed stays owed: it paid for this fill.
         let paid = self.account.settle(&asset, amount, time_exchange);
-        let repays = effect == MarginEffect::Repay && self.account.is_margin();
-        let received = self.account.deliver(delivery, repays, time_exchange);
+        let received = self.account.deliver(delivery, effect, time_exchange);
         RestingSettlement::Settled(Commitment::from(Committed {
             paid,
             received: Some(received),
@@ -12147,6 +12146,97 @@ mod tests {
             order_of(&events[1]).state,
             OrderState::Inactive(InactiveOrderState::Cancelled(_))
         ));
+    }
+
+    /// [`margin_venue_holding`], with `config` adjusted by `adjust`.
+    fn margin_venue_holding_with(
+        adjust: impl FnOnce(SpotMarginConfig) -> SpotMarginConfig,
+        effect: MarginEffect,
+    ) -> SimulatedVenue {
+        let mut config = MockExecutionConfig {
+            market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
+            ..margin_config("0", "100", "2")
+        };
+        config.spot_margin = Some(adjust(
+            SpotMarginConfig::new(quote(), d("2"), effect).unwrap(),
+        ));
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+        advance(&mut venue, time(1));
+        assert!(feed_bar(&mut venue, 1, ohlc("95", "105", "90", "100")).is_empty());
+        venue
+    }
+
+    #[test]
+    fn without_auto_repay_at_cancel_a_held_buy_costed_lower_keeps_the_loan_it_no_longer_needs() {
+        let mut venue = margin_venue_holding_with(
+            |config| config.with_auto_repay_at_cancel(false),
+            MarginEffect::Borrow,
+        );
+        venue.open_order(market_order("held", Side::Buy, "1.5", gtc()));
+
+        // 120 at an open of 80: 20 of the 50 loan is used, and the other 30 stays owed.
+        let events = feed_bar(&mut venue, 2, ohlc("80", "81", "79", "80"));
+
+        assert_eq!(
+            balance_of(&events[0]).balance,
+            Balance::new_margin(d("30"), d("30"), d("50"), Decimal::ZERO)
+        );
+    }
+
+    #[test]
+    fn without_auto_repay_at_cancel_a_held_buy_unaffordable_at_its_bar_keeps_its_loan() {
+        let mut venue = margin_venue_holding_with(
+            |config| config.with_auto_repay_at_cancel(false),
+            MarginEffect::Borrow,
+        );
+        venue.open_order(market_order("held", Side::Buy, "1.5", gtc()));
+
+        let events = feed_bar(&mut venue, 2, ohlc("250", "251", "249", "250"));
+
+        assert_eq!(
+            balance_of(&events[0]).balance,
+            Balance::new_margin(d("150"), d("150"), d("50"), Decimal::ZERO),
+            "the cancel gives the hold back and leaves the 50 the order borrowed owed"
+        );
+        assert!(matches!(
+            order_of(&events[1]).state,
+            OrderState::Inactive(InactiveOrderState::Cancelled(_))
+        ));
+    }
+
+    #[test]
+    fn without_auto_repay_at_cancel_a_held_sell_that_expires_keeps_its_loan() {
+        let mut venue = margin_venue_holding_with(
+            |config| config.with_auto_repay_at_cancel(false),
+            MarginEffect::Borrow,
+        );
+        venue.open_order(market_order("held", Side::Sell, "1", gtc()));
+
+        let events = venue.expire_held(time(2));
+
+        assert_eq!(
+            balance_of(&events[0]).balance,
+            Balance::new_margin(d("1"), d("1"), d("1"), Decimal::ZERO)
+        );
+    }
+
+    #[test]
+    fn a_held_buy_costed_afresh_at_its_bar_borrows_as_it_was_placed_to() {
+        // The venue borrows nothing by default, but this buy was placed to borrow: at its bar
+        // the fill is costed afresh, and the 30 more it needs is lent because of the effect it
+        // was placed with, not the configuration's.
+        let mut venue = margin_venue_holding_with(|config| config, MarginEffect::NoSideEffect);
+        let mut request = market_order("held", Side::Buy, "1.5", gtc());
+        request.state = request.state.with_margin_effect(MarginEffect::Borrow);
+        venue.open_order(request);
+
+        let events = feed_bar(&mut venue, 2, ohlc("120", "121", "119", "120"));
+
+        assert_eq!(
+            balance_of(&events[0]).balance,
+            Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("80"), Decimal::ZERO)
+        );
+        assert_eq!(trade_of(&events[2]).price, d("120"));
     }
 
     /// A margin venue also holding `eth`, which no instrument values, owing `eth_owed` of it.

@@ -146,8 +146,10 @@ pub struct RequestOpen {
     /// [`MarginEffect`] for the three values. A client that cannot honour a `Some` refuses the
     /// order unsent with
     /// [`OrderError::UnsupportedMarginEffect`]:
-    /// a cash or spot-only account takes `Some(NoSideEffect)` alone, and a venue with
-    /// account-level margin takes none.
+    /// a cash or spot-only account takes `Some(NoSideEffect)` alone, and a client that cannot
+    /// promise it (account-level margin, or implicit borrowing as under Hyperliquid's portfolio
+    /// margin) takes no `Some` at all, `NoSideEffect` included. A caller that sets an effect on
+    /// every order must leave it `None` for those venues.
     ///
     /// `#[serde(default)]` so requests serialised before this field existed still load.
     #[serde(default)]

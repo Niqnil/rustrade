@@ -143,7 +143,9 @@ struct SpotMarginRepr {
     auto_repay_at_cancel: bool,
 }
 
-fn default_auto_repay_at_cancel() -> bool {
+/// Serde default for `auto_repay_at_cancel`, here and on `BinanceMarginConfig`: on, as Binance's
+/// `autoRepayAtCancel` is.
+pub(crate) fn default_auto_repay_at_cancel() -> bool {
     true
 }
 
@@ -476,6 +478,7 @@ mod tests {
         let omitted = r#"{"valuation_asset":"usdt","max_leverage":"3"}"#;
         assert!(serde_json::from_str::<SpotMarginConfig>(omitted).is_err());
 
+        // The retired key alone is no substitute for the effect.
         let retired =
             r#"{"valuation_asset":"usdt","max_leverage":"3","side_effect":"auto_borrow_repay"}"#;
         assert!(serde_json::from_str::<SpotMarginConfig>(retired).is_err());

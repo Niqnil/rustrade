@@ -88,12 +88,6 @@ impl AccountState {
         }
     }
 
-    /// Whether this is a margin account, which an order's [`MarginEffect`] can borrow or repay
-    /// on. A cash account ignores the effect.
-    pub fn is_margin(&self) -> bool {
-        self.margin
-    }
-
     /// The free balance of `asset`, zero for an asset the account has never held.
     pub fn free(&self, asset: &AssetNameExchange) -> Decimal {
         self.balances
@@ -477,15 +471,17 @@ impl AccountState {
     /// `free` below zero rather than being refused. [`commit`](Self::commit) is the checked path,
     /// and a fill that can be refused goes through it.
     ///
-    /// With `repays` on a margin account (an order whose effect is
-    /// [`Repay`](MarginEffect::Repay)), what is delivered into an asset the account owes repays
-    /// that loan first, interest then principal, and only the rest is added to `free`.
+    /// On a margin account, for an order whose `effect` is [`Repay`](MarginEffect::Repay), what is
+    /// delivered into an asset the account owes repays that loan first, interest then principal,
+    /// and only the rest is added to `free`. Under any other effect, or on a cash account, all of
+    /// it is added to `free`.
     pub fn deliver(
         &mut self,
         delivery: &Delivery,
-        repays: bool,
+        effect: MarginEffect,
         time_exchange: DateTime<Utc>,
     ) -> AssetBalance<AssetNameExchange> {
+        let repays = self.margin && effect == MarginEffect::Repay;
         let balance = self.balance_or_open(&delivery.asset, time_exchange);
 
         balance.balance.total += delivery.amount;
@@ -717,8 +713,7 @@ impl AccountState {
         // settled stays held.
         self.reserve(&debit.asset, required, time_exchange)?;
         let paid = self.settle(&debit.asset, debit.settled, time_exchange);
-        let repays = self.margin && effect == MarginEffect::Repay;
-        let received = delivery.map(|delivery| self.deliver(delivery, repays, time_exchange));
+        let received = delivery.map(|delivery| self.deliver(delivery, effect, time_exchange));
 
         Ok(Committed {
             paid,
@@ -1287,7 +1282,7 @@ mod tests {
                 asset: btc(),
                 amount: dec!(1),
             },
-            true,
+            MarginEffect::Repay,
             at,
         );
         assert_eq!(
