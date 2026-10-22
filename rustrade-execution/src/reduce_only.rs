@@ -449,6 +449,22 @@ mod tests {
     }
 
     #[test]
+    fn retire_untracked_keeps_the_reduce_only_count_and_forgets_ordinary_orders() {
+        let mut book = ReduceOnlyBook::new();
+        book.register(&cid("ro1"), true);
+        book.register(&cid("gone"), false);
+        book.register(&cid("ro2"), true);
+        book.register(&cid("kept"), false);
+        book.retire_untracked(|c| *c == cid("kept"));
+        assert_eq!(book.live_reduce_only, 0);
+        assert!(book.live.keys().eq([&cid("kept")]));
+        assert!(book.retired.keys().eq([&cid("ro1"), &cid("ro2")]));
+        assert!(book.has_reduce_only(), "retired ones are still held");
+        book.retired.clear();
+        assert!(!book.has_reduce_only());
+    }
+
+    #[test]
     fn retiring_or_acknowledging_an_unknown_order_does_nothing() {
         let mut book = ReduceOnlyBook::new();
         book.retire(&cid("none"));
