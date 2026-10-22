@@ -608,6 +608,15 @@ pub(crate) mod fixtures {
         }
     }
 
+    /// `request`, carrying `effect` as its [`RequestOpen::margin_effect`].
+    pub(super) fn with_effect(
+        mut request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
+        effect: crate::margin::MarginEffect,
+    ) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
+        request.state = request.state.with_margin_effect(effect);
+        request
+    }
+
     pub(super) fn buy_request(
         quantity: &str,
         market: Option<MarketSnapshot>,

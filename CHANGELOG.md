@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A per-order margin effect** (`rustrade-execution`, `binance` feature, #107). A new
+  `MarginEffect { NoSideEffect, Borrow, Repay }` says what one order does to a margin account's
+  loans, and `RequestOpen::margin_effect: Option<MarginEffect>` carries it, with a
+  `with_margin_effect` builder. `None` takes the client's default.
+  - `BinanceMargin` sends `NO_SIDE_EFFECT`, `MARGIN_BUY` (`Borrow`) or `AUTO_REPAY` (`Repay`). The
+    client's default is `BinanceMarginConfig::margin_effect`.
+  - `BinanceMarginConfig::auto_repay_at_cancel` (default `true`, as Binance's) is sent as
+    `autoRepayAtCancel` on every `Borrow` order, and on no other.
+  - The simulated venue applies the effect per order, including to a resting order's later fill:
+    `Borrow` lends the shortfall when the order is placed and repays nothing from proceeds,
+    `Repay` lends nothing and repays the received asset's loan, interest first, and
+    `NoSideEffect` does neither.
+  - `SpotMarginConfig::with_auto_repay_at_cancel` (default `true`) says whether the venue repays
+    a loan its order no longer needs: the order was cancelled, expired or refused at its fill, or
+    a held market order filled for less than was held. With it off the loan stays owed until a
+    `Repay` order clears it.
+  - `OrderError::UnsupportedMarginEffect(MarginEffect)` is how a client refuses, unsent, an
+    effect it cannot honour. Binance spot and the simulated venue without `spot_margin` honour
+    `Some(NoSideEffect)` only, and so does the simulated venue for a CFD order. Hyperliquid,
+    IBKR and Alpaca refuse every `Some`, since margin is account-level there and Hyperliquid's
+    portfolio margin borrows implicitly.
+  - `BinanceMargin`'s rustdoc now says that a `Borrow` borrows when the order is placed, not when
+    it fills, and that it weighs 1500 against the UID limit where the other effects weigh 6.
+    Hyperliquid spot's rustdoc no longer says spot has no margin concepts.
 - `ExecutionClient`'s rustdoc has a section on wrapping a client in a generic decorator
   (`rustrade-execution`, #678), with a compiled example that delivers only some of an account's
   fills.
@@ -23,6 +47,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking:** `MarginSideEffect` is replaced by `MarginEffect`, and `AutoBorrowRepay` is gone
+  everywhere (`rustrade-execution`, #107, #684).
+  - `BinanceMarginConfig`'s `side_effect` field is now `margin_effect` and defaults to
+    `NoSideEffect`, so no order takes on debt unless asked. `BinanceMarginConfig::new` takes the
+    effect and `auto_repay_at_cancel`. A `side_effect` key in a config file is ignored, and a
+    `margin_effect` of `"auto_borrow_repay"` fails to parse.
+  - `SpotMarginConfig::new(valuation_asset, max_leverage, margin_effect)` requires the effect,
+    and the serialised field has no default, so an old configuration fails to parse instead of
+    changing meaning. `with_side_effect` and `side_effect()` are now `margin_effect()`.
+  - **No setting reproduces the old automatic repay.** The simulated venue used to repay a loan
+    from whatever an order received. It now repays only for an order carrying
+    `MarginEffect::Repay`, as on Binance: open with `Borrow`, close with `Repay`.
+  - `AccountState` (the simulated venue's ledger) takes the order's effect in `commit`, a flag in
+    `deliver` and `release_reservation`, and `enable_margin` takes nothing. `Reservation` has an
+    `effect` field.
+  - `OrderError` has a new variant, `UnsupportedMarginEffect`.
+  - `RequestOpen::new` leaves `margin_effect` as `None`.
 - **Breaking:** `RequestOpen` is `#[non_exhaustive]` (`rustrade-execution`, #686), so a field can
   be added to it later without breaking a caller. Outside the crate it can no longer be built with
   a struct literal.
@@ -48,6 +89,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     read over REST straight after a fill can still be the pre-trade ones (current about 2 s later
     in a live check). Use the account stream's balance events, or read again after a short
     delay. The client adds no retry or delay of its own.
+
+### Fixed
+
+- **`BinanceMargin`'s default client borrowed without repaying** (`rustrade-execution`, `binance`
+  feature, #684). Binance retired `AUTO_BORROW_REPAY` from 2026-10-14 and downgrades it to
+  `MARGIN_BUY`, so a client left on the old default took loans that nothing repaid from proceeds.
+  The client no longer sends it. Its default is `NoSideEffect`, and an order that should borrow
+  or repay says so with `margin_effect`. The `BinanceMargin` and `SpotMarginConfig` rustdoc, which
+  described the combined effect, is rewritten.
 
 ## [0.13.0] - 2026-10-20
 

@@ -87,7 +87,7 @@ pub struct MockExecutionConfig {
     ///
     /// Defaults to `None`: a cash account, whose spot orders are paid for with what it holds, and
     /// whose balances report no loans. A [`SpotMarginConfig`] makes it a cross margin account that
-    /// borrows and repays under its [`MarginSideEffect`](crate::margin::MarginSideEffect), up to a
+    /// borrows under each order's [`MarginEffect`](crate::margin::MarginEffect), up to a
     /// leverage limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spot_margin: Option<SpotMarginConfig>,

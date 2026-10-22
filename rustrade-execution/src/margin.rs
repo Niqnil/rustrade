@@ -1,8 +1,9 @@
 //! Margin borrowing: the borrow and repay policy a margin account applies to its orders, the
 //! simulated venue's spot margin configuration, and the interest it charges on its loans.
 //!
-//! [`MarginSideEffect`] is the policy a live margin client sends with each order, and the one the
-//! simulated venue applies when [`SpotMarginConfig`] turns its spot margin on. A
+//! [`MarginEffect`] is what an order does to a margin account's loans: borrow what it lacks, repay
+//! from what it receives, or neither. A live margin client sends it with each order, and the
+//! simulated venue applies it when [`SpotMarginConfig`] turns its spot margin on. A
 //! [`MarginInterestModel`] prices those loans over time; [`PeriodicMarginInterest`] is the
 //! built-in one.
 
@@ -15,38 +16,48 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use thiserror::Error;
 
-/// Whether a margin account borrows what an order lacks and repays its loans from what an order
-/// receives, fixed once per client or simulated venue.
+/// What an order does to a margin account's loans: borrow what it lacks, repay from what it
+/// receives, or touch neither.
 ///
-/// Only the two *intent-agnostic* modes are modelled. Whether an order opens or closes a position
-/// decides whether it should borrow or repay, and that is position state the library deliberately
-/// does not track, so the venue is left to infer it from the account's loans. The per-order modes
-/// (Binance's `MARGIN_BUY` / `AUTO_REPAY`) are intentionally **not** modelled here; they belong to
-/// a future generic per-order `RequestOpen::margin_effect` field that all margin adapters would
-/// map, added only when a venue with genuine per-order borrow intent appears. Mixed borrow
-/// appetite on a single venue today means running two clients (one per mode).
+/// A margin client has one as its default and a request may carry its own
+/// (`RequestOpen::margin_effect`, where `None` takes the client's default). The three values are
+/// the ones a margin venue takes per order (Binance's `NO_SIDE_EFFECT`, `MARGIN_BUY` and
+/// `AUTO_REPAY`). Whether an order opens or closes a position decides which it should be, and
+/// that is position state the library deliberately does not track, so the caller says.
 ///
-/// The `Serialize`/`Deserialize` wire form is the config-file value (`"auto_borrow_repay"` /
-/// `"no_borrow"`), which is not any venue's API value.
+/// A client or simulated venue that cannot honour an effect refuses the order unsent with
+/// [`OrderError::UnsupportedMarginEffect`](crate::error::OrderError::UnsupportedMarginEffect),
+/// rather than place it without the effect.
+///
+/// The `Serialize`/`Deserialize` wire form is the config-file value (`"no_side_effect"`,
+/// `"borrow"`, `"repay"`), which is not any venue's API value.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum MarginSideEffect {
-    /// Borrow what an order lacks when it is placed, and repay loans from what an order receives,
-    /// as Binance's `AUTO_BORROW_REPAY` does.
+#[non_exhaustive]
+pub enum MarginEffect {
+    /// Neither borrow nor repay: an order that would need a loan is refused, and what it receives
+    /// stays free, as Binance's `NO_SIDE_EFFECT` does. The default, so that no order takes on
+    /// debt unless the caller asks.
+    #[default]
+    NoSideEffect,
+    /// Borrow what the order lacks, as Binance's `MARGIN_BUY` does: the shortfall, and only the
+    /// shortfall, of the asset it pays with (base for a sell, which opens or extends a short).
+    ///
+    /// The loan is taken when the order is placed, not when it fills, and nothing repays it from
+    /// the order's proceeds: close it with a [`Repay`](Self::Repay) order. Whether a loan
+    /// is repaid when the order is cancelled before it fills is the client's `auto_repay_at_cancel`
+    /// option.
     ///
     /// # Warning
-    /// This is the default because it makes shorting work out of the box, but it means a
-    /// **mis-sized order silently takes on debt**: an order larger than the free balance borrows
-    /// the shortfall without any further opt-in (same footgun class as `RequestOpen::reduce_only`).
-    /// Use [`MarginSideEffect::NoBorrow`] for a client that must never silently borrow.
-    #[default]
-    AutoBorrowRepay,
-    /// Never borrow or repay; an order that would need to borrow is rejected, as Binance's
-    /// `NO_SIDE_EFFECT` is. The conservative opt-out from the
-    /// [`AutoBorrowRepay`](Self::AutoBorrowRepay) silent-borrow behaviour.
-    NoBorrow,
+    /// A **mis-sized order takes on debt**: one larger than the free balance borrows the shortfall
+    /// without any further opt-in, and interest accrues on it.
+    Borrow,
+    /// Repay the loan of the asset the order receives from what it receives, interest first, as
+    /// Binance's `AUTO_REPAY` does. It borrows nothing: an order the free balance cannot pay for
+    /// is refused.
+    Repay,
 }
 
 /// Spot margin on the simulated venue: what it lends a spot order, how much, and what it repays.
@@ -57,23 +68,29 @@ pub enum MarginSideEffect {
 /// what it lacks and reports each balance's loan as Binance's margin account does.
 ///
 /// # What it lends, and when
-/// Under [`MarginSideEffect::AutoBorrowRepay`], an order the account cannot pay for with its free
-/// balance borrows the shortfall, and only the shortfall, of the asset it pays with: base for a
-/// sell, quote for a buy. It borrows when the venue accepts the order, as Binance does, so a
-/// resting limit order or a held market order is lent its shortfall at once, and the venue holds
-/// it against the order as it holds any other balance. An asset the account has never held is
-/// opened with the loan. An order that is cancelled or expires before it fills repays what it
-/// borrowed, interest first, and a held market order that fills for less than was held repays the
-/// part of its loan it no longer needs. One that fills in part and rests the
-/// remainder pays for the part that filled with the account's own balance first, so the loan is
-/// held against the remainder and repaid if the remainder is cancelled.
+/// Each spot order has a [`MarginEffect`]: its request's `margin_effect`, else this
+/// configuration's [`margin_effect`](Self::margin_effect). An order with [`MarginEffect::Borrow`]
+/// that the account cannot pay for with its free balance borrows the shortfall, and only the
+/// shortfall, of the asset it pays with: base for a sell, quote for a buy. It borrows when the
+/// venue accepts the order, as Binance does, so a resting limit order or a held market order is
+/// lent its shortfall at once, and the venue holds it against the order as it holds any other
+/// balance. An asset the account has never held is opened with the loan.
 ///
-/// Under [`MarginSideEffect::NoBorrow`], the venue lends nothing and repays nothing: an order it
-/// cannot pay for is rejected as on a cash account, and a loan already in the venue's initial
-/// state is left as it is. Balances still report their loans.
+/// An order that is cancelled, expires or is refused at its fill before it fills repays what it
+/// borrowed, interest first, and a held market order that fills for less than was held repays the
+/// part of its loan it no longer needs, if [`auto_repay_at_cancel`](Self::auto_repay_at_cancel)
+/// is on (the default, as on Binance). One that fills in part and rests the remainder pays for the
+/// part that filled with the account's own balance first, so the loan is held against the
+/// remainder and repaid if the remainder is cancelled.
+///
+/// An order with [`MarginEffect::NoSideEffect`] or [`MarginEffect::Repay`] lends nothing: one it
+/// cannot pay for is rejected as on a cash account. A loan already in the venue's initial state
+/// is left as it is, and balances still report their loans.
 ///
 /// Only spot orders borrow. A CFD's margin is posted from the quote asset's free balance, as
-/// without this configuration.
+/// without this configuration, and a CFD order carrying [`MarginEffect::Borrow`] or
+/// [`MarginEffect::Repay`] is refused with
+/// [`OrderError::UnsupportedMarginEffect`](crate::error::OrderError::UnsupportedMarginEffect).
 ///
 /// # How much it lends
 /// A borrow is allowed while the account's debt, after it, is at most `max_leverage − 1` times
@@ -93,11 +110,12 @@ pub enum MarginSideEffect {
 /// balance's loan.
 ///
 /// # What it repays
-/// Under [`MarginSideEffect::AutoBorrowRepay`], whatever a fill delivers into an asset the account
-/// owes repays that asset's loan, interest first, then principal, and only the rest becomes free
-/// balance. What a buy delivers is its quantity less any fee charged in base, so a buy of exactly
-/// what is owed, with a base fee, leaves a fee-sized loan. Gross the buy up by the fee to clear
-/// it.
+/// Under [`MarginEffect::Repay`], whatever a fill delivers into an asset the account owes repays
+/// that asset's loan, interest first, then principal, and only the rest becomes free balance. What
+/// a buy delivers is its quantity less any fee charged in base, so a buy of exactly what is owed,
+/// with a base fee, leaves a fee-sized loan. Gross the buy up by the fee to clear it. Under the
+/// other two effects a fill repays nothing: as on Binance, a repay is per order, and nothing
+/// repays a loan automatically.
 ///
 /// # What it does not model
 /// - **Liquidation.** An account whose debt grows past its equity keeps trading; nothing closes
@@ -120,32 +138,47 @@ struct SpotMarginRepr {
     valuation_asset: AssetNameExchange,
     #[serde(with = "rust_decimal::serde::str")]
     max_leverage: Decimal,
-    #[serde(default)]
-    side_effect: MarginSideEffect,
+    margin_effect: MarginEffect,
+    #[serde(default = "default_auto_repay_at_cancel")]
+    auto_repay_at_cancel: bool,
+}
+
+fn default_auto_repay_at_cancel() -> bool {
+    true
 }
 
 impl SpotMarginConfig {
-    /// Spot margin that borrows and repays automatically
-    /// ([`MarginSideEffect::AutoBorrowRepay`]), up to `max_leverage` over the account's equity,
-    /// valued in `valuation_asset`.
+    /// Spot margin applying `margin_effect` to each order that does not carry its own, up to
+    /// `max_leverage` over the account's equity, valued in `valuation_asset`.
+    ///
+    /// The effect has no default, so that a configuration says whether the venue may take on debt
+    /// for an order. Unused loans are repaid when their order ends unfilled; see
+    /// [`with_auto_repay_at_cancel`](Self::with_auto_repay_at_cancel).
     ///
     /// # Errors
     /// Returns [`SpotMarginConfigError`] if `max_leverage` is below one.
     pub fn new(
         valuation_asset: AssetNameExchange,
         max_leverage: Decimal,
+        margin_effect: MarginEffect,
     ) -> Result<Self, SpotMarginConfigError> {
         Self::try_from(SpotMarginRepr {
             valuation_asset,
             max_leverage,
-            side_effect: MarginSideEffect::AutoBorrowRepay,
+            margin_effect,
+            auto_repay_at_cancel: default_auto_repay_at_cancel(),
         })
     }
 
-    /// This configuration, applying `side_effect` instead.
+    /// This configuration, repaying a loan its order no longer needs (the order was cancelled,
+    /// expired or refused at its fill, or a held market order filled for less than was held) when
+    /// `auto_repay_at_cancel` is true, and leaving it owed when false.
+    ///
+    /// On by default, as Binance's `autoRepayAtCancel` is. With it off, an unused loan stays owed
+    /// until a [`MarginEffect::Repay`] order repays it.
     #[must_use]
-    pub fn with_side_effect(mut self, side_effect: MarginSideEffect) -> Self {
-        self.0.side_effect = side_effect;
+    pub fn with_auto_repay_at_cancel(mut self, auto_repay_at_cancel: bool) -> Self {
+        self.0.auto_repay_at_cancel = auto_repay_at_cancel;
         self
     }
 
@@ -160,9 +193,15 @@ impl SpotMarginConfig {
         self.0.max_leverage
     }
 
-    /// Whether the venue borrows and repays automatically.
-    pub fn side_effect(&self) -> MarginSideEffect {
-        self.0.side_effect
+    /// The effect of an order whose request carries none.
+    pub fn margin_effect(&self) -> MarginEffect {
+        self.0.margin_effect
+    }
+
+    /// Whether a loan its order no longer needs is repaid. See
+    /// [`with_auto_repay_at_cancel`](Self::with_auto_repay_at_cancel).
+    pub fn auto_repay_at_cancel(&self) -> bool {
+        self.0.auto_repay_at_cancel
     }
 }
 
@@ -420,39 +459,71 @@ mod tests {
     #[test]
     fn a_leverage_below_one_is_refused_by_the_constructor_and_by_deserialising() {
         assert_eq!(
-            SpotMarginConfig::new(AssetNameExchange::new("usdt"), dec!(0.5)),
+            SpotMarginConfig::new(
+                AssetNameExchange::new("usdt"),
+                dec!(0.5),
+                MarginEffect::NoSideEffect
+            ),
             Err(SpotMarginConfigError::LeverageBelowOne(dec!(0.5)))
         );
 
-        let json = r#"{"valuation_asset":"usdt","max_leverage":"0.5"}"#;
+        let json = r#"{"valuation_asset":"usdt","max_leverage":"0.5","margin_effect":"borrow"}"#;
         assert!(serde_json::from_str::<SpotMarginConfig>(json).is_err());
     }
 
     #[test]
-    fn the_side_effect_defaults_to_auto_borrow_repay_when_omitted() {
-        let json = r#"{"valuation_asset":"usdt","max_leverage":"3"}"#;
+    fn the_margin_effect_has_no_default_and_a_retired_side_effect_is_refused() {
+        let omitted = r#"{"valuation_asset":"usdt","max_leverage":"3"}"#;
+        assert!(serde_json::from_str::<SpotMarginConfig>(omitted).is_err());
+
+        let retired =
+            r#"{"valuation_asset":"usdt","max_leverage":"3","side_effect":"auto_borrow_repay"}"#;
+        assert!(serde_json::from_str::<SpotMarginConfig>(retired).is_err());
+    }
+
+    #[test]
+    fn auto_repay_at_cancel_defaults_to_true_when_omitted() {
+        let json = r#"{"valuation_asset":"usdt","max_leverage":"3","margin_effect":"repay"}"#;
         let config: SpotMarginConfig = serde_json::from_str(json).unwrap();
 
-        assert_eq!(config.side_effect(), MarginSideEffect::AutoBorrowRepay);
+        assert_eq!(config.margin_effect(), MarginEffect::Repay);
+        assert!(config.auto_repay_at_cancel());
         assert_eq!(config.max_leverage(), dec!(3));
         assert_eq!(config.valuation_asset(), &AssetNameExchange::new("usdt"));
     }
 
     #[test]
     fn a_configuration_round_trips_through_its_serialised_form() {
-        let config = SpotMarginConfig::new(AssetNameExchange::new("usdt"), dec!(3))
-            .unwrap()
-            .with_side_effect(MarginSideEffect::NoBorrow);
+        let config = SpotMarginConfig::new(
+            AssetNameExchange::new("usdt"),
+            dec!(3),
+            MarginEffect::Borrow,
+        )
+        .unwrap()
+        .with_auto_repay_at_cancel(false);
 
         let json = serde_json::to_string(&config).unwrap();
         assert_eq!(
             json,
-            r#"{"valuation_asset":"usdt","max_leverage":"3","side_effect":"no_borrow"}"#
+            r#"{"valuation_asset":"usdt","max_leverage":"3","margin_effect":"borrow","auto_repay_at_cancel":false}"#
         );
         assert_eq!(
             serde_json::from_str::<SpotMarginConfig>(&json).unwrap(),
             config
         );
+    }
+
+    #[test]
+    fn the_effect_wire_names_are_snake_case_and_the_default_borrows_nothing() {
+        assert_eq!(MarginEffect::default(), MarginEffect::NoSideEffect);
+        for (effect, name) in [
+            (MarginEffect::NoSideEffect, r#""no_side_effect""#),
+            (MarginEffect::Borrow, r#""borrow""#),
+            (MarginEffect::Repay, r#""repay""#),
+        ] {
+            assert_eq!(serde_json::to_string(&effect).unwrap(), name);
+            assert_eq!(serde_json::from_str::<MarginEffect>(name).unwrap(), effect);
+        }
     }
 
     fn btc() -> AssetNameExchange {

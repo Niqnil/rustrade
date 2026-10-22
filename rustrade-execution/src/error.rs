@@ -11,6 +11,7 @@
 //! it over pattern matching on specific variants, as the internal taxonomy may
 //! evolve while `is_transient()` semantics remain stable.
 
+use crate::margin::MarginEffect;
 use derive_more::Constructor;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
@@ -565,6 +566,18 @@ pub enum OrderError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// documents how to read the venue's precision so the caller can round first.
     #[error("invalid precision: {0}")]
     InvalidPrecision(PrecisionViolation),
+
+    /// The request names a [`MarginEffect`] this client cannot honour, so it refused the order
+    /// without sending it.
+    ///
+    /// Non-transient — drop the effect (`RequestOpen::margin_effect` of `None` takes the client's
+    /// default) or send the order to a client that honours it. A client refuses rather than
+    /// ignores an effect it cannot honour, because placing the order without it would borrow, or
+    /// not repay, against the caller's intent. Which effects a client honours is on its type: a
+    /// spot or cash account takes only [`NoSideEffect`](MarginEffect::NoSideEffect), a venue
+    /// with account-level margin takes none.
+    #[error("unsupported margin effect: {0:?}")]
+    UnsupportedMarginEffect(MarginEffect),
 }
 
 /// A value in an order request with more precision than the venue accepts, or that is not
@@ -677,14 +690,17 @@ impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
     /// # Non-transient errors
     /// - Other [`Rejected`](Self::Rejected) errors (invalid instrument, insufficient balance,
     ///   refused borrow, etc.)
-    /// - [`UnsupportedOrderType`](Self::UnsupportedOrderType) and
-    ///   [`InvalidPrecision`](Self::InvalidPrecision)
+    /// - [`UnsupportedOrderType`](Self::UnsupportedOrderType),
+    ///   [`InvalidPrecision`](Self::InvalidPrecision) and
+    ///   [`UnsupportedMarginEffect`](Self::UnsupportedMarginEffect)
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Connectivity(e) => e.is_transient(),
             Self::Rejected(ApiError::RateLimit { .. }) => true,
             Self::Rejected(_) => false,
-            Self::UnsupportedOrderType(_) | Self::InvalidPrecision(_) => false,
+            Self::UnsupportedOrderType(_)
+            | Self::InvalidPrecision(_)
+            | Self::UnsupportedMarginEffect(_) => false,
         }
     }
 }

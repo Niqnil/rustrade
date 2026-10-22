@@ -106,7 +106,7 @@ pub mod indexer;
 pub mod map;
 pub mod margin;
 pub use margin::{
-    InterestCharge, InterestDue, InterestSchedule, MarginInterestModel, MarginSideEffect,
+    InterestCharge, InterestDue, InterestSchedule, MarginEffect, MarginInterestModel,
     PeriodicMarginInterest, SpotMarginConfig, SpotMarginConfigError,
 };
 pub mod market;

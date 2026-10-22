@@ -4,7 +4,7 @@ use crate::{
     exchange::mock::orders::{
         AlreadyResting, OpenOrder, OpenOrders, Reservation, RestingOrder, as_open,
     },
-    margin::MarginSideEffect,
+    margin::MarginEffect,
     order::{
         Order, UnindexedInactiveOrder,
         id::ClientOrderId,
@@ -42,9 +42,9 @@ pub struct AccountState {
     /// in [`trades`](Self::trades). Grows with the run, like `trades` and `orders_cancelled`.
     orders_expired: FnvHashMap<ClientOrderId, Order<ExchangeId, InstrumentNameExchange, Expired>>,
     trades: Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
-    /// The policy of a margin account, or `None` for a cash account, which reports no loans and
-    /// borrows nothing. Set by [`enable_margin`](Self::enable_margin).
-    margin: Option<MarginSideEffect>,
+    /// Whether this is a margin account, which reports every balance's loan, or a cash account,
+    /// which reports none and borrows nothing. Set by [`enable_margin`](Self::enable_margin).
+    margin: bool,
     /// Counts each time an asset's principal opened from zero or was repaid to zero. Read through
     /// [`loans_changed`](Self::loans_changed).
     loans_changed: u64,
@@ -67,20 +67,19 @@ impl AccountState {
             orders_filled: FnvHashMap::default(),
             orders_expired: FnvHashMap::default(),
             trades,
-            margin: None,
+            margin: false,
             loans_changed: 0,
         }
     }
 
-    /// Makes this a margin account applying `side_effect`: every balance reports its loan, and
-    /// under [`MarginSideEffect::AutoBorrowRepay`] the account borrows what an arrival lacks and
-    /// repays its loans from what it receives — see
-    /// [`SpotMarginConfig`](crate::margin::SpotMarginConfig).
+    /// Makes this a margin account: every balance reports its loan, and an order whose
+    /// [`MarginEffect`] says so borrows what an arrival lacks or repays loans from what it
+    /// receives — see [`SpotMarginConfig`](crate::margin::SpotMarginConfig).
     ///
     /// A balance that already reports a loan, as one seeded from a live margin account does, keeps
     /// it; every other balance starts owing nothing.
-    pub fn enable_margin(&mut self, side_effect: MarginSideEffect) {
-        self.margin = Some(side_effect);
+    pub fn enable_margin(&mut self) {
+        self.margin = true;
         for balance in self.balances.values_mut() {
             balance
                 .balance
@@ -89,9 +88,10 @@ impl AccountState {
         }
     }
 
-    /// Whether this account borrows what an arrival lacks and repays loans from what it receives.
-    pub fn lends(&self) -> bool {
-        self.margin == Some(MarginSideEffect::AutoBorrowRepay)
+    /// Whether this is a margin account, which an order's [`MarginEffect`] can borrow or repay
+    /// on. A cash account ignores the effect.
+    pub fn is_margin(&self) -> bool {
+        self.margin
     }
 
     /// The free balance of `asset`, zero for an asset the account has never held.
@@ -477,19 +477,20 @@ impl AccountState {
     /// `free` below zero rather than being refused. [`commit`](Self::commit) is the checked path,
     /// and a fill that can be refused goes through it.
     ///
-    /// On an account that [`lends`](Self::lends), what is delivered into an asset the account owes
-    /// repays that loan first, interest then principal, and only the rest is added to `free`.
+    /// With `repays` on a margin account (an order whose effect is
+    /// [`Repay`](MarginEffect::Repay)), what is delivered into an asset the account owes repays
+    /// that loan first, interest then principal, and only the rest is added to `free`.
     pub fn deliver(
         &mut self,
         delivery: &Delivery,
+        repays: bool,
         time_exchange: DateTime<Utc>,
     ) -> AssetBalance<AssetNameExchange> {
-        let lends = self.lends();
         let balance = self.balance_or_open(&delivery.asset, time_exchange);
 
         balance.balance.total += delivery.amount;
         balance.balance.free += delivery.amount;
-        let cleared = lends && repay(&mut balance.balance, delivery.amount);
+        let cleared = repays && repay(&mut balance.balance, delivery.amount);
         balance.time_exchange = time_exchange;
 
         let balance = balance.clone();
@@ -497,24 +498,27 @@ impl AccountState {
         balance
     }
 
-    /// Gives `reservation` back to `free`, as [`release`](Self::release) does, then repays the
-    /// loan its order took when it was placed out of what came back, interest first.
+    /// Gives `reservation` back to `free`, as [`release`](Self::release) does, then, with
+    /// `auto_repay_at_cancel`, repays the loan its order took when it was placed out of what came
+    /// back, interest first.
     ///
     /// What a cancelled, expired or rejected order does to the balance held against it on a margin
-    /// account, which repays an unused loan when the order it was taken for ends. A reservation
-    /// that borrowed nothing is simply released.
+    /// account, which repays an unused loan when the order it was taken for ends. Without
+    /// `auto_repay_at_cancel` the loan stays owed. A reservation that borrowed nothing is simply
+    /// released.
     ///
     /// # Panics
     /// As [`release`](Self::release).
     pub fn release_reservation(
         &mut self,
         reservation: &Reservation,
+        auto_repay_at_cancel: bool,
         time_exchange: DateTime<Utc>,
     ) -> AssetBalance<AssetNameExchange> {
         let released = self.release(&reservation.asset, reservation.amount, time_exchange);
-        match reservation.borrowed.is_zero() {
-            true => released,
-            false => self.repay_loan(&reservation.asset, reservation.borrowed, time_exchange),
+        match auto_repay_at_cancel && !reservation.borrowed.is_zero() {
+            false => released,
+            true => self.repay_loan(&reservation.asset, reservation.borrowed, time_exchange),
         }
     }
 
@@ -559,7 +563,7 @@ impl AccountState {
         asset: &AssetNameExchange,
         time_exchange: DateTime<Utc>,
     ) -> &mut AssetBalance<AssetNameExchange> {
-        let margin = self.margin.map(|_| MarginDetails::default());
+        let margin = self.margin.then(MarginDetails::default);
         // `SmolStr` clones without allocating for an asset name, so the entry API costs nothing
         // on the common path where the balance exists.
         self.balances
@@ -615,13 +619,17 @@ impl AccountState {
     /// leaves the ledger exactly as it was. `None` is an arrival with nothing to pay back: an
     /// order that rests having traded nothing.
     ///
-    /// # What a margin account lends
-    /// On an account that [`lends`](Self::lends), a requirement `free` and the credit do not cover
-    /// borrows the shortfall of the paying asset, if it is at most `borrowable`, the most the
-    /// venue will lend of it now. The loan is taken with the rest of the arrival, or not at all.
-    /// [`Committed::borrowed`] says how much was lent. A paying asset the account has never held
-    /// has nothing free, and is opened when the loan is taken. A cash account ignores
-    /// `borrowable`, and a negative one lends nothing.
+    /// # What a margin account lends and repays
+    /// On a margin account, for an order whose `effect` is [`Borrow`](MarginEffect::Borrow), a
+    /// requirement `free` and the credit do not cover borrows the shortfall of the paying asset, if
+    /// it is at most `borrowable`, the most the venue will lend of it now. The loan is taken with
+    /// the rest of the arrival, or not at all. [`Committed::borrowed`] says how much was lent. A
+    /// paying asset the account has never held has nothing free, and is opened when the loan is
+    /// taken. A cash account, and an order with another effect, ignore `borrowable`, and a
+    /// negative one lends nothing.
+    ///
+    /// For an order whose `effect` is [`Repay`](MarginEffect::Repay), what the credit delivers
+    /// repays the loan of the asset it is delivered into, as [`deliver`](Self::deliver) does.
     ///
     /// # Errors
     /// [`BalanceInsufficient`], naming the asset short, if `free` plus a credit into the paying
@@ -637,6 +645,7 @@ impl AccountState {
         &mut self,
         debit: &Debit,
         credit: Option<&Credit>,
+        effect: MarginEffect,
         borrowable: Decimal,
         time_exchange: DateTime<Utc>,
     ) -> Result<Committed, BalanceInsufficient> {
@@ -657,8 +666,8 @@ impl AccountState {
         // A margin account lends the shortfall, within what the venue allows.
         // A margin account borrows even an asset it has never held, which it opens on lending.
         let required = debit.settled + debit.reserved;
-        let lends = self.lends();
-        let free = match lends {
+        let lends = self.margin && effect == MarginEffect::Borrow;
+        let free = match self.margin {
             true => self.free(&debit.asset),
             false => self.balance_expect(&debit.asset).balance.free,
         };
@@ -708,7 +717,8 @@ impl AccountState {
         // settled stays held.
         self.reserve(&debit.asset, required, time_exchange)?;
         let paid = self.settle(&debit.asset, debit.settled, time_exchange);
-        let received = delivery.map(|delivery| self.deliver(delivery, time_exchange));
+        let repays = self.margin && effect == MarginEffect::Repay;
+        let received = delivery.map(|delivery| self.deliver(delivery, repays, time_exchange));
 
         Ok(Committed {
             paid,
@@ -910,7 +920,7 @@ impl TryFrom<UnindexedAccountSnapshot> for AccountState {
             orders_filled: FnvHashMap::default(),
             orders_expired: FnvHashMap::default(),
             trades: vec![],
-            margin: None,
+            margin: false,
             loans_changed: 0,
         })
     }
@@ -967,6 +977,7 @@ mod tests {
         let Ok(committed) = account.commit(
             &debit,
             Some(&credit),
+            MarginEffect::NoSideEffect,
             Decimal::ZERO,
             DateTime::<Utc>::MIN_UTC,
         ) else {
@@ -996,6 +1007,7 @@ mod tests {
         let Err(insufficient) = account.commit(
             &debit,
             Some(&credit),
+            MarginEffect::NoSideEffect,
             Decimal::ZERO,
             DateTime::<Utc>::MIN_UTC,
         ) else {
@@ -1043,6 +1055,7 @@ mod tests {
         let Ok(committed) = account.commit(
             &debit,
             Some(&credit),
+            MarginEffect::NoSideEffect,
             Decimal::ZERO,
             DateTime::<Utc>::MIN_UTC,
         ) else {
@@ -1078,6 +1091,7 @@ mod tests {
         let Err(insufficient) = account.commit(
             &debit,
             Some(&credit),
+            MarginEffect::NoSideEffect,
             Decimal::ZERO,
             DateTime::<Utc>::MIN_UTC,
         ) else {
@@ -1127,6 +1141,7 @@ mod tests {
         let Err(insufficient) = account.commit(
             &debit,
             Some(&short),
+            MarginEffect::NoSideEffect,
             Decimal::ZERO,
             DateTime::<Utc>::MIN_UTC,
         ) else {
@@ -1154,6 +1169,7 @@ mod tests {
         let Ok(committed) = account.commit(
             &debit,
             Some(&covered),
+            MarginEffect::NoSideEffect,
             Decimal::ZERO,
             DateTime::<Utc>::MIN_UTC,
         ) else {
@@ -1257,7 +1273,7 @@ mod tests {
             FnvHashMap::default(),
             vec![],
         );
-        account.enable_margin(MarginSideEffect::AutoBorrowRepay);
+        account.enable_margin();
         account
     }
 
@@ -1271,6 +1287,7 @@ mod tests {
                 asset: btc(),
                 amount: dec!(1),
             },
+            true,
             at,
         );
         assert_eq!(

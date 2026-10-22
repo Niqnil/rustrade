@@ -3,7 +3,7 @@
 //! - [`BinanceSpot`] — Binance Spot `ExecutionClient` (REST + signed WebSocket API).
 //! - [`BinanceMargin`] — Binance Cross Margin `ExecutionClient` (REST orders/queries +
 //!   a hand-rolled `userListenToken` user-data stream). Configured via
-//!   [`BinanceMarginConfig`]/[`MarginSideEffect`].
+//!   [`BinanceMarginConfig`] and [`MarginEffect`](crate::margin::MarginEffect).
 //!
 //! Both clients share exchange-agnostic infrastructure (reconnect/backoff,
 //! rate-limit tracking, event deduplication, error parsing, and the
@@ -91,5 +91,5 @@ mod margin_risk;
 mod shared;
 mod spot;
 
-pub use margin::{BinanceMargin, BinanceMarginConfig, MarginForcedLiquidation, MarginSideEffect};
+pub use margin::{BinanceMargin, BinanceMarginConfig, MarginForcedLiquidation};
 pub use spot::{BinanceSpot, BinanceSpotConfig, BinanceSpotConfigError};

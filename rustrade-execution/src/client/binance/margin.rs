@@ -7,7 +7,7 @@
 //!
 //! ## Scope
 //! This module provides the client's identity and configuration ([`BinanceMargin`],
-//! [`BinanceMarginConfig`], [`MarginSideEffect`]) and a full [`ExecutionClient`] implementation:
+//! [`BinanceMarginConfig`], [`MarginEffect`]) and a full [`ExecutionClient`] implementation:
 //! order submission/cancel and account snapshot / balance / open-order / trade queries over REST,
 //! plus a live account event stream ([`ExecutionClient::account_stream`]) over the hand-rolled
 //! `userListenToken` user-data WebSocket (the retired `/sapi/v1/userDataStream` listen-key path is
@@ -32,9 +32,12 @@
 //! `(pair, asset)` pools). See [`BinanceMargin`] for the per-method contract.
 //!
 //! ## Borrow/repay
-//! Margin orders carry a `sideEffectType` controlling whether the venue borrows on entry and
-//! repays on close. This is configured once per client via [`MarginSideEffect`] (see its docs for
-//! the silent-borrow footgun under the default [`MarginSideEffect::AutoBorrowRepay`]).
+//! Margin orders carry a `sideEffectType` controlling whether the venue borrows when the order is
+//! placed and whether it repays from the order's proceeds. A client has a default
+//! [`MarginEffect`] ([`BinanceMarginConfig::margin_effect`], `NoSideEffect` unless set), and a
+//! request may carry its own (`RequestOpen::margin_effect`). Binance retired the combined
+//! `AUTO_BORROW_REPAY` on 2026-10-14, so a position is opened with `Borrow` (`MARGIN_BUY`) and
+//! closed with `Repay` (`AUTO_REPAY`), each per order.
 //!
 //! ## No testnet
 //! Binance margin/SAPI exists on **no** testnet — the SDK exposes only
@@ -93,6 +96,7 @@ use crate::{
     },
     emit_stream_terminated,
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError},
+    margin::MarginEffect,
     order::{
         Order, OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
@@ -165,31 +169,17 @@ use tracing::{debug, error, info, trace, warn};
 // Margin sideEffectType
 // ---------------------------------------------------------------------------
 
-// The borrow and repay policy, fixed once per `BinanceMargin` client. Defined venue-agnostically in
-// `crate::margin`, which the simulated venue shares, and re-exported here from where it began.
-pub use crate::margin::MarginSideEffect;
-
-impl MarginSideEffect {
-    /// The Binance `sideEffectType` wire string for this policy.
-    pub fn as_binance_str(self) -> &'static str {
-        match self {
-            MarginSideEffect::AutoBorrowRepay => "AUTO_BORROW_REPAY",
-            MarginSideEffect::NoBorrow => "NO_SIDE_EFFECT",
-        }
-    }
-
-    /// This policy as the margin SDK's `sideEffectType` parameter enum.
-    ///
-    /// The SDK also exposes `MARGIN_BUY` and `AUTO_REPAY` (the pre-`AUTO_BORROW_REPAY` split
-    /// primitives); rustrade deliberately models only the two composite policies, so those
-    /// variants are unreachable from here.
-    fn as_sdk_enum(self) -> MarginAccountNewOrderSideEffectTypeEnum {
-        match self {
-            MarginSideEffect::AutoBorrowRepay => {
-                MarginAccountNewOrderSideEffectTypeEnum::AutoBorrowRepay
-            }
-            MarginSideEffect::NoBorrow => MarginAccountNewOrderSideEffectTypeEnum::NoSideEffect,
-        }
+/// `effect` as the margin SDK's `sideEffectType` parameter enum: `NO_SIDE_EFFECT`, `MARGIN_BUY`
+/// or `AUTO_REPAY`.
+///
+/// The SDK also has `AUTO_BORROW_REPAY`, which Binance retired on 2026-10-14 by downgrading it to
+/// `MARGIN_BUY`; it is never sent. Exhaustive, so an effect added to [`MarginEffect`] must say
+/// here what it sends.
+fn binance_side_effect(effect: MarginEffect) -> MarginAccountNewOrderSideEffectTypeEnum {
+    match effect {
+        MarginEffect::NoSideEffect => MarginAccountNewOrderSideEffectTypeEnum::NoSideEffect,
+        MarginEffect::Borrow => MarginAccountNewOrderSideEffectTypeEnum::MarginBuy,
+        MarginEffect::Repay => MarginAccountNewOrderSideEffectTypeEnum::AutoRepay,
     }
 }
 
@@ -234,11 +224,24 @@ pub struct BinanceMarginConfig {
     /// empty-set combination is a misconfiguration that panics in [`BinanceMargin::new`].
     #[serde(default)]
     pub isolated_symbols: Vec<InstrumentNameExchange>,
-    /// Borrow/repay policy applied to every order placed by this client.
+    /// The [`MarginEffect`] of an order whose request carries none.
     ///
-    /// Defaults to [`MarginSideEffect::AutoBorrowRepay`] — see its `# Warning` on silent borrowing.
+    /// Defaults to [`MarginEffect::NoSideEffect`], Binance's own default, so that no order takes
+    /// on debt unless the caller asks. A `side_effect` key from an earlier version is ignored.
     #[serde(default)]
-    pub side_effect: MarginSideEffect,
+    pub margin_effect: MarginEffect,
+    /// Whether the debt of an order that is cancelled before it fills is repaid, as Binance's
+    /// `autoRepayAtCancel`. Sent with every [`MarginEffect::Borrow`] order, and with no other.
+    ///
+    /// Defaults to `true`, Binance's default. Binance suggests `false` for a strategy that places
+    /// and cancels at high frequency: the repay is a request of its own. With it off, a cancelled
+    /// order's loan stays owed until a [`MarginEffect::Repay`] order repays it.
+    #[serde(default = "default_auto_repay_at_cancel")]
+    pub auto_repay_at_cancel: bool,
+}
+
+fn default_auto_repay_at_cancel() -> bool {
+    true
 }
 
 // custom Debug to avoid leaking credentials in logs
@@ -250,7 +253,8 @@ impl std::fmt::Debug for BinanceMarginConfig {
             .field("testnet", &self.testnet)
             .field("is_isolated", &self.is_isolated)
             .field("isolated_symbols", &self.isolated_symbols)
-            .field("side_effect", &self.side_effect)
+            .field("margin_effect", &self.margin_effect)
+            .field("auto_repay_at_cancel", &self.auto_repay_at_cancel)
             .finish()
     }
 }
@@ -261,7 +265,8 @@ impl BinanceMarginConfig {
     /// Prefer [`BinanceMarginConfig::cross_margin`] / [`BinanceMarginConfig::isolated`] for the
     /// common cases, or deserialize from a config file to keep credentials out of source. The
     /// positional args expose every field for full control; defaultable knobs (`is_isolated`,
-    /// `isolated_symbols`, `side_effect`) also default via `#[serde(default)]` on the file path.
+    /// `isolated_symbols`, `margin_effect`, `auto_repay_at_cancel`) also default via
+    /// `#[serde(default)]` on the file path.
     ///
     /// Note: this does not itself validate `is_isolated` against `isolated_symbols`; that gate
     /// lives in [`BinanceMargin::new`] (it must also cover the `Deserialize`-only path).
@@ -271,7 +276,8 @@ impl BinanceMarginConfig {
         testnet: bool,
         is_isolated: bool,
         isolated_symbols: Vec<InstrumentNameExchange>,
-        side_effect: MarginSideEffect,
+        margin_effect: MarginEffect,
+        auto_repay_at_cancel: bool,
     ) -> Self {
         Self {
             api_key,
@@ -279,16 +285,17 @@ impl BinanceMarginConfig {
             testnet,
             is_isolated,
             isolated_symbols,
-            side_effect,
+            margin_effect,
+            auto_repay_at_cancel,
         }
     }
 
     /// Convenience constructor for the common case: cross margin, production endpoints, and the
-    /// default [`MarginSideEffect::AutoBorrowRepay`] borrow/repay policy.
+    /// default [`MarginEffect::NoSideEffect`].
     ///
     /// Equivalent to [`new`](Self::new) with `testnet = false`, `is_isolated = false`, no
-    /// `isolated_symbols`, and the default `side_effect`. Use [`new`](Self::new) when any of those
-    /// need to differ.
+    /// `isolated_symbols`, the default `margin_effect` and `auto_repay_at_cancel = true`. Use
+    /// [`new`](Self::new) when any of those need to differ.
     pub fn cross_margin(api_key: String, secret_key: String) -> Self {
         Self::new(
             api_key,
@@ -296,17 +303,18 @@ impl BinanceMarginConfig {
             false,
             false,
             Vec::new(),
-            MarginSideEffect::default(),
+            MarginEffect::default(),
+            true,
         )
     }
 
     /// Convenience constructor for isolated margin: production endpoints, the default
-    /// [`MarginSideEffect::AutoBorrowRepay`] borrow/repay policy, and the given per-pair symbol
-    /// universe (see [`isolated_symbols`](Self::isolated_symbols)).
+    /// default [`MarginEffect::NoSideEffect`], and the given per-pair symbol universe (see
+    /// [`isolated_symbols`](Self::isolated_symbols)).
     ///
     /// `symbols` should be non-empty: an isolated client with no symbols has nothing to
     /// snapshot or stream and [`BinanceMargin::new`] panics on it. Use [`new`](Self::new) to
-    /// override `side_effect`.
+    /// override `margin_effect`.
     pub fn isolated(
         api_key: String,
         secret_key: String,
@@ -318,7 +326,8 @@ impl BinanceMarginConfig {
             false,
             true,
             symbols,
-            MarginSideEffect::default(),
+            MarginEffect::default(),
+            true,
         )
     }
 
@@ -343,11 +352,13 @@ impl BinanceMarginConfig {
 /// is summarised below, with links to the authoritative detail.
 ///
 /// # Borrow/repay (`sideEffectType`)
-/// Fixed once per client via [`BinanceMarginConfig::side_effect`] / [`MarginSideEffect`]. The
-/// default [`MarginSideEffect::AutoBorrowRepay`] makes shorting work out of the box but lets a
-/// **mis-sized order silently borrow** — use [`MarginSideEffect::NoBorrow`] to opt out. Per-order
-/// borrow intent is intentionally not modelled (it would require position tracking); see
-/// [`MarginSideEffect`] for the rationale and upgrade path.
+/// A client has a default [`MarginEffect`] ([`BinanceMarginConfig::margin_effect`], by default
+/// `NoSideEffect`, so no order takes on debt unless asked), and each request may carry its own
+/// (`RequestOpen::margin_effect`). Open a short or a margin long with `Borrow` (`MARGIN_BUY`),
+/// which borrows what the order lacks **when it is placed**, and close it with `Repay`
+/// (`AUTO_REPAY`), which repays from the proceeds. Binance retired `AUTO_BORROW_REPAY` on
+/// 2026-10-14, so there is no longer one value that does both. A **mis-sized `Borrow` order
+/// borrows the shortfall** without further opt-in. See [`open_order`](Self::open_order).
 ///
 /// # Cross vs. isolated margin
 /// The mode is fixed per client via [`BinanceMarginConfig::is_isolated`]:
@@ -482,7 +493,7 @@ impl std::fmt::Debug for BinanceMargin {
         f.debug_struct("BinanceMargin")
             .field("testnet", &self.config.testnet)
             .field("is_isolated", &self.config.is_isolated)
-            .field("side_effect", &self.config.side_effect)
+            .field("margin_effect", &self.config.margin_effect)
             .finish_non_exhaustive()
     }
 }
@@ -714,10 +725,17 @@ impl ExecutionClient for BinanceMargin {
     /// [`OrderState::inactive`]), so the engine always sees a definitive outcome.
     ///
     /// Margin specifics:
-    /// - `sideEffectType` is the client-level [`MarginSideEffect`] (borrow/repay policy).
+    /// - `sideEffectType` is the request's [`MarginEffect`], else the client's
+    ///   [`BinanceMarginConfig::margin_effect`]: `NO_SIDE_EFFECT`, `MARGIN_BUY` for `Borrow` and
+    ///   `AUTO_REPAY` for `Repay`.
+    /// - A `Borrow` borrows when the order is **placed**, not when it fills, and nothing repays
+    ///   it from the order's proceeds: close the position with a `Repay` order. The placement
+    ///   response carries the amount borrowed.
+    /// - `autoRepayAtCancel` is sent with `Borrow` only, from
+    ///   [`BinanceMarginConfig::auto_repay_at_cancel`]: Binance applies it to `MARGIN_BUY` alone.
+    /// - An order with `Borrow` has a request weight of 1500 against the account's UID limit,
+    ///   against 6 for the other effects. Place them accordingly.
     /// - `isIsolated` is config-driven (`"TRUE"` for isolated, `"FALSE"` for cross).
-    /// - `autoRepayAtCancel` is set only under [`MarginSideEffect::AutoBorrowRepay`]: a `NoBorrow`
-    ///   client takes no loan, so requesting repay-on-cancel would be incoherent.
     /// - A `TrailingStop` is sent as a `STOP_LOSS` with `trailingDelta` in basis points, and a
     ///   `TrailingStopFixedLimit` as a `STOP_LOSS_LIMIT` with `trailingDelta` and its fixed limit
     ///   as `price`; an activation price goes as `stopPrice`. An Absolute offset, and
@@ -767,7 +785,11 @@ impl ExecutionClient for BinanceMargin {
             kind,
             time_in_force,
             cid.0.to_string(),
-            self.config.side_effect,
+            request
+                .state
+                .margin_effect
+                .unwrap_or(self.config.margin_effect),
+            self.config.auto_repay_at_cancel,
             self.config.is_isolated,
         ) {
             Ok(params) => params,
@@ -4440,7 +4462,8 @@ fn build_new_order_params(
     kind: OrderKind,
     time_in_force: TimeInForce,
     new_client_order_id: String,
-    side_effect: MarginSideEffect,
+    margin_effect: MarginEffect,
+    auto_repay_at_cancel: bool,
     is_isolated: bool,
 ) -> Result<MarginAccountNewOrderParams, BuildOrderError> {
     let binance_side = match side {
@@ -4455,14 +4478,14 @@ fn build_new_order_params(
     let mut builder = MarginAccountNewOrderParams::builder(symbol, binance_side, binance_type)
         .quantity(quantity)
         .is_isolated(MarginAccountNewOrderIsIsolatedEnum::from_flag(is_isolated))
-        .side_effect_type(side_effect.as_sdk_enum())
+        .side_effect_type(binance_side_effect(margin_effect))
         .new_client_order_id(new_client_order_id)
         .new_order_resp_type(MarginAccountNewOrderNewOrderRespTypeEnum::Full);
 
-    // auto_repay_at_cancel only coheres under AutoBorrowRepay: a NoBorrow client never borrows,
-    // so there is no loan to repay when an order is cancelled.
-    if side_effect == MarginSideEffect::AutoBorrowRepay {
-        builder = builder.auto_repay_at_cancel(true);
+    // Binance applies `autoRepayAtCancel` to MARGIN_BUY only, and only that order has a loan to
+    // repay when it is cancelled, so it is sent with `Borrow` and with nothing else.
+    if margin_effect == MarginEffect::Borrow {
+        builder = builder.auto_repay_at_cancel(auto_repay_at_cancel);
     }
 
     if let Some(tif) = binance_tif {
@@ -4907,44 +4930,19 @@ mod tests {
     }
 
     #[test]
-    fn margin_side_effect_default_is_auto_borrow_repay() {
-        assert_eq!(
-            MarginSideEffect::default(),
-            MarginSideEffect::AutoBorrowRepay
-        );
+    fn margin_effect_default_is_no_side_effect() {
+        assert_eq!(MarginEffect::default(), MarginEffect::NoSideEffect);
     }
 
     #[test]
-    fn margin_side_effect_wire_strings() {
-        assert_eq!(
-            MarginSideEffect::AutoBorrowRepay.as_binance_str(),
-            "AUTO_BORROW_REPAY"
-        );
-        assert_eq!(
-            MarginSideEffect::NoBorrow.as_binance_str(),
-            "NO_SIDE_EFFECT"
-        );
-    }
-
-    #[test]
-    fn margin_side_effect_serde_round_trip() {
-        // serde/config-file form is snake_case, distinct from the Binance wire string (as_binance_str).
-        assert_eq!(
-            serde_json::to_string(&MarginSideEffect::AutoBorrowRepay).unwrap(),
-            r#""auto_borrow_repay""#
-        );
-        assert_eq!(
-            serde_json::to_string(&MarginSideEffect::NoBorrow).unwrap(),
-            r#""no_borrow""#
-        );
-        assert_eq!(
-            serde_json::from_str::<MarginSideEffect>(r#""auto_borrow_repay""#).unwrap(),
-            MarginSideEffect::AutoBorrowRepay
-        );
-        assert_eq!(
-            serde_json::from_str::<MarginSideEffect>(r#""no_borrow""#).unwrap(),
-            MarginSideEffect::NoBorrow
-        );
+    fn margin_effect_wire_values() {
+        for (effect, wire) in [
+            (MarginEffect::NoSideEffect, "NO_SIDE_EFFECT"),
+            (MarginEffect::Borrow, "MARGIN_BUY"),
+            (MarginEffect::Repay, "AUTO_REPAY"),
+        ] {
+            assert_eq!(binance_side_effect(effect).as_str(), wire);
+        }
     }
 
     #[test]
@@ -4955,7 +4953,8 @@ mod tests {
             false,
             false,
             Vec::new(),
-            MarginSideEffect::default(),
+            MarginEffect::default(),
+            true,
         );
         let debug = format!("{config:?}");
         assert!(!debug.contains("my_api_key"));
@@ -4968,28 +4967,41 @@ mod tests {
         let config = BinanceMarginConfig::cross_margin("k".to_string(), "s".to_string());
         assert!(!config.testnet);
         assert!(!config.is_isolated);
-        assert_eq!(config.side_effect, MarginSideEffect::AutoBorrowRepay);
+        assert_eq!(config.margin_effect, MarginEffect::NoSideEffect);
+        assert!(config.auto_repay_at_cancel);
         assert_eq!(config.api_key(), "k");
     }
 
     #[test]
     fn config_deserializes_with_defaults() {
-        // is_isolated and side_effect default when omitted; testnet has no default and must be present.
+        // is_isolated, margin_effect and auto_repay_at_cancel default when omitted; testnet has no
+        // default and must be present.
         let config: BinanceMarginConfig =
             serde_json::from_str(r#"{"api_key":"k","secret_key":"s","testnet":false}"#)
                 .expect("deserialize");
         assert!(!config.is_isolated);
-        assert_eq!(config.side_effect, MarginSideEffect::AutoBorrowRepay);
+        assert_eq!(config.margin_effect, MarginEffect::NoSideEffect);
+        assert!(config.auto_repay_at_cancel);
     }
 
     #[test]
-    fn config_deserializes_explicit_side_effect() {
+    fn config_deserializes_explicit_margin_effect() {
         let config: BinanceMarginConfig = serde_json::from_str(
-            r#"{"api_key":"k","secret_key":"s","testnet":false,"is_isolated":true,"side_effect":"no_borrow"}"#,
+            r#"{"api_key":"k","secret_key":"s","testnet":false,"is_isolated":true,"margin_effect":"borrow","auto_repay_at_cancel":false}"#,
         )
         .expect("deserialize");
         assert!(config.is_isolated);
-        assert_eq!(config.side_effect, MarginSideEffect::NoBorrow);
+        assert_eq!(config.margin_effect, MarginEffect::Borrow);
+        assert!(!config.auto_repay_at_cancel);
+    }
+
+    #[test]
+    fn config_refuses_the_retired_combined_effect() {
+        // Binance retired AUTO_BORROW_REPAY; a config naming it must not parse as something else.
+        let parsed = serde_json::from_str::<BinanceMarginConfig>(
+            r#"{"api_key":"k","secret_key":"s","testnet":false,"margin_effect":"auto_borrow_repay"}"#,
+        );
+        assert!(parsed.is_err());
     }
 
     #[test]
@@ -5002,7 +5014,7 @@ mod tests {
             BinanceMarginConfig::isolated("k".to_string(), "s".to_string(), symbols.clone());
         assert!(config.is_isolated);
         assert_eq!(config.isolated_symbols, symbols);
-        assert_eq!(config.side_effect, MarginSideEffect::AutoBorrowRepay);
+        assert_eq!(config.margin_effect, MarginEffect::NoSideEffect);
     }
 
     #[test]
@@ -5026,7 +5038,8 @@ mod tests {
             false,
             true,
             Vec::new(),
-            MarginSideEffect::default(),
+            MarginEffect::default(),
+            true,
         );
         let _ = BinanceMargin::new(config);
     }
@@ -5152,7 +5165,7 @@ mod tests {
         price: Option<Decimal>,
         kind: OrderKind,
         tif: TimeInForce,
-        side_effect: MarginSideEffect,
+        margin_effect: MarginEffect,
     ) -> Result<MarginAccountNewOrderParams, BuildOrderError> {
         build_new_order_params(
             "BTCUSDT".to_string(),
@@ -5162,7 +5175,8 @@ mod tests {
             kind,
             tif,
             "cid-1".to_string(),
-            side_effect,
+            margin_effect,
+            true,
             false, // cross
         )
     }
@@ -5178,7 +5192,7 @@ mod tests {
             Some(Decimal::from(50_000)),
             OrderKind::Limit,
             gtc(),
-            MarginSideEffect::AutoBorrowRepay,
+            MarginEffect::Borrow,
         )
         .expect("build");
 
@@ -5208,7 +5222,8 @@ mod tests {
             OrderKind::Limit,
             gtc(),
             "cid-1".to_string(),
-            MarginSideEffect::AutoBorrowRepay,
+            MarginEffect::Borrow,
+            true,
             false,
         )
         .expect("build");
@@ -5227,7 +5242,8 @@ mod tests {
             OrderKind::Limit,
             gtc(),
             "cid-1".to_string(),
-            MarginSideEffect::AutoBorrowRepay,
+            MarginEffect::Borrow,
+            true,
             true,
         )
         .expect("build");
@@ -5239,35 +5255,42 @@ mod tests {
 
     #[test]
     fn side_effect_and_auto_repay_gating() {
-        // AutoBorrowRepay → AUTO_BORROW_REPAY + auto_repay_at_cancel(true).
-        let auto = params(
-            Side::Buy,
-            Some(Decimal::from(1)),
-            OrderKind::Limit,
-            gtc(),
-            MarginSideEffect::AutoBorrowRepay,
-        )
-        .expect("build");
-        assert_eq!(
-            auto.side_effect_type.as_ref().map(|s| s.as_str()),
-            Some("AUTO_BORROW_REPAY")
-        );
-        assert_eq!(auto.auto_repay_at_cancel, Some(true));
+        let build = |effect, auto_repay_at_cancel| {
+            build_new_order_params(
+                "BTCUSDT".to_string(),
+                Side::Buy,
+                Some(Decimal::from(1)),
+                Decimal::from(2),
+                OrderKind::Limit,
+                gtc(),
+                "cid-1".to_string(),
+                effect,
+                auto_repay_at_cancel,
+                false,
+            )
+            .expect("build")
+        };
+        let wire = |params: &MarginAccountNewOrderParams| {
+            params
+                .side_effect_type
+                .as_ref()
+                .map(|s| s.as_str().to_owned())
+        };
 
-        // NoBorrow → NO_SIDE_EFFECT and NO auto_repay_at_cancel (no loan to repay).
-        let no_borrow = params(
-            Side::Buy,
-            Some(Decimal::from(1)),
-            OrderKind::Limit,
-            gtc(),
-            MarginSideEffect::NoBorrow,
-        )
-        .expect("build");
-        assert_eq!(
-            no_borrow.side_effect_type.as_ref().map(|s| s.as_str()),
-            Some("NO_SIDE_EFFECT")
-        );
-        assert_eq!(no_borrow.auto_repay_at_cancel, None);
+        // Borrow → MARGIN_BUY, with autoRepayAtCancel as configured, either way explicit.
+        let borrow = build(MarginEffect::Borrow, true);
+        assert_eq!(wire(&borrow).as_deref(), Some("MARGIN_BUY"));
+        assert_eq!(borrow.auto_repay_at_cancel, Some(true));
+        let borrow_off = build(MarginEffect::Borrow, false);
+        assert_eq!(borrow_off.auto_repay_at_cancel, Some(false));
+
+        // Repay and NoSideEffect have no loan to repay at cancel, so send no autoRepayAtCancel.
+        let repay = build(MarginEffect::Repay, true);
+        assert_eq!(wire(&repay).as_deref(), Some("AUTO_REPAY"));
+        assert_eq!(repay.auto_repay_at_cancel, None);
+        let none = build(MarginEffect::NoSideEffect, true);
+        assert_eq!(wire(&none).as_deref(), Some("NO_SIDE_EFFECT"));
+        assert_eq!(none.auto_repay_at_cancel, None);
     }
 
     #[test]
@@ -5277,7 +5300,7 @@ mod tests {
             None,
             OrderKind::Market,
             gtc(),
-            MarginSideEffect::AutoBorrowRepay,
+            MarginEffect::Borrow,
         )
         .expect("build");
         assert_eq!(p.r#type.as_str(), "MARKET");
@@ -5293,7 +5316,7 @@ mod tests {
             Some(Decimal::from(10)),
             OrderKind::Limit,
             TimeInForce::GoodUntilCancelled { post_only: true },
-            MarginSideEffect::AutoBorrowRepay,
+            MarginEffect::Borrow,
         )
         .expect("build");
         assert_eq!(p.r#type.as_str(), "LIMIT_MAKER");
@@ -5312,7 +5335,7 @@ mod tests {
                 trigger_price: trigger,
             },
             gtc(),
-            MarginSideEffect::AutoBorrowRepay,
+            MarginEffect::Borrow,
         )
         .expect("build");
         assert_eq!(stop.r#type.as_str(), "STOP_LOSS");
@@ -5326,7 +5349,7 @@ mod tests {
                 trigger_price: trigger,
             },
             gtc(),
-            MarginSideEffect::AutoBorrowRepay,
+            MarginEffect::Borrow,
         )
         .expect("build");
         assert_eq!(stop_limit.r#type.as_str(), "STOP_LOSS_LIMIT");
@@ -5344,7 +5367,7 @@ mod tests {
                 trigger_price: trigger,
             },
             gtc(),
-            MarginSideEffect::AutoBorrowRepay,
+            MarginEffect::Borrow,
         )
         .expect("build");
         assert_eq!(take_profit.r#type.as_str(), "TAKE_PROFIT");
@@ -5369,7 +5392,7 @@ mod tests {
                     activation_price: None,
                 },
                 gtc(),
-                MarginSideEffect::NoBorrow,
+                MarginEffect::NoSideEffect,
             )
             .expect("build");
             assert_eq!(p.r#type.as_str(), "STOP_LOSS");
@@ -5395,7 +5418,7 @@ mod tests {
                 activation_price: activation,
             },
             gtc(),
-            MarginSideEffect::NoBorrow,
+            MarginEffect::NoSideEffect,
         )
         .expect("build");
         assert_eq!(trailing_stop.r#type.as_str(), "STOP_LOSS");
@@ -5413,7 +5436,7 @@ mod tests {
                     activation_price,
                 },
                 TimeInForce::ImmediateOrCancel,
-                MarginSideEffect::NoBorrow,
+                MarginEffect::NoSideEffect,
             )
             .expect("build");
             assert_eq!(fixed_limit.r#type.as_str(), "STOP_LOSS_LIMIT");
@@ -5435,7 +5458,7 @@ mod tests {
                 activation_price: None,
             },
             gtc(),
-            MarginSideEffect::NoBorrow,
+            MarginEffect::NoSideEffect,
         );
         assert!(matches!(absolute, Err(BuildOrderError::Unsupported)));
 
@@ -5449,7 +5472,7 @@ mod tests {
                 activation_price: None,
             },
             gtc(),
-            MarginSideEffect::NoBorrow,
+            MarginEffect::NoSideEffect,
         );
         assert!(matches!(
             no_limit,
@@ -5466,7 +5489,7 @@ mod tests {
                 activation_price: Some(Decimal::ZERO),
             },
             gtc(),
-            MarginSideEffect::NoBorrow,
+            MarginEffect::NoSideEffect,
         );
         assert!(matches!(
             zero_activation,
@@ -5487,7 +5510,7 @@ mod tests {
                 activation_price: None,
             },
             gtc(),
-            MarginSideEffect::AutoBorrowRepay,
+            MarginEffect::Borrow,
         );
         assert!(matches!(absolute, Err(BuildOrderError::Unsupported)));
 
@@ -5501,7 +5524,7 @@ mod tests {
                 limit_offset: Decimal::from(10),
             },
             gtc(),
-            MarginSideEffect::AutoBorrowRepay,
+            MarginEffect::Borrow,
         );
         assert!(matches!(
             trailing_stop_limit,
@@ -5521,7 +5544,7 @@ mod tests {
                 activation_price: None,
             },
             gtc(),
-            MarginSideEffect::AutoBorrowRepay,
+            MarginEffect::Borrow,
         );
         assert!(matches!(
             fractional,
@@ -5543,7 +5566,7 @@ mod tests {
                 Some(Decimal::from(1)),
                 OrderKind::Limit,
                 tif,
-                MarginSideEffect::AutoBorrowRepay,
+                MarginEffect::Borrow,
             )
             .expect("build");
             assert_eq!(p.time_in_force.as_ref().map(|t| t.as_str()), Some(expected));
@@ -8355,7 +8378,7 @@ mod tests {
             let has = |key: &str, value: &str| params.iter().any(|(k, v)| k == key && v == value);
             has("type", "STOP_LOSS")
                 && has("trailingDelta", "25")
-                && has("sideEffectType", "AUTO_BORROW_REPAY")
+                && has("sideEffectType", "NO_SIDE_EFFECT")
                 && !params.iter().any(|(k, _)| k == "stopPrice" || k == "price")
         };
         wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -8406,6 +8429,70 @@ mod tests {
             ),
             "{refused:?}"
         );
+    }
+
+    /// A request's [`MarginEffect`] reaches Binance as its `sideEffectType`, and as
+    /// `autoRepayAtCancel` only on a `Borrow`, from the config; a request that names none takes
+    /// the config's default.
+    #[tokio::test]
+    async fn a_request_margin_effect_picks_the_side_effect_type_sent() {
+        let server = wiremock::MockServer::start().await;
+        let sends = |wire: &'static str, auto_repay_at_cancel: Option<&'static str>| {
+            move |request: &wiremock::Request| {
+                let mut body_as_query = request.url.clone();
+                body_as_query.set_query(Some(&String::from_utf8_lossy(&request.body)));
+                let params: Vec<(String, String)> = request
+                    .url
+                    .query_pairs()
+                    .chain(body_as_query.query_pairs())
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+                let value = |key: &str| {
+                    params
+                        .iter()
+                        .find(|(k, _)| k == key)
+                        .map(|(_, v)| v.as_str())
+                };
+                value("sideEffectType") == Some(wire)
+                    && value("autoRepayAtCancel") == auto_repay_at_cancel
+            }
+        };
+        for (matcher, cid) in [
+            (sends("MARGIN_BUY", Some("true")), "borrow"),
+            (sends("AUTO_REPAY", None), "repay"),
+            (sends("NO_SIDE_EFFECT", None), "default"),
+        ] {
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+                .and(matcher)
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "symbol": "BTCUSDT", "orderId": 7, "clientOrderId": cid,
+                        "transactTime": 1_700_000_000_000_i64, "price": "50000", "origQty": "2",
+                        "executedQty": "0", "cummulativeQuoteQty": "0", "status": "NEW",
+                        "timeInForce": "GTC", "type": "LIMIT", "side": "BUY",
+                    }),
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let client = margin_client_at(&server, false);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+
+        for (cid, effect) in [
+            ("borrow", Some(MarginEffect::Borrow)),
+            ("repay", Some(MarginEffect::Repay)),
+            ("default", None),
+        ] {
+            let mut request = margin_open_request(&btcusdt, cid);
+            request.state.margin_effect = effect;
+            let placed = client.open_order(request).await;
+            assert!(
+                matches!(placed.state, OrderState::Active(ActiveOrderState::Open(_))),
+                "{cid}: {placed:?}"
+            );
+        }
     }
 
     /// A cross account refuses a trailing `STOP_LOSS` with `-3111`. The order fails as
