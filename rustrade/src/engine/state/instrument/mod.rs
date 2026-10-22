@@ -1204,7 +1204,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         &'a self,
         trade: &'a Trade<AssetKey, InstrumentKey>,
     ) -> Option<&'a ClientOrderId> {
-        if self.reduce_only.is_empty() {
+        if !self.reduce_only.has_reduce_only() {
             return None;
         }
         // A tracked order outranks a retired one under the same venue order id, and the book
@@ -2038,7 +2038,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// whose venue names no client order id and that arrives before the order is acknowledged.
     /// So is a fill of an order this state did not send, such as one restored from a venue
     /// snapshot after a restart, and a late fill of a reduce-only order more than
-    /// [`MAX_RETIRED_ROUTING`] retirements old.
+    /// [`ReduceOnlyBook::RETIRED_CAPACITY`] retirements old.
     ///
     /// [`Trade::holding_move`] is this rule too.
     ///
@@ -5425,7 +5425,7 @@ mod tests {
     #[test]
     fn retired_reduce_only_orders_evict_the_oldest_at_capacity() {
         let mut state = instrument_state(OmsMode::Netting);
-        let ids: Vec<(ClientOrderId, OrderId)> = (0..=MAX_RETIRED_ROUTING)
+        let ids: Vec<(ClientOrderId, OrderId)> = (0..=ReduceOnlyBook::RETIRED_CAPACITY)
             .map(|i| {
                 (
                     ClientOrderId::new(format!("cid-{i}")),
@@ -5443,7 +5443,7 @@ mod tests {
             |cid: &ClientOrderId| state.reduce_only.lookup_ids(Some(cid), &OrderId::new("-"));
         assert!(found(&ids[0].0).is_none());
         assert!(found(&ids[1].0).is_some());
-        assert!(found(&ids[MAX_RETIRED_ROUTING].0).is_some());
+        assert!(found(&ids[ReduceOnlyBook::RETIRED_CAPACITY].0).is_some());
     }
 
     /// In a hedged account the cut is against the position the order is routed to.

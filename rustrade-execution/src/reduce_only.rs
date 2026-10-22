@@ -50,15 +50,49 @@ pub struct BookedOrder<'a> {
 /// [`RETIRED_CAPACITY`](Self::RETIRED_CAPACITY) of those, oldest dropped first, so that a late
 /// fill of one is still recognised and ordinary orders do not push them out. A late fill of any
 /// other retired order is not found: read that as not reduce-only.
-#[derive(Debug, Clone, Default, Eq, PartialEq, Deserialize, Serialize)]
+///
+/// # Serialised form
+/// `{"live": {<cid>: {"reduce_only": bool, "venue_id": <id>|null}}, "retired": {<cid>: <id>|null}}`,
+/// each map in order, either part optional. It is stored as part of its owner's state, so a
+/// change to it is a breaking change. A book loaded with more retired orders than
+/// [`RETIRED_CAPACITY`](Self::RETIRED_CAPACITY) keeps the latest.
+#[derive(Debug, Clone, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(from = "BookParts")]
 pub struct ReduceOnlyBook {
     /// In the order registered.
-    #[serde(default)]
     live: FnvIndexMap<ClientOrderId, LiveOrder>,
     /// The reduce-only orders that ended, each with its venue order id once known, in the order
     /// they ended.
+    retired: FnvIndexMap<ClientOrderId, Option<OrderId>>,
+    /// How many of `live` are reduce-only, so that [`has_reduce_only`](Self::has_reduce_only) is
+    /// O(1). Derived, so it is not serialised.
+    #[serde(skip)]
+    live_reduce_only: usize,
+}
+
+/// What is serialised of a [`ReduceOnlyBook`]; loading one rebuilds the rest.
+#[derive(Deserialize)]
+struct BookParts {
+    #[serde(default)]
+    live: FnvIndexMap<ClientOrderId, LiveOrder>,
     #[serde(default)]
     retired: FnvIndexMap<ClientOrderId, Option<OrderId>>,
+}
+
+impl From<BookParts> for ReduceOnlyBook {
+    fn from(parts: BookParts) -> Self {
+        let BookParts { live, mut retired } = parts;
+        // An order is live or retired, never both; the live one wins.
+        retired.retain(|cid, _| !live.contains_key(cid));
+        let excess = retired.len().saturating_sub(Self::RETIRED_CAPACITY);
+        retired.drain(..excess);
+        let live_reduce_only = live.values().filter(|order| order.reduce_only).count();
+        Self {
+            live,
+            retired,
+            live_reduce_only,
+        }
+    }
 }
 
 impl ReduceOnlyBook {
@@ -75,14 +109,30 @@ impl ReduceOnlyBook {
         self.live.is_empty() && self.retired.is_empty()
     }
 
+    /// How many orders are live: registered and not yet retired. An owner that retires every
+    /// order sees this fall back to the number it has open.
+    pub fn live_len(&self) -> usize {
+        self.live.len()
+    }
+
+    /// Whether any order the book holds is reduce-only, live or retired. When it is not, every
+    /// [`lookup`](Self::lookup) finds no reduce-only order, so a caller can skip it. O(1).
+    pub fn has_reduce_only(&self) -> bool {
+        self.live_reduce_only > 0 || !self.retired.is_empty()
+    }
+
     /// Record that the open request `cid` is being sent, reduce-only or not.
     ///
     /// A client order id reused for a new order replaces everything an earlier order under it
     /// left, live or retired, so its flag does not outlive the order. The new order counts as the
-    /// latest registered.
+    /// latest registered. Registering a client order id that is still live replaces that order,
+    /// dropping the venue order id it was acknowledged with, so register once for each order sent.
     pub fn register(&mut self, cid: &ClientOrderId, reduce_only: bool) {
         self.retired.shift_remove(cid);
-        self.live.shift_remove(cid);
+        if let Some(earlier) = self.live.shift_remove(cid) {
+            self.live_reduce_only -= usize::from(earlier.reduce_only);
+        }
+        self.live_reduce_only += usize::from(reduce_only);
         self.live.insert(
             cid.clone(),
             LiveOrder {
@@ -114,21 +164,28 @@ impl ReduceOnlyBook {
         if let Some(live) = self.live.shift_remove(cid)
             && live.reduce_only
         {
+            self.live_reduce_only -= 1;
             self.insert_retired(cid.clone(), live.venue_id);
         }
     }
 
     /// [`retire`](Self::retire) every live order for which `is_tracked` is `false`, in the order
     /// they were registered, so which retirement is dropped first never depends on hashing.
+    ///
+    /// One pass over the live orders, so O(live orders), and it allocates only when a reduce-only
+    /// order ended.
     pub fn retire_untracked(&mut self, mut is_tracked: impl FnMut(&ClientOrderId) -> bool) {
-        let ended: Vec<ClientOrderId> = self
-            .live
-            .keys()
-            .filter(|cid| !is_tracked(cid))
-            .cloned()
-            .collect();
-        for cid in ended {
-            self.retire(&cid);
+        let mut ended: Vec<(ClientOrderId, Option<OrderId>)> = Vec::new();
+        self.live.retain(|cid, order| {
+            let tracked = is_tracked(cid);
+            if !tracked && order.reduce_only {
+                ended.push((cid.clone(), order.venue_id.take()));
+            }
+            tracked
+        });
+        self.live_reduce_only -= ended.len();
+        for (cid, venue_id) in ended {
+            self.insert_retired(cid, venue_id);
         }
     }
 
@@ -144,7 +201,9 @@ impl ReduceOnlyBook {
         self.lookup_ids(trade.client_order_id.as_ref(), &trade.order_id)
     }
 
-    /// [`lookup`](Self::lookup) for the ids of a fill.
+    /// [`lookup`](Self::lookup) for the ids of a fill, for a caller that resolved the client order
+    /// id itself. A `cid` the book does not hold finds nothing and does not fall back to
+    /// `order_id`; pass `None` to look up by the venue's id alone.
     pub fn lookup_ids(
         &self,
         cid: Option<&ClientOrderId>,
@@ -198,6 +257,7 @@ impl ReduceOnlyBook {
     pub fn clear(&mut self) {
         self.live.clear();
         self.retired.clear();
+        self.live_reduce_only = 0;
     }
 
     fn insert_retired(&mut self, cid: ClientOrderId, venue_id: Option<OrderId>) {
@@ -404,6 +464,65 @@ mod tests {
         book.retire(&cid("b"));
         book.clear();
         assert!(book.is_empty());
+    }
+
+    #[test]
+    fn has_reduce_only_follows_the_orders_held() {
+        let mut book = ReduceOnlyBook::new();
+        assert!(!book.has_reduce_only());
+        book.register(&cid("plain"), false);
+        assert!(!book.has_reduce_only());
+        book.register(&cid("ro"), true);
+        assert!(book.has_reduce_only());
+        book.register(&cid("ro"), false);
+        assert!(!book.has_reduce_only(), "replaced by an ordinary order");
+        book.register(&cid("ro"), true);
+        book.retire(&cid("ro"));
+        assert!(book.has_reduce_only(), "retired but still held");
+        book.clear();
+        assert!(!book.has_reduce_only());
+        book.register(&cid("a"), true);
+        book.register(&cid("b"), true);
+        book.retire_untracked(|c| *c == cid("a"));
+        assert_eq!((book.live_len(), book.has_reduce_only()), (1, true));
+    }
+
+    #[test]
+    fn the_serialised_form_is_pinned_and_keeps_the_retirement_order() {
+        let mut book = ReduceOnlyBook::new();
+        book.register(&cid("b"), true);
+        book.acknowledge(&cid("b"), &venue("v"));
+        book.retire(&cid("b"));
+        book.register(&cid("a"), true);
+        book.retire(&cid("a"));
+        book.register(&cid("c"), false);
+        let json = serde_json::to_string(&book).unwrap();
+        assert_eq!(
+            json,
+            r#"{"live":{"c":{"reduce_only":false,"venue_id":null}},"retired":{"b":"v","a":null}}"#
+        );
+        let loaded: ReduceOnlyBook = serde_json::from_str(&json).unwrap();
+        assert!(loaded.retired.keys().eq(book.retired.keys()));
+        assert_eq!(loaded.has_reduce_only(), book.has_reduce_only());
+    }
+
+    #[test]
+    fn a_loaded_book_keeps_its_bound_and_counts_its_live_reduce_only_orders() {
+        let retired: serde_json::Map<String, serde_json::Value> = (0..100)
+            .map(|i| (format!("c{i}"), serde_json::Value::Null))
+            .collect();
+        let json = serde_json::json!({
+            "live": {"l": {"reduce_only": true, "venue_id": null}, "c99": {"reduce_only": false, "venue_id": null}},
+            "retired": retired,
+        });
+        let mut book: ReduceOnlyBook = serde_json::from_value(json).unwrap();
+        assert_eq!(book.retired.len(), ReduceOnlyBook::RETIRED_CAPACITY);
+        assert!(book.retired.keys().next().is_some_and(|c| *c == cid("c35")));
+        assert!(!book.retired.contains_key(&cid("c99")), "live wins");
+        book.retire(&cid("l"));
+        assert_eq!(book.retired.len(), ReduceOnlyBook::RETIRED_CAPACITY);
+        book.retire(&cid("c99"));
+        assert!(book.live.is_empty() && book.live_reduce_only == 0);
     }
 
     #[test]
