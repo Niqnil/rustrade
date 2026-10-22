@@ -247,6 +247,13 @@ mod tests {
         assert!(rule.is_off());
         assert!(OrderRules::default().is_off());
         assert!(!rules().is_off());
+        // One part on is enough for the rules to be on.
+        let on = ValueRule::new(dec!(1), dec!(0), dec!(0));
+        let off = ValueRule::default();
+        assert!(!OrderRules::new(on, off, off, off).is_off());
+        assert!(!OrderRules::new(off, on, off, off).is_off());
+        assert!(!OrderRules::new(off, off, on, off).is_off());
+        assert!(!OrderRules::new(off, off, off, on).is_off());
         assert_eq!(
             OrderRules::default().check::<(), ()>(OrderKind::Limit, Some(dec!(0.0001)), dec!(7.77)),
             Ok(())

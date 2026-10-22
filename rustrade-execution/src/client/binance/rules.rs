@@ -581,6 +581,22 @@ mod tests {
         assert_eq!(rules, Some(some_rules()));
     }
 
+    /// The max age is a day, and rules exactly that old are no longer used.
+    #[tokio::test(start_paused = true)]
+    async fn rules_are_dropped_at_exactly_the_max_age_inside_a_back_off() {
+        assert_eq!(RULES_MAX_AGE, Duration::from_secs(86_400));
+        let cache = RulesCache::new(PreSendRules::Enforce);
+        cache
+            .rules("BTCUSDT", || async { Ok(Some(some_rules())) })
+            .await;
+        let failing = || async { Err("offline".to_owned()) };
+        tokio::time::advance(RULES_MAX_AGE - Duration::from_secs(10)).await;
+        assert_eq!(cache.rules("BTCUSDT", failing).await, Some(some_rules()));
+        // Still inside the back-off, now exactly one max age since the load.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(cache.rules("BTCUSDT", failing).await, None);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_failure_inside_the_back_off_past_the_max_age_drops_the_rules() {
         let cache = RulesCache::new(PreSendRules::Enforce);

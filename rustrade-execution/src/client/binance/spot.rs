@@ -2670,6 +2670,45 @@ mod tests {
         }
     }
 
+    /// `load_rules` returns the rules it read.
+    #[tokio::test]
+    async fn load_rules_returns_the_rules_it_read() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v3/exchangeInfo"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"symbols": [{
+                    "symbol": "BTCUSDT", "status": "TRADING",
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "100", "stepSize": "0.001"},
+                    ],
+                }]}),
+            ))
+            .mount(&server)
+            .await;
+        let mut client =
+            BinanceSpot::new(BinanceSpotConfig::testnet("key".into(), "secret".into()));
+        client.rules = Arc::new(RulesLoader::new(
+            PreSendRules::Enforce,
+            Arc::new(SpotRestApi::from_config(
+                ConfigurationRestApi::builder()
+                    .api_key("key")
+                    .api_secret("secret")
+                    .base_path(server.uri())
+                    .build()
+                    .unwrap(),
+            )),
+            Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+        ));
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+
+        let loaded = client.load_rules(std::slice::from_ref(&btcusdt)).await;
+        let rules = loaded.ok().and_then(|mut loaded| loaded.remove(&btcusdt));
+        assert_eq!(
+            rules.map(|rules| rules.quantity.step),
+            Some(Some(Decimal::new(1, 3)))
+        );
+    }
+
     /// An order that breaks the symbol's rules is refused before a connection opens, with the
     /// limit it broke; a refusal costs no order request.
     #[tokio::test]
