@@ -712,3 +712,52 @@ async fn test_trailing_stop_limit_rejected() {
         other => panic!("Expected rejection, got: {:?}", other),
     }
 }
+
+/// The testnet's `exchangeInfo` loads into rules, and an order off BTCUSDT's tick grid is refused
+/// unsent with the tick, so nothing is placed.
+#[tokio::test]
+#[ignore = "requires Binance testnet connectivity"]
+async fn test_order_rules_load_and_refuse_an_off_grid_price() {
+    use rustrade_execution::{
+        error::{OrderError, PrecisionLimit},
+        order::state::InactiveOrderState,
+    };
+
+    init_logging();
+    let client = BinanceSpot::new(test_config());
+    let instrument = test_instrument();
+
+    let loaded = client
+        .load_rules(std::slice::from_ref(&instrument))
+        .await
+        .expect("exchangeInfo should load");
+    let rules = loaded.get(&instrument).expect("BTCUSDT should have rules");
+    let tick = rules.price.step.expect("BTCUSDT has a tick size");
+    assert!(rules.quantity.step.is_some(), "BTCUSDT has a lot step");
+    assert!(rules.notional.min.is_some(), "BTCUSDT has a min notional");
+
+    let off_grid = dec!(30000) + tick / dec!(2);
+    let order = client
+        .open_order(rustrade_execution::order::OrderEvent {
+            key: OrderKey {
+                exchange: ExchangeId::BinanceSpot,
+                instrument: &instrument,
+                strategy: StrategyId::new("rules-check"),
+                cid: ClientOrderId::new("rules-off-grid"),
+            },
+            state: RequestOpen::new(
+                Side::Buy,
+                Some(off_grid),
+                dec!(0.001),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilCancelled { post_only: false },
+            ),
+        })
+        .await;
+    match order.state {
+        OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::InvalidPrecision(
+            violation,
+        ))) => assert_eq!(violation.limit, PrecisionLimit::NotOnGrid { step: tick }),
+        other => panic!("expected an off-grid refusal, got {other:?}"),
+    }
+}

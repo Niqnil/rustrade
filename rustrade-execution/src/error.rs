@@ -567,6 +567,18 @@ pub enum OrderError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     #[error("invalid precision: {0}")]
     InvalidPrecision(PrecisionViolation),
 
+    /// A value in the request is outside the range the venue accepts for the instrument, so the
+    /// client refused it without sending it.
+    ///
+    /// Non-transient — change the request. Unlike [`InvalidPrecision`](Self::InvalidPrecision),
+    /// which says a value is badly formed, this says a well-formed value is too small or too
+    /// large: below a minimum price, quantity or notional, or above a maximum. The error carries
+    /// the limit that was broken, so the caller can resize the order. A client checks only the
+    /// rules it has loaded (see [`OrderRules`](crate::rules::OrderRules)); a request that passes
+    /// can still be rejected by the venue.
+    #[error("out of bounds: {0}")]
+    OutOfBounds(BoundsViolation),
+
     /// The request names a [`MarginEffect`] this client cannot honour, so it refused the order
     /// without sending it.
     ///
@@ -628,11 +640,68 @@ impl fmt::Display for PrecisionViolation {
                 write!(f, "cannot be sent exactly in the venue's number format")
             }
             PrecisionLimit::NotPositive => write!(f, "is not positive"),
+            PrecisionLimit::NotOnGrid { step } => {
+                write!(f, "is not a multiple of {step}")
+            }
         }
     }
 }
 
-/// A value of an order request, as named by a [`PrecisionViolation`].
+/// A value in an order request that is below a venue minimum or above a venue maximum.
+///
+/// Carried by [`OrderError::OutOfBounds`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub struct BoundsViolation {
+    /// Which value of the request broke the bound.
+    pub field: OrderField,
+    /// Whether `value` is below the minimum or above the maximum.
+    pub bound: Bound,
+    /// The limit `value` broke.
+    pub limit: Decimal,
+    /// The value as requested. For [`OrderField::Notional`] it is the price times the quantity.
+    pub value: Decimal,
+}
+
+impl BoundsViolation {
+    /// The request's `field`, of `value`, is beyond the `bound` at `limit`.
+    pub fn new(field: OrderField, bound: Bound, limit: Decimal, value: Decimal) -> Self {
+        Self {
+            field,
+            bound,
+            limit,
+            value,
+        }
+    }
+}
+
+impl fmt::Display for BoundsViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            field,
+            bound,
+            limit,
+            value,
+        } = self;
+        let (relation, name) = match bound {
+            Bound::Min => ("below", "minimum"),
+            Bound::Max => ("above", "maximum"),
+        };
+        write!(f, "{field} {value} is {relation} the {name} {limit}")
+    }
+}
+
+/// Which end of a range a [`BoundsViolation`] broke.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub enum Bound {
+    /// The value is below the minimum.
+    Min,
+    /// The value is above the maximum.
+    Max,
+}
+
+/// A value of an order request, as named by a [`PrecisionViolation`] or [`BoundsViolation`].
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub enum OrderField {
@@ -644,6 +713,9 @@ pub enum OrderField {
     TriggerPrice,
     /// A trailing order's offset.
     TrailingOffset,
+    /// The order's price times its quantity, in the quote asset. Never a request field of its
+    /// own: only a [`BoundsViolation`] names it.
+    Notional,
 }
 
 impl fmt::Display for OrderField {
@@ -653,6 +725,7 @@ impl fmt::Display for OrderField {
             Self::Price => "price",
             Self::TriggerPrice => "trigger price",
             Self::TrailingOffset => "trailing offset",
+            Self::Notional => "notional",
         })
     }
 }
@@ -676,6 +749,12 @@ pub enum PrecisionLimit {
     NotRepresentable,
     /// The value is zero or negative. A quantity, price or trailing offset must be positive.
     NotPositive,
+    /// The value is not a whole multiple of `step`: a price must sit on the instrument's tick
+    /// grid and a quantity on its lot grid, counted from zero.
+    NotOnGrid {
+        /// The grid's step: the tick size for a price, the lot step for a quantity.
+        step: Decimal,
+    },
 }
 
 impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
@@ -691,7 +770,8 @@ impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
     /// - Other [`Rejected`](Self::Rejected) errors (invalid instrument, insufficient balance,
     ///   refused borrow, etc.)
     /// - [`UnsupportedOrderType`](Self::UnsupportedOrderType),
-    ///   [`InvalidPrecision`](Self::InvalidPrecision) and
+    ///   [`InvalidPrecision`](Self::InvalidPrecision),
+    ///   [`OutOfBounds`](Self::OutOfBounds) and
     ///   [`UnsupportedMarginEffect`](Self::UnsupportedMarginEffect)
     pub fn is_transient(&self) -> bool {
         match self {
@@ -700,6 +780,7 @@ impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
             Self::Rejected(_) => false,
             Self::UnsupportedOrderType(_)
             | Self::InvalidPrecision(_)
+            | Self::OutOfBounds(_)
             | Self::UnsupportedMarginEffect(_) => false,
         }
     }
