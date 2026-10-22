@@ -5422,7 +5422,7 @@ mod tests {
     /// ping. A connection Binance accepts and drops at once is a failure like any other, and so is
     /// one that stays silent past the first tick, so a venue doing either to every connection
     /// exhausts the budget.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_reconnect_budget_resets_only_once_a_connection_proves_stable() {
         async fn run(pinging: bool) {
             let lifetime = if pinging {

@@ -99,6 +99,11 @@ pub(crate) mod order_recovery;
 #[cfg(any(feature = "alpaca", feature = "binance"))]
 pub(crate) mod reconnect_budget;
 
+// A REST stub on the test's own runtime, for the reconnect tests on a paused clock.
+#[cfg(all(test, any(feature = "alpaca", feature = "binance")))]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+pub(crate) mod test_http;
+
 // Alpaca ExecutionClient implementation (options, equities, crypto — single unified API)
 #[cfg(feature = "alpaca")]
 pub mod alpaca;

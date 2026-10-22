@@ -9130,15 +9130,16 @@ mod tests {
         /// window. A connection the server accepts and closes at once is a failure like any
         /// other, so the waits between such reconnects grow, and a server doing so to every
         /// connection exhausts the budget.
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn the_reconnect_budget_resets_only_once_a_connection_proves_stable() {
             use futures::{SinkExt as _, StreamExt as _};
             use tokio_tungstenite::tungstenite::Message;
 
             // The third connection receives pings past the heartbeat window; the fourth stays open.
             const STABLE: Duration = Duration::from_secs(HEARTBEAT_TIMEOUT_SECS + 3);
+            const DROPPED: Duration = Duration::from_millis(100);
             let lifetime = |n: usize| match n {
-                0 | 1 => Some(Duration::from_millis(100)),
+                0 | 1 => Some(DROPPED),
                 2 => Some(STABLE),
                 _ => None,
             };
@@ -9152,6 +9153,9 @@ mod tests {
             tokio::spawn(async move {
                 let mut connections = 0..;
                 while let Ok((stream, _)) = listener.accept().await {
+                    // Without it, a frame can wait in the kernel for the client's delayed ACK,
+                    // which is real time the paused clock does not wait for.
+                    stream.set_nodelay(true).unwrap();
                     let seen = Arc::clone(&seen);
                     let lifetime = connections.next().and_then(lifetime);
                     tokio::spawn(async move {
@@ -9199,10 +9203,10 @@ mod tests {
                     });
                 }
             });
-            // REST answers nothing, so each reconnect's recovery fails at once.
-            let server = MockServer::start().await;
-            let mut config =
-                AlpacaConfig::with_base_url("key".into(), "secret".into(), server.uri());
+            // REST answers nothing, so each reconnect's recovery fails at once. It is served on
+            // this runtime, so the paused clock measures the waits exactly.
+            let rest_url = crate::client::test_http::serve(|_, _| (404, String::new())).await;
+            let mut config = AlpacaConfig::with_base_url("key".into(), "secret".into(), rest_url);
             config.ws_url_override = Some(ws_url);
             let (tx, _rx) = mpsc::unbounded_channel();
             tokio::spawn(connection_manager(
@@ -9226,19 +9230,15 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
 
-            let listens = listens.lock();
-            // Not reset by the second connection's handshake: its close waits the second backoff.
-            let escalated = listens[2] - listens[1];
-            assert!(
-                escalated >= 2 * BackoffLimits::ACCOUNT_STREAM.initial,
-                "reconnected {escalated:?} after a closed connection"
-            );
-            // Reset by the third connection's stability timer: its close waits the first backoff
-            // again, not the third (4 s).
-            let after_stable = listens[3] - listens[2] - STABLE;
-            assert!(
-                after_stable < 3 * BackoffLimits::ACCOUNT_STREAM.initial,
-                "reconnected {after_stable:?} after a stable connection"
+            // On the paused clock each wait is exact. Not reset by the second connection's
+            // handshake: its close waits the second backoff. Reset by the third connection's
+            // stability timer: its close waits the first backoff again, not the third.
+            let initial = BackoffLimits::ACCOUNT_STREAM.initial;
+            let waits: Vec<_> = listens.lock().windows(2).map(|w| w[1] - w[0]).collect();
+            assert_eq!(
+                waits,
+                [DROPPED + initial, DROPPED + 2 * initial, STABLE + initial],
+                "the waits between listens"
             );
         }
 

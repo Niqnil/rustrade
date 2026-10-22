@@ -4613,7 +4613,6 @@ mod tests {
         rate_limiter: Arc<RateLimitTracker>,
         /// When each request reached the WS API.
         requests: Arc<parking_lot::Mutex<Vec<tokio::time::Instant>>>,
-        _rest_server: wiremock::MockServer,
     }
 
     impl ManagerRig {
@@ -4623,22 +4622,23 @@ mod tests {
         ) -> Self {
             let (ws_url, requests) = test_ws_api::serve(answer, lifetime).await;
 
-            let rest_server = wiremock::MockServer::start().await;
-            wiremock::Mock::given(wiremock::matchers::method("POST"))
-                .and(wiremock::matchers::path("/sapi/v1/userListenToken"))
-                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-                    serde_json::json!({
-                        "token": "token",
-                        "expirationTime": Utc::now().timestamp_millis() + 86_400_000,
-                    }),
-                ))
-                .mount(&rest_server)
-                .await;
+            // On the test's runtime, so the tests on a paused clock measure the waits exactly.
+            let rest_url = crate::client::test_http::serve(|method, path| {
+                if (method, path) != ("POST", "/sapi/v1/userListenToken") {
+                    return (404, String::new());
+                }
+                let token = serde_json::json!({
+                    "token": "token",
+                    "expirationTime": Utc::now().timestamp_millis() + 86_400_000,
+                });
+                (200, token.to_string())
+            })
+            .await;
             let rest_config = Arc::new(
                 ConfigurationRestApi::builder()
                     .api_key("key")
                     .api_secret("secret")
-                    .base_path(rest_server.uri())
+                    .base_path(rest_url)
                     .build()
                     .unwrap(),
             );
@@ -4653,7 +4653,6 @@ mod tests {
                 rest_config,
                 rate_limiter: Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
                 requests,
-                _rest_server: rest_server,
             }
         }
 
@@ -4860,7 +4859,7 @@ mod tests {
     /// ping. A connection the venue accepts and drops at once is a failure like any other, and so
     /// is one that stays silent past the first tick, so a venue doing either to every connection
     /// exhausts the budget.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_margin_reconnect_budget_resets_only_once_a_connection_proves_stable() {
         async fn run(isolated: bool, pinging: bool) {
             let lifetime = if pinging {
