@@ -12,7 +12,9 @@
 //! their own request. A failed reload keeps the old rules until they are 24 hours old, so a
 //! blip at the venue does not turn into a stream of false refusals. Rules older than that are
 //! dropped, and a symbol with no rules, because the venue lists none or the load failed, is sent
-//! unchecked with a warning, and the venue decides.
+//! unchecked with a warning, and the venue decides. After a failed load a symbol is left alone for
+//! 30 seconds, so an outage costs one request per window, not one per order. One gate serves every
+//! symbol, so a slow load delays the first order of another symbol that needs one.
 //!
 //! # What is read
 //!
@@ -139,36 +141,43 @@ impl RulesCache {
         }
     }
 
-    /// The held rules if they need no load: fresh, or stale with a reload that failed lately.
-    /// `Some(None)` means the symbol is known to have none.
+    /// The held rules if they need no load: fresh, or inside the back-off of a failed reload (then
+    /// only while within the max age). `Some(None)` means no rules are to be used.
     fn usable(&self, symbol: &str) -> Option<Option<OrderRules>> {
         let entries = self.entries.lock();
         let held = entries.get(symbol)?;
         let now = Instant::now();
         let age = now.saturating_duration_since(held.loaded_at);
-        if age < self.ttl {
-            return Some(held.rules);
+        match held.retry_at {
+            Some(retry_at) if now < retry_at => {
+                Some(if age < self.max_age { held.rules } else { None })
+            }
+            Some(_) => None,
+            None => (age < self.ttl).then_some(held.rules),
         }
-        let backing_off = held.retry_at.is_some_and(|retry_at| now < retry_at);
-        (backing_off && age < self.max_age).then_some(held.rules)
     }
 
-    /// After a failed reload: the stale rules while they are within the max age, else none.
+    /// After a failed load: the held rules while they are within the max age, else none. Either
+    /// way the symbol is left alone for [`RELOAD_BACKOFF`], so a first load that fails, or rules
+    /// gone over-age, do not send a request for every order.
     fn keep_stale(&self, symbol: &str, error: &str) -> Option<OrderRules> {
         let mut entries = self.entries.lock();
         let now = Instant::now();
-        match entries.get_mut(symbol) {
-            Some(held) if now.saturating_duration_since(held.loaded_at) < self.max_age => {
-                held.retry_at = Some(now + RELOAD_BACKOFF);
-                warn!(%symbol, %error, "Binance order rules failed to reload: keeping the old ones");
-                held.rules
-            }
-            _ => {
-                entries.remove(symbol);
-                warn!(%symbol, %error, "Binance order rules unavailable: orders are sent unchecked");
-                None
-            }
+        let held = entries.entry(SmolStr::new(symbol)).or_insert(Loaded {
+            rules: None,
+            loaded_at: now,
+            retry_at: None,
+        });
+        if now.saturating_duration_since(held.loaded_at) >= self.max_age {
+            held.rules = None;
         }
+        held.retry_at = Some(now + RELOAD_BACKOFF);
+        if held.rules.is_some() {
+            warn!(%symbol, %error, "Binance order rules failed to reload: keeping the old ones");
+        } else {
+            warn!(%symbol, %error, "Binance order rules unavailable: orders are sent unchecked");
+        }
+        held.rules
     }
 }
 
@@ -224,6 +233,9 @@ impl RulesLoader {
         &self,
         instruments: &[InstrumentNameExchange],
     ) -> Result<HashMap<InstrumentNameExchange, OrderRules>, UnindexedClientError> {
+        if instruments.is_empty() {
+            return Ok(HashMap::new());
+        }
         let symbols: Vec<String> = instruments
             .iter()
             .map(|instrument| instrument.name().to_string())
@@ -481,12 +493,17 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_failed_first_load_sends_unchecked_and_tries_again_on_the_next_order() {
+    async fn a_failed_first_load_sends_unchecked_and_backs_off_before_trying_again() {
         let cache = RulesCache::new(PreSendRules::Enforce);
-        let failed = cache
-            .rules("BTCUSDT", || async { Err("offline".to_owned()) })
-            .await;
-        assert_eq!(failed, None);
+        let attempts = AtomicUsize::new(0);
+        let failing = || async {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err("offline".to_owned())
+        };
+        assert_eq!(cache.rules("BTCUSDT", failing).await, None);
+        assert_eq!(cache.rules("BTCUSDT", failing).await, None);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "backing off");
+        tokio::time::advance(RELOAD_BACKOFF).await;
         let loaded = cache
             .rules("BTCUSDT", || async { Ok(Some(some_rules())) })
             .await;
@@ -562,5 +579,19 @@ mod tests {
             .rules("BTCUSDT", || async { Err("must not load".to_owned()) })
             .await;
         assert_eq!(rules, Some(some_rules()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failure_inside_the_back_off_past_the_max_age_drops_the_rules() {
+        let cache = RulesCache::new(PreSendRules::Enforce);
+        cache
+            .rules("BTCUSDT", || async { Ok(Some(some_rules())) })
+            .await;
+        tokio::time::advance(RULES_MAX_AGE - Duration::from_secs(1)).await;
+        let failing = || async { Err("offline".to_owned()) };
+        assert_eq!(cache.rules("BTCUSDT", failing).await, Some(some_rules()));
+        // Inside the 30 s back-off, but now past the max age.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(cache.rules("BTCUSDT", failing).await, None);
     }
 }

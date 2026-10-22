@@ -70,7 +70,8 @@ impl ValueRule {
         field: OrderField,
         value: Decimal,
     ) -> Result<(), OrderError<AssetKey, InstrumentKey>> {
-        if let Some(step) = self.step
+        // A step set to zero by hand, not through `new`, is no grid: `%` would panic on it.
+        if let Some(step) = self.step.filter(|step| *step > Decimal::ZERO)
             && !(value % step).is_zero()
         {
             return Err(OrderError::InvalidPrecision(PrecisionViolation::new(
@@ -248,6 +249,16 @@ mod tests {
         assert!(!rules().is_off());
         assert_eq!(
             OrderRules::default().check::<(), ()>(OrderKind::Limit, Some(dec!(0.0001)), dec!(7.77)),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_step_of_zero_set_by_hand_is_no_grid_not_a_panic() {
+        let mut rules = OrderRules::default();
+        rules.quantity.step = Some(Decimal::ZERO);
+        assert_eq!(
+            rules.check::<(), ()>(OrderKind::Market, None, dec!(1.5)),
             Ok(())
         );
     }

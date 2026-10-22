@@ -738,6 +738,8 @@ impl ExecutionClient for BinanceMargin {
         let rest_config = Self::build_rest_config(&config);
         let rest = Arc::new(MarginTradingRestApi::production(rest_config.clone()));
         // The rules come from the spot `exchangeInfo`, a public endpoint on the spot weight pool.
+        // Its tracker is this client's own: a `BinanceSpot` in the same process keeps another for
+        // the same IP pool, which is cheap, as rules load once per pair an hour.
         let rules = Arc::new(RulesLoader::new(
             config.pre_send_rules,
             Arc::new(binance_sdk::spot::SpotRestApi::production(
@@ -8722,6 +8724,19 @@ mod tests {
             matches!(refused.state, OrderState::Inactive(_)),
             "{refused:?}"
         );
+    }
+
+    /// Loading no symbols asks Binance for nothing.
+    #[tokio::test]
+    async fn load_rules_of_no_symbols_sends_no_request() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v3/exchangeInfo"))
+            .respond_with(btcusdt_exchange_info())
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = margin_client_at(&server, false);
+        assert_eq!(client.load_rules(&[]).await, Ok(HashMap::new()));
     }
 
     /// A cross account refuses a trailing `STOP_LOSS` with `-3111`. The order fails as
