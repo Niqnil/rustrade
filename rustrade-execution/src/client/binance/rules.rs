@@ -426,6 +426,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn rules_load_once_and_are_reused_until_the_ttl() {
+        assert_eq!(RULES_TTL, Duration::from_secs(3_600));
         let cache = RulesCache::new(PreSendRules::Enforce);
         let loads = AtomicUsize::new(0);
         let load = || async {
