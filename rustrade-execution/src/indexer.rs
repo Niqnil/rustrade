@@ -556,6 +556,7 @@ impl AccountEventIndexer {
             UnindexedOrderError::InvalidPrecision(violation) => {
                 OrderError::InvalidPrecision(violation)
             }
+            UnindexedOrderError::OutOfBounds(violation) => OrderError::OutOfBounds(violation),
             UnindexedOrderError::UnsupportedMarginEffect(effect) => {
                 OrderError::UnsupportedMarginEffect(effect)
             }
