@@ -95,6 +95,57 @@ impl SimVenueOptions {
     }
 }
 
+/// The market-driven [`SimulatedVenue`] `config` describes, modelling what `options` add to it.
+///
+/// Shared by every builder of a market-driven venue, the backtest's and paper trading's, so a
+/// configuration and its options build the same venue on both.
+///
+/// # Errors
+/// [`BarterError::ExecutionBuilder`] if `options` carries a
+/// [`margin_interest`](SimVenueOptions::margin_interest) model while `config` has no
+/// [`spot_margin`](MockExecutionConfig::spot_margin).
+///
+/// # Panics
+/// If an instrument executed on the venue has a kind the venue cannot model: callers check
+/// [`MockExecution::SUPPORTED_KINDS`](ExecutionClient::SUPPORTED_KINDS) first.
+pub(crate) fn market_driven_venue(
+    config: &MockExecutionConfig,
+    options: SimVenueOptions,
+    instruments: &IndexedInstruments,
+) -> Result<SimulatedVenue, BarterError> {
+    let SimVenueOptions {
+        holding_costs,
+        shortability,
+        fill_model,
+        margin_interest,
+    } = options;
+
+    let exchange = config.mocked_exchange;
+
+    if margin_interest.is_some() && config.spot_margin.is_none() {
+        return Err(BarterError::ExecutionBuilder(format!(
+            "simulated venue {exchange} has a margin interest model but no spot_margin: a cash \
+             account takes no loans to charge"
+        )));
+    }
+
+    let mut venue = SimulatedVenue::new_market_driven(
+        config,
+        generate_mock_exchange_instruments(instruments, exchange),
+    )
+    .with_holding_costs(holding_costs);
+    if let Some(provider) = shortability {
+        venue = venue.with_shortability(provider);
+    }
+    if let Some(model) = fill_model {
+        venue = venue.with_fill_model(model);
+    }
+    if let Some(model) = margin_interest {
+        venue = venue.with_margin_interest(model);
+    }
+    Ok(venue)
+}
+
 /// Builds the execution half of a deterministic simulation: one [`SimulatedVenue`] per configured
 /// exchange, plus the [`MultiExchangeTxMap`] the `Engine` routes requests through.
 ///
@@ -177,27 +228,17 @@ impl<'a> SimExecutionBuilder<'a> {
         options: SimVenueOptions,
         position_seeds: Option<Vec<PositionSeed>>,
     ) -> Result<Self, BarterError> {
-        let SimVenueOptions {
-            holding_costs,
-            shortability,
-            fill_model,
-            margin_interest,
-        } = options;
-
         let exchange = config.mocked_exchange;
-
-        if margin_interest.is_some() && config.spot_margin.is_none() {
-            return Err(BarterError::ExecutionBuilder(format!(
-                "simulated venue {exchange} has a margin interest model but no spot_margin: a \
-                 cash account takes no loans to charge"
-            )));
-        }
 
         validate_supported_instrument_kinds(
             self.instruments,
             exchange,
             <MockExecution<fn() -> chrono::DateTime<chrono::Utc>> as ExecutionClient>::SUPPORTED_KINDS,
         )?;
+
+        // Market-driven: `SimRunner::poll_next` routes every source market event to this venue
+        // before the `Engine` sees it, which is what lets it accept resting orders.
+        let venue = market_driven_venue(&config, options, self.instruments)?;
 
         let instrument_map = generate_execution_instrument_map(self.instruments, exchange)?;
         let index = instrument_map.exchange.key;
@@ -218,23 +259,6 @@ impl<'a> SimExecutionBuilder<'a> {
         // division truncates, so an odd `latency_ms` loses its final millisecond on each leg rather
         // than skewing one direction.
         let leg = TimeDelta::milliseconds((config.latency_ms / 2) as i64);
-
-        // Market-driven: `SimRunner::poll_next` routes every source market event to this venue
-        // before the `Engine` sees it, which is what lets it accept resting orders.
-        let mut venue = SimulatedVenue::new_market_driven(
-            &config,
-            generate_mock_exchange_instruments(self.instruments, exchange),
-        )
-        .with_holding_costs(holding_costs);
-        if let Some(provider) = shortability {
-            venue = venue.with_shortability(provider);
-        }
-        if let Some(model) = fill_model {
-            venue = venue.with_fill_model(model);
-        }
-        if let Some(model) = margin_interest {
-            venue = venue.with_margin_interest(model);
-        }
 
         let venue = SimVenue {
             venue,

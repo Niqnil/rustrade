@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Paper trading on the simulated venue a backtest uses** (`rustrade`, `rustrade-execution`,
+  #677). `ExecutionBuilder::add_paper(config, options, clock, &feed)` adds a venue that trades on
+  a live market: limit orders rest and fill as the market crosses them, and spot margin, interest,
+  holding costs, fees in a third asset and the stale-market policies behave as in a backtest of
+  the same `MockExecutionConfig` and `SimVenueOptions`.
+  - `PaperMarketFeed::tap(market_stream)` wraps the stream fed to the `Engine`. It yields every
+    event unchanged and sends each instrument's market, folded as the backtest folds it, to the
+    paper venues. A venue sees only its own exchange's instruments.
+  - A request waits half of `latency_ms` before it is booked, against the market as it then
+    stands, and its result arrives after the other half, as in a backtest. Order expiry, interest
+    and holding-cost boundaries fall when they are due, in a quiet market too. Everything is
+    stamped from `clock`, which the venue never lets move backwards.
+  - A venue that falls behind the feed ends its account stream with a `StreamTerminated`; the
+    manager reopens it and reads back the fills. A price that crossed a resting order only in the
+    dropped observations, or while the market stream was reconnecting, fills nothing.
+  - `MarketOrderTiming::NextBar` is refused, since a live feed cannot deliver a bar's fills ahead
+    of the bar. The venue keeps its state in memory: a restart starts again from
+    `initial_state`.
+  - `PaperOptions` holds the `SimVenueOptions` and the account stream's capacity (default 4096).
+    `MockExchange::new_market_driven` and `MarketFeedEvent` drive a market-driven venue without
+    the builder. `TokioClock` is a live clock that moves with tokio's, for tests under paused
+    time.
 - **Fills missed while an account stream was down are read when it reopens** (`rustrade`, #675).
   `ExecutionManager` reads them with `fetch_trades`, from the last moment it knew it was in sync
   less an overlap, and delivers them as `Trade` events before the new `Snapshot`, so the snapshot
@@ -105,6 +127,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking in behaviour:** `MockExchange` sends every response through its ordered emission
+  queue (`rustrade-execution`, #677). A fetch is answered after the account events booked before
+  it, so a balance read while a fill is in flight is no longer older than the fill. A cancel's
+  response follows its restatement and now waits `latency_ms`, as an open's does; it used to be
+  sent at once. `MockExchange` has a private field, so it can no longer be built with a struct
+  literal: use `new` or `new_market_driven`.
 - **Breaking: `ExecutionManager::init` takes an `AccountStreamOptions`** in place of its
   `ReconnectionBackoffPolicy` (#675); `AccountStreamOptions::default().with_reconnect(policy)`
   keeps a custom policy. `TradesRead` gains
@@ -164,6 +192,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The mock client's account stream ended after a lag only once another event arrived**
+  (`rustrade-execution`, #677). It delivered the `StreamTerminated` and then waited for the next
+  broadcast event, which a quiet venue may never send, so the manager did not reopen it. It now
+  ends on the poll after any `StreamTerminated` it delivers.
 - **`BinanceMargin`'s default client borrowed without repaying** (`rustrade-execution`, `binance`
   feature, #684). Binance retired `AUTO_BORROW_REPAY` from 2026-10-14 and downgrades it to
   `MARGIN_BUY`, so a client left on the old default took loans that nothing repaid from proceeds.
