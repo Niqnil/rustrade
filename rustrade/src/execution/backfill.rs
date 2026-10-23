@@ -534,4 +534,44 @@ mod tests {
         assert_eq!(watermark.receipt, at(200));
         assert_eq!(watermark.exchange, Some(at(95)));
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_that_finishes_within_the_timeout_is_not_a_gap() {
+        let config = FillRecoveryConfig {
+            read_timeout: Duration::from_secs(5),
+            ..config(100)
+        };
+
+        let result = backfill(
+            |_, _| async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(TradesRead::complete(vec![trade("a", 10)]))
+            },
+            &[],
+            at(0),
+            &config,
+        )
+        .await;
+
+        assert_eq!(result.trades.len(), 1);
+        assert!(result.gaps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_span_exactly_the_maximum_long_is_read_whole_with_no_gap() {
+        let config = FillRecoveryConfig {
+            max_span: Duration::from_secs(100),
+            ..config(100)
+        };
+
+        let (result, calls) = run(vec![Ok(TradesRead::complete(vec![]))], 0, &config).await;
+
+        assert_eq!(calls, [at(0)]);
+        assert!(result.gaps.is_empty());
+    }
+
+    #[test]
+    fn the_clock_has_a_debug_form() {
+        assert_eq!(format!("{:?}", Clock::default()), "Clock(..)");
+    }
 }
