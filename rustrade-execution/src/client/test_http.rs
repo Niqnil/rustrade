@@ -82,3 +82,92 @@ fn reason(status: u16) -> &'static str {
         _ => "Unknown",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::net::TcpStream;
+
+    fn echo(method: &str, path: &str) -> (u16, String) {
+        let status = match path {
+            "/ok" => 200,
+            "/missing" => 404,
+            _ => 500,
+        };
+        (status, format!("{method} {path}"))
+    }
+
+    async fn get(url: &str, target: &str) -> String {
+        let mut stream = TcpStream::connect(url.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        stream
+            .write_all(format!("GET {target} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).await.unwrap();
+        answer
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_answers_with_status_line_and_body_for_the_path_without_its_query() {
+        let url = serve(echo).await;
+
+        let ok = get(&url, "/ok?a=1").await;
+        assert!(ok.starts_with("HTTP/1.1 200 OK\r\n"), "{ok}");
+        assert!(ok.ends_with("\r\n\r\nGET /ok"), "{ok}");
+        assert!(ok.contains("content-length: 7\r\n"), "{ok}");
+
+        let missing = get(&url, "/missing").await;
+        assert!(
+            missing.starts_with("HTTP/1.1 404 Not Found\r\n"),
+            "{missing}"
+        );
+
+        let other = get(&url, "/other").await;
+        assert!(other.starts_with("HTTP/1.1 500 Unknown\r\n"), "{other}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_request_waits_for_the_whole_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let mut read = tokio::spawn(async move { read_request(&mut server).await });
+
+        client
+            .write_all(b"POST /x HTTP/1.1\r\nContent-Length: 10\r\n\r\n01234")
+            .await
+            .unwrap();
+        // The head and half the body are in: the request is not complete yet.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut read)
+                .await
+                .is_err()
+        );
+
+        client.write_all(b"56789").await.unwrap();
+        let head = read.await.unwrap().unwrap();
+        assert!(head.starts_with("POST /x HTTP/1.1\r\n"), "{head}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_request_without_body_returns_at_the_end_of_the_head() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+
+        client.write_all(b"GET /x HTTP/1.1\r\n\r\n").await.unwrap();
+        let head = read_request(&mut server).await.unwrap();
+        assert_eq!(head, "GET /x HTTP/1.1\r\n\r\n");
+
+        drop(client);
+        assert!(read_request(&mut server).await.is_none());
+    }
+}
