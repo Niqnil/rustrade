@@ -6672,6 +6672,9 @@ pub(super) mod test_ws_api {
         tokio::spawn(async move {
             let mut connections = 0..;
             while let Ok((stream, _)) = listener.accept().await {
+                // Without it, a frame can wait in the kernel for the client's delayed ACK, which is
+                // real time a paused clock does not wait for.
+                stream.set_nodelay(true).unwrap();
                 let seen = Arc::clone(&seen);
                 let lifetime = connections.next().map_or(Lifetime::Open, lifetime);
                 tokio::spawn(async move {
@@ -6722,11 +6725,14 @@ pub(super) mod test_ws_api {
     pub(in crate::client::binance) const STABLE: Duration =
         Duration::from_secs(HEARTBEAT_TIMEOUT_SECS + 3);
 
+    /// How long a dropped connection lives.
+    const DROPPED: Duration = Duration::from_millis(100);
+
     /// Two connections dropped at once, then one that pings past the heartbeat tick, then one that
     /// stays.
     pub(in crate::client::binance) fn dropped_then_pinging(n: usize) -> Lifetime {
         match n {
-            0 | 1 => Lifetime::Silent(Duration::from_millis(100)),
+            0 | 1 => Lifetime::Silent(DROPPED),
             2 => Lifetime::Pinging(STABLE),
             _ => Lifetime::Open,
         }
@@ -6735,7 +6741,7 @@ pub(super) mod test_ws_api {
     /// A connection dropped at once, then one silent past the heartbeat tick, then one that stays.
     pub(in crate::client::binance) fn dropped_then_silent(n: usize) -> Lifetime {
         match n {
-            0 => Lifetime::Silent(Duration::from_millis(100)),
+            0 => Lifetime::Silent(DROPPED),
             1 => Lifetime::Silent(STABLE),
             _ => Lifetime::Open,
         }
@@ -6759,38 +6765,39 @@ pub(super) mod test_ws_api {
         requests.lock().clone()
     }
 
-    /// Checks a manager serving [`dropped_then_pinging`]: the subscribe on the second dropped
-    /// connection does not clear the budget, so its drop waits the second backoff; the pinged
-    /// connection's heartbeat tick does, so its drop waits the first again, not the third (4 s).
+    /// Checks a manager serving [`dropped_then_pinging`], on a paused clock so each wait is exact.
+    /// The subscribe on the second dropped connection does not clear the budget, so its drop waits
+    /// the second backoff. The pinged connection's heartbeat tick does, so its drop waits the first
+    /// again, not the third.
     pub(in crate::client::binance) async fn assert_reset_once_pinged(
         requests: &Mutex<Vec<Instant>>,
         label: &str,
     ) {
-        let at = requests_until(requests, 4, label).await;
-        let escalated = at[2] - at[1];
-        assert!(
-            escalated >= 2 * BackoffLimits::ACCOUNT_STREAM.initial,
-            "{label}: reconnected {escalated:?} after a dropped connection"
-        );
-        let after_stable = (at[3] - at[2]).saturating_sub(STABLE);
-        assert!(
-            after_stable < 3 * BackoffLimits::ACCOUNT_STREAM.initial,
-            "{label}: reconnected {after_stable:?} after a pinged connection"
+        let initial = BackoffLimits::ACCOUNT_STREAM.initial;
+        assert_eq!(
+            waits(&requests_until(requests, 4, label).await),
+            [DROPPED + initial, DROPPED + 2 * initial, STABLE + initial],
+            "{label}: the waits between connections"
         );
     }
 
-    /// Checks a manager serving [`dropped_then_silent`]: a connection that outlives the first
-    /// heartbeat tick with nothing received does not clear the budget, so its drop waits the
-    /// second backoff.
+    /// Checks a manager serving [`dropped_then_silent`], on a paused clock so each wait is exact. A
+    /// connection that outlives the first heartbeat tick with nothing received does not clear the
+    /// budget, so its drop waits the second backoff.
     pub(in crate::client::binance) async fn assert_no_reset_when_silent(
         requests: &Mutex<Vec<Instant>>,
         label: &str,
     ) {
-        let at = requests_until(requests, 3, label).await;
-        let after_silent = (at[2] - at[1]).saturating_sub(STABLE);
-        assert!(
-            after_silent >= 2 * BackoffLimits::ACCOUNT_STREAM.initial,
-            "{label}: reconnected {after_silent:?} after a silent connection"
+        let initial = BackoffLimits::ACCOUNT_STREAM.initial;
+        assert_eq!(
+            waits(&requests_until(requests, 3, label).await),
+            [DROPPED + initial, STABLE + 2 * initial],
+            "{label}: the waits between connections"
         );
+    }
+
+    /// The time between each request and the next.
+    fn waits(at: &[Instant]) -> Vec<Duration> {
+        at.windows(2).map(|w| w[1] - w[0]).collect()
     }
 }

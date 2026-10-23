@@ -436,6 +436,7 @@ jobs:
         if: ${{ !cancelled() && steps.diff.outputs.rust == 'true' }}
         env:
           OUTCOME: ${{ steps.mutants.outcome }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           out="$RUNNER_TEMP/mutants.out"
           count() { if [ -f "$out/$1.txt" ]; then wc -l < "$out/$1.txt"; else echo 0; fi; }
@@ -462,9 +463,25 @@ jobs:
               echo
               echo "Missed: add a test that fails on the mutant, or explain in the PR why it is"
               echo "equivalent to the original."
+              # The line numbers are the tested merge commit's, which differ from the branch's
+              # once the base has moved on, so each mutant's diff names the exact change.
+              echo "Lines are those of \`$(git rev-parse --short HEAD)\`, the PR head \`${PR_HEAD::8}\`"
+              echo "merged into its base. Each mutant's diff follows the list."
               echo '```'
               cat "$out/missed.txt"
               echo '```'
+              if [ -f "$out/outcomes.json" ]; then
+                # Four backticks, so a code fence in a diff's context cannot close the block;
+                # at most 20 diffs, because the step summary is capped at 1 MiB.
+                jq -r '.outcomes[] | select(.summary == "MissedMutant") | .diff_path' \
+                  "$out/outcomes.json" | head -n 20 |
+                  while read -r diff; do
+                    [ -f "$out/$diff" ] || continue
+                    echo '````diff'
+                    cat "$out/$diff"
+                    echo '````'
+                  done
+              fi
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
