@@ -9,7 +9,7 @@
 
 use super::{
     LISTING_STALL_TIMEOUT, ListingLock, cancelled_at_expiry,
-    execution::{self, ExecutionRevision, try_decimal_or_warn},
+    execution::{self, EXECUTIONS_COVER, ExecutionRevision, try_decimal_or_warn},
     order::{self, OrderContext, OrderIdMap, PendingCancels, Registration},
     read_listing,
 };
@@ -26,24 +26,15 @@ use chrono::{DateTime, Utc};
 use fnv::FnvHashMap;
 use ibapi::{
     client::blocking::Client,
-    orders::{ExecutionFilter, Executions, OrderData, OrderStatusKind, Orders},
+    orders::{Executions, OrderData, OrderStatusKind, Orders},
 };
 use lru::LruCache;
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use rustrade_instrument::ibkr::ContractRegistry;
 use smol_str::{SmolStr, format_smolstr};
-use std::{cell::OnceCell, num::NonZeroUsize, ops::ControlFlow, sync::Arc, time::Duration};
+use std::{cell::OnceCell, num::NonZeroUsize, ops::ControlFlow, sync::Arc};
 use tracing::{debug, warn};
-
-/// How many days of executions are read for the fill of an order that ended cancelled or
-/// expired.
-const EXECUTION_DAYS: i32 = 7;
-
-/// How long ago an order may have been placed for a read of [`EXECUTION_DAYS`] days of executions
-/// to cover its whole life, so that finding none of them means it filled nothing. A day short of
-/// the read, since IB counts its days in a time zone of its own.
-const EXECUTIONS_COVER: Duration = Duration::from_secs(6 * 24 * 60 * 60);
 
 /// How far IB's clock, which stamps an order's completion to the second, and this host's may be
 /// apart, when a completion is compared with when this client began tracking the order.
@@ -473,10 +464,7 @@ impl<'a> EndedOrderReader<'a> {
         }
         let subscription = self
             .client
-            .executions(ExecutionFilter {
-                last_n_days: EXECUTION_DAYS,
-                ..ExecutionFilter::default()
-            })
+            .executions(execution::executions_filter())
             .map_err(|e| UnindexedClientError::Internal(format!("executions: {e}")))?;
         let api_client_id = self.client.client_id();
         let mut executed = ExecutedQuantities::default();
@@ -527,6 +515,7 @@ mod tests {
     use rustrade_instrument::{
         Side, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
     };
+    use std::time::Duration;
 
     const API_CLIENT: i32 = 903;
 
@@ -774,9 +763,11 @@ mod tests {
         };
 
         let young = tracked(1, GTC, true);
-        let old = tracked(6, GTC, true);
+        let within = tracked(4, GTC, true);
+        let old = tracked(5, GTC, true);
         assert_eq!(filled(Some(&young), Some(dec!(2))), Some(dec!(2)));
         assert_eq!(filled(Some(&young), None), Some(Decimal::ZERO));
+        assert_eq!(filled(Some(&within), None), Some(Decimal::ZERO));
         assert_eq!(filled(Some(&old), None), None);
         assert_eq!(filled(None, None), None);
         assert_eq!(filled(None, Some(dec!(2))), Some(dec!(2)));

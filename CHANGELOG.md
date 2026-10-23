@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fills missed while an account stream was down are read when it reopens** (`rustrade`, #675).
+  `ExecutionManager` reads them with `fetch_trades`, from the last moment it knew it was in sync
+  less an overlap, and delivers them as `Trade` events before the new `Snapshot`, so the snapshot
+  is the state after them. A span it cannot cover (the venue no longer holds the fills, the budget
+  ran out, or a call failed) is reported as `FillRecoveryGaveUp` and the stream still opens. Fills
+  are deduplicated by instrument and trade id across the read, the new stream and earlier
+  streams. `FillRecoveryConfig` sets the overlap, the clock-skew allowance, the time and call
+  budget, and the longest span.
+- **`AccountStreamOptions` and `ExecutionBuilder::add_live_with`** (`rustrade`, #675). Per venue:
+  the reconnect backoff, the `FillRecoveryConfig`, and the `Clock` the read is measured on.
+  `add_live` uses the defaults. A mock venue added with `add_mock` reads on the engine clock it
+  is given, the clock it stamps its fills with, so a backtest's read spans simulated time.
+- **`TradesRead::held_since`** (`rustrade-execution`, #675). Where a venue's retention limit cuts
+  into the span a `fetch_trades` call read, so a caller can tell fills the venue no longer holds
+  from fills that never happened. Hyperliquid sets it once a wallet's 10,000 retained fills all
+  fall inside the span. IBKR's `fetch_trades` now reads the last 7 days' executions, not only the
+  current day's, and sets it to 5 days ago, as far as that read is sure to reach, for a span
+  starting earlier. Its ended-order lookup now counts a cancelled or expired order with no
+  executions as unfilled only when this client placed it under 5 days ago, not 6, by the same
+  bound.
+- **`AccountEventDeduper`** (`rustrade-execution`, #675). A public bounded record of the fills
+  already delivered, for a consumer that takes the same fill from more than one source. Clones
+  share one record, keyed by instrument and trade id. Other event kinds are never reported as
+  duplicates.
+- **`FillRecoveryFailure::VenueRetention`, `SpanLimit` and `PageLimit`** (`rustrade-execution`,
+  #675), for spans the venue no longer holds and spans the recovery's budget did not cover.
 - **`ReduceOnlyBook`** (`rustrade-execution`, #689). A public record of which orders were sent
   reduce-only, for whoever needs a fill's flag after the request is gone, such as a tracker that
   cuts a reduce-only fill with `Trade::holding_move`. `register` it when the open request is sent,
@@ -79,6 +105,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: `ExecutionManager::init` takes an `AccountStreamOptions`** in place of its
+  `ReconnectionBackoffPolicy` (#675); `AccountStreamOptions::default().with_reconnect(policy)`
+  keeps a custom policy. `TradesRead` gains
+  a `held_since` field; it is `#[non_exhaustive]`, so `TradesRead::new(trades, resume)` and
+  `complete` still build one. `lru` and `parking_lot` are now always dependencies of
+  `rustrade-execution`, for `AccountEventDeduper`.
 - **Breaking:** `InstrumentState::reduce_only_orders` and `retired_reduce_only_orders` are replaced
   by one field, `reduce_only: ReduceOnlyBook` (`rustrade`, #689). A struct literal supplies the
   one field. A state serialised before this loads with an empty book, so the reduce-only flags of

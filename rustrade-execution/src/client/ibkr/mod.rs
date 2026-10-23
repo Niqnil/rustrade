@@ -3213,10 +3213,11 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Limitations
     ///
-    /// - IB only returns executions from the current trading day. The span is applied
-    ///   client-side to filter within that day, and the read is always complete
-    ///   (`resume: None`) for what IB returned: a span reaching before today is not read
-    ///   before today. For historical executions beyond today, use IB's Flex Query or
+    /// - IB lists executions from the last 7 days at most, counted in a time zone of its own. One
+    ///   request reads them all, the span is applied client-side, and the read is always
+    ///   complete (`resume: None`) for what IB returned. A span starting more than 5 days ago
+    ///   has [`held_since`](TradesRead::held_since) set to 5 days ago, the most the read is sure
+    ///   to reach: fills before it may be missing. For older executions, use IB's Flex Query or
     ///   Activity Statements.
     /// - Only the executions of orders this API client placed are returned, plus any
     ///   execution IB flags as an IB-initiated liquidation, whoever placed its order, as a
@@ -3253,6 +3254,7 @@ impl ExecutionClient for IbkrClient {
         if start > end {
             return Ok(TradesRead::complete(Vec::new()));
         }
+        let held_since = execution::executions_held_since(start, Utc::now());
         let client = self.client.clone();
         let contracts = self.contracts.clone();
         let scope = self.execution_scope();
@@ -3267,7 +3269,7 @@ impl ExecutionClient for IbkrClient {
             // `ExecutionScope::classify`).
             // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
             let sub = client
-                .executions(ibapi::orders::ExecutionFilter::default())
+                .executions(execution::executions_filter())
                 .map_err(|e| UnindexedClientError::Internal(format!("executions: {e}")))?;
 
             let mut listing = Vec::new();
@@ -3289,9 +3291,10 @@ impl ExecutionClient for IbkrClient {
                 start..=end,
                 instruments_filter.as_ref(),
             );
-            Ok(TradesRead::complete(execution::keep_latest_revisions(
-                trades,
-            )))
+            Ok(
+                TradesRead::complete(execution::keep_latest_revisions(trades))
+                    .with_held_since(held_since),
+            )
         })
         .await
         .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))?
@@ -3865,7 +3868,7 @@ impl BracketOrderClient for IbkrClient {
 ///
 /// A filled order is reported fully filled, without an average price; a cancelled or expired one
 /// with the fill its executions show, which is nothing when they show none of it and the order
-/// was placed through this client under six days ago, since the read then covers its whole life,
+/// was placed through this client under five days ago, since the read then covers its whole life,
 /// and otherwise unknown (`None`); a placement IB accepted and then rejected, or left `Inactive`,
 /// as [`OpenFailed`](crate::order::state::InactiveOrderState::OpenFailed). A cancelled order is
 /// reported expired by the rule [`ExecutionClient::account_stream`] applies. An order IB lists

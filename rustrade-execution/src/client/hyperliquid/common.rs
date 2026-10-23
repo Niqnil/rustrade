@@ -138,6 +138,24 @@ pub(super) fn span_millis(start: DateTime<Utc>, end: DateTime<Utc>) -> Option<(u
 /// The most fills one `userFillsByTime` response holds.
 const USER_FILLS_PER_RESPONSE: usize = 2_000;
 
+/// How many of a wallet's most recent fills Hyperliquid keeps.
+const FILLS_RETAINED: usize = 10_000;
+
+/// When the 10,000-fill limit cuts into a span that `fills` (everything `userFillsByTime` returned
+/// for it, before any filter by instrument) was read from `start_ms`: the time of the oldest fill
+/// held, when a full 10,000 came back and it is after `start_ms`. Fewer than 10,000 means nothing
+/// has been dropped, however old the span.
+pub(super) fn held_since(fills: &[UserFill], start_ms: u64) -> Option<DateTime<Utc>> {
+    if fills.len() < FILLS_RETAINED {
+        return None;
+    }
+    let oldest = fills.iter().map(|fill| fill.time).min()?;
+    (oldest > start_ms).then(|| {
+        Utc.timestamp_millis_opt(i64::try_from(oldest).ok()?)
+            .single()
+    })?
+}
+
 /// Read every fill `address` made from `start_ms` to `end_ms`, both inclusive, in epoch
 /// milliseconds, parsed into [`UserFill`] rather than the SDK's lossy type.
 ///
@@ -777,6 +795,39 @@ pub(super) fn spot_base_quote(instrument: &InstrumentNameExchange) -> Option<(&s
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    fn fills_at(times: impl IntoIterator<Item = u64>) -> Vec<UserFill> {
+        times
+            .into_iter()
+            .map(|time| {
+                serde_json::from_value(serde_json::json!({
+                    "coin": "BTC", "side": "B", "px": "1", "sz": "1", "time": time,
+                    "oid": 1, "fee": "0", "tid": time
+                }))
+                .unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn held_since_is_the_oldest_fill_only_when_the_retention_limit_is_reached() {
+        let full = fills_at((0..FILLS_RETAINED as u64).map(|i| 5_000 + i));
+        assert_eq!(
+            held_since(&full, 1_000),
+            Some(Utc.timestamp_millis_opt(5_000).unwrap())
+        );
+
+        let short = fills_at((0..FILLS_RETAINED as u64 - 1).map(|i| 5_000 + i));
+        assert_eq!(held_since(&short, 1_000), None);
+    }
+
+    #[test]
+    fn held_since_is_none_when_the_oldest_fill_is_not_after_the_span_start() {
+        let full = fills_at((0..FILLS_RETAINED as u64).map(|i| 5_000 + i));
+
+        assert_eq!(held_since(&full, 5_000), None);
+        assert_eq!(held_since(&full, 9_000), None);
+    }
 
     #[test]
     fn an_instrument_filter_keeps_what_it_was_given_or_everything_when_given_nothing() {

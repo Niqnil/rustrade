@@ -605,6 +605,7 @@ async fn test_fetch_trades() {
 
     let read = result.unwrap();
     assert_eq!(read.resume, None, "the venue reads a span whole");
+    assert_eq!(read.held_since, None, "a day's span is inside the read");
     let trades = read.trades;
     println!("Trades in last 24h: {}", trades.len());
     for trade in trades.iter().take(5) {
@@ -617,6 +618,21 @@ async fn test_fetch_trades() {
             trade.fees
         );
     }
+
+    // A span older than the read covers reports where the cover starts.
+    let before = chrono::Utc::now();
+    let read = client
+        .fetch_trades(before - chrono::Duration::days(8), before, &instruments)
+        .await
+        .expect("fetch_trades over 8 days failed");
+    let held_since = read
+        .held_since
+        .expect("an 8-day span reaches past the read");
+    let cover_start = before - chrono::Duration::days(5);
+    assert!(
+        held_since >= cover_start && held_since <= chrono::Utc::now() - chrono::Duration::days(5),
+        "held_since {held_since} is not 5 days before the read"
+    );
 }
 
 // ============================================================================
