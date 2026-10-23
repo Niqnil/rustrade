@@ -20,16 +20,24 @@ use rustrade_execution::{
 use rustrade_instrument::{
     asset::name::AssetNameExchange, instrument::name::InstrumentNameExchange,
 };
-use std::{fmt, future::Future, sync::Arc, time::Duration};
+use serde::{Deserialize, Serialize};
+use std::{future::Future, time::Duration};
 use tokio::time::Instant;
 
 /// Reads of the fills missed across a re-opened account stream: what to read and how much effort
-/// to spend. [`Default`] is what [`ExecutionBuilder`](super::builder::ExecutionBuilder) uses.
+/// to spend. [`Default`] is the one in
+/// [`AccountStreamOptions::default`](super::manager::AccountStreamOptions), which
+/// [`ExecutionBuilder::add_live`](super::builder::ExecutionBuilder::add_live) uses.
 ///
 /// Recovery is on whenever the manager reopens a stream. It never blocks the reopening: a read
 /// that fails or runs out of budget is reported in-band as a
 /// [`FillRecoveryGaveUp`](AccountEventKind::FillRecoveryGaveUp) and the stream still opens.
-#[derive(Debug, Clone)]
+///
+/// Built from [`Default`] and the `with_*` methods, so fields can be added without a breaking
+/// change. Venues differ in how many fills one call returns and how long they keep them, so the
+/// budget is set per venue.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct FillRecoveryConfig {
     /// How far before the watermark the read starts. Covers the delay between a fill and its
     /// delivery, so a fill delivered just before the stream ended is read again, not missed.
@@ -43,14 +51,12 @@ pub struct FillRecoveryConfig {
     /// is the new stream's to deliver.
     pub max_clock_skew: Duration,
     /// The time the whole read may take, across all its calls. Measured on the tokio clock, not
-    /// on [`clock`](Self::clock).
+    /// on the manager's [`Clock`](super::manager::Clock).
     pub read_timeout: Duration,
     /// The most calls to `fetch_trades` one read makes; at least one call is always made.
     pub max_pages: u32,
     /// The longest span one read covers. What lies further back is reported as a gap, not read.
     pub max_span: Duration,
-    /// Where "now" comes from, for the end of the span and for the watermark.
-    pub clock: Clock,
 }
 
 impl Default for FillRecoveryConfig {
@@ -61,37 +67,45 @@ impl Default for FillRecoveryConfig {
             read_timeout: Duration::from_secs(30),
             max_pages: 20,
             max_span: Duration::from_secs(24 * 60 * 60),
-            clock: Clock::default(),
         }
     }
 }
 
-/// A source of the current time, injectable so a test controls it.
-#[derive(Clone)]
-pub struct Clock(Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>);
-
-impl Clock {
-    /// A clock that calls `now`.
-    pub fn new(now: impl Fn() -> DateTime<Utc> + Send + Sync + 'static) -> Self {
-        Self(Arc::new(now))
+impl FillRecoveryConfig {
+    /// Sets [`overlap`](Self::overlap).
+    #[must_use]
+    pub const fn with_overlap(self, overlap: Duration) -> Self {
+        Self { overlap, ..self }
     }
 
-    /// The current time.
-    pub fn now(&self) -> DateTime<Utc> {
-        (self.0)()
+    /// Sets [`max_clock_skew`](Self::max_clock_skew).
+    #[must_use]
+    pub const fn with_max_clock_skew(self, max_clock_skew: Duration) -> Self {
+        Self {
+            max_clock_skew,
+            ..self
+        }
     }
-}
 
-impl Default for Clock {
-    /// The system clock.
-    fn default() -> Self {
-        Self::new(Utc::now)
+    /// Sets [`read_timeout`](Self::read_timeout).
+    #[must_use]
+    pub const fn with_read_timeout(self, read_timeout: Duration) -> Self {
+        Self {
+            read_timeout,
+            ..self
+        }
     }
-}
 
-impl fmt::Debug for Clock {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Clock(..)")
+    /// Sets [`max_pages`](Self::max_pages).
+    #[must_use]
+    pub const fn with_max_pages(self, max_pages: u32) -> Self {
+        Self { max_pages, ..self }
+    }
+
+    /// Sets [`max_span`](Self::max_span).
+    #[must_use]
+    pub const fn with_max_span(self, max_span: Duration) -> Self {
+        Self { max_span, ..self }
     }
 }
 
@@ -115,11 +129,19 @@ impl Watermark {
     }
 
     /// Records an event delivered at `now`.
+    ///
+    /// A [`StreamTerminated`](AccountEventKind::StreamTerminated) is not a sign of sync but the
+    /// end of it: the stream can have lost events before it says so, as on a lagged buffer, so it
+    /// leaves the watermark where the last event before it put it.
     pub(crate) fn delivered<K, A, I>(&mut self, now: DateTime<Utc>, event: &AccountEvent<K, A, I>) {
-        self.receipt = now;
-        if let AccountEventKind::Trade(trade) = &event.kind {
-            self.exchange = self.exchange.max(Some(trade.time_exchange));
+        match &event.kind {
+            AccountEventKind::StreamTerminated(_) => return,
+            AccountEventKind::Trade(trade) => {
+                self.exchange = self.exchange.max(Some(trade.time_exchange));
+            }
+            _ => {}
         }
+        self.receipt = now;
     }
 
     /// Where a read to cover everything missed starts.
@@ -155,6 +177,7 @@ pub(crate) async fn backfill<Fetch, Fut>(
     mut fetch: Fetch,
     instruments: &[InstrumentNameExchange],
     start: DateTime<Utc>,
+    now: DateTime<Utc>,
     config: &FillRecoveryConfig,
 ) -> Backfill
 where
@@ -166,7 +189,6 @@ where
         >,
     >,
 {
-    let now = config.clock.now();
     let deadline = Instant::now() + config.read_timeout;
     let scope = || {
         if instruments.is_empty() {
@@ -297,12 +319,8 @@ mod tests {
         )
     }
 
-    fn config(now: i64) -> FillRecoveryConfig {
-        FillRecoveryConfig {
-            clock: Clock::new(move || at(now)),
-            ..FillRecoveryConfig::default()
-        }
-    }
+    /// When every read in these tests runs.
+    const NOW: i64 = 100;
 
     type Read = Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError>;
 
@@ -322,6 +340,7 @@ mod tests {
             },
             &[InstrumentNameExchange::new("btc_usdt")],
             at(start),
+            at(NOW),
             config,
         )
         .await;
@@ -332,7 +351,7 @@ mod tests {
     async fn a_complete_read_returns_its_trades_oldest_first_and_no_gap() {
         let read = TradesRead::complete(vec![trade("b", 20), trade("a", 10)]);
 
-        let (result, calls) = run(vec![Ok(read)], 0, &config(100)).await;
+        let (result, calls) = run(vec![Ok(read)], 0, &FillRecoveryConfig::default()).await;
 
         assert_eq!(calls, [at(0)]);
         let ids = result
@@ -349,7 +368,12 @@ mod tests {
         let first = TradesRead::new(vec![trade("a", 10)], Some(at(10)));
         let second = TradesRead::complete(vec![trade("b", 30)]);
 
-        let (result, calls) = run(vec![Ok(first), Ok(second)], 0, &config(100)).await;
+        let (result, calls) = run(
+            vec![Ok(first), Ok(second)],
+            0,
+            &FillRecoveryConfig::default(),
+        )
+        .await;
 
         assert_eq!(calls, [at(0), at(10)]);
         assert_eq!(result.trades.len(), 2);
@@ -360,7 +384,7 @@ mod tests {
     async fn a_read_that_does_not_advance_is_a_truncated_gap() {
         let stuck = TradesRead::new(vec![trade("a", 0)], Some(at(0)));
 
-        let (result, calls) = run(vec![Ok(stuck)], 0, &config(100)).await;
+        let (result, calls) = run(vec![Ok(stuck)], 0, &FillRecoveryConfig::default()).await;
 
         assert_eq!(calls.len(), 1);
         assert_eq!(result.trades.len(), 1);
@@ -376,7 +400,7 @@ mod tests {
         let page = |resume| Ok(TradesRead::new(vec![], Some(at(resume))));
         let config = FillRecoveryConfig {
             max_pages: 2,
-            ..config(100)
+            ..FillRecoveryConfig::default()
         };
 
         let (result, calls) = run(vec![page(10), page(20)], 0, &config).await;
@@ -394,7 +418,7 @@ mod tests {
         let first = Ok(TradesRead::new(vec![trade("a", 10)], Some(at(10))));
         let failed = Err(UnindexedClientError::Internal("boom".into()));
 
-        let (result, _) = run(vec![first, failed], 0, &config(100)).await;
+        let (result, _) = run(vec![first, failed], 0, &FillRecoveryConfig::default()).await;
 
         assert_eq!(result.trades.len(), 1);
         let [gap] = result.gaps.as_slice() else {
@@ -409,7 +433,7 @@ mod tests {
     async fn a_span_older_than_the_maximum_is_a_gap_and_the_rest_is_read() {
         let config = FillRecoveryConfig {
             max_span: Duration::from_secs(60),
-            ..config(100)
+            ..FillRecoveryConfig::default()
         };
 
         let (result, calls) = run(vec![Ok(TradesRead::complete(vec![]))], 0, &config).await;
@@ -432,7 +456,7 @@ mod tests {
     async fn fills_the_venue_no_longer_holds_are_a_gap_before_held_since() {
         let read = TradesRead::complete(vec![trade("a", 50)]).with_held_since(Some(at(40)));
 
-        let (result, _) = run(vec![Ok(read)], 0, &config(100)).await;
+        let (result, _) = run(vec![Ok(read)], 0, &FillRecoveryConfig::default()).await;
 
         let [gap] = result.gaps.as_slice() else {
             panic!("one gap, got {:?}", result.gaps)
@@ -453,7 +477,7 @@ mod tests {
         let held_since = at(0) + chrono::Duration::microseconds(500);
         let read = TradesRead::complete(vec![]).with_held_since(Some(held_since));
 
-        let (result, _) = run(vec![Ok(read)], 0, &config(100)).await;
+        let (result, _) = run(vec![Ok(read)], 0, &FillRecoveryConfig::default()).await;
 
         let [gap] = result.gaps.as_slice() else {
             panic!("one gap, got {:?}", result.gaps)
@@ -465,7 +489,7 @@ mod tests {
     async fn a_held_since_at_or_before_the_start_is_no_gap() {
         let read = TradesRead::complete(vec![]).with_held_since(Some(at(0)));
 
-        let (result, _) = run(vec![Ok(read)], 0, &config(100)).await;
+        let (result, _) = run(vec![Ok(read)], 0, &FillRecoveryConfig::default()).await;
 
         assert!(result.gaps.is_empty());
     }
@@ -474,10 +498,17 @@ mod tests {
     async fn a_read_that_outlasts_the_timeout_is_a_timed_out_gap() {
         let config = FillRecoveryConfig {
             read_timeout: Duration::from_secs(5),
-            ..config(100)
+            ..FillRecoveryConfig::default()
         };
 
-        let result = backfill(|_, _| std::future::pending::<Read>(), &[], at(0), &config).await;
+        let result = backfill(
+            |_, _| std::future::pending::<Read>(),
+            &[],
+            at(0),
+            at(NOW),
+            &config,
+        )
+        .await;
 
         let [gap] = result.gaps.as_slice() else {
             panic!("one gap, got {:?}", result.gaps)
@@ -491,7 +522,7 @@ mod tests {
 
     #[test]
     fn the_watermark_reads_from_the_receipt_time_less_the_overlap_until_a_fill_is_delivered() {
-        let config = config(0);
+        let config = FillRecoveryConfig::default();
 
         let watermark = Watermark::opened(at(100));
 
@@ -500,7 +531,7 @@ mod tests {
 
     #[test]
     fn a_fill_stamped_before_the_receipt_time_pulls_the_watermark_back_within_the_skew() {
-        let config = config(0);
+        let config = FillRecoveryConfig::default();
         let mut watermark = Watermark::opened(at(100));
         watermark.exchange = Some(at(90));
 
@@ -510,7 +541,7 @@ mod tests {
 
     #[test]
     fn a_fill_stamped_long_before_the_receipt_time_is_held_to_the_skew_allowance() {
-        let config = config(0);
+        let config = FillRecoveryConfig::default();
         let mut watermark = Watermark::opened(at(10_000));
         watermark.exchange = Some(at(0));
 
@@ -519,7 +550,7 @@ mod tests {
 
     #[test]
     fn a_fill_stamped_after_the_receipt_time_does_not_push_the_watermark_forward() {
-        let config = config(0);
+        let config = FillRecoveryConfig::default();
         let mut watermark = Watermark::opened(at(100));
         watermark.exchange = Some(at(150));
 
@@ -552,11 +583,27 @@ mod tests {
         assert_eq!(watermark.exchange, Some(at(95)));
     }
 
+    #[test]
+    fn a_stream_terminated_leaves_the_watermark_where_it_was() {
+        let mut watermark = Watermark::opened(at(0));
+        let terminated = AccountEvent {
+            exchange: 0usize,
+            kind: AccountEventKind::<usize, usize, usize>::StreamTerminated(
+                rustrade_execution::error::StreamTerminationReason::Error("lagged".to_owned()),
+            ),
+        };
+
+        watermark.delivered(at(100), &terminated);
+
+        assert_eq!(watermark.receipt, at(0));
+        assert_eq!(watermark.exchange, None);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_read_that_finishes_within_the_timeout_is_not_a_gap() {
         let config = FillRecoveryConfig {
             read_timeout: Duration::from_secs(5),
-            ..config(100)
+            ..FillRecoveryConfig::default()
         };
 
         let result = backfill(
@@ -566,6 +613,7 @@ mod tests {
             },
             &[],
             at(0),
+            at(NOW),
             &config,
         )
         .await;
@@ -578,7 +626,7 @@ mod tests {
     async fn a_span_exactly_the_maximum_long_is_read_whole_with_no_gap() {
         let config = FillRecoveryConfig {
             max_span: Duration::from_secs(100),
-            ..config(100)
+            ..FillRecoveryConfig::default()
         };
 
         let (result, calls) = run(vec![Ok(TradesRead::complete(vec![]))], 0, &config).await;
@@ -588,7 +636,43 @@ mod tests {
     }
 
     #[test]
-    fn the_clock_has_a_debug_form() {
-        assert_eq!(format!("{:?}", Clock::default()), "Clock(..)");
+    fn the_setters_set_only_their_field() {
+        let second = Duration::from_secs(1);
+        let base = FillRecoveryConfig::default();
+        assert_eq!(
+            base.with_overlap(second),
+            FillRecoveryConfig {
+                overlap: second,
+                ..base
+            }
+        );
+        assert_eq!(
+            base.with_max_clock_skew(second),
+            FillRecoveryConfig {
+                max_clock_skew: second,
+                ..base
+            }
+        );
+        assert_eq!(
+            base.with_read_timeout(second),
+            FillRecoveryConfig {
+                read_timeout: second,
+                ..base
+            }
+        );
+        assert_eq!(
+            base.with_max_pages(3),
+            FillRecoveryConfig {
+                max_pages: 3,
+                ..base
+            }
+        );
+        assert_eq!(
+            base.with_max_span(second),
+            FillRecoveryConfig {
+                max_span: second,
+                ..base
+            }
+        );
     }
 }

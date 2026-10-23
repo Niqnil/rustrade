@@ -2,16 +2,16 @@ use crate::{
     engine::{clock::EngineClock, execution_tx::MultiExchangeTxMap, in_flight::InFlightDeadlines},
     error::BarterError,
     execution::{
-        AccountStreamEvent, Execution, backfill::FillRecoveryConfig, error::ExecutionError,
-        manager::ExecutionManager, request::ExecutionRequest,
+        AccountStreamEvent, Execution,
+        error::ExecutionError,
+        manager::{AccountStreamOptions, Clock as ManagerClock, ExecutionManager},
+        request::ExecutionRequest,
     },
     shutdown::AsyncShutdown,
 };
 use fnv::FnvHashMap;
 use futures::{FutureExt, future::try_join_all};
-use rustrade_data::streams::{
-    consumer::STREAM_RECONNECTION_POLICY, reconnect::stream::ReconnectingStream,
-};
+use rustrade_data::streams::reconnect::stream::ReconnectingStream;
 use rustrade_execution::{
     UnindexedAccountEvent,
     client::{
@@ -113,6 +113,13 @@ impl<'a> ExecutionBuilder<'a> {
     /// [`InstrumentKind`]: rustrade_instrument::instrument::kind::InstrumentKind
     /// [`MockExecution::SUPPORTED_KINDS`]: rustrade_execution::client::ExecutionClient::SUPPORTED_KINDS
     /// [`IndexedInstruments`]: rustrade_instrument::index::IndexedInstruments
+    ///
+    /// # Missed fills
+    ///
+    /// The manager reads the fills the mock's account stream missed, should it end, on `clock`:
+    /// the clock the mock stamps its fills with, so a backtest's read spans simulated time. The
+    /// read's [`read_timeout`](crate::execution::backfill::FillRecoveryConfig::read_timeout) is
+    /// still real time.
     pub fn add_mock<Clock>(
         self,
         config: MockExecutionConfig,
@@ -127,6 +134,7 @@ impl<'a> ExecutionBuilder<'a> {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = broadcast::channel(ACCOUNT_STREAM_CAPACITY);
 
+        let options = mock_account_stream_options(clock.clone());
         let mock_execution_client_config = MockExecutionClientConfig {
             mocked_exchange: config.mocked_exchange,
             clock: move || clock.time(),
@@ -144,6 +152,7 @@ impl<'a> ExecutionBuilder<'a> {
             mock_execution_client_config,
             DUMMY_EXECUTION_REQUEST_TIMEOUT,
             None,
+            options,
         )?;
 
         // Register MockExchange init Future
@@ -164,14 +173,35 @@ impl<'a> ExecutionBuilder<'a> {
         Box::pin(MockExchange::new(config, request_rx, event_tx, instruments).run())
     }
 
-    /// Adds an [`ExecutionManager`] for a live exchange.
-    ///
-    /// The exchange's in-flight deadline (see [`ExecutionBuild::in_flight_deadlines`]) is derived
-    /// from `request_timeout` by [`InFlightDeadlines::deadline_for_request_timeout`].
+    /// Adds an [`ExecutionManager`] for a live exchange, with the default
+    /// [`AccountStreamOptions`]. See [`add_live_with`](Self::add_live_with).
     pub fn add_live<Client>(
         self,
         config: Client::Config,
         request_timeout: Duration,
+    ) -> Result<Self, BarterError>
+    where
+        Client: ExecutionClient + Send + Sync + 'static,
+        Client::AccountStream: Send,
+        Client::Config: Send,
+    {
+        self.add_live_with::<Client>(config, request_timeout, AccountStreamOptions::default())
+    }
+
+    /// Adds an [`ExecutionManager`] for a live exchange, whose account stream reconnects and reads
+    /// the fills it missed as `options` says.
+    ///
+    /// Venues differ in how many fills one call returns and how long they keep them, so the
+    /// budget for reading missed fills
+    /// ([`FillRecoveryConfig`](crate::execution::backfill::FillRecoveryConfig)) is set per venue.
+    ///
+    /// The exchange's in-flight deadline (see [`ExecutionBuild::in_flight_deadlines`]) is derived
+    /// from `request_timeout` by [`InFlightDeadlines::deadline_for_request_timeout`].
+    pub fn add_live_with<Client>(
+        self,
+        config: Client::Config,
+        request_timeout: Duration,
+        options: AccountStreamOptions,
     ) -> Result<Self, BarterError>
     where
         Client: ExecutionClient + Send + Sync + 'static,
@@ -185,6 +215,7 @@ impl<'a> ExecutionBuilder<'a> {
             Some(InFlightDeadlines::deadline_for_request_timeout(
                 request_timeout,
             )),
+            options,
         )
     }
 
@@ -195,6 +226,7 @@ impl<'a> ExecutionBuilder<'a> {
         config: Client::Config,
         request_timeout: Duration,
         in_flight_deadline: Option<Duration>,
+        options: AccountStreamOptions,
     ) -> Result<Self, BarterError>
     where
         Client: ExecutionClient + Send + Sync + 'static,
@@ -233,8 +265,7 @@ impl<'a> ExecutionBuilder<'a> {
             request_timeout,
             Arc::new(Client::new(config)),
             AccountEventIndexer::new(Arc::new(instrument_map)),
-            STREAM_RECONNECTION_POLICY,
-            FillRecoveryConfig::default(),
+            options,
         );
 
         let future_result = future_result.map(|result| {
@@ -687,6 +718,15 @@ fn join_kinds(kinds: impl Iterator<Item = InstrumentKindDiscriminant>) -> String
         .join(", ")
 }
 
+/// The [`AccountStreamOptions`] of a mock venue's manager: the defaults, measured on `clock`, the
+/// clock the mock stamps its fills with.
+fn mock_account_stream_options<Clock>(clock: Clock) -> AccountStreamOptions
+where
+    Clock: EngineClock + Send + Sync + 'static,
+{
+    AccountStreamOptions::default().with_clock(ManagerClock::new(move || clock.time()))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panicking on a bad fixture is acceptable
 mod tests {
@@ -1054,5 +1094,17 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("the mock exchange task was left running after the build failed");
+    }
+
+    #[test]
+    fn a_mock_venue_reads_missed_fills_on_the_engine_clock() {
+        let seed = DateTime::<Utc>::from_timestamp(1_600_000_000, 0).unwrap();
+        let options = mock_account_stream_options(HistoricalClock::new(seed));
+        assert_eq!(options.clock.now(), seed);
+        assert_eq!(
+            options.fill_recovery,
+            AccountStreamOptions::default().fill_recovery
+        );
+        assert_eq!(options.reconnect, AccountStreamOptions::default().reconnect);
     }
 }

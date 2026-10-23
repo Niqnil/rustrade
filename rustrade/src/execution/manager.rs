@@ -4,6 +4,7 @@ use crate::execution::{
     error::ExecutionError,
     request::{ExecutionRequest, RequestFuture},
 };
+use chrono::{DateTime, Utc};
 use derive_more::Constructor;
 use futures::{
     FutureExt, Stream, StreamExt,
@@ -11,7 +12,7 @@ use futures::{
     stream::{BoxStream, FuturesUnordered},
 };
 use rustrade_data::streams::{
-    consumer::StreamKey,
+    consumer::{STREAM_RECONNECTION_POLICY, StreamKey},
     reconnect::stream::{
         ReconnectingStream, ReconnectionBackoffPolicy, ReinitFailure, init_reconnecting_stream,
     },
@@ -39,8 +40,94 @@ use rustrade_integration::{
     channel::{Tx, UnboundedTx, mpsc_unbounded},
     collection::snapshot::Snapshot,
 };
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    fmt::{self, Debug},
+    sync::Arc,
+};
 use tracing::{error, info};
+
+/// How an [`ExecutionManager`] keeps its account stream going: how it reconnects, how it reads the
+/// fills missed while the stream was down, and the clock it measures that on.
+///
+/// Set per venue, through [`ExecutionManager::init`] or
+/// [`ExecutionBuilder::add_live_with`](super::builder::ExecutionBuilder::add_live_with), since
+/// venues differ in how many fills one call returns and how long they keep them. Built from
+/// [`Default`] and the `with_*` methods, so fields can be added without a breaking change.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct AccountStreamOptions {
+    /// The backoff between attempts to re-initialise an account stream that ended.
+    pub reconnect: ReconnectionBackoffPolicy,
+    /// The budget for reading the fills missed while the stream was down.
+    pub fill_recovery: FillRecoveryConfig,
+    /// Where "now" comes from: for the end of a read's span, and for the watermark it starts
+    /// from. It must be the clock the venue stamps its fills on, so on a simulated venue it is
+    /// the simulation's.
+    pub clock: Clock,
+}
+
+impl Default for AccountStreamOptions {
+    /// [`STREAM_RECONNECTION_POLICY`], [`FillRecoveryConfig::default`] and the system clock.
+    fn default() -> Self {
+        Self {
+            reconnect: STREAM_RECONNECTION_POLICY,
+            fill_recovery: FillRecoveryConfig::default(),
+            clock: Clock::default(),
+        }
+    }
+}
+
+impl AccountStreamOptions {
+    /// Sets [`reconnect`](Self::reconnect).
+    #[must_use]
+    pub fn with_reconnect(self, reconnect: ReconnectionBackoffPolicy) -> Self {
+        Self { reconnect, ..self }
+    }
+
+    /// Sets [`fill_recovery`](Self::fill_recovery).
+    #[must_use]
+    pub fn with_fill_recovery(self, fill_recovery: FillRecoveryConfig) -> Self {
+        Self {
+            fill_recovery,
+            ..self
+        }
+    }
+
+    /// Sets [`clock`](Self::clock).
+    #[must_use]
+    pub fn with_clock(self, clock: Clock) -> Self {
+        Self { clock, ..self }
+    }
+}
+
+/// A source of the current time, injectable so a simulation or a test controls it.
+#[derive(Clone)]
+pub struct Clock(Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>);
+
+impl Clock {
+    /// A clock that calls `now`.
+    pub fn new(now: impl Fn() -> DateTime<Utc> + Send + Sync + 'static) -> Self {
+        Self(Arc::new(now))
+    }
+
+    /// The current time.
+    pub fn now(&self) -> DateTime<Utc> {
+        (self.0)()
+    }
+}
+
+impl Default for Clock {
+    /// The system clock.
+    fn default() -> Self {
+        Self::new(Utc::now)
+    }
+}
+
+impl Debug for Clock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Clock(..)")
+    }
+}
 
 /// Per-exchange execution manager that actions order requests from the Engine and forwards back
 /// responses.
@@ -125,7 +212,7 @@ where
     /// # Re-initialisation
     /// When the AccountStream ends, the returned `Stream` yields one
     /// [`Reconnecting`](rustrade_data::streams::reconnect::Event::Reconnecting), and the manager
-    /// re-initialises it with `reconnect_policy`'s backoff, for as long as it runs. Each failed
+    /// re-initialises it with `options.reconnect`'s backoff, for as long as it runs. Each failed
     /// attempt is yielded as an [`AccountEventKind::ReinitFailed`], with no further
     /// `Reconnecting`. Whether to stop waiting is the caller's decision.
     ///
@@ -137,11 +224,11 @@ where
     ///
     /// Each re-initialisation after the first reads the fills made while the stream was down,
     /// with [`ExecutionClient::fetch_trades`], from the last moment the manager knows it was in
-    /// sync (less `fill_recovery.overlap`). They are delivered as
+    /// sync (less `options.fill_recovery.overlap`). They are delivered as
     /// [`AccountEventKind::Trade`] events before the new
     /// [`AccountEventKind::Snapshot`], so the snapshot is the state after them. A span the read
-    /// could not cover (the venue no longer holds the fills, the budget in `fill_recovery` ran
-    /// out, or a call failed) is reported as an [`AccountEventKind::FillRecoveryGaveUp`] and the
+    /// could not cover (the venue no longer holds the fills, the budget in
+    /// `options.fill_recovery` ran out, or a call failed) is reported as an [`AccountEventKind::FillRecoveryGaveUp`] and the
     /// stream still opens: what to do about a gap is the caller's policy. The first open reads
     /// nothing, because the snapshot is its starting point.
     ///
@@ -158,9 +245,14 @@ where
         request_timeout: std::time::Duration,
         client: Arc<Client>,
         indexer: AccountEventIndexer,
-        reconnect_policy: ReconnectionBackoffPolicy,
-        fill_recovery: FillRecoveryConfig,
+        options: AccountStreamOptions,
     ) -> Result<(Self, impl Stream<Item = AccountStreamEvent> + Send), ExecutionError> {
+        let AccountStreamOptions {
+            reconnect: reconnect_policy,
+            fill_recovery,
+            clock,
+        } = options;
+
         // Determine StreamKey & ExchangeId for use in logging
         let stream_key = Self::determine_account_stream_key(&indexer.map)?;
 
@@ -179,13 +271,12 @@ where
         // reconnect can be one an earlier stream delivered.
         let deduper = AccountEventDeduper::new();
         let watermark = Arc::new(parking_lot::Mutex::new(None::<Watermark>));
-        let fill_recovery = Arc::new(fill_recovery);
         let account_stream = init_reconnecting_stream(move || {
             let client = client_clone.clone();
             let indexer = indexer_clone.clone();
             let deduper = deduper.clone();
             let watermark = Arc::clone(&watermark);
-            let fill_recovery = Arc::clone(&fill_recovery);
+            let clock = clock.clone();
             async move {
                 // Allocate AssetNameExchanges & InstrumentNameExchanges to avoid lifetime issues
                 let assets = indexer.map.exchange_assets().cloned().collect::<Vec<_>>();
@@ -197,7 +288,7 @@ where
 
                 // When this attempt began: what the watermark is on a first open, so a fill made
                 // while the snapshot is fetched is inside the span of the next read.
-                let opened = fill_recovery.clock.now();
+                let opened = clock.now();
 
                 // Where this open reads from: `None` on the first open. Taken before the stream
                 // opens, so the span runs from the last event delivered to the moment it reads.
@@ -224,6 +315,7 @@ where
                             |from, to| client.fetch_trades(from, to, &instruments),
                             &instruments,
                             start,
+                            clock.now(),
                             &fill_recovery,
                         )
                         .await;
@@ -258,7 +350,6 @@ where
                 // Nothing delivered counts until it is delivered: the watermark moves as events
                 // pass, so an attempt that fails above leaves it where it was.
                 watermark.lock().get_or_insert(Watermark::opened(opened));
-                let clock = fill_recovery.clock.clone();
 
                 // It's expected downstream consumers (eg/ EngineState will sync updates)
                 // Boxed: the chain is named by every layer above it, once per client type.
@@ -1097,13 +1188,13 @@ mod tests {
         >,
         ExecutionError,
     > {
-        init_flaky_recovering(client, FillRecoveryConfig::default()).await
+        init_flaky_recovering(client, Clock::default()).await
     }
 
-    /// As [`init_flaky`], with `fill_recovery` for the re-initialisations.
+    /// As [`init_flaky`], with `clock` for the re-initialisations' reads.
     async fn init_flaky_recovering(
         client: FlakyAccountClient,
-        fill_recovery: FillRecoveryConfig,
+        clock: Clock,
     ) -> Result<
         ExecutionManager<
             futures::stream::Pending<ExecutionRequest<ExchangeIndex, InstrumentIndex>>,
@@ -1120,8 +1211,9 @@ mod tests {
             std::time::Duration::from_secs(5),
             Arc::new(client),
             AccountEventIndexer::new(Arc::new(map)),
-            ReconnectionBackoffPolicy::new(1, 1, 1),
-            fill_recovery,
+            AccountStreamOptions::default()
+                .with_reconnect(ReconnectionBackoffPolicy::new(1, 1, 1))
+                .with_clock(clock),
         )
         .await
         .map(|(manager, _events)| manager)
@@ -1212,13 +1304,8 @@ mod tests {
         }
     }
 
-    fn at_clock(secs: i64) -> FillRecoveryConfig {
-        FillRecoveryConfig {
-            clock: crate::execution::backfill::Clock::new(move || {
-                DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap()
-            }),
-            ..FillRecoveryConfig::default()
-        }
+    fn at_clock(secs: i64) -> Clock {
+        Clock::new(move || DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap())
     }
 
     /// The fills read for the span a stream was down come before the snapshot that follows them,
@@ -1289,9 +1376,9 @@ mod tests {
     }
 
     /// A clock that starts at `secs` and moves on 1000 s at each reading.
-    fn stepping_clock(secs: i64) -> crate::execution::backfill::Clock {
+    fn stepping_clock(secs: i64) -> Clock {
         let readings = Arc::new(std::sync::atomic::AtomicI64::new(0));
-        crate::execution::backfill::Clock::new(move || {
+        Clock::new(move || {
             let reading = readings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             DateTime::<Utc>::from_timestamp(1_800_000_000 + secs + 1000 * reading, 0).unwrap()
         })
@@ -1307,11 +1394,7 @@ mod tests {
             ..FlakyAccountClient::default()
         };
         let fetched = Arc::clone(&client.fetched);
-        let config = FillRecoveryConfig {
-            clock: stepping_clock(0),
-            ..FillRecoveryConfig::default()
-        };
-        let Ok(manager) = init_flaky_recovering(client, config).await else {
+        let Ok(manager) = init_flaky_recovering(client, stepping_clock(0)).await else {
             panic!("the first attempt succeeds, so init should too");
         };
 
@@ -1343,11 +1426,7 @@ mod tests {
             ..FlakyAccountClient::default()
         };
         let fetched = Arc::clone(&client.fetched);
-        let config = FillRecoveryConfig {
-            clock: stepping_clock(0),
-            ..FillRecoveryConfig::default()
-        };
-        let Ok(manager) = init_flaky_recovering(client, config).await else {
+        let Ok(manager) = init_flaky_recovering(client, stepping_clock(0)).await else {
             panic!("the first attempt succeeds, so init should too");
         };
 
@@ -1461,5 +1540,140 @@ mod tests {
             "insufficient balance".to_string(),
         ));
         assert_both_answered(&key, &events, &rejection);
+    }
+
+    /// A mock venue's account stream that ends on broadcast lag loses the events in its buffer.
+    /// On a simulated clock the fill among them is read back, before the new snapshot, because
+    /// the read spans the simulation's time, the time the venue stamps its fills with.
+    #[tokio::test]
+    async fn a_lagged_mock_stream_reads_back_its_lost_fill_on_the_simulated_clock() {
+        use rustrade_execution::{
+            client::mock::MockExecution,
+            exchange::mock::request::{MockExchangeRequest, MockExchangeRequestKind},
+        };
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        let sim_secs = Arc::new(AtomicI64::new(0));
+        let sim_now = {
+            let sim_secs = Arc::clone(&sim_secs);
+            move || {
+                DateTime::<Utc>::from_timestamp(1_800_000_000 + sim_secs.load(Ordering::Relaxed), 0)
+                    .unwrap()
+            }
+        };
+        // Capacity 1, so three events sent while the stream is not read lag it.
+        let (event_tx, event_rx) = tokio::sync::broadcast::channel(1);
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = MockExecution::new(ExchangeId::Mock, sim_now.clone(), request_tx, event_rx);
+
+        // The venue: an empty snapshot, and its one fill when a read's span holds its time.
+        let fill = missed_trade("a", 10);
+        let venue = tokio::spawn({
+            let fill = fill.clone();
+            async move {
+                while let Some(MockExchangeRequest { kind, .. }) = request_rx.recv().await {
+                    match kind {
+                        MockExchangeRequestKind::FetchAccountSnapshot { response_tx } => {
+                            let _ = response_tx.send(UnindexedAccountSnapshot::new(
+                                ExchangeId::Mock,
+                                vec![],
+                                vec![],
+                            ));
+                        }
+                        MockExchangeRequestKind::FetchTrades {
+                            response_tx,
+                            start,
+                            end,
+                        } => {
+                            let held = (start..=end).contains(&fill.time_exchange);
+                            let _ =
+                                response_tx.send(held.then(|| fill.clone()).into_iter().collect());
+                        }
+                        other => panic!("unexpected request {other:?}"),
+                    }
+                }
+            }
+        });
+
+        let instruments = IndexedInstruments::new([instrument(ExchangeId::Mock, "btc", "usdt")]);
+        let Ok(map) = generate_execution_instrument_map(&instruments, ExchangeId::Mock) else {
+            panic!("the instrument map should build");
+        };
+        let Ok((manager, _responses)) = ExecutionManager::init(
+            futures::stream::pending::<ExecutionRequest<ExchangeIndex, InstrumentIndex>>(),
+            std::time::Duration::from_secs(5),
+            Arc::new(client),
+            AccountEventIndexer::new(Arc::new(map)),
+            AccountStreamOptions::default()
+                .with_reconnect(ReconnectionBackoffPolicy::new(1, 1, 1))
+                .with_clock(Clock::new(sim_now)),
+        )
+        .await
+        else {
+            panic!("the first open should succeed");
+        };
+        let mut events = manager.account_stream;
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), events.next())
+            .await
+            .expect("the first snapshot arrives");
+        assert_eq!(describe(&first.unwrap()), "snapshot");
+
+        // The fill and two more, sent while the stream is not read: the buffer laps.
+        sim_secs.store(10, Ordering::Relaxed);
+        for _ in 0..3 {
+            event_tx
+                .send(UnindexedAccountEvent {
+                    exchange: ExchangeId::Mock,
+                    kind: AccountEventKind::Trade(fill.clone()),
+                })
+                .unwrap();
+        }
+        sim_secs.store(20, Ordering::Relaxed);
+
+        // Each wait bounded, so a fill the read misses fails the test rather than hanging it.
+        let mut rest = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), events.next()).await
+        {
+            rest.push(describe(&event));
+            if rest.last().is_some_and(|last| last == "snapshot") {
+                break;
+            }
+        }
+        assert_eq!(
+            rest,
+            [
+                "StreamTerminated(Error(\"mock broadcast stream lagged\"))",
+                "reconnecting",
+                "trade a",
+                "snapshot"
+            ]
+        );
+        venue.abort();
+    }
+
+    #[test]
+    fn account_stream_options_default_to_the_stream_policy_and_the_default_recovery() {
+        let options = AccountStreamOptions::default();
+        assert_eq!(options.reconnect, STREAM_RECONNECTION_POLICY);
+        assert_eq!(options.fill_recovery, FillRecoveryConfig::default());
+    }
+
+    #[test]
+    fn account_stream_options_setters_set_their_field() {
+        let reconnect = ReconnectionBackoffPolicy::new(7, 3, 9);
+        let fill_recovery = FillRecoveryConfig::default().with_max_pages(3);
+        let options = AccountStreamOptions::default()
+            .with_reconnect(reconnect.clone())
+            .with_fill_recovery(fill_recovery)
+            .with_clock(at_clock(5));
+        assert_eq!(options.reconnect, reconnect);
+        assert_eq!(options.fill_recovery, fill_recovery);
+        assert_eq!(options.clock.now(), at_clock(5).now());
+    }
+
+    #[test]
+    fn the_clock_has_a_debug_form() {
+        assert_eq!(format!("{:?}", Clock::default()), "Clock(..)");
     }
 }

@@ -16,7 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ran out, or a call failed) is reported as `FillRecoveryGaveUp` and the stream still opens. Fills
   are deduplicated by instrument and trade id across the read, the new stream and earlier
   streams. `FillRecoveryConfig` sets the overlap, the clock-skew allowance, the time and call
-  budget, the longest span and the clock. `ExecutionBuilder` uses its default.
+  budget, and the longest span.
+- **`AccountStreamOptions` and `ExecutionBuilder::add_live_with`** (`rustrade`, #675). Per venue:
+  the reconnect backoff, the `FillRecoveryConfig`, and the `Clock` the read is measured on.
+  `add_live` uses the defaults. A mock venue added with `add_mock` reads on the engine clock it
+  is given, the clock it stamps its fills with, so a backtest's read spans simulated time.
 - **`TradesRead::held_since`** (`rustrade-execution`, #675). Where a venue's retention limit cuts
   into the span a `fetch_trades` call read, so a caller can tell fills the venue no longer holds
   from fills that never happened. Hyperliquid sets it once a wallet's 10,000 retained fills all
@@ -98,7 +102,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Breaking: `ExecutionManager::init` takes a `FillRecoveryConfig`** (#675). `TradesRead` gains
+- **Breaking: `ExecutionManager::init` takes an `AccountStreamOptions`** in place of its
+  `ReconnectionBackoffPolicy` (#675); `AccountStreamOptions::default().with_reconnect(policy)`
+  keeps a custom policy. `TradesRead` gains
   a `held_since` field; it is `#[non_exhaustive]`, so `TradesRead::new(trades, resume)` and
   `complete` still build one. `lru` and `parking_lot` are now always dependencies of
   `rustrade-execution`, for `AccountEventDeduper`.
