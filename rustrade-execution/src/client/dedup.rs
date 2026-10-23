@@ -196,18 +196,21 @@ pub(crate) fn is_duplicate(cache: &SharedDedupCache, key: DedupKey) -> bool {
     false
 }
 
-/// A shared, bounded record of the account events already delivered, for a consumer that takes the
-/// same event from more than one source.
+/// A shared, bounded record of the fills already delivered, for a consumer that takes the same
+/// fill from more than one source.
 ///
 /// Fills reach a consumer by more than one path: the live stream, a read of the span the stream
 /// missed (see [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades)),
 /// and a replay when a stream reopens. Their spans overlap on purpose, so the same fill arrives
-/// twice. [`is_duplicate`](Self::is_duplicate) says whether an event is one already seen, keyed by
-/// instrument, id and kind: a trade is identified by its instrument and [`TradeId`](crate::trade::TradeId),
-/// whichever path delivered it.
+/// twice. [`is_duplicate`](Self::is_duplicate) says whether a [`Trade`](crate::AccountEventKind::Trade)
+/// event is one already seen, keyed by instrument and [`TradeId`](crate::trade::TradeId):
+/// whichever path delivered it, a fill has one id.
+///
+/// Only fills are recorded. An order snapshot, a cancellation or a notice can legitimately repeat
+/// (an order amended without a new fill is a second `Open` snapshot with the same quantity), so
+/// each is always passed on.
 ///
 /// Clones share one record, which holds the 10,000 most recent keys and forgets the oldest first.
-/// Events with no identity, such as balances, are never duplicates.
 ///
 /// Call [`is_duplicate`](Self::is_duplicate) when the event is delivered, not when it is read: it
 /// records the event as seen, so an event read but never delivered would be dropped on its retry.
@@ -226,9 +229,11 @@ impl AccountEventDeduper {
         Self(new_dedup_cache())
     }
 
-    /// Whether `event` was already seen. Records it as seen when it was not.
+    /// Whether `event` is a fill already seen. Records it as seen when it was not. Always `false`
+    /// for an event that is not a fill.
     pub fn is_duplicate(&self, event: &UnindexedAccountEvent) -> bool {
-        dedup_key_from_event(event).is_some_and(|key| is_duplicate(&self.0, key))
+        matches!(event.kind, AccountEventKind::Trade(_))
+            && dedup_key_from_event(event).is_some_and(|key| is_duplicate(&self.0, key))
     }
 }
 
@@ -286,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    fn an_event_without_an_identity_is_never_a_duplicate() {
+    fn an_event_that_is_not_a_fill_is_never_a_duplicate() {
         let deduper = AccountEventDeduper::new();
         let event = UnindexedAccountEvent {
             exchange: ExchangeId::BinanceSpot,
@@ -299,5 +304,25 @@ mod tests {
 
         assert!(!deduper.is_duplicate(&event));
         assert!(!deduper.is_duplicate(&event));
+    }
+
+    #[test]
+    fn a_repeated_notice_is_passed_on_because_only_fills_are_recorded() {
+        let deduper = AccountEventDeduper::new();
+        let notice = || UnindexedAccountEvent {
+            exchange: ExchangeId::BinanceSpot,
+            kind: AccountEventKind::Notice(crate::notice::AccountNotice::new(
+                crate::notice::NoticeKind::Other,
+                None,
+                DateTime::UNIX_EPOCH,
+                None,
+                "STATUS".into(),
+            )),
+        };
+
+        // The client-level dedup would treat the second as a duplicate.
+        assert!(dedup_key_from_event(&notice()).is_some());
+        assert!(!deduper.is_duplicate(&notice()));
+        assert!(!deduper.is_duplicate(&notice()));
     }
 }

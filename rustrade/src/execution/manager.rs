@@ -195,6 +195,10 @@ where
                     .cloned()
                     .collect::<Vec<_>>();
 
+                // When this attempt began: what the watermark is on a first open, so a fill made
+                // while the snapshot is fetched is inside the span of the next read.
+                let opened = fill_recovery.clock.now();
+
                 // Where this open reads from: `None` on the first open. Taken before the stream
                 // opens, so the span runs from the last event delivered to the moment it reads.
                 let read_from = watermark
@@ -253,19 +257,20 @@ where
 
                 // Nothing delivered counts until it is delivered: the watermark moves as events
                 // pass, so an attempt that fails above leaves it where it was.
-                let delivered_at = fill_recovery.clone();
-                let opened = delivered_at.clock.now();
                 watermark.lock().get_or_insert(Watermark::opened(opened));
+                let clock = fill_recovery.clock.clone();
 
                 // It's expected downstream consumers (eg/ EngineState will sync updates)
+                // Boxed: the chain is named by every layer above it, once per client type.
                 Ok(missed
                     .chain(futures::stream::once(std::future::ready(snapshot)))
                     .chain(updates)
                     .inspect(move |event| {
                         if let Some(watermark) = watermark.lock().as_mut() {
-                            watermark.delivered(delivered_at.clock.now(), event);
+                            watermark.delivered(clock.now(), event);
                         }
-                    }))
+                    })
+                    .boxed())
             }
         })
         .await?;
@@ -969,6 +974,11 @@ mod tests {
         rate_limited_for: Option<std::time::Duration>,
         /// What a stream that stays open sends before it goes quiet.
         live: Vec<UnindexedAccountEvent>,
+        /// What a stream that ends sends before it ends.
+        ending: Vec<UnindexedAccountEvent>,
+        /// The account snapshot calls that fail, counted from 0.
+        snapshot_fail_on: &'static [usize],
+        snapshots: Arc<std::sync::atomic::AtomicUsize>,
         /// The answers `fetch_trades` gives, in turn; an empty read once they run out.
         reads: Arc<
             std::sync::Mutex<
@@ -999,6 +1009,14 @@ mod tests {
             _: &[AssetNameExchange],
             _: &[InstrumentNameExchange],
         ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
+            let call = self
+                .snapshots
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.snapshot_fail_on.contains(&call) {
+                return Err(UnindexedClientError::Connectivity(
+                    ConnectivityError::Timeout,
+                ));
+            }
             Ok(UnindexedAccountSnapshot::new(EXCHANGE, vec![], vec![]))
         }
 
@@ -1016,7 +1034,7 @@ mod tests {
                     None => UnindexedClientError::Connectivity(ConnectivityError::Timeout),
                 })
             } else if attempt < self.open_from {
-                Ok(futures::stream::empty().boxed())
+                Ok(futures::stream::iter(self.ending.clone()).boxed())
             } else {
                 Ok(futures::stream::iter(self.live.clone())
                     .chain(futures::stream::pending())
@@ -1270,24 +1288,81 @@ mod tests {
         assert_eq!(words[3], "snapshot");
     }
 
-    /// A re-init that fails before it delivers anything leaves the watermark where it was, so the
-    /// attempt that succeeds reads the whole span, and a fill is not delivered twice.
+    /// A clock that starts at `secs` and moves on 1000 s at each reading.
+    fn stepping_clock(secs: i64) -> crate::execution::backfill::Clock {
+        let readings = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        crate::execution::backfill::Clock::new(move || {
+            let reading = readings.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            DateTime::<Utc>::from_timestamp(1_800_000_000 + secs + 1000 * reading, 0).unwrap()
+        })
+    }
+
+    /// The watermark moves as events are delivered: after a stream that delivered a fill ends,
+    /// the read starts at the moment of that delivery, not at the moment the stream opened.
     #[tokio::test]
-    async fn a_failed_reinit_does_not_move_the_read_start() {
+    async fn the_read_starts_from_the_last_event_delivered_not_from_the_open() {
         let client = FlakyAccountClient {
-            fail_on: &[1],
-            open_from: 2,
+            open_from: 1,
+            ending: vec![live_trade("x", 0)],
             ..FlakyAccountClient::default()
         };
         let fetched = Arc::clone(&client.fetched);
-        let Ok(manager) = init_flaky_recovering(client, at_clock(100)).await else {
+        let config = FillRecoveryConfig {
+            clock: stepping_clock(0),
+            ..FillRecoveryConfig::default()
+        };
+        let Ok(manager) = init_flaky_recovering(client, config).await else {
             panic!("the first attempt succeeds, so init should too");
         };
 
-        let _ = manager.account_stream.take(4).collect::<Vec<_>>().await;
+        // snapshot, the fill, the reconnect, then the re-init's own snapshot.
+        let events = manager.account_stream.take(4).collect::<Vec<_>>().await;
 
-        let at = |secs: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap();
-        assert_eq!(*fetched.lock().unwrap(), [(at(98), at(100))]);
+        assert_eq!(
+            events.iter().map(describe).collect::<Vec<_>>(),
+            ["snapshot", "trade x", "reconnecting", "snapshot"]
+        );
+        let opened = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
+        let [(start, _)] = fetched.lock().unwrap().clone()[..] else {
+            panic!("one read")
+        };
+        assert!(start > opened, "{start} is not after the open at {opened}");
+    }
+
+    /// A re-init whose snapshot fails after the read leaves the watermark where it was and marks
+    /// none of the fills it read: the next attempt reads from the same start and delivers them.
+    #[tokio::test]
+    async fn a_failed_reinit_after_the_read_is_read_again_from_the_same_start() {
+        let reads = (0..2)
+            .map(|_| Ok(TradesRead::complete(vec![missed_trade("a", 10)])))
+            .collect();
+        let client = FlakyAccountClient {
+            open_from: 1,
+            snapshot_fail_on: &[1],
+            reads: Arc::new(std::sync::Mutex::new(reads)),
+            ..FlakyAccountClient::default()
+        };
+        let fetched = Arc::clone(&client.fetched);
+        let config = FillRecoveryConfig {
+            clock: stepping_clock(0),
+            ..FillRecoveryConfig::default()
+        };
+        let Ok(manager) = init_flaky_recovering(client, config).await else {
+            panic!("the first attempt succeeds, so init should too");
+        };
+
+        let events = manager.account_stream.take(5).collect::<Vec<_>>().await;
+
+        let words = events.iter().map(describe).collect::<Vec<_>>();
+        assert_eq!(words[0], "snapshot");
+        assert_eq!(words[1], "reconnecting");
+        assert!(words[2].starts_with("ReinitFailed"), "{words:?}");
+        assert_eq!(&words[3..], ["trade a", "snapshot"]);
+        let fetched = fetched.lock().unwrap().clone();
+        let [(first, _), (second, _)] = fetched[..] else {
+            panic!("two reads, got {fetched:?}")
+        };
+        assert_eq!(first, second);
     }
 
     /// A re-init the venue refused for a rate limit is not retried before the wait it named,

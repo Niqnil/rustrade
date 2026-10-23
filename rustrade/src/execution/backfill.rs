@@ -37,11 +37,15 @@ pub struct FillRecoveryConfig {
     /// The most the venue's clock is assumed to lag this host's. The watermark can sit up to this
     /// much before the local time the last event arrived, to follow the exchange's clock when the
     /// last fill carries an earlier time than the local clock says. Beyond it the local time is
-    /// trusted, so a long idle spell does not turn into a long read.
+    /// trusted, so an old last fill does not stretch the read. The span still starts at the last
+    /// event delivered, so a stream that was quiet for hours reads those hours (up to `max_span`).
+    /// A venue clock ahead of this host's is not allowed for: a fill stamped after the read began
+    /// is the new stream's to deliver.
     pub max_clock_skew: Duration,
-    /// The time the whole read may take, across all its calls.
+    /// The time the whole read may take, across all its calls. Measured on the tokio clock, not
+    /// on [`clock`](Self::clock).
     pub read_timeout: Duration,
-    /// The most calls to `fetch_trades` one read makes.
+    /// The most calls to `fetch_trades` one read makes; at least one call is always made.
     pub max_pages: u32,
     /// The longest span one read covers. What lies further back is reported as a gap, not read.
     pub max_span: Duration,
@@ -225,7 +229,7 @@ where
         {
             result.gaps.push(gap(
                 cursor,
-                held_since - chrono::Duration::milliseconds(1),
+                (held_since - chrono::Duration::milliseconds(1)).max(cursor),
                 FillRecoveryFailure::VenueRetention { held_since },
             ));
         }

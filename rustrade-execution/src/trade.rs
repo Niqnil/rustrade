@@ -421,7 +421,9 @@ pub struct TradesRead<AssetKey, InstrumentKey> {
     /// into the span, which is no claim that the venue holds fills without limit.
     ///
     /// A caller that needs every fill in the span treats the part before `held_since` as a gap:
-    /// `resume: None` covers what the venue holds, not what it held.
+    /// `resume: None` covers what the venue holds, not what it held. The limit cuts into the span
+    /// from its start, so only the first call of a span can report it; a caller reading on from
+    /// `resume` has nothing to learn from a later call's.
     pub held_since: Option<DateTime<Utc>>,
 }
 
