@@ -16,6 +16,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   find its order by client order id or, for a fill carrying only the venue's id, by that. It
   keeps the last 64 retired reduce-only orders per instrument, oldest dropped first. Plain data,
   `Serialize` and `Deserialize`, no locking.
+- **Orders are checked against the symbol's rules before they are sent** (`rustrade-execution`,
+  #676). `BinanceSpot` and `BinanceMargin` read the symbol's `PRICE_FILTER`, `LOT_SIZE`,
+  `MARKET_LOT_SIZE` and `NOTIONAL`/`MIN_NOTIONAL` from the spot `exchangeInfo` on its first order,
+  refresh them hourly, and refuse an order that breaks them without sending it. Nothing is
+  rounded.
+  - A price or quantity off its tick or lot grid is `OrderError::InvalidPrecision` with the new
+    `PrecisionLimit::NotOnGrid { step }`; one below a minimum or above a maximum is the new
+    `OrderError::OutOfBounds(BoundsViolation)`, which carries the field, which bound, the limit
+    and the value. `OrderField` gains `Notional`.
+  - The check is the new venue-agnostic `OrderRules::check` (`rustrade_execution::rules`, with
+    `ValueRule`), so another client can fill the rules from its own venue. A zero in a venue
+    rule means the rule is off. A notional is checked only where the price is the order's own
+    limit, never for a market or plain stop order, and a pass is not a guarantee: the venue's
+    other filters still apply.
+  - `BinanceSpotConfig::pre_send_rules` and `BinanceMarginConfig::pre_send_rules`
+    (`PreSendRules::Enforce` by default, or `Off`, with `with_pre_send_rules`). A failed refresh
+    keeps the old rules for up to 24 hours; a symbol with no rules is sent unchecked, with a
+    warning.
+  - `BinanceSpot::load_rules` and `BinanceMargin::load_rules` load a set of symbols ahead of
+    their first order. Binance margin has no rules endpoint, so `BinanceMargin` uses the pair's
+    spot rules.
+  - **Behaviour change:** an order Binance would have rejected for its tick, lot or notional now
+    comes back unsent as one of these errors. Set `pre_send_rules` to `Off` to keep the old
+    behaviour.
 
 - **A per-order margin effect** (`rustrade-execution`, #107). A new
   `MarginEffect { NoSideEffect, Borrow, Repay }` says what one order does to a margin account's

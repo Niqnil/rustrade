@@ -66,6 +66,7 @@ use super::margin_risk::{
     RISK_STREAM_URL, RiskStreamTask, SapiRiskListenKeys, log_liability_change,
     log_margin_level_change, margin_level_notice,
 };
+use super::rules::RulesLoader;
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, DisconnectOnDrop, ExecutionReport, FILL_RECOVERY_TIMEOUT_SECS,
@@ -80,6 +81,7 @@ use super::shared::{
     parse_user_data_frame, placed_order_state, recovered_order_cids, recovered_order_totals,
     response_decode_error, rest_call_with_retry, retry_or_end, trailing_params,
 };
+use crate::rules::{OrderRules, PreSendRules};
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
     InstrumentBalanceUpdate, IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent,
@@ -238,6 +240,13 @@ pub struct BinanceMarginConfig {
     /// order's loan stays owed until a [`MarginEffect::Repay`] order repays it.
     #[serde(default = "crate::margin::default_auto_repay_at_cancel")]
     pub auto_repay_at_cancel: bool,
+    /// Whether an order is checked against its pair's tick, lot and notional rules before it is
+    /// sent. Defaults to [`PreSendRules::Enforce`].
+    ///
+    /// Binance margin publishes no rules of its own: the check reads the pair's spot rules, which
+    /// a margin order obeys.
+    #[serde(default)]
+    pub pre_send_rules: PreSendRules,
 }
 
 // custom Debug to avoid leaking credentials in logs
@@ -251,6 +260,7 @@ impl std::fmt::Debug for BinanceMarginConfig {
             .field("isolated_symbols", &self.isolated_symbols)
             .field("margin_effect", &self.margin_effect)
             .field("auto_repay_at_cancel", &self.auto_repay_at_cancel)
+            .field("pre_send_rules", &self.pre_send_rules)
             .finish()
     }
 }
@@ -283,7 +293,15 @@ impl BinanceMarginConfig {
             isolated_symbols,
             margin_effect,
             auto_repay_at_cancel,
+            pre_send_rules: PreSendRules::default(),
         }
+    }
+
+    /// Set whether an order is checked against its pair's rules before it is sent.
+    #[must_use]
+    pub fn with_pre_send_rules(mut self, pre_send_rules: PreSendRules) -> Self {
+        self.pre_send_rules = pre_send_rules;
+        self
     }
 
     /// Convenience constructor for the common case: cross margin, production endpoints, and the
@@ -482,6 +500,9 @@ pub struct BinanceMargin {
     // The orders seen live and not yet seen end, which a reconnect asks about. Shared by every
     // clone and every account stream, since an order placed through one ends on any of them.
     known_live: SharedKnownLiveOrders,
+    // The pairs' tick, lot and notional rules, loaded on each pair's first order from the spot
+    // `exchangeInfo`. Shared by every clone.
+    rules: Arc<RulesLoader>,
 }
 
 impl std::fmt::Debug for BinanceMargin {
@@ -495,6 +516,20 @@ impl std::fmt::Debug for BinanceMargin {
 }
 
 impl BinanceMargin {
+    /// Load the order rules of `instruments` from Binance now, and hold them for
+    /// [`open_order`](ExecutionClient::open_order) to check against.
+    ///
+    /// Rules otherwise load on each pair's first order, which adds a request to that order.
+    /// Calling this ahead takes it off the first order, and shows a bad symbol or a failed load
+    /// here. Binance refuses the whole request if one symbol is not listed. The rules are the
+    /// pair's spot rules, which Binance margin has no endpoint for.
+    pub async fn load_rules(
+        &self,
+        instruments: &[InstrumentNameExchange],
+    ) -> Result<HashMap<InstrumentNameExchange, OrderRules>, UnindexedClientError> {
+        self.rules.load(instruments).await
+    }
+
     /// Hold each of `orders` as live, for a reconnect to ask about if the stream misses its end.
     fn remember_live<'a>(
         &self,
@@ -702,6 +737,16 @@ impl ExecutionClient for BinanceMargin {
         // clones from building it twice.
         let rest_config = Self::build_rest_config(&config);
         let rest = Arc::new(MarginTradingRestApi::production(rest_config.clone()));
+        // The rules come from the spot `exchangeInfo`, a public endpoint on the spot weight pool.
+        // Its tracker is this client's own: a `BinanceSpot` in the same process keeps another for
+        // the same IP pool, which is cheap, as rules load once per pair an hour.
+        let rules = Arc::new(RulesLoader::new(
+            config.pre_send_rules,
+            Arc::new(binance_sdk::spot::SpotRestApi::production(
+                rest_config.clone(),
+            )),
+            Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+        ));
         let rest_config = Arc::new(rest_config);
         let ws_config = Self::build_ws_config(&config);
         Self {
@@ -711,6 +756,7 @@ impl ExecutionClient for BinanceMargin {
             ws_config,
             rate_limiter: Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
             known_live: KnownLiveOrders::shared(ExchangeId::BinanceMargin),
+            rules,
         }
     }
 
@@ -806,6 +852,14 @@ impl ExecutionClient for BinanceMargin {
                 )));
             }
         };
+
+        if let Err(refused) = self
+            .rules
+            .check(instrument.name(), kind, price, quantity)
+            .await
+        {
+            return inactive(OrderState::inactive(refused));
+        }
 
         let response =
             match rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Order, |rest| {
@@ -8066,9 +8120,27 @@ mod tests {
         } else {
             BinanceMarginConfig::cross_margin("key".into(), "secret".into())
         };
+        let mode = config.pre_send_rules;
         let mut client = <BinanceMargin as ExecutionClient>::new(config);
         client.rest = margin_rest_at(server);
+        client.rules = rules_at(server, mode);
         client
+    }
+
+    /// Rules loaded from the spot `exchangeInfo` that `server` answers.
+    fn rules_at(server: &wiremock::MockServer, mode: PreSendRules) -> Arc<RulesLoader> {
+        Arc::new(RulesLoader::new(
+            mode,
+            Arc::new(binance_sdk::spot::SpotRestApi::from_config(
+                ConfigurationRestApi::builder()
+                    .api_key("key")
+                    .api_secret("secret")
+                    .base_path(server.uri())
+                    .build()
+                    .unwrap(),
+            )),
+            Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+        ))
     }
 
     /// Answer `GET /sapi/v1/margin/order` for client order id `cid` with `response`.
@@ -8498,6 +8570,173 @@ mod tests {
                 "{cid}: {placed:?}"
             );
         }
+    }
+
+    use crate::error::{Bound, BoundsViolation, OrderField, PrecisionLimit, PrecisionViolation};
+    use rust_decimal_macros::dec;
+
+    /// BTCUSDT's spot `exchangeInfo` with a 0.01 tick, a 0.001 lot and a 5 minimum notional.
+    fn btcusdt_exchange_info() -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "timezone": "UTC", "serverTime": 1_700_000_000_000_i64,
+            "symbols": [{
+                "symbol": "BTCUSDT", "status": "TRADING",
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "0", "tickSize": "0.01"},
+                    {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "100", "stepSize": "0.001"},
+                    {"filterType": "NOTIONAL", "minNotional": "5", "applyMinToMarket": true,
+                     "maxNotional": "9000000", "applyMaxToMarket": false, "avgPriceMins": 5},
+                ],
+            }],
+        }))
+    }
+
+    async fn mount_order_accepted(server: &wiremock::MockServer, expected: u64) {
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "symbol": "BTCUSDT", "orderId": 7, "clientOrderId": "c",
+                    "transactTime": 1_700_000_000_000_i64, "price": "50000", "origQty": "2",
+                    "executedQty": "0", "cummulativeQuoteQty": "0", "status": "NEW",
+                    "timeInForce": "GTC", "type": "LIMIT", "side": "BUY",
+                })),
+            )
+            .expect(expected)
+            .mount(server)
+            .await;
+    }
+
+    /// An order that breaks the symbol's rules is refused without a request to the order
+    /// endpoint, and the rules are read once for every order after.
+    #[tokio::test]
+    async fn an_order_breaking_the_symbols_rules_is_refused_unsent() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/exchangeInfo"))
+            .and(wiremock::matchers::query_param("symbols", r#"["BTCUSDT"]"#))
+            .respond_with(btcusdt_exchange_info())
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_order_accepted(&server, 1).await;
+        let client = margin_client_at(&server, false);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+        let order = |cid: &str, price: Decimal, quantity: Decimal| {
+            let mut request = margin_open_request(&btcusdt, cid);
+            request.state.price = Some(price);
+            request.state.quantity = quantity;
+            request
+        };
+
+        let off_tick = client.open_order(order("a", dec!(100.001), dec!(1))).await;
+        assert_eq!(
+            off_tick.state,
+            OrderState::inactive(OrderError::InvalidPrecision(PrecisionViolation::new(
+                OrderField::Price,
+                dec!(100.001),
+                PrecisionLimit::NotOnGrid { step: dec!(0.01) }
+            )))
+        );
+        let dust = client.open_order(order("b", dec!(100), dec!(0.001))).await;
+        assert_eq!(
+            dust.state,
+            OrderState::inactive(OrderError::OutOfBounds(BoundsViolation::new(
+                OrderField::Notional,
+                Bound::Min,
+                dec!(5),
+                dec!(0.100)
+            )))
+        );
+        let placed = client.open_order(order("c", dec!(100), dec!(1))).await;
+        assert!(
+            matches!(placed.state, OrderState::Active(ActiveOrderState::Open(_))),
+            "{placed:?}"
+        );
+    }
+
+    /// With the rules off, nothing is read and every order is sent.
+    #[tokio::test]
+    async fn with_the_rules_off_every_order_is_sent_and_no_rules_are_read() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v3/exchangeInfo"))
+            .respond_with(btcusdt_exchange_info())
+            .expect(0)
+            .mount(&server)
+            .await;
+        mount_order_accepted(&server, 1).await;
+        let mut client = margin_client_at(&server, false);
+        client.rules = rules_at(&server, PreSendRules::Off);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+        let mut request = margin_open_request(&btcusdt, "x");
+        request.state.price = Some(dec!(100.001));
+        let placed = client.open_order(request).await;
+        assert!(
+            matches!(placed.state, OrderState::Active(ActiveOrderState::Open(_))),
+            "{placed:?}"
+        );
+    }
+
+    /// An order for a symbol whose rules cannot be loaded is sent, for the venue to decide.
+    #[tokio::test]
+    async fn an_order_whose_rules_cannot_be_loaded_is_sent_unchecked() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v3/exchangeInfo"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        mount_order_accepted(&server, 1).await;
+        let client = margin_client_at(&server, false);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+        let mut request = margin_open_request(&btcusdt, "x");
+        request.state.price = Some(dec!(100.001));
+        let placed = client.open_order(request).await;
+        assert!(
+            matches!(placed.state, OrderState::Active(ActiveOrderState::Open(_))),
+            "{placed:?}"
+        );
+    }
+
+    /// `load_rules` returns the rules it read and holds them, so the first order needs no load.
+    #[tokio::test]
+    async fn load_rules_returns_the_rules_and_the_first_order_reuses_them() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v3/exchangeInfo"))
+            .respond_with(btcusdt_exchange_info())
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_order_accepted(&server, 0).await;
+        let client = margin_client_at(&server, false);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+
+        let loaded = client.load_rules(std::slice::from_ref(&btcusdt)).await;
+        let rules = loaded.ok().and_then(|mut loaded| loaded.remove(&btcusdt));
+        assert_eq!(
+            rules.map(|rules| (rules.price.step, rules.quantity.step, rules.notional.min)),
+            Some((Some(dec!(0.01)), Some(dec!(0.001)), Some(dec!(5))))
+        );
+
+        let mut request = margin_open_request(&btcusdt, "x");
+        request.state.price = Some(dec!(100.001));
+        let refused = client.open_order(request).await;
+        assert!(
+            matches!(refused.state, OrderState::Inactive(_)),
+            "{refused:?}"
+        );
+    }
+
+    /// Loading no symbols asks Binance for nothing.
+    #[tokio::test]
+    async fn load_rules_of_no_symbols_sends_no_request() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v3/exchangeInfo"))
+            .respond_with(btcusdt_exchange_info())
+            .expect(0)
+            .mount(&server)
+            .await;
+        let client = margin_client_at(&server, false);
+        assert_eq!(client.load_rules(&[]).await, Ok(HashMap::new()));
     }
 
     /// A cross account refuses a trailing `STOP_LOSS` with `-3111`. The order fails as
