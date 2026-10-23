@@ -36,8 +36,12 @@ use tokio::time::Instant;
 /// Built from [`Default`] and the `with_*` methods, so fields can be added without a breaking
 /// change. Venues differ in how many fills one call returns and how long they keep them, so the
 /// budget is set per venue.
+///
+/// A field missing from its serialised form takes its default, so a form written before a field
+/// was added still loads. Each [`Duration`] is serialised as `secs` and `nanos`.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(default)]
 pub struct FillRecoveryConfig {
     /// How far before the watermark the read starts. Covers the delay between a fill and its
     /// delivery, so a fill delivered just before the stream ended is read again, not missed.
@@ -132,7 +136,8 @@ impl Watermark {
     ///
     /// A [`StreamTerminated`](AccountEventKind::StreamTerminated) is not a sign of sync but the
     /// end of it: the stream can have lost events before it says so, as on a lagged buffer, so it
-    /// leaves the watermark where the last event before it put it.
+    /// leaves the watermark where the last event before it put it. A loss the stream delivers
+    /// further events after, without ending, is not seen here.
     pub(crate) fn delivered<K, A, I>(&mut self, now: DateTime<Utc>, event: &AccountEvent<K, A, I>) {
         match &event.kind {
             AccountEventKind::StreamTerminated(_) => return,
@@ -633,6 +638,30 @@ mod tests {
 
         assert_eq!(calls, [at(0)]);
         assert!(result.gaps.is_empty());
+    }
+
+    #[test]
+    fn the_config_serialises_each_duration_as_secs_and_nanos_and_loads_a_partial_form() {
+        let config = FillRecoveryConfig::default();
+        let json = serde_json::to_value(config).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "overlap": { "secs": 2, "nanos": 0 },
+                "max_clock_skew": { "secs": 30, "nanos": 0 },
+                "read_timeout": { "secs": 30, "nanos": 0 },
+                "max_pages": 20,
+                "max_span": { "secs": 86_400, "nanos": 0 },
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<FillRecoveryConfig>(json).unwrap(),
+            config
+        );
+
+        let partial: FillRecoveryConfig =
+            serde_json::from_value(serde_json::json!({ "max_pages": 3 })).unwrap();
+        assert_eq!(partial, config.with_max_pages(3));
     }
 
     #[test]

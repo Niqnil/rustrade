@@ -228,9 +228,10 @@ where
     /// [`AccountEventKind::Trade`] events before the new
     /// [`AccountEventKind::Snapshot`], so the snapshot is the state after them. A span the read
     /// could not cover (the venue no longer holds the fills, the budget in
-    /// `options.fill_recovery` ran out, or a call failed) is reported as an [`AccountEventKind::FillRecoveryGaveUp`] and the
-    /// stream still opens: what to do about a gap is the caller's policy. The first open reads
-    /// nothing, because the snapshot is its starting point.
+    /// `options.fill_recovery` ran out, or a call failed) is reported as an
+    /// [`AccountEventKind::FillRecoveryGaveUp`] and the stream still opens: what to do about a
+    /// gap is the caller's policy. The first open reads nothing, because the snapshot is its
+    /// starting point.
     ///
     /// Fills are deduplicated by instrument and trade id, across the read and the new stream and
     /// across re-initialisations, with the 10,000 most recent kept. An order that ended without a

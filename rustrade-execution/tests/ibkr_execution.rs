@@ -628,10 +628,10 @@ async fn test_fetch_trades() {
     let held_since = read
         .held_since
         .expect("an 8-day span reaches past the read");
-    let cover_start = before - chrono::Duration::days(6);
+    let cover_start = before - chrono::Duration::days(5);
     assert!(
-        held_since >= cover_start && held_since <= chrono::Utc::now() - chrono::Duration::days(6),
-        "held_since {held_since} is not 6 days before the read"
+        held_since >= cover_start && held_since <= chrono::Utc::now() - chrono::Duration::days(5),
+        "held_since {held_since} is not 5 days before the read"
     );
 }
 

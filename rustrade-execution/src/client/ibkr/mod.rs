@@ -3215,9 +3215,9 @@ impl ExecutionClient for IbkrClient {
     ///
     /// - IB lists executions from the last 7 days at most, counted in a time zone of its own. One
     ///   request reads them all, the span is applied client-side, and the read is always
-    ///   complete (`resume: None`) for what IB returned. A span starting more than 6 days ago
-    ///   has [`held_since`](TradesRead::held_since) set to 6 days ago: fills before it may be
-    ///   missing. For older executions, use IB's Flex Query or Activity Statements.
+    ///   complete (`resume: None`) for what IB returned. A span starting more than 5 days ago
+    ///   has [`held_since`](TradesRead::held_since) set to 5 days ago, the most the read is sure
+    ///   to reach: fills before it may be missing. For older executions, use IB's Flex Query or Activity Statements.
     /// - Only the executions of orders this API client placed are returned, plus any
     ///   execution IB flags as an IB-initiated liquidation, whoever placed its order, as a
     ///   [`Liquidation`](crate::trade::TradeOrigin::Liquidation) trade. With
@@ -3867,7 +3867,7 @@ impl BracketOrderClient for IbkrClient {
 ///
 /// A filled order is reported fully filled, without an average price; a cancelled or expired one
 /// with the fill its executions show, which is nothing when they show none of it and the order
-/// was placed through this client under six days ago, since the read then covers its whole life,
+/// was placed through this client under five days ago, since the read then covers its whole life,
 /// and otherwise unknown (`None`); a placement IB accepted and then rejected, or left `Inactive`,
 /// as [`OpenFailed`](crate::order::state::InactiveOrderState::OpenFailed). A cancelled order is
 /// reported expired by the rule [`ExecutionClient::account_stream`] applies. An order IB lists

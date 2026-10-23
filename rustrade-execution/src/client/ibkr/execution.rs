@@ -497,9 +497,11 @@ pub fn parse_ib_timestamp(s: &str) -> Option<DateTime<Utc>> {
 /// day's, so a read across midnight would miss the fills before it.
 pub(super) const EXECUTION_DAYS: i32 = 7;
 
-/// How far back a read of [`EXECUTION_DAYS`] days of executions surely reaches. A day short of the
-/// read, since IB counts its days in a time zone of its own.
-pub(super) const EXECUTIONS_COVER: Duration = Duration::from_secs(6 * 24 * 60 * 60);
+/// How far back a read of [`EXECUTION_DAYS`] days of executions surely reaches. Two days short of
+/// the read: IB counts its days in a time zone of its own, whose day can start up to a day after
+/// this host's and shifts by an hour across daylight saving, and whether its count takes in today
+/// is not documented.
+pub(super) const EXECUTIONS_COVER: Duration = Duration::from_secs(5 * 24 * 60 * 60);
 
 /// The filter for a read of [`EXECUTION_DAYS`] days of every client's executions.
 pub(super) fn executions_filter() -> ExecutionFilter {
@@ -700,7 +702,7 @@ mod tests {
     #[test]
     fn executions_held_since_is_the_cover_start_only_when_the_span_starts_before_it() {
         let now = Utc.with_ymd_and_hms(2026, 10, 23, 9, 0, 0).unwrap();
-        let covered_from = Utc.with_ymd_and_hms(2026, 10, 17, 9, 0, 0).unwrap();
+        let covered_from = Utc.with_ymd_and_hms(2026, 10, 18, 9, 0, 0).unwrap();
         let before = covered_from - chrono::TimeDelta::seconds(1);
         assert_eq!(executions_held_since(before, now), Some(covered_from));
         assert_eq!(executions_held_since(covered_from, now), None);

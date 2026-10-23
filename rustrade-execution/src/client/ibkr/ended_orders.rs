@@ -763,9 +763,11 @@ mod tests {
         };
 
         let young = tracked(1, GTC, true);
-        let old = tracked(6, GTC, true);
+        let within = tracked(4, GTC, true);
+        let old = tracked(5, GTC, true);
         assert_eq!(filled(Some(&young), Some(dec!(2))), Some(dec!(2)));
         assert_eq!(filled(Some(&young), None), Some(Decimal::ZERO));
+        assert_eq!(filled(Some(&within), None), Some(Decimal::ZERO));
         assert_eq!(filled(Some(&old), None), None);
         assert_eq!(filled(None, None), None);
         assert_eq!(filled(None, Some(dec!(2))), Some(dec!(2)));
