@@ -3217,7 +3217,8 @@ impl ExecutionClient for IbkrClient {
     ///   request reads them all, the span is applied client-side, and the read is always
     ///   complete (`resume: None`) for what IB returned. A span starting more than 5 days ago
     ///   has [`held_since`](TradesRead::held_since) set to 5 days ago, the most the read is sure
-    ///   to reach: fills before it may be missing. For older executions, use IB's Flex Query or Activity Statements.
+    ///   to reach: fills before it may be missing. For older executions, use IB's Flex Query or
+    ///   Activity Statements.
     /// - Only the executions of orders this API client placed are returned, plus any
     ///   execution IB flags as an IB-initiated liquidation, whoever placed its order, as a
     ///   [`Liquidation`](crate::trade::TradeOrigin::Liquidation) trade. With
