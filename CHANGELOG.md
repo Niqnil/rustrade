@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ReduceOnlyBook`** (`rustrade-execution`, #689). A public record of which orders were sent
+  reduce-only, for whoever needs a fill's flag after the request is gone, such as a tracker that
+  cuts a reduce-only fill with `Trade::holding_move`. `register` it when the open request is sent,
+  `acknowledge` the venue's order id, `retire` the order when it ends, and `lookup` a `Trade` to
+  find its order by client order id or, for a fill carrying only the venue's id, by that. It
+  keeps the last 64 retired reduce-only orders per instrument, oldest dropped first. Plain data,
+  `Serialize` and `Deserialize`, no locking.
 - **Orders are checked against the symbol's rules before they are sent** (`rustrade-execution`,
   #676). `BinanceSpot` and `BinanceMargin` read the symbol's `PRICE_FILTER`, `LOT_SIZE`,
   `MARKET_LOT_SIZE` and `NOTIONAL`/`MIN_NOTIONAL` from the spot `exchangeInfo` on its first order,
@@ -71,6 +78,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     so filtering belongs in the wrapper.
 
 ### Changed
+
+- **Breaking:** `InstrumentState::reduce_only_orders` and `retired_reduce_only_orders` are replaced
+  by one field, `reduce_only: ReduceOnlyBook` (`rustrade`, #689). A struct literal supplies the
+  one field. A state serialised before this loads with an empty book, so the reduce-only flags of
+  orders in flight at the upgrade are not carried over: their fills are applied in full.
 
 - **Breaking:** `MarginSideEffect` is replaced by `MarginEffect`, and `AutoBorrowRepay` is gone
   everywhere (`rustrade-execution`, #107, #684).
