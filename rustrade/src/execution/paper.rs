@@ -21,7 +21,7 @@ use tokio::sync::broadcast;
 /// The market of one instrument, as a [`PaperMarketTap`] has folded it from the events seen so
 /// far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PaperMarketUpdate {
+pub(crate) struct PaperMarketUpdate {
     pub instrument: InstrumentIndex,
     pub observation: MarketObservation,
 }
@@ -58,6 +58,8 @@ impl PaperMarketFeed {
     /// [`VenueMarketUpdate`] fold a backtest's venue uses, and that market is sent to every
     /// subscribed venue. So a venue has observed an event no later than the `Engine` sees it,
     /// and an event the stream does not yield, because nothing polls it, reaches no venue either.
+    ///
+    /// The fold runs inline in the task that polls the returned stream, ahead of the `Engine`.
     ///
     /// A [`Reconnecting`](reconnect::Event::Reconnecting) event is passed on and sends nothing. A
     /// venue sees no market while the stream reconnects, so a price that crossed a resting order

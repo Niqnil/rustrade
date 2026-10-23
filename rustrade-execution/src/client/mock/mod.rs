@@ -236,6 +236,8 @@ where
                 let ended = matches!(event.kind, AccountEventKind::StreamTerminated(_));
                 Some((event, (events, ended)))
             })
+            // `unfold` panics when polled again after it ends, which a combinator downstream may do.
+            .fuse()
             .boxed(),
         )
     }
@@ -591,6 +593,11 @@ mod tests {
             futures::FutureExt::now_or_never(stream.next()),
             Some(None),
             "the stream must end on the poll after its terminal event, with the sender still open"
+        );
+        assert_eq!(
+            futures::FutureExt::now_or_never(stream.next()),
+            Some(None),
+            "and stay ended however often it is polled"
         );
         drop(event_tx);
     }

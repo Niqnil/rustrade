@@ -17,6 +17,14 @@ use rustrade_instrument::{
     instrument::{Instrument, name::InstrumentNameExchange},
 };
 use std::{collections::VecDeque, fmt::Debug, sync::Arc, time::Duration};
+
+/// The longest the market-driven loop sleeps for a venue deadline in one go, well inside the
+/// longest a tokio timer can wait. A deadline beyond it is waited for in steps.
+const MAX_DEADLINE_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How far before a deadline, by the venue's clock, a wake for it still counts as due: the timer
+/// and the clock are two sources and can differ by a hair.
+const DEADLINE_TOLERANCE: TimeDelta = TimeDelta::seconds(1);
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{error, info, warn};
@@ -149,6 +157,10 @@ impl MockExchange {
     /// When the feed ends, the driver logs a warning and serves requests on the last market it
     /// saw. Deadlines keep falling.
     ///
+    /// The feed is served ahead of requests, so while it has a backlog a request is read, and its
+    /// wait for the venue begins, only after that backlog is applied. The latency above is a lower
+    /// bound. The backlog is bounded by the feed's own buffer.
+    ///
     /// # Panics
     /// If `venue` is not [`VenueRegime::MarketDriven`]: a request-priced venue does not price from
     /// the feed, so feeding it would change nothing.
@@ -259,7 +271,7 @@ impl MockExchange {
             let deadline_at = deadline.map(|deadline| {
                 // Rebuilt on every pass, so it needs no state of its own and cannot drift.
                 let wait = (deadline - clock.peek()).to_std().unwrap_or(Duration::ZERO);
-                tokio::time::Instant::now() + wait
+                tokio::time::Instant::now() + wait.min(MAX_DEADLINE_WAIT)
             });
 
             tokio::select! {
@@ -316,6 +328,10 @@ impl MockExchange {
                     // The timer and `clock` are two sources, so the wake can land a hair before the
                     // deadline by `clock`. It is due by the timer, so the venue moves to it.
                     if let Some(deadline) = deadline {
+                        // A deadline further out than the cap woke this loop early: wait again.
+                        if deadline - clock.peek() > DEADLINE_TOLERANCE {
+                            continue;
+                        }
                         let now = clock.raise_to(deadline);
                         let events = self.venue.advance_time(now);
                         emit.queue(events, None);
@@ -1672,5 +1688,78 @@ mod tests {
         let config = spot_config("0", "10000000", FeeModelConfig::default());
         let exchange = MockExchange::new(config, request_rx, event_tx, spot_instruments());
         assert!(format!("{exchange:?}").contains("MockExchange"));
+    }
+
+    /// Before the venue has observed an instrument a market order is refused, while a resting
+    /// limit is accepted and can then be cancelled.
+    #[tokio::test(start_paused = true)]
+    async fn a_paper_venue_refuses_a_market_order_before_the_first_observation_and_cancels_a_rest()
+    {
+        let mut config = spot_config("0", "10000000", FeeModelConfig::default());
+        config.latency_ms = 100;
+        let paper = Paper::start(config);
+
+        let refused = paper.open(buy_request("0.01", None)).await;
+        assert!(
+            matches!(refused.state, OrderState::Inactive(_)),
+            "nothing to price a market order from: {refused:?}"
+        );
+
+        let rest = limit_request("rest", Side::Buy, "1", "49000", gtc());
+        let key = rest.key.clone();
+        let resting = paper.open(rest).await;
+        assert!(matches!(resting.state, OrderState::Active(_)));
+
+        let (response_tx, response_rx) = oneshot::channel();
+        paper
+            .request_tx
+            .send(MockExchangeRequest::cancel_order(
+                Utc::now(),
+                response_tx,
+                OrderEvent {
+                    key,
+                    state: RequestCancel { id: None },
+                },
+            ))
+            .unwrap();
+        let cancelled = response_rx.await.expect("the cancel is answered");
+        assert!(cancelled.state.is_ok(), "{cancelled:?}");
+        paper.stop().await;
+    }
+
+    /// A deadline further out than one sleep can wait is retired at its own instant, not early.
+    #[tokio::test(start_paused = true)]
+    async fn a_paper_deadline_beyond_the_longest_sleep_is_retired_on_time() {
+        let config = spot_config("0", "100000", FeeModelConfig::default());
+        let mut paper = Paper::start(config);
+        paper.observe(priced("50000"));
+        let expiry = paper.start + TimeDelta::days(3);
+        let started = tokio::time::Instant::now();
+
+        paper
+            .open(limit_request(
+                "far",
+                Side::Buy,
+                "1",
+                "49000",
+                crate::order::TimeInForce::GoodTillDate { expiry },
+            ))
+            .await;
+
+        let expired = loop {
+            let event = paper
+                .events
+                .recv()
+                .await
+                .expect("the account channel is open");
+            if let AccountEventKind::OrderSnapshot(order) = event.kind
+                && let OrderState::Inactive(InactiveOrderState::Expired(expired)) = order.0.state
+            {
+                break expired;
+            }
+        };
+        assert_eq!(expired.time_exchange, expiry);
+        assert!(started.elapsed() >= std::time::Duration::from_secs(3 * 24 * 60 * 60));
+        paper.stop().await;
     }
 }
