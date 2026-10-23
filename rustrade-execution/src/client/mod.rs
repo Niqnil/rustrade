@@ -79,14 +79,12 @@ use rustrade_instrument::{
 };
 use std::future::Future;
 
-// Account-event deduplication over rustrade's own event type. Gated on the clients that use it
-// so a build selecting none of them does not compile it unused. Alpaca deduplicates too, but
-// against a raw `SmolStr` fill key rather than this cache, so it is deliberately not in this list.
-#[cfg(any(feature = "binance", feature = "hyperliquid", feature = "ibkr"))]
-pub(crate) mod dedup;
+// Account-event deduplication over rustrade's own event type. Alpaca deduplicates too, but against
+// a raw `SmolStr` fill key rather than this cache. Always compiled: `AccountEventDeduper` is public.
+pub mod dedup;
 
 // What a client knows of its live orders, and the reconnect check of how those orders ended while
-// its account stream was down. Gated on the clients that use it, like `dedup`.
+// its account stream was down. Gated on the clients that use it.
 #[cfg(any(
     feature = "alpaca",
     feature = "binance",
@@ -95,7 +93,7 @@ pub(crate) mod dedup;
 ))]
 pub(crate) mod order_recovery;
 
-// The account streams' reconnect budget. Gated on the clients that use it, like `dedup`.
+// The account streams' reconnect budget. Gated on the clients that use it.
 #[cfg(any(feature = "alpaca", feature = "binance"))]
 pub(crate) mod reconnect_budget;
 

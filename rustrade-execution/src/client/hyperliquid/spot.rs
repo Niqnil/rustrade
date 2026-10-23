@@ -1086,7 +1086,8 @@ impl ExecutionClient for HyperliquidSpotClient {
 
     /// Reads the span with `userFillsByTime`, to its end within the call, so the read is always
     /// complete (`resume: None`). Hyperliquid keeps only each wallet's 10,000 most recent fills,
-    /// so a span reaching further back is read only as far as those go.
+    /// so a span reaching further back is read only as far as those go, and
+    /// [`held_since`](TradesRead::held_since) says where that is.
     async fn fetch_trades(
         &self,
         start: DateTime<Utc>,
@@ -1099,12 +1100,14 @@ impl ExecutionClient for HyperliquidSpotClient {
         let address = self.wallet_h160();
 
         let fills = user_fills_by_time(&self.info_client, address, start_ms, end_ms).await?;
+        let held_since = super::common::held_since(&fills, start_ms);
         let pairs = self
             .spot_coins
             .covering(fills.iter().map(|fill| fill.coin.as_str()))
             .await;
 
-        spot_trades(&fills, &pairs, start, end, instruments).map(TradesRead::complete)
+        spot_trades(&fills, &pairs, start, end, instruments)
+            .map(|trades| TradesRead::complete(trades).with_held_since(held_since))
     }
 }
 

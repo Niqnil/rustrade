@@ -1287,7 +1287,8 @@ impl ExecutionClient for HyperliquidClient {
 
     /// Reads the span with `userFillsByTime`, to its end within the call, so the read is always
     /// complete (`resume: None`). Hyperliquid keeps only each wallet's 10,000 most recent fills,
-    /// so a span reaching further back is read only as far as those go. One read covers every
+    /// so a span reaching further back is read only as far as those go, and
+    /// [`held_since`](TradesRead::held_since) says where that is. One read covers every
     /// DEX; fills on a HIP-3 DEX this client is not configured with are left out.
     ///
     /// # Errors
@@ -1307,6 +1308,7 @@ impl ExecutionClient for HyperliquidClient {
         let address = self.wallet_h160();
 
         let fills = user_fills_by_time(&self.info_client, address, start_ms, end_ms).await?;
+        let held_since = common::held_since(&fills, start_ms);
         warn_unknown_coins(fills.iter().map(|fill| fill.coin.as_str()));
         warn_unconfigured_dexes(&self.dexes, fills.iter().map(|fill| fill.coin.as_str()));
 
@@ -1361,7 +1363,7 @@ impl ExecutionClient for HyperliquidClient {
             });
         }
 
-        Ok(TradesRead::complete(result))
+        Ok(TradesRead::complete(result).with_held_since(held_since))
     }
 }
 

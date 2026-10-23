@@ -11,6 +11,9 @@ use rustrade_instrument::{
 };
 use rustrade_integration::channel::Channel;
 
+/// Reads the fills an account stream missed while it was down, when the manager reopens it.
+pub mod backfill;
+
 /// Provides an execution manager builder for ergonomically initialising multiple execution links
 /// to mock and live exchanges.
 pub mod builder;

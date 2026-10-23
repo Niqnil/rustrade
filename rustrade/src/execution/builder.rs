@@ -2,8 +2,8 @@ use crate::{
     engine::{clock::EngineClock, execution_tx::MultiExchangeTxMap, in_flight::InFlightDeadlines},
     error::BarterError,
     execution::{
-        AccountStreamEvent, Execution, error::ExecutionError, manager::ExecutionManager,
-        request::ExecutionRequest,
+        AccountStreamEvent, Execution, backfill::FillRecoveryConfig, error::ExecutionError,
+        manager::ExecutionManager, request::ExecutionRequest,
     },
     shutdown::AsyncShutdown,
 };
@@ -234,6 +234,7 @@ impl<'a> ExecutionBuilder<'a> {
             Arc::new(Client::new(config)),
             AccountEventIndexer::new(Arc::new(instrument_map)),
             STREAM_RECONNECTION_POLICY,
+            FillRecoveryConfig::default(),
         );
 
         let future_result = future_result.map(|result| {

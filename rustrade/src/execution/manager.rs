@@ -1,5 +1,6 @@
 use crate::execution::{
     AccountStreamEvent,
+    backfill::{FillRecoveryConfig, Watermark, backfill},
     error::ExecutionError,
     request::{ExecutionRequest, RequestFuture},
 };
@@ -16,8 +17,8 @@ use rustrade_data::streams::{
     },
 };
 use rustrade_execution::{
-    AccountEvent, AccountEventKind,
-    client::ExecutionClient,
+    AccountEvent, AccountEventKind, UnindexedAccountEvent,
+    client::{ExecutionClient, dedup::AccountEventDeduper},
     error::{AccountReinitFailure, AccountStreamInitError, ConnectivityError, OrderError},
     indexer::{AccountEventIndexer, IndexedAccountStream},
     map::ExecutionInstrumentMap,
@@ -132,6 +133,22 @@ where
     /// ([`AccountStreamInitError::retry_after`]), is not followed by another until that wait has
     /// passed, even when the backoff is shorter.
     ///
+    /// # Recovering missed fills
+    ///
+    /// Each re-initialisation after the first reads the fills made while the stream was down,
+    /// with [`ExecutionClient::fetch_trades`], from the last moment the manager knows it was in
+    /// sync (less `fill_recovery.overlap`). They are delivered as
+    /// [`AccountEventKind::Trade`] events before the new
+    /// [`AccountEventKind::Snapshot`], so the snapshot is the state after them. A span the read
+    /// could not cover (the venue no longer holds the fills, the budget in `fill_recovery` ran
+    /// out, or a call failed) is reported as an [`AccountEventKind::FillRecoveryGaveUp`] and the
+    /// stream still opens: what to do about a gap is the caller's policy. The first open reads
+    /// nothing, because the snapshot is its starting point.
+    ///
+    /// Fills are deduplicated by instrument and trade id, across the read and the new stream and
+    /// across re-initialisations, with the 10,000 most recent kept. An order that ended without a
+    /// fill in the gap is the snapshot's to show, as before.
+    ///
     /// # Errors
     /// [`ExecutionError::Config`] if `client` and `indexer` are for different exchanges, and
     /// [`ExecutionError::AccountStreamInit`] if the first attempt to initialise the AccountStream
@@ -142,6 +159,7 @@ where
         client: Arc<Client>,
         indexer: AccountEventIndexer,
         reconnect_policy: ReconnectionBackoffPolicy,
+        fill_recovery: FillRecoveryConfig,
     ) -> Result<(Self, impl Stream<Item = AccountStreamEvent> + Send), ExecutionError> {
         // Determine StreamKey & ExchangeId for use in logging
         let stream_key = Self::determine_account_stream_key(&indexer.map)?;
@@ -157,9 +175,17 @@ where
         // Initialise reconnecting IndexedAccountStream (snapshot + updates)
         let client_clone = Arc::clone(&client);
         let indexer_clone = indexer.clone();
+        // Shared by every re-initialisation: the closure is `Fn`, and a fill read after one
+        // reconnect can be one an earlier stream delivered.
+        let deduper = AccountEventDeduper::new();
+        let watermark = Arc::new(parking_lot::Mutex::new(None::<Watermark>));
+        let fill_recovery = Arc::new(fill_recovery);
         let account_stream = init_reconnecting_stream(move || {
             let client = client_clone.clone();
             let indexer = indexer_clone.clone();
+            let deduper = deduper.clone();
+            let watermark = Arc::clone(&watermark);
+            let fill_recovery = Arc::clone(&fill_recovery);
             async move {
                 // Allocate AssetNameExchanges & InstrumentNameExchanges to avoid lifetime issues
                 let assets = indexer.map.exchange_assets().cloned().collect::<Vec<_>>();
@@ -169,22 +195,77 @@ where
                     .cloned()
                     .collect::<Vec<_>>();
 
-                // Initialise AccountStream & apply indexing
+                // Where this open reads from: `None` on the first open. Taken before the stream
+                // opens, so the span runs from the last event delivered to the moment it reads.
+                let read_from = watermark
+                    .lock()
+                    .as_ref()
+                    .map(|watermark| watermark.read_from(&fill_recovery));
+
+                // Initialise AccountStream & apply indexing. Opened before the read, so a fill
+                // made during it arrives on the stream.
                 let updates = Self::init_indexed_account_stream(
                     &client,
                     indexer.clone(),
+                    &deduper,
                     &assets,
                     &instruments,
                 )
                 .await?;
+
+                // Fills missed while the stream was down, before the snapshot that follows them.
+                let missed = match read_from {
+                    Some(start) => {
+                        let read = backfill(
+                            |from, to| client.fetch_trades(from, to, &instruments),
+                            &instruments,
+                            start,
+                            &fill_recovery,
+                        )
+                        .await;
+                        let exchange = indexer.map.exchange.value;
+                        let trades = read.trades.into_iter().map(|trade| UnindexedAccountEvent {
+                            exchange,
+                            kind: AccountEventKind::Trade(trade),
+                        });
+                        let gaps = read.gaps.into_iter().map(|gap| UnindexedAccountEvent {
+                            exchange,
+                            kind: AccountEventKind::FillRecoveryGaveUp(gap),
+                        });
+                        trades.chain(gaps).collect::<Vec<_>>()
+                    }
+                    None => Vec::new(),
+                };
+                // Deduplicated as each is delivered, so a read dropped part-way marks none of
+                // the fills it did not deliver.
+                let missed = Self::index_account_stream(
+                    futures::stream::iter(missed).filter({
+                        let deduper = deduper.clone();
+                        move |event| std::future::ready(!deduper.is_duplicate(event))
+                    }),
+                    indexer.clone(),
+                );
 
                 // Fetch AccountSnapshot & index
                 let snapshot =
                     Self::fetch_indexed_account_snapshot(&client, &indexer, &assets, &instruments)
                         .await?;
 
+                // Nothing delivered counts until it is delivered: the watermark moves as events
+                // pass, so an attempt that fails above leaves it where it was.
+                let delivered_at = fill_recovery.clone();
+                let opened = delivered_at.clock.now();
+                watermark.lock().get_or_insert(Watermark::opened(opened));
+
                 // It's expected downstream consumers (eg/ EngineState will sync updates)
-                Ok(futures::stream::once(std::future::ready(snapshot)).chain(updates))
+                Ok(missed
+                    .chain(futures::stream::once(std::future::ready(snapshot)))
+                    .chain(updates)
+                    .inspect(move |event| {
+                        if let Some(watermark) = watermark.lock().as_mut() {
+                            watermark.delivered(delivered_at.clock.now(), event);
+                        }
+                    }))
             }
         })
         .await?;
@@ -273,6 +354,7 @@ where
     async fn init_indexed_account_stream(
         client: &Arc<Client>,
         indexer: AccountEventIndexer,
+        deduper: &AccountEventDeduper,
         assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
     ) -> Result<impl Stream<Item = AccountEvent> + use<RequestStream, Client>, AccountStreamInitError>
@@ -284,20 +366,32 @@ where
             }
         };
 
-        Ok(
-            IndexedAccountStream::new(stream, indexer).filter_map(|result| {
-                std::future::ready(match result {
-                    Ok(indexed_event) => Some(indexed_event),
-                    Err(error) => {
-                        error!(
-                            ?error,
-                            "filtered IndexError produced by IndexedAccountStream"
-                        );
-                        None
-                    }
-                })
-            }),
-        )
+        // Deduplicated before indexing: the deduper keys on the venue's own names, and a fill the
+        // stream repeats from the read, or from an earlier stream, is dropped here.
+        let deduper = deduper.clone();
+        Ok(Self::index_account_stream(
+            stream.filter(move |event| std::future::ready(!deduper.is_duplicate(event))),
+            indexer,
+        ))
+    }
+
+    /// Index an unindexed account stream, logging and dropping each event the indexer rejects.
+    fn index_account_stream(
+        stream: impl Stream<Item = UnindexedAccountEvent>,
+        indexer: AccountEventIndexer,
+    ) -> impl Stream<Item = AccountEvent> {
+        IndexedAccountStream::new(stream, indexer).filter_map(|result| {
+            std::future::ready(match result {
+                Ok(indexed_event) => Some(indexed_event),
+                Err(error) => {
+                    error!(
+                        ?error,
+                        "filtered IndexError produced by IndexedAccountStream"
+                    );
+                    None
+                }
+            })
+        })
     }
 
     /// Run the `ExecutionManager`, processing execution requests and forwarding both their
@@ -610,6 +704,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
     use crate::execution::request::ExecutionRequest;
@@ -622,11 +717,11 @@ mod tests {
         map::generate_execution_instrument_map,
         order::{
             OrderKey, OrderKind, TimeInForce,
-            id::{ClientOrderId, StrategyId},
+            id::{ClientOrderId, OrderId, StrategyId},
             request::{RequestCancel, RequestOpen},
             state::Open,
         },
-        trade::TradesRead,
+        trade::{AssetFees, Trade, TradeId, TradesRead},
     };
     use rustrade_instrument::{
         Side, index::IndexedInstruments, instrument::kind::InstrumentKindDiscriminant,
@@ -872,6 +967,21 @@ mod tests {
         attempts: Arc<std::sync::atomic::AtomicUsize>,
         /// When set, a failing attempt is a rate-limit refusal naming this wait, not a timeout.
         rate_limited_for: Option<std::time::Duration>,
+        /// What a stream that stays open sends before it goes quiet.
+        live: Vec<UnindexedAccountEvent>,
+        /// The answers `fetch_trades` gives, in turn; an empty read once they run out.
+        reads: Arc<
+            std::sync::Mutex<
+                std::collections::VecDeque<
+                    Result<
+                        TradesRead<AssetNameExchange, InstrumentNameExchange>,
+                        UnindexedClientError,
+                    >,
+                >,
+            >,
+        >,
+        /// The span of each `fetch_trades` call.
+        fetched: Arc<std::sync::Mutex<Vec<(DateTime<Utc>, DateTime<Utc>)>>>,
     }
 
     impl ExecutionClient for FlakyAccountClient {
@@ -908,7 +1018,9 @@ mod tests {
             } else if attempt < self.open_from {
                 Ok(futures::stream::empty().boxed())
             } else {
-                Ok(futures::stream::pending().boxed())
+                Ok(futures::stream::iter(self.live.clone())
+                    .chain(futures::stream::pending())
+                    .boxed())
             }
         }
 
@@ -943,18 +1055,37 @@ mod tests {
 
         async fn fetch_trades(
             &self,
-            _: DateTime<Utc>,
-            _: DateTime<Utc>,
+            start: DateTime<Utc>,
+            end: DateTime<Utc>,
             _: &[InstrumentNameExchange],
         ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError>
         {
-            unreachable!("the account stream does not fetch trades")
+            self.fetched.lock().unwrap().push((start, end));
+            self.reads
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Ok(TradesRead::complete(Vec::new())))
         }
     }
 
     /// Initialise a manager over `client`, with a 1 ms backoff.
     async fn init_flaky(
         client: FlakyAccountClient,
+    ) -> Result<
+        ExecutionManager<
+            futures::stream::Pending<ExecutionRequest<ExchangeIndex, InstrumentIndex>>,
+            FlakyAccountClient,
+        >,
+        ExecutionError,
+    > {
+        init_flaky_recovering(client, FillRecoveryConfig::default()).await
+    }
+
+    /// As [`init_flaky`], with `fill_recovery` for the re-initialisations.
+    async fn init_flaky_recovering(
+        client: FlakyAccountClient,
+        fill_recovery: FillRecoveryConfig,
     ) -> Result<
         ExecutionManager<
             futures::stream::Pending<ExecutionRequest<ExchangeIndex, InstrumentIndex>>,
@@ -972,6 +1103,7 @@ mod tests {
             Arc::new(client),
             AccountEventIndexer::new(Arc::new(map)),
             ReconnectionBackoffPolicy::new(1, 1, 1),
+            fill_recovery,
         )
         .await
         .map(|(manager, _events)| manager)
@@ -1025,6 +1157,137 @@ mod tests {
                 snapshot(),
             ]
         );
+    }
+
+    fn missed_trade(id: &str, secs: i64) -> Trade<AssetNameExchange, InstrumentNameExchange> {
+        Trade::new(
+            TradeId::new(id),
+            OrderId::new("o"),
+            InstrumentNameExchange::new("btc_usdt"),
+            StrategyId::unknown(),
+            DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap(),
+            Side::Buy,
+            dec!(1),
+            dec!(1),
+            None,
+            AssetFees::new(AssetNameExchange::from("usdt"), dec!(0), None),
+        )
+    }
+
+    fn live_trade(id: &str, secs: i64) -> UnindexedAccountEvent {
+        UnindexedAccountEvent {
+            exchange: EXCHANGE,
+            kind: AccountEventKind::Trade(missed_trade(id, secs)),
+        }
+    }
+
+    /// One word per event: what a test about order and content needs to see.
+    fn describe(event: &AccountStreamEvent) -> String {
+        match event {
+            AccountStreamEvent::Reconnecting(_) => "reconnecting".to_owned(),
+            AccountStreamEvent::Item(event) => match &event.kind {
+                AccountEventKind::Snapshot(_) => "snapshot".to_owned(),
+                AccountEventKind::Trade(trade) => format!("trade {}", trade.id.0),
+                AccountEventKind::FillRecoveryGaveUp(gap) => format!("gap {}", gap.reason),
+                other => format!("{other:?}"),
+            },
+        }
+    }
+
+    fn at_clock(secs: i64) -> FillRecoveryConfig {
+        FillRecoveryConfig {
+            clock: crate::execution::backfill::Clock::new(move || {
+                DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap()
+            }),
+            ..FillRecoveryConfig::default()
+        }
+    }
+
+    /// The fills read for the span a stream was down come before the snapshot that follows them,
+    /// the read starts at the watermark less the overlap and runs to now, and a fill the new
+    /// stream sends again, read already, is delivered once.
+    #[tokio::test]
+    async fn a_reopened_stream_delivers_the_missed_fills_before_its_snapshot() {
+        let client = FlakyAccountClient {
+            open_from: 1,
+            live: vec![live_trade("b", 20), live_trade("c", 30)],
+            reads: Arc::new(std::sync::Mutex::new(
+                [Ok(TradesRead::complete(vec![
+                    missed_trade("b", 20),
+                    missed_trade("a", 10),
+                ]))]
+                .into(),
+            )),
+            ..FlakyAccountClient::default()
+        };
+        let fetched = Arc::clone(&client.fetched);
+        let Ok(manager) = init_flaky_recovering(client, at_clock(100)).await else {
+            panic!("the first attempt succeeds, so init should too");
+        };
+
+        let events = manager.account_stream.take(6).collect::<Vec<_>>().await;
+
+        assert_eq!(
+            events.iter().map(describe).collect::<Vec<_>>(),
+            [
+                "snapshot",
+                "reconnecting",
+                "trade a",
+                "trade b",
+                "snapshot",
+                "trade c",
+            ]
+        );
+        let at = |secs: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap();
+        // The first open reads nothing; the re-init reads from the watermark less 2 s to now.
+        assert_eq!(*fetched.lock().unwrap(), [(at(98), at(100))]);
+    }
+
+    /// A read that fails does not stop the stream opening: its span is reported and the snapshot
+    /// follows.
+    #[tokio::test]
+    async fn a_failed_read_is_reported_as_a_gap_and_the_stream_still_opens() {
+        let client = FlakyAccountClient {
+            open_from: 1,
+            reads: Arc::new(std::sync::Mutex::new(
+                [Err(UnindexedClientError::Connectivity(
+                    ConnectivityError::Timeout,
+                ))]
+                .into(),
+            )),
+            ..FlakyAccountClient::default()
+        };
+        let Ok(manager) = init_flaky_recovering(client, at_clock(100)).await else {
+            panic!("the first attempt succeeds, so init should too");
+        };
+
+        let events = manager.account_stream.take(4).collect::<Vec<_>>().await;
+
+        let words = events.iter().map(describe).collect::<Vec<_>>();
+        assert_eq!(words.len(), 4);
+        assert_eq!(&words[..2], ["snapshot", "reconnecting"]);
+        assert!(words[2].starts_with("gap request failed"), "{words:?}");
+        assert_eq!(words[3], "snapshot");
+    }
+
+    /// A re-init that fails before it delivers anything leaves the watermark where it was, so the
+    /// attempt that succeeds reads the whole span, and a fill is not delivered twice.
+    #[tokio::test]
+    async fn a_failed_reinit_does_not_move_the_read_start() {
+        let client = FlakyAccountClient {
+            fail_on: &[1],
+            open_from: 2,
+            ..FlakyAccountClient::default()
+        };
+        let fetched = Arc::clone(&client.fetched);
+        let Ok(manager) = init_flaky_recovering(client, at_clock(100)).await else {
+            panic!("the first attempt succeeds, so init should too");
+        };
+
+        let _ = manager.account_stream.take(4).collect::<Vec<_>>().await;
+
+        let at = |secs: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap();
+        assert_eq!(*fetched.lock().unwrap(), [(at(98), at(100))]);
     }
 
     /// A re-init the venue refused for a rate limit is not retried before the wait it named,

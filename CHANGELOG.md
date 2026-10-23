@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Fills missed while an account stream was down are read when it reopens** (`rustrade`, #675).
+  `ExecutionManager` reads them with `fetch_trades`, from the last moment it knew it was in sync
+  less an overlap, and delivers them as `Trade` events before the new `Snapshot`, so the snapshot
+  is the state after them. A span it cannot cover (the venue no longer holds the fills, the budget
+  ran out, or a call failed) is reported as `FillRecoveryGaveUp` and the stream still opens. Fills
+  are deduplicated by instrument and trade id across the read, the new stream and earlier
+  streams. `FillRecoveryConfig` sets the overlap, the clock-skew allowance, the time and call
+  budget, the longest span and the clock. `ExecutionBuilder` uses its default.
+- **`TradesRead::held_since`** (`rustrade-execution`, #675). Where a venue's retention limit cuts
+  into the span a `fetch_trades` call read, so a caller can tell fills the venue no longer holds
+  from fills that never happened. Hyperliquid sets it once a wallet's 10,000 retained fills all
+  fall inside the span.
+- **`AccountEventDeduper`** (`rustrade-execution`, #675). The bounded record the clients use to
+  drop a fill delivered twice, now public: clones share one record, keyed by instrument and id.
+- **`FillRecoveryFailure::VenueRetention`, `SpanLimit` and `PageLimit`** (`rustrade-execution`,
+  #675), for spans the venue no longer holds and spans the recovery's budget did not cover.
 - **`ReduceOnlyBook`** (`rustrade-execution`, #689). A public record of which orders were sent
   reduce-only, for whoever needs a fill's flag after the request is gone, such as a tracker that
   cuts a reduce-only fill with `Trade::holding_move`. `register` it when the open request is sent,
@@ -79,6 +95,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: `ExecutionManager::init` takes a `FillRecoveryConfig`** (#675). `TradesRead` gains
+  a `held_since` field; it is `#[non_exhaustive]`, so `TradesRead::new(trades, resume)` and
+  `complete` still build one. `lru` and `parking_lot` are now always dependencies of
+  `rustrade-execution`, for `AccountEventDeduper`.
 - **Breaking:** `InstrumentState::reduce_only_orders` and `retired_reduce_only_orders` are replaced
   by one field, `reduce_only: ReduceOnlyBook` (`rustrade`, #689). A struct literal supplies the
   one field. A state serialised before this loads with an empty book, so the reduce-only flags of
