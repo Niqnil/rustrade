@@ -600,7 +600,7 @@ where
     /// # Venue limits
     ///
     /// `resume: None` covers what the venue still holds, which can be less than the span:
-    /// - IBKR returns the current trading day's executions only.
+    /// - IBKR lists the last 7 days' executions at most.
     /// - Hyperliquid keeps only each wallet's 10,000 most recent fills.
     ///
     /// Binance needs instruments: an empty slice reads nothing. Each client documents its limits.

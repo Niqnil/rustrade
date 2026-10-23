@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`TradesRead::held_since`** (`rustrade-execution`, #675). Where a venue's retention limit cuts
   into the span a `fetch_trades` call read, so a caller can tell fills the venue no longer holds
   from fills that never happened. Hyperliquid sets it once a wallet's 10,000 retained fills all
-  fall inside the span.
+  fall inside the span. IBKR's `fetch_trades` now reads the last 7 days' executions, not only the
+  current day's, and sets it to 6 days ago for a span starting earlier.
 - **`AccountEventDeduper`** (`rustrade-execution`, #675). A public bounded record of the fills
   already delivered, for a consumer that takes the same fill from more than one source. Clones
   share one record, keyed by instrument and trade id. Other event kinds are never reported as
