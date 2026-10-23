@@ -21,10 +21,6 @@ use std::{collections::VecDeque, fmt::Debug, sync::Arc, time::Duration};
 /// The longest the market-driven loop sleeps for a venue deadline in one go, well inside the
 /// longest a tokio timer can wait. A deadline beyond it is waited for in steps.
 const MAX_DEADLINE_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// How far before a deadline, by the venue's clock, a wake for it still counts as due: the timer
-/// and the clock are two sources and can differ by a hair.
-const DEADLINE_TOLERANCE: TimeDelta = TimeDelta::seconds(1);
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{error, info, warn};
@@ -268,9 +264,13 @@ impl MockExchange {
                 .venue
                 .next_deadline()
                 .filter(|deadline| Some(*deadline) != stuck_deadline);
+            // Whether the sleep for the deadline is cut short at the cap, so that waking from it
+            // does not mean the deadline is due.
+            let mut capped = false;
             let deadline_at = deadline.map(|deadline| {
                 // Rebuilt on every pass, so it needs no state of its own and cannot drift.
                 let wait = (deadline - clock.peek()).to_std().unwrap_or(Duration::ZERO);
+                capped = wait > MAX_DEADLINE_WAIT;
                 tokio::time::Instant::now() + wait.min(MAX_DEADLINE_WAIT)
             });
 
@@ -328,8 +328,8 @@ impl MockExchange {
                     // The timer and `clock` are two sources, so the wake can land a hair before the
                     // deadline by `clock`. It is due by the timer, so the venue moves to it.
                     if let Some(deadline) = deadline {
-                        // A deadline further out than the cap woke this loop early: wait again.
-                        if deadline - clock.peek() > DEADLINE_TOLERANCE {
+                        // The cap woke this loop before the deadline: wait again.
+                        if capped {
                             continue;
                         }
                         let now = clock.raise_to(deadline);
@@ -1727,13 +1727,13 @@ mod tests {
         paper.stop().await;
     }
 
-    /// A deadline further out than one sleep can wait is retired at its own instant, not early.
+    /// A deadline further out than a tokio timer can wait is retired at its own instant, not early.
     #[tokio::test(start_paused = true)]
     async fn a_paper_deadline_beyond_the_longest_sleep_is_retired_on_time() {
         let config = spot_config("0", "100000", FeeModelConfig::default());
         let mut paper = Paper::start(config);
         paper.observe(priced("50000"));
-        let expiry = paper.start + TimeDelta::days(3);
+        let expiry = paper.start + TimeDelta::days(3 * 365);
         let started = tokio::time::Instant::now();
 
         paper
@@ -1759,7 +1759,7 @@ mod tests {
             }
         };
         assert_eq!(expired.time_exchange, expiry);
-        assert!(started.elapsed() >= std::time::Duration::from_secs(3 * 24 * 60 * 60));
+        assert!(started.elapsed() >= std::time::Duration::from_secs(3 * 365 * 24 * 60 * 60));
         paper.stop().await;
     }
 }
