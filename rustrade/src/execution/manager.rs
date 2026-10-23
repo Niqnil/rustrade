@@ -709,7 +709,7 @@ where
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
     use crate::execution::request::ExecutionRequest;
@@ -1351,7 +1351,13 @@ mod tests {
             panic!("the first attempt succeeds, so init should too");
         };
 
-        let events = manager.account_stream.take(5).collect::<Vec<_>>().await;
+        // Bounded, so a fill dropped by the retry fails the test rather than hanging it.
+        let events = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.account_stream.take(5).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the retry delivers the fill and the snapshot");
 
         let words = events.iter().map(describe).collect::<Vec<_>>();
         assert_eq!(words[0], "snapshot");

@@ -449,6 +449,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_held_since_less_than_a_millisecond_after_the_start_is_a_gap_of_that_moment() {
+        let held_since = at(0) + chrono::Duration::microseconds(500);
+        let read = TradesRead::complete(vec![]).with_held_since(Some(held_since));
+
+        let (result, _) = run(vec![Ok(read)], 0, &config(100)).await;
+
+        let [gap] = result.gaps.as_slice() else {
+            panic!("one gap, got {:?}", result.gaps)
+        };
+        assert_eq!((gap.start, gap.end), (at(0), at(0)));
+    }
+
+    #[tokio::test]
     async fn a_held_since_at_or_before_the_start_is_no_gap() {
         let read = TradesRead::complete(vec![]).with_held_since(Some(at(0)));
 

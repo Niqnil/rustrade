@@ -21,8 +21,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   into the span a `fetch_trades` call read, so a caller can tell fills the venue no longer holds
   from fills that never happened. Hyperliquid sets it once a wallet's 10,000 retained fills all
   fall inside the span.
-- **`AccountEventDeduper`** (`rustrade-execution`, #675). The bounded record the clients use to
-  drop a fill delivered twice, now public: clones share one record, keyed by instrument and id.
+- **`AccountEventDeduper`** (`rustrade-execution`, #675). A public bounded record of the fills
+  already delivered, for a consumer that takes the same fill from more than one source. Clones
+  share one record, keyed by instrument and trade id. Other event kinds are never reported as
+  duplicates.
 - **`FillRecoveryFailure::VenueRetention`, `SpanLimit` and `PageLimit`** (`rustrade-execution`,
   #675), for spans the venue no longer holds and spans the recovery's budget did not cover.
 - **`ReduceOnlyBook`** (`rustrade-execution`, #689). A public record of which orders were sent
