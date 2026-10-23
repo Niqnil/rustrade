@@ -471,12 +471,15 @@ jobs:
               cat "$out/missed.txt"
               echo '```'
               if [ -f "$out/outcomes.json" ]; then
+                # Four backticks, so a code fence in a diff's context cannot close the block;
+                # at most 20 diffs, because the step summary is capped at 1 MiB.
                 jq -r '.outcomes[] | select(.summary == "MissedMutant") | .diff_path' \
-                  "$out/outcomes.json" |
+                  "$out/outcomes.json" | head -n 20 |
                   while read -r diff; do
-                    echo '```diff'
+                    [ -f "$out/$diff" ] || continue
+                    echo '````diff'
                     cat "$out/$diff"
-                    echo '```'
+                    echo '````'
                   done
               fi
             fi
