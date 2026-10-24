@@ -27,27 +27,13 @@ use rustrade_instrument::{
     index::error::IndexError,
     instrument::{InstrumentIndex, name::InstrumentNameExchange},
 };
-use rustrade_integration::{
-    collection::snapshot::Snapshot,
-    stream::ext::indexed::{IndexedStream, Indexer},
-};
+use rustrade_integration::collection::snapshot::Snapshot;
 use std::sync::Arc;
 use tracing::warn;
-
-pub type IndexedAccountStream<St> = IndexedStream<St, AccountEventIndexer>;
 
 #[derive(Debug, Clone, Constructor)]
 pub struct AccountEventIndexer {
     pub map: Arc<ExecutionInstrumentMap>,
-}
-
-impl Indexer for AccountEventIndexer {
-    type Unindexed = UnindexedAccountEvent;
-    type Indexed = AccountEvent;
-
-    fn index(&self, item: Self::Unindexed) -> Result<Self::Indexed, IndexError> {
-        self.account_event(item)
-    }
 }
 
 /// Why [`AccountEventIndexer::index_account_event`] did not index an event.
