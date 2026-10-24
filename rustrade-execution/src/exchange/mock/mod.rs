@@ -20,7 +20,7 @@ use std::{collections::VecDeque, fmt::Debug, sync::Arc, time::Duration};
 
 /// The longest the market-driven loop sleeps for a venue deadline in one go, well inside the
 /// longest a tokio timer can wait. A deadline beyond it is waited for in steps.
-const MAX_DEADLINE_WAIT: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_DEADLINE_WAIT: Duration = Duration::from_secs(86_400);
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tracing::{error, info, warn};
