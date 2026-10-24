@@ -1,8 +1,4 @@
-use crate::stream::ext::{
-    forward_by::ForwardBy,
-    forward_clone_by::ForwardCloneBy,
-    indexed::{IndexedStream, Indexer},
-};
+use crate::stream::ext::{forward_by::ForwardBy, forward_clone_by::ForwardCloneBy};
 use futures::Stream;
 
 /// Forward matching items, yield non-matching items.
@@ -10,9 +6,6 @@ pub mod forward_by;
 
 /// Forward clones of matching items, yield all items.
 pub mod forward_clone_by;
-
-/// Indexed Stream.
-pub mod indexed;
 
 /// `Stream` extension trait.
 pub trait BarterStreamExt
@@ -43,15 +36,6 @@ where
                     None
                 }
             })
-    }
-
-    /// Indexes the `Stream` using the provided `Indexer`.
-    fn with_index<I>(self, indexer: I) -> IndexedStream<Self, I>
-    where
-        Self: Stream<Item = I::Unindexed> + Sized,
-        I: Indexer,
-    {
-        IndexedStream::new(self, indexer)
     }
 
     /// Forward a subset of `Stream::Item`s.

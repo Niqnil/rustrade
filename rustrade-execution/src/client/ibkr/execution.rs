@@ -500,7 +500,8 @@ pub(super) const EXECUTION_DAYS: i32 = 7;
 /// How far back a read of [`EXECUTION_DAYS`] days of executions surely reaches. Two days short of
 /// the read: IB counts its days in a time zone of its own, whose day can start up to a day after
 /// this host's and shifts by an hour across daylight saving, and whether its count takes in today
-/// is not documented.
+/// is not documented. A paper account listed the previous day's fills for a count of 2 and not
+/// for 1, so in practice the count takes in today.
 pub(super) const EXECUTIONS_COVER: Duration = Duration::from_secs(5 * 24 * 60 * 60);
 
 /// The filter for a read of [`EXECUTION_DAYS`] days of every client's executions.

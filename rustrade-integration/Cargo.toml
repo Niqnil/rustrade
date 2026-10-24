@@ -20,11 +20,11 @@ all-features = true
 default = ["collection", "error", "protocol", "serde", "subscription", "socket", "stream", "corporate-action"]
 full = ["collection", "channel", "error", "metric", "protocol", "serde", "subscription", "socket", "stream", "corporate-action"]
 collection = ["dep:indexmap", "dep:fnv", "dep:itertools", "dep:derive_more"]
-# PULL corporate-action sourcing trait + filter. Needs `stream` (rustrade-instrument descriptor +
-# chrono + futures), `subscription` (smol_str symbol key), and `derive_more` for the `Constructor`
-# derive on `CorporateActionFilter`. `derive_more` also arrives transitively via `stream`, but is
-# listed explicitly so this module's requirement is self-described and survives a `stream` refactor.
-corporate-action = ["stream", "subscription", "dep:derive_more"]
+# PULL corporate-action sourcing trait + filter. Needs `stream` (chrono + futures), `subscription`
+# (smol_str symbol key), `rustrade-instrument` (descriptor), and `derive_more` for the `Constructor`
+# derive on `CorporateActionFilter`. Both are listed explicitly so this module's requirement is
+# self-described and survives a `stream` refactor.
+corporate-action = ["stream", "subscription", "dep:rustrade-instrument", "dep:derive_more"]
 channel = ["dep:tokio", "dep:tokio-stream", "dep:futures", "dep:derive_more", "dep:tracing"]
 error = ["dep:url", "dep:serde_qs", "dep:serde_urlencoded", "dep:thiserror"]
 metric = []
@@ -32,7 +32,7 @@ protocol = ["error", "metric", "serde", "dep:tokio-tungstenite", "dep:reqwest", 
 serde = ["dep:serde_json", "dep:prost", "dep:bytes", "dep:thiserror", "dep:tracing", "dep:chrono"]
 subscription = ["dep:smol_str"]
 socket = ["dep:tokio", "dep:pin-project", "dep:futures"]
-stream = ["dep:tokio-stream", "dep:pin-project", "dep:futures", "dep:rustrade-instrument", "dep:chrono", "dep:derive_more"]
+stream = ["dep:tokio-stream", "dep:pin-project", "dep:futures", "dep:chrono"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }
