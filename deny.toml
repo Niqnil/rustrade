@@ -117,6 +117,15 @@ ignore = [
     # move off rustls 0.21.
     { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.25 has no patched release; reached only via the hyperliquid feature; that rustls 0.21 stack verifies no connection (reqwest 0.11 uses native-tls)" },
     { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.101 has no patched release; reached only via the hyperliquid feature; that rustls 0.21 stack verifies no connection (reqwest 0.11 uses native-tls)" },
+    # crypto-bigint 0.5.5 is pinned by elliptic-curve 0.13 (`^0.5`) under k256 0.13, which ethers
+    # 2.0 uses to sign for the hyperliquid feature; the fix (0.7.6) is a semver-incompatible line,
+    # so only an ethers / hyperliquid_rust_sdk move off that stack removes it. The advisory is about
+    # secret-dependent branching in constant-time operations, so it matters only to a process that
+    # signs with the hyperliquid feature while a local timing observer can watch it. This library
+    # does not expose signing to remote callers, but a consumer that signs on a shared or
+    # multi-tenant host should treat the advisory as open. Drop this ignore, and the ban below,
+    # once ethers or hyperliquid_rust_sdk moves to a crypto-bigint 0.7.6+ stack.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 is pinned by elliptic-curve 0.13 under ethers (hyperliquid feature); the patched 0.7.6 is semver-incompatible; needs a local timing observer of the signing process" },
 ]
 
 # Licenses - strict permissive only
@@ -198,6 +207,11 @@ deny = [
     # two ignores.
     { crate = "rustls-webpki:>=0.102, <0.103.16" },
     { crate = "webpki-roots:>=1.0.0, <1.0.10" },
+
+    # Likewise for RUSTSEC-2026-0387 (crypto-bigint), ignored above by id for the unpatched 0.5
+    # line: this bans every 0.6.x and any 0.7.x below the fixed 0.7.6, so only the 0.5 line is
+    # exempt. Drop it together with that ignore.
+    { crate = "crypto-bigint:>=0.6, <0.7.6" },
 ]
 
 # Sources - only allow crates.io
