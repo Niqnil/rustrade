@@ -15,6 +15,7 @@ use crate::{
     execution::{
         AccountStreamEvent,
         builder::{ExecutionBuildFutures, ExecutionBuilder},
+        paper::{PaperMarketFeed, PaperOptions},
     },
     shutdown::SyncShutdown,
     system::{System, SystemAuxillaryHandles, config::ExecutionConfig},
@@ -23,7 +24,7 @@ use derive_more::Constructor;
 use fnv::FnvHashMap;
 use futures::Stream;
 use rustrade_data::streams::reconnect::stream::ReconnectingStream;
-use rustrade_execution::balance::Balance;
+use rustrade_execution::{balance::Balance, client::mock::MockExecutionConfig};
 use rustrade_instrument::{
     Keyed,
     asset::{AssetIndex, ExchangeAsset, name::AssetNameInternal},
@@ -111,6 +112,7 @@ pub struct SystemBuilder<'a, Clock, Strategy, Risk, MarketStream, GlobalData, Fn
     balances: FnvHashMap<ExchangeAsset<AssetNameInternal>, Balance>,
     positions: Vec<PositionSeed>,
     expiry_handling: FnvHashMap<ExchangeId, ExpiryHandling>,
+    paper_venues: Vec<(MockExecutionConfig, PaperOptions, PaperMarketFeed)>,
 }
 
 impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
@@ -131,6 +133,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             balances: FnvHashMap::default(),
             positions: Vec::new(),
             expiry_handling: FnvHashMap::default(),
+            paper_venues: Vec::new(),
         }
     }
 
@@ -182,6 +185,34 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
     /// execution client in the system, or the deadline is zero.
     pub fn in_flight_deadline(mut self, exchange: ExchangeId, deadline: Option<Duration>) -> Self {
         self.in_flight_deadline_overrides.push((exchange, deadline));
+        self
+    }
+
+    /// Add a paper-trading venue: the simulated venue a backtest uses, trading on a live market.
+    ///
+    /// Registered after [`SystemArgs::executions`], with the system's own clock, through
+    /// [`ExecutionBuilder::add_paper`], which describes the venue. Paper options hold models that
+    /// cannot be serialised, so a paper venue is not an [`ExecutionConfig`] variant: load the
+    /// configuration, then call this.
+    ///
+    /// # Caller obligation
+    /// `feed` must come from [`PaperMarketFeed::tap`] on the very stream passed as
+    /// [`SystemArgs::market_stream`]. The venue sees only the market that tap observes. With
+    /// another stream, or an untapped one, the venue never sees a price, and nothing reports it.
+    ///
+    /// For the same exchange, a second paper venue, or one beside an [`ExecutionConfig`] venue,
+    /// fails the build.
+    ///
+    /// # Errors
+    /// [`build`](Self::build) returns the errors of [`ExecutionBuilder::add_paper`], such as
+    /// `MarketOrderTiming::NextBar` or a zero `options.account_stream_capacity`.
+    pub fn paper_venue(
+        mut self,
+        config: MockExecutionConfig,
+        options: PaperOptions,
+        feed: &PaperMarketFeed,
+    ) -> Self {
+        self.paper_venues.push((config, options, feed.clone()));
         self
     }
 
@@ -274,6 +305,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             balances,
             positions,
             expiry_handling,
+            paper_venues,
         } = self;
 
         // Default if not provided
@@ -282,16 +314,17 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
         let trading_state = trading_state.unwrap_or_default();
 
         // Build Execution infrastructure
-        let execution = executions
+        let execution = executions.into_iter().try_fold(
+            ExecutionBuilder::new(instruments),
+            |builder, config| match config {
+                ExecutionConfig::Mock(mock_config) => builder.add_mock(mock_config, clock.clone()),
+            },
+        )?;
+        let execution = paper_venues
             .into_iter()
-            .try_fold(
-                ExecutionBuilder::new(instruments),
-                |builder, config| match config {
-                    ExecutionConfig::Mock(mock_config) => {
-                        builder.add_mock(mock_config, clock.clone())
-                    }
-                },
-            )?
+            .try_fold(execution, |builder, (config, options, feed)| {
+                builder.add_paper(config, options, clock.clone(), &feed)
+            })?
             .build();
 
         // Read before `execution_tx_map` is moved into the Engine below.
@@ -569,7 +602,11 @@ mod tests {
     };
     use chrono::{DateTime, Utc};
     use rust_decimal::Decimal;
-    use rustrade_execution::{AccountSnapshot, client::mock::MockExecutionConfig};
+    use rustrade_execution::{
+        AccountSnapshot,
+        client::mock::MockExecutionConfig,
+        fill::{MarketOrderTiming, NextBarPrice},
+    };
     use rustrade_instrument::{Side, test_utils::instrument};
 
     /// Prices an instrument nothing is traded on, and has no execution client.
@@ -581,7 +618,11 @@ mod tests {
     type TestState = EngineState<DefaultGlobalData, DefaultInstrumentMarketData>;
 
     fn mock_config(exchange: ExchangeId) -> ExecutionConfig {
-        ExecutionConfig::Mock(MockExecutionConfig {
+        ExecutionConfig::Mock(mock_execution_config(exchange))
+    }
+
+    fn mock_execution_config(exchange: ExchangeId) -> MockExecutionConfig {
+        MockExecutionConfig {
             mocked_exchange: exchange,
             initial_state: AccountSnapshot {
                 exchange,
@@ -597,7 +638,18 @@ mod tests {
             stale_market: Default::default(),
             spot_margin: None,
             fee_asset: None,
-        })
+        }
+    }
+
+    /// A feed tapped from a market stream that yields nothing.
+    fn paper_feed() -> PaperMarketFeed {
+        let (_tap, feed) = PaperMarketFeed::tap(futures::stream::empty::<
+            rustrade_data::streams::consumer::MarketStreamEvent<
+                InstrumentIndex,
+                rustrade_data::event::DataKind,
+            >,
+        >());
+        feed
     }
 
     /// A function pointer rather than a closure, so [`system_args`] can name its type.
@@ -814,6 +866,94 @@ mod tests {
             error,
             BarterError::InFlightDeadline(InFlightDeadlineError::NoExecution(DATA))
         );
+    }
+
+    /// A paper venue is registered like an execution client: its exchange is derived as an
+    /// account-holding venue, and the deadline-free default of the mock clients applies to it.
+    #[test]
+    fn a_paper_venue_registers_an_execution_client() {
+        let instruments = IndexedInstruments::new([
+            instrument(DATA, "xau", "usd"),
+            instrument(EXECUTION, "btc", "usdt"),
+        ]);
+        let paper = instruments.find_exchange_index(DATA).unwrap();
+
+        let system = SystemBuilder::new(system_args(&instruments))
+            .paper_venue(
+                mock_execution_config(DATA),
+                PaperOptions::default(),
+                &paper_feed(),
+            )
+            .build::<EngineEvent, _>()
+            .expect("a paper venue beside a mock one must build");
+
+        let connectivity = &system.engine.state.connectivity;
+        assert_eq!(connectivity.connectivity(&DATA).role(), VenueRole::Both);
+        assert_eq!(
+            connectivity.connectivity(&EXECUTION).role(),
+            VenueRole::Both
+        );
+        assert!(system.engine.in_flight_deadlines().get(paper).is_none());
+    }
+
+    /// A paper venue on an exchange that already has a venue, paper or mock, fails the build
+    /// rather than replacing it.
+    #[test]
+    fn a_paper_venue_on_an_exchange_with_a_venue_fails_the_build() {
+        let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
+        let feed = paper_feed();
+
+        let beside_mock = SystemBuilder::new(system_args(&instruments))
+            .paper_venue(
+                mock_execution_config(EXECUTION),
+                PaperOptions::default(),
+                &feed,
+            )
+            .build::<EngineEvent, _>();
+        assert!(matches!(beside_mock, Err(BarterError::ExecutionBuilder(_))));
+
+        let twice = SystemBuilder::new(SystemArgs {
+            executions: vec![],
+            ..system_args(&instruments)
+        })
+        .paper_venue(
+            mock_execution_config(EXECUTION),
+            PaperOptions::default(),
+            &feed,
+        )
+        .paper_venue(
+            mock_execution_config(EXECUTION),
+            PaperOptions::default(),
+            &feed,
+        )
+        .build::<EngineEvent, _>();
+        assert!(matches!(twice, Err(BarterError::ExecutionBuilder(_))));
+    }
+
+    /// `add_paper`'s refusals surface from [`SystemBuilder::build`].
+    #[test]
+    fn a_refused_paper_venue_fails_the_build() {
+        let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
+        let system_args = || SystemArgs {
+            executions: vec![],
+            ..system_args(&instruments)
+        };
+
+        let mut next_bar = mock_execution_config(EXECUTION);
+        next_bar.market_order_timing = MarketOrderTiming::NextBar(NextBarPrice::Open);
+        let result = SystemBuilder::new(system_args())
+            .paper_venue(next_bar, PaperOptions::default(), &paper_feed())
+            .build::<EngineEvent, _>();
+        assert!(matches!(result, Err(BarterError::ExecutionBuilder(_))));
+
+        let options = PaperOptions {
+            account_stream_capacity: 0,
+            ..PaperOptions::default()
+        };
+        let result = SystemBuilder::new(system_args())
+            .paper_venue(mock_execution_config(EXECUTION), options, &paper_feed())
+            .build::<EngineEvent, _>();
+        assert!(matches!(result, Err(BarterError::ExecutionBuilder(_))));
     }
 
     /// `SystemBuilder` derives the account dimension from the execution clients it registers, so a

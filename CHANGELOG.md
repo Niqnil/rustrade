@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`SystemBuilder::paper_venue(config, options, &feed)`** (`rustrade`, #698). Adds a paper-trading
+  venue (see `ExecutionBuilder::add_paper`) to a system, on the system's own clock. It is a builder
+  method rather than an `ExecutionConfig` variant because `PaperOptions` holds models that cannot
+  be serialised. `feed` must come from `PaperMarketFeed::tap` on the stream passed as
+  `SystemArgs::market_stream`, or the venue never sees a price. A second venue on the same
+  exchange, a `MarketOrderTiming::NextBar` config or a zero account-stream capacity fails
+  `build`.
+
 - **Paper trading on the simulated venue a backtest uses** (`rustrade`, `rustrade-execution`,
   #677). `ExecutionBuilder::add_paper(config, options, clock, &feed)` adds a venue that trades on
   a live market: limit orders rest and fill as the market crosses them, and spot margin, interest,
