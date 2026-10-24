@@ -357,7 +357,7 @@ impl<'a> ExecutionBuilder<'a> {
             .is_some()
         {
             return Err(BarterError::ExecutionBuilder(format!(
-                "ExecutionBuilder does not support duplicate mocked ExecutionManagers: {exchange}"
+                "ExecutionBuilder does not support duplicate mocked or paper ExecutionManagers: {exchange}"
             )));
         }
 
