@@ -192,6 +192,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A multi-venue backtest fed every simulated venue every exchange's market** (`rustrade`,
+  `rustrade-execution`, #699). The runner skipped a venue only when its instrument lookup failed,
+  which never happens because the index holds every exchange's instruments. Two venues listing the
+  same exchange-native name traded on each other's prices, and a resting order could fill on
+  another exchange's tick. A venue now receives only the instruments listed on its own exchange.
+  `ExecutionInstrumentMap::find_own_instrument_name_exchange` answers that question.
 - **The mock client's account stream ended after a lag only once another event arrived**
   (`rustrade-execution`, #677). It delivered the `StreamTerminated` and then waited for the next
   broadcast event, which a quiet venue may never send, so the manager did not reopen it. It now

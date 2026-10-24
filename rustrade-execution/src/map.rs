@@ -191,6 +191,22 @@ impl ExecutionInstrumentMap {
             .map(|instrument| &instrument.name_exchange)
     }
 
+    /// The name this exchange knows `instrument` by, or `None` when the instrument is listed on a
+    /// different exchange.
+    ///
+    /// Unlike [`Self::find_instrument_name_exchange`], which resolves any indexed instrument
+    /// whatever its exchange, this answers "does this exchange trade it?". Use it to decide which
+    /// venue an instrument-keyed event belongs to.
+    pub fn find_own_instrument_name_exchange(
+        &self,
+        instrument: InstrumentIndex,
+    ) -> Option<&InstrumentNameExchange> {
+        self.instruments
+            .get_index(instrument.index())
+            .filter(|listed| listed.exchange.key == self.exchange.key)
+            .map(|listed| &listed.name_exchange)
+    }
+
     /// Find the [`InstrumentIndex`] of the instrument this exchange reports as `instrument`.
     ///
     /// Matches the registered spelling first, and failing that ignores ASCII case, logging the
