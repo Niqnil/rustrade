@@ -209,6 +209,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`AccountEventIndexer::order_request` rejects an instrument listed on another exchange**
+  (`rustrade-execution`, #706). A request keyed to one exchange but naming an instrument of
+  another used to resolve to that instrument's name and be sent to the wrong venue; it now fails
+  with `KeyError::InstrumentKey`, which `ExecutionManager` treats as a set-up error and panics on.
+
 - **An account snapshot with a balance for an unregistered asset failed startup** (`rustrade`,
   `rustrade-execution`, #703). Binance and other venues report every asset on the account, so a
   client that did not filter its balances made `ExecutionManager::init` fail, and every reconnect

@@ -611,6 +611,13 @@ impl AccountEventIndexer {
         rejected(error)
     }
 
+    /// Index an order request for this exchange, resolving its instrument to the name this
+    /// exchange knows it by.
+    ///
+    /// # Errors
+    /// Returns [`KeyError`] when the order's exchange or instrument is not in the map, and when
+    /// the instrument is indexed but listed on a different exchange: a request keyed to another
+    /// exchange's instrument is not this exchange's to send.
     pub fn order_request<Kind>(
         &self,
         order: &OrderEvent<Kind, ExchangeIndex, InstrumentIndex>,
@@ -630,7 +637,15 @@ impl AccountEventIndexer {
         } = order;
 
         let exchange = self.map.find_exchange_id(*exchange)?;
-        let instrument = self.map.find_instrument_name_exchange(*instrument)?;
+        let instrument = self
+            .map
+            .find_own_instrument_name_exchange(*instrument)
+            .ok_or_else(|| {
+                KeyError::InstrumentKey(format!(
+                    "ExecutionInstrumentMap for {} does not contain: {instrument}",
+                    self.map.exchange.value
+                ))
+            })?;
 
         Ok(OrderEvent {
             key: OrderKey {
@@ -929,6 +944,57 @@ mod tests {
             indexer.snapshot_partitioned(other_exchange),
             Err(IndexError::ExchangeIndex(_))
         ));
+    }
+
+    /// An order naming an instrument listed on another exchange does not resolve, though the plain
+    /// instrument lookup would find it.
+    #[test]
+    fn an_order_request_for_another_exchanges_instrument_fails() {
+        use crate::order::id::{ClientOrderId, StrategyId};
+        let instruments = IndexedInstruments::new(vec![
+            test_utils::instrument(ExchangeId::Kraken, "BTC", "USDT"),
+            test_utils::instrument(ExchangeId::BinanceSpot, "BTC", "USDT"),
+        ]);
+        let binance = generate_execution_instrument_map(&instruments, ExchangeId::BinanceSpot)
+            .map(Arc::new)
+            .map(AccountEventIndexer::new)
+            .unwrap();
+        let instrument_on = |exchange| {
+            instruments
+                .find_instrument_index(
+                    exchange,
+                    &test_utils::instrument(exchange, "BTC", "USDT").name_internal,
+                )
+                .unwrap()
+        };
+        let order = |exchange, instrument| OrderEvent {
+            key: OrderKey {
+                exchange,
+                instrument,
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::random(),
+            },
+            state: (),
+        };
+        let binance_index = instruments
+            .find_exchange_index(ExchangeId::BinanceSpot)
+            .unwrap();
+
+        let own = binance
+            .order_request(&order(
+                binance_index,
+                instrument_on(ExchangeId::BinanceSpot),
+            ))
+            .unwrap();
+        assert_eq!(own.key.exchange, ExchangeId::BinanceSpot);
+        assert_eq!(own.key.instrument.as_ref(), "BTC_USDT");
+
+        let foreign =
+            binance.order_request(&order(binance_index, instrument_on(ExchangeId::Kraken)));
+        assert!(
+            matches!(foreign, Err(KeyError::InstrumentKey(_))),
+            "{foreign:?}"
+        );
     }
 
     fn binance_indexer() -> AccountEventIndexer {
