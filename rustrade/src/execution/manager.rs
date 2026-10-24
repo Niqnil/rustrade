@@ -439,13 +439,17 @@ where
     ) -> Result<AccountEvent, AccountStreamInitError> {
         match client.account_snapshot(assets, instruments).await {
             Ok(snapshot) => {
-                let had_balances = !snapshot.balances.is_empty();
                 let partitioned = indexer.snapshot_partitioned(snapshot)?;
                 let (indexed_snapshot, untracked) = (partitioned.snapshot, partitioned.untracked);
+                let untracked: Vec<&str> = untracked
+                    .iter()
+                    .map(|asset| asset.name().as_str())
+                    .collect();
                 if !untracked.is_empty() {
-                    if had_balances && indexed_snapshot.balances.is_empty() {
+                    if indexed_snapshot.balances.is_empty() {
                         // Every balance was dropped: more likely the asset names do not match
-                        // the venue's than a venue holding nothing registered.
+                        // the venue's than an account holding only unregistered assets, though
+                        // that is possible too.
                         error!(
                             ?untracked,
                             "Account snapshot kept no balance: none of its assets is registered \
@@ -1776,7 +1780,7 @@ mod tests {
     }
 
     /// Fetch the indexed account snapshot of a client holding balances for `held`, with the map
-    /// registering `btc` and `usdt` only: the balances kept, and the `(warn, debug, error)` logs.
+    /// registering `btc` and `usdt` only: `(kept, warn, debug, error)`, the balances kept and the logs.
     fn snapshot_balances_kept(held: &[&str]) -> (usize, usize, usize, usize) {
         let instruments = IndexedInstruments::new(vec![instrument(EXCHANGE, "btc", "usdt")]);
         let map = generate_execution_instrument_map(&instruments, EXCHANGE).unwrap();
