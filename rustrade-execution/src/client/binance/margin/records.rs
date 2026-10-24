@@ -101,8 +101,11 @@ impl BinanceMargin {
     ///   does not document which of the two fields holds BNB. Check a converted record before
     ///   relying on its asset.
     /// - [`principal`](CashFlowKind::MarginInterest::principal) is the loan the charge was on.
-    /// - [`rate`](CashFlowKind::MarginInterest::rate) is the rate charged for the period, hourly
-    ///   for an hourly charge, as Binance quotes it.
+    /// - [`rate`](CashFlowKind::MarginInterest::rate) is Binance's `interestRate`, a **daily** rate
+    ///   even on an hourly charge: an hourly charge is about the rate divided by 24 of the
+    ///   principal. Binance's API documentation does not state the unit; it is read off the rates
+    ///   Binance publishes, whose hourly figure is the daily one divided by 24 (BTC's daily rate
+    ///   matches the field, its hourly rate is about 24 times smaller).
     /// - [`id`](CashFlow::id) is Binance's transaction id for the charge.
     ///
     /// The engine adds a flow attributed to an instrument to the carry of its open position only

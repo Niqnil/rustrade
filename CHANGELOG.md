@@ -209,6 +209,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`BinanceMargin::fetch_margin_interest` documents `rate` as a daily rate** (`rustrade-execution`).
+  The method's docs called it the hourly rate for an hourly charge, contradicting
+  `CashFlowKind::MarginInterest::rate`. Binance's `interestRate` is quoted per day even on an hourly
+  charge, so an hourly charge is about `principal x rate / 24`. Documentation only; the value is
+  unchanged.
+
 - **`AccountEventIndexer::order_request` rejects an instrument listed on another exchange**
   (`rustrade-execution`, #706). A request keyed to one exchange but naming an instrument of
   another used to resolve to that instrument's name and be sent to the wrong venue; it now fails
