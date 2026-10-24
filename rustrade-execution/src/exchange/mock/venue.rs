@@ -115,7 +115,7 @@ pub enum VenueRegime {
     /// No market feed: a market order is priced from the snapshot its own request carries, and
     /// nothing can rest, so [`OrderKind::Limit`] is rejected.
     ///
-    /// The regime of [`SimulatedVenue::new`], and what [`MockExchange`](super::MockExchange)
+    /// The regime of [`SimulatedVenue::new`], and what [`MockExchange::new`](super::MockExchange::new)
     /// drives.
     RequestPriced,
 
@@ -123,7 +123,8 @@ pub enum VenueRegime {
     /// matched against that feed later — and **every** fill, market orders included, is priced
     /// from that feed rather than from the snapshot a request carried.
     ///
-    /// The regime of [`SimulatedVenue::new_market_driven`], and what `SimRunner` drives.
+    /// The regime of [`SimulatedVenue::new_market_driven`], and what `SimRunner` and
+    /// [`MockExchange::new_market_driven`](super::MockExchange::new_market_driven) drive.
     MarketDriven,
 }
 
@@ -740,8 +741,9 @@ impl SimulatedVenue {
     /// [`FillModel`] for what an implementation must uphold.
     ///
     /// The model is not part of the configuration, so a serialised configuration no longer says
-    /// what priced the fills: its `fill_model` is unused. A venue that `MockExchange` drives is
-    /// built from its configuration alone, so it takes no custom model.
+    /// what priced the fills: its `fill_model` is unused. A venue that
+    /// [`MockExchange::new`](super::MockExchange::new) drives is built from its configuration
+    /// alone, so it takes no custom model.
     #[must_use]
     pub fn with_fill_model(mut self, model: Arc<dyn FillModel>) -> Self {
         self.fill_model = model;
@@ -1352,10 +1354,13 @@ impl SimulatedVenue {
     ///
     /// # Not every driver supplies this
     /// A venue only has market state if something feeds it one. `SimRunner` does, routing each
-    /// source market event to the venues trading that instrument before the `Engine` sees it.
-    /// `MockExchange` has no market feed and cannot acquire one without re-creating the look-ahead
-    /// hazard that motivated the split, so a venue driven by it reports [`market`](Self::market) as
-    /// `None` forever. That difference is a property of this type, not an accident of wiring.
+    /// source market event to the venues trading that instrument before the `Engine` sees it, and
+    /// so does [`MockExchange::new_market_driven`](super::MockExchange::new_market_driven), from a
+    /// live feed. A request-priced venue, which [`MockExchange::new`](super::MockExchange::new)
+    /// drives, is fed nothing, since a backtest feeding it the market alongside requests would
+    /// re-create the look-ahead hazard that motivated the split, so it reports
+    /// [`market`](Self::market) as `None` forever. That difference is a property of the regime,
+    /// not an accident of wiring.
     ///
     /// # What it prices
     /// Everything this venue fills. It is the market a **resting** order is matched against, the
@@ -2539,7 +2544,7 @@ impl SimulatedVenue {
     ///
     /// [`RequestPriced`](VenueRegime::RequestPriced) has no book at all, so the snapshot the
     /// request carried is its only price source. That is the whole of the difference, and it is why
-    /// `MockExchange`'s results do not move.
+    /// a request-priced `MockExchange`'s results do not move.
     ///
     /// A `MarketDriven` venue that has not been fed this instrument answers `None` rather than
     /// falling back to the request's snapshot. A venue with no market for an instrument cannot fill

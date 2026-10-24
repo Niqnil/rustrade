@@ -25,6 +25,8 @@ pub mod error;
 /// responses.
 pub mod manager;
 
+pub mod paper;
+
 /// Defines an `ExecutionRequest` used by the `Engine` to communicate with an `ExecutionManager`.
 pub mod request;
 

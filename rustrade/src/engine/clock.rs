@@ -68,6 +68,51 @@ impl<Event> Processor<&Event> for LiveClock {
     fn process(&mut self, _: &Event) -> Self::Audit {}
 }
 
+/// Live `Clock` measured on tokio's clock: the wall-clock instant it was created at, plus the
+/// [`tokio::time::Instant`] time elapsed since.
+///
+/// For tests of a live setup, such as paper trading on a
+/// [`PaperMarketFeed`](crate::execution::paper::PaperMarketFeed), under tokio's paused time
+/// (`#[tokio::test(start_paused = true)]`): it moves only as tokio's clock does, so a test that
+/// advances time sees every timer and every stamp move together, where [`LiveClock`] would not move
+/// at all.
+///
+/// It never moves backwards, but after it is created it follows tokio's monotonic clock rather
+/// than the system clock, so it drifts from `Utc::now()` by however the system clock is adjusted
+/// later. Live trading wants [`LiveClock`].
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub struct TokioClock {
+    anchor_time: DateTime<Utc>,
+    anchor_instant: tokio::time::Instant,
+}
+
+impl TokioClock {
+    /// A clock reading `time` now, and moving on with tokio's clock from here.
+    pub fn starting_at(time: DateTime<Utc>) -> Self {
+        Self {
+            anchor_time: time,
+            anchor_instant: tokio::time::Instant::now(),
+        }
+    }
+}
+
+impl EngineClock for TokioClock {
+    /// Saturates at [`DateTime::<Utc>::MAX_UTC`] rather than overflowing, which would take some
+    /// hundreds of thousands of years.
+    fn time(&self) -> DateTime<Utc> {
+        chrono::TimeDelta::from_std(self.anchor_instant.elapsed())
+            .ok()
+            .and_then(|elapsed| self.anchor_time.checked_add_signed(elapsed))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+    }
+}
+
+impl<Event> Processor<&Event> for TokioClock {
+    type Audit = ();
+
+    fn process(&mut self, _: &Event) -> Self::Audit {}
+}
+
 /// Historical `Clock` whose "now" is the `time_exchange` of the most recent event processed.
 ///
 /// [`time`](EngineClock::time) is a pure function of the events replayed so far: it returns that
@@ -484,5 +529,16 @@ mod tests {
             )));
 
         assert_eq!(event.time_exchange(), Some(time));
+    }
+
+    /// A `TokioClock` reads its start, then moves exactly as far as tokio's clock does.
+    #[tokio::test(start_paused = true)]
+    async fn a_tokio_clock_moves_with_tokios_clock() {
+        let start = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
+        let clock = TokioClock::starting_at(start);
+        assert_eq!(clock.time(), start);
+
+        tokio::time::advance(std::time::Duration::from_millis(1_500)).await;
+        assert_eq!(clock.time(), start + chrono::TimeDelta::milliseconds(1_500));
     }
 }
