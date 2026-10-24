@@ -266,7 +266,7 @@ where
             "AccountStream with auto reconnect initialising"
         );
 
-        // Initialise reconnecting IndexedAccountStream (snapshot + updates)
+        // Initialise the reconnecting, indexed account stream (snapshot + updates)
         let client_clone = Arc::clone(&client);
         let indexer_clone = indexer.clone();
         // Shared by every re-initialisation: the closure is `Fn`, and a fill read after one
