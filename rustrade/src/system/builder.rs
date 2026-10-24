@@ -868,6 +868,17 @@ mod tests {
         );
     }
 
+    /// Asserts a failed build is an `ExecutionBuilder` error whose message contains `expected`.
+    fn assert_builder_error<T>(result: Result<T, BarterError>, expected: &str) {
+        match result {
+            Err(BarterError::ExecutionBuilder(message)) => {
+                assert!(message.contains(expected), "{message}");
+            }
+            Err(other) => panic!("expected an ExecutionBuilder error, got {other}"),
+            Ok(_) => panic!("expected the build to fail"),
+        }
+    }
+
     /// A paper venue is registered like an execution client: its exchange is derived as an
     /// account-holding venue, and the deadline-free default of the mock clients applies to it.
     #[test]
@@ -910,7 +921,7 @@ mod tests {
                 &feed,
             )
             .build::<EngineEvent, _>();
-        assert!(matches!(beside_mock, Err(BarterError::ExecutionBuilder(_))));
+        assert_builder_error(beside_mock, "duplicate mocked or paper");
 
         let twice = SystemBuilder::new(SystemArgs {
             executions: vec![],
@@ -927,7 +938,7 @@ mod tests {
             &feed,
         )
         .build::<EngineEvent, _>();
-        assert!(matches!(twice, Err(BarterError::ExecutionBuilder(_))));
+        assert_builder_error(twice, "duplicate mocked or paper");
     }
 
     /// `add_paper`'s refusals surface from [`SystemBuilder::build`].
@@ -944,7 +955,7 @@ mod tests {
         let result = SystemBuilder::new(system_args())
             .paper_venue(next_bar, PaperOptions::default(), &paper_feed())
             .build::<EngineEvent, _>();
-        assert!(matches!(result, Err(BarterError::ExecutionBuilder(_))));
+        assert_builder_error(result, "NextBar");
 
         let options = PaperOptions {
             account_stream_capacity: 0,
@@ -953,7 +964,7 @@ mod tests {
         let result = SystemBuilder::new(system_args())
             .paper_venue(mock_execution_config(EXECUTION), options, &paper_feed())
             .build::<EngineEvent, _>();
-        assert!(matches!(result, Err(BarterError::ExecutionBuilder(_))));
+        assert_builder_error(result, "account_stream_capacity");
     }
 
     /// `SystemBuilder` derives the account dimension from the execution clients it registers, so a
