@@ -142,7 +142,7 @@ pub(super) fn classify_notice(code: i32) -> Option<ConnectivityNotice> {
 /// 1,500,000,000. `ibapi` also copies every execution it receives to the order update stream, including
 /// those answering [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades)
 /// and fill recovery, so the stream worker uses this to skip them. Otherwise each such call would
-/// replay the whole day's fills onto the stream.
+/// replay every execution in its span onto the stream.
 pub(super) fn is_replayed_execution(execution: &ExecutionData) -> bool {
     execution.request_id > 0
 }
@@ -550,6 +550,12 @@ fn retention_gap(
 /// consumer has gone.
 fn report_retention_gap(sink: &EventSink, floor: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     retention_gap(floor, now).is_none_or(|gap| {
+        warn!(
+            since = %gap.start,
+            until = %gap.end,
+            "Part of the IBKR fill gap is older than IB holds executions for and cannot be \
+             recovered: reconcile it from another source"
+        );
         sink.send(UnindexedAccountEvent::new(
             ExchangeId::Ibkr,
             AccountEventKind::FillRecoveryGaveUp(gap),
@@ -692,6 +698,8 @@ impl RecoveryWatcher {
 
     /// Recover the gap from `floor` on.
     fn recover(&self, tracker: &mut GapTracker, floor: DateTime<Utc>) -> Recovery {
+        // Taken before the read: IB's retention applied when it was requested.
+        let requested_at = Utc::now();
         match recover_fills(
             &self.client,
             floor,
@@ -711,7 +719,7 @@ impl RecoveryWatcher {
                         return Recovery::StreamClosed;
                     }
                 }
-                if !report_retention_gap(&self.sink, floor, Utc::now()) {
+                if !report_retention_gap(&self.sink, floor, requested_at) {
                     return Recovery::StreamClosed;
                 }
                 tracker.recovered();
@@ -956,6 +964,23 @@ mod tests {
         assert!(retention_gap(held_since, now).is_none());
         assert!(retention_gap(held_since + chrono::Duration::seconds(1), now).is_none());
         assert!(retention_gap(held_since - chrono::Duration::seconds(1), now).is_some());
+    }
+
+    /// The gap ends the moment before `held_since`, and never before it starts.
+    #[test]
+    fn retention_gap_ends_before_held_since_and_not_before_its_start() {
+        let now = at("2026-10-24T12:00:00Z");
+        let held_since = now - EXECUTIONS_COVER;
+
+        let early = held_since - chrono::Duration::hours(3);
+        let gap = retention_gap(early, now).unwrap();
+        assert_eq!(gap.start, early);
+        assert_eq!(gap.end, held_since - chrono::Duration::milliseconds(1));
+
+        // Less than the 1 ms the end backs off by: the end stays at the start.
+        let just_before = held_since - chrono::Duration::nanoseconds(1);
+        let gap = retention_gap(just_before, now).unwrap();
+        assert_eq!((gap.start, gap.end), (just_before, just_before));
     }
 
     #[test]
