@@ -140,6 +140,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `AccountEventIndexer::index_account_event`, which tells a balance for an unregistered asset
   apart from a lost event, and the `Indexer` impl could not. Call `account_event` or
   `index_account_event` on the indexer directly.
+- **Removed `rustrade_integration::stream::ext::indexed` (`IndexedStream`, `Indexer`) and
+  `BarterStreamExt::with_index`** (`rustrade-integration`, breaking). Nothing used them since the
+  account stream stopped indexing through `Indexer`. Map a stream's items with the combinators of
+  `futures::StreamExt`.
 - **Breaking in behaviour:** `MockExchange` sends every response through its ordered emission
   queue (`rustrade-execution`, #677). A fetch is answered after the account events booked before
   it, so a balance read while a fill is in flight is no longer older than the fill. A cancel's
