@@ -1097,8 +1097,9 @@ where
 /// market — a gap in a feed does not mean the instrument stopped having a price, and a venue that
 /// forgot its market on every reconnect would refuse to match orders it should have matched.
 ///
-/// A venue that does not trade the instrument is skipped: its own index is what decides, so a
-/// runner driving several venues never leaks one venue's instruments into another's view.
+/// A venue whose exchange does not list the instrument is skipped, so a runner driving several
+/// venues never leaks one exchange's prices into another's view, even when both list the same
+/// exchange-native name.
 ///
 /// # A tick-caused fill pays one latency leg, not two
 /// `to_venue` is the delay from the `Engine` issuing a request to the venue acting on it. Nothing
@@ -1142,12 +1143,12 @@ where
     let mut routed = Routed::Now;
 
     for (exchange, slot) in venues.iter_mut() {
-        // `Err` means this venue does not trade the instrument, which is ordinary on a multi-venue
-        // run and not a misconfiguration.
-        let Ok(name) = slot
+        // The index holds every exchange's instruments, so a name lookup alone would succeed for
+        // all of them: only an instrument listed on this venue's own exchange is its to trade.
+        let Some(name) = slot
             .indexer
             .map
-            .find_instrument_name_exchange(event.instrument)
+            .find_own_instrument_name_exchange(event.instrument)
         else {
             continue;
         };
