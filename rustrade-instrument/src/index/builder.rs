@@ -130,6 +130,10 @@ impl IndexedInstrumentsBuilder {
     /// - [`AssetIndex`] values are assigned after sorting, so registering an asset can change the
     ///   indices of others. Resolve indices from the built [`IndexedInstruments`], never hard-code
     ///   them.
+    ///
+    /// A balance a venue reports for an asset that is not registered, by this method or by an
+    /// instrument, is not tracked: the execution manager drops it, logging the first one for each
+    /// asset at `warn!`. Register every asset whose balance matters, such as a fee asset.
     pub fn add_asset(mut self, asset: ExchangeAsset<Asset>) -> Self {
         self.exchanges.push(asset.exchange);
         self.assets.push(asset);

@@ -192,6 +192,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A balance for an unregistered asset was logged at `ERROR` on every event** (`rustrade`,
+  `rustrade-execution`, #693). Binance pushes balances for every asset on the account, so one
+  holding an asset the instrument index does not register, such as BNB held for fees, logged
+  `ExecutionInstrumentMap does not contain` on every fill. The balance is still not tracked, but
+  the first one for each asset on a stream is now a `warn!` naming the asset, and later ones are
+  `debug!`. `AccountEventIndexer::index_account_event` fails with the new `AccountIndexError` to
+  tell this case apart from an event lost to an unregistered exchange, asset or instrument,
+  which stays at `error!`.
 - **A multi-venue backtest fed every simulated venue every exchange's market** (`rustrade`,
   `rustrade-execution`, #699). The runner skipped a venue only when its instrument lookup failed,
   which never happens because the index holds every exchange's instruments. Two venues listing the

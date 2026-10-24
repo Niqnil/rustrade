@@ -50,7 +50,48 @@ impl Indexer for AccountEventIndexer {
     }
 }
 
+/// Why [`AccountEventIndexer::index_account_event`] did not index an event.
+///
+/// [`AccountEventIndexer::account_event`] folds both causes into one [`IndexError`]; this tells
+/// them apart for a caller that treats them differently.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AccountIndexError {
+    /// A balance snapshot or update named an asset the [`ExecutionInstrumentMap`] does not
+    /// register.
+    ///
+    /// Expected rather than a fault: a venue such as Binance pushes balances for every asset on
+    /// the account, including ones the caller never asked to track (BNB held for fees, say). The
+    /// balance is not tracked. An unregistered asset on any other event is still an
+    /// [`Self::Rejected`] error, because that drops ledger data.
+    UntrackedBalance(AssetNameExchange),
+    /// The event named an exchange, asset or instrument the map does not register, and is lost.
+    Rejected(IndexError),
+}
+
 impl AccountEventIndexer {
+    /// Index `event`, telling a balance for an unregistered asset apart from a lost event.
+    ///
+    /// See [`AccountIndexError`]. [`Self::account_event`] is the same indexing with one error.
+    pub fn index_account_event(
+        &self,
+        event: UnindexedAccountEvent,
+    ) -> Result<AccountEvent, AccountIndexError> {
+        let balance_asset = match &event.kind {
+            AccountEventKind::BalanceSnapshot(snapshot) => Some(snapshot.0.asset.clone()),
+            AccountEventKind::BalanceStreamUpdate(update) => Some(update.0.asset.clone()),
+            _ => None,
+        };
+
+        self.account_event(event)
+            .map_err(|error| match (error, balance_asset) {
+                // A balance event reaches no other lookup that can fail on an asset.
+                (IndexError::AssetIndex(_), Some(asset)) => {
+                    AccountIndexError::UntrackedBalance(asset)
+                }
+                (error, _) => AccountIndexError::Rejected(error),
+            })
+    }
+
     pub fn account_event(&self, event: UnindexedAccountEvent) -> Result<AccountEvent, IndexError> {
         let UnindexedAccountEvent { exchange, kind } = event;
 
@@ -770,6 +811,71 @@ mod tests {
         )]);
         let map = generate_execution_instrument_map(&instruments, ExchangeId::BinanceSpot).unwrap();
         AccountEventIndexer::new(Arc::new(map))
+    }
+
+    fn balance_update(asset: &str) -> UnindexedAccountEvent {
+        UnindexedAccountEvent::new(
+            ExchangeId::BinanceSpot,
+            AccountEventKind::BalanceStreamUpdate(Snapshot(AssetBalanceUpdate::new(
+                AssetNameExchange::new(asset),
+                crate::balance::BalanceUpdate::new(rust_decimal::Decimal::ONE, Default::default()),
+                DateTime::<Utc>::MIN_UTC,
+            ))),
+        )
+    }
+
+    #[test]
+    fn a_balance_for_an_unregistered_asset_is_an_untracked_balance_not_a_rejection() {
+        let indexer = binance_indexer();
+
+        assert!(indexer.index_account_event(balance_update("usdt")).is_ok());
+        assert_eq!(
+            indexer.index_account_event(balance_update("bnb")),
+            Err(AccountIndexError::UntrackedBalance(AssetNameExchange::new(
+                "bnb"
+            )))
+        );
+
+        let snapshot = UnindexedAccountEvent::new(
+            ExchangeId::BinanceSpot,
+            AccountEventKind::BalanceSnapshot(Snapshot(AssetBalance::new(
+                AssetNameExchange::new("bnb"),
+                crate::balance::Balance::new(Default::default(), Default::default()),
+                DateTime::<Utc>::MIN_UTC,
+            ))),
+        );
+        assert!(matches!(
+            indexer.index_account_event(snapshot),
+            Err(AccountIndexError::UntrackedBalance(_))
+        ));
+    }
+
+    #[test]
+    fn an_unregistered_asset_on_any_other_event_is_still_a_rejection() {
+        let indexer = binance_indexer();
+        let cash_flow = UnindexedAccountEvent::new(
+            ExchangeId::BinanceSpot,
+            AccountEventKind::CashFlow(CashFlow {
+                kind: crate::cash_flow::CashFlowKind::Rebate,
+                asset: AssetNameExchange::new("bnb"),
+                amount: rust_decimal::Decimal::ONE,
+                instrument: None,
+                time_exchange: DateTime::<Utc>::MIN_UTC,
+                id: None,
+            }),
+        );
+        assert!(matches!(
+            indexer.index_account_event(cash_flow),
+            Err(AccountIndexError::Rejected(IndexError::AssetIndex(_)))
+        ));
+
+        // A balance on an exchange the map does not hold fails on the exchange, not the asset.
+        let mut wrong_exchange = balance_update("bnb");
+        wrong_exchange.exchange = ExchangeId::Kraken;
+        assert!(matches!(
+            indexer.index_account_event(wrong_exchange),
+            Err(AccountIndexError::Rejected(IndexError::ExchangeIndex(_)))
+        ));
     }
 
     /// `StreamTerminated` carries no asset/instrument keys, so it must index by mapping only the
