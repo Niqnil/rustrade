@@ -117,7 +117,8 @@
 //!
 //! 1. **Fill reconciliation**: when fill recovery fails repeatedly, the stream reports the
 //!    gap as `AccountEventKind::FillRecoveryGaveUp` and stays open. Read the gap's fills
-//!    with [`ExecutionClient::fetch_trades`].
+//!    with [`ExecutionClient::fetch_trades`]. A `VenueRetention` gap is the part IB no longer
+//!    holds: `fetch_trades` cannot read it, so reconcile it from another source.
 //! 2. **Permanent disconnect**: when `ibapi` gives up reconnecting,
 //!    [`IbkrClient::disconnect`] is called, or TWS/Gateway ends the API session,
 //!    `account_stream` ends with `StreamTerminated`, and `account_stream` on the
@@ -2558,7 +2559,7 @@ impl ExecutionClient for IbkrClient {
     /// `StreamTerminated`. TWS does not resend what it sent while the socket was
     /// down, and TWS losing its own link to IB's servers (notice 1100) opens the
     /// same kind of gap. Once delivery is restored, this stream asks TWS for the
-    /// day's executions and emits the ones from the gap as `Trade` events. The
+    /// last seven days of executions and emits the ones from the gap as `Trade` events. The
     /// gap is taken to start up to a poll interval before the drop was noticed,
     /// minus a lookback margin. Trades the stream already delivered are not
     /// emitted twice. The log line `Recovered IBKR fills after a gap in event
@@ -2569,6 +2570,12 @@ impl ExecutionClient for IbkrClient {
     /// `AccountEventKind::FillRecoveryGaveUp` covering every instrument, from the
     /// start of the gap to when it gave up, and stays open. Read that span with
     /// [`ExecutionClient::fetch_trades`].
+    ///
+    /// A gap that starts before the span IB surely holds (see `fetch_trades`' `held_since`) is
+    /// reported too, even though the read succeeds: after the recovered trades, one
+    /// `FillRecoveryGaveUp` with `FillRecoveryFailure::VenueRetention` covers the part before
+    /// that span, ending the moment before `held_since`. `fetch_trades` cannot read that part
+    /// either, so reconcile it from another source.
     ///
     /// **Orders that ended during the gap.** After the fills, recovered or given
     /// up, the stream checks how each order the client holds as live ended:

@@ -215,6 +215,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   charge, so an hourly charge is about `principal x rate / 24`. Documentation only; the value is
   unchanged.
 
+- **IBKR fill recovery lost the fills from before IB's midnight** (`rustrade-execution`, #696).
+  The read after a gap asked TWS for the current day's executions only, so a gap spanning IB's
+  daily restart recovered nothing from the day before, and reported no failure. It now reads the
+  last seven days, and when the gap starts before the part of that span IB surely holds (five
+  days), it sends a `FillRecoveryGaveUp` with `FillRecoveryFailure::VenueRetention` for the part
+  before it, after the recovered trades.
+
 - **`AccountEventIndexer::order_request` rejects an instrument listed on another exchange**
   (`rustrade-execution`, #706). A request keyed to one exchange but naming an instrument of
   another used to resolve to that instrument's name and be sent to the wrong venue; it now fails
