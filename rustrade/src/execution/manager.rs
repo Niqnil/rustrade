@@ -439,7 +439,26 @@ where
     ) -> Result<AccountEvent, AccountStreamInitError> {
         match client.account_snapshot(assets, instruments).await {
             Ok(snapshot) => {
-                let indexed_snapshot = indexer.snapshot(snapshot)?;
+                let had_balances = !snapshot.balances.is_empty();
+                let partitioned = indexer.snapshot_partitioned(snapshot)?;
+                let (indexed_snapshot, untracked) = (partitioned.snapshot, partitioned.untracked);
+                if !untracked.is_empty() {
+                    if had_balances && indexed_snapshot.balances.is_empty() {
+                        // Every balance was dropped: more likely the asset names do not match
+                        // the venue's than a venue holding nothing registered.
+                        error!(
+                            ?untracked,
+                            "Account snapshot kept no balance: none of its assets is registered \
+                             in the ExecutionInstrumentMap"
+                        );
+                    } else {
+                        warn!(
+                            ?untracked,
+                            "Account snapshot balances dropped for assets the \
+                             ExecutionInstrumentMap does not register"
+                        );
+                    }
+                }
                 Ok(AccountEvent {
                     exchange: indexer.map.exchange.key,
                     kind: AccountEventKind::Snapshot(indexed_snapshot),
@@ -1086,6 +1105,8 @@ mod tests {
         ending: Vec<UnindexedAccountEvent>,
         /// The account snapshot calls that fail, counted from 0.
         snapshot_fail_on: &'static [usize],
+        /// The assets the account snapshot holds a balance for.
+        snapshot_balances: Vec<AssetNameExchange>,
         snapshots: Arc<std::sync::atomic::AtomicUsize>,
         /// The answers `fetch_trades` gives, in turn; an empty read once they run out.
         reads: Arc<
@@ -1125,7 +1146,20 @@ mod tests {
                     ConnectivityError::Timeout,
                 ));
             }
-            Ok(UnindexedAccountSnapshot::new(EXCHANGE, vec![], vec![]))
+            Ok(UnindexedAccountSnapshot::new(
+                EXCHANGE,
+                self.snapshot_balances
+                    .iter()
+                    .map(|asset| {
+                        AssetBalance::new(
+                            asset.clone(),
+                            rustrade_execution::balance::Balance::new(dec!(1), dec!(1)),
+                            DateTime::<Utc>::MIN_UTC,
+                        )
+                    })
+                    .collect(),
+                vec![],
+            ))
         }
 
         async fn account_stream(
@@ -1689,12 +1723,9 @@ mod tests {
         assert_eq!(options.clock.now(), at_clock(5).now());
     }
 
-    /// Index `events` through `index_account_stream`, returning how many events came out and how
-    /// many `WARN`, `DEBUG` and `ERROR` events it logged: `(indexed, warn, debug, error)`.
-    fn index_and_count_logs(
-        indexer: AccountEventIndexer,
-        events: Vec<UnindexedAccountEvent>,
-    ) -> (usize, usize, usize, usize) {
+    /// Run `f`, returning its result and how many `WARN`, `DEBUG` and `ERROR` events it logged:
+    /// `(result, warn, debug, error)`.
+    fn with_log_counts<R>(f: impl FnOnce() -> R) -> (R, usize, usize, usize) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tracing_subscriber::layer::SubscriberExt;
 
@@ -1719,22 +1750,72 @@ mod tests {
 
         let counts = Counts::default();
         // Thread-local, so tests running in parallel are not counted.
-        let indexed = tracing::subscriber::with_default(
+        let result = tracing::subscriber::with_default(
             tracing_subscriber::registry().with(counts.clone()),
-            || {
-                futures::executor::block_on(
-                    ExecutionManager::<
-                        futures::stream::Pending<ExecutionRequest<ExchangeIndex, InstrumentIndex>>,
-                        RejectingClient,
-                    >::index_account_stream(
-                        futures::stream::iter(events), indexer
-                    )
-                    .count(),
-                )
-            },
+            f,
         );
         let [warn, debug, error] = counts.0.each_ref().map(|n| n.load(Ordering::Relaxed));
-        (indexed, warn, debug, error)
+        (result, warn, debug, error)
+    }
+
+    /// Index `events` through `index_account_stream`, returning how many events came out and how
+    /// many `WARN`, `DEBUG` and `ERROR` events it logged: `(indexed, warn, debug, error)`.
+    fn index_and_count_logs(
+        indexer: AccountEventIndexer,
+        events: Vec<UnindexedAccountEvent>,
+    ) -> (usize, usize, usize, usize) {
+        with_log_counts(|| {
+            futures::executor::block_on(
+                ExecutionManager::<
+                    futures::stream::Pending<ExecutionRequest<ExchangeIndex, InstrumentIndex>>,
+                    RejectingClient,
+                >::index_account_stream(futures::stream::iter(events), indexer)
+                .count(),
+            )
+        })
+    }
+
+    /// Fetch the indexed account snapshot of a client holding balances for `held`, with the map
+    /// registering `btc` and `usdt` only: the balances kept, and the `(warn, debug, error)` logs.
+    fn snapshot_balances_kept(held: &[&str]) -> (usize, usize, usize, usize) {
+        let instruments = IndexedInstruments::new(vec![instrument(EXCHANGE, "btc", "usdt")]);
+        let map = generate_execution_instrument_map(&instruments, EXCHANGE).unwrap();
+        let indexer = AccountEventIndexer::new(Arc::new(map));
+        let client = Arc::new(FlakyAccountClient {
+            snapshot_balances: held.iter().map(|a| AssetNameExchange::new(*a)).collect(),
+            ..Default::default()
+        });
+        with_log_counts(|| {
+            let event = futures::executor::block_on(ExecutionManager::<
+                futures::stream::Pending<ExecutionRequest<ExchangeIndex, InstrumentIndex>>,
+                FlakyAccountClient,
+            >::fetch_indexed_account_snapshot(
+                &client, &indexer, &[], &[]
+            ))
+            .unwrap();
+            let AccountEventKind::Snapshot(snapshot) = event.kind else {
+                panic!("expected a snapshot");
+            };
+            snapshot.balances.len()
+        })
+    }
+
+    #[test]
+    fn a_snapshot_drops_an_unregistered_balance_with_one_warning() {
+        // The registered balances are kept; bnb and sol are named in a single warning.
+        assert_eq!(
+            snapshot_balances_kept(&["usdt", "bnb", "btc", "sol"]),
+            (2, 1, 0, 0)
+        );
+        // Nothing to drop, nothing logged.
+        assert_eq!(snapshot_balances_kept(&["usdt", "btc"]), (2, 0, 0, 0));
+        // An account holding nothing is not a mismatch.
+        assert_eq!(snapshot_balances_kept(&[]), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn a_snapshot_that_keeps_no_balance_is_an_error() {
+        assert_eq!(snapshot_balances_kept(&["bnb", "sol"]), (0, 0, 0, 1));
     }
 
     #[test]
