@@ -209,6 +209,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`BinanceMargin::fetch_margin_interest` documents `rate` as a daily rate** (`rustrade-execution`).
+  The method's docs called it the hourly rate for an hourly charge, contradicting
+  `CashFlowKind::MarginInterest::rate`. Binance's `interestRate` is quoted per day even on an hourly
+  charge, so an hourly charge is about `principal x rate / 24`. Documentation only; the value is
+  unchanged.
+
 - **IBKR fill recovery lost the fills from before IB's midnight** (`rustrade-execution`, #696).
   The read after a gap asked TWS for the current day's executions only, so a gap spanning IB's
   daily restart recovered nothing from the day before, and reported no failure. It now reads the
