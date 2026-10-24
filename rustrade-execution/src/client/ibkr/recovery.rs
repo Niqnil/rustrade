@@ -11,8 +11,8 @@
 //! 1. It samples [`Client::is_connected`] and drains the globally routed notice stream every
 //!    [`POLL_INTERVAL`], estimating when a gap started ([`GapTracker`]).
 //! 2. When the gap closes, meaning `ibapi`'s [`TRANSPORT_RECONNECT_CODE`] notice or TWS's
-//!    1101/1102, it asks TWS for the day's executions and keeps those from the start of the gap
-//!    on ([`RecoveredFills`]).
+//!    1101/1102, it asks TWS for the last seven days of executions and keeps those from the start of the
+//!    gap on ([`RecoveredFills`]).
 //! 3. It emits them through the stream's [`EventSink`], which drops every trade already delivered
 //!    and reports a correction as one.
 //!
@@ -32,7 +32,10 @@
 use super::{
     ListingLock,
     ended_orders::{EarlierCompletions, EndedOrderReader, release_ended},
-    execution::{ExecutionBuffer, ExecutionRevision, ExecutionScope, revision_of},
+    execution::{
+        ExecutionBuffer, ExecutionRevision, ExecutionScope, executions_filter,
+        executions_held_since, revision_of,
+    },
     listed_cids,
     order::{OrderIdMap, PendingCancels},
     resolve_execution,
@@ -57,7 +60,7 @@ use fnv::FnvHashSet;
 use ibapi::{
     TRANSPORT_RECONNECT_CODE,
     client::blocking::{Client, NoticeStream},
-    orders::{ExecutionData, ExecutionFilter, Executions},
+    orders::{ExecutionData, Executions},
     subscriptions::SubscriptionItem,
 };
 use lru::LruCache;
@@ -526,7 +529,36 @@ impl<'a> RecoveredFills<'a> {
     }
 }
 
-/// Ask TWS for the day's executions and return the fills from `floor` on.
+/// The part of a gap from `floor` that a read at `now` surely does not reach back to, as a gap
+/// to report, if any. The read succeeded, so the fills it lists are sent either way, but those
+/// before the start of IB's retention may be missing from it.
+fn retention_gap(
+    floor: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Option<FillRecoveryGap<InstrumentNameExchange>> {
+    let held_since = executions_held_since(floor, now)?;
+    Some(FillRecoveryGap::new(
+        FillRecoveryScope::AllInstruments,
+        floor,
+        (held_since - chrono::Duration::milliseconds(1)).max(floor),
+        1,
+        FillRecoveryFailure::VenueRetention { held_since },
+    ))
+}
+
+/// Send the gap [`retention_gap`] finds, if any. Returns `false` once the stream has ended or the
+/// consumer has gone.
+fn report_retention_gap(sink: &EventSink, floor: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    retention_gap(floor, now).is_none_or(|gap| {
+        sink.send(UnindexedAccountEvent::new(
+            ExchangeId::Ibkr,
+            AccountEventKind::FillRecoveryGaveUp(gap),
+        ))
+    })
+}
+
+/// Ask TWS for the last [`EXECUTION_DAYS`](super::execution::EXECUTION_DAYS) days of executions
+/// and return the fills from `floor` on.
 fn recover_fills(
     client: &Client,
     floor: DateTime<Utc>,
@@ -535,12 +567,13 @@ fn recover_fills(
     pending: &ExecutionBuffer,
     sink: &EventSink,
 ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, RecoveryError> {
-    // No server-side filter. Not on time: TWS reads `ExecutionFilter::time` in a zone of its own
-    // choosing. A day's executions are few, and `RecoveredFills` applies the window. Not on the
-    // client either: `scope` reports a liquidation of another client's order whatever it is set
+    // A day count and nothing else, since with none TWS lists only the current day's executions
+    // and a gap across its midnight would lose the fills before it. Not on time: TWS reads
+    // `ExecutionFilter::time` in a zone of its own choosing, so `RecoveredFills` applies the
+    // window. Not on the client either: `scope` reports a liquidation of another client's order whatever it is set
     // to, so which executions are reported is decided by `ExecutionScope::classify`.
     let subscription = client
-        .executions(ExecutionFilter::default())
+        .executions(executions_filter())
         .map_err(RecoveryError::Ibapi)?;
     let deadline = Instant::now() + RECOVERY_TIMEOUT;
     let mut fills = RecoveredFills::new(floor, scope, contracts);
@@ -678,6 +711,9 @@ impl RecoveryWatcher {
                         return Recovery::StreamClosed;
                     }
                 }
+                if !report_retention_gap(&self.sink, floor, Utc::now()) {
+                    return Recovery::StreamClosed;
+                }
                 tracker.recovered();
                 Recovery::Done
             }
@@ -780,6 +816,7 @@ fn observe_notice(tracker: &mut GapTracker, notice: &ibapi::Notice) {
 mod tests {
     use super::*;
     use crate::client::dedup::new_dedup_cache;
+    use crate::client::ibkr::execution::EXECUTIONS_COVER;
     use ibapi::{
         contracts::Contract,
         orders::{CommissionReport, Execution},
@@ -894,6 +931,50 @@ mod tests {
             tracker.recovery_floor(true),
             Some(at("2026-09-29T14:01:00Z") - RECOVERY_LOOKBACK)
         );
+    }
+
+    #[test]
+    fn retention_gap_starts_at_the_floor_and_ends_before_the_cover() {
+        let now = at("2026-10-24T12:00:00Z");
+        let held_since = now - EXECUTIONS_COVER;
+        let floor = held_since - chrono::Duration::hours(3);
+        let gap = retention_gap(floor, now).unwrap();
+        assert_eq!(gap.start, floor);
+        assert_eq!(gap.end, held_since - chrono::Duration::milliseconds(1));
+        assert_eq!(gap.attempts, 1);
+        assert_eq!(gap.scope, FillRecoveryScope::AllInstruments);
+        assert!(matches!(
+            gap.reason,
+            FillRecoveryFailure::VenueRetention { held_since: h } if h == held_since
+        ));
+    }
+
+    #[test]
+    fn retention_gap_is_absent_when_the_cover_reaches_the_floor() {
+        let now = at("2026-10-24T12:00:00Z");
+        let held_since = now - EXECUTIONS_COVER;
+        assert!(retention_gap(held_since, now).is_none());
+        assert!(retention_gap(held_since + chrono::Duration::seconds(1), now).is_none());
+        assert!(retention_gap(held_since - chrono::Duration::seconds(1), now).is_some());
+    }
+
+    #[test]
+    fn retention_gap_is_sent_and_reports_a_closed_stream() {
+        let now = at("2026-10-24T12:00:00Z");
+        let old = now - EXECUTIONS_COVER - chrono::Duration::hours(1);
+        let (sink, mut rx) = sink();
+        assert!(report_retention_gap(&sink, now, now));
+        assert!(drain(&mut rx).is_empty());
+        assert!(report_retention_gap(&sink, old, now));
+        let events = drain(&mut rx);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0].kind,
+            AccountEventKind::FillRecoveryGaveUp(_)
+        ));
+        drop(rx);
+        assert!(!report_retention_gap(&sink, old, now));
+        assert!(report_retention_gap(&sink, now, now));
     }
 
     #[test]

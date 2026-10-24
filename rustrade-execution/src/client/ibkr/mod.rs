@@ -2558,7 +2558,7 @@ impl ExecutionClient for IbkrClient {
     /// `StreamTerminated`. TWS does not resend what it sent while the socket was
     /// down, and TWS losing its own link to IB's servers (notice 1100) opens the
     /// same kind of gap. Once delivery is restored, this stream asks TWS for the
-    /// day's executions and emits the ones from the gap as `Trade` events. The
+    /// last seven days of executions and emits the ones from the gap as `Trade` events. The
     /// gap is taken to start up to a poll interval before the drop was noticed,
     /// minus a lookback margin. Trades the stream already delivered are not
     /// emitted twice. The log line `Recovered IBKR fills after a gap in event

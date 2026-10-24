@@ -197,6 +197,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **IBKR fill recovery lost the fills from before IB's midnight** (`rustrade-execution`, #696).
+  The read after a gap asked TWS for the current day's executions only, so a gap spanning IB's
+  daily restart recovered nothing from the day before, and reported no failure. It now reads the
+  last seven days, and when the gap starts before the part of that span IB surely holds (five
+  days), it sends a `FillRecoveryGaveUp` with `FillRecoveryFailure::VenueRetention` for the part
+  before it, after the recovered trades.
+
 - **A balance for an unregistered asset was logged at `ERROR` on every event** (`rustrade`,
   `rustrade-execution`, #693). Binance pushes balances for every asset on the account, so one
   holding an asset the instrument index does not register, such as BNB held for fees, logged
