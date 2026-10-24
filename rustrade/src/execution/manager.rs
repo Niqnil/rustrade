@@ -500,10 +500,7 @@ where
                     None
                 }
                 Err(AccountIndexError::Rejected(error)) => {
-                    error!(
-                        ?error,
-                        "filtered IndexError produced by IndexedAccountStream"
-                    );
+                    error!(?error, "dropped an account event the indexer rejected");
                     None
                 }
             })
@@ -1742,7 +1739,10 @@ mod tests {
 
     #[test]
     fn a_balance_for_an_unregistered_asset_warns_once_per_asset_then_logs_at_debug() {
-        use rustrade_execution::balance::{AssetBalanceUpdate, BalanceUpdate};
+        use rustrade_execution::{
+            balance::{AssetBalanceUpdate, Balance, BalanceUpdate},
+            cash_flow::{CashFlow, CashFlowKind},
+        };
 
         let instruments = IndexedInstruments::new(vec![instrument(EXCHANGE, "btc", "usdt")]);
         let map = generate_execution_instrument_map(&instruments, EXCHANGE).unwrap();
@@ -1758,6 +1758,27 @@ mod tests {
             )
         };
 
+        let snapshot = UnindexedAccountEvent::new(
+            EXCHANGE,
+            AccountEventKind::BalanceSnapshot(Snapshot(AssetBalance::new(
+                AssetNameExchange::new("sol"),
+                Balance::new(dec!(1), dec!(1)),
+                DateTime::<Utc>::MIN_UTC,
+            ))),
+        );
+        // A cash flow in an unregistered asset loses ledger data, so it stays an error.
+        let cash_flow = UnindexedAccountEvent::new(
+            EXCHANGE,
+            AccountEventKind::CashFlow(CashFlow::new(
+                CashFlowKind::Rebate,
+                AssetNameExchange::new("bnb"),
+                dec!(1),
+                None,
+                DateTime::<Utc>::MIN_UTC,
+                None,
+            )),
+        );
+
         let (indexed, warn, debug, error) = index_and_count_logs(
             indexer,
             vec![
@@ -1766,13 +1787,15 @@ mod tests {
                 update("usdt"),
                 update("bnb"),
                 update("eth"),
+                snapshot,
+                cash_flow,
             ],
         );
 
         assert_eq!(indexed, 1, "only the registered asset's balance is kept");
-        assert_eq!(warn, 2, "one warning for each of bnb and eth");
+        assert_eq!(warn, 3, "one warning for each of bnb, eth and sol");
         assert_eq!(debug, 2, "the repeats of bnb are logged at debug");
-        assert_eq!(error, 0);
+        assert_eq!(error, 1, "the cash flow is still an error");
     }
 
     #[test]
