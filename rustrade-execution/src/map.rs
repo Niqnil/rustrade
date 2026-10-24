@@ -192,7 +192,7 @@ impl ExecutionInstrumentMap {
     }
 
     /// The name this exchange knows `instrument` by, or `None` when the instrument is listed on a
-    /// different exchange.
+    /// different exchange or `instrument` is not indexed. The two are not told apart.
     ///
     /// Unlike [`Self::find_instrument_name_exchange`], which resolves any indexed instrument
     /// whatever its exchange, this answers "does this exchange trade it?". Use it to decide which
@@ -419,6 +419,32 @@ mod tests {
             .unwrap();
 
         assert_eq!(usdc_usdt_exchange_name, &usdc_usdt.name_exchange);
+    }
+
+    #[test]
+    fn test_find_own_instrument_name_exchange() {
+        let instruments = indexed_instruments();
+        let kraken = generate_execution_instrument_map(&instruments, ExchangeId::Kraken).unwrap();
+        let usdc_usdt = test_utils::instrument(ExchangeId::Kraken, "USDC", "USDT");
+        let own = instruments
+            .find_instrument_index(ExchangeId::Kraken, &usdc_usdt.name_internal)
+            .unwrap();
+        let binance = test_utils::instrument(ExchangeId::BinanceSpot, "BTC", "ETH");
+        let other = instruments
+            .find_instrument_index(ExchangeId::BinanceSpot, &binance.name_internal)
+            .unwrap();
+
+        assert_eq!(
+            kraken.find_own_instrument_name_exchange(own),
+            Some(&usdc_usdt.name_exchange)
+        );
+        // Indexed, so the plain lookup resolves it, but it is not this exchange's to trade.
+        assert!(kraken.find_instrument_name_exchange(other).is_ok());
+        assert_eq!(kraken.find_own_instrument_name_exchange(other), None);
+        assert_eq!(
+            kraken.find_own_instrument_name_exchange(InstrumentIndex::new(99)),
+            None
+        );
     }
 
     #[test]
