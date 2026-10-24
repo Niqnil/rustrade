@@ -6,6 +6,7 @@ use crate::execution::{
 };
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
+use fnv::FnvHashSet;
 use futures::{
     FutureExt, Stream, StreamExt,
     future::Either,
@@ -21,7 +22,7 @@ use rustrade_execution::{
     AccountEvent, AccountEventKind, UnindexedAccountEvent,
     client::{ExecutionClient, dedup::AccountEventDeduper},
     error::{AccountReinitFailure, AccountStreamInitError, ConnectivityError, OrderError},
-    indexer::{AccountEventIndexer, IndexedAccountStream},
+    indexer::{AccountEventIndexer, AccountIndexError},
     map::ExecutionInstrumentMap,
     order::{
         Order, OrderKey, UnindexedOrderKey,
@@ -44,7 +45,7 @@ use std::{
     fmt::{self, Debug},
     sync::Arc,
 };
-use tracing::{error, info};
+use tracing::{debug, error, info, warn};
 
 /// How an [`ExecutionManager`] keeps its account stream going: how it reconnects, how it reads the
 /// fills missed while the stream was down, and the clock it measures that on.
@@ -265,7 +266,7 @@ where
             "AccountStream with auto reconnect initialising"
         );
 
-        // Initialise reconnecting IndexedAccountStream (snapshot + updates)
+        // Initialise the reconnecting, indexed account stream (snapshot + updates)
         let client_clone = Arc::clone(&client);
         let indexer_clone = indexer.clone();
         // Shared by every re-initialisation: the closure is `Fn`, and a fill read after one
@@ -473,18 +474,33 @@ where
     }
 
     /// Index an unindexed account stream, logging and dropping each event the indexer rejects.
+    ///
+    /// A balance for an asset the map does not register is not a rejection: the first one per
+    /// asset is a `warn!`, naming the asset, and later ones are `debug!`. The set of warned assets
+    /// belongs to the stream, so a reconnected stream warns again.
     fn index_account_stream(
         stream: impl Stream<Item = UnindexedAccountEvent>,
         indexer: AccountEventIndexer,
     ) -> impl Stream<Item = AccountEvent> {
-        IndexedAccountStream::new(stream, indexer).filter_map(|result| {
-            std::future::ready(match result {
+        let mut warned = FnvHashSet::<AssetNameExchange>::default();
+        stream.filter_map(move |event| {
+            std::future::ready(match indexer.index_account_event(event) {
                 Ok(indexed_event) => Some(indexed_event),
-                Err(error) => {
-                    error!(
-                        ?error,
-                        "filtered IndexError produced by IndexedAccountStream"
-                    );
+                Err(AccountIndexError::UntrackedBalance(asset)) => {
+                    if warned.contains(&asset) {
+                        debug!(%asset, "dropped a balance for an asset the map does not register");
+                    } else {
+                        warn!(
+                            %asset,
+                            "dropped a balance for an asset the map does not register; later \
+                             ones for it are logged at debug"
+                        );
+                        warned.insert(asset);
+                    }
+                    None
+                }
+                Err(AccountIndexError::Rejected(error)) => {
+                    error!(?error, "dropped an account event the indexer rejected");
                     None
                 }
             })
@@ -1671,6 +1687,115 @@ mod tests {
         assert_eq!(options.reconnect, reconnect);
         assert_eq!(options.fill_recovery, fill_recovery);
         assert_eq!(options.clock.now(), at_clock(5).now());
+    }
+
+    /// Index `events` through `index_account_stream`, returning how many events came out and how
+    /// many `WARN`, `DEBUG` and `ERROR` events it logged: `(indexed, warn, debug, error)`.
+    fn index_and_count_logs(
+        indexer: AccountEventIndexer,
+        events: Vec<UnindexedAccountEvent>,
+    ) -> (usize, usize, usize, usize) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Default, Clone)]
+        struct Counts([Arc<AtomicUsize>; 3]);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Counts {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let slot = match *event.metadata().level() {
+                    tracing::Level::WARN => 0,
+                    tracing::Level::DEBUG => 1,
+                    tracing::Level::ERROR => 2,
+                    _ => return,
+                };
+                self.0[slot].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let counts = Counts::default();
+        // Thread-local, so tests running in parallel are not counted.
+        let indexed = tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(counts.clone()),
+            || {
+                futures::executor::block_on(
+                    ExecutionManager::<
+                        futures::stream::Pending<ExecutionRequest<ExchangeIndex, InstrumentIndex>>,
+                        RejectingClient,
+                    >::index_account_stream(
+                        futures::stream::iter(events), indexer
+                    )
+                    .count(),
+                )
+            },
+        );
+        let [warn, debug, error] = counts.0.each_ref().map(|n| n.load(Ordering::Relaxed));
+        (indexed, warn, debug, error)
+    }
+
+    #[test]
+    fn a_balance_for_an_unregistered_asset_warns_once_per_asset_then_logs_at_debug() {
+        use rustrade_execution::{
+            balance::{AssetBalanceUpdate, Balance, BalanceUpdate},
+            cash_flow::{CashFlow, CashFlowKind},
+        };
+
+        let instruments = IndexedInstruments::new(vec![instrument(EXCHANGE, "btc", "usdt")]);
+        let map = generate_execution_instrument_map(&instruments, EXCHANGE).unwrap();
+        let indexer = AccountEventIndexer::new(Arc::new(map));
+        let update = |asset: &str| {
+            UnindexedAccountEvent::new(
+                EXCHANGE,
+                AccountEventKind::BalanceStreamUpdate(Snapshot(AssetBalanceUpdate::new(
+                    AssetNameExchange::new(asset),
+                    BalanceUpdate::new(dec!(1), dec!(0)),
+                    DateTime::<Utc>::MIN_UTC,
+                ))),
+            )
+        };
+
+        let snapshot = UnindexedAccountEvent::new(
+            EXCHANGE,
+            AccountEventKind::BalanceSnapshot(Snapshot(AssetBalance::new(
+                AssetNameExchange::new("sol"),
+                Balance::new(dec!(1), dec!(1)),
+                DateTime::<Utc>::MIN_UTC,
+            ))),
+        );
+        // A cash flow in an unregistered asset loses ledger data, so it stays an error.
+        let cash_flow = UnindexedAccountEvent::new(
+            EXCHANGE,
+            AccountEventKind::CashFlow(CashFlow::new(
+                CashFlowKind::Rebate,
+                AssetNameExchange::new("bnb"),
+                dec!(1),
+                None,
+                DateTime::<Utc>::MIN_UTC,
+                None,
+            )),
+        );
+
+        let (indexed, warn, debug, error) = index_and_count_logs(
+            indexer,
+            vec![
+                update("bnb"),
+                update("bnb"),
+                update("usdt"),
+                update("bnb"),
+                update("eth"),
+                snapshot,
+                cash_flow,
+            ],
+        );
+
+        assert_eq!(indexed, 1, "only the registered asset's balance is kept");
+        assert_eq!(warn, 3, "one warning for each of bnb, eth and sol");
+        assert_eq!(debug, 2, "the repeats of bnb are logged at debug");
+        assert_eq!(error, 1, "the cash flow is still an error");
     }
 
     #[test]
