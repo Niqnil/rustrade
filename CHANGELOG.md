@@ -204,6 +204,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   days), it sends a `FillRecoveryGaveUp` with `FillRecoveryFailure::VenueRetention` for the part
   before it, after the recovered trades.
 
+- **An account snapshot with a balance for an unregistered asset failed startup** (`rustrade`,
+  `rustrade-execution`, #703). Binance and other venues report every asset on the account, so a
+  client that did not filter its balances made `ExecutionManager::init` fail, and every reconnect
+  after it report a failed reinit that never recovered. The balance is now left out and the assets
+  are logged once per snapshot at `warn!`. When no balance of a non-empty snapshot is registered,
+  that is an `error!`, as the asset names are then likely to disagree with the venue's. Only
+  top-level balances are skipped: an unregistered exchange, instrument, order or isolated-margin
+  asset still fails the snapshot. New `AccountEventIndexer::snapshot_partitioned` returns the
+  snapshot with the skipped assets, and `ExecutionClient::account_snapshot` documents that a client
+  need not filter.
+
 - **A balance for an unregistered asset was logged at `ERROR` on every event** (`rustrade`,
   `rustrade-execution`, #693). Binance pushes balances for every asset on the account, so one
   holding an asset the instrument index does not register, such as BNB held for fees, logged

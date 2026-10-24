@@ -429,6 +429,12 @@ where
     /// reconnect, and emits the result ahead of the new stream's updates. It is how the engine
     /// catches up on what changed while the stream was down.
     ///
+    /// # Assets
+    ///
+    /// `assets` are the ones the caller registered. Return balances for those only when the venue
+    /// lets you ask, which saves bandwidth. A balance for another asset is not an error: the
+    /// `ExecutionManager` drops it and logs the asset names once per snapshot.
+    ///
     /// # Order completeness
     ///
     /// Each [`InstrumentAccountSnapshot`](crate::InstrumentAccountSnapshot) states through
