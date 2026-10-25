@@ -190,6 +190,13 @@ debug info. Results land in `mutants.out/`, with the missed mutants in `missed.t
 - To narrow a run, mutate one crate with `-p <crate>`. With it, replacing `--cargo-arg=--tests`
   with `--cargo-arg=--test=<file>` runs that one integration test file in place of all of them
   (the crate's unit tests still run).
+- To recheck missed mutants after adding their tests, keep the whole PR's diff: a diff of test
+  code alone gives cargo-mutants nothing to mutate. Select the mutants with `--re` (short
+  form `-F`), a regex matched against the names `--list` prints, for example
+  `--re 'ValueRule::check'`, and run with `--list` first to see what it selects. `-f` is
+  different: a glob over file paths. Match on the function or the change, not the line: CI
+  reports the lines of the PR merged into its base, which differ from the branch's once the
+  base has moved on. The job summary shows each missed mutant's diff for that reason.
 - Never pass `--in-place` locally. CI uses it on a throwaway runner, but it mutates your working
   tree, and a run that is killed part-way can leave a mutant in it.
 

@@ -766,16 +766,13 @@ impl AlgoStrategy for LoseMoneyStrategy {
                         strategy: self.id.clone(),
                         cid: ClientOrderId::random(),
                     },
-                    state: RequestOpen {
-                        side: Side::Buy,
-                        price: None, // Market orders don't have a limit price
-                        quantity: trade_not_sent_as_order_open.amount,
-                        kind: OrderKind::Market,
-                        time_in_force: TimeInForce::ImmediateOrCancel,
-                        position_id: None,
-                        reduce_only: false,
-                        market: None,
-                    },
+                    state: RequestOpen::new(
+                        Side::Buy,
+                        None, // Market orders don't have a limit price
+                        trade_not_sent_as_order_open.amount,
+                        OrderKind::Market,
+                        TimeInForce::ImmediateOrCancel,
+                    ),
                 })
             });
 

@@ -5,14 +5,14 @@ use crate::{
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use fnv::FnvHashMap;
-use ibapi::orders::{CommissionReport, Execution, ExecutionData, ExecutionSide};
+use ibapi::orders::{CommissionReport, Execution, ExecutionData, ExecutionFilter, ExecutionSide};
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, instrument::name::InstrumentNameExchange,
 };
 use smol_str::{SmolStr, format_smolstr};
-use std::{cell::RefCell, collections::hash_map::Entry, sync::Arc};
+use std::{cell::RefCell, collections::hash_map::Entry, sync::Arc, time::Duration};
 use tracing::{debug, warn};
 
 // Thread-local cache for parsed IANA timezones. IB uses per-exchange timezones,
@@ -493,6 +493,36 @@ pub fn parse_ib_timestamp(s: &str) -> Option<DateTime<Utc>> {
     Some(naive.and_utc())
 }
 
+/// How many days of executions a read asks IB for. With no day count, IB lists only the current
+/// day's, so a read across midnight would miss the fills before it.
+pub(super) const EXECUTION_DAYS: i32 = 7;
+
+/// How far back a read of [`EXECUTION_DAYS`] days of executions surely reaches. Two days short of
+/// the read: IB counts its days in a time zone of its own, whose day can start up to a day after
+/// this host's and shifts by an hour across daylight saving, and whether its count takes in today
+/// is not documented. A paper account listed the previous day's fills for a count of 2 and not
+/// for 1, so in practice the count takes in today.
+pub(super) const EXECUTIONS_COVER: Duration = Duration::from_secs(5 * 24 * 60 * 60);
+
+/// The filter for a read of [`EXECUTION_DAYS`] days of every client's executions.
+pub(super) fn executions_filter() -> ExecutionFilter {
+    ExecutionFilter {
+        last_n_days: EXECUTION_DAYS,
+        ..ExecutionFilter::default()
+    }
+}
+
+/// Where IB's retention cuts into a span from `start` read at `now`: the start of
+/// [`EXECUTIONS_COVER`], when the span starts before it. Fills before it may still be listed,
+/// but are not sure to be.
+pub(super) fn executions_held_since(
+    start: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let covered_from = now - EXECUTIONS_COVER;
+    (start < covered_from).then_some(covered_from)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // Test code: panics are the correct failure mode
 mod tests {
@@ -668,5 +698,23 @@ mod tests {
     fn test_parse_ib_timestamp_invalid() {
         assert!(parse_ib_timestamp("invalid").is_none());
         assert!(parse_ib_timestamp("").is_none());
+    }
+
+    #[test]
+    fn executions_held_since_is_the_cover_start_only_when_the_span_starts_before_it() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 23, 9, 0, 0).unwrap();
+        let covered_from = Utc.with_ymd_and_hms(2026, 10, 18, 9, 0, 0).unwrap();
+        let before = covered_from - chrono::TimeDelta::seconds(1);
+        assert_eq!(executions_held_since(before, now), Some(covered_from));
+        assert_eq!(executions_held_since(covered_from, now), None);
+        assert_eq!(executions_held_since(now, now), None);
+    }
+
+    #[test]
+    fn executions_filter_reads_every_client_over_the_execution_days() {
+        let filter = executions_filter();
+        assert_eq!(filter.last_n_days, 7);
+        assert_eq!(filter.client_id, None);
+        assert!(filter.specific_dates.is_empty());
     }
 }

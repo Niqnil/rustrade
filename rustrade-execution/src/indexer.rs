@@ -27,30 +27,68 @@ use rustrade_instrument::{
     index::error::IndexError,
     instrument::{InstrumentIndex, name::InstrumentNameExchange},
 };
-use rustrade_integration::{
-    collection::snapshot::Snapshot,
-    stream::ext::indexed::{IndexedStream, Indexer},
-};
+use rustrade_integration::collection::snapshot::Snapshot;
 use std::sync::Arc;
 use tracing::warn;
-
-pub type IndexedAccountStream<St> = IndexedStream<St, AccountEventIndexer>;
 
 #[derive(Debug, Clone, Constructor)]
 pub struct AccountEventIndexer {
     pub map: Arc<ExecutionInstrumentMap>,
 }
 
-impl Indexer for AccountEventIndexer {
-    type Unindexed = UnindexedAccountEvent;
-    type Indexed = AccountEvent;
+/// Why [`AccountEventIndexer::index_account_event`] did not index an event.
+///
+/// [`AccountEventIndexer::account_event`] folds both causes into one [`IndexError`]; this tells
+/// them apart for a caller that treats them differently.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AccountIndexError {
+    /// A balance snapshot or update named an asset the [`ExecutionInstrumentMap`] does not
+    /// register.
+    ///
+    /// Expected rather than a fault: a venue such as Binance pushes balances for every asset on
+    /// the account, including ones the caller never asked to track (BNB held for fees, say). The
+    /// balance is not tracked. An unregistered asset on any other event is still an
+    /// [`Self::Rejected`] error, because that drops ledger data.
+    UntrackedBalance(AssetNameExchange),
+    /// The event named an exchange, asset or instrument the map does not register, and is lost.
+    Rejected(IndexError),
+}
 
-    fn index(&self, item: Self::Unindexed) -> Result<Self::Indexed, IndexError> {
-        self.account_event(item)
-    }
+/// An indexed [`AccountSnapshot`] and the assets whose balances it left out. See
+/// [`AccountEventIndexer::snapshot_partitioned`], whose caller must report `untracked`.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct PartitionedSnapshot {
+    /// The snapshot, without the balances of the untracked assets.
+    pub snapshot: AccountSnapshot,
+    /// The assets of the skipped balances, in the order the venue reported them.
+    pub untracked: Vec<AssetNameExchange>,
 }
 
 impl AccountEventIndexer {
+    /// Index `event`, telling a balance for an unregistered asset apart from a lost event.
+    ///
+    /// See [`AccountIndexError`]. [`Self::account_event`] is the same indexing with one error.
+    pub fn index_account_event(
+        &self,
+        event: UnindexedAccountEvent,
+    ) -> Result<AccountEvent, AccountIndexError> {
+        let balance_asset = match &event.kind {
+            AccountEventKind::BalanceSnapshot(snapshot) => Some(snapshot.0.asset.clone()),
+            AccountEventKind::BalanceStreamUpdate(update) => Some(update.0.asset.clone()),
+            _ => None,
+        };
+
+        self.account_event(event)
+            .map_err(|error| match (error, balance_asset) {
+                // A balance event reaches no other lookup that can fail on an asset.
+                (IndexError::AssetIndex(_), Some(asset)) => {
+                    AccountIndexError::UntrackedBalance(asset)
+                }
+                (error, _) => AccountIndexError::Rejected(error),
+            })
+    }
+
     pub fn account_event(&self, event: UnindexedAccountEvent) -> Result<AccountEvent, IndexError> {
         let UnindexedAccountEvent { exchange, kind } = event;
 
@@ -100,10 +138,56 @@ impl AccountEventIndexer {
         Ok(AccountEvent { exchange, kind })
     }
 
+    /// Index `snapshot`, failing on any asset the [`ExecutionInstrumentMap`] does not register.
+    ///
+    /// Use [`Self::snapshot_partitioned`] to skip an unregistered balance instead. This is also
+    /// the path of an [`AccountEventKind::Snapshot`] event on an account stream, which stays
+    /// strict: it replaces the engine's whole view of the account, so losing part of it is not
+    /// tolerated.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError`] for an exchange, asset, instrument or order the map does not register.
     pub fn snapshot(
         &self,
         snapshot: UnindexedAccountSnapshot,
     ) -> Result<AccountSnapshot, IndexError> {
+        let PartitionedSnapshot {
+            snapshot,
+            untracked,
+        } = self.snapshot_partitioned(snapshot)?;
+        match untracked.first() {
+            None => Ok(snapshot),
+            Some(asset) => Err(self
+                .map
+                .find_asset_index(asset)
+                .err()
+                .unwrap_or_else(|| IndexError::AssetIndex(format!("not registered: {asset}")))),
+        }
+    }
+
+    /// Index `snapshot`, skipping the top-level balance of an asset the
+    /// [`ExecutionInstrumentMap`] does not register, and returning those assets beside it.
+    ///
+    /// A venue may report more assets than the caller registered (see
+    /// [`AccountIndexError::UntrackedBalance`]), so such a balance is not a fault. Only top-level
+    /// balances are skipped: an unregistered exchange, instrument, order, or isolated-margin
+    /// base or quote asset still fails the snapshot, because each registered instrument brings
+    /// its own assets and the loss would be a mapping defect.
+    ///
+    /// The caller must report [`PartitionedSnapshot::untracked`], or the drop is silent. An empty
+    /// [`PartitionedSnapshot::snapshot`] balance list beside a non-empty `untracked` usually means
+    /// the registered asset names do not match the venue's; it can also be an account that holds
+    /// only unregistered assets.
+    ///
+    /// # Errors
+    ///
+    /// [`IndexError`] for an exchange, instrument, order or isolated-margin asset the map does
+    /// not register.
+    pub fn snapshot_partitioned(
+        &self,
+        snapshot: UnindexedAccountSnapshot,
+    ) -> Result<PartitionedSnapshot, IndexError> {
         let UnindexedAccountSnapshot {
             exchange,
             balances,
@@ -112,10 +196,19 @@ impl AccountEventIndexer {
 
         let exchange = self.map.find_exchange_index(exchange)?;
 
-        let balances = balances
-            .into_iter()
-            .map(|balance| self.asset_balance(balance))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut untracked = Vec::new();
+        let mut indexed_balances = Vec::with_capacity(balances.len());
+        for balance in balances {
+            match self.map.find_asset_index(&balance.asset) {
+                Ok(asset) => indexed_balances.push(AssetBalance {
+                    asset,
+                    balance: balance.balance,
+                    time_exchange: balance.time_exchange,
+                }),
+                Err(IndexError::AssetIndex(_)) => untracked.push(balance.asset),
+                Err(error) => return Err(error),
+            }
+        }
 
         let instruments = instruments
             .into_iter()
@@ -152,10 +245,13 @@ impl AccountEventIndexer {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(AccountSnapshot {
-            exchange,
-            balances,
-            instruments,
+        Ok(PartitionedSnapshot {
+            snapshot: AccountSnapshot {
+                exchange,
+                balances: indexed_balances,
+                instruments,
+            },
+            untracked,
         })
     }
 
@@ -515,6 +611,13 @@ impl AccountEventIndexer {
         rejected(error)
     }
 
+    /// Index an order request for this exchange, resolving its instrument to the name this
+    /// exchange knows it by.
+    ///
+    /// # Errors
+    /// Returns [`KeyError`] when the order's exchange or instrument is not in the map, and when
+    /// the instrument is indexed but listed on a different exchange: a request keyed to another
+    /// exchange's instrument is not this exchange's to send.
     pub fn order_request<Kind>(
         &self,
         order: &OrderEvent<Kind, ExchangeIndex, InstrumentIndex>,
@@ -534,7 +637,15 @@ impl AccountEventIndexer {
         } = order;
 
         let exchange = self.map.find_exchange_id(*exchange)?;
-        let instrument = self.map.find_instrument_name_exchange(*instrument)?;
+        let instrument = self
+            .map
+            .find_own_instrument_name_exchange(*instrument)
+            .ok_or_else(|| {
+                KeyError::InstrumentKey(format!(
+                    "ExecutionInstrumentMap for {} does not contain: {instrument}",
+                    self.map.exchange.value
+                ))
+            })?;
 
         Ok(OrderEvent {
             key: OrderKey {
@@ -555,6 +666,10 @@ impl AccountEventIndexer {
             UnindexedOrderError::UnsupportedOrderType(msg) => OrderError::UnsupportedOrderType(msg),
             UnindexedOrderError::InvalidPrecision(violation) => {
                 OrderError::InvalidPrecision(violation)
+            }
+            UnindexedOrderError::OutOfBounds(violation) => OrderError::OutOfBounds(violation),
+            UnindexedOrderError::UnsupportedMarginEffect(effect) => {
+                OrderError::UnsupportedMarginEffect(effect)
             }
         }
     }
@@ -758,6 +873,130 @@ mod tests {
     use chrono::{DateTime, Utc};
     use rustrade_instrument::{index::IndexedInstruments, test_utils};
 
+    #[test]
+    fn a_partitioned_snapshot_skips_an_unregistered_balance_and_the_strict_one_fails() {
+        let indexer = binance_indexer();
+        let snapshot = || {
+            UnindexedAccountSnapshot::new(
+                ExchangeId::BinanceSpot,
+                ["usdt", "bnb", "btc", "sol"]
+                    .map(|asset| {
+                        AssetBalance::new(
+                            AssetNameExchange::new(asset),
+                            crate::balance::Balance::new(Decimal::ONE, Decimal::ONE),
+                            DateTime::<Utc>::MIN_UTC,
+                        )
+                    })
+                    .to_vec(),
+                vec![],
+            )
+        };
+
+        let partitioned = indexer.snapshot_partitioned(snapshot()).unwrap();
+        assert_eq!(partitioned.snapshot.balances.len(), 2);
+        assert_eq!(
+            partitioned.untracked,
+            vec![AssetNameExchange::new("bnb"), AssetNameExchange::new("sol")]
+        );
+        assert!(matches!(
+            indexer.snapshot(snapshot()),
+            Err(IndexError::AssetIndex(_))
+        ));
+    }
+
+    #[test]
+    fn a_partitioned_snapshot_still_fails_on_an_unregistered_instrument_or_exchange() {
+        let indexer = binance_indexer();
+        let instrument = |name: &str| {
+            InstrumentAccountSnapshot::new(
+                InstrumentNameExchange::new(name),
+                vec![],
+                false,
+                crate::position::PositionReport::Unreported,
+                None,
+            )
+        };
+        let unknown_instrument = UnindexedAccountSnapshot::new(
+            ExchangeId::BinanceSpot,
+            vec![],
+            vec![instrument("ETHUSDT")],
+        );
+        assert!(matches!(
+            indexer.snapshot_partitioned(unknown_instrument),
+            Err(IndexError::InstrumentIndex(_))
+        ));
+        // A skipped balance does not hide a failure elsewhere in the same snapshot.
+        let skipped_and_unknown_instrument = UnindexedAccountSnapshot::new(
+            ExchangeId::BinanceSpot,
+            vec![AssetBalance::new(
+                AssetNameExchange::new("bnb"),
+                crate::balance::Balance::new(Decimal::ONE, Decimal::ONE),
+                DateTime::<Utc>::MIN_UTC,
+            )],
+            vec![instrument("ETHUSDT")],
+        );
+        assert!(matches!(
+            indexer.snapshot_partitioned(skipped_and_unknown_instrument),
+            Err(IndexError::InstrumentIndex(_))
+        ));
+        let other_exchange = UnindexedAccountSnapshot::new(ExchangeId::Ibkr, vec![], vec![]);
+        assert!(matches!(
+            indexer.snapshot_partitioned(other_exchange),
+            Err(IndexError::ExchangeIndex(_))
+        ));
+    }
+
+    /// An order naming an instrument listed on another exchange does not resolve, though the plain
+    /// instrument lookup would find it.
+    #[test]
+    fn an_order_request_for_another_exchanges_instrument_fails() {
+        use crate::order::id::{ClientOrderId, StrategyId};
+        let instruments = IndexedInstruments::new(vec![
+            test_utils::instrument(ExchangeId::Kraken, "BTC", "USDT"),
+            test_utils::instrument(ExchangeId::BinanceSpot, "BTC", "USDT"),
+        ]);
+        let binance = generate_execution_instrument_map(&instruments, ExchangeId::BinanceSpot)
+            .map(Arc::new)
+            .map(AccountEventIndexer::new)
+            .unwrap();
+        let instrument_on = |exchange| {
+            instruments
+                .find_instrument_index(
+                    exchange,
+                    &test_utils::instrument(exchange, "BTC", "USDT").name_internal,
+                )
+                .unwrap()
+        };
+        let order = |exchange, instrument| OrderEvent {
+            key: OrderKey {
+                exchange,
+                instrument,
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::random(),
+            },
+            state: (),
+        };
+        let binance_index = instruments
+            .find_exchange_index(ExchangeId::BinanceSpot)
+            .unwrap();
+
+        let own = binance
+            .order_request(&order(
+                binance_index,
+                instrument_on(ExchangeId::BinanceSpot),
+            ))
+            .unwrap();
+        assert_eq!(own.key.exchange, ExchangeId::BinanceSpot);
+        assert_eq!(own.key.instrument.as_ref(), "BTC_USDT");
+
+        let foreign =
+            binance.order_request(&order(binance_index, instrument_on(ExchangeId::Kraken)));
+        assert!(
+            matches!(foreign, Err(KeyError::InstrumentKey(_))),
+            "{foreign:?}"
+        );
+    }
+
     fn binance_indexer() -> AccountEventIndexer {
         let instruments = IndexedInstruments::new(vec![test_utils::instrument(
             ExchangeId::BinanceSpot,
@@ -766,6 +1005,71 @@ mod tests {
         )]);
         let map = generate_execution_instrument_map(&instruments, ExchangeId::BinanceSpot).unwrap();
         AccountEventIndexer::new(Arc::new(map))
+    }
+
+    fn balance_update(asset: &str) -> UnindexedAccountEvent {
+        UnindexedAccountEvent::new(
+            ExchangeId::BinanceSpot,
+            AccountEventKind::BalanceStreamUpdate(Snapshot(AssetBalanceUpdate::new(
+                AssetNameExchange::new(asset),
+                crate::balance::BalanceUpdate::new(rust_decimal::Decimal::ONE, Default::default()),
+                DateTime::<Utc>::MIN_UTC,
+            ))),
+        )
+    }
+
+    #[test]
+    fn a_balance_for_an_unregistered_asset_is_an_untracked_balance_not_a_rejection() {
+        let indexer = binance_indexer();
+
+        assert!(indexer.index_account_event(balance_update("usdt")).is_ok());
+        assert_eq!(
+            indexer.index_account_event(balance_update("bnb")),
+            Err(AccountIndexError::UntrackedBalance(AssetNameExchange::new(
+                "bnb"
+            )))
+        );
+
+        let snapshot = UnindexedAccountEvent::new(
+            ExchangeId::BinanceSpot,
+            AccountEventKind::BalanceSnapshot(Snapshot(AssetBalance::new(
+                AssetNameExchange::new("bnb"),
+                crate::balance::Balance::new(Default::default(), Default::default()),
+                DateTime::<Utc>::MIN_UTC,
+            ))),
+        );
+        assert!(matches!(
+            indexer.index_account_event(snapshot),
+            Err(AccountIndexError::UntrackedBalance(_))
+        ));
+    }
+
+    #[test]
+    fn an_unregistered_asset_on_any_other_event_is_still_a_rejection() {
+        let indexer = binance_indexer();
+        let cash_flow = UnindexedAccountEvent::new(
+            ExchangeId::BinanceSpot,
+            AccountEventKind::CashFlow(CashFlow {
+                kind: crate::cash_flow::CashFlowKind::Rebate,
+                asset: AssetNameExchange::new("bnb"),
+                amount: rust_decimal::Decimal::ONE,
+                instrument: None,
+                time_exchange: DateTime::<Utc>::MIN_UTC,
+                id: None,
+            }),
+        );
+        assert!(matches!(
+            indexer.index_account_event(cash_flow),
+            Err(AccountIndexError::Rejected(IndexError::AssetIndex(_)))
+        ));
+
+        // A balance on an exchange the map does not hold fails on the exchange, not the asset.
+        let mut wrong_exchange = balance_update("bnb");
+        wrong_exchange.exchange = ExchangeId::Kraken;
+        assert!(matches!(
+            indexer.index_account_event(wrong_exchange),
+            Err(AccountIndexError::Rejected(IndexError::ExchangeIndex(_)))
+        ));
     }
 
     /// `StreamTerminated` carries no asset/instrument keys, so it must index by mapping only the

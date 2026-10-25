@@ -9,7 +9,7 @@
 //!   a gap will refetch some the stream already delivered, because the window is deliberately
 //!   wider than the gap.
 //!
-//! The cache is keyed on (instrument, id, kind) rather than on the id alone, and [`DedupKey`]
+//! The cache is keyed on (instrument, id, kind) rather than on the id alone, and `DedupKey`
 //! documents why. It is bounded and LRU, so it degrades by forgetting the oldest event rather
 //! than by growing without limit.
 //!
@@ -194,4 +194,135 @@ pub(crate) fn is_duplicate(cache: &SharedDedupCache, key: DedupKey) -> bool {
     }
     guard.put(key, ());
     false
+}
+
+/// A shared, bounded record of the fills already delivered, for a consumer that takes the same
+/// fill from more than one source.
+///
+/// Fills reach a consumer by more than one path: the live stream, a read of the span the stream
+/// missed (see [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades)),
+/// and a replay when a stream reopens. Their spans overlap on purpose, so the same fill arrives
+/// twice. [`is_duplicate`](Self::is_duplicate) says whether a [`Trade`](crate::AccountEventKind::Trade)
+/// event is one already seen, keyed by instrument and [`TradeId`](crate::trade::TradeId):
+/// whichever path delivered it, a fill has one id.
+///
+/// Only fills are recorded. An order snapshot, a cancellation or a notice can legitimately repeat
+/// (an order amended without a new fill is a second `Open` snapshot with the same quantity), so
+/// each is always passed on.
+///
+/// Clones share one record, which holds the 10,000 most recent keys and forgets the oldest first.
+///
+/// Call [`is_duplicate`](Self::is_duplicate) when the event is delivered, not when it is read: it
+/// records the event as seen, so an event read but never delivered would be dropped on its retry.
+#[derive(Debug, Clone)]
+pub struct AccountEventDeduper(SharedDedupCache);
+
+impl Default for AccountEventDeduper {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AccountEventDeduper {
+    /// An empty record.
+    pub fn new() -> Self {
+        Self(new_dedup_cache())
+    }
+
+    /// Whether `event` is a fill already seen. Records it as seen when it was not. Always `false`
+    /// for an event that is not a fill.
+    pub fn is_duplicate(&self, event: &UnindexedAccountEvent) -> bool {
+        matches!(event.kind, AccountEventKind::Trade(_))
+            && dedup_key_from_event(event).is_some_and(|key| is_duplicate(&self.0, key))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        order::id::{OrderId, StrategyId},
+        trade::{AssetFees, Trade, TradeId},
+    };
+    use chrono::DateTime;
+    use rust_decimal::Decimal;
+    use rustrade_instrument::{
+        Side, asset::name::AssetNameExchange, exchange::ExchangeId,
+        instrument::name::InstrumentNameExchange,
+    };
+
+    fn trade_event(instrument: &str, id: &str) -> UnindexedAccountEvent {
+        UnindexedAccountEvent {
+            exchange: ExchangeId::BinanceSpot,
+            kind: AccountEventKind::Trade(Trade::new(
+                TradeId::new(id),
+                OrderId::new("o"),
+                InstrumentNameExchange::new(instrument),
+                StrategyId::unknown(),
+                DateTime::UNIX_EPOCH,
+                Side::Buy,
+                Decimal::ONE,
+                Decimal::ONE,
+                None,
+                AssetFees::new(AssetNameExchange::from("usdt"), Decimal::ZERO, None),
+            )),
+        }
+    }
+
+    #[test]
+    fn a_trade_is_a_duplicate_the_second_time_it_is_seen_by_instrument_and_id() {
+        let deduper = AccountEventDeduper::new();
+
+        assert!(!deduper.is_duplicate(&trade_event("btc_usdt", "1")));
+        assert!(deduper.is_duplicate(&trade_event("btc_usdt", "1")));
+        // The id is per instrument.
+        assert!(!deduper.is_duplicate(&trade_event("eth_usdt", "1")));
+        assert!(!deduper.is_duplicate(&trade_event("btc_usdt", "2")));
+    }
+
+    #[test]
+    fn clones_share_one_record() {
+        let deduper = AccountEventDeduper::new();
+        let clone = deduper.clone();
+
+        assert!(!deduper.is_duplicate(&trade_event("btc_usdt", "1")));
+
+        assert!(clone.is_duplicate(&trade_event("btc_usdt", "1")));
+    }
+
+    #[test]
+    fn an_event_that_is_not_a_fill_is_never_a_duplicate() {
+        let deduper = AccountEventDeduper::new();
+        let event = UnindexedAccountEvent {
+            exchange: ExchangeId::BinanceSpot,
+            kind: AccountEventKind::StreamTerminated(
+                crate::error::StreamTerminationReason::RateLimited {
+                    retry_after: std::time::Duration::from_secs(1),
+                },
+            ),
+        };
+
+        assert!(!deduper.is_duplicate(&event));
+        assert!(!deduper.is_duplicate(&event));
+    }
+
+    #[test]
+    fn a_repeated_notice_is_passed_on_because_only_fills_are_recorded() {
+        let deduper = AccountEventDeduper::new();
+        let notice = || UnindexedAccountEvent {
+            exchange: ExchangeId::BinanceSpot,
+            kind: AccountEventKind::Notice(crate::notice::AccountNotice::new(
+                crate::notice::NoticeKind::Other,
+                None,
+                DateTime::UNIX_EPOCH,
+                None,
+                "STATUS".into(),
+            )),
+        };
+
+        // The client-level dedup would treat the second as a duplicate.
+        assert!(dedup_key_from_event(&notice()).is_some());
+        assert!(!deduper.is_duplicate(&notice()));
+        assert!(!deduper.is_duplicate(&notice()));
+    }
 }

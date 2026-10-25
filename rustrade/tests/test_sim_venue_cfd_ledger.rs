@@ -176,16 +176,14 @@ fn fill(
             strategy: StrategyId::new("test"),
             cid: ClientOrderId::random(),
         },
-        state: RequestOpen {
+        state: RequestOpen::new(
             side,
-            price: None,
+            None,
             quantity,
-            kind: OrderKind::Market,
-            time_in_force: TimeInForce::ImmediateOrCancel,
-            position_id: None,
-            reduce_only: false,
-            market: Some(snapshot),
-        },
+            OrderKind::Market,
+            TimeInForce::ImmediateOrCancel,
+        )
+        .with_market(snapshot),
     });
     assert!(
         outcome.response.state.is_accepted(),
@@ -346,16 +344,13 @@ impl AlgoStrategy for RoundTrip {
                 strategy: StrategyId::new("round-trip"),
                 cid: ClientOrderId::random(),
             },
-            state: RequestOpen {
+            state: RequestOpen::new(
                 side,
-                price: None,
-                quantity: dec!(1),
-                kind: OrderKind::Market,
-                time_in_force: TimeInForce::ImmediateOrCancel,
-                position_id: None,
-                reduce_only: false,
-                market: None,
-            },
+                None,
+                dec!(1),
+                OrderKind::Market,
+                TimeInForce::ImmediateOrCancel,
+            ),
         };
 
         (std::iter::empty(), Some(open))

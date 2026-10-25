@@ -1041,6 +1041,13 @@ impl ExecutionClient for HyperliquidClient {
             )))
         };
         let make_unsupported = |msg: String| make_inactive(OrderError::UnsupportedOrderType(msg));
+
+        // Hyperliquid has no order flag for borrowing, and under portfolio margin an order borrows
+        // implicitly when it falls short, so the client cannot promise either way: no effect,
+        // not even `NoSideEffect`, is honoured.
+        if let Some(effect) = request.state.margin_effect {
+            return make_inactive(OrderError::UnsupportedMarginEffect(effect));
+        }
         let make_invalid_instrument = |reason: String| {
             make_inactive(OrderError::Rejected(
                 crate::error::ApiError::InstrumentInvalid(request.key.instrument.clone(), reason),
@@ -1280,7 +1287,8 @@ impl ExecutionClient for HyperliquidClient {
 
     /// Reads the span with `userFillsByTime`, to its end within the call, so the read is always
     /// complete (`resume: None`). Hyperliquid keeps only each wallet's 10,000 most recent fills,
-    /// so a span reaching further back is read only as far as those go. One read covers every
+    /// so a span reaching further back is read only as far as those go, and
+    /// [`held_since`](TradesRead::held_since) says where that is. One read covers every
     /// DEX; fills on a HIP-3 DEX this client is not configured with are left out.
     ///
     /// # Errors
@@ -1300,6 +1308,7 @@ impl ExecutionClient for HyperliquidClient {
         let address = self.wallet_h160();
 
         let fills = user_fills_by_time(&self.info_client, address, start_ms, end_ms).await?;
+        let held_since = common::held_since(&fills, start_ms);
         warn_unknown_coins(fills.iter().map(|fill| fill.coin.as_str()));
         warn_unconfigured_dexes(&self.dexes, fills.iter().map(|fill| fill.coin.as_str()));
 
@@ -1354,7 +1363,7 @@ impl ExecutionClient for HyperliquidClient {
             });
         }
 
-        Ok(TradesRead::complete(result))
+        Ok(TradesRead::complete(result).with_held_since(held_since))
     }
 }
 
@@ -1803,16 +1812,13 @@ mod tests {
                         strategy: StrategyId::new("strategy"),
                         cid: ClientOrderId::uuid(),
                     },
-                    state: RequestOpen {
-                        side: Side::Buy,
+                    state: RequestOpen::new(
+                        Side::Buy,
                         price,
                         quantity,
                         kind,
-                        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                        position_id: None,
-                        reduce_only: false,
-                        market: None,
-                    },
+                        TimeInForce::GoodUntilCancelled { post_only: false },
+                    ),
                 })
                 .await
         }
@@ -2121,16 +2127,13 @@ mod tests {
                             strategy: StrategyId::new("strategy"),
                             cid: ClientOrderId::uuid(),
                         },
-                        state: RequestOpen {
-                            side: Side::Buy,
-                            price: Some(dec!(1)),
-                            quantity: dec!(1),
-                            kind: OrderKind::Limit,
-                            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                            position_id: None,
-                            reduce_only: false,
-                            market: None,
-                        },
+                        state: RequestOpen::new(
+                            Side::Buy,
+                            Some(dec!(1)),
+                            dec!(1),
+                            OrderKind::Limit,
+                            TimeInForce::GoodUntilCancelled { post_only: false },
+                        ),
                     })
                     .await;
                 let OrderState::Inactive(crate::order::state::InactiveOrderState::OpenFailed(

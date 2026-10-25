@@ -169,19 +169,18 @@ where
             strategy: strategy_id,
             cid: gen_cid(),
         },
-        state: RequestOpen {
-            side: match position.side {
+        state: RequestOpen::new(
+            match position.side {
                 Side::Buy => Side::Sell,
                 Side::Sell => Side::Buy,
             },
-            price: None,
+            None,
             quantity,
-            kind: OrderKind::Market,
-            time_in_force: TimeInForce::ImmediateOrCancel,
-            position_id: None, // caller sets this when hedging-mode routing is required
-            reduce_only: true, // closing existing position
-            market: None,
-        },
+            OrderKind::Market,
+            TimeInForce::ImmediateOrCancel,
+        )
+        // No position_id: the caller sets one when hedging-mode routing is required.
+        .with_reduce_only(true), // closing existing position
     })
 }
 

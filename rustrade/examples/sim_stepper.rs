@@ -222,16 +222,13 @@ fn market_order(side: Side, quantity: Decimal, n: usize) -> Command {
             strategy: StrategyId::new("agent"),
             cid: ClientOrderId::new(format!("agent-{n}")),
         },
-        state: RequestOpen {
+        state: RequestOpen::new(
             side,
-            price: None,
+            None,
             quantity,
-            kind: OrderKind::Market,
-            time_in_force: TimeInForce::ImmediateOrCancel,
-            position_id: None,
-            reduce_only: false,
-            market: None,
-        },
+            OrderKind::Market,
+            TimeInForce::ImmediateOrCancel,
+        ),
     }))
 }
 

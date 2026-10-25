@@ -80,7 +80,7 @@ pub mod balance;
 pub mod borrow_capacity;
 pub use borrow_capacity::BorrowCapacity;
 pub mod cash_flow;
-pub use cash_flow::{CashFlow, CashFlowId, CashFlowKind, CashFlowsRead};
+pub use cash_flow::{CashFlow, CashFlowId, CashFlowKind, CashFlowsRead, InterestTiming};
 pub mod client;
 pub mod error;
 pub mod exchange;
@@ -106,7 +106,7 @@ pub mod indexer;
 pub mod map;
 pub mod margin;
 pub use margin::{
-    InterestCharge, InterestDue, InterestSchedule, MarginInterestModel, MarginSideEffect,
+    InterestCharge, InterestDue, InterestSchedule, MarginEffect, MarginInterestModel,
     PeriodicMarginInterest, SpotMarginConfig, SpotMarginConfigError,
 };
 pub mod market;
@@ -115,6 +115,9 @@ pub mod notice;
 pub use notice::{AccountNotice, NoticeKind};
 pub mod order;
 pub mod position;
+pub mod reduce_only;
+pub mod rules;
+pub use rules::{OrderRules, PreSendRules, ValueRule};
 pub mod shortability;
 pub mod slippage;
 pub use shortability::{Shortability, ShortabilityProvider, ShortabilityTable};

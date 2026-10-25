@@ -9,7 +9,10 @@
 //!   `"PURR/USDC"`; perps by their asset (`"BTC"`). See [Spot coins](#spot-coins).
 //! - **Asset indices**: Spot uses 10000+ (vs 0-9999 for perps)
 //! - **Balances**: Uses `user_token_balances()` instead of `user_state()` margin summary
-//! - **No positions**: Spot has no margin/leverage concepts
+//! - **No positions**: a spot order opens no position. Under portfolio margin it can still
+//!   borrow, implicitly, when the account falls short; there is no order flag for it, so this
+//!   client refuses every `RequestOpen::margin_effect`
+//!   ([`OrderError::UnsupportedMarginEffect`])
 //! - **$10 minimum**: Spot orders require minimum $10 notional value
 //!
 //! # Unified Account Model
@@ -809,6 +812,13 @@ impl ExecutionClient for HyperliquidSpotClient {
         };
         let make_unsupported = |msg: String| make_inactive(OrderError::UnsupportedOrderType(msg));
 
+        // Hyperliquid has no order flag for borrowing, and under portfolio margin an order borrows
+        // implicitly when it falls short, so the client cannot promise either way: no effect,
+        // not even `NoSideEffect`, is honoured.
+        if let Some(effect) = request.state.margin_effect {
+            return make_inactive(OrderError::UnsupportedMarginEffect(effect));
+        }
+
         let Some((base, quote)) = spot_base_quote(request.key.instrument) else {
             warn!(
                 instrument = %request.key.instrument,
@@ -1076,7 +1086,8 @@ impl ExecutionClient for HyperliquidSpotClient {
 
     /// Reads the span with `userFillsByTime`, to its end within the call, so the read is always
     /// complete (`resume: None`). Hyperliquid keeps only each wallet's 10,000 most recent fills,
-    /// so a span reaching further back is read only as far as those go.
+    /// so a span reaching further back is read only as far as those go, and
+    /// [`held_since`](TradesRead::held_since) says where that is.
     async fn fetch_trades(
         &self,
         start: DateTime<Utc>,
@@ -1089,12 +1100,14 @@ impl ExecutionClient for HyperliquidSpotClient {
         let address = self.wallet_h160();
 
         let fills = user_fills_by_time(&self.info_client, address, start_ms, end_ms).await?;
+        let held_since = super::common::held_since(&fills, start_ms);
         let pairs = self
             .spot_coins
             .covering(fills.iter().map(|fill| fill.coin.as_str()))
             .await;
 
-        spot_trades(&fills, &pairs, start, end, instruments).map(TradesRead::complete)
+        spot_trades(&fills, &pairs, start, end, instruments)
+            .map(|trades| TradesRead::complete(trades).with_held_since(held_since))
     }
 }
 
@@ -1613,16 +1626,13 @@ mod tests {
                         strategy: StrategyId::new("strategy"),
                         cid: ClientOrderId::uuid(),
                     },
-                    state: RequestOpen {
-                        side: Side::Buy,
-                        price: Some(price),
+                    state: RequestOpen::new(
+                        Side::Buy,
+                        Some(price),
                         quantity,
-                        kind: OrderKind::Limit,
-                        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                        position_id: None,
-                        reduce_only: false,
-                        market: None,
-                    },
+                        OrderKind::Limit,
+                        TimeInForce::GoodUntilCancelled { post_only: false },
+                    ),
                 })
                 .await
         }
@@ -1640,6 +1650,50 @@ mod tests {
                     body["action"]["orders"][0].clone()
                 })
                 .collect()
+        }
+
+        #[tokio::test]
+        async fn every_margin_effect_is_refused_without_sending() {
+            use crate::margin::MarginEffect;
+
+            let (server, client) = resting_client().await;
+            let instrument = InstrumentNameExchange::new("HYPE-USDC-SPOT");
+
+            for effect in [
+                MarginEffect::NoSideEffect,
+                MarginEffect::Borrow,
+                MarginEffect::Repay,
+            ] {
+                let order = client
+                    .open_order(OrderEvent {
+                        key: OrderKey {
+                            exchange: ExchangeId::HyperliquidSpot,
+                            instrument: &instrument,
+                            strategy: StrategyId::new("strategy"),
+                            cid: ClientOrderId::uuid(),
+                        },
+                        state: RequestOpen::new(
+                            Side::Buy,
+                            Some(dec!(10)),
+                            dec!(2),
+                            OrderKind::Limit,
+                            TimeInForce::GoodUntilCancelled { post_only: false },
+                        )
+                        .with_margin_effect(effect),
+                    })
+                    .await;
+
+                assert!(
+                    matches!(
+                        order.state,
+                        OrderState::Inactive(InactiveOrderState::OpenFailed(
+                            OrderError::UnsupportedMarginEffect(refused)
+                        )) if refused == effect
+                    ),
+                    "{order:?}"
+                );
+            }
+            assert!(sent_orders(&server).await.is_empty());
         }
 
         #[tokio::test]

@@ -205,18 +205,15 @@ impl AlgoStrategy for OneShotStrategy {
                     strategy: StrategyId::new("probe"),
                     cid: ClientOrderId::random(),
                 },
-                state: RequestOpen {
-                    side: Side::Buy,
+                state: RequestOpen::new(
+                    Side::Buy,
                     // A priced kind carries one so the request is well-formed; the venue rejects
                     // it on `kind` before reading it.
-                    price: (self.kind != OrderKind::Market).then(|| dec!(50_000)),
-                    quantity: dec!(0.01),
-                    kind: self.kind,
-                    time_in_force: TimeInForce::ImmediateOrCancel,
-                    position_id: None,
-                    reduce_only: false,
-                    market: None,
-                },
+                    (self.kind != OrderKind::Market).then(|| dec!(50_000)),
+                    dec!(0.01),
+                    self.kind,
+                    TimeInForce::ImmediateOrCancel,
+                ),
             })
             .collect::<Vec<_>>();
 

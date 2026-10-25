@@ -1,5 +1,5 @@
 use crate::{
-    UnindexedAccountEvent, UnindexedAccountSnapshot,
+    AccountEventKind, UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::AssetBalance,
     client::{ExecutionClient, OrderStatusClient},
     error::{
@@ -87,7 +87,7 @@ pub struct MockExecutionConfig {
     ///
     /// Defaults to `None`: a cash account, whose spot orders are paid for with what it holds, and
     /// whose balances report no loans. A [`SpotMarginConfig`] makes it a cross margin account that
-    /// borrows and repays under its [`MarginSideEffect`](crate::margin::MarginSideEffect), up to a
+    /// borrows under each order's [`MarginEffect`](crate::margin::MarginEffect), up to a
     /// leverage limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spot_margin: Option<SpotMarginConfig>,
@@ -209,37 +209,37 @@ where
         _: &[AssetNameExchange],
         _: &[InstrumentNameExchange],
     ) -> Result<Self::AccountStream, UnindexedClientError> {
-        // `scan` (not `map_while`) so the broadcast-lag terminal is delivered in-band: on lag we
-        // yield one StreamTerminated event, set `done`, and the next poll ends the stream — whereas
-        // `map_while` would end on lag with a silent EOF and no terminal event.
+        // A lag is delivered in-band as one StreamTerminated, where `map_while` would end the
+        // stream with a silent EOF. Whatever its source, a StreamTerminated is terminal by
+        // contract, so the stream ends on the poll after it: a lag, or one the venue sends itself,
+        // as a market-driven venue does when its market feed lags. It ends there rather than on the
+        // next broadcast item, which a quiet venue may never send.
         let exchange = self.mocked_exchange;
-        Ok(BroadcastStream::new(self.event_rx.resubscribe())
-            .scan(false, move |done, result| {
-                // `futures::StreamExt::scan` ends the stream when the closure resolves to None.
-                let item = if *done {
-                    // Terminal already emitted on the prior poll — end the stream now.
-                    None
-                } else {
-                    match result {
-                        Ok(event) => Some(event),
-                        Err(error) => {
-                            error!(
-                                ?error,
-                                "MockExchange Broadcast AccountStream lagged - terminating"
-                            );
-                            *done = true;
-                            Some(UnindexedAccountEvent::stream_terminated(
-                                exchange,
-                                StreamTerminationReason::Error(
-                                    "mock broadcast stream lagged".to_string(),
-                                ),
-                            ))
-                        }
-                    }
-                };
-                futures::future::ready(item)
+        let events = BroadcastStream::new(self.event_rx.resubscribe()).map(move |result| {
+            result.unwrap_or_else(|error| {
+                error!(
+                    ?error,
+                    "MockExchange Broadcast AccountStream lagged - terminating"
+                );
+                UnindexedAccountEvent::stream_terminated(
+                    exchange,
+                    StreamTerminationReason::Error("mock broadcast stream lagged".to_string()),
+                )
             })
-            .boxed())
+        });
+        Ok(
+            futures::stream::unfold((events, false), |(mut events, ended)| async move {
+                if ended {
+                    return None;
+                }
+                let event = events.next().await?;
+                let ended = matches!(event.kind, AccountEventKind::StreamTerminated(_));
+                Some((event, (events, ended)))
+            })
+            // `unfold` panics when polled again after it ends, which a combinator downstream may do.
+            .fuse()
+            .boxed(),
+        )
     }
 
     async fn cancel_order(
@@ -561,5 +561,44 @@ mod tests {
             stream.next().await.is_none(),
             "stream must end after the terminal event"
         );
+    }
+
+    /// A terminal event the venue sends itself, as a market-driven one does when its market feed
+    /// lags, ends the stream on the next poll, without waiting for an event a quiet venue may
+    /// never send.
+    #[tokio::test]
+    async fn account_stream_ends_right_after_a_terminal_event_from_the_venue() {
+        let (event_tx, event_rx) = broadcast::channel::<UnindexedAccountEvent>(16);
+        let (request_tx, _request_rx) = mpsc::unbounded_channel();
+        let client = MockExecution::new(ExchangeId::Mock, Utc::now, request_tx, event_rx);
+        let mut stream = client.account_stream(&[], &[]).await.unwrap();
+
+        event_tx.send(filler_event()).unwrap();
+        event_tx
+            .send(UnindexedAccountEvent::stream_terminated(
+                ExchangeId::Mock,
+                StreamTerminationReason::Error("market feed lagged".to_string()),
+            ))
+            .unwrap();
+
+        assert!(matches!(
+            stream.next().await.map(|event| event.kind),
+            Some(AccountEventKind::BalanceSnapshot(_))
+        ));
+        assert!(matches!(
+            stream.next().await.map(|event| event.kind),
+            Some(AccountEventKind::StreamTerminated(_))
+        ));
+        assert_eq!(
+            futures::FutureExt::now_or_never(stream.next()),
+            Some(None),
+            "the stream must end on the poll after its terminal event, with the sender still open"
+        );
+        assert_eq!(
+            futures::FutureExt::now_or_never(stream.next()),
+            Some(None),
+            "and stay ended however often it is polled"
+        );
+        drop(event_tx);
     }
 }

@@ -2,23 +2,28 @@ use crate::{
     engine::{clock::EngineClock, execution_tx::MultiExchangeTxMap, in_flight::InFlightDeadlines},
     error::BarterError,
     execution::{
-        AccountStreamEvent, Execution, error::ExecutionError, manager::ExecutionManager,
+        AccountStreamEvent, Execution,
+        error::ExecutionError,
+        manager::{AccountStreamOptions, Clock as ManagerClock, ExecutionManager},
+        paper::{PaperMarketFeed, PaperMarketUpdate, PaperOptions},
         request::ExecutionRequest,
+        sim::builder::market_driven_venue,
     },
     shutdown::AsyncShutdown,
 };
 use fnv::FnvHashMap;
-use futures::{FutureExt, future::try_join_all};
-use rustrade_data::streams::{
-    consumer::STREAM_RECONNECTION_POLICY, reconnect::stream::ReconnectingStream,
-};
+use futures::{FutureExt, StreamExt, future::try_join_all, stream::BoxStream};
+use rustrade_data::streams::reconnect::stream::ReconnectingStream;
 use rustrade_execution::{
     UnindexedAccountEvent,
     client::{
         ClientInstrument, ExecutionClient,
         mock::{MockExecution, MockExecutionClientConfig, MockExecutionConfig},
     },
-    exchange::mock::{MockExchange, request::MockExchangeRequest},
+    exchange::mock::{
+        MarketFeedEvent, MockExchange, MockExchangeClock, request::MockExchangeRequest,
+    },
+    fill::MarketOrderTiming,
     indexer::AccountEventIndexer,
     map::generate_execution_instrument_map,
 };
@@ -113,6 +118,16 @@ impl<'a> ExecutionBuilder<'a> {
     /// [`InstrumentKind`]: rustrade_instrument::instrument::kind::InstrumentKind
     /// [`MockExecution::SUPPORTED_KINDS`]: rustrade_execution::client::ExecutionClient::SUPPORTED_KINDS
     /// [`IndexedInstruments`]: rustrade_instrument::index::IndexedInstruments
+    ///
+    /// # Missed fills
+    ///
+    /// The manager reads the fills the mock's account stream missed, should it end, on `clock`:
+    /// the clock the mock stamps its fills with, so a backtest's read spans simulated time. The
+    /// read's [`read_timeout`](crate::execution::backfill::FillRecoveryConfig::read_timeout) is
+    /// still real time.
+    ///
+    /// To trade on a live market instead of the request's own price, see
+    /// [`add_paper`](Self::add_paper).
     pub fn add_mock<Clock>(
         self,
         config: MockExecutionConfig,
@@ -127,6 +142,7 @@ impl<'a> ExecutionBuilder<'a> {
         let (request_tx, request_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = broadcast::channel(ACCOUNT_STREAM_CAPACITY);
 
+        let options = mock_account_stream_options(clock.clone());
         let mock_execution_client_config = MockExecutionClientConfig {
             mocked_exchange: config.mocked_exchange,
             clock: move || clock.time(),
@@ -144,6 +160,7 @@ impl<'a> ExecutionBuilder<'a> {
             mock_execution_client_config,
             DUMMY_EXECUTION_REQUEST_TIMEOUT,
             None,
+            options,
         )?;
 
         // Register MockExchange init Future
@@ -164,14 +181,136 @@ impl<'a> ExecutionBuilder<'a> {
         Box::pin(MockExchange::new(config, request_rx, event_tx, instruments).run())
     }
 
-    /// Adds an [`ExecutionManager`] for a live exchange.
+    /// Adds an [`ExecutionManager`] for a paper venue: the market-driven simulated venue a backtest
+    /// uses, run by a [`MockExchange::new_market_driven`] on the market `feed` observes and on
+    /// `clock`.
     ///
-    /// The exchange's in-flight deadline (see [`ExecutionBuild::in_flight_deadlines`]) is derived
-    /// from `request_timeout` by [`InFlightDeadlines::deadline_for_request_timeout`].
+    /// The venue is the one [`SimExecutionBuilder::add_venue_with_options`] builds from the same
+    /// `config` and [`PaperOptions::venue`], so limit orders rest and fill as the market crosses
+    /// them, and spot margin, interest, fees and the stale-market policies apply as in a backtest.
+    /// See [`MockExchange::new_market_driven`] for how time, latency and the feed drive it, and
+    /// [`PaperMarketFeed::tap`](super::paper::PaperMarketFeed::tap) for what the feed observes.
+    ///
+    /// `clock` should be the `Engine`'s: the venue stamps everything with it, held so it never
+    /// moves backwards, and the manager measures its [`AccountStreamOptions`] on it, as for
+    /// [`add_mock`](Self::add_mock). Live paper trading wants
+    /// [`LiveClock`](crate::engine::clock::LiveClock); a test under tokio's paused time,
+    /// [`TokioClock`](crate::engine::clock::TokioClock).
+    ///
+    /// The venue holds its state in memory only: it starts from `config.initial_state` every time
+    /// it is built, so restarting the process loses the paper account.
+    ///
+    /// The exchange gets no in-flight deadline, as for [`add_mock`](Self::add_mock).
+    ///
+    /// # Errors
+    /// Returns [`BarterError::ExecutionBuilder`] if:
+    /// - `config.market_order_timing` is [`MarketOrderTiming::NextBar`]. A backtest delivers the
+    ///   fill a bar releases ahead of the bar itself, which a live feed shared with a running
+    ///   `Engine` cannot do, so the venue would not behave as its backtest does.
+    /// - `options.account_stream_capacity` is zero.
+    /// - Any of [`add_mock`](Self::add_mock)'s and
+    ///   [`SimExecutionBuilder::add_venue_with_options`]'s errors apply.
+    ///
+    /// [`SimExecutionBuilder::add_venue_with_options`]: crate::execution::sim::SimExecutionBuilder::add_venue_with_options
+    pub fn add_paper<Clock>(
+        self,
+        config: MockExecutionConfig,
+        options: PaperOptions,
+        clock: Clock,
+        feed: &PaperMarketFeed,
+    ) -> Result<Self, BarterError>
+    where
+        Clock: EngineClock + Clone + Send + Sync + 'static,
+    {
+        const DUMMY_EXECUTION_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+
+        let exchange = config.mocked_exchange;
+        if matches!(config.market_order_timing, MarketOrderTiming::NextBar(_)) {
+            return Err(BarterError::ExecutionBuilder(format!(
+                "paper venue {exchange} cannot use MarketOrderTiming::NextBar: a live feed cannot \
+                 deliver a bar's fills ahead of the bar, as a backtest does"
+            )));
+        }
+        let PaperOptions {
+            venue: venue_options,
+            account_stream_capacity,
+        } = options;
+        if account_stream_capacity == 0 {
+            return Err(BarterError::ExecutionBuilder(format!(
+                "paper venue {exchange} has an account_stream_capacity of zero"
+            )));
+        }
+
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = broadcast::channel(account_stream_capacity);
+
+        let options = mock_account_stream_options(clock.clone());
+        let venue_clock: MockExchangeClock = {
+            let clock = clock.clone();
+            Arc::new(move || clock.time())
+        };
+        let mock_execution_client_config = MockExecutionClientConfig {
+            mocked_exchange: exchange,
+            clock: move || clock.time(),
+            request_tx,
+            event_rx,
+        };
+
+        // As in `add_mock`: the supported-kind check runs before the venue projects the
+        // instruments, which panics on a kind it cannot model.
+        let mut this = self.add_execution::<MockExecution<_>>(
+            exchange,
+            mock_execution_client_config,
+            DUMMY_EXECUTION_REQUEST_TIMEOUT,
+            None,
+            options,
+        )?;
+
+        let venue = market_driven_venue(&config, venue_options, this.instruments)?;
+        let market = paper_market(this.instruments, exchange, feed);
+        let mock_exchange = MockExchange::new_market_driven(
+            venue,
+            config.latency_ms,
+            request_rx,
+            event_tx,
+            market,
+            venue_clock,
+        );
+        this.mock_exchange_futures
+            .push(Box::pin(mock_exchange.run()));
+
+        Ok(this)
+    }
+
+    /// Adds an [`ExecutionManager`] for a live exchange, with the default
+    /// [`AccountStreamOptions`]. See [`add_live_with`](Self::add_live_with).
     pub fn add_live<Client>(
         self,
         config: Client::Config,
         request_timeout: Duration,
+    ) -> Result<Self, BarterError>
+    where
+        Client: ExecutionClient + Send + Sync + 'static,
+        Client::AccountStream: Send,
+        Client::Config: Send,
+    {
+        self.add_live_with::<Client>(config, request_timeout, AccountStreamOptions::default())
+    }
+
+    /// Adds an [`ExecutionManager`] for a live exchange, whose account stream reconnects and reads
+    /// the fills it missed as `options` says.
+    ///
+    /// Venues differ in how many fills one call returns and how long they keep them, so the
+    /// budget for reading missed fills
+    /// ([`FillRecoveryConfig`](crate::execution::backfill::FillRecoveryConfig)) is set per venue.
+    ///
+    /// The exchange's in-flight deadline (see [`ExecutionBuild::in_flight_deadlines`]) is derived
+    /// from `request_timeout` by [`InFlightDeadlines::deadline_for_request_timeout`].
+    pub fn add_live_with<Client>(
+        self,
+        config: Client::Config,
+        request_timeout: Duration,
+        options: AccountStreamOptions,
     ) -> Result<Self, BarterError>
     where
         Client: ExecutionClient + Send + Sync + 'static,
@@ -185,6 +324,7 @@ impl<'a> ExecutionBuilder<'a> {
             Some(InFlightDeadlines::deadline_for_request_timeout(
                 request_timeout,
             )),
+            options,
         )
     }
 
@@ -195,6 +335,7 @@ impl<'a> ExecutionBuilder<'a> {
         config: Client::Config,
         request_timeout: Duration,
         in_flight_deadline: Option<Duration>,
+        options: AccountStreamOptions,
     ) -> Result<Self, BarterError>
     where
         Client: ExecutionClient + Send + Sync + 'static,
@@ -216,7 +357,7 @@ impl<'a> ExecutionBuilder<'a> {
             .is_some()
         {
             return Err(BarterError::ExecutionBuilder(format!(
-                "ExecutionBuilder does not support duplicate mocked ExecutionManagers: {exchange}"
+                "ExecutionBuilder does not support duplicate mocked or paper ExecutionManagers: {exchange}"
             )));
         }
 
@@ -233,7 +374,7 @@ impl<'a> ExecutionBuilder<'a> {
             request_timeout,
             Arc::new(Client::new(config)),
             AccountEventIndexer::new(Arc::new(instrument_map)),
-            STREAM_RECONNECTION_POLICY,
+            options,
         );
 
         let future_result = future_result.map(|result| {
@@ -686,6 +827,59 @@ fn join_kinds(kinds: impl Iterator<Item = InstrumentKindDiscriminant>) -> String
         .join(", ")
 }
 
+/// The market a paper venue for `exchange` trades on: what `feed` observes of `exchange`'s
+/// instruments, by their names on it, and a [`MarketFeedEvent::Lagged`] wherever the venue fell
+/// behind.
+fn paper_market(
+    instruments: &IndexedInstruments,
+    exchange: ExchangeId,
+    feed: &PaperMarketFeed,
+) -> BoxStream<'static, MarketFeedEvent> {
+    let names = instruments
+        .instruments()
+        .iter()
+        .filter(|instrument| instrument.value.exchange.value == exchange)
+        .map(|instrument| (instrument.key, instrument.value.name_exchange.clone()))
+        .collect::<FnvHashMap<_, _>>();
+
+    futures::stream::unfold(
+        (feed.subscribe(), names),
+        |(mut updates, names)| async move {
+            loop {
+                match updates.recv().await {
+                    Ok(PaperMarketUpdate {
+                        instrument,
+                        observation,
+                    }) => {
+                        // Absent for another exchange's instrument, which this venue does not trade.
+                        if let Some(name) = names.get(&instrument) {
+                            let event = MarketFeedEvent::Observation {
+                                instrument: name.clone(),
+                                observation,
+                            };
+                            return Some((event, (updates, names)));
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(missed)) => {
+                        return Some((MarketFeedEvent::Lagged { missed }, (updates, names)));
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        },
+    )
+    .boxed()
+}
+
+/// The [`AccountStreamOptions`] of a mock venue's manager: the defaults, measured on `clock`, the
+/// clock the mock stamps its fills with.
+fn mock_account_stream_options<Clock>(clock: Clock) -> AccountStreamOptions
+where
+    Clock: EngineClock + Send + Sync + 'static,
+{
+    AccountStreamOptions::default().with_clock(ManagerClock::new(move || clock.time()))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panicking on a bad fixture is acceptable
 mod tests {
@@ -1053,5 +1247,179 @@ mod tests {
             tokio::task::yield_now().await;
         }
         panic!("the mock exchange task was left running after the build failed");
+    }
+
+    #[test]
+    fn a_mock_venue_reads_missed_fills_on_the_engine_clock() {
+        let seed = DateTime::<Utc>::from_timestamp(1_600_000_000, 0).unwrap();
+        let options = mock_account_stream_options(HistoricalClock::new(seed));
+        assert_eq!(options.clock.now(), seed);
+        assert_eq!(
+            options.fill_recovery,
+            AccountStreamOptions::default().fill_recovery
+        );
+        assert_eq!(options.reconnect, AccountStreamOptions::default().reconnect);
+    }
+
+    /// The message of the [`BarterError::ExecutionBuilder`] `result` must be.
+    fn builder_error(result: Result<ExecutionBuilder<'_>, BarterError>) -> String {
+        match result {
+            Err(BarterError::ExecutionBuilder(message)) => message,
+            Err(error) => panic!("expected an ExecutionBuilder error, got {error:?}"),
+            Ok(_) => panic!("expected the paper venue to be refused"),
+        }
+    }
+
+    fn paper_feed() -> PaperMarketFeed {
+        PaperMarketFeed::tap(futures::stream::empty::<
+            rustrade_data::streams::consumer::MarketStreamEvent<
+                InstrumentIndex,
+                rustrade_data::event::DataKind,
+            >,
+        >())
+        .1
+    }
+
+    /// A paper venue cannot deliver a bar's fills ahead of the bar, as a backtest does, so it
+    /// refuses the timing rather than behaving unlike its backtest.
+    #[test]
+    fn add_paper_refuses_next_bar_market_orders() {
+        let instruments = instruments(InstrumentKind::Spot);
+        let config = MockExecutionConfig {
+            market_order_timing: MarketOrderTiming::NextBar(
+                rustrade_execution::fill::NextBarPrice::Open,
+            ),
+            ..mock_config()
+        };
+
+        let message = builder_error(ExecutionBuilder::new(&instruments).add_paper(
+            config,
+            PaperOptions::default(),
+            HistoricalClock::new(at("2025-03-24T22:00:00Z")),
+            &paper_feed(),
+        ));
+        assert!(message.contains("NextBar"), "{message}");
+    }
+
+    #[test]
+    fn add_paper_refuses_an_account_stream_with_no_capacity() {
+        let instruments = instruments(InstrumentKind::Spot);
+
+        let message = builder_error(ExecutionBuilder::new(&instruments).add_paper(
+            mock_config(),
+            PaperOptions::default().with_account_stream_capacity(0),
+            HistoricalClock::new(at("2025-03-24T22:00:00Z")),
+            &paper_feed(),
+        ));
+        assert!(message.contains("account_stream_capacity"), "{message}");
+    }
+
+    /// The venue is built as the backtest builds it, refusals included.
+    #[test]
+    fn add_paper_refuses_margin_interest_on_a_cash_account() {
+        let instruments = instruments(InstrumentKind::Spot);
+        let interest = rustrade_execution::PeriodicMarginInterest::new(
+            chrono::TimeDelta::hours(1),
+            rustrade_execution::holding_cost::DayCount::Act365,
+        );
+        let options = PaperOptions::default().with_venue(
+            crate::execution::sim::SimVenueOptions::default()
+                .with_margin_interest(Arc::new(interest)),
+        );
+
+        let message = builder_error(ExecutionBuilder::new(&instruments).add_paper(
+            mock_config(),
+            options,
+            HistoricalClock::new(at("2025-03-24T22:00:00Z")),
+            &paper_feed(),
+        ));
+        assert!(message.contains("spot_margin"), "{message}");
+    }
+
+    /// A paper venue observes only its own exchange's instruments, by their names there, and
+    /// hears of every update it missed.
+    #[tokio::test]
+    async fn a_paper_venue_observes_its_own_instruments_by_name_and_hears_of_a_lag() {
+        use rustrade_data::{
+            event::{DataKind, MarketEvent},
+            streams::reconnect,
+            subscription::trade::PublicTrade,
+        };
+        use rustrade_execution::market::{MarketObservation, MarketSnapshot};
+
+        let instrument_on = |exchange, base: &str, quote: &str| {
+            let name = format!("{base}_{quote}");
+            Instrument::new(
+                exchange,
+                name.as_str(),
+                name.as_str(),
+                Underlying::new(asset(base), asset(quote)),
+                InstrumentQuoteAsset::UnderlyingQuote,
+                InstrumentKind::Spot,
+                None,
+            )
+        };
+        let instruments = IndexedInstrumentsBuilder::default()
+            .add_instrument(instrument_on(ExchangeId::BinanceSpot, "btc", "usdt"))
+            .add_instrument(instrument_on(EXCHANGE, "spx500", "usd"))
+            .build();
+        let index_on = |exchange| {
+            instruments
+                .instruments()
+                .iter()
+                .find(|instrument| instrument.value.exchange.value == exchange)
+                .unwrap()
+                .key
+        };
+        let (ours, other) = (index_on(EXCHANGE), index_on(ExchangeId::BinanceSpot));
+
+        let trade = |seconds: i64, instrument, price| {
+            let time = at("2025-03-24T22:00:00Z") + chrono::TimeDelta::seconds(seconds);
+            reconnect::Event::Item(MarketEvent {
+                time_exchange: time,
+                time_received: time,
+                exchange: ExchangeId::Simulated,
+                instrument,
+                kind: DataKind::Trade(PublicTrade {
+                    id: seconds.to_string().into(),
+                    price,
+                    amount: dec!(1),
+                    side: None,
+                }),
+            })
+        };
+        let (tap, feed) = PaperMarketFeed::tap_with_capacity(
+            futures::stream::iter([
+                trade(1, ours, dec!(1)),
+                trade(2, ours, dec!(2)),
+                trade(3, other, dec!(3)),
+                trade(4, ours, dec!(4)),
+            ]),
+            2,
+        );
+        let market = paper_market(&instruments, EXCHANGE, &feed);
+        assert_eq!(
+            tap.count().await,
+            4,
+            "the tap yields every event it is given"
+        );
+        // With the tap and the handle gone, the venue's feed ends once it has read what is left.
+        drop(feed);
+
+        assert_eq!(
+            market.collect::<Vec<_>>().await,
+            vec![
+                MarketFeedEvent::Lagged { missed: 2 },
+                MarketFeedEvent::Observation {
+                    instrument: InstrumentNameExchange::from("spx500_usd"),
+                    observation: MarketObservation::new(MarketSnapshot {
+                        best_bid: None,
+                        best_ask: None,
+                        last_price: Some(dec!(4)),
+                    }),
+                },
+            ],
+            "the two oldest are reported missed, and the other exchange's update is skipped"
+        );
     }
 }

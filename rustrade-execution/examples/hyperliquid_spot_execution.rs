@@ -153,16 +153,13 @@ async fn main() {
 
     // Price must be reasonable - BTC ~$95k, so $50k is well below market
     // Quantity 0.001 BTC @ $50k = $50 notional (above $10 minimum)
-    let request_open = RequestOpen {
-        side: Side::Buy,
-        price: Some(dec!(50000.0)),
-        quantity: dec!(0.001),
-        kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request_open = RequestOpen::new(
+        Side::Buy,
+        Some(dec!(50000.0)),
+        dec!(0.001),
+        OrderKind::Limit,
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = OrderEvent {
         key: order_key.clone(),

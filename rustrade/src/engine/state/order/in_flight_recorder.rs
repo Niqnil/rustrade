@@ -127,6 +127,8 @@ where
 
         // Neither an `Order` nor the venue's report of one carries the flag, so this is the only
         // place the engine learns it.
-        instrument_state.record_reduce_only(&request.key.cid, request.state.reduce_only);
+        instrument_state
+            .reduce_only
+            .register(&request.key.cid, request.state.reduce_only);
     }
 }

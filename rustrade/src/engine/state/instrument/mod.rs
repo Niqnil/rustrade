@@ -6,8 +6,9 @@ use crate::{
             instrument::{data::InstrumentDataState, filter::InstrumentFilter},
             order::{Orders, manager::OrderManager},
             position::{
-                CarryUpdate, OmsMode, PnlUnrealisedUpdate, PositionExited, PositionManager,
-                PreparedSplit, SplitError, SplitRoundingPolicy, TradeOutcome, fee_in_quote,
+                CarrySlot, CarryUpdate, OmsMode, PnlUnrealisedUpdate, PositionExited,
+                PositionManager, PreparedSplit, SplitError, SplitRoundingPolicy, TradeOutcome,
+                fee_in_quote,
             },
         },
     },
@@ -28,6 +29,7 @@ use rustrade_execution::{
         state::{ActiveOrderState, InactiveOrderState, OrderState},
     },
     position::PositionReport,
+    reduce_only::ReduceOnlyBook,
     trade::{AssetFees, Trade, TradeId, TradeOrigin},
 };
 use rustrade_instrument::{
@@ -42,7 +44,7 @@ use rustrade_instrument::{
         name::{InstrumentNameExchange, InstrumentNameInternal},
     },
 };
-use rustrade_integration::collection::{FnvIndexMap, FnvIndexSet, snapshot::Snapshot};
+use rustrade_integration::collection::{FnvIndexMap, snapshot::Snapshot};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::fmt::Debug;
@@ -838,34 +840,24 @@ pub struct InstrumentState<
     #[serde(default = "FnvIndexMap::default")]
     pub retired_routing: FnvIndexMap<OrderId, PositionId>,
 
-    /// The orders tracked in [`Self::orders`] that were sent with
+    /// Which of the orders sent were sent with
     /// [`RequestOpen::reduce_only`](rustrade_execution::order::request::RequestOpen::reduce_only)
     /// set, whose fills [`Self::update_from_trade`] never lets grow or flip a position.
     ///
     /// Recorded by `InFlightRequestRecorder::record_in_flight_open`, since neither an [`Order`]
-    /// nor a venue's report of one carries the flag. `cleanup_routing_tables` moves an order that
-    /// leaves [`Self::orders`] to [`Self::retired_reduce_only_orders`], in the order they were
-    /// sent. An order this state did not send, such as one restored from a venue snapshot after a
+    /// nor a venue's report of one carries the flag. `cleanup_routing_tables` retires an order
+    /// that leaves [`Self::orders`], and the book keeps the last
+    /// [`ReduceOnlyBook::RETIRED_CAPACITY`] retired reduce-only orders, oldest evicted first, so
+    /// a fill arriving after its order's terminal snapshot is still cut, whether it names its
+    /// client order id or only the venue's. A late fill of an order evicted from it is applied in
+    /// full. An order this state did not send, such as one restored from a venue snapshot after a
     /// restart, is never in it.
-    #[serde(default)]
-    pub reduce_only_orders: FnvIndexSet<ClientOrderId>,
-
-    /// The reduce-only orders that have left [`Self::orders`], each with its venue order id once
-    /// known, so a fill arriving after its order's terminal snapshot is still cut, whether it names
-    /// its client order id or only the venue's. As [`Self::retired_routing`] does for routing, it
-    /// keeps the last [`MAX_RETIRED_ROUTING`] retirements, oldest evicted first; a late fill of an
-    /// order evicted from it is applied in full.
-    ///
-    /// The venue order id is taken from [`Self::exchange_id_to_cid`] when `cleanup_routing_tables`
-    /// prunes the order's entry there, which for an order filled on its acknowledgement is the
-    /// cleanup after its retirement rather than the one at it. It stays `None` for an order the
-    /// venue never acknowledged.
     ///
     /// Kept under both OMS modes, unlike [`Self::retired_routing`]: a netting position can be
-    /// flipped too. A new order sent under a client order id in it removes it, so the flag of an
-    /// earlier order does not outlive its id's reuse.
+    /// flipped too. A new order sent under a client order id in it replaces what an earlier order
+    /// left, so the flag of an earlier order does not outlive its id's reuse.
     #[serde(default)]
-    pub retired_reduce_only_orders: FnvIndexMap<ClientOrderId, Option<OrderId>>,
+    pub reduce_only: ReduceOnlyBook,
 
     /// The orders that were `Open` when this instrument's account stream last began to
     /// resynchronise, each with the venue order it was: the only orders the next account snapshot
@@ -1166,33 +1158,16 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
 
         // Both modes: a reduce-only fill can flip a netting position too. Retired in the order
         // sent, so which retirement is evicted first does not depend on hashing.
-        if !self.reduce_only_orders.is_empty() {
-            let retired: Vec<ClientOrderId> = self
-                .reduce_only_orders
-                .iter()
-                .filter(|cid| !self.orders.0.contains_key(*cid))
-                .cloned()
-                .collect();
-            for cid in retired {
-                self.reduce_only_orders.shift_remove(&cid);
-                self.insert_retired_reduce_only(cid);
-            }
-        }
+        self.reduce_only
+            .retire_untracked(|cid| self.orders.0.contains_key(cid));
 
         if !self.position_ids.is_empty() {
             self.position_ids
                 .retain(|cid, _| self.orders.0.contains_key(cid));
         }
         if !self.exchange_id_to_cid.is_empty() {
-            // A retired reduce-only order keeps the venue order id pruned here, so a late fill
-            // naming only that id still finds the order.
-            self.exchange_id_to_cid.retain(|exchange_id, cid| {
-                let tracked = self.orders.0.contains_key(cid);
-                if !tracked && let Some(venue_id) = self.retired_reduce_only_orders.get_mut(cid) {
-                    *venue_id = Some(exchange_id.clone());
-                }
-                tracked
-            });
+            self.exchange_id_to_cid
+                .retain(|_, cid| self.orders.0.contains_key(cid));
         }
     }
 
@@ -1223,37 +1198,6 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         self.retired_routing.insert(exchange_id, position_id);
     }
 
-    /// Record a retired reduce-only order, its venue order id not yet known, evicting the oldest
-    /// at [`MAX_RETIRED_ROUTING`].
-    fn insert_retired_reduce_only(&mut self, cid: ClientOrderId) {
-        let at_capacity = !self.retired_reduce_only_orders.contains_key(&cid)
-            && self.retired_reduce_only_orders.len() >= MAX_RETIRED_ROUTING;
-
-        if at_capacity
-            && let Some((evicted, _)) = self.retired_reduce_only_orders.shift_remove_index(0)
-        {
-            debug!(
-                evicted_cid = %evicted,
-                capacity = MAX_RETIRED_ROUTING,
-                "Retired reduce-only orders at capacity — evicting oldest retirement. A late fill \
-                 for the evicted order would now be applied in full."
-            );
-        }
-
-        self.retired_reduce_only_orders.entry(cid).or_insert(None);
-    }
-
-    /// Record that the open `cid` is being sent, reduce-only or not. A reused `cid` drops the
-    /// flag an earlier order under it left, live or retired.
-    pub(crate) fn record_reduce_only(&mut self, cid: &ClientOrderId, reduce_only: bool) {
-        self.retired_reduce_only_orders.shift_remove(cid);
-        if reduce_only {
-            self.reduce_only_orders.insert(cid.clone());
-        } else {
-            self.reduce_only_orders.shift_remove(cid);
-        }
-    }
-
     /// The client order id of the reduce-only order `trade` is a fill of, if it is one: found by
     /// the fill's [`Trade::client_order_id`], or failing that by its venue order id, among the
     /// tracked orders first and then the retired reduce-only ones.
@@ -1261,25 +1205,19 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         &'a self,
         trade: &'a Trade<AssetKey, InstrumentKey>,
     ) -> Option<&'a ClientOrderId> {
-        if self.reduce_only_orders.is_empty() && self.retired_reduce_only_orders.is_empty() {
+        if !self.reduce_only.has_reduce_only() {
             return None;
         }
-        let is_reduce_only = |cid: &ClientOrderId| {
-            self.reduce_only_orders.contains(cid)
-                || self.retired_reduce_only_orders.contains_key(cid)
-        };
-        if let Some(cid) = &trade.client_order_id {
-            return is_reduce_only(cid).then_some(cid);
-        }
-        // A tracked order outranks a retired one under the same venue order id, as in routing.
-        if let Some(cid) = self.tracked_order_cid(&trade.order_id) {
-            return is_reduce_only(cid).then_some(cid);
-        }
-        // At most `MAX_RETIRED_ROUTING` entries, scanned only for a fill naming no client order id
-        // and no tracked order.
-        self.retired_reduce_only_orders
-            .iter()
-            .find_map(|(cid, venue_id)| (venue_id.as_ref() == Some(&trade.order_id)).then_some(cid))
+        // A tracked order outranks a retired one under the same venue order id, and the book
+        // does not hold an order this state did not send, so the tracked order is asked for first.
+        let cid = trade
+            .client_order_id
+            .as_ref()
+            .or_else(|| self.tracked_order_cid(&trade.order_id));
+        self.reduce_only
+            .lookup_ids(cid, &trade.order_id)
+            .filter(|order| order.reduce_only)
+            .map(|order| order.cid)
     }
 
     /// The client order id of the tracked order the venue knows as `order_id`: O(1) through the
@@ -1308,8 +1246,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         self.retired_routing.clear();
         self.position_ids.clear();
         self.pending_fills.clear();
-        self.reduce_only_orders.clear();
-        self.retired_reduce_only_orders.clear();
+        self.reduce_only.clear();
     }
 
     /// Updates the instrument state from an [`Order`] snapshot.
@@ -1481,6 +1418,9 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             // (a) PERF-1: O(1) reverse index for subsequent fill routing.
             self.exchange_id_to_cid
                 .insert(exchange_id.clone(), cid.clone());
+            // Where the venue's id reaches the reduce-only book, whether the order is still live
+            // or this update retired it.
+            self.reduce_only.acknowledge(&cid, &exchange_id);
 
             // C1 fix: restore the CID → PositionId entry that cleanup_routing_tables removed
             // because this update retired the order (removed it from orders.0). Needed both by
@@ -1614,12 +1554,18 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// - [`BeforeEntry`](CarryUpdate::BeforeEntry): the flow predates the position's
     ///   `time_enter`, so it belongs to an earlier position, or to carry seeded with this one
     ///   (see [`PositionSeed::with_carry`](super::position::PositionSeed::with_carry)). DEBUG.
-    /// - [`AssetMismatch`](CarryUpdate::AssetMismatch): the flow's asset is not the instrument's
-    ///   quote asset, which carry is kept in. WARN.
-    /// - Otherwise the flow is added, by
+    /// - Otherwise the flow is added to the carry for its asset: the quote asset's
+    ///   [`Position::carry`](super::position::Position::carry), the base asset's
+    ///   [`AssetCarry::base`](super::position::AssetCarry::base), or any other asset's entry in
+    ///   [`AssetCarry::other`](super::position::AssetCarry::other). It is added by
     ///   [`Position::apply_carry`](super::position::Position::apply_carry), which returns
     ///   [`Applied`](CarryUpdate::Applied), or [`Overflowed`](CarryUpdate::Overflowed) if the sum
     ///   does not fit a `Decimal`.
+    ///
+    /// The base slot assumes a linear instrument settled in its quote asset. A flow in the base
+    /// asset of an inverse or base-settled instrument also lands there, and is valued at the exit
+    /// price like any other: the engine's PnL is not modelled for such an instrument, so check it
+    /// before relying on the figure.
     ///
     /// The flow's own [`instrument`](CashFlow::instrument) is not checked; the caller routes it
     /// here.
@@ -1632,7 +1578,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// consumer that opens a new stream must drop the flows it has already passed on.
     pub fn update_from_cash_flow(&mut self, flow: &CashFlow<AssetKey, InstrumentKey>) -> CarryUpdate
     where
-        AssetKey: Debug + PartialEq,
+        AssetKey: Debug + PartialEq + Clone,
         InstrumentKey: Debug,
     {
         let mut open = self.position.positions.values_mut();
@@ -1683,20 +1629,15 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             return CarryUpdate::BeforeEntry;
         }
 
-        if flow.asset != self.instrument.underlying.quote {
-            warn!(
-                instrument = ?self.key,
-                kind = ?flow.kind,
-                asset = ?flow.asset,
-                quote = ?self.instrument.underlying.quote,
-                amount = %flow.amount,
-                time_exchange = %flow.time_exchange,
-                "cash flow is not in the instrument's quote asset — not applied to carry",
-            );
-            return CarryUpdate::AssetMismatch;
-        }
+        let slot = if flow.asset == self.instrument.underlying.quote {
+            CarrySlot::Quote
+        } else if flow.asset == self.instrument.underlying.base {
+            CarrySlot::Base
+        } else {
+            CarrySlot::Other(flow.asset.clone())
+        };
 
-        position.apply_carry(flow.amount, flow.time_exchange)
+        position.apply_carry(slot, flow.amount, flow.time_exchange)
     }
 
     /// Log a fill the venue forced, and count it. See [`Self::update_from_trade`].
@@ -2092,14 +2033,14 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ///   and returned in [`FillsApplied::capped`], which the `Engine` emits as
     ///   [`EngineOutput::ReduceOnlyCapped`](crate::engine::EngineOutput::ReduceOnlyCapped).
     ///
-    /// The flag comes from the request recorded in flight (see [`Self::reduce_only_orders`]). A
+    /// The flag comes from the request recorded in flight (see [`Self::reduce_only`]). A
     /// fill finds its order by [`Trade::client_order_id`], or failing that by the venue's order
     /// id, while the order is tracked or after it retired (see
-    /// [`Self::retired_reduce_only_orders`]). A fill that reaches neither is applied in full: one
+    /// [`ReduceOnlyBook`]). A fill that reaches neither is applied in full: one
     /// whose venue names no client order id and that arrives before the order is acknowledged.
     /// So is a fill of an order this state did not send, such as one restored from a venue
     /// snapshot after a restart, and a late fill of a reduce-only order more than
-    /// [`MAX_RETIRED_ROUTING`] retirements old.
+    /// [`ReduceOnlyBook::RETIRED_CAPACITY`] retirements old.
     ///
     /// [`Trade::holding_move`] is this rule too.
     ///
@@ -2577,8 +2518,7 @@ where
         pending_fills: _,
         exchange_id_to_cid: _,
         retired_routing: _,
-        reduce_only_orders: _,
-        retired_reduce_only_orders: _,
+        reduce_only: _,
         orders_open_at_resync: _,
     } = state;
 
@@ -2665,8 +2605,7 @@ where
                         pending_fills: Vec::new(),
                         exchange_id_to_cid: FnvHashMap::default(),
                         retired_routing: FnvIndexMap::default(),
-                        reduce_only_orders: FnvIndexSet::default(),
-                        retired_reduce_only_orders: FnvIndexMap::default(),
+                        reduce_only: ReduceOnlyBook::default(),
                         orders_open_at_resync: FnvHashMap::default(),
                     },
                 )
@@ -4445,14 +4384,14 @@ mod tests {
         assert_eq!(position.carry, dec!(-1.5));
         assert_eq!(position.pnl_realised, Decimal::ZERO);
         assert_eq!(position.time_exchange_update, after(2));
-        assert_eq!(position.pnl_realised_net(), Some(dec!(-1.5)));
+        assert_eq!(position.pnl_realised_net(dec!(100)), Some(dec!(-1.5)));
 
         let exited = state
             .update_from_trade(&fill(OrderId::new("close"), Side::Buy, dec!(1)))
             .exited
             .expect("a fill for the whole quantity exits the position");
         assert_eq!(exited.carry, dec!(-1.5));
-        assert_eq!(exited.pnl_realised_net(), Some(dec!(-1.5)));
+        assert_eq!(exited.pnl_realised_net(), Ok(dec!(-1.5)));
     }
 
     #[test]
@@ -4517,18 +4456,62 @@ mod tests {
     }
 
     #[test]
-    fn a_flow_in_an_asset_other_than_the_quote_is_left_out() {
+    fn a_flow_in_the_base_asset_is_carried_and_valued_at_the_exit_price() {
         let mut state = instrument_state(OmsMode::Netting);
         let base = state.instrument.underlying.base;
         let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
 
-        let (update, warnings) =
-            count_warnings(|| state.update_from_cash_flow(&funding(base, dec!(-2), after(1))));
-        assert_eq!(update, CarryUpdate::AssetMismatch);
-        assert_eq!(warnings, 1);
+        let (updates, warnings) = count_warnings(|| {
+            [
+                state.update_from_cash_flow(&funding(base, dec!(-0.01), after(1))),
+                state.update_from_cash_flow(&funding(base, dec!(-0.005), after(2))),
+            ]
+        });
+        assert_eq!(updates, [CarryUpdate::Applied, CarryUpdate::Applied]);
+        assert_eq!(warnings, 0);
+        let position = &state.position.positions[&PositionId::NETTING];
+        assert_eq!(position.carry, Decimal::ZERO, "quote carry is untouched");
+        assert_eq!(position.carry_assets.base, dec!(-0.015));
+        assert_eq!(position.pnl_realised_net(dec!(100)), Some(dec!(-1.5)));
+        assert_eq!(position.pnl_realised_net(dec!(200)), Some(dec!(-3)));
+
+        let exited = state
+            .update_from_trade(&fill(OrderId::new("close"), Side::Buy, dec!(1)))
+            .exited
+            .expect("a fill for the whole quantity exits the position");
+        assert_eq!(exited.price_exit, Some(dec!(100)));
+        assert_eq!(exited.carry_valued(), Ok(dec!(-1.5)));
+        assert_eq!(exited.pnl_realised_net(), Ok(dec!(-1.5)));
+    }
+
+    #[test]
+    fn a_flow_in_a_third_asset_is_carried_unconverted() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let bnb = AssetIndex(99);
+        let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
+
+        let (updates, warnings) = count_warnings(|| {
+            [
+                state.update_from_cash_flow(&funding(bnb, dec!(-2), after(1))),
+                state.update_from_cash_flow(&funding(bnb, dec!(-1), after(2))),
+            ]
+        });
+        assert_eq!(updates, [CarryUpdate::Applied, CarryUpdate::Applied]);
+        assert_eq!(warnings, 0);
+        let position = &state.position.positions[&PositionId::NETTING];
+        assert_eq!(position.carry_assets.other, [(bnb, dec!(-3))]);
+        assert_eq!(position.carry, Decimal::ZERO);
+        assert_eq!(position.carry_assets.base, Decimal::ZERO);
+
+        let exited = state
+            .update_from_trade(&fill(OrderId::new("close"), Side::Buy, dec!(1)))
+            .exited
+            .expect("a fill for the whole quantity exits the position");
+        assert_eq!(exited.carry_assets.other, [(bnb, dec!(-3))]);
         assert_eq!(
-            state.position.positions[&PositionId::NETTING].carry,
-            Decimal::ZERO
+            exited.pnl_realised_net(),
+            Ok(Decimal::ZERO),
+            "an asset with no price is in no PnL figure"
         );
     }
 
@@ -5143,7 +5126,7 @@ mod tests {
             cid.clone(),
             OrderState::active(OpenInFlight::new(TIME_SENT)),
         )));
-        state.record_reduce_only(cid, reduce_only);
+        state.reduce_only.register(cid, reduce_only);
     }
 
     /// `trade` charged `fee` in `asset`, worth `fee_quote`.
@@ -5311,11 +5294,13 @@ mod tests {
             let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
             send_order(&mut state, &cid, &exchange_id, true);
             cancel_order(&mut state, &cid, &exchange_id);
-            assert!(state.reduce_only_orders.is_empty());
             assert!(state.exchange_id_to_cid.is_empty());
             assert_eq!(
-                state.retired_reduce_only_orders.get(&cid),
-                Some(&Some(exchange_id.clone()))
+                state
+                    .reduce_only
+                    .lookup_ids(None, &exchange_id)
+                    .map(|order| (order.cid.clone(), order.reduce_only)),
+                Some((cid.clone(), true))
             );
             state
         };
@@ -5332,8 +5317,8 @@ mod tests {
     }
 
     /// An order filled on its acknowledgement retires before its venue order id is indexed, so
-    /// the id is kept when a later cleanup prunes the entry restored for it. A late fill naming
-    /// only that id is then still cut.
+    /// the book takes the id for the retired order. A late fill naming only that id is still cut,
+    /// after a later cleanup prunes the entry restored for it too.
     #[test]
     fn a_late_fill_of_a_reduce_only_order_filled_on_ack_is_cut_by_its_venue_order_id() {
         let mut state = instrument_state(OmsMode::Netting);
@@ -5344,7 +5329,13 @@ mod tests {
             cid.clone(),
             OrderState::fully_filled(Filled::new(exchange_id.clone(), TIME, dec!(1), None)),
         )));
-        assert_eq!(state.retired_reduce_only_orders.get(&cid), Some(&None));
+        assert_eq!(
+            state
+                .reduce_only
+                .lookup_ids(None, &exchange_id)
+                .map(|order| order.cid.clone()),
+            Some(cid.clone())
+        );
 
         // Any later order update prunes the restored index entry.
         send_order(
@@ -5354,10 +5345,6 @@ mod tests {
             false,
         );
         assert!(!state.exchange_id_to_cid.contains_key(&exchange_id));
-        assert_eq!(
-            state.retired_reduce_only_orders.get(&cid),
-            Some(&Some(exchange_id.clone()))
-        );
 
         let applied = state.update_from_trade(&fill(exchange_id, Side::Buy, dec!(3)));
 
@@ -5398,9 +5385,12 @@ mod tests {
 
             send_order(&mut state, &cid, &OrderId::new("ex-2"), false);
 
-            assert!(!state.reduce_only_orders.contains(&cid), "{retire_first}");
-            assert!(
-                !state.retired_reduce_only_orders.contains_key(&cid),
+            assert_eq!(
+                state
+                    .reduce_only
+                    .lookup_ids(Some(&cid), &OrderId::new("ex-2"))
+                    .map(|order| order.reduce_only),
+                Some(false),
                 "{retire_first}"
             );
             let applied = state.update_from_trade(&fill(OrderId::new("ex-2"), Side::Buy, dec!(3)));
@@ -5413,7 +5403,7 @@ mod tests {
     #[test]
     fn reduce_only_orders_retire_in_the_order_sent() {
         let mut state = instrument_state(OmsMode::Netting);
-        let cids: Vec<ClientOrderId> = (0..16)
+        let cids: Vec<ClientOrderId> = (0..ReduceOnlyBook::RETIRED_CAPACITY + 2)
             .map(|i| ClientOrderId::new(format!("cid-{i}")))
             .collect();
         for cid in &cids {
@@ -5423,12 +5413,10 @@ mod tests {
         state.orders.0.clear();
         state.cleanup_routing_tables();
 
-        assert!(state.reduce_only_orders.is_empty());
-        assert!(
-            state.retired_reduce_only_orders.keys().eq(cids.iter()),
-            "{:?}",
-            state.retired_reduce_only_orders.keys().collect::<Vec<_>>()
-        );
+        let found =
+            |cid: &ClientOrderId| state.reduce_only.lookup_ids(Some(cid), &OrderId::new("-"));
+        assert!(found(&cids[0]).is_none() && found(&cids[1]).is_none());
+        assert!(cids[2..].iter().all(|cid| found(cid).is_some()));
     }
 
     /// The reduce-only orders, live and retired with or without a venue order id, survive a
@@ -5444,45 +5432,46 @@ mod tests {
         // Cancelled straight out of flight: no acknowledgement ever indexed its venue order id.
         cancel_order(&mut state, &unacked, &OrderId::new("ex-unacked"));
         send_in_flight(&mut state, &ClientOrderId::new("live"), true);
-        assert_eq!(
-            state.retired_reduce_only_orders.get(&acked),
-            Some(&Some(exchange_id))
+        assert!(
+            state
+                .reduce_only
+                .lookup_ids(None, &exchange_id)
+                .is_some_and(|order| order.cid == &acked)
         );
-        assert_eq!(state.retired_reduce_only_orders.get(&unacked), Some(&None));
-        assert_eq!(state.reduce_only_orders.len(), 1);
+        assert!(
+            state
+                .reduce_only
+                .lookup_ids(Some(&unacked), &OrderId::new("-"))
+                .is_some()
+        );
 
         let loaded: InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex> =
             serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
 
-        assert_eq!(loaded.reduce_only_orders, state.reduce_only_orders);
-        assert_eq!(
-            loaded.retired_reduce_only_orders,
-            state.retired_reduce_only_orders
-        );
+        assert_eq!(loaded.reduce_only, state.reduce_only);
     }
 
-    /// A state serialised before the reduce-only fields existed loads with none recorded.
+    /// A state serialised without the reduce-only book, such as before it existed, loads with none
+    /// recorded.
     #[test]
-    fn a_state_serialised_without_the_reduce_only_fields_loads() {
+    fn a_state_serialised_without_the_reduce_only_book_loads() {
         let mut state = instrument_state(OmsMode::Netting);
         send_in_flight(&mut state, &ClientOrderId::new("close"), true);
         let mut value = serde_json::to_value(&state).unwrap();
         let fields = value.as_object_mut().unwrap();
-        fields.remove("reduce_only_orders").unwrap();
-        fields.remove("retired_reduce_only_orders").unwrap();
+        fields.remove("reduce_only").unwrap();
 
         let loaded: InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex> =
             serde_json::from_value(value).unwrap();
 
-        assert!(loaded.reduce_only_orders.is_empty());
-        assert!(loaded.retired_reduce_only_orders.is_empty());
+        assert!(loaded.reduce_only.is_empty());
         assert_eq!(loaded.orders, state.orders);
     }
 
     #[test]
     fn retired_reduce_only_orders_evict_the_oldest_at_capacity() {
         let mut state = instrument_state(OmsMode::Netting);
-        let ids: Vec<(ClientOrderId, OrderId)> = (0..=MAX_RETIRED_ROUTING)
+        let ids: Vec<(ClientOrderId, OrderId)> = (0..=ReduceOnlyBook::RETIRED_CAPACITY)
             .map(|i| {
                 (
                     ClientOrderId::new(format!("cid-{i}")),
@@ -5496,13 +5485,11 @@ mod tests {
             cancel_order(&mut state, cid, oid);
         }
 
-        assert_eq!(state.retired_reduce_only_orders.len(), MAX_RETIRED_ROUTING);
-        assert!(!state.retired_reduce_only_orders.contains_key(&ids[0].0));
-        assert!(
-            state
-                .retired_reduce_only_orders
-                .contains_key(&ids[MAX_RETIRED_ROUTING].0)
-        );
+        let found =
+            |cid: &ClientOrderId| state.reduce_only.lookup_ids(Some(cid), &OrderId::new("-"));
+        assert!(found(&ids[0].0).is_none());
+        assert!(found(&ids[1].0).is_some());
+        assert!(found(&ids[ReduceOnlyBook::RETIRED_CAPACITY].0).is_some());
     }
 
     /// In a hedged account the cut is against the position the order is routed to.
@@ -5667,12 +5654,10 @@ mod tests {
             &ClientOrderId::new("gone"),
             &OrderId::new("ex-gone"),
         );
-        assert!(!state.reduce_only_orders.is_empty());
-        assert!(!state.retired_reduce_only_orders.is_empty());
+        assert!(!state.reduce_only.is_empty());
 
         state.clear_order_routing();
 
-        assert!(state.reduce_only_orders.is_empty());
-        assert!(state.retired_reduce_only_orders.is_empty());
+        assert!(state.reduce_only.is_empty());
     }
 }

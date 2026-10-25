@@ -36,6 +36,7 @@
 //   report cannot resurrect a retired order as a resting one. That order's filled
 //   quantity is settled instead by the terminal report's own z, or by fetch_open_orders.
 
+use super::rules::RulesLoader;
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, DisconnectOnDrop, ExecutionReport, FILL_RECOVERY_TIMEOUT_SECS,
@@ -50,6 +51,7 @@ use super::shared::{
     parse_user_data_frame, placed_order_state, recovered_order_cids, recovered_order_totals,
     response_decode_error, rest_call_with_retry, retry_or_end, trailing_params, unix_ms,
 };
+use crate::rules::{OrderRules, PreSendRules};
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
     UnindexedAccountEvent, UnindexedAccountSnapshot,
@@ -64,6 +66,7 @@ use crate::{
     },
     emit_stream_terminated,
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
+    margin::MarginEffect,
     order::{
         Order, OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
@@ -104,6 +107,7 @@ use rustrade_instrument::{
 use serde::Deserialize;
 use smol_str::format_smolstr;
 use std::{
+    collections::HashMap,
     str::FromStr,
     sync::{
         Arc,
@@ -130,6 +134,12 @@ pub struct BinanceSpotConfig {
     /// Use testnet endpoints instead of production.
     #[serde(default = "default_testnet")]
     pub testnet: bool,
+
+    /// Whether an order is checked against its symbol's tick, lot and notional rules before it
+    /// is sent. Defaults to [`PreSendRules::Enforce`]. See
+    /// [`BinanceSpot::open_order`](crate::client::ExecutionClient::open_order).
+    #[serde(default)]
+    pub pre_send_rules: PreSendRules,
 }
 
 /// Serde default for [`BinanceSpotConfig::testnet`]: an absent `testnet` field deserializes to the
@@ -148,6 +158,7 @@ impl std::fmt::Debug for BinanceSpotConfig {
             .field("api_key", &"***")
             .field("secret_key", &"***")
             .field("testnet", &self.testnet)
+            .field("pre_send_rules", &self.pre_send_rules)
             .finish()
     }
 }
@@ -165,7 +176,15 @@ impl BinanceSpotConfig {
             api_key,
             secret_key,
             testnet: true,
+            pre_send_rules: PreSendRules::default(),
         }
+    }
+
+    /// Set whether an order is checked against its symbol's rules before it is sent.
+    #[must_use]
+    pub fn with_pre_send_rules(mut self, pre_send_rules: PreSendRules) -> Self {
+        self.pre_send_rules = pre_send_rules;
+        self
     }
 
     /// Create a config targeting Binance Spot's **production** endpoints.
@@ -177,6 +196,7 @@ impl BinanceSpotConfig {
             api_key,
             secret_key,
             testnet: false,
+            pre_send_rules: PreSendRules::default(),
         }
     }
 
@@ -353,6 +373,9 @@ pub struct BinanceSpot {
     // The orders seen live and not yet seen end, which a reconnect asks about. Shared by every
     // clone and every account stream, since an order placed through one ends on any of them.
     known_live: SharedKnownLiveOrders,
+    // The symbols' tick, lot and notional rules, loaded on each symbol's first order. Shared by
+    // every clone.
+    rules: Arc<RulesLoader>,
 }
 
 impl std::fmt::Debug for BinanceSpot {
@@ -364,6 +387,21 @@ impl std::fmt::Debug for BinanceSpot {
 }
 
 impl BinanceSpot {
+    /// Load the order rules of `instruments` from Binance now, and hold them for
+    /// [`open_order`](ExecutionClient::open_order) to check against.
+    ///
+    /// Rules otherwise load on each symbol's first order, which adds a request to that order.
+    /// Calling this ahead takes it off the first order, and shows a bad symbol or a failed load
+    /// here, not as an unchecked order. Binance refuses the whole request if one symbol is not
+    /// listed. Holds nothing back when [`BinanceSpotConfig::pre_send_rules`] is
+    /// [`PreSendRules::Off`]: the rules are returned but not used.
+    pub async fn load_rules(
+        &self,
+        instruments: &[InstrumentNameExchange],
+    ) -> Result<HashMap<InstrumentNameExchange, OrderRules>, UnindexedClientError> {
+        self.rules.load(instruments).await
+    }
+
     /// Hold each of `orders` as live, for a reconnect to ask about if the stream misses its end.
     fn remember_live<'a>(
         &self,
@@ -794,13 +832,20 @@ impl ExecutionClient for BinanceSpot {
     fn new(config: Self::Config) -> Self {
         let rest = Self::build_rest(&config);
         let ws_handle = Self::build_ws_handle(&config);
+        let rate_limiter = Arc::new(RateLimitTracker::new(WeightPool::Spot));
+        let rules = Arc::new(RulesLoader::new(
+            config.pre_send_rules,
+            Arc::clone(&rest),
+            Arc::clone(&rate_limiter),
+        ));
         Self {
             config: Arc::new(config),
             rest,
             ws_handle,
             ws_api: Arc::new(RwLock::new(None)),
-            rate_limiter: Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+            rate_limiter,
             known_live: KnownLiveOrders::shared(ExchangeId::BinanceSpot),
+            rules,
         }
     }
 
@@ -1226,6 +1271,39 @@ impl ExecutionClient for BinanceSpot {
             request.key.strategy.clone(),
             cid.clone(),
         );
+
+        // A spot account never borrows, so `NoSideEffect` is the one effect it honours.
+        if let Some(effect) = request
+            .state
+            .margin_effect
+            .filter(|effect| *effect != MarginEffect::NoSideEffect)
+        {
+            return Order {
+                key: order_key,
+                side,
+                price,
+                quantity,
+                kind,
+                time_in_force,
+                state: OrderState::inactive(OrderError::UnsupportedMarginEffect(effect)),
+            };
+        }
+
+        if let Err(refused) = self
+            .rules
+            .check(instrument.name(), kind, price, quantity)
+            .await
+        {
+            return Order {
+                key: order_key,
+                side,
+                price,
+                quantity,
+                kind,
+                time_in_force,
+                state: OrderState::inactive(refused),
+            };
+        }
 
         let ws = match self.get_ws_api().await {
             Ok(ws) => ws,
@@ -2546,6 +2624,164 @@ mod tests {
     use crate::order::{TrailingOffsetType, id::ClientOrderId};
     use binance_sdk::common::errors::WebsocketError;
     use smol_str::SmolStr;
+
+    /// A spot account never borrows, so it honours `NoSideEffect` alone, and refuses a borrow or
+    /// a repay before it opens a connection.
+    #[tokio::test]
+    async fn open_order_refuses_a_borrow_or_repay_effect_unsent() {
+        use crate::{
+            client::ExecutionClient,
+            margin::MarginEffect,
+            order::{request::RequestOpen, state::InactiveOrderState},
+        };
+
+        let client = BinanceSpot::new(BinanceSpotConfig::testnet("key".into(), "secret".into()));
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+
+        for effect in [MarginEffect::Borrow, MarginEffect::Repay] {
+            let order = client
+                .open_order(OrderRequestOpen {
+                    key: OrderKey::new(
+                        ExchangeId::BinanceSpot,
+                        &instrument,
+                        StrategyId::new("strategy"),
+                        ClientOrderId::new("cid"),
+                    ),
+                    state: RequestOpen::new(
+                        Side::Buy,
+                        Some(Decimal::from(50_000)),
+                        Decimal::ONE,
+                        OrderKind::Limit,
+                        TimeInForce::GoodUntilCancelled { post_only: false },
+                    )
+                    .with_margin_effect(effect),
+                })
+                .await;
+
+            assert!(
+                matches!(
+                    order.state,
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(
+                        OrderError::UnsupportedMarginEffect(refused)
+                    )) if refused == effect
+                ),
+                "{order:?}"
+            );
+        }
+    }
+
+    /// `load_rules` returns the rules it read.
+    #[tokio::test]
+    async fn load_rules_returns_the_rules_it_read() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v3/exchangeInfo"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"symbols": [{
+                    "symbol": "BTCUSDT", "status": "TRADING",
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "100", "stepSize": "0.001"},
+                    ],
+                }]}),
+            ))
+            .mount(&server)
+            .await;
+        let mut client =
+            BinanceSpot::new(BinanceSpotConfig::testnet("key".into(), "secret".into()));
+        client.rules = Arc::new(RulesLoader::new(
+            PreSendRules::Enforce,
+            Arc::new(SpotRestApi::from_config(
+                ConfigurationRestApi::builder()
+                    .api_key("key")
+                    .api_secret("secret")
+                    .base_path(server.uri())
+                    .build()
+                    .unwrap(),
+            )),
+            Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+        ));
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+
+        let loaded = client.load_rules(std::slice::from_ref(&btcusdt)).await;
+        let rules = loaded.ok().and_then(|mut loaded| loaded.remove(&btcusdt));
+        assert_eq!(
+            rules.map(|rules| rules.quantity.step),
+            Some(Some(Decimal::new(1, 3)))
+        );
+    }
+
+    /// An order that breaks the symbol's rules is refused before a connection opens, with the
+    /// limit it broke; a refusal costs no order request.
+    #[tokio::test]
+    async fn open_order_refuses_an_order_breaking_the_symbols_rules_unsent() {
+        use crate::{
+            client::ExecutionClient,
+            error::{Bound, BoundsViolation, OrderField},
+            order::{request::RequestOpen, state::InactiveOrderState},
+        };
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/exchangeInfo"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"symbols": [{
+                    "symbol": "BTCUSDT", "status": "TRADING",
+                    "filters": [
+                        {"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "100", "stepSize": "0.001"},
+                    ],
+                }]}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client =
+            BinanceSpot::new(BinanceSpotConfig::testnet("key".into(), "secret".into()));
+        client.rules = Arc::new(RulesLoader::new(
+            PreSendRules::Enforce,
+            Arc::new(SpotRestApi::from_config(
+                ConfigurationRestApi::builder()
+                    .api_key("key")
+                    .api_secret("secret")
+                    .base_path(server.uri())
+                    .build()
+                    .unwrap(),
+            )),
+            Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+        ));
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+
+        let order = client
+            .open_order(OrderRequestOpen {
+                key: OrderKey::new(
+                    ExchangeId::BinanceSpot,
+                    &instrument,
+                    StrategyId::new("strategy"),
+                    ClientOrderId::new("cid"),
+                ),
+                state: RequestOpen::new(
+                    Side::Buy,
+                    Some(Decimal::from(50_000)),
+                    Decimal::from(101),
+                    OrderKind::Limit,
+                    TimeInForce::GoodUntilCancelled { post_only: false },
+                ),
+            })
+            .await;
+
+        assert!(
+            matches!(
+                order.state,
+                OrderState::Inactive(InactiveOrderState::OpenFailed(
+                    OrderError::OutOfBounds(violation)
+                )) if violation == BoundsViolation::new(
+                    OrderField::Quantity,
+                    Bound::Max,
+                    Decimal::from(100),
+                    Decimal::from(101),
+                )
+            ),
+            "{order:?}"
+        );
+    }
 
     #[test]
     fn test_binance_spot_config_new_uses_testnet_by_default() {
@@ -5126,16 +5362,13 @@ mod tests {
                 strategy: StrategyId::new("strategy"),
                 cid: ClientOrderId::new("cid"),
             },
-            state: crate::order::request::RequestOpen {
-                side: Side::Buy,
-                price: Some(Decimal::new(50_000, 0)),
-                quantity: Decimal::new(1, 3),
-                kind: OrderKind::Limit,
-                time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                position_id: None,
-                reduce_only: false,
-                market: None,
-            },
+            state: crate::order::request::RequestOpen::new(
+                Side::Buy,
+                Some(Decimal::new(50_000, 0)),
+                Decimal::new(1, 3),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilCancelled { post_only: false },
+            ),
         };
 
         let order = client.open_order(request).await;
@@ -5362,7 +5595,7 @@ mod tests {
     /// ping. A connection Binance accepts and drops at once is a failure like any other, and so is
     /// one that stays silent past the first tick, so a venue doing either to every connection
     /// exhausts the budget.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_reconnect_budget_resets_only_once_a_connection_proves_stable() {
         async fn run(pinging: bool) {
             let lifetime = if pinging {

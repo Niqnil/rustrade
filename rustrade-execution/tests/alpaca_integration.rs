@@ -416,16 +416,13 @@ async fn test_place_and_cancel_limit_order() {
         cid: order_cid.clone(),
     };
 
-    let request_open = RequestOpen {
-        side: Side::Buy,
-        price: Some(dec!(1.00)),
-        quantity: dec!(1),
-        kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodUntilEndOfDay,
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request_open = RequestOpen::new(
+        Side::Buy,
+        Some(dec!(1.00)),
+        dec!(1),
+        OrderKind::Limit,
+        TimeInForce::GoodUntilEndOfDay,
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -598,16 +595,13 @@ async fn test_snapshot_lists_an_equity_order_under_its_client_id_and_complete() 
     init_logging();
     assert_snapshot_lists_the_order_then_drops_it(
         spy_instrument(),
-        RequestOpen {
-            side: Side::Buy,
-            price: Some(dec!(1.00)),
-            quantity: dec!(1),
-            kind: OrderKind::Limit,
-            time_in_force: TimeInForce::GoodUntilEndOfDay,
-            position_id: None,
-            reduce_only: false,
-            market: None,
-        },
+        RequestOpen::new(
+            Side::Buy,
+            Some(dec!(1.00)),
+            dec!(1),
+            OrderKind::Limit,
+            TimeInForce::GoodUntilEndOfDay,
+        ),
     )
     .await;
 }
@@ -620,16 +614,13 @@ async fn test_snapshot_lists_a_crypto_order_under_its_client_id_and_complete() {
     init_logging();
     assert_snapshot_lists_the_order_then_drops_it(
         btc_instrument(),
-        RequestOpen {
-            side: Side::Buy,
-            price: Some(dec!(1000.00)),
-            quantity: dec!(0.01),
-            kind: OrderKind::Limit,
-            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-            position_id: None,
-            reduce_only: false,
-            market: None,
-        },
+        RequestOpen::new(
+            Side::Buy,
+            Some(dec!(1000.00)),
+            dec!(0.01),
+            OrderKind::Limit,
+            TimeInForce::GoodUntilCancelled { post_only: false },
+        ),
     )
     .await;
 }
@@ -657,16 +648,13 @@ async fn test_place_crypto_limit_order() {
         cid: order_cid.clone(),
     };
 
-    let request_open = RequestOpen {
-        side: Side::Buy,
-        price: Some(dec!(1000.00)),
-        quantity: dec!(0.01),
-        kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request_open = RequestOpen::new(
+        Side::Buy,
+        Some(dec!(1000.00)),
+        dec!(0.01),
+        OrderKind::Limit,
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -810,16 +798,13 @@ async fn test_account_stream_with_order() {
         cid: order_cid.clone(),
     };
 
-    let request_open = RequestOpen {
-        side: Side::Buy,
-        price: Some(dec!(1.00)),
-        quantity: dec!(1),
-        kind: OrderKind::Limit,
-        time_in_force: TimeInForce::GoodUntilEndOfDay,
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+    let request_open = RequestOpen::new(
+        Side::Buy,
+        Some(dec!(1.00)),
+        dec!(1),
+        OrderKind::Limit,
+        TimeInForce::GoodUntilEndOfDay,
+    );
 
     println!("Placing order to trigger stream events...");
     let response = client
@@ -927,18 +912,15 @@ async fn test_place_and_cancel_stop_order() {
 
     // Stop order: triggers a market order when SPY drops to $1.00
     // This price is unrealistically low so the order will never trigger
-    let request_open = RequestOpen {
-        side: Side::Sell,
-        price: None,
-        quantity: dec!(1),
-        kind: OrderKind::Stop {
+    let request_open = RequestOpen::new(
+        Side::Sell,
+        None,
+        dec!(1),
+        OrderKind::Stop {
             trigger_price: dec!(1.00),
         },
-        time_in_force: TimeInForce::GoodUntilEndOfDay,
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+        TimeInForce::GoodUntilEndOfDay,
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),
@@ -1020,20 +1002,17 @@ async fn test_place_and_cancel_trailing_stop_order() {
     };
 
     // Trailing stop order with 5% trail distance
-    let request_open = RequestOpen {
-        side: Side::Sell,
-        price: None,
-        quantity: dec!(1),
-        kind: OrderKind::TrailingStop {
+    let request_open = RequestOpen::new(
+        Side::Sell,
+        None,
+        dec!(1),
+        OrderKind::TrailingStop {
             offset: dec!(5.0),
             offset_type: TrailingOffsetType::Percentage,
             activation_price: None,
         },
-        time_in_force: TimeInForce::GoodUntilEndOfDay,
-        position_id: None,
-        reduce_only: false,
-        market: None,
-    };
+        TimeInForce::GoodUntilEndOfDay,
+    );
 
     let open_request = rustrade_execution::order::OrderEvent {
         key: order_key.clone(),

@@ -1018,9 +1018,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "38d28fb6aa7dd680b3ffd1a3e64e115c177bdba63c0ae7f9cd48129ff05c4fa0"
 dependencies = [
  "cmov",
 ]
@@ -4447,7 +4447,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -4477,7 +4477,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-data"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "async-stream",
  "chrono",
@@ -4522,7 +4522,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-execution"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "binance-sdk",
@@ -4562,7 +4562,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-instrument"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "chrono",
  "derive_more 2.1.1",
@@ -4579,7 +4579,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-integration"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -4613,7 +4613,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-macro"
-version = "0.13.0"
+version = "0.14.0"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",

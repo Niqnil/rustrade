@@ -1097,8 +1097,9 @@ where
 /// market — a gap in a feed does not mean the instrument stopped having a price, and a venue that
 /// forgot its market on every reconnect would refuse to match orders it should have matched.
 ///
-/// A venue that does not trade the instrument is skipped: its own index is what decides, so a
-/// runner driving several venues never leaks one venue's instruments into another's view.
+/// A venue whose exchange does not list the instrument is skipped, so a runner driving several
+/// venues never leaks one exchange's prices into another's view, even when both list the same
+/// exchange-native name.
 ///
 /// # A tick-caused fill pays one latency leg, not two
 /// `to_venue` is the delay from the `Engine` issuing a request to the venue acting on it. Nothing
@@ -1142,12 +1143,12 @@ where
     let mut routed = Routed::Now;
 
     for (exchange, slot) in venues.iter_mut() {
-        // `Err` means this venue does not trade the instrument, which is ordinary on a multi-venue
-        // run and not a misconfiguration.
-        let Ok(name) = slot
+        // The index holds every exchange's instruments, so a name lookup alone would succeed for
+        // all of them: only an instrument listed on this venue's own exchange is its to trade.
+        let Some(name) = slot
             .indexer
             .map
-            .find_instrument_name_exchange(event.instrument)
+            .find_own_instrument_name_exchange(event.instrument)
         else {
             continue;
         };
@@ -1635,7 +1636,7 @@ mod tests {
         subscription::{candle::Candle, trade::PublicTrade},
     };
     use rustrade_execution::{
-        AccountSnapshot, PeriodicMarginInterest, SpotMarginConfig,
+        AccountSnapshot, MarginEffect, PeriodicMarginInterest, SpotMarginConfig,
         balance::{AssetBalance, Balance},
         client::mock::MockExecutionConfig,
         exchange::mock::VenueInstrumentMarket,
@@ -1888,17 +1889,15 @@ mod tests {
                     strategy: StrategyId::new("test"),
                     cid: ClientOrderId::random(),
                 },
-                state: RequestOpen {
-                    side: Side::Buy,
+                state: RequestOpen::new(
+                    Side::Buy,
                     // `None` by construction for a Market order; the venue prices it from `market`.
-                    price: None,
-                    quantity: dec!(0.01),
-                    kind: OrderKind::Market,
+                    None,
+                    dec!(0.01),
+                    OrderKind::Market,
                     time_in_force,
-                    position_id: None,
-                    reduce_only: false,
-                    market: Some(MarketSnapshot::new(None, None, Some(price))),
-                },
+                )
+                .with_market(MarketSnapshot::new(None, None, Some(price))),
             }));
         }
 
@@ -1915,16 +1914,13 @@ mod tests {
                     strategy: StrategyId::new("test"),
                     cid: cid.clone(),
                 },
-                state: RequestOpen {
-                    side: Side::Buy,
-                    price: Some(price),
-                    quantity: dec!(0.01),
-                    kind: OrderKind::Limit,
-                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                    position_id: None,
-                    reduce_only: false,
-                    market: None,
-                },
+                state: RequestOpen::new(
+                    Side::Buy,
+                    Some(price),
+                    dec!(0.01),
+                    OrderKind::Limit,
+                    TimeInForce::GoodUntilCancelled { post_only: false },
+                ),
             }));
             cid
         }
@@ -1939,16 +1935,13 @@ mod tests {
                     strategy: StrategyId::new("test"),
                     cid: cid.clone(),
                 },
-                state: RequestOpen {
-                    side: Side::Buy,
-                    price: Some(price),
-                    quantity: dec!(0.01),
-                    kind: OrderKind::Limit,
-                    time_in_force: TimeInForce::GoodTillDate { expiry },
-                    position_id: None,
-                    reduce_only: false,
-                    market: None,
-                },
+                state: RequestOpen::new(
+                    Side::Buy,
+                    Some(price),
+                    dec!(0.01),
+                    OrderKind::Limit,
+                    TimeInForce::GoodTillDate { expiry },
+                ),
             }));
             cid
         }
@@ -2136,16 +2129,13 @@ mod tests {
                 strategy: StrategyId::new("test"),
                 cid: ClientOrderId::new("unindexed"),
             },
-            state: RequestOpen {
-                side: Side::Buy,
-                price: None,
-                quantity: dec!(0.01),
-                kind: OrderKind::Market,
-                time_in_force: TimeInForce::ImmediateOrCancel,
-                position_id: None,
-                reduce_only: false,
-                market: None,
-            },
+            state: RequestOpen::new(
+                Side::Buy,
+                None,
+                dec!(0.01),
+                OrderKind::Market,
+                TimeInForce::ImmediateOrCancel,
+            ),
         }));
 
         harness.next().await;
@@ -2469,7 +2459,12 @@ mod tests {
 
         let margin = MockExecutionConfig {
             spot_margin: Some(
-                SpotMarginConfig::new(AssetNameExchange::new("usdt"), dec!(3)).unwrap(),
+                SpotMarginConfig::new(
+                    AssetNameExchange::new("usdt"),
+                    dec!(3),
+                    MarginEffect::Borrow,
+                )
+                .unwrap(),
             ),
             ..config(0)
         };

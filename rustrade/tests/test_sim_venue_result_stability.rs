@@ -189,16 +189,13 @@ impl AlgoStrategy for MetronomeStrategy {
                 // open-order store is going to key on this.
                 cid: ClientOrderId::new(format!("metronome-{seq}")),
             },
-            state: RequestOpen {
-                side: Side::Buy,
-                price: None,
-                quantity: dec!(0.001),
-                kind: OrderKind::Market,
-                time_in_force: TimeInForce::ImmediateOrCancel,
-                position_id: None,
-                reduce_only: false,
-                market: None,
-            },
+            state: RequestOpen::new(
+                Side::Buy,
+                None,
+                dec!(0.001),
+                OrderKind::Market,
+                TimeInForce::ImmediateOrCancel,
+            ),
         };
 
         (std::iter::empty(), vec![open])

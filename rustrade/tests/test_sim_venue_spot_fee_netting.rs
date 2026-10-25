@@ -165,20 +165,18 @@ fn market_order(
             strategy: StrategyId::new("test"),
             cid: ClientOrderId::random(),
         },
-        state: RequestOpen {
+        state: RequestOpen::new(
             side,
-            price: None,
+            None,
             quantity,
-            kind: OrderKind::Market,
-            time_in_force: TimeInForce::ImmediateOrCancel,
-            position_id: None,
-            reduce_only: false,
-            market: Some(MarketSnapshot {
-                best_bid: Some(price),
-                best_ask: Some(price),
-                last_price: Some(price),
-            }),
-        },
+            OrderKind::Market,
+            TimeInForce::ImmediateOrCancel,
+        )
+        .with_market(MarketSnapshot {
+            best_bid: Some(price),
+            best_ask: Some(price),
+            last_price: Some(price),
+        }),
     }
 }
 

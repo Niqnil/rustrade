@@ -117,7 +117,8 @@
 //!
 //! 1. **Fill reconciliation**: when fill recovery fails repeatedly, the stream reports the
 //!    gap as `AccountEventKind::FillRecoveryGaveUp` and stays open. Read the gap's fills
-//!    with [`ExecutionClient::fetch_trades`].
+//!    with [`ExecutionClient::fetch_trades`]. A `VenueRetention` gap is the part IB no longer
+//!    holds: `fetch_trades` cannot read it, so reconcile it from another source.
 //! 2. **Permanent disconnect**: when `ibapi` gives up reconnecting,
 //!    [`IbkrClient::disconnect`] is called, or TWS/Gateway ends the API session,
 //!    `account_stream` ends with `StreamTerminated`, and `account_stream` on the
@@ -2558,7 +2559,7 @@ impl ExecutionClient for IbkrClient {
     /// `StreamTerminated`. TWS does not resend what it sent while the socket was
     /// down, and TWS losing its own link to IB's servers (notice 1100) opens the
     /// same kind of gap. Once delivery is restored, this stream asks TWS for the
-    /// day's executions and emits the ones from the gap as `Trade` events. The
+    /// last seven days of executions and emits the ones from the gap as `Trade` events. The
     /// gap is taken to start up to a poll interval before the drop was noticed,
     /// minus a lookback margin. Trades the stream already delivered are not
     /// emitted twice. The log line `Recovered IBKR fills after a gap in event
@@ -2569,6 +2570,12 @@ impl ExecutionClient for IbkrClient {
     /// `AccountEventKind::FillRecoveryGaveUp` covering every instrument, from the
     /// start of the gap to when it gave up, and stays open. Read that span with
     /// [`ExecutionClient::fetch_trades`].
+    ///
+    /// A gap that starts before the span IB surely holds (see `fetch_trades`' `held_since`) is
+    /// reported too, even though the read succeeds: after the recovered trades, one
+    /// `FillRecoveryGaveUp` with `FillRecoveryFailure::VenueRetention` covers the part before
+    /// that span, ending the moment before `held_since`. `fetch_trades` cannot read that part
+    /// either, so reconcile it from another source.
     ///
     /// **Orders that ended during the gap.** After the fills, recovered or given
     /// up, the stream checks how each order the client holds as live ended:
@@ -2868,6 +2875,20 @@ impl ExecutionClient for IbkrClient {
             strategy: request.key.strategy.clone(),
             cid: request.key.cid.clone(),
         };
+
+        // Margin is account-level at IBKR: no order flag borrows or repays, so no effect is
+        // honoured.
+        if let Some(effect) = request.state.margin_effect {
+            return Order {
+                key,
+                side: request.state.side,
+                price: request.state.price,
+                quantity: request.state.quantity,
+                kind: request.state.kind,
+                time_in_force: request.state.time_in_force,
+                state: OrderState::inactive(OrderError::UnsupportedMarginEffect(effect)),
+            };
+        }
 
         let contract = match self.contracts.get_contract(request.key.instrument) {
             Some(c) => c,
@@ -3199,10 +3220,11 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Limitations
     ///
-    /// - IB only returns executions from the current trading day. The span is applied
-    ///   client-side to filter within that day, and the read is always complete
-    ///   (`resume: None`) for what IB returned: a span reaching before today is not read
-    ///   before today. For historical executions beyond today, use IB's Flex Query or
+    /// - IB lists executions from the last 7 days at most, counted in a time zone of its own. One
+    ///   request reads them all, the span is applied client-side, and the read is always
+    ///   complete (`resume: None`) for what IB returned. A span starting more than 5 days ago
+    ///   has [`held_since`](TradesRead::held_since) set to 5 days ago, the most the read is sure
+    ///   to reach: fills before it may be missing. For older executions, use IB's Flex Query or
     ///   Activity Statements.
     /// - Only the executions of orders this API client placed are returned, plus any
     ///   execution IB flags as an IB-initiated liquidation, whoever placed its order, as a
@@ -3239,6 +3261,7 @@ impl ExecutionClient for IbkrClient {
         if start > end {
             return Ok(TradesRead::complete(Vec::new()));
         }
+        let held_since = execution::executions_held_since(start, Utc::now());
         let client = self.client.clone();
         let contracts = self.contracts.clone();
         let scope = self.execution_scope();
@@ -3253,7 +3276,7 @@ impl ExecutionClient for IbkrClient {
             // `ExecutionScope::classify`).
             // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
             let sub = client
-                .executions(ibapi::orders::ExecutionFilter::default())
+                .executions(execution::executions_filter())
                 .map_err(|e| UnindexedClientError::Internal(format!("executions: {e}")))?;
 
             let mut listing = Vec::new();
@@ -3275,9 +3298,10 @@ impl ExecutionClient for IbkrClient {
                 start..=end,
                 instruments_filter.as_ref(),
             );
-            Ok(TradesRead::complete(execution::keep_latest_revisions(
-                trades,
-            )))
+            Ok(
+                TradesRead::complete(execution::keep_latest_revisions(trades))
+                    .with_held_since(held_since),
+            )
         })
         .await
         .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))?
@@ -3851,7 +3875,7 @@ impl BracketOrderClient for IbkrClient {
 ///
 /// A filled order is reported fully filled, without an average price; a cancelled or expired one
 /// with the fill its executions show, which is nothing when they show none of it and the order
-/// was placed through this client under six days ago, since the read then covers its whole life,
+/// was placed through this client under five days ago, since the read then covers its whole life,
 /// and otherwise unknown (`None`); a placement IB accepted and then rejected, or left `Inactive`,
 /// as [`OpenFailed`](crate::order::state::InactiveOrderState::OpenFailed). A cancelled order is
 /// reported expired by the rule [`ExecutionClient::account_stream`] applies. An order IB lists

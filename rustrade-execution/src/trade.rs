@@ -404,23 +404,49 @@ fn reduced_by(held: Decimal, moved: Decimal) -> Option<Decimal> {
 /// `trades` can be empty while `resume` is `Some`: a venue that reads every instrument's fills
 /// and filters them afterwards can spend a whole call on other instruments'. A caller that takes
 /// `trades` without reading on from `resume` can miss fills.
+///
+/// A venue also keeps fills for a limited time or count. `held_since` says when that limit cuts
+/// into the span, so a caller can tell fills the venue no longer has from fills that never
+/// happened.
 #[non_exhaustive]
 #[must_use = "`resume` says whether the span was read to its end"]
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Constructor)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize)]
 pub struct TradesRead<AssetKey, InstrumentKey> {
     /// The fills read, in the span and for the requested instruments.
     pub trades: Vec<Trade<AssetKey, InstrumentKey>>,
     /// Where to read on from, or `None` when the read reached the span's end.
     pub resume: Option<DateTime<Utc>>,
+    /// The earliest moment the venue still holds fills from, when that is inside the span; fills
+    /// before it may exist but cannot be read. `None` when the venue's limit is not known to cut
+    /// into the span, which is no claim that the venue holds fills without limit.
+    ///
+    /// A caller that needs every fill in the span treats the part before `held_since` as a gap:
+    /// `resume: None` covers what the venue holds, not what it held. The limit cuts into the span
+    /// from its start, so only the first call of a span can report it; a caller reading on from
+    /// `resume` has nothing to learn from a later call's.
+    pub held_since: Option<DateTime<Utc>>,
 }
 
 impl<AssetKey, InstrumentKey> TradesRead<AssetKey, InstrumentKey> {
-    /// A read that reached the span's end.
-    pub fn complete(trades: Vec<Trade<AssetKey, InstrumentKey>>) -> Self {
+    /// A read that stopped at `resume` (`None`: it reached the span's end), with no venue limit
+    /// cutting into the span.
+    pub fn new(trades: Vec<Trade<AssetKey, InstrumentKey>>, resume: Option<DateTime<Utc>>) -> Self {
         Self {
             trades,
-            resume: None,
+            resume,
+            held_since: None,
         }
+    }
+
+    /// A read that reached the span's end.
+    pub fn complete(trades: Vec<Trade<AssetKey, InstrumentKey>>) -> Self {
+        Self::new(trades, None)
+    }
+
+    /// Sets [`held_since`](Self::held_since).
+    pub fn with_held_since(mut self, held_since: Option<DateTime<Utc>>) -> Self {
+        self.held_since = held_since;
+        self
     }
 }
 

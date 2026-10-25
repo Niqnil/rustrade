@@ -1,5 +1,6 @@
 //! Resting orders, held in the order a venue would match them.
 
+use crate::margin::MarginEffect;
 use crate::order::{
     Order, TimeInForce, UnindexedOrder,
     id::ClientOrderId,
@@ -38,9 +39,13 @@ pub struct Reservation {
     /// rested, or one a configured `initial_state` seeded already part-filled.
     pub amount: Decimal,
     /// How much of [`amount`](Self::amount) a margin account lent the order when it was placed,
-    /// repaid if the order ends unfilled. Zero on a cash account, and for an order the account
-    /// could pay for itself.
+    /// repaid if the order ends unfilled. Zero on a cash account, for an order whose effect is
+    /// not [`Borrow`](MarginEffect::Borrow), and for an order the account could pay for itself.
     pub borrowed: Decimal,
+    /// What the order does to the account's loans, resolved from its request and the venue's
+    /// default at placement, so that a resting order's later fill borrows or repays as it
+    /// was placed to.
+    pub effect: MarginEffect,
 }
 
 /// One resting order, and whatever the venue is holding against it.
@@ -627,6 +632,7 @@ mod tests {
             asset: AssetNameExchange::new("usdt"),
             amount: dec!(98),
             borrowed: Decimal::ZERO,
+            effect: MarginEffect::NoSideEffect,
         };
 
         let Err(AlreadyResting(refused)) = open.insert(

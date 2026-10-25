@@ -7,6 +7,307 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-25
+
+### Added
+
+- **Carry in the base asset and other assets on a position** (`rustrade`). A margin short borrows
+  the base asset and the venue charges its interest in that asset, so the cost in quote is the
+  interest times the price the asset is bought back at. A cash flow in an asset other than the
+  instrument's quote asset used to be refused (`CarryUpdate::AssetMismatch`); it is now added to
+  the open position:
+  - `Position::carry_assets` and `PositionExited::carry_assets` (`AssetCarry`) hold the carry in
+    the instrument's base asset (`base`, in units of the asset) and in any other asset (`other`,
+    one entry per asset). `Position::carry` stays the quote asset's.
+  - The base carry is valued at the price of the trade that closed the position, stored as
+    `PositionExited::price_exit`. Carry in any other asset, such as BNB, has no price the engine
+    knows, so it is kept as charged and is in no PnL figure or tear sheet.
+  - `PositionSeed::with_carry_base` seeds the base carry. There is no seed for other assets.
+  - `TearSheet::carry` and `pnl` include the valued base carry. A position removed without a
+    closing trade, as a reverse split that rounds it to zero does, has no exit price: it counts
+    with its quote carry alone, a `warn!` is logged and `TearSheet::positions_carry_unpriced`
+    counts it.
+  - **Breaking:**
+    - `Position::pnl_realised_net` takes the price to value the base carry at (the mark price
+      while the position is open).
+    - `PositionExited::pnl_realised_net` returns `Result<Decimal, NetPnlError>`: `Overflow`, or
+      `BaseCarryUnpriced` when there is base carry and no exit price. Use
+      `PositionExited::carry_valued` for the quote-equivalent carry.
+    - `Position::apply_carry` takes a `CarrySlot`, and `CarryUpdate::AssetMismatch` is removed.
+    - `Position` and `PositionExited` gain fields, so `Position::new`, `PositionExited::new` and
+      struct literals need them.
+    - `EngineOutput::PositionExit` holds a `Box<PositionExited>`. This keeps `EngineOutput`, and so
+      the per-tick audit copy, small. Boxing does not change how it serialises.
+    - `From<Position> for PositionExited` is replaced by `Position::into_exited(price_exit)`, so a
+      caller must say what price closed the position.
+    - `TearSheet` and `PnLReturns` gain `positions_carry_unpriced`, and
+      `InstrumentState::update_from_cash_flow` needs `AssetKey: Clone`.
+  - `PositionExited` serialises with the two new fields; records written before them still load,
+    with no non-quote carry and no exit price. A reader built before this change needs to ignore
+    unknown fields to read a new record.
+  - The base slot assumes a linear instrument settled in its quote asset. The engine's PnL is not
+    modelled for an inverse or base-settled instrument, so check a base-asset carry on one.
+- **`CashFlowKind::MarginInterest::timing`** (`rustrade-execution`). Says whether a margin interest
+  charge is the first one, made when the loan is taken (`InterestTiming::OnBorrow`), or one for
+  holding the loan over a charging period (`InterestTiming::Periodic`), with
+  `InterestTiming::Other(SmolStr)` for a venue's own name for anything else. `None` where the venue
+  does not say.
+  - `BinanceMargin::fetch_margin_interest` reads it from the record's `type`. An `ON_BORROW`
+    charge is stamped at the start of the hour the loan was taken in, so its time can precede the
+    position it belongs to.
+  - The simulated venue reports `OnBorrow` for a charge on a new loan and `Periodic` for one at a
+    boundary. Alpaca does not say, so reports `None`.
+  - **Breaking:** code that builds a `MarginInterest`, or names all its fields in a pattern
+    without `..`, must add `timing`.
+- **`SystemBuilder::paper_venue(config, options, &feed)`** (`rustrade`, #698). Adds a paper-trading
+  venue (see `ExecutionBuilder::add_paper`) to a system, on the system's own clock. It is a builder
+  method rather than an `ExecutionConfig` variant because `PaperOptions` holds models that cannot
+  be serialised. `feed` must come from `PaperMarketFeed::tap` on the stream passed as
+  `SystemArgs::market_stream`, or the venue never sees a price. A second venue on the same
+  exchange, a `MarketOrderTiming::NextBar` config or a zero account-stream capacity fails
+  `build`.
+- **Paper trading on the simulated venue a backtest uses** (`rustrade`, `rustrade-execution`,
+  #677). `ExecutionBuilder::add_paper(config, options, clock, &feed)` adds a venue that trades on
+  a live market: limit orders rest and fill as the market crosses them, and spot margin, interest,
+  holding costs, fees in a third asset and the stale-market policies behave as in a backtest of
+  the same `MockExecutionConfig` and `SimVenueOptions`.
+  - `PaperMarketFeed::tap(market_stream)` wraps the stream fed to the `Engine`. It yields every
+    event unchanged and sends each instrument's market, folded as the backtest folds it, to the
+    paper venues. A venue sees only its own exchange's instruments.
+  - A request waits half of `latency_ms` before it is booked, against the market as it then
+    stands, and its result arrives after the other half, as in a backtest. Order expiry, interest
+    and holding-cost boundaries fall when they are due, in a quiet market too. Everything is
+    stamped from `clock`, which the venue never lets move backwards.
+  - A venue that falls behind the feed ends its account stream with a `StreamTerminated`; the
+    manager reopens it and reads back the fills. A price that crossed a resting order only in the
+    dropped observations, or while the market stream was reconnecting, fills nothing.
+  - `MarketOrderTiming::NextBar` is refused, since a live feed cannot deliver a bar's fills ahead
+    of the bar. The venue keeps its state in memory: a restart starts again from
+    `initial_state`.
+  - `PaperOptions` holds the `SimVenueOptions` and the account stream's capacity (default 4096).
+    `MockExchange::new_market_driven` and `MarketFeedEvent` drive a market-driven venue without
+    the builder. `TokioClock` is a live clock that moves with tokio's, for tests under paused
+    time.
+- **Fills missed while an account stream was down are read when it reopens** (`rustrade`, #675).
+  `ExecutionManager` reads them with `fetch_trades`, from the last moment it knew it was in sync
+  less an overlap, and delivers them as `Trade` events before the new `Snapshot`, so the snapshot
+  is the state after them. A span it cannot cover (the venue no longer holds the fills, the budget
+  ran out, or a call failed) is reported as `FillRecoveryGaveUp` and the stream still opens. Fills
+  are deduplicated by instrument and trade id across the read, the new stream and earlier
+  streams. `FillRecoveryConfig` sets the overlap, the clock-skew allowance, the time and call
+  budget, and the longest span.
+- **`AccountStreamOptions` and `ExecutionBuilder::add_live_with`** (`rustrade`, #675). Per venue:
+  the reconnect backoff, the `FillRecoveryConfig`, and the `Clock` the read is measured on.
+  `add_live` uses the defaults. A mock venue added with `add_mock` reads on the engine clock it
+  is given, the clock it stamps its fills with, so a backtest's read spans simulated time.
+- **`TradesRead::held_since`** (`rustrade-execution`, #675). Where a venue's retention limit cuts
+  into the span a `fetch_trades` call read, so a caller can tell fills the venue no longer holds
+  from fills that never happened. Hyperliquid sets it once a wallet's 10,000 retained fills all
+  fall inside the span. IBKR's `fetch_trades` now reads the last 7 days' executions, not only the
+  current day's, and sets it to 5 days ago, as far as that read is sure to reach, for a span
+  starting earlier. Its ended-order lookup now counts a cancelled or expired order with no
+  executions as unfilled only when this client placed it under 5 days ago, not 6, by the same
+  bound.
+- **`AccountEventDeduper`** (`rustrade-execution`, #675). A public bounded record of the fills
+  already delivered, for a consumer that takes the same fill from more than one source. Clones
+  share one record, keyed by instrument and trade id. Other event kinds are never reported as
+  duplicates.
+- **`FillRecoveryFailure::VenueRetention`, `SpanLimit` and `PageLimit`** (`rustrade-execution`,
+  #675), for spans the venue no longer holds and spans the recovery's budget did not cover.
+- **`ReduceOnlyBook`** (`rustrade-execution`, #689). A public record of which orders were sent
+  reduce-only, for whoever needs a fill's flag after the request is gone, such as a tracker that
+  cuts a reduce-only fill with `Trade::holding_move`. `register` it when the open request is sent,
+  `acknowledge` the venue's order id, `retire` the order when it ends, and `lookup` a `Trade` to
+  find its order by client order id or, for a fill carrying only the venue's id, by that. It
+  keeps the last 64 retired reduce-only orders per instrument, oldest dropped first. Plain data,
+  `Serialize` and `Deserialize`, no locking.
+- **Orders are checked against the symbol's rules before they are sent** (`rustrade-execution`,
+  #676). `BinanceSpot` and `BinanceMargin` read the symbol's `PRICE_FILTER`, `LOT_SIZE`,
+  `MARKET_LOT_SIZE` and `NOTIONAL`/`MIN_NOTIONAL` from the spot `exchangeInfo` on its first order,
+  refresh them hourly, and refuse an order that breaks them without sending it. Nothing is
+  rounded.
+  - A price or quantity off its tick or lot grid is `OrderError::InvalidPrecision` with the new
+    `PrecisionLimit::NotOnGrid { step }`; one below a minimum or above a maximum is the new
+    `OrderError::OutOfBounds(BoundsViolation)`, which carries the field, which bound, the limit
+    and the value. `OrderField` gains `Notional`.
+  - The check is the new venue-agnostic `OrderRules::check` (`rustrade_execution::rules`, with
+    `ValueRule`), so another client can fill the rules from its own venue. A zero in a venue
+    rule means the rule is off. A notional is checked only where the price is the order's own
+    limit, never for a market or plain stop order, and a pass is not a guarantee: the venue's
+    other filters still apply.
+  - `BinanceSpotConfig::pre_send_rules` and `BinanceMarginConfig::pre_send_rules`
+    (`PreSendRules::Enforce` by default, or `Off`, with `with_pre_send_rules`). A failed refresh
+    keeps the old rules for up to 24 hours; a symbol with no rules is sent unchecked, with a
+    warning.
+  - `BinanceSpot::load_rules` and `BinanceMargin::load_rules` load a set of symbols ahead of
+    their first order. Binance margin has no rules endpoint, so `BinanceMargin` uses the pair's
+    spot rules.
+  - **Behaviour change:** an order Binance would have rejected for its tick, lot or notional now
+    comes back unsent as one of these errors. Set `pre_send_rules` to `Off` to keep the old
+    behaviour.
+- **A per-order margin effect** (`rustrade-execution`, #107). A new
+  `MarginEffect { NoSideEffect, Borrow, Repay }` says what one order does to a margin account's
+  loans, and `RequestOpen::margin_effect: Option<MarginEffect>` carries it, with a
+  `with_margin_effect` builder. `None` takes the client's default.
+  - `BinanceMargin` sends `NO_SIDE_EFFECT`, `MARGIN_BUY` (`Borrow`) or `AUTO_REPAY` (`Repay`). The
+    client's default is `BinanceMarginConfig::margin_effect`.
+  - `BinanceMarginConfig::auto_repay_at_cancel` (default `true`, as Binance's) is sent as
+    `autoRepayAtCancel` on every `Borrow` order, and on no other.
+  - The simulated venue applies the effect per order, including to a resting order's later fill:
+    `Borrow` lends the shortfall when the order is placed and repays nothing from proceeds,
+    `Repay` lends nothing and repays the received asset's loan, interest first, and
+    `NoSideEffect` does neither.
+  - `SpotMarginConfig::with_auto_repay_at_cancel` (default `true`) says whether the venue repays
+    a loan its order no longer needs: the order was cancelled, expired or refused at its fill, or
+    a held market order filled for less than was held. With it off the loan stays owed until a
+    `Repay` order clears it.
+  - `OrderError::UnsupportedMarginEffect(MarginEffect)` is how a client refuses, unsent, an
+    effect it cannot honour. Binance spot and the simulated venue without `spot_margin` honour
+    `Some(NoSideEffect)` only, and so does the simulated venue for a CFD order. Hyperliquid,
+    IBKR and Alpaca refuse every `Some`, since margin is account-level there and Hyperliquid's
+    portfolio margin borrows implicitly.
+  - `BinanceMargin`'s rustdoc now says that a `Borrow` borrows when the order is placed, not when
+    it fills, and that it weighs 1500 against the UID limit where the other effects weigh 6.
+    Hyperliquid spot's rustdoc no longer says spot has no margin concepts.
+- `ExecutionClient`'s rustdoc has a section on wrapping a client in a generic decorator
+  (`rustrade-execution`, #678), with a compiled example that delivers only some of an account's
+  fills.
+  - The wrapper takes the inner client's `EXCHANGE` and `SUPPORTED_KINDS`, so one wrapper serves
+    every venue client. It forwards every method, including the provided ones and the extension
+    traits.
+  - It must withhold a fill from `account_stream` and `fetch_trades` alike, by a rule both carry,
+    since not every venue reports `Trade::client_order_id` on `fetch_trades`.
+  - Two inner clients on one account deliver each fill twice.
+  - A fill that reaches the engine moves its positions even when it matches none of its orders,
+    so filtering belongs in the wrapper.
+
+### Changed
+
+- **Breaking in behaviour:** `MockExchange` sends every response through its ordered emission
+  queue (`rustrade-execution`, #677). A fetch is answered after the account events booked before
+  it, so a balance read while a fill is in flight is no longer older than the fill. A cancel's
+  response follows its restatement and now waits `latency_ms`, as an open's does; it used to be
+  sent at once. `MockExchange` has a private field, so it can no longer be built with a struct
+  literal: use `new` or `new_market_driven`.
+- **Breaking: `ExecutionManager::init` takes an `AccountStreamOptions`** in place of its
+  `ReconnectionBackoffPolicy` (#675); `AccountStreamOptions::default().with_reconnect(policy)`
+  keeps a custom policy. `TradesRead` gains a `held_since` field; it is `#[non_exhaustive]`, so
+  `TradesRead::new(trades, resume)` and `complete` still build one. `lru` and `parking_lot` are
+  now always dependencies of `rustrade-execution`, for `AccountEventDeduper`.
+- **Breaking:** `InstrumentState::reduce_only_orders` and `retired_reduce_only_orders` are replaced
+  by one field, `reduce_only: ReduceOnlyBook` (`rustrade`, #689). A struct literal supplies the
+  one field. A state serialised before this loads with an empty book, so the reduce-only flags of
+  orders in flight at the upgrade are not carried over: their fills are applied in full.
+- **Breaking:** `MarginSideEffect` is replaced by `MarginEffect`, and `AutoBorrowRepay` is gone
+  everywhere (`rustrade-execution`, #107, #684).
+  - `BinanceMarginConfig`'s `side_effect` field is now `margin_effect` and defaults to
+    `NoSideEffect`, so no order takes on debt unless asked. `BinanceMarginConfig::new` takes the
+    effect and `auto_repay_at_cancel`. A `side_effect` key in a config file is ignored, and a
+    `margin_effect` of `"auto_borrow_repay"` fails to parse.
+  - `SpotMarginConfig::new(valuation_asset, max_leverage, margin_effect)` requires the effect,
+    and the serialised field has no default, so an old configuration fails to parse instead of
+    changing meaning. `with_side_effect` is removed, and `side_effect()` is now
+    `margin_effect()`.
+  - **No setting reproduces the old automatic repay.** The simulated venue used to repay a loan
+    from whatever an order received. It now repays only for an order carrying
+    `MarginEffect::Repay`, as on Binance: open with `Borrow`, close with `Repay`.
+  - `MarginSideEffect::as_binance_str` and the `client::binance::MarginSideEffect` re-export are
+    gone.
+  - `AccountState` (the simulated venue's ledger) takes the order's effect in `commit` and
+    `deliver`, a flag in `release_reservation`, and `enable_margin` takes nothing. `lends()` is
+    removed. `Reservation` has an `effect` field.
+  - `OrderError` has a new variant, `UnsupportedMarginEffect`.
+  - `RequestOpen::new` leaves `margin_effect` as `None`.
+- **Breaking:** `RequestOpen` is `#[non_exhaustive]` (`rustrade-execution`, #686), so a field can
+  be added to it later without breaking a caller. Outside the crate it can no longer be built with
+  a struct literal.
+  - Build one with `RequestOpen::new(side, price, quantity, kind, time_in_force)`, which leaves
+    `position_id` as `None`, `reduce_only` as `false` and `market` as `None`.
+  - Set those with `with_position_id`, `with_reduce_only` and `with_market`.
+  - The fields stay public, so reading them and assigning them on a request you hold still work.
+- **Breaking in behaviour:** a Binance margin `TrailingStop` that the venue refuses as an order
+  type it does not take is now `OrderError::UnsupportedOrderType` (`rustrade-execution`,
+  `binance` feature, #682). A cross margin account answers a trailing `STOP_LOSS` with `-3111`
+  ("Trailing stop order only supports limit type"), which used to arrive as
+  `OrderError::Rejected(ApiError::OrderRejected(..))`. A caller that matched that refusal must
+  match the new variant. It carries the venue's message, and like before it is not transient.
+  - The client still sends the order and lets Binance decide, so an isolated account, which has
+    accepted the trailing market form, is unaffected. On a cross account, place a
+    `TrailingStopFixedLimit` (a `STOP_LOSS_LIMIT` with a `trailingDelta`): both account modes
+    accept it.
+  - `BinanceMargin`'s rustdoc said Binance margin accepts a `trailingDelta` on every conditional
+    type. It now says a cross account refuses a trailing `STOP_LOSS`, and its "Trailing stops"
+    section and `open_order` state the account-mode difference. `OrderError::UnsupportedOrderType`'s
+    rustdoc now says a venue's refusal can also produce it, after the round trip.
+  - `BinanceMargin::account_snapshot` and `fetch_balances` document a known limitation: balances
+    read over REST straight after a fill can still be the pre-trade ones (current about 2 s later
+    in a live check). Use the account stream's balance events, or read again after a short
+    delay. The client adds no retry or delay of its own.
+
+### Removed
+
+- **`IndexedAccountStream` and `impl Indexer for AccountEventIndexer`** (`rustrade-execution`,
+  breaking). Nothing used them: `ExecutionManager` indexes its account stream with
+  `AccountEventIndexer::index_account_event`, which tells a balance for an unregistered asset
+  apart from a lost event, and the `Indexer` impl could not. Call `account_event` or
+  `index_account_event` on the indexer directly.
+- **`rustrade_integration::stream::ext::indexed` (`IndexedStream`, `Indexer`) and
+  `BarterStreamExt::with_index`** (`rustrade-integration`, breaking). Nothing used them since the
+  account stream stopped indexing through `Indexer`. Map a stream's items with the combinators of
+  `futures::StreamExt`.
+
+### Fixed
+
+- **`BinanceMargin::fetch_margin_interest` documents `rate` as a daily rate**
+  (`rustrade-execution`). The method's docs called it the hourly rate for an hourly charge,
+  contradicting `CashFlowKind::MarginInterest::rate`. Binance's `interestRate` is quoted per day
+  even on an hourly charge, so an hourly charge is about `principal x rate / 24`. Documentation
+  only; the value is unchanged.
+- **IBKR fill recovery lost the fills from before IB's midnight** (`rustrade-execution`, #696).
+  The read after a gap asked TWS for the current day's executions only, so a gap spanning IB's
+  daily restart recovered nothing from the day before, and reported no failure. It now reads the
+  last seven days, and when the gap starts before the part of that span IB surely holds (five
+  days), it sends a `FillRecoveryGaveUp` with `FillRecoveryFailure::VenueRetention` for the part
+  before it, after the recovered trades.
+- **`AccountEventIndexer::order_request` rejects an instrument listed on another exchange**
+  (`rustrade-execution`, #706). A request keyed to one exchange but naming an instrument of
+  another used to resolve to that instrument's name and be sent to the wrong venue; it now fails
+  with `KeyError::InstrumentKey`, which `ExecutionManager` treats as a set-up error and panics on.
+- **An account snapshot with a balance for an unregistered asset failed startup** (`rustrade`,
+  `rustrade-execution`, #703). Binance and other venues report every asset on the account, so a
+  client that did not filter its balances made `ExecutionManager::init` fail, and every reconnect
+  after it report a failed reinit that never recovered. The balance is now left out and the assets
+  are logged once per snapshot at `warn!`. When no balance of a non-empty snapshot is registered,
+  that is an `error!`, as the asset names are then likely to disagree with the venue's. Only
+  top-level balances are skipped: an unregistered exchange, instrument, order or isolated-margin
+  asset still fails the snapshot. New `AccountEventIndexer::snapshot_partitioned` returns the
+  snapshot with the skipped assets, and `ExecutionClient::account_snapshot` documents that a client
+  need not filter.
+- **A balance for an unregistered asset was logged at `ERROR` on every event** (`rustrade`,
+  `rustrade-execution`, #693). Binance pushes balances for every asset on the account, so one
+  holding an asset the instrument index does not register, such as BNB held for fees, logged
+  `ExecutionInstrumentMap does not contain` on every fill. The balance is still not tracked, but
+  the first one for each asset on a stream is now a `warn!` naming the asset, and later ones are
+  `debug!`. `AccountEventIndexer::index_account_event` fails with the new `AccountIndexError` to
+  tell this case apart from an event lost to an unregistered exchange, asset or instrument,
+  which stays at `error!`.
+- **A multi-venue backtest fed every simulated venue every exchange's market** (`rustrade`,
+  `rustrade-execution`, #699). The runner skipped a venue only when its instrument lookup failed,
+  which never happens because the index holds every exchange's instruments. Two venues listing the
+  same exchange-native name traded on each other's prices, and a resting order could fill on
+  another exchange's tick. A venue now receives only the instruments listed on its own exchange.
+  `ExecutionInstrumentMap::find_own_instrument_name_exchange` answers that question.
+- **The mock client's account stream ended after a lag only once another event arrived**
+  (`rustrade-execution`, #677). It delivered the `StreamTerminated` and then waited for the next
+  broadcast event, which a quiet venue may never send, so the manager did not reopen it. It now
+  ends on the poll after any `StreamTerminated` it delivers.
+- **`BinanceMargin`'s default client borrowed without repaying** (`rustrade-execution`, `binance`
+  feature, #684). Binance retired `AUTO_BORROW_REPAY` from 2026-10-14 and downgrades it to
+  `MARGIN_BUY`, so a client left on the old default took loans that nothing repaid from proceeds.
+  The client no longer sends it. Its default is `NoSideEffect`, and an order that should borrow
+  or repay says so with `margin_effect`. The `BinanceMargin` and `SpotMarginConfig` rustdoc, which
+  described the combined effect, is rewritten.
+
 ## [0.13.0] - 2026-10-20
 
 ### Added

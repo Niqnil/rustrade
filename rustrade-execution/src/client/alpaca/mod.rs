@@ -2449,6 +2449,20 @@ impl AlpacaClient {
             cid.clone(),
         );
 
+        // Margin is account-level at Alpaca: no order flag borrows or repays, so no effect is
+        // honoured.
+        if let Some(effect) = request.state.margin_effect {
+            return Order {
+                key: order_key,
+                side,
+                price,
+                quantity,
+                kind,
+                time_in_force,
+                state: OrderState::inactive(OrderError::UnsupportedMarginEffect(effect)),
+            };
+        }
+
         // Validate time_in_force before building the request — reject post_only early.
         let tif_str = match map_time_in_force(time_in_force) {
             Ok(s) => s,
@@ -4959,11 +4973,13 @@ fn convert_cash_flow(
         ("INT", Some("MGN")) => CashFlowKind::MarginInterest {
             rate: None,
             principal: None,
+            timing: None,
         },
         // Credit interest is received; margin interest is paid.
         ("INT", None) if amount.is_sign_negative() => CashFlowKind::MarginInterest {
             rate: None,
             principal: None,
+            timing: None,
         },
         ("PTR", _) => CashFlowKind::Rebate,
         (activity_type, Some(sub_type)) => {
@@ -8503,6 +8519,68 @@ mod tests {
 
         // --- L-2: open_order passes reduce_only through to position_intent ---
 
+        /// Margin is account-level at Alpaca, so a request naming a margin effect is refused
+        /// unsent, `NoSideEffect` included: nothing here can promise it.
+        #[tokio::test]
+        async fn open_order_refuses_every_margin_effect_without_sending() {
+            use crate::client::ExecutionClient;
+            use crate::error::OrderError;
+            use crate::margin::MarginEffect;
+            use crate::order::request::{OrderRequestOpen, RequestOpen};
+            use crate::order::state::InactiveOrderState;
+            use crate::order::{
+                OrderKey, OrderKind, TimeInForce,
+                id::{ClientOrderId, StrategyId},
+            };
+            use rust_decimal::Decimal;
+            use rustrade_instrument::Side;
+            use rustrade_instrument::exchange::ExchangeId;
+            use rustrade_instrument::instrument::name::InstrumentNameExchange;
+
+            let server = MockServer::start().await;
+            let client = client_for(&server);
+            let instrument = InstrumentNameExchange::new("AAPL");
+
+            for effect in [
+                MarginEffect::NoSideEffect,
+                MarginEffect::Borrow,
+                MarginEffect::Repay,
+            ] {
+                let order = client
+                    .open_order(OrderRequestOpen {
+                        key: OrderKey {
+                            exchange: ExchangeId::AlpacaBroker,
+                            instrument: &instrument,
+                            strategy: StrategyId::new("test-strategy"),
+                            cid: ClientOrderId::new("test-cid"),
+                        },
+                        state: RequestOpen::new(
+                            Side::Buy,
+                            None,
+                            Decimal::new(10, 0),
+                            OrderKind::Market,
+                            TimeInForce::ImmediateOrCancel,
+                        )
+                        .with_margin_effect(effect),
+                    })
+                    .await;
+
+                assert!(
+                    matches!(
+                        order.state,
+                        OrderState::Inactive(InactiveOrderState::OpenFailed(
+                            OrderError::UnsupportedMarginEffect(refused)
+                        )) if refused == effect
+                    ),
+                    "{order:?}"
+                );
+            }
+            assert!(
+                server.received_requests().await.unwrap().is_empty(),
+                "a refused order is never sent"
+            );
+        }
+
         /// Verifies that `open_order` correctly derives `position_intent` from
         /// `reduce_only` and `side`. This test exercises the full path:
         /// `open_order` → `map_position_intent` → `open_order_inner` → HTTP request.
@@ -8565,16 +8643,14 @@ mod tests {
                     strategy: StrategyId::new("test-strategy"),
                     cid: ClientOrderId::new("test-cid"),
                 },
-                state: RequestOpen {
-                    side: Side::Sell,
-                    price: None,
-                    quantity: Decimal::new(10, 0),
-                    kind: OrderKind::Market,
-                    time_in_force: TimeInForce::ImmediateOrCancel,
-                    position_id: None,
-                    reduce_only: true, // This should map to SellToClose
-                    market: None,
-                },
+                state: RequestOpen::new(
+                    Side::Sell,
+                    None,
+                    Decimal::new(10, 0),
+                    OrderKind::Market,
+                    TimeInForce::ImmediateOrCancel,
+                )
+                .with_reduce_only(true), // This should map to SellToClose
             };
 
             // Call open_order (borrows instrument)
@@ -8662,16 +8738,14 @@ mod tests {
                     strategy: StrategyId::new("test-strategy"),
                     cid: ClientOrderId::new("test-cid"),
                 },
-                state: RequestOpen {
-                    side: Side::Buy,
-                    price: None,
-                    quantity: Decimal::new(10, 0),
-                    kind: OrderKind::Market,
-                    time_in_force: TimeInForce::ImmediateOrCancel,
-                    position_id: None,
-                    reduce_only: false, // This should map to BuyToOpen
-                    market: None,
-                },
+                // Not reduce_only: this should map to BuyToOpen
+                state: RequestOpen::new(
+                    Side::Buy,
+                    None,
+                    Decimal::new(10, 0),
+                    OrderKind::Market,
+                    TimeInForce::ImmediateOrCancel,
+                ),
             };
 
             let order = client.open_order(request).await;
@@ -8844,16 +8918,13 @@ mod tests {
                         strategy: StrategyId::new("test-strategy"),
                         cid: ClientOrderId::new("test-cid"),
                     },
-                    state: RequestOpen {
-                        side: Side::Buy,
-                        price: None,
-                        quantity: Decimal::new(10, 0),
-                        kind: OrderKind::Market,
-                        time_in_force: TimeInForce::ImmediateOrCancel,
-                        position_id: None,
-                        reduce_only: false,
-                        market: None,
-                    },
+                    state: RequestOpen::new(
+                        Side::Buy,
+                        None,
+                        Decimal::new(10, 0),
+                        OrderKind::Market,
+                        TimeInForce::ImmediateOrCancel,
+                    ),
                 })
                 .await;
 
@@ -8904,16 +8975,13 @@ mod tests {
                             strategy: StrategyId::new("test-strategy"),
                             cid: ClientOrderId::new("test-cid"),
                         },
-                        state: RequestOpen {
-                            side: Side::Sell,
-                            price: None,
-                            quantity: Decimal::new(10, 0),
-                            kind: OrderKind::Market,
-                            time_in_force: TimeInForce::ImmediateOrCancel,
-                            position_id: None,
-                            reduce_only: false,
-                            market: None,
-                        },
+                        state: RequestOpen::new(
+                            Side::Sell,
+                            None,
+                            Decimal::new(10, 0),
+                            OrderKind::Market,
+                            TimeInForce::ImmediateOrCancel,
+                        ),
                     })
                     .await
                     .state
@@ -9064,15 +9132,16 @@ mod tests {
         /// window. A connection the server accepts and closes at once is a failure like any
         /// other, so the waits between such reconnects grow, and a server doing so to every
         /// connection exhausts the budget.
-        #[tokio::test]
+        #[tokio::test(start_paused = true)]
         async fn the_reconnect_budget_resets_only_once_a_connection_proves_stable() {
             use futures::{SinkExt as _, StreamExt as _};
             use tokio_tungstenite::tungstenite::Message;
 
             // The third connection receives pings past the heartbeat window; the fourth stays open.
             const STABLE: Duration = Duration::from_secs(HEARTBEAT_TIMEOUT_SECS + 3);
+            const DROPPED: Duration = Duration::from_millis(100);
             let lifetime = |n: usize| match n {
-                0 | 1 => Some(Duration::from_millis(100)),
+                0 | 1 => Some(DROPPED),
                 2 => Some(STABLE),
                 _ => None,
             };
@@ -9086,6 +9155,9 @@ mod tests {
             tokio::spawn(async move {
                 let mut connections = 0..;
                 while let Ok((stream, _)) = listener.accept().await {
+                    // Without it, a frame can wait in the kernel for the client's delayed ACK,
+                    // which is real time the paused clock does not wait for.
+                    stream.set_nodelay(true).unwrap();
                     let seen = Arc::clone(&seen);
                     let lifetime = connections.next().and_then(lifetime);
                     tokio::spawn(async move {
@@ -9133,10 +9205,10 @@ mod tests {
                     });
                 }
             });
-            // REST answers nothing, so each reconnect's recovery fails at once.
-            let server = MockServer::start().await;
-            let mut config =
-                AlpacaConfig::with_base_url("key".into(), "secret".into(), server.uri());
+            // REST answers nothing, so each reconnect's recovery fails at once. It is served on
+            // this runtime, so the paused clock measures the waits exactly.
+            let rest_url = crate::client::test_http::serve(|_, _| (404, String::new())).await;
+            let mut config = AlpacaConfig::with_base_url("key".into(), "secret".into(), rest_url);
             config.ws_url_override = Some(ws_url);
             let (tx, _rx) = mpsc::unbounded_channel();
             tokio::spawn(connection_manager(
@@ -9160,19 +9232,15 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
 
-            let listens = listens.lock();
-            // Not reset by the second connection's handshake: its close waits the second backoff.
-            let escalated = listens[2] - listens[1];
-            assert!(
-                escalated >= 2 * BackoffLimits::ACCOUNT_STREAM.initial,
-                "reconnected {escalated:?} after a closed connection"
-            );
-            // Reset by the third connection's stability timer: its close waits the first backoff
-            // again, not the third (4 s).
-            let after_stable = listens[3] - listens[2] - STABLE;
-            assert!(
-                after_stable < 3 * BackoffLimits::ACCOUNT_STREAM.initial,
-                "reconnected {after_stable:?} after a stable connection"
+            // On the paused clock each wait is exact. Not reset by the second connection's
+            // handshake: its close waits the second backoff. Reset by the third connection's
+            // stability timer: its close waits the first backoff again, not the third.
+            let initial = BackoffLimits::ACCOUNT_STREAM.initial;
+            let waits: Vec<_> = listens.lock().windows(2).map(|w| w[1] - w[0]).collect();
+            assert_eq!(
+                waits,
+                [DROPPED + initial, DROPPED + 2 * initial, STABLE + initial],
+                "the waits between listens"
             );
         }
 
@@ -9753,6 +9821,7 @@ mod tests {
             let interest = CashFlowKind::MarginInterest {
                 rate: None,
                 principal: None,
+                timing: None,
             };
             assert_eq!(
                 kinds,
@@ -11081,16 +11150,13 @@ mod tests {
                         StrategyId::new("strategy"),
                         ClientOrderId::new(cid),
                     ),
-                    state: RequestOpen {
-                        side: Side::Buy,
-                        price: Some(Decimal::ONE_HUNDRED),
-                        quantity: Decimal::TWO,
-                        kind: OrderKind::Limit,
-                        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                        position_id: None,
-                        reduce_only: false,
-                        market: None,
-                    },
+                    state: RequestOpen::new(
+                        Side::Buy,
+                        Some(Decimal::ONE_HUNDRED),
+                        Decimal::TWO,
+                        OrderKind::Limit,
+                        TimeInForce::GoodUntilCancelled { post_only: false },
+                    ),
                 };
                 client.open_order(request).await;
             }
@@ -11292,16 +11358,13 @@ mod tests {
                                 StrategyId::new("strategy"),
                                 ClientOrderId::new(cid),
                             ),
-                            state: RequestOpen {
-                                side: Side::Buy,
-                                price: Some(Decimal::ONE_HUNDRED),
-                                quantity: Decimal::TWO,
-                                kind: OrderKind::Limit,
+                            state: RequestOpen::new(
+                                Side::Buy,
+                                Some(Decimal::ONE_HUNDRED),
+                                Decimal::TWO,
+                                OrderKind::Limit,
                                 time_in_force,
-                                position_id: None,
-                                reduce_only: false,
-                                market: None,
-                            },
+                            ),
                         };
                         client.open_order(request).await.state
                     };

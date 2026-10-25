@@ -3,12 +3,31 @@
 //! - [`BinanceSpot`] — Binance Spot `ExecutionClient` (REST + signed WebSocket API).
 //! - [`BinanceMargin`] — Binance Cross Margin `ExecutionClient` (REST orders/queries +
 //!   a hand-rolled `userListenToken` user-data stream). Configured via
-//!   [`BinanceMarginConfig`]/[`MarginSideEffect`].
+//!   [`BinanceMarginConfig`] and [`MarginEffect`](crate::margin::MarginEffect).
 //!
 //! Both clients share exchange-agnostic infrastructure (reconnect/backoff,
 //! rate-limit tracking, event deduplication, error parsing, and the
 //! Binance-string parsers) from the `shared` module, so resilience behaviour is
 //! implemented once and reused rather than duplicated per client.
+//!
+//! # Orders are checked against the symbol's rules before they are sent
+//!
+//! Each client reads the symbol's tick, lot and notional rules from Binance's spot `exchangeInfo`
+//! on the symbol's first order, and refuses an order that breaks them without sending it: a price
+//! or quantity off its grid as [`OrderError::InvalidPrecision`](crate::error::OrderError::InvalidPrecision)
+//! with [`NotOnGrid`](crate::error::PrecisionLimit::NotOnGrid), and one outside its range as
+//! [`OrderError::OutOfBounds`](crate::error::OrderError::OutOfBounds). Nothing is rounded.
+//!
+//! - **What is checked** is in [`OrderRules::check`](crate::rules::OrderRules::check). A pass is
+//!   not a guarantee: the filters that need a reference price or account state stay the venue's.
+//! - **Loading.** Rules refresh hourly. A failed refresh keeps the old rules for up to 24 hours,
+//!   and a symbol with no rules is sent unchecked, with a warning. `load_rules` on each client
+//!   loads a set of symbols ahead of their first order.
+//! - **Margin** has no rules endpoint of its own, so [`BinanceMargin`] uses the pair's spot
+//!   rules, which a margin order obeys.
+//! - **Turning it off.** `pre_send_rules` on each config takes
+//!   [`PreSendRules::Off`](crate::rules::PreSendRules::Off) to send every order and leave the
+//!   rules to Binance, for when the loaded rules could be out of date.
 //!
 //! # Every fill on the account is delivered
 //!
@@ -88,8 +107,9 @@
 
 mod margin;
 mod margin_risk;
+mod rules;
 mod shared;
 mod spot;
 
-pub use margin::{BinanceMargin, BinanceMarginConfig, MarginForcedLiquidation, MarginSideEffect};
+pub use margin::{BinanceMargin, BinanceMarginConfig, MarginForcedLiquidation};
 pub use spot::{BinanceSpot, BinanceSpotConfig, BinanceSpotConfigError};

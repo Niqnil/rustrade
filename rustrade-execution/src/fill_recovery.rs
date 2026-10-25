@@ -1,8 +1,9 @@
 //! What an account stream reports when its fill recovery gives up on a span of fills.
 //!
 //! Venues that reconnect internally (Binance Spot and Margin, Alpaca) read the fills they missed
-//! while disconnected by REST after each reconnect. When that read fails for good, the fills in
-//! its span never reach the consumer, and the stream says so in-band with
+//! while disconnected by REST after each reconnect, and so does the execution manager when it
+//! reopens an account stream that ended. When that read fails for good, or the venue no longer
+//! holds the fills, they never reach the consumer, and the stream says so in-band with
 //! [`AccountEventKind::FillRecoveryGaveUp`](crate::AccountEventKind::FillRecoveryGaveUp), carrying
 //! a [`FillRecoveryGap`].
 
@@ -99,5 +100,29 @@ pub enum FillRecoveryFailure {
         /// How many fills the read returned before it stopped, counted across the account,
         /// before any filter by instrument.
         fills_read: usize,
+    },
+
+    /// The venue no longer holds the fills before `held_since`, so the span's part before it
+    /// could not be read. It is the gap: its `end` is the moment before `held_since`.
+    #[error("the venue holds fills only from {held_since}")]
+    VenueRetention {
+        /// The earliest moment the venue still holds fills from.
+        held_since: DateTime<Utc>,
+    },
+
+    /// The span reaches back further than the recovery's configured maximum span. The gap is the
+    /// part before that maximum, which was not read.
+    #[error("older than the maximum span of {max_span_secs}s")]
+    SpanLimit {
+        /// The maximum span, in seconds.
+        max_span_secs: u64,
+    },
+
+    /// The read stopped at the recovery's configured maximum number of calls. The gap is the part
+    /// not yet read.
+    #[error("stopped after {max_pages} reads")]
+    PageLimit {
+        /// The maximum number of calls.
+        max_pages: u32,
     },
 }

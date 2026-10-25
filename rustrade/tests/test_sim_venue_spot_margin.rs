@@ -27,7 +27,8 @@ use rustrade::engine::state::{
     position::PositionId,
 };
 use rustrade_execution::{
-    AccountEventKind, AccountSnapshot, PeriodicMarginInterest, SpotFeeAsset, SpotMarginConfig,
+    AccountEventKind, AccountSnapshot, MarginEffect, PeriodicMarginInterest, SpotFeeAsset,
+    SpotMarginConfig,
     balance::{AssetBalance, Balance, MarginDetails},
     client::mock::MockExecutionConfig,
     exchange::mock::SimulatedVenue,
@@ -134,7 +135,7 @@ fn venue(spot_fee_asset: SpotFeeAsset) -> SimulatedVenue {
         slippage: Default::default(),
         market_order_timing: Default::default(),
         stale_market: Default::default(),
-        spot_margin: Some(SpotMarginConfig::new(quote(), dec!(3)).unwrap()),
+        spot_margin: Some(SpotMarginConfig::new(quote(), dec!(3), MarginEffect::Borrow).unwrap()),
         fee_asset: None,
     };
     let spot = Instrument {
@@ -165,20 +166,24 @@ fn market_order(
             strategy: StrategyId::new("test"),
             cid: ClientOrderId::random(),
         },
-        state: RequestOpen {
+        state: RequestOpen::new(
             side,
-            price: None,
+            None,
             quantity,
-            kind: OrderKind::Market,
-            time_in_force: TimeInForce::ImmediateOrCancel,
-            position_id: None,
-            reduce_only: false,
-            market: Some(MarketSnapshot {
-                best_bid: Some(price),
-                best_ask: Some(price),
-                last_price: Some(price),
-            }),
-        },
+            OrderKind::Market,
+            TimeInForce::ImmediateOrCancel,
+        )
+        .with_market(MarketSnapshot {
+            best_bid: Some(price),
+            best_ask: Some(price),
+            last_price: Some(price),
+        })
+        // A sell borrows the base it lacks and a buy repays the base loan, as on a venue with
+        // per-order borrow and repay.
+        .with_margin_effect(match side {
+            Side::Buy => MarginEffect::Repay,
+            Side::Sell => MarginEffect::Borrow,
+        }),
     }
 }
 
