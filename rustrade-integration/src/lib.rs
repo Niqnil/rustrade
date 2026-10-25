@@ -39,9 +39,13 @@
 //!
 //! Both core abstractions provide the robust glue you need to conveniently translate between server & client data models.
 
-// Silence unused_crate_dependencies for dev-dependencies used only in tests
+// Silence unused_crate_dependencies for dev-dependencies: each is used only by the tests or
+// examples of some features, so a test build with other features alone would report it.
 #[cfg(test)]
-use sha2 as _;
+use {
+    rustrade_instrument as _, serde_json as _, sha2 as _, tokio as _, tokio_stream as _,
+    tokio_test as _, wiremock as _,
+};
 
 use ::serde::{Deserialize, Serialize};
 

@@ -148,7 +148,7 @@ jobs:
 
       # The workspace builds `rustrade-integration` with its defaults on, so a feature that forgets
       # a dependency it needs still builds everywhere here and breaks only for a user who turns the
-      # defaults off. Build each feature on its own to catch that.
+      # defaults off. Build each feature on its own to catch that, with its tests and examples.
       - name: Run cargo check (each rustrade-integration feature alone)
         run: |
           features=$(cargo metadata --locked --no-deps --format-version 1 \
@@ -156,7 +156,7 @@ jobs:
           test -n "$features"
           for feature in $features; do
             echo "::group::$feature"
-            cargo check --locked -p rustrade-integration --no-default-features --features "$feature" --lib
+            cargo check --locked -p rustrade-integration --no-default-features --features "$feature" --lib --tests --examples
             echo "::endgroup::"
           done
 
