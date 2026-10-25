@@ -198,7 +198,8 @@ pub enum VenueRegime {
 /// The interest is added to the loan, so `total` and `free` are unchanged and what a fill
 /// delivers repays it first. Each cash flow is a
 /// [`CashFlowKind::MarginInterest`], in the borrowed asset, negative, with no instrument, since a
-/// cross margin loan belongs to the account rather than to a position. A venue that books such
+/// cross margin loan belongs to the account rather than to a position. A charge on a new loan
+/// carries [`InterestTiming::OnBorrow`] and one at a boundary [`InterestTiming::Periodic`]. A venue that books such
 /// interest at the start of its hour stamps it earlier than this venue does.
 ///
 /// [`Balance::margin`]: crate::balance::Balance::margin

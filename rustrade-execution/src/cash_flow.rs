@@ -119,7 +119,8 @@ pub enum InterestTiming {
     Periodic,
     /// The first charge, made when the loan is taken.
     OnBorrow,
-    /// A timing neither variant names, with the venue's own name for it.
+    /// A timing neither variant names, with the venue's own name for it. Like an absent timing
+    /// (`None`), it is unknown: do not treat it as either named variant.
     Other(SmolStr),
 }
 

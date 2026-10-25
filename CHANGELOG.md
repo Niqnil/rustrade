@@ -19,9 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     position it belongs to.
   - The simulated venue reports `OnBorrow` for a charge on a new loan and `Periodic` for one at a
     boundary. Alpaca does not say, so reports `None`.
-  - **Breaking:** `CashFlowKind` is `#[non_exhaustive]`, so a `match` with a wildcard still
-    compiles, but code that builds a `MarginInterest` or names all its fields in a pattern must add
-    `timing` (or `..`).
+  - **Breaking:** code that builds a `MarginInterest`, or names all its fields in a pattern
+    without `..`, must add `timing`.
 
 - **`SystemBuilder::paper_venue(config, options, &feed)`** (`rustrade`, #698). Adds a paper-trading
   venue (see `ExecutionBuilder::add_paper`) to a system, on the system's own clock. It is a builder

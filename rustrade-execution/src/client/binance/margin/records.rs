@@ -751,6 +751,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_charge_on_borrow_has_its_timing() {
+        let server = MockServer::start().await;
+        let now = Utc::now();
+        let mut row = interest_row(1, now - TimeDelta::hours(1), None);
+        row["type"] = json!("ON_BORROW");
+        mount(&server, INTEREST_PATH, page(vec![row])).await;
+        let client = margin_client_at(&server, false);
+
+        let flows = client
+            .fetch_margin_interest(now - TimeDelta::days(1), now)
+            .await
+            .unwrap();
+
+        let [flow] = flows.as_slice() else {
+            panic!("one flow: {flows:?}");
+        };
+        let CashFlowKind::MarginInterest { timing, .. } = &flow.kind else {
+            panic!("margin interest: {flow:?}");
+        };
+        assert_eq!(*timing, Some(InterestTiming::OnBorrow));
+    }
+
+    #[tokio::test]
     async fn a_charge_without_a_type_has_no_timing() {
         let server = MockServer::start().await;
         let now = Utc::now();
