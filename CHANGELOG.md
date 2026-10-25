@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-25
+
 ### Added
 
 - **Carry in the base asset and other assets on a position** (`rustrade`). A margin short borrows
@@ -45,7 +47,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     unknown fields to read a new record.
   - The base slot assumes a linear instrument settled in its quote asset. The engine's PnL is not
     modelled for an inverse or base-settled instrument, so check a base-asset carry on one.
-
 - **`CashFlowKind::MarginInterest::timing`** (`rustrade-execution`). Says whether a margin interest
   charge is the first one, made when the loan is taken (`InterestTiming::OnBorrow`), or one for
   holding the loan over a charging period (`InterestTiming::Periodic`), with
@@ -58,7 +59,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     boundary. Alpaca does not say, so reports `None`.
   - **Breaking:** code that builds a `MarginInterest`, or names all its fields in a pattern
     without `..`, must add `timing`.
-
 - **`SystemBuilder::paper_venue(config, options, &feed)`** (`rustrade`, #698). Adds a paper-trading
   venue (see `ExecutionBuilder::add_paper`) to a system, on the system's own clock. It is a builder
   method rather than an `ExecutionConfig` variant because `PaperOptions` holds models that cannot
@@ -66,7 +66,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SystemArgs::market_stream`, or the venue never sees a price. A second venue on the same
   exchange, a `MarketOrderTiming::NextBar` config or a zero account-stream capacity fails
   `build`.
-
 - **Paper trading on the simulated venue a backtest uses** (`rustrade`, `rustrade-execution`,
   #677). `ExecutionBuilder::add_paper(config, options, clock, &feed)` adds a venue that trades on
   a live market: limit orders rest and fill as the market crosses them, and spot margin, interest,
@@ -146,7 +145,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Behaviour change:** an order Binance would have rejected for its tick, lot or notional now
     comes back unsent as one of these errors. Set `pre_send_rules` to `Off` to keep the old
     behaviour.
-
 - **A per-order margin effect** (`rustrade-execution`, #107). A new
   `MarginEffect { NoSideEffect, Borrow, Repay }` says what one order does to a margin account's
   loans, and `RequestOpen::margin_effect: Option<MarginEffect>` carries it, with a
@@ -185,15 +183,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **Removed `IndexedAccountStream` and `impl Indexer for AccountEventIndexer`** (`rustrade-execution`,
-  breaking). Nothing used them: `ExecutionManager` indexes its account stream with
-  `AccountEventIndexer::index_account_event`, which tells a balance for an unregistered asset
-  apart from a lost event, and the `Indexer` impl could not. Call `account_event` or
-  `index_account_event` on the indexer directly.
-- **Removed `rustrade_integration::stream::ext::indexed` (`IndexedStream`, `Indexer`) and
-  `BarterStreamExt::with_index`** (`rustrade-integration`, breaking). Nothing used them since the
-  account stream stopped indexing through `Indexer`. Map a stream's items with the combinators of
-  `futures::StreamExt`.
 - **Breaking in behaviour:** `MockExchange` sends every response through its ordered emission
   queue (`rustrade-execution`, #677). A fetch is answered after the account events booked before
   it, so a balance read while a fill is in flight is no longer older than the fill. A cancel's
@@ -202,15 +191,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   literal: use `new` or `new_market_driven`.
 - **Breaking: `ExecutionManager::init` takes an `AccountStreamOptions`** in place of its
   `ReconnectionBackoffPolicy` (#675); `AccountStreamOptions::default().with_reconnect(policy)`
-  keeps a custom policy. `TradesRead` gains
-  a `held_since` field; it is `#[non_exhaustive]`, so `TradesRead::new(trades, resume)` and
-  `complete` still build one. `lru` and `parking_lot` are now always dependencies of
-  `rustrade-execution`, for `AccountEventDeduper`.
+  keeps a custom policy. `TradesRead` gains a `held_since` field; it is `#[non_exhaustive]`, so
+  `TradesRead::new(trades, resume)` and `complete` still build one. `lru` and `parking_lot` are
+  now always dependencies of `rustrade-execution`, for `AccountEventDeduper`.
 - **Breaking:** `InstrumentState::reduce_only_orders` and `retired_reduce_only_orders` are replaced
   by one field, `reduce_only: ReduceOnlyBook` (`rustrade`, #689). A struct literal supplies the
   one field. A state serialised before this loads with an empty book, so the reduce-only flags of
   orders in flight at the upgrade are not carried over: their fills are applied in full.
-
 - **Breaking:** `MarginSideEffect` is replaced by `MarginEffect`, and `AutoBorrowRepay` is gone
   everywhere (`rustrade-execution`, #107, #684).
   - `BinanceMarginConfig`'s `side_effect` field is now `margin_effect` and defaults to
@@ -257,26 +244,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     in a live check). Use the account stream's balance events, or read again after a short
     delay. The client adds no retry or delay of its own.
 
+### Removed
+
+- **`IndexedAccountStream` and `impl Indexer for AccountEventIndexer`** (`rustrade-execution`,
+  breaking). Nothing used them: `ExecutionManager` indexes its account stream with
+  `AccountEventIndexer::index_account_event`, which tells a balance for an unregistered asset
+  apart from a lost event, and the `Indexer` impl could not. Call `account_event` or
+  `index_account_event` on the indexer directly.
+- **`rustrade_integration::stream::ext::indexed` (`IndexedStream`, `Indexer`) and
+  `BarterStreamExt::with_index`** (`rustrade-integration`, breaking). Nothing used them since the
+  account stream stopped indexing through `Indexer`. Map a stream's items with the combinators of
+  `futures::StreamExt`.
+
 ### Fixed
 
-- **`BinanceMargin::fetch_margin_interest` documents `rate` as a daily rate** (`rustrade-execution`).
-  The method's docs called it the hourly rate for an hourly charge, contradicting
-  `CashFlowKind::MarginInterest::rate`. Binance's `interestRate` is quoted per day even on an hourly
-  charge, so an hourly charge is about `principal x rate / 24`. Documentation only; the value is
-  unchanged.
-
+- **`BinanceMargin::fetch_margin_interest` documents `rate` as a daily rate**
+  (`rustrade-execution`). The method's docs called it the hourly rate for an hourly charge,
+  contradicting `CashFlowKind::MarginInterest::rate`. Binance's `interestRate` is quoted per day
+  even on an hourly charge, so an hourly charge is about `principal x rate / 24`. Documentation
+  only; the value is unchanged.
 - **IBKR fill recovery lost the fills from before IB's midnight** (`rustrade-execution`, #696).
   The read after a gap asked TWS for the current day's executions only, so a gap spanning IB's
   daily restart recovered nothing from the day before, and reported no failure. It now reads the
   last seven days, and when the gap starts before the part of that span IB surely holds (five
   days), it sends a `FillRecoveryGaveUp` with `FillRecoveryFailure::VenueRetention` for the part
   before it, after the recovered trades.
-
 - **`AccountEventIndexer::order_request` rejects an instrument listed on another exchange**
   (`rustrade-execution`, #706). A request keyed to one exchange but naming an instrument of
   another used to resolve to that instrument's name and be sent to the wrong venue; it now fails
   with `KeyError::InstrumentKey`, which `ExecutionManager` treats as a set-up error and panics on.
-
 - **An account snapshot with a balance for an unregistered asset failed startup** (`rustrade`,
   `rustrade-execution`, #703). Binance and other venues report every asset on the account, so a
   client that did not filter its balances made `ExecutionManager::init` fail, and every reconnect
@@ -287,7 +283,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   asset still fails the snapshot. New `AccountEventIndexer::snapshot_partitioned` returns the
   snapshot with the skipped assets, and `ExecutionClient::account_snapshot` documents that a client
   need not filter.
-
 - **A balance for an unregistered asset was logged at `ERROR` on every event** (`rustrade`,
   `rustrade-execution`, #693). Binance pushes balances for every asset on the account, so one
   holding an asset the instrument index does not register, such as BNB held for fees, logged

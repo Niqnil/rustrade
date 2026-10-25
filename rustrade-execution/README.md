@@ -90,11 +90,22 @@ Hyperliquid requires every order it accepts to carry a client order ID in
 `ClientOrderId::uuid()` form; an order with any other ID is rejected. It also refuses, unsent,
 an order whose quantity or price is not positive or has more precision than the market
 allows (`OrderError::InvalidPrecision`), and never rounds one: read the rules with
-`order_precision` and round first. `BinanceMargin` matches Binance spot,
-`TrailingStop` included. Its REST order queries do not report a trailing delta, so
-`fetch_open_orders` and `account_snapshot` leave out its conditional orders (stop,
-stop-limit, take-profit and take-profit-limit). `account_snapshot` reports such a listing
-incomplete; `fetch_open_orders` has no completeness flag, so there only a warning shows it.
+`order_precision` and round first. `BinanceSpot` and `BinanceMargin` refuse, unsent, an order
+that breaks the symbol's tick, lot or notional rules from `exchangeInfo`
+(`OrderError::InvalidPrecision` or `OrderError::OutOfBounds`), and never round one; set
+`pre_send_rules` to `PreSendRules::Off` to let Binance decide. `BinanceMargin` matches Binance
+spot, except that a cross margin account refuses a `TrailingStop` (a trailing `STOP_LOSS`) with
+`OrderError::UnsupportedOrderType`: place a `TrailingStopFixedLimit` there. Its REST order
+queries do not report a trailing delta, so `fetch_open_orders` and `account_snapshot` leave out
+its conditional orders (stop, stop-limit, take-profit and take-profit-limit). `account_snapshot`
+reports such a listing incomplete; `fetch_open_orders` has no completeness flag, so there only a
+warning shows it.
 The account stream reports these orders in full.
+
+`RequestOpen::margin_effect` says whether one order borrows (`MarginEffect::Borrow`), repays
+(`Repay`) or does neither (`NoSideEffect`); `None` takes the client's default. `BinanceMargin`
+honours all three, with `NoSideEffect` as its default. Binance spot honours `NoSideEffect` only.
+Alpaca, Hyperliquid and IBKR refuse every `Some`, unsent, with
+`OrderError::UnsupportedMarginEffect`, since margin is set per account there.
 
 See the [workspace README](../README.md) for documentation, examples, and contributing guidelines.
