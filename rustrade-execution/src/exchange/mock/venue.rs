@@ -3,7 +3,7 @@
 use crate::{
     AccountEventKind, InstrumentAccountSnapshot, UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::AssetBalance,
-    cash_flow::{CashFlow, CashFlowId, CashFlowKind},
+    cash_flow::{CashFlow, CashFlowId, CashFlowKind, InterestTiming},
     client::mock::MockExecutionConfig,
     error::{ApiError, BorrowReject, BorrowRejectReason, UnindexedApiError, UnindexedOrderError},
     exchange::mock::{
@@ -198,7 +198,8 @@ pub enum VenueRegime {
 /// The interest is added to the loan, so `total` and `free` are unchanged and what a fill
 /// delivers repays it first. Each cash flow is a
 /// [`CashFlowKind::MarginInterest`], in the borrowed asset, negative, with no instrument, since a
-/// cross margin loan belongs to the account rather than to a position. A venue that books such
+/// cross margin loan belongs to the account rather than to a position. A charge on a new loan
+/// carries [`InterestTiming::OnBorrow`] and one at a boundary [`InterestTiming::Periodic`]. A venue that books such
 /// interest at the start of its hour stamps it earlier than this venue does.
 ///
 /// [`Balance::margin`]: crate::balance::Balance::margin
@@ -1009,6 +1010,10 @@ impl SimulatedVenue {
             CashFlowKind::MarginInterest {
                 rate: charge.rate,
                 principal: Some(principal),
+                timing: Some(match due {
+                    InterestDue::Borrow(_) => InterestTiming::OnBorrow,
+                    InterestDue::Boundary(_) => InterestTiming::Periodic,
+                }),
             },
             asset.clone(),
             -charge.interest,
@@ -12419,12 +12424,14 @@ mod tests {
         principal: &str,
         interest: &str,
         time: DateTime<Utc>,
+        timing: InterestTiming,
         id: &str,
     ) -> CashFlow<AssetNameExchange, InstrumentNameExchange> {
         CashFlow::new(
             CashFlowKind::MarginInterest {
                 rate: Some(d(HOURLY_BASIS_POINT)),
                 principal: Some(d(principal)),
+                timing: Some(timing),
             },
             asset,
             -d(interest),
@@ -12468,7 +12475,14 @@ mod tests {
         );
         assert_eq!(
             *cash_flow_of(&outcome.events[2]),
-            interest_flow(base(), "0.75", "0.000075", time(1), "0"),
+            interest_flow(
+                base(),
+                "0.75",
+                "0.000075",
+                time(1),
+                InterestTiming::OnBorrow,
+                "0"
+            ),
             "charged on the amount lent, stamped at the borrow, after both balances"
         );
         assert_eq!(filled_trade(&outcome).quantity, d("1"));
@@ -12490,7 +12504,14 @@ mod tests {
         assert_eq!(charged[0].0.time_exchange, boundary(0));
         assert_eq!(
             *charged[0].1,
-            interest_flow(base(), "0.75", "0.000075", boundary(0), "1")
+            interest_flow(
+                base(),
+                "0.75",
+                "0.000075",
+                boundary(0),
+                InterestTiming::Periodic,
+                "1"
+            )
         );
         assert_eq!(
             charged[1].0.balance,
@@ -12498,7 +12519,14 @@ mod tests {
         );
         assert_eq!(
             *charged[1].1,
-            interest_flow(base(), "0.75", "0.000075", boundary(1), "2")
+            interest_flow(
+                base(),
+                "0.75",
+                "0.000075",
+                boundary(1),
+                InterestTiming::Periodic,
+                "2"
+            )
         );
         assert_eq!(venue.next_deadline(), Some(boundary(2)));
     }
@@ -12534,7 +12562,14 @@ mod tests {
         let events = venue.advance_time(boundary(0));
         assert_eq!(
             *charges(&events)[0].1,
-            interest_flow(base(), "0.250075", "0.00002501", boundary(0), "1"),
+            interest_flow(
+                base(),
+                "0.250075",
+                "0.00002501",
+                boundary(0),
+                InterestTiming::Periodic,
+                "1"
+            ),
             "0.250075 at 0.01% is 0.0000250075, rounded up to the satoshi"
         );
     }
@@ -12549,7 +12584,14 @@ mod tests {
         let outcome = venue.open_order(sell_request("1", market_prices("50000")));
         assert_eq!(
             *cash_flow_of(&outcome.events[2]),
-            interest_flow(base(), "0.75", "0.000075", boundary(0), "0")
+            interest_flow(
+                base(),
+                "0.75",
+                "0.000075",
+                boundary(0),
+                InterestTiming::OnBorrow,
+                "0"
+            )
         );
 
         assert!(
@@ -12572,7 +12614,14 @@ mod tests {
         );
         assert_eq!(
             *cash_flow_of(&outcome.events[1]),
-            interest_flow(base(), "1", "0.0001", time(1), "0")
+            interest_flow(
+                base(),
+                "1",
+                "0.0001",
+                time(1),
+                InterestTiming::OnBorrow,
+                "0"
+            )
         );
 
         let cancelled = venue.cancel_order(OrderRequestCancel {
@@ -12600,7 +12649,14 @@ mod tests {
         );
         assert_eq!(
             *cash_flow_of(&outcome.events[1]),
-            interest_flow(quote(), "50", "0.005", time(1), "0")
+            interest_flow(
+                quote(),
+                "50",
+                "0.005",
+                time(1),
+                InterestTiming::OnBorrow,
+                "0"
+            )
         );
 
         // 180 at an open of 120: 30 more borrowed, charged 0.003.
@@ -12669,7 +12725,14 @@ mod tests {
         let events = venue.advance_time(boundary(0));
         assert_eq!(
             *charges(&events)[0].1,
-            interest_flow(base(), "0.5", "0.00005", boundary(0), "0")
+            interest_flow(
+                base(),
+                "0.5",
+                "0.00005",
+                boundary(0),
+                InterestTiming::Periodic,
+                "0"
+            )
         );
     }
 
@@ -13361,7 +13424,14 @@ mod tests {
         // 5,000 at 0.01% for the hour.
         assert_eq!(
             *cash_flow_of(&outcome.events[3]),
-            interest_flow(quote(), "5000", "0.5", time(1), "0")
+            interest_flow(
+                quote(),
+                "5000",
+                "0.5",
+                time(1),
+                InterestTiming::OnBorrow,
+                "0"
+            )
         );
     }
 

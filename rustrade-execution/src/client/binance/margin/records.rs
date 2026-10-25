@@ -5,7 +5,7 @@
 
 use super::BinanceMargin;
 use crate::{
-    cash_flow::{CashFlow, CashFlowId, CashFlowKind},
+    cash_flow::{CashFlow, CashFlowId, CashFlowKind, InterestTiming},
     client::binance::shared::{
         RequestKind, classify_rest_query_error, parse_side, response_decode_error,
         rest_call_with_retry,
@@ -25,7 +25,7 @@ use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, instrument::name::InstrumentNameExchange,
 };
 use serde::{Deserialize, Serialize};
-use smol_str::format_smolstr;
+use smol_str::{SmolStr, format_smolstr};
 use std::{future::Future, str::FromStr};
 use tracing::{debug, warn};
 
@@ -107,6 +107,14 @@ impl BinanceMargin {
     ///   Binance publishes on its [margin fee page](https://www.binance.com/en/fee/marginFee),
     ///   whose hourly figure is the daily one divided by 24 (BTC's daily rate matches the field,
     ///   its hourly rate is about 24 times smaller).
+    /// - [`timing`](CashFlowKind::MarginInterest::timing) is read from Binance's `type`:
+    ///   `PERIODIC` (and `PERIODIC_CONVERTED`, and portfolio margin's daily `PORTFOLIO`) is
+    ///   [`Periodic`](InterestTiming::Periodic), `ON_BORROW` (and `ON_BORROW_CONVERTED`) is
+    ///   [`OnBorrow`](InterestTiming::OnBorrow), and any other value is
+    ///   [`Other`](InterestTiming::Other) with Binance's own name. `None` when the record has no
+    ///   `type`. An `ON_BORROW` charge is stamped at the start of the hour the loan was taken in, so
+    ///   its [`time_exchange`](CashFlow::time_exchange) can precede the opening of the position it
+    ///   belongs to.
     /// - [`id`](CashFlow::id) is Binance's transaction id for the charge.
     ///
     /// The engine adds a flow attributed to an instrument to the carry of its open position only
@@ -432,6 +440,16 @@ fn optional_decimal(record: &str, field: &str, value: Option<&str>) -> Option<De
         .ok()
 }
 
+/// The [`InterestTiming`] of an `interestHistory` row's `type`. A `_CONVERTED` type is the same
+/// charge settled in BNB, and `PORTFOLIO` is portfolio margin's daily charge on a negative balance.
+fn interest_timing(r#type: &str) -> InterestTiming {
+    match r#type {
+        "PERIODIC" | "PERIODIC_CONVERTED" | "PORTFOLIO" => InterestTiming::Periodic,
+        "ON_BORROW" | "ON_BORROW_CONVERTED" => InterestTiming::OnBorrow,
+        other => InterestTiming::Other(SmolStr::new(other)),
+    }
+}
+
 /// One `interestHistory` row as a [`CashFlow`], or `None`, with a warning, if it lacks what a flow
 /// needs. `pair` is the isolated pair the row was read for, if any.
 fn convert_interest(
@@ -479,6 +497,7 @@ fn convert_interest(
         CashFlowKind::MarginInterest {
             rate: optional_decimal("interest", "interestRate", row.interest_rate.as_deref()),
             principal: optional_decimal("interest", "principal", row.principal.as_deref()),
+            timing: row.r#type.as_deref().map(interest_timing),
         },
         AssetNameExchange::new(asset),
         -interest,
@@ -683,6 +702,7 @@ mod tests {
             CashFlowKind::MarginInterest {
                 rate: Some(dec!(0.0000125)),
                 principal: Some(dec!(1000)),
+                timing: Some(InterestTiming::Periodic),
             }
         );
         assert_eq!(
@@ -690,6 +710,7 @@ mod tests {
             CashFlowKind::MarginInterest {
                 rate: None,
                 principal: Some(dec!(1000)),
+                timing: Some(InterestTiming::Periodic),
             },
             "a rate that does not parse is left out, not the charge"
         );
@@ -710,6 +731,69 @@ mod tests {
             assert_eq!(query["size"], "100");
             assert!(!query.contains_key("isolatedSymbol"), "{query:?}");
         }
+    }
+
+    #[test]
+    fn interest_timing_is_read_from_the_record_type() {
+        for (r#type, expected) in [
+            ("PERIODIC", InterestTiming::Periodic),
+            ("PERIODIC_CONVERTED", InterestTiming::Periodic),
+            ("PORTFOLIO", InterestTiming::Periodic),
+            ("ON_BORROW", InterestTiming::OnBorrow),
+            ("ON_BORROW_CONVERTED", InterestTiming::OnBorrow),
+            (
+                "ON_LIQUIDATION",
+                InterestTiming::Other("ON_LIQUIDATION".into()),
+            ),
+        ] {
+            assert_eq!(interest_timing(r#type), expected, "{type}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_charge_on_borrow_has_its_timing() {
+        let server = MockServer::start().await;
+        let now = Utc::now();
+        let mut row = interest_row(1, now - TimeDelta::hours(1), None);
+        row["type"] = json!("ON_BORROW");
+        mount(&server, INTEREST_PATH, page(vec![row])).await;
+        let client = margin_client_at(&server, false);
+
+        let flows = client
+            .fetch_margin_interest(now - TimeDelta::days(1), now)
+            .await
+            .unwrap();
+
+        let [flow] = flows.as_slice() else {
+            panic!("one flow: {flows:?}");
+        };
+        let CashFlowKind::MarginInterest { timing, .. } = &flow.kind else {
+            panic!("margin interest: {flow:?}");
+        };
+        assert_eq!(*timing, Some(InterestTiming::OnBorrow));
+    }
+
+    #[tokio::test]
+    async fn a_charge_without_a_type_has_no_timing() {
+        let server = MockServer::start().await;
+        let now = Utc::now();
+        let mut row = interest_row(1, now - TimeDelta::hours(1), None);
+        row.as_object_mut().unwrap().remove("type");
+        mount(&server, INTEREST_PATH, page(vec![row])).await;
+        let client = margin_client_at(&server, false);
+
+        let flows = client
+            .fetch_margin_interest(now - TimeDelta::days(1), now)
+            .await
+            .unwrap();
+
+        let [flow] = flows.as_slice() else {
+            panic!("one flow: {flows:?}");
+        };
+        let CashFlowKind::MarginInterest { timing, .. } = &flow.kind else {
+            panic!("margin interest: {flow:?}");
+        };
+        assert_eq!(*timing, None);
     }
 
     #[tokio::test]
