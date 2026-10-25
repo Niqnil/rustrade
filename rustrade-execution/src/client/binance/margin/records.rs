@@ -144,7 +144,8 @@ impl BinanceMargin {
     ///   up to a minute inside that limit, clear of any skew between the clocks, and
     ///   [`held_since`](CashFlowsRead::held_since) is where the read then starts: charges before
     ///   it may exist but were not read. A caller adding up the interest on a position opened
-    ///   before it has only part of it. `held_since` is `None` when `start` is within the limit.
+    ///   before it has only part of it. `held_since` is `None` when `start` is at or after that
+    ///   point, a minute inside the 90 days; a request for the last 90 days reports it.
     /// - Charges are read up to `end`, or up to the local clock at the call if that is earlier.
     /// - The whole span is read in one call, so [`resume`](CashFlowsRead::resume) is always
     ///   `None`.
@@ -1025,14 +1026,14 @@ mod tests {
         let interest = client
             .fetch_margin_interest(now, now - TimeDelta::hours(1))
             .await
-            .unwrap()
-            .flows;
+            .unwrap();
         let liquidations = client
             .fetch_forced_liquidations(now + TimeDelta::hours(1), now + TimeDelta::hours(2))
             .await
             .unwrap();
 
-        assert!(interest.is_empty() && liquidations.is_empty());
+        assert!(interest.flows.is_empty() && liquidations.is_empty());
+        assert_eq!((interest.resume, interest.held_since), (None, None));
         assert!(queries(&server).await.is_empty());
     }
 
