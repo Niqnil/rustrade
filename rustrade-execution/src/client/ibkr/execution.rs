@@ -360,7 +360,7 @@ fn build_trade(
     let fees = AssetFees {
         asset: AssetNameExchange::from(commission.currency.as_str()),
         fees: commission_amount,
-        fees_quote: None, // Indexer computes based on fee asset vs instrument quote
+        fees_quote: None, // `AccountEventIndexer` fills this in for a fee in base or quote
     };
     trade_with_fees(pending, fees)
 }

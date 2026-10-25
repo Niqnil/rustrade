@@ -20,18 +20,22 @@ all-features = true
 default = ["collection", "error", "protocol", "serde", "subscription", "socket", "stream", "corporate-action"]
 full = ["collection", "channel", "error", "metric", "protocol", "serde", "subscription", "socket", "stream", "corporate-action"]
 collection = ["dep:indexmap", "dep:fnv", "dep:itertools", "dep:derive_more"]
-# PULL corporate-action sourcing trait + filter. Needs `stream` (chrono + futures), `subscription`
-# (smol_str symbol key), `rustrade-instrument` (descriptor), and `derive_more` for the `Constructor`
-# derive on `CorporateActionFilter`. Both are listed explicitly so this module's requirement is
-# self-described and survives a `stream` refactor.
-corporate-action = ["stream", "subscription", "dep:rustrade-instrument", "dep:derive_more"]
+# PULL corporate-action sourcing trait + filter. Needs `futures` (the `Stream` it returns), `chrono`
+# (dates), `subscription` (smol_str symbol key), `rustrade-instrument` (descriptor), and
+# `derive_more` for the `Constructor` derive on `CorporateActionFilter`. It uses no item of the
+# `stream` module, so it lists those crates itself rather than enabling `stream`.
+corporate-action = ["subscription", "dep:futures", "dep:chrono", "dep:rustrade-instrument", "dep:derive_more"]
 channel = ["dep:tokio", "dep:tokio-stream", "dep:futures", "dep:derive_more", "dep:tracing"]
-error = ["dep:url", "dep:serde_qs", "dep:serde_urlencoded", "dep:thiserror"]
+# `SocketError` wraps the errors of reqwest, tokio-tungstenite, serde_json and prost, and names
+# `SubscriptionId`.
+error = ["subscription", "dep:url", "dep:serde_qs", "dep:serde_urlencoded", "dep:thiserror", "dep:serde_json", "dep:prost", "dep:reqwest", "dep:tokio-tungstenite"]
 metric = []
-protocol = ["error", "metric", "serde", "dep:tokio-tungstenite", "dep:reqwest", "dep:hmac", "dep:hex", "dep:base64", "dep:tokio", "dep:chrono", "dep:bytes", "dep:tracing"]
+protocol = ["error", "metric", "serde", "subscription", "dep:futures", "dep:tokio-tungstenite", "dep:reqwest", "dep:hmac", "dep:hex", "dep:base64", "dep:tokio", "dep:chrono", "dep:bytes", "dep:tracing"]
 serde = ["dep:serde_json", "dep:prost", "dep:bytes", "dep:thiserror", "dep:tracing", "dep:chrono"]
 subscription = ["dep:smol_str"]
 socket = ["dep:tokio", "dep:pin-project", "dep:futures"]
+# `stream::ExchangeStream` parses protocol messages, so it also needs `protocol`; without it the
+# rest of the module (extensions, merge, data) builds on these alone.
 stream = ["dep:tokio-stream", "dep:pin-project", "dep:futures", "dep:chrono"]
 
 [dev-dependencies]

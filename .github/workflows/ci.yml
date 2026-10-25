@@ -146,6 +146,20 @@ jobs:
           cargo check --locked -p rustrade-data --no-default-features
           cargo check --locked -p rustrade-execution --no-default-features
 
+      # The workspace builds `rustrade-integration` with its defaults on, so a feature that forgets
+      # a dependency it needs still builds everywhere here and breaks only for a user who turns the
+      # defaults off. Build each feature on its own to catch that.
+      - name: Run cargo check (each rustrade-integration feature alone)
+        run: |
+          features=$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "rustrade-integration") | .features | keys[] | select(. != "default")')
+          test -n "$features"
+          for feature in $features; do
+            echo "::group::$feature"
+            cargo check --locked -p rustrade-integration --no-default-features --features "$feature" --lib
+            echo "::endgroup::"
+          done
+
   test:
     name: cargo test
     needs: [fmt, check]
