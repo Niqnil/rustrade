@@ -7,7 +7,7 @@ pub mod ext;
 /// Stream utility functions.
 pub mod util;
 
-// `ExchangeStream` parses protocol messages, so it needs `protocol` on top of `stream`.
+// `ExchangeStream` parses protocol messages, so it requires both `stream` and `protocol`.
 #[cfg(feature = "protocol")]
 mod exchange;
 #[cfg(feature = "protocol")]

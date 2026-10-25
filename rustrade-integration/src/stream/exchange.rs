@@ -11,7 +11,7 @@ use std::{
 /// An [`ExchangeStream`] is a communication protocol agnostic [`Stream`]. It polls protocol
 /// messages from the inner [`Stream`], and transforms them into the desired output data structure.
 ///
-/// Available with the `protocol` feature as well as `stream`.
+/// Requires both the `stream` and `protocol` features.
 #[derive(Debug)]
 #[pin_project]
 pub struct ExchangeStream<Protocol, InnerStream, StreamTransformer>
