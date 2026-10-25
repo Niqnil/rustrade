@@ -86,6 +86,8 @@ pub enum CashFlowKind {
         rate: Option<Decimal>,
         /// The amount borrowed that the interest was charged on.
         principal: Option<Decimal>,
+        /// When in the loan's life the charge falls, where the venue says.
+        timing: Option<InterestTiming>,
     },
     /// The financing of a leveraged position held past a venue's daily cutoff, such as a CFD's
     /// overnight financing.
@@ -103,6 +105,22 @@ pub enum CashFlowKind {
     Rebate,
     /// A flow of a kind no other variant names, with the venue's own name for it.
     Other(String),
+}
+
+/// When in a loan's life a [`CashFlowKind::MarginInterest`] charge falls.
+///
+/// A venue charges the interest on a new loan when it is taken and again at each of its charging
+/// boundaries. A charge on a new loan can carry a time before the position it belongs to opened,
+/// since a venue may stamp it at the start of the period the loan was taken in.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub enum InterestTiming {
+    /// The charge for holding the loan over a charging period, at one of the venue's boundaries.
+    Periodic,
+    /// The first charge, made when the loan is taken.
+    OnBorrow,
+    /// A timing neither variant names, with the venue's own name for it.
+    Other(SmolStr),
 }
 
 /// A venue's own identifier for one [`CashFlow`], carried through opaquely.

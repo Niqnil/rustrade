@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`CashFlowKind::MarginInterest::timing`** (`rustrade-execution`). Says whether a margin interest
+  charge is the first one, made when the loan is taken (`InterestTiming::OnBorrow`), or one for
+  holding the loan over a charging period (`InterestTiming::Periodic`), with
+  `InterestTiming::Other(SmolStr)` for a venue's own name for anything else. `None` where the venue
+  does not say.
+  - `BinanceMargin::fetch_margin_interest` reads it from the record's `type`. An `ON_BORROW`
+    charge is stamped at the start of the hour the loan was taken in, so its time can precede the
+    position it belongs to.
+  - The simulated venue reports `OnBorrow` for a charge on a new loan and `Periodic` for one at a
+    boundary. Alpaca does not say, so reports `None`.
+  - **Breaking:** `CashFlowKind` is `#[non_exhaustive]`, so a `match` with a wildcard still
+    compiles, but code that builds a `MarginInterest` or names all its fields in a pattern must add
+    `timing` (or `..`).
+
 - **`SystemBuilder::paper_venue(config, options, &feed)`** (`rustrade`, #698). Adds a paper-trading
   venue (see `ExecutionBuilder::add_paper`) to a system, on the system's own clock. It is a builder
   method rather than an `ExecutionConfig` variant because `PaperOptions` holds models that cannot

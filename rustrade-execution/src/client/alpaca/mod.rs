@@ -4973,11 +4973,13 @@ fn convert_cash_flow(
         ("INT", Some("MGN")) => CashFlowKind::MarginInterest {
             rate: None,
             principal: None,
+            timing: None,
         },
         // Credit interest is received; margin interest is paid.
         ("INT", None) if amount.is_sign_negative() => CashFlowKind::MarginInterest {
             rate: None,
             principal: None,
+            timing: None,
         },
         ("PTR", _) => CashFlowKind::Rebate,
         (activity_type, Some(sub_type)) => {
@@ -9819,6 +9821,7 @@ mod tests {
             let interest = CashFlowKind::MarginInterest {
                 rate: None,
                 principal: None,
+                timing: None,
             };
             assert_eq!(
                 kinds,
