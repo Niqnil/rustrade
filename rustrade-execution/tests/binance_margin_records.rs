@@ -61,10 +61,15 @@ async fn margin_interest_and_forced_liquidations_read_back() {
     let client = BinanceMargin::new(BinanceMarginConfig::cross_margin(api_key, secret_key));
     let now = Utc::now();
 
-    let interest = client
+    let read = client
         .fetch_margin_interest(now - TimeDelta::days(90), now)
         .await
         .expect("fetch_margin_interest");
+    assert!(
+        read.held_since.is_some(),
+        "90 days back is a minute past what the read covers"
+    );
+    let interest = read.flows;
     let mut by_asset = BTreeMap::<String, usize>::new();
     for flow in &interest {
         *by_asset.entry(flow.asset.to_string()).or_default() += 1;
