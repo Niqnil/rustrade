@@ -7,6 +7,7 @@ TradingSummary {
         ): TearSheet {
             pnl: 0,
             carry: 0,
+            positions_carry_unpriced: 0,
             fees_unattributed: 0,
             dust: 0,
             reduce_only_excess: 0,
@@ -49,6 +50,7 @@ TradingSummary {
         ): TearSheet {
             pnl: 0,
             carry: 0,
+            positions_carry_unpriced: 0,
             fees_unattributed: 0,
             dust: 0,
             reduce_only_excess: 0,
@@ -91,6 +93,7 @@ TradingSummary {
         ): TearSheet {
             pnl: 0,
             carry: 0,
+            positions_carry_unpriced: 0,
             fees_unattributed: 0,
             dust: 0,
             reduce_only_excess: 0,

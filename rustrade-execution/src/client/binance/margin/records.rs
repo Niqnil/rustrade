@@ -117,10 +117,11 @@ impl BinanceMargin {
     ///   belongs to.
     /// - [`id`](CashFlow::id) is Binance's transaction id for the charge.
     ///
-    /// The engine adds a flow attributed to an instrument to the carry of its open position only
-    /// when the flow is in the instrument's quote asset. Interest on a short's borrowed base asset,
-    /// or in BNB, is not: the engine leaves it out of carry and says so. To count it, convert it
-    /// into the quote asset first.
+    /// The engine adds a flow attributed to an instrument to the carry of its open position, in
+    /// the slot for the flow's asset: the quote asset's carry, the base asset's, or any other
+    /// asset's. Interest on a short's borrowed base asset is valued at the price the position
+    /// closes at, which is what buying the asset back costs. Interest in BNB, or any asset that is
+    /// neither the instrument's base nor quote, is kept as charged and is in no PnL figure.
     ///
     /// # Delivery
     /// Nothing is pushed: the caller decides when to read, and must drop the charges it has

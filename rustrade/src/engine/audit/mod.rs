@@ -261,7 +261,11 @@ impl<Event, OnTradingDisabled, OnDisconnect>
                         .into_iter()
                         .map(EngineOutput::ReduceOnlyCapped),
                 )
-                .chain(applied.exited.map(EngineOutput::PositionExit))
+                .chain(
+                    applied
+                        .exited
+                        .map(|exit| EngineOutput::PositionExit(Box::new(exit))),
+                )
                 .fold(Self::with_event(event), |audit, output| {
                     audit.add_output(output)
                 }),
