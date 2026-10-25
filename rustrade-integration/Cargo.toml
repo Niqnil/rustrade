@@ -42,6 +42,13 @@ stream = ["dep:tokio-stream", "dep:pin-project", "dep:futures", "dep:chrono"]
 tokio-test = { workspace = true }
 sha2 = { workspace = true }
 wiremock = { workspace = true }
+# Unit tests use these under features that do not enable them as optional dependencies, so a test
+# build with one feature alone would miss them.
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+# `examples/signed_get_request.rs` names an asset type from it.
+rustrade-instrument = { workspace = true }
 
 [dependencies]
 # Rustrade Ecosystem
@@ -91,3 +98,12 @@ itertools = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 derive_more = { workspace = true, optional = true, features = ["display", "constructor"] }
 prost = { workspace = true, optional = true }
+
+# Each example builds only with the features it uses, so a test build with fewer features skips it.
+[[example]]
+name = "signed_get_request"
+required-features = ["protocol"]
+
+[[example]]
+name = "simple_websocket_integration"
+required-features = ["protocol", "stream"]
