@@ -1562,6 +1562,11 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ///   [`Applied`](CarryUpdate::Applied), or [`Overflowed`](CarryUpdate::Overflowed) if the sum
     ///   does not fit a `Decimal`.
     ///
+    /// The base slot assumes a linear instrument settled in its quote asset. A flow in the base
+    /// asset of an inverse or base-settled instrument also lands there, and is valued at the exit
+    /// price like any other: the engine's PnL is not modelled for such an instrument, so check it
+    /// before relying on the figure.
+    ///
     /// The flow's own [`instrument`](CashFlow::instrument) is not checked; the caller routes it
     /// here.
     ///

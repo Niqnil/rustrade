@@ -277,6 +277,37 @@ mod tests {
     }
 
     #[test]
+    fn test_received_base_carry_is_a_gain() {
+        let mut returns = PnLReturns::default();
+        returns.update(&PositionExited {
+            carry_assets: AssetCarry {
+                base: dec!(0.02),
+                other: Vec::new(),
+            },
+            price_exit: Some(dec!(150)),
+            ..exited(dec!(10), dec!(100), dec!(1))
+        });
+
+        assert_eq!(returns.pnl_raw, dec!(13));
+        assert_eq!(returns.carry, dec!(3));
+    }
+
+    #[test]
+    fn test_overflowing_base_carry_skips_the_position() {
+        let mut returns = PnLReturns::default();
+        returns.update(&PositionExited {
+            carry_assets: AssetCarry {
+                base: Decimal::MAX,
+                other: Vec::new(),
+            },
+            price_exit: Some(dec!(2)),
+            ..exited(dec!(10), dec!(100), dec!(1))
+        });
+
+        assert_eq!(returns, PnLReturns::default());
+    }
+
+    #[test]
     fn test_unpriced_base_carry_counts_the_position_with_its_quote_carry() {
         let mut returns = PnLReturns::default();
         returns.update(&PositionExited {

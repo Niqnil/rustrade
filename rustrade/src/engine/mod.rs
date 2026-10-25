@@ -1157,7 +1157,8 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             if quantity_abs_after.is_zero() {
                 let instrument_state = self.state.instruments.instrument_index_mut(key);
                 if let Some(closed) = instrument_state.position.positions.shift_remove(&pos_id) {
-                    let mut exit = PositionExited::from(closed);
+                    // No trade closed it, so there is no exit price to value its base-asset carry at.
+                    let mut exit = closed.into_exited(None);
                     exit.position_id = pos_id.clone();
                     exit.time_exit = engine_time;
                     instrument_state.tear_sheet.update_from_position(&exit);

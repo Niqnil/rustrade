@@ -152,6 +152,7 @@ pub enum PnlRealisedUpdate {
 
 /// Which of a [`Position`]'s carry amounts a cash flow is added to. See [`AssetCarry`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CarrySlot<AssetKey> {
     /// The instrument's quote asset: [`Position::carry`].
     Quote,
@@ -176,7 +177,16 @@ pub enum CarrySlot<AssetKey> {
 /// asset lands in [`other`](Self::other).
 ///
 /// Every amount is signed (positive = received), as [`Position::carry`] is.
+///
+/// A split does not rescale it: the base amount counts the borrowed asset itself. `other` is a
+/// list rather than a map so the key needs no `Ord` or `Hash` and serialises as an array of pairs
+/// whatever its type; the order is the order of first charge and takes part in equality and
+/// hashing.
+///
+/// `#[non_exhaustive]`: construct with [`Default`] and set the fields, so a field can be added
+/// without a breaking change.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct AssetCarry<AssetKey> {
     /// Carry in the instrument's base asset, in units of that asset.
     pub base: Decimal,
@@ -287,10 +297,13 @@ pub(crate) struct PreparedSplit {
 /// only the caller can book it. `#[non_exhaustive]`: more outcomes may be told apart later.
 #[must_use = "an unapplied fill carries a fee that reached no PnL; book it or drop it explicitly"]
 #[non_exhaustive]
-// A transient return value, handed to the caller by value and never stored: the larger variant
-// costs a few hundred bytes of stack for the call, and boxing it would add an allocation (and a
-// public type change) to every exit for no gain.
-#[allow(clippy::large_enum_variant)]
+// A transient return value: handed to the caller by value, never stored, and not copied per tick,
+// unlike `EngineOutput`. The larger variant costs a few hundred bytes of stack for the call, so
+// boxing it would trade a public type change for no gain.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a transient return value, never stored or copied per tick"
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TradeOutcome<AssetKey, InstrumentKey = InstrumentIndex> {
     /// The fill moved a position: it opened, changed, closed or flipped one, and its fees were
@@ -1081,10 +1094,7 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                 let _ = self.update_pnl_realised(trade.quantity, trade.price, closed_fee_quote);
                 self.update_pnl_unrealised_post_trade(trade.price);
 
-                let mut exited = PositionExited::from(self);
-                exited.price_exit = Some(trade.price);
-
-                (None, Some(exited))
+                (None, Some(self.into_exited(Some(trade.price))))
             }
 
             // Close LONG/SHORT Position & open SHORT/LONG with remaining trade.quantity
@@ -1132,12 +1142,42 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                 let mut next_position = Self::from(&next_position_trade);
                 next_position.contract_size = self.contract_size;
 
-                let mut exited = PositionExited::from(self);
-                exited.price_exit = Some(trade.price);
-
-                (Some(next_position), Some(exited))
+                (
+                    Some(next_position),
+                    Some(self.into_exited(Some(trade.price))),
+                )
             }
             _ => unreachable!("match expression guard statements cover all cases"),
+        }
+    }
+
+    /// Close this [`Position`] into its [`PositionExited`] record, with `price_exit` the price of
+    /// the trade that closed it.
+    ///
+    /// `price_exit` values the base-asset carry (see [`AssetCarry`]). Pass `None` only for a
+    /// position removed with no closing trade, as a reverse split that rounds it to zero does:
+    /// base carry is then unpriced, which [`PositionExited::pnl_realised_net`] reports as
+    /// [`NetPnlError::BaseCarryUnpriced`]. The record has the default [`PositionId`] and a
+    /// `time_exit` of the position's last update: set them if the caller knows better.
+    pub fn into_exited(
+        self,
+        price_exit: Option<Decimal>,
+    ) -> PositionExited<AssetKey, InstrumentKey> {
+        PositionExited {
+            position_id: PositionId::default(),
+            instrument: self.instrument,
+            side: self.side,
+            price_entry_average: self.price_entry_average,
+            quantity_abs_max: self.quantity_abs_max,
+            pnl_realised: self.pnl_realised,
+            carry: self.carry,
+            carry_assets: self.carry_assets,
+            price_exit,
+            fees_enter: self.fees_enter,
+            fees_exit: self.fees_exit,
+            time_enter: self.time_enter,
+            time_exit: self.time_exchange_update,
+            trades: self.trades,
         }
     }
 
@@ -1147,6 +1187,9 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
     /// `price` is the price one unit of the base asset is bought back at: the mark price while the
     /// position is open. A closed position values it at its exit price, see
     /// [`PositionExited::pnl_realised_net`].
+    ///
+    /// [`pnl_unrealised`](Self::pnl_unrealised) does not include the base-asset carry: add this
+    /// figure's carry terms to it separately, not the whole of it.
     ///
     /// `None` if a sum or product overflows `Decimal`, which needs a value near `Decimal::MAX`
     /// (~7.9e28).
@@ -1691,30 +1734,6 @@ pub struct PositionExited<AssetKey, InstrumentKey = InstrumentIndex> {
 
     /// [`TradeId`]s of all the [`Trade`]s associated with the closed [`Position`].
     pub trades: Vec<TradeId>,
-}
-
-impl<AssetKey, InstrumentKey> From<Position<AssetKey, InstrumentKey>>
-    for PositionExited<AssetKey, InstrumentKey>
-{
-    fn from(value: Position<AssetKey, InstrumentKey>) -> Self {
-        Self {
-            position_id: PositionId::default(),
-            instrument: value.instrument,
-            side: value.side,
-            price_entry_average: value.price_entry_average,
-            quantity_abs_max: value.quantity_abs_max,
-            pnl_realised: value.pnl_realised,
-            carry: value.carry,
-            carry_assets: value.carry_assets,
-            // Set by the trade that closes it, see `Position::update_from_trade`.
-            price_exit: None,
-            fees_enter: value.fees_enter,
-            fees_exit: value.fees_exit,
-            time_enter: value.time_enter,
-            time_exit: value.time_exchange_update,
-            trades: value.trades,
-        }
-    }
 }
 
 impl<AssetKey, InstrumentKey> PositionExited<AssetKey, InstrumentKey> {
@@ -3100,8 +3119,12 @@ mod tests {
             assert_eq!(exited.price_exit, Some(dec!(90)), "quantity {quantity}");
             assert_eq!(exited.carry_valued(), Ok(dec!(-0.9)));
             assert_eq!(exited.pnl_realised_net(), Ok(dec!(20) - dec!(0.9)));
-            if let Some(next) = next {
+            if quantity > 2.0 {
+                let next = next.expect("a larger trade flips the position");
                 assert!(next.carry_assets.is_empty(), "a flip starts at zero");
+                assert_eq!(next.carry, Decimal::ZERO);
+            } else {
+                assert!(next.is_none(), "an exact close leaves no position");
             }
         }
     }
@@ -3114,7 +3137,7 @@ mod tests {
             position.apply_carry(CarrySlot::Quote, dec!(-2), time_plus_days(base_time, 1)),
             CarryUpdate::Applied
         );
-        let mut exited = PositionExited::from(position);
+        let mut exited = position.into_exited(None);
         assert_eq!(exited.price_exit, None);
         // No base carry needs no price.
         assert_eq!(exited.carry_valued(), Ok(dec!(-2)));
@@ -3172,7 +3195,7 @@ mod tests {
         // A record from before the fields existed loads with none.
         let base_time = DateTime::<Utc>::MIN_UTC;
         let position = Position::from(&trade(base_time, Side::Buy, 100.0, 1.0, 0.0));
-        let exited = PositionExited::from(position);
+        let exited = position.into_exited(None);
         let mut value = serde_json::to_value(&exited).unwrap();
         let record = value.as_object_mut().unwrap();
         record.remove("carry_assets");

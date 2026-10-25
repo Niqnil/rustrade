@@ -35,8 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - `Position` and `PositionExited` gain fields, so `Position::new`, `PositionExited::new` and
       struct literals need them.
     - `EngineOutput::PositionExit` holds a `Box<PositionExited>`. This keeps `EngineOutput`, and so
-      the per-tick audit copy, small. The audit serialisation is unchanged.
-  - Records serialised before these fields load with no non-quote carry and no exit price.
+      the per-tick audit copy, small. Boxing does not change how it serialises.
+    - `From<Position> for PositionExited` is replaced by `Position::into_exited(price_exit)`, so a
+      caller must say what price closed the position.
+    - `TearSheet` and `PnLReturns` gain `positions_carry_unpriced`, and
+      `InstrumentState::update_from_cash_flow` needs `AssetKey: Clone`.
+  - `PositionExited` serialises with the two new fields; records written before them still load,
+    with no non-quote carry and no exit price. A reader built before this change needs to ignore
+    unknown fields to read a new record.
+  - The base slot assumes a linear instrument settled in its quote asset. The engine's PnL is not
+    modelled for an inverse or base-settled instrument, so check a base-asset carry on one.
 
 - **`CashFlowKind::MarginInterest::timing`** (`rustrade-execution`). Says whether a margin interest
   charge is the first one, made when the loan is taken (`InterestTiming::OnBorrow`), or one for

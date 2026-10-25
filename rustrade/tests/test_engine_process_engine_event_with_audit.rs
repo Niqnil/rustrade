@@ -1477,6 +1477,11 @@ fn test_contract_expiry_otm_call() {
     // OTM: settlement price is 0, position closes at zero value → position exits
     assert_eq!(exited.len(), 1);
     assert_eq!(exited[0].pnl_realised, dec!(-2_000)); // bought at 1000*2, settled at 0
+    assert_eq!(
+        exited[0].price_exit,
+        Some(Decimal::ZERO),
+        "a settlement closes at the settlement price"
+    );
 
     // Position should be cleared
     assert!(
