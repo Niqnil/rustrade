@@ -5,7 +5,7 @@
 
 use super::BinanceMargin;
 use crate::{
-    cash_flow::{CashFlow, CashFlowId, CashFlowKind, InterestTiming},
+    cash_flow::{CashFlow, CashFlowId, CashFlowKind, CashFlowsRead, InterestTiming},
     client::binance::shared::{
         RequestKind, classify_rest_query_error, parse_side, response_decode_error,
         rest_call_with_retry,
@@ -35,6 +35,14 @@ const INTEREST_LOOKBACK: TimeDelta = TimeDelta::days(90);
 /// Kept clear of [`INTEREST_LOOKBACK`]'s edge, so that a start at the edge is not refused for any
 /// skew between the local clock and Binance's.
 const INTEREST_LOOKBACK_MARGIN: TimeDelta = TimeDelta::minutes(1);
+
+/// Where an interest read asked to start at `start` at `now` starts instead, because Binance no
+/// longer serves charges that old: a minute inside [`INTEREST_LOOKBACK`]. `None` when it serves
+/// `start`.
+fn interest_held_since(start: DateTime<Utc>, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    let held_since = now - INTEREST_LOOKBACK + INTEREST_LOOKBACK_MARGIN;
+    (start < held_since).then_some(held_since)
+}
 
 /// The span of one interest history request. Binance serves at most 30 days per request, and
 /// says the limit is needed for the data to be correct; a day less leaves room for how it counts.
@@ -82,7 +90,8 @@ pub struct MarginForcedLiquidation {
 
 impl BinanceMargin {
     /// Read the interest Binance charged the account from `start` to `end`, each charge as a
-    /// [`CashFlow`] of [`MarginInterest`](CashFlowKind::MarginInterest), oldest first.
+    /// [`CashFlow`] of [`MarginInterest`](CashFlowKind::MarginInterest), oldest first, in
+    /// [`CashFlowsRead::flows`].
     ///
     /// A cross-margin client reads the cross account. An isolated one reads each pair in its
     /// [`isolated_symbols`](super::BinanceMarginConfig::isolated_symbols), and attributes each
@@ -132,10 +141,13 @@ impl BinanceMargin {
     ///
     /// # Span
     /// - Binance serves interest charged in the last 90 days only. A `start` before that is moved
-    ///   up to a minute inside that limit, clear of any skew between the clocks. A `start` more
-    ///   than a minute before the limit is logged at WARN; one within a minute of it, on either
-    ///   side, as a request for the last 90 days is, is moved silently.
+    ///   up to a minute inside that limit, clear of any skew between the clocks, and
+    ///   [`held_since`](CashFlowsRead::held_since) is where the read then starts: charges before
+    ///   it may exist but were not read. A caller adding up the interest on a position opened
+    ///   before it has only part of it. `held_since` is `None` when `start` is within the limit.
     /// - Charges are read up to `end`, or up to the local clock at the call if that is earlier.
+    /// - The whole span is read in one call, so [`resume`](CashFlowsRead::resume) is always
+    ///   `None`.
     /// - Binance serves at most 30 days per request, so a span is read in windows of 29 days,
     ///   each paged by 100 charges. A read costs a request weight of 1 per page, at least 1 per
     ///   window, and, on an isolated client, as much again for each pair.
@@ -151,26 +163,22 @@ impl BinanceMargin {
         &self,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
-    ) -> Result<Vec<CashFlow<AssetNameExchange, InstrumentNameExchange>>, UnindexedClientError>
+    ) -> Result<CashFlowsRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError>
     {
         let now = Utc::now();
-        let horizon = now - INTEREST_LOOKBACK + INTEREST_LOOKBACK_MARGIN;
-        let start = if start < horizon {
-            if start < now - INTEREST_LOOKBACK - INTEREST_LOOKBACK_MARGIN {
-                warn!(
-                    requested = %start,
-                    served_from = %horizon,
-                    "BinanceMargin fetch_margin_interest: Binance serves 90 days of interest \
-                     history — reading from the earliest time it serves"
-                );
-            }
-            horizon
-        } else {
-            start
-        };
+        let held_since = interest_held_since(start, now);
+        if let Some(held_since) = held_since {
+            debug!(
+                requested = %start,
+                %held_since,
+                "BinanceMargin fetch_margin_interest: Binance serves 90 days of interest \
+                 history — reading from the earliest time it serves"
+            );
+        }
+        let start = held_since.unwrap_or(start);
         let end = end.min(now);
         if start > end {
-            return Ok(Vec::new());
+            return Ok(CashFlowsRead::complete(Vec::new()).with_held_since(held_since));
         }
         let (start_ms, end_ms) = (start.timestamp_millis(), end.timestamp_millis());
 
@@ -191,7 +199,7 @@ impl BinanceMargin {
             .filter(|flow| seen.insert(ChargeKey::of(flow)))
             .collect();
         flows.sort_by_key(|flow| flow.time_exchange);
-        Ok(flows)
+        Ok(CashFlowsRead::complete(flows).with_held_since(held_since))
     }
 
     /// Read the orders Binance placed from `start` to `end` to liquidate the account, oldest
@@ -687,10 +695,12 @@ mod tests {
         .await;
         let client = margin_client_at(&server, false);
 
-        let flows = client
+        let read = client
             .fetch_margin_interest(start, now + TimeDelta::days(5))
             .await
             .unwrap();
+        assert_eq!((read.resume, read.held_since), (None, None));
+        let flows = read.flows;
 
         let ids: Vec<_> = flows.iter().map(|flow| flow.id.clone().unwrap()).collect();
         assert_eq!(ids, ["1", "4", "3", "2"].map(CashFlowId::new));
@@ -763,7 +773,8 @@ mod tests {
         let flows = client
             .fetch_margin_interest(now - TimeDelta::days(1), now)
             .await
-            .unwrap();
+            .unwrap()
+            .flows;
 
         let [flow] = flows.as_slice() else {
             panic!("one flow: {flows:?}");
@@ -786,7 +797,8 @@ mod tests {
         let flows = client
             .fetch_margin_interest(now - TimeDelta::days(1), now)
             .await
-            .unwrap();
+            .unwrap()
+            .flows;
 
         let [flow] = flows.as_slice() else {
             panic!("one flow: {flows:?}");
@@ -817,7 +829,8 @@ mod tests {
         let flows = client
             .fetch_margin_interest(now - TimeDelta::days(1), now)
             .await
-            .unwrap();
+            .unwrap()
+            .flows;
 
         let [flow] = flows.as_slice() else {
             panic!("one charge: {flows:?}");
@@ -840,7 +853,7 @@ mod tests {
         .await;
         let client = margin_client_at(&server, false);
 
-        let flows = client.fetch_margin_interest(at, at).await.unwrap();
+        let flows = client.fetch_margin_interest(at, at).await.unwrap().flows;
 
         assert_eq!(flows.len(), 1);
         let queries = queries(&server).await;
@@ -870,7 +883,8 @@ mod tests {
         let flows = client
             .fetch_margin_interest(now - TimeDelta::days(1), now)
             .await
-            .unwrap();
+            .unwrap()
+            .flows;
 
         assert_eq!(flows.len(), 101);
         assert_eq!(queries(&server).await.len(), 2);
@@ -919,7 +933,8 @@ mod tests {
         let flows = client
             .fetch_margin_interest(now - TimeDelta::days(1), now)
             .await
-            .unwrap();
+            .unwrap()
+            .flows;
 
         assert_eq!(flows.len(), 2);
         for flow in flows {
@@ -940,13 +955,13 @@ mod tests {
         let client = margin_client_at(&server, false);
         let before = Utc::now();
 
-        let flows = client
+        let read = client
             .fetch_margin_interest(before - TimeDelta::days(200), before)
             .await
             .unwrap();
         let after = Utc::now();
 
-        assert!(flows.is_empty());
+        assert!(read.flows.is_empty());
         let queries = queries(&server).await;
         let first = millis(&queries[0], "startTime");
         let horizon = |now: DateTime<Utc>| {
@@ -956,7 +971,49 @@ mod tests {
             (horizon(before)..=horizon(after)).contains(&first),
             "{first}"
         );
+        assert_eq!(
+            read.held_since
+                .map(|held_since| held_since.timestamp_millis()),
+            Some(first),
+            "held_since is where the read started"
+        );
         assert_eq!(queries.len(), 4, "90 days in windows of 29");
+    }
+
+    #[test]
+    fn interest_is_held_since_a_minute_inside_ninety_days_only_for_an_older_start() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 25, 12, 0, 0).unwrap();
+        let held_since = now - TimeDelta::days(90) + TimeDelta::minutes(1);
+        let before = held_since - TimeDelta::milliseconds(1);
+
+        assert_eq!(interest_held_since(before, now), Some(held_since));
+        assert_eq!(
+            interest_held_since(now - TimeDelta::days(90), now),
+            Some(held_since),
+            "a request for the last 90 days misses its first minute"
+        );
+        assert_eq!(interest_held_since(held_since, now), None);
+        assert_eq!(interest_held_since(now, now), None);
+    }
+
+    #[tokio::test]
+    async fn interest_entirely_older_than_binance_serves_reads_nothing_and_says_so() {
+        let server = MockServer::start().await;
+        let client = margin_client_at(&server, false);
+        let end = Utc::now() - TimeDelta::days(100);
+
+        let read = client
+            .fetch_margin_interest(end - TimeDelta::days(1), end)
+            .await
+            .unwrap();
+
+        assert!(read.flows.is_empty());
+        assert!(
+            read.held_since.is_some_and(|held_since| held_since > end),
+            "{:?}",
+            read.held_since
+        );
+        assert!(queries(&server).await.is_empty());
     }
 
     #[tokio::test]
@@ -968,7 +1025,8 @@ mod tests {
         let interest = client
             .fetch_margin_interest(now, now - TimeDelta::hours(1))
             .await
-            .unwrap();
+            .unwrap()
+            .flows;
         let liquidations = client
             .fetch_forced_liquidations(now + TimeDelta::hours(1), now + TimeDelta::hours(2))
             .await

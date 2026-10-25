@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking: `BinanceMargin::fetch_margin_interest` returns a `CashFlowsRead`** in place of a
+  `Vec<CashFlow>` (`rustrade-execution`, #718). Binance serves 90 days of interest history, and a
+  read asked to start earlier starts at that limit. Its result looked the same as a complete one,
+  so a caller adding up a position's whole interest could not tell part of it was missing. The
+  new `CashFlowsRead::held_since` is where the read started when the limit cut into the span,
+  and `None` otherwise. `resume` is always `None`, as the whole span is read in one call. The
+  flows are in `flows`. The read logs the move at DEBUG rather than WARN, since the result now
+  carries it.
+- `CashFlowsRead` gains `held_since`, with the same meaning as `TradesRead::held_since`. It is
+  `#[non_exhaustive]`, so `CashFlowsRead::new(flows, resume)` and `complete` still build one,
+  with `held_since: None`; `with_held_since` sets it. Alpaca's `fetch_cash_flows` leaves it
+  `None`.
+
 ### Fixed
 
 - **Each `rustrade-integration` feature builds on its own** (`rustrade-integration`). With
