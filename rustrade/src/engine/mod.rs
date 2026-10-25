@@ -815,7 +815,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 .update_from_trade_with_id(&settlement_trade, &pos_id, contract_size)
             {
                 instrument_state.tear_sheet.update_from_position(&exit);
-                exited.push(EngineOutput::PositionExit(exit));
+                exited.push(EngineOutput::PositionExit(Box::new(exit)));
             }
         }
 
@@ -1161,7 +1161,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                     exit.position_id = pos_id.clone();
                     exit.time_exit = engine_time;
                     instrument_state.tear_sheet.update_from_position(&exit);
-                    outputs.push(EngineOutput::PositionExit(exit));
+                    outputs.push(EngineOutput::PositionExit(Box::new(exit)));
 
                     // Prune the hedging fill-routing map for the removed position. This must prune
                     // by VALUE (the removed `PositionId`), NOT via `cleanup_routing_tables` (which
@@ -1639,8 +1639,8 @@ pub enum EngineOutput<
     /// Output of an actioned [`Command`].
     ///
     /// **Inline.** [`ActionOutput`]'s inner order payloads are boxed at the root (#195), so
-    /// `ActionOutput` is only ~96 B — well under the ~248 B [`PositionExit`](Self::PositionExit)
-    /// variant that floors this enum's size. Carrying it inline therefore costs `EngineOutput`
+    /// `ActionOutput` is only ~96 B — well under the ~144 B `AlgoOrders` variant that floors
+    /// this enum's size. Carrying it inline therefore costs `EngineOutput`
     /// nothing in stack size (and thus in the per-tick [`ProcessAudit`] copy), while avoiding a
     /// heap allocation and pointer indirection on the command path that an outer `Box` would add.
     /// The audit wire format is unchanged (a newtype variant serializes its payload identically
@@ -1648,16 +1648,22 @@ pub enum EngineOutput<
     Commanded(ActionOutput<ExchangeKey, InstrumentKey>),
     OnTradingDisabled(OnTradingDisabled),
     AccountDisconnect(OnDisconnect),
-    PositionExit(PositionExited<AssetIndex, InstrumentKey>),
+    /// A position closed.
+    ///
+    /// **Boxed**, because a [`PositionExited`] is large (it carries its per-asset carry and exit
+    /// price) and a close is rare: boxing keeps this enum small, and with it the per-tick
+    /// [`ProcessAudit`] copy, for an allocation only when a position exits. The audit wire format
+    /// is unchanged (a boxed payload serializes as its content).
+    PositionExit(Box<PositionExited<AssetIndex, InstrumentKey>>),
     MarketDisconnect(OnDisconnect),
 
     /// Summary of algorithmic orders generated for a processed event (the per-tick auto-generation
     /// path).
     ///
     /// **Inline.** `GenerateAlgoOrdersOutput`'s inner order payloads are boxed at the root (#195),
-    /// so it is only ~144 B — under the ~248 B [`PositionExit`](Self::PositionExit) variant that
-    /// floors this enum's size. Carrying it inline therefore costs `EngineOutput` nothing in stack
-    /// size (and thus in the per-tick [`ProcessAudit`] copy). The only allocation is the root
+    /// so it is only ~144 B, the variant that floors this enum's size now that
+    /// [`PositionExit`](Self::PositionExit) is boxed. Carrying it inline therefore costs
+    /// `EngineOutput` nothing beyond that floor in stack size (and thus in the per-tick [`ProcessAudit`] copy). The only allocation is the root
     /// boxing of the orders themselves, paid solely when the strategy actually emits some — the
     /// empty no-order case short-circuits before this variant is even constructed. The audit wire
     /// format is unchanged (a newtype variant serializes its payload identically whether boxed or
@@ -2158,7 +2164,7 @@ impl<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
     for EngineOutput<OnTradingDisabled, OnDisconnect, ExchangeKey, InstrumentKey>
 {
     fn from(value: PositionExited<AssetIndex, InstrumentKey>) -> Self {
-        Self::PositionExit(value)
+        Self::PositionExit(Box::new(value))
     }
 }
 
@@ -2176,21 +2182,20 @@ mod size_guard {
     use super::*;
 
     /// Regression guard: `EngineOutput` stays small so the per-tick `ProcessAudit` copy is cheap. Its
-    /// floor is the largest variant `PositionExit(PositionExited)` (~248 B). The `AlgoOrders`/
-    /// `Commanded` variants are carried inline, but their order payloads are boxed at the root (#195)
-    /// — `GenerateAlgoOrdersOutput` ~144 B, `ActionOutput` ~96 B — so both sit under the
-    /// `PositionExit` floor and neither dominates. This bound (<= 256 B) catches a large regression —
-    /// a new big inline variant, or a re-inlined order payload that lifts `AlgoOrders`/`Commanded`
-    /// above the floor — while leaving headroom for unrelated growth.
+    /// floor is the largest inline variant, `AlgoOrders` (`GenerateAlgoOrdersOutput`, ~144 B). The
+    /// order payloads of `AlgoOrders`/`Commanded` are boxed at the root (#195), and `PositionExit`
+    /// is boxed because a `PositionExited` is large and a close is rare. This bound (<= 192 B)
+    /// catches a large regression — a new big inline variant, a re-inlined payload, or an unboxed
+    /// `PositionExited` — while leaving headroom for unrelated growth.
     #[test]
     fn engine_output_stays_small() {
-        // Measured 248 B, floored by the PositionExit variant (232 B before its `carry` field).
+        // Measured 168 B, floored by the AlgoOrders variant.
         let size = std::mem::size_of::<EngineOutput<(), (), ExchangeIndex, InstrumentIndex>>();
         assert!(
-            size <= 256,
-            "EngineOutput grew to {size} B (expected <= 256): a variant gained a large inline \
-             payload. AlgoOrders/Commanded order payloads must stay root-boxed (#195) so those \
-             variants sit under the ~248 B PositionExit floor."
+            size <= 192,
+            "EngineOutput grew to {size} B (expected <= 192): a variant gained a large inline \
+             payload. AlgoOrders/Commanded order payloads must stay root-boxed (#195), and \
+             PositionExit must stay boxed."
         );
     }
 }

@@ -508,6 +508,8 @@ fn test_engine_process_engine_event_with_audit() {
                 pnl_realised: dec!(7000.0), // (-10k entry - 1k fees)+(20k exit - 2k fees) = 7k
                 fees_enter: asset_fees(0, dec!(1_000.0)),
                 carry: Decimal::ZERO,
+                carry_assets: Default::default(),
+                price_exit: Some(dec!(20_000.0)),
                 fees_exit: asset_fees(0, dec!(2_000.0)),
                 time_enter: time_plus_days(STARTING_TIMESTAMP, 2),
                 time_exit: time_plus_days(STARTING_TIMESTAMP, 3),
@@ -708,6 +710,8 @@ fn test_engine_process_engine_event_with_audit() {
                 fees_exit: asset_fees(1, dec!(0.005)), // 0.005 btc
                 time_enter: time_plus_days(STARTING_TIMESTAMP, 2),
                 carry: Decimal::ZERO,
+                carry_assets: Default::default(),
+                price_exit: Some(dec!(0.05)),
                 time_exit: time_plus_days(STARTING_TIMESTAMP, 5),
                 trades: vec![gen_trade_id(1), gen_trade_id(1)],
             }
@@ -1418,7 +1422,7 @@ fn expiry_exits(
     outputs
         .into_iter()
         .map(|output| match output {
-            EngineOutput::PositionExit(exit) => exit,
+            EngineOutput::PositionExit(exit) => *exit,
             other => panic!("expected only PositionExit outputs, got {other:?}"),
         })
         .collect()
@@ -2961,6 +2965,17 @@ fn test_corporate_action_replica_parity_floor_split() {
             )
         })
         .expect("dust floored to zero must emit a PositionExit");
+    let dust_exit = outputs
+        .iter()
+        .find_map(|o| match o {
+            EngineOutput::PositionExit(exit) if exit.position_id == dust_id => Some(exit),
+            _ => None,
+        })
+        .expect("the PositionExit found above");
+    assert_eq!(
+        dust_exit.price_exit, None,
+        "a position floored to zero closed with no trade, so it has no exit price"
+    );
     assert!(
         dust_remainder_idx < dust_exit_idx,
         "SplitRemainder (idx {dust_remainder_idx}) must precede its paired PositionExit \

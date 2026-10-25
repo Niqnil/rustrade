@@ -360,7 +360,7 @@ mod tests {
         engine::state::{
             EngineState,
             connectivity::VenueRole,
-            position::{CarryUpdate, PnlUnrealisedUpdate, PositionId},
+            position::{CarrySlot, CarryUpdate, PnlUnrealisedUpdate, PositionId},
         },
         statistic::{summary::TradingSummaryGenerator, time::Annual365},
     };
@@ -730,7 +730,7 @@ mod tests {
         assert_eq!(position.carry, dec!(-4));
         assert_eq!(position.pnl_realised, Decimal::ZERO);
         assert_eq!(
-            position.apply_carry(dec!(1.5), time(2_000)),
+            position.apply_carry(CarrySlot::Quote, dec!(1.5), time(2_000)),
             CarryUpdate::Applied
         );
 
@@ -752,7 +752,7 @@ mod tests {
 
         assert_eq!(exited.pnl_realised, dec!(1_000));
         assert_eq!(exited.carry, dec!(-2.5));
-        assert_eq!(exited.pnl_realised_net(), Some(dec!(997.5)));
+        assert_eq!(exited.pnl_realised_net(), Ok(dec!(997.5)));
     }
 
     /// Closing a position seeded with entry fees nets them out of its realised PnL, together with

@@ -9,6 +9,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Carry in the base asset and other assets on a position** (`rustrade`). A margin short borrows
+  the base asset and the venue charges its interest in that asset, so the cost in quote is the
+  interest times the price the asset is bought back at. A cash flow in an asset other than the
+  instrument's quote asset used to be refused (`CarryUpdate::AssetMismatch`); it is now added to
+  the open position:
+  - `Position::carry_assets` and `PositionExited::carry_assets` (`AssetCarry`) hold the carry in
+    the instrument's base asset (`base`, in units of the asset) and in any other asset (`other`,
+    one entry per asset). `Position::carry` stays the quote asset's.
+  - The base carry is valued at the price of the trade that closed the position, stored as
+    `PositionExited::price_exit`. Carry in any other asset, such as BNB, has no price the engine
+    knows, so it is kept as charged and is in no PnL figure or tear sheet.
+  - `PositionSeed::with_carry_base` seeds the base carry. There is no seed for other assets.
+  - `TearSheet::carry` and `pnl` include the valued base carry. A position removed without a
+    closing trade, as a reverse split that rounds it to zero does, has no exit price: it counts
+    with its quote carry alone, a `warn!` is logged and `TearSheet::positions_carry_unpriced`
+    counts it.
+  - **Breaking:**
+    - `Position::pnl_realised_net` takes the price to value the base carry at (the mark price
+      while the position is open).
+    - `PositionExited::pnl_realised_net` returns `Result<Decimal, NetPnlError>`: `Overflow`, or
+      `BaseCarryUnpriced` when there is base carry and no exit price. Use
+      `PositionExited::carry_valued` for the quote-equivalent carry.
+    - `Position::apply_carry` takes a `CarrySlot`, and `CarryUpdate::AssetMismatch` is removed.
+    - `Position` and `PositionExited` gain fields, so `Position::new`, `PositionExited::new` and
+      struct literals need them.
+    - `EngineOutput::PositionExit` holds a `Box<PositionExited>`. This keeps `EngineOutput`, and so
+      the per-tick audit copy, small. The audit serialisation is unchanged.
+  - Records serialised before these fields load with no non-quote carry and no exit price.
+
 - **`CashFlowKind::MarginInterest::timing`** (`rustrade-execution`). Says whether a margin interest
   charge is the first one, made when the loan is taken (`InterestTiming::OnBorrow`), or one for
   holding the loan over a charging period (`InterestTiming::Periodic`), with

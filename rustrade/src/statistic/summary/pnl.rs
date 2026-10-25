@@ -1,5 +1,5 @@
 use crate::{
-    engine::state::position::{PositionExited, calculate_pnl_return},
+    engine::state::position::{NetPnlError, PositionExited, calculate_pnl_return},
     statistic::summary::dataset::DataSetSummary,
 };
 use rust_decimal::Decimal;
@@ -40,11 +40,20 @@ pub struct PnLReturns {
     pub pnl_raw: Decimal,
 
     /// Carry included in `pnl_raw`: funding, interest and borrow fees, signed (positive =
-    /// received), in the same asset.
+    /// received), in the same asset. Base-asset carry is valued at each position's exit price;
+    /// carry in any other asset is in neither.
     ///
     /// `#[serde(default)]` so a summary serialised before this field existed still loads.
     #[serde(default)]
     pub carry: Decimal,
+
+    /// How many positions had base-asset carry and no exit price, so counted in `carry` and
+    /// `pnl_raw` with their quote carry alone: ones removed without a closing trade, such as by a
+    /// reverse split that rounds them to zero. Zero when every closed position was priced.
+    ///
+    /// `#[serde(default)]` so a summary serialised before this field existed still loads.
+    #[serde(default)]
+    pub positions_carry_unpriced: u64,
 
     /// Fees of fills that opened no position, already subtracted from `pnl_raw`: positive =
     /// paid, negative = a rebate received. Each is the fee's quote equivalent, as a position's
@@ -81,10 +90,32 @@ impl PnLReturns {
         &mut self,
         position: &PositionExited<AssetKey, InstrumentKey>,
     ) {
-        let Some(pnl_net) = position.pnl_realised_net() else {
+        // Base-asset carry is valued at the exit price. A position removed without a closing trade
+        // has none, so it counts with its quote carry alone, and is counted and warned about:
+        // skipping it would drop its realised PnL from the summary.
+        let carry = match position.carry_valued() {
+            Ok(carry) => carry,
+            Err(NetPnlError::BaseCarryUnpriced) => {
+                self.positions_carry_unpriced = self.positions_carry_unpriced.saturating_add(1);
+                warn!(
+                    base_carry = %position.carry_assets.base,
+                    "position has base-asset carry but no exit price; counting its quote carry only"
+                );
+                position.carry
+            }
+            Err(NetPnlError::Overflow) => {
+                warn!(
+                    position_pnl_realised = %position.pnl_realised,
+                    position_carry = %position.carry,
+                    "position net PnL overflowed Decimal; skipping this position"
+                );
+                return;
+            }
+        };
+        let Some(pnl_net) = position.pnl_realised.checked_add(carry) else {
             warn!(
                 position_pnl_realised = %position.pnl_realised,
-                position_carry = %position.carry,
+                position_carry = %carry,
                 "position net PnL overflowed Decimal; skipping this position"
             );
             return;
@@ -101,11 +132,11 @@ impl PnLReturns {
                 "pnl_raw accumulation overflowed Decimal; holding last-good value"
             ),
         }
-        match self.carry.checked_add(position.carry) {
+        match self.carry.checked_add(carry) {
             Some(new_total) => self.carry = new_total,
             None => warn!(
                 carry_held = %self.carry,
-                position_carry = %position.carry,
+                position_carry = %carry,
                 "carry accumulation overflowed Decimal; holding last-good value"
             ),
         }
@@ -158,6 +189,7 @@ impl PnLReturns {
 #[allow(clippy::unwrap_used, clippy::expect_used)] // test code: panics acceptable
 mod tests {
     use super::*;
+    use crate::engine::state::position::AssetCarry;
     use chrono::{DateTime, Utc};
     use rust_decimal_macros::dec;
     use rustrade_execution::{
@@ -182,6 +214,8 @@ mod tests {
             quantity_abs_max,
             pnl_realised,
             carry: Decimal::ZERO,
+            carry_assets: Default::default(),
+            price_exit: None,
             fees_enter: AssetFees {
                 asset: QuoteAsset,
                 fees: dec!(0.0),
@@ -217,6 +251,48 @@ mod tests {
         assert_eq!(returns.total.count, dec!(2));
         assert_eq!(returns.total.sum, dec!(0.08));
         assert_eq!(returns.losses.count, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_base_carry_is_valued_at_the_exit_price() {
+        // 10 won on price; 0.02 of base interest paid, bought back at 150: 3 of cost.
+        let mut returns = PnLReturns::default();
+        returns.update(&PositionExited {
+            carry: dec!(-1),
+            carry_assets: AssetCarry {
+                base: dec!(-0.02),
+                other: vec![(QuoteAsset, dec!(-9))],
+            },
+            price_exit: Some(dec!(150)),
+            ..exited(dec!(10), dec!(100), dec!(1))
+        });
+
+        assert_eq!(
+            returns.pnl_raw,
+            dec!(6),
+            "10 - 1 - 3; the unpriced asset is left out"
+        );
+        assert_eq!(returns.carry, dec!(-4));
+        assert_eq!(returns.positions_carry_unpriced, 0);
+    }
+
+    #[test]
+    fn test_unpriced_base_carry_counts_the_position_with_its_quote_carry() {
+        let mut returns = PnLReturns::default();
+        returns.update(&PositionExited {
+            carry: dec!(-1),
+            carry_assets: AssetCarry {
+                base: dec!(-0.02),
+                other: Vec::new(),
+            },
+            price_exit: None,
+            ..exited(dec!(10), dec!(100), dec!(1))
+        });
+
+        assert_eq!(returns.pnl_raw, dec!(9), "not dropped from the summary");
+        assert_eq!(returns.carry, dec!(-1));
+        assert_eq!(returns.total.count, Decimal::ONE);
+        assert_eq!(returns.positions_carry_unpriced, 1);
     }
 
     #[test]

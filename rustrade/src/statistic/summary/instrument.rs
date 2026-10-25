@@ -43,11 +43,19 @@ pub struct TearSheet<Interval> {
     pub pnl: Decimal,
 
     /// Carry of the closed positions, already included in `pnl`: funding, interest and borrow
-    /// fees, signed (positive = received).
+    /// fees, signed (positive = received). Base-asset carry is valued at each position's exit
+    /// price; carry in any other asset is left out.
     ///
     /// `#[serde(default)]` so tear sheets serialised before this field existed still load.
     #[serde(default)]
     pub carry: Decimal,
+
+    /// How many closed positions had base-asset carry and no exit price, so counted in `carry`
+    /// and `pnl` with their quote carry alone. See [`PnLReturns::positions_carry_unpriced`].
+    ///
+    /// `#[serde(default)]` so tear sheets serialised before this field existed still load.
+    #[serde(default)]
+    pub positions_carry_unpriced: u64,
 
     /// Fees of fills that opened no position, already subtracted from `pnl`: positive = paid.
     /// In the instrument's quote asset, as each fee's quote equivalent.
@@ -536,6 +544,7 @@ impl TearSheetGenerator {
             calmar_ratio,
             pnl: self.pnl_returns.pnl_raw,
             carry: self.pnl_returns.carry,
+            positions_carry_unpriced: self.pnl_returns.positions_carry_unpriced,
             fees_unattributed: self.pnl_returns.fees_unattributed,
             dust: self.dust,
             reduce_only_excess: self.reduce_only_excess,

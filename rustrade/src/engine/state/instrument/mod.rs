@@ -6,8 +6,9 @@ use crate::{
             instrument::{data::InstrumentDataState, filter::InstrumentFilter},
             order::{Orders, manager::OrderManager},
             position::{
-                CarryUpdate, OmsMode, PnlUnrealisedUpdate, PositionExited, PositionManager,
-                PreparedSplit, SplitError, SplitRoundingPolicy, TradeOutcome, fee_in_quote,
+                CarrySlot, CarryUpdate, OmsMode, PnlUnrealisedUpdate, PositionExited,
+                PositionManager, PreparedSplit, SplitError, SplitRoundingPolicy, TradeOutcome,
+                fee_in_quote,
             },
         },
     },
@@ -1553,9 +1554,10 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// - [`BeforeEntry`](CarryUpdate::BeforeEntry): the flow predates the position's
     ///   `time_enter`, so it belongs to an earlier position, or to carry seeded with this one
     ///   (see [`PositionSeed::with_carry`](super::position::PositionSeed::with_carry)). DEBUG.
-    /// - [`AssetMismatch`](CarryUpdate::AssetMismatch): the flow's asset is not the instrument's
-    ///   quote asset, which carry is kept in. WARN.
-    /// - Otherwise the flow is added, by
+    /// - Otherwise the flow is added to the carry for its asset: the quote asset's
+    ///   [`Position::carry`](super::position::Position::carry), the base asset's
+    ///   [`AssetCarry::base`](super::position::AssetCarry::base), or any other asset's entry in
+    ///   [`AssetCarry::other`](super::position::AssetCarry::other). It is added by
     ///   [`Position::apply_carry`](super::position::Position::apply_carry), which returns
     ///   [`Applied`](CarryUpdate::Applied), or [`Overflowed`](CarryUpdate::Overflowed) if the sum
     ///   does not fit a `Decimal`.
@@ -1571,7 +1573,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// consumer that opens a new stream must drop the flows it has already passed on.
     pub fn update_from_cash_flow(&mut self, flow: &CashFlow<AssetKey, InstrumentKey>) -> CarryUpdate
     where
-        AssetKey: Debug + PartialEq,
+        AssetKey: Debug + PartialEq + Clone,
         InstrumentKey: Debug,
     {
         let mut open = self.position.positions.values_mut();
@@ -1622,20 +1624,15 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             return CarryUpdate::BeforeEntry;
         }
 
-        if flow.asset != self.instrument.underlying.quote {
-            warn!(
-                instrument = ?self.key,
-                kind = ?flow.kind,
-                asset = ?flow.asset,
-                quote = ?self.instrument.underlying.quote,
-                amount = %flow.amount,
-                time_exchange = %flow.time_exchange,
-                "cash flow is not in the instrument's quote asset — not applied to carry",
-            );
-            return CarryUpdate::AssetMismatch;
-        }
+        let slot = if flow.asset == self.instrument.underlying.quote {
+            CarrySlot::Quote
+        } else if flow.asset == self.instrument.underlying.base {
+            CarrySlot::Base
+        } else {
+            CarrySlot::Other(flow.asset.clone())
+        };
 
-        position.apply_carry(flow.amount, flow.time_exchange)
+        position.apply_carry(slot, flow.amount, flow.time_exchange)
     }
 
     /// Log a fill the venue forced, and count it. See [`Self::update_from_trade`].
@@ -4382,14 +4379,14 @@ mod tests {
         assert_eq!(position.carry, dec!(-1.5));
         assert_eq!(position.pnl_realised, Decimal::ZERO);
         assert_eq!(position.time_exchange_update, after(2));
-        assert_eq!(position.pnl_realised_net(), Some(dec!(-1.5)));
+        assert_eq!(position.pnl_realised_net(dec!(100)), Some(dec!(-1.5)));
 
         let exited = state
             .update_from_trade(&fill(OrderId::new("close"), Side::Buy, dec!(1)))
             .exited
             .expect("a fill for the whole quantity exits the position");
         assert_eq!(exited.carry, dec!(-1.5));
-        assert_eq!(exited.pnl_realised_net(), Some(dec!(-1.5)));
+        assert_eq!(exited.pnl_realised_net(), Ok(dec!(-1.5)));
     }
 
     #[test]
@@ -4454,18 +4451,62 @@ mod tests {
     }
 
     #[test]
-    fn a_flow_in_an_asset_other_than_the_quote_is_left_out() {
+    fn a_flow_in_the_base_asset_is_carried_and_valued_at_the_exit_price() {
         let mut state = instrument_state(OmsMode::Netting);
         let base = state.instrument.underlying.base;
         let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
 
-        let (update, warnings) =
-            count_warnings(|| state.update_from_cash_flow(&funding(base, dec!(-2), after(1))));
-        assert_eq!(update, CarryUpdate::AssetMismatch);
-        assert_eq!(warnings, 1);
+        let (updates, warnings) = count_warnings(|| {
+            [
+                state.update_from_cash_flow(&funding(base, dec!(-0.01), after(1))),
+                state.update_from_cash_flow(&funding(base, dec!(-0.005), after(2))),
+            ]
+        });
+        assert_eq!(updates, [CarryUpdate::Applied, CarryUpdate::Applied]);
+        assert_eq!(warnings, 0);
+        let position = &state.position.positions[&PositionId::NETTING];
+        assert_eq!(position.carry, Decimal::ZERO, "quote carry is untouched");
+        assert_eq!(position.carry_assets.base, dec!(-0.015));
+        assert_eq!(position.pnl_realised_net(dec!(100)), Some(dec!(-1.5)));
+        assert_eq!(position.pnl_realised_net(dec!(200)), Some(dec!(-3)));
+
+        let exited = state
+            .update_from_trade(&fill(OrderId::new("close"), Side::Buy, dec!(1)))
+            .exited
+            .expect("a fill for the whole quantity exits the position");
+        assert_eq!(exited.price_exit, Some(dec!(100)));
+        assert_eq!(exited.carry_valued(), Ok(dec!(-1.5)));
+        assert_eq!(exited.pnl_realised_net(), Ok(dec!(-1.5)));
+    }
+
+    #[test]
+    fn a_flow_in_a_third_asset_is_carried_unconverted() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let bnb = AssetIndex(99);
+        let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
+
+        let (updates, warnings) = count_warnings(|| {
+            [
+                state.update_from_cash_flow(&funding(bnb, dec!(-2), after(1))),
+                state.update_from_cash_flow(&funding(bnb, dec!(-1), after(2))),
+            ]
+        });
+        assert_eq!(updates, [CarryUpdate::Applied, CarryUpdate::Applied]);
+        assert_eq!(warnings, 0);
+        let position = &state.position.positions[&PositionId::NETTING];
+        assert_eq!(position.carry_assets.other, [(bnb, dec!(-3))]);
+        assert_eq!(position.carry, Decimal::ZERO);
+        assert_eq!(position.carry_assets.base, Decimal::ZERO);
+
+        let exited = state
+            .update_from_trade(&fill(OrderId::new("close"), Side::Buy, dec!(1)))
+            .exited
+            .expect("a fill for the whole quantity exits the position");
+        assert_eq!(exited.carry_assets.other, [(bnb, dec!(-3))]);
         assert_eq!(
-            state.position.positions[&PositionId::NETTING].carry,
-            Decimal::ZERO
+            exited.pnl_realised_net(),
+            Ok(Decimal::ZERO),
+            "an asset with no price is in no PnL figure"
         );
     }
 

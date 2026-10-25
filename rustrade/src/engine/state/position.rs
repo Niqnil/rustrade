@@ -150,6 +150,83 @@ pub enum PnlRealisedUpdate {
     Overflowed,
 }
 
+/// Which of a [`Position`]'s carry amounts a cash flow is added to. See [`AssetCarry`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CarrySlot<AssetKey> {
+    /// The instrument's quote asset: [`Position::carry`].
+    Quote,
+    /// The instrument's base asset: [`AssetCarry::base`].
+    Base,
+    /// Any other asset: [`AssetCarry::other`].
+    Other(AssetKey),
+}
+
+/// The carry a [`Position`] has accrued in assets other than its instrument's quote asset.
+///
+/// A margin short borrows the base asset and the venue charges interest in it, so the cost is a
+/// quantity of base, not of quote. What it costs in quote is known only when the borrowed asset is
+/// bought back: the quantity times the price it is bought back at. So the base amount is kept as
+/// it was charged and valued at the exit price, by
+/// [`Position::pnl_realised_net`] while the position is open and by [`PositionExited`] when it
+/// closed. An amount in any other asset, such as BNB, has no price the engine knows: it is kept
+/// apart and never converted.
+///
+/// The base slot assumes a linear instrument settled in its quote asset, whose PnL is
+/// `price x quantity` in quote. A flow in a settlement asset that is neither the base nor the quote
+/// asset lands in [`other`](Self::other).
+///
+/// Every amount is signed (positive = received), as [`Position::carry`] is.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+pub struct AssetCarry<AssetKey> {
+    /// Carry in the instrument's base asset, in units of that asset.
+    pub base: Decimal,
+    /// Carry in any other asset, by asset, in the order each asset was first charged. One entry
+    /// per asset. Never converted to the quote asset, so it is in no PnL figure or tear sheet.
+    pub other: Vec<(AssetKey, Decimal)>,
+}
+
+// Not derived: a derive would require `AssetKey: Default`.
+impl<AssetKey> Default for AssetCarry<AssetKey> {
+    fn default() -> Self {
+        Self {
+            base: Decimal::ZERO,
+            other: Vec::new(),
+        }
+    }
+}
+
+impl<AssetKey> AssetCarry<AssetKey> {
+    /// `base` valued at `price`, the price of one unit of the base asset in the quote asset.
+    /// `None` if the product overflows `Decimal`.
+    ///
+    /// `price` is not multiplied by the instrument's contract size: the carry is a quantity of the
+    /// borrowed asset itself, not of contracts.
+    pub fn base_value_at(&self, price: Decimal) -> Option<Decimal> {
+        self.base.checked_mul(price)
+    }
+
+    /// Whether no non-quote carry has accrued.
+    pub fn is_empty(&self) -> bool {
+        self.base.is_zero() && self.other.is_empty()
+    }
+}
+
+/// Why a position's net PnL could not be worked out.
+///
+/// `#[non_exhaustive]`: a further reason can be added without breaking downstream exhaustive
+/// matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum NetPnlError {
+    /// A sum or product overflowed `Decimal`, which needs a value near `Decimal::MAX` (~7.9e28).
+    #[error("net PnL overflowed Decimal")]
+    Overflow,
+    /// The position has base-asset carry but no exit price to value it at: it was removed without
+    /// a closing trade, as a reverse split rounding it to zero does.
+    #[error("base-asset carry cannot be valued: the position has no exit price")]
+    BaseCarryUnpriced,
+}
+
 /// Outcome of applying a cash flow to a [`Position`]'s [`carry`](Position::carry), from
 /// [`InstrumentState::update_from_cash_flow`](super::instrument::InstrumentState::update_from_cash_flow).
 /// [`Position::apply_carry`] returns only [`Applied`](Self::Applied) or
@@ -178,9 +255,6 @@ pub enum CarryUpdate {
     /// Several positions are open on the instrument ([`OmsMode::Hedging`]) and the venue does not
     /// say which one the flow belongs to.
     SeveralOpen,
-    /// The flow is in an asset other than the instrument's quote asset, the asset carry is kept
-    /// in.
-    AssetMismatch,
 }
 
 /// The rescaled field values a split produces, pre-computed by [`Position::prepare_split`] without
@@ -213,6 +287,10 @@ pub(crate) struct PreparedSplit {
 /// only the caller can book it. `#[non_exhaustive]`: more outcomes may be told apart later.
 #[must_use = "an unapplied fill carries a fee that reached no PnL; book it or drop it explicitly"]
 #[non_exhaustive]
+// A transient return value, handed to the caller by value and never stored: the larger variant
+// costs a few hundred bytes of stack for the call, and boxing it would add an allocation (and a
+// public type change) to every exit for no gain.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TradeOutcome<AssetKey, InstrumentKey = InstrumentIndex> {
     /// The fill moved a position: it opened, changed, closed or flipped one, and its fees were
@@ -418,8 +496,8 @@ impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, Instrumen
 /// - Entry fees from [`PositionSeed::with_fees_enter`], zero by default, in the instrument's
 ///   quote asset, and zero exit fees. As for a position opened by a fill, realised PnL starts at
 ///   minus the entry fees, and unrealised PnL deducts an exit-fee estimate scaled from them.
-/// - Carry from [`PositionSeed::with_carry`], zero by default, kept apart from realised PnL as
-///   for any position.
+/// - Carry from [`PositionSeed::with_carry`] and [`PositionSeed::with_carry_base`], zero by
+///   default, kept apart from realised PnL as for any position.
 /// - Zero unrealised PnL until the first market price for the instrument arrives.
 /// - `quantity_abs_max` equal to `quantity_abs`, and no [`TradeId`]s.
 ///
@@ -468,6 +546,11 @@ pub struct PositionSeed {
     /// instrument's quote asset. Zero by default, including when absent from a deserialised seed.
     #[serde(default)]
     pub carry: Decimal,
+    /// Carry the position has accrued in the instrument's base asset, signed, in units of that
+    /// asset: the interest on a borrowed base asset. Zero by default, including when absent from a
+    /// deserialised seed.
+    #[serde(default)]
+    pub carry_base: Decimal,
 }
 
 impl PositionSeed {
@@ -489,6 +572,7 @@ impl PositionSeed {
             position_id: None,
             fees_enter: Decimal::ZERO,
             carry: Decimal::ZERO,
+            carry_base: Decimal::ZERO,
         }
     }
 
@@ -523,6 +607,16 @@ impl PositionSeed {
     /// behind the venue's would let a replayed flow already in the carry be added again.
     pub fn with_carry(self, carry: Decimal) -> Self {
         Self { carry, ..self }
+    }
+
+    /// Set the carry the position has accrued in the instrument's base asset, signed, in units of
+    /// that asset, such as the interest on a borrowed base asset. It starts the position's
+    /// [`AssetCarry::base`], valued at the exit price when the position closes. The timing rule of
+    /// [`Self::with_carry`] applies.
+    ///
+    /// There is no seed for carry in any other asset: [`AssetCarry::other`] starts empty.
+    pub fn with_carry_base(self, carry_base: Decimal) -> Self {
+        Self { carry_base, ..self }
     }
 
     /// Validate this seed against `manager` and insert it as an open [`Position`].
@@ -577,6 +671,10 @@ impl PositionSeed {
             // As `Position::from(&Trade)` sets it: the entry fees are realised when paid.
             pnl_realised: -self.fees_enter,
             carry: self.carry,
+            carry_assets: AssetCarry {
+                base: self.carry_base,
+                other: Vec::new(),
+            },
             fees_enter: AssetFees::new(quote, self.fees_enter, Some(self.fees_enter)),
             fees_exit: AssetFees::new(quote, Decimal::ZERO, Some(Decimal::ZERO)),
             time_enter: self.time_enter,
@@ -637,8 +735,11 @@ pub enum PositionSeedError {
 /// # What the PnL covers
 /// `pnl_realised` and `pnl_unrealised` are computed from fills and their fees alone. They leave
 /// out the costs of *holding* a position, which arrive as no [`Trade`]: perpetual funding, margin
-/// interest and stock borrow fees. Those accumulate separately, in [`carry`](Position::carry), and
-/// [`pnl_realised_net`](Position::pnl_realised_net) adds it to realised PnL.
+/// interest and stock borrow fees. Those accumulate separately, in [`carry`](Position::carry) (the
+/// quote asset) and [`carry_assets`](Position::carry_assets) (the base asset, and any other), and
+/// [`pnl_realised_net`](Position::pnl_realised_net) adds them to realised PnL. Base-asset carry is
+/// valued at a price, the exit price once the position closes; carry in any other asset has no
+/// price, so it stays out of every PnL figure.
 ///
 /// `carry` holds only what reaches the engine:
 /// - Payments a venue reports as it posts them, which arrive on the account feed as an
@@ -648,7 +749,8 @@ pub enum PositionSeedError {
 ///   [`InstrumentState::update_from_cash_flow`](super::instrument::InstrumentState::update_from_cash_flow)
 ///   for the flows it leaves out. A flow for the account as a whole, such as margin interest, never
 ///   reaches a position.
-/// - Carry seeded with the position (see [`PositionSeed::with_carry`]).
+/// - Carry seeded with the position (see [`PositionSeed::with_carry`] and
+///   [`PositionSeed::with_carry_base`]).
 ///
 /// So `carry` stays zero on a venue that reports no such payments, and PnL then overstates the
 /// result of a position that pays carry (a short on borrowed stock, or a perpetual on the side
@@ -815,7 +917,7 @@ pub struct Position<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
 
     /// Cumulative carry while the [`Position`] has been open: funding, interest and borrow fees
     /// the venue posted for it, signed (positive = received, negative = paid), in the
-    /// instrument's quote asset.
+    /// instrument's quote asset. Carry in other assets is in [`Self::carry_assets`].
     ///
     /// Kept apart from `pnl_realised`, which stays fill-based; [`Self::pnl_realised_net`] adds
     /// the two. See [What the PnL covers](Position#what-the-pnl-covers) for what reaches it.
@@ -823,6 +925,13 @@ pub struct Position<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// `#[serde(default)]` so a position serialised before this field existed still loads.
     #[serde(default)]
     pub carry: Decimal,
+
+    /// Cumulative carry in assets other than the quote asset, such as the interest on a borrowed
+    /// base asset. See [`AssetCarry`] for how each is valued.
+    ///
+    /// `#[serde(default)]` so a position serialised before this field existed still loads.
+    #[serde(default = "AssetCarry::default")]
+    pub carry_assets: AssetCarry<AssetKey>,
 
     /// Cumulative fees paid when entering/increasing [`Position`] quantity.
     ///
@@ -972,7 +1081,10 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                 let _ = self.update_pnl_realised(trade.quantity, trade.price, closed_fee_quote);
                 self.update_pnl_unrealised_post_trade(trade.price);
 
-                (None, Some(PositionExited::from(self)))
+                let mut exited = PositionExited::from(self);
+                exited.price_exit = Some(trade.price);
+
+                (None, Some(exited))
             }
 
             // Close LONG/SHORT Position & open SHORT/LONG with remaining trade.quantity
@@ -1020,45 +1132,86 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
                 let mut next_position = Self::from(&next_position_trade);
                 next_position.contract_size = self.contract_size;
 
-                (Some(next_position), Some(PositionExited::from(self)))
+                let mut exited = PositionExited::from(self);
+                exited.price_exit = Some(trade.price);
+
+                (Some(next_position), Some(exited))
             }
             _ => unreachable!("match expression guard statements cover all cases"),
         }
     }
 
-    /// Realised PnL net of carry: `pnl_realised + carry`. `None` if the sum overflows `Decimal`,
-    /// which needs a value near `Decimal::MAX` (~7.9e28).
-    pub fn pnl_realised_net(&self) -> Option<Decimal> {
-        self.pnl_realised.checked_add(self.carry)
+    /// Realised PnL net of carry: `pnl_realised`, plus [`carry`](Self::carry), plus the base-asset
+    /// carry valued at `price`. Carry in other assets is left out, as it has no price.
+    ///
+    /// `price` is the price one unit of the base asset is bought back at: the mark price while the
+    /// position is open. A closed position values it at its exit price, see
+    /// [`PositionExited::pnl_realised_net`].
+    ///
+    /// `None` if a sum or product overflows `Decimal`, which needs a value near `Decimal::MAX`
+    /// (~7.9e28).
+    pub fn pnl_realised_net(&self, price: Decimal) -> Option<Decimal> {
+        self.pnl_realised
+            .checked_add(self.carry)?
+            .checked_add(self.carry_assets.base_value_at(price)?)
     }
 
-    /// Add a cash flow the venue posted for this [`Position`] to its [`carry`](Self::carry).
+    /// Add a cash flow the venue posted for this [`Position`] to the carry in `slot`.
     ///
-    /// `amount` is signed, positive when the account received it, and must be in the instrument's
-    /// quote asset. `time_exchange_update` moves forward to `time_exchange`, never back, since a
-    /// flow can arrive after later updates.
+    /// `amount` is signed, positive when the account received it, and in the asset `slot` names.
+    /// `time_exchange_update` moves forward to `time_exchange`, never back, since a flow can
+    /// arrive after later updates.
     ///
-    /// Nothing else is checked: whether the flow belongs to this position is the caller's
-    /// decision, as
+    /// Nothing else is checked: whether the flow belongs to this position, and which slot its asset
+    /// is, is the caller's decision, as
     /// [`InstrumentState::update_from_cash_flow`](super::instrument::InstrumentState::update_from_cash_flow)
     /// makes it. On `Decimal` overflow nothing is mutated, a `warn!` is emitted and
     /// [`CarryUpdate::Overflowed`] is returned; otherwise [`CarryUpdate::Applied`].
-    pub fn apply_carry(&mut self, amount: Decimal, time_exchange: DateTime<Utc>) -> CarryUpdate {
-        match self.carry.checked_add(amount) {
-            Some(carry) => {
-                self.carry = carry;
-                self.time_exchange_update = self.time_exchange_update.max(time_exchange);
-                CarryUpdate::Applied
-            }
-            None => {
-                warn!(
-                    %amount,
-                    carry_held = %self.carry,
-                    "carry accumulation overflowed Decimal; holding last-good value"
-                );
-                CarryUpdate::Overflowed
+    pub fn apply_carry(
+        &mut self,
+        slot: CarrySlot<AssetKey>,
+        amount: Decimal,
+        time_exchange: DateTime<Utc>,
+    ) -> CarryUpdate
+    where
+        AssetKey: PartialEq + Debug,
+    {
+        let held = match &slot {
+            CarrySlot::Quote => self.carry,
+            CarrySlot::Base => self.carry_assets.base,
+            CarrySlot::Other(asset) => self
+                .carry_assets
+                .other
+                .iter()
+                .find_map(|(held_asset, held)| (held_asset == asset).then_some(*held))
+                .unwrap_or(Decimal::ZERO),
+        };
+        let Some(sum) = held.checked_add(amount) else {
+            warn!(
+                ?slot,
+                %amount,
+                carry_held = %held,
+                "carry accumulation overflowed Decimal; holding last-good value"
+            );
+            return CarryUpdate::Overflowed;
+        };
+        match slot {
+            CarrySlot::Quote => self.carry = sum,
+            CarrySlot::Base => self.carry_assets.base = sum,
+            CarrySlot::Other(asset) => {
+                match self
+                    .carry_assets
+                    .other
+                    .iter_mut()
+                    .find(|(held_asset, _)| *held_asset == asset)
+                {
+                    Some((_, held)) => *held = sum,
+                    None => self.carry_assets.other.push((asset, sum)),
+                }
             }
         }
+        self.time_exchange_update = self.time_exchange_update.max(time_exchange);
+        CarryUpdate::Applied
     }
 
     /// Updates the volume-weighted average entry price of the [`Position`].
@@ -1452,6 +1605,7 @@ where
             pnl_unrealised: Decimal::ZERO,
             pnl_realised: -fee_in_quote(&trade.fees),
             carry: Decimal::ZERO,
+            carry_assets: AssetCarry::default(),
             fees_enter: trade.fees.clone(),
             fees_exit: AssetFees::new(trade.fees.asset.clone(), Decimal::ZERO, Some(Decimal::ZERO)),
             time_enter: trade.time_exchange,
@@ -1510,6 +1664,19 @@ pub struct PositionExited<AssetKey, InstrumentKey = InstrumentIndex> {
     #[serde(default)]
     pub carry: Decimal,
 
+    /// Cumulative carry in assets other than the quote asset, as [`Position::carry_assets`].
+    /// [`Self::carry_assets`]`.base` is valued at [`Self::price_exit`]; `other` is never converted.
+    ///
+    /// `#[serde(default)]` so a record serialised before this field existed still loads.
+    #[serde(default = "AssetCarry::default")]
+    pub carry_assets: AssetCarry<AssetKey>,
+
+    /// The price of the trade that closed the [`Position`], which values the base-asset carry.
+    /// `None` when no trade closed it (a reverse split that rounds it to zero removes it), and for
+    /// a record serialised before this field existed.
+    #[serde(default)]
+    pub price_exit: Option<Decimal>,
+
     /// Cumulative fees paid when entering the [`Position`].
     pub fees_enter: AssetFees<AssetKey>,
 
@@ -1538,6 +1705,9 @@ impl<AssetKey, InstrumentKey> From<Position<AssetKey, InstrumentKey>>
             quantity_abs_max: value.quantity_abs_max,
             pnl_realised: value.pnl_realised,
             carry: value.carry,
+            carry_assets: value.carry_assets,
+            // Set by the trade that closes it, see `Position::update_from_trade`.
+            price_exit: None,
             fees_enter: value.fees_enter,
             fees_exit: value.fees_exit,
             time_enter: value.time_enter,
@@ -1548,10 +1718,33 @@ impl<AssetKey, InstrumentKey> From<Position<AssetKey, InstrumentKey>>
 }
 
 impl<AssetKey, InstrumentKey> PositionExited<AssetKey, InstrumentKey> {
-    /// Realised PnL net of carry: `pnl_realised + carry`. `None` if the sum overflows `Decimal`,
-    /// which needs a value near `Decimal::MAX` (~7.9e28).
-    pub fn pnl_realised_net(&self) -> Option<Decimal> {
-        self.pnl_realised.checked_add(self.carry)
+    /// The carry in the quote asset: [`carry`](Self::carry) plus the base-asset carry valued at
+    /// [`price_exit`](Self::price_exit). Carry in other assets is left out, as it has no price.
+    ///
+    /// # Errors
+    /// - [`NetPnlError::BaseCarryUnpriced`] if there is base-asset carry and no exit price. A zero
+    ///   base carry needs none.
+    /// - [`NetPnlError::Overflow`] if a sum or product overflows `Decimal`.
+    pub fn carry_valued(&self) -> Result<Decimal, NetPnlError> {
+        let base = if self.carry_assets.base.is_zero() {
+            Decimal::ZERO
+        } else {
+            let price = self.price_exit.ok_or(NetPnlError::BaseCarryUnpriced)?;
+            self.carry_assets
+                .base_value_at(price)
+                .ok_or(NetPnlError::Overflow)?
+        };
+        self.carry.checked_add(base).ok_or(NetPnlError::Overflow)
+    }
+
+    /// Realised PnL net of carry: `pnl_realised` plus [`carry_valued`](Self::carry_valued).
+    ///
+    /// # Errors
+    /// As [`carry_valued`](Self::carry_valued).
+    pub fn pnl_realised_net(&self) -> Result<Decimal, NetPnlError> {
+        self.pnl_realised
+            .checked_add(self.carry_valued()?)
+            .ok_or(NetPnlError::Overflow)
     }
 }
 
@@ -1784,6 +1977,7 @@ mod tests {
                     pnl_unrealised: dec!(0.0),
                     pnl_realised: dec!(-20.0), // Sum of fees
                     carry: Decimal::ZERO,
+                    carry_assets: AssetCarry::default(),
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(20.0),
@@ -1814,6 +2008,7 @@ mod tests {
                     pnl_unrealised: dec!(67.5), // (150-100)*(2.0-0.5) - approx_exit_fees (1.5/2 * 10)
                     pnl_realised: dec!(10.0),   // (150-100)*0.5 - 15_fees
                     carry: Decimal::ZERO,
+                    carry_assets: AssetCarry::default(),
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
@@ -1844,6 +2039,8 @@ mod tests {
                     quantity_abs_max: dec!(1.0),
                     pnl_realised: dec!(30.0), // (150-100)*1 - 20 (total fees)
                     carry: Decimal::ZERO,
+                    carry_assets: AssetCarry::default(),
+                    price_exit: Some(dec!(150.0)),
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
@@ -1872,6 +2069,7 @@ mod tests {
                     pnl_unrealised: dec!(0.0),
                     pnl_realised: dec!(-10.0), // Entry fees for new position (2-1)*(1/2)*20
                     carry: Decimal::ZERO,
+                    carry_assets: AssetCarry::default(),
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
@@ -1895,6 +2093,8 @@ mod tests {
                     quantity_abs_max: dec!(1.0),
                     pnl_realised: dec!(30.0), // (150-100)*1 - 20 (total fees)
                     carry: Decimal::ZERO,
+                    carry_assets: AssetCarry::default(),
+                    price_exit: Some(dec!(150.0)),
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
@@ -1923,6 +2123,7 @@ mod tests {
                     pnl_unrealised: dec!(0.0), // (90-80)*2 - approx_exit_fees(2/2 * 20)
                     pnl_realised: dec!(-20.0), // Sum of entry fees
                     carry: Decimal::ZERO,
+                    carry_assets: AssetCarry::default(),
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(20.0),
@@ -1953,6 +2154,7 @@ mod tests {
                     pnl_unrealised: dec!(22.5), // (100-80)*1.5 - approx_exit_fees(1.5/2 * 10)
                     pnl_realised: dec!(-5.0),   // 10_fee_entry - (100-80)*0.5 - 5_fee_exit
                     carry: Decimal::ZERO,
+                    carry_assets: AssetCarry::default(),
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
@@ -1983,6 +2185,8 @@ mod tests {
                     quantity_abs_max: dec!(1.0),
                     pnl_realised: dec!(0.0), // (100-80)*1 - 20 (total fees)
                     carry: Decimal::ZERO,
+                    carry_assets: AssetCarry::default(),
+                    price_exit: Some(dec!(80.0)),
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
@@ -2011,6 +2215,7 @@ mod tests {
                     pnl_unrealised: dec!(0.0),
                     pnl_realised: dec!(-10.0), // Entry fees for new position
                     carry: Decimal::ZERO,
+                    carry_assets: AssetCarry::default(),
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
@@ -2034,6 +2239,8 @@ mod tests {
                     quantity_abs_max: dec!(1.0),
                     pnl_realised: dec!(0.0), // (100-80)*1 - 20 (total fees)
                     carry: Decimal::ZERO,
+                    carry_assets: AssetCarry::default(),
+                    price_exit: Some(dec!(80.0)),
                     fees_enter: AssetFees {
                         asset: QuoteAsset,
                         fees: dec!(10.0),
@@ -2275,6 +2482,7 @@ mod tests {
             pnl_unrealised: dec!(0.0),
             pnl_realised: dec!(0.0),
             carry: Decimal::ZERO,
+            carry_assets: AssetCarry::default(),
             fees_enter: AssetFees {
                 asset: QuoteAsset,
                 fees: dec!(0.001),            // raw fee in BASE asset units (BTC)
@@ -2316,6 +2524,7 @@ mod tests {
             pnl_unrealised: dec!(0.0),
             pnl_realised: dec!(0.0),
             carry: Decimal::ZERO,
+            carry_assets: AssetCarry::default(),
             fees_enter: AssetFees {
                 asset: QuoteAsset,
                 fees: dec!(2.0),
@@ -2519,6 +2728,7 @@ mod tests {
             pnl_unrealised: sentinel,
             pnl_realised: dec!(0.0),
             carry: Decimal::ZERO,
+            carry_assets: AssetCarry::default(),
             fees_enter: AssetFees {
                 asset: QuoteAsset,
                 fees: dec!(0.0),
@@ -2773,7 +2983,7 @@ mod tests {
         let open = || {
             let mut position = Position::from(&trade(base_time, Side::Buy, 100.0, 2.0, 0.0));
             assert_eq!(
-                position.apply_carry(dec!(-3), time_plus_days(base_time, 1)),
+                position.apply_carry(CarrySlot::Quote, dec!(-3), time_plus_days(base_time, 1)),
                 CarryUpdate::Applied
             );
             position
@@ -2802,7 +3012,7 @@ mod tests {
         let exited = exited.unwrap();
         assert_eq!(exited.carry, dec!(-3));
         assert_eq!(exited.pnl_realised, dec!(20));
-        assert_eq!(exited.pnl_realised_net(), Some(dec!(17)));
+        assert_eq!(exited.pnl_realised_net(), Ok(dec!(17)));
 
         // A flip reports it on the exit and starts the new position at zero.
         let (next, exited) = open().update_from_trade(&trade(
@@ -2819,16 +3029,171 @@ mod tests {
     }
 
     #[test]
+    fn test_base_carry_is_valued_at_the_price_it_is_asked_at() {
+        let base_time = DateTime::<Utc>::MIN_UTC;
+        let mut position = Position::from(&trade(base_time, Side::Sell, 100.0, 2.0, 0.0));
+        assert_eq!(
+            position.apply_carry(CarrySlot::Base, dec!(-0.01), time_plus_days(base_time, 1)),
+            CarryUpdate::Applied
+        );
+        assert_eq!(
+            position.apply_carry(CarrySlot::Base, dec!(-0.02), time_plus_days(base_time, 2)),
+            CarryUpdate::Applied
+        );
+        assert_eq!(
+            position.apply_carry(CarrySlot::Quote, dec!(-5), time_plus_days(base_time, 3)),
+            CarryUpdate::Applied
+        );
+
+        assert_eq!(position.carry_assets.base, dec!(-0.03));
+        assert!(!position.carry_assets.is_empty());
+        assert!(AssetCarry::<QuoteAsset>::default().is_empty());
+        assert!(
+            !AssetCarry {
+                base: Decimal::ZERO,
+                other: vec![(QuoteAsset, dec!(1))],
+            }
+            .is_empty()
+        );
+        assert_eq!(position.carry, dec!(-5));
+        assert_eq!(position.time_exchange_update, time_plus_days(base_time, 3));
+        // 0 realised, -5 quote carry, -0.03 base at the asked price.
+        assert_eq!(position.pnl_realised_net(dec!(100)), Some(dec!(-8)));
+        assert_eq!(position.pnl_realised_net(dec!(200)), Some(dec!(-11)));
+        position.carry_assets.base = Decimal::MAX;
+        assert_eq!(position.pnl_realised_net(dec!(2)), None, "overflow");
+    }
+
+    #[test]
+    fn test_exit_price_is_the_closing_trade_s_on_a_close_and_a_flip() {
+        let base_time = DateTime::<Utc>::MIN_UTC;
+        let open = || {
+            let mut position = Position::from(&trade(base_time, Side::Sell, 100.0, 2.0, 0.0));
+            assert_eq!(
+                position.apply_carry(CarrySlot::Base, dec!(-0.01), time_plus_days(base_time, 1)),
+                CarryUpdate::Applied
+            );
+            position
+        };
+
+        // A partial close keeps the base carry on the remaining position.
+        let (reduced, exited) = open().update_from_trade(&trade(
+            time_plus_days(base_time, 2),
+            Side::Buy,
+            90.0,
+            1.0,
+            0.0,
+        ));
+        assert!(exited.is_none());
+        assert_eq!(reduced.unwrap().carry_assets.base, dec!(-0.01));
+
+        // An exact close and a flip value it at the closing trade's price.
+        for quantity in [2.0, 3.0] {
+            let (next, exited) = open().update_from_trade(&trade(
+                time_plus_days(base_time, 2),
+                Side::Buy,
+                90.0,
+                quantity,
+                0.0,
+            ));
+            let exited = exited.unwrap();
+            assert_eq!(exited.price_exit, Some(dec!(90)), "quantity {quantity}");
+            assert_eq!(exited.carry_valued(), Ok(dec!(-0.9)));
+            assert_eq!(exited.pnl_realised_net(), Ok(dec!(20) - dec!(0.9)));
+            if let Some(next) = next {
+                assert!(next.carry_assets.is_empty(), "a flip starts at zero");
+            }
+        }
+    }
+
+    #[test]
+    fn test_base_carry_without_an_exit_price_is_unpriced_not_zero() {
+        let base_time = DateTime::<Utc>::MIN_UTC;
+        let mut position = Position::from(&trade(base_time, Side::Sell, 100.0, 1.0, 0.0));
+        assert_eq!(
+            position.apply_carry(CarrySlot::Quote, dec!(-2), time_plus_days(base_time, 1)),
+            CarryUpdate::Applied
+        );
+        let mut exited = PositionExited::from(position);
+        assert_eq!(exited.price_exit, None);
+        // No base carry needs no price.
+        assert_eq!(exited.carry_valued(), Ok(dec!(-2)));
+
+        exited.carry_assets.base = dec!(-0.01);
+        assert_eq!(exited.carry_valued(), Err(NetPnlError::BaseCarryUnpriced));
+        assert_eq!(
+            exited.pnl_realised_net(),
+            Err(NetPnlError::BaseCarryUnpriced)
+        );
+
+        exited.carry_assets.base = Decimal::MAX;
+        exited.price_exit = Some(dec!(2));
+        assert_eq!(exited.carry_valued(), Err(NetPnlError::Overflow));
+    }
+
+    #[test]
+    fn test_seed_carries_base_asset_carry() {
+        let seed = PositionSeed::new(
+            "x",
+            Side::Sell,
+            dec!(1),
+            dec!(100),
+            time_plus_days(DateTime::<Utc>::MIN_UTC, 1),
+        )
+        .with_carry_base(dec!(-0.02));
+        assert_eq!(seed.carry_base, dec!(-0.02));
+        assert_eq!(seed.carry, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_asset_carry_serde_round_trips_and_old_records_load() {
+        use rustrade_instrument::asset::{AssetIndex, name::AssetNameInternal};
+
+        let by_index = AssetCarry {
+            base: dec!(-0.5),
+            other: vec![(AssetIndex(3), dec!(-2)), (AssetIndex(7), dec!(1))],
+        };
+        let json = serde_json::to_string(&by_index).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AssetCarry<AssetIndex>>(&json).unwrap(),
+            by_index
+        );
+
+        let by_name = AssetCarry {
+            base: dec!(-0.5),
+            other: vec![(AssetNameInternal::new("bnb"), dec!(-2))],
+        };
+        let json = serde_json::to_string(&by_name).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AssetCarry<AssetNameInternal>>(&json).unwrap(),
+            by_name
+        );
+
+        // A record from before the fields existed loads with none.
+        let base_time = DateTime::<Utc>::MIN_UTC;
+        let position = Position::from(&trade(base_time, Side::Buy, 100.0, 1.0, 0.0));
+        let exited = PositionExited::from(position);
+        let mut value = serde_json::to_value(&exited).unwrap();
+        let record = value.as_object_mut().unwrap();
+        record.remove("carry_assets");
+        record.remove("price_exit");
+        let loaded: PositionExited<QuoteAsset, InstrumentNameInternal> =
+            serde_json::from_value(value).unwrap();
+        assert!(loaded.carry_assets.is_empty());
+        assert_eq!(loaded.price_exit, None);
+    }
+
+    #[test]
     fn test_apply_carry_holds_last_good_on_overflow() {
         let base_time = DateTime::<Utc>::MIN_UTC;
         let mut position = Position::from(&trade(base_time, Side::Buy, 100.0, 1.0, 0.0));
         assert_eq!(
-            position.apply_carry(dec!(1), time_plus_days(base_time, 1)),
+            position.apply_carry(CarrySlot::Quote, dec!(1), time_plus_days(base_time, 1)),
             CarryUpdate::Applied
         );
 
         assert_eq!(
-            position.apply_carry(Decimal::MAX, time_plus_days(base_time, 2)),
+            position.apply_carry(CarrySlot::Quote, Decimal::MAX, time_plus_days(base_time, 2)),
             CarryUpdate::Overflowed
         );
         assert_eq!(position.carry, dec!(1));
@@ -2853,6 +3218,7 @@ mod tests {
             pnl_unrealised: dec!(0.0),
             pnl_realised: sentinel,
             carry: Decimal::ZERO,
+            carry_assets: AssetCarry::default(),
             fees_enter: AssetFees {
                 asset: QuoteAsset,
                 fees: dec!(0.0),
@@ -2961,6 +3327,7 @@ mod tests {
             pnl_unrealised: dec!(999.0), // sentinel: apply_split must overwrite this
             pnl_realised: dec!(-12.5),   // sentinel: apply_split must NOT touch this
             carry: Decimal::ZERO,
+            carry_assets: AssetCarry::default(),
             fees_enter: AssetFees {
                 asset: QuoteAsset,
                 fees: fees_enter,
