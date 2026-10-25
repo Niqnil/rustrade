@@ -97,3 +97,64 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+
+    /// Parses `0` as a message to skip, a negative number as a parse error, and anything else as
+    /// itself.
+    struct SkipZeroParser;
+
+    impl StreamParser<i32> for SkipZeroParser {
+        type Stream = futures::stream::Empty<i32>;
+        type Message = i32;
+        type Error = SocketError;
+
+        fn parse(input: Result<i32, SocketError>) -> Option<Result<i32, SocketError>> {
+            match input {
+                Ok(0) => None,
+                Ok(n) if n < 0 => Some(Err(SocketError::Sink)),
+                other => Some(other),
+            }
+        }
+    }
+
+    /// Transforms each message into two outputs, so the buffer has to hold the second.
+    struct TwoOutputs;
+
+    impl Transformer for TwoOutputs {
+        type Error = SocketError;
+        type Input = i32;
+        type Output = i32;
+        type OutputIter = Vec<Result<i32, SocketError>>;
+
+        fn transform(&mut self, input: i32) -> Self::OutputIter {
+            vec![Ok(input), Ok(input * 10)]
+        }
+    }
+
+    #[tokio::test]
+    async fn exchange_stream_parses_skips_and_buffers_until_the_inner_stream_ends() {
+        let inner = futures::stream::iter([Ok(1), Ok(0), Ok(-1), Ok(2)]);
+        let stream =
+            ExchangeStream::<SkipZeroParser, _, _>::new(inner, TwoOutputs, VecDeque::new());
+
+        let outputs = stream
+            .map(|result| result.map_err(|error| error.to_string()))
+            .collect::<Vec<_>>()
+            .await;
+
+        assert_eq!(
+            outputs,
+            vec![
+                Ok(1),
+                Ok(10),
+                Err(SocketError::Sink.to_string()),
+                Ok(2),
+                Ok(20),
+            ]
+        );
+    }
+}
