@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Each `rustrade-integration` feature builds on its own** (`rustrade-integration`). With
+  `default-features = false`, enabling `error`, `protocol`, `stream` or `corporate-action` alone
+  failed to compile, because those features did not enable the crates and features their code
+  uses. Each now does. `stream::ExchangeStream` requires both the `stream` and `protocol`
+  features; the rest of the `stream` module still needs only `stream`. CI now builds each feature
+  alone.
+
 ## [0.14.0] - 2026-10-25
 
 ### Added
