@@ -171,9 +171,9 @@ impl AccountState {
         Ok(())
     }
 
-    /// Holds `order`, a market order, for its instrument's next bar with `reservation` held
-    /// against it, unless an order is already resting under its [`ClientOrderId`]. Forgets how an
-    /// earlier order under the id ended, as [`book`](Self::book) does.
+    /// Holds `order` until its venue releases it, with `reservation` held against it, unless an
+    /// order is already resting under its [`ClientOrderId`]. Forgets how an earlier order under
+    /// the id ended, as [`book`](Self::book) does.
     ///
     /// # Errors
     /// [`AlreadyResting`], as for [`book`](Self::book). See [`OpenOrders::hold`].
@@ -188,7 +188,7 @@ impl AccountState {
         Ok(())
     }
 
-    /// The orders held for `instrument`'s next bar, earliest arrival first, no longer held. See
+    /// The orders held on `instrument`, earliest arrival first, no longer held. See
     /// [`OpenOrders::take_held`].
     pub fn take_held(&mut self, instrument: &InstrumentNameExchange) -> Vec<ClientOrderId> {
         self.orders_open.take_held(instrument)

@@ -436,7 +436,7 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 ///
 /// A bar that releases nothing, and every event that is not a bar, is shown at once, as always.
 ///
-/// A market order a venue holds on a stale market under
+/// An order a venue holds on a stale market under
 /// [`StaleMarketPolicy::Wait`](rustrade_execution::fill::StaleMarketPolicy::Wait) is no exception
 /// either. The next fresh observation releases it, but fills it at the market that observation
 /// leaves, so the fill follows the observation as a resting fill does.

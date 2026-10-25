@@ -191,6 +191,30 @@ fn order_working(
     }))
 }
 
+fn limit_order(
+    instrument: usize,
+    side: Side,
+    quantity: Decimal,
+    limit: Decimal,
+    cid: &str,
+) -> Command {
+    Command::SendOpenRequests(OneOrMany::One(OrderRequestOpen {
+        key: OrderKey {
+            exchange: ExchangeIndex::new(0),
+            instrument: InstrumentIndex::new(instrument),
+            strategy: StrategyId::new("agent"),
+            cid: ClientOrderId::new(cid),
+        },
+        state: RequestOpen::new(
+            side,
+            Some(limit),
+            quantity,
+            OrderKind::Limit,
+            TimeInForce::GoodUntilCancelled { post_only: false },
+        ),
+    }))
+}
+
 /// One simulated spot venue trading btc and eth against usdt, the `Engine` on it, and the stepper.
 struct Session<Strategy> {
     engine: TestEngine<Strategy>,
@@ -767,6 +791,55 @@ fn under_stale_wait_an_order_on_a_stale_market_fills_after_the_next_fresh_bar() 
         position(&s.engine, BTC),
         Some((Side::Buy, dec!(2), dec!(104)))
     );
+}
+
+#[test]
+fn under_stale_wait_a_limit_order_on_a_stale_market_is_decided_by_the_next_fresh_bar() {
+    let mut s = stale_btc_session();
+
+    // Both cross the stale 100 close; only the first crosses the fresh 102.
+    s.engine
+        .action(&limit_order(BTC, Side::Buy, dec!(1), dec!(103), "crossed"));
+    s.engine
+        .action(&limit_order(BTC, Side::Buy, dec!(1), dec!(101), "passive"));
+    let settled = s.stepper.settle(&mut s.engine).unwrap();
+    assert!(
+        fills(events(&settled)).is_empty(),
+        "waiting, so nothing fills at the 3s close"
+    );
+
+    let stepped = s
+        .stepper
+        .step(&mut s.engine, at(7), [bar(BTC, 7, dec!(102))])
+        .unwrap();
+    assert_eq!(
+        fills(events(&stepped)),
+        vec![(
+            InstrumentIndex::new(BTC),
+            Side::Buy,
+            dec!(102),
+            dec!(1),
+            at(7)
+        )],
+        "the fresh close fills the limit it crosses, better than that limit"
+    );
+
+    let stepped = s
+        .stepper
+        .step(&mut s.engine, at(8), [bar(BTC, 8, dec!(100))])
+        .unwrap();
+    assert_eq!(
+        fills(events(&stepped)),
+        vec![(
+            InstrumentIndex::new(BTC),
+            Side::Buy,
+            dec!(101),
+            dec!(1),
+            at(8)
+        )],
+        "the other rested at its limit and fills there"
+    );
+    assert_eq!(balance(&s.engine, "usdt"), dec!(9797));
 }
 
 #[test]
