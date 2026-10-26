@@ -98,7 +98,7 @@ use crate::{
     },
     emit_stream_terminated,
     error::{ApiError, ConnectivityError, OrderError, UnindexedClientError},
-    margin::MarginEffect,
+    margin::{MarginBorrow, MarginEffect, MarginPlacement},
     order::{
         Order, OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
@@ -373,6 +373,7 @@ impl BinanceMarginConfig {
 /// (`AUTO_REPAY`), which repays from the proceeds. Binance retired `AUTO_BORROW_REPAY` on
 /// 2026-10-14, so there is no longer one value that does both. A **mis-sized `Borrow` order
 /// borrows the shortfall** without further opt-in. See [`open_order`](Self::open_order).
+/// [`open_margin_order`](Self::open_margin_order) also reports what the order borrowed.
 ///
 /// # Cross vs. isolated margin
 /// The mode is fixed per client via [`BinanceMarginConfig::is_isolated`]:
@@ -529,6 +530,223 @@ impl BinanceMargin {
         instruments: &[InstrumentNameExchange],
     ) -> Result<HashMap<InstrumentNameExchange, OrderRules>, UnindexedClientError> {
         self.rules.load(instruments).await
+    }
+
+    /// Submit a margin order over the SAPI `POST /sapi/v1/margin/order` endpoint, and report
+    /// what it borrowed.
+    ///
+    /// [`ExecutionClient::open_order`] returns this method's [`MarginPlacement::order`]. Call
+    /// this one to learn what an order placed with [`MarginEffect::Borrow`] borrowed, which
+    /// Binance reports only in its answer to the order (`marginBuyBorrowAmount`,
+    /// `marginBuyBorrowAsset`): see [`MarginPlacement::borrowed`]. Binance leaves them out when
+    /// the free balance covered the order. Read the amount rather than compute it from the
+    /// balance: Binance has been seen to lend a resting limit order more than its shortfall.
+    ///
+    /// Mirrors [`BinanceSpot::open_order`](super::spot::BinanceSpot)'s contract: every failure is
+    /// folded into the returned order's state as [`OrderState::inactive`], so the engine always
+    /// sees an outcome.
+    ///
+    /// Margin specifics:
+    /// - `sideEffectType` is the request's [`MarginEffect`], else the client's
+    ///   [`BinanceMarginConfig::margin_effect`]: `NO_SIDE_EFFECT`, `MARGIN_BUY` for `Borrow` and
+    ///   `AUTO_REPAY` for `Repay`.
+    /// - A `Borrow` borrows when the order is **placed**, not when it fills, and nothing repays
+    ///   it from the order's proceeds: close the position with a `Repay` order.
+    /// - `autoRepayAtCancel` is sent with `Borrow` only, from
+    ///   [`BinanceMarginConfig::auto_repay_at_cancel`]: Binance applies it to `MARGIN_BUY` alone.
+    /// - An order with `Borrow` has a request weight of 1500 against the account's UID limit,
+    ///   against 6 for the other effects. Place them accordingly.
+    /// - `isIsolated` is config-driven (`"TRUE"` for isolated, `"FALSE"` for cross).
+    /// - A `TrailingStop` is sent as a `STOP_LOSS` with `trailingDelta` in basis points, and a
+    ///   `TrailingStopFixedLimit` as a `STOP_LOSS_LIMIT` with `trailingDelta` and its fixed limit
+    ///   as `price`; an activation price goes as `stopPrice`. An Absolute offset, and
+    ///   `TrailingStopLimit`, return [`OrderError::UnsupportedOrderType`]; an offset that is not a
+    ///   positive whole number of basis points returns [`OrderError::InvalidPrecision`] (see the
+    ///   type-level docs). A non-positive activation price, or a `TrailingStopFixedLimit` without
+    ///   a positive `price`, is refused unsent as [`OrderError::Rejected`].
+    /// - A **cross** account refuses the `STOP_LOSS` form of a `TrailingStop` with `-3111`, which
+    ///   comes back as [`OrderError::UnsupportedOrderType`] after the round trip. Place a
+    ///   `TrailingStopFixedLimit` there instead: it is accepted on both account modes.
+    /// - A successful answer that cannot be read (one that does not decode, has no `orderId`, or
+    ///   reports a borrowed amount without its asset or the other way round) returns
+    ///   [`OrderError::Connectivity`]: the venue acted on the request, so the order may be live,
+    ///   and its outcome is unknown rather than refused.
+    pub async fn open_margin_order(
+        &self,
+        request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
+    ) -> MarginPlacement {
+        let instrument = request.key.instrument.clone();
+        let side = request.state.side;
+        let price = request.state.price;
+        let quantity = request.state.quantity;
+        let kind = request.state.kind;
+        let time_in_force = request.state.time_in_force;
+        let cid = request.key.cid.clone();
+
+        let order_key = OrderKey::new(
+            ExchangeId::BinanceMargin,
+            instrument.clone(),
+            request.key.strategy.clone(),
+            cid.clone(),
+        );
+
+        // Build the returned placement with a given inactive (failure) state and no loan,
+        // preserving the request fields — keeps the many early-return error paths to one line each.
+        let inactive = |state: UnindexedOrderState| MarginPlacement {
+            order: Order {
+                key: order_key.clone(),
+                side,
+                price,
+                quantity,
+                kind,
+                time_in_force,
+                state,
+            },
+            borrowed: None,
+        };
+
+        let params = match build_new_order_params(
+            instrument.name().to_string(),
+            side,
+            price,
+            quantity,
+            kind,
+            time_in_force,
+            cid.0.to_string(),
+            request
+                .state
+                .margin_effect
+                .unwrap_or(self.config.margin_effect),
+            self.config.auto_repay_at_cancel,
+            self.config.is_isolated,
+        ) {
+            Ok(params) => params,
+            Err(BuildOrderError::Unsupported) => {
+                return inactive(OrderState::inactive(OrderError::UnsupportedOrderType(
+                    format!(
+                        "BinanceMargin does not support OrderKind::{kind:?} with {time_in_force:?}"
+                    ),
+                )));
+            }
+            Err(BuildOrderError::Trailing(refused)) => {
+                return inactive(OrderState::inactive(refused.into_order_error()));
+            }
+            Err(BuildOrderError::Build(msg)) => {
+                error!(%msg, "BinanceMargin failed to build new order params");
+                return inactive(OrderState::inactive(OrderError::Rejected(
+                    ApiError::OrderRejected(msg),
+                )));
+            }
+        };
+
+        if let Err(refused) = self
+            .rules
+            .check(instrument.name(), kind, price, quantity)
+            .await
+        {
+            return inactive(OrderState::inactive(refused));
+        }
+
+        // Sent through `send_request` with the SDK's own query, so that the answer decodes into
+        // `NewOrderAnswer` (see there) rather than the SDK's response type.
+        let query = new_order_query(params);
+        let response = match rest_call_with_retry(
+            &self.rest_config,
+            &self.rate_limiter,
+            RequestKind::Order,
+            |cfg| {
+                let query = query.clone();
+                Box::pin(async move {
+                    binance_sdk::common::utils::send_request::<NewOrderAnswer>(
+                        &cfg,
+                        NEW_ORDER_PATH,
+                        reqwest::Method::POST,
+                        query,
+                        BTreeMap::new(),
+                        None,
+                        true,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                return inactive(OrderState::inactive(classify_rest_order_error(
+                    &e,
+                    &instrument,
+                )));
+            }
+        };
+
+        let data = match response.data().await {
+            Ok(data) => data,
+            Err(e) => {
+                return inactive(OrderState::inactive(unreadable_answer(
+                    ExchangeId::BinanceMargin,
+                    &e.to_string(),
+                )));
+            }
+        };
+
+        let time_exchange = data
+            .transact_time
+            .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+            .unwrap_or_else(Utc::now);
+
+        let exchange_order_id = match data.order_id {
+            Some(id) => OrderId(format_smolstr!("{id}")),
+            None => {
+                return inactive(OrderState::inactive(unreadable_answer(
+                    ExchangeId::BinanceMargin,
+                    "open_order answer has no orderId",
+                )));
+            }
+        };
+
+        let borrowed = match (data.margin_buy_borrow_amount, data.margin_buy_borrow_asset) {
+            (Some(amount), Some(asset)) => Some(MarginBorrow::new(asset, amount)),
+            (None, None) => None,
+            (Some(_), None) | (None, Some(_)) => {
+                return inactive(OrderState::inactive(unreadable_answer(
+                    ExchangeId::BinanceMargin,
+                    "open_order answer has a borrowed amount or asset without the other",
+                )));
+            }
+        };
+
+        // Read from the response's status, so an order that ended in it (an IOC or FOK order
+        // that expired) is not reported, or held, as live.
+        let state = placed_order_state(
+            ExchangeId::BinanceMargin,
+            &instrument,
+            quantity,
+            PlacementResponse {
+                status: data.status.as_deref(),
+                order_id: exchange_order_id,
+                time_exchange,
+                executed_qty: data.executed_qty.as_deref(),
+                cumulative_quote_qty: data.cummulative_quote_qty.as_deref(),
+            },
+        );
+        self.known_live
+            .lock()
+            .placed(&order_key, quantity, kind, &state);
+
+        MarginPlacement {
+            order: Order {
+                key: order_key,
+                side,
+                price,
+                quantity,
+                kind,
+                time_in_force,
+                state,
+            },
+            borrowed,
+        }
     }
 
     /// Hold each of `orders` as live, for a reconnect to ask about if the stream misses its end.
@@ -764,194 +982,13 @@ impl ExecutionClient for BinanceMargin {
 
     /// Submit a margin order over the SAPI `POST /sapi/v1/margin/order` endpoint.
     ///
-    /// Mirrors [`BinanceSpot::open_order`](super::spot::BinanceSpot)'s contract: never returns
-    /// `None` (every failure is folded into the returned [`Order`]'s state as
-    /// [`OrderState::inactive`]), so the engine always sees a definitive outcome.
-    ///
-    /// Margin specifics:
-    /// - `sideEffectType` is the request's [`MarginEffect`], else the client's
-    ///   [`BinanceMarginConfig::margin_effect`]: `NO_SIDE_EFFECT`, `MARGIN_BUY` for `Borrow` and
-    ///   `AUTO_REPAY` for `Repay`.
-    /// - A `Borrow` borrows when the order is **placed**, not when it fills, and nothing repays
-    ///   it from the order's proceeds: close the position with a `Repay` order. The placement
-    ///   response carries the amount borrowed.
-    /// - `autoRepayAtCancel` is sent with `Borrow` only, from
-    ///   [`BinanceMarginConfig::auto_repay_at_cancel`]: Binance applies it to `MARGIN_BUY` alone.
-    /// - An order with `Borrow` has a request weight of 1500 against the account's UID limit,
-    ///   against 6 for the other effects. Place them accordingly.
-    /// - `isIsolated` is config-driven (`"TRUE"` for isolated, `"FALSE"` for cross).
-    /// - A `TrailingStop` is sent as a `STOP_LOSS` with `trailingDelta` in basis points, and a
-    ///   `TrailingStopFixedLimit` as a `STOP_LOSS_LIMIT` with `trailingDelta` and its fixed limit
-    ///   as `price`; an activation price goes as `stopPrice`. An Absolute offset, and
-    ///   `TrailingStopLimit`, return [`OrderError::UnsupportedOrderType`]; an offset that is not a
-    ///   positive whole number of basis points returns [`OrderError::InvalidPrecision`] (see the
-    ///   type-level docs). A non-positive activation price, or a `TrailingStopFixedLimit` without
-    ///   a positive `price`, is refused unsent as [`OrderError::Rejected`].
-    /// - A **cross** account refuses the `STOP_LOSS` form of a `TrailingStop` with `-3111`, which
-    ///   comes back as [`OrderError::UnsupportedOrderType`] after the round trip. Place a
-    ///   `TrailingStopFixedLimit` there instead: it is accepted on both account modes.
-    /// - A successful answer that cannot be read (one that does not decode, or has no `orderId`)
-    ///   returns [`OrderError::Connectivity`]: the venue acted on the request, so the order may be
-    ///   live, and its outcome is unknown rather than refused.
+    /// [`BinanceMargin::open_margin_order`]'s order, without what it borrowed: see there for the
+    /// margin specifics.
     async fn open_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
     ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
-        let instrument = request.key.instrument.clone();
-        let side = request.state.side;
-        let price = request.state.price;
-        let quantity = request.state.quantity;
-        let kind = request.state.kind;
-        let time_in_force = request.state.time_in_force;
-        let cid = request.key.cid.clone();
-
-        let order_key = OrderKey::new(
-            ExchangeId::BinanceMargin,
-            instrument.clone(),
-            request.key.strategy.clone(),
-            cid.clone(),
-        );
-
-        // Build the returned Order with a given inactive (failure) state, preserving the request
-        // fields — keeps the many early-return error paths to one line each.
-        let inactive = |state: UnindexedOrderState| Order {
-            key: order_key.clone(),
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            state,
-        };
-
-        let params = match build_new_order_params(
-            instrument.name().to_string(),
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            cid.0.to_string(),
-            request
-                .state
-                .margin_effect
-                .unwrap_or(self.config.margin_effect),
-            self.config.auto_repay_at_cancel,
-            self.config.is_isolated,
-        ) {
-            Ok(params) => params,
-            Err(BuildOrderError::Unsupported) => {
-                return inactive(OrderState::inactive(OrderError::UnsupportedOrderType(
-                    format!(
-                        "BinanceMargin does not support OrderKind::{kind:?} with {time_in_force:?}"
-                    ),
-                )));
-            }
-            Err(BuildOrderError::Trailing(refused)) => {
-                return inactive(OrderState::inactive(refused.into_order_error()));
-            }
-            Err(BuildOrderError::Build(msg)) => {
-                error!(%msg, "BinanceMargin failed to build new order params");
-                return inactive(OrderState::inactive(OrderError::Rejected(
-                    ApiError::OrderRejected(msg),
-                )));
-            }
-        };
-
-        if let Err(refused) = self
-            .rules
-            .check(instrument.name(), kind, price, quantity)
-            .await
-        {
-            return inactive(OrderState::inactive(refused));
-        }
-
-        // Sent through `send_request` with the SDK's own query, so that the answer decodes into
-        // `NewOrderAnswer` (see there) rather than the SDK's response type.
-        let query = new_order_query(params);
-        let response = match rest_call_with_retry(
-            &self.rest_config,
-            &self.rate_limiter,
-            RequestKind::Order,
-            |cfg| {
-                let query = query.clone();
-                Box::pin(async move {
-                    binance_sdk::common::utils::send_request::<NewOrderAnswer>(
-                        &cfg,
-                        NEW_ORDER_PATH,
-                        reqwest::Method::POST,
-                        query,
-                        BTreeMap::new(),
-                        None,
-                        true,
-                    )
-                    .await
-                })
-            },
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                return inactive(OrderState::inactive(classify_rest_order_error(
-                    &e,
-                    &instrument,
-                )));
-            }
-        };
-
-        let data = match response.data().await {
-            Ok(data) => data,
-            Err(e) => {
-                return inactive(OrderState::inactive(unreadable_answer(
-                    ExchangeId::BinanceMargin,
-                    &e.to_string(),
-                )));
-            }
-        };
-
-        let time_exchange = data
-            .transact_time
-            .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-            .unwrap_or_else(Utc::now);
-
-        let exchange_order_id = match data.order_id {
-            Some(id) => OrderId(format_smolstr!("{id}")),
-            None => {
-                return inactive(OrderState::inactive(unreadable_answer(
-                    ExchangeId::BinanceMargin,
-                    "open_order answer has no orderId",
-                )));
-            }
-        };
-
-        // Read from the response's status, so an order that ended in it (an IOC or FOK order
-        // that expired) is not reported, or held, as live.
-        let state = placed_order_state(
-            ExchangeId::BinanceMargin,
-            &instrument,
-            quantity,
-            PlacementResponse {
-                status: data.status.as_deref(),
-                order_id: exchange_order_id,
-                time_exchange,
-                executed_qty: data.executed_qty.as_deref(),
-                cumulative_quote_qty: data.cummulative_quote_qty.as_deref(),
-            },
-        );
-        self.known_live
-            .lock()
-            .placed(&order_key, quantity, kind, &state);
-
-        Order {
-            key: order_key,
-            side,
-            price,
-            quantity,
-            kind,
-            time_in_force,
-            state,
-        }
+        self.open_margin_order(request).await.order
     }
 
     /// Cancel a resting margin order via `DELETE /sapi/v1/margin/order`.
@@ -4610,8 +4647,8 @@ const NEW_ORDER_PATH: &str = "/sapi/v1/margin/order";
 /// The query of a margin new-order request, built from `params` as the SDK's own
 /// `margin_account_new_order` builds it.
 ///
-/// [`BinanceMargin::open_order`] sends the order through the SDK's `send_request` instead of that
-/// call, so that the answer decodes into [`NewOrderAnswer`]. The SDK's response type reads
+/// [`BinanceMargin::open_margin_order`] sends the order through the SDK's `send_request` instead of
+/// that call, so that the answer decodes into [`NewOrderAnswer`]. The SDK's response type reads
 /// `marginBuyBorrowAmount` as an integer, while Binance sends a decimal string, so every order
 /// that borrows failed its decode. The destructuring names every field, so a field the SDK adds
 /// fails to compile here rather than go unsent.
@@ -4667,8 +4704,8 @@ fn new_order_query(params: MarginAccountNewOrderParams) -> BTreeMap<String, serd
     query
 }
 
-/// The fields of the answer to a margin new-order request that [`BinanceMargin::open_order`]
-/// reads.
+/// The fields of the answer to a margin new-order request that
+/// [`BinanceMargin::open_margin_order`] reads.
 ///
 /// Serde ignores the other fields, so a field the client does not read cannot fail the decode.
 #[derive(Debug, Deserialize)]
@@ -4681,6 +4718,10 @@ struct NewOrderAnswer {
     /// Absent from an `ACK` answer.
     executed_qty: Option<String>,
     cummulative_quote_qty: Option<String>,
+    /// What a `MARGIN_BUY` order borrowed, as a decimal string. Absent when it borrowed nothing.
+    margin_buy_borrow_amount: Option<Decimal>,
+    /// The asset `margin_buy_borrow_amount` is of.
+    margin_buy_borrow_asset: Option<AssetNameExchange>,
 }
 
 /// Map a rustrade [`OrderKind`] + [`TimeInForce`] to the margin SDK's order `type`/`timeInForce`.
@@ -9024,6 +9065,70 @@ mod tests {
         })
     }
 
+    /// A market sell of 0.00007 BTCUSDT that borrows what it lacks.
+    fn borrowing_request(
+        instrument: &InstrumentNameExchange,
+    ) -> OrderRequestOpen<ExchangeId, &InstrumentNameExchange> {
+        let mut request = margin_open_request(instrument, "borrow");
+        request.state.side = Side::Sell;
+        request.state.kind = OrderKind::Market;
+        request.state.price = None;
+        request.state.quantity = dec!(0.00007);
+        request.state.margin_effect = Some(MarginEffect::Borrow);
+        request
+    }
+
+    /// `borrowing_answer` without the fields named.
+    fn borrowing_answer_without(fields: &[&str]) -> serde_json::Value {
+        let mut answer = borrowing_answer();
+        let object = answer.as_object_mut().unwrap();
+        for field in fields {
+            object.remove(*field);
+        }
+        answer
+    }
+
+    /// A placement reports what the order borrowed as Binance's answer gives it, with its asset:
+    /// the amount as a decimal string, or as a number; and no loan when the answer gives none.
+    #[tokio::test]
+    async fn a_margin_placement_reports_what_the_order_borrowed() {
+        let mut as_a_number = borrowing_answer();
+        as_a_number["marginBuyBorrowAmount"] = serde_json::json!(5);
+        let btc = AssetNameExchange::new("BTC");
+        for (answer, expected) in [
+            (
+                borrowing_answer(),
+                Some(MarginBorrow::new(btc.clone(), dec!(0.00006029))),
+            ),
+            (as_a_number, Some(MarginBorrow::new(btc, dec!(5)))),
+            (
+                borrowing_answer_without(&["marginBuyBorrowAmount", "marginBuyBorrowAsset"]),
+                None,
+            ),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&answer))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = margin_client_at(&server, false);
+            let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+
+            let placement = client.open_margin_order(borrowing_request(&btcusdt)).await;
+
+            assert!(
+                matches!(
+                    placement.order.state,
+                    OrderState::Inactive(crate::order::state::InactiveOrderState::FullyFilled(_))
+                ),
+                "{answer}: {placement:?}"
+            );
+            assert_eq!(placement.borrowed, expected, "{answer}");
+        }
+    }
+
     /// An order that borrowed is answered with the borrowed amount as a decimal string, which
     /// does not stop the answer being read: the order is reported as it is.
     #[tokio::test]
@@ -9037,14 +9142,8 @@ mod tests {
             .await;
         let client = margin_client_at(&server, false);
         let btcusdt = InstrumentNameExchange::new("BTCUSDT");
-        let mut request = margin_open_request(&btcusdt, "borrow");
-        request.state.side = Side::Sell;
-        request.state.kind = OrderKind::Market;
-        request.state.price = None;
-        request.state.quantity = dec!(0.00007);
-        request.state.margin_effect = Some(MarginEffect::Borrow);
 
-        let placed = client.open_order(request).await;
+        let placed = client.open_order(borrowing_request(&btcusdt)).await;
 
         let OrderState::Inactive(crate::order::state::InactiveOrderState::FullyFilled(filled)) =
             placed.state
@@ -9062,6 +9161,8 @@ mod tests {
         for answer in [
             serde_json::json!({ "symbol": "BTCUSDT", "clientOrderId": "x" }),
             serde_json::json!({ "symbol": "BTCUSDT", "orderId": "not a number" }),
+            borrowing_answer_without(&["marginBuyBorrowAsset"]),
+            borrowing_answer_without(&["marginBuyBorrowAmount"]),
         ] {
             let server = wiremock::MockServer::start().await;
             wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -9073,17 +9174,20 @@ mod tests {
             let client = margin_client_at(&server, false);
             let btcusdt = InstrumentNameExchange::new("BTCUSDT");
 
-            let placed = client.open_order(margin_open_request(&btcusdt, "x")).await;
+            let placed = client
+                .open_margin_order(margin_open_request(&btcusdt, "x"))
+                .await;
 
             assert!(
                 matches!(
-                    placed.state,
+                    placed.order.state,
                     OrderState::Inactive(crate::order::state::InactiveOrderState::OpenFailed(
                         OrderError::Connectivity(_)
                     ))
                 ),
                 "{answer}: {placed:?}"
             );
+            assert_eq!(placed.borrowed, None);
         }
     }
 

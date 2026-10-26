@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`BinanceMargin::open_margin_order` reports what an order borrowed** (#730). It returns the new
+  `MarginPlacement`: the order, as `open_order` returns it, and `borrowed:
+  Option<MarginBorrow>`, the asset and principal Binance lent the order when it was placed
+  (`marginBuyBorrowAmount`, `marginBuyBorrowAsset`). `None` when the answer reports no loan: the
+  order borrowed nothing, or was refused. When the order's outcome is unknown, `None` says nothing
+  about a loan. Without it, a caller placing with `MarginEffect::Borrow` could tell the loan it
+  owes from the balance it spent only by reading the account, which races the asset's other
+  activity. `open_order` is unchanged and returns the same order.
+
 ### Changed
 
 - **Breaking: an open whose outcome is unknown keeps its order in flight, and the

@@ -5,13 +5,18 @@
 //! from what it receives, or neither. A live margin client sends it with each order, and the
 //! simulated venue applies it when [`SpotMarginConfig`] turns its spot margin on. A
 //! [`MarginInterestModel`] prices those loans over time; [`PeriodicMarginInterest`] is the
-//! built-in one.
+//! built-in one. A margin client that learns what an order borrowed reports it as a
+//! [`MarginBorrow`], in a [`MarginPlacement`].
 
 use crate::holding_cost::{DayCount, RateSeries, next_whole_interval};
+use crate::order::{Order, state::UnindexedOrderState};
 use chrono::{DateTime, TimeDelta, Utc};
+use derive_more::Constructor;
 use fnv::FnvHashMap;
 use rust_decimal::Decimal;
-use rustrade_instrument::asset::name::AssetNameExchange;
+use rustrade_instrument::{
+    asset::name::AssetNameExchange, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
+};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use thiserror::Error;
@@ -58,6 +63,41 @@ pub enum MarginEffect {
     /// Binance's `AUTO_REPAY` does. It borrows nothing: an order the free balance cannot pay for
     /// is refused.
     Repay,
+}
+
+/// A loan a margin order took out when it was placed: `amount` of `asset`.
+///
+/// `amount` is the loan's principal, as the venue reports lending it. It is not the order's net
+/// effect on the balance: a fee the order pays in `asset` is not in it, and interest accrues on
+/// it from the moment it is lent. `asset` is the asset the order pays with, which may be the base
+/// or the quote asset of the pair.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, Constructor)]
+pub struct MarginBorrow {
+    pub asset: AssetNameExchange,
+    pub amount: Decimal,
+}
+
+/// The answer to placing a margin order: the order, and what it borrowed.
+///
+/// Returned by a margin client's own placement method (for example `BinanceMargin`'s
+/// `open_margin_order`), whose venue reports the loan in its answer to the order.
+/// `ExecutionClient::open_order` returns only the order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarginPlacement {
+    /// The order, as [`ExecutionClient::open_order`](crate::client::ExecutionClient::open_order)
+    /// returns it.
+    pub order: Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
+    /// What the order borrowed when it was placed.
+    ///
+    /// - `Some` when the venue's answer reports a loan.
+    /// - `None` when the answer reports none: the order borrowed nothing (its
+    ///   [`MarginEffect`] is not [`Borrow`](MarginEffect::Borrow), or its free balance covered
+    ///   it), or the order was refused.
+    /// - When [`order.state`](Order::state) is an unknown outcome
+    ///   ([`OrderState::is_outcome_unknown`](crate::order::state::OrderState::is_outcome_unknown)),
+    ///   the venue may have placed the order and lent to it without the client learning how
+    ///   much. `None` then says nothing about a loan: read the account's balances.
+    pub borrowed: Option<MarginBorrow>,
 }
 
 /// Spot margin on the simulated venue: what it lends a spot order, how much, and what it repays.
