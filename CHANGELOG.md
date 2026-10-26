@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-26
+
 ### Changed
 
 - **Breaking: `BinanceMargin::fetch_margin_interest` returns a `CashFlowsRead`** in place of a
@@ -21,10 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[non_exhaustive]`, so `CashFlowsRead::new(flows, resume)` and `complete` still build one,
   with `held_since: None`; `with_held_since` sets it. Alpaca's `fetch_cash_flows` leaves it
   `None`.
-- **`StaleMarketPolicy::Wait` now holds limit orders too, and stops stale observations filling
-  resting orders** (`rustrade-execution`, #667). Previously the policy held only market orders. A
-  limit order that crossed the stale price still filled against it, however old: on a bar feed,
-  a buy limit above the last close of an instrument with no bar now filled at that close.
+- **Breaking: `StaleMarketPolicy::Wait` now holds limit orders too, and stops stale observations
+  filling resting orders** (`rustrade-execution`, #667). Previously the policy held only market
+  orders. A limit order that crossed the stale price still filled against it, however old: on a
+  bar feed, a buy limit above the last close of an instrument with no bar now filled at that
+  close.
   - Under `Wait`, every order arriving on a stale market waits for the instrument's next fresh
     observation and is decided as if it had arrived just after it. A limit order that market
     crosses fills as a taker at the fresh price, capped at its limit, and what the size there
