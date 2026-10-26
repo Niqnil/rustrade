@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`BinanceMargin::open_margin_order` reports what an order borrowed** (#730). It returns the new
+  `MarginPlacement`: the order, as `open_order` returns it, and `borrowed:
+  Option<MarginBorrow>`, the asset and principal Binance lent the order when it was placed
+  (`marginBuyBorrowAmount`, `marginBuyBorrowAsset`). `None` when the answer reports no loan: the
+  order borrowed nothing, or was refused. When the order's outcome is unknown, `None` says nothing
+  about a loan. Without it, a caller placing with `MarginEffect::Borrow` could tell the loan it
+  owes from the balance it spent only by reading the account, which races the asset's other
+  activity. `open_order` is unchanged and returns the same order.
+
 ### Changed
 
 - **Breaking: an open whose outcome is unknown keeps its order in flight, and the
@@ -79,6 +90,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   later account-stream report of the order as live did not add it back to the orders the client
   holds live, which a reconnect asks the venue about. Seen with IBKR since #726, and with
   Hyperliquid's unknown outcomes above.
+- **`BinanceMargin` reported every order that borrowed as rejected while it was live** (#730).
+  Binance answers an order placed with `MarginEffect::Borrow` (`MARGIN_BUY`) that borrowed with
+  `marginBuyBorrowAmount` as a decimal string, which the SDK's response type reads as an
+  integer. The answer failed to decode, and `open_order` returned `Rejected(OrderRejected)` for an
+  order that was resting or filled. The order is now sent through the client's own request, whose
+  answer reads only the fields the client uses. An order that borrowed nothing was not affected.
+- **A Binance order or cancel answered with a success that cannot be read is an unknown outcome,
+  not a refusal** (#730). An answer that does not decode, or has no `orderId`, now returns
+  `OrderError::Connectivity`, so the order stays in flight and is looked up, instead of
+  `Rejected`. The venue acted on the request. Applies to `BinanceMargin` and `BinanceSpot`, for
+  opens and cancels.
 
 ## [0.15.0] - 2026-10-26
 

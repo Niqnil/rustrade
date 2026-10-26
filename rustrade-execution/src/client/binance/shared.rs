@@ -1759,6 +1759,19 @@ pub(crate) fn ended_order_state<AssetKey, InstrumentKey>(
     })
 }
 
+/// The error for a successful answer to an order or cancel request that cannot be read: one that
+/// does not decode, or that lacks the `orderId` the client needs.
+///
+/// The venue acted on the request, so its outcome is unknown, not refused: it is
+/// [`OrderError::Connectivity`], and a caller looks the order up rather than treat it as never
+/// placed (or, for a cancel, as still working).
+pub(crate) fn unreadable_answer(exchange: ExchangeId, problem: &str) -> UnindexedOrderError {
+    error!(%exchange, problem, "Binance answered an order request unreadably - outcome unknown");
+    OrderError::Connectivity(ConnectivityError::Socket(format!(
+        "{exchange} answered unreadably, outcome unknown: {problem}"
+    )))
+}
+
 /// The fields of Binance's response to placing an order that say what became of it.
 #[derive(Debug, Clone)]
 pub(crate) struct PlacementResponse<'a> {
