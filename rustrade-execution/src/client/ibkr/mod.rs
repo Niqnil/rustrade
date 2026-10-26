@@ -1138,6 +1138,23 @@ fn open_send_error<AssetKey, InstrumentKey>(
     }
 }
 
+/// Forget the IB order id `ib_order_id` of an open that failed with `error`: the order was never
+/// sent, or TWS rejected it (Cancelled/Inactive or a genuine notice).
+///
+/// Unless the open's outcome is unknown ([`OrderError::is_outcome_unknown`]): then TWS may have
+/// placed the order, so the mapping stays, to route its status and fills on the account stream
+/// while the order is looked up. If it was never placed, the mapping holds its client order id
+/// until [`IbkrClient::clear_stale_order_ids`] clears it.
+fn release_failed_open<AssetKey, InstrumentKey>(
+    order_ids: &OrderIdMap,
+    ib_order_id: i32,
+    error: &OrderError<AssetKey, InstrumentKey>,
+) {
+    if !error.is_outcome_unknown() {
+        order_ids.remove_by_ib_id(ib_order_id);
+    }
+}
+
 /// Drive an order-placement subscription to its initial [`PlacementOutcome`].
 ///
 /// Shared by the single-order and bracket-leg placement paths. Consumes events
@@ -3088,9 +3105,7 @@ impl ExecutionClient for IbkrClient {
                 }
             }
             Ok(Err(error)) => {
-                // Cleanup order_ids: the order was never sent (place_order error)
-                // or TWS rejected it (Cancelled/Inactive or a genuine notice).
-                self.order_ids.remove_by_ib_id(ib_order_id);
+                release_failed_open(&self.order_ids, ib_order_id, &error);
                 Order {
                     key,
                     side,
@@ -4419,6 +4434,35 @@ mod order_status_tests {
             "io".into(),
         );
         assert!(io.is_outcome_unknown());
+    }
+
+    /// A failed open forgets its IB order id, unless its outcome is unknown: TWS may hold the
+    /// order, whose status and fills the mapping still routes.
+    #[test]
+    fn a_failed_open_keeps_its_ib_order_id_only_when_its_outcome_is_unknown() {
+        let cid = ClientOrderId::new("failed-open");
+        let failures: [(OrderError<AssetNameExchange, InstrumentNameExchange>, bool); 3] = [
+            (
+                OrderError::Connectivity(ConnectivityError::Socket("io".into())),
+                true,
+            ),
+            (
+                OrderError::NotPlaced(NotPlacedReason::NotSent(ConnectivityError::Socket(
+                    "refused".into(),
+                ))),
+                false,
+            ),
+            (
+                OrderError::Rejected(ApiError::OrderRejected("no".into())),
+                false,
+            ),
+        ];
+        for (error, kept) in failures {
+            let order_ids = OrderIdMap::new();
+            order_ids.register(cid.clone(), 7, ctx()).unwrap();
+            release_failed_open(&order_ids, 7, &error);
+            assert_eq!(order_ids.get_client_id(7).is_some(), kept, "{error:?}");
+        }
     }
 
     /// Regression anchors: the statuses that were already decisive must keep
