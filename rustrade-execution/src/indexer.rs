@@ -662,6 +662,7 @@ impl AccountEventIndexer {
     pub fn order_error(&self, error: UnindexedOrderError) -> OrderError {
         match error {
             UnindexedOrderError::Connectivity(error) => OrderError::Connectivity(error),
+            UnindexedOrderError::NotPlaced(reason) => OrderError::NotPlaced(reason),
             UnindexedOrderError::Rejected(error) => OrderError::Rejected(self.api_error(error)),
             UnindexedOrderError::UnsupportedOrderType(msg) => OrderError::UnsupportedOrderType(msg),
             UnindexedOrderError::InvalidPrecision(violation) => {

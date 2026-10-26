@@ -3,16 +3,26 @@
 //! Every open and cancel request the [`Engine`](crate::engine::Engine) sends leaves its order
 //! [`OpenInFlight`](rustrade_execution::order::state::OpenInFlight) or
 //! [`CancelInFlight`](rustrade_execution::order::state::CancelInFlight) until the venue's answer
-//! arrives. The `ExecutionManager` answers every request within its `request_timeout`, so an order
-//! still in flight well after that was stranded some other way: the manager task died, an answer
-//! was ignored by a state transition, or a bug. While it stays, `has_requests_in_flight` stays
-//! true, and in Hedging mode fills that match no order are held back.
+//! arrives. The `ExecutionManager` answers every request within its `request_timeout`. An open
+//! whose answer leaves its outcome unknown (a timeout, or a connectivity error: see
+//! [`OrderError::is_outcome_unknown`](rustrade_execution::error::OrderError::is_outcome_unknown))
+//! stays in flight, because the venue may hold the order. The manager then looks the order up at
+//! the venue (see [`UnknownOutcomeLookup`])
+//! and reports what it finds.
+//!
+//! So an order still in flight well after all that was stranded some other way: the venue could
+//! not be asked about it, the manager task died, an answer was ignored by a state transition, or a
+//! bug. While it stays, `has_requests_in_flight` stays true, and in Hedging mode fills that match
+//! no order are held back.
 //!
 //! The engine **flags** such an order and does nothing else. Settling it would be a guess: the
 //! venue may hold the order live, and a retired order's later reports are ignored, so a wrong
 //! guess would hide a live order. Settling and reconciling are the caller's decision.
 
-use crate::engine::state::{instrument::InstrumentState, order::manager::OrderManager};
+use crate::{
+    engine::state::{instrument::InstrumentState, order::manager::OrderManager},
+    execution::unknown_outcome::UnknownOutcomeLookup,
+};
 use chrono::{DateTime, TimeDelta, Utc};
 use rustrade_execution::order::{OrderKey, state::ActiveOrderState};
 use rustrade_instrument::exchange::ExchangeId;
@@ -35,9 +45,11 @@ use tracing::error;
 ///
 /// # Choosing a deadline
 /// A deadline must exceed the exchange's `ExecutionManager` `request_timeout`, by which the manager
-/// answers every request, plus the time that answer takes to reach the engine. Otherwise orders
-/// awaiting an ordinary answer are flagged. [`ExecutionBuilder`](crate::execution::builder::ExecutionBuilder)
-/// derives one per live exchange with [`Self::deadline_for_request_timeout`], and exposes them on
+/// answers every request, plus the longest its lookups of an open whose outcome is unknown can
+/// take, plus the time an answer takes to reach the engine. Otherwise orders awaiting an ordinary
+/// answer, or still being looked up, are flagged.
+/// [`ExecutionBuilder`](crate::execution::builder::ExecutionBuilder)
+/// derives one per live exchange with [`Self::deadline_for`], and exposes them on
 /// [`ExecutionBuild`](crate::execution::builder::ExecutionBuild) and
 /// [`Execution`](crate::execution::Execution).
 /// [`SystemBuilder::in_flight_deadline`](crate::system::builder::SystemBuilder::in_flight_deadline)
@@ -53,14 +65,21 @@ pub struct InFlightDeadlines(
 );
 
 impl InFlightDeadlines {
-    /// What [`Self::deadline_for_request_timeout`] adds to an
-    /// exchange's `request_timeout`, for the manager's answer to reach the engine.
+    /// What [`Self::deadline_for`] adds, for the manager's answer to reach the engine.
     pub const REQUEST_TIMEOUT_MARGIN: Duration = Duration::from_secs(5);
 
-    /// The deadline for an exchange whose `ExecutionManager` has this `request_timeout`:
-    /// `request_timeout` plus [`Self::REQUEST_TIMEOUT_MARGIN`].
-    pub fn deadline_for_request_timeout(request_timeout: Duration) -> Duration {
-        request_timeout.saturating_add(Self::REQUEST_TIMEOUT_MARGIN)
+    /// The deadline for an exchange whose `ExecutionManager` has this `request_timeout` and
+    /// looks up an open whose outcome is unknown as `unknown_outcome` says: `request_timeout`,
+    /// plus the longest those lookups can take
+    /// ([`UnknownOutcomeLookup::longest`] of `request_timeout`, the manager's timeout for each
+    /// lookup), plus [`Self::REQUEST_TIMEOUT_MARGIN`].
+    pub fn deadline_for(
+        request_timeout: Duration,
+        unknown_outcome: &UnknownOutcomeLookup,
+    ) -> Duration {
+        request_timeout
+            .saturating_add(unknown_outcome.longest(request_timeout))
+            .saturating_add(Self::REQUEST_TIMEOUT_MARGIN)
     }
 
     /// Set the deadline for `exchange`, replacing any it had.
@@ -462,13 +481,26 @@ mod tests {
     }
 
     #[test]
-    fn deadline_for_request_timeout_adds_the_margin() {
+    fn deadline_for_adds_the_lookups_and_the_margin() {
+        let lookups = UnknownOutcomeLookup::default()
+            .with_attempts(2)
+            .with_first_delay(Duration::from_secs(1));
+        // Waits of 1 s and 2 s, each lookup given the 10 s request timeout.
         assert_eq!(
-            InFlightDeadlines::deadline_for_request_timeout(Duration::from_secs(10)),
-            Duration::from_secs(10) + InFlightDeadlines::REQUEST_TIMEOUT_MARGIN
+            InFlightDeadlines::deadline_for(Duration::from_secs(10), &lookups),
+            Duration::from_secs(10 + (1 + 10) + (2 + 10))
+                + InFlightDeadlines::REQUEST_TIMEOUT_MARGIN
         );
         assert_eq!(
-            InFlightDeadlines::deadline_for_request_timeout(Duration::MAX),
+            InFlightDeadlines::deadline_for(
+                Duration::from_secs(10),
+                &UnknownOutcomeLookup::default().with_attempts(0)
+            ),
+            Duration::from_secs(10) + InFlightDeadlines::REQUEST_TIMEOUT_MARGIN,
+            "no lookups add nothing"
+        );
+        assert_eq!(
+            InFlightDeadlines::deadline_for(Duration::MAX, &lookups),
             Duration::MAX
         );
     }
