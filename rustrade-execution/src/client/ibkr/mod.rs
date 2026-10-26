@@ -160,7 +160,8 @@ use crate::{
         order_recovery::{KnownLiveOrders, SharedKnownLiveOrders},
     },
     error::{
-        ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
+        ApiError, ConnectivityError, NotPlacedReason, OrderError, StreamTerminationReason,
+        UnindexedClientError,
     },
     order::{
         Order, OrderKey, OrderKind, TimeInForce, UnindexedOrderSnapshot,
@@ -1099,10 +1100,12 @@ fn panic_message(panic_info: &(dyn std::any::Any + Send)) -> String {
 /// before TWS acknowledged anything, carrying `message` as the reason.
 ///
 /// A dropped or reconnecting transport (`ConnectionReset`, `Io`) is a transient
-/// [`OrderError::Connectivity`]: the request did not reach TWS and may be retried
-/// once the connection is back. `Shutdown` and `ConnectionFailed` mean ibapi has
-/// given up reconnecting, so they are non-transient, like any other refusal
-/// ([`ApiError::OrderRejected`]).
+/// [`OrderError::Connectivity`], which may be retried once the connection is back.
+/// ibapi raises `ConnectionReset` before writing anything, so that request did not
+/// reach TWS; `Io` comes from the write itself, which may have sent part of it. An
+/// open refused with `ConnectionReset` is reported by [`open_send_error`] instead.
+/// `Shutdown` and `ConnectionFailed` mean ibapi has given up reconnecting, so they
+/// are non-transient, like any other refusal ([`ApiError::OrderRejected`]).
 ///
 /// # Known limitation
 ///
@@ -1118,6 +1121,37 @@ fn send_error<AssetKey, InstrumentKey>(
         OrderError::Connectivity(ConnectivityError::Socket(message))
     } else {
         OrderError::Rejected(ApiError::OrderRejected(message))
+    }
+}
+
+/// Classify the error from a `place_order` that failed before TWS acknowledged
+/// anything, as [`send_error`] does, except that a `ConnectionReset` says the order
+/// was not placed: ibapi refuses the send with it before writing anything.
+fn open_send_error<AssetKey, InstrumentKey>(
+    e: &ibapi::Error,
+    message: String,
+) -> OrderError<AssetKey, InstrumentKey> {
+    if matches!(e, ibapi::Error::ConnectionReset) {
+        OrderError::NotPlaced(NotPlacedReason::NotSent(ConnectivityError::Socket(message)))
+    } else {
+        send_error(e, message)
+    }
+}
+
+/// Forget the IB order id `ib_order_id` of an open that failed with `error`: the order was never
+/// sent, or TWS rejected it (Cancelled/Inactive or a genuine notice).
+///
+/// Unless the open's outcome is unknown ([`OrderError::is_outcome_unknown`]): then TWS may have
+/// placed the order, so the mapping stays, to route its status and fills on the account stream
+/// while the order is looked up. If it was never placed, the mapping holds its client order id
+/// until [`IbkrClient::clear_stale_order_ids`] clears it.
+fn release_failed_open<AssetKey, InstrumentKey>(
+    order_ids: &OrderIdMap,
+    ib_order_id: i32,
+    error: &OrderError<AssetKey, InstrumentKey>,
+) {
+    if !error.is_outcome_unknown() {
+        order_ids.remove_by_ib_id(ib_order_id);
     }
 }
 
@@ -2845,6 +2879,10 @@ impl ExecutionClient for IbkrClient {
     /// [`account_stream`](Self::account_stream), no order is reported ended, and an id is held
     /// until reaped.
     ///
+    /// An open whose outcome is unknown ([`OrderError::is_outcome_unknown`]) keeps holding its id,
+    /// as TWS may hold the order. If the order was never placed, the id is held until reaped, so
+    /// retry such an open under a new id.
+    ///
     /// A cancel names the live order under its id, so cancelling a filled order's id once it is
     /// freed is refused locally as not found, rather than at TWS.
     ///
@@ -2997,7 +3035,7 @@ impl ExecutionClient for IbkrClient {
         let result = tokio::task::spawn_blocking(move || {
             let sub = match client.place_order(ib_order_id, &contract, &ib_order) {
                 Ok(s) => s,
-                Err(e) => return Err(send_error(&e, e.to_string())),
+                Err(e) => return Err(open_send_error(&e, e.to_string())),
             };
 
             match await_order_placement(sub.timeout_iter_data(PLACEMENT_STATUS_TIMEOUT)) {
@@ -3071,9 +3109,7 @@ impl ExecutionClient for IbkrClient {
                 }
             }
             Ok(Err(error)) => {
-                // Cleanup order_ids: the order was never sent (place_order error)
-                // or TWS rejected it (Cancelled/Inactive or a genuine notice).
-                self.order_ids.remove_by_ib_id(ib_order_id);
+                release_failed_open(&self.order_ids, ib_order_id, &error);
                 Order {
                     key,
                     side,
@@ -4362,6 +4398,10 @@ mod order_status_tests {
             "io".into(),
         );
         assert!(io.is_transient());
+        assert!(
+            io.is_outcome_unknown(),
+            "a failed write may have sent part of it"
+        );
 
         // ibapi has given up reconnecting: retrying cannot succeed.
         for e in [
@@ -4377,6 +4417,55 @@ mod order_status_tests {
                 "{label} must be a non-transient refusal"
             );
             assert!(!rejected.is_transient(), "{label}");
+        }
+    }
+
+    /// An open ibapi refused with `ConnectionReset` was never written, so the order was not
+    /// placed. Every other send error is classified as for a cancel, an `Io` one leaving the
+    /// outcome unknown.
+    #[test]
+    fn open_send_error_reports_a_refused_send_as_not_placed() {
+        let refused: OrderError<AssetNameExchange, InstrumentNameExchange> =
+            open_send_error(&ibapi::Error::ConnectionReset, "down".into());
+        assert!(matches!(
+            &refused,
+            OrderError::NotPlaced(NotPlacedReason::NotSent(ConnectivityError::Socket(m))) if m == "down"
+        ));
+        assert!(!refused.is_outcome_unknown());
+
+        let io: OrderError<AssetNameExchange, InstrumentNameExchange> = open_send_error(
+            &ibapi::Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            "io".into(),
+        );
+        assert!(io.is_outcome_unknown());
+    }
+
+    /// A failed open forgets its IB order id, unless its outcome is unknown: TWS may hold the
+    /// order, whose status and fills the mapping still routes.
+    #[test]
+    fn a_failed_open_keeps_its_ib_order_id_only_when_its_outcome_is_unknown() {
+        let cid = ClientOrderId::new("failed-open");
+        let failures: [(OrderError<AssetNameExchange, InstrumentNameExchange>, bool); 3] = [
+            (
+                OrderError::Connectivity(ConnectivityError::Socket("io".into())),
+                true,
+            ),
+            (
+                OrderError::NotPlaced(NotPlacedReason::NotSent(ConnectivityError::Socket(
+                    "refused".into(),
+                ))),
+                false,
+            ),
+            (
+                OrderError::Rejected(ApiError::OrderRejected("no".into())),
+                false,
+            ),
+        ];
+        for (error, kept) in failures {
+            let order_ids = OrderIdMap::new();
+            order_ids.register(cid.clone(), 7, ctx()).unwrap();
+            release_failed_open(&order_ids, 7, &error);
+            assert_eq!(order_ids.get_client_id(7).is_some(), kept, "{error:?}");
         }
     }
 

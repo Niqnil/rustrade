@@ -166,9 +166,9 @@ impl<'a> ClientInstrument<'a> {
 ///   [`open_orders`](Self::open_orders), [`cancel_orders`](Self::cancel_orders) and
 ///   [`validate_config`](Self::validate_config): left to the trait's defaults, they would bypass
 ///   any batching or config check the inner client has. Implement the extension traits the inner
-///   client implements as well, with impls bounded on it:
+///   client implements as well, with impls bounded on it, forwarding their provided methods too:
+///   - [`OrderStatusClient`], which the `ExecutionManager` requires of every client it runs;
 ///   - [`BracketOrderClient`]
-///   - [`OrderStatusClient`]
 ///   - [`ShortabilityClient`]
 ///   - [`BorrowCapacityClient`]
 /// - **Withhold a fill from [`account_stream`](Self::account_stream) and
@@ -201,10 +201,10 @@ impl<'a> ClientInstrument<'a> {
 /// use rustrade_execution::{
 ///     AccountEventKind, UnindexedAccountEvent, UnindexedAccountSnapshot,
 ///     balance::AssetBalance,
-///     client::{ClientInstrument, ExecutionClient},
+///     client::{ClientInstrument, ExecutionClient, OrderStatusClient, VenueOrderStatus},
 ///     error::UnindexedClientError,
 ///     order::{
-///         Order,
+///         Order, UnindexedInactiveOrder, UnindexedOrderKey,
 ///         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
 ///         state::{Open, UnindexedOrderState},
 ///     },
@@ -347,6 +347,26 @@ impl<'a> ClientInstrument<'a> {
 ///         instruments: &[InstrumentNameExchange],
 ///     ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
 ///         self.inner.fetch_open_orders(instruments).await
+///     }
+/// }
+///
+/// impl<C> OrderStatusClient for OwnFills<C>
+/// where
+///     C: OrderStatusClient + Sync,
+///     C::AccountStream: 'static,
+/// {
+///     async fn fetch_ended_orders(
+///         &self,
+///         orders: &[UnindexedOrderKey],
+///     ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
+///         self.inner.fetch_ended_orders(orders).await
+///     }
+///
+///     async fn fetch_order_status(
+///         &self,
+///         key: &UnindexedOrderKey,
+///     ) -> Result<VenueOrderStatus, UnindexedClientError> {
+///         self.inner.fetch_order_status(key).await
 ///     }
 /// }
 /// ```
@@ -777,6 +797,73 @@ pub trait OrderStatusClient: ExecutionClient {
         &self,
         orders: &[UnindexedOrderKey],
     ) -> impl Future<Output = Result<Vec<UnindexedInactiveOrder>, UnindexedClientError>> + Send;
+
+    /// What the venue knows of the order under `key`: live, ended, or nothing.
+    ///
+    /// This is how an open request whose outcome is unknown is settled (see
+    /// [`OrderError::is_outcome_unknown`](crate::error::OrderError::is_outcome_unknown)).
+    ///
+    /// # Contract
+    ///
+    /// - [`VenueOrderStatus::Unknown`] means the venue lists the order neither as live nor as
+    ///   ended, under the key's `instrument`. A venue may take a moment to list an order it has
+    ///   just accepted, so one `Unknown` does not prove the order was never placed. A caller asks
+    ///   again before it concludes that.
+    /// - The order is found by its [`cid`](crate::order::OrderKey::cid), and a found order
+    ///   carries `key`.
+    ///
+    /// The provided method asks [`fetch_ended_orders`](Self::fetch_ended_orders) about `key`
+    /// first, then lists the open orders of its instrument with
+    /// [`ExecutionClient::fetch_open_orders`]. In that order, an order that is placed between
+    /// the two reads is listed as live, so it is not missed. An order that ends between them is
+    /// found by neither, and is reported `Unknown` once; the next lookup finds it ended. A client
+    /// whose venue answers in one request may override it.
+    ///
+    /// # Errors
+    ///
+    /// `Err` if either read fails. A failed read is never reported as `Unknown`.
+    fn fetch_order_status(
+        &self,
+        key: &UnindexedOrderKey,
+    ) -> impl Future<Output = Result<VenueOrderStatus, UnindexedClientError>> + Send
+    where
+        Self: Sync,
+    {
+        async move {
+            let ended = self.fetch_ended_orders(std::slice::from_ref(key)).await?;
+            if let Some(order) = ended.into_iter().find(|order| order.key.cid == key.cid) {
+                return Ok(VenueOrderStatus::Ended(Box::new(Order {
+                    key: key.clone(),
+                    ..order
+                })));
+            }
+
+            let open = self
+                .fetch_open_orders(std::slice::from_ref(&key.instrument))
+                .await?;
+            Ok(open
+                .into_iter()
+                .find(|order| order.key.cid == key.cid && order.key.instrument == key.instrument)
+                .map_or(VenueOrderStatus::Unknown, |order| {
+                    VenueOrderStatus::Live(Box::new(Order {
+                        key: key.clone(),
+                        ..order
+                    }))
+                }))
+        }
+    }
+}
+
+/// What a venue knows of one order, as
+/// [`OrderStatusClient::fetch_order_status`] reads it.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum VenueOrderStatus {
+    /// The order is live at the venue, in this state. Boxed, as `Unknown` carries nothing.
+    Live(Box<Order<ExchangeId, InstrumentNameExchange, Open>>),
+    /// The order has ended, as this says.
+    Ended(Box<UnindexedInactiveOrder>),
+    /// The venue lists the order neither as live nor as ended.
+    Unknown,
 }
 
 /// Extension trait for clients that can say what the venue would lend for a short sale.
@@ -954,6 +1041,186 @@ mod tests {
                 InstrumentKindDiscriminant::Future,
                 InstrumentKindDiscriminant::Option
             ]
+        );
+    }
+
+    /// Answers `fetch_ended_orders` and `fetch_open_orders` with fixed lists, whatever is asked.
+    #[derive(Debug, Clone, Default)]
+    struct ListingClient {
+        ended: Vec<UnindexedInactiveOrder>,
+        open: Vec<Order<ExchangeId, InstrumentNameExchange, Open>>,
+    }
+
+    impl ExecutionClient for ListingClient {
+        const EXCHANGE: ExchangeId = ExchangeId::Simulated;
+        const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] = &[];
+        type Config = ();
+        type AccountStream = futures::stream::Empty<UnindexedAccountEvent>;
+
+        fn new(_: Self::Config) -> Self {
+            Self::default()
+        }
+
+        async fn account_snapshot(
+            &self,
+            _: &[AssetNameExchange],
+            _: &[InstrumentNameExchange],
+        ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
+            unreachable!("not a lookup")
+        }
+
+        async fn account_stream(
+            &self,
+            _: &[AssetNameExchange],
+            _: &[InstrumentNameExchange],
+        ) -> Result<Self::AccountStream, UnindexedClientError> {
+            unreachable!("not a lookup")
+        }
+
+        async fn cancel_order(
+            &self,
+            _: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
+        ) -> UnindexedOrderResponseCancel {
+            unreachable!("not a lookup")
+        }
+
+        async fn open_order(
+            &self,
+            _: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
+        ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+            unreachable!("not a lookup")
+        }
+
+        async fn fetch_balances(
+            &self,
+            _: &[AssetNameExchange],
+        ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
+            unreachable!("not a lookup")
+        }
+
+        async fn fetch_open_orders(
+            &self,
+            _: &[InstrumentNameExchange],
+        ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError>
+        {
+            Ok(self.open.clone())
+        }
+
+        async fn fetch_trades(
+            &self,
+            _: DateTime<Utc>,
+            _: DateTime<Utc>,
+            _: &[InstrumentNameExchange],
+        ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError>
+        {
+            unreachable!("not a lookup")
+        }
+    }
+
+    impl OrderStatusClient for ListingClient {
+        async fn fetch_ended_orders(
+            &self,
+            _: &[UnindexedOrderKey],
+        ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
+            Ok(self.ended.clone())
+        }
+    }
+
+    /// An order under `cid` on `instrument`, as a venue lists it: with no strategy.
+    fn listed<State>(
+        instrument: &str,
+        cid: &str,
+        quantity: rust_decimal::Decimal,
+        state: State,
+    ) -> Order<ExchangeId, InstrumentNameExchange, State> {
+        Order {
+            key: crate::order::OrderKey {
+                exchange: ExchangeId::Simulated,
+                instrument: InstrumentNameExchange::new(instrument),
+                strategy: crate::order::id::StrategyId::unknown(),
+                cid: crate::order::id::ClientOrderId::new(cid),
+            },
+            side: Side::Buy,
+            price: None,
+            quantity,
+            kind: crate::order::OrderKind::Market,
+            time_in_force: crate::order::TimeInForce::ImmediateOrCancel,
+            state,
+        }
+    }
+
+    fn open_state() -> Open {
+        Open::new(
+            crate::order::id::VenueOrderId::Assigned(crate::order::id::OrderId::new("v")),
+            DateTime::<Utc>::MIN_UTC,
+            rust_decimal::Decimal::ZERO,
+        )
+    }
+
+    fn cancelled_state() -> crate::order::state::UnindexedInactiveOrderState {
+        crate::order::state::InactiveOrderState::Cancelled(crate::order::state::Cancelled::new(
+            crate::order::id::OrderId::new("v"),
+            DateTime::<Utc>::MIN_UTC,
+            None,
+        ))
+    }
+
+    /// The provided lookup picks the order under the asked client order id and instrument out of
+    /// what each read lists, ended first, and reports it under the asked key.
+    #[tokio::test]
+    async fn fetch_order_status_finds_the_order_asked_about_under_its_key() {
+        use rust_decimal::Decimal;
+
+        let key = UnindexedOrderKey {
+            exchange: ExchangeId::Simulated,
+            instrument: InstrumentNameExchange::new("btc_usdt"),
+            strategy: crate::order::id::StrategyId::new("asked"),
+            cid: crate::order::id::ClientOrderId::new("target"),
+        };
+        // Decoys come first: another order on the instrument, and the id on another instrument.
+        let open = vec![
+            listed("btc_usdt", "other", Decimal::ONE, open_state()),
+            listed("eth_usdt", "target", Decimal::TWO, open_state()),
+            listed("btc_usdt", "target", Decimal::TEN, open_state()),
+        ];
+
+        let live = ListingClient {
+            ended: Vec::new(),
+            open: open.clone(),
+        };
+        match live.fetch_order_status(&key).await {
+            Ok(VenueOrderStatus::Live(order)) => {
+                assert_eq!(order.key, key, "reported under the asked key");
+                assert_eq!(order.quantity, Decimal::TEN, "the asked order: {order:?}");
+            }
+            other => panic!("expected live, got {other:?}"),
+        }
+
+        let ended = ListingClient {
+            ended: vec![
+                listed("btc_usdt", "other", Decimal::ONE, cancelled_state()),
+                listed("btc_usdt", "target", Decimal::TEN, cancelled_state()),
+            ],
+            open,
+        };
+        match ended.fetch_order_status(&key).await {
+            Ok(VenueOrderStatus::Ended(order)) => {
+                assert_eq!(order.key, key, "reported under the asked key");
+                assert_eq!(order.quantity, Decimal::TEN, "the asked order: {order:?}");
+            }
+            other => panic!("expected ended, got {other:?}"),
+        }
+
+        let unknown = ListingClient {
+            ended: vec![listed("btc_usdt", "other", Decimal::ONE, cancelled_state())],
+            open: vec![
+                listed("btc_usdt", "other", Decimal::ONE, open_state()),
+                listed("eth_usdt", "target", Decimal::TWO, open_state()),
+            ],
+        };
+        assert_eq!(
+            unknown.fetch_order_status(&key).await,
+            Ok(VenueOrderStatus::Unknown)
         );
     }
 }

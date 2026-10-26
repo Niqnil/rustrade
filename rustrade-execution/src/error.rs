@@ -538,8 +538,19 @@ pub enum OrderError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// Transient — retry with backoff. See [`ConnectivityError`] for details. The order may or
     /// may not have reached the matching engine, so before resubmitting an open request,
     /// reconcile its state (open orders, fills); a blind retry can place it twice.
+    ///
+    /// For an open request, this means **the outcome is unknown**, not that the open failed: see
+    /// [`is_outcome_unknown`](Self::is_outcome_unknown). A client that knows the request never
+    /// left returns [`NotPlaced`](Self::NotPlaced) instead.
     #[error("connectivity: {0}")]
     Connectivity(#[from] ConnectivityError),
+
+    /// The order was not placed, and this is known rather than guessed: see [`NotPlacedReason`].
+    ///
+    /// Unlike [`Connectivity`](Self::Connectivity), it ends the order. Resubmitting the open
+    /// request cannot place the order twice.
+    #[error("not placed: {0}")]
+    NotPlaced(NotPlacedReason),
 
     /// API-based error (rate limit, invalid instrument, order rejected, etc.).
     ///
@@ -590,6 +601,28 @@ pub enum OrderError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// with account-level margin takes none.
     #[error("unsupported margin effect: {0:?}")]
     UnsupportedMarginEffect(MarginEffect),
+}
+
+/// How an order is known not to have been placed.
+///
+/// Carried by [`OrderError::NotPlaced`].
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
+pub enum NotPlacedReason {
+    /// The open request never left the client, because the connection failed before the send:
+    /// refused, unresolved, or a closed channel to a simulated venue.
+    ///
+    /// A client returns this only where the failure provably came before the send. A failure it
+    /// cannot place is [`OrderError::Connectivity`].
+    #[error("not sent: {0}")]
+    NotSent(ConnectivityError),
+
+    /// The open's outcome was unknown, and the venue, asked about the order by its client order
+    /// id several times since, does not know it.
+    ///
+    /// The engine's `ExecutionManager` reports this, after the lookups its policy sets out.
+    #[error("unknown to the venue")]
+    UnknownToVenue,
 }
 
 /// A value in an order request with more precision than the venue accepts, or that is not
@@ -773,9 +806,15 @@ impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
     ///   [`InvalidPrecision`](Self::InvalidPrecision),
     ///   [`OutOfBounds`](Self::OutOfBounds) and
     ///   [`UnsupportedMarginEffect`](Self::UnsupportedMarginEffect)
+    ///
+    /// [`NotPlaced`](Self::NotPlaced) is transient when the request was not sent, since a later
+    /// send may get through, and not when the venue does not know the order.
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::Connectivity(e) => e.is_transient(),
+            Self::Connectivity(e) | Self::NotPlaced(NotPlacedReason::NotSent(e)) => {
+                e.is_transient()
+            }
+            Self::NotPlaced(NotPlacedReason::UnknownToVenue) => false,
             Self::Rejected(ApiError::RateLimit { .. }) => true,
             Self::Rejected(_) => false,
             Self::UnsupportedOrderType(_)
@@ -783,6 +822,15 @@ impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
             | Self::OutOfBounds(_)
             | Self::UnsupportedMarginEffect(_) => false,
         }
+    }
+
+    /// Returns `true` if, as the answer to an open request, this error leaves the order's outcome
+    /// unknown: the order may be live at the venue.
+    ///
+    /// Only [`Connectivity`](Self::Connectivity) does. Every other error says the order was not
+    /// placed.
+    pub fn is_outcome_unknown(&self) -> bool {
+        matches!(self, Self::Connectivity(_))
     }
 }
 
@@ -1151,6 +1199,38 @@ mod tests {
         let err: UnindexedOrderError =
             OrderError::Connectivity(ConnectivityError::ExchangeOffline(ExchangeId::BinanceSpot));
         assert!(err.is_transient(), "expected transient for {:?}", err);
+    }
+
+    #[test]
+    fn test_order_error_not_placed() {
+        let not_sent: UnindexedOrderError = OrderError::NotPlaced(NotPlacedReason::NotSent(
+            ConnectivityError::Socket("connection refused".into()),
+        ));
+        assert!(not_sent.is_transient(), "a later send may get through");
+        assert!(!not_sent.is_outcome_unknown());
+
+        let unknown: UnindexedOrderError = OrderError::NotPlaced(NotPlacedReason::UnknownToVenue);
+        assert!(!unknown.is_transient());
+        assert!(!unknown.is_outcome_unknown());
+    }
+
+    /// Only a connectivity error leaves an open's outcome unknown, and only as an open's answer
+    /// does `OrderState` read it so.
+    #[test]
+    fn test_order_error_is_outcome_unknown() {
+        use crate::order::state::{OrderState, UnindexedOrderState};
+
+        let timeout: UnindexedOrderError = OrderError::Connectivity(ConnectivityError::Timeout);
+        assert!(timeout.is_outcome_unknown());
+        let rejected: UnindexedOrderError =
+            OrderError::Rejected(ApiError::OrderRejected("no".into()));
+        assert!(!rejected.is_outcome_unknown());
+
+        let state: UnindexedOrderState = OrderState::inactive(timeout);
+        assert!(state.is_outcome_unknown());
+        assert!(state.is_failed());
+        let state: UnindexedOrderState = OrderState::inactive(rejected);
+        assert!(!state.is_outcome_unknown());
     }
 
     #[test]

@@ -7,6 +7,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-10-26
+
+### Added
+
+- **`BinanceMargin::open_margin_order` reports what an order borrowed** (#730). It returns the new
+  `MarginPlacement`: the order, as `open_order` returns it, and `borrowed:
+  Option<MarginBorrow>`, the asset and principal Binance lent the order when it was placed
+  (`marginBuyBorrowAmount`, `marginBuyBorrowAsset`). `None` when the answer reports no loan: the
+  order borrowed nothing, or was refused. When the order's outcome is unknown, `None` says nothing
+  about a loan. Without it, a caller placing with `MarginEffect::Borrow` could tell the loan it
+  owes from the balance it spent only by reading the account, which races the asset's other
+  activity. `open_order` is unchanged and returns the same order.
+
+### Changed
+
+- **Breaking: an open whose outcome is unknown keeps its order in flight, and the
+  `ExecutionManager` looks the order up at the venue** (`rustrade`, `rustrade-execution`, #726).
+  - An open answered with `OrderError::Connectivity` (a timeout, or a transport or venue failure
+    after which the order may be live) no longer ends the order. The engine keeps it
+    `OpenInFlight`, so `has_requests_in_flight` stays true, and the venue's later report of it
+    settles it. `OrderError::is_outcome_unknown` and `OrderState::is_outcome_unknown` say which
+    answers these are. Such an answer is not counted as a rejected open.
+  - The `ExecutionManager` then looks the order up by its client order id, with backoff, and
+    forwards what it finds as an order snapshot: the order live, how it ended, or the new
+    `OrderError::NotPlaced(NotPlacedReason::UnknownToVenue)`. It concludes that only after
+    several `Unknown` answers in a row, each past a grace period; a failed lookup never counts.
+    Lookups that run out forward nothing more, and the in-flight deadline flags the order.
+    `NotPlaced` does not end an order the venue has already reported working, as when its report
+    arrives just before the lookup's conclusion. The IBKR client keeps routing the account
+    stream's status and fills of such an order while it is looked up.
+  - The new `UnknownOutcomeLookup` sets the attempts, the first wait (each later one doubles),
+    the `Unknown` answers that conclude, and the grace period. It is set per exchange with
+    `AccountStreamOptions::with_unknown_outcome`; `ExecutionManager` gains an `unknown_outcome`
+    field. Defaults: five lookups 1, 2, 4, 8 and 16 s apart; three `Unknown` answers from 5 s
+    after the send conclude. Each lookup is given the manager's `request_timeout`.
+  - **`OrderStatusClient` is now required** of a client run by the `ExecutionManager`
+    (`ExecutionManager::init`, `ExecutionBuilder::add_live`, `add_live_with`). Every client in
+    this crate implements it. It gains `fetch_order_status`, which answers with the new
+    `VenueOrderStatus` (`Live`, `Ended` or `Unknown`). The provided method combines
+    `fetch_ended_orders` and `fetch_open_orders`, and a client may override it. A decorator
+    forwards it as well.
+  - `InFlightDeadlines::deadline_for_request_timeout(request_timeout)` is replaced by
+    `deadline_for(request_timeout, &unknown_outcome)`, which adds the longest the lookups can
+    take. The builder's default deadlines grow accordingly.
+  - A graceful drain also waits for the lookups in flight, which their policy bounds.
+- **Breaking: `OrderError` gains `NotPlaced(NotPlacedReason)`**, an open known not to have been
+  placed. `NotPlacedReason::NotSent` is returned by a client whose send provably failed before
+  anything was sent:
+  - Binance spot when no WebSocket API session could be connected;
+  - IBKR when the API refuses `place_order` with `ConnectionReset`;
+  - the mock client when its venue's channel is closed.
+
+  These used to be `Connectivity` errors. A cancel that fails the same way is unchanged.
+
+### Fixed
+
+- **A live order could be left untracked after an open whose outcome was unknown** (#726). The
+  engine retired the order on a timeout or connectivity error, so the venue's later report that
+  the order was open was ignored as a late report. The order then rested and filled at the
+  venue, but `Command::CancelOrders` sent no cancel for it. See the first entry under Changed.
+- **Hyperliquid reported an open that may have reached the venue as rejected** (#728). Perp and
+  spot mapped every error from placing an order to `OrderError::Rejected`, so the engine ended
+  an order that could be live, and never looked it up. The SDK reports every failure after it
+  signs the request with the same error variant, so its text now decides:
+  - an HTTP 4xx is still a refusal, classified as before. A 429 is now
+    `ApiError::RateLimit`;
+  - anything else after the send (a failure to send or to read the answer, a 5xx, an answer that
+    does not parse) is `OrderError::Connectivity`, so the order is kept in flight and looked up
+    by its client order id;
+  - an error from before the send (signing, an asset the SDK does not list, ...) is still a
+    refusal;
+  - an `ok` answer whose status is a bare `success`, or missing, is now an unknown outcome too.
+    It used to be `Rejected("no order ID in response")`.
+
+  A cancel is classified the same way, so a cancel that failed after the send is now
+  `Connectivity` instead of `Rejected`. The order stays open either way.
+
+  Perp and spot now answer `OrderStatusClient::fetch_order_status` with one `orderStatus`
+  request (weight 2), which reports a live order as well as an ended one. The provided method
+  also listed the open orders (weight 20 per DEX) whenever the order had not ended, which every
+  lookup of an order the venue never received did.
+- **An open whose outcome was unknown was remembered by the client as ended** (#728). Then a
+  later account-stream report of the order as live did not add it back to the orders the client
+  holds live, which a reconnect asks the venue about. Seen with IBKR since #726, and with
+  Hyperliquid's unknown outcomes above.
+- **`BinanceMargin` reported every order that borrowed as rejected while it was live** (#730).
+  Binance answers an order placed with `MarginEffect::Borrow` (`MARGIN_BUY`) that borrowed with
+  `marginBuyBorrowAmount` as a decimal string, which the SDK's response type reads as an
+  integer. The answer failed to decode, and `open_order` returned `Rejected(OrderRejected)` for an
+  order that was resting or filled. The order is now sent through the client's own request, whose
+  answer reads only the fields the client uses. An order that borrowed nothing was not affected.
+- **A Binance order or cancel answered with a success that cannot be read is an unknown outcome,
+  not a refusal** (#730). An answer that does not decode, or has no `orderId`, now returns
+  `OrderError::Connectivity` instead of `Rejected`: the venue acted on the request. An open then
+  stays in flight and is looked up. A cancel is not looked up: the venue's later report of the
+  order settles it. Applies to `BinanceMargin` and `BinanceSpot`, for opens and cancels.
+
 ## [0.15.0] - 2026-10-26
 
 ### Changed
