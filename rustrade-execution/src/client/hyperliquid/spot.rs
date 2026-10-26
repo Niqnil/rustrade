@@ -85,7 +85,7 @@ use super::common::{
     spot_balances, spot_base_quote, spot_pair_to_instrument, user_fills_by_time,
 };
 use super::config::HyperliquidConfig;
-use super::error::{map_order_error, map_sdk_error, order_rejection};
+use super::error::{map_order_error, map_sdk_error, order_outcome_unanswered, order_rejection};
 use super::order_recovery::{
     ReconnectWatch, fetch_order_record, listed_cids, lookup_from_record, remember_open,
     remember_snapshot, send_fills, send_observed, spawn_order_checks,
@@ -728,7 +728,7 @@ impl ExecutionClient for HyperliquidSpotClient {
         let response = match response {
             Ok(r) => r,
             Err(e) => {
-                warn!(%e, "Spot cancel order failed (transport)");
+                warn!(%e, "Spot cancel order failed");
                 return OrderResponseCancel {
                     key: OrderKey {
                         exchange: ExchangeId::HyperliquidSpot,
@@ -1016,12 +1016,10 @@ impl ExecutionClient for HyperliquidSpotClient {
                         })
                     }
                     Some(ExchangeDataStatus::Success) | None => {
-                        warn!("Spot order accepted but no order ID returned");
-                        OrderState::inactive(OrderError::Rejected(
-                            crate::error::ApiError::OrderRejected(
-                                "no order ID in response".to_string(),
-                            ),
-                        ))
+                        // The venue took the request without saying what became of the order,
+                        // so it may be live: the outcome is unknown, not a refusal.
+                        warn!(cid = %request.key.cid, "Spot order answered without its status; outcome unknown");
+                        OrderState::inactive(order_outcome_unanswered())
                     }
                 }
             }
@@ -1600,6 +1598,32 @@ mod tests {
                     panic!("{body}: expected a rejection, got {:?}", order.state);
                 };
                 assert_eq!(reported, &expected, "{body}");
+            }
+        }
+
+        /// An `ok` answer that does not say what became of the order leaves its outcome unknown,
+        /// so the engine looks it up rather than ending it.
+        #[tokio::test]
+        async fn a_spot_order_answered_without_its_status_has_an_unknown_outcome() {
+            for body in [
+                serde_json::json!({"status": "ok", "response": {"type": "order"}}),
+                serde_json::json!({
+                    "status": "ok",
+                    "response": {"type": "order", "data": {"statuses": ["success"]}},
+                }),
+            ] {
+                let (_server, client) = client_responding(body.clone()).await;
+                let order = place_hype(&client, dec!(10), dec!(1)).await;
+                assert!(
+                    matches!(
+                        order.state,
+                        OrderState::Inactive(InactiveOrderState::OpenFailed(
+                            OrderError::Connectivity(_)
+                        ))
+                    ),
+                    "{body}: {:?}",
+                    order.state
+                );
             }
         }
 

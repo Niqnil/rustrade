@@ -100,17 +100,60 @@ pub fn map_sdk_error(error: hyperliquid_rust_sdk::Error) -> UnindexedClientError
     UnindexedClientError::Internal(msg)
 }
 
-/// Maps an SDK error from placing or cancelling an order to `UnindexedOrderError`.
+/// Maps an SDK error from placing or cancelling an order to `UnindexedOrderError`, by whether
+/// Hyperliquid may have acted on the request.
 ///
-/// An unknown instrument is [`ApiError::InstrumentInvalid`]; anything else is classified by its
-/// text, as a refusal in a placement response is, so a shortfall of funds is
-/// [`ApiError::BalanceInsufficient`].
-/// A cancel never fails for want of funds, so it shares the classifier harmlessly.
+/// The SDK reports whatever goes wrong once the request is signed as one variant,
+/// [`Error::JsonParse`](hyperliquid_rust_sdk::Error::JsonParse), holding the underlying error's
+/// text: a failure to send the request or to read the answer, an HTTP 4xx or 5xx, and an answer
+/// that does not parse. So its text decides:
+/// - **An HTTP 4xx is a refusal.** The request was turned away, and Hyperliquid acts on an
+///   `/exchange` request only when it answers 200. A 429 is [`ApiError::RateLimit`]; any other
+///   4xx is classified as below.
+/// - **Anything else in `JsonParse` is [`OrderError::Connectivity`]**: the request may have
+///   reached the venue, so its outcome is unknown, and the engine looks an open up by its client
+///   order id. `JsonParse` also covers encoding the request before the send, which the requests
+///   this client builds do not fail; if one did, the lookups would find the order never placed.
+///
+/// Every other variant fails before the request is sent (an asset the SDK does not list,
+/// signing, a number it cannot encode, ...), so it is a refusal too.
+///
+/// A refusal naming an unknown instrument is [`ApiError::InstrumentInvalid`]. Any other is
+/// classified by its text, as a refusal in a placement response is, so a shortfall of funds is
+/// [`ApiError::BalanceInsufficient`]. A cancel never fails for want of funds, so it shares the
+/// classifier harmlessly.
+///
+/// [`OrderError::Connectivity`]: crate::error::OrderError::Connectivity
 pub fn map_order_error(
     error: hyperliquid_rust_sdk::Error,
     instrument: &InstrumentNameExchange,
 ) -> UnindexedOrderError {
-    let msg = error.to_string();
+    let hyperliquid_rust_sdk::Error::JsonParse(text) = error else {
+        return refusal(error.to_string(), instrument);
+    };
+    match client_error_status(&text) {
+        Some(429) => UnindexedOrderError::Rejected(ApiError::rate_limited(None)),
+        Some(_) => refusal(text, instrument),
+        None => UnindexedOrderError::Connectivity(ConnectivityError::Socket(text)),
+    }
+}
+
+/// What the SDK's text for an HTTP 4xx answer (`Error::ClientRequest`) starts with, followed by
+/// the status code.
+const CLIENT_ERROR_PREFIX: &str = "Client error: status code: ";
+
+/// The HTTP status of a 4xx answer, read from the text the SDK's `/exchange` post wraps in
+/// `JsonParse`. `None` for any other text.
+fn client_error_status(text: &str) -> Option<u16> {
+    let status = text.strip_prefix(CLIENT_ERROR_PREFIX)?.split(',').next()?;
+    status
+        .parse()
+        .ok()
+        .filter(|status| (400..500).contains(status))
+}
+
+/// A refusal of an order request, classified by its text `msg`.
+fn refusal(msg: String, instrument: &InstrumentNameExchange) -> UnindexedOrderError {
     let msg_lower = msg.to_lowercase();
 
     // Instrument not found / invalid
@@ -124,6 +167,15 @@ pub fn map_order_error(
     // Anything else is classified by its text like a refusal in a response: a shortfall of
     // funds is BalanceInsufficient, the rest OrderRejected.
     UnindexedOrderError::Rejected(order_rejection(msg))
+}
+
+/// An order answered `ok` with a bare `success` status or with none: Hyperliquid took the
+/// request but did not say what became of the order, which may be live. Its outcome is unknown,
+/// as [`map_order_error`] reads a failure after the send.
+pub(super) fn order_outcome_unanswered() -> UnindexedOrderError {
+    UnindexedOrderError::Connectivity(ConnectivityError::Socket(
+        "Hyperliquid answered the order without its status".to_owned(),
+    ))
 }
 
 /// Classify why Hyperliquid refused an order: the error of a placement response or of the SDK
@@ -320,6 +372,106 @@ mod tests {
             err,
             UnindexedOrderError::Rejected(ApiError::OrderRejected(_))
         ));
+    }
+
+    /// The `/exchange` post wraps the text of what failed in `JsonParse`, as the SDK writes it.
+    fn after_the_send(error: Error) -> Error {
+        Error::JsonParse(error.to_string())
+    }
+
+    fn client_error(status_code: u16, error_message: &str) -> Error {
+        after_the_send(Error::ClientRequest {
+            status_code,
+            error_code: None,
+            error_message: error_message.to_owned(),
+            error_data: None,
+        })
+    }
+
+    /// An HTTP 4xx was refused before Hyperliquid acted on it, so it ends the order, classified
+    /// as any refusal is. Read from the SDK's own text for one, so a change to it fails here.
+    #[test]
+    fn a_4xx_is_a_refusal_and_a_429_a_rate_limit() {
+        let instrument = InstrumentNameExchange::from("BTC-USDC-PERP");
+        for status in [400, 422, 499] {
+            assert!(
+                matches!(
+                    map_order_error(client_error(status, "Failed to deserialize"), &instrument),
+                    UnindexedOrderError::Rejected(ApiError::OrderRejected(reason))
+                        if reason.starts_with(&format!("{CLIENT_ERROR_PREFIX}{status},"))
+                ),
+                "{status}"
+            );
+        }
+        assert!(matches!(
+            map_order_error(client_error(400, "Insufficient margin"), &instrument),
+            UnindexedOrderError::Rejected(ApiError::BalanceInsufficient(None, _))
+        ));
+        assert_eq!(
+            map_order_error(client_error(429, "too many"), &instrument),
+            UnindexedOrderError::Rejected(ApiError::rate_limited(None))
+        );
+    }
+
+    /// Anything after the send other than a 4xx may have reached the venue: a 5xx, a failure to
+    /// send or to read, an answer that does not parse, and text that only looks like a 4xx.
+    #[test]
+    fn any_other_failure_after_the_send_has_an_unknown_outcome() {
+        let instrument = InstrumentNameExchange::from("BTC-USDC-PERP");
+        for error in [
+            after_the_send(Error::ServerRequest {
+                status_code: 502,
+                error_message: "Bad Gateway".to_owned(),
+            }),
+            after_the_send(Error::GenericRequest(
+                "error sending request for url (https://api.hyperliquid.xyz/exchange)".to_owned(),
+            )),
+            Error::JsonParse("expected value at line 1 column 1".to_owned()),
+            Error::JsonParse(format!("{CLIENT_ERROR_PREFIX}500, error code: None")),
+            Error::JsonParse(format!("{CLIENT_ERROR_PREFIX}abc, error code: None")),
+            Error::JsonParse(format!("{CLIENT_ERROR_PREFIX}399, error code: None")),
+        ] {
+            let text = match &error {
+                Error::JsonParse(text) => text.clone(),
+                _ => unreachable!(),
+            };
+            let mapped = map_order_error(error, &instrument);
+            assert_eq!(
+                mapped,
+                UnindexedOrderError::Connectivity(ConnectivityError::Socket(text.clone())),
+                "{text}"
+            );
+            assert!(mapped.is_outcome_unknown(), "{text}");
+        }
+    }
+
+    /// Every variant other than `JsonParse` comes from before the send, so it ends the order.
+    #[test]
+    fn a_failure_before_the_send_is_a_refusal() {
+        let instrument = InstrumentNameExchange::from("BTC-USDC-PERP");
+        assert!(matches!(
+            map_order_error(Error::AssetNotFound, &instrument),
+            UnindexedOrderError::Rejected(ApiError::InstrumentInvalid(name, _)) if name == instrument
+        ));
+        for error in [
+            Error::Eip712("bad domain".to_owned()),
+            Error::SignatureFailure("bad key".to_owned()),
+            Error::FloatStringParse,
+            Error::NoCloid,
+        ] {
+            assert!(
+                matches!(
+                    map_order_error(error.clone(), &instrument),
+                    UnindexedOrderError::Rejected(ApiError::OrderRejected(_))
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_order_answered_without_its_status_has_an_unknown_outcome() {
+        assert!(order_outcome_unanswered().is_outcome_unknown());
     }
 
     #[test]

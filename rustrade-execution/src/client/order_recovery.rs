@@ -342,6 +342,10 @@ impl KnownLiveOrders {
 
     /// Record what the response to placing the order under `key`, of `quantity` and `kind`, said:
     /// live, or already ended, which a later report of it as live then cannot undo.
+    ///
+    /// A response that leaves the outcome unknown
+    /// ([`OrderState::is_outcome_unknown`]) records nothing: the order may be live, and a later
+    /// report of it as live must still be held.
     pub(crate) fn placed(
         &mut self,
         key: &UnindexedOrderKey,
@@ -354,6 +358,7 @@ impl KnownLiveOrders {
                 self.live(key, quantity, kind, open);
             }
             OrderState::Active(_) => {}
+            OrderState::Inactive(_) if state.is_outcome_unknown() => {}
             OrderState::Inactive(_) => {
                 self.ended(&key.cid);
             }
@@ -1503,6 +1508,24 @@ mod tests {
                 "{cid}: a late live report does not bring it back"
             );
         }
+        known.assert_consistent();
+    }
+
+    /// An open answered with an unknown outcome may be live, so it is not remembered as ended: a
+    /// later report of it as live holds it.
+    #[test]
+    fn a_placement_with_an_unknown_outcome_is_held_once_reported_live() {
+        let mut known = KnownLiveOrders::new(ExchangeId::BinanceSpot);
+        let order = key("BTCUSDT", "unknown");
+        known.placed(
+            &order,
+            dec!(2),
+            OrderKind::Limit,
+            &OrderState::inactive(OrderError::Connectivity(ConnectivityError::Timeout)),
+        );
+        assert!(!known.contains(&order.cid), "not yet known to be live");
+        known.live(&order, dec!(2), OrderKind::Limit, &open("9", Decimal::ZERO));
+        assert!(known.contains(&order.cid), "held once reported live");
         known.assert_consistent();
     }
 
