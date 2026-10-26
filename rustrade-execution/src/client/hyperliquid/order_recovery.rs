@@ -13,6 +13,7 @@
 use super::common::{OpenOrder, cid_to_cloid, info, order_update_to_order, record_cid};
 use crate::{
     UnindexedAccountEvent, UnindexedAccountSnapshot,
+    client::VenueOrderStatus,
     client::dedup::{SharedDedupCache, dedup_key_from_event, is_duplicate},
     client::order_recovery::{
         KnownLiveOrders, NoPendingFills, OpenListing, OrderLookup, SharedKnownLiveOrders,
@@ -124,23 +125,43 @@ pub(super) async fn fetch_order_record(
     }
 }
 
-/// What the order `record` says of the order under `key`, the key it was asked about.
+/// The error of a lookup of `cid` whose record does not convert: not an answer, so it is never
+/// read as the order being unknown.
+pub(super) fn unreadable_record(cid: &ClientOrderId) -> UnindexedClientError {
+    UnindexedClientError::Internal(format!(
+        "Hyperliquid's orderStatus record of {cid} does not convert"
+    ))
+}
+
+/// The [`OrderLookup`] a [`status_from_record`] answer gives: a live order, and one whose record
+/// does not convert, have not ended, so they are asked about again rather than retired on a
+/// guess.
+pub(super) fn lookup_of(status: Option<VenueOrderStatus>) -> OrderLookup {
+    match status {
+        Some(VenueOrderStatus::Ended(order)) => OrderLookup::Ended(order),
+        Some(VenueOrderStatus::Unknown) => OrderLookup::Unknown,
+        Some(VenueOrderStatus::Live(_)) | None => OrderLookup::NotEnded,
+    }
+}
+
+/// What the order `record` says of the order under `key`, the key it was asked about: live, in
+/// its state, or how it ended. Hyperliquid's `orderStatus` reports a live order as well as an
+/// ended one, so one request answers a lookup.
 ///
 /// `instrument` is the instrument the record's coin names, `None` for a market this client does not
-/// trade. An order on another instrument than the key's is [`OrderLookup::Unknown`]. One live, or
-/// whose record does not convert (logged at `warn`), is [`OrderLookup::NotEnded`], so it is asked
-/// about again rather than retired on a guess. One that ended carries `key`, so a strategy the
-/// venue does not record survives.
-pub(super) fn lookup_from_record(
+/// trade. An order on another instrument than the key's is [`VenueOrderStatus::Unknown`]. A found
+/// order carries `key`, so a strategy the venue does not record survives. `None` for a record that
+/// does not convert (logged at `warn`).
+pub(super) fn status_from_record(
     key: UnindexedOrderKey,
     record: &OrderUpdate,
     instrument: Option<InstrumentNameExchange>,
-) -> OrderLookup {
+) -> Option<VenueOrderStatus> {
     if instrument.as_ref() != Some(&key.instrument) {
         debug!(cid = %key.cid, asked = %key.instrument, coin = %record.order.coin, "Hyperliquid order is on another instrument than asked");
-        return OrderLookup::Unknown;
+        return Some(VenueOrderStatus::Unknown);
     }
-    let Some(Order {
+    let Order {
         side,
         price,
         quantity,
@@ -148,13 +169,22 @@ pub(super) fn lookup_from_record(
         time_in_force,
         state,
         ..
-    }) = order_update_to_order(record, key.exchange, key.instrument.clone())
-    else {
-        return OrderLookup::NotEnded;
-    };
+    } = order_update_to_order(record, key.exchange, key.instrument.clone())?;
     match state {
-        OrderState::Active(_) => OrderLookup::NotEnded,
-        OrderState::Inactive(state) => OrderLookup::Ended(Box::new(Order {
+        OrderState::Active(ActiveOrderState::Open(state)) => {
+            Some(VenueOrderStatus::Live(Box::new(Order {
+                key,
+                side,
+                price,
+                quantity,
+                kind,
+                time_in_force,
+                state,
+            })))
+        }
+        // The record converts an order it reports live to `Open` only.
+        OrderState::Active(_) => None,
+        OrderState::Inactive(state) => Some(VenueOrderStatus::Ended(Box::new(Order {
             key,
             side,
             price,
@@ -162,7 +192,7 @@ pub(super) fn lookup_from_record(
             kind,
             time_in_force,
             state,
-        })),
+        }))),
     }
 }
 
@@ -568,6 +598,15 @@ pub(super) mod tests {
         assert!(matches!(found, Err(UnindexedClientError::Internal(_))));
     }
 
+    /// The lookup a reconnect's check reads from `record`.
+    fn lookup_from_record(
+        key: UnindexedOrderKey,
+        record: &OrderUpdate,
+        instrument: Option<InstrumentNameExchange>,
+    ) -> OrderLookup {
+        lookup_of(status_from_record(key, record, instrument))
+    }
+
     fn ended(lookup: OrderLookup) -> crate::order::UnindexedInactiveOrder {
         match lookup {
             OrderLookup::Ended(order) => *order,
@@ -633,6 +672,30 @@ pub(super) mod tests {
             let lookup = lookup_from_record(key(CID), &record("BTC", status, "0.01"), Some(btc()));
             assert!(matches!(lookup, OrderLookup::NotEnded), "{status}");
         }
+    }
+
+    /// A live order is reported in its state, under the key asked; a record that does not
+    /// convert answers nothing.
+    #[test]
+    fn a_live_order_is_reported_live_in_its_state() {
+        let Some(VenueOrderStatus::Live(order)) =
+            status_from_record(key(CID), &record("BTC", "open", "0.004"), Some(btc()))
+        else {
+            panic!("expected a live order");
+        };
+        assert_eq!(order.key, key(CID));
+        assert_eq!(order.quantity, dec!(0.01));
+        assert_eq!(order.state.id.assigned(), Some(&OrderId::new("42")));
+        assert_eq!(order.state.filled_quantity, dec!(0.006));
+
+        assert!(
+            status_from_record(
+                key(CID),
+                &record("BTC", "aStatusAddedLater", "0"),
+                Some(btc())
+            )
+            .is_none()
+        );
     }
 
     #[test]

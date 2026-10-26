@@ -207,7 +207,7 @@ use crate::{
     AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
     UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::AssetBalance,
-    client::{ExecutionClient, OrderStatusClient},
+    client::{ExecutionClient, OrderStatusClient, VenueOrderStatus},
     emit_stream_terminated,
     error::{
         ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
@@ -230,15 +230,15 @@ use common::{
 };
 pub use config::{HyperliquidConfig, HyperliquidConfigError, Network};
 pub use error::HyperliquidConnectError;
-use error::{map_order_error, order_rejection};
+use error::{map_order_error, order_outcome_unanswered, order_rejection};
 use ethers::signers::Signer;
 use fnv::FnvHashSet;
 use funding::{funding_cash_flow, send_fundings};
 use futures::{StreamExt, stream::BoxStream};
 use hyperliquid_rust_sdk::{ExchangeClient, InfoClient, Message, Subscription};
 use order_recovery::{
-    ReconnectWatch, fetch_order_record, listed_cids, lookup_from_record, remember_open,
-    remember_snapshot, send_fills, send_observed, spawn_order_checks,
+    ReconnectWatch, fetch_order_record, listed_cids, lookup_of, remember_open, remember_snapshot,
+    send_fills, send_observed, spawn_order_checks, status_from_record, unreadable_record,
 };
 use perp_account::{account_mode, dex_states};
 use perp_dexes::{PerpDexes, UnconfiguredDexes, warn_unconfigured_dexes};
@@ -959,7 +959,7 @@ impl ExecutionClient for HyperliquidClient {
         let response = match response {
             Ok(r) => r,
             Err(e) => {
-                warn!(%e, "Cancel order failed (transport)");
+                warn!(%e, "Cancel order failed");
                 return OrderResponseCancel {
                     key: OrderKey {
                         exchange: ExchangeId::HyperliquidPerp,
@@ -1206,14 +1206,10 @@ impl ExecutionClient for HyperliquidClient {
                         })
                     }
                     Some(ExchangeDataStatus::Success) | None => {
-                        // Generic success without order ID — SDK didn't return structured data.
-                        // This shouldn't happen for limit orders; reject to avoid silent failures.
-                        warn!("Order accepted but no order ID returned");
-                        OrderState::inactive(OrderError::Rejected(
-                            crate::error::ApiError::OrderRejected(
-                                "no order ID in response".to_string(),
-                            ),
-                        ))
+                        // The venue took the request without saying what became of the order,
+                        // so it may be live: the outcome is unknown, not a refusal.
+                        warn!(cid = %request.key.cid, "Order answered without its status; outcome unknown");
+                        OrderState::inactive(order_outcome_unanswered())
                     }
                 }
             }
@@ -1392,6 +1388,26 @@ impl OrderStatusClient for HyperliquidClient {
         })
         .await
     }
+
+    /// One `orderStatus` (weight 2), which reports a live order as well as an ended one, read
+    /// as [`fetch_ended_orders`](OrderStatusClient::fetch_ended_orders) reads it.
+    ///
+    /// # Errors
+    ///
+    /// When the lookup fails, or Hyperliquid's record of the order does not convert.
+    async fn fetch_order_status(
+        &self,
+        key: &UnindexedOrderKey,
+    ) -> Result<VenueOrderStatus, UnindexedClientError> {
+        perp_order_status(
+            self.info_client.clone(),
+            self.dexes.clone(),
+            self.wallet_h160(),
+            key.clone(),
+        )
+        .await?
+        .ok_or_else(|| unreadable_record(&key.cid))
+    }
 }
 
 /// Look the order under `key` up with `orderStatus`, on the perpetual its coin names.
@@ -1401,11 +1417,24 @@ async fn perp_order_lookup(
     address: ethers::types::H160,
     key: UnindexedOrderKey,
 ) -> Result<OrderLookup, UnindexedClientError> {
+    Ok(lookup_of(
+        perp_order_status(info_client, dexes, address, key).await?,
+    ))
+}
+
+/// What `orderStatus` says of the order under `key`, on the perpetual its coin names: see
+/// `status_from_record`.
+async fn perp_order_status(
+    info_client: Arc<InfoClient>,
+    dexes: Arc<PerpDexes>,
+    address: ethers::types::H160,
+    key: UnindexedOrderKey,
+) -> Result<Option<VenueOrderStatus>, UnindexedClientError> {
     let Some(record) = fetch_order_record(&info_client, address, &key.cid).await? else {
-        return Ok(OrderLookup::Unknown);
+        return Ok(Some(VenueOrderStatus::Unknown));
     };
     let instrument = dexes.instrument(&record.order.coin);
-    Ok(lookup_from_record(key, &record, instrument))
+    Ok(status_from_record(key, &record, instrument))
 }
 
 /// The client order ids `openOrders` (weight 20 per DEX traded) lists on the perpetuals
@@ -1657,6 +1686,44 @@ mod tests {
             assert!(matches!(order.state, InactiveOrderState::Cancelled(_)));
         }
 
+        /// One `orderStatus` answers a lookup, live, ended or unknown, without listing the open
+        /// orders; a record that does not convert is an error, never `Unknown`.
+        #[tokio::test]
+        async fn a_perp_order_status_is_one_order_status_request() {
+            let answer = |status: &str| {
+                serde_json::json!({
+                    "status": "order",
+                    "order": record_json("BTC", status, "0.01", Some(CLOID)),
+                })
+            };
+            for (body, expected) in [
+                (answer("open"), "live"),
+                (answer("canceled"), "ended"),
+                (serde_json::json!({"status": "unknownOid"}), "unknown"),
+                (answer("aStatusAddedLater"), "error"),
+            ] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/info"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .mount(&server)
+                    .await;
+                let client = client_against(&server, HashMap::new()).await;
+
+                let status = client.fetch_order_status(&key()).await;
+
+                let found = match &status {
+                    Ok(VenueOrderStatus::Live(order)) if order.key == key() => "live",
+                    Ok(VenueOrderStatus::Ended(order)) if order.key == key() => "ended",
+                    Ok(VenueOrderStatus::Unknown) => "unknown",
+                    Err(UnindexedClientError::Internal(_)) => "error",
+                    _ => "other",
+                };
+                assert_eq!(found, expected, "{status:?}");
+                assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            }
+        }
+
         #[tokio::test]
         async fn a_perp_lookup_of_a_spot_order_is_unknown() {
             let (_server, client) = serve(order_status("@107")).await;
@@ -1736,13 +1803,123 @@ mod tests {
 
         /// A server whose exchange endpoint answers every request with `body`.
         async fn server_responding(body: serde_json::Value) -> MockServer {
+            server_with(ResponseTemplate::new(200).set_body_json(body)).await
+        }
+
+        /// A server whose exchange endpoint gives `response` to every request.
+        async fn server_with(response: ResponseTemplate) -> MockServer {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/exchange"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .respond_with(response)
                 .mount(&server)
                 .await;
             server
+        }
+
+        /// Place a `BTC-USDC-PERP` limit order through a client against `server`.
+        async fn place_on(
+            server: &MockServer,
+        ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+            let client = client_against(server, HashMap::from([("BTC".to_owned(), 0)])).await;
+            place(
+                &client,
+                &InstrumentNameExchange::from("BTC-USDC-PERP"),
+                OrderKind::Limit,
+                Some(dec!(50000)),
+                dec!(0.001),
+            )
+            .await
+        }
+
+        /// An open the venue may have acted on keeps an unknown outcome, so the engine looks it
+        /// up rather than ending it: a 5xx, an answer that does not parse, no answer at all, and
+        /// an `ok` answer that does not say what became of the order.
+        #[tokio::test]
+        async fn an_open_the_venue_may_have_acted_on_has_an_unknown_outcome() {
+            let no_status = serde_json::json!({"status": "ok", "response": {"type": "order"}});
+            let success = serde_json::json!({
+                "status": "ok",
+                "response": {"type": "order", "data": {"statuses": ["success"]}},
+            });
+            for (case, response) in [
+                (
+                    "5xx",
+                    ResponseTemplate::new(502).set_body_string("Bad Gateway"),
+                ),
+                (
+                    "unparsable",
+                    ResponseTemplate::new(200).set_body_string("<html>"),
+                ),
+                (
+                    "no status",
+                    ResponseTemplate::new(200).set_body_json(no_status),
+                ),
+                ("success", ResponseTemplate::new(200).set_body_json(success)),
+            ] {
+                let order = place_on(&server_with(response).await).await;
+                assert!(
+                    matches!(
+                        order.state,
+                        OrderState::Inactive(InactiveOrderState::OpenFailed(
+                            OrderError::Connectivity(_)
+                        ))
+                    ),
+                    "{case}: {:?}",
+                    order.state
+                );
+                assert!(order.state.is_outcome_unknown(), "{case}");
+            }
+
+            // Nothing listening: the send itself fails. A port bound and released, since a
+            // dropped mock server goes back to wiremock's pool still listening.
+            let server = MockServer::start().await;
+            let mut client = client_against(&server, HashMap::from([("BTC".to_owned(), 0)])).await;
+            let closed = std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|listener| listener.local_addr())
+                .unwrap();
+            client.exchange_client = Arc::new(
+                super::super::common::info_tests::exchange_client_against(
+                    format!("http://{closed}"),
+                    HashMap::from([("BTC".to_owned(), 0)]),
+                )
+                .await,
+            );
+            let order = place(
+                &client,
+                &InstrumentNameExchange::from("BTC-USDC-PERP"),
+                OrderKind::Limit,
+                Some(dec!(50000)),
+                dec!(0.001),
+            )
+            .await;
+            assert!(order.state.is_outcome_unknown(), "{:?}", order.state);
+        }
+
+        /// A 4xx turned the request away, so the open ends as refused; a 429 as rate-limited.
+        #[tokio::test]
+        async fn an_open_turned_away_with_a_4xx_is_refused() {
+            let order = place_on(
+                &server_with(ResponseTemplate::new(422).set_body_string("Failed to deserialize"))
+                    .await,
+            )
+            .await;
+            assert!(
+                matches!(
+                    order.state,
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                        ApiError::OrderRejected(_)
+                    )))
+                ),
+                "{:?}",
+                order.state
+            );
+
+            let order = place_on(&server_with(ResponseTemplate::new(429)).await).await;
+            assert_eq!(
+                order.state,
+                OrderState::inactive(OrderError::Rejected(ApiError::rate_limited(None)))
+            );
         }
 
         /// A refusal for want of margin is a balance shortfall, as on other venues; any other
@@ -1996,10 +2173,17 @@ mod tests {
         async fn cancel_answered(
             answer: serde_json::Value,
         ) -> (UnindexedOrderResponseCancel, bool) {
+            cancel_responded(ResponseTemplate::new(200).set_body_json(answer)).await
+        }
+
+        /// [`cancel_answered`], with the exchange endpoint giving `response`.
+        async fn cancel_responded(
+            response: ResponseTemplate,
+        ) -> (UnindexedOrderResponseCancel, bool) {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/exchange"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+                .respond_with(response)
                 .mount(&server)
                 .await;
             let client = client_against(&server, HashMap::from([("BTC".to_owned(), 0)])).await;
@@ -2058,6 +2242,31 @@ mod tests {
                 panic!("expected a rejected cancel, got {:?}", response.state);
             };
             assert_eq!(reason, CANCEL_NOT_APPLIED);
+            assert!(live, "the order is still held live");
+        }
+
+        /// A cancel the venue may have acted on is not reported refused, and one turned away
+        /// with a 4xx is. Either way the order stays held live until a report ends it.
+        #[tokio::test]
+        async fn a_cancel_failing_after_the_send_has_an_unknown_outcome() {
+            let (response, live) = cancel_responded(ResponseTemplate::new(503)).await;
+            assert!(
+                matches!(response.state, Err(UnindexedOrderError::Connectivity(_))),
+                "{:?}",
+                response.state
+            );
+            assert!(live, "the order is still held live");
+
+            let (response, live) =
+                cancel_responded(ResponseTemplate::new(422).set_body_string("bad request")).await;
+            assert!(
+                matches!(
+                    response.state,
+                    Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(_)))
+                ),
+                "{:?}",
+                response.state
+            );
             assert!(live, "the order is still held live");
         }
 
