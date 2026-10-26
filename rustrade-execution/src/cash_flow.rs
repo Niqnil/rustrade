@@ -48,7 +48,11 @@ pub struct CashFlow<AssetKey, InstrumentKey> {
     /// How much moved, signed: positive when the account received it, negative when it paid.
     pub amount: Decimal,
     /// The instrument whose position caused the flow, when the venue attributes it to one, as it
-    /// does funding. `None` for a flow on the account as a whole.
+    /// does funding. `None` for a flow on the account as a whole, such as cross-margin interest.
+    ///
+    /// The `rustrade` engine applies a `None` flow to no position, and does not guess one. A
+    /// consumer that knows which position a flow belongs to sets this before the engine sees the
+    /// event. See `EngineState::update_from_account` in `rustrade` for why and how.
     pub instrument: Option<InstrumentKey>,
     /// When the venue posted the flow.
     pub time_exchange: DateTime<Utc>,
