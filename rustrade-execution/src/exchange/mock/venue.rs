@@ -1946,14 +1946,6 @@ impl SimulatedVenue {
         let side = order.side;
         let quantity = order.state.quantity_remaining(order.quantity);
 
-        // An order sent with nothing to trade has nothing to decide, and is cancelled as
-        // `fill_held` cancels one, rather than rested or filled.
-        if quantity <= Decimal::ZERO {
-            let released = reservation
-                .map(|reservation| self.release_reservation(&reservation, time_exchange));
-            return self.cancel_unfilled(order, released, time_exchange);
-        }
-
         let (market, reference) = match release {
             Release::Bar(bar, price) => {
                 let reference = price.reference(side, bar);
@@ -2024,8 +2016,9 @@ impl SimulatedVenue {
             (Some((_, fill)), None) => (fill.settled(), Some(&fill.credit)),
             (None, Some(held)) => (held.reserved(), None),
             (None, None) => unreachable!(
-                "SimulatedVenue released {} with nothing to trade or rest: an order with a quantity \
-                 left either trades or rests some of it",
+                "SimulatedVenue released {} with nothing to trade or rest: it holds only an order \
+                 with a positive quantity, which `open_order_inner` checks, and such an order \
+                 either trades or rests some of it",
                 order.key.cid
             ),
         };
@@ -2542,6 +2535,10 @@ impl SimulatedVenue {
     /// [`RequestPriced`](VenueRegime::RequestPriced) one. A Limit order is always judged and priced
     /// against this venue's own market; see the type's `# How an order is priced`.
     ///
+    /// An order whose quantity is zero or negative is rejected, moving nothing, whatever the
+    /// market: with an [`ApiError::OrderRejected`] naming the quantity, unless its kind or time in
+    /// force is refused first.
+    ///
     /// # Panics
     /// If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract: a
     /// boundary not after the instant it was asked from, or a negative interest.
@@ -2841,6 +2838,23 @@ impl SimulatedVenue {
             validate_time_in_force_supported(request.state.kind, request.state.time_in_force)
         {
             return (build_open_order_err_response(request, error), None);
+        }
+
+        // An order for nothing, or for less than nothing, is refused as a venue refuses it. Every
+        // path below takes the quantity as positive: a held order, for one, is released only to
+        // trade or rest some of it.
+        if request.state.quantity <= Decimal::ZERO {
+            let reason = format!(
+                "cannot open {} for {}: quantity {} is not positive",
+                request.key.instrument, request.key.exchange, request.state.quantity
+            );
+            return (
+                build_open_order_err_response(
+                    request,
+                    UnindexedOrderError::Rejected(ApiError::OrderRejected(reason)),
+                ),
+                None,
+            );
         }
 
         // Read out before the `&mut self` balance borrows below.
@@ -7397,6 +7411,41 @@ mod tests {
         );
 
         assert_eq!(first_unseeded_order_id(&account), u128::from(u64::MAX) + 1);
+    }
+
+    #[test]
+    fn an_order_for_a_quantity_that_is_not_positive_is_rejected_before_the_ledger_moves() {
+        for request in [
+            buy_request("0", market_prices("50000")),
+            sell_request("-1", market_prices("50000")),
+        ] {
+            let mut venue = make_venue("100", "10000000");
+            let quantity = request.state.quantity;
+
+            let outcome = venue.open_order(request);
+
+            assert_eq!(
+                rejection_reason(&outcome),
+                format!(
+                    "cannot open {} for {EXCHANGE}: quantity {quantity} is not positive",
+                    instrument_name()
+                )
+            );
+            assert!(outcome.events.is_empty(), "a refused order moves nothing");
+            assert!(venue.trades(time(0)).is_empty(), "and nothing traded");
+            assert!(venue.orders_open(&[]).is_empty(), "or rests");
+            assert_eq!(free_quote(&venue), d("10000000"));
+            assert_eq!(total_base(&venue), d("100"));
+        }
+
+        // Its kind is refused first: this venue holds no limit order, whatever its quantity.
+        let mut venue = make_venue("100", "10000000");
+        let outcome = venue.open_order(limit_request("limit", Side::Buy, "0", "50000", gtc()));
+        let reason = rejection_reason(&outcome);
+        assert!(
+            reason.contains("does not support OrderKind::Limit"),
+            "{reason}"
+        );
     }
 
     /// A [`RequestPriced`](VenueRegime::RequestPriced) venue rejects a limit order on its kind,
@@ -12076,22 +12125,39 @@ mod tests {
         );
     }
 
+    /// On a fresh market, and on a stale one, where it is refused rather than held for a release
+    /// with nothing to trade.
     #[test]
-    fn a_held_limit_order_with_nothing_to_trade_is_cancelled_at_its_release() {
-        let mut venue = venue_waiting();
-        advance(&mut venue, time(12));
-        let _ = venue.open_order(gtc_limit("empty", Side::Buy, "0", "105"));
+    fn an_order_for_a_quantity_that_is_not_positive_is_refused_rather_than_held() {
+        for (now, quantity) in [(1, "0"), (1, "-1"), (12, "0"), (12, "-1")] {
+            for request in [
+                gtc_limit("limit", Side::Buy, quantity, "105"),
+                gtc_buy("market", quantity),
+            ] {
+                let mut venue = venue_waiting();
+                advance(&mut venue, time(now));
 
-        let events = observe(&mut venue, 20, traded("102"));
+                let outcome = venue.open_order(request);
 
-        assert!(trades_in(&events).is_empty(), "{events:?}");
-        assert!(matches!(
-            &order_of(events.last().unwrap()).state,
-            OrderState::Inactive(InactiveOrderState::Cancelled(cancelled))
-                if cancelled.filled_quantity == Some(Decimal::ZERO)
-        ));
-        assert!(venue.account.orders().is_empty());
-        assert_eq!(free_quote(&venue), d("10000"));
+                assert_eq!(
+                    rejection_reason(&outcome),
+                    format!(
+                        "cannot open {} for {EXCHANGE}: quantity {quantity} is not positive",
+                        instrument_name()
+                    )
+                );
+                assert!(outcome.events.is_empty(), "a refused order moves nothing");
+                assert!(
+                    venue.account.orders().is_empty(),
+                    "and is neither held nor rested"
+                );
+                assert_eq!(free_quote(&venue), d("10000"));
+                assert!(
+                    observe(&mut venue, 20, traded("102")).is_empty(),
+                    "so a fresh observation has nothing to release"
+                );
+            }
+        }
     }
 
     #[test]

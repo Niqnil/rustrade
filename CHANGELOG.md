@@ -47,6 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses. Each now does. `stream::ExchangeStream` requires both the `stream` and `protocol`
   features; the rest of the `stream` module still needs only `stream`. CI now builds each feature
   alone.
+- **The simulated venue rejects an order for a zero or negative quantity** (`rustrade-execution`).
+  `SimulatedVenue::open_order`, and so `MockExecution` and the backtest, accepted one. It could
+  rest on the book, or be held under `StaleMarketPolicy::Wait` until the next fresh observation
+  cancelled it. It is now rejected on arrival with `ApiError::OrderRejected` naming the quantity,
+  and moves nothing, as a live venue rejects it.
 
 ## [0.14.0] - 2026-10-25
 
