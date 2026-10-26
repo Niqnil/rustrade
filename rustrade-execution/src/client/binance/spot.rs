@@ -50,6 +50,7 @@ use super::shared::{
     is_duplicate, is_unknown_order, log_unhandled_event, log_unrecognised_frame, new_dedup_cache,
     parse_user_data_frame, placed_order_state, recovered_order_cids, recovered_order_totals,
     response_decode_error, rest_call_with_retry, retry_or_end, trailing_params, unix_ms,
+    unreadable_answer,
 };
 use crate::rules::{OrderRules, PreSendRules};
 use crate::{
@@ -1202,12 +1203,12 @@ impl ExecutionClient for BinanceSpot {
                     let exchange_order_id = match data.order_id {
                         Some(id) => OrderId(format_smolstr!("{id}")),
                         None => {
-                            error!("BinanceSpot cancel response missing orderId");
                             return UnindexedOrderResponseCancel {
                                 key,
-                                state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
-                                    "cancel response missing orderId".into(),
-                                ))),
+                                state: Err(unreadable_answer(
+                                    ExchangeId::BinanceSpot,
+                                    "cancel answer has no orderId",
+                                )),
                             };
                         }
                     };
@@ -1224,15 +1225,10 @@ impl ExecutionClient for BinanceSpot {
                         state: Ok(Cancelled::new(exchange_order_id, time_exchange, filled_qty)),
                     }
                 }
-                Err(e) => {
-                    // serde_json deserialization failure on a successful response — not an API error
-                    UnindexedOrderResponseCancel {
-                        key,
-                        state: Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
-                            e.to_string(),
-                        ))),
-                    }
-                }
+                Err(e) => UnindexedOrderResponseCancel {
+                    key,
+                    state: Err(unreadable_answer(ExchangeId::BinanceSpot, &e.to_string())),
+                },
             },
             Err(e) => {
                 // binance-sdk routes both transport failures and venue responses with status
@@ -1455,7 +1451,6 @@ impl ExecutionClient for BinanceSpot {
                     let exchange_order_id = match data.order_id {
                         Some(id) => OrderId(format_smolstr!("{id}")),
                         None => {
-                            error!("BinanceSpot open_order response missing orderId");
                             return Order {
                                 key: order_key,
                                 side,
@@ -1463,10 +1458,9 @@ impl ExecutionClient for BinanceSpot {
                                 quantity,
                                 kind,
                                 time_in_force,
-                                state: OrderState::inactive(OrderError::Rejected(
-                                    ApiError::OrderRejected(
-                                        "open_order response missing orderId".into(),
-                                    ),
+                                state: OrderState::inactive(unreadable_answer(
+                                    ExchangeId::BinanceSpot,
+                                    "open_order answer has no orderId",
                                 )),
                             };
                         }
@@ -1502,20 +1496,18 @@ impl ExecutionClient for BinanceSpot {
                         state,
                     }
                 }
-                Err(e) => {
-                    // serde_json deserialization failure on a successful response — not an API error
-                    Order {
-                        key: order_key,
-                        side,
-                        price,
-                        quantity,
-                        kind,
-                        time_in_force,
-                        state: OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
-                            e.to_string(),
-                        ))),
-                    }
-                }
+                Err(e) => Order {
+                    key: order_key,
+                    side,
+                    price,
+                    quantity,
+                    kind,
+                    time_in_force,
+                    state: OrderState::inactive(unreadable_answer(
+                        ExchangeId::BinanceSpot,
+                        &e.to_string(),
+                    )),
+                },
             },
             Err(e) => {
                 // binance-sdk routes both transport failures and venue responses with status
@@ -5175,12 +5167,13 @@ mod tests {
         }
     }
 
-    /// A spot client whose WS-API order session connects to `ws_url`.
+    /// A spot client whose WS-API order session connects to `ws_url`. Its pre-send rules are off,
+    /// so an open reads no `exchangeInfo` from the production REST API.
     fn client_with_ws_api(ws_url: String) -> BinanceSpot {
-        let mut client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
-            "key".into(),
-            "secret".into(),
-        ));
+        let mut client = <BinanceSpot as ExecutionClient>::new(
+            BinanceSpotConfig::new("key".into(), "secret".into())
+                .with_pre_send_rules(PreSendRules::Off),
+        );
         client.ws_handle = SpotWsApi::from_config(
             ConfigurationWebsocketApi::builder()
                 .api_key("key")
@@ -5422,6 +5415,82 @@ mod tests {
         assert_rate_limited_for(&state, TWO_MINUTE_BAN);
         assert_cooldown_about(&client, TWO_MINUTE_BAN);
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// A WS-API success whose result has no `orderId`.
+    fn answered_without_an_order_id(request: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": request["id"],
+            "status": 200,
+            "result": { "symbol": "BTCUSDT", "clientOrderId": "cid" },
+        })
+    }
+
+    /// A WS-API success whose result does not decode: its `orderId` is not a number.
+    fn answered_undecodably(request: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": request["id"],
+            "status": 200,
+            "result": { "symbol": "BTCUSDT", "orderId": "not a number" },
+        })
+    }
+
+    /// An open the WS API answered with a success it cannot read was acted on, so its outcome is
+    /// unknown: `Connectivity`, not a refusal.
+    #[tokio::test]
+    async fn an_open_answered_unreadably_is_an_unknown_outcome() {
+        for answer in [answered_without_an_order_id, answered_undecodably] {
+            let (url, _) = ws_api_answering(answer).await;
+            let client = client_with_ws_api(url);
+            let instrument = InstrumentNameExchange::new("BTCUSDT");
+            let request = crate::order::OrderEvent {
+                key: OrderKey {
+                    exchange: ExchangeId::BinanceSpot,
+                    instrument: &instrument,
+                    strategy: StrategyId::new("strategy"),
+                    cid: ClientOrderId::new("cid"),
+                },
+                state: crate::order::request::RequestOpen::new(
+                    Side::Buy,
+                    Some(Decimal::new(50_000, 0)),
+                    Decimal::new(1, 3),
+                    OrderKind::Limit,
+                    TimeInForce::GoodUntilCancelled { post_only: false },
+                ),
+            };
+
+            let order = client.open_order(request).await;
+
+            assert!(
+                matches!(
+                    order.state,
+                    OrderState::Inactive(crate::order::state::InactiveOrderState::OpenFailed(
+                        OrderError::Connectivity(_)
+                    ))
+                ),
+                "{:?}",
+                order.state
+            );
+        }
+    }
+
+    /// A cancel the WS API answered with a success it cannot read was acted on, so whether the
+    /// order still works is unknown: `Connectivity`, not a refusal.
+    #[tokio::test]
+    async fn a_cancel_answered_unreadably_is_an_unknown_outcome() {
+        for answer in [answered_without_an_order_id, answered_undecodably] {
+            let (url, _) = ws_api_answering(answer).await;
+            let client = client_with_ws_api(url);
+            let instrument = InstrumentNameExchange::new("BTCUSDT");
+
+            let response = client.cancel_order(cancel_request(&instrument)).await;
+
+            assert!(
+                matches!(response.state, Err(OrderError::Connectivity(_))),
+                "{:?}",
+                response.state
+            );
+        }
     }
 
     /// A WS-API answer accepting a user-data subscription.

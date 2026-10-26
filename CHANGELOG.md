@@ -54,6 +54,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine retired the order on a timeout or connectivity error, so the venue's later report that
   the order was open was ignored as a late report. The order then rested and filled at the
   venue, but `Command::CancelOrders` sent no cancel for it. See the first entry under Changed.
+- **`BinanceMargin` reported every order that borrowed as rejected while it was live** (#730).
+  Binance answers an order placed with `MarginEffect::Borrow` (`MARGIN_BUY`) that borrowed with
+  `marginBuyBorrowAmount` as a decimal string, which the SDK's response type reads as an
+  integer. The answer failed to decode, and `open_order` returned `Rejected(OrderRejected)` for an
+  order that was resting or filled. The order is now sent through the client's own request, whose
+  answer reads only the fields the client uses. An order that borrowed nothing was not affected.
+- **A Binance order or cancel answered with a success that cannot be read is an unknown outcome,
+  not a refusal** (#730). An answer that does not decode, or has no `orderId`, now returns
+  `OrderError::Connectivity`, so the order stays in flight and is looked up, instead of
+  `Rejected`. The venue acted on the request. Applies to `BinanceMargin` and `BinanceSpot`, for
+  opens and cancels.
 
 ## [0.15.0] - 2026-10-26
 
