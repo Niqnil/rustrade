@@ -8072,11 +8072,11 @@ fn test_in_flight_deadline_reflags_once_after_restore() {
 }
 
 /// An open the `ExecutionManager` timed out may still have reached the venue. The engine keeps it
-/// in flight, and when the venue reports it open, tracks it: routes its fills, and cancels it on
-/// command.
+/// in flight, and when the venue reports it open, tracks it: routes its fills, ignores a lookup's
+/// late conclusion that the venue does not know it, and cancels it on command.
 #[test]
 fn test_open_timed_out_by_the_manager_is_tracked_when_the_venue_reports_it() {
-    use rustrade_execution::error::{ConnectivityError, OrderError};
+    use rustrade_execution::error::{ConnectivityError, NotPlacedReason, OrderError};
 
     let (execution_tx, mut execution_rx) = mpsc_unbounded();
     let mut engine = build_engine(TradingState::Disabled, execution_tx);
@@ -8152,6 +8152,36 @@ fn test_open_timed_out_by_the_manager_is_tracked_when_the_venue_reports_it() {
         .get(&PositionId::NETTING)
         .map(|position| position.quantity_abs);
     assert_eq!(position, Some(dec!(0.5)));
+
+    // The manager's lookup concluded the order unknown to the venue, but too late: the venue has
+    // reported it working since, so the order stays tracked and no rejection is counted.
+    let never_placed = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+            key: request.key.clone(),
+            side: request.state.side,
+            price: request.state.price,
+            quantity: request.state.quantity,
+            kind: request.state.kind,
+            time_in_force: request.state.time_in_force,
+            state: OrderState::inactive(OrderError::NotPlaced(NotPlacedReason::UnknownToVenue)),
+        })),
+    }));
+    process_with_audit(&mut engine, never_placed);
+    assert!(
+        matches!(tracked(&engine), Some(ActiveOrderState::Open(_))),
+        "{:?}",
+        tracked(&engine)
+    );
+    assert_eq!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&instrument)
+            .tear_sheet
+            .orders_rejected,
+        0
+    );
 
     process_with_audit(
         &mut engine,

@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `OrderError::NotPlaced(NotPlacedReason::UnknownToVenue)`. It concludes that only after
     several `Unknown` answers in a row, each past a grace period; a failed lookup never counts.
     Lookups that run out forward nothing more, and the in-flight deadline flags the order.
+    `NotPlaced` does not end an order the venue has already reported working, as when its report
+    arrives just before the lookup's conclusion. The IBKR client keeps routing the account
+    stream's status and fills of such an order while it is looked up.
   - The new `UnknownOutcomeLookup` sets the attempts, the first wait (each later one doubles),
     the `Unknown` answers that conclude, and the grace period. It is set per exchange with
     `AccountStreamOptions::with_unknown_outcome`; `ExecutionManager` gains an `unknown_outcome`

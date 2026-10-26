@@ -1314,9 +1314,11 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         // `InstrumentKey: Display`, and requiring those here would narrow this method's callers.
         //
         // An open whose outcome is unknown is not counted: it may be live. If the venue never
-        // placed it, the `ExecutionManager`'s lookup reports that later, and that is counted.
+        // placed it, the `ExecutionManager`'s lookup reports that later, and that is counted,
+        // unless the venue has meanwhile reported the order working, which `Orders` keeps.
         if let OrderState::Inactive(InactiveOrderState::OpenFailed(error)) = &order.0.state
             && !error.is_outcome_unknown()
+            && !self.orders.is_contradicted_never_placed(order.0)
         {
             self.tear_sheet.record_open_rejected(format!("{error:?}"));
         }

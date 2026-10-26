@@ -53,7 +53,9 @@ pub mod manager;
 /// An open whose outcome is unknown
 /// ([`OrderState::is_outcome_unknown`](rustrade_execution::order::state::OrderState::is_outcome_unknown))
 /// is not terminal: it changes nothing, and an `OpenInFlight` order stays in flight until the
-/// venue's report of it, or the `ExecutionManager`'s lookup, arrives.
+/// venue's report of it, or the `ExecutionManager`'s lookup, arrives. A report that the order was
+/// never placed ([`OrderError::NotPlaced`]) ends it only while the venue has not reported it
+/// working: a lookup can conclude the order unknown just as the venue's report of it arrives.
 ///
 /// # Retired orders stay retired
 ///
@@ -178,6 +180,71 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
                 ActiveOrderState::OpenInFlight(_) | ActiveOrderState::CancelInFlight(_)
             )
         })
+    }
+
+    /// Whether `snapshot` reports that its order was never placed
+    /// ([`OrderError::NotPlaced`]) while the order is tracked as one the venue has reported
+    /// working: `Open`, or `CancelInFlight` after it was. The venue's own report outweighs the
+    /// conclusion, so [`update_from_order_snapshot`](OrderManager::update_from_order_snapshot)
+    /// ignores such a snapshot.
+    pub(crate) fn is_contradicted_never_placed<AssetKey>(
+        &self,
+        snapshot: &Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>,
+    ) -> bool {
+        let OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::NotPlaced(_))) =
+            &snapshot.state
+        else {
+            return false;
+        };
+        self.0
+            .get(&snapshot.key.cid)
+            .is_some_and(|order| match &order.state {
+                ActiveOrderState::OpenInFlight(_) => false,
+                ActiveOrderState::Open(_) => true,
+                ActiveOrderState::CancelInFlight(cancel) => cancel.order.is_some(),
+            })
+    }
+
+    /// Whether `snapshot` is a failed open that `update_from_order_snapshot` leaves unapplied,
+    /// logging why.
+    fn is_failed_open_to_ignore<AssetKey>(
+        &self,
+        snapshot: &Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>,
+    ) -> bool
+    where
+        ExchangeKey: Debug,
+        AssetKey: Debug,
+        InstrumentKey: Debug,
+    {
+        // An open whose outcome is unknown says nothing about the order: the venue may hold it
+        // live. So it neither ends a tracked order nor retires the id, and the venue's later
+        // report of the order, or the `ExecutionManager`'s lookup of it, settles it.
+        if snapshot.state.is_outcome_unknown() {
+            debug!(
+                exchange = ?snapshot.key.exchange,
+                instrument = ?snapshot.key.instrument,
+                strategy = %snapshot.key.strategy,
+                cid = %snapshot.key.cid,
+                update = ?snapshot,
+                "OrderManager received an open whose outcome is unknown - leaving the order as it is"
+            );
+            return true;
+        }
+
+        // A report that the order was never placed is contradicted once the venue has reported
+        // the order working, so it does not end it: the venue's own reports settle the order.
+        if self.is_contradicted_never_placed(snapshot) {
+            warn!(
+                exchange = ?snapshot.key.exchange,
+                instrument = ?snapshot.key.instrument,
+                strategy = %snapshot.key.strategy,
+                cid = %snapshot.key.cid,
+                update = ?snapshot,
+                "OrderManager received a never-placed report for an order the venue reported working - ignoring"
+            );
+            return true;
+        }
+        false
     }
 
     /// Stop tracking the order under `cid` if it is `Open` as the venue order `id`, returning it.
@@ -307,18 +374,7 @@ where
     {
         let Snapshot(snapshot) = snapshot;
 
-        // An open whose outcome is unknown says nothing about the order: the venue may hold it
-        // live. So it neither ends a tracked order nor retires the id, and the venue's later
-        // report of the order, or the `ExecutionManager`'s lookup of it, settles it.
-        if snapshot.state.is_outcome_unknown() {
-            debug!(
-                exchange = ?snapshot.key.exchange,
-                instrument = ?snapshot.key.instrument,
-                strategy = %snapshot.key.strategy,
-                cid = %snapshot.key.cid,
-                update = ?snapshot,
-                "OrderManager received an open whose outcome is unknown - leaving the order as it is"
-            );
+        if self.is_failed_open_to_ignore(snapshot) {
             return;
         }
 
@@ -835,7 +891,7 @@ mod tests {
     use crate::{engine::state::order::Orders, test_utils::time_plus_secs};
     use rust_decimal_macros::dec;
     use rustrade_execution::{
-        error::{ConnectivityError, OrderError},
+        error::{ConnectivityError, NotPlacedReason, OrderError},
         order::{
             Order, OrderKey, OrderKind, TimeInForce,
             id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
@@ -1016,6 +1072,13 @@ mod tests {
     fn order_snapshot_outcome_unknown(
         cid: ClientOrderId,
     ) -> Snapshot<Order<ExchangeId, u64, OrderState<u64, u64>>> {
+        order_snapshot_open_failed(cid, OrderError::Connectivity(ConnectivityError::Timeout))
+    }
+
+    fn order_snapshot_open_failed(
+        cid: ClientOrderId,
+        error: OrderError<u64, u64>,
+    ) -> Snapshot<Order<ExchangeId, u64, OrderState<u64, u64>>> {
         Snapshot(Order {
             key: OrderKey {
                 exchange: ExchangeId::Simulated,
@@ -1028,7 +1091,7 @@ mod tests {
             quantity: Default::default(),
             kind: OrderKind::Market,
             time_in_force: TimeInForce::GoodUntilEndOfDay,
-            state: OrderState::inactive(OrderError::Connectivity(ConnectivityError::Timeout)),
+            state: OrderState::inactive(error),
         })
     }
 
@@ -2242,6 +2305,58 @@ mod tests {
             state.0.contains_key(&cid),
             "the unknown outcome did not retire the id, so the venue's report tracks the order"
         );
+    }
+
+    /// A report that an order was never placed ends it only while the venue has not reported it.
+    /// Once the venue has reported it working, as when its report beats a lookup that concluded
+    /// otherwise, the order stays tracked, so its later fills and its cancel still reach it.
+    #[test]
+    fn a_never_placed_report_ends_only_an_order_the_venue_has_not_reported() {
+        let time = DateTime::<Utc>::MIN_UTC;
+        let not_placed = [
+            OrderError::NotPlaced(NotPlacedReason::UnknownToVenue),
+            OrderError::NotPlaced(NotPlacedReason::NotSent(ConnectivityError::Timeout)),
+        ];
+        let reported = [
+            ActiveOrderState::Open(open(time)),
+            ActiveOrderState::CancelInFlight(CancelInFlight {
+                order: Some(open(time)),
+                time_sent: TIME_SENT,
+            }),
+        ];
+        let unreported = [
+            ActiveOrderState::OpenInFlight(OpenInFlight::new(TIME_SENT)),
+            ActiveOrderState::CancelInFlight(CancelInFlight {
+                order: None,
+                time_sent: TIME_SENT,
+            }),
+        ];
+        for error in not_placed {
+            for tracked in reported.clone() {
+                let cid = ClientOrderId::new("reported");
+                let mut state = orders([order(cid.clone(), tracked.clone())]);
+                state.update_from_order_snapshot(
+                    order_snapshot_open_failed(cid.clone(), error.clone()).as_ref(),
+                );
+                assert_eq!(
+                    state.0.get(&cid).map(|order| &order.state),
+                    Some(&tracked),
+                    "{error:?} must not end {tracked:?}"
+                );
+            }
+            for tracked in unreported.clone() {
+                let cid = ClientOrderId::new("unreported");
+                let mut state = orders([order(cid.clone(), tracked.clone())]);
+                state.update_from_order_snapshot(
+                    order_snapshot_open_failed(cid.clone(), error.clone()).as_ref(),
+                );
+                assert!(
+                    !state.0.contains_key(&cid),
+                    "{error:?} must end {tracked:?}"
+                );
+                assert!(state.1.contains(&cid), "and retire its id");
+            }
+        }
     }
 
     /// Every way `Orders` retires an order is remembered, so a stale listing that still shows
