@@ -51,6 +51,15 @@ ignore = [
     { id = "RUSTSEC-2026-0368", reason = "zip is an unenabled optional dep (ethers -> ethers-solc -> svm-rs); never compiled in this workspace" },
     { id = "RUSTSEC-2026-0369", reason = "zip is an unenabled optional dep (ethers -> ethers-solc -> svm-rs); never compiled in this workspace" },
 
+    # zstd-safe legacy-frame decompression advisory of 2026-10-16. Two copies are in Cargo.lock. The
+    # compiled one (8.x, via zstd 0.14 <- async-compression, databento, parquet) is bumped past the
+    # fix (>=8.2.0), so this entry covers only 5.0.2, which arrives through zip 0.6.6 -> zstd 0.11:
+    # the same never-compiled chain as the zip entries above (`cargo tree -i
+    # zstd@0.11.2+zstd.1.5.2 --workspace --all-features --target all` finds no path). The fix is in
+    # zstd-safe 8.2.0 only, which zip 0.6 cannot take. Drop this entry with the zip entries. If the
+    # compiled copy ever falls below 8.2.0, this ignore would hide it: re-check on any zstd bump.
+    { id = "RUSTSEC-2026-0403", reason = "zstd-safe 5.0.2 is an unenabled optional dep (zip -> zstd 0.11); never compiled in this workspace; the compiled 8.x copy is >=8.2.0" },
+
     # hyperliquid_rust_sdk transitive dependencies (no direct control)
     { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained; transitive via hyperliquid_rust_sdk" },
     { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; transitive via hyperliquid_rust_sdk" },
