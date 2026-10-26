@@ -67,7 +67,9 @@ pub enum MarginEffect {
 
 /// A loan a margin order took out when it was placed: `amount` of `asset`.
 ///
-/// `amount` is the loan's principal, as the venue reports lending it. It is not the order's net
+/// `amount` is the loan's principal, as the venue reports lending it: a reported zero is kept as
+/// zero, not read as no loan, and the amount need not equal what the order lacked. It is not the
+/// order's net
 /// effect on the balance: a fee the order pays in `asset` is not in it, and interest accrues on
 /// it from the moment it is lent. `asset` is the asset the order pays with, which may be the base
 /// or the quote asset of the pair.

@@ -539,8 +539,8 @@ impl BinanceMargin {
     /// this one to learn what an order placed with [`MarginEffect::Borrow`] borrowed, which
     /// Binance reports only in its answer to the order (`marginBuyBorrowAmount`,
     /// `marginBuyBorrowAsset`): see [`MarginPlacement::borrowed`]. Binance leaves them out when
-    /// the free balance covered the order. Read the amount rather than compute it from the
-    /// balance: Binance has been seen to lend a resting limit order more than its shortfall.
+    /// the free balance covered the order. The amount is what Binance reports lending, which need
+    /// not equal the order's shortfall, so read it rather than compute it from the balance.
     ///
     /// Mirrors [`BinanceSpot::open_order`](super::spot::BinanceSpot)'s contract: every failure is
     /// folded into the returned order's state as [`OrderState::inactive`], so the engine always
@@ -9053,19 +9053,19 @@ mod tests {
     fn borrowing_answer() -> serde_json::Value {
         serde_json::json!({
             "symbol": "BTCUSDT", "orderId": 7, "clientOrderId": "borrow",
-            "transactTime": 1_700_000_000_000_i64, "price": "0", "origQty": "0.00007",
-            "executedQty": "0.00007", "cummulativeQuoteQty": "5.72544", "status": "FILLED",
+            "transactTime": 1_700_000_000_000_i64, "price": "0", "origQty": "0.0001",
+            "executedQty": "0.0001", "cummulativeQuoteQty": "8", "status": "FILLED",
             "timeInForce": "GTC", "type": "MARKET", "side": "SELL", "isIsolated": false,
             "selfTradePreventionMode": "EXPIRE_MAKER",
-            "marginBuyBorrowAmount": "0.00006029", "marginBuyBorrowAsset": "BTC",
+            "marginBuyBorrowAmount": "0.00004321", "marginBuyBorrowAsset": "BTC",
             "fills": [{
-                "price": "81792", "qty": "0.00007", "commission": "0.00572544",
+                "price": "80000", "qty": "0.0001", "commission": "0.008",
                 "commissionAsset": "USDT", "tradeId": 1,
             }],
         })
     }
 
-    /// A market sell of 0.00007 BTCUSDT that borrows what it lacks.
+    /// A market sell of 0.0001 BTCUSDT that borrows what it lacks.
     fn borrowing_request(
         instrument: &InstrumentNameExchange,
     ) -> OrderRequestOpen<ExchangeId, &InstrumentNameExchange> {
@@ -9073,7 +9073,7 @@ mod tests {
         request.state.side = Side::Sell;
         request.state.kind = OrderKind::Market;
         request.state.price = None;
-        request.state.quantity = dec!(0.00007);
+        request.state.quantity = dec!(0.0001);
         request.state.margin_effect = Some(MarginEffect::Borrow);
         request
     }
@@ -9098,7 +9098,7 @@ mod tests {
         for (answer, expected) in [
             (
                 borrowing_answer(),
-                Some(MarginBorrow::new(btc.clone(), dec!(0.00006029))),
+                Some(MarginBorrow::new(btc.clone(), dec!(0.00004321))),
             ),
             (as_a_number, Some(MarginBorrow::new(btc, dec!(5)))),
             (
@@ -9151,7 +9151,7 @@ mod tests {
             panic!("expected a filled order, got {placed:?}");
         };
         assert_eq!(filled.id, OrderId::new("7"));
-        assert_eq!(filled.filled_quantity, dec!(0.00007));
+        assert_eq!(filled.filled_quantity, dec!(0.0001));
     }
 
     /// An open answered with a success that cannot be read was acted on, so its outcome is
