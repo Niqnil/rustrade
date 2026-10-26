@@ -100,9 +100,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answer reads only the fields the client uses. An order that borrowed nothing was not affected.
 - **A Binance order or cancel answered with a success that cannot be read is an unknown outcome,
   not a refusal** (#730). An answer that does not decode, or has no `orderId`, now returns
-  `OrderError::Connectivity`, so the order stays in flight and is looked up, instead of
-  `Rejected`. The venue acted on the request. Applies to `BinanceMargin` and `BinanceSpot`, for
-  opens and cancels.
+  `OrderError::Connectivity` instead of `Rejected`: the venue acted on the request. An open then
+  stays in flight and is looked up. A cancel leaves the order open either way, until the venue
+  reports it. Applies to `BinanceMargin` and `BinanceSpot`, for opens and cancels.
 
 ## [0.15.0] - 2026-10-26
 
