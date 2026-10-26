@@ -2879,6 +2879,10 @@ impl ExecutionClient for IbkrClient {
     /// [`account_stream`](Self::account_stream), no order is reported ended, and an id is held
     /// until reaped.
     ///
+    /// An open whose outcome is unknown ([`OrderError::is_outcome_unknown`]) keeps holding its id,
+    /// as TWS may hold the order. If the order was never placed, the id is held until reaped, so
+    /// retry such an open under a new id.
+    ///
     /// A cancel names the live order under its id, so cancelling a filled order's id once it is
     /// freed is refused locally as not found, rather than at TWS.
     ///
