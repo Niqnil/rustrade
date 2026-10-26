@@ -2157,6 +2157,37 @@ mod tests {
     }
 
     #[test]
+    fn the_unknown_outcome_option_is_set_and_shown() {
+        let policy = UnknownOutcomeLookup::default().with_attempts(9);
+        let options = AccountStreamOptions::default().with_unknown_outcome(policy);
+        assert_eq!(options.unknown_outcome, policy);
+        assert_eq!(
+            AccountStreamOptions::default().unknown_outcome,
+            UnknownOutcomeLookup::default()
+        );
+
+        let (response_tx, _response_rx) = mpsc_unbounded();
+        let manager = ExecutionManager {
+            request_stream: futures::stream::empty::<ExecutionRequest>(),
+            request_timeout: std::time::Duration::from_secs(5),
+            unknown_outcome: policy,
+            response_tx,
+            client: Arc::new(RejectingClient::default()),
+            indexer: AccountEventIndexer::new(Arc::new(
+                generate_execution_instrument_map(
+                    &IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]),
+                    EXCHANGE,
+                )
+                .unwrap(),
+            )),
+            account_stream: futures::stream::empty().boxed(),
+        };
+        let debug = format!("{manager:?}");
+        assert!(debug.starts_with("ExecutionManager"), "{debug}");
+        assert!(debug.contains("attempts: 9"), "{debug}");
+    }
+
+    #[test]
     fn the_clock_has_a_debug_form() {
         assert_eq!(format!("{:?}", Clock::default()), "Clock(..)");
     }

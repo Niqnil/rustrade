@@ -186,3 +186,42 @@ where
     }
     LookupOutcome::Exhausted
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_setter_sets_its_field_alone() {
+        let set = UnknownOutcomeLookup::default()
+            .with_attempts(7)
+            .with_first_delay(Duration::from_millis(250))
+            .with_unknowns_to_conclude(4)
+            .with_grace(Duration::from_secs(9));
+        assert_eq!(
+            set,
+            UnknownOutcomeLookup {
+                attempts: 7,
+                first_delay: Duration::from_millis(250),
+                unknowns_to_conclude: 4,
+                grace: Duration::from_secs(9),
+            }
+        );
+    }
+
+    #[test]
+    fn longest_sums_the_doubling_waits_and_a_timeout_per_lookup() {
+        let policy = UnknownOutcomeLookup::default()
+            .with_attempts(3)
+            .with_first_delay(Duration::from_millis(500));
+        // Waits of 0.5, 1 and 2 s, each lookup given 3 s.
+        assert_eq!(
+            policy.longest(Duration::from_secs(3)),
+            Duration::from_millis(500 + 1_000 + 2_000 + 3 * 3_000)
+        );
+        assert_eq!(
+            policy.with_attempts(0).longest(Duration::from_secs(3)),
+            Duration::ZERO
+        );
+    }
+}
