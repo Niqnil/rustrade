@@ -70,6 +70,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   A cancel is classified the same way, so a cancel that failed after the send is now
   `Connectivity` instead of `Rejected`. The order stays open either way.
+
+  Perp and spot now answer `OrderStatusClient::fetch_order_status` with one `orderStatus`
+  request (weight 2), which reports a live order as well as an ended one. The provided method
+  also listed the open orders (weight 20 per DEX) whenever the order had not ended, which every
+  lookup of an order the venue never received did.
 - **An open whose outcome was unknown was remembered by the client as ended** (#728). Then a
   later account-stream report of the order as live did not add it back to the orders the client
   holds live, which a reconnect asks the venue about. Seen with IBKR since #726, and with

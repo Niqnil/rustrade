@@ -107,13 +107,15 @@ pub fn map_sdk_error(error: hyperliquid_rust_sdk::Error) -> UnindexedClientError
 /// [`Error::JsonParse`](hyperliquid_rust_sdk::Error::JsonParse), holding the underlying error's
 /// text: a failure to send the request or to read the answer, an HTTP 4xx or 5xx, and an answer
 /// that does not parse. So its text decides:
-/// - **An HTTP 4xx is a refusal.** The request was turned away, and Hyperliquid acts on an
-///   `/exchange` request only when it answers 200. A 429 is [`ApiError::RateLimit`]; any other
-///   4xx is classified as below.
+/// - **An HTTP 4xx is a refusal.** The request was turned away: Hyperliquid answers an
+///   `/exchange` request it acts on with 200, refusals included. This rests on the venue's
+///   behaviour; a proxy in between that forwarded the request and then answered 4xx would be
+///   misread. A 429 is [`ApiError::RateLimit`]; any other 4xx is classified as below.
 /// - **Anything else in `JsonParse` is [`OrderError::Connectivity`]**: the request may have
 ///   reached the venue, so its outcome is unknown, and the engine looks an open up by its client
-///   order id. `JsonParse` also covers encoding the request before the send, which the requests
-///   this client builds do not fail; if one did, the lookups would find the order never placed.
+///   order id. `JsonParse` also covers encoding and building the request before the send, which
+///   the requests this client builds do not fail; if one did, the lookups would find the order
+///   never placed.
 ///
 /// Every other variant fails before the request is sent (an asset the SDK does not list,
 /// signing, a number it cannot encode, ...), so it is a refusal too.
@@ -138,14 +140,17 @@ pub fn map_order_error(
     }
 }
 
-/// What the SDK's text for an HTTP 4xx answer (`Error::ClientRequest`) starts with, followed by
-/// the status code.
+/// What the SDK's text for an HTTP 4xx answer (`Error::ClientRequest`'s `Display`) starts with,
+/// followed by the status code and a comma.
+///
+/// The SDK's text is the contract here: if it changed, a 4xx would read as an unknown outcome.
+/// The tests build their input from the SDK's own `Display`, so such a change fails them.
 const CLIENT_ERROR_PREFIX: &str = "Client error: status code: ";
 
 /// The HTTP status of a 4xx answer, read from the text the SDK's `/exchange` post wraps in
 /// `JsonParse`. `None` for any other text.
 fn client_error_status(text: &str) -> Option<u16> {
-    let status = text.strip_prefix(CLIENT_ERROR_PREFIX)?.split(',').next()?;
+    let (status, _) = text.strip_prefix(CLIENT_ERROR_PREFIX)?.split_once(',')?;
     status
         .parse()
         .ok()
@@ -418,24 +423,23 @@ mod tests {
     #[test]
     fn any_other_failure_after_the_send_has_an_unknown_outcome() {
         let instrument = InstrumentNameExchange::from("BTC-USDC-PERP");
-        for error in [
-            after_the_send(Error::ServerRequest {
+        for text in [
+            Error::ServerRequest {
                 status_code: 502,
                 error_message: "Bad Gateway".to_owned(),
-            }),
-            after_the_send(Error::GenericRequest(
+            }
+            .to_string(),
+            Error::GenericRequest(
                 "error sending request for url (https://api.hyperliquid.xyz/exchange)".to_owned(),
-            )),
-            Error::JsonParse("expected value at line 1 column 1".to_owned()),
-            Error::JsonParse(format!("{CLIENT_ERROR_PREFIX}500, error code: None")),
-            Error::JsonParse(format!("{CLIENT_ERROR_PREFIX}abc, error code: None")),
-            Error::JsonParse(format!("{CLIENT_ERROR_PREFIX}399, error code: None")),
+            )
+            .to_string(),
+            "expected value at line 1 column 1".to_owned(),
+            format!("{CLIENT_ERROR_PREFIX}500, error code: None"),
+            format!("{CLIENT_ERROR_PREFIX}abc, error code: None"),
+            format!("{CLIENT_ERROR_PREFIX}399, error code: None"),
+            format!("{CLIENT_ERROR_PREFIX}422 without a comma"),
         ] {
-            let text = match &error {
-                Error::JsonParse(text) => text.clone(),
-                _ => unreachable!(),
-            };
-            let mapped = map_order_error(error, &instrument);
+            let mapped = map_order_error(Error::JsonParse(text.clone()), &instrument);
             assert_eq!(
                 mapped,
                 UnindexedOrderError::Connectivity(ConnectivityError::Socket(text.clone())),

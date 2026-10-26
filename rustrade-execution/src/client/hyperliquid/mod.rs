@@ -207,7 +207,7 @@ use crate::{
     AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
     UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::AssetBalance,
-    client::{ExecutionClient, OrderStatusClient},
+    client::{ExecutionClient, OrderStatusClient, VenueOrderStatus},
     emit_stream_terminated,
     error::{
         ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
@@ -237,8 +237,8 @@ use funding::{funding_cash_flow, send_fundings};
 use futures::{StreamExt, stream::BoxStream};
 use hyperliquid_rust_sdk::{ExchangeClient, InfoClient, Message, Subscription};
 use order_recovery::{
-    ReconnectWatch, fetch_order_record, listed_cids, lookup_from_record, remember_open,
-    remember_snapshot, send_fills, send_observed, spawn_order_checks,
+    ReconnectWatch, fetch_order_record, listed_cids, lookup_of, remember_open, remember_snapshot,
+    send_fills, send_observed, spawn_order_checks, status_from_record, unreadable_record,
 };
 use perp_account::{account_mode, dex_states};
 use perp_dexes::{PerpDexes, UnconfiguredDexes, warn_unconfigured_dexes};
@@ -1388,6 +1388,26 @@ impl OrderStatusClient for HyperliquidClient {
         })
         .await
     }
+
+    /// One `orderStatus` (weight 2), which reports a live order as well as an ended one, read
+    /// as [`fetch_ended_orders`](OrderStatusClient::fetch_ended_orders) reads it.
+    ///
+    /// # Errors
+    ///
+    /// When the lookup fails, or Hyperliquid's record of the order does not convert.
+    async fn fetch_order_status(
+        &self,
+        key: &UnindexedOrderKey,
+    ) -> Result<VenueOrderStatus, UnindexedClientError> {
+        perp_order_status(
+            self.info_client.clone(),
+            self.dexes.clone(),
+            self.wallet_h160(),
+            key.clone(),
+        )
+        .await?
+        .ok_or_else(|| unreadable_record(&key.cid))
+    }
 }
 
 /// Look the order under `key` up with `orderStatus`, on the perpetual its coin names.
@@ -1397,11 +1417,24 @@ async fn perp_order_lookup(
     address: ethers::types::H160,
     key: UnindexedOrderKey,
 ) -> Result<OrderLookup, UnindexedClientError> {
+    Ok(lookup_of(
+        perp_order_status(info_client, dexes, address, key).await?,
+    ))
+}
+
+/// What `orderStatus` says of the order under `key`, on the perpetual its coin names: see
+/// `status_from_record`.
+async fn perp_order_status(
+    info_client: Arc<InfoClient>,
+    dexes: Arc<PerpDexes>,
+    address: ethers::types::H160,
+    key: UnindexedOrderKey,
+) -> Result<Option<VenueOrderStatus>, UnindexedClientError> {
     let Some(record) = fetch_order_record(&info_client, address, &key.cid).await? else {
-        return Ok(OrderLookup::Unknown);
+        return Ok(Some(VenueOrderStatus::Unknown));
     };
     let instrument = dexes.instrument(&record.order.coin);
-    Ok(lookup_from_record(key, &record, instrument))
+    Ok(status_from_record(key, &record, instrument))
 }
 
 /// The client order ids `openOrders` (weight 20 per DEX traded) lists on the perpetuals
@@ -1651,6 +1684,44 @@ mod tests {
             };
             assert_eq!(order.key, key());
             assert!(matches!(order.state, InactiveOrderState::Cancelled(_)));
+        }
+
+        /// One `orderStatus` answers a lookup, live, ended or unknown, without listing the open
+        /// orders; a record that does not convert is an error, never `Unknown`.
+        #[tokio::test]
+        async fn a_perp_order_status_is_one_order_status_request() {
+            let answer = |status: &str| {
+                serde_json::json!({
+                    "status": "order",
+                    "order": record_json("BTC", status, "0.01", Some(CLOID)),
+                })
+            };
+            for (body, expected) in [
+                (answer("open"), "live"),
+                (answer("canceled"), "ended"),
+                (serde_json::json!({"status": "unknownOid"}), "unknown"),
+                (answer("aStatusAddedLater"), "error"),
+            ] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path("/info"))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                    .mount(&server)
+                    .await;
+                let client = client_against(&server, HashMap::new()).await;
+
+                let status = client.fetch_order_status(&key()).await;
+
+                let found = match &status {
+                    Ok(VenueOrderStatus::Live(order)) if order.key == key() => "live",
+                    Ok(VenueOrderStatus::Ended(order)) if order.key == key() => "ended",
+                    Ok(VenueOrderStatus::Unknown) => "unknown",
+                    Err(UnindexedClientError::Internal(_)) => "error",
+                    _ => "other",
+                };
+                assert_eq!(found, expected, "{status:?}");
+                assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            }
         }
 
         #[tokio::test]

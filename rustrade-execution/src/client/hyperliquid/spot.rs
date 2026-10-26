@@ -87,8 +87,8 @@ use super::common::{
 use super::config::HyperliquidConfig;
 use super::error::{map_order_error, map_sdk_error, order_outcome_unanswered, order_rejection};
 use super::order_recovery::{
-    ReconnectWatch, fetch_order_record, listed_cids, lookup_from_record, remember_open,
-    remember_snapshot, send_fills, send_observed, spawn_order_checks,
+    ReconnectWatch, fetch_order_record, listed_cids, lookup_of, remember_open, remember_snapshot,
+    send_fills, send_observed, spawn_order_checks, status_from_record, unreadable_record,
 };
 use super::precision::{OrderPrecision, WireOrderError, wire_order};
 use super::spot_coins::{SpotCoins, spot_pair};
@@ -100,7 +100,7 @@ use crate::{
     AccountEvent, AccountEventKind, AccountSnapshot, UnindexedAccountEvent,
     UnindexedAccountSnapshot,
     balance::AssetBalance,
-    client::{ExecutionClient, OrderStatusClient},
+    client::{ExecutionClient, OrderStatusClient, VenueOrderStatus},
     emit_stream_terminated,
     error::{
         ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
@@ -1133,6 +1133,27 @@ impl OrderStatusClient for HyperliquidSpotClient {
         })
         .await
     }
+
+    /// One `orderStatus` (weight 2), which reports a live order as well as an ended one, read
+    /// as [`fetch_ended_orders`](OrderStatusClient::fetch_ended_orders) reads it.
+    ///
+    /// # Errors
+    ///
+    /// When the lookup fails, the order is on a spot coin missing from `spotMeta`, or
+    /// Hyperliquid's record of the order does not convert.
+    async fn fetch_order_status(
+        &self,
+        key: &UnindexedOrderKey,
+    ) -> Result<VenueOrderStatus, UnindexedClientError> {
+        spot_order_status(
+            self.info_client.clone(),
+            self.spot_coins.clone(),
+            self.wallet_h160(),
+            key.clone(),
+        )
+        .await?
+        .ok_or_else(|| unreadable_record(&key.cid))
+    }
 }
 
 /// Look the order under `key` up with `orderStatus`, on the spot pair its coin names.
@@ -1146,13 +1167,30 @@ async fn spot_order_lookup(
     address: ethers::types::H160,
     key: UnindexedOrderKey,
 ) -> Result<OrderLookup, UnindexedClientError> {
+    Ok(lookup_of(
+        spot_order_status(info_client, spot_coins, address, key).await?,
+    ))
+}
+
+/// What `orderStatus` says of the order under `key`, on the spot pair its coin names: see
+/// `status_from_record`.
+///
+/// # Errors
+///
+/// When the lookup fails, or the order is on a spot coin missing from `spotMeta`.
+async fn spot_order_status(
+    info_client: Arc<InfoClient>,
+    spot_coins: SpotCoins,
+    address: ethers::types::H160,
+    key: UnindexedOrderKey,
+) -> Result<Option<VenueOrderStatus>, UnindexedClientError> {
     let Some(record) = fetch_order_record(&info_client, address, &key.cid).await? else {
-        return Ok(OrderLookup::Unknown);
+        return Ok(Some(VenueOrderStatus::Unknown));
     };
     let coin = record.order.coin.as_str();
     let pairs = spot_coins.covering([coin]).await;
     let instrument = spot_pair(&pairs, coin)?.map(spot_pair_to_instrument);
-    Ok(lookup_from_record(key, &record, instrument))
+    Ok(status_from_record(key, &record, instrument))
 }
 
 /// The client order ids `openOrders` (weight 20) lists on the spot `instruments`, for a
@@ -1442,6 +1480,54 @@ mod tests {
             assert!(matches!(order.state, InactiveOrderState::Cancelled(_)));
         }
 
+        /// One `orderStatus` answers a lookup without listing the open orders; a record that does
+        /// not convert is an error, never `Unknown`.
+        #[tokio::test]
+        async fn a_spot_order_status_is_one_order_status_request() {
+            use super::super::super::common::info_tests::{exchange_client_against, test_wallet};
+            use super::super::super::config::Network;
+
+            for (status, live) in [("open", true), ("aStatusAddedLater", false)] {
+                let (server, info_client, spot_coins) = serve(serde_json::json!({
+                    "status": "order",
+                    "order": record_json("@107", status, "0.01", Some(CLOID)),
+                }))
+                .await;
+                let client = HyperliquidSpotClient {
+                    config: HyperliquidConfig::new(test_wallet(), Network::Testnet),
+                    spot_coins,
+                    info_client,
+                    exchange_client: Arc::new(
+                        exchange_client_against(server.uri(), std::collections::HashMap::new())
+                            .await,
+                    ),
+                    known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidSpot),
+                };
+
+                let found = client.fetch_order_status(&key()).await;
+
+                if live {
+                    assert!(
+                        matches!(&found, Ok(VenueOrderStatus::Live(order)) if order.key == key()),
+                        "{found:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(found, Err(UnindexedClientError::Internal(_))),
+                        "{found:?}"
+                    );
+                }
+                let lookups = server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|request| !String::from_utf8_lossy(&request.body).contains("spotMeta"))
+                    .count();
+                assert_eq!(lookups, 1, "{status}");
+            }
+        }
+
         #[tokio::test]
         async fn a_spot_lookup_of_a_perp_order_is_unknown() {
             let (_server, client, coins) = serve(order_status("BTC")).await;
@@ -1532,6 +1618,11 @@ mod tests {
         /// A spot client on [`TEST_SPOT_META`]'s pairs whose exchange endpoint answers every
         /// request with `body`.
         async fn client_responding(body: serde_json::Value) -> (MockServer, HyperliquidSpotClient) {
+            client_with(ResponseTemplate::new(200).set_body_json(body)).await
+        }
+
+        /// [`client_responding`], with the exchange endpoint giving `response`.
+        async fn client_with(response: ResponseTemplate) -> (MockServer, HyperliquidSpotClient) {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/info"))
@@ -1542,7 +1633,7 @@ mod tests {
                 .await;
             Mock::given(method("POST"))
                 .and(path("/exchange"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .respond_with(response)
                 .mount(&server)
                 .await;
             let info_client = Arc::new(info_client_against(server.uri()).await);
@@ -1625,6 +1716,29 @@ mod tests {
                     order.state
                 );
             }
+        }
+
+        /// A 5xx may have reached the venue, so its outcome is unknown; a 4xx turned the
+        /// request away, so it is refused.
+        #[tokio::test]
+        async fn a_spot_order_failing_after_the_send_is_unknown_unless_turned_away() {
+            let (_server, client) = client_with(ResponseTemplate::new(502)).await;
+            let order = place_hype(&client, dec!(10), dec!(1)).await;
+            assert!(order.state.is_outcome_unknown(), "{:?}", order.state);
+
+            let (_server, client) =
+                client_with(ResponseTemplate::new(422).set_body_string("bad request")).await;
+            let order = place_hype(&client, dec!(10), dec!(1)).await;
+            assert!(
+                matches!(
+                    order.state,
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                        ApiError::OrderRejected(_)
+                    )))
+                ),
+                "{:?}",
+                order.state
+            );
         }
 
         async fn place_hype(
@@ -1864,6 +1978,13 @@ mod tests {
         async fn cancel_answered(
             answer: serde_json::Value,
         ) -> (UnindexedOrderResponseCancel, bool) {
+            cancel_responded(ResponseTemplate::new(200).set_body_json(answer)).await
+        }
+
+        /// [`cancel_answered`], with the exchange endpoint giving `response`.
+        async fn cancel_responded(
+            response: ResponseTemplate,
+        ) -> (UnindexedOrderResponseCancel, bool) {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .and(path("/info"))
@@ -1874,7 +1995,7 @@ mod tests {
                 .await;
             Mock::given(method("POST"))
                 .and(path("/exchange"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+                .respond_with(response)
                 .mount(&server)
                 .await;
             let info_client = Arc::new(info_client_against(server.uri()).await);
@@ -1922,6 +2043,29 @@ mod tests {
                 .await;
             let live = client.known_live.lock().contains(&key.cid);
             (response, live)
+        }
+
+        #[tokio::test]
+        async fn a_spot_cancel_failing_after_the_send_has_an_unknown_outcome() {
+            let (response, live) = cancel_responded(ResponseTemplate::new(503)).await;
+            assert!(
+                matches!(response.state, Err(UnindexedOrderError::Connectivity(_))),
+                "{:?}",
+                response.state
+            );
+            assert!(live, "the order is still held live");
+
+            let (response, live) =
+                cancel_responded(ResponseTemplate::new(422).set_body_string("bad request")).await;
+            assert!(
+                matches!(
+                    response.state,
+                    Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(_)))
+                ),
+                "{:?}",
+                response.state
+            );
+            assert!(live, "the order is still held live");
         }
 
         #[tokio::test]

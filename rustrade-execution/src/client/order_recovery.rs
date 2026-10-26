@@ -358,6 +358,7 @@ impl KnownLiveOrders {
                 self.live(key, quantity, kind, open);
             }
             OrderState::Active(_) => {}
+            // Not an end: the order may be live, so a later live report must still be held.
             OrderState::Inactive(_) if state.is_outcome_unknown() => {}
             OrderState::Inactive(_) => {
                 self.ended(&key.cid);
