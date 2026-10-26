@@ -3,8 +3,8 @@ use crate::{
     balance::AssetBalance,
     client::{ExecutionClient, OrderStatusClient},
     error::{
-        ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
-        UnindexedOrderError,
+        ConnectivityError, NotPlacedReason, OrderError, StreamTerminationReason,
+        UnindexedClientError, UnindexedOrderError,
     },
     exchange::mock::request::MockExchangeRequest,
     fee::{FeeAssetConfig, FeeModelConfig, SpotFeeAsset},
@@ -304,6 +304,7 @@ where
             ))
             .is_err()
         {
+            // The venue's channel is closed, so the request never reached it.
             return Order {
                 key: request.key,
                 side: request.state.side,
@@ -311,9 +312,9 @@ where
                 quantity: request.state.quantity,
                 kind: request.state.kind,
                 time_in_force: request.state.time_in_force,
-                state: OrderState::inactive(OrderError::Connectivity(
+                state: OrderState::inactive(OrderError::NotPlaced(NotPlacedReason::NotSent(
                     ConnectivityError::ExchangeOffline(self.mocked_exchange),
-                )),
+                ))),
             };
         }
 

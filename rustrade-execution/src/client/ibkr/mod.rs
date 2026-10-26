@@ -160,7 +160,8 @@ use crate::{
         order_recovery::{KnownLiveOrders, SharedKnownLiveOrders},
     },
     error::{
-        ApiError, ConnectivityError, OrderError, StreamTerminationReason, UnindexedClientError,
+        ApiError, ConnectivityError, NotPlacedReason, OrderError, StreamTerminationReason,
+        UnindexedClientError,
     },
     order::{
         Order, OrderKey, OrderKind, TimeInForce, UnindexedOrderSnapshot,
@@ -1099,10 +1100,12 @@ fn panic_message(panic_info: &(dyn std::any::Any + Send)) -> String {
 /// before TWS acknowledged anything, carrying `message` as the reason.
 ///
 /// A dropped or reconnecting transport (`ConnectionReset`, `Io`) is a transient
-/// [`OrderError::Connectivity`]: the request did not reach TWS and may be retried
-/// once the connection is back. `Shutdown` and `ConnectionFailed` mean ibapi has
-/// given up reconnecting, so they are non-transient, like any other refusal
-/// ([`ApiError::OrderRejected`]).
+/// [`OrderError::Connectivity`], which may be retried once the connection is back.
+/// ibapi raises `ConnectionReset` before writing anything, so that request did not
+/// reach TWS; `Io` comes from the write itself, which may have sent part of it. An
+/// open refused with `ConnectionReset` is reported by [`open_send_error`] instead.
+/// `Shutdown` and `ConnectionFailed` mean ibapi has given up reconnecting, so they
+/// are non-transient, like any other refusal ([`ApiError::OrderRejected`]).
 ///
 /// # Known limitation
 ///
@@ -1118,6 +1121,20 @@ fn send_error<AssetKey, InstrumentKey>(
         OrderError::Connectivity(ConnectivityError::Socket(message))
     } else {
         OrderError::Rejected(ApiError::OrderRejected(message))
+    }
+}
+
+/// Classify the error from a `place_order` that failed before TWS acknowledged
+/// anything, as [`send_error`] does, except that a `ConnectionReset` says the order
+/// was not placed: ibapi refuses the send with it before writing anything.
+fn open_send_error<AssetKey, InstrumentKey>(
+    e: &ibapi::Error,
+    message: String,
+) -> OrderError<AssetKey, InstrumentKey> {
+    if matches!(e, ibapi::Error::ConnectionReset) {
+        OrderError::NotPlaced(NotPlacedReason::NotSent(ConnectivityError::Socket(message)))
+    } else {
+        send_error(e, message)
     }
 }
 
@@ -2997,7 +3014,7 @@ impl ExecutionClient for IbkrClient {
         let result = tokio::task::spawn_blocking(move || {
             let sub = match client.place_order(ib_order_id, &contract, &ib_order) {
                 Ok(s) => s,
-                Err(e) => return Err(send_error(&e, e.to_string())),
+                Err(e) => return Err(open_send_error(&e, e.to_string())),
             };
 
             match await_order_placement(sub.timeout_iter_data(PLACEMENT_STATUS_TIMEOUT)) {
@@ -4362,6 +4379,10 @@ mod order_status_tests {
             "io".into(),
         );
         assert!(io.is_transient());
+        assert!(
+            io.is_outcome_unknown(),
+            "a failed write may have sent part of it"
+        );
 
         // ibapi has given up reconnecting: retrying cannot succeed.
         for e in [
@@ -4378,6 +4399,26 @@ mod order_status_tests {
             );
             assert!(!rejected.is_transient(), "{label}");
         }
+    }
+
+    /// An open ibapi refused with `ConnectionReset` was never written, so the order was not
+    /// placed. Every other send error is classified as for a cancel, an `Io` one leaving the
+    /// outcome unknown.
+    #[test]
+    fn open_send_error_reports_a_refused_send_as_not_placed() {
+        let refused: OrderError<AssetNameExchange, InstrumentNameExchange> =
+            open_send_error(&ibapi::Error::ConnectionReset, "down".into());
+        assert!(matches!(
+            &refused,
+            OrderError::NotPlaced(NotPlacedReason::NotSent(ConnectivityError::Socket(m))) if m == "down"
+        ));
+        assert!(!refused.is_outcome_unknown());
+
+        let io: OrderError<AssetNameExchange, InstrumentNameExchange> = open_send_error(
+            &ibapi::Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            "io".into(),
+        );
+        assert!(io.is_outcome_unknown());
     }
 
     /// Regression anchors: the statuses that were already decisive must keep

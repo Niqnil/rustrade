@@ -30,6 +30,9 @@ pub mod paper;
 /// Defines an `ExecutionRequest` used by the `Engine` to communicate with an `ExecutionManager`.
 pub mod request;
 
+/// Settles an open request whose outcome is unknown, by looking the order up at the venue.
+pub mod unknown_outcome;
+
 /// Deterministic, synchronous driver for simulated venues, used in place of the task-and-channel
 /// execution path when a run must be reproducible.
 pub mod sim;

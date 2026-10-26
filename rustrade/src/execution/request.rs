@@ -21,8 +21,11 @@ pub enum ExecutionRequest<ExchangeKey = ExchangeIndex, InstrumentKey = Instrumen
     /// Finish what is in flight, forward the account events that produced, then stop.
     ///
     /// The manager stops accepting new requests, awaits every in-flight open and cancel (each
-    /// bounded by its `request_timeout`, so this cannot hang), forwards the account events already
-    /// made available alongside those responses, and only then closes its channel.
+    /// bounded by its `request_timeout`) and every lookup of an open whose outcome came back
+    /// unknown (bounded by its
+    /// [`UnknownOutcomeLookup`](crate::execution::unknown_outcome::UnknownOutcomeLookup)), so this
+    /// cannot hang. It forwards the account events already made available alongside those
+    /// responses, and only then closes its channel.
     ///
     /// # Why this is distinct from [`Shutdown`](Self::Shutdown)
     /// Closing the channel is how a manager reports "I am finished", and a caller may be waiting on

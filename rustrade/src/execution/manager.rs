@@ -3,6 +3,7 @@ use crate::execution::{
     backfill::{FillRecoveryConfig, Watermark, backfill},
     error::ExecutionError,
     request::{ExecutionRequest, RequestFuture},
+    unknown_outcome::{LookupOutcome, UnknownOutcomeLookup, look_up_unknown_outcome},
 };
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
@@ -20,8 +21,11 @@ use rustrade_data::streams::{
 };
 use rustrade_execution::{
     AccountEvent, AccountEventKind, UnindexedAccountEvent,
-    client::{ExecutionClient, dedup::AccountEventDeduper},
-    error::{AccountReinitFailure, AccountStreamInitError, ConnectivityError, OrderError},
+    client::{ExecutionClient, OrderStatusClient, dedup::AccountEventDeduper},
+    error::{
+        AccountReinitFailure, AccountStreamInitError, ConnectivityError, NotPlacedReason,
+        OrderError,
+    },
     indexer::{AccountEventIndexer, AccountIndexError},
     map::ExecutionInstrumentMap,
     order::{
@@ -45,14 +49,17 @@ use std::{
     fmt::{self, Debug},
     sync::Arc,
 };
+use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 /// How an [`ExecutionManager`] keeps its account stream going: how it reconnects, how it reads the
-/// fills missed while the stream was down, and the clock it measures that on.
+/// fills missed while the stream was down, and the clock it measures that on. Also how it settles
+/// an open request whose outcome is unknown.
 ///
 /// Set per venue, through [`ExecutionManager::init`] or
 /// [`ExecutionBuilder::add_live_with`](super::builder::ExecutionBuilder::add_live_with), since
-/// venues differ in how many fills one call returns and how long they keep them. Built from
+/// venues differ in how many fills one call returns and how long they keep them, and in how late
+/// an order they accepted can show up. Built from
 /// [`Default`] and the `with_*` methods, so fields can be added without a breaking change.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -65,6 +72,9 @@ pub struct AccountStreamOptions {
     /// from. It must be the clock the venue stamps its fills on, so on a simulated venue it is
     /// the simulation's.
     pub clock: Clock,
+    /// How an open request whose outcome is unknown is settled, by looking the order up at the
+    /// venue.
+    pub unknown_outcome: UnknownOutcomeLookup,
 }
 
 impl Default for AccountStreamOptions {
@@ -74,6 +84,7 @@ impl Default for AccountStreamOptions {
             reconnect: STREAM_RECONNECTION_POLICY,
             fill_recovery: FillRecoveryConfig::default(),
             clock: Clock::default(),
+            unknown_outcome: UnknownOutcomeLookup::default(),
         }
     }
 }
@@ -98,6 +109,15 @@ impl AccountStreamOptions {
     #[must_use]
     pub fn with_clock(self, clock: Clock) -> Self {
         Self { clock, ..self }
+    }
+
+    /// Sets [`unknown_outcome`](Self::unknown_outcome).
+    #[must_use]
+    pub fn with_unknown_outcome(self, unknown_outcome: UnknownOutcomeLookup) -> Self {
+        Self {
+            unknown_outcome,
+            ..self
+        }
     }
 }
 
@@ -139,6 +159,14 @@ impl Debug for Clock {
 /// - Answers every request exactly once, keyed by the request: with the client's response, or with
 ///   a timeout once `request_timeout` elapses. Only [`ExecutionRequest::Shutdown`] abandons
 ///   requests in flight.
+/// - Settles an open whose answer leaves its outcome unknown (a timeout, or a connectivity error:
+///   see [`OrderError::is_outcome_unknown`]) by looking the order up at the venue with
+///   [`OrderStatusClient::fetch_order_status`], as its
+///   [`UnknownOutcomeLookup`] says, and forwards
+///   what it finds as one more order snapshot under the request's key: the order live, how it
+///   ended, or [`NotPlacedReason::UnknownToVenue`]. Lookups that run out forward nothing more.
+///
+/// The client must implement [`OrderStatusClient`] for that lookup.
 #[derive(Constructor)]
 pub struct ExecutionManager<RequestStream, Client> {
     /// `Stream` of incoming Engine [`ExecutionRequest`]s.
@@ -146,6 +174,9 @@ pub struct ExecutionManager<RequestStream, Client> {
 
     /// Maximum `Duration` to wait for execution request responses from the [`ExecutionClient`].
     pub request_timeout: std::time::Duration,
+
+    /// How an open request whose outcome is unknown is settled.
+    pub unknown_outcome: UnknownOutcomeLookup,
 
     /// Transmitter for sending execution request responses back to the Engine.
     pub response_tx: UnboundedTx<AccountStreamEvent<ExchangeIndex, AssetIndex, InstrumentIndex>>,
@@ -178,6 +209,7 @@ where
         f.debug_struct("ExecutionManager")
             .field("request_stream", &self.request_stream)
             .field("request_timeout", &self.request_timeout)
+            .field("unknown_outcome", &self.unknown_outcome)
             .field("response_tx", &self.response_tx)
             .field("client", &self.client)
             .field("indexer", &self.indexer)
@@ -192,7 +224,7 @@ where
     // from these parameters -- and because it is spawned as a task, which requires it regardless.
     RequestStream:
         Stream<Item = ExecutionRequest<ExchangeIndex, InstrumentIndex>> + Unpin + 'static,
-    Client: ExecutionClient + Send + Sync + 'static,
+    Client: ExecutionClient + OrderStatusClient + Send + Sync + 'static,
     Client::AccountStream: Send,
 {
     /// Initialises a new `ExecutionManager` and the `Stream` of events it will emit.
@@ -253,6 +285,7 @@ where
             reconnect: reconnect_policy,
             fill_recovery,
             clock,
+            unknown_outcome,
         } = options;
 
         // Determine StreamKey & ExchangeId for use in logging
@@ -400,6 +433,7 @@ where
             Self::new(
                 request_stream,
                 request_timeout,
+                unknown_outcome,
                 response_tx,
                 client,
                 indexer,
@@ -541,7 +575,9 @@ where
     /// *accepting* new requests, then:
     ///
     /// 1. every already in-flight open and cancel is awaited to completion, each response
-    ///    forwarded — these are bounded by `request_timeout`, so this cannot hang;
+    ///    forwarded — these are bounded by `request_timeout` — and so is every lookup of an open
+    ///    whose outcome came back unknown, which its `UnknownOutcomeLookup` bounds, so this cannot
+    ///    hang;
     /// 2. the account tail — every event the exchange has already made available — is drained;
     /// 3. only then does the loop end, dropping `response_tx` and ending the `Stream` returned by
     ///    [`init`](Self::init).
@@ -551,6 +587,8 @@ where
     pub async fn run(mut self) {
         let mut in_flight_cancels = FuturesUnordered::new();
         let mut in_flight_opens = FuturesUnordered::new();
+        // Lookups of the orders whose open came back with its outcome unknown.
+        let mut in_flight_lookups = FuturesUnordered::new();
 
         // Set once a Shutdown (or a closed request Stream) has been observed. New requests are no
         // longer accepted, but the loop keeps running until nothing is outstanding.
@@ -561,7 +599,11 @@ where
         let mut account_stream_done = false;
 
         loop {
-            if draining && in_flight_cancels.is_empty() && in_flight_opens.is_empty() {
+            if draining
+                && in_flight_cancels.is_empty()
+                && in_flight_opens.is_empty()
+                && in_flight_lookups.is_empty()
+            {
                 // Every response this manager owed has been forwarded. Anything the exchange sent
                 // alongside those responses is already queued on the account side, so take it
                 // before the channel closes.
@@ -588,6 +630,12 @@ where
                 Either::Left(std::future::pending())
             } else {
                 Either::Right(in_flight_opens.select_next_some())
+            };
+
+            let next_lookup = if in_flight_lookups.is_empty() {
+                Either::Left(std::future::pending())
+            } else {
+                Either::Right(in_flight_lookups.select_next_some())
             };
 
             tokio::select! {
@@ -639,10 +687,12 @@ where
                                 "ExecutionManager received open request for non-configured key: {error}"
                             ));
 
+                        // The send time travels with the request, for the lookup an unknown outcome
+                        // starts.
                         in_flight_opens.push(RequestFuture::new(
                             self.client.open_order(client_request),
                             self.request_timeout,
-                            request,
+                            (request, Instant::now()),
                         ))
                     }
                 },
@@ -660,13 +710,23 @@ where
                 },
 
                 // Process next ExecutionRequest::Open response
-                (request, response) = next_open_response => {
-                    let event = match response {
-                        Ok(response) => self.process_open_response(request, response),
-                        Err(_elapsed) => Self::process_open_timeout(request),
-                    };
+                ((request, sent), response) = next_open_response => {
+                    let (event, lookup) = self.process_open_answer(request, sent, response);
 
                     if self.response_tx.send(event).is_err() {
+                        break;
+                    }
+
+                    if let Some(lookup) = lookup {
+                        in_flight_lookups.push(lookup);
+                    }
+                }
+
+                // Process the next lookup of an order whose open outcome was unknown
+                (request, outcome) = next_lookup => {
+                    if let Some(event) = self.process_lookup_outcome(request, outcome)
+                        && self.response_tx.send(event).is_err()
+                    {
                         break;
                     }
                 }
@@ -819,6 +879,200 @@ where
         })
     }
 
+    /// The event that answers the open `request`, sent at `sent`, from the client's `response`
+    /// or its timeout; and, when that answer leaves the outcome unknown, the lookup of the order
+    /// to start.
+    ///
+    /// The answer is forwarded as it is either way: the engine keeps the order in flight on an
+    /// unknown outcome, and the lookup's finding settles it.
+    fn process_open_answer(
+        &self,
+        request: OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
+        sent: Instant,
+        response: Result<
+            Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
+            tokio::time::error::Elapsed,
+        >,
+    ) -> (
+        AccountStreamEvent,
+        Option<
+            impl Future<
+                Output = (
+                    OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
+                    LookupOutcome,
+                ),
+            > + use<RequestStream, Client>,
+        >,
+    ) {
+        let (event, unknown) = match response {
+            Ok(response) => {
+                let unknown = response.state.is_outcome_unknown().then(|| request.clone());
+                (self.process_open_response(request, response), unknown)
+            }
+            Err(_elapsed) => (Self::process_open_timeout(request.clone()), Some(request)),
+        };
+
+        let lookup = unknown.and_then(|request| {
+            let key = self.lookup_key(&request)?;
+            if self.unknown_outcome.attempts == 0 {
+                warn!(
+                    exchange = %key.exchange,
+                    instrument = %key.instrument,
+                    cid = %key.cid,
+                    "ExecutionManager received an open whose outcome is unknown - lookups are off, so it stays in flight"
+                );
+                return None;
+            }
+            warn!(
+                exchange = %key.exchange,
+                instrument = %key.instrument,
+                cid = %key.cid,
+                "ExecutionManager received an open whose outcome is unknown - looking the order up at the venue"
+            );
+            Some(Self::look_up(
+                Arc::clone(&self.client),
+                key,
+                request,
+                sent,
+                self.unknown_outcome,
+                self.request_timeout,
+            ))
+        });
+
+        (event, lookup)
+    }
+
+    /// The key `request` was sent under, as the venue knows it, to look its order up by.
+    ///
+    /// The request was indexed when it was sent, so this does not fail in practice; if it did, the
+    /// order is not looked up and the engine's in-flight deadline flags it.
+    fn lookup_key(
+        &self,
+        request: &OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
+    ) -> Option<UnindexedOrderKey> {
+        match self.indexer.order_request(request) {
+            Ok(request) => Some(UnindexedOrderKey {
+                exchange: request.key.exchange,
+                instrument: request.key.instrument.clone(),
+                strategy: request.key.strategy,
+                cid: request.key.cid,
+            }),
+            Err(error) => {
+                error!(
+                    exchange = %self.indexer.map.exchange.value,
+                    ?request,
+                    %error,
+                    "ExecutionManager cannot look up an order whose open outcome is unknown: its key does not index"
+                );
+                None
+            }
+        }
+    }
+
+    /// Look up at the venue the order `request` placed under `key`, sent at `sent`, whose outcome
+    /// came back unknown.
+    ///
+    /// Owns what it uses, so every lookup is one future type that outlives the borrow of `self`.
+    async fn look_up(
+        client: Arc<Client>,
+        key: UnindexedOrderKey,
+        request: OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
+        sent: Instant,
+        policy: UnknownOutcomeLookup,
+        lookup_timeout: std::time::Duration,
+    ) -> (
+        OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
+        LookupOutcome,
+    ) {
+        let outcome =
+            look_up_unknown_outcome(client.as_ref(), &key, sent, policy, lookup_timeout).await;
+        (request, outcome)
+    }
+
+    /// The order snapshot that reports what a lookup found, under the key of the request it was
+    /// for; `None` if the lookups ran out.
+    fn process_lookup_outcome(
+        &self,
+        request: OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
+        outcome: LookupOutcome,
+    ) -> Option<AccountStreamEvent> {
+        let OrderRequestOpen { key, state } = request;
+        let order = match outcome {
+            LookupOutcome::Live(order) => {
+                let Order {
+                    side,
+                    price,
+                    quantity,
+                    kind,
+                    time_in_force,
+                    state: open,
+                    ..
+                } = *order;
+                Order {
+                    key,
+                    side,
+                    price,
+                    quantity,
+                    kind,
+                    time_in_force,
+                    state: OrderState::active(open),
+                }
+            }
+            LookupOutcome::Ended(order) => {
+                let Order {
+                    side,
+                    price,
+                    quantity,
+                    kind,
+                    time_in_force,
+                    state: ended,
+                    ..
+                } = *order;
+                Order {
+                    key,
+                    side,
+                    price,
+                    quantity,
+                    kind,
+                    time_in_force,
+                    state: self
+                        .indexer
+                        .order_state(UnindexedOrderState::Inactive(ended)),
+                }
+            }
+            LookupOutcome::NeverPlaced => Order {
+                key,
+                side: state.side,
+                price: state.price,
+                quantity: state.quantity,
+                kind: state.kind,
+                time_in_force: state.time_in_force,
+                state: OrderState::inactive(OrderError::NotPlaced(NotPlacedReason::UnknownToVenue)),
+            },
+            LookupOutcome::Exhausted => {
+                warn!(
+                    exchange = %self.indexer.map.exchange.value,
+                    instrument = ?key.instrument,
+                    cid = %key.cid,
+                    "ExecutionManager could not settle an order whose open outcome is unknown - it stays in flight"
+                );
+                return None;
+            }
+        };
+
+        info!(
+            exchange = %self.indexer.map.exchange.value,
+            instrument = ?order.key.instrument,
+            cid = %order.key.cid,
+            state = ?order.state,
+            "ExecutionManager settled an order whose open outcome was unknown"
+        );
+        Some(AccountStreamEvent::Item(AccountEvent {
+            exchange: order.key.exchange,
+            kind: AccountEventKind::OrderSnapshot(Snapshot(order)),
+        }))
+    }
+
     fn process_open_timeout(
         order: OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
     ) -> AccountStreamEvent {
@@ -852,10 +1106,10 @@ mod tests {
         error::{ApiError, ClientError, UnindexedClientError, UnindexedOrderError},
         map::generate_execution_instrument_map,
         order::{
-            OrderKey, OrderKind, TimeInForce,
-            id::{ClientOrderId, OrderId, StrategyId},
+            OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder,
+            id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
             request::{RequestCancel, RequestOpen},
-            state::Open,
+            state::{ActiveOrderState, Cancelled, InactiveOrderState, Open},
         },
         trade::{AssetFees, Trade, TradeId, TradesRead},
     };
@@ -980,6 +1234,15 @@ mod tests {
         }
     }
 
+    impl OrderStatusClient for RejectingClient {
+        async fn fetch_ended_orders(
+            &self,
+            _: &[UnindexedOrderKey],
+        ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
+            unreachable!("a definite answer to an open starts no lookup")
+        }
+    }
+
     /// Send one open and one cancel for the same order through a manager over `client`, and
     /// collect everything it forwards once the request stream ends and it drains.
     async fn run_open_and_cancel(
@@ -1021,6 +1284,7 @@ mod tests {
         ExecutionManager {
             request_stream: requests,
             request_timeout: std::time::Duration::from_secs(5),
+            unknown_outcome: UnknownOutcomeLookup::default(),
             response_tx,
             client: Arc::new(client),
             indexer,
@@ -1234,6 +1498,15 @@ mod tests {
     }
 
     /// Initialise a manager over `client`, with a 1 ms backoff.
+    impl OrderStatusClient for FlakyAccountClient {
+        async fn fetch_ended_orders(
+            &self,
+            _: &[UnindexedOrderKey],
+        ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
+            unreachable!("the account stream tests send no open")
+        }
+    }
+
     async fn init_flaky(
         client: FlakyAccountClient,
     ) -> Result<
@@ -1886,5 +2159,403 @@ mod tests {
     #[test]
     fn the_clock_has_a_debug_form() {
         assert_eq!(format!("{:?}", Clock::default()), "Clock(..)");
+    }
+
+    /// What [`LookupClient`] answers to one lookup.
+    #[derive(Debug, Clone)]
+    enum Lookup {
+        /// Both reads fail.
+        Fail,
+        /// Neither read finds the order.
+        Unknown,
+        /// The open-order listing holds the order, with this much filled.
+        Live(rust_decimal::Decimal),
+        /// The ended-order read finds the order cancelled.
+        Cancelled,
+    }
+
+    /// Answers every open with `open_answer`, or never, and each lookup of the order with the next
+    /// of `lookups`, through the reads the provided
+    /// [`OrderStatusClient::fetch_order_status`] makes.
+    #[derive(Debug, Clone)]
+    struct LookupClient {
+        /// `None` never answers an open, so the manager times it out.
+        open_answer: Option<UnindexedOrderError>,
+        lookups: Arc<std::sync::Mutex<std::collections::VecDeque<Lookup>>>,
+    }
+
+    impl LookupClient {
+        fn new(open_answer: Option<UnindexedOrderError>, lookups: Vec<Lookup>) -> Self {
+            Self {
+                open_answer,
+                lookups: Arc::new(std::sync::Mutex::new(lookups.into())),
+            }
+        }
+
+        fn lookups_left(&self) -> usize {
+            self.lookups.lock().unwrap().len()
+        }
+    }
+
+    impl ExecutionClient for LookupClient {
+        const EXCHANGE: ExchangeId = EXCHANGE;
+        const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] = &[];
+        type Config = ();
+        type AccountStream = futures::stream::Empty<UnindexedAccountEvent>;
+
+        fn new(_: Self::Config) -> Self {
+            unreachable!("built by the tests")
+        }
+
+        async fn account_snapshot(
+            &self,
+            _: &[AssetNameExchange],
+            _: &[InstrumentNameExchange],
+        ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
+            unreachable!("ExecutionManager::run does not fetch account snapshots")
+        }
+
+        async fn account_stream(
+            &self,
+            _: &[AssetNameExchange],
+            _: &[InstrumentNameExchange],
+        ) -> Result<Self::AccountStream, UnindexedClientError> {
+            unreachable!("ExecutionManager::run does not open account streams")
+        }
+
+        async fn cancel_order(
+            &self,
+            _: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
+        ) -> UnindexedOrderResponseCancel {
+            unreachable!("the tests send no cancel")
+        }
+
+        async fn open_order(
+            &self,
+            request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
+        ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+            let Some(error) = self.open_answer.clone() else {
+                return std::future::pending().await;
+            };
+            let OrderRequestOpen { key, state } = request;
+            Order {
+                key: OrderKey {
+                    exchange: key.exchange,
+                    instrument: key.instrument.clone(),
+                    strategy: key.strategy,
+                    cid: key.cid,
+                },
+                side: state.side,
+                price: state.price,
+                quantity: state.quantity,
+                kind: state.kind,
+                time_in_force: state.time_in_force,
+                state: OrderState::inactive(error),
+            }
+        }
+
+        async fn fetch_balances(
+            &self,
+            _: &[AssetNameExchange],
+        ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
+            unreachable!("ExecutionManager::run does not fetch balances")
+        }
+
+        /// The second read of a lookup: takes its answer.
+        async fn fetch_open_orders(
+            &self,
+            instruments: &[InstrumentNameExchange],
+        ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError>
+        {
+            let lookup = self.lookups.lock().unwrap().pop_front();
+            Ok(match lookup {
+                Some(Lookup::Live(filled_quantity)) => vec![Order {
+                    key: OrderKey {
+                        exchange: EXCHANGE,
+                        instrument: instruments[0].clone(),
+                        strategy: StrategyId::unknown(),
+                        cid: ClientOrderId::new(LOOKUP_CID),
+                    },
+                    side: Side::Buy,
+                    price: Some(dec!(100)),
+                    quantity: dec!(1),
+                    kind: OrderKind::Limit,
+                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                    state: Open::new(
+                        VenueOrderId::Assigned(OrderId::new("venue-id")),
+                        DateTime::<Utc>::MIN_UTC,
+                        filled_quantity,
+                    ),
+                }],
+                _ => Vec::new(),
+            })
+        }
+
+        async fn fetch_trades(
+            &self,
+            _: DateTime<Utc>,
+            _: DateTime<Utc>,
+            _: &[InstrumentNameExchange],
+        ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError>
+        {
+            unreachable!("ExecutionManager::run does not fetch trades")
+        }
+    }
+
+    impl OrderStatusClient for LookupClient {
+        /// The first read of a lookup: takes its answer when it is a failure or an end, and leaves
+        /// the rest to [`fetch_open_orders`](ExecutionClient::fetch_open_orders).
+        async fn fetch_ended_orders(
+            &self,
+            orders: &[UnindexedOrderKey],
+        ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
+            let mut lookups = self.lookups.lock().unwrap();
+            match lookups.front() {
+                Some(Lookup::Fail) => {
+                    lookups.pop_front();
+                    Err(UnindexedClientError::Connectivity(
+                        ConnectivityError::Timeout,
+                    ))
+                }
+                Some(Lookup::Cancelled) => {
+                    lookups.pop_front();
+                    Ok(vec![Order {
+                        key: orders[0].clone(),
+                        side: Side::Buy,
+                        price: Some(dec!(100)),
+                        quantity: dec!(1),
+                        kind: OrderKind::Limit,
+                        time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                        state: InactiveOrderState::Cancelled(Cancelled::new(
+                            OrderId::new("venue-id"),
+                            DateTime::<Utc>::MIN_UTC,
+                            Some(dec!(0)),
+                        )),
+                    }])
+                }
+                _ => Ok(Vec::new()),
+            }
+        }
+    }
+
+    const LOOKUP_CID: &str = "unknown-outcome";
+
+    /// Send one open through a manager over `client`, with `policy`, and collect the order
+    /// snapshots it forwards once the request stream ends and it drains.
+    async fn run_open_with_lookups(
+        client: LookupClient,
+        policy: UnknownOutcomeLookup,
+    ) -> Vec<Order<ExchangeIndex, InstrumentIndex, OrderState<AssetIndex, InstrumentIndex>>> {
+        let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
+        let Ok(map) = generate_execution_instrument_map(&instruments, EXCHANGE) else {
+            panic!("the instrument map should build");
+        };
+        let indexer = AccountEventIndexer::new(Arc::new(map));
+        let requests = futures::stream::iter([ExecutionRequest::Open(OrderRequestOpen {
+            key: OrderKey {
+                exchange: indexer.map.exchange.key,
+                instrument: InstrumentIndex(0),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new(LOOKUP_CID),
+            },
+            state: RequestOpen::new(
+                Side::Buy,
+                Some(dec!(100)),
+                dec!(1),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilCancelled { post_only: false },
+            ),
+        })]);
+        let (response_tx, response_rx) = mpsc_unbounded();
+
+        ExecutionManager {
+            request_stream: requests,
+            request_timeout: std::time::Duration::from_secs(5),
+            unknown_outcome: policy,
+            response_tx,
+            client: Arc::new(client),
+            indexer,
+            account_stream: futures::stream::empty().boxed(),
+        }
+        .run()
+        .await;
+
+        response_rx
+            .into_stream()
+            .filter_map(|event| async move {
+                match event {
+                    rustrade_data::streams::reconnect::Event::Item(AccountEvent {
+                        kind: AccountEventKind::OrderSnapshot(Snapshot(order)),
+                        ..
+                    }) => Some(order),
+                    _ => None,
+                }
+            })
+            .collect()
+            .await
+    }
+
+    fn is_unknown_outcome(
+        order: &Order<ExchangeIndex, InstrumentIndex, OrderState<AssetIndex, InstrumentIndex>>,
+    ) -> bool {
+        order.state.is_outcome_unknown()
+    }
+
+    fn socket_reset() -> Option<UnindexedOrderError> {
+        Some(OrderError::Connectivity(ConnectivityError::Socket(
+            "reset".to_string(),
+        )))
+    }
+
+    /// An open whose outcome is unknown is forwarded as it is, then the order is looked up, and
+    /// the venue's live state of it is forwarded under the request's key.
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_outcome_is_looked_up_and_a_live_order_reported_open() {
+        let client = LookupClient::new(socket_reset(), vec![Lookup::Live(dec!(0.25))]);
+
+        let orders = run_open_with_lookups(client.clone(), UnknownOutcomeLookup::default()).await;
+
+        assert_eq!(orders.len(), 2, "{orders:#?}");
+        assert!(is_unknown_outcome(&orders[0]), "{:?}", orders[0]);
+        assert_eq!(
+            orders[1].key.strategy,
+            StrategyId::new("test"),
+            "the request's key"
+        );
+        match &orders[1].state {
+            OrderState::Active(ActiveOrderState::Open(open)) => {
+                assert_eq!(open.filled_quantity, dec!(0.25));
+                assert_eq!(open.id, VenueOrderId::Assigned(OrderId::new("venue-id")));
+            }
+            other => panic!("expected the venue's open state, got {other:?}"),
+        }
+        assert_eq!(client.lookups_left(), 0);
+    }
+
+    /// A failed lookup is not an answer: the next one settles the order, here as ended.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_lookup_is_retried_and_an_ended_order_reported_ended() {
+        let client = LookupClient::new(socket_reset(), vec![Lookup::Fail, Lookup::Cancelled]);
+
+        let orders = run_open_with_lookups(client, UnknownOutcomeLookup::default()).await;
+
+        assert_eq!(orders.len(), 2, "{orders:#?}");
+        assert!(
+            matches!(
+                orders[1].state,
+                OrderState::Inactive(InactiveOrderState::Cancelled(_))
+            ),
+            "{:?}",
+            orders[1]
+        );
+    }
+
+    /// An open the client never answers is timed out, and the timeout's unknown outcome is looked
+    /// up like any other.
+    #[tokio::test(start_paused = true)]
+    async fn a_timed_out_open_is_looked_up() {
+        let client = LookupClient::new(None, vec![Lookup::Live(dec!(0))]);
+
+        let orders = run_open_with_lookups(client, UnknownOutcomeLookup::default()).await;
+
+        assert_eq!(orders.len(), 2, "{orders:#?}");
+        assert_eq!(
+            orders[0].state,
+            OrderState::inactive(OrderError::Connectivity(ConnectivityError::Timeout))
+        );
+        assert!(matches!(
+            orders[1].state,
+            OrderState::Active(ActiveOrderState::Open(_))
+        ));
+    }
+
+    /// `Unknown` answers conclude the order was never placed only once enough of them come in a
+    /// row, each after the grace period: with the default policy the lookups at 1 s and 3 s are
+    /// too early, and those at 7, 15 and 31 s conclude.
+    #[tokio::test(start_paused = true)]
+    async fn unknown_answers_after_the_grace_period_conclude_never_placed() {
+        let client = LookupClient::new(socket_reset(), vec![Lookup::Unknown; 5]);
+
+        let orders = run_open_with_lookups(client.clone(), UnknownOutcomeLookup::default()).await;
+
+        assert_eq!(orders.len(), 2, "{orders:#?}");
+        assert_eq!(
+            orders[1].state,
+            OrderState::inactive(OrderError::NotPlaced(NotPlacedReason::UnknownToVenue))
+        );
+        assert_eq!(client.lookups_left(), 0, "all five lookups were needed");
+    }
+
+    /// A failed lookup breaks a run of `Unknown` answers, so lookups that run out without a
+    /// conclusion report nothing more: the order stays in flight for the engine to flag.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_lookup_breaks_the_run_and_exhausted_lookups_report_nothing() {
+        let client = LookupClient::new(
+            socket_reset(),
+            vec![
+                Lookup::Unknown,
+                Lookup::Unknown,
+                Lookup::Unknown,
+                Lookup::Fail,
+                Lookup::Unknown,
+            ],
+        );
+
+        let orders = run_open_with_lookups(client.clone(), UnknownOutcomeLookup::default()).await;
+
+        assert_eq!(orders.len(), 1, "only the unknown outcome: {orders:#?}");
+        assert_eq!(client.lookups_left(), 0);
+    }
+
+    /// The provided lookup reads ended orders first and then the open-order listing, reports a
+    /// found order under the key it was asked about, and never reads a failed read as `Unknown`.
+    #[tokio::test]
+    async fn the_provided_order_status_lookup_reads_both_and_keeps_the_key() {
+        use rustrade_execution::client::VenueOrderStatus;
+
+        let key = UnindexedOrderKey {
+            exchange: EXCHANGE,
+            instrument: InstrumentNameExchange::new("btc_usdt"),
+            strategy: StrategyId::new("asked"),
+            cid: ClientOrderId::new(LOOKUP_CID),
+        };
+        let client = LookupClient::new(
+            None,
+            vec![
+                Lookup::Live(dec!(0)),
+                Lookup::Cancelled,
+                Lookup::Unknown,
+                Lookup::Fail,
+            ],
+        );
+
+        match client.fetch_order_status(&key).await {
+            Ok(VenueOrderStatus::Live(order)) => assert_eq!(order.key, key),
+            other => panic!("expected live, got {other:?}"),
+        }
+        match client.fetch_order_status(&key).await {
+            Ok(VenueOrderStatus::Ended(order)) => assert_eq!(order.key, key),
+            other => panic!("expected ended, got {other:?}"),
+        }
+        assert_eq!(
+            client.fetch_order_status(&key).await,
+            Ok(VenueOrderStatus::Unknown)
+        );
+        assert!(client.fetch_order_status(&key).await.is_err());
+    }
+
+    /// With no attempts, nothing is looked up.
+    #[tokio::test(start_paused = true)]
+    async fn no_attempts_look_nothing_up() {
+        let client = LookupClient::new(socket_reset(), vec![Lookup::Live(dec!(0))]);
+
+        let orders = run_open_with_lookups(
+            client.clone(),
+            UnknownOutcomeLookup::default().with_attempts(0),
+        )
+        .await;
+
+        assert_eq!(orders.len(), 1, "{orders:#?}");
+        assert_eq!(client.lookups_left(), 1, "never asked");
     }
 }

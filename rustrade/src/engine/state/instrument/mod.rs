@@ -1312,7 +1312,12 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         // trade", and once the snapshot is dropped nothing can tell the two apart. Debug rather
         // than Display for the reason: `OrderError`'s Display needs `AssetKey: Display` and
         // `InstrumentKey: Display`, and requiring those here would narrow this method's callers.
-        if let OrderState::Inactive(InactiveOrderState::OpenFailed(error)) = &order.0.state {
+        //
+        // An open whose outcome is unknown is not counted: it may be live. If the venue never
+        // placed it, the `ExecutionManager`'s lookup reports that later, and that is counted.
+        if let OrderState::Inactive(InactiveOrderState::OpenFailed(error)) = &order.0.state
+            && !error.is_outcome_unknown()
+        {
             self.tear_sheet.record_open_rejected(format!("{error:?}"));
         }
 
@@ -1368,7 +1373,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         // or an `Open` with nothing left to fill -- some venues report a completed order that way
         // rather than with a distinct state, and it denotes the same fact.
         let update_retires_order = match &order.0.state {
-            OrderState::Inactive(_) => true,
+            OrderState::Inactive(_) => !order.0.state.is_outcome_unknown(),
             OrderState::Active(ActiveOrderState::Open(open)) => {
                 open.quantity_remaining(order.0.quantity).is_zero()
             }

@@ -50,6 +50,11 @@ pub mod manager;
 /// remaining is terminal too, and is untracked on the same rule. Every arm that accepts an `Open`
 /// update applies it, so an order cannot be retained as active once it has nothing left to fill.
 ///
+/// An open whose outcome is unknown
+/// ([`OrderState::is_outcome_unknown`](rustrade_execution::order::state::OrderState::is_outcome_unknown))
+/// is not terminal: it changes nothing, and an `OpenInFlight` order stays in flight until the
+/// venue's report of it, or the `ExecutionManager`'s lookup, arrives.
+///
 /// # Retired orders stay retired
 ///
 /// The account stream and the response to an open request travel on different connections, so
@@ -301,6 +306,21 @@ where
         AssetKey: Debug + Clone,
     {
         let Snapshot(snapshot) = snapshot;
+
+        // An open whose outcome is unknown says nothing about the order: the venue may hold it
+        // live. So it neither ends a tracked order nor retires the id, and the venue's later
+        // report of the order, or the `ExecutionManager`'s lookup of it, settles it.
+        if snapshot.state.is_outcome_unknown() {
+            debug!(
+                exchange = ?snapshot.key.exchange,
+                instrument = ?snapshot.key.instrument,
+                strategy = %snapshot.key.strategy,
+                cid = %snapshot.key.cid,
+                update = ?snapshot,
+                "OrderManager received an open whose outcome is unknown - leaving the order as it is"
+            );
+            return;
+        }
 
         let (mut current_entry, update) = match (
             self.0.entry(snapshot.key.cid.clone()),
@@ -983,6 +1003,17 @@ mod tests {
     }
 
     fn order_snapshot_failed(
+        cid: ClientOrderId,
+    ) -> Snapshot<Order<ExchangeId, u64, OrderState<u64, u64>>> {
+        let Snapshot(mut order) = order_snapshot_outcome_unknown(cid);
+        order.state = OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
+            "refused".into(),
+        )));
+        Snapshot(order)
+    }
+
+    /// What `ExecutionManager::process_open_timeout` sends when no answer came in time.
+    fn order_snapshot_outcome_unknown(
         cid: ClientOrderId,
     ) -> Snapshot<Order<ExchangeId, u64, OrderState<u64, u64>>> {
         Snapshot(Order {
@@ -2157,6 +2188,60 @@ mod tests {
         );
         state.update_from_order_snapshot(order_snapshot_fully_filled(cid.clone()).as_ref());
         assert!(!state.0.contains_key(&cid));
+    }
+
+    /// An open the `ExecutionManager` timed out may still have reached the venue: the timeout
+    /// says only that no answer came in time. The venue's later report of the order must track it.
+    #[test]
+    fn an_open_that_timed_out_is_tracked_when_the_venue_reports_it_open() {
+        let time = DateTime::<Utc>::MIN_UTC;
+        let cid = ClientOrderId::new("timed-out");
+        let mut state = Orders::<ExchangeId, u64>::default();
+        state.record_in_flight_open(&request_open(cid.clone()), TIME_SENT);
+
+        state.update_from_order_snapshot(order_snapshot_outcome_unknown(cid.clone()).as_ref());
+        assert!(
+            matches!(
+                state.0.get(&cid).map(|order| &order.state),
+                Some(ActiveOrderState::OpenInFlight(_))
+            ),
+            "an unknown outcome leaves the order in flight"
+        );
+
+        state.update_from_order_snapshot(order_snapshot_open(cid.clone(), time).as_ref());
+        assert!(
+            matches!(
+                state.0.get(&cid).map(|order| &order.state),
+                Some(ActiveOrderState::Open(_))
+            ),
+            "the venue holds the order live, so the engine must track it"
+        );
+    }
+
+    /// An unknown outcome changes nothing, whatever state the order is in, and does not retire
+    /// an id the engine does not track.
+    #[test]
+    fn an_unknown_outcome_changes_no_order() {
+        let time = DateTime::<Utc>::MIN_UTC;
+        let cancel_in_flight = ActiveOrderState::CancelInFlight(CancelInFlight {
+            order: Some(open(time)),
+            time_sent: TIME_SENT,
+        });
+        for tracked in [ActiveOrderState::Open(open(time)), cancel_in_flight] {
+            let cid = ClientOrderId::new("tracked");
+            let mut state = orders([order(cid.clone(), tracked.clone())]);
+            state.update_from_order_snapshot(order_snapshot_outcome_unknown(cid.clone()).as_ref());
+            assert_eq!(state.0.get(&cid).map(|order| &order.state), Some(&tracked));
+        }
+
+        let cid = ClientOrderId::new("untracked");
+        let mut state = Orders::<ExchangeId, u64>::default();
+        state.update_from_order_snapshot(order_snapshot_outcome_unknown(cid.clone()).as_ref());
+        state.update_from_order_snapshot(order_snapshot_open(cid.clone(), time).as_ref());
+        assert!(
+            state.0.contains_key(&cid),
+            "the unknown outcome did not retire the id, so the venue's report tracks the order"
+        );
     }
 
     /// Every way `Orders` retires an order is remembered, so a stale listing that still shows

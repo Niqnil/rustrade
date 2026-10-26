@@ -50,6 +50,8 @@ pub enum Shutdown {
     /// # Termination
     /// Bounded by the `request_timeout` each `ExecutionManager` applies: every request that was
     /// successfully sent resolves into either a response or a timeout, so the drain always ends.
+    /// An open whose outcome came back unknown adds the manager's lookups of it, which its
+    /// [`UnknownOutcomeLookup`](crate::execution::unknown_outcome::UnknownOutcomeLookup) bounds.
     /// Orders that are merely *resting* at the venue ([`ActiveOrderState::Open`]) are not in
     /// flight and do not hold it up. [`System::shutdown_after_backtest`] applies its own deadline
     /// on top, so misusing it against a live system fails rather than hangs.

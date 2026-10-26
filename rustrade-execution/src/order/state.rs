@@ -81,8 +81,24 @@ impl<AssetKey, InstrumentKey> OrderState<AssetKey, InstrumentKey> {
     }
 
     /// Returns `true` if the order failed to open.
+    ///
+    /// That includes an open whose outcome is unknown (see
+    /// [`is_outcome_unknown`](Self::is_outcome_unknown)), which may in fact be live.
     pub fn is_failed(&self) -> bool {
         matches!(self, Self::Inactive(InactiveOrderState::OpenFailed(_)))
+    }
+
+    /// Returns `true` if this is the answer to an open request whose outcome is unknown: the open
+    /// failed with an error after which the order may still be live at the venue (see
+    /// [`OrderError::is_outcome_unknown`]).
+    ///
+    /// Such a state does not end the order. Only a later report of the order, or a lookup at the
+    /// venue, says whether it was placed.
+    pub fn is_outcome_unknown(&self) -> bool {
+        matches!(
+            self,
+            Self::Inactive(InactiveOrderState::OpenFailed(error)) if error.is_outcome_unknown()
+        )
     }
 }
 

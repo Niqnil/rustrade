@@ -8071,6 +8071,98 @@ fn test_in_flight_deadline_reflags_once_after_restore() {
     assert!(in_flight_overdue(audit).is_empty(), "and only once");
 }
 
+/// An open the `ExecutionManager` timed out may still have reached the venue. The engine keeps it
+/// in flight, and when the venue reports it open, tracks it: routes its fills, and cancels it on
+/// command.
+#[test]
+fn test_open_timed_out_by_the_manager_is_tracked_when_the_venue_reports_it() {
+    use rustrade_execution::error::{ConnectivityError, OrderError};
+
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+    let instrument = InstrumentIndex(0);
+    let cid = gen_cid(0);
+    let mut request = open_request(instrument, "unused");
+    request.key.cid = cid.clone();
+    let tracked = |engine: &TestEngine| {
+        engine
+            .state
+            .instruments
+            .instrument_index(&instrument)
+            .orders
+            .0
+            .get(&cid)
+            .map(|order| order.state.clone())
+    };
+
+    let snapshot = account_event_snapshot(&engine.state.assets);
+    process_with_audit(&mut engine, snapshot);
+    process_with_audit(&mut engine, market_event_trade(0, 0, dec!(45_000)));
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(request.clone()))),
+    );
+    assert!(matches!(
+        execution_rx.rx.try_recv(),
+        Ok(ExecutionRequest::Open(_))
+    ));
+
+    // What `ExecutionManager::process_open_timeout` sends when no answer came in time.
+    let timeout = EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+        exchange: ExchangeIndex(0),
+        kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+            key: request.key.clone(),
+            side: request.state.side,
+            price: request.state.price,
+            quantity: request.state.quantity,
+            kind: request.state.kind,
+            time_in_force: request.state.time_in_force,
+            state: OrderState::inactive(OrderError::Connectivity(ConnectivityError::Timeout)),
+        })),
+    }));
+    process_with_audit(&mut engine, timeout);
+    assert!(
+        matches!(tracked(&engine), Some(ActiveOrderState::OpenInFlight(_))),
+        "the outcome is unknown, so the order stays in flight: {:?}",
+        tracked(&engine)
+    );
+    assert!(engine.state.has_requests_in_flight());
+
+    // The venue did place it, and reports it open, then a partial fill.
+    process_with_audit(
+        &mut engine,
+        account_event_order_response(0, 1, Side::Buy, 1.0, 0.0),
+    );
+    assert!(
+        matches!(tracked(&engine), Some(ActiveOrderState::Open(_))),
+        "{:?}",
+        tracked(&engine)
+    );
+
+    process_with_audit(
+        &mut engine,
+        account_event_trade(0, 2, Side::Buy, 45_000.0, 0.5),
+    );
+    let position = engine
+        .state
+        .instruments
+        .instrument_index(&instrument)
+        .position
+        .positions
+        .get(&PositionId::NETTING)
+        .map(|position| position.quantity_abs);
+    assert_eq!(position, Some(dec!(0.5)));
+
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::CancelOrders(InstrumentFilter::None)),
+    );
+    match execution_rx.rx.try_recv() {
+        Ok(ExecutionRequest::Cancel(cancel)) => assert_eq!(cancel.key.cid, cid),
+        other => panic!("expected a cancel of the live order, got {other:?}"),
+    }
+}
+
 /// A reduce-only order's fill larger than the short it closes is cut, and the engine emits the
 /// cut before the exit it causes. The audit replica, which never records the order request, cuts
 /// the same fill from that output, so its positions and PnL stay the engine's.

@@ -28,7 +28,8 @@ use tracing::error;
 ///
 /// A backtest's drain is bounded by the `request_timeout` each `ExecutionManager` applies to its
 /// in-flight requests, plus the account events already queued behind them, so it completes far
-/// inside this. The deadline is a guard against the one misuse that has no natural end: calling
+/// inside this. A simulated venue answers every open, so no open comes back with its outcome
+/// unknown and no lookup of one adds to the drain, unless the venue itself has stopped. The deadline is a guard against the one misuse that has no natural end: calling
 /// `shutdown_after_backtest` on a live system, whose AccountStream reconnects indefinitely and
 /// therefore never finishes. Reaching it logs an error and severs the feed.
 pub const AFTER_DRAIN_DEADLINE: Duration = Duration::from_secs(60);

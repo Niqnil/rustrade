@@ -65,7 +65,10 @@ use crate::{
         reconnect_budget::{BackoffLimits, ReconnectBudget},
     },
     emit_stream_terminated,
-    error::{ApiError, ConnectivityError, OrderError, UnindexedClientError, UnindexedOrderError},
+    error::{
+        ApiError, ConnectivityError, NotPlacedReason, OrderError, UnindexedClientError,
+        UnindexedOrderError,
+    },
     margin::MarginEffect,
     order::{
         Order, OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrderKey,
@@ -314,6 +317,18 @@ impl WsApiUnavailable {
                 UnindexedOrderError::Rejected(ApiError::rate_limited(retry_after))
             }
             Self::Connect(msg) => UnindexedOrderError::Connectivity(ConnectivityError::Socket(msg)),
+        }
+    }
+
+    /// The error an open that could not be sent fails with: as
+    /// [`into_order_error`](Self::into_order_error), but a connect failure says the order was not
+    /// placed, since no session existed to send it on.
+    fn into_open_error(self) -> UnindexedOrderError {
+        match self {
+            Self::Connect(msg) => UnindexedOrderError::NotPlaced(NotPlacedReason::NotSent(
+                ConnectivityError::Socket(msg),
+            )),
+            rate_limited @ Self::RateLimited { .. } => rate_limited.into_order_error(),
         }
     }
 }
@@ -1315,7 +1330,7 @@ impl ExecutionClient for BinanceSpot {
                     quantity,
                     kind,
                     time_in_force,
-                    state: OrderState::inactive(unavailable.into_order_error()),
+                    state: OrderState::inactive(unavailable.into_open_error()),
                 };
             }
         };
@@ -2624,6 +2639,31 @@ mod tests {
     use crate::order::{TrailingOffsetType, id::ClientOrderId};
     use binance_sdk::common::errors::WebsocketError;
     use smol_str::SmolStr;
+
+    /// No WS-API session could be connected, so an open was never sent: the order was not
+    /// placed. A cancel keeps the connectivity error, and a rate limit is a rejection for both.
+    #[test]
+    fn an_unconnected_session_fails_an_open_as_not_placed() {
+        let open = WsApiUnavailable::Connect("refused".into()).into_open_error();
+        assert!(matches!(
+            &open,
+            OrderError::NotPlaced(NotPlacedReason::NotSent(ConnectivityError::Socket(m))) if m == "refused"
+        ));
+        assert!(!open.is_outcome_unknown());
+
+        let cancel = WsApiUnavailable::Connect("refused".into()).into_order_error();
+        assert!(matches!(cancel, OrderError::Connectivity(_)));
+
+        let limited = || WsApiUnavailable::RateLimited {
+            msg: "banned".into(),
+            retry_after: None,
+        };
+        assert_eq!(limited().into_open_error(), limited().into_order_error());
+        assert!(matches!(
+            limited().into_open_error(),
+            OrderError::Rejected(ApiError::RateLimit { .. })
+        ));
+    }
 
     /// A spot account never borrows, so it honours `NoSideEffect` alone, and refuses a borrow or
     /// a repay before it opens a connection.

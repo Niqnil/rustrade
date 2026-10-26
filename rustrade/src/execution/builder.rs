@@ -17,7 +17,7 @@ use rustrade_data::streams::reconnect::stream::ReconnectingStream;
 use rustrade_execution::{
     UnindexedAccountEvent,
     client::{
-        ClientInstrument, ExecutionClient,
+        ClientInstrument, ExecutionClient, OrderStatusClient,
         mock::{MockExecution, MockExecutionClientConfig, MockExecutionConfig},
     },
     exchange::mock::{
@@ -290,7 +290,7 @@ impl<'a> ExecutionBuilder<'a> {
         request_timeout: Duration,
     ) -> Result<Self, BarterError>
     where
-        Client: ExecutionClient + Send + Sync + 'static,
+        Client: ExecutionClient + OrderStatusClient + Send + Sync + 'static,
         Client::AccountStream: Send,
         Client::Config: Send,
     {
@@ -305,7 +305,9 @@ impl<'a> ExecutionBuilder<'a> {
     /// ([`FillRecoveryConfig`](crate::execution::backfill::FillRecoveryConfig)) is set per venue.
     ///
     /// The exchange's in-flight deadline (see [`ExecutionBuild::in_flight_deadlines`]) is derived
-    /// from `request_timeout` by [`InFlightDeadlines::deadline_for_request_timeout`].
+    /// from `request_timeout` and `options`'s
+    /// [`unknown_outcome`](AccountStreamOptions::unknown_outcome) by
+    /// [`InFlightDeadlines::deadline_for`].
     pub fn add_live_with<Client>(
         self,
         config: Client::Config,
@@ -313,7 +315,7 @@ impl<'a> ExecutionBuilder<'a> {
         options: AccountStreamOptions,
     ) -> Result<Self, BarterError>
     where
-        Client: ExecutionClient + Send + Sync + 'static,
+        Client: ExecutionClient + OrderStatusClient + Send + Sync + 'static,
         Client::AccountStream: Send,
         Client::Config: Send,
     {
@@ -321,8 +323,9 @@ impl<'a> ExecutionBuilder<'a> {
             Client::EXCHANGE,
             config,
             request_timeout,
-            Some(InFlightDeadlines::deadline_for_request_timeout(
+            Some(InFlightDeadlines::deadline_for(
                 request_timeout,
+                &options.unknown_outcome,
             )),
             options,
         )
@@ -338,7 +341,7 @@ impl<'a> ExecutionBuilder<'a> {
         options: AccountStreamOptions,
     ) -> Result<Self, BarterError>
     where
-        Client: ExecutionClient + Send + Sync + 'static,
+        Client: ExecutionClient + OrderStatusClient + Send + Sync + 'static,
         Client::AccountStream: Send,
         Client::Config: Send,
     {
