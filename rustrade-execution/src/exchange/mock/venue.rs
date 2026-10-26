@@ -7413,14 +7413,6 @@ mod tests {
         assert_eq!(first_unseeded_order_id(&account), u128::from(u64::MAX) + 1);
     }
 
-    /// A [`RequestPriced`](VenueRegime::RequestPriced) venue rejects a limit order on its kind,
-    /// before any fill model is consulted.
-    ///
-    /// The clamp that bounds a fill by the order's own terms lives on the market-driven path, so
-    /// this venue must never reach a pricing decision for an order it cannot hold. The snapshot is
-    /// chosen so a lapse would be unmistakable: `MidpointFillModel` would price this buy at 50,000
-    /// against a limit of 40,000 — a fill 25% above the order's own limit — so a `Filled` response
-    /// here means the gate stopped holding, not merely that a rejection message changed.
     #[test]
     fn an_order_for_a_quantity_that_is_not_positive_is_rejected_before_the_ledger_moves() {
         for request in [
@@ -7445,8 +7437,25 @@ mod tests {
             assert_eq!(free_quote(&venue), d("10000000"));
             assert_eq!(total_base(&venue), d("100"));
         }
+
+        // Its kind is refused first: this venue holds no limit order, whatever its quantity.
+        let mut venue = make_venue("100", "10000000");
+        let outcome = venue.open_order(limit_request("limit", Side::Buy, "0", "50000", gtc()));
+        let reason = rejection_reason(&outcome);
+        assert!(
+            reason.contains("does not support OrderKind::Limit"),
+            "{reason}"
+        );
     }
 
+    /// A [`RequestPriced`](VenueRegime::RequestPriced) venue rejects a limit order on its kind,
+    /// before any fill model is consulted.
+    ///
+    /// The clamp that bounds a fill by the order's own terms lives on the market-driven path, so
+    /// this venue must never reach a pricing decision for an order it cannot hold. The snapshot is
+    /// chosen so a lapse would be unmistakable: `MidpointFillModel` would price this buy at 50,000
+    /// against a limit of 40,000 — a fill 25% above the order's own limit — so a `Filled` response
+    /// here means the gate stopped holding, not merely that a rejection message changed.
     #[test]
     fn a_limit_order_is_rejected_before_a_fill_model_is_consulted() {
         let mut venue = make_venue("100", "10000000");
