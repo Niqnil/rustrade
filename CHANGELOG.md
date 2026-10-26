@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Binance order or cancel answer without a readable `transactTime` is logged** (#744).
+  `BinanceMargin::open_margin_order` (and so `open_order`), `BinanceSpot::open_order` and
+  `BinanceSpot::cancel_order` still read such an answer at the local time, but now log a `warn!`
+  instead of doing so silently, as the Binance account stream already does for a missing time.
+
 ## [0.16.0] - 2026-10-26
 
 ### Added

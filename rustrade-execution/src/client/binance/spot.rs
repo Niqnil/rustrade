@@ -43,14 +43,14 @@ use super::shared::{
     HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal, MyTradesFrom, ORDER_EXECUTIONS_BUDGET,
     OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
-    UnsubscribeOnDrop, UserDataFrame, WeightPool, binance_filled_qty, classify_order_kind_tif,
-    classify_rest_query_error, classify_ws_order_error, convert_ended_order,
-    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
-    dedup_key_from_event, disconnect_error, drop_after, frame_excerpt, gap_failed, gap_time,
-    is_duplicate, is_unknown_order, log_unhandled_event, log_unrecognised_frame, new_dedup_cache,
-    parse_user_data_frame, placed_order_state, recovered_order_cids, recovered_order_totals,
-    response_decode_error, rest_call_with_retry, retry_or_end, trailing_params, unix_ms,
-    unreadable_answer,
+    UnsubscribeOnDrop, UserDataFrame, WeightPool, answer_time, binance_filled_qty,
+    classify_order_kind_tif, classify_rest_query_error, classify_ws_order_error,
+    convert_ended_order, convert_execution_report, convert_open_order_listing,
+    convert_open_order_owned_symbol, dedup_key_from_event, disconnect_error, drop_after,
+    frame_excerpt, gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
+    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
+    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
+    retry_or_end, trailing_params, unix_ms, unreadable_answer,
 };
 use crate::rules::{OrderRules, PreSendRules};
 use crate::{
@@ -365,6 +365,10 @@ impl WsApiUnavailable {
 /// the 10 s default, and handshakes refused that way spend the
 /// [reconnect budget](super#account-stream-reconnection) as any failure does; a 418, an IP ban,
 /// starts Binance's shortest ban, 2 minutes, and so ends the stream.
+///
+/// # Order and cancel times
+/// The time of a placed or cancelled order is the `transactTime` of Binance's answer. An answer
+/// without a readable one is still read, at the local time, and logged with a `warn!`.
 ///
 /// # Fills of other clients' orders
 /// The account stream, fill recovery and `fetch_trades` report every fill on the account, whoever
@@ -1195,10 +1199,12 @@ impl ExecutionClient for BinanceSpot {
         match result {
             Ok(response) => match response.data() {
                 Ok(data) => {
-                    let time_exchange = data
-                        .transact_time
-                        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-                        .unwrap_or_else(Utc::now);
+                    let time_exchange = answer_time(
+                        ExchangeId::BinanceSpot,
+                        &instrument,
+                        "cancel_order",
+                        data.transact_time,
+                    );
 
                     let exchange_order_id = match data.order_id {
                         Some(id) => OrderId(format_smolstr!("{id}")),
@@ -1443,10 +1449,12 @@ impl ExecutionClient for BinanceSpot {
         match result {
             Ok(response) => match response.data() {
                 Ok(data) => {
-                    let time_exchange = data
-                        .transact_time
-                        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-                        .unwrap_or_else(Utc::now);
+                    let time_exchange = answer_time(
+                        ExchangeId::BinanceSpot,
+                        &instrument,
+                        "open_order",
+                        data.transact_time,
+                    );
 
                     let exchange_order_id = match data.order_id {
                         Some(id) => OrderId(format_smolstr!("{id}")),
