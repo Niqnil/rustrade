@@ -29,8 +29,13 @@ use tracing::{debug, warn};
 /// [`VenueOrderStatus::Unknown`] proves nothing. The manager reports
 /// [`NotPlacedReason::UnknownToVenue`](rustrade_execution::error::NotPlacedReason::UnknownToVenue)
 /// only after [`unknowns_to_conclude`](Self::unknowns_to_conclude) `Unknown` answers in a row,
-/// each received at least [`grace`](Self::grace) after the open was sent. A failed lookup is not an
-/// answer: it never counts, and it breaks the run.
+/// each received at least [`grace`](Self::grace) after the open request was handed to the client.
+/// A failed lookup is not an answer: it never counts, and it breaks the run. An `Unknown` within
+/// the grace period neither counts nor breaks the run.
+///
+/// So the conclusion is reachable only when the lookups that end after the grace period number at
+/// least `unknowns_to_conclude`. A policy with fewer, as with `unknowns_to_conclude` above
+/// `attempts`, never concludes it: every order it does not find stays in flight.
 ///
 /// # When the lookups run out
 /// After [`attempts`](Self::attempts) lookups with no conclusion, the manager reports nothing more
@@ -38,6 +43,15 @@ use tracing::{debug, warn};
 /// in-flight deadline flags it with
 /// [`InFlightOverdue`](crate::engine::in_flight::InFlightOverdue). What to do then is the
 /// caller's decision. `attempts` of zero turns the lookups off.
+///
+/// # What the lookups cost
+/// Each lookup is one [`fetch_order_status`](OrderStatusClient::fetch_order_status), which by
+/// default is two reads at the venue: its ended orders, then its open orders on the instrument.
+/// They count against the venue's rate limit like any other request, and each order whose outcome
+/// is unknown has its own lookups, so an outage that leaves many opens unanswered multiplies them.
+/// A lookup the rate limit holds back past its timeout counts as failed, never as `Unknown`.
+/// Where that cost matters, lower `attempts`, or have the client override `fetch_order_status`
+/// with a cheaper read.
 ///
 /// Built from [`Default`] and the `with_*` methods, so fields can be added without a breaking
 /// change. Venues differ in how late an order they accepted can show up, so the policy is set per
@@ -51,16 +65,17 @@ pub struct UnknownOutcomeLookup {
     /// The wait before the first lookup. Each later wait doubles the one before it.
     pub first_delay: Duration,
     /// How many `Unknown` answers in a row conclude that the order was never placed. Zero is
-    /// treated as one.
+    /// treated as one. Above [`attempts`](Self::attempts), the conclusion is never reached.
     pub unknowns_to_conclude: u32,
-    /// How long after the open was sent an `Unknown` answer starts to count.
+    /// How long after the open request was handed to the client an `Unknown` answer starts to
+    /// count. One longer than the lookups last leaves the conclusion out of reach.
     pub grace: Duration,
 }
 
 impl Default for UnknownOutcomeLookup {
     /// Five lookups, 1, 2, 4, 8 and 16 seconds apart, the first one second after the outcome
-    /// came back unknown; three `Unknown` answers in a row, from five seconds after the send,
-    /// conclude the order was never placed.
+    /// came back unknown; three `Unknown` answers in a row, from five seconds after the open
+    /// request was handed to the client, conclude the order was never placed.
     fn default() -> Self {
         Self {
             attempts: 5,
@@ -109,12 +124,21 @@ impl UnknownOutcomeLookup {
     /// An [`ExecutionManager`](super::manager::ExecutionManager) gives each lookup its
     /// `request_timeout`.
     pub fn longest(&self, lookup_timeout: Duration) -> Duration {
-        (0..self.attempts)
+        // From lookup `u32::BITS` on, the wait stops doubling, so those lookups are summed at once
+        // and a large `attempts` costs no more than a small one.
+        let doubling = self.attempts.min(u32::BITS);
+        let doubled = (0..doubling)
             .map(|attempt| self.delay(attempt).saturating_add(lookup_timeout))
-            .fold(Duration::ZERO, Duration::saturating_add)
+            .fold(Duration::ZERO, Duration::saturating_add);
+        let level = self
+            .delay(u32::BITS)
+            .saturating_add(lookup_timeout)
+            .saturating_mul(self.attempts - doubling);
+        doubled.saturating_add(level)
     }
 
-    /// The wait before lookup number `attempt`, counting from zero.
+    /// The wait before lookup number `attempt`, counting from zero: `first_delay` doubled
+    /// `attempt` times, the factor capped at `u32::MAX`.
     fn delay(&self, attempt: u32) -> Duration {
         let factor = 2_u32.checked_pow(attempt).unwrap_or(u32::MAX);
         self.first_delay.saturating_mul(factor)
@@ -134,7 +158,8 @@ pub(crate) enum LookupOutcome {
     Exhausted,
 }
 
-/// Look the order under `key`, sent at `sent`, up at the venue as `policy` says, until it is found
+/// Look the order under `key`, handed to the client at `sent`, up at the venue as `policy` says,
+/// until it is found
 /// or concluded never placed, or the lookups run out. A lookup still unanswered after
 /// `lookup_timeout` counts as failed.
 pub(crate) async fn look_up_unknown_outcome<Client>(
@@ -222,6 +247,32 @@ mod tests {
         assert_eq!(
             policy.with_attempts(0).longest(Duration::from_secs(3)),
             Duration::ZERO
+        );
+    }
+
+    /// Past the doubling, `longest` still sums every lookup, and does so without counting them
+    /// one by one.
+    #[test]
+    fn longest_sums_the_lookups_past_the_doubling() {
+        let policy = UnknownOutcomeLookup::default().with_first_delay(Duration::from_nanos(1));
+        let timeout = Duration::from_nanos(7);
+        for attempts in [31, 32, 33, 40] {
+            let one_by_one = (0..attempts)
+                .map(|attempt| policy.delay(attempt) + timeout)
+                .sum::<Duration>();
+            assert_eq!(
+                policy.with_attempts(attempts).longest(timeout),
+                one_by_one,
+                "{attempts} attempts"
+            );
+        }
+        assert_eq!(
+            UnknownOutcomeLookup::default()
+                .with_attempts(u32::MAX)
+                .with_first_delay(Duration::from_secs(2))
+                .longest(Duration::from_secs(1)),
+            Duration::MAX,
+            "saturates rather than overflowing"
         );
     }
 }

@@ -2517,6 +2517,79 @@ mod tests {
         assert_eq!(client.lookups_left(), 0, "all five lookups were needed");
     }
 
+    fn never_placed(
+        orders: &[Order<ExchangeIndex, InstrumentIndex, OrderState<AssetIndex, InstrumentIndex>>],
+    ) -> bool {
+        matches!(
+            orders,
+            [_, last] if last.state
+                == OrderState::inactive(OrderError::NotPlaced(NotPlacedReason::UnknownToVenue))
+        )
+    }
+
+    /// An `Unknown` answer received exactly as the grace period ends counts; one received before
+    /// it does not.
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_answer_counts_from_the_end_of_the_grace_period() {
+        let policy = UnknownOutcomeLookup::default()
+            .with_attempts(1)
+            .with_first_delay(std::time::Duration::from_secs(1))
+            .with_unknowns_to_conclude(1);
+
+        let at_the_end = policy.with_grace(std::time::Duration::from_secs(1));
+        let client = LookupClient::new(socket_reset(), vec![Lookup::Unknown]);
+        let orders = run_open_with_lookups(client, at_the_end).await;
+        assert!(never_placed(&orders), "{orders:#?}");
+
+        let before_the_end = policy.with_grace(std::time::Duration::from_millis(1_001));
+        let client = LookupClient::new(socket_reset(), vec![Lookup::Unknown]);
+        let orders = run_open_with_lookups(client, before_the_end).await;
+        assert_eq!(orders.len(), 1, "too early to count: {orders:#?}");
+    }
+
+    /// The count of `Unknown` answers that concludes is the policy's, and zero is taken as one.
+    #[tokio::test(start_paused = true)]
+    async fn the_policys_count_of_unknown_answers_concludes() {
+        let policy = UnknownOutcomeLookup::default().with_grace(std::time::Duration::ZERO);
+        for (count, needed) in [(0, 1), (1, 1), (2, 2)] {
+            let client = LookupClient::new(
+                socket_reset(),
+                vec![Lookup::Unknown, Lookup::Unknown, Lookup::Live(dec!(0))],
+            );
+            let orders =
+                run_open_with_lookups(client.clone(), policy.with_unknowns_to_conclude(count))
+                    .await;
+            assert!(never_placed(&orders), "{count}: {orders:#?}");
+            assert_eq!(client.lookups_left(), 3 - needed, "{count}");
+        }
+    }
+
+    /// An `Unknown` answer within the grace period does not count toward the conclusion, so the
+    /// venue's later report of the order still settles it.
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_answer_within_the_grace_period_does_not_count() {
+        // Lookups at 1, 3 and 7 s: only the first is within the grace period.
+        let policy = UnknownOutcomeLookup::default()
+            .with_unknowns_to_conclude(2)
+            .with_grace(std::time::Duration::from_secs(2));
+        let client = LookupClient::new(
+            socket_reset(),
+            vec![Lookup::Unknown, Lookup::Unknown, Lookup::Live(dec!(0))],
+        );
+
+        let orders = run_open_with_lookups(client, policy).await;
+
+        assert_eq!(orders.len(), 2, "{orders:#?}");
+        assert!(
+            matches!(
+                orders[1].state,
+                OrderState::Active(ActiveOrderState::Open(_))
+            ),
+            "{:?}",
+            orders[1]
+        );
+    }
+
     /// A failed lookup breaks a run of `Unknown` answers, so lookups that run out without a
     /// conclusion report nothing more: the order stays in flight for the engine to flag.
     #[tokio::test(start_paused = true)]
