@@ -32,9 +32,11 @@ Margin) and Hyperliquid Spot a holding is an asset balance instead, and `positio
   contract multiplier, commissions included). It reports no unrealised PnL. With several
   accounts, the first account holding an instrument is kept; positions are never summed.
 
-**OrderRecovery** means the client implements `OrderStatusClient::fetch_ended_orders`, which
-reads how the listed orders ended at the venue. After an account-stream outage, each client uses
-it to report the orders that ended while the stream was down.
+**OrderRecovery** means the client implements `OrderStatusClient`. Its `fetch_ended_orders` reads
+how the listed orders ended at the venue; after an account-stream outage, each client uses it to
+report the orders that ended while the stream was down. Its `fetch_order_status` says whether one
+order is live, has ended, or is unknown to the venue; the `ExecutionManager`, which requires
+`OrderStatusClient`, uses it to look up an order whose open had an unknown outcome.
 
 **Shortability** means the client implements `ShortabilityClient::fetch_shortability`, which asks
 the venue whether it would lend an instrument for a short sale: whether it is shortable and easy to
@@ -104,7 +106,9 @@ The account stream reports these orders in full.
 
 `RequestOpen::margin_effect` says whether one order borrows (`MarginEffect::Borrow`), repays
 (`Repay`) or does neither (`NoSideEffect`); `None` takes the client's default. `BinanceMargin`
-honours all three, with `NoSideEffect` as its default. Binance spot honours `NoSideEffect` only.
+honours all three, with `NoSideEffect` as its default, and `BinanceMargin::open_margin_order`
+also reports what the order borrowed (`MarginPlacement::borrowed`). Binance spot honours
+`NoSideEffect` only.
 Alpaca, Hyperliquid and IBKR refuse every `Some`, unsent, with
 `OrderError::UnsupportedMarginEffect`, since margin is set per account there.
 
