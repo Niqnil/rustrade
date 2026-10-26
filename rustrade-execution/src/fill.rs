@@ -284,11 +284,12 @@ pub enum NextBarPrice {
 /// # The problem it addresses
 /// A venue fed a market keeps the last one it saw for each instrument, and by default fills an
 /// order against it however old it is. On a bar feed, a market order on an instrument with no bar
-/// at the current instant therefore fills at the close of its last bar, which may be minutes,
-/// hours or a weekend old, and so does a limit order that close crosses. A real order would not get that price: in a quiet market it
-/// trades against the book, and in an outage, a halt or a closed market it is refused or waits
-/// for the reopen, filling at a price that may have gapped. A bar that only carries the previous
-/// close forward, with zero volume, makes this worse: it looks recent, but nothing traded.
+/// at the current instant therefore fills at the close of its last bar, which may be minutes, hours
+/// or a weekend old, and so does a limit order that close crosses. A real order would not get that
+/// price: in a quiet market it trades against the book, and in an outage, a halt or a closed market
+/// it is refused or waits for the reopen, filling at a price that may have gapped. A bar that only
+/// carries the previous close forward, with zero volume, makes this worse: it looks recent, but
+/// nothing traded.
 ///
 /// A venue cannot tell a quiet market from a dead feed or a halt by looking at bars, and this
 /// policy does not try to. It treats an old market as one nobody can trade in yet.
@@ -372,18 +373,17 @@ pub enum StaleMarketPolicy {
     /// waits for the next bar too, and is decided against that bar's price as a market order is
     /// priced from it. What it does not trade there rests at its limit, where the rest of that bar
     /// can cross it as it crosses any resting order. On a fresh market a limit order is decided on
-    /// arrival, as without this policy. A bar
-    /// reported with zero volume releases nothing: the orders held for it wait for the next bar
-    /// something traded in, except an immediate-or-cancel or fill-or-kill order, which the bar
-    /// cancels, since it had nothing to trade. An immediate-or-cancel or fill-or-kill order
-    /// arriving on a stale market is rejected, as above.
+    /// arrival, as without this policy. A bar reported with zero volume releases nothing: the
+    /// orders held for it wait for the next bar something traded in, except an immediate-or-cancel
+    /// or fill-or-kill order, which the bar cancels, since it had nothing to trade. An
+    /// immediate-or-cancel or fill-or-kill order arriving on a stale market is rejected, as above.
     ///
     /// # Needs a market feed
     /// A [`RequestPriced`](crate::exchange::mock::venue::VenueRegime::RequestPriced) venue, the
     /// kind `MockExchange` drives, has no market feed to measure an age from, so it rejects every
-    /// market order, naming this policy (it accepts no limit order at all). On a venue that is fed a market, an instrument it has
-    /// never been fed has no price at all, and its market orders are rejected as unpriced, as
-    /// above.
+    /// market order, naming this policy (it accepts no limit order at all). On a venue that is fed
+    /// a market, an instrument it has never been fed has no price at all, and its market orders are
+    /// rejected as unpriced, as above.
     ///
     /// # Serialised
     /// `max_age` is a [`Duration`], so it serialises as seconds and nanoseconds:

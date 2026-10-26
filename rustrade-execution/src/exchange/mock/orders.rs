@@ -348,10 +348,13 @@ impl OpenOrders {
 
     /// Takes `order` out of every index that ranks it, leaving [`by_id`](Self::by_id) to its caller.
     fn unindex(&mut self, order: &OpenOrder) {
-        if !self.unqueued.remove(&order.key.cid) {
+        // A queued order is never held, and a held one is never queued: see the type's note on
+        // held orders.
+        if self.unqueued.remove(&order.key.cid) || order.price.is_none() {
+            self.unhold(order);
+        } else {
             self.dequeue(order);
         }
-        self.unhold(order);
 
         if let Some(expiry) = deadline_of(order) {
             self.expiries.remove(&(expiry, order.key.cid.clone()));

@@ -1727,6 +1727,15 @@ impl SimulatedVenue {
                 continue;
             };
             // Only a limit order is held with a price: `hold_on_arrival` drops a market order's.
+            debug_assert_eq!(
+                resting.order.kind == OrderKind::Limit,
+                resting.order.price.is_some(),
+                "SimulatedVenue held {} as {:?} with price {:?}: only a limit order is held with \
+                 a price",
+                resting.order.key.cid,
+                resting.order.kind,
+                resting.order.price
+            );
             events.extend(match resting.order.price {
                 Some(limit) => {
                     self.release_held_limit(resting, limit, release, &terms, time_exchange)
@@ -1937,6 +1946,14 @@ impl SimulatedVenue {
         let side = order.side;
         let quantity = order.state.quantity_remaining(order.quantity);
 
+        // An order sent with nothing to trade has nothing to decide, and is cancelled as
+        // `fill_held` cancels one, rather than rested or filled.
+        if quantity <= Decimal::ZERO {
+            let released = reservation
+                .map(|reservation| self.release_reservation(&reservation, time_exchange));
+            return self.cancel_unfilled(order, released, time_exchange);
+        }
+
         let (market, reference) = match release {
             Release::Bar(bar, price) => {
                 let reference = price.reference(side, bar);
@@ -2007,8 +2024,8 @@ impl SimulatedVenue {
             (Some((_, fill)), None) => (fill.settled(), Some(&fill.credit)),
             (None, Some(held)) => (held.reserved(), None),
             (None, None) => unreachable!(
-                "SimulatedVenue released {} with nothing left of it: a held order is removed from \
-                 the book once it has filled",
+                "SimulatedVenue released {} with nothing to trade or rest: an order with a quantity \
+                 left either trades or rests some of it",
                 order.key.cid
             ),
         };
@@ -2064,8 +2081,8 @@ impl SimulatedVenue {
                 );
                 rested.map_state(OrderState::active)
             }
-            // Filled outright: the trade carries the order's id, and its price is the mean of
-            // every fill behind the total only if the order had done nothing before.
+            // Filled outright by this one trade, which carries the order's id: a held order has
+            // traded nothing before its release, so the trade's price is the mean of its fills.
             None => {
                 let Some(trade) = &trade else {
                     unreachable!("an order with nothing left to rest has traded");
@@ -2081,7 +2098,7 @@ impl SimulatedVenue {
                         trade.order_id.clone(),
                         time_exchange,
                         order.quantity,
-                        order.state.filled_quantity.is_zero().then_some(trade.price),
+                        Some(trade.price),
                     ),
                 };
                 self.account.ack_filled(filled.clone());
@@ -12057,6 +12074,189 @@ mod tests {
             resting_on(&venue, Side::Buy),
             [ClientOrderId::new("resting")]
         );
+    }
+
+    #[test]
+    fn a_held_limit_order_with_nothing_to_trade_is_cancelled_at_its_release() {
+        let mut venue = venue_waiting();
+        advance(&mut venue, time(12));
+        let _ = venue.open_order(gtc_limit("empty", Side::Buy, "0", "105"));
+
+        let events = observe(&mut venue, 20, traded("102"));
+
+        assert!(trades_in(&events).is_empty(), "{events:?}");
+        assert!(matches!(
+            &order_of(events.last().unwrap()).state,
+            OrderState::Inactive(InactiveOrderState::Cancelled(cancelled))
+                if cancelled.filled_quantity == Some(Decimal::ZERO)
+        ));
+        assert!(venue.account.orders().is_empty());
+        assert_eq!(free_quote(&venue), d("10000"));
+    }
+
+    #[test]
+    fn a_held_limit_order_the_account_can_no_longer_afford_is_cancelled_and_hands_back_its_draw() {
+        let config = MockExecutionConfig {
+            slippage: uniform(5),
+            ..MockExecutionConfig {
+                stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
+                ..spot_config("10", "100", FeeModelConfig::default())
+            }
+        };
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+        advance(&mut venue, time(1));
+        assert!(observe(&mut venue, 1, traded("100")).is_empty());
+        advance(&mut venue, time(12));
+        // Held at the stale 100: the account's whole balance.
+        let outcome = venue.open_order(gtc_limit("waiting", Side::Buy, "1", "105"));
+        assert_eq!(balance_of(&outcome.events[0]).balance.free, Decimal::ZERO);
+
+        let events = observe(&mut venue, 20, traded("104"));
+
+        assert_eq!(
+            events.len(),
+            2,
+            "the released hold, then the order: {events:?}"
+        );
+        assert_eq!(balance_of(&events[0]).balance.free, d("100"));
+        assert!(matches!(
+            &order_of(&events[1]).state,
+            OrderState::Inactive(InactiveOrderState::Cancelled(cancelled))
+                if cancelled.filled_quantity == Some(Decimal::ZERO)
+        ));
+        assert!(venue.account.orders().is_empty());
+        assert_eq!(venue.slippage, Slippage::new(uniform(5)));
+    }
+
+    #[test]
+    fn a_held_sell_limit_order_fills_at_the_fresh_price_or_rests_at_its_limit() {
+        let mut venue = venue_waiting();
+        advance(&mut venue, time(12));
+        // Both cross the stale 100; the fresh 97 crosses only the first.
+        let _ = venue.open_order(gtc_limit("crossed", Side::Sell, "1", "95"));
+        let _ = venue.open_order(gtc_limit("passive", Side::Sell, "1", "99"));
+
+        let events = observe(&mut venue, 20, traded("97"));
+
+        let prices = trades_in(&events)
+            .iter()
+            .map(|trade| (trade.client_order_id.clone(), trade.price))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prices,
+            vec![(Some(ClientOrderId::new("crossed")), d("97"))],
+            "above its limit, at the fresh price"
+        );
+        assert_eq!(
+            resting_on(&venue, Side::Sell),
+            [ClientOrderId::new("passive")]
+        );
+        assert_eq!(total_base(&venue), d("9"));
+    }
+
+    #[test]
+    fn a_held_limit_order_paying_its_fee_in_a_third_asset_takes_the_fee_apart_at_its_release() {
+        let config = MockExecutionConfig {
+            stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
+            ..fee_asset_config("10")
+        };
+        let mut venue = fee_asset_venue_from(&config, true);
+        advance(&mut venue, time(12));
+        let _ = venue.open_order(gtc_limit("waiting", Side::Buy, "1", "51000"));
+
+        let events = observe(&mut venue, 20, traded("50000"));
+
+        assert_eq!(
+            restated(&events)
+                .iter()
+                .map(|(asset, _)| asset.clone())
+                .collect::<Vec<_>>(),
+            [quote(), base(), bnb()],
+            "paid, received, then the fee: {events:?}"
+        );
+        let trade = trades_in(&events)[0];
+        assert_eq!(trade.price, d("50000"));
+        // 10bp of 50,000 is 50 USDT, a quarter off in BNB at 600.
+        assert_eq!(
+            restated(&events)[2].1.free,
+            d("10") - d("50") * d("0.75") / d("600")
+        );
+        assert_eq!(restated(&events)[0].1.total, d("50000"), "no fee in USDT");
+    }
+
+    fn cfd_venue_with(usd: &str, stale_market: StaleMarketPolicy) -> SimulatedVenue {
+        let config = MockExecutionConfig {
+            stale_market,
+            ..config_from_balances(vec![funded(self::usd(), d(usd))], FeeModelConfig::default())
+        };
+        let mut venue =
+            SimulatedVenue::new_market_driven(&config, instruments_of(cfd_instrument()));
+        advance(&mut venue, time(1));
+        venue
+    }
+
+    /// A released CFD order settles exactly as the same order arriving to the market that released
+    /// it: against the position as it stands then, closing the long and opening a short, with the
+    /// remainder the size there cannot fill held against the position the fill leaves.
+    #[test]
+    fn a_held_cfd_limit_order_settles_against_the_position_at_its_release_as_on_arrival() {
+        let fresh = MarketObservation::new(MarketSnapshot {
+            best_bid: Some(d("4950")),
+            best_ask: Some(d("4960")),
+            last_price: Some(d("4950")),
+        });
+        for depth in [MarketDepth::UNKNOWN, MarketDepth::new(Some(d("1.5")), None)] {
+            let observation = fresh.with_depth(depth);
+
+            let mut held = cfd_venue_with(
+                "400000",
+                StaleMarketPolicy::Wait {
+                    max_age: Duration::from_secs(10),
+                },
+            );
+            assert!(cfd_market(&mut held, "5000", "5000", "5000").is_empty());
+            cfd_market_fill(&mut held, Side::Buy, "1");
+            advance(&mut held, time(12));
+            let outcome = held.open_order(cfd_limit("flip", Side::Sell, "2", "4900"));
+            assert!(outcome.response.state.is_accepted());
+            assert!(held.account.orders().holds(&cfd_instrument_name()));
+            let released = held.apply_market(&cfd_instrument_name(), observation, time(12));
+            assert!(!trades_in(&released).is_empty(), "{released:?}");
+
+            let mut arriving = cfd_venue_with("400000", StaleMarketPolicy::Off);
+            assert!(cfd_market(&mut arriving, "5000", "5000", "5000").is_empty());
+            cfd_market_fill(&mut arriving, Side::Buy, "1");
+            advance(&mut arriving, time(12));
+            assert!(
+                arriving
+                    .apply_market(&cfd_instrument_name(), observation, time(12))
+                    .is_empty()
+            );
+            let _ = arriving.open_order(cfd_limit("flip", Side::Sell, "2", "4900"));
+
+            assert_eq!(
+                (free_usd(&held), total_usd(&held), cfd_position(&held)),
+                (
+                    free_usd(&arriving),
+                    total_usd(&arriving),
+                    cfd_position(&arriving)
+                ),
+                "depth {depth:?}"
+            );
+            assert_eq!(
+                resting_count(&held),
+                resting_count(&arriving),
+                "depth {depth:?}"
+            );
+        }
+    }
+
+    fn resting_count(venue: &SimulatedVenue) -> usize {
+        venue
+            .account
+            .orders()
+            .resting(&cfd_instrument_name(), Side::Sell)
+            .count()
     }
 
     #[test]
