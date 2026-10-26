@@ -54,6 +54,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine retired the order on a timeout or connectivity error, so the venue's later report that
   the order was open was ignored as a late report. The order then rested and filled at the
   venue, but `Command::CancelOrders` sent no cancel for it. See the first entry under Changed.
+- **Hyperliquid reported an open that may have reached the venue as rejected** (#728). Perp and
+  spot mapped every error from placing an order to `OrderError::Rejected`, so the engine ended
+  an order that could be live, and never looked it up. The SDK reports every failure after it
+  signs the request with the same error variant, so its text now decides:
+  - an HTTP 4xx is still a refusal, classified as before. A 429 is now
+    `ApiError::RateLimit`;
+  - anything else after the send (a failure to send or to read the answer, a 5xx, an answer that
+    does not parse) is `OrderError::Connectivity`, so the order is kept in flight and looked up
+    by its client order id;
+  - an error from before the send (signing, an asset the SDK does not list, ...) is still a
+    refusal;
+  - an `ok` answer whose status is a bare `success`, or missing, is now an unknown outcome too.
+    It used to be `Rejected("no order ID in response")`.
+
+  A cancel is classified the same way, so a cancel that failed after the send is now
+  `Connectivity` instead of `Rejected`. The order stays open either way.
+
+  Perp and spot now answer `OrderStatusClient::fetch_order_status` with one `orderStatus`
+  request (weight 2), which reports a live order as well as an ended one. The provided method
+  also listed the open orders (weight 20 per DEX) whenever the order had not ended, which every
+  lookup of an order the venue never received did.
+- **An open whose outcome was unknown was remembered by the client as ended** (#728). Then a
+  later account-stream report of the order as live did not add it back to the orders the client
+  holds live, which a reconnect asks the venue about. Seen with IBKR since #726, and with
+  Hyperliquid's unknown outcomes above.
 
 ## [0.15.0] - 2026-10-26
 
