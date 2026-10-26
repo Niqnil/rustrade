@@ -21,6 +21,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `#[non_exhaustive]`, so `CashFlowsRead::new(flows, resume)` and `complete` still build one,
   with `held_since: None`; `with_held_since` sets it. Alpaca's `fetch_cash_flows` leaves it
   `None`.
+- **`StaleMarketPolicy::Wait` now holds limit orders too, and stops stale observations filling
+  resting orders** (`rustrade-execution`, #667). Previously the policy held only market orders. A
+  limit order that crossed the stale price still filled against it, however old: on a bar feed,
+  a buy limit above the last close of an instrument with no bar now filled at that close.
+  - Under `Wait`, every order arriving on a stale market waits for the instrument's next fresh
+    observation and is decided as if it had arrived just after it. A limit order that market
+    crosses fills as a taker at the fresh price, capped at its limit, and what the size there
+    cannot fill rests at the limit. One it does not cross rests whole at its limit. A post-only
+    one it crosses is cancelled. Whether the stale price crossed the order no longer matters.
+  - An immediate-or-cancel or fill-or-kill limit order on a stale market is rejected naming the
+    policy, as market orders already were, whether or not it crosses. It used to fill against the
+    stale price or be cancelled unfilled.
+  - While held, a limit order is `Open` with its limit, a cancel takes it back, and the venue
+    holds what it would cost arriving now. One still held when the data ends expires.
+  - Under `Wait`, an observation that is not fresh, such as a zero-volume bar, still moves the
+    price but no longer fills a resting limit order it crosses. Without the policy nothing
+    changes.
 
 ### Fixed
 
