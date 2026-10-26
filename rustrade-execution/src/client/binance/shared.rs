@@ -1772,6 +1772,26 @@ pub(crate) fn unreadable_answer(exchange: ExchangeId, problem: &str) -> Unindexe
     )))
 }
 
+/// The time of a successful answer to an order or cancel request: its `transactTime`, else the
+/// local clock.
+///
+/// Binance stamps every such answer, so one without a readable `transactTime` is logged with a
+/// `warn!`, but read: the rest of the answer still says what became of the request.
+pub(crate) fn answer_time(
+    exchange: ExchangeId,
+    instrument: &InstrumentNameExchange,
+    request: &'static str,
+    transact_time: Option<i64>,
+) -> DateTime<Utc> {
+    match transact_time.and_then(|ms| Utc.timestamp_millis_opt(ms).single()) {
+        Some(time) => time,
+        None => {
+            warn!(%exchange, %instrument, request, ?transact_time, "Binance answer missing/unparseable transactTime, using now");
+            Utc::now()
+        }
+    }
+}
+
 /// The fields of Binance's response to placing an order that say what became of it.
 #[derive(Debug, Clone)]
 pub(crate) struct PlacementResponse<'a> {
@@ -3866,6 +3886,39 @@ mod tests {
     fn the_heartbeat_and_cooldown_are_as_documented() {
         assert_eq!(HEARTBEAT_TIMEOUT_SECS, 30);
         assert_eq!(MAX_COOLDOWN_SLEEP, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn an_answers_time_is_its_transact_time() {
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        assert_eq!(
+            answer_time(
+                ExchangeId::BinanceSpot,
+                &instrument,
+                "open_order",
+                Some(1_700_000_000_000)
+            ),
+            Utc.timestamp_millis_opt(1_700_000_000_000).unwrap()
+        );
+    }
+
+    /// An answer without a readable `transactTime` is still read, at the local time.
+    #[test]
+    fn an_answer_without_a_readable_transact_time_is_at_the_local_time() {
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        for transact_time in [None, Some(i64::MAX)] {
+            let before = Utc::now();
+            let time = answer_time(
+                ExchangeId::BinanceMargin,
+                &instrument,
+                "open_order",
+                transact_time,
+            );
+            assert!(
+                (before..=Utc::now()).contains(&time),
+                "{transact_time:?} gave {time}"
+            );
+        }
     }
 
     /// A connection that counts its closes, and whose close never finishes while `stall` is set.

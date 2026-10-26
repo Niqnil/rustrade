@@ -73,7 +73,7 @@ use super::shared::{
     HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
     PlacementResponse, RateLimitTracker, RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS,
     SharedDedupCache, TrailingOrderError, UnhandledEvents, UnrecoveredFills, UnsubscribeOnDrop,
-    UserDataFrame, WeightPool, binance_filled_qty, classify_order_kind_tif,
+    UserDataFrame, WeightPool, answer_time, binance_filled_qty, classify_order_kind_tif,
     classify_rest_order_error, classify_rest_query_error, convert_ended_order,
     convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
     dedup_key_from_event, disconnect_error, drop_after, frame_excerpt, gap_failed, gap_time,
@@ -571,6 +571,8 @@ impl BinanceMargin {
     ///   reports a borrowed amount without its asset or the other way round) returns
     ///   [`OrderError::Connectivity`]: the venue acted on the request, so the order may be live,
     ///   and its outcome is unknown rather than refused.
+    /// - The order's time is the answer's `transactTime`. An answer without a readable one is
+    ///   still read, at the local time, and logged with a `warn!`.
     pub async fn open_margin_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
@@ -691,10 +693,12 @@ impl BinanceMargin {
             }
         };
 
-        let time_exchange = data
-            .transact_time
-            .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-            .unwrap_or_else(Utc::now);
+        let time_exchange = answer_time(
+            ExchangeId::BinanceMargin,
+            &instrument,
+            "open_order",
+            data.transact_time,
+        );
 
         let exchange_order_id = match data.order_id {
             Some(id) => OrderId(format_smolstr!("{id}")),
