@@ -48,7 +48,11 @@ pub struct CashFlow<AssetKey, InstrumentKey> {
     /// How much moved, signed: positive when the account received it, negative when it paid.
     pub amount: Decimal,
     /// The instrument whose position caused the flow, when the venue attributes it to one, as it
-    /// does funding. `None` for a flow on the account as a whole.
+    /// does funding. `None` for a flow on the account as a whole, such as cross-margin interest.
+    ///
+    /// The `rustrade` engine applies a `None` flow to no position, and does not guess one. A
+    /// consumer that knows which position a flow belongs to sets this before the engine sees the
+    /// event. See `EngineState::update_from_account` in `rustrade` for why and how.
     pub instrument: Option<InstrumentKey>,
     /// When the venue posted the flow.
     pub time_exchange: DateTime<Utc>,
@@ -144,8 +148,7 @@ impl CashFlowId {
     }
 }
 
-/// What one read of a venue's cash flows over a span returned, for a venue that serves them in
-/// bounded calls.
+/// What one read of a venue's cash flows over a span returned.
 ///
 /// `resume` says whether the read stopped before the span's end:
 /// - `None`: every flow in the span the venue still holds, and the client reports, is in `flows`.
@@ -153,22 +156,53 @@ impl CashFlowId {
 /// - `Some(t)`: the read stopped at its bound, and flows from `t` on may be missing from `flows`.
 ///   Read on from `start = t` with the same end. That read can return again flows this one
 ///   returned at or after `t`, so match them by [`CashFlowId`].
+///
+/// A venue also keeps its records for a limited time. `held_since` says when that limit cuts
+/// into the span, so a caller can tell flows the venue no longer has from flows that never
+/// happened.
 #[non_exhaustive]
-#[must_use = "`resume` says whether the span was read to its end"]
-#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize, Constructor)]
+#[must_use = "`resume` and `held_since` say whether the span was read in full"]
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Deserialize, Serialize)]
 pub struct CashFlowsRead<AssetKey, InstrumentKey> {
     /// The flows read, in the span.
     pub flows: Vec<CashFlow<AssetKey, InstrumentKey>>,
     /// Where to read on from, or `None` when the read reached the span's end.
     pub resume: Option<DateTime<Utc>>,
+    /// The earliest moment the read covers, when the span starts before it; flows before it may
+    /// exist but cannot be read. It is after the span's end when none of the span can be read.
+    /// `None` when the venue's limit is not known to cut into the span, which is no claim that
+    /// the venue holds flows without limit.
+    ///
+    /// A caller that needs every flow in the span, such as one adding up a position's whole
+    /// interest, treats the part before `held_since` as a gap: `resume: None` covers what the
+    /// venue holds, not what it held. The limit cuts into the span from its start, so only the
+    /// first read of a span can report it; a caller reading on from `resume` has nothing to learn
+    /// from a later read's.
+    pub held_since: Option<DateTime<Utc>>,
 }
 
 impl<AssetKey, InstrumentKey> CashFlowsRead<AssetKey, InstrumentKey> {
-    /// A read that reached the span's end.
-    pub fn complete(flows: Vec<CashFlow<AssetKey, InstrumentKey>>) -> Self {
+    /// A read that stopped at `resume` (`None`: it reached the span's end), with no venue limit
+    /// cutting into the span.
+    pub fn new(
+        flows: Vec<CashFlow<AssetKey, InstrumentKey>>,
+        resume: Option<DateTime<Utc>>,
+    ) -> Self {
         Self {
             flows,
-            resume: None,
+            resume,
+            held_since: None,
         }
+    }
+
+    /// A read that reached the span's end.
+    pub fn complete(flows: Vec<CashFlow<AssetKey, InstrumentKey>>) -> Self {
+        Self::new(flows, None)
+    }
+
+    /// Sets [`held_since`](Self::held_since).
+    pub fn with_held_since(mut self, held_since: Option<DateTime<Utc>>) -> Self {
+        self.held_since = held_since;
+        self
     }
 }

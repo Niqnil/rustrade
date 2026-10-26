@@ -416,9 +416,10 @@ pub struct TradesRead<AssetKey, InstrumentKey> {
     pub trades: Vec<Trade<AssetKey, InstrumentKey>>,
     /// Where to read on from, or `None` when the read reached the span's end.
     pub resume: Option<DateTime<Utc>>,
-    /// The earliest moment the venue still holds fills from, when that is inside the span; fills
-    /// before it may exist but cannot be read. `None` when the venue's limit is not known to cut
-    /// into the span, which is no claim that the venue holds fills without limit.
+    /// The earliest moment the read covers, when the span starts before it; fills before it may
+    /// exist but be missing from `trades`. It is after the span's end when none of the span can
+    /// be read. `None` when the venue's limit is not known to cut into the span, which is no
+    /// claim that the venue holds fills without limit.
     ///
     /// A caller that needs every fill in the span treats the part before `held_since` as a gap:
     /// `resume: None` covers what the venue holds, not what it held. The limit cuts into the span

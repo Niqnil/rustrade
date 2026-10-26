@@ -367,6 +367,10 @@ pub enum VenueRegime {
 ///   [`MarketOrderTiming::NextBar`] — priced like a market order, but from the next bar's
 ///   reference price rather than the market it arrived to: the [`FillModel`] is handed that price
 ///   as the only one there is, and the slippage moves it. Charged [`Liquidity::Taker`].
+/// - **An order held on a stale market**, under
+///   [`StaleMarketPolicy::Wait`] — priced as if it arrived just after the fresh observation that
+///   releases it, by the rules above: a market order as a market order, a limit order as one
+///   marketable on arrival if that market crosses it and as a resting one if not.
 ///
 /// The marketable and resting rules agree exactly at the crossing point — an order arriving when
 /// `best_ask == limit` fills at the limit either way — and diverge only where the order genuinely
@@ -584,7 +588,7 @@ pub struct SimulatedVenue {
     /// construction from [`MockExecutionConfig::market_order_timing`]: switching it while orders
     /// are held would leave them waiting for a bar that no longer releases them.
     market_order_timing: MarketOrderTiming,
-    /// What a market order does on a stale market. Fixed at construction from
+    /// What an order does on a stale market. Fixed at construction from
     /// [`MockExecutionConfig::stale_market`], for the same reason as
     /// [`market_order_timing`](Self::market_order_timing).
     stale_market: StaleMarketPolicy,
@@ -1389,10 +1393,11 @@ impl SimulatedVenue {
     /// expiries this tick reached, exactly as [`advance_time`](Self::advance_time) reports them.
     /// The costs are valued at the market as it stood before this tick replaced it.
     ///
-    /// # A bar releases the market orders held for it
+    /// # A bar releases the orders held for it
     /// Under [`MarketOrderTiming::NextBar`], an observation carrying a
-    /// [`bar`](MarketObservation::bar) releases every market order held on `instrument`, earliest
-    /// first, each filled at the bar's reference price as a taker, stamped `time_exchange`. Their
+    /// [`bar`](MarketObservation::bar) releases every order held on `instrument`, earliest first,
+    /// stamped `time_exchange`: each market order filled at the bar's reference price as a taker,
+    /// and each limit order held on a stale market decided as if it arrived to that price. Their
     /// events follow the expiries and precede the resting fills, since a held order trades at the
     /// start of the bar and a resting one is crossed during it.
     /// [`fills_ahead_of`](Self::fills_ahead_of) says beforehand whether an observation will
@@ -1401,12 +1406,19 @@ impl SimulatedVenue {
     /// Under [`StaleMarketPolicy::Wait`], a bar that is not [`fresh`](MarketObservation::fresh)
     /// releases nothing, and cancels the immediate-or-cancel and fill-or-kill orders held for it.
     ///
-    /// # A fresh observation releases the market orders waiting for one
+    /// # A fresh observation releases the orders waiting for one
     /// Under [`StaleMarketPolicy::Wait`] with [`MarketOrderTiming::OnArrival`], a
-    /// [`fresh`](MarketObservation::fresh) observation releases every market order that arrived on
-    /// a stale `instrument`, earliest first, each filled as if it had arrived just after this
-    /// observation, stamped `time_exchange`. Their events follow the resting fills, which the
-    /// observation crossed first.
+    /// [`fresh`](MarketObservation::fresh) observation releases every order that arrived on a
+    /// stale `instrument`, earliest first, each decided as if it had arrived just after this
+    /// observation, stamped `time_exchange`: a market order fills, and a limit order trades what
+    /// the market crosses and rests the rest at its limit. Their events follow the resting fills,
+    /// which the observation crossed first, so a limit order resting on release is not crossed by
+    /// the observation that released it.
+    ///
+    /// # An observation that is not fresh crosses no resting order
+    /// Under [`StaleMarketPolicy::Wait`], an observation that is not
+    /// [`fresh`](MarketObservation::fresh) still moves the price the venue holds, but fills no
+    /// resting order, however far it moves: it is not evidence that anything traded there.
     ///
     /// `#[must_use]` because a driver that applies the market and drops the result has silently
     /// eaten the fills, leaving its client holding an order the venue no longer has.
@@ -1445,6 +1457,8 @@ impl SimulatedVenue {
         // Swept before matching, so an order whose deadline this tick has reached cannot trade on
         // the very tick that retires it -- see `advance_time`.
         events.append(&mut self.sweep_expired(time_exchange));
+        // Under `Wait`, an observation that shows nothing trading moves the price but fills no one.
+        let crosses_resting = fresh || !matches!(self.stale_market, StaleMarketPolicy::Wait { .. });
         match self.market_order_timing {
             MarketOrderTiming::NextBar(price) => {
                 if let Some(bar) = bar {
@@ -1458,10 +1472,14 @@ impl SimulatedVenue {
                         events.append(&mut self.cancel_held_immediate(instrument, time_exchange));
                     }
                 }
-                events.append(&mut self.match_resting(instrument, snapshot, time_exchange));
+                if crosses_resting {
+                    events.append(&mut self.match_resting(instrument, snapshot, time_exchange));
+                }
             }
             MarketOrderTiming::OnArrival => {
-                events.append(&mut self.match_resting(instrument, snapshot, time_exchange));
+                if crosses_resting {
+                    events.append(&mut self.match_resting(instrument, snapshot, time_exchange));
+                }
                 // Only `Wait` holds an order under `OnArrival`, so no other policy has one to look
                 // up.
                 if fresh && matches!(self.stale_market, StaleMarketPolicy::Wait { .. }) {
@@ -1477,7 +1495,7 @@ impl SimulatedVenue {
         events
     }
 
-    /// Whether applying `observation` to `instrument` releases market orders held for its bar,
+    /// Whether applying `observation` to `instrument` releases orders held for its bar,
     /// whose fills a driver must deliver **ahead of** the observation itself — see
     /// [`MarketOrderTiming::NextBar`].
     ///
@@ -1494,14 +1512,14 @@ impl SimulatedVenue {
             && self.account.orders().holds(instrument)
     }
 
-    /// Whether `observation` carries a bar that releases the market orders held for one: any bar,
+    /// Whether `observation` carries a bar that releases the orders held for one: any bar,
     /// unless [`StaleMarketPolicy::Wait`] asks for one something traded in.
     fn bar_releases(&self, observation: &MarketObservation) -> bool {
         observation.bar.is_some()
             && (observation.fresh || !matches!(self.stale_market, StaleMarketPolicy::Wait { .. }))
     }
 
-    /// Retires every market order still held as expired, filled nothing, stamped `time_exchange`:
+    /// Retires every order still held as expired, filled nothing, stamped `time_exchange`:
     /// the data has ended before the bar or the fresh observation it was waiting for.
     ///
     /// For a driver at the end of its data, so that no order it accepted is left unanswered. Per
@@ -1677,9 +1695,11 @@ impl SimulatedVenue {
         events
     }
 
-    /// Fills every market order held on `instrument`, earliest arrival first, priced from
-    /// `release`: the bar it was held for under [`MarketOrderTiming::NextBar`], or the market a
-    /// fresh observation left under [`StaleMarketPolicy::Wait`].
+    /// Releases every order held on `instrument`, earliest arrival first, priced from `release`:
+    /// the bar it was held for under [`MarketOrderTiming::NextBar`], or the market a fresh
+    /// observation left under [`StaleMarketPolicy::Wait`]. A market order fills, and a limit order
+    /// is decided as if it arrived to that market — see
+    /// [`release_held_limit`](Self::release_held_limit).
     fn release(
         &mut self,
         instrument: &InstrumentNameExchange,
@@ -1695,17 +1715,33 @@ impl SimulatedVenue {
             Ok(terms) => terms,
             // Unreachable, as in `match_resting`: an order is held only on an instrument this
             // venue accepted it for.
-            Err(error) => panic!(
-                "SimulatedVenue holds market orders on an instrument it cannot price: {error}"
-            ),
+            Err(error) => {
+                panic!("SimulatedVenue holds orders on an instrument it cannot price: {error}")
+            }
         };
 
         let mut events = Vec::with_capacity(held.len() * 4);
         for cid in held {
             // Handed out by the held index with nothing in between, so this always finds it.
-            if let Some(resting) = self.account.remove_order(&cid) {
-                events.extend(self.fill_held(resting, release, &terms, time_exchange));
-            }
+            let Some(resting) = self.account.remove_order(&cid) else {
+                continue;
+            };
+            // Only a limit order is held with a price: `hold_on_arrival` drops a market order's.
+            debug_assert_eq!(
+                resting.order.kind == OrderKind::Limit,
+                resting.order.price.is_some(),
+                "SimulatedVenue held {} as {:?} with price {:?}: only a limit order is held with \
+                 a price",
+                resting.order.key.cid,
+                resting.order.kind,
+                resting.order.price
+            );
+            events.extend(match resting.order.price {
+                Some(limit) => {
+                    self.release_held_limit(resting, limit, release, &terms, time_exchange)
+                }
+                None => self.fill_held(resting, release, &terms, time_exchange),
+            });
         }
         events
     }
@@ -1880,6 +1916,197 @@ impl SimulatedVenue {
         events
     }
 
+    /// Releases one limit order held on a stale market, as if it had arrived to the market
+    /// `release` gives it, and returns `[balance.., trade, order]` for one that trades,
+    /// `[balance, order]` for one that joins the book whole or that it cancels.
+    ///
+    /// Decided against that market as an arriving limit order is decided against the market it
+    /// arrives to:
+    /// - one the market crosses trades as a taker, priced by the venue's [`FillModel`], moved by
+    ///   its slippage and capped at its limit, up to the size the market has, and what is left of
+    ///   it joins the book at its limit;
+    /// - one the market does not cross joins the book whole, at its limit;
+    /// - a post-only one the market crosses is cancelled, having traded nothing.
+    ///
+    /// A bar's reference price is handed over as the only price there is, as for a held market
+    /// order — see [`fill_held`](Self::fill_held).
+    ///
+    /// What the order would cost was held when it arrived, at the market the venue held then. The
+    /// hold is released and the order costed afresh, its fill and what it rests as one
+    /// requirement, as on arrival, so an order the account can no longer afford is cancelled.
+    /// Whatever joins the book is stamped `time_exchange`, which is when it joined the queue.
+    fn release_held_limit(
+        &mut self,
+        RestingOrder { order, reservation }: RestingOrder,
+        limit: Decimal,
+        release: Release<'_>,
+        terms: &InstrumentTerms,
+        time_exchange: DateTime<Utc>,
+    ) -> Vec<UnindexedAccountEvent> {
+        let side = order.side;
+        let quantity = order.state.quantity_remaining(order.quantity);
+
+        let (market, reference) = match release {
+            Release::Bar(bar, price) => {
+                let reference = price.reference(side, bar);
+                (
+                    MarketSnapshot::from_last_price(Some(reference)),
+                    Some(reference),
+                )
+            }
+            Release::Market(market) => (*market, None),
+        };
+
+        let marketable = crosses(side, limit, &market);
+        let post_only = matches!(
+            order.time_in_force,
+            TimeInForce::GoodUntilCancelled { post_only: true }
+        );
+        if marketable && post_only {
+            let released = reservation
+                .map(|reservation| self.release_reservation(&reservation, time_exchange));
+            return self.cancel_unfilled(order, released, time_exchange);
+        }
+
+        // What the market has to give this order: nothing if it does not cross, and all of it
+        // wherever no size is known.
+        let filled_quantity = match self.depth_available(&order.key.instrument, side) {
+            _ if !marketable => Decimal::ZERO,
+            Some(available) => quantity.min(available),
+            None => quantity,
+        };
+        let unfilled = quantity - filled_quantity;
+
+        // Drawn only if the order trades, and handed back if the ledger refuses it, as in
+        // `fill_on_arrival`.
+        let slippage_before = self.slippage.clone();
+        let position = self.net_position(terms, &order.key.instrument);
+        let fill = (filled_quantity > Decimal::ZERO).then(|| {
+            // A crossed market prices it, but a model that needs more of a book than the market
+            // has falls back to the bar's reference price, or to the limit, as on arrival.
+            let price = self
+                .fill_model
+                .fill_price(&FillContext::new(side, quantity, &market))
+                .or(reference)
+                .unwrap_or(limit);
+            let price = clamp_to_limit(side, self.slippage.apply(side, price), limit);
+            let settlement = self.fill_settlement(
+                terms,
+                position,
+                side,
+                filled_quantity,
+                price,
+                Liquidity::Taker,
+            );
+            (price, settlement)
+        });
+
+        // What resting the rest will cost, priced as the fill that settles it will be: at the
+        // limit, as the maker, against the position the fill leaves.
+        let held = (unfilled > Decimal::ZERO).then(|| {
+            let position = match &fill {
+                Some((price, _)) => position.after(side, filled_quantity, *price),
+                None => position,
+            };
+            self.settlement(terms, position, side, unfilled, limit, Liquidity::Maker)
+        });
+
+        let (debit, credit) = match (&fill, &held) {
+            (Some((_, fill)), Some(held)) => (fill.settled_holding(held), Some(&fill.credit)),
+            (Some((_, fill)), None) => (fill.settled(), Some(&fill.credit)),
+            (None, Some(held)) => (held.reserved(), None),
+            (None, None) => unreachable!(
+                "SimulatedVenue released {} with nothing to trade or rest: it holds only an order \
+                 with a positive quantity, which `open_order_inner` checks, and such an order \
+                 either trades or rests some of it",
+                order.key.cid
+            ),
+        };
+        let effect = reservation.as_ref().map_or_else(
+            || self.margin_effect(None),
+            |reservation| reservation.effect,
+        );
+        let (mut committed, loan) =
+            match self.commit_afresh(terms, reservation, &debit, credit, time_exchange) {
+                Recommitted::Committed { commitment, loan } => (commitment, loan),
+                Recommitted::Unaffordable { released } => {
+                    self.slippage = slippage_before;
+                    return self.cancel_unfilled(order, released, time_exchange);
+                }
+            };
+
+        let mut events = Vec::with_capacity(4);
+        let mut filled_total = order.state.filled_quantity;
+        let mut trade = None;
+        if let Some((price, settlement)) = fill {
+            self.take_fee_apart(&settlement, &mut committed, time_exchange);
+            self.consume_depth(&order.key.instrument, side, filled_quantity);
+            let fill = Fill {
+                quantity: filled_quantity,
+                price,
+            };
+            trade = Some(self.print_fill(terms, &order, fill, settlement.fees, time_exchange));
+            filled_total += filled_quantity;
+        }
+
+        let terminal = match held {
+            // What is left joins the book, carrying what has already traded, holding the loan
+            // this release left the order with, as a remainder rested on arrival does.
+            Some(held) => {
+                let open = Open::new(order.state.id.clone(), time_exchange, filled_total);
+                let rested = Order {
+                    key: order.key,
+                    side,
+                    price: order.price,
+                    quantity: order.quantity,
+                    kind: order.kind,
+                    time_in_force: order.time_in_force,
+                    state: open,
+                };
+                self.book_rested(
+                    rested.clone(),
+                    Reservation {
+                        borrowed: loan.min(held.requirement()),
+                        amount: held.requirement(),
+                        asset: held.asset,
+                        effect,
+                    },
+                );
+                rested.map_state(OrderState::active)
+            }
+            // Filled outright by this one trade, which carries the order's id: a held order has
+            // traded nothing before its release, so the trade's price is the mean of its fills.
+            None => {
+                let Some(trade) = &trade else {
+                    unreachable!("an order with nothing left to rest has traded");
+                };
+                let filled = Order {
+                    key: order.key,
+                    side,
+                    price: order.price,
+                    quantity: order.quantity,
+                    kind: order.kind,
+                    time_in_force: order.time_in_force,
+                    state: Filled::new(
+                        trade.order_id.clone(),
+                        time_exchange,
+                        order.quantity,
+                        Some(trade.price),
+                    ),
+                };
+                self.account.ack_filled(filled.clone());
+                filled.map_state(OrderState::fully_filled)
+            }
+        };
+
+        self.push_committed(&mut events, committed);
+        if let Some(trade) = trade {
+            events.push(self.build_account_event(trade));
+        }
+        events.push(self.build_account_event(Snapshot(terminal)));
+        events
+    }
+
     /// Records `fill` of `order`, an order this venue already holds, and returns the trade it
     /// printed, acknowledged in the ledger.
     ///
@@ -2025,6 +2252,29 @@ impl SimulatedVenue {
         settlement: &Settlement,
         time_exchange: DateTime<Utc>,
     ) -> RestingSettlement {
+        match self.commit_afresh(
+            terms,
+            reservation,
+            &settlement.settled(),
+            Some(&settlement.credit),
+            time_exchange,
+        ) {
+            Recommitted::Committed { commitment, .. } => RestingSettlement::Settled(commitment),
+            Recommitted::Unaffordable { released } => RestingSettlement::Unaffordable { released },
+        }
+    }
+
+    /// Releases an order's hold and commits `debit` and `credit` afresh in its place, restating
+    /// each asset it moved once, or reports the account cannot cover them. See
+    /// [`settle_resting_afresh`](Self::settle_resting_afresh) and [`Recommitted`].
+    fn commit_afresh(
+        &mut self,
+        terms: &InstrumentTerms,
+        reservation: Option<Reservation>,
+        debit: &Debit,
+        credit: Option<&Credit>,
+        time_exchange: DateTime<Utc>,
+    ) -> Recommitted {
         let effect = reservation.as_ref().map_or_else(
             || self.margin_effect(None),
             |reservation| reservation.effect,
@@ -2037,16 +2287,12 @@ impl SimulatedVenue {
         });
 
         let repays_at_cancel = self.repays_at_cancel();
-        let debit = settlement.settled();
-        match self.commit(
-            &debit,
-            Some(&settlement.credit),
-            effect,
-            terms,
-            None,
-            time_exchange,
-        ) {
+        match self.commit(debit, credit, effect, terms, None, time_exchange) {
             Ok(mut commitment) => {
+                let mut loan = commitment.committed.borrowed;
+                if let Some((reservation, _)) = &released {
+                    loan += reservation.borrowed;
+                }
                 // A fill that cost less than was held needs less of the loan; the account's own
                 // funds pay first, so the unused loan is the smaller of the loan and the surplus.
                 // It is repaid only if the venue repays what its orders no longer need.
@@ -2058,11 +2304,12 @@ impl SimulatedVenue {
                         commitment.committed.paid =
                             self.account
                                 .repay_loan(&reservation.asset, unused, time_exchange);
+                        loan -= unused;
                     }
                 }
-                RestingSettlement::Settled(commitment)
+                Recommitted::Committed { commitment, loan }
             }
-            Err(_) => RestingSettlement::Unaffordable {
+            Err(_) => Recommitted::Unaffordable {
                 released: released.map(|(reservation, balance)| {
                     match !repays_at_cancel || reservation.borrowed.is_zero() {
                         true => balance,
@@ -2287,6 +2534,10 @@ impl SimulatedVenue {
     /// [`RequestOpen::market`](crate::order::request::RequestOpen::market) on a
     /// [`RequestPriced`](VenueRegime::RequestPriced) one. A Limit order is always judged and priced
     /// against this venue's own market; see the type's `# How an order is priced`.
+    ///
+    /// An order whose quantity is zero or negative is rejected, moving nothing, whatever the
+    /// market: with an [`ApiError::OrderRejected`] naming the quantity, unless its kind or time in
+    /// force is refused first.
     ///
     /// # Panics
     /// If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract: a
@@ -2589,6 +2840,23 @@ impl SimulatedVenue {
             return (build_open_order_err_response(request, error), None);
         }
 
+        // An order for nothing, or for less than nothing, is refused as a venue refuses it. Every
+        // path below takes the quantity as positive: a held order, for one, is released only to
+        // trade or rest some of it.
+        if request.state.quantity <= Decimal::ZERO {
+            let reason = format!(
+                "cannot open {} for {}: quantity {} is not positive",
+                request.key.instrument, request.key.exchange, request.state.quantity
+            );
+            return (
+                build_open_order_err_response(
+                    request,
+                    UnindexedOrderError::Rejected(ApiError::OrderRejected(reason)),
+                ),
+                None,
+            );
+        }
+
         // Read out before the `&mut self` balance borrows below.
         let terms = match self.instrument_terms(&request.key.instrument) {
             Ok(terms) => terms,
@@ -2627,11 +2895,92 @@ impl SimulatedVenue {
 
         let now = self.time_exchange();
 
-        if request.state.kind != OrderKind::Limit {
-            // Every other kind this venue accepts is marketable on arrival by definition, so only
-            // the two aggressing arms an order with no limit price can reach, and `Expire`, are
-            // reachable: `Rest` and `FillAndRest` need somewhere to rest, which such an order has
-            // not got, and `CancelUnfilled` needs `post_only`, which the static gate already
+        // Only a limit order's price is a limit, and a limit order without one has nothing to rest
+        // at or bound a fill by. Refused before the stale-market gate below, so that the gate
+        // never holds an order this venue would refuse anyway.
+        let limit = match request.state.kind {
+            OrderKind::Limit => match request.state.price {
+                Some(limit) => Some(limit),
+                None => {
+                    let reason = format!(
+                        "cannot open {} for {}: OrderKind::Limit carries no limit price",
+                        request.key.instrument, request.key.exchange
+                    );
+                    return (
+                        build_open_order_err_response(
+                            request,
+                            UnindexedOrderError::Rejected(ApiError::OrderRejected(reason)),
+                        ),
+                        None,
+                    );
+                }
+            },
+            _ => None,
+        };
+
+        // Under `StaleMarketPolicy::Wait`, an order arriving on a stale market is handled as if it
+        // arrived just after the instrument's next fresh observation: held until then, or refused
+        // if its time in force will not wait. An order already past its own deadline is not asked,
+        // since it expires below whatever the market is doing.
+        if let StaleMarketPolicy::Wait { max_age } = self.stale_market
+            && !matches!(
+                request.state.time_in_force,
+                TimeInForce::GoodTillDate { expiry } if now >= expiry
+            )
+        {
+            match self.market_age(&request.key.instrument, max_age, now) {
+                MarketAge::NoFeed => {
+                    let reason = format!(
+                        "cannot accept {} on {}: StaleMarketPolicy::Wait needs a market feed to \
+                         measure {}'s age from, and this venue has none",
+                        request.key.cid, request.key.exchange, request.key.instrument
+                    );
+                    return (
+                        build_open_order_err_response(
+                            request,
+                            UnindexedOrderError::Rejected(ApiError::OrderRejected(reason)),
+                        ),
+                        None,
+                    );
+                }
+                MarketAge::Stale { fresh_at } => {
+                    if matches!(
+                        request.state.time_in_force,
+                        TimeInForce::ImmediateOrCancel | TimeInForce::FillOrKill
+                    ) {
+                        let last = fresh_at.map_or_else(
+                            || "never observed fresh".to_owned(),
+                            |fresh_at| format!("last observed fresh at {fresh_at}"),
+                        );
+                        let reason = format!(
+                            "cannot fill {} on {}: {}'s market is stale under \
+                             StaleMarketPolicy::Wait (max_age {max_age:?}; {last}), and \
+                             TimeInForce::{} does not wait for a fresh observation",
+                            request.key.cid,
+                            request.key.exchange,
+                            request.key.instrument,
+                            request.state.time_in_force
+                        );
+                        return (
+                            build_open_order_err_response(
+                                request,
+                                UnindexedOrderError::Rejected(ApiError::OrderRejected(reason)),
+                            ),
+                            None,
+                        );
+                    }
+                    return self.hold_on_arrival(request, market, &terms);
+                }
+                MarketAge::Fresh | MarketAge::Unpriced => {}
+            }
+        }
+
+        // `None` for every kind but a limit order, each of which is marketable on arrival by
+        // definition.
+        let Some(limit) = limit else {
+            // Only the two aggressing arms an order with no limit price can reach, and `Expire`,
+            // are reachable: `Rest` and `FillAndRest` need somewhere to rest, which such an order
+            // has not got, and `CancelUnfilled` needs `post_only`, which the static gate already
             // refused on a market order. The remaining arms retire the order unfilled rather than
             // asserting, because filling an order this function could not account for is the one
             // wrong answer.
@@ -2642,64 +2991,7 @@ impl SimulatedVenue {
             //
             // Under `MarketOrderTiming::NextBar`, both aggressing arms wait for the bar instead,
             // and their time in force is applied when it fills them.
-            //
-            // Under `StaleMarketPolicy::Wait`, both aggressing arms on a stale market wait for a
-            // fresh observation, or are refused if their time in force will not wait.
-            let disposition =
-                disposition(request.state.kind, request.state.time_in_force, true, now);
-            if matches!(
-                disposition,
-                Disposition::FillAndCancel | Disposition::FillOrNothing
-            ) && let StaleMarketPolicy::Wait { max_age } = self.stale_market
-            {
-                match self.market_age(&request.key.instrument, max_age, now) {
-                    MarketAge::NoFeed => {
-                        let reason = format!(
-                            "cannot accept market order {} on {}: StaleMarketPolicy::Wait needs a \
-                             market feed to measure {}'s age from, and this venue has none",
-                            request.key.cid, request.key.exchange, request.key.instrument
-                        );
-                        return (
-                            build_open_order_err_response(
-                                request,
-                                UnindexedOrderError::Rejected(ApiError::OrderRejected(reason)),
-                            ),
-                            None,
-                        );
-                    }
-                    MarketAge::Stale { fresh_at } => {
-                        if matches!(
-                            request.state.time_in_force,
-                            TimeInForce::ImmediateOrCancel | TimeInForce::FillOrKill
-                        ) {
-                            let last = fresh_at.map_or_else(
-                                || "never observed fresh".to_owned(),
-                                |fresh_at| format!("last observed fresh at {fresh_at}"),
-                            );
-                            let reason = format!(
-                                "cannot fill {} on {}: {}'s market is stale under \
-                                 StaleMarketPolicy::Wait (max_age {max_age:?}; {last}), and \
-                                 TimeInForce::{} does not wait for a fresh observation",
-                                request.key.cid,
-                                request.key.exchange,
-                                request.key.instrument,
-                                request.state.time_in_force
-                            );
-                            return (
-                                build_open_order_err_response(
-                                    request,
-                                    UnindexedOrderError::Rejected(ApiError::OrderRejected(reason)),
-                                ),
-                                None,
-                            );
-                        }
-                        return self.hold_on_arrival(request, market, &terms);
-                    }
-                    MarketAge::Fresh | MarketAge::Unpriced => {}
-                }
-            }
-
-            return match disposition {
+            return match disposition(request.state.kind, request.state.time_in_force, true, now) {
                 Disposition::FillAndCancel | Disposition::FillOrNothing
                     if matches!(self.market_order_timing, MarketOrderTiming::NextBar(_)) =>
                 {
@@ -2716,20 +3008,6 @@ impl SimulatedVenue {
                     self.cancel_on_arrival(request, now)
                 }
             };
-        }
-
-        let Some(limit) = request.state.price else {
-            let reason = format!(
-                "cannot open {} for {}: OrderKind::Limit carries no limit price",
-                request.key.instrument, request.key.exchange
-            );
-            return (
-                build_open_order_err_response(
-                    request,
-                    UnindexedOrderError::Rejected(ApiError::OrderRejected(reason)),
-                ),
-                None,
-            );
         };
 
         // The same snapshot the order will be priced from, so marketability and price cannot be
@@ -2794,15 +3072,21 @@ impl SimulatedVenue {
         }
     }
 
-    /// Accepts a market order to fill later, holding what it would cost at the venue's current
-    /// price: on its instrument's next bar under [`MarketOrderTiming::NextBar`], or on its next
-    /// fresh observation under [`StaleMarketPolicy::Wait`].
+    /// Accepts an order to fill later, holding what it would cost at the venue's current market:
+    /// a market order on its instrument's next bar under [`MarketOrderTiming::NextBar`], and any
+    /// order arriving on a stale market on its next fresh observation under
+    /// [`StaleMarketPolicy::Wait`] (or, combined with `NextBar`, its next fresh bar).
+    ///
+    /// What it would cost is what it would cost arriving now: a market order, or a limit order the
+    /// market crosses, as a taker at the price the [`FillModel`] gives, capped at a limit order's
+    /// limit; a limit order the market does not cross, or a post-only one, at its limit as the
+    /// maker it would rest as.
     ///
     /// Refused instead, with nothing moved, when the order waits for a bar and the instrument has
     /// never been fed one (there is no next bar this venue can know to wait for), when the current
-    /// market prices nothing, and when the account cannot cover the hold. The last two are what an
-    /// arriving fill would be refused for too, so a strategy is refused the same orders whether
-    /// or not they wait.
+    /// market prices nothing for a market order, and when the account cannot cover the hold. The
+    /// last two are what an arriving order would be refused for too, so a strategy is refused the
+    /// same orders whether or not they wait.
     fn hold_on_arrival(
         &mut self,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
@@ -2819,8 +3103,8 @@ impl SimulatedVenue {
                 .is_none()
         {
             let reason = format!(
-                "cannot hold {} on {} for {}'s next bar: MarketOrderTiming::NextBar needs a bar \
-                 feed, and this venue has been fed no bar for it",
+                "cannot hold {} on {} for {}'s next bar: MarketOrderTiming::NextBar holds it for \
+                 one and needs a bar feed, and this venue has been fed no bar for it",
                 request.key.cid, request.key.exchange, request.key.instrument
             );
             return (
@@ -2832,15 +3116,39 @@ impl SimulatedVenue {
             );
         }
 
+        let side = request.state.side;
+        let limit = match request.state.kind {
+            OrderKind::Limit => request.state.price,
+            _ => None,
+        };
+        let post_only = matches!(
+            request.state.time_in_force,
+            TimeInForce::GoodUntilCancelled { post_only: true }
+        );
+
         // The price the order would fill at now, unslipped: the hold is an estimate, released and
-        // costed afresh when the bar fills it, so it takes no draw from the slippage stream.
-        let estimate = market.and_then(|market| {
-            self.fill_model.fill_price(&FillContext::new(
-                request.state.side,
-                request.state.quantity,
-                &market,
-            ))
-        });
+        // costed afresh when the order is released, so it takes no draw from the slippage stream.
+        let taker_estimate = || {
+            market.and_then(|market| {
+                self.fill_model
+                    .fill_price(&FillContext::new(side, request.state.quantity, &market))
+            })
+        };
+        let (estimate, liquidity) = match limit {
+            Some(limit)
+                if !post_only && market.is_some_and(|market| crosses(side, limit, &market)) =>
+            {
+                // A crossed market prices it, but a model that needs more of a book than the
+                // market has falls back to the limit, as on arrival.
+                let estimate = taker_estimate().unwrap_or(limit);
+                (
+                    Some(clamp_to_limit(side, estimate, limit)),
+                    Liquidity::Taker,
+                )
+            }
+            Some(limit) => (Some(limit), Liquidity::Maker),
+            None => (taker_estimate(), Liquidity::Taker),
+        };
         let Some(estimate) = estimate else {
             let reason = format!(
                 "cannot price {} for {}: no market price available yet and OrderKind::{:?} carries \
@@ -2860,10 +3168,10 @@ impl SimulatedVenue {
         let settlement = self.settlement(
             terms,
             self.net_position(terms, &request.key.instrument),
-            request.state.side,
+            side,
             request.state.quantity,
             estimate,
-            Liquidity::Taker,
+            liquidity,
         );
 
         let debit = settlement.reserved();
@@ -2888,12 +3196,12 @@ impl SimulatedVenue {
             time_exchange,
             Decimal::ZERO,
         );
-        // Held with no price whatever the request carried: a price on a market order is ignored,
-        // and one kept here would queue the order to be matched as a limit.
+        // A market order is held with no price whatever the request carried, since a price on one
+        // is ignored, and a limit order with its limit, which it rests at once released.
         let order = Order {
             key: request.key,
-            side: request.state.side,
-            price: None,
+            side,
+            price: limit,
             quantity: request.state.quantity,
             kind: request.state.kind,
             time_in_force: request.state.time_in_force,
@@ -3252,10 +3560,9 @@ impl SimulatedVenue {
         // a sell never below. Applied here rather than inside the model because it is a property of
         // the order's terms, not of how the market is read, and after the slippage so that no
         // rate, however large, fills an order past its limit.
-        let fill_price = match (limit, side) {
-            (Some(limit), Side::Buy) => fill_price.min(limit),
-            (Some(limit), Side::Sell) => fill_price.max(limit),
-            (None, _) => fill_price,
+        let fill_price = match limit {
+            Some(limit) => clamp_to_limit(side, fill_price, limit),
+            None => fill_price,
         };
 
         // Marketable on arrival, so this fill takes liquidity and is charged the taker rate.
@@ -4128,6 +4435,14 @@ fn crosses(side: Side, limit: Decimal, market: &MarketSnapshot) -> bool {
     }
 }
 
+/// `price` bounded by `limit` for an order on `side`: a buy never above it, a sell never below.
+fn clamp_to_limit(side: Side, price: Decimal, limit: Decimal) -> Decimal {
+    match side {
+        Side::Buy => price.min(limit),
+        Side::Sell => price.max(limit),
+    }
+}
+
 /// Whether this venue can honour `time_in_force` for an order of `order_kind` **at all**.
 ///
 /// This is the static half of the time-in-force decision: it asks only whether the pair could ever
@@ -4287,7 +4602,7 @@ fn disposition(
     }
 }
 
-/// How old an instrument's market is when a market order arrives — see
+/// How old an instrument's market is when an order arrives — see
 /// [`StaleMarketPolicy::Wait`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MarketAge {
@@ -4303,7 +4618,7 @@ enum MarketAge {
     Stale { fresh_at: Option<DateTime<Utc>> },
 }
 
-/// What a held market order is priced from when it is released.
+/// What a held order is priced from when it is released.
 #[derive(Debug, Clone, Copy)]
 enum Release<'a> {
     /// The bar it was held for, at the reference price its [`MarketOrderTiming::NextBar`] picks.
@@ -4446,6 +4761,24 @@ enum RestingSettlement {
     /// one, or a spot fill whose fee exceeds what it receives by more than that asset's balance
     /// holds.
     /// Carries the balance its released hold restated, if it held anything.
+    Unaffordable {
+        released: Option<AssetBalance<AssetNameExchange>>,
+    },
+}
+
+/// What committing an order afresh, in place of the hold it was released from, came to — see
+/// `SimulatedVenue::commit_afresh`.
+enum Recommitted {
+    /// Committed, restating these balances. `loan` is how much of the account's loans the order
+    /// accounts for afterwards: what its hold had borrowed, less what this repaid, plus what this
+    /// borrowed. A caller holding part of what it committed against a remainder holds that loan
+    /// against it, so a later cancel repays it.
+    Committed {
+        commitment: Commitment,
+        loan: Decimal,
+    },
+    /// The account cannot cover it. Carries the balance the released hold restated, if it held
+    /// anything.
     Unaffordable {
         released: Option<AssetBalance<AssetNameExchange>>,
     },
@@ -7078,6 +7411,41 @@ mod tests {
         );
 
         assert_eq!(first_unseeded_order_id(&account), u128::from(u64::MAX) + 1);
+    }
+
+    #[test]
+    fn an_order_for_a_quantity_that_is_not_positive_is_rejected_before_the_ledger_moves() {
+        for request in [
+            buy_request("0", market_prices("50000")),
+            sell_request("-1", market_prices("50000")),
+        ] {
+            let mut venue = make_venue("100", "10000000");
+            let quantity = request.state.quantity;
+
+            let outcome = venue.open_order(request);
+
+            assert_eq!(
+                rejection_reason(&outcome),
+                format!(
+                    "cannot open {} for {EXCHANGE}: quantity {quantity} is not positive",
+                    instrument_name()
+                )
+            );
+            assert!(outcome.events.is_empty(), "a refused order moves nothing");
+            assert!(venue.trades(time(0)).is_empty(), "and nothing traded");
+            assert!(venue.orders_open(&[]).is_empty(), "or rests");
+            assert_eq!(free_quote(&venue), d("10000000"));
+            assert_eq!(total_base(&venue), d("100"));
+        }
+
+        // Its kind is refused first: this venue holds no limit order, whatever its quantity.
+        let mut venue = make_venue("100", "10000000");
+        let outcome = venue.open_order(limit_request("limit", Side::Buy, "0", "50000", gtc()));
+        let reason = rejection_reason(&outcome);
+        assert!(
+            reason.contains("does not support OrderKind::Limit"),
+            "{reason}"
+        );
     }
 
     /// A [`RequestPriced`](VenueRegime::RequestPriced) venue rejects a limit order on its kind,
@@ -11398,6 +11766,765 @@ mod tests {
         let outcome = venue.open_order(gtc_buy("patient", "1"));
         assert_eq!(rested_open(&outcome).filled_quantity, Decimal::ZERO);
         assert!(venue.account.orders().holds(&instrument_name()));
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Limit orders on a stale market.
+    // ---------------------------------------------------------------------------------------
+
+    fn gtc_limit(
+        cid: &str,
+        side: Side,
+        quantity: &str,
+        limit: &str,
+    ) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
+        limit_request(cid, side, quantity, limit, gtc())
+    }
+
+    fn post_only() -> TimeInForce {
+        TimeInForce::GoodUntilCancelled { post_only: true }
+    }
+
+    /// The orders resting on the book for matching on `side`, best first.
+    fn resting_on(venue: &SimulatedVenue, side: Side) -> Vec<ClientOrderId> {
+        venue
+            .account
+            .orders()
+            .resting(&instrument_name(), side)
+            .map(|order| order.key.cid.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_limit_order_on_a_stale_market_waits_open_holding_what_it_would_cost_arriving_now() {
+        // The stale market is 100: a buy at 105 would take it, capped at the limit, and a buy at
+        // 95 would rest at its limit.
+        for (limit, free) in [("105", "9900"), ("95", "9905")] {
+            let mut venue = venue_waiting();
+            advance(&mut venue, time(12));
+
+            let outcome = venue.open_order(gtc_limit("waiting", Side::Buy, "1", limit));
+
+            assert_eq!(rested_open(&outcome).filled_quantity, Decimal::ZERO);
+            assert_eq!(outcome.events.len(), 1, "{:?}", outcome.events);
+            assert_eq!(balance_of(&outcome.events[0]).balance.free, d(free));
+            assert!(venue.trades(time(0)).is_empty());
+            assert!(venue.account.orders().holds(&instrument_name()));
+            assert!(
+                resting_on(&venue, Side::Buy).is_empty(),
+                "held, so nothing matches it"
+            );
+            assert_eq!(
+                venue
+                    .account
+                    .orders()
+                    .get(&ClientOrderId::new("waiting"))
+                    .unwrap()
+                    .price,
+                Some(d(limit)),
+                "held with its limit"
+            );
+        }
+    }
+
+    #[test]
+    fn a_held_limit_order_the_fresh_market_crosses_fills_as_a_taker_at_the_fresh_price() {
+        let mut venue = venue_waiting();
+        advance(&mut venue, time(12));
+        let _ = venue.open_order(gtc_limit("waiting", Side::Buy, "1", "105"));
+
+        let events = observe(&mut venue, 20, traded("102"));
+
+        assert_eq!(events.len(), 4, "{events:?}");
+        assert_eq!(balance_of(&events[0]).balance.free, d("9898"));
+        let trade = trade_of(&events[2]);
+        assert_eq!(
+            (trade.price, trade.quantity, trade.time_exchange),
+            (d("102"), d("1"), time(20)),
+            "at the fresh market, better than its limit, stamped at the observation"
+        );
+        assert!(matches!(
+            &order_of(&events[3]).state,
+            OrderState::Inactive(InactiveOrderState::FullyFilled(filled))
+                if filled.avg_price == Some(d("102"))
+        ));
+        assert!(!venue.account.orders().holds(&instrument_name()));
+        assert!(venue.account.orders().is_empty());
+        assert_eq!(total_base(&venue), d("11"));
+    }
+
+    #[test]
+    fn a_held_limit_order_is_capped_at_its_limit_however_far_the_slippage_moves_it() {
+        let config = MockExecutionConfig {
+            slippage: SlippageConfig::fixed(d("0.1")).unwrap(),
+            ..stale_config(MAX_AGE)
+        };
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+        advance(&mut venue, time(1));
+        assert!(observe(&mut venue, 1, traded("100")).is_empty());
+        advance(&mut venue, time(12));
+        let _ = venue.open_order(gtc_limit("waiting", Side::Buy, "1", "105"));
+
+        // 102 slipped by 10% is 112.2, over the limit.
+        let events = observe(&mut venue, 20, traded("102"));
+
+        assert_eq!(trade_of(&events[2]).price, d("105"));
+    }
+
+    #[test]
+    fn a_held_limit_order_the_fresh_market_does_not_cross_joins_the_book_at_its_limit() {
+        let mut venue = venue_waiting();
+        advance(&mut venue, time(12));
+        let _ = venue.open_order(gtc_limit("waiting", Side::Buy, "1", "105"));
+
+        let events = observe(&mut venue, 20, traded("110"));
+
+        assert_eq!(
+            events.len(),
+            2,
+            "the hold restated, then the order: {events:?}"
+        );
+        assert_eq!(
+            balance_of(&events[0]).balance.free,
+            d("9895"),
+            "now held at its limit, as the maker it rests as"
+        );
+        let order = order_of(&events[1]);
+        assert!(matches!(
+            &order.state,
+            OrderState::Active(ActiveOrderState::Open(open))
+                if open.time_exchange == time(20) && open.filled_quantity.is_zero()
+        ));
+        assert!(!venue.account.orders().holds(&instrument_name()));
+        assert_eq!(
+            resting_on(&venue, Side::Buy),
+            [ClientOrderId::new("waiting")]
+        );
+
+        let events = observe(&mut venue, 21, traded("104"));
+        assert_eq!(
+            trade_of(&events[2]).price,
+            d("105"),
+            "resting, it fills at its limit"
+        );
+    }
+
+    #[test]
+    fn a_limit_order_on_a_stale_market_is_decided_by_the_fresh_market_not_the_stale_one() {
+        // At the stale 100 a buy at 101 crosses and a buy at 99 does not. The fresh 95 crosses
+        // both, and both are filled at it: the one that looked passive is not filled worse.
+        let mut venue = venue_waiting();
+        advance(&mut venue, time(12));
+        let _ = venue.open_order(gtc_limit("crossing", Side::Buy, "1", "101"));
+        let _ = venue.open_order(gtc_limit("passive", Side::Buy, "1", "99"));
+
+        let events = observe(&mut venue, 20, traded("95"));
+
+        let prices = trades_in(&events)
+            .iter()
+            .map(|trade| (trade.client_order_id.clone(), trade.price))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prices,
+            vec![
+                (Some(ClientOrderId::new("crossing")), d("95")),
+                (Some(ClientOrderId::new("passive")), d("95")),
+            ],
+            "earliest arrival first"
+        );
+    }
+
+    #[test]
+    fn a_held_limit_order_the_fresh_size_cannot_fill_rests_the_rest_at_its_limit() {
+        let mut venue = venue_waiting();
+        advance(&mut venue, time(12));
+        let _ = venue.open_order(gtc_limit("waiting", Side::Buy, "1", "105"));
+
+        let events = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("101", "102"))
+                .with_depth(MarketDepth::new(Some(d("1")), Some(d("0.4")))),
+            time(20),
+        );
+
+        assert_eq!(events.len(), 4, "{events:?}");
+        assert_eq!(
+            balance_of(&events[0]).balance.free,
+            d("9896.20"),
+            "0.4 paid at 102 and 0.6 held at 105: 10000 - 40.8 - 63"
+        );
+        let trade = trade_of(&events[2]);
+        assert_eq!(
+            (trade.price, trade.quantity, trade.order_filled_quantity),
+            (d("102"), d("0.4"), Some(d("0.4")))
+        );
+        assert!(matches!(
+            &order_of(&events[3]).state,
+            OrderState::Active(ActiveOrderState::Open(open)) if open.filled_quantity == d("0.4")
+        ));
+        assert_eq!(
+            resting_on(&venue, Side::Buy),
+            [ClientOrderId::new("waiting")]
+        );
+
+        let events = observe(&mut venue, 21, traded("104"));
+        let trade = trade_of(&events[2]);
+        assert_eq!(
+            (trade.price, trade.quantity, trade.order_filled_quantity),
+            (d("105"), d("0.6"), Some(d("1"))),
+            "the remainder fills at its limit, as the maker"
+        );
+        assert_eq!(free_quote(&venue), d("9896.20"));
+    }
+
+    #[test]
+    fn a_held_post_only_order_the_fresh_market_crosses_is_cancelled_and_one_it_does_not_rests() {
+        let mut venue = venue_waiting();
+        advance(&mut venue, time(12));
+        let outcome = venue.open_order(limit_request("maker", Side::Buy, "1", "105", post_only()));
+        assert_eq!(
+            balance_of(&outcome.events[0]).balance.free,
+            d("9895"),
+            "held at its limit, as the maker it promises to be"
+        );
+
+        let events = observe(&mut venue, 20, traded("104"));
+
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(balance_of(&events[0]).balance.free, d("10000"));
+        assert!(matches!(
+            &order_of(&events[1]).state,
+            OrderState::Inactive(InactiveOrderState::Cancelled(cancelled))
+                if cancelled.filled_quantity == Some(Decimal::ZERO)
+        ));
+
+        advance(&mut venue, time(40));
+        let _ = venue.open_order(limit_request("passive", Side::Buy, "1", "100", post_only()));
+        let events = observe(&mut venue, 41, traded("104"));
+        assert!(matches!(
+            &order_of(&events[1]).state,
+            OrderState::Active(ActiveOrderState::Open(_))
+        ));
+        assert_eq!(
+            resting_on(&venue, Side::Buy),
+            [ClientOrderId::new("passive")]
+        );
+    }
+
+    #[test]
+    fn an_immediate_or_cancel_or_fill_or_kill_limit_on_a_stale_market_is_rejected_whether_or_not_it_crosses()
+     {
+        for (time_in_force, limit) in [
+            (TimeInForce::ImmediateOrCancel, "105"),
+            (TimeInForce::ImmediateOrCancel, "95"),
+            (TimeInForce::FillOrKill, "105"),
+            (TimeInForce::FillOrKill, "95"),
+        ] {
+            let mut venue = venue_waiting();
+            advance(&mut venue, time(12));
+
+            let outcome =
+                venue.open_order(limit_request("now", Side::Buy, "1", limit, time_in_force));
+
+            assert!(outcome.events.is_empty());
+            let reason = rejection_reason(&outcome);
+            assert!(
+                reason.contains("StaleMarketPolicy::Wait")
+                    && reason.contains(&time_in_force.to_string()),
+                "{reason}"
+            );
+            assert!(venue.account.orders().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_limit_order_past_its_deadline_on_a_stale_market_expires_rather_than_waits() {
+        let mut venue = venue_waiting();
+        advance(&mut venue, time(12));
+
+        let outcome = venue.open_order(limit_request(
+            "late",
+            Side::Buy,
+            "1",
+            "105",
+            TimeInForce::GoodTillDate { expiry: time(12) },
+        ));
+
+        assert!(matches!(
+            outcome.response.state,
+            OrderState::Inactive(InactiveOrderState::Expired(_))
+        ));
+        assert!(venue.account.orders().is_empty());
+    }
+
+    #[test]
+    fn a_held_limit_order_reaching_its_deadline_expires_and_releases_its_hold() {
+        let mut venue = venue_waiting();
+        advance(&mut venue, time(12));
+        let _ = venue.open_order(limit_request(
+            "dated",
+            Side::Buy,
+            "1",
+            "105",
+            TimeInForce::GoodTillDate { expiry: time(15) },
+        ));
+
+        let events = observe(&mut venue, 15, traded("102"));
+
+        assert!(trades_in(&events).is_empty(), "{events:?}");
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            AccountEventKind::OrderSnapshot(order)
+                if matches!(order.0.state, OrderState::Inactive(InactiveOrderState::Expired(_)))
+        )));
+        assert_eq!(free_quote(&venue), d("10000"));
+        assert!(venue.account.orders().is_empty());
+    }
+
+    #[test]
+    fn a_held_limit_order_can_be_cancelled_and_one_still_held_at_the_end_of_the_data_expires() {
+        let mut venue = venue_waiting();
+        advance(&mut venue, time(12));
+        let _ = venue.open_order(gtc_limit("cancelled", Side::Buy, "1", "105"));
+        let _ = venue.open_order(gtc_limit("expired", Side::Buy, "1", "95"));
+
+        let cancelled = venue.cancel_order(OrderRequestCancel {
+            key: gtc_limit("cancelled", Side::Buy, "1", "105").key,
+            state: RequestCancel { id: None },
+        });
+        assert!(cancelled.response.state.is_ok());
+        assert_eq!(free_quote(&venue), d("9905"));
+        assert_eq!(
+            venue.account.orders().held_on(&instrument_name()),
+            [ClientOrderId::new("expired")]
+        );
+
+        let events = venue.expire_held(time(30));
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert_eq!(balance_of(&events[0]).balance.free, d("10000"));
+        assert!(matches!(
+            order_of(&events[1]).state,
+            OrderState::Inactive(InactiveOrderState::Expired(_))
+        ));
+        assert!(venue.account.orders().is_empty());
+    }
+
+    #[test]
+    fn a_limit_order_on_an_unpriced_instrument_rests_as_it_does_without_the_policy() {
+        let mut venue =
+            SimulatedVenue::new_market_driven(&stale_config(MAX_AGE), spot_instruments());
+        advance(&mut venue, time(12));
+
+        let outcome = venue.open_order(gtc_limit("resting", Side::Buy, "1", "100"));
+
+        assert_eq!(rested_open(&outcome).filled_quantity, Decimal::ZERO);
+        assert!(!venue.account.orders().holds(&instrument_name()));
+        assert_eq!(
+            resting_on(&venue, Side::Buy),
+            [ClientOrderId::new("resting")]
+        );
+    }
+
+    /// On a fresh market, and on a stale one, where it is refused rather than held for a release
+    /// with nothing to trade.
+    #[test]
+    fn an_order_for_a_quantity_that_is_not_positive_is_refused_rather_than_held() {
+        for (now, quantity) in [(1, "0"), (1, "-1"), (12, "0"), (12, "-1")] {
+            for request in [
+                gtc_limit("limit", Side::Buy, quantity, "105"),
+                gtc_buy("market", quantity),
+            ] {
+                let mut venue = venue_waiting();
+                advance(&mut venue, time(now));
+
+                let outcome = venue.open_order(request);
+
+                assert_eq!(
+                    rejection_reason(&outcome),
+                    format!(
+                        "cannot open {} for {EXCHANGE}: quantity {quantity} is not positive",
+                        instrument_name()
+                    )
+                );
+                assert!(outcome.events.is_empty(), "a refused order moves nothing");
+                assert!(
+                    venue.account.orders().is_empty(),
+                    "and is neither held nor rested"
+                );
+                assert_eq!(free_quote(&venue), d("10000"));
+                assert!(
+                    observe(&mut venue, 20, traded("102")).is_empty(),
+                    "so a fresh observation has nothing to release"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_held_limit_order_the_account_can_no_longer_afford_is_cancelled_and_hands_back_its_draw() {
+        let config = MockExecutionConfig {
+            slippage: uniform(5),
+            ..MockExecutionConfig {
+                stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
+                ..spot_config("10", "100", FeeModelConfig::default())
+            }
+        };
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+        advance(&mut venue, time(1));
+        assert!(observe(&mut venue, 1, traded("100")).is_empty());
+        advance(&mut venue, time(12));
+        // Held at the stale 100: the account's whole balance.
+        let outcome = venue.open_order(gtc_limit("waiting", Side::Buy, "1", "105"));
+        assert_eq!(balance_of(&outcome.events[0]).balance.free, Decimal::ZERO);
+
+        let events = observe(&mut venue, 20, traded("104"));
+
+        assert_eq!(
+            events.len(),
+            2,
+            "the released hold, then the order: {events:?}"
+        );
+        assert_eq!(balance_of(&events[0]).balance.free, d("100"));
+        assert!(matches!(
+            &order_of(&events[1]).state,
+            OrderState::Inactive(InactiveOrderState::Cancelled(cancelled))
+                if cancelled.filled_quantity == Some(Decimal::ZERO)
+        ));
+        assert!(venue.account.orders().is_empty());
+        assert_eq!(venue.slippage, Slippage::new(uniform(5)));
+    }
+
+    #[test]
+    fn a_held_sell_limit_order_fills_at_the_fresh_price_or_rests_at_its_limit() {
+        let mut venue = venue_waiting();
+        advance(&mut venue, time(12));
+        // Both cross the stale 100; the fresh 97 crosses only the first.
+        let _ = venue.open_order(gtc_limit("crossed", Side::Sell, "1", "95"));
+        let _ = venue.open_order(gtc_limit("passive", Side::Sell, "1", "99"));
+
+        let events = observe(&mut venue, 20, traded("97"));
+
+        let prices = trades_in(&events)
+            .iter()
+            .map(|trade| (trade.client_order_id.clone(), trade.price))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prices,
+            vec![(Some(ClientOrderId::new("crossed")), d("97"))],
+            "above its limit, at the fresh price"
+        );
+        assert_eq!(
+            resting_on(&venue, Side::Sell),
+            [ClientOrderId::new("passive")]
+        );
+        assert_eq!(total_base(&venue), d("9"));
+    }
+
+    #[test]
+    fn a_held_limit_order_paying_its_fee_in_a_third_asset_takes_the_fee_apart_at_its_release() {
+        let config = MockExecutionConfig {
+            stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
+            ..fee_asset_config("10")
+        };
+        let mut venue = fee_asset_venue_from(&config, true);
+        advance(&mut venue, time(12));
+        let _ = venue.open_order(gtc_limit("waiting", Side::Buy, "1", "51000"));
+
+        let events = observe(&mut venue, 20, traded("50000"));
+
+        assert_eq!(
+            restated(&events)
+                .iter()
+                .map(|(asset, _)| asset.clone())
+                .collect::<Vec<_>>(),
+            [quote(), base(), bnb()],
+            "paid, received, then the fee: {events:?}"
+        );
+        let trade = trades_in(&events)[0];
+        assert_eq!(trade.price, d("50000"));
+        // 10bp of 50,000 is 50 USDT, a quarter off in BNB at 600.
+        assert_eq!(
+            restated(&events)[2].1.free,
+            d("10") - d("50") * d("0.75") / d("600")
+        );
+        assert_eq!(restated(&events)[0].1.total, d("50000"), "no fee in USDT");
+    }
+
+    fn cfd_venue_with(usd: &str, stale_market: StaleMarketPolicy) -> SimulatedVenue {
+        let config = MockExecutionConfig {
+            stale_market,
+            ..config_from_balances(vec![funded(self::usd(), d(usd))], FeeModelConfig::default())
+        };
+        let mut venue =
+            SimulatedVenue::new_market_driven(&config, instruments_of(cfd_instrument()));
+        advance(&mut venue, time(1));
+        venue
+    }
+
+    /// A released CFD order settles exactly as the same order arriving to the market that released
+    /// it: against the position as it stands then, closing the long and opening a short, with the
+    /// remainder the size there cannot fill held against the position the fill leaves.
+    #[test]
+    fn a_held_cfd_limit_order_settles_against_the_position_at_its_release_as_on_arrival() {
+        let fresh = MarketObservation::new(MarketSnapshot {
+            best_bid: Some(d("4950")),
+            best_ask: Some(d("4960")),
+            last_price: Some(d("4950")),
+        });
+        for depth in [MarketDepth::UNKNOWN, MarketDepth::new(Some(d("1.5")), None)] {
+            let observation = fresh.with_depth(depth);
+
+            let mut held = cfd_venue_with(
+                "400000",
+                StaleMarketPolicy::Wait {
+                    max_age: Duration::from_secs(10),
+                },
+            );
+            assert!(cfd_market(&mut held, "5000", "5000", "5000").is_empty());
+            cfd_market_fill(&mut held, Side::Buy, "1");
+            advance(&mut held, time(12));
+            let outcome = held.open_order(cfd_limit("flip", Side::Sell, "2", "4900"));
+            assert!(outcome.response.state.is_accepted());
+            assert!(held.account.orders().holds(&cfd_instrument_name()));
+            let released = held.apply_market(&cfd_instrument_name(), observation, time(12));
+            assert!(!trades_in(&released).is_empty(), "{released:?}");
+
+            let mut arriving = cfd_venue_with("400000", StaleMarketPolicy::Off);
+            assert!(cfd_market(&mut arriving, "5000", "5000", "5000").is_empty());
+            cfd_market_fill(&mut arriving, Side::Buy, "1");
+            advance(&mut arriving, time(12));
+            assert!(
+                arriving
+                    .apply_market(&cfd_instrument_name(), observation, time(12))
+                    .is_empty()
+            );
+            let _ = arriving.open_order(cfd_limit("flip", Side::Sell, "2", "4900"));
+
+            assert_eq!(
+                (free_usd(&held), total_usd(&held), cfd_position(&held)),
+                (
+                    free_usd(&arriving),
+                    total_usd(&arriving),
+                    cfd_position(&arriving)
+                ),
+                "depth {depth:?}"
+            );
+            assert_eq!(
+                resting_count(&held),
+                resting_count(&arriving),
+                "depth {depth:?}"
+            );
+        }
+    }
+
+    fn resting_count(venue: &SimulatedVenue) -> usize {
+        venue
+            .account
+            .orders()
+            .resting(&cfd_instrument_name(), Side::Sell)
+            .count()
+    }
+
+    #[test]
+    fn under_wait_an_observation_that_is_not_fresh_crosses_no_resting_order() {
+        let mut venue = venue_waiting();
+        let _ = venue.open_order(gtc_limit("resting", Side::Buy, "1", "99"));
+        let _ = venue.open_order(gtc_limit("selling", Side::Sell, "1", "101"));
+
+        assert!(observe_idle(&mut venue, 5, traded("95")).is_empty());
+        assert!(observe_idle(&mut venue, 6, traded("105")).is_empty());
+        assert_eq!(
+            resting_on(&venue, Side::Buy),
+            [ClientOrderId::new("resting")]
+        );
+        assert_eq!(
+            resting_on(&venue, Side::Sell),
+            [ClientOrderId::new("selling")]
+        );
+
+        let events = observe(&mut venue, 7, traded("98"));
+        assert_eq!(
+            trade_of(&events[2]).price,
+            d("99"),
+            "a fresh observation crosses it"
+        );
+    }
+
+    #[test]
+    fn without_the_policy_an_observation_that_is_not_fresh_still_crosses_a_resting_order() {
+        let mut venue = SimulatedVenue::new_market_driven(
+            &spot_config("10", "10000", FeeModelConfig::default()),
+            spot_instruments(),
+        );
+        advance(&mut venue, time(1));
+        assert!(observe(&mut venue, 1, traded("100")).is_empty());
+        let _ = venue.open_order(gtc_limit("resting", Side::Buy, "1", "99"));
+
+        let events = observe_idle(&mut venue, 5, traded("95"));
+
+        assert_eq!(trade_of(&events[2]).price, d("99"));
+    }
+
+    #[test]
+    fn a_held_limit_order_is_not_released_by_an_observation_that_is_not_fresh() {
+        let mut venue = venue_waiting();
+        advance(&mut venue, time(12));
+        let _ = venue.open_order(gtc_limit("waiting", Side::Buy, "1", "105"));
+
+        assert!(observe_idle(&mut venue, 13, traded("90")).is_empty());
+        assert!(venue.account.orders().holds(&instrument_name()));
+
+        let events = observe(&mut venue, 14, traded("103"));
+        assert_eq!(trade_of(&events[2]).price, d("103"));
+    }
+
+    #[test]
+    fn under_next_bar_a_limit_order_on_a_stale_market_is_decided_against_the_next_fresh_bar() {
+        let mut venue = venue_holding_fresh_bars();
+        advance(&mut venue, time(12));
+        let _ = venue.open_order(gtc_limit("crossed", Side::Buy, "1", "104"));
+        let _ = venue.open_order(gtc_limit("passive", Side::Buy, "1", "101"));
+        let bar = ohlc("102", "106", "101", "105");
+        assert!(venue.fills_ahead_of(
+            &instrument_name(),
+            &MarketObservation::new(traded("105")).with_bar(Some(bar))
+        ));
+
+        let events = feed_bar(&mut venue, 13, bar);
+
+        let prices = trades_in(&events)
+            .iter()
+            .map(|trade| (trade.client_order_id.clone(), trade.price))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            prices,
+            vec![(Some(ClientOrderId::new("crossed")), d("102"))],
+            "the open crosses 104 and fills it there; it does not cross 101, which rests"
+        );
+        assert_eq!(
+            resting_on(&venue, Side::Buy),
+            [ClientOrderId::new("passive")]
+        );
+    }
+
+    #[test]
+    fn under_next_bar_a_held_limit_order_its_open_does_not_cross_can_be_crossed_by_its_close() {
+        let mut venue = venue_holding_fresh_bars();
+        advance(&mut venue, time(12));
+        let _ = venue.open_order(gtc_limit("waiting", Side::Buy, "1", "101"));
+
+        let events = feed_bar(&mut venue, 13, ohlc("102", "103", "99", "100"));
+
+        let trades = trades_in(&events);
+        assert_eq!(trades.len(), 1, "{events:?}");
+        assert_eq!(
+            trades[0].price,
+            d("101"),
+            "rested at its limit when the open did not reach it, then crossed by the close"
+        );
+        assert!(venue.account.orders().is_empty());
+    }
+
+    #[test]
+    fn under_next_bar_a_limit_order_on_a_fresh_market_is_decided_on_arrival() {
+        let mut venue = venue_holding_fresh_bars();
+
+        let outcome = venue.open_order(gtc_limit("crossing", Side::Buy, "1", "104"));
+
+        assert_eq!(filled_trade(&outcome).price, d("100"));
+    }
+
+    #[test]
+    fn a_held_limit_buy_that_rests_a_remainder_holds_the_loan_left_against_it() {
+        let config = MockExecutionConfig {
+            stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
+            ..margin_config("0", "100", "2")
+        };
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+        advance(&mut venue, time(1));
+        assert!(observe(&mut venue, 1, traded("100")).is_empty());
+        advance(&mut venue, time(12));
+        // 1.5 at the stale 100 needs 150 of the 100 held: 50 is lent.
+        let outcome = venue.open_order(gtc_limit("waiting", Side::Buy, "1.5", "100"));
+        assert_eq!(
+            balance_of(&outcome.events[0]).balance,
+            Balance::new_margin(d("150"), Decimal::ZERO, d("50"), Decimal::ZERO)
+        );
+
+        // 0.5 at 80 and 1 held at 100 need 140: 40 of the loan is still used, 10 is repaid.
+        let events = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("79", "80"))
+                .with_depth(MarketDepth::new(Some(d("1")), Some(d("0.5")))),
+            time(20),
+        );
+        assert_eq!(
+            balance_of(&events[0]).balance,
+            Balance::new_margin(d("100"), Decimal::ZERO, d("40"), Decimal::ZERO)
+        );
+        assert_eq!(trade_of(&events[2]).quantity, d("0.5"));
+
+        let cancelled = venue.cancel_order(OrderRequestCancel {
+            key: gtc_limit("waiting", Side::Buy, "1.5", "100").key,
+            state: RequestCancel { id: None },
+        });
+        assert!(cancelled.response.state.is_ok());
+        assert_eq!(
+            venue.balances(&[quote()])[0].balance,
+            Balance::new_margin(d("60"), d("60"), Decimal::ZERO, Decimal::ZERO),
+            "cancelling the remainder repays the 40 it held"
+        );
+    }
+
+    #[test]
+    fn cancelling_a_released_remainder_repays_only_its_own_loan_and_not_one_already_owed() {
+        // Owing 20 USDT already, the account has 100 of its own and 120 to spend.
+        let config = MockExecutionConfig {
+            stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
+            spot_margin: Some(
+                SpotMarginConfig::new(quote(), d("2"), MarginEffect::Borrow).unwrap(),
+            ),
+            ..config_from_balances(
+                vec![
+                    funded(base(), Decimal::ZERO),
+                    AssetBalance::new(
+                        quote(),
+                        Balance::new_margin(d("120"), d("120"), d("20"), Decimal::ZERO),
+                        Utc::now(),
+                    ),
+                ],
+                FeeModelConfig::default(),
+            )
+        };
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+        advance(&mut venue, time(1));
+        assert!(observe(&mut venue, 1, traded("100")).is_empty());
+        advance(&mut venue, time(12));
+        // 150 at the stale 100 lends 30 more.
+        let _ = venue.open_order(gtc_limit("waiting", Side::Buy, "1.5", "100"));
+
+        // 0.5 at 80 and 1 held at 100 need 140: 10 of the 30 is repaid, 20 still used.
+        let events = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("79", "80"))
+                .with_depth(MarketDepth::new(Some(d("1")), Some(d("0.5")))),
+            time(20),
+        );
+        assert_eq!(
+            balance_of(&events[0]).balance,
+            Balance::new_margin(d("100"), Decimal::ZERO, d("40"), Decimal::ZERO)
+        );
+
+        let cancelled = venue.cancel_order(OrderRequestCancel {
+            key: gtc_limit("waiting", Side::Buy, "1.5", "100").key,
+            state: RequestCancel { id: None },
+        });
+        assert!(cancelled.response.state.is_ok());
+        assert_eq!(
+            venue.balances(&[quote()])[0].balance,
+            Balance::new_margin(d("80"), d("80"), d("20"), Decimal::ZERO),
+            "the remainder repays the 20 it borrowed, and the 20 owed before stays owed"
+        );
     }
 
     // ---------------------------------------------------------------------------------------

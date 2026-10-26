@@ -137,10 +137,12 @@ pub type StepAudit<GlobalData, InstrumentData, Strategy, Risk, MarketKind> = <Si
 /// instead trade against the book as it is now, or be refused if the market is closed or halted.
 ///
 /// [`MockExecutionConfig::stale_market`] closes that gap on a bar feed. Under
-/// [`StaleMarketPolicy::Wait`] a market order on an instrument last observed fresh longer ago than
-/// its `max_age` is held, and a [`settle`](Self::settle) returns with it open. The next step with
-/// a fresh observation of that instrument fills it at the market that observation leaves, and
-/// shows the `Engine` the fill after it. An immediate-or-cancel market order is rejected instead.
+/// [`StaleMarketPolicy::Wait`] an order on an instrument last observed fresh longer ago than its
+/// `max_age` is held, a limit order as well as a market one, and a [`settle`](Self::settle)
+/// returns with it open. The next step with a fresh observation of that instrument fills it at
+/// the market that observation leaves, a limit order capped at its limit and resting what that
+/// market does not fill, and shows the `Engine` the fill after it. An immediate-or-cancel order is
+/// rejected instead.
 /// Without the policy, the gap is the caller's to avoid, for example by sending orders only for
 /// instruments that had an event at this instant.
 ///

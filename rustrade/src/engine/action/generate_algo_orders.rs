@@ -93,8 +93,7 @@ where
 /// aggregate stays small (~144 B) instead of inlining six full `OrderEvent`s (~928 B, #195). That is
 /// small enough for [`EngineOutput`]'s `AlgoOrders` variant to carry it **inline** (it is the
 /// variant that floors `EngineOutput`'s size now that `PositionExit` is boxed), so no outer box is
-/// needed. `Box<T>` is
-/// serde-transparent, so the wire format is unchanged.
+/// needed. `Box<T>` is serde-transparent, so the wire format is unchanged.
 ///
 /// [`EngineOutput`]: crate::engine::EngineOutput
 /// [`SendRequestsOutput`]: crate::engine::action::send_requests::SendRequestsOutput

@@ -359,6 +359,46 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     /// Only this method values fees. [`InstrumentState::update_from_trade`](instrument::InstrumentState::update_from_trade),
     /// called directly, applies the fill's fee as it finds it.
     ///
+    /// # A cash flow on the account as a whole
+    /// A [`CashFlow`](AccountEventKind::CashFlow) whose
+    /// [`instrument`](rustrade_execution::cash_flow::CashFlow::instrument) is set goes to that
+    /// instrument's open position's carry (see
+    /// [`InstrumentState::update_from_cash_flow`](instrument::InstrumentState::update_from_cash_flow)).
+    /// One with `instrument: None` is logged at DEBUG and applied to nothing. The engine does not
+    /// guess an instrument for it, because no rule is right for every account:
+    /// - Several pairs can share a base asset, so the flow's asset alone may not name one.
+    /// - Cross-margin interest is charged on the account's whole net loan, which can include
+    ///   borrowing that no open position caused.
+    /// - Interest on a quote asset is shared by every pair quoted in it.
+    ///
+    /// A consumer whose account rules out these cases can route a flow itself, before the event
+    /// reaches the engine. For example, it can give the flow to the only instrument on the
+    /// exchange whose base asset is the flow's asset and that has an open position, and leave the
+    /// flow on the account otherwise:
+    /// ```rust
+    /// use rustrade::engine::state::{EngineState, instrument::filter::InstrumentFilter};
+    /// use rustrade_execution::{AccountEvent, AccountEventKind};
+    ///
+    /// fn route_to_base<GlobalData, InstrumentData>(
+    ///     state: &EngineState<GlobalData, InstrumentData>,
+    ///     event: &mut AccountEvent,
+    /// ) {
+    ///     let filter = InstrumentFilter::exchanges([event.exchange]);
+    ///     let AccountEventKind::CashFlow(flow) = &mut event.kind else { return };
+    ///     if flow.instrument.is_some() {
+    ///         return;
+    ///     }
+    ///     let asset = flow.asset;
+    ///     let mut held = state.instruments.instruments(&filter).filter(|instrument| {
+    ///         instrument.instrument.underlying.base == asset
+    ///             && !instrument.position.positions.is_empty()
+    ///     });
+    ///     if let (Some(only), None) = (held.next(), held.next()) {
+    ///         flow.instrument = Some(only.key);
+    ///     }
+    /// }
+    /// ```
+    ///
     /// This method:
     /// - Sets the account [`ConnectivityState`](connectivity::ConnectivityState) to
     ///   [`Health::Healthy`](connectivity::Health::Healthy) if it was not previously, unless the

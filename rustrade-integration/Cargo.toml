@@ -1,6 +1,6 @@
 [package]
 name = "rustrade-integration"
-version = "0.14.0"
+version = "0.15.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -26,18 +26,29 @@ collection = ["dep:indexmap", "dep:fnv", "dep:itertools", "dep:derive_more"]
 # self-described and survives a `stream` refactor.
 corporate-action = ["stream", "subscription", "dep:rustrade-instrument", "dep:derive_more"]
 channel = ["dep:tokio", "dep:tokio-stream", "dep:futures", "dep:derive_more", "dep:tracing"]
-error = ["dep:url", "dep:serde_qs", "dep:serde_urlencoded", "dep:thiserror"]
+# `SocketError` wraps the errors of reqwest, tokio-tungstenite, serde_json and prost, and names
+# `SubscriptionId`.
+error = ["subscription", "dep:url", "dep:serde_qs", "dep:serde_urlencoded", "dep:thiserror", "dep:serde_json", "dep:prost", "dep:reqwest", "dep:tokio-tungstenite"]
 metric = []
-protocol = ["error", "metric", "serde", "dep:tokio-tungstenite", "dep:reqwest", "dep:hmac", "dep:hex", "dep:base64", "dep:tokio", "dep:chrono", "dep:bytes", "dep:tracing"]
+protocol = ["error", "metric", "serde", "subscription", "dep:futures", "dep:tokio-tungstenite", "dep:reqwest", "dep:hmac", "dep:hex", "dep:base64", "dep:tokio", "dep:chrono", "dep:bytes", "dep:tracing"]
 serde = ["dep:serde_json", "dep:prost", "dep:bytes", "dep:thiserror", "dep:tracing", "dep:chrono"]
 subscription = ["dep:smol_str"]
 socket = ["dep:tokio", "dep:pin-project", "dep:futures"]
+# `stream::ExchangeStream` parses protocol messages, so it requires both `stream` and `protocol`.
+# The rest of the module (extensions, merge, data) needs only `stream`.
 stream = ["dep:tokio-stream", "dep:pin-project", "dep:futures", "dep:chrono"]
 
 [dev-dependencies]
 tokio-test = { workspace = true }
 sha2 = { workspace = true }
 wiremock = { workspace = true }
+# Unit tests use these under features that do not enable them as optional dependencies, so a test
+# build with one feature alone would miss them.
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+# `examples/signed_get_request.rs` names an asset type from it.
+rustrade-instrument = { workspace = true }
 
 [dependencies]
 # Rustrade Ecosystem
@@ -87,3 +98,12 @@ itertools = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 derive_more = { workspace = true, optional = true, features = ["display", "constructor"] }
 prost = { workspace = true, optional = true }
+
+# Each example builds only with the features it uses, so a test build with fewer features skips it.
+[[example]]
+name = "signed_get_request"
+required-features = ["protocol"]
+
+[[example]]
+name = "simple_websocket_integration"
+required-features = ["protocol", "stream"]

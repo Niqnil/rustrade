@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-10-26
+
+### Changed
+
+- **Breaking: `BinanceMargin::fetch_margin_interest` returns a `CashFlowsRead`** in place of a
+  `Vec<CashFlow>` (`rustrade-execution`, #718). Binance serves 90 days of interest history, and a
+  read asked to start earlier starts at that limit. Its result looked the same as a complete one,
+  so a caller adding up a position's whole interest could not tell part of it was missing. The
+  new `CashFlowsRead::held_since` is where the read started when the limit cut into the span,
+  and `None` otherwise. `resume` is always `None`, as the whole span is read in one call. The
+  flows are in `flows`. The read logs the move at DEBUG rather than WARN, since the result now
+  carries it.
+- `CashFlowsRead` gains `held_since`, with the same meaning as `TradesRead::held_since`. It is
+  `#[non_exhaustive]`, so `CashFlowsRead::new(flows, resume)` and `complete` still build one,
+  with `held_since: None`; `with_held_since` sets it. Alpaca's `fetch_cash_flows` leaves it
+  `None`.
+- **Breaking: `StaleMarketPolicy::Wait` now holds limit orders too, and stops stale observations
+  filling resting orders** (`rustrade-execution`, #667). Previously the policy held only market
+  orders. A limit order that crossed the stale price still filled against it, however old: on a
+  bar feed, a buy limit above the last close of an instrument with no bar now filled at that
+  close.
+  - Under `Wait`, every order arriving on a stale market waits for the instrument's next fresh
+    observation and is decided as if it had arrived just after it. A limit order that market
+    crosses fills as a taker at the fresh price, capped at its limit, and what the size there
+    cannot fill rests at the limit. One it does not cross rests whole at its limit. A post-only
+    one it crosses is cancelled. Whether the stale price crossed the order no longer matters.
+  - An immediate-or-cancel or fill-or-kill limit order on a stale market is rejected naming the
+    policy, as market orders already were, whether or not it crosses. It used to fill against the
+    stale price or be cancelled unfilled.
+  - While held, a limit order is `Open` with its limit, a cancel takes it back, and the venue
+    holds what it would cost arriving now. One still held when the data ends expires.
+  - Under `Wait`, an observation that is not fresh, such as a zero-volume bar, still moves the
+    price but no longer fills a resting limit order it crosses. Without the policy nothing
+    changes.
+
+### Fixed
+
+- **Each `rustrade-integration` feature builds on its own** (`rustrade-integration`). With
+  `default-features = false`, enabling `error`, `protocol`, `stream` or `corporate-action` alone
+  failed to compile, because those features did not enable the crates and features their code
+  uses. Each now does. `stream::ExchangeStream` requires both the `stream` and `protocol`
+  features; the rest of the `stream` module still needs only `stream`. CI now builds each feature
+  alone.
+- **The simulated venue rejects an order for a zero or negative quantity** (`rustrade-execution`).
+  `SimulatedVenue::open_order`, and so `MockExecution` and the backtest, accepted one. It could
+  rest on the book, or be held under `StaleMarketPolicy::Wait` until the next fresh observation
+  cancelled it. It is now rejected on arrival with `ApiError::OrderRejected` naming the quantity,
+  and moves nothing, as a live venue rejects it.
+
 ## [0.14.0] - 2026-10-25
 
 ### Added
