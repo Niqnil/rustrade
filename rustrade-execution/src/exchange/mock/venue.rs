@@ -12210,6 +12210,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cancelling_a_released_remainder_repays_only_its_own_loan_and_not_one_already_owed() {
+        // Owing 20 USDT already, the account has 100 of its own and 120 to spend.
+        let config = MockExecutionConfig {
+            stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
+            spot_margin: Some(
+                SpotMarginConfig::new(quote(), d("2"), MarginEffect::Borrow).unwrap(),
+            ),
+            ..config_from_balances(
+                vec![
+                    funded(base(), Decimal::ZERO),
+                    AssetBalance::new(
+                        quote(),
+                        Balance::new_margin(d("120"), d("120"), d("20"), Decimal::ZERO),
+                        Utc::now(),
+                    ),
+                ],
+                FeeModelConfig::default(),
+            )
+        };
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+        advance(&mut venue, time(1));
+        assert!(observe(&mut venue, 1, traded("100")).is_empty());
+        advance(&mut venue, time(12));
+        // 150 at the stale 100 lends 30 more.
+        let _ = venue.open_order(gtc_limit("waiting", Side::Buy, "1.5", "100"));
+
+        // 0.5 at 80 and 1 held at 100 need 140: 10 of the 30 is repaid, 20 still used.
+        let events = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("79", "80"))
+                .with_depth(MarketDepth::new(Some(d("1")), Some(d("0.5")))),
+            time(20),
+        );
+        assert_eq!(
+            balance_of(&events[0]).balance,
+            Balance::new_margin(d("100"), Decimal::ZERO, d("40"), Decimal::ZERO)
+        );
+
+        let cancelled = venue.cancel_order(OrderRequestCancel {
+            key: gtc_limit("waiting", Side::Buy, "1.5", "100").key,
+            state: RequestCancel { id: None },
+        });
+        assert!(cancelled.response.state.is_ok());
+        assert_eq!(
+            venue.balances(&[quote()])[0].balance,
+            Balance::new_margin(d("80"), d("80"), d("20"), Decimal::ZERO),
+            "the remainder repays the 20 it borrowed, and the 20 owed before stays owed"
+        );
+    }
+
     // ---------------------------------------------------------------------------------------
     // Spot margin: what the venue lends, holds and repays.
     // ---------------------------------------------------------------------------------------
