@@ -254,6 +254,7 @@ impl<MarketEventKind: Debug> TimeExchange for EngineEvent<MarketEventKind> {
                 AccountEventKind::Trade(trade) => Some(trade.time_exchange),
                 AccountEventKind::CashFlow(flow) => Some(flow.time_exchange),
                 AccountEventKind::Notice(notice) => Some(notice.time_exchange),
+                AccountEventKind::MarginDebt(update) => Some(update.time_exchange),
                 _ => None,
             },
             // The corporate action carries its own resolved effective instant, so the

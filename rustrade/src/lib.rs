@@ -426,6 +426,8 @@ pub mod test_utils {
         AssetState {
             asset: asset(symbol),
             balance: Some(balance),
+            // As a balance snapshot at `time_exchange` leaves it: that states the debt too.
+            debt_time: Some(time_exchange),
             statistics: TearSheetAssetGenerator::init(&balance),
         }
     }

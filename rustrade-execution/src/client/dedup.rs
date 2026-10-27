@@ -68,6 +68,12 @@ pub(crate) enum DedupEventKind {
     Notice {
         time_exchange_ms: i64,
     },
+    /// A margin debt update, keyed on its instrument (empty for the account as a whole), its asset
+    /// and the time the venue made the change, since an update has no id. A venue that sends one
+    /// update on two streams sends it with the same time, so the second is dropped.
+    MarginDebt {
+        time_exchange_ms: i64,
+    },
 }
 
 /// Dedup cache key: (instrument, event ID, event kind).
@@ -84,6 +90,8 @@ pub(crate) enum DedupEventKind {
 ///   `DedupEventKind::Funding`, since a payment has no id
 /// - For account notices: instrument (empty when the notice names none) + the venue's status +
 ///   `DedupEventKind::Notice`, carrying the time the venue sent it
+/// - For margin debt updates: instrument (empty when the update names none) + the asset +
+///   `DedupEventKind::MarginDebt`, carrying the time the venue made the change
 #[derive(Debug, Hash, Eq, PartialEq)]
 pub(crate) struct DedupKey {
     pub(crate) instrument: SmolStr,
@@ -164,6 +172,17 @@ pub(crate) fn dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<Dedu
             id: notice.status.clone(),
             kind: DedupEventKind::Notice {
                 time_exchange_ms: notice.time_exchange.timestamp_millis(),
+            },
+        }),
+        AccountEventKind::MarginDebt(update) => Some(DedupKey {
+            instrument: update
+                .instrument
+                .as_ref()
+                .map(|instrument| instrument.name().clone())
+                .unwrap_or_default(),
+            id: update.asset.name().clone(),
+            kind: DedupEventKind::MarginDebt {
+                time_exchange_ms: update.time_exchange.timestamp_millis(),
             },
         }),
         // CashFlow has none here: a venue may give a flow no id, and what identifies one then is

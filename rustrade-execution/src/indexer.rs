@@ -11,6 +11,7 @@ use crate::{
     },
     fill_recovery::{FillRecoveryGap, FillRecoveryScope},
     map::ExecutionInstrumentMap,
+    margin_debt::MarginDebtUpdate,
     notice::AccountNotice,
     order::{
         Order, OrderEvent, OrderKey, OrderSnapshot, UnindexedOrderKey, UnindexedOrderSnapshot,
@@ -132,6 +133,9 @@ impl AccountEventIndexer {
             AccountEventKind::CashFlow(flow) => AccountEventKind::CashFlow(self.cash_flow(flow)?),
             AccountEventKind::Notice(notice) => {
                 AccountEventKind::Notice(self.notice(exchange, notice))
+            }
+            AccountEventKind::MarginDebt(update) => {
+                AccountEventKind::MarginDebt(self.margin_debt(update)?)
             }
         };
 
@@ -373,6 +377,39 @@ impl AccountEventIndexer {
                 .transpose()?,
             time_exchange,
             id,
+        })
+    }
+
+    /// Index a [`MarginDebtUpdate`]'s asset and, when it names one, instrument.
+    ///
+    /// Unlike a notice's, an unknown instrument is an error rather than dropped: an update without
+    /// one is a debt of the account as a whole, which the engine applies to its asset balances, so
+    /// an isolated pair's debt delivered unattributed would overwrite the account's.
+    ///
+    /// # Errors
+    /// Returns `IndexError` if the asset, or a named instrument, is not registered in the map.
+    pub fn margin_debt(
+        &self,
+        update: MarginDebtUpdate<AssetNameExchange, InstrumentNameExchange>,
+    ) -> Result<MarginDebtUpdate<AssetIndex, InstrumentIndex>, IndexError> {
+        let MarginDebtUpdate {
+            asset,
+            instrument,
+            debt,
+            kind,
+            venue_kind,
+            time_exchange,
+        } = update;
+
+        Ok(MarginDebtUpdate {
+            asset: self.map.find_asset_index(&asset)?,
+            instrument: instrument
+                .map(|instrument| self.map.find_instrument_index(&instrument))
+                .transpose()?,
+            debt,
+            kind,
+            venue_kind,
+            time_exchange,
         })
     }
 
