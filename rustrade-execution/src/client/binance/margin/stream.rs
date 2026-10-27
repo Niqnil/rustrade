@@ -273,45 +273,66 @@ pub(super) fn convert_stream_frame(
     };
     let pair = header.s.as_deref();
 
+    // Each arm scopes the frame from its header before decoding it, so a frame of another part of
+    // the account costs no decode and logs nothing above `trace`.
     match event_type {
         "executionReport" => {
-            let Ok(report) = serde_json::from_str::<ExecutionReport>(frame).inspect_err(|e| {
-                warn!(error = %e, frame = frame_excerpt(&logged()), "BinanceMargin: undeserializable executionReport, dropping");
-            }) else {
-                return pushed;
-            };
             let keep = match account.scope(header.is_isolated, pair) {
                 Some(FrameScope::Account | FrameScope::Pair(_)) => true,
                 Some(FrameScope::Unknown) => {
-                    let symbol = report.symbol.as_deref().unwrap_or_default();
+                    // A report's `s` is its symbol.
+                    let symbol = pair.unwrap_or_default();
                     log_unattributed_report(symbol);
                     account.may_trade(symbol)
                 }
                 None => false,
             };
-            if keep {
-                // Evidence for a future margin-liquidation marker: Binance documents none for
-                // margin, so a forced liquidation's report looks like any other. These fields are
-                // where one would show.
-                debug!(
-                    symbol = report.symbol.as_deref().unwrap_or("?"),
-                    order_id = ?report.order_id,
-                    client_order_id = report.client_order_id.as_deref().unwrap_or("?"),
-                    orig_client_order_id = report.orig_client_order_id.as_deref().unwrap_or("?"),
-                    order_type = report.order_type.as_deref().unwrap_or("?"),
-                    execution_type = report.execution_type.as_deref().unwrap_or("?"),
-                    order_status = report.order_status.as_deref().unwrap_or("?"),
-                    "BinanceMargin executionReport"
-                );
-                convert_execution_report(&report, ExchangeId::BinanceMargin, buf);
-            } else {
+            if !keep {
                 trace!(
                     symbol = pair.unwrap_or("?"),
                     "BinanceMargin: executionReport of another margin account, skipping"
                 );
+                return pushed;
             }
+            let Ok(report) = serde_json::from_str::<ExecutionReport>(frame).inspect_err(|e| {
+                warn!(error = %e, frame = frame_excerpt(&logged()), "BinanceMargin: undeserializable executionReport, dropping");
+            }) else {
+                return pushed;
+            };
+            // Evidence for a future margin-liquidation marker: Binance documents none for margin,
+            // so a forced liquidation's report looks like any other. These fields are where one
+            // would show.
+            debug!(
+                symbol = report.symbol.as_deref().unwrap_or("?"),
+                order_id = ?report.order_id,
+                client_order_id = report.client_order_id.as_deref().unwrap_or("?"),
+                orig_client_order_id = report.orig_client_order_id.as_deref().unwrap_or("?"),
+                order_type = report.order_type.as_deref().unwrap_or("?"),
+                execution_type = report.execution_type.as_deref().unwrap_or("?"),
+                order_status = report.order_status.as_deref().unwrap_or("?"),
+                "BinanceMargin executionReport"
+            );
+            convert_execution_report(&report, ExchangeId::BinanceMargin, buf);
         }
         "outboundAccountPosition" => {
+            let scope = match account.scope(header.is_isolated, pair) {
+                Some(FrameScope::Unknown) => {
+                    warn!(
+                        is = ?header.is_isolated,
+                        pair = pair.unwrap_or("?"),
+                        "BinanceMargin: outboundAccountPosition that does not say which margin \
+                         account it is about, dropping it"
+                    );
+                    return pushed;
+                }
+                Some(scope) => scope,
+                None => {
+                    trace!(
+                        "BinanceMargin: outboundAccountPosition of another margin account, skipping"
+                    );
+                    return pushed;
+                }
+            };
             let Ok(position) =
                 serde_json::from_str::<OutboundAccountPosition>(frame).inspect_err(|e| {
                     warn!(error = %e, frame = frame_excerpt(&logged()), "BinanceMargin: undeserializable outboundAccountPosition, dropping");
@@ -319,9 +340,8 @@ pub(super) fn convert_stream_frame(
             else {
                 return pushed;
             };
-            match (account.scope(header.is_isolated, pair), account) {
-                (Some(FrameScope::Account), _) => convert_margin_account_position(position, buf),
-                (Some(FrameScope::Pair(instrument)), StreamAccount::Isolated { pairs }) => {
+            match (scope, account) {
+                (FrameScope::Pair(instrument), StreamAccount::Isolated { pairs }) => {
                     match pairs.get(&instrument) {
                         Some(Some((base, quote))) => {
                             route_isolated_account_position(
@@ -339,17 +359,8 @@ pub(super) fn convert_stream_frame(
                         ),
                     }
                 }
-                (Some(_), _) => warn!(
-                    is = ?header.is_isolated,
-                    pair = pair.unwrap_or("?"),
-                    "BinanceMargin: outboundAccountPosition that does not say which margin \
-                     account it is about, dropping it"
-                ),
-                (None, _) => {
-                    trace!(
-                        "BinanceMargin: outboundAccountPosition of another margin account, skipping"
-                    );
-                }
+                // `scope` gives a pair only on isolated, and `Unknown` returned above.
+                _ => convert_margin_account_position(position, buf),
             }
         }
         "balanceUpdate" => {
@@ -357,29 +368,37 @@ pub(super) fn convert_stream_frame(
             // the balance. No log: this fires on every transfer.
         }
         "liabilityChange" => {
+            let instrument = match account.scope(header.is_isolated, pair) {
+                Some(FrameScope::Account) => None,
+                Some(FrameScope::Pair(instrument)) => Some(instrument),
+                Some(FrameScope::Unknown) => {
+                    warn!(
+                        is = ?header.is_isolated,
+                        pair = pair.unwrap_or("?"),
+                        "BinanceMargin: liabilityChange that does not say which margin account it \
+                         is about, dropping it rather than apply it to the wrong one"
+                    );
+                    return pushed;
+                }
+                None => {
+                    trace!("BinanceMargin: liabilityChange of another margin account, skipping");
+                    return pushed;
+                }
+            };
             let Ok(change) = serde_json::from_str::<LiabilityChange>(frame).inspect_err(|e| {
                 warn!(error = %e, frame = frame_excerpt(&logged()), "BinanceMargin: undeserializable liabilityChange, dropping");
             }) else {
                 return pushed;
             };
             log_liability_change(&change);
-            match account.scope(header.is_isolated, pair) {
-                Some(FrameScope::Account) => buf.extend(liability_debt_updates(change, None)),
-                Some(FrameScope::Pair(instrument)) => {
-                    buf.extend(liability_debt_updates(change, Some(instrument)));
-                }
-                Some(FrameScope::Unknown) => warn!(
-                    is = ?header.is_isolated,
-                    pair = pair.unwrap_or("?"),
-                    "BinanceMargin: liabilityChange that does not say which margin account it is \
-                     about, dropping it rather than apply it to the wrong one"
-                ),
-                None => {
-                    trace!("BinanceMargin: liabilityChange of another margin account, skipping")
-                }
-            }
+            buf.extend(liability_debt_updates(change, instrument));
         }
         "marginLevelChange" => {
+            // `s` is the status here, so no pair is read from it.
+            let Some(scope) = account.scope(header.is_isolated, None) else {
+                trace!("BinanceMargin: marginLevelChange of another margin account, skipping");
+                return pushed;
+            };
             let Ok(change) =
                 serde_json::from_str::<MarginLevelStatusChange>(frame).inspect_err(|e| {
                     warn!(error = %e, frame = frame_excerpt(&logged()), "BinanceMargin: undeserializable marginLevelChange, dropping");
@@ -388,22 +407,15 @@ pub(super) fn convert_stream_frame(
                 return pushed;
             };
             log_margin_level_change(&change);
-            // `s` is the status here, so no pair is read from it.
-            match account.scope(header.is_isolated, None) {
-                Some(FrameScope::Account) => buf.extend(margin_level_notice(change, None)),
-                Some(_) => {
-                    warn!(
-                        is = ?header.is_isolated,
-                        status = change.s.as_deref().unwrap_or("?"),
-                        "BinanceMargin: marginLevelChange that names no pair, delivering the \
-                         notice without an instrument"
-                    );
-                    buf.extend(margin_level_notice(change, None));
-                }
-                None => {
-                    trace!("BinanceMargin: marginLevelChange of another margin account, skipping")
-                }
+            if scope != FrameScope::Account {
+                warn!(
+                    is = ?header.is_isolated,
+                    status = change.s.as_deref().unwrap_or("?"),
+                    "BinanceMargin: marginLevelChange that names no pair, delivering the notice \
+                     without an instrument"
+                );
             }
+            buf.extend(margin_level_notice(change, None));
         }
         "listenKeyExpired" => {
             warn!(
@@ -871,14 +883,15 @@ enum SessionEnd {
 
 impl SessionEnd {
     /// Where the gap this end leaves begins, for fill recovery: a short lookback before `now`,
-    /// and for a heartbeat timeout a whole heartbeat window more, since the connection may have
-    /// gone quiet as soon as that window began. `None` when the consumer dropped the stream,
-    /// which leaves nothing to recover.
+    /// and for a heartbeat timeout two heartbeat windows more. A check that finds proof of life
+    /// only says the connection was alive at some point in the window before it, so a connection
+    /// that died just after one check is declared dead two checks later. `None` when the
+    /// consumer dropped the stream, which leaves nothing to recover.
     fn gap_start(self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         let lookback = match self {
             Self::ConsumerDropped => return None,
             Self::HeartbeatTimeout => {
-                chrono::Duration::seconds(HEARTBEAT_TIMEOUT_SECS as i64)
+                chrono::Duration::seconds(2 * HEARTBEAT_TIMEOUT_SECS as i64)
                     + chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS)
             }
             Self::Disconnected | Self::KeyExpired => {
@@ -943,6 +956,19 @@ impl<K: ListenKeys> MarginStream<K> {
             error!(%e, "BinanceMargin listen-key request failed");
             e.to_string()
         })?;
+        // As in `open`: the key request may have waited out a cooldown, and one a concurrent
+        // refusal started since must not be connected into. A long one fails this attempt, and
+        // `retry_or_end` then ends the stream for it.
+        self.rate_limiter
+            .before_stream_connect()
+            .await
+            .map_err(|reason| {
+                warn!(
+                    ?reason,
+                    "BinanceMargin reconnect held back by a rate-limit cooldown"
+                );
+                format!("{reason:?}")
+            })?;
         connect_and_subscribe(&self.url, &listen_key)
             .await
             .map_err(|e| {
@@ -1085,13 +1111,12 @@ impl<K: ListenKeys> MarginStream<K> {
                 }
             }
         };
-        // A failed keepalive is not fatal: the key has 30 minutes left, and the venue sends
-        // listenKeyExpired if it lapses.
+        // Kept alive as the session opens, then every 30 minutes: Binance hands back a key that is
+        // still live without saying how long it has left, and does not document that handing it
+        // back extends it. A failed keepalive is not fatal: the key then has at least 30 minutes
+        // left, and the venue sends listenKeyExpired if it lapses.
         let keepalive = async {
-            let mut ticks = tokio::time::interval_at(
-                Instant::now() + LISTEN_KEY_KEEPALIVE,
-                LISTEN_KEY_KEEPALIVE,
-            );
+            let mut ticks = tokio::time::interval(LISTEN_KEY_KEEPALIVE);
             ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
             loop {
                 ticks.tick().await;
@@ -2022,6 +2047,34 @@ mod tests {
         }
     }
 
+    /// A frame of another part of the account is skipped on its header alone: it is not decoded,
+    /// so a body that would not decode logs nothing, and its arrival is not logged at `info`.
+    #[test]
+    fn another_accounts_frame_is_skipped_undecoded() {
+        for event in [
+            serde_json::json!({ "e": "executionReport", "q": [1] }),
+            serde_json::json!({ "e": "outboundAccountPosition", "E": 1, "B": 5 }),
+            serde_json::json!({ "e": "liabilityChange", "E": 1, "t": "BORROW", "L": 5 }),
+            serde_json::json!({ "e": "marginLevelChange", "E": 1, "l": [1] }),
+        ] {
+            let frame = push_isolated("BTCUSDT", event);
+            let (buf, messages) = log_messages(|| delivered(&frame, &StreamAccount::Cross));
+            assert!(buf.is_empty(), "{frame}");
+            assert!(
+                !messages
+                    .iter()
+                    .any(|m| m.contains("undeserializable") || m.contains("received")),
+                "{frame}: {messages:?}"
+            );
+            // The client the frame is about does decode it: the body is what fails.
+            let (_, messages) = log_messages(|| delivered(&frame, &isolated()));
+            assert!(
+                messages.iter().any(|m| m.contains("undeserializable")),
+                "{frame}: {messages:?}"
+            );
+        }
+    }
+
     /// An `executionReport` that does not say whose it is is kept by its symbol, and the
     /// ambiguity logged: on cross any symbol, on isolated a configured pair.
     #[test]
@@ -2541,17 +2594,23 @@ mod tests {
 
     // -- The session -----------------------------------------------------------------------------
 
-    /// Hands out `key-1`, `key-2`, … and counts keepalives.
+    /// Hands out `key-1`, `key-2`, … and counts keepalives. With `cooldown_from` set, handing out
+    /// any key after the first starts a 60 s rate-limit cooldown on it, as a refusal elsewhere
+    /// on the same tracker would while the key request ran.
     #[derive(Default)]
     struct FakeKeys {
         issued: Mutex<u32>,
         keepalives: Mutex<Vec<String>>,
+        cooldown_from: std::sync::OnceLock<Arc<RateLimitTracker>>,
     }
 
     impl ListenKeys for Arc<FakeKeys> {
         async fn start(&self) -> Result<String, UnindexedClientError> {
             let mut issued = self.issued.lock().unwrap();
             *issued += 1;
+            if let Some(rate_limiter) = self.cooldown_from.get().filter(|_| *issued > 1) {
+                rate_limiter.on_rate_limited(Some(Duration::from_secs(60)));
+            }
             Ok(format!("key-{issued}"))
         }
 
@@ -2561,8 +2620,8 @@ mod tests {
         }
     }
 
-    /// A gap begins a short lookback before its session ended, and after a heartbeat timeout a
-    /// whole 30 s window earlier still. A consumer that left leaves no gap.
+    /// A gap begins a short lookback before its session ended, and after a heartbeat timeout two
+    /// 30 s windows earlier still. A consumer that left leaves no gap.
     #[test]
     fn a_session_end_sets_where_its_gap_begins() {
         let now = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
@@ -2574,7 +2633,7 @@ mod tests {
         }
         assert_eq!(
             SessionEnd::HeartbeatTimeout.gap_start(now),
-            Some(now - chrono::Duration::seconds(30) - lookback)
+            Some(now - chrono::Duration::seconds(60) - lookback)
         );
     }
 
@@ -2940,7 +2999,7 @@ mod tests {
 
     /// A connection whose pings go unanswered is dropped at the second heartbeat check, the first
     /// being a grace, and reconnected after the backoff; one that answers is kept, and its key is
-    /// kept alive every 30 minutes.
+    /// kept alive as the session opens and every 30 minutes after.
     #[tokio::test(start_paused = true)]
     async fn the_heartbeat_drops_a_silent_connection_and_keeps_an_answering_one() {
         let (listener, url) = listen().await;
@@ -2988,8 +3047,10 @@ mod tests {
             panic!("the answering connection was dropped");
         };
         tokio::pin!(second, third);
-        // Kept alive once 30 minutes have passed, and not before.
-        for (wait_secs, kept_alive) in [(29 * 60, vec![]), (2 * 60, vec!["key-2".to_owned()])] {
+        // Each key is kept alive as its session opens, then once 30 minutes have passed.
+        let opened = vec!["key-1".to_owned(), "key-2".to_owned()];
+        let again = [opened.clone(), vec!["key-2".to_owned()]].concat();
+        for (wait_secs, kept_alive) in [(29 * 60, opened), (2 * 60, again)] {
             tokio::select! {
                 () = &mut second => panic!("the client closed the answering connection"),
                 () = &mut third => {}
@@ -3049,6 +3110,59 @@ mod tests {
         assert!(rx.recv().await.is_none(), "the stream has ended");
         task.await.unwrap();
         assert_eq!(*keys.issued.lock().unwrap(), 1, "no reconnect");
+    }
+
+    /// A cooldown that starts while a reconnect's key request runs stops the connect: the stream
+    /// ends rate-limited, and nothing connects into the cooldown.
+    #[tokio::test]
+    async fn a_cooldown_started_during_the_key_request_holds_back_the_reconnect() {
+        use crate::error::StreamTerminationReason;
+
+        let (listener, url) = listen().await;
+        let keys = Arc::new(FakeKeys::default());
+        let (stream, mut rx) = margin_stream(&keys, url, StreamAccount::Cross);
+        assert!(
+            keys.cooldown_from
+                .set(Arc::clone(&stream.rate_limiter))
+                .is_ok()
+        );
+        let server = async {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let Some(Ok(Message::Text(subscribe))) = ws.next().await else {
+                panic!("expected a SUBSCRIBE frame")
+            };
+            let subscribe: serde_json::Value = serde_json::from_str(&subscribe).unwrap();
+            let ack = serde_json::json!({ "result": null, "id": subscribe["id"] });
+            ws.send(Message::Text(ack.to_string().into()))
+                .await
+                .unwrap();
+            ws
+        };
+        let (session, mut ws) = tokio::join!(stream.open(), server);
+        let task = tokio::spawn(stream.run(session.unwrap()));
+        ws.close(None).await.unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the stream ends rate-limited within the timeout")
+            .expect("it reports why before it ends");
+        assert!(
+            matches!(
+                event.kind,
+                AccountEventKind::StreamTerminated(StreamTerminationReason::RateLimited { .. })
+            ),
+            "{:?}",
+            event.kind
+        );
+        task.await.unwrap();
+        assert_eq!(*keys.issued.lock().unwrap(), 2, "a key was requested");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "nothing connected into the cooldown"
+        );
     }
 
     /// When the consumer drops the stream, its socket is closed.

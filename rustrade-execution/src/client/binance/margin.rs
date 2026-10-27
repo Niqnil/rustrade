@@ -411,7 +411,8 @@ impl BinanceMarginConfig {
 ///
 /// # User-data stream
 /// [`account_stream`](Self::account_stream) reads Binance's margin user-data stream with a listen
-/// key from `POST /sapi/v2/margin/listen-key`, kept alive every 30 minutes. Since 2026-10-14
+/// key from `POST /sapi/v2/margin/listen-key`, kept alive as each connection opens and every 30
+/// minutes after. Since 2026-10-14
 /// Binance refuses the earlier margin streams' credentials (`POST /sapi/v1/userListenToken` and
 /// `POST /sapi/v1/margin/listen-key`) with `-3086` for new accounts and for accounts it has
 /// migrated, and the v2 key is open to every account. One stream carries fills, orders, balances,
@@ -1390,8 +1391,9 @@ impl ExecutionClient for BinanceMargin {
     /// Gets a listen key (`POST /sapi/v2/margin/listen-key`, weight 1), connects to
     /// `wss://fstream.binance.com/private/ws` and subscribes the key, then keeps the stream live
     /// with auto-reconnect, exponential backoff, heartbeat monitoring and fill recovery (mirroring
-    /// [`BinanceSpot`](super::spot::BinanceSpot)). The key is kept alive every 30 minutes
-    /// (`PUT`, weight 1); a failed keepalive is logged at `warn`, and if the key lapses anyway
+    /// [`BinanceSpot`](super::spot::BinanceSpot)). The key is kept alive as each connection
+    /// opens and every 30 minutes after (`PUT`, weight 1), since Binance hands back a key that is
+    /// still live without saying how long it has left; a failed keepalive is logged at `warn`, and if the key lapses anyway
     /// Binance says so on the stream, and the stream reconnects with a new one. The key is not
     /// closed when the stream ends: it lapses 60 minutes after its last keepalive. The stream ends
     /// once 10 reconnects in a row have failed or a rate-limit cooldown outlasts what it waits
@@ -1437,7 +1439,9 @@ impl ExecutionClient for BinanceMargin {
     /// The event's `s` is its status, so it names no pair. A cross account's notice names no
     /// instrument. An isolated pair's is delivered to an isolated client naming no instrument,
     /// with a `warn`, whichever pair it is about, since losing a margin call costs more than losing
-    /// its attribution; a cross client does not receive it.
+    /// its attribution; a cross client does not receive it. So an isolated client's notice can be
+    /// about any isolated pair of the account, one it is not configured for included, and two
+    /// isolated clients on one account each receive it.
     ///
     /// A notice with no time is stamped on arrival. Each arrival is logged at `info`, before
     /// dedup. A notice sent while the stream is disconnected is not recovered.

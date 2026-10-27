@@ -70,8 +70,9 @@
 //!   when to try again is the caller's decision, as it is after the stream ends.
 //!
 //! [`BinanceMargin`] also reconnects with a new listen key when Binance says the old one has
-//! expired, which spends an attempt like any other failure. Its key is kept alive every 30
-//! minutes, which Binance documents as enough to keep it valid.
+//! expired, which spends an attempt like any other failure. Its key is kept alive as each
+//! connection opens and every 30 minutes after, which Binance documents as enough to keep it
+//! valid.
 //!
 //! # Logging: `binance_sdk` writes request credentials at `DEBUG`
 //!

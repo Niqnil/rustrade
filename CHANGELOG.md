@@ -64,7 +64,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   /sapi/v1/margin/listen-key`) with `-3086` for new accounts and for accounts it has migrated,
   which it is doing gradually.
   - **One listen key, one stream.** `account_stream` gets a key from `POST
-    /sapi/v2/margin/listen-key`, keeps it alive every 30 minutes, and reads
+    /sapi/v2/margin/listen-key`, keeps it alive as each connection opens and every 30 minutes
+    after, and reads
     `wss://fstream.binance.com/private/ws`, sending the key in a subscribe frame rather than in
     the URL. One key covers the cross account and every isolated pair, and each frame says which
     it is about, so a client keeps only the frames of the account it is configured for. An
@@ -74,9 +75,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     margin notices as `marginLevelChange` (was `MARGIN_LEVEL_STATUS_CHANGE`), still delivered as
     `AccountEventKind::MarginDebt` and `AccountEventKind::Notice`.
   - **Isolated notices name no instrument.** A `marginLevelChange` does not say which pair it is
-    about, so an isolated client delivers each with no instrument, logged at `warn`. Before, it
-    named the pair whose subscription carried it. A cross client does not receive an isolated
-    pair's notice.
+    about, so an isolated client delivers each with no instrument, logged at `warn`, whichever
+    isolated pair of the account it is about, one the client is not configured for included.
+    Before, it named the pair whose subscription carried it. A cross client does not receive an
+    isolated pair's notice.
   - **Isolated debt is not streamed.** Binance has not been seen to send `liabilityChange` for an
     isolated pair, so an isolated client gets no `AccountEventKind::MarginDebt`; its debt comes
     from `account_snapshot`.

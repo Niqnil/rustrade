@@ -366,7 +366,9 @@ async fn flatten_all(rest: &RestApi, symbol: &str) {
     }
     assert!(
         not_flat.is_empty(),
-        "the subaccount is NOT flat after cleanup: {not_flat:?}. Flatten it by hand"
+        "the subaccount is NOT flat after cleanup: {not_flat:?}. Flatten it by hand. The cleanup \
+         cancels orders on the tested pair only: an open cross order on another pair must be \
+         cancelled by hand"
     );
     println!("the subaccount is flat");
 }
@@ -767,7 +769,15 @@ async fn real_money_run(account: Account) {
 
     collector.abort();
     if let Some(tap) = tap {
-        tap.abort();
+        // The tap reads until it is aborted, so one already finished failed.
+        if tap.is_finished() {
+            match tap.await {
+                Err(error) if error.is_panic() => println!("NOTE: the raw tap failed: {error}"),
+                _ => println!("NOTE: the raw tap stopped early"),
+            }
+        } else {
+            tap.abort();
+        }
     }
     let summary: Vec<String> = events.lock().unwrap().iter().map(describe).collect();
     println!("SUMMARY {account:?} stream events: {summary:#?}");
