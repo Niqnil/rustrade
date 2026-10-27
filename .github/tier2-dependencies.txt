@@ -447,7 +447,18 @@ ibapi=5.2.0  # 2026-10-27 | Financial protocol, community-maintained, no officia
 #     item for a dropped subscription is now discarded at `trace!` (transport/sync.rs:1064-1065).
 #   - Async-only changes (#1047, clone cancellation) are not compiled: we select `sync` only.
 #
-# NOT VERIFIABLE OFF-GATEWAY: the #[ignore]d ibkr integration tests do not run in CI.
+# Exercised against a paper IB Gateway on 2026-10-27, outside US regular trading hours, the client
+# advertising server versions up to 226:
+# the 12 #[ignore]d tests in rustrade-execution/tests/ibkr_execution.rs listed in the PR (connection,
+# placement and cancel, brackets and OCA, account stream, open orders, the restart lookup, shortability) and
+# 8 in rustrade-data/tests/ibkr_integration.rs (contract resolution, historical bars/ticks/midpoint, the two
+# market-stream disconnect tests) pass. With another API client buying and selling EUR.USD, no observer's
+# account stream reported its fills live, client id 0 included; `fetch_trades` returned both as External with
+# `other_clients_fills` on and none with it off. `test_market_stream_disconnect_while_running` can fail when IB
+# answers its AAPL tick-by-tick request with 10189 (which ends it) instead of the 10089 notice, leaving nothing
+# to disconnect; the same run order reproduces that on =5.1.0, so it is the paper account's permissions, not
+# this bump. Not exercised: a fill of this client's own order (outside regular hours), an automatic reconnect, a
+# liquidation.
 binance-sdk=77.0.0  # 2026-10-27 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
 #   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
