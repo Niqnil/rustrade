@@ -36,10 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
       (its docs do not say).
     - Isolated updates name the pair whose subscription carried them. One whose subscription maps
       to no pair is dropped with a `warn`.
+    - A change with no asset, or whose totals or time cannot be read, is dropped with a `warn`; the
+      next account snapshot restates the debt.
   - **The engine** applies an update that names no instrument to the asset's `Balance::margin`,
     so `net_asset` follows debt between account snapshots.
     - Debt is ordered by its own time against earlier debt alone. A newer free/locked update does
       not block it, and an older balance snapshot no longer overwrites it.
+    - An update for an asset with no balance yet opens one holding nothing, which the first
+      statement of its holdings replaces, whatever that statement's time.
     - An update naming an isolated pair changes no engine state.
   - **`SimulatedVenue`** on a spot-margin account follows each balance restatement whose loan
     changed with the same event.
