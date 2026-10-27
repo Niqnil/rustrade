@@ -259,6 +259,12 @@ impl AssetState {
     }
 }
 
+/// The asset's balance as held, stamped with its holdings' time.
+///
+/// An asset whose balance only a debt update has stated reads as holding nothing at
+/// [`DateTime::<Utc>::MIN_UTC`], with that debt (see [`AssetState::apply_margin_debt`]), so any
+/// statement of its holdings supersedes it. An asset with no balance at all reads as holding
+/// nothing, now.
 impl From<&AssetState> for AssetBalance<AssetNameExchange> {
     fn from(value: &AssetState) -> Self {
         let AssetState {
