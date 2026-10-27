@@ -449,10 +449,15 @@ ibapi=5.2.0  # 2026-10-27 | Financial protocol, community-maintained, no officia
 #
 # Exercised against a paper IB Gateway on 2026-10-27, outside US regular trading hours, the client
 # advertising server versions up to 226:
-# the 12 #[ignore]d tests in rustrade-execution/tests/ibkr_execution.rs listed in the PR (connection,
-# placement and cancel, brackets and OCA, account stream, open orders, the restart lookup, shortability) and
-# 8 in rustrade-data/tests/ibkr_integration.rs (contract resolution, historical bars/ticks/midpoint, the two
-# market-stream disconnect tests) pass. With another API client buying and selling EUR.USD, no observer's
+# in rustrade-execution/tests/ibkr_execution.rs, test_connection, test_contract_registration,
+# test_fetch_open_orders, test_place_and_cancel_limit_order, test_account_stream,
+# test_cancel_produces_cancelled_not_expired, test_place_and_cancel_bracket_order,
+# test_bracket_order_oca_group_linkage, test_orders_found_by_client_order_id_across_a_restart,
+# test_order_id_mapping_cleanup, test_fetch_shortability and test_shortability_raw_ticks; in
+# rustrade-data/tests/ibkr_integration.rs, test_contract_resolution, test_historical_connection,
+# test_historical_daily_bars, test_historical_minute_bars, test_historical_ticks_trade,
+# test_historical_midpoint_data and both test_market_stream_disconnect_* tests. All pass.
+# With another API client buying and selling EUR.USD, no observer's
 # account stream reported its fills live, client id 0 included; `fetch_trades` returned both as External with
 # `other_clients_fills` on and none with it off. `test_market_stream_disconnect_while_running` can fail when IB
 # answers its AAPL tick-by-tick request with 10189 (which ends it) instead of the 10089 notice, leaving nothing
