@@ -1689,4 +1689,73 @@ mod tests {
             "an unmapped instrument is dropped from the notice, not the notice itself"
         );
     }
+
+    /// A margin debt update indexes its asset and instrument, and one naming an unmapped
+    /// instrument fails rather than becoming the account's debt.
+    #[test]
+    fn account_event_indexes_a_margin_debt_update() {
+        use crate::{
+            balance::MarginDetails,
+            margin_debt::{MarginDebtKind, MarginDebtUpdate},
+        };
+        use rust_decimal_macros::dec;
+        use smol_str::SmolStr;
+
+        let indexer = binance_indexer();
+        let time = DateTime::<Utc>::MIN_UTC;
+        let debt = MarginDetails::new(dec!(0.5), dec!(0.01));
+        let update = |asset: &str, instrument: Option<&str>| {
+            UnindexedAccountEvent::new(
+                ExchangeId::BinanceSpot,
+                AccountEventKind::MarginDebt(MarginDebtUpdate::new(
+                    AssetNameExchange::new(asset),
+                    instrument.map(InstrumentNameExchange::new),
+                    debt,
+                    MarginDebtKind::Borrow,
+                    SmolStr::new("BORROW"),
+                    time,
+                )),
+            )
+        };
+        let index_of = |event| match indexer.account_event(event) {
+            Ok(AccountEvent {
+                kind: AccountEventKind::MarginDebt(update),
+                ..
+            }) => Ok(update),
+            Ok(other) => panic!("expected MarginDebt, got {other:?}"),
+            Err(error) => Err(error),
+        };
+        let (Ok(btc), Ok(btc_usdt)) = (
+            indexer.map.find_asset_index(&AssetNameExchange::new("BTC")),
+            indexer
+                .map
+                .find_instrument_index(&InstrumentNameExchange::new("BTC_USDT")),
+        ) else {
+            panic!("BTC and BTC_USDT are mapped");
+        };
+
+        assert_eq!(
+            index_of(update("BTC", Some("BTC_USDT"))),
+            Ok(MarginDebtUpdate::new(
+                btc,
+                Some(btc_usdt),
+                debt,
+                MarginDebtKind::Borrow,
+                SmolStr::new("BORROW"),
+                time,
+            ))
+        );
+        assert_eq!(
+            index_of(update("BTC", None)).map(|update| update.instrument),
+            Ok(None)
+        );
+        assert!(
+            index_of(update("ETH", None)).is_err(),
+            "an unmapped asset fails"
+        );
+        assert!(
+            index_of(update("BTC", Some("ETHUSDT"))).is_err(),
+            "an unmapped instrument fails"
+        );
+    }
 }
