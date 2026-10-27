@@ -1792,6 +1792,28 @@ pub(crate) fn answer_time(
     }
 }
 
+/// When an `outboundAccountPosition` says its balances were last updated: its `u`, else its event
+/// time `E`, else the local clock.
+///
+/// Binance stamps every such frame with both, so either falling back is logged with a `warn!`. The
+/// balances are still delivered, because they state what the account holds whatever their time.
+pub(crate) fn account_position_time(
+    exchange: ExchangeId,
+    last_update: Option<i64>,
+    event_time: Option<i64>,
+) -> DateTime<Utc> {
+    let read = |ms: Option<i64>| ms.and_then(|ms| Utc.timestamp_millis_opt(ms).single());
+    if let Some(time) = read(last_update) {
+        return time;
+    }
+    if let Some(time) = read(event_time) {
+        warn!(%exchange, ?last_update, "Binance outboundAccountPosition missing/unparseable update time (u), using its event time (E)");
+        return time;
+    }
+    warn!(%exchange, ?last_update, ?event_time, "Binance outboundAccountPosition missing/unparseable update time (u) and event time (E), using now");
+    Utc::now()
+}
+
 /// The fields of Binance's response to placing an order that say what became of it.
 #[derive(Debug, Clone)]
 pub(crate) struct PlacementResponse<'a> {
@@ -3969,6 +3991,25 @@ mod tests {
             assert!(
                 (before..=Utc::now()).contains(&time),
                 "{transact_time:?} gave {time}"
+            );
+        }
+    }
+
+    /// An account position is at its update time `u`, else its event time `E`, else now.
+    #[test]
+    fn an_account_positions_time_is_its_update_time_then_its_event_time_then_now() {
+        let at = |ms| Utc.timestamp_millis_opt(ms).unwrap();
+        let time = |u, e| account_position_time(ExchangeId::BinanceSpot, u, e);
+
+        assert_eq!(time(Some(2_000), Some(3_000)), at(2_000));
+        assert_eq!(time(None, Some(3_000)), at(3_000));
+        assert_eq!(time(Some(i64::MAX), Some(3_000)), at(3_000));
+        for event_time in [None, Some(i64::MAX)] {
+            let before = Utc::now();
+            let now = time(None, event_time);
+            assert!(
+                (before..=Utc::now()).contains(&now),
+                "{event_time:?} gave {now}"
             );
         }
     }

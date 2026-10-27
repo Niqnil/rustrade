@@ -70,13 +70,14 @@ use super::shared::{
     HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
     PlacementResponse, RateLimitTracker, RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS,
     SharedDedupCache, TrailingOrderError, UnhandledEvents, UnrecoveredFills, UnsubscribeOnDrop,
-    UserDataFrame, WeightPool, WireInt, answer_time, binance_filled_qty, classify_order_kind_tif,
-    classify_rest_order_error, classify_rest_query_error, convert_ended_order,
-    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
-    dedup_key_from_event, disconnect_error, drop_after, frame_excerpt, gap_failed, gap_time,
-    is_duplicate, is_unknown_order, log_unhandled_event, log_unrecognised_frame, new_dedup_cache,
-    parse_user_data_frame, placed_order_state, recovered_order_cids, recovered_order_totals,
-    response_decode_error, rest_call_with_retry, retry_or_end, trailing_params, unreadable_answer,
+    UserDataFrame, WeightPool, WireInt, account_position_time, answer_time, binance_filled_qty,
+    classify_order_kind_tif, classify_rest_order_error, classify_rest_query_error,
+    convert_ended_order, convert_execution_report, convert_open_order_listing,
+    convert_open_order_owned_symbol, dedup_key_from_event, disconnect_error, drop_after,
+    frame_excerpt, gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
+    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
+    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
+    retry_or_end, trailing_params, unreadable_answer,
 };
 use crate::rules::{OrderRules, PreSendRules};
 use crate::{
@@ -2595,10 +2596,8 @@ fn convert_margin_account_position(
     position: OutboundAccountPosition,
     buf: &mut Vec<UnindexedAccountEvent>,
 ) {
-    let time_exchange = position
-        .u
-        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-        .unwrap_or_else(Utc::now);
+    let time_exchange =
+        account_position_time(ExchangeId::BinanceMargin, position.u, position.e_uppercase);
 
     for b in position.b_uppercase.unwrap_or_default() {
         let asset = match b.a {
@@ -2685,10 +2684,8 @@ fn route_isolated_account_position(
         return;
     };
 
-    let time_exchange = position
-        .u
-        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-        .unwrap_or_else(Utc::now);
+    let time_exchange =
+        account_position_time(ExchangeId::BinanceMargin, position.u, position.e_uppercase);
 
     for b in position.b_uppercase.unwrap_or_default() {
         let Some(asset) = b.a.as_deref() else {
