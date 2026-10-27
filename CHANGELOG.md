@@ -7,7 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **The simulated venue can lend at least an asset's minimum borrow** (`rustrade-execution`,
+  #749). `SpotMarginConfig::with_min_borrow(asset, min_borrow)` sets a per-asset minimum, read
+  back with `SpotMarginConfig::min_borrow`, and serialised as a `min_borrow` map of decimal
+  strings. A `MarginEffect::Borrow` order whose shortfall is below the minimum borrows the minimum,
+  as Binance raises a `MARGIN_BUY` loan to the asset's `userMinBorrow`. The part above the
+  shortfall stays free balance, owed. With `auto_repay_at_cancel` it is repaid with the rest of
+  the loan if the order ends before it fills in full, and it stays owed once the order fills. An
+  order whose minimum is more than the venue will lend is refused, and its reason names the
+  minimum (`Minimum Borrow: …`) beside what the venue would lend. No asset has a minimum by
+  default, so existing configurations lend as before.
+
 ### Changed
+
+- **Breaking: the simulated venue's minimum borrow changes its config error and ledger types**
+  (`rustrade-execution`, #749).
+  - `SpotMarginConfigError` is no longer `Copy`, and gains `NegativeMinBorrow { asset,
+    min_borrow }`, returned by `with_min_borrow` and by deserialising a negative minimum.
+  - `AccountState::commit` takes the paying asset's minimum borrow after `borrowable`.
+  - `Committed` and `Reservation` have a new `excess_borrowed` field: what the minimum lent beyond
+    the shortfall, which is free rather than held. `Committed::borrowed` stays the whole loan;
+    `Committed::shortfall_borrowed` is the rest. `Reservation::loan` is what a cancel repays.
+  - `BalanceInsufficient` has a new `min_borrow` field: the minimum, when it is what the venue
+    would not lend.
 
 - **`ibapi` 5.1.0 → 5.2.0** (`rustrade-execution`, `rustrade-data`, `rustrade-instrument`, feature
   `ibkr`). The bytes sent for every order are unchanged. Four changes reach the compiled code:
@@ -29,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   listen-key endpoints, which nothing here uses yet. No behaviour change.
 
 ### Fixed
+
+- **`MarginEffect::Borrow` states how much Binance lends** (`rustrade-execution`, #749). Its
+  rustdoc said a `MARGIN_BUY` order borrows the shortfall, and only the shortfall. Binance lends
+  the shortfall or the asset's minimum borrow (`userMinBorrow`), whichever is more, so a small
+  order on an empty balance can borrow more than it pays. The `SpotMarginConfig` and
+  `BinanceMargin` rustdoc now say the same.
 
 - **A Binance order or cancel answer without a readable `transactTime` is logged** (#744).
   `BinanceMargin::open_margin_order` (and so `open_order`), `BinanceSpot::open_order` and

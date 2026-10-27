@@ -42,10 +42,21 @@ pub struct Reservation {
     /// repaid if the order ends unfilled. Zero on a cash account, for an order whose effect is
     /// not [`Borrow`](MarginEffect::Borrow), and for an order the account could pay for itself.
     pub borrowed: Decimal,
+    /// What the asset's minimum borrow lent the order beyond its shortfall, which is free balance
+    /// rather than held. Repaid with [`borrowed`](Self::borrowed) if the order ends before it fills
+    /// in full, and left owed once it does. Zero when the order's loan was its shortfall.
+    pub excess_borrowed: Decimal,
     /// What the order does to the account's loans, resolved from its request and the venue's
     /// default at placement, so that a resting order's later fill borrows or repays as it
     /// was placed to.
     pub effect: MarginEffect,
+}
+
+impl Reservation {
+    /// The loan the order took that it has not spent: what is repaid if it ends unfilled.
+    pub fn loan(&self) -> Decimal {
+        self.borrowed + self.excess_borrowed
+    }
 }
 
 /// One resting order, and whatever the venue is holding against it.
@@ -649,6 +660,7 @@ mod tests {
             asset: AssetNameExchange::new("usdt"),
             amount: dec!(98),
             borrowed: Decimal::ZERO,
+            excess_borrowed: Decimal::ZERO,
             effect: MarginEffect::NoSideEffect,
         };
 

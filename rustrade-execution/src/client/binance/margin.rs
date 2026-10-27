@@ -372,7 +372,8 @@ impl BinanceMarginConfig {
 /// which borrows what the order lacks **when it is placed**, and close it with `Repay`
 /// (`AUTO_REPAY`), which repays from the proceeds. Binance retired `AUTO_BORROW_REPAY` on
 /// 2026-10-14, so there is no longer one value that does both. A **mis-sized `Borrow` order
-/// borrows the shortfall** without further opt-in. See [`open_order`](Self::open_order).
+/// borrows the shortfall**, or the asset's minimum borrow if that is more, without further opt-in:
+/// see [`MarginEffect::Borrow`] for the rule, and [`open_order`](Self::open_order).
 /// [`open_margin_order`](Self::open_margin_order) also reports what the order borrowed.
 ///
 /// # Cross vs. isolated margin
@@ -540,7 +541,8 @@ impl BinanceMargin {
     /// Binance reports only in its answer to the order (`marginBuyBorrowAmount`,
     /// `marginBuyBorrowAsset`): see [`MarginPlacement::borrowed`]. Binance leaves them out when
     /// the free balance covered the order. The amount is what Binance reports lending, which need
-    /// not equal the order's shortfall, so read it rather than compute it from the balance.
+    /// not equal the order's shortfall: it is at least the asset's minimum borrow (see
+    /// [`MarginEffect::Borrow`]), so read it rather than compute it from the balance.
     ///
     /// Mirrors [`BinanceSpot::open_order`](super::spot::BinanceSpot)'s contract: every failure is
     /// folded into the returned order's state as [`OrderState::inactive`], so the engine always
