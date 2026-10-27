@@ -684,9 +684,9 @@ impl AccountState {
                     free: free + funding,
                     required,
                     borrowable: lends.then_some(borrowable.max(Decimal::ZERO)),
-                    // Named only when it is what was refused: the shortfall alone was lendable.
-                    min_borrow: (lends && loan > shortfall && shortfall <= borrowable)
-                        .then_some(min_borrow),
+                    // Named only when it is what was refused: the shortfall alone was lendable, so
+                    // the loan refused is the minimum it was raised to.
+                    min_borrow: (lends && shortfall <= borrowable).then_some(min_borrow),
                 });
             }
         };
