@@ -976,8 +976,8 @@ fn forward_order_updates(
             }
         };
         let event = match update {
-            // IB numbers orders per API client, and `ibapi` copies here every order status an
-            // open-orders listing carries, other clients' included.
+            // IB numbers orders per API client. `ibapi` keeps other clients' order statuses off
+            // this stream, but only by reading the client id from the frame, so this check stays.
             OrderUpdate::OrderStatus(status) if status.client_id != scope.api_client_id => {
                 trace!(
                     ib_order_id = status.order_id,

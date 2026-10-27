@@ -16,7 +16,7 @@
 # cannot land while leaving this record behind. CI cannot verify that the re-verification a
 # pinned entry mandates was actually performed — only that this file was not left untouched.
 
-ibapi=5.1.0  # 2026-10-13 | Financial protocol, community-maintained, no official SDK. Reviewed 3.2.0->3.3.0, all four properties recorded at 3.2.0 re-verified and still hold: zero unsafe (also no transmute/from_raw/extern "C"/asm!; holds by inspection, not by lint — upstream has no #![forbid(unsafe_code)]), no build.rs, dependency tree byte-identical vs 3.2.0 (both Cargo.toml and Cargo.lock differ by the version line alone; 9 direct deps under our `default-features = false, features = ["sync"]` selection, unchanged), still only a caller-supplied TWS socket (reconnect reuses the caller's address — no fallback host, no telemetry) + the opt-in local recorder dir (IBAPI_RECORDING_DIR; recorder.rs byte-identical). Env set unchanged (IBAPI_RECORDING_DIR, IBAPI_TIMEZONE_ALIASES); no process spawn, no obfuscation; published from git b140b312d1136d240f3b5651a89f4778e01aa222.
+ibapi=5.2.0  # 2026-10-27 | Financial protocol, community-maintained, no official SDK. Reviewed 3.2.0->3.3.0, all four properties recorded at 3.2.0 re-verified and still hold: zero unsafe (also no transmute/from_raw/extern "C"/asm!; holds by inspection, not by lint — upstream has no #![forbid(unsafe_code)]), no build.rs, dependency tree byte-identical vs 3.2.0 (both Cargo.toml and Cargo.lock differ by the version line alone; 9 direct deps under our `default-features = false, features = ["sync"]` selection, unchanged), still only a caller-supplied TWS socket (reconnect reuses the caller's address — no fallback host, no telemetry) + the opt-in local recorder dir (IBAPI_RECORDING_DIR; recorder.rs byte-identical). Env set unchanged (IBAPI_RECORDING_DIR, IBAPI_TIMEZONE_ALIASES); no process spawn, no obfuscation; published from git b140b312d1136d240f3b5651a89f4778e01aa222.
 #   New in 3.3.0, reviewed: `src/config` — despite the name it reads NO local files and NO env vars. It wraps two TWS wire messages (ReqConfig=108/UpdateConfig=109) over the already-open socket, whose protobuf types already existed in 3.2.0. Version-gated, #[must_use] builder, not reachable during connect/handshake.
 #   NOTE (capability, not vulnerability): `update_config()` can write the gateway's own safety settings — read_only_api, the bypass_* order precautions, trusted_ips, allow_localhost_only, socket_port, master_client_id. rustrade does not call it and does not re-export it; keep it out of the wrapper surface unless there is a deliberate reason.
 #   Upstream BREAKING in a minor release: the `fundamental` module was removed (IBKR retired reqFundamentalData in TWS API 10.47). rustrade never used it — verified no reference to fundamental_data / FundamentalData / FundamentalReportType / TickType::FundamentalRatios.
@@ -379,6 +379,65 @@ ibapi=5.1.0  # 2026-10-13 | Financial protocol, community-maintained, no officia
 #
 # NOT VERIFIABLE OFF-GATEWAY: the #[ignore]d ibkr integration tests do not run in CI. Nothing has exercised 5.1.0's
 # socket-level disconnect or the stricter historical fetch against a real gateway.
+#
+# Re-verified against the =5.2.0 crates.io source on 2026-10-27 (5.1.0 -> 5.2.0). Published 2026-10-20 by
+# the same crates.io owner as 5.1.0, from git 37a7e9681472047b4d4558c275b1ffef3afcf7f7; crate sha256
+# 73d090a47160fa89dabd7d328c75d4a282c843f9cf95ad6d944370b6c89c37c6 (= Cargo.lock).
+#
+# Standing properties, all hold:
+#   1. ZERO unsafe -- no unsafe / transmute / extern "C" / asm! / #[no_mangle] / #[link] / dlopen in src/. The
+#      only `from_raw` is still the safe `RequestId::from_raw(i32)` (client/ids.rs:35). By inspection.
+#   2. NO build.rs (`build = false`), no proc macros, no include_bytes!/include_str!.
+#   3. DEPENDENCY TREE -- `[dependencies.` up to `[dev-dependencies` byte-identical (md5
+#      70579189ca8164ddeb6430a1861f954f), `[features]` identical, rust-version stays 1.88. Cargo.lock: ibapi's
+#      version and checksum only, zero packages added or removed. (A plain `cargo update -p ibapi` also re-points
+#      unrelated windows-sys/socket2 edges between versions already in the lock; a no-op update on develop does
+#      the same, so that churn is cargo's, not ibapi's, and was left out.)
+#   4. NETWORK SURFACE -- still only the caller's TWS socket (transport/sync.rs:1248, reconnect :1284 reuses the
+#      stored address). The one new URL host, cmegroup.com, is in a doc comment (proto/protobuf.rs:910). No
+#      process spawn, no telemetry, no obfuscation. Thread spawns unchanged (transport/sync.rs:598 dispatcher,
+#      :832 cleanup).
+#   5. ENV SURFACE unchanged: IBAPI_RAW_CAPTURE_DIR (transport/raw_capture.rs:92), IBAPI_RECORDING_DIR
+#      (transport/recorder.rs:34), IBAPI_TIMEZONE_ALIASES (now common/timezone.rs:174; the module directories
+#      were flattened into files). raw_capture.rs and recorder.rs byte-identical.
+#
+# ORDER WIRE FORMAT: unchanged for every order rustrade builds. `orders/common/encoders.rs` byte-identical (md5
+# 83b12f6a5d924b325c7c2994e3d998b5). `proto/encoders.rs` (md5 fb478bdbf4d4607af877e0e70bdc0d05) only adds
+# `Order::conditions_include_overnight`: `false` by default and omitted by `some_bool`, and we build every order
+# from `..Order::default()`. The handshake now advertises max server version 226.
+#
+# API: `ContractDetails::settlement_method` and `Order::conditions_include_overnight` added; the `Notice` types
+# moved to messages/notice.rs, re-exports unchanged; `generic_tick::ETF_NAV_BID` removed and 53 protocol
+# `Features` constants deprecated, none used. `cargo check --workspace --all-targets --all-features` is
+# warning-free with no source change.
+#
+# BEHAVIOUR CHANGES ON PATHS WE COMPILE:
+#   - FOREIGN ORDER FRAMES (#1021): a frame whose client id is not this connection's skips the order routes and
+#     the order update stream (transport/routing.rs:185-208). OpenOrder/OrderStatus go to the shared listing
+#     channel only, ExecutionData only to the request its id names, OrderBound nowhere. Fixes a 5.1.0 hazard we
+#     were exposed to: during an `all_open_orders` listing, another client's status for an IB order id this
+#     client also used reached this client's `place_order` subscription and could answer the placement. Our
+#     own client-id guards (order update stream, `open_orders_from_listing`) stay; ibapi decides foreignness
+#     from the frame's client id alone. `other_clients_fills` is unaffected: IB never sends another client's
+#     execution live, and the ones answering fill recovery / `fetch_trades` still reach that request. Such an
+#     execution's CommissionsReport still reaches the update stream (routed by execution id, which carries no
+#     client id), as in 5.1.0; the stream worker already skipped the replayed execution, so nothing changes.
+#   - OWN LIVE ORDERS IN LISTINGS (#1033): `all_open_orders` now also lists this client's orders that have a
+#     live `place_order` subscription; we hold one only while placement is in flight, so a concurrent
+#     `fetch_open_orders` now lists that order rather than missing it.
+#   - SHARED ONE-SHOTS (#1029): request-id-less one-shots fail with `Error::Timeout` after 30 s instead of
+#     blocking. Our only library call is `managed_accounts` in `account_snapshot`, which maps every ibapi error
+#     to `Internal`; a dead gateway now ends the snapshot with that error instead of holding a blocking thread
+#     for good.
+#   - MARKET DATA TYPE (#1016): re-sent on reconnect before the reconnect notice. `fetch_shortability` already
+#     sets Delayed before every request, so it is unaffected.
+#   - Order-status cache after reconnect and `wait_for_fill`'s open/completed-orders lookups (#1020): we use
+#     neither `wait_for_fill` nor `order_status_stream`.
+#   - The 5.1.0 caveat about `warn!("error sending: ...")` on a just-dropped subscription is gone (#999): an
+#     item for a dropped subscription is now discarded at `trace!` (transport/sync.rs:1064-1065).
+#   - Async-only changes (#1047, clone cancellation) are not compiled: we select `sync` only.
+#
+# NOT VERIFIABLE OFF-GATEWAY: the #[ignore]d ibkr integration tests do not run in CI.
 binance-sdk=76.0.0  # 2026-10-20 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
 #   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)

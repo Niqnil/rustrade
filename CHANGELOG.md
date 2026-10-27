@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`ibapi` 5.1.0 → 5.2.0** (`rustrade-execution`, `rustrade-data`, `rustrade-instrument`, feature
+  `ibkr`). The bytes sent for every order are unchanged. Three changes reach the compiled code:
+  - Another API client's order frames no longer reach this client's order placement or the
+    account stream. Before, while an open-orders listing was read, another client's status for an
+    IB order id this client had also used could reach this client's placement and answer it with
+    that order's fill or cancel.
+  - An order this client is placing is now included when `fetch_open_orders` or `account_snapshot`
+    reads the open-orders listing at the same moment. Before, it could be missing from that listing.
+  - `account_snapshot` ends with an error when TWS/Gateway does not answer its accounts request
+    within 30 seconds. Before, it waited forever.
+
 ### Fixed
 
 - **A Binance order or cancel answer without a readable `transactTime` is logged** (#744).
