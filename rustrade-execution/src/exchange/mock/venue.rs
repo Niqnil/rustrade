@@ -13676,6 +13676,24 @@ mod tests {
     }
 
     #[test]
+    fn a_held_buy_lent_the_minimum_that_needs_none_of_its_loan_keeps_only_the_excess_owed() {
+        let mut venue = margin_venue_holding_with(
+            |config| config.with_min_borrow(quote(), d("80")).unwrap(),
+            MarginEffect::Borrow,
+        );
+        // 150 at the close of 100 lacks 50, so the minimum 80 is lent: 30 of it free.
+        venue.open_order(market_order("held", Side::Buy, "1.5", gtc()));
+
+        // 30 at an open of 20 is paid from the account's own 100, so all 50 held on loan is
+        // repaid, and only the 30 lent beyond the shortfall stays owed.
+        let events = feed_bar(&mut venue, 2, ohlc("20", "21", "19", "20"));
+        assert_eq!(
+            balance_of(&events[0]).balance,
+            Balance::new_margin(d("100"), d("100"), d("30"), Decimal::ZERO)
+        );
+    }
+
+    #[test]
     fn a_held_buy_costed_higher_at_its_bar_borrows_at_least_the_minimum_more() {
         let mut venue = margin_venue_holding_with(
             |config| config.with_min_borrow(quote(), d("40")).unwrap(),
