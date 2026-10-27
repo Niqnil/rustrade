@@ -780,9 +780,8 @@ fn contract_details_error(e: ibapi::Error) -> ResolveContractError {
 
 /// What an `ibapi` error answering the request for the login's accounts means for the caller.
 ///
-/// IB sending no answer is a stall a retry can clear. Any other error is mapped to `Internal`
-/// (non-transient) conservatively: a caller needing reconnect logic should drive it from
-/// connection state, not from the error type.
+/// IB sending no answer is a stall a retry can clear. Any other error is `Internal`; see the call
+/// in `account_snapshot` for why.
 fn managed_accounts_error(e: ibapi::Error) -> UnindexedClientError {
     match e {
         ibapi::Error::Timeout => ConnectivityError::Timeout.into(),
@@ -809,7 +808,7 @@ impl ListingLock {
         client: &Client,
     ) -> Result<Vec<ibapi::orders::Orders>, UnindexedClientError> {
         let _serial = self.0.lock();
-        // Note: mapped to Internal conservatively — see managed_accounts_error
+        // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
         let subscription = client
             .all_open_orders()
             .map_err(|e| UnindexedClientError::Internal(format!("open_orders: {e}")))?;
@@ -2456,6 +2455,10 @@ impl ExecutionClient for IbkrClient {
         let positions_filter = instruments_filter.clone();
         let positions_future = tokio::task::spawn_blocking(move || {
             let instruments_filter = positions_filter;
+            // ibapi::Error is unstructured — apart from a timeout, we cannot distinguish
+            // connection failures (transient, should retry) from API errors (e.g., invalid
+            // request). Mapped to Internal (non-transient) conservatively; a caller needing
+            // reconnect logic should drive it from connection state, not from the error type.
             let accounts = client.managed_accounts().map_err(managed_accounts_error)?;
             if accounts.is_empty() {
                 // `ibapi` also answers with no accounts when the session ends mid-request.
@@ -2706,7 +2709,7 @@ impl ExecutionClient for IbkrClient {
         let client = self.client.clone();
 
         // M-8 fix: Wrap blocking subscription call in spawn_blocking
-        // Note: mapped to Internal conservatively — see managed_accounts_error
+        // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
         let (notices, order_sub) = tokio::task::spawn_blocking(move || {
             // Notices first, so a reconnect that lands while the order stream is being set up is
             // not missed.
@@ -3180,7 +3183,7 @@ impl ExecutionClient for IbkrClient {
         tokio::task::spawn_blocking(move || {
             // IB's reqAccountSummary expects a group name ("All" for all linked accounts),
             // not an account ID. Using account ID causes error 321 "Unified group name is invalid".
-            // Note: mapped to Internal conservatively — see managed_accounts_error
+            // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
             let sub = client
                 .account_summary(&ACCOUNT_GROUP_ALL, account::BALANCE_SUMMARY_TAGS)
                 .map_err(|e| UnindexedClientError::Internal(format!("account_summary: {e}")))?;
@@ -3322,7 +3325,7 @@ impl ExecutionClient for IbkrClient {
         tokio::task::spawn_blocking(move || {
             // Every client's executions: `scope` decides which are reported (see
             // `ExecutionScope::classify`).
-            // Note: mapped to Internal conservatively — see managed_accounts_error
+            // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
             let sub = client
                 .executions(execution::executions_filter())
                 .map_err(|e| UnindexedClientError::Internal(format!("executions: {e}")))?;
