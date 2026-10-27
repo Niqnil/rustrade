@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`ibapi` 5.1.0 → 5.2.0** (`rustrade-execution`, `rustrade-data`, `rustrade-instrument`, feature
+  `ibkr`). The bytes sent for every order are unchanged. Four changes reach the compiled code:
+  - Another API client's order frames no longer reach this client's order placement or the
+    account stream. Before, while an open-orders listing was read, another client's status for an
+    IB order id this client had also used could reach this client's placement and answer it with
+    that order's fill or cancel.
+  - An order this client is placing is now included when `fetch_open_orders` or `account_snapshot`
+    reads the open-orders listing at the same moment. Before, it could be missing from that listing.
+  - `account_snapshot` ends with `ConnectivityError::Timeout`, which is transient, when
+    TWS/Gateway does not answer its accounts request within 30 seconds. Before, it waited forever.
+  - `account_stream` no longer reports a live execution that IB tags with another API client's ID,
+    even one IB flags as a liquidation. IB is not known to send another client's executions live.
+    Fill recovery and `fetch_trades` still read such an execution.
+
+- **`binance-sdk` 76.0.0 → 77.0.0** (`rustrade-execution`, `binance` feature). The SDK's common
+  layer, which the margin user-data stream couples to, and its spot module are unchanged, so the
+  three internals hold as before. The margin module only adds bindings for the v2 margin
+  listen-key endpoints, which nothing here uses yet. No behaviour change.
+
 ### Fixed
 
 - **A Binance order or cancel answer without a readable `transactTime` is logged** (#744).
@@ -14,13 +35,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `BinanceSpot::cancel_order` still read such an answer at the local time, but now log a `warn!`
   instead of doing so silently, as an execution report or a queried order without a time already
   is.
-
-### Changed
-
-- **`binance-sdk` 76.0.0 → 77.0.0** (`rustrade-execution`, `binance` feature). The SDK's common
-  layer, which the margin user-data stream couples to, and its spot module are unchanged, so the
-  three internals hold as before. The margin module only adds bindings for the v2 margin
-  listen-key endpoints, which nothing here uses yet. No behaviour change.
 
 ## [0.16.0] - 2026-10-26
 
