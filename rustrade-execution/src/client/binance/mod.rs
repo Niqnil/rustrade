@@ -1,8 +1,8 @@
 //! Binance execution clients.
 //!
 //! - [`BinanceSpot`] — Binance Spot `ExecutionClient` (REST + signed WebSocket API).
-//! - [`BinanceMargin`] — Binance Cross Margin `ExecutionClient` (REST orders/queries +
-//!   a hand-rolled `userListenToken` user-data stream). Configured via
+//! - [`BinanceMargin`] — Binance Margin (cross and isolated) `ExecutionClient` (REST
+//!   orders/queries + the margin user-data stream, read with a listen key). Configured via
 //!   [`BinanceMarginConfig`] and [`MarginEffect`](crate::margin::MarginEffect).
 //!
 //! Both clients share exchange-agnostic infrastructure (reconnect/backoff,
@@ -51,7 +51,7 @@
 //!
 //! - **Attempts.** A dropped connection, and each reconnect that fails after it, spends one
 //!   attempt: a wait, then a reconnect. A reconnect fails when its connect, its user-data
-//!   subscribe, or for [`BinanceMargin`] its listen-token request fails. The waits double from 1 s
+//!   subscribe, or for [`BinanceMargin`] its listen-key request fails. The waits double from 1 s
 //!   up to 30 s: 1, 2, 4, 8, 16, then 30 s.
 //! - **Reset.** A heartbeat check that finds a frame or ping clears the attempts spent before it,
 //!   so only failures in a row count. A connection the venue accepts and then drops or leaves
@@ -69,19 +69,20 @@
 //! - **Opening is not retried.** A failed `account_stream` call returns its error. Whether and
 //!   when to try again is the caller's decision, as it is after the stream ends.
 //!
-//! [`BinanceMargin`] also reconnects shortly before its listen token expires. That planned
-//! reconnect spends no attempt.
+//! [`BinanceMargin`] also reconnects with a new listen key when Binance says the old one has
+//! expired, which spends an attempt like any other failure. Its key is kept alive every 30
+//! minutes, which Binance documents as enough to keep it valid.
 //!
 //! # Logging: `binance_sdk` writes request credentials at `DEBUG`
 //!
 //! Both clients run on the `binance-sdk` crate, whose WebSocket API client logs every outgoing
-//! request at `DEBUG`, after it has been signed:
+//! request at `DEBUG`, after it has been signed. [`BinanceSpot`] places and cancels orders and
+//! subscribes to its user-data stream with signed requests, so each of those log lines carries
+//! the account's **API key** and the request's **signature**.
 //!
-//! - [`BinanceSpot`] places and cancels orders and subscribes to its user-data stream with signed
-//!   requests, so each of those log lines carries the account's **API key** and the request's
-//!   **signature**.
-//! - [`BinanceMargin`] subscribes to its user-data stream with an unsigned request whose only
-//!   credential is the **listen token**, which is logged in the same way.
+//! [`BinanceMargin`] uses only the SDK's REST client, which logs no requests. Its user-data
+//! stream sends the listen key in a subscribe frame, which is not logged, and this client masks
+//! the key in the warnings it writes.
 //!
 //! The API secret and private key are never logged. The SDK logs these lines with `tracing`
 //! under the `binance_sdk` target.
@@ -106,7 +107,6 @@
 //! an explicit request.
 
 mod margin;
-mod margin_risk;
 mod rules;
 mod shared;
 mod spot;

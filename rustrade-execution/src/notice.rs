@@ -26,8 +26,8 @@ use std::fmt::{Display, Formatter};
 /// # Producers
 ///
 /// Known producers, as of writing:
-/// - Binance margin (`BinanceMargin`): `MARGIN_LEVEL_STATUS_CHANGE`. See the client's rustdoc for
-///   which streams it is read from and how a notice sent on more than one is delivered once.
+/// - Binance margin (`BinanceMargin`): `marginLevelChange`. See the client's rustdoc for how
+///   its status maps to a [`NoticeKind`], and which instrument an isolated pair's notice names.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, Constructor)]
 pub struct AccountNotice<InstrumentKey> {

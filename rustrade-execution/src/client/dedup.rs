@@ -66,14 +66,15 @@ pub(crate) enum DedupEventKind {
     Funding,
     /// An account notice, keyed on its instrument (empty for the account as a whole), the venue's
     /// status and the time the venue sent it, since a notice has no id. A venue that sends one
-    /// notice on two streams sends it with the same time, so the second is dropped.
+    /// notice twice, such as on two streams, sends it with the same time, so the second is
+    /// dropped.
     Notice {
         time_exchange_ms: i64,
     },
     /// A margin debt update, keyed on its instrument (empty for the account as a whole), its asset,
     /// the time the venue made the change, what changed it and the totals after it, since an update
-    /// has no id. A venue that sends one update on two streams sends it with the same time and
-    /// totals, so the second is dropped.
+    /// has no id. A venue that sends one update twice, such as on two streams, sends it with the
+    /// same time and totals, so the second is dropped.
     ///
     /// The kind and totals are part of the discriminant because two changes to one asset can share
     /// a millisecond, such as a repay that settles several loans at once. Each states the debt

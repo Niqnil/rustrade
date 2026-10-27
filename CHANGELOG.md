@@ -29,13 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - a `MarginDebtKind` (`Borrow`, `Repay`, `Interest`, `Other`) and the venue's own name for the
       change;
     - the venue's time.
-  - **`BinanceMargin`** forwards each `USER_LIABILITY_CHANGE` as one, instead of only logging it.
-    - It reads from both the Risk Data Stream and the user-data stream, and delivers a change sent
-      on both once.
+  - **`BinanceMargin`** forwards each asset a `liabilityChange` lists as one, instead of only
+    logging the change (see the v2 stream under Changed).
     - Binance's principal and interest are the asset's totals after the change, as observed live
       (its docs do not say).
-    - Isolated updates name the pair whose subscription carried them. One whose subscription maps
-      to no pair is dropped with a `warn`.
+    - Binance has not been seen to send the event for an isolated pair, whose debt is therefore
+      read from `account_snapshot`. One that did arrive would name its pair.
     - A change with no asset, or whose totals or time cannot be read, is dropped with a `warn`; the
       next account snapshot restates the debt.
   - **The engine** applies an update that names no instrument to the asset's `Balance::margin`,
@@ -58,6 +57,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - On a spot-margin `SimulatedVenue`, a restatement whose loan changed is now followed by an
     `AccountEventKind::MarginDebt`, so a consumer that reads the venue's events by position sees
     one more.
+
+- **Breaking: `BinanceMargin`'s account stream reads Binance's v2 margin user-data stream**
+  (`rustrade-execution`, `binance` feature, #759). Since 2026-10-14 Binance refuses the earlier
+  margin streams' credentials (`POST /sapi/v1/userListenToken` and `POST
+  /sapi/v1/margin/listen-key`) with `-3086` for new accounts and for accounts it has migrated,
+  which it is doing gradually.
+  - **One listen key, one stream.** `account_stream` gets a key from `POST
+    /sapi/v2/margin/listen-key`, keeps it alive every 30 minutes, and reads
+    `wss://fstream.binance.com/private/ws`, sending the key in a subscribe frame rather than in
+    the URL. One key covers the cross account and every isolated pair, and each frame says which
+    it is about, so a client keeps only the frames of the account it is configured for. An
+    isolated client no longer opens one token and subscription per pair, and a cross client no
+    longer also reads the Risk Data Stream.
+  - **Event names.** Margin debt arrives as `liabilityChange` (was `USER_LIABILITY_CHANGE`) and
+    margin notices as `marginLevelChange` (was `MARGIN_LEVEL_STATUS_CHANGE`), still delivered as
+    `AccountEventKind::MarginDebt` and `AccountEventKind::Notice`.
+  - **Isolated notices name no instrument.** A `marginLevelChange` does not say which pair it is
+    about, so an isolated client delivers each with no instrument, logged at `warn`. Before, it
+    named the pair whose subscription carried it. A cross client does not receive an isolated
+    pair's notice.
+  - **Isolated debt is not streamed.** Binance has not been seen to send `liabilityChange` for an
+    isolated pair, so an isolated client gets no `AccountEventKind::MarginDebt`; its debt comes
+    from `account_snapshot`.
+  - **Frames that do not say which account they are about.** An `executionReport` without it is
+    kept by its symbol, with a one-time `warn`. A balance or debt frame without it is dropped
+    with a `warn`.
+  - **Key expiry.** When Binance says the key has expired (`listenKeyExpired`), the stream
+    reconnects with a new one, which spends a reconnect attempt. The planned reconnect before a
+    token's expiry is gone, and the key is not closed when the stream ends.
+  - **Heartbeat.** The client pings the stream at each heartbeat check, since Binance sends on it
+    only when the account changes, and the pong keeps a quiet connection alive.
+  - **An empty trailing delta.** The stream sends `"d": ""` on every order that does not trail.
+    It reads as no trailing delta, without a warning, so a stop or take-profit reported that way
+    is the fixed-trigger order it is.
+
+- **Binance margin's `-3116` refusal is `OrderError::UnsupportedOrderType`** (`rustrade-execution`,
+  `binance` feature, #760). Since 2026-10-14 Binance margin refuses `STOP_LOSS` and
+  `TAKE_PROFIT` orders "for this account", which hits a `BinanceMargin` `Stop`, `TakeProfit` and
+  `TrailingStop`. The refusal used to come back as `OrderError::Rejected`, like any other; it now
+  says the order type is the problem, as `-3111` already did, so a caller can place the limit form
+  (`StopLimit`, `TakeProfitLimit`, `TrailingStopFixedLimit`) instead. Both variants are
+  non-transient. The orders are still sent, so they go through again once Binance takes them.
 
 - **Breaking: the simulated venue's minimum borrow changes its config error and ledger types**
   (`rustrade-execution`, #749).
@@ -86,8 +127,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`binance-sdk` 76.0.0 → 77.0.0** (`rustrade-execution`, `binance` feature). The SDK's common
   layer, which the margin user-data stream couples to, and its spot module are unchanged, so the
-  three internals hold as before. The margin module only adds bindings for the v2 margin
-  listen-key endpoints, which nothing here uses yet. No behaviour change.
+  three internals hold as before. The margin module adds bindings for the v2 margin listen-key
+  endpoints, which the margin account stream now uses (see below). The bump itself changes no
+  behaviour.
 
 ### Fixed
 
