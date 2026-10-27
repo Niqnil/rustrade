@@ -111,7 +111,10 @@
 //! [`External`](crate::trade::TradeOrigin::External). A fill IB flags as an IB-initiated
 //! liquidation is reported either way, as a
 //! [`Liquidation`](crate::trade::TradeOrigin::Liquidation), on the stream, by fill recovery and by
-//! `fetch_trades`, whenever IB sends it to this connection.
+//! `fetch_trades`, whenever IB sends it to this connection. The stream reports one as it happens
+//! only when IB tags its execution with this client's ID: `ibapi` drops a live execution tagged
+//! with another client's, so such a fill reaches only fill recovery and `fetch_trades`. Which ID
+//! IB gives a liquidation's execution is not documented.
 //!
 //! # Caller Responsibilities
 //!
@@ -269,7 +272,8 @@ pub struct IbkrConfig {
     ///
     /// Either way, a fill IB flags as an IB-initiated liquidation is reported, as
     /// [`Liquidation`](crate::trade::TradeOrigin::Liquidation), since it moves the account's
-    /// position whoever placed the order.
+    /// position whoever placed the order. The account stream reports one live only under this
+    /// client's ID (see [the module docs](crate::client::ibkr)).
     #[serde(default)]
     pub other_clients_fills: bool,
     /// How long [`fetch_shortability`](crate::client::ShortabilityClient::fetch_shortability)
@@ -774,6 +778,18 @@ fn contract_details_error(e: ibapi::Error) -> ResolveContractError {
     }
 }
 
+/// What an `ibapi` error answering the request for the login's accounts means for the caller.
+///
+/// IB sending no answer is a stall a retry can clear. Any other error is mapped to `Internal`
+/// (non-transient) conservatively: a caller needing reconnect logic should drive it from
+/// connection state, not from the error type.
+fn managed_accounts_error(e: ibapi::Error) -> UnindexedClientError {
+    match e {
+        ibapi::Error::Timeout => ConnectivityError::Timeout.into(),
+        e => UnindexedClientError::Internal(format!("managed accounts: {e}")),
+    }
+}
+
 /// Serializes the reads of IB's order listings.
 ///
 /// IB answers an open-orders or completed-orders request without naming the request, so `ibapi`
@@ -793,7 +809,7 @@ impl ListingLock {
         client: &Client,
     ) -> Result<Vec<ibapi::orders::Orders>, UnindexedClientError> {
         let _serial = self.0.lock();
-        // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
+        // Note: mapped to Internal conservatively — see managed_accounts_error
         let subscription = client
             .all_open_orders()
             .map_err(|e| UnindexedClientError::Internal(format!("open_orders: {e}")))?;
@@ -2397,10 +2413,12 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Errors
     ///
-    /// [`UnindexedClientError::Internal`] if a position quantity does not convert to a
-    /// `Decimal`, if the request for the login's accounts fails or yields none (as it does when the
-    /// session ends during it), if a positions subscription fails, or as
-    /// [`fetch_balances`](ExecutionClient::fetch_balances).
+    /// - [`ConnectivityError::Timeout`] if IB does not answer the request for the login's
+    ///   accounts within 30 seconds. Transient: retry.
+    /// - [`UnindexedClientError::Internal`] if a position quantity does not convert to a
+    ///   `Decimal`, if the request for the login's accounts fails otherwise or yields none (as it
+    ///   does when the session ends during it), if a positions subscription fails, or as
+    ///   [`fetch_balances`](ExecutionClient::fetch_balances).
     ///
     /// # Known Issue: ibapi Decode Errors
     ///
@@ -2438,13 +2456,7 @@ impl ExecutionClient for IbkrClient {
         let positions_filter = instruments_filter.clone();
         let positions_future = tokio::task::spawn_blocking(move || {
             let instruments_filter = positions_filter;
-            // ibapi::Error is unstructured — we cannot distinguish connection failures
-            // (transient, should retry) from API errors (e.g., invalid request).
-            // Mapped to Internal (non-transient) conservatively; a caller needing reconnect
-            // logic should drive it from connection state, not from the error type.
-            let accounts = client
-                .managed_accounts()
-                .map_err(|e| UnindexedClientError::Internal(format!("managed accounts: {e}")))?;
+            let accounts = client.managed_accounts().map_err(managed_accounts_error)?;
             if accounts.is_empty() {
                 // `ibapi` also answers with no accounts when the session ends mid-request.
                 return Err(UnindexedClientError::Internal(
@@ -2694,7 +2706,7 @@ impl ExecutionClient for IbkrClient {
         let client = self.client.clone();
 
         // M-8 fix: Wrap blocking subscription call in spawn_blocking
-        // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
+        // Note: mapped to Internal conservatively — see managed_accounts_error
         let (notices, order_sub) = tokio::task::spawn_blocking(move || {
             // Notices first, so a reconnect that lands while the order stream is being set up is
             // not missed.
@@ -3168,7 +3180,7 @@ impl ExecutionClient for IbkrClient {
         tokio::task::spawn_blocking(move || {
             // IB's reqAccountSummary expects a group name ("All" for all linked accounts),
             // not an account ID. Using account ID causes error 321 "Unified group name is invalid".
-            // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
+            // Note: mapped to Internal conservatively — see managed_accounts_error
             let sub = client
                 .account_summary(&ACCOUNT_GROUP_ALL, account::BALANCE_SUMMARY_TAGS)
                 .map_err(|e| UnindexedClientError::Internal(format!("account_summary: {e}")))?;
@@ -3310,7 +3322,7 @@ impl ExecutionClient for IbkrClient {
         tokio::task::spawn_blocking(move || {
             // Every client's executions: `scope` decides which are reported (see
             // `ExecutionScope::classify`).
-            // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
+            // Note: mapped to Internal conservatively — see managed_accounts_error
             let sub = client
                 .executions(execution::executions_filter())
                 .map_err(|e| UnindexedClientError::Internal(format!("executions: {e}")))?;
@@ -5391,6 +5403,26 @@ mod order_reader_tests {
                 .is_transient()
             );
             assert!(!ResolveContractError::NoMatch.is_transient());
+        }
+
+        /// IB not answering the request for the login's accounts is a stall a retry can clear;
+        /// any other failure is not.
+        #[test]
+        fn only_an_unanswered_accounts_request_is_worth_retrying() {
+            let timeout = managed_accounts_error(ibapi::Error::Timeout);
+            assert_eq!(
+                timeout,
+                UnindexedClientError::Connectivity(ConnectivityError::Timeout)
+            );
+            assert!(timeout.is_transient());
+
+            for e in [ibapi::Error::Shutdown, ibapi::Error::Simple("no".into())] {
+                let label = e.to_string();
+                assert_eq!(
+                    managed_accounts_error(e),
+                    UnindexedClientError::Internal(format!("managed accounts: {label}"))
+                );
+            }
         }
 
         /// The account summary stays live after its listing, so only its `End` item ends the
