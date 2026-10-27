@@ -49,9 +49,6 @@
 //! - `balanceUpdate` events (deposits/withdrawals) are not forwarded. Callers reconcile balances
 //!   after external transfers via [`ExecutionClient::fetch_balances`] or
 //!   [`ExecutionClient::account_snapshot`].
-//! - `USER_LIABILITY_CHANGE` (borrow/repay) is surfaced at INFO but never folded into balance
-//!   state: it is a delta, and accumulating it would be the position tracking this library leaves
-//!   to its consumers.
 //! - A `TRADE` report whose order status (`X`) is neither `PARTIALLY_FILLED` nor `FILLED` emits
 //!   the execution but no order snapshot, so a fill arriving after its order's terminal report
 //!   cannot resurrect a retired order as a resting one. That order's filled quantity is settled
@@ -63,8 +60,8 @@ mod records;
 pub use records::MarginForcedLiquidation;
 
 use super::margin_risk::{
-    RISK_STREAM_URL, RiskStreamTask, SapiRiskListenKeys, log_liability_change,
-    log_margin_level_change, margin_level_notice,
+    RISK_STREAM_URL, RiskStreamTask, SapiRiskListenKeys, liability_debt_update,
+    log_liability_change, log_margin_level_change, margin_level_notice,
 };
 use super::rules::RulesLoader;
 use super::shared::{
@@ -437,12 +434,11 @@ impl BinanceMarginConfig {
 /// Balances carry per-asset margin debt: [`Balance::net_asset`](crate::balance::Balance::net_asset)
 /// returns `total - borrowed`, with `borrowed`/`interest` exposed via
 /// [`MarginDetails`](crate::balance::MarginDetails). Authoritative debt totals come from the REST
-/// [`account_snapshot`](Self::account_snapshot) (`BalanceSnapshot`); the WS stream keeps
-/// `free`/`locked` live via `BalanceStreamUpdate` but **never** clobbers or re-establishes debt, and
-/// `USER_LIABILITY_CHANGE` is surfaced as an observable log only, never accumulated into state.
-/// Consequently `net_asset` reflects debt only as fresh as the last `account_snapshot` for that
-/// asset — call it at startup and refresh on demand (see [`account_stream`](Self::account_stream)'s
-/// cold-start note).
+/// [`account_snapshot`](Self::account_snapshot) (`BalanceSnapshot`). The WS stream keeps
+/// `free`/`locked` live via `BalanceStreamUpdate`, which **never** clobbers debt, and keeps debt
+/// live via [`AccountEventKind::MarginDebt`], one per `USER_LIABILITY_CHANGE`. A debt change sent
+/// while the stream is down is not recovered, so call `account_snapshot` at startup and after a
+/// reconnect (see [`account_stream`](Self::account_stream)'s cold-start note).
 ///
 /// As Binance documents it, margin interest is charged hourly on what is borrowed and accrues as
 /// the asset's unpaid `interest`, which comes out of `total` only when it is repaid. `net_asset`
@@ -1449,9 +1445,9 @@ impl ExecutionClient for BinanceMargin {
     /// # Debt cold-start
     /// This method does **not** seed balances. Margin debt (`borrowed`/`interest`) is correct only
     /// if the caller invokes [`ExecutionClient::account_snapshot`] at startup (the `BalanceSnapshot`
-    /// that populates `margin`). WS thereafter keeps `free`/`locked` live via `BalanceStreamUpdate`
-    /// but never re-establishes debt; `USER_LIABILITY_CHANGE` is logged observably, not applied to
-    /// balance state.
+    /// that populates `margin`). WS thereafter keeps `free`/`locked` live via `BalanceStreamUpdate`,
+    /// and debt via [`AccountEventKind::MarginDebt`] (see "Margin debt" below), but only for the
+    /// assets whose debt changes; a change sent while the stream was down is not recovered.
     ///
     /// # Margin notices
     /// Binance's `MARGIN_LEVEL_STATUS_CHANGE` is delivered as an
@@ -1478,7 +1474,25 @@ impl ExecutionClient for BinanceMargin {
     /// Each arrival is logged at `info`, naming the stream, before the duplicate is dropped. A
     /// notice sent while a stream is disconnected is not recovered.
     ///
-    /// `USER_LIABILITY_CHANGE`, on either stream, is logged at `info` and not forwarded.
+    /// # Margin debt
+    /// Binance's `USER_LIABILITY_CHANGE` is delivered as an [`AccountEventKind::MarginDebt`],
+    /// read from the same streams as notices and delivered once (matched on asset, Binance's event
+    /// time, type and totals). Its principal (`p`) and interest (`i`) are the asset's totals after
+    /// the change, as observed live (Binance's docs do not say), so each update states the whole
+    /// debt. Its type (`t`) maps to a [`MarginDebtKind`](crate::MarginDebtKind): `BORROW` →
+    /// `Borrow`, `REPAY` → `Repay`, `INTEREST` (the periodic charge) → `Interest`, anything else →
+    /// `Other`, with Binance's type verbatim in
+    /// [`venue_kind`](crate::MarginDebtUpdate::venue_kind).
+    /// - **Cross** updates name no instrument: they are the account's debt in that asset.
+    /// - **Isolated** updates name the pair whose subscription carried them. One whose subscription
+    ///   is missing or unmapped is dropped with a `warn`, since without its pair it would read as
+    ///   the whole account's debt. Whether Binance sends the event to an isolated subscription is
+    ///   unconfirmed.
+    ///
+    /// Binance posts an interest charge some time after the period it is for; when is not
+    /// documented. An update with no asset, or whose `p` or `i` cannot be read, is dropped with a
+    /// `warn`, as is one with no readable time, which could not be ordered against the debt held.
+    /// Each arrival is logged at `info`, naming the stream.
     ///
     /// # Startup race window
     /// Like spot, fills arriving between subscribe and the listener being registered may be missed;
@@ -1543,8 +1557,9 @@ impl ExecutionClient for BinanceMargin {
     /// [`AccountEventKind::InstrumentBalanceUpdate`], one per asset whose balance changed: base,
     /// quote or both. A side that did not change is not reported.
     ///
-    /// Debt totals (`borrowed`/`interest`) stay REST-`BalanceSnapshot`-fresh per the
-    /// debt-freshness contract; the stream keeps only `free`/`locked` live.
+    /// Debt totals (`borrowed`/`interest`) arrive as [`AccountEventKind::MarginDebt`] naming the
+    /// pair (see [`account_stream`](Self::account_stream)'s "Margin debt"), which the engine does not
+    /// store either.
     ///
     /// **Consumption contract (important):** the engine deliberately does **not** store
     /// `InstrumentBalanceUpdate` — it falls through `update_from_account`'s `_ => None` wildcard,
@@ -2339,47 +2354,47 @@ fn cross_account_position_handler(
     convert_margin_account_position(position, buf);
 }
 
-/// Cross-margin notice attribution: a cross account's margin level is the whole account's, so a
-/// notice names no instrument. The `notice_instrument` passed to
-/// [`convert_margin_user_data_events_with`] / the cross manager.
-fn cross_notice_instrument(_subscription_id: Option<i64>) -> Option<InstrumentNameExchange> {
-    None
+/// Whose account a user-data frame is about, from the subscription it arrived on.
+///
+/// A notice and a debt update name their instrument from it, and treat an unknown one differently:
+/// see [`convert_margin_user_data_events_with`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FrameScope {
+    /// The account as a whole, as every cross account frame is.
+    Account,
+    /// The isolated pair whose subscription carried the frame.
+    Pair(InstrumentNameExchange),
+    /// An isolated frame whose subscription is missing or not mapped to a pair.
+    Unknown { subscription_id: Option<i64> },
 }
 
-/// Isolated-margin notice attribution: the pair whose subscription the frame came on, recovered
-/// from `subscription_id` via `sub_map` as [`route_isolated_account_position`] recovers a balance
-/// frame's. A notice whose subscription is missing or unmapped is still delivered, naming no
-/// instrument, with a `warn`: losing a margin call costs more than losing its attribution, and
-/// unlike a balance there is no snapshot to repair it.
-fn isolated_notice_instrument(
+/// Cross-margin attribution: a cross account's margin level and debt are the whole account's. The
+/// `frame_scope` passed to [`convert_margin_user_data_events_with`] / the cross manager.
+fn cross_frame_scope(_subscription_id: Option<i64>) -> FrameScope {
+    FrameScope::Account
+}
+
+/// Isolated-margin attribution: the pair whose subscription the frame came on, recovered from
+/// `subscription_id` via `sub_map` as [`route_isolated_account_position`] recovers a balance
+/// frame's.
+fn isolated_frame_scope(
     subscription_id: Option<i64>,
     sub_map: &Mutex<HashMap<i64, InstrumentNameExchange>>,
-) -> Option<InstrumentNameExchange> {
-    let Some(sub_id) = subscription_id else {
-        warn!(
-            "BinanceMargin isolated: MARGIN_LEVEL_STATUS_CHANGE without subscriptionId — \
-             delivering the notice without an instrument"
-        );
-        return None;
-    };
-    let instrument = sub_map
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(&sub_id)
-        .cloned();
-    if instrument.is_none() {
-        warn!(
-            subscription_id = sub_id,
-            "BinanceMargin isolated: MARGIN_LEVEL_STATUS_CHANGE for unmapped subscriptionId — \
-             delivering the notice without an instrument"
-        );
-    }
-    instrument
+) -> FrameScope {
+    subscription_id
+        .and_then(|sub_id| {
+            sub_map
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&sub_id)
+                .cloned()
+        })
+        .map_or(FrameScope::Unknown { subscription_id }, FrameScope::Pair)
 }
 
 /// Cross-margin convenience wrapper over [`convert_margin_user_data_events_with`] using
 /// [`cross_account_position_handler`] (account-wide `BalanceStreamUpdate`s) and
-/// [`cross_notice_instrument`]. Test-only: the cross manager calls the listener helper with the
+/// [`cross_frame_scope`]. Test-only: the cross manager calls the listener helper with the
 /// handlers directly, but the converter unit tests exercise frame discrimination through this
 /// two-arg form (they do not route balances per-instrument).
 #[cfg(test)]
@@ -2389,7 +2404,7 @@ fn convert_margin_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEv
             frame,
             buf,
             &mut cross_account_position_handler,
-            &mut cross_notice_instrument,
+            &mut cross_frame_scope,
         ),
         FrameOutcome::Pushed { terminated: true }
     )
@@ -2418,8 +2433,10 @@ enum FrameOutcome {
 /// Two arms differ between cross and isolated, and are delegated: the `outboundAccountPosition`
 /// (balance) arm to `handle_position` (cross: account-wide `BalanceStreamUpdate`; isolated:
 /// per-instrument `InstrumentBalanceUpdate`, routed via the frame's `subscriptionId`), and the
-/// instrument a `MARGIN_LEVEL_STATUS_CHANGE` notice names to `notice_instrument` (cross: none;
-/// isolated: the subscription's pair). Everything else (`executionReport` routing by inner `s`,
+/// account a notice or debt update is about to `frame_scope` (cross: the whole account; isolated:
+/// the subscription's pair). A `MARGIN_LEVEL_STATUS_CHANGE` whose isolated pair is unknown is
+/// delivered naming no instrument, and a `USER_LIABILITY_CHANGE` is dropped, since without its
+/// pair it would read as the whole account's debt. Everything else (`executionReport` routing by inner `s`,
 /// the margin events, termination signalling) is single-sourced here.
 fn convert_margin_user_data_events_with(
     frame: &str,
@@ -2429,7 +2446,7 @@ fn convert_margin_user_data_events_with(
         Option<i64>,
         &mut Vec<UnindexedAccountEvent>,
     ),
-    notice_instrument: &mut impl FnMut(Option<i64>) -> Option<InstrumentNameExchange>,
+    frame_scope: &mut impl FnMut(Option<i64>) -> FrameScope,
 ) -> FrameOutcome {
     let (subscription_id, event_type, event_raw) = match parse_user_data_frame(frame) {
         // RPC responses (subscribe ack, errors): not a user-data event.
@@ -2492,14 +2509,26 @@ fn convert_margin_user_data_events_with(
         // `MARGIN_LEVEL_STATUS_CHANGE`. The camelCase spellings are also accepted until a live frame
         // from the `userListenToken` stream confirms which one it sends (#547).
         "USER_LIABILITY_CHANGE" | "userLiabilityChange" => {
-            // Observable, NOT accumulated into balance state: borrow/repay is a
-            // delta, and folding it in would be the position tracking the library refuses. Surfaced
-            // via logs, naming this stream (the risk data stream logs its copy too); consumers
-            // needing exact live debt refresh via account_snapshot. Always deserialized (rare
-            // borrow/repay path, not per-frame) so a parse failure — exchange schema drift — is
-            // surfaced at WARN rather than silently dropped (observable failures over silent ones).
+            // Forwarded as a MarginDebt update. The risk data stream may send the same change, and
+            // the listener's dedup gate delivers it once. An isolated change whose pair is unknown
+            // is dropped: without its pair it would read as the whole account's debt, and a REST
+            // snapshot restates the pair's.
             match serde_json::from_str::<UserLiabilityChange>(event_raw) {
-                Ok(c) => log_liability_change(&c, "user data"),
+                Ok(change) => {
+                    log_liability_change(&change, "user data");
+                    match frame_scope(subscription_id) {
+                        FrameScope::Account => buf.extend(liability_debt_update(change, None)),
+                        FrameScope::Pair(instrument) => {
+                            buf.extend(liability_debt_update(change, Some(instrument)));
+                        }
+                        FrameScope::Unknown { subscription_id } => warn!(
+                            ?subscription_id,
+                            asset = change.a.as_deref().unwrap_or("?"),
+                            "BinanceMargin isolated: USER_LIABILITY_CHANGE whose subscription \
+                             names no pair, dropping it rather than apply it to the account"
+                        ),
+                    }
+                }
                 Err(e) => warn!(
                     error = %e,
                     frame = frame_excerpt(event_raw),
@@ -2514,10 +2543,22 @@ fn convert_margin_user_data_events_with(
             match serde_json::from_str::<MarginLevelStatusChange>(event_raw) {
                 Ok(change) => {
                     log_margin_level_change(&change, "user data");
-                    buf.extend(margin_level_notice(
-                        change,
-                        notice_instrument(subscription_id),
-                    ));
+                    let instrument = match frame_scope(subscription_id) {
+                        FrameScope::Account => None,
+                        FrameScope::Pair(instrument) => Some(instrument),
+                        // Still delivered: losing a margin call costs more than losing its
+                        // attribution, and unlike a balance there is no snapshot to repair it.
+                        FrameScope::Unknown { subscription_id } => {
+                            warn!(
+                                ?subscription_id,
+                                "BinanceMargin isolated: MARGIN_LEVEL_STATUS_CHANGE whose \
+                                 subscription names no pair, delivering the notice without an \
+                                 instrument"
+                            );
+                            None
+                        }
+                    };
+                    buf.extend(margin_level_notice(change, instrument));
                 }
                 Err(e) => warn!(
                     error = %e,
@@ -2684,10 +2725,10 @@ fn route_isolated_account_position(
 ///
 /// Single-sources the demux/dedup/dispatch + heartbeat + terminal-signal logic the cross and
 /// isolated managers both need; only the `outboundAccountPosition` (balance) arm and the
-/// instrument a margin notice names differ, supplied as `handle_position` (cross → account-wide
-/// `BalanceStreamUpdate` via [`cross_account_position_handler`]; isolated → per-instrument
-/// `InstrumentBalanceUpdate` via [`route_isolated_account_position`]) and `notice_instrument`
-/// ([`cross_notice_instrument`]; [`isolated_notice_instrument`]). Returns the subscription,
+/// instrument a margin notice or debt update names differ, supplied as `handle_position` (cross →
+/// account-wide `BalanceStreamUpdate` via [`cross_account_position_handler`]; isolated →
+/// per-instrument `InstrumentBalanceUpdate` via [`route_isolated_account_position`]) and
+/// `frame_scope` ([`cross_frame_scope`]; [`isolated_frame_scope`]). Returns the subscription,
 /// which the caller unsubscribes on disconnect; dropping it unsubscribes too. `heartbeat_flag` is
 /// shared with the caller's monitor loop (set on every pushed frame and ping, not on responses);
 /// `signal_tx` fires once on a terminal condition (consumer-drop, socket error/close, or exchange
@@ -2705,7 +2746,7 @@ fn register_user_data_listener(
         &mut Vec<UnindexedAccountEvent>,
     ) + Send
     + 'static,
-    mut notice_instrument: impl FnMut(Option<i64>) -> Option<InstrumentNameExchange> + Send + 'static,
+    mut frame_scope: impl FnMut(Option<i64>) -> FrameScope + Send + 'static,
 ) -> UnsubscribeOnDrop {
     let mut signal_tx_opt = Some(signal_tx);
     let mut event_tx = Some(tx);
@@ -2727,7 +2768,7 @@ fn register_user_data_listener(
                     &json_str,
                     &mut event_buf,
                     &mut handle_position,
-                    &mut notice_instrument,
+                    &mut frame_scope,
                 ) {
                     // The listener is registered before subscribing, so it also sees the
                     // subscribe's answer. That proves only the connect, not a live stream.
@@ -3107,7 +3148,7 @@ async fn margin_connection_manager(
             heartbeat_flag.clone(),
             signal_tx,
             cross_account_position_handler,
-            cross_notice_instrument,
+            cross_frame_scope,
         );
 
         // --- Subscribe (token is the sole auth) ---
@@ -3423,9 +3464,9 @@ async fn isolated_connect_and_subscribe(
             route_isolated_account_position(position, subscription_id, &sub_map, &base_quote, buf);
         }
     };
-    let notice_instrument = {
+    let frame_scope = {
         let sub_map = sub_map.clone();
-        move |subscription_id| isolated_notice_instrument(subscription_id, &sub_map)
+        move |subscription_id| isolated_frame_scope(subscription_id, &sub_map)
     };
     // Register BEFORE subscribing so a pushed event arriving mid-fan-out is not missed.
     let subscription = register_user_data_listener(
@@ -3436,7 +3477,7 @@ async fn isolated_connect_and_subscribe(
         heartbeat_flag.clone(),
         signal_tx,
         handle_position,
-        notice_instrument,
+        frame_scope,
     );
 
     let earliest_expiry_ms = earliest_token_expiry_ms(tokens);
@@ -6412,7 +6453,7 @@ mod tests {
             frame,
             buf,
             &mut cross_account_position_handler,
-            &mut cross_notice_instrument,
+            &mut cross_frame_scope,
         )
     }
 
@@ -6672,16 +6713,82 @@ mod tests {
         assert!(buf.is_empty());
     }
 
+    /// A cross liability change becomes the account's debt in its asset: the totals after the
+    /// change, its type mapped and kept verbatim, Binance's time, and no instrument.
     #[test]
-    fn margin_ws_liability_change_is_observable_only() {
-        // USER_LIABILITY_CHANGE is logged, NOT forwarded as an account event and NOT signalled as
-        // a reconnect: observable, not accumulated.
+    fn margin_ws_liability_change_is_the_accounts_debt_after_it() {
         let mut buf = Vec::new();
         assert!(!convert_margin_user_data_events(
-            &push(documented_liability_change("USER_LIABILITY_CHANGE")),
+            &push(serde_json::json!({
+                "e": "USER_LIABILITY_CHANGE", "E": 1_700_000_000_123_i64, "a": "BTC",
+                "t": "INTEREST", "p": "0.00006000", "i": "0.00000002",
+            })),
             &mut buf
         ));
-        assert!(buf.is_empty());
+        let [event] = buf.as_slice() else {
+            panic!("expected one event, got {buf:?}");
+        };
+        let AccountEventKind::MarginDebt(update) = &event.kind else {
+            panic!("expected MarginDebt, got {:?}", event.kind);
+        };
+        assert_eq!(event.exchange, ExchangeId::BinanceMargin);
+        assert_eq!(update.asset, AssetNameExchange::new("BTC"));
+        assert_eq!(update.instrument, None);
+        assert_eq!(
+            update.debt,
+            crate::balance::MarginDetails {
+                borrowed: dec!(0.00006),
+                interest: dec!(0.00000002),
+            }
+        );
+        assert_eq!(update.kind, crate::MarginDebtKind::Interest);
+        assert_eq!(update.venue_kind, "INTEREST");
+        assert_eq!(
+            update.time_exchange,
+            Utc.timestamp_millis_opt(1_700_000_000_123).unwrap()
+        );
+    }
+
+    /// An isolated liability change names its subscription's pair; one whose subscription names
+    /// no pair is dropped, loudly, since it would otherwise read as the account's debt.
+    #[test]
+    fn isolated_liability_change_names_its_pair_or_is_dropped() {
+        let sub_map = Arc::new(Mutex::new(HashMap::from([(7_i64, btcusdt())])));
+        let debt_on = |subscription_id: i64| {
+            let mut buf = Vec::new();
+            let frame = push_with_sub(
+                subscription_id,
+                documented_liability_change("USER_LIABILITY_CHANGE"),
+            );
+            let (outcome, messages) = log_messages(|| {
+                convert_margin_user_data_events_with(
+                    &frame,
+                    &mut buf,
+                    &mut cross_account_position_handler,
+                    &mut |id| isolated_frame_scope(id, &sub_map),
+                )
+            });
+            assert_eq!(outcome, FrameOutcome::Pushed { terminated: false });
+            (buf, messages)
+        };
+
+        let (buf, _) = debt_on(7);
+        let [event] = buf.as_slice() else {
+            panic!("expected one event, got {buf:?}");
+        };
+        let AccountEventKind::MarginDebt(update) = &event.kind else {
+            panic!("expected MarginDebt, got {:?}", event.kind);
+        };
+        assert_eq!(update.instrument, Some(btcusdt()));
+
+        let (buf, messages) = debt_on(99);
+        assert!(buf.is_empty(), "{buf:?}");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("names no pair, dropping")),
+            "{messages:?}"
+        );
     }
 
     /// The notice a converter pushed, which must be its only event.
@@ -6799,7 +6906,7 @@ mod tests {
             (
                 "USER_LIABILITY_CHANGE",
                 documented_liability_change("USER_LIABILITY_CHANGE"),
-                "USER_LIABILITY_CHANGE (observable",
+                "USER_LIABILITY_CHANGE received",
             ),
             (
                 "MARGIN_LEVEL_STATUS_CHANGE",
@@ -6810,7 +6917,7 @@ mod tests {
             (
                 "userLiabilityChange",
                 documented_liability_change("userLiabilityChange"),
-                "USER_LIABILITY_CHANGE (observable",
+                "USER_LIABILITY_CHANGE received",
             ),
             (
                 "marginLevelStatusChange",
@@ -6822,12 +6929,8 @@ mod tests {
             let (terminated, messages) =
                 log_messages(|| convert_margin_user_data_events(&push(frame), &mut buf));
             assert!(!terminated, "{e}");
-            // Only the margin-level arm forwards anything: its notice.
-            assert_eq!(
-                buf.len(),
-                usize::from(expected.starts_with("MARGIN")),
-                "{e}"
-            );
+            // Each arm forwards its one event: a notice or a debt update.
+            assert_eq!(buf.len(), 1, "{e}");
             assert!(
                 messages.iter().any(|m| m.contains(expected)),
                 "{e}: expected its own arm's log, got {messages:?}"
@@ -7234,7 +7337,7 @@ mod tests {
                     &frame,
                     &mut buf,
                     &mut cross_account_position_handler,
-                    &mut |id| isolated_notice_instrument(id, &sub_map),
+                    &mut |id| isolated_frame_scope(id, &sub_map),
                 ),
                 FrameOutcome::Pushed { terminated: false }
             );
@@ -7245,7 +7348,12 @@ mod tests {
         // Unmapped: still delivered, unattributed, rather than dropped like a balance frame.
         assert_eq!(notice_on(99), None);
         // No subscriptionId at all.
-        assert_eq!(isolated_notice_instrument(None, &sub_map), None);
+        assert_eq!(
+            isolated_frame_scope(None, &sub_map),
+            FrameScope::Unknown {
+                subscription_id: None
+            }
+        );
     }
 
     #[test]
@@ -7262,6 +7370,31 @@ mod tests {
             convert_risk_frame(&risk_frame.to_string(), "listen-key", &mut from_risk),
             RiskFrame::Continue
         );
+
+        let dedup = new_dedup_cache();
+        let key = |events: &[UnindexedAccountEvent]| dedup_key_from_event(&events[0]).unwrap();
+        assert!(!is_duplicate(&dedup, key(&from_user_data)));
+        assert!(
+            is_duplicate(&dedup, key(&from_risk)),
+            "the risk data stream's copy is dropped"
+        );
+    }
+
+    #[test]
+    fn the_two_streams_key_one_debt_change_alike() {
+        // The same liability change, as each stream frames it, must collide in the shared cache.
+        use crate::client::binance::margin_risk::{RiskFrame, convert_risk_frame};
+
+        let change = documented_liability_change("USER_LIABILITY_CHANGE");
+        let mut from_user_data = Vec::new();
+        convert_margin_user_data_events(&push(change.clone()), &mut from_user_data);
+        let mut from_risk = Vec::new();
+        let risk_frame = serde_json::json!({ "stream": "listen-key", "data": change });
+        assert_eq!(
+            convert_risk_frame(&risk_frame.to_string(), "listen-key", &mut from_risk),
+            RiskFrame::Continue
+        );
+        assert_eq!(from_user_data, from_risk);
 
         let dedup = new_dedup_cache();
         let key = |events: &[UnindexedAccountEvent]| dedup_key_from_event(&events[0]).unwrap();
@@ -7327,7 +7460,7 @@ mod tests {
                 &frame,
                 &mut buf,
                 &mut handler,
-                &mut cross_notice_instrument,
+                &mut cross_frame_scope,
             ),
             FrameOutcome::Pushed { terminated: false }
         );
@@ -7373,7 +7506,7 @@ mod tests {
                 &frame,
                 &mut buf,
                 &mut handler,
-                &mut cross_notice_instrument,
+                &mut cross_frame_scope,
             ),
             FrameOutcome::Pushed { terminated: false }
         );
@@ -7408,7 +7541,7 @@ mod tests {
                     &frame,
                     &mut buf,
                     &mut handler,
-                    &mut cross_notice_instrument,
+                    &mut cross_frame_scope,
                 ),
                 FrameOutcome::Pushed { terminated: false }
             );
@@ -7447,7 +7580,7 @@ mod tests {
                 &mixed,
                 &mut buf,
                 &mut handler,
-                &mut cross_notice_instrument,
+                &mut cross_frame_scope,
             ),
             FrameOutcome::Pushed { terminated: false }
         );
@@ -7469,7 +7602,7 @@ mod tests {
                 &stray_only,
                 &mut buf,
                 &mut handler,
-                &mut cross_notice_instrument,
+                &mut cross_frame_scope,
             ),
             FrameOutcome::Pushed { terminated: false }
         );
@@ -7502,7 +7635,7 @@ mod tests {
                 &frame,
                 &mut buf,
                 &mut handler,
-                &mut cross_notice_instrument,
+                &mut cross_frame_scope,
             ),
             FrameOutcome::Pushed { terminated: false }
         );
@@ -7536,7 +7669,7 @@ mod tests {
                 &frame,
                 &mut buf,
                 &mut handler,
-                &mut cross_notice_instrument,
+                &mut cross_frame_scope,
             ),
             FrameOutcome::Pushed { terminated: false }
         );

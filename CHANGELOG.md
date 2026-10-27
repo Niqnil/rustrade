@@ -20,7 +20,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   minimum (`Minimum Borrow: …`) beside what the venue would lend. No asset has a minimum by
   default, so existing configurations lend as before.
 
+- **Margin debt changes are streamed as `AccountEventKind::MarginDebt`** (`rustrade-execution`,
+  `rustrade`, #755).
+  - **The event.** A `MarginDebtUpdate` carries:
+    - the asset;
+    - the isolated pair it belongs to, if any;
+    - the principal and interest owed after the change, both totals (`MarginDetails`);
+    - a `MarginDebtKind` (`Borrow`, `Repay`, `Interest`, `Other`) and the venue's own name for the
+      change;
+    - the venue's time.
+  - **`BinanceMargin`** forwards each `USER_LIABILITY_CHANGE` as one, instead of only logging it.
+    - It reads from both the Risk Data Stream and the user-data stream, and delivers a change sent
+      on both once.
+    - Binance's principal and interest are the asset's totals after the change, as observed live
+      (its docs do not say).
+    - Isolated updates name the pair whose subscription carried them. One whose subscription maps
+      to no pair is dropped with a `warn`.
+    - A change with no asset, or whose totals or time cannot be read, is dropped with a `warn`; the
+      next account snapshot restates the debt.
+  - **The engine** applies an update that names no instrument to the asset's `Balance::margin`,
+    so `net_asset` follows debt between account snapshots.
+    - Debt is ordered by its own time against earlier debt alone. A newer free/locked update does
+      not block it, and an older balance snapshot no longer overwrites it.
+    - An update for an asset with no balance yet opens one holding nothing, which the first
+      statement of its holdings replaces, whatever that statement's time.
+    - An update naming an isolated pair changes no engine state.
+  - **`SimulatedVenue`** on a spot-margin account follows each balance restatement whose loan
+    changed with the same event.
+
 ### Changed
+
+- **Breaking: `AssetState` has a new `debt_time` field** (`rustrade`, #755). It holds when the debt
+  in `balance`'s `margin` was stated, so `AssetState::new` takes it as a fourth argument (`None`
+  for a fresh state).
+  - `AssetState::update_from_balance` now restates the holdings and the debt each as far as the
+    snapshot is newer. Before, a snapshot older than the held balance changed nothing.
+  - On a spot-margin `SimulatedVenue`, a restatement whose loan changed is now followed by an
+    `AccountEventKind::MarginDebt`, so a consumer that reads the venue's events by position sees
+    one more.
 
 - **Breaking: the simulated venue's minimum borrow changes its config error and ledger types**
   (`rustrade-execution`, #749).

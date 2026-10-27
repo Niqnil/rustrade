@@ -11,6 +11,7 @@ use crate::{
     },
     fill_recovery::{FillRecoveryGap, FillRecoveryScope},
     map::ExecutionInstrumentMap,
+    margin_debt::MarginDebtUpdate,
     notice::AccountNotice,
     order::{
         Order, OrderEvent, OrderKey, OrderSnapshot, UnindexedOrderKey, UnindexedOrderSnapshot,
@@ -132,6 +133,9 @@ impl AccountEventIndexer {
             AccountEventKind::CashFlow(flow) => AccountEventKind::CashFlow(self.cash_flow(flow)?),
             AccountEventKind::Notice(notice) => {
                 AccountEventKind::Notice(self.notice(exchange, notice))
+            }
+            AccountEventKind::MarginDebt(update) => {
+                AccountEventKind::MarginDebt(self.margin_debt(update)?)
             }
         };
 
@@ -373,6 +377,39 @@ impl AccountEventIndexer {
                 .transpose()?,
             time_exchange,
             id,
+        })
+    }
+
+    /// Index a [`MarginDebtUpdate`]'s asset and, when it names one, instrument.
+    ///
+    /// Unlike a notice's, an unknown instrument is an error rather than dropped: an update without
+    /// one is a debt of the account as a whole, which the engine applies to its asset balances, so
+    /// an isolated pair's debt delivered unattributed would overwrite the account's.
+    ///
+    /// # Errors
+    /// Returns `IndexError` if the asset, or a named instrument, is not registered in the map.
+    pub fn margin_debt(
+        &self,
+        update: MarginDebtUpdate<AssetNameExchange, InstrumentNameExchange>,
+    ) -> Result<MarginDebtUpdate<AssetIndex, InstrumentIndex>, IndexError> {
+        let MarginDebtUpdate {
+            asset,
+            instrument,
+            debt,
+            kind,
+            venue_kind,
+            time_exchange,
+        } = update;
+
+        Ok(MarginDebtUpdate {
+            asset: self.map.find_asset_index(&asset)?,
+            instrument: instrument
+                .map(|instrument| self.map.find_instrument_index(&instrument))
+                .transpose()?,
+            debt,
+            kind,
+            venue_kind,
+            time_exchange,
         })
     }
 
@@ -1650,6 +1687,75 @@ mod tests {
             index_of(notice(Some("ETHUSDT"))).instrument,
             None,
             "an unmapped instrument is dropped from the notice, not the notice itself"
+        );
+    }
+
+    /// A margin debt update indexes its asset and instrument, and one naming an unmapped
+    /// instrument fails rather than becoming the account's debt.
+    #[test]
+    fn account_event_indexes_a_margin_debt_update() {
+        use crate::{
+            balance::MarginDetails,
+            margin_debt::{MarginDebtKind, MarginDebtUpdate},
+        };
+        use rust_decimal_macros::dec;
+        use smol_str::SmolStr;
+
+        let indexer = binance_indexer();
+        let time = DateTime::<Utc>::MIN_UTC;
+        let debt = MarginDetails::new(dec!(0.5), dec!(0.01));
+        let update = |asset: &str, instrument: Option<&str>| {
+            UnindexedAccountEvent::new(
+                ExchangeId::BinanceSpot,
+                AccountEventKind::MarginDebt(MarginDebtUpdate::new(
+                    AssetNameExchange::new(asset),
+                    instrument.map(InstrumentNameExchange::new),
+                    debt,
+                    MarginDebtKind::Borrow,
+                    SmolStr::new("BORROW"),
+                    time,
+                )),
+            )
+        };
+        let index_of = |event| match indexer.account_event(event) {
+            Ok(AccountEvent {
+                kind: AccountEventKind::MarginDebt(update),
+                ..
+            }) => Ok(update),
+            Ok(other) => panic!("expected MarginDebt, got {other:?}"),
+            Err(error) => Err(error),
+        };
+        let (Ok(btc), Ok(btc_usdt)) = (
+            indexer.map.find_asset_index(&AssetNameExchange::new("BTC")),
+            indexer
+                .map
+                .find_instrument_index(&InstrumentNameExchange::new("BTC_USDT")),
+        ) else {
+            panic!("BTC and BTC_USDT are mapped");
+        };
+
+        assert_eq!(
+            index_of(update("BTC", Some("BTC_USDT"))),
+            Ok(MarginDebtUpdate::new(
+                btc,
+                Some(btc_usdt),
+                debt,
+                MarginDebtKind::Borrow,
+                SmolStr::new("BORROW"),
+                time,
+            ))
+        );
+        assert_eq!(
+            index_of(update("BTC", None)).map(|update| update.instrument),
+            Ok(None)
+        );
+        assert!(
+            index_of(update("ETH", None)).is_err(),
+            "an unmapped asset fails"
+        );
+        assert!(
+            index_of(update("BTC", Some("ETHUSDT"))).is_err(),
+            "an unmapped instrument fails"
         );
     }
 }

@@ -622,6 +622,24 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                 }
                 FillsApplied::default()
             }
+            AccountEventKind::MarginDebt(update) => {
+                match &update.instrument {
+                    None => self
+                        .assets
+                        .asset_index_mut(&update.asset)
+                        .apply_margin_debt(update),
+                    // An isolated pair's debt: the engine stores no isolated balances, as it
+                    // stores no `InstrumentBalanceUpdate`. A consumer reads it off the feed.
+                    Some(instrument) => debug!(
+                        exchange = ?event.exchange,
+                        ?instrument,
+                        asset = ?update.asset,
+                        kind = %update.kind,
+                        "isolated margin debt update received — not applied to asset balances",
+                    ),
+                }
+                FillsApplied::default()
+            }
             _ => FillsApplied::default(),
         };
 
@@ -965,6 +983,57 @@ mod tests {
             );
         }
         assert_eq!(state.assets, before.assets);
+        assert_eq!(state.instruments, before.instruments);
+        assert_eq!(state.trading, before.trading);
+    }
+
+    /// An account-level debt update replaces its asset's debt and fills nothing; one naming an
+    /// isolated pair changes no state.
+    #[test]
+    fn a_margin_debt_update_reaches_only_an_account_level_asset_balance() {
+        use crate::engine::state::{
+            global::DefaultGlobalData, instrument::data::DefaultInstrumentMarketData,
+        };
+        use chrono::{DateTime, Utc};
+        use rust_decimal_macros::dec;
+        use rustrade_execution::{MarginDebtKind, MarginDebtUpdate, balance::MarginDetails};
+        use smol_str::SmolStr;
+
+        let instruments = IndexedInstruments::new([test_instrument(EXECUTION, "btc", "usdt")]);
+        let base = instruments.instruments()[0].value.underlying.base;
+        let mut state: EngineState<DefaultGlobalData, DefaultInstrumentMarketData> =
+            EngineState::builder(&instruments, DefaultGlobalData, |_| {
+                DefaultInstrumentMarketData::default()
+            })
+            .build();
+        let debt = MarginDetails::new(dec!(0.00006), dec!(0.00000002));
+        let update = |instrument| {
+            AccountEvent::new(
+                ExchangeIndex::new(0),
+                AccountEventKind::MarginDebt(MarginDebtUpdate::new(
+                    base,
+                    instrument,
+                    debt,
+                    MarginDebtKind::Interest,
+                    SmolStr::new("INTEREST"),
+                    DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+                )),
+            )
+        };
+
+        let before = state.clone();
+        assert_eq!(
+            state.update_from_account(&update(Some(InstrumentIndex::new(0)))),
+            FillsApplied::default()
+        );
+        assert_eq!(state.assets, before.assets);
+
+        assert_eq!(
+            state.update_from_account(&update(None)),
+            FillsApplied::default()
+        );
+        let balance = state.assets.asset_index(&base).balance.unwrap();
+        assert_eq!(balance.value.margin, Some(debt));
         assert_eq!(state.instruments, before.instruments);
         assert_eq!(state.trading, before.trading);
     }

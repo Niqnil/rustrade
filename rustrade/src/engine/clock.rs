@@ -254,6 +254,7 @@ impl<MarketEventKind: Debug> TimeExchange for EngineEvent<MarketEventKind> {
                 AccountEventKind::Trade(trade) => Some(trade.time_exchange),
                 AccountEventKind::CashFlow(flow) => Some(flow.time_exchange),
                 AccountEventKind::Notice(notice) => Some(notice.time_exchange),
+                AccountEventKind::MarginDebt(update) => Some(update.time_exchange),
                 _ => None,
             },
             // The corporate action carries its own resolved effective instant, so the
@@ -525,6 +526,37 @@ mod tests {
                     Some(InstrumentIndex::new(0)),
                     time,
                     None,
+                )),
+            )));
+
+        assert_eq!(event.time_exchange(), Some(time));
+    }
+
+    /// A margin debt change is stamped with the venue's time, so a historical clock advances on
+    /// one as it does on a balance update.
+    #[test]
+    fn a_margin_debt_update_reports_its_time_exchange() {
+        use rustrade_execution::{
+            AccountEvent, AccountEventKind,
+            balance::MarginDetails,
+            margin_debt::{MarginDebtKind, MarginDebtUpdate},
+        };
+        use rustrade_instrument::{asset::AssetIndex, exchange::ExchangeIndex};
+
+        let time = DateTime::<Utc>::MIN_UTC + TimeDelta::hours(1);
+        let event: EngineEvent<()> =
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent::new(
+                ExchangeIndex(0),
+                AccountEventKind::MarginDebt(MarginDebtUpdate::new(
+                    AssetIndex(0),
+                    None,
+                    MarginDetails {
+                        borrowed: Decimal::ONE,
+                        interest: Decimal::ZERO,
+                    },
+                    MarginDebtKind::Borrow,
+                    "BORROW".into(),
+                    time,
                 )),
             )));
 

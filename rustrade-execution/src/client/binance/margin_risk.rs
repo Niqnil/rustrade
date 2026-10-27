@@ -1,17 +1,19 @@
-//! Binance margin account notices, and the Risk Data Stream that carries them.
+//! Binance margin account notices and debt changes, and the Risk Data Stream that carries them.
 //!
-//! Binance reports a cross-margin account's margin-level status as `MARGIN_LEVEL_STATUS_CHANGE`.
-//! Its own SDKs read that event from the Risk Data Stream (`wss://margin-stream.binance.com`, keyed
-//! by a listen key from `POST /sapi/v1/margin/listen-key`), a stream separate from the
-//! `userListenToken` user-data stream the margin client reads fills from. Whether the user-data
-//! stream carries it too is not documented, so a cross account stream reads both, and the shared
-//! dedup cache delivers a notice sent on both once (see [`DedupEventKind::Notice`]).
+//! Binance reports a cross-margin account's margin-level status as `MARGIN_LEVEL_STATUS_CHANGE`,
+//! and each change in what the account owes as `USER_LIABILITY_CHANGE`. Its own SDKs read both from
+//! the Risk Data Stream (`wss://margin-stream.binance.com`, keyed by a listen key from
+//! `POST /sapi/v1/margin/listen-key`), a stream separate from the `userListenToken` user-data stream
+//! the margin client reads fills from. Whether the user-data stream carries them too is not
+//! documented, so a cross account stream reads both, and the shared dedup cache delivers an event
+//! sent on both once (see [`DedupEventKind::Notice`] and [`DedupEventKind::MarginDebt`]).
 //!
 //! The Risk Data Stream is a side channel: it never ends the account stream. A failure to get a
 //! listen key or to connect is logged and retried with backoff, without limit, until the account
 //! stream ends.
 //!
 //! [`DedupEventKind::Notice`]: crate::client::dedup::DedupEventKind::Notice
+//! [`DedupEventKind::MarginDebt`]: crate::client::dedup::DedupEventKind::MarginDebt
 
 use super::shared::{
     CONNECT_TIMEOUT_SECS, RateLimitTracker, RequestKind, UnhandledEvents, frame_excerpt,
@@ -19,7 +21,9 @@ use super::shared::{
 };
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
+    balance::MarginDetails,
     client::dedup::{SharedDedupCache, dedup_key_from_event, is_duplicate},
+    margin_debt::{MarginDebtKind, MarginDebtUpdate},
     notice::{AccountNotice, NoticeKind},
 };
 use binance_sdk::margin_trading::{
@@ -29,7 +33,9 @@ use binance_sdk::margin_trading::{
 use chrono::{TimeZone, Utc};
 use futures::{FutureExt as _, Sink, SinkExt as _, StreamExt as _};
 use rust_decimal::Decimal;
-use rustrade_instrument::{exchange::ExchangeId, instrument::name::InstrumentNameExchange};
+use rustrade_instrument::{
+    asset::name::AssetNameExchange, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
+};
 use rustrade_integration::protocol::websocket::{WebSocket, WsMessage, connect};
 use serde::Deserialize as _;
 use smol_str::SmolStr;
@@ -456,7 +462,7 @@ fn forward(
         if let Some(key) = dedup_key_from_event(&event)
             && is_duplicate(dedup, key)
         {
-            debug!("BinanceMargin risk data stream: notice already delivered, skipping");
+            debug!("BinanceMargin risk data stream: event already delivered, skipping");
             continue;
         }
         if tx.send(event).is_err() {
@@ -474,7 +480,7 @@ pub(super) enum RiskFrame {
     KeyExpired,
 }
 
-/// Convert one Risk Data Stream frame, pushing any notice onto `buf`.
+/// Convert one Risk Data Stream frame, pushing any notice or debt update onto `buf`.
 ///
 /// Frames come wrapped as `{ "stream": <listen key>, "data": { "e", … } }`; a bare event is read
 /// too. Event types with no arm are logged by [`log_unhandled_event`], so a renamed event is seen.
@@ -519,7 +525,10 @@ pub(super) fn convert_risk_frame(
             ),
         },
         "USER_LIABILITY_CHANGE" => match UserLiabilityChange::deserialize(event) {
-            Ok(change) => log_liability_change(&change, "risk data"),
+            Ok(change) => {
+                log_liability_change(&change, "risk data");
+                buf.extend(liability_debt_update(change, None));
+            }
             Err(e) => warn!(
                 error = %e,
                 frame = frame_excerpt(&logged()),
@@ -562,8 +571,7 @@ pub(super) fn log_margin_level_change(change: &MarginLevelStatusChange, stream: 
     );
 }
 
-/// Log a `USER_LIABILITY_CHANGE`, naming the stream it arrived on. It is not applied to balance
-/// state: borrowing and repaying is a delta, and debt is refreshed by `account_snapshot`.
+/// Log that a `USER_LIABILITY_CHANGE` arrived, naming the stream it arrived on.
 pub(super) fn log_liability_change(change: &UserLiabilityChange, stream: &'static str) {
     info!(
         stream,
@@ -571,7 +579,7 @@ pub(super) fn log_liability_change(change: &UserLiabilityChange, stream: &'stati
         kind = change.t.as_deref().unwrap_or("?"),
         principal = change.p.as_deref().unwrap_or("?"),
         interest = change.i.as_deref().unwrap_or("?"),
-        "BinanceMargin USER_LIABILITY_CHANGE (observable; not applied to balance state)",
+        "BinanceMargin USER_LIABILITY_CHANGE received",
     );
 }
 
@@ -642,6 +650,86 @@ pub(super) fn margin_level_notice(
             time_exchange,
             margin_level,
             SmolStr::new(status),
+        )),
+    ))
+}
+
+/// The [`MarginDebtKind`] for a Binance liability change type (`t`).
+///
+/// Binance documents none of its values. `BORROW`, `REPAY` and `INTEREST` (the hourly charge) have
+/// been seen on a live account; anything else is [`MarginDebtKind::Other`].
+pub(super) fn margin_debt_kind(kind: &str) -> MarginDebtKind {
+    match kind {
+        "BORROW" => MarginDebtKind::Borrow,
+        "REPAY" => MarginDebtKind::Repay,
+        "INTEREST" => MarginDebtKind::Interest,
+        _ => MarginDebtKind::Other,
+    }
+}
+
+/// The debt update for a `USER_LIABILITY_CHANGE`, attributed to `instrument`.
+///
+/// Binance's principal (`p`) and interest (`i`) are what the asset owes after the change, as
+/// observed live: a repay that cleared a loan reads zero, and an hourly charge leaves `p` as it was
+/// and raises `i` to the whole interest owed. Binance's docs do not say either way.
+///
+/// `None`, logged at `warn`, for a change with no asset, whose principal or interest is missing or
+/// unreadable, or with no readable time (`E`): a total that cannot be read cannot replace the debt
+/// held, and one with no venue time cannot be ordered against it (stamped on arrival, it could
+/// shadow the venue's later changes, and its copies on the two streams would not match). A REST
+/// snapshot restates the debt.
+pub(super) fn liability_debt_update(
+    change: UserLiabilityChange,
+    instrument: Option<InstrumentNameExchange>,
+) -> Option<UnindexedAccountEvent> {
+    let venue_kind = change.t.unwrap_or_default();
+    let Some(asset) = change.a else {
+        warn!(
+            kind = %venue_kind,
+            "BinanceMargin USER_LIABILITY_CHANGE without an asset (a), dropping"
+        );
+        return None;
+    };
+    let total = |field: &str, value: Option<&str>| {
+        let parsed = value.map(Decimal::from_str);
+        match parsed {
+            Some(Ok(total)) => Some(total),
+            _ => {
+                warn!(
+                    %asset,
+                    kind = %venue_kind,
+                    field,
+                    value = value.unwrap_or("<missing>"),
+                    "BinanceMargin USER_LIABILITY_CHANGE with a missing or unreadable total, \
+                     dropping"
+                );
+                None
+            }
+        }
+    };
+    let borrowed = total("p", change.p.as_deref())?;
+    let interest = total("i", change.i.as_deref())?;
+    let Some(time_exchange) = change
+        .e_uppercase
+        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+    else {
+        warn!(
+            %asset,
+            kind = %venue_kind,
+            "BinanceMargin USER_LIABILITY_CHANGE without a readable time (E), dropping"
+        );
+        return None;
+    };
+
+    Some(UnindexedAccountEvent::new(
+        ExchangeId::BinanceMargin,
+        AccountEventKind::MarginDebt(MarginDebtUpdate::new(
+            AssetNameExchange::new(asset),
+            instrument,
+            MarginDetails { borrowed, interest },
+            margin_debt_kind(&venue_kind),
+            SmolStr::new(venue_kind),
+            time_exchange,
         )),
     ))
 }
@@ -780,14 +868,71 @@ mod tests {
         }
     }
 
+    /// A liability change, wrapped or bare, becomes the asset's debt after it, its type mapped and
+    /// kept verbatim. One without an asset, or whose principal or interest cannot be read, forwards
+    /// nothing; one without a time is stamped on arrival.
+    #[test]
+    fn a_liability_change_becomes_the_debt_after_it() {
+        let change = |t: &str| {
+            serde_json::json!({
+                "e": "USER_LIABILITY_CHANGE", "E": 1_700_000_000_000_i64, "a": "BTC",
+                "t": t, "p": "0.00006000", "i": "0.00000001",
+            })
+        };
+        let debt_of = |frame: String| {
+            let mut buf = Vec::new();
+            assert_eq!(
+                convert_risk_frame(&frame, LISTEN_KEY, &mut buf),
+                RiskFrame::Continue
+            );
+            match buf.as_slice() {
+                [] => None,
+                [event] => match &event.kind {
+                    AccountEventKind::MarginDebt(update) => Some(update.clone()),
+                    other => panic!("expected MarginDebt, got {other:?}"),
+                },
+                more => panic!("expected at most one event, got {more:?}"),
+            }
+        };
+
+        for (t, kind) in [
+            ("BORROW", MarginDebtKind::Borrow),
+            ("REPAY", MarginDebtKind::Repay),
+            ("INTEREST", MarginDebtKind::Interest),
+            ("SOME_FUTURE_TYPE", MarginDebtKind::Other),
+        ] {
+            for frame in [wrapped(change(t)), change(t).to_string()] {
+                assert_eq!(
+                    debt_of(frame),
+                    Some(MarginDebtUpdate::new(
+                        AssetNameExchange::new("BTC"),
+                        None,
+                        MarginDetails {
+                            borrowed: Decimal::new(6, 5),
+                            interest: Decimal::new(1, 8),
+                        },
+                        kind,
+                        SmolStr::new(t),
+                        Utc.timestamp_millis_opt(1_700_000_000_000).unwrap(),
+                    )),
+                    "{t}"
+                );
+            }
+        }
+
+        for missing in ["a", "p", "i", "E"] {
+            let mut frame = change("BORROW");
+            frame.as_object_mut().unwrap().remove(missing);
+            assert_eq!(debt_of(wrapped(frame)), None, "{missing}");
+        }
+        let mut unreadable = change("BORROW");
+        unreadable["p"] = serde_json::json!("not a number");
+        assert_eq!(debt_of(wrapped(unreadable)), None);
+    }
+
     #[test]
     fn other_frames_forward_nothing_and_an_expired_key_ends_the_session() {
-        let liability = serde_json::json!({
-            "e": "USER_LIABILITY_CHANGE", "E": 1_700_000_000_000_i64, "a": "BTC",
-            "t": "BORROW", "p": "1", "i": "0",
-        });
         for (frame, expected) in [
-            (wrapped(liability), RiskFrame::Continue),
             (
                 serde_json::json!({ "result": null, "id": 1 }).to_string(),
                 RiskFrame::Continue,
