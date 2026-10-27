@@ -131,7 +131,7 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
 
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31  # v2
         with:
           shared-key: "rustrade-ci-check"
 
@@ -210,7 +210,7 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
 
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31  # v2
         with:
           shared-key: "rustrade-ci-test"
 
@@ -268,7 +268,7 @@ jobs:
         with:
           components: clippy
 
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31  # v2
         with:
           shared-key: "rustrade-ci-check"
 
@@ -293,7 +293,7 @@ jobs:
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
 
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31  # v2
         with:
           shared-key: "rustrade-ci-check"
 
@@ -401,7 +401,7 @@ jobs:
       # rebuilds those: 84 crates for `rustrade-execution` and 95 for `rustrade`, measured locally.
       # `--test-workspace` would hit the cache in full, but then every mutant rebuilds and tests
       # every crate that depends on its own.
-      - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31  # v2
         if: steps.diff.outputs.rust == 'true'
         with:
           shared-key: "rustrade-ci-test"
