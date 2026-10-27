@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of doing so silently, as an execution report or a queried order without a time already
   is.
 
+### Changed
+
+- **`binance-sdk` 76.0.0 → 77.0.0** (`rustrade-execution`, `binance` feature). The SDK's common
+  layer, which the margin user-data stream couples to, and its spot module are unchanged, so the
+  three internals hold as before. The margin module only adds bindings for the v2 margin
+  listen-key endpoints, which nothing here uses yet. No behaviour change.
+
 ## [0.16.0] - 2026-10-26
 
 ### Added
