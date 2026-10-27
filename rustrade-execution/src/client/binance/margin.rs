@@ -2427,6 +2427,7 @@ fn convert_margin_user_data_events_with(
                         symbol = report.symbol.as_deref().unwrap_or("?"),
                         order_id = ?report.order_id,
                         client_order_id = report.client_order_id.as_deref().unwrap_or("?"),
+                        orig_client_order_id = report.orig_client_order_id.as_deref().unwrap_or("?"),
                         order_type = report.order_type.as_deref().unwrap_or("?"),
                         execution_type = report.execution_type.as_deref().unwrap_or("?"),
                         order_status = report.order_status.as_deref().unwrap_or("?"),
@@ -6508,18 +6509,23 @@ mod tests {
         }
     }
 
+    /// A cancel report names the cancel request in `c` and the cancelled order in `C`, and the
+    /// cancel is keyed by the order's.
     #[test]
     fn margin_ws_canceled_report_maps_to_order_cancelled() {
         let frame = push(serde_json::json!({
             "e": "executionReport", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT",
-            "x": "CANCELED", "X": "CANCELED", "i": 8_i64, "c": "cid-3",
-            "z": "0", "T": 1_700_000_000_000_i64,
+            "x": "CANCELED", "X": "CANCELED", "i": 8_i64, "c": "cancel-request",
+            "C": "cid-3", "z": "0", "T": 1_700_000_000_000_i64,
         }));
         let mut buf = Vec::new();
         assert!(!convert_margin_user_data_events(&frame, &mut buf));
         assert_eq!(buf.len(), 1);
         match &buf[0].kind {
-            AccountEventKind::OrderCancelled(resp) => assert!(resp.state.is_ok()),
+            AccountEventKind::OrderCancelled(resp) => {
+                assert!(resp.state.is_ok());
+                assert_eq!(resp.key.cid, ClientOrderId::new("cid-3"));
+            }
             other => panic!("expected OrderCancelled, got {other:?}"),
         }
     }

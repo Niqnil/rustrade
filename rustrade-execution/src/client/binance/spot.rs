@@ -4042,6 +4042,49 @@ mod tests {
         );
     }
 
+    /// A cancel report's `c` is the cancel request's id, so the cancel is keyed by the order's own
+    /// id in `C`, and by `c` only when `C` is empty or absent.
+    #[test]
+    fn a_cancel_report_is_keyed_by_the_cancelled_orders_id() {
+        let cancelled_cid = |orig: Option<&str>| {
+            let report = ExecutionReport {
+                execution_type: Some("CANCELED".to_string()),
+                client_order_id: Some("cancel-request".to_string()),
+                orig_client_order_id: orig.map(str::to_string),
+                ..make_base_report()
+            };
+            let event = sole_event(convert(report)).expect("CANCELED should produce Some");
+            let AccountEventKind::OrderCancelled(response) = event.kind else {
+                panic!("expected OrderCancelled, got {:?}", event.kind);
+            };
+            response.key.cid
+        };
+
+        assert_eq!(
+            cancelled_cid(Some("client-1")),
+            ClientOrderId::new("client-1")
+        );
+        assert_eq!(
+            cancelled_cid(Some("")),
+            ClientOrderId::new("cancel-request")
+        );
+        assert_eq!(cancelled_cid(None), ClientOrderId::new("cancel-request"));
+    }
+
+    /// Only a cancel report names the order in `C`: every other report names it in `c`, an amend
+    /// by the id the amend gave it.
+    #[test]
+    fn only_a_cancel_report_reads_the_orders_id_from_c_upper() {
+        for exec_type in ["NEW", "TRADE", "EXPIRED", "TRADE_PREVENTION", "REPLACED"] {
+            let report = ExecutionReport {
+                execution_type: Some(exec_type.to_string()),
+                orig_client_order_id: Some("client-0".to_string()),
+                ..make_base_report()
+            };
+            assert_eq!(report.order_client_id(), Some("client-1"), "{exec_type}");
+        }
+    }
+
     /// A cancel report carries what filled (`z`), and an unknown one stays unknown, not zero.
     #[test]
     fn a_cancel_report_carries_its_fill_or_none() {
@@ -4080,17 +4123,39 @@ mod tests {
         );
     }
 
+    /// Self-trade prevention that expires an order removes it; one that leaves it live (the
+    /// `DECREMENT` mode) or names no status produces nothing.
     #[test]
-    fn test_convert_execution_report_expired_in_match() {
+    fn a_trade_prevention_report_removes_the_order_only_once_it_has_ended() {
+        let prevented = |status: Option<&str>| {
+            convert(ExecutionReport {
+                execution_type: Some("TRADE_PREVENTION".to_string()),
+                order_status: status.map(str::to_string),
+                ..make_base_report()
+            })
+        };
+
+        let event = sole_event(prevented(Some("EXPIRED_IN_MATCH")))
+            .expect("an expired order should produce an event");
+        assert!(
+            matches!(event.kind, AccountEventKind::OrderCancelled(ref r) if r.state.is_ok()),
+            "an expired order should yield OrderCancelled with Ok state, got {:?}",
+            event.kind
+        );
+        for live in ["NEW", "PARTIALLY_FILLED"] {
+            assert!(prevented(Some(live)).is_empty(), "{live}");
+        }
+        assert!(prevented(None).is_empty());
+    }
+
+    /// `EXPIRED_IN_MATCH` is an order status, never an execution type.
+    #[test]
+    fn expired_in_match_as_an_execution_type_produces_nothing() {
         let report = ExecutionReport {
             execution_type: Some("EXPIRED_IN_MATCH".to_string()),
             ..make_base_report()
         };
-        let event = sole_event(convert(report)).expect("EXPIRED_IN_MATCH should produce Some");
-        assert!(
-            matches!(event.kind, AccountEventKind::OrderCancelled(ref r) if r.state.is_ok()),
-            "EXPIRED_IN_MATCH should yield OrderCancelled with Ok state"
-        );
+        assert!(convert(report).is_empty());
     }
 
     #[test]
@@ -4194,19 +4259,18 @@ mod tests {
         );
     }
 
+    /// An amended order is still live, so an amend report must not retire it.
     #[test]
-    fn test_convert_execution_report_replace_yields_cancelled() {
-        let report = ExecutionReport {
-            execution_type: Some("REPLACE".to_string()),
-            ..make_base_report()
-        };
-        // REPLACE describes the cancelled original order (field `i` = original order ID).
-        // The replacement order arrives as a subsequent NEW execution report.
-        let event = sole_event(convert(report)).expect("REPLACE should produce Some");
-        assert!(
-            matches!(event.kind, AccountEventKind::OrderCancelled(ref r) if r.state.is_ok()),
-            "REPLACE should yield OrderCancelled with Ok state"
-        );
+    fn an_amend_report_produces_nothing() {
+        for exec_type in ["REPLACED", "REPLACE"] {
+            let report = ExecutionReport {
+                execution_type: Some(exec_type.to_string()),
+                order_status: Some("NEW".to_string()),
+                orig_client_order_id: Some("client-0".to_string()),
+                ..make_base_report()
+            };
+            assert!(convert(report).is_empty(), "{exec_type}");
+        }
     }
 
     // ---------------------------------------------------------------------------

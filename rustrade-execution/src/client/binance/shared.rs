@@ -2430,9 +2430,15 @@ pub(crate) struct ExecutionReport {
     /// `i`: the venue's order id.
     #[serde(rename = "i")]
     pub(crate) order_id: Option<i64>,
-    /// `c`.
+    /// `c`: the order's client order id, except on a `CANCELED` report, where it is the cancel
+    /// request's own id (random when the request sent none). Read through
+    /// [`ExecutionReport::order_client_id`].
     #[serde(rename = "c")]
     pub(crate) client_order_id: Option<String>,
+    /// `C`: on a `CANCELED` report, the cancelled order's client order id; on a `REPLACED` one, the
+    /// id the amend replaced. An empty string on every other report.
+    #[serde(rename = "C")]
+    pub(crate) orig_client_order_id: Option<String>,
     /// `T`: transaction time, in milliseconds.
     #[serde(rename = "T")]
     pub(crate) transaction_time: Option<i64>,
@@ -2480,6 +2486,24 @@ pub(crate) struct ExecutionReport {
     /// testnet to confirm which the live stream sends, so either is accepted.
     #[serde(rename = "d")]
     pub(crate) trailing_delta: Option<WireInt>,
+}
+
+impl ExecutionReport {
+    /// The client order id of the order this report is about.
+    ///
+    /// A `CANCELED` report names the cancel request in `c` and the cancelled order in `C`, so there
+    /// `C` is read when it is non-empty. Every other report names the order in `c`; a `REPLACED`
+    /// one names it by the id the amend gave it, which is the order's id from then on.
+    pub(crate) fn order_client_id(&self) -> Option<&str> {
+        match self.orig_client_order_id.as_deref() {
+            Some(orig)
+                if !orig.is_empty() && self.execution_type.as_deref() == Some("CANCELED") =>
+            {
+                Some(orig)
+            }
+            _ => self.client_order_id.as_deref(),
+        }
+    }
 }
 
 /// An integer that Binance may send as a JSON number or as a numeric string.
@@ -2587,7 +2611,7 @@ fn trade_order_is_live(status: &str) -> bool {
 /// `exchange` stamps every event and every diagnostic below, so one implementation serves each
 /// Binance client without a venue name baked into its warnings.
 // Inherent complexity: one arm per Binance execution type (TRADE, NEW, CANCELED, EXPIRED,
-// REJECTED, REPLACE), each validating the fields its own variant needs.
+// TRADE_PREVENTION, REJECTED, REPLACED), each validating the fields its own variant needs.
 #[allow(clippy::cognitive_complexity)]
 pub(crate) fn convert_execution_report(
     report: &ExecutionReport,
@@ -2608,7 +2632,7 @@ pub(crate) fn convert_execution_report(
         return;
     };
     let order_id = OrderId(format_smolstr!("{order_id_raw}"));
-    let cid = match report.client_order_id.as_deref() {
+    let cid = match report.order_client_id() {
         Some(c) => ClientOrderId::new(c),
         None => ClientOrderId::new(order_id.0.as_str()),
     };
@@ -2711,8 +2735,8 @@ pub(crate) fn convert_execution_report(
                 order_filled_quantity,
                 AssetFees::new(fee_asset, commission, None),
             );
-            // Only the order's own `c`: `cid` falls back to the exchange id without one.
-            let trade = match report.client_order_id.as_deref() {
+            // Only the order's own id: `cid` falls back to the exchange id without one.
+            let trade = match report.order_client_id() {
                 Some(c) if !c.is_empty() => trade.with_client_order_id(cid.clone()),
                 _ => trade,
             };
@@ -2746,7 +2770,7 @@ pub(crate) fn convert_execution_report(
                 );
             }
         }
-        "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" => {
+        "CANCELED" | "EXPIRED" => {
             buf.push(cancelled_event(
                 report,
                 exchange,
@@ -2755,6 +2779,30 @@ pub(crate) fn convert_execution_report(
                 order_id,
                 time_exchange,
             ));
+        }
+        "TRADE_PREVENTION" => {
+            // Self-trade prevention stopped the order matching another order of this account. In
+            // the expire modes the order leaves the book (`EXPIRED_IN_MATCH`); in `DECREMENT` it
+            // may stay live with less left to fill, which an order snapshot cannot express.
+            match report.order_status.as_deref() {
+                Some(status) if rest_order_is_open(status) => warn!(
+                    %exchange, %symbol, %order_id, status,
+                    "Binance self-trade prevention reduced a live order's quantity - the engine \
+                     still holds its earlier quantity"
+                ),
+                Some(_) => buf.push(cancelled_event(
+                    report,
+                    exchange,
+                    symbol,
+                    cid,
+                    order_id,
+                    time_exchange,
+                )),
+                None => warn!(
+                    %exchange, %symbol, %order_id,
+                    "Binance TRADE_PREVENTION report missing order status (X), dropping"
+                ),
+            }
         }
         "REJECTED" => {
             // Rejected by the matching engine after initial acceptance (e.g. insufficient funds
@@ -2778,20 +2826,19 @@ pub(crate) fn convert_execution_report(
                 AccountEventKind::OrderCancelled(response),
             ));
         }
-        "REPLACE" => {
-            // REPLACE is emitted when an order is replaced via the cancel-replace endpoint. The
-            // report describes the CANCELLED original order: field `i` is the original order id
-            // (already extracted as `order_id` above). The replacement arrives as a subsequent
-            // NEW report with its own order id. Emitting OrderCancelled for the original is what
-            // removes it from the engine's open-order book.
-            buf.push(cancelled_event(
-                report,
-                exchange,
-                symbol,
-                cid,
-                order_id,
-                time_exchange,
-            ));
+        "REPLACED" => {
+            // An amend (Order Amend Keep Priority): the order stays live with a new quantity and,
+            // unless the amend chose one, a new client order id in `c`; `C` holds the old one.
+            // This library sends no amends, so one came from outside it, and the engine, which
+            // knows the order by its old id, cannot follow it. A cancel-replace is not this: it
+            // reports `CANCELED` for the original and `NEW` for the replacement.
+            warn!(
+                %exchange, %symbol, %order_id,
+                client_order_id = %cid,
+                previous_client_order_id = report.orig_client_order_id.as_deref().unwrap_or(""),
+                "Binance order amended outside this client - the engine still holds it under its \
+                 old id and quantity"
+            );
         }
         _ => {
             // PENDING_NEW and PENDING_CANCEL are transient; the terminal state
@@ -2801,7 +2848,7 @@ pub(crate) fn convert_execution_report(
     }
 }
 
-/// Build the `OrderCancelled` event shared by the `CANCELED`/`EXPIRED`/`REPLACE` arms.
+/// Build the `OrderCancelled` event shared by the `CANCELED`/`EXPIRED`/`TRADE_PREVENTION` arms.
 ///
 /// All of them report an order leaving the book with whatever it had filled (`z`) at that point,
 /// and differ only in why -- which the caller has already established by matching on `x`.

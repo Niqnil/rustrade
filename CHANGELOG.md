@@ -36,6 +36,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of doing so silently, as an execution report or a queried order without a time already
   is.
 
+- **Binance execution reports for cancels, self-trade prevention and amends** (#751). These fixes
+  apply to `BinanceSpot` and `BinanceMargin`, whose account streams share one converter:
+  - A cancelled order's `OrderCancelled` now carries that order's client order id. A cancel report
+    holds the cancel request's own id in `c`, which is random when the request sent none, and the
+    order's id in `C`. Before, the event was keyed by the cancel request's id, so it did not reach
+    the order it ended.
+  - An order that self-trade prevention expires (`x=TRADE_PREVENTION`, order status
+    `EXPIRED_IN_MATCH`) is reported as `OrderCancelled`, as an `EXPIRED` order is. Before, the
+    report was ignored and the order stayed open in engine state. When prevention leaves the order
+    live with less to fill (the `DECREMENT` mode), a `warn!` is logged.
+  - An amend (`x=REPLACED`) no longer goes unnoticed. The order is still live, but the amend
+    changes its quantity and, unless the amend named one, its client order id. This library sends
+    no amends and the engine cannot follow the new id, so a `warn!` is logged and no event is
+    emitted. The converter used to match `REPLACE`, which Binance never sends, and would have
+    removed the still-live order.
+
 ## [0.16.0] - 2026-10-26
 
 ### Added
