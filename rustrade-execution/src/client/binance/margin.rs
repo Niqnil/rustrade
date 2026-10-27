@@ -6699,6 +6699,35 @@ mod tests {
         }
     }
 
+    /// A cross position is at its update time `u`, or at its event time `E` when it has no `u`.
+    #[test]
+    fn margin_ws_outbound_account_position_is_at_u_else_at_e() {
+        let time_of = |frame: serde_json::Value| {
+            let mut buf = Vec::new();
+            assert!(!convert_margin_user_data_events(&push(frame), &mut buf));
+            match &buf[..] {
+                [event] => match &event.kind {
+                    AccountEventKind::BalanceStreamUpdate(snap) => snap.0.time_exchange,
+                    other => panic!("expected BalanceStreamUpdate, got {other:?}"),
+                },
+                other => panic!("expected one event, got {other:?}"),
+            }
+        };
+        let balances = serde_json::json!([{ "a": "BTC", "f": "0.5", "l": "0" }]);
+        assert_eq!(
+            time_of(serde_json::json!({
+                "e": "outboundAccountPosition", "E": 3_000, "u": 2_000, "B": balances,
+            })),
+            Utc.timestamp_millis_opt(2_000).unwrap()
+        );
+        assert_eq!(
+            time_of(serde_json::json!({
+                "e": "outboundAccountPosition", "E": 3_000, "B": balances,
+            })),
+            Utc.timestamp_millis_opt(3_000).unwrap()
+        );
+    }
+
     #[test]
     fn margin_ws_stream_terminated_signals_reconnect() {
         let frame = push(serde_json::json!({ "e": "eventStreamTerminated" }));
@@ -7475,6 +7504,52 @@ mod tests {
             &event.kind,
             AccountEventKind::InstrumentBalanceUpdate(ibu) if ibu.balance.time_exchange == time
         )));
+    }
+
+    /// An isolated position is at its update time `u`, or at its event time `E` when it has no
+    /// `u`.
+    #[test]
+    fn isolated_outbound_position_is_at_u_else_at_e() {
+        let sub_map = Arc::new(Mutex::new(HashMap::from([(7_i64, btcusdt())])));
+        let base_quote = Arc::new(HashMap::from([(
+            btcusdt(),
+            (
+                AssetNameExchange::new("BTC"),
+                AssetNameExchange::new("USDT"),
+            ),
+        )]));
+        let mut handler = isolated_handler(sub_map, base_quote);
+        let mut time_of = |frame: serde_json::Value| {
+            let mut buf = Vec::new();
+            convert_margin_user_data_events_with(
+                &push_with_sub(7, frame),
+                &mut buf,
+                &mut handler,
+                &mut cross_frame_scope,
+            );
+            match &buf[..] {
+                [event] => match &event.kind {
+                    AccountEventKind::InstrumentBalanceUpdate(update) => {
+                        update.balance.time_exchange
+                    }
+                    other => panic!("expected InstrumentBalanceUpdate, got {other:?}"),
+                },
+                other => panic!("expected one event, got {other:?}"),
+            }
+        };
+        let balances = serde_json::json!([{ "a": "BTC", "f": "0.5", "l": "0" }]);
+        assert_eq!(
+            time_of(serde_json::json!({
+                "e": "outboundAccountPosition", "E": 3_000, "u": 2_000, "B": balances,
+            })),
+            Utc.timestamp_millis_opt(2_000).unwrap()
+        );
+        assert_eq!(
+            time_of(serde_json::json!({
+                "e": "outboundAccountPosition", "E": 3_000, "B": balances,
+            })),
+            Utc.timestamp_millis_opt(3_000).unwrap()
+        );
     }
 
     #[test]

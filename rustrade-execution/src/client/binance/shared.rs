@@ -1797,6 +1797,9 @@ pub(crate) fn answer_time(
 ///
 /// Binance stamps every such frame with both, so either falling back is logged with a `warn!`. The
 /// balances are still delivered, because they state what the account holds whatever their time.
+/// `E` is when the frame was sent, so it can be a little later than the change it reports; a
+/// consumer that orders balances by time may then take the next frame, if its `u` falls in between,
+/// as the older one.
 pub(crate) fn account_position_time(
     exchange: ExchangeId,
     last_update: Option<i64>,

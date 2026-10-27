@@ -3612,17 +3612,29 @@ mod tests {
         }
     }
 
+    /// A position is at its update time `u`, or at its event time `E` when it has no `u`.
     #[test]
-    fn test_convert_account_position_u_field_none_uses_now() {
-        // When `u` is None the function falls back to Utc::now() — just verify it doesn't panic
-        let position = binance_sdk::spot::websocket_api::OutboundAccountPosition {
-            u: None,
-            b_uppercase: Some(vec![make_balance_inner("ETH", "2.0", "0.0")]),
-            ..Default::default()
+    fn test_convert_account_position_is_at_u_else_at_e() {
+        let time_of = |u, e| {
+            let position = binance_sdk::spot::websocket_api::OutboundAccountPosition {
+                u,
+                e_uppercase: e,
+                b_uppercase: Some(vec![make_balance_inner("ETH", "2.0", "0.0")]),
+                ..Default::default()
+            };
+            let mut buf = Vec::new();
+            convert_account_position(position, &mut buf);
+            match &buf[..] {
+                [event] => match &event.kind {
+                    AccountEventKind::BalanceStreamUpdate(snap) => snap.0.time_exchange,
+                    other => panic!("expected BalanceStreamUpdate, got {other:?}"),
+                },
+                other => panic!("expected one event, got {other:?}"),
+            }
         };
-        let mut buf = Vec::new();
-        convert_account_position(position, &mut buf);
-        assert_eq!(buf.len(), 1);
+        let at = |ms| Utc.timestamp_millis_opt(ms).unwrap();
+        assert_eq!(time_of(Some(2_000), Some(3_000)), at(2_000));
+        assert_eq!(time_of(None, Some(3_000)), at(3_000));
     }
 
     #[test]
