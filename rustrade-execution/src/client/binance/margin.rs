@@ -2683,7 +2683,7 @@ fn register_user_data_listener(
     let mut event_buf = Vec::with_capacity(32);
 
     // Safety — non-atomic Option::take() in the callback is safe: binance-sdk drives one spawned
-    // task per subscription, invoking the FnMut sequentially (verified =76.0.0; re-verify on SDK
+    // task per subscription, invoking the FnMut sequentially (verified =77.0.0; re-verify on SDK
     // upgrade). Same contract spot relies on.
     UnsubscribeOnDrop::new(ws.common.events.subscribe(move |event| {
         let Some(ref sender) = event_tx else { return };

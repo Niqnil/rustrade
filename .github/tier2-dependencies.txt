@@ -808,8 +808,9 @@ binance-sdk=77.0.0  # 2026-10-27 | Exchange SDK, signing/IO. PINNED: margin user
 #   1. `send_message` (websocket.rs:1896); WebsocketMessageSendOptions (:1660) unchanged. Both margin call
 #      sites (margin.rs:2234, :2281) still pass `::new()` (:2237, :2284).
 #   2. `WebsocketEventEmitter::subscribe` (websocket.rs:133) unchanged; registered at margin.rs:2688.
-#   3. `send_request` (utils.rs:983) unchanged, 7 args. Its two callers pass the same 7 args: the hand-rolled
-#      `userListenToken` POST (margin.rs:2148) and the margin new-order POST (margin.rs:662).
+#   3. `send_request` (utils.rs:983) unchanged, 7 args. Its two production callers pass the same 7 args: the
+#      hand-rolled `userListenToken` POST (margin.rs:2148) and the margin new-order POST (margin.rs:662). A
+#      parity test (margin.rs:9279) also calls it, checking the raw new-order request against the SDK's typed one.
 # The disconnected-connection property holds too (websocket.rs identical; still pinned by
 # `a_disconnected_connection_leaves_no_task_behind`, client/binance/shared.rs).
 # What changed in the compiled `margin_trading` module (rest_api only):
