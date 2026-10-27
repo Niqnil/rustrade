@@ -1476,8 +1476,8 @@ impl ExecutionClient for BinanceMargin {
     ///
     /// # Margin debt
     /// Binance's `USER_LIABILITY_CHANGE` is delivered as an [`AccountEventKind::MarginDebt`],
-    /// read from the same streams as notices and delivered once in the same way (matched on asset
-    /// and Binance's event time). Its principal (`p`) and interest (`i`) are the asset's totals after
+    /// read from the same streams as notices and delivered once (matched on asset, Binance's event
+    /// time, type and totals). Its principal (`p`) and interest (`i`) are the asset's totals after
     /// the change, as observed live (Binance's docs do not say), so each update states the whole
     /// debt. Its type (`t`) maps to a [`MarginDebtKind`](crate::MarginDebtKind): `BORROW` →
     /// `Borrow`, `REPAY` → `Repay`, `INTEREST` (the periodic charge) → `Interest`, anything else →
@@ -1491,8 +1491,8 @@ impl ExecutionClient for BinanceMargin {
     ///
     /// Binance posts an interest charge some time after the period it is for; when is not
     /// documented. An update with no asset, or whose `p` or `i` cannot be read, is dropped with a
-    /// `warn`, and one with no readable time is stamped on arrival. Each arrival is logged at
-    /// `info`, naming the stream.
+    /// `warn`, as is one with no readable time, which could not be ordered against the debt held.
+    /// Each arrival is logged at `info`, naming the stream.
     ///
     /// # Startup race window
     /// Like spot, fills arriving between subscribe and the listener being registered may be missed;

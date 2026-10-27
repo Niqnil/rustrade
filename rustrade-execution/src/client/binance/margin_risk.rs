@@ -673,9 +673,11 @@ pub(super) fn margin_debt_kind(kind: &str) -> MarginDebtKind {
 /// observed live: a repay that cleared a loan reads zero, and an hourly charge leaves `p` as it was
 /// and raises `i` to the whole interest owed. Binance's docs do not say either way.
 ///
-/// `None`, logged at `warn`, for a change with no asset, or whose principal or interest is missing
-/// or unreadable: a total that cannot be read cannot replace the debt held, and a REST snapshot
-/// restates it. A change with no readable time (`E`) is stamped now, with a `warn`.
+/// `None`, logged at `warn`, for a change with no asset, whose principal or interest is missing or
+/// unreadable, or with no readable time (`E`): a total that cannot be read cannot replace the debt
+/// held, and one with no venue time cannot be ordered against it (stamped on arrival, it could
+/// shadow the venue's later changes, and its copies on the two streams would not match). A REST
+/// snapshot restates the debt.
 pub(super) fn liability_debt_update(
     change: UserLiabilityChange,
     instrument: Option<InstrumentNameExchange>,
@@ -707,19 +709,16 @@ pub(super) fn liability_debt_update(
     };
     let borrowed = total("p", change.p.as_deref())?;
     let interest = total("i", change.i.as_deref())?;
-    let time_exchange = match change
+    let Some(time_exchange) = change
         .e_uppercase
         .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-    {
-        Some(time) => time,
-        None => {
-            warn!(
-                %asset,
-                kind = %venue_kind,
-                "BinanceMargin USER_LIABILITY_CHANGE without a readable time (E), using now"
-            );
-            Utc::now()
-        }
+    else {
+        warn!(
+            %asset,
+            kind = %venue_kind,
+            "BinanceMargin USER_LIABILITY_CHANGE without a readable time (E), dropping"
+        );
+        return None;
     };
 
     Some(UnindexedAccountEvent::new(
@@ -921,7 +920,7 @@ mod tests {
             }
         }
 
-        for missing in ["a", "p", "i"] {
+        for missing in ["a", "p", "i", "E"] {
             let mut frame = change("BORROW");
             frame.as_object_mut().unwrap().remove(missing);
             assert_eq!(debt_of(wrapped(frame)), None, "{missing}");
@@ -929,12 +928,6 @@ mod tests {
         let mut unreadable = change("BORROW");
         unreadable["p"] = serde_json::json!("not a number");
         assert_eq!(debt_of(wrapped(unreadable)), None);
-
-        let mut untimed = change("REPAY");
-        untimed.as_object_mut().unwrap().remove("E");
-        let before = Utc::now();
-        let stamped = debt_of(wrapped(untimed)).unwrap().time_exchange;
-        assert!(stamped >= before && stamped <= Utc::now(), "{stamped}");
     }
 
     #[test]
