@@ -6822,6 +6822,28 @@ mod tests {
         }
     }
 
+    /// An amend leaves the order live, so its report emits no event, but it is reported loudly: the
+    /// engine still holds the order under its old id and quantity.
+    #[test]
+    fn margin_ws_amend_report_is_logged_without_an_event() {
+        let frame = push(serde_json::json!({
+            "e": "executionReport", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT",
+            "x": "REPLACED", "X": "NEW", "i": 8_i64, "c": "amended", "C": "cid-3",
+            "q": "0.5", "z": "0", "T": 1_700_000_000_000_i64,
+        }));
+        let mut buf = Vec::new();
+        let (terminated, messages) =
+            log_messages(|| convert_margin_user_data_events(&frame, &mut buf));
+        assert!(!terminated);
+        assert!(buf.is_empty(), "{buf:?}");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("amended outside this client")),
+            "{messages:?}"
+        );
+    }
+
     // -- User-data stream: dedup -----------------------------------------------------------------
 
     #[test]
