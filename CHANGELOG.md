@@ -23,6 +23,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     even one IB flags as a liquidation. IB is not known to send another client's executions live.
     Fill recovery and `fetch_trades` still read such an execution.
 
+- **`binance-sdk` 76.0.0 → 77.0.0** (`rustrade-execution`, `binance` feature). The SDK's common
+  layer, which the margin user-data stream couples to, and its spot module are unchanged, so the
+  three internals hold as before. The margin module only adds bindings for the v2 margin
+  listen-key endpoints, which nothing here uses yet. No behaviour change.
+
 ### Fixed
 
 - **A Binance order or cancel answer without a readable `transactTime` is logged** (#744).
