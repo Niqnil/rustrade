@@ -73,7 +73,7 @@ use super::shared::{
     HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
     PlacementResponse, RateLimitTracker, RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS,
     SharedDedupCache, TrailingOrderError, UnhandledEvents, UnrecoveredFills, UnsubscribeOnDrop,
-    UserDataFrame, WeightPool, answer_time, binance_filled_qty, classify_order_kind_tif,
+    UserDataFrame, WeightPool, WireInt, answer_time, binance_filled_qty, classify_order_kind_tif,
     classify_rest_order_error, classify_rest_query_error, convert_ended_order,
     convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
     dedup_key_from_event, disconnect_error, drop_after, frame_excerpt, gap_failed, gap_time,
@@ -154,7 +154,7 @@ use rustrade_instrument::{
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
 };
 use serde::Deserialize;
-use smol_str::{SmolStr, format_smolstr};
+use smol_str::format_smolstr;
 use std::{
     collections::{BTreeMap, HashMap},
     str::FromStr,
@@ -663,7 +663,7 @@ impl BinanceMargin {
                 Box::pin(async move {
                     binance_sdk::common::utils::send_request::<NewOrderAnswer>(
                         &cfg,
-                        NEW_ORDER_PATH,
+                        ORDER_PATH,
                         reqwest::Method::POST,
                         query,
                         BTreeMap::new(),
@@ -1004,10 +1004,10 @@ impl ExecutionClient for BinanceMargin {
     /// [`BinanceSpot::cancel_order`](super::spot::BinanceSpot): every failure is folded into the
     /// returned response's `state` as an `Err`.
     ///
-    /// The margin cancel response carries no `transactTime`, so the cancellation timestamp is the
-    /// local receive time.
+    /// The cancellation's time is the answer's `transactTime`. An answer without a readable one is
+    /// read at the local time, with a `warn!`.
     ///
-    /// A successful answer that cannot be read (one that does not decode, or has no `orderId`)
+    /// A successful answer that cannot be read (one that does not decode, or has no readable `orderId`)
     /// returns [`OrderError::Connectivity`]: the venue acted on the cancel, so whether the order
     /// is still working is unknown.
     async fn cancel_order(
@@ -1038,21 +1038,39 @@ impl ExecutionClient for BinanceMargin {
             }
         };
 
-        let response =
-            match rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Order, |rest| {
-                let params = params.clone();
-                Box::pin(async move { rest.margin_account_cancel_order(params).await })
-            })
-            .await
-            {
-                Ok(response) => response,
-                Err(e) => {
-                    return UnindexedOrderResponseCancel {
-                        key,
-                        state: Err(classify_rest_order_error(&e, &instrument)),
-                    };
-                }
-            };
+        // Sent through `send_request` with the SDK's own query, so that the answer decodes into
+        // `CancelOrderAnswer` (see there) rather than the SDK's response type.
+        let query = cancel_order_query(params);
+        let response = match rest_call_with_retry(
+            &self.rest_config,
+            &self.rate_limiter,
+            RequestKind::Order,
+            |cfg| {
+                let query = query.clone();
+                Box::pin(async move {
+                    binance_sdk::common::utils::send_request::<CancelOrderAnswer>(
+                        &cfg,
+                        ORDER_PATH,
+                        reqwest::Method::DELETE,
+                        query,
+                        BTreeMap::new(),
+                        None,
+                        true,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                return UnindexedOrderResponseCancel {
+                    key,
+                    state: Err(classify_rest_order_error(&e, &instrument)),
+                };
+            }
+        };
 
         let data = match response.data().await {
             Ok(data) => data,
@@ -1064,13 +1082,24 @@ impl ExecutionClient for BinanceMargin {
             }
         };
 
-        // Margin cancel response has no transactTime field — use local receive time.
-        let time_exchange = Utc::now();
+        let time_exchange = answer_time(
+            ExchangeId::BinanceMargin,
+            &instrument,
+            "cancel_order",
+            data.transact_time,
+        );
 
         let exchange_order_id = match data.order_id {
-            // NB: the margin cancel response types orderId as a String (the new-order response
-            // types it as i64) — use it verbatim.
-            Some(id) => OrderId(SmolStr::new(id)),
+            Some(WireInt::Int(id)) => OrderId(format_smolstr!("{id}")),
+            Some(WireInt::Unreadable(raw)) => {
+                return UnindexedOrderResponseCancel {
+                    key,
+                    state: Err(unreadable_answer(
+                        ExchangeId::BinanceMargin,
+                        &format!("cancel answer has an unreadable orderId: {raw}"),
+                    )),
+                };
+            }
             None => {
                 return UnindexedOrderResponseCancel {
                     key,
@@ -4648,8 +4677,9 @@ fn build_new_order_params(
         .map_err(|e| BuildOrderError::Build(e.to_string()))
 }
 
-/// The margin new-order endpoint, joined onto the REST config's base path.
-const NEW_ORDER_PATH: &str = "/sapi/v1/margin/order";
+/// The margin order endpoint, joined onto the REST config's base path: `POST` places an order and
+/// `DELETE` cancels one.
+const ORDER_PATH: &str = "/sapi/v1/margin/order";
 
 /// The query of a margin new-order request, built from `params` as the SDK's own
 /// `margin_account_new_order` builds it.
@@ -4709,6 +4739,55 @@ fn new_order_query(params: MarginAccountNewOrderParams) -> BTreeMap<String, serd
     insert("autoRepayAtCancel", auto_repay_at_cancel.map(|v| json!(v)));
     insert("recvWindow", recv_window.map(|v| json!(v)));
     query
+}
+
+/// The query of a margin cancel request, built from `params` as the SDK's own
+/// `margin_account_cancel_order` builds it.
+///
+/// [`BinanceMargin::cancel_order`] sends the cancel through the SDK's `send_request` instead of that
+/// call, so that the answer decodes into [`CancelOrderAnswer`]: the SDK's response type has no
+/// `transactTime`. The destructuring names every field, so a field the SDK adds fails to compile
+/// here rather than go unsent.
+fn cancel_order_query(
+    params: MarginAccountCancelOrderParams,
+) -> BTreeMap<String, serde_json::Value> {
+    use serde_json::json;
+
+    let MarginAccountCancelOrderParams {
+        symbol,
+        is_isolated,
+        order_id,
+        orig_client_order_id,
+        new_client_order_id,
+        recv_window,
+    } = params;
+
+    let mut query = BTreeMap::new();
+    let mut insert = |key: &str, value: Option<serde_json::Value>| {
+        if let Some(value) = value {
+            query.insert(key.to_string(), value);
+        }
+    };
+    insert("symbol", Some(json!(symbol)));
+    insert("isIsolated", is_isolated.map(|v| json!(v)));
+    insert("orderId", order_id.map(|v| json!(v)));
+    insert("origClientOrderId", orig_client_order_id.map(|v| json!(v)));
+    insert("newClientOrderId", new_client_order_id.map(|v| json!(v)));
+    insert("recvWindow", recv_window.map(|v| json!(v)));
+    query
+}
+
+/// The fields of the answer to a margin cancel request that [`BinanceMargin::cancel_order`] reads.
+///
+/// Serde ignores the other fields, so a field the client does not read cannot fail the decode.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelOrderAnswer {
+    /// Binance sends it as a string here, though as a number in its other order answers, so
+    /// either is accepted.
+    order_id: Option<WireInt>,
+    transact_time: Option<i64>,
+    executed_qty: Option<String>,
 }
 
 /// The fields of the answer to a margin new-order request that
@@ -4779,6 +4858,7 @@ mod tests {
     use crate::notice::{AccountNotice, NoticeKind};
     use crate::order::state::ActiveOrderState;
     use binance_sdk::margin_trading::rest_api::QueryMarginAccountsOpenOrdersResponseInner;
+    use smol_str::SmolStr;
 
     /// A listen-token subscribe the WS API refuses with a ban keeps the SDK's error beneath its
     /// message, so the refusal starts the cooldown, as long as the ban it names.
@@ -9262,6 +9342,7 @@ mod tests {
         for answer in [
             serde_json::json!({ "symbol": "BTCUSDT", "status": "CANCELED" }),
             serde_json::json!({ "symbol": "BTCUSDT", "orderId": ["7"] }),
+            serde_json::json!({ "symbol": "BTCUSDT", "orderId": "abc", "transactTime": 1 }),
         ] {
             let server = wiremock::MockServer::start().await;
             mount_order_accepted(&server, 1).await;
@@ -9295,6 +9376,134 @@ mod tests {
             );
             assert!(client.known_live.lock().contains(&ClientOrderId::new("c")));
         }
+    }
+
+    /// Each request `server` received, as its sorted query and its body, less the timestamp and
+    /// the signature over it, so two signings of one request compare equal.
+    async fn signed_requests_sent(
+        server: &wiremock::MockServer,
+    ) -> Vec<(Vec<(String, String)>, Vec<u8>)> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|request| {
+                let mut query: Vec<(String, String)> = request
+                    .url
+                    .query_pairs()
+                    .filter(|(k, _)| k != "timestamp" && k != "signature")
+                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                    .collect();
+                query.sort();
+                (query, request.body)
+            })
+            .collect()
+    }
+
+    /// A cancel is stamped with the answer's `transactTime`, and reads the order id whether
+    /// Binance sends it as a string (as it does in this answer) or as a number. An answer without a
+    /// time is read at the local time.
+    #[tokio::test]
+    async fn a_cancel_is_stamped_with_the_answers_transact_time() {
+        let cancel = |answer: serde_json::Value| async move {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+                .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&answer))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = margin_client_at(&server, false);
+            let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+            let cancelled = client
+                .cancel_order(OrderRequestCancel {
+                    key: OrderKey::new(
+                        ExchangeId::BinanceMargin,
+                        &btcusdt,
+                        StrategyId::new("strategy"),
+                        ClientOrderId::new("c"),
+                    ),
+                    state: crate::order::request::RequestCancel {
+                        id: Some(VenueOrderId::Assigned(OrderId::new("7"))),
+                    },
+                })
+                .await;
+            match cancelled.state {
+                Ok(cancelled) => cancelled,
+                Err(error) => panic!("{answer}: {error:?}"),
+            }
+        };
+        let answer = |order_id: serde_json::Value, time: Option<i64>| {
+            let mut answer = serde_json::json!({
+                "orderId": order_id, "symbol": "BTCUSDT", "origClientOrderId": "c",
+                "clientOrderId": "cancel", "price": "100", "origQty": "2", "executedQty": "0.5",
+                "cummulativeQuoteQty": "50", "status": "CANCELED", "timeInForce": "GTC",
+                "type": "LIMIT", "side": "BUY", "isIsolated": false,
+                "selfTradePreventionMode": "EXPIRE_MAKER",
+            });
+            if let Some(time) = time {
+                answer["transactTime"] = serde_json::json!(time);
+            }
+            answer
+        };
+        let sent_at = Utc.timestamp_millis_opt(1_700_000_000_123).unwrap();
+
+        for order_id in [serde_json::json!("7"), serde_json::json!(7)] {
+            let cancelled = cancel(answer(order_id, Some(1_700_000_000_123))).await;
+            assert_eq!(cancelled.id, OrderId::new("7"));
+            assert_eq!(cancelled.time_exchange, sent_at);
+            assert_eq!(cancelled.filled_quantity, Some(dec!(0.5)));
+        }
+
+        let before = Utc::now();
+        let cancelled = cancel(answer(serde_json::json!("7"), None)).await;
+        assert!(
+            cancelled.time_exchange >= before && cancelled.time_exchange <= Utc::now(),
+            "{cancelled:?}"
+        );
+    }
+
+    /// The cancel query is the one the SDK's own call sends, field for field, with every optional
+    /// field set.
+    #[tokio::test]
+    async fn the_cancel_order_query_is_the_one_the_sdk_sends() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("DELETE"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let params = MarginAccountCancelOrderParams::builder("BTCUSDT".to_string())
+            .is_isolated(MarginAccountCancelOrderIsIsolatedEnum::from_flag(true))
+            .order_id(7)
+            .orig_client_order_id("c".to_string())
+            .new_client_order_id("cancel".to_string())
+            .recv_window(5000)
+            .build()
+            .unwrap();
+
+        let _ = margin_rest_at(&server)
+            .margin_account_cancel_order(params.clone())
+            .await
+            .unwrap();
+        let _ = binance_sdk::common::utils::send_request::<serde_json::Value>(
+            &margin_rest_config_at(&server),
+            ORDER_PATH,
+            reqwest::Method::DELETE,
+            cancel_order_query(params),
+            BTreeMap::new(),
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let sent = signed_requests_sent(&server).await;
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].0.len(), 6, "every field is sent: {:?}", sent[0].0);
+        assert_eq!(sent[0], sent[1]);
     }
 
     /// The new-order query is the one the SDK's own call sends, field for field, with every
@@ -9338,7 +9547,7 @@ mod tests {
             .unwrap();
         let _ = binance_sdk::common::utils::send_request::<serde_json::Value>(
             &margin_rest_config_at(&server),
-            NEW_ORDER_PATH,
+            ORDER_PATH,
             reqwest::Method::POST,
             new_order_query(params),
             BTreeMap::new(),
@@ -9348,23 +9557,7 @@ mod tests {
         .await
         .unwrap();
 
-        // Each request's query and body, less the timestamp and the signature over it.
-        let sent: Vec<(Vec<(String, String)>, Vec<u8>)> = server
-            .received_requests()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|request| {
-                let mut query: Vec<(String, String)> = request
-                    .url
-                    .query_pairs()
-                    .filter(|(k, _)| k != "timestamp" && k != "signature")
-                    .map(|(k, v)| (k.into_owned(), v.into_owned()))
-                    .collect();
-                query.sort();
-                (query, request.body)
-            })
-            .collect();
+        let sent = signed_requests_sent(&server).await;
         assert_eq!(sent.len(), 2);
         assert_eq!(sent[0].0.len(), 17, "every field is sent: {:?}", sent[0].0);
         assert_eq!(sent[0], sent[1]);
