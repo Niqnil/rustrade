@@ -121,9 +121,11 @@ impl BinanceMargin {
     ///   [`Periodic`](InterestTiming::Periodic), `ON_BORROW` (and `ON_BORROW_CONVERTED`) is
     ///   [`OnBorrow`](InterestTiming::OnBorrow), and any other value is
     ///   [`Other`](InterestTiming::Other) with Binance's own name. `None` when the record has no
-    ///   `type`. An `ON_BORROW` charge is stamped at the start of the hour the loan was taken in, so
-    ///   its [`time_exchange`](CashFlow::time_exchange) can precede the opening of the position it
-    ///   belongs to.
+    ///   `type`.
+    /// - [`time_exchange`](CashFlow::time_exchange) is Binance's `interestAccuredTime`: the start of
+    ///   the hour the charge is for, not when Binance posted it (see [Delivery](#delivery)). An
+    ///   `ON_BORROW` charge is stamped at the start of the hour the loan was taken in, so it can
+    ///   precede the opening of the position it belongs to.
     /// - [`id`](CashFlow::id) is Binance's transaction id for the charge.
     ///
     /// The engine adds a flow attributed to an instrument to the carry of its open position, in
@@ -138,6 +140,19 @@ impl BinanceMargin {
     /// each charge appears once: a charge read twice, as one stamped on a window's boundary is, is
     /// kept the first time its id is seen in its asset and pair, or, without an id, once per
     /// identical record.
+    ///
+    /// A charge is posted some time after the hour it is for, by a delay Binance does not document
+    /// and that may vary, and is then served stamped at that hour. A read whose span ends near the
+    /// present can therefore miss a charge that a later read returns at a time inside the earlier
+    /// span. A caller that polls by time should start each read some way before the previous
+    /// read's `end`, and drop the charges it has already counted by id.
+    ///
+    /// The records need not add up to the interest owed. On a live account, a loan small enough
+    /// that its first charge rounded up to the smallest unit owed that charge, yet a read served
+    /// only the hourly charge that followed it, with no `ON_BORROW` record. Whether such a record
+    /// is posted later, or never, is not known. The account's balance, which reports the
+    /// interest owed (see [`MarginDetails::interest`](crate::balance::MarginDetails::interest)),
+    /// is the figure to rely on for what is owed.
     ///
     /// # Span
     /// - Binance serves interest charged in the last 90 days only. A `start` before that is moved
