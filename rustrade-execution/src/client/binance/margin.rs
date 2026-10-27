@@ -2429,6 +2429,7 @@ fn convert_margin_user_data_events_with(
                         symbol = report.symbol.as_deref().unwrap_or("?"),
                         order_id = ?report.order_id,
                         client_order_id = report.client_order_id.as_deref().unwrap_or("?"),
+                        orig_client_order_id = report.orig_client_order_id.as_deref().unwrap_or("?"),
                         order_type = report.order_type.as_deref().unwrap_or("?"),
                         execution_type = report.execution_type.as_deref().unwrap_or("?"),
                         order_status = report.order_status.as_deref().unwrap_or("?"),
@@ -6510,18 +6511,23 @@ mod tests {
         }
     }
 
+    /// A cancel report names the cancel request in `c` and the cancelled order in `C`, and the
+    /// cancel is keyed by the order's.
     #[test]
     fn margin_ws_canceled_report_maps_to_order_cancelled() {
         let frame = push(serde_json::json!({
             "e": "executionReport", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT",
-            "x": "CANCELED", "X": "CANCELED", "i": 8_i64, "c": "cid-3",
-            "z": "0", "T": 1_700_000_000_000_i64,
+            "x": "CANCELED", "X": "CANCELED", "i": 8_i64, "c": "cancel-request",
+            "C": "cid-3", "z": "0", "T": 1_700_000_000_000_i64,
         }));
         let mut buf = Vec::new();
         assert!(!convert_margin_user_data_events(&frame, &mut buf));
         assert_eq!(buf.len(), 1);
         match &buf[0].kind {
-            AccountEventKind::OrderCancelled(resp) => assert!(resp.state.is_ok()),
+            AccountEventKind::OrderCancelled(resp) => {
+                assert!(resp.state.is_ok());
+                assert_eq!(resp.key.cid, ClientOrderId::new("cid-3"));
+            }
             other => panic!("expected OrderCancelled, got {other:?}"),
         }
     }
@@ -6814,6 +6820,58 @@ mod tests {
             assert!(
                 messages.iter().any(|m| m.contains(expected)),
                 "{e}: {messages:?}"
+            );
+        }
+    }
+
+    /// An amend leaves the order live, so its report emits no event, but it is reported loudly: the
+    /// engine still holds the order under its old id and quantity.
+    #[test]
+    fn margin_ws_amend_report_is_logged_without_an_event() {
+        let frame = push(serde_json::json!({
+            "e": "executionReport", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT",
+            "x": "REPLACED", "X": "NEW", "i": 8_i64, "c": "amended", "C": "cid-3",
+            "q": "0.5", "z": "0", "T": 1_700_000_000_000_i64,
+        }));
+        let mut buf = Vec::new();
+        let (terminated, messages) =
+            log_messages(|| convert_margin_user_data_events(&frame, &mut buf));
+        assert!(!terminated);
+        assert!(buf.is_empty(), "{buf:?}");
+        assert!(
+            messages
+                .iter()
+                .any(|m| m.contains("amended outside this client")),
+            "{messages:?}"
+        );
+    }
+
+    /// Self-trade prevention that leaves an order live, or names a status that is not known to
+    /// end it, emits no event but is reported loudly, each case in its own words.
+    #[test]
+    fn margin_ws_trade_prevention_without_an_end_is_logged_without_an_event() {
+        for (status, expected) in [
+            (Some("PARTIALLY_FILLED"), "reduced a live order's quantity"),
+            (Some("SOME_FUTURE_STATUS"), "unrecognised order status"),
+            (None, "unrecognised order status"),
+        ] {
+            let mut report = serde_json::json!({
+                "e": "executionReport", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT",
+                "x": "TRADE_PREVENTION", "i": 8_i64, "c": "cid-3", "C": "",
+                "q": "1", "z": "0.5", "T": 1_700_000_000_000_i64,
+            });
+            if let Some(status) = status {
+                report["X"] = serde_json::json!(status);
+            }
+            let frame = push(report);
+            let mut buf = Vec::new();
+            let (terminated, messages) =
+                log_messages(|| convert_margin_user_data_events(&frame, &mut buf));
+            assert!(!terminated, "{status:?}");
+            assert!(buf.is_empty(), "{status:?}: {buf:?}");
+            assert!(
+                messages.iter().any(|m| m.contains(expected)),
+                "{status:?}: {messages:?}"
             );
         }
     }
