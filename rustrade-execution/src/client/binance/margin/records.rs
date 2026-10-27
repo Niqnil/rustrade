@@ -152,9 +152,10 @@ impl BinanceMargin {
     ///
     /// The records need not add up to the interest owed. On a live account, a loan was charged
     /// interest when it was taken, yet a read served only the hourly charge that followed, with no
-    /// `ON_BORROW` record. Whether such a record is posted later, or never, is not known. The account's balance, which reports the
-    /// interest owed (see [`MarginDetails::interest`](crate::balance::MarginDetails::interest)),
-    /// is the figure to rely on for what is owed.
+    /// `ON_BORROW` record. Whether such a record is posted later, or never, is not known. The
+    /// account's balance, which reports the interest owed (see
+    /// [`MarginDetails::interest`](crate::balance::MarginDetails::interest)), is the figure to rely
+    /// on for what is owed.
     ///
     /// # Span
     /// - Binance serves interest charged in the last 90 days only. A `start` before that is moved
