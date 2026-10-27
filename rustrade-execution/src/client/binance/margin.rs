@@ -1007,7 +1007,7 @@ impl ExecutionClient for BinanceMargin {
     /// The cancellation's time is the answer's `transactTime`. An answer without a readable one is
     /// read at the local time, with a `warn!`.
     ///
-    /// A successful answer that cannot be read (one that does not decode, or has no `orderId`)
+    /// A successful answer that cannot be read (one that does not decode, or has no readable `orderId`)
     /// returns [`OrderError::Connectivity`]: the venue acted on the cancel, so whether the order
     /// is still working is unknown.
     async fn cancel_order(
@@ -1091,12 +1091,21 @@ impl ExecutionClient for BinanceMargin {
 
         let exchange_order_id = match data.order_id {
             Some(WireInt::Int(id)) => OrderId(format_smolstr!("{id}")),
-            Some(WireInt::Unreadable(_)) | None => {
+            Some(WireInt::Unreadable(raw)) => {
                 return UnindexedOrderResponseCancel {
                     key,
                     state: Err(unreadable_answer(
                         ExchangeId::BinanceMargin,
-                        "cancel answer has no readable orderId",
+                        &format!("cancel answer has an unreadable orderId: {raw}"),
+                    )),
+                };
+            }
+            None => {
+                return UnindexedOrderResponseCancel {
+                    key,
+                    state: Err(unreadable_answer(
+                        ExchangeId::BinanceMargin,
+                        "cancel answer has no orderId",
                     )),
                 };
             }
@@ -9333,6 +9342,7 @@ mod tests {
         for answer in [
             serde_json::json!({ "symbol": "BTCUSDT", "status": "CANCELED" }),
             serde_json::json!({ "symbol": "BTCUSDT", "orderId": ["7"] }),
+            serde_json::json!({ "symbol": "BTCUSDT", "orderId": "abc", "transactTime": 1 }),
         ] {
             let server = wiremock::MockServer::start().await;
             mount_order_accepted(&server, 1).await;
