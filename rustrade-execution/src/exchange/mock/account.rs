@@ -495,8 +495,8 @@ impl AccountState {
     }
 
     /// Gives `reservation` back to `free`, as [`release`](Self::release) does, then, with
-    /// `auto_repay_at_cancel`, repays the loan its order took when it was placed out of what came
-    /// back, interest first.
+    /// `auto_repay_at_cancel`, repays the loan its order took when it was placed
+    /// ([`Reservation::loan`]) out of the free balance, interest first.
     ///
     /// What a cancelled, expired or rejected order does to the balance held against it on a margin
     /// account, which repays an unused loan when the order it was taken for ends. Without
@@ -512,9 +512,9 @@ impl AccountState {
         time_exchange: DateTime<Utc>,
     ) -> AssetBalance<AssetNameExchange> {
         let released = self.release(&reservation.asset, reservation.amount, time_exchange);
-        match auto_repay_at_cancel && !reservation.borrowed.is_zero() {
+        match auto_repay_at_cancel && !reservation.loan().is_zero() {
             false => released,
-            true => self.repay_loan(&reservation.asset, reservation.borrowed, time_exchange),
+            true => self.repay_loan(&reservation.asset, reservation.loan(), time_exchange),
         }
     }
 
@@ -617,12 +617,14 @@ impl AccountState {
     ///
     /// # What a margin account lends and repays
     /// On a margin account, for an order whose `effect` is [`Borrow`](MarginEffect::Borrow), a
-    /// requirement `free` and the credit do not cover borrows the shortfall of the paying asset, if
-    /// it is at most `borrowable`, the most the venue will lend of it now. The loan is taken with
-    /// the rest of the arrival, or not at all. [`Committed::borrowed`] says how much was lent. A
-    /// paying asset the account has never held has nothing free, and is opened when the loan is
-    /// taken. A cash account, and an order with another effect, ignore `borrowable`, and a
-    /// negative one lends nothing.
+    /// requirement `free` and the credit do not cover borrows the shortfall of the paying asset,
+    /// raised to `min_borrow` if it is less, if that loan is at most `borrowable`, the most the
+    /// venue will lend of it now. The loan is taken with the rest of the arrival, or not at all.
+    /// [`Committed::borrowed`] says how much was lent, and [`Committed::excess_borrowed`] how much
+    /// of it the minimum added, which stays free. A paying asset the account has never held has
+    /// nothing free, and is opened when the loan is taken. A cash account, and an order with
+    /// another effect, ignore `borrowable` and `min_borrow`, and a negative `borrowable` lends
+    /// nothing.
     ///
     /// For an order whose `effect` is [`Repay`](MarginEffect::Repay), what the credit delivers
     /// repays the loan of the asset it is delivered into, as [`deliver`](Self::deliver) does.
@@ -643,6 +645,7 @@ impl AccountState {
         credit: Option<&Credit>,
         effect: MarginEffect,
         borrowable: Decimal,
+        min_borrow: Decimal,
         time_exchange: DateTime<Utc>,
     ) -> Result<Committed, BalanceInsufficient> {
         let (funding, delivery) = match credit {
@@ -659,7 +662,9 @@ impl AccountState {
         };
 
         // Asked for as one requirement, so a refusal refuses the arrival rather than half of it.
-        // A margin account lends the shortfall, within what the venue allows.
+        // A margin account lends the shortfall, or the asset's minimum borrow if that is more,
+        // within what the venue allows. It never lends less than the minimum, so a minimum the
+        // venue cannot lend refuses the arrival.
         // A margin account borrows even an asset it has never held, which it opens on lending.
         let required = debit.settled + debit.reserved;
         let lends = self.margin && effect == MarginEffect::Borrow;
@@ -668,9 +673,10 @@ impl AccountState {
             false => self.balance_expect(&debit.asset).balance.free,
         };
         let shortfall = required - (free + funding);
-        let borrowed = match shortfall > Decimal::ZERO {
-            false => Decimal::ZERO,
-            true if lends && shortfall <= borrowable => shortfall,
+        let loan = shortfall.max(min_borrow);
+        let (borrowed, excess_borrowed) = match shortfall > Decimal::ZERO {
+            false => (Decimal::ZERO, Decimal::ZERO),
+            true if lends && loan <= borrowable => (loan, loan - shortfall),
             true => {
                 return Err(BalanceInsufficient {
                     asset: debit.asset.clone(),
@@ -719,6 +725,7 @@ impl AccountState {
             paid,
             received,
             borrowed,
+            excess_borrowed,
         })
     }
 
@@ -815,6 +822,18 @@ pub struct Committed {
     pub received: Option<AssetBalance<AssetNameExchange>>,
     /// How much of the paying asset a margin account lent the arrival. Zero when it lent nothing.
     pub borrowed: Decimal,
+    /// How much of [`borrowed`](Self::borrowed) the paying asset's minimum borrow lent beyond the
+    /// arrival's shortfall. The arrival does not spend it, so it stays free. Zero when the loan
+    /// was the shortfall.
+    pub excess_borrowed: Decimal,
+}
+
+impl Committed {
+    /// How much of [`borrowed`](Self::borrowed) the arrival's shortfall took: the loan less what
+    /// the minimum borrow added.
+    pub fn shortfall_borrowed(&self) -> Decimal {
+        self.borrowed - self.excess_borrowed
+    }
 }
 
 /// A ledger operation asked for more of an asset than `free` covers.
@@ -974,6 +993,7 @@ mod tests {
             Some(&credit),
             MarginEffect::NoSideEffect,
             Decimal::ZERO,
+            Decimal::ZERO,
             DateTime::<Utc>::MIN_UTC,
         ) else {
             panic!("100 free plus a 200 credit covers 290");
@@ -1003,6 +1023,7 @@ mod tests {
             &debit,
             Some(&credit),
             MarginEffect::NoSideEffect,
+            Decimal::ZERO,
             Decimal::ZERO,
             DateTime::<Utc>::MIN_UTC,
         ) else {
@@ -1052,6 +1073,7 @@ mod tests {
             Some(&credit),
             MarginEffect::NoSideEffect,
             Decimal::ZERO,
+            Decimal::ZERO,
             DateTime::<Utc>::MIN_UTC,
         ) else {
             panic!("100 free covers 100");
@@ -1087,6 +1109,7 @@ mod tests {
             &debit,
             Some(&credit),
             MarginEffect::NoSideEffect,
+            Decimal::ZERO,
             Decimal::ZERO,
             DateTime::<Utc>::MIN_UTC,
         ) else {
@@ -1138,6 +1161,7 @@ mod tests {
             Some(&short),
             MarginEffect::NoSideEffect,
             Decimal::ZERO,
+            Decimal::ZERO,
             DateTime::<Utc>::MIN_UTC,
         ) else {
             panic!("3 usd free does not cover a 4 usd excess fee");
@@ -1165,6 +1189,7 @@ mod tests {
             &debit,
             Some(&covered),
             MarginEffect::NoSideEffect,
+            Decimal::ZERO,
             Decimal::ZERO,
             DateTime::<Utc>::MIN_UTC,
         ) else {
