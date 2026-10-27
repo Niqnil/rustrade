@@ -684,7 +684,9 @@ impl AccountState {
                     free: free + funding,
                     required,
                     borrowable: lends.then_some(borrowable.max(Decimal::ZERO)),
-                    min_borrow: (lends && loan > shortfall).then_some(min_borrow),
+                    // Named only when it is what was refused: the shortfall alone was lendable.
+                    min_borrow: (lends && loan > shortfall && shortfall <= borrowable)
+                        .then_some(min_borrow),
                 });
             }
         };
@@ -854,9 +856,8 @@ pub struct BalanceInsufficient {
     /// How much of the asset a margin account would have lent, or `None` when the account lends
     /// nothing, as a cash account does.
     pub borrowable: Option<Decimal>,
-    /// The asset's minimum borrow, when a margin account had to raise the loan to it: the
-    /// operation was refused because the venue would not lend that much, though it might have
-    /// lent the shortfall. `None` otherwise.
+    /// The asset's minimum borrow, when it is why a margin account refused: the venue would have
+    /// lent the shortfall, but not the minimum the loan was raised to. `None` otherwise.
     pub min_borrow: Option<Decimal>,
 }
 

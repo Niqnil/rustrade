@@ -13531,6 +13531,22 @@ mod tests {
     }
 
     #[test]
+    fn a_shortfall_beyond_what_the_venue_lends_names_no_minimum() {
+        // 0.3 lacks more than the 0.2 the venue lends, so the 0.5 minimum is not why it is refused.
+        let config = with_min_borrow(margin_config("0", "10000", "2"), base(), "0.5");
+        let mut venue = SimulatedVenue::new(&config, spot_instruments());
+
+        let outcome = venue.open_order(sell_request("0.3", market_prices("50000")));
+
+        assert!(
+            insufficient_reason(&outcome).contains("Borrowable: 0.2")
+                && !insufficient_reason(&outcome).contains("Minimum Borrow"),
+            "{}",
+            insufficient_reason(&outcome)
+        );
+    }
+
+    #[test]
     fn a_minimum_borrow_of_exactly_what_the_venue_lends_is_lent() {
         let config = with_min_borrow(margin_config("0", "10000", "2"), base(), "0.2");
         let mut venue = SimulatedVenue::new(&config, spot_instruments());
