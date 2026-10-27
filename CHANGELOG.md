@@ -66,6 +66,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of doing so silently, as an execution report or a queried order without a time already
   is.
 
+- **`BinanceMargin::cancel_order` reports Binance's cancel time** (#753). The cancel answer
+  carries `transactTime`, but binance-sdk's response type has no field for it, so every margin
+  cancel was stamped with the local receive time. The client now decodes the answer itself and
+  uses its `transactTime`. An answer without one is read at the local time with a `warn!`, as the
+  open paths do. The order id is accepted as a string, as Binance sends it in this answer, or as a
+  number.
+
 - **Binance execution reports for cancels, self-trade prevention and amends** (#751). These fixes
   apply to `BinanceSpot` and `BinanceMargin`, whose account streams share one converter:
   - A cancelled order's `OrderCancelled` now carries that order's client order id. A cancel report
