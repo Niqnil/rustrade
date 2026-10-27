@@ -2430,8 +2430,9 @@ pub(crate) struct ExecutionReport {
     /// `i`: the venue's order id.
     #[serde(rename = "i")]
     pub(crate) order_id: Option<i64>,
-    /// `c`: the order's client order id, except on a `CANCELED` report, where it is the cancel
-    /// request's own id (random when the request sent none). Read through
+    /// `c`: the order's client order id, except on a `CANCELED` report with a non-empty `C`, where
+    /// it is the cancel request's own id (random when the request sent none). Without one, `c` is
+    /// taken as the order's. Read through
     /// [`ExecutionReport::order_client_id`].
     #[serde(rename = "c")]
     pub(crate) client_order_id: Option<String>,
@@ -2785,12 +2786,8 @@ pub(crate) fn convert_execution_report(
             // the expire modes the order leaves the book (`EXPIRED_IN_MATCH`); in `DECREMENT` it
             // may stay live with less left to fill, which an order snapshot cannot express.
             match report.order_status.as_deref() {
-                Some(status) if rest_order_is_open(status) => warn!(
-                    %exchange, %symbol, %order_id, status,
-                    "Binance self-trade prevention reduced a live order's quantity - the engine \
-                     still holds its earlier quantity"
-                ),
-                Some(_) => buf.push(cancelled_event(
+                // The statuses Binance gives an order once prevention leaves it nothing to fill.
+                Some("EXPIRED_IN_MATCH" | "EXPIRED" | "FILLED") => buf.push(cancelled_event(
                     report,
                     exchange,
                     symbol,
@@ -2798,9 +2795,17 @@ pub(crate) fn convert_execution_report(
                     order_id,
                     time_exchange,
                 )),
-                None => warn!(
-                    %exchange, %symbol, %order_id,
-                    "Binance TRADE_PREVENTION report missing order status (X), dropping"
+                // Not sampled: each one leaves the engine holding a quantity the order no longer has.
+                Some(status) if rest_order_is_open(status) => warn!(
+                    %exchange, %symbol, %order_id, status,
+                    "Binance self-trade prevention reduced a live order's quantity - the engine \
+                     still holds its earlier quantity"
+                ),
+                // An unknown status could still be a live order, so it is not taken as an end.
+                status => warn!(
+                    %exchange, %symbol, %order_id, status = status.unwrap_or("<missing>"),
+                    "Binance TRADE_PREVENTION report with an unrecognised order status (X), \
+                     dropping"
                 ),
             }
         }

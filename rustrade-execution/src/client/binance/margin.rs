@@ -6844,6 +6844,36 @@ mod tests {
         );
     }
 
+    /// Self-trade prevention that leaves an order live, or names a status that is not known to
+    /// end it, emits no event but is reported loudly, each case in its own words.
+    #[test]
+    fn margin_ws_trade_prevention_without_an_end_is_logged_without_an_event() {
+        for (status, expected) in [
+            (Some("PARTIALLY_FILLED"), "reduced a live order's quantity"),
+            (Some("SOME_FUTURE_STATUS"), "unrecognised order status"),
+            (None, "unrecognised order status"),
+        ] {
+            let mut report = serde_json::json!({
+                "e": "executionReport", "s": "BTCUSDT", "S": "BUY", "o": "LIMIT",
+                "x": "TRADE_PREVENTION", "i": 8_i64, "c": "cid-3", "C": "",
+                "q": "1", "z": "0.5", "T": 1_700_000_000_000_i64,
+            });
+            if let Some(status) = status {
+                report["X"] = serde_json::json!(status);
+            }
+            let frame = push(report);
+            let mut buf = Vec::new();
+            let (terminated, messages) =
+                log_messages(|| convert_margin_user_data_events(&frame, &mut buf));
+            assert!(!terminated, "{status:?}");
+            assert!(buf.is_empty(), "{status:?}: {buf:?}");
+            assert!(
+                messages.iter().any(|m| m.contains(expected)),
+                "{status:?}: {messages:?}"
+            );
+        }
+    }
+
     // -- User-data stream: dedup -----------------------------------------------------------------
 
     #[test]

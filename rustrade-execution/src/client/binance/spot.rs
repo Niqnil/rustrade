@@ -4123,8 +4123,8 @@ mod tests {
         );
     }
 
-    /// Self-trade prevention that expires an order removes it; one that leaves it live (the
-    /// `DECREMENT` mode) or names no status produces nothing.
+    /// Self-trade prevention that ends an order removes it; one that leaves it live (the
+    /// `DECREMENT` mode), or names no status or an unknown one, produces nothing.
     #[test]
     fn a_trade_prevention_report_removes_the_order_only_once_it_has_ended() {
         let prevented = |status: Option<&str>| {
@@ -4135,17 +4135,25 @@ mod tests {
             })
         };
 
-        let event = sole_event(prevented(Some("EXPIRED_IN_MATCH")))
-            .expect("an expired order should produce an event");
-        assert!(
-            matches!(event.kind, AccountEventKind::OrderCancelled(ref r) if r.state.is_ok()),
-            "an expired order should yield OrderCancelled with Ok state, got {:?}",
-            event.kind
-        );
-        for live in ["NEW", "PARTIALLY_FILLED"] {
-            assert!(prevented(Some(live)).is_empty(), "{live}");
+        for ended in ["EXPIRED_IN_MATCH", "EXPIRED", "FILLED"] {
+            let event = sole_event(prevented(Some(ended))).expect(ended);
+            let AccountEventKind::OrderCancelled(response) = event.kind else {
+                panic!("{ended}: expected OrderCancelled, got {:?}", event.kind);
+            };
+            assert_eq!(response.key.cid, ClientOrderId::new("client-1"), "{ended}");
+            let Ok(cancelled) = response.state else {
+                panic!("{ended}: expected Ok, got {:?}", response.state);
+            };
+            assert_eq!(cancelled.id, OrderId::new("12345"), "{ended}");
         }
-        assert!(prevented(None).is_empty());
+        for not_ended in [
+            Some("NEW"),
+            Some("PARTIALLY_FILLED"),
+            Some("SOME_FUTURE_STATUS"),
+            None,
+        ] {
+            assert!(prevented(not_ended).is_empty(), "{not_ended:?}");
+        }
     }
 
     /// `EXPIRED_IN_MATCH` is an order status, never an execution type.

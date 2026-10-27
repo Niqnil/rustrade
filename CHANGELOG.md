@@ -45,7 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - An order that self-trade prevention expires (`x=TRADE_PREVENTION`, order status
     `EXPIRED_IN_MATCH`) is reported as `OrderCancelled`, as an `EXPIRED` order is. Before, the
     report was ignored and the order stayed open in engine state. When prevention leaves the order
-    live with less to fill (the `DECREMENT` mode), a `warn!` is logged.
+    live with less to fill (the `DECREMENT` mode), or the report names a status not known to end
+    the order, a `warn!` is logged and no event is emitted.
   - An amend (`x=REPLACED`) no longer goes unnoticed. The order is still live, but the amend
     changes its quantity and, unless the amend named one, its client order id. This library sends
     no amends and the engine cannot follow the new id, so a `warn!` is logged and no event is
