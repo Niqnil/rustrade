@@ -532,6 +532,37 @@ mod tests {
         assert_eq!(event.time_exchange(), Some(time));
     }
 
+    /// A margin debt change is stamped with the venue's time, so a historical clock advances on
+    /// one as it does on a balance update.
+    #[test]
+    fn a_margin_debt_update_reports_its_time_exchange() {
+        use rustrade_execution::{
+            AccountEvent, AccountEventKind,
+            balance::MarginDetails,
+            margin_debt::{MarginDebtKind, MarginDebtUpdate},
+        };
+        use rustrade_instrument::{asset::AssetIndex, exchange::ExchangeIndex};
+
+        let time = DateTime::<Utc>::MIN_UTC + TimeDelta::hours(1);
+        let event: EngineEvent<()> =
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent::new(
+                ExchangeIndex(0),
+                AccountEventKind::MarginDebt(MarginDebtUpdate::new(
+                    AssetIndex(0),
+                    None,
+                    MarginDetails {
+                        borrowed: Decimal::ONE,
+                        interest: Decimal::ZERO,
+                    },
+                    MarginDebtKind::Borrow,
+                    "BORROW".into(),
+                    time,
+                )),
+            )));
+
+        assert_eq!(event.time_exchange(), Some(time));
+    }
+
     /// A `TokioClock` reads its start, then moves exactly as far as tokio's clock does.
     #[tokio::test(start_paused = true)]
     async fn a_tokio_clock_moves_with_tokios_clock() {

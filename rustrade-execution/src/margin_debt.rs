@@ -115,4 +115,16 @@ mod tests {
             update
         );
     }
+
+    #[test]
+    fn a_kind_displays_as_its_lowercase_name() {
+        let names = [
+            MarginDebtKind::Borrow,
+            MarginDebtKind::Repay,
+            MarginDebtKind::Interest,
+            MarginDebtKind::Other,
+        ]
+        .map(|kind| kind.to_string());
+        assert_eq!(names, ["borrow", "repay", "interest", "other"]);
+    }
 }

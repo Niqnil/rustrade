@@ -2736,7 +2736,6 @@ impl SimulatedVenue {
                 index,
                 self.build_account_event(AccountEventKind::MarginDebt(update)),
             );
-            index += 1;
         }
     }
 
@@ -14262,6 +14261,43 @@ mod tests {
         // Nothing moved the loan since: a restatement with the same debt reports none.
         let traded = venue.open_order(sell_request("0.1", market_prices("50000")));
         assert!(debt_updates(&traded.events).is_empty(), "{traded:?}");
+    }
+
+    /// A repay is told apart from an interest charge by either part of the debt falling: interest
+    /// alone, with the principal left as it was, or principal alone, with no interest owed.
+    #[test]
+    fn a_repay_of_either_part_of_the_debt_reports_a_repay() {
+        // 0.00005 BTC repays part of the 0.000075 interest, and none of the 0.75 principal.
+        let mut venue = margin_venue_short_btc();
+        let repaid = venue.open_order(with_effect(
+            buy_request("0.00005", market_prices("50000")),
+            MarginEffect::Repay,
+        ));
+        assert_eq!(
+            debt_updates(&repaid.events),
+            [(
+                base(),
+                MarginDebtKind::Repay,
+                MarginDetails::new(d("0.75"), d("0.000025"))
+            )]
+        );
+
+        // With no interest model, the loan owes no interest, so a repay lowers the principal alone.
+        let mut venue = margin_venue("0.25", "100000", "3");
+        advance(&mut venue, time(1));
+        venue.open_order(sell_request("1", market_prices("50000")));
+        let repaid = venue.open_order(with_effect(
+            buy_request("0.5", market_prices("50000")),
+            MarginEffect::Repay,
+        ));
+        assert_eq!(
+            debt_updates(&repaid.events),
+            [(
+                base(),
+                MarginDebtKind::Repay,
+                MarginDetails::new(d("0.25"), Decimal::ZERO)
+            )]
+        );
     }
 
     /// A seeded loan is the debt the venue starts from, so it is not reported as a change, and a
