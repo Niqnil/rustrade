@@ -1169,8 +1169,7 @@ impl SimulatedVenue {
     ///
     /// Zero unless spot margin lends, the order's `effect` is [`Borrow`](MarginEffect::Borrow),
     /// the instrument is spot, and `free` falls short of the debit, so a venue that lends nothing,
-    /// or an order that needs no loan, values nothing. Zero too when it is less than the asset's
-    /// minimum borrow, since the venue lends no less than that.
+    /// or an order that needs no loan, values nothing.
     /// `market` is the snapshot the order is priced from, used to value an asset on an instrument
     /// this venue holds no market for, as on a [`RequestPriced`](VenueRegime::RequestPriced)
     /// venue.
@@ -1215,13 +1214,9 @@ impl SimulatedVenue {
 
         let headroom = (config.max_leverage() - Decimal::ONE) * equity - debt;
         // `price_in` never values an asset at zero, so the division is safe.
-        let borrowable = match headroom > Decimal::ZERO {
+        match headroom > Decimal::ZERO {
             true => headroom / asset_price,
             false => Decimal::ZERO,
-        };
-        match borrowable < config.min_borrow(&debit.asset) {
-            true => Decimal::ZERO,
-            false => borrowable,
         }
     }
 
@@ -4415,19 +4410,25 @@ fn seeded_positions(
 }
 
 /// The rejection for an order the account cannot pay for, naming what it has, what it needs, and,
-/// on a margin account, what the venue would have lent.
+/// on a margin account, what the venue would have lent, and the asset's minimum borrow when that
+/// is what it would not lend.
 fn insufficient_error(insufficient: BalanceInsufficient) -> UnindexedApiError {
     let BalanceInsufficient {
         asset,
         free,
         required,
         borrowable,
+        min_borrow,
     } = insufficient;
-    let message = match borrowable {
-        None => format!("Available Balance: {free}, Required Balance inc. fees: {required}"),
-        Some(borrowable) => format!(
+    let message = match (borrowable, min_borrow) {
+        (None, _) => format!("Available Balance: {free}, Required Balance inc. fees: {required}"),
+        (Some(borrowable), None) => format!(
             "Available Balance: {free}, Required Balance inc. fees: {required}, Borrowable: \
              {borrowable}"
+        ),
+        (Some(borrowable), Some(min_borrow)) => format!(
+            "Available Balance: {free}, Required Balance inc. fees: {required}, Borrowable: \
+             {borrowable}, Minimum Borrow: {min_borrow}"
         ),
     };
     ApiError::BalanceInsufficient(Some(asset), message)
@@ -13502,14 +13503,30 @@ mod tests {
         let outcome = venue.open_order(sell_request("0.1", market_prices("50000")));
 
         assert!(
-            insufficient_reason(&outcome).contains("Borrowable: 0"),
-            "the venue lends nothing it cannot lend at least the minimum of: {}",
+            insufficient_reason(&outcome).contains("Borrowable: 0.2")
+                && insufficient_reason(&outcome).ends_with("Minimum Borrow: 0.21"),
+            "the reason names what the venue would lend and the minimum it would not: {}",
             insufficient_reason(&outcome)
         );
         assert_eq!(
             balance_now(&venue, base()),
             Balance::new_margin(Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO),
             "a refused order borrows nothing"
+        );
+    }
+
+    #[test]
+    fn a_shortfall_above_the_minimum_refused_by_the_leverage_limit_names_no_minimum() {
+        let config = with_min_borrow(margin_config("0", "10000", "2"), base(), "0.05");
+        let mut venue = SimulatedVenue::new(&config, spot_instruments());
+
+        let outcome = venue.open_order(sell_request("0.3", market_prices("50000")));
+
+        assert!(
+            insufficient_reason(&outcome).contains("Borrowable: 0.2")
+                && !insufficient_reason(&outcome).contains("Minimum Borrow"),
+            "{}",
+            insufficient_reason(&outcome)
         );
     }
 

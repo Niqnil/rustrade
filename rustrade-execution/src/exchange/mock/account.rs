@@ -361,6 +361,7 @@ impl AccountState {
                 free: balance.balance.free,
                 required: amount,
                 borrowable: None,
+                min_borrow: None,
             });
         }
 
@@ -683,6 +684,7 @@ impl AccountState {
                     free: free + funding,
                     required,
                     borrowable: lends.then_some(borrowable.max(Decimal::ZERO)),
+                    min_borrow: (lends && loan > shortfall).then_some(min_borrow),
                 });
             }
         };
@@ -700,6 +702,7 @@ impl AccountState {
                     free,
                     required: -delivery.amount,
                     borrowable: None,
+                    min_borrow: None,
                 });
             }
         }
@@ -851,6 +854,10 @@ pub struct BalanceInsufficient {
     /// How much of the asset a margin account would have lent, or `None` when the account lends
     /// nothing, as a cash account does.
     pub borrowable: Option<Decimal>,
+    /// The asset's minimum borrow, when a margin account had to raise the loan to it: the
+    /// operation was refused because the venue would not lend that much, though it might have
+    /// lent the shortfall. `None` otherwise.
+    pub min_borrow: Option<Decimal>,
 }
 
 /// An account snapshot lists one [`ClientOrderId`] more than once among the orders it seeds.
@@ -1037,6 +1044,7 @@ mod tests {
                 free: dec!(300),
                 required: dec!(310),
                 borrowable: None,
+                min_borrow: None,
             }
         );
         assert_eq!(usd_balance(&account), Balance::new(dec!(100), dec!(100)));
@@ -1123,6 +1131,7 @@ mod tests {
                 free: dec!(100),
                 required: dec!(101),
                 borrowable: None,
+                min_borrow: None,
             }
         );
         assert_eq!(usd_balance(&account), Balance::new(dec!(100), dec!(100)));
@@ -1173,6 +1182,7 @@ mod tests {
                 free: dec!(3),
                 required: dec!(4),
                 borrowable: None,
+                min_borrow: None,
             }
         );
         assert_eq!(

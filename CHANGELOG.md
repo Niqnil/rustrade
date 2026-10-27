@@ -16,14 +16,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as Binance raises a `MARGIN_BUY` loan to the asset's `userMinBorrow`. The part above the
   shortfall stays free balance, owed. With `auto_repay_at_cancel` it is repaid with the rest of
   the loan if the order ends before it fills in full, and it stays owed once the order fills. An
-  order whose minimum is more than the venue will lend is refused. No asset has a minimum by
+  order whose minimum is more than the venue will lend is refused, and its reason names the
+  minimum (`Minimum Borrow: …`) beside what the venue would lend. No asset has a minimum by
   default, so existing configurations lend as before.
 
 ### Changed
 
-- **Breaking: `SpotMarginConfigError` is no longer `Copy`**, and gains `NegativeMinBorrow { asset,
-  min_borrow }`, returned by `with_min_borrow` and by deserialising a negative minimum
+- **Breaking: the simulated venue's minimum borrow changes its config error and ledger types**
   (`rustrade-execution`, #749).
+  - `SpotMarginConfigError` is no longer `Copy`, and gains `NegativeMinBorrow { asset,
+    min_borrow }`, returned by `with_min_borrow` and by deserialising a negative minimum.
+  - `AccountState::commit` takes the paying asset's minimum borrow after `borrowable`.
+  - `Committed` and `Reservation` have a new `excess_borrowed` field: what the minimum lent beyond
+    the shortfall, which is free rather than held. `Committed::borrowed` stays the whole loan;
+    `Committed::shortfall_borrowed` is the rest. `Reservation::loan` is what a cancel repays.
+  - `BalanceInsufficient` has a new `min_borrow` field: the minimum, when it is what the venue
+    would not lend.
 
 - **`ibapi` 5.1.0 → 5.2.0** (`rustrade-execution`, `rustrade-data`, `rustrade-instrument`, feature
   `ibkr`). The bytes sent for every order are unchanged. Four changes reach the compiled code:

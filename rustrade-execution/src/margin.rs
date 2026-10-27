@@ -160,8 +160,8 @@ pub struct MarginPlacement {
 ///
 /// An order that needs more than that is rejected as unaffordable, with a reason that says how
 /// much the venue would lend. So is one whose asset's [`min_borrow`](Self::min_borrow) is more
-/// than that, since the venue never lends less than the minimum. A `max_leverage` of one lends
-/// nothing, but still reports each balance's loan.
+/// than that, since the venue never lends less than the minimum, and its reason names the minimum
+/// too. A `max_leverage` of one lends nothing, but still reports each balance's loan.
 ///
 /// # What it repays
 /// Under [`MarginEffect::Repay`], whatever a fill delivers into an asset the account owes repays
@@ -270,7 +270,8 @@ impl SpotMarginConfig {
     /// below it is raised to it, as Binance raises a `MARGIN_BUY` loan to the asset's
     /// `userMinBorrow`. A minimum of zero removes it. Replaces any minimum `asset` had.
     ///
-    /// No asset has one by default, so each loan is exactly its order's shortfall.
+    /// No asset has one by default, so each loan is exactly its order's shortfall. An order its
+    /// free balance covers borrows nothing, whatever the minimum.
     ///
     /// # Errors
     /// Returns [`SpotMarginConfigError::NegativeMinBorrow`] if `min_borrow` is negative.
@@ -334,8 +335,11 @@ pub enum SpotMarginConfigError {
     LeverageBelowOne(Decimal),
     /// A negative minimum borrow for `asset`.
     #[error("spot margin min_borrow {min_borrow} of {asset} is negative")]
+    #[non_exhaustive]
     NegativeMinBorrow {
+        /// The asset given the minimum.
         asset: AssetNameExchange,
+        /// The minimum given, below zero.
         min_borrow: Decimal,
     },
 }
