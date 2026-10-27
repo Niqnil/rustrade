@@ -122,10 +122,10 @@ impl BinanceMargin {
     ///   [`OnBorrow`](InterestTiming::OnBorrow), and any other value is
     ///   [`Other`](InterestTiming::Other) with Binance's own name. `None` when the record has no
     ///   `type`.
-    /// - [`time_exchange`](CashFlow::time_exchange) is Binance's `interestAccuredTime`: the start of
-    ///   the hour the charge is for, not when Binance posted it (see [Delivery](#delivery)). An
-    ///   `ON_BORROW` charge is stamped at the start of the hour the loan was taken in, so it can
-    ///   precede the opening of the position it belongs to.
+    /// - [`time_exchange`](CashFlow::time_exchange) is Binance's `interestAccuredTime`, the period
+    ///   the charge is for, not when Binance posted it (see [Delivery](#delivery)): for an hourly
+    ///   charge, the start of its hour. An `ON_BORROW` charge is stamped at the start of the hour
+    ///   the loan was taken in, so it can precede the opening of the position it belongs to.
     /// - [`id`](CashFlow::id) is Binance's transaction id for the charge.
     ///
     /// The engine adds a flow attributed to an instrument to the carry of its open position, in
@@ -141,16 +141,18 @@ impl BinanceMargin {
     /// kept the first time its id is seen in its asset and pair, or, without an id, once per
     /// identical record.
     ///
-    /// A charge is posted some time after the hour it is for, by a delay Binance does not document
-    /// and that may vary, and is then served stamped at that hour. A read whose span ends near the
-    /// present can therefore miss a charge that a later read returns at a time inside the earlier
-    /// span. A caller that polls by time should start each read some way before the previous
-    /// read's `end`, and drop the charges it has already counted by id.
+    /// A charge is posted some time after the period it is for, by a delay Binance does not
+    /// document and that may vary, and is then served stamped at that period. A read whose span
+    /// ends near the present can therefore miss a charge that a later read returns at a time
+    /// inside the earlier span. A caller that polls by time should start each read before the
+    /// previous read's `end`, by at least the longest posting delay it is prepared to allow for,
+    /// and drop the charges it has already counted by id within their asset and pair. A charge
+    /// with no id can be matched only by its whole record, which cannot tell it from an identical
+    /// charge.
     ///
-    /// The records need not add up to the interest owed. On a live account, a loan small enough
-    /// that its first charge rounded up to the smallest unit owed that charge, yet a read served
-    /// only the hourly charge that followed it, with no `ON_BORROW` record. Whether such a record
-    /// is posted later, or never, is not known. The account's balance, which reports the
+    /// The records need not add up to the interest owed. On a live account, a loan was charged
+    /// interest when it was taken, yet a read served only the hourly charge that followed, with no
+    /// `ON_BORROW` record. Whether such a record is posted later, or never, is not known. The account's balance, which reports the
     /// interest owed (see [`MarginDetails::interest`](crate::balance::MarginDetails::interest)),
     /// is the figure to rely on for what is owed.
     ///
