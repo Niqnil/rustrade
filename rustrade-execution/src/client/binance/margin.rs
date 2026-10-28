@@ -70,13 +70,14 @@ use super::shared::{
     HEARTBEAT_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
     PlacementResponse, RateLimitTracker, RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS,
     SharedDedupCache, TrailingOrderError, UnhandledEvents, UnrecoveredFills, UnsubscribeOnDrop,
-    UserDataFrame, WeightPool, WireInt, answer_time, binance_filled_qty, classify_order_kind_tif,
-    classify_rest_order_error, classify_rest_query_error, convert_ended_order,
-    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
-    dedup_key_from_event, disconnect_error, drop_after, frame_excerpt, gap_failed, gap_time,
-    is_duplicate, is_unknown_order, log_unhandled_event, log_unrecognised_frame, new_dedup_cache,
-    parse_user_data_frame, placed_order_state, recovered_order_cids, recovered_order_totals,
-    response_decode_error, rest_call_with_retry, retry_or_end, trailing_params, unreadable_answer,
+    UserDataFrame, WeightPool, WireInt, account_position_time, answer_time, binance_filled_qty,
+    classify_order_kind_tif, classify_rest_order_error, classify_rest_query_error,
+    convert_ended_order, convert_execution_report, convert_open_order_listing,
+    convert_open_order_owned_symbol, dedup_key_from_event, disconnect_error, drop_after,
+    frame_excerpt, gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
+    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
+    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
+    retry_or_end, trailing_params, unreadable_answer,
 };
 use crate::rules::{OrderRules, PreSendRules};
 use crate::{
@@ -2595,10 +2596,8 @@ fn convert_margin_account_position(
     position: OutboundAccountPosition,
     buf: &mut Vec<UnindexedAccountEvent>,
 ) {
-    let time_exchange = position
-        .u
-        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-        .unwrap_or_else(Utc::now);
+    let time_exchange =
+        account_position_time(ExchangeId::BinanceMargin, position.u, position.e_uppercase);
 
     for b in position.b_uppercase.unwrap_or_default() {
         let asset = match b.a {
@@ -2685,10 +2684,8 @@ fn route_isolated_account_position(
         return;
     };
 
-    let time_exchange = position
-        .u
-        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-        .unwrap_or_else(Utc::now);
+    let time_exchange =
+        account_position_time(ExchangeId::BinanceMargin, position.u, position.e_uppercase);
 
     for b in position.b_uppercase.unwrap_or_default() {
         let Some(asset) = b.a.as_deref() else {
@@ -6702,6 +6699,35 @@ mod tests {
         }
     }
 
+    /// A cross position is at its update time `u`, or at its event time `E` when it has no `u`.
+    #[test]
+    fn margin_ws_outbound_account_position_is_at_u_else_at_e() {
+        let time_of = |frame: serde_json::Value| {
+            let mut buf = Vec::new();
+            assert!(!convert_margin_user_data_events(&push(frame), &mut buf));
+            match &buf[..] {
+                [event] => match &event.kind {
+                    AccountEventKind::BalanceStreamUpdate(snap) => snap.0.time_exchange,
+                    other => panic!("expected BalanceStreamUpdate, got {other:?}"),
+                },
+                other => panic!("expected one event, got {other:?}"),
+            }
+        };
+        let balances = serde_json::json!([{ "a": "BTC", "f": "0.5", "l": "0" }]);
+        assert_eq!(
+            time_of(serde_json::json!({
+                "e": "outboundAccountPosition", "E": 3_000, "u": 2_000, "B": balances,
+            })),
+            Utc.timestamp_millis_opt(2_000).unwrap()
+        );
+        assert_eq!(
+            time_of(serde_json::json!({
+                "e": "outboundAccountPosition", "E": 3_000, "B": balances,
+            })),
+            Utc.timestamp_millis_opt(3_000).unwrap()
+        );
+    }
+
     #[test]
     fn margin_ws_stream_terminated_signals_reconnect() {
         let frame = push(serde_json::json!({ "e": "eventStreamTerminated" }));
@@ -7478,6 +7504,52 @@ mod tests {
             &event.kind,
             AccountEventKind::InstrumentBalanceUpdate(ibu) if ibu.balance.time_exchange == time
         )));
+    }
+
+    /// An isolated position is at its update time `u`, or at its event time `E` when it has no
+    /// `u`.
+    #[test]
+    fn isolated_outbound_position_is_at_u_else_at_e() {
+        let sub_map = Arc::new(Mutex::new(HashMap::from([(7_i64, btcusdt())])));
+        let base_quote = Arc::new(HashMap::from([(
+            btcusdt(),
+            (
+                AssetNameExchange::new("BTC"),
+                AssetNameExchange::new("USDT"),
+            ),
+        )]));
+        let mut handler = isolated_handler(sub_map, base_quote);
+        let mut time_of = |frame: serde_json::Value| {
+            let mut buf = Vec::new();
+            convert_margin_user_data_events_with(
+                &push_with_sub(7, frame),
+                &mut buf,
+                &mut handler,
+                &mut cross_frame_scope,
+            );
+            match &buf[..] {
+                [event] => match &event.kind {
+                    AccountEventKind::InstrumentBalanceUpdate(update) => {
+                        update.balance.time_exchange
+                    }
+                    other => panic!("expected InstrumentBalanceUpdate, got {other:?}"),
+                },
+                other => panic!("expected one event, got {other:?}"),
+            }
+        };
+        let balances = serde_json::json!([{ "a": "BTC", "f": "0.5", "l": "0" }]);
+        assert_eq!(
+            time_of(serde_json::json!({
+                "e": "outboundAccountPosition", "E": 3_000, "u": 2_000, "B": balances,
+            })),
+            Utc.timestamp_millis_opt(2_000).unwrap()
+        );
+        assert_eq!(
+            time_of(serde_json::json!({
+                "e": "outboundAccountPosition", "E": 3_000, "B": balances,
+            })),
+            Utc.timestamp_millis_opt(3_000).unwrap()
+        );
     }
 
     #[test]

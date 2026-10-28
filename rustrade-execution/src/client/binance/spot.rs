@@ -43,14 +43,15 @@ use super::shared::{
     HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal, MyTradesFrom, ORDER_EXECUTIONS_BUDGET,
     OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
-    UnsubscribeOnDrop, UserDataFrame, WeightPool, answer_time, binance_filled_qty,
-    classify_order_kind_tif, classify_rest_query_error, classify_ws_order_error,
-    convert_ended_order, convert_execution_report, convert_open_order_listing,
-    convert_open_order_owned_symbol, dedup_key_from_event, disconnect_error, drop_after,
-    frame_excerpt, gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
-    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
-    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
-    retry_or_end, trailing_params, unix_ms, unreadable_answer,
+    UnsubscribeOnDrop, UserDataFrame, WeightPool, account_position_time, answer_time,
+    binance_filled_qty, classify_order_kind_tif, classify_rest_query_error,
+    classify_ws_order_error, convert_ended_order, convert_execution_report,
+    convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
+    disconnect_error, drop_after, frame_excerpt, gap_failed, gap_time, is_duplicate,
+    is_unknown_order, log_unhandled_event, log_unrecognised_frame, new_dedup_cache,
+    parse_user_data_frame, placed_order_state, recovered_order_cids, recovered_order_totals,
+    response_decode_error, rest_call_with_retry, retry_or_end, trailing_params, unix_ms,
+    unreadable_answer,
 };
 use crate::rules::{OrderRules, PreSendRules};
 use crate::{
@@ -1849,7 +1850,7 @@ async fn connection_manager(
         // subscription; that task processes events sequentially from an internal channel,
         // so FnMut callbacks are never invoked concurrently per subscription. If the SDK
         // changes to concurrent callbacks, these `Option::take()` calls would need a Mutex.
-        // verified against binance-sdk =50.0.0. Re-verify on SDK upgrade.
+        // verified against binance-sdk =77.0.0. Re-verify on SDK upgrade.
         let subscription = ws.subscribe_on_ws_events(move |event| {
             let Some(ref sender) = event_tx else { return };
             match event {
@@ -2045,10 +2046,12 @@ async fn connection_manager(
         // --- Cleanup current connection ---
         // must explicitly unsubscribe — Subscription::drop only detaches the
         // internal JoinHandle, it doesn't abort it.
-        // assumption (verified against binance-sdk =50.0.0): unsubscribe() stops
-        // the callback task before returning, so no further invocations of the FnMut
-        // callback occur after this point. The old `heartbeat_flag` Arc is therefore
-        // safe to drop here. Re-verify on SDK upgrade if the callback invocation model changes.
+        // unsubscribe() aborts the callback task without waiting for it (verified against
+        // binance-sdk =77.0.0): a callback already running finishes, and none starts once the
+        // task sees the abort. That is benign: the callback holds its own clone of the
+        // `heartbeat_flag` Arc, so dropping ours here is safe, and an event it still forwards
+        // reaches the consumer through the dedup cache like any other from this connection.
+        // Re-verify on SDK upgrade if the callback invocation model changes.
         subscription.unsubscribe();
         // binance-sdk WebsocketApi has no Drop impl that closes the TCP connection. Disconnect
         // explicitly to report the result; the guard's drop is the fallback.
@@ -2530,12 +2533,10 @@ fn convert_account_position(
     position: binance_sdk::spot::websocket_api::OutboundAccountPosition,
     buf: &mut Vec<UnindexedAccountEvent>,
 ) {
-    // Use field `u` (last account update time) rather than `E` (event time)
-    // for more accurate balance timestamps
-    let time_exchange = position
-        .u
-        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-        .unwrap_or_else(Utc::now);
+    // `u` (last account update time) rather than `E` (event time), for more accurate balance
+    // timestamps.
+    let time_exchange =
+        account_position_time(ExchangeId::BinanceSpot, position.u, position.e_uppercase);
 
     for b in position.b_uppercase.unwrap_or_default() {
         let asset = match b.a {
@@ -3611,17 +3612,29 @@ mod tests {
         }
     }
 
+    /// A position is at its update time `u`, or at its event time `E` when it has no `u`.
     #[test]
-    fn test_convert_account_position_u_field_none_uses_now() {
-        // When `u` is None the function falls back to Utc::now() — just verify it doesn't panic
-        let position = binance_sdk::spot::websocket_api::OutboundAccountPosition {
-            u: None,
-            b_uppercase: Some(vec![make_balance_inner("ETH", "2.0", "0.0")]),
-            ..Default::default()
+    fn test_convert_account_position_is_at_u_else_at_e() {
+        let time_of = |u, e| {
+            let position = binance_sdk::spot::websocket_api::OutboundAccountPosition {
+                u,
+                e_uppercase: e,
+                b_uppercase: Some(vec![make_balance_inner("ETH", "2.0", "0.0")]),
+                ..Default::default()
+            };
+            let mut buf = Vec::new();
+            convert_account_position(position, &mut buf);
+            match &buf[..] {
+                [event] => match &event.kind {
+                    AccountEventKind::BalanceStreamUpdate(snap) => snap.0.time_exchange,
+                    other => panic!("expected BalanceStreamUpdate, got {other:?}"),
+                },
+                other => panic!("expected one event, got {other:?}"),
+            }
         };
-        let mut buf = Vec::new();
-        convert_account_position(position, &mut buf);
-        assert_eq!(buf.len(), 1);
+        let at = |ms| Utc.timestamp_millis_opt(ms).unwrap();
+        assert_eq!(time_of(Some(2_000), Some(3_000)), at(2_000));
+        assert_eq!(time_of(None, Some(3_000)), at(3_000));
     }
 
     #[test]

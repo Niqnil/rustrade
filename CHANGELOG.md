@@ -103,6 +103,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of doing so silently, as an execution report or a queried order without a time already
   is.
 
+- **A Binance balance update without a readable update time falls back to its event time, with a
+  warning** (`rustrade-execution`). `outboundAccountPosition` on `BinanceSpot` and `BinanceMargin`
+  (cross and isolated) was silently stamped with the local clock when its `u` was missing or
+  unreadable. It now uses the frame's event time `E`, and the local clock only when that is
+  unreadable too, logging a `warn!` either way.
+
 - **`BinanceMargin::cancel_order` reports Binance's cancel time** (#753). The cancel answer
   carries `transactTime`, but binance-sdk's response type has no field for it, so every margin
   cancel was stamped with the local receive time. The client now decodes the answer itself and
