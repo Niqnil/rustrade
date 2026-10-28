@@ -26,12 +26,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on different threads do not share a cache line. `process` now logs after storing rather than
   while holding the clock, and the `Debug` output shows `time_exchange_last` directly, without the
   lock around it.
-  - A read takes 5.4 ns instead of 8.6 ns, and a `process` at the clock's instant 7.1 ns instead
-    of 9.4 ns.
-  - A `SimStepper` step is 2.0% faster when it only shows a bar, and 3.9% faster when it also
-    fills an order.
-  - With clocks running on 16 threads at once, an advance and three reads take 60 ns per thread
-    instead of 158 ns.
+  - A read takes about 5.4 ns instead of 8.6 ns, and a `process` at the clock's instant about
+    7.1 ns instead of 9.4 ns.
+  - A `SimStepper` step is about 2% faster when it only shows a bar, and about 4% faster when it
+    also fills an order.
+  - Clocks used on many threads at once no longer slow each other down. The previous clocks were
+    allocated next to each other and could share a cache line, so their cost depended on where the
+    allocator placed them. On 16 threads, an advance and three reads now take about 60 ns per
+    thread, where the previous clock took up to 158 ns. Most of that gain is the alignment.
 
 ## [0.17.0] - 2026-10-28
 

@@ -5,13 +5,15 @@
 //!
 //! - `read`: one `time()`.
 //! - `advance_and_read`: one `advance_to` a later instant, then three `time()`, roughly what one
-//!   event costs the engine and the simulated venue.
+//!   event costs the engine and the simulated venue. It includes computing the next instant with
+//!   `DateTime + TimeDelta`, which costs the same whatever the clock.
 //! - `process_same_instant`: one `process` of an event at the clock's instant, as for every event
 //!   after the first that shares a timestamp.
 //! - `per_thread/<n>`: `advance_and_read` on `n` threads at once, each on its own clock, the
 //!   clocks allocated one after another, as parallel backtests or training workers in one process
-//!   run. Reported per thread, so a value above the single-threaded one is interference between
-//!   the clocks, such as two sharing a cache line.
+//!   run. Reported as the slowest thread's time per operation. A value above the single-threaded
+//!   one comes from interference between the clocks, such as two sharing a cache line, but also
+//!   from scheduling noise, and from hardware threads sharing a core once `n` exceeds the cores.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use criterion::Criterion;
