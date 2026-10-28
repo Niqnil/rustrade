@@ -54,6 +54,8 @@
 #[cfg(test)]
 use criterion as _;
 #[cfg(test)]
+use loom as _;
+#[cfg(test)]
 use serde_json as _;
 
 use crate::{
