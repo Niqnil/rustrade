@@ -61,7 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     kind itself. It is kept until the order is seen to end. The client persists nothing.
 
 - **`EngineState::free_base` reads the base an account holds outside its spot positions**
-  (`rustrade`, #PRNUM). For an asset on one exchange: the balance's `total`, less borrowed principal
+  (`rustrade`, #764). For an asset on one exchange: the balance's `total`, less borrowed principal
   and interest, less the signed net quantity of every spot instrument there whose base it is,
   capped at `free`. A derivative's contracts are not taken out. It is signed, so a sell sized at a
   long plus it sells no more than the account holds, and `None` with no balance for the asset. It
@@ -73,7 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Breaking: a base-asset fee's sub-step remainder is held, not written off** (`rustrade`,
-  #PRNUM). A spot fill whose base-asset fee leaves the holding off the quantity step still rounds
+  #764). A spot fill whose base-asset fee leaves the holding off the quantity step still rounds
   the position toward zero to the step, but the remainder is no longer charged as part of the
   fill's fee. PnL is charged the venue's fee alone, so a position's PnL agrees with the account at
   the fill's price; what the remainder gains or loses afterwards is the account's.
@@ -87,7 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     Value".
 
 - **Breaking: `RequestOpen::reduce_only` is a `ReduceOnly`, which can also say to trade free
-  base** (`rustrade-execution`, `rustrade`, #PRNUM). `No`, `Position` (the old `true`) or
+  base** (`rustrade-execution`, `rustrade`, #764). `No`, `Position` (the old `true`) or
   `PositionAndFreeBase`. A serialised `true` or `false` still loads, as `Position` or `No`.
   - **Venues.** Adapters send both reduce-only values the same intent or flag, through
     `ReduceOnly::is_reduce_only`: Alpaca's close intents and Hyperliquid's `reduce_only`.
