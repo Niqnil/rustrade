@@ -386,7 +386,7 @@ mod tests {
             }
 
             assert_eq!(
-                clock.inner.read().time_exchange_last,
+                clock.time(),
                 test.expected_time_exchange_last,
                 "TC{} ({}) failed - incorrect time_exchange_last",
                 index,
@@ -467,18 +467,18 @@ mod tests {
         // advances to the split, then monotonically through the intraday prints.
         let mut clock = HistoricalClock::new(effective - TimeDelta::days(1));
         clock.process(&corporate_action_event(effective));
-        assert_eq!(clock.inner.read().time_exchange_last, effective);
+        assert_eq!(clock.time(), effective);
         clock.process(&market_event(intraday_open));
-        assert_eq!(clock.inner.read().time_exchange_last, intraday_open);
+        assert_eq!(clock.time(), intraday_open);
         clock.process(&market_event(intraday_later));
-        assert_eq!(clock.inner.read().time_exchange_last, intraday_later);
+        assert_eq!(clock.time(), intraday_later);
 
         // Out-of-order safety: a midnight split arriving after that day's intraday events
         // must not regress the clock (same monotonic guard as any other event).
         let mut clock = HistoricalClock::new(intraday_later);
         clock.process(&corporate_action_event(effective));
         assert_eq!(
-            clock.inner.read().time_exchange_last,
+            clock.time(),
             intraday_later,
             "an earlier midnight split must not regress time_exchange_last"
         );
@@ -493,13 +493,146 @@ mod tests {
         // jump the clock to a far-future contract expiry before stamping the settlement fill).
         let clock = HistoricalClock::new(base);
         clock.advance_to(later);
-        assert_eq!(clock.inner.read().time_exchange_last, later);
+        assert_eq!(clock.time(), later);
 
         // Advancing to an earlier — or equal — instant is a no-op: the clock never regresses.
         clock.advance_to(base);
-        assert_eq!(clock.inner.read().time_exchange_last, later);
+        assert_eq!(clock.time(), later);
         clock.advance_to(later);
-        assert_eq!(clock.inner.read().time_exchange_last, later);
+        assert_eq!(clock.time(), later);
+    }
+
+    /// Every `DateTime<Utc>` round-trips through the clock exactly: the extremes, which builders
+    /// seed it with, and a leap second, whose nanoseconds exceed one second.
+    #[test]
+    fn historical_clock_holds_every_instant_exactly() {
+        use chrono::NaiveDate;
+
+        let leap_second = NaiveDate::from_ymd_opt(2016, 12, 31)
+            .unwrap()
+            .and_hms_nano_opt(23, 59, 59, 1_500_000_000)
+            .unwrap()
+            .and_utc();
+        let sub_microsecond = DateTime::<Utc>::from_timestamp(-1, 999_999_999).unwrap();
+
+        for time in [
+            DateTime::<Utc>::MIN_UTC,
+            DateTime::<Utc>::MAX_UTC,
+            DateTime::<Utc>::UNIX_EPOCH,
+            leap_second,
+            sub_microsecond,
+        ] {
+            assert_eq!(
+                HistoricalClock::new(time).time(),
+                time,
+                "seeded with {time:?}"
+            );
+
+            let clock = HistoricalClock::new(DateTime::<Utc>::MIN_UTC);
+            clock.advance_to(time);
+            assert_eq!(clock.time(), time, "advanced to {time:?}");
+
+            let mut clock = HistoricalClock::new(DateTime::<Utc>::MIN_UTC);
+            clock.process(&market_event(time));
+            assert_eq!(clock.time(), time, "processed an event at {time:?}");
+        }
+    }
+
+    /// Neither `advance_to` nor `process` moves the clock backwards, including from the largest
+    /// instant, and an event at the current instant leaves it there.
+    #[test]
+    fn historical_clock_never_moves_backwards() {
+        let max = DateTime::<Utc>::MAX_UTC;
+        let earlier = max - TimeDelta::nanoseconds(1);
+
+        let mut clock = HistoricalClock::new(max);
+        clock.advance_to(earlier);
+        assert_eq!(clock.time(), max);
+        clock.process(&market_event(earlier));
+        assert_eq!(clock.time(), max);
+        clock.process(&market_event(DateTime::<Utc>::MIN_UTC));
+        assert_eq!(clock.time(), max);
+
+        // An event at the current instant is accepted, and changes nothing.
+        clock.process(&market_event(max));
+        assert_eq!(clock.time(), max);
+
+        // One nanosecond later is an advance.
+        let mut clock = HistoricalClock::new(earlier);
+        clock.process(&market_event(max));
+        assert_eq!(clock.time(), max);
+    }
+
+    /// Clones share one instant: advancing either, by `advance_to` or by `process`, advances both.
+    /// A clock built separately with the same seed does not.
+    #[test]
+    fn historical_clock_clones_share_one_instant() {
+        let base = DateTime::<Utc>::UNIX_EPOCH;
+        let mut clock = HistoricalClock::new(base);
+        let clone = clock.clone();
+        let separate = HistoricalClock::new(base);
+
+        assert!(clock.is_shared_with(&clone));
+        assert!(clone.is_shared_with(&clock));
+        assert!(!clock.is_shared_with(&separate));
+
+        clone.advance_to(base + TimeDelta::seconds(1));
+        assert_eq!(clock.time(), base + TimeDelta::seconds(1));
+
+        clock.process(&market_event(base + TimeDelta::seconds(2)));
+        assert_eq!(clone.time(), base + TimeDelta::seconds(2));
+
+        assert_eq!(separate.time(), base);
+    }
+
+    /// Clones advanced from several threads end at the latest instant any of them was given, and a
+    /// reader running alongside never sees the clock move backwards or read an instant no writer
+    /// stored.
+    #[test]
+    fn historical_clock_advances_from_several_threads() {
+        // Few iterations under Miri, which interprets every step.
+        const STEPS: i64 = if cfg!(miri) { 20 } else { 2_000 };
+        const WRITERS: i64 = 4;
+
+        let base = DateTime::<Utc>::UNIX_EPOCH;
+        // Writer `w` stores `base + (step * WRITERS + w)` seconds and as many nanoseconds, so a
+        // read mixing two writes' seconds and nanoseconds does not have this shape.
+        let instant = |n: i64| base + TimeDelta::seconds(n) + TimeDelta::nanoseconds(n);
+        let clock = HistoricalClock::new(base);
+
+        std::thread::scope(|scope| {
+            for writer in 0..WRITERS {
+                let mut clock = clock.clone();
+                scope.spawn(move || {
+                    for step in 0..STEPS {
+                        let n = step * WRITERS + writer;
+                        if n % 2 == 0 {
+                            clock.advance_to(instant(n));
+                        } else {
+                            clock.process(&market_event(instant(n)));
+                        }
+                    }
+                });
+            }
+
+            let reader = clock.clone();
+            scope.spawn(move || {
+                let mut previous = base;
+                for _ in 0..STEPS * WRITERS {
+                    let time = reader.time();
+                    assert!(time >= previous, "{time:?} read after {previous:?}");
+                    let elapsed = time - base;
+                    assert_eq!(
+                        elapsed.subsec_nanos() as i64,
+                        elapsed.num_seconds(),
+                        "{time:?} mixes two writes"
+                    );
+                    previous = time;
+                }
+            });
+        });
+
+        assert_eq!(clock.time(), instant(STEPS * WRITERS - 1));
     }
 
     /// A cash flow is stamped with the venue's time, so a historical clock advances on one as it

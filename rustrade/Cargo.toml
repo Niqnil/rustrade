@@ -44,6 +44,11 @@ name = "sim_stepper"
 path = "benches/sim_stepper/mod.rs"
 harness = false
 
+[[bench]]
+name = "clock"
+path = "benches/clock/mod.rs"
+harness = false
+
 [dev-dependencies]
 rustrade-instrument = { workspace = true, features = ["test-utils"] }
 rust_decimal_macros = { workspace = true }
