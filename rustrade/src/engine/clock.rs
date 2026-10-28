@@ -2,9 +2,22 @@ use crate::{EngineEvent, engine::Processor, execution::AccountStreamEvent};
 use chrono::{DateTime, Utc};
 use rustrade_data::streams::consumer::MarketStreamEvent;
 use rustrade_execution::AccountEventKind;
+use seqlock::SeqLockInstant;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, sync::Arc};
 use tracing::{debug, error, warn};
+
+mod seqlock;
+
+/// The atomics [`seqlock`] is built from: the standard library's here, a model checker's in its
+/// test.
+mod sync {
+    pub(super) use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering, fence};
+
+    pub(super) fn spin() {
+        std::hint::spin_loop();
+    }
+}
 
 /// Defines how an [`Engine`](super::Engine) will determine the current time.
 ///
@@ -128,23 +141,37 @@ impl<Event> Processor<&Event> for TokioClock {
 /// measures elapsed time by differencing `time()` will measure the data rather than itself.
 ///
 /// Note that this cannot be initialised without a starting `last_exchange_timestamp`.
-#[derive(Debug, Clone)]
+///
+/// # Sharing between threads
+///
+/// Clones share one instant, so advancing any clone advances them all.
+/// - [`time`](EngineClock::time) never takes a lock. A read that overlaps an advance retries, and
+///   never blocks the advance.
+/// - Advances ([`advance_to`](EngineClock::advance_to) and [`process`](Processor::process))
+///   serialise among themselves: one waits, spinning, while another on a clone is storing. An
+///   advance to an instant no later than the current one stores nothing and waits for nothing.
+/// - Monotonic: whatever order advances on several threads arrive in, the clock ends at the
+///   latest instant any of them was given, and a reader never sees it move backwards.
+/// - Every `DateTime<Utc>` is held exactly, from [`DateTime::<Utc>::MIN_UTC`] to
+///   [`DateTime::<Utc>::MAX_UTC`], leap seconds and nanoseconds included.
+#[derive(Clone)]
 pub struct HistoricalClock {
-    inner: Arc<parking_lot::RwLock<HistoricalClockInner>>,
+    inner: Arc<SeqLockInstant>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
-struct HistoricalClockInner {
-    time_exchange_last: DateTime<Utc>,
+impl Debug for HistoricalClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HistoricalClock")
+            .field("time_exchange_last", &self.inner.load())
+            .finish()
+    }
 }
 
 impl HistoricalClock {
     /// Construct a new `HistoricalClock` using the provided `last_exchange_time` as a seed.
     pub fn new(last_exchange_time: DateTime<Utc>) -> Self {
         Self {
-            inner: Arc::new(parking_lot::RwLock::new(HistoricalClockInner {
-                time_exchange_last: last_exchange_time,
-            })),
+            inner: Arc::new(SeqLockInstant::new(last_exchange_time)),
         }
     }
 
@@ -156,18 +183,12 @@ impl HistoricalClock {
 
 impl EngineClock for HistoricalClock {
     fn time(&self) -> DateTime<Utc> {
-        self.inner.read().time_exchange_last
+        self.inner.load()
     }
 
     fn advance_to(&self, time: DateTime<Utc>) {
-        let mut lock = self.inner.write();
-        // Monotonic: only advance strictly forwards, so the clock never regresses. An earlier — or
-        // equal — `time` is a no-op. This is stricter than `process`'s in-order branch (`>=`), but
-        // equivalent in effect: assigning `time_exchange_last` a value it already holds changes
-        // nothing now that no wall-clock anchor is re-based alongside it.
-        if time > lock.time_exchange_last {
-            lock.time_exchange_last = time;
-        }
+        // Monotonic: an earlier or equal `time` leaves the clock where it is.
+        self.inner.advance(time);
     }
 }
 
@@ -183,31 +204,31 @@ where
             return;
         };
 
-        // Obtain lock
-        let mut lock = self.inner.write();
+        // Decided and stored at once, so that another clone's concurrent advance cannot fall
+        // between the comparison and the store. Logged after, outside the store.
+        let time_exchange_last = self.inner.advance(time_event_exchange);
 
-        // Input event is more recent
-        if time_event_exchange >= lock.time_exchange_last {
+        // Input event is as recent or more recent
+        if time_event_exchange >= time_exchange_last {
             debug!(
                 ?event,
-                time_exchange_last_current = ?lock.time_exchange_last,
+                time_exchange_last_current = ?time_exchange_last,
                 time_update = ?time_event_exchange,
                 "HistoricalClock updating based on input event time_exchange"
             );
-            lock.time_exchange_last = time_event_exchange;
             return;
         };
 
         // Input event is older, so log at varying degrees of severity
         let time_diff_secs = time_event_exchange
-            .signed_duration_since(lock.time_exchange_last)
+            .signed_duration_since(time_exchange_last)
             .num_seconds()
             .abs();
 
         if time_diff_secs < 1 {
             debug!(
                 ?event,
-                time_exchange_last_current = ?lock.time_exchange_last,
+                time_exchange_last_current = ?time_exchange_last,
                 time_update = ?time_event_exchange,
                 time_diff_secs,
                 "HistoricalClock received out-of-order events"
@@ -215,7 +236,7 @@ where
         } else if time_diff_secs < 30 {
             warn!(
                 ?event,
-                time_exchange_last_current = ?lock.time_exchange_last,
+                time_exchange_last_current = ?time_exchange_last,
                 time_update = ?time_event_exchange,
                 time_diff_secs,
                 "HistoricalClock received out-of-order events"
@@ -223,7 +244,7 @@ where
         } else {
             error!(
                 ?event,
-                time_exchange_last_current = ?lock.time_exchange_last,
+                time_exchange_last_current = ?time_exchange_last,
                 time_update = ?time_event_exchange,
                 time_diff_secs,
                 "HistoricalClock received out-of-order events"

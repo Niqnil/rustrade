@@ -56,6 +56,7 @@ serde_json = { workspace = true }
 spin_sleep = { workspace = true }
 tokio = { workspace = true, features = ["fs", "test-util"]} # test-util gives the fill-recovery tests a paused clock
 criterion = { workspace = true }
+loom = { workspace = true } # Model-checks the clock's seqlock: tests/test_clock_seqlock_loom.rs
 
 [dependencies]
 # Rustrade Ecosystem

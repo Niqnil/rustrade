@@ -94,7 +94,9 @@ fn bench_per_thread(c: &mut Criterion) {
 /// returns the slowest thread's time.
 fn per_thread(threads: usize, iters: u64) -> Duration {
     // Allocated back to back, before any thread starts.
-    let clocks: Vec<_> = (0..threads).map(|_| HistoricalClock::new(start())).collect();
+    let clocks: Vec<_> = (0..threads)
+        .map(|_| HistoricalClock::new(start()))
+        .collect();
     let barrier = Barrier::new(threads);
 
     std::thread::scope(|scope| {
