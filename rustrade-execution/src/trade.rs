@@ -272,10 +272,10 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
     ///
     /// - **The price and the fee.** The netted quantity keeps the fill's price, so PnL is charged
     ///   the fee's quote equivalent, its `fees_quote`: buying `q − f` at `p` and paying `f × p`
-    ///   costs `q × p`, what the fill paid. The engine also adds the value of a long's dust, at
-    ///   the fill's price, to the fill's fee, since the account holds that base but cannot sell
-    ///   it. A short's dust is base still owed on the loan, which the position books as bought
-    ///   back at the fill's price, so nothing is added.
+    ///   costs `q × p`, what the fill paid. The engine charges nothing for the dust: it is held,
+    ///   a long's as base the account holds and a short's as base still owed on the loan, and
+    ///   the position books neither it nor the quote it cost. So the position agrees with the
+    ///   account at the fill's price, and the dust's value moves with the price outside it.
     /// - **Only the fee the venue reported** is netted. A fee the caller computes itself, as the
     ///   engine's fee model does, is in quote, and reaches PnL alone.
     /// - **The excess and its share of the fee.** No position takes the excess: the account

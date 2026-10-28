@@ -1701,8 +1701,8 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// `trade`, while the fill booked keeps everything else of `effective`, the fee this state's
     /// fee model added included.
     ///
-    /// When the move rounds the position to the quantity step, it also adds a long's remainder
-    /// to the fill's fee, logs the fill at INFO and counts it on the tear sheet. When it cuts a
+    /// When the move rounds the position to the quantity step, it logs the fill at INFO and
+    /// counts it and its remainder on the tear sheet. When it cuts a
     /// reduce-only fill, it keeps on the fill the share of its fees that the move is of the
     /// netted move, charges the rest to the tear sheet, logs the fill at WARN and counts it.
     fn move_holding(
@@ -1741,21 +1741,11 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             return Some((netted, None));
         }
 
-        // A long's remainder is base the account holds but cannot sell: written off at the fill's
-        // price, as a fee of the fill, so the fill's PnL still totals what it paid. A short's is
-        // base still owed on the loan: the position books it bought back at the fill's price,
-        // which values the debt at that price, so nothing is written off.
-        let written_off = if moved.dust.is_sign_positive() {
-            let value = moved.dust * netted.price;
-            netted.fees.fees += moved.dust;
-            // The value is in quote terms, so it adds to the quote equivalent PnL charges even
-            // when the base fee itself has none (one the indexer zeroed).
-            netted.fees.fees_quote = Some(netted.fees.fees_quote.unwrap_or(Decimal::ZERO) + value);
-            value
-        } else {
-            Decimal::ZERO
-        };
-
+        // The remainder is held, not a cost: base the account holds that a long does not count,
+        // or base still owed on a short's loan that the short does not count. The position books
+        // neither the remainder nor the quote it cost, so its PnL agrees with the account at the
+        // fill's price, and the remainder's value moves with the price outside it.
+        let value = moved.dust * netted.price;
         info!(
             instrument = ?netted.instrument,
             order_id = %netted.order_id,
@@ -1763,11 +1753,11 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             // Dust is only ever rounded off to a step, so there is one here.
             step = %self.instrument.quantity_step().unwrap_or_default(),
             remainder = %moved.dust,
-            %written_off,
+            remainder_value = %value,
             "base-asset fee left the holding off the quantity step: position rounded toward zero, \
-             the remainder left in the balance"
+             the remainder held in the balance"
         );
-        self.tear_sheet.record_fill_dust(written_off);
+        self.tear_sheet.record_fill_dust(moved.dust, value);
         Some((netted, None))
     }
 
@@ -1984,13 +1974,16 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ///   account's balance. A buy of 1 with a 0.1 % fee and a step of 0.01 holds 0.999, and the
     ///   position books 0.99. The fill is logged at INFO and counted on
     ///   [`TearSheet::fills_dust`](crate::statistic::summary::instrument::TearSheet::fills_dust).
-    ///   - A long's remainder is written off: its value at the fill's price is added to the fill's
-    ///     fee, so PnL still totals what the fill paid, and is summed on
-    ///     [`TearSheet::dust`](crate::statistic::summary::instrument::TearSheet::dust).
-    ///   - A short's remainder is base still owed on the loan. The position books it bought back
-    ///     at the fill's price, which values the debt at that price, so nothing is written off.
-    ///     A remainder this fill's fee did not create, as from a short already off the step, is
-    ///     booked bought back the same way, though the fill paid nothing for it.
+    ///   - The remainder is held, not a cost. A long's is base the account holds, a short's base
+    ///     still owed on the loan. The position books neither it nor the quote it cost, and PnL is
+    ///     charged the venue's fee alone, so the position agrees with the account at the fill's
+    ///     price. What the remainder gains or loses after that is the account's, not the
+    ///     position's. Its quantity and its value at the fill's price are summed on
+    ///     [`TearSheet::dust_quantity`](crate::statistic::summary::instrument::TearSheet::dust_quantity)
+    ///     and
+    ///     [`TearSheet::dust_value`](crate::statistic::summary::instrument::TearSheet::dust_value).
+    ///   - A remainder this fill's fee did not create, as from a position already off the step, is
+    ///     held the same way.
     ///   - Without a step, the position holds the exact quantity, 0.999 above, and a full-size
     ///     close can leave a remainder the venue will not sell.
     ///   - Each fill's remainder is rounded away on its own, so the balance can gather more than
@@ -4861,7 +4854,8 @@ mod tests {
     }
 
     /// A buy of 1 with a base fee of 0.001 holds 0.999. The position books 0.99, what a close can
-    /// sell, and the 0.009 left over is written off at the fill's price as part of its fee.
+    /// sell, and the 0.009 left over is held, valued at the fill's price, with only the venue's
+    /// fee charged.
     #[test]
     fn a_base_fee_netted_position_is_rounded_toward_zero_to_the_step() {
         let mut state = stepped_state();
@@ -4873,16 +4867,19 @@ mod tests {
         assert_eq!(position.side, Side::Buy);
         assert_eq!(position.quantity_abs, dec!(0.99));
         assert_eq!(position.price_entry_average, dec!(100));
-        // The fee of 0.001 plus the 0.009 written off: what the fill paid less what it booked.
-        assert_eq!(position.fees_enter.fees, dec!(0.01));
-        assert_eq!(position.fees_enter.fees_quote, Some(dec!(1)));
-        assert_eq!(position.pnl_realised, dec!(-1));
+        assert_eq!(position.fees_enter.fees, dec!(0.001));
+        assert_eq!(position.fees_enter.fees_quote, Some(dec!(0.1)));
+        assert_eq!(position.pnl_realised, dec!(-0.1));
         assert_eq!(state.tear_sheet.fills_dust, 1);
-        assert_eq!(state.tear_sheet.dust, dec!(0.9));
+        assert_eq!(
+            (state.tear_sheet.dust_quantity, state.tear_sheet.dust_value),
+            (dec!(0.009), dec!(0.9))
+        );
     }
 
-    /// Selling the rounded position closes it exactly, and its PnL is what the account made with
-    /// the dust written off: 100 paid, 0.99 sold at 110 for 108.9, and 0.009 left unsellable.
+    /// Selling the rounded position closes it exactly. Its PnL and the held dust's gain together
+    /// are what the account made: 100 paid, 0.99 sold at 110 for 108.9, and 0.009 still held,
+    /// now worth 0.99.
     #[test]
     fn a_full_close_of_a_rounded_position_lands_flat() {
         use crate::statistic::time::Annual365;
@@ -4901,11 +4898,16 @@ mod tests {
             .exited
             .expect("the sell closes the position");
 
-        assert_eq!(exited.pnl_realised, dec!(8.9));
+        assert_eq!(exited.pnl_realised, dec!(9.8));
         assert!(netting_position(&state).is_none());
         let sheet = state.tear_sheet.generate(Decimal::ZERO, Annual365);
-        assert_eq!(sheet.pnl, dec!(8.9));
-        assert_eq!((sheet.fills_dust, sheet.dust), (1, dec!(0.9)));
+        assert_eq!(sheet.pnl, dec!(9.8));
+        assert_eq!(
+            (sheet.fills_dust, sheet.dust_quantity, sheet.dust_value),
+            (1, dec!(0.009), dec!(0.9))
+        );
+        let dust_gain = sheet.dust_quantity * close.price - sheet.dust_value;
+        assert_eq!(sheet.pnl + dust_gain, dec!(108.9) - dec!(100) + dec!(0.99));
     }
 
     /// It is the position that is rounded, not the fill's move. A sell of 1 with a base fee of
@@ -4924,8 +4926,11 @@ mod tests {
             (position.side, position.quantity_abs),
             (Side::Buy, dec!(0.99))
         );
-        assert_eq!(position.pnl_realised, dec!(-1));
-        assert_eq!(state.tear_sheet.dust, dec!(0.9));
+        assert_eq!(position.pnl_realised, dec!(-0.1));
+        assert_eq!(
+            (state.tear_sheet.dust_quantity, state.tear_sheet.dust_value),
+            (dec!(0.009), dec!(0.9))
+        );
     }
 
     /// A position already off the step, from before the instrument had one, is rounded at the
@@ -4940,14 +4945,17 @@ mod tests {
         let _ = state.update_from_trade(&fill_charging(Side::Buy, dec!(1), base, dec!(0.001)));
 
         assert_eq!(netting_position(&state).unwrap().quantity_abs, dec!(1.99));
-        assert_eq!(state.tear_sheet.dust, dec!(0.8));
+        assert_eq!(
+            (state.tear_sheet.dust_quantity, state.tear_sheet.dust_value),
+            (dec!(0.008), dec!(0.8))
+        );
     }
 
     /// A short bought back in full with a base fee still owes the fee. Rounded toward zero, the
-    /// position closes, booking that debt bought back at the fill's price, so nothing is written
-    /// off: the fill's PnL is its fee alone.
+    /// position closes, and the debt is held as owed dust, valued at the fill's price: the fill's
+    /// PnL is its fee alone.
     #[test]
-    fn a_short_bought_back_with_a_base_fee_lands_flat_with_nothing_written_off() {
+    fn a_short_bought_back_with_a_base_fee_lands_flat_owing_the_fee_as_dust() {
         let mut state = stepped_state();
         let (base, quote) = (
             state.instrument.underlying.base,
@@ -4963,15 +4971,20 @@ mod tests {
         assert_eq!(exited.pnl_realised, dec!(-0.1));
         assert!(netting_position(&state).is_none());
         assert_eq!(
-            (state.tear_sheet.fills_dust, state.tear_sheet.dust),
-            (1, Decimal::ZERO)
+            (
+                state.tear_sheet.fills_dust,
+                state.tear_sheet.dust_quantity,
+                state.tear_sheet.dust_value
+            ),
+            (1, dec!(-0.001), dec!(-0.1))
         );
     }
 
     /// A buy that holds less than one step once its fee is netted books nothing. From flat it
-    /// opens no position, so the tear sheet's unattributed fees take all the fill paid.
+    /// opens no position, so the tear sheet's unattributed fees take its fee, and all it holds is
+    /// dust.
     #[test]
-    fn a_buy_holding_less_than_a_step_from_flat_charges_all_it_paid_to_the_tear_sheet() {
+    fn a_buy_holding_less_than_a_step_from_flat_charges_its_fee_to_the_tear_sheet() {
         let mut state = stepped_state();
         let base = state.instrument.underlying.base;
 
@@ -4982,10 +4995,14 @@ mod tests {
         assert!(applied.exited.is_none());
         assert!(netting_position(&state).is_none());
         assert_eq!(warnings, 1);
-        assert_eq!(state.tear_sheet.pnl_returns.fees_unattributed, dec!(1));
+        assert_eq!(state.tear_sheet.pnl_returns.fees_unattributed, dec!(0.001));
         assert_eq!(
-            (state.tear_sheet.fills_dust, state.tear_sheet.dust),
-            (1, dec!(0.999))
+            (
+                state.tear_sheet.fills_dust,
+                state.tear_sheet.dust_quantity,
+                state.tear_sheet.dust_value
+            ),
+            (1, dec!(0.00999), dec!(0.999))
         );
     }
 
@@ -5001,8 +5018,12 @@ mod tests {
         assert_eq!(position.quantity_abs, dec!(0.99));
         assert_eq!(position.fees_enter.fees_quote, Some(dec!(1)));
         assert_eq!(
-            (state.tear_sheet.fills_dust, state.tear_sheet.dust),
-            (0, Decimal::ZERO)
+            (
+                state.tear_sheet.fills_dust,
+                state.tear_sheet.dust_quantity,
+                state.tear_sheet.dust_value
+            ),
+            (0, Decimal::ZERO, Decimal::ZERO)
         );
     }
 
@@ -5051,7 +5072,7 @@ mod tests {
 
     /// A buy with a base fee that flips a short rounds the long it opens. From a short of 0.5, a
     /// buy of 1.01 with a fee of 0.001 holds 0.509: the position books a long of 0.5, a move of 1,
-    /// and the fee with the 0.009 written off is split between the two halves.
+    /// the fee is split between the two halves, and the 0.009 left over is held.
     #[test]
     fn a_base_fee_netted_flip_rounds_the_position_it_opens() {
         let mut state = stepped_state();
@@ -5067,23 +5088,27 @@ mod tests {
             .exited
             .expect("the buy closes the short");
 
-        assert_eq!(exited.pnl_realised, dec!(-0.5));
+        assert_eq!(exited.pnl_realised, dec!(-0.05));
         let position = netting_position(&state).unwrap();
         assert_eq!(
             (position.side, position.quantity_abs),
             (Side::Buy, dec!(0.5))
         );
-        assert_eq!(position.fees_enter.fees_quote, Some(dec!(0.5)));
+        assert_eq!(position.fees_enter.fees_quote, Some(dec!(0.05)));
         assert_eq!(
-            (state.tear_sheet.fills_dust, state.tear_sheet.dust),
-            (1, dec!(0.9))
+            (
+                state.tear_sheet.fills_dust,
+                state.tear_sheet.dust_quantity,
+                state.tear_sheet.dust_value
+            ),
+            (1, dec!(0.009), dec!(0.9))
         );
     }
 
     /// A sell with a base fee from flat opens a short of what it sold, rounded toward zero. The
-    /// fee is base still owed on the loan, so nothing is written off and the fee is as charged.
+    /// fee is base still owed on the loan, held as owed dust, and the fee is as charged.
     #[test]
-    fn a_sell_with_a_base_fee_opening_a_short_writes_nothing_off() {
+    fn a_sell_with_a_base_fee_opening_a_short_owes_the_fee_as_dust() {
         let mut state = stepped_state();
         let base = state.instrument.underlying.base;
 
@@ -5097,8 +5122,12 @@ mod tests {
         assert_eq!(position.fees_enter.fees, dec!(0.001));
         assert_eq!(position.fees_enter.fees_quote, Some(dec!(0.1)));
         assert_eq!(
-            (state.tear_sheet.fills_dust, state.tear_sheet.dust),
-            (1, Decimal::ZERO)
+            (
+                state.tear_sheet.fills_dust,
+                state.tear_sheet.dust_quantity,
+                state.tear_sheet.dust_value
+            ),
+            (1, dec!(-0.001), dec!(-0.1))
         );
     }
 

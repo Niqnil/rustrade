@@ -102,7 +102,7 @@ pub struct TradingSummary<Interval> {
 
     /// Spot fills this session whose base-asset fee left dust out of the position, summed over
     /// every instrument. Routine where a venue charges fees in the base asset; each instrument's
-    /// value written off is its [`TearSheet::dust`](instrument::TearSheet::dust). See
+    /// dust held is its [`TearSheet::dust_quantity`](instrument::TearSheet::dust_quantity). See
     /// [`TearSheet::fills_dust`](instrument::TearSheet::fills_dust).
     #[serde(default)]
     pub fills_dust: usize,
