@@ -38,7 +38,7 @@ criterion::criterion_group!(
     targets = bench_single_thread, bench_per_thread
 );
 
-const THREADS: [usize; 2] = [2, 8];
+const THREADS: [usize; 3] = [2, 8, 16];
 
 fn start() -> DateTime<Utc> {
     DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap()

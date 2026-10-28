@@ -17,6 +17,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   take a `Decimal` square root, twice for a loss, though only `TearSheetGenerator::generate`
   reads the result. That was about 30% of a simulated step that fills an order.
 
+- **`HistoricalClock` reads its instant without a lock** (`rustrade`, #768). Its instant is held
+  in a sequence lock over the seconds and nanoseconds instead of a `parking_lot::RwLock`. A read
+  that overlaps an advance retries rather than blocking it, and advances on clones serialise
+  among themselves. An advance to an instant no later than the clock's stores nothing. Every
+  `DateTime<Utc>` is still held exactly, from `MIN_UTC` to `MAX_UTC`, leap seconds included, and
+  the clock still never moves backwards. The shared state is aligned to 128 bytes, so clocks used
+  on different threads do not share a cache line. `process` now logs after storing rather than
+  while holding the clock, and the `Debug` output shows `time_exchange_last` directly, without the
+  lock around it.
+  - A read takes 5.4 ns instead of 8.6 ns, and a `process` at the clock's instant 7.1 ns instead
+    of 9.4 ns.
+  - A `SimStepper` step is 2.0% faster when it only shows a bar, and 3.9% faster when it also
+    fills an order.
+  - With clocks running on 16 threads at once, an advance and three reads take 60 ns per thread
+    instead of 158 ns.
+
 ## [0.17.0] - 2026-10-28
 
 ### Added
