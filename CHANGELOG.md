@@ -12,11 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking: a dataset summary's variance and standard deviation are computed when read**
   (`rustrade`). `Dispersion` holds the range and the recurrence relation M only: its `variance`
   and `std_dev` fields are gone, and `Dispersion::update` no longer takes the count. Read them
-  with `DataSetSummary::variance` and `DataSetSummary::std_dev`, or `Dispersion::variance(count)`
-  and `Dispersion::std_dev(count)`. A serialised summary no longer carries the two fields, and
-  one serialised with them still loads. Each closed position used to take a `Decimal` square
-  root, twice for a loss, though only `TearSheetGenerator::generate` reads the result. That was
-  about 30% of a simulated step that fills an order.
+  with `DataSetSummary::variance` and `DataSetSummary::std_dev`. A serialised summary no longer
+  carries the two fields, and one serialised with them still loads. Each closed position used to
+  take a `Decimal` square root, twice for a loss, though only `TearSheetGenerator::generate`
+  reads the result. That was about 30% of a simulated step that fills an order.
 
 ## [0.17.0] - 2026-10-28
 

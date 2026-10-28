@@ -9,7 +9,8 @@
 //!   turn) and settles it, so every step fills.
 //! - `build`: a fresh session, which every episode needs.
 //!
-//! Each iteration runs `STEPS` one-second bars on a fresh session; building it is excluded.
+//! Each `hold` and `round_trip` iteration runs `STEPS` one-second bars on a fresh session,
+//! building it excluded. `build` times the construction alone.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use criterion::{BatchSize, Criterion, Throughput};
@@ -231,6 +232,20 @@ fn bench_steps(c: &mut Criterion) {
         .positions
         .is_empty();
     assert!(flat, "the round trips must close flat");
+    let closed = probe
+        .engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex::new(0))
+        .tear_sheet
+        .pnl_returns
+        .total
+        .count;
+    assert_eq!(
+        closed,
+        Decimal::from(STEPS / 2),
+        "every round trip must close a position into the tear sheet"
+    );
     let usd = probe
         .engine
         .state

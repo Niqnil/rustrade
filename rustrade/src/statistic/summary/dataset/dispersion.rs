@@ -2,12 +2,13 @@ use crate::statistic::algorithm::welford_online;
 use rust_decimal::{Decimal, MathematicalOps};
 use serde::{Deserialize, Serialize};
 
-/// Representation of a dataset using measures of dispersion - range, variance & standard deviation.
+/// Representation of a dataset using measures of dispersion: the range, and the Welford
+/// recurrence relation M, the running sum of squared deviations from the mean.
 ///
-/// Holds the range and the Welford recurrence relation M, the running sum of squared deviations
-/// from the mean. The variance and standard deviation are derived from M when read, not on each
-/// update: [`std_dev`](Self::std_dev) takes a `Decimal` square root, which would otherwise cost
-/// every update far more than the update itself.
+/// The variance and standard deviation are derived from M and the dataset's count when read,
+/// through [`DataSetSummary`](super::DataSetSummary), which holds the count. Not on each update:
+/// the standard deviation takes a `Decimal` square root, which would otherwise cost every update
+/// far more than the update itself.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Default, Deserialize, Serialize)]
 pub struct Dispersion {
     pub range: Range,
@@ -32,7 +33,7 @@ impl Dispersion {
 
     /// The population variance of a dataset of `count` values, the count this `Dispersion` was
     /// updated with. Zero for an empty dataset.
-    pub fn variance(&self, count: Decimal) -> Decimal {
+    pub(super) fn variance(&self, count: Decimal) -> Decimal {
         welford_online::calculate_population_variance(self.recurrence_relation_m, count)
     }
 
@@ -41,7 +42,7 @@ impl Dispersion {
     ///
     /// Computed on each call, with a `Decimal` square root.
     #[allow(clippy::expect_used)] // sqrt fails only on a negative input, which abs() rules out
-    pub fn std_dev(&self, count: Decimal) -> Decimal {
+    pub(super) fn std_dev(&self, count: Decimal) -> Decimal {
         // Welford variance can be slightly negative due to Decimal rounding; abs() guards sqrt input
         self.variance(count)
             .abs()
@@ -247,6 +248,17 @@ mod tests {
                 std_dev_diff
             );
         }
+    }
+
+    #[test]
+    fn std_dev_of_a_variance_rounded_below_zero_is_its_magnitude_root() {
+        let dispersion = Dispersion {
+            range: Range::default(),
+            recurrence_relation_m: dec!(-0.005),
+        };
+
+        assert_eq!(dispersion.variance(dec!(2)), dec!(-0.0025));
+        assert_eq!(dispersion.std_dev(dec!(2)), dec!(0.05));
     }
 
     #[test]

@@ -15,7 +15,7 @@ pub mod dispersion;
 /// - Count of observations
 /// - Sum of all values
 /// - Running mean
-/// - Dispersion measures (range, variance, and standard deviation)
+/// - Dispersion measures: the range, and the variance and standard deviation
 ///
 /// The variance and standard deviation are derived when read, by [`variance`](Self::variance)
 /// and [`std_dev`](Self::std_dev), so an update stays cheap.
@@ -243,8 +243,8 @@ mod tests {
             "dispersion": {
                 "range": { "activated": true, "high": "1.2", "low": "1.1" },
                 "recurrence_relation_m": "0.005",
-                "variance": "0.0025",
-                "std_dev": "0.05"
+                "variance": "9",
+                "std_dev": "9"
             }
         }"#;
 
@@ -253,6 +253,7 @@ mod tests {
         assert_eq!(summary.variance(), dec!(0.0025));
         assert_eq!(summary.std_dev(), dec!(0.05));
         let reserialised = serde_json::to_value(&summary).unwrap();
+        assert!(reserialised["dispersion"].get("variance").is_none());
         assert!(reserialised["dispersion"].get("std_dev").is_none());
     }
 }
