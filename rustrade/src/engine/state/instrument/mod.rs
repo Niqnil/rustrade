@@ -2043,7 +2043,9 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ///   - Without a step, the position holds the exact quantity, 0.999 above, and a full-size
     ///     close can leave a remainder the venue will not sell.
     ///   - Each fill's remainder is rounded away on its own, so the balance can gather more than
-    ///     one step of them over many fills, which no position holds.
+    ///     one step of them over many fills, which no position holds. How much there is, and how
+    ///     to sell it, is in
+    ///     [`EngineState::free_base`](crate::engine::state::EngineState::free_base).
     /// - **A spot-margin short closed by a buy** keeps the fee as a residual short, since the fee
     ///   came out of the base that was to repay the loan. With a step, a residual below one step
     ///   is rounded away, as above, and the position closes. Buying more than the debt to cover
