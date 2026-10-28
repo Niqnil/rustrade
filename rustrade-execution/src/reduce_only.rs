@@ -17,7 +17,8 @@ use crate::{
     trade::Trade,
 };
 use rustrade_integration::collection::FnvIndexMap;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt;
 use tracing::debug;
 
 /// An order the book was told of: live, or retired if it was reduce-only.
@@ -27,25 +28,61 @@ struct SentOrder {
     venue_id: Option<OrderId>,
 }
 
-/// What is serialised of a retired order. Before the book kept a retired order's
-/// [`ReduceOnly`], it kept its venue order id alone, and every retired order was
-/// [`ReduceOnly::Position`].
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum RetiredParts {
-    Sent(SentOrder),
-    VenueId(Option<OrderId>),
-}
+/// A retired order as serialised. Before the book kept a retired order's [`ReduceOnly`], it kept
+/// its venue order id alone (`<id>|null`), and every retired order was [`ReduceOnly::Position`].
+/// A human-readable format can hold either form; a binary one holds the current form alone.
+struct RetiredOrder(SentOrder);
 
-impl From<RetiredParts> for SentOrder {
-    fn from(parts: RetiredParts) -> Self {
-        match parts {
-            RetiredParts::Sent(order) => order,
-            RetiredParts::VenueId(venue_id) => Self {
+impl<'de> Deserialize<'de> for RetiredOrder {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct RetiredOrderVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for RetiredOrderVisitor {
+            type Value = SentOrder;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a retired order, or its venue order id alone, or null")
+            }
+
+            // Delegated whole, so an error inside the order keeps its own message.
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<SentOrder, A::Error> {
+                SentOrder::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            }
+
+            fn visit_str<E: serde::de::Error>(self, venue_id: &str) -> Result<SentOrder, E> {
+                Ok(bare(Some(OrderId::new(venue_id))))
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<SentOrder, E> {
+                Ok(bare(None))
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<SentOrder, E> {
+                Ok(bare(None))
+            }
+
+            fn visit_some<D: Deserializer<'de>>(self, inner: D) -> Result<SentOrder, D::Error> {
+                inner.deserialize_any(self)
+            }
+        }
+
+        /// A retired order of the earlier form: always reduce-only.
+        fn bare(venue_id: Option<OrderId>) -> SentOrder {
+            SentOrder {
                 reduce_only: ReduceOnly::Position,
                 venue_id,
-            },
+            }
         }
+
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_any(RetiredOrderVisitor)
+        } else {
+            SentOrder::deserialize(deserializer)
+        }
+        .map(Self)
     }
 }
 
@@ -103,7 +140,7 @@ struct BookParts {
     #[serde(default)]
     live: FnvIndexMap<ClientOrderId, SentOrder>,
     #[serde(default)]
-    retired: FnvIndexMap<ClientOrderId, RetiredParts>,
+    retired: FnvIndexMap<ClientOrderId, RetiredOrder>,
 }
 
 impl From<BookParts> for ReduceOnlyBook {
@@ -112,7 +149,7 @@ impl From<BookParts> for ReduceOnlyBook {
         // A retired order that was not reduce-only is not one the book would have kept.
         let mut retired: FnvIndexMap<ClientOrderId, SentOrder> = retired
             .into_iter()
-            .map(|(cid, order)| (cid, SentOrder::from(order)))
+            .map(|(cid, RetiredOrder(order))| (cid, order))
             .filter(|(_, order)| order.reduce_only.is_reduce_only())
             .collect();
         // An order is live or retired, never both; the live one wins.
@@ -603,9 +640,39 @@ mod tests {
 
     #[test]
     fn a_loaded_retirement_that_was_not_reduce_only_is_dropped() {
-        let json = r#"{"retired":{"p":{"reduce_only":"no","venue_id":"v"}}}"#;
+        for not_reduce_only in [r#""no""#, "false"] {
+            let json = format!(
+                r#"{{"retired":{{"p":{{"reduce_only":{not_reduce_only},"venue_id":"v"}}}}}}"#
+            );
+            let book: ReduceOnlyBook = serde_json::from_str(&json).unwrap();
+            assert!(
+                book.is_empty() && !book.has_reduce_only(),
+                "{not_reduce_only}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_loaded_retirement_with_a_reduce_only_flag_is_kept_as_position() {
+        let json = r#"{"retired":{"r":{"reduce_only":true,"venue_id":"v"}}}"#;
         let book: ReduceOnlyBook = serde_json::from_str(json).unwrap();
-        assert!(book.is_empty() && !book.has_reduce_only());
+        assert_eq!(flag(&book, &fill(None, "v")), Some(Position));
+    }
+
+    /// A retired order that cannot be read says why, not only that it matched no form.
+    #[test]
+    fn a_malformed_retirement_keeps_the_error_inside_it() {
+        let json = r#"{"retired":{"r":{"reduce_only":"sometimes","venue_id":null}}}"#;
+        let error = serde_json::from_str::<ReduceOnlyBook>(json).unwrap_err();
+        assert!(error.to_string().contains("sometimes"), "{error}");
+
+        let error = serde_json::from_str::<ReduceOnlyBook>(r#"{"retired":{"r":7}}"#).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("a retired order, or its venue order id alone, or null"),
+            "{error}"
+        );
     }
 
     #[test]

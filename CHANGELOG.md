@@ -99,7 +99,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `TradingSummary::fills_free_base_traded`, shown as "Free Base Traded") instead of
     `fills_reduce_only_capped`. Its share of the fee still goes to `fees_unattributed`. On a
     derivative the excess is a mistake, as for `Position`.
-  - `ReduceOnlyCapped` has new `reduce_only` and `trades_free_base` fields.
+  - `ReduceOnlyCapped` has new `reduce_only` and `trades_free_base` fields, and is emitted for a
+    free-base trade too: a handler that treats a cut as a fault checks `trades_free_base` first.
+    `ReduceOnly` is `#[non_exhaustive]`; adapters read `is_reduce_only` rather than matching it.
+    Its `Deserialize` takes a flag only in a human-readable format; a binary one reads the
+    variant.
     `EngineState::replay_account` takes `(TradeId, ReduceOnly)` pairs, so the audit replica counts
     each cut fill as the engine did. `Trade::holding_move` takes a `ReduceOnly`.
   - `ReduceOnlyBook::register` takes a `ReduceOnly`, `BookedOrder::reduce_only` is one, and a

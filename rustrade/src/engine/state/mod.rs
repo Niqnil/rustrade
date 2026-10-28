@@ -300,7 +300,10 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     /// - **Orders in flight.** Base a resting order locks is already out of `free`, but an open
     ///   the venue has not yet acknowledged is not taken out. Nor is a fill whose balance update
     ///   has not arrived. Read it while no order on `asset` is working, or after an account
-    ///   snapshot.
+    ///   snapshot. That includes an order closing the position itself: a resting sell of a long
+    ///   locks its base out of `free`, so the read falls by it.
+    /// - **Pairs quoted in the asset.** Only positions whose base is `asset` are taken out. What
+    ///   a pair quoted in it holds, such as a short of `ETHBTC`'s proceeds in BTC, reads as free.
     /// - **Isolated margin.** The engine stores no isolated balances, so a position in an
     ///   isolated margin pair is taken out of a balance that does not hold it. Do not read it for
     ///   an asset traded isolated.

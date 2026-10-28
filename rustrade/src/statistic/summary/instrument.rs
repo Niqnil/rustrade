@@ -91,7 +91,8 @@ pub struct TearSheet<Interval> {
     ///
     /// `#[serde(default)]` so tear sheets serialised before this field existed still load, and
     /// read from a `dust` field, which held a long's dust written off as a fee before the engine
-    /// held it instead.
+    /// held it instead. A total loaded that way was charged to `pnl` and has no quantity beside
+    /// it, so the gain above does not hold for it.
     #[serde(default, alias = "dust")]
     pub dust_value: Decimal,
 

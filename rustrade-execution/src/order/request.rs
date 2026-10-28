@@ -240,8 +240,14 @@ impl RequestOpen {
 ///   trade of free base the order was sized to make: logged at INFO, and counted apart.
 ///
 /// # Serialised form
-/// `"no"`, `"position"` or `"position_and_free_base"`. A `false` or `true`, the form before this
-/// type replaced a flag, loads as [`No`](Self::No) or [`Position`](Self::Position).
+/// `"no"`, `"position"` or `"position_and_free_base"`. In a human-readable format such as JSON, a
+/// `false` or `true`, the form before this type replaced a flag, loads as [`No`](Self::No) or
+/// [`Position`](Self::Position). A binary format, which cannot say which of the two it holds,
+/// reads the variant alone, as serde derives it.
+///
+/// `#[non_exhaustive]`, so a value can be added without breaking a caller. An adapter reads
+/// [`Self::is_reduce_only`] rather than matching the values.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReduceOnly {
@@ -270,6 +276,26 @@ impl ReduceOnly {
     /// or flag an adapter sends the venue.
     pub const fn is_reduce_only(self) -> bool {
         !matches!(self, Self::No)
+    }
+}
+
+/// [`ReduceOnly`]'s values as serde derives them, for a format that is not human-readable. In the
+/// same order, so a variant index reads back as the value it was written from.
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReduceOnlyVariant {
+    No,
+    Position,
+    PositionAndFreeBase,
+}
+
+impl From<ReduceOnlyVariant> for ReduceOnly {
+    fn from(variant: ReduceOnlyVariant) -> Self {
+        match variant {
+            ReduceOnlyVariant::No => Self::No,
+            ReduceOnlyVariant::Position => Self::Position,
+            ReduceOnlyVariant::PositionAndFreeBase => Self::PositionAndFreeBase,
+        }
     }
 }
 
@@ -305,7 +331,12 @@ impl<'de> Deserialize<'de> for ReduceOnly {
             }
         }
 
-        deserializer.deserialize_any(ReduceOnlyVisitor)
+        // Only a self-describing format can say whether it holds a flag or a name.
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_any(ReduceOnlyVisitor)
+        } else {
+            ReduceOnlyVariant::deserialize(deserializer).map(Self::from)
+        }
     }
 }
 
@@ -412,6 +443,60 @@ mod tests {
                 .contains(r#""no", "position", "position_and_free_base", or a bool"#),
             "{error}"
         );
+    }
+
+    /// A deserializer that reads `value` as a binary format would: not human-readable, so it
+    /// reads a value by the shape asked for, as an enum.
+    struct NotHumanReadable<'a>(&'a serde_json::Value);
+
+    impl<'de, 'a: 'de> Deserializer<'de> for NotHumanReadable<'a> {
+        type Error = serde_json::Error;
+
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            Err(serde::de::Error::custom(
+                "a binary format cannot deserialize_any",
+            ))
+        }
+
+        fn deserialize_enum<V: serde::de::Visitor<'de>>(
+            self,
+            name: &'static str,
+            variants: &'static [&'static str],
+            visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            self.0.deserialize_enum(name, variants, visitor)
+        }
+
+        fn is_human_readable(&self) -> bool {
+            false
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf
+            option unit unit_struct newtype_struct seq tuple tuple_struct map struct identifier
+            ignored_any
+        }
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)] // Test code: panics are the correct failure mode
+    fn a_binary_format_reads_reduce_only_as_a_variant() {
+        for reduce_only in [
+            ReduceOnly::No,
+            ReduceOnly::Position,
+            ReduceOnly::PositionAndFreeBase,
+        ] {
+            let written = serde_json::to_value(reduce_only).unwrap();
+            assert_eq!(
+                ReduceOnly::deserialize(NotHumanReadable(&written)).unwrap(),
+                reduce_only
+            );
+        }
+        // A flag has no variant to read.
+        assert!(ReduceOnly::deserialize(NotHumanReadable(&serde_json::Value::Bool(true))).is_err());
     }
 
     #[test]

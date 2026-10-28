@@ -574,10 +574,11 @@ pub enum ExpiryHandling {
 }
 
 /// A reduce-only order's fill the engine cut so it would not grow or flip the position it
-/// reduces, or applied none of, because the position was flat or on the fill's side. See the
+/// reduces, or applied none of, because the position was flat or on the fill's side: by mistake,
+/// or, when [`Self::trades_free_base`], to trade free base as the order was sized to. See the
 /// reduce-only fills section of [`InstrumentState::update_from_trade`].
 ///
-/// [`Self::trades_free_base`] tells an excess the order was sized to trade from a mistake.
+/// A handler that treats a cut as a fault checks [`Self::trades_free_base`] first.
 ///
 /// Carried by [`EngineOutput::ReduceOnlyCapped`](crate::engine::EngineOutput::ReduceOnlyCapped).
 #[non_exhaustive]
@@ -616,6 +617,9 @@ pub struct ReduceOnlyCapped<InstrumentKey = InstrumentIndex> {
     /// [`TearSheet::fills_free_base_traded`](crate::statistic::summary::instrument::TearSheet::fills_free_base_traded)
     /// if so, and otherwise at WARN and on
     /// [`TearSheet::fills_reduce_only_capped`](crate::statistic::summary::instrument::TearSheet::fills_reduce_only_capped).
+    ///
+    /// It follows from [`Self::reduce_only`] and the instrument's kind, and is carried because a
+    /// consumer of the output has no instrument to read the kind from.
     ///
     /// `#[serde(default)]` so outputs serialised before this field existed still load, as
     /// `false`.
