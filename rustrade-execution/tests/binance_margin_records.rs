@@ -4,8 +4,9 @@
 //! Binance margin has no testnet, so this runs against production. It places no orders and moves
 //! nothing. It prints only counts and field names, never an amount, so its output can be shared:
 //!
-//! - which `asset` and `rawAsset` an interest record of each `type` names, to learn which of the
-//!   two holds BNB on a record converted into BNB;
+//! - which `asset` and `rawAsset` an interest record of each `type` names, to confirm what Binance
+//!   says: a record converted into BNB holds BNB in `asset`, and an isolated record has no
+//!   `rawAsset`;
 //! - whether a cross forced-liquidation query returns records marked isolated;
 //! - whether the forced-liquidation endpoint refuses a span of two years.
 //!

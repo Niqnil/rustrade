@@ -106,10 +106,15 @@ impl BinanceMargin {
     ///
     /// - [`asset`](CashFlow::asset) is the `asset` field of Binance's record. Binance charges
     ///   interest in the asset borrowed, or converts it into BNB for an account that pays interest
-    ///   in BNB. A converted record also names the asset borrowed, in a separate field, and Binance
-    ///   does not document which of the two fields holds BNB. Check a converted record before
-    ///   relying on its asset.
-    /// - [`principal`](CashFlowKind::MarginInterest::principal) is the loan the charge was on.
+    ///   in BNB: a `_CONVERTED` record's `asset` is BNB, so its flow does not name the asset
+    ///   borrowed. Binance names that asset in a separate `rawAsset` field, which this method does
+    ///   not read, and which Binance does not return on an isolated record.
+    /// - [`principal`](CashFlowKind::MarginInterest::principal) is the loan the charge was on. On a
+    ///   `_CONVERTED` record it can read 0, and Binance's documentation does not say when.
+    ///   Binance's support points to its borrow and repay history
+    ///   (`GET /sapi/v1/margin/borrow-repay`) for the loan. A converted record's flow does not
+    ///   carry the asset borrowed, so that history cannot be narrowed to it by asset from the flow
+    ///   alone.
     /// - [`rate`](CashFlowKind::MarginInterest::rate) is Binance's `interestRate`, a **daily** rate
     ///   even on an hourly charge: an hourly charge is about the rate divided by 24 of the
     ///   principal. Binance's API documentation does not state the unit; it is read off the rates
@@ -802,6 +807,41 @@ mod tests {
             panic!("margin interest: {flow:?}");
         };
         assert_eq!(*timing, Some(InterestTiming::OnBorrow));
+    }
+
+    /// A charge converted into BNB is in BNB, from `asset` rather than the `rawAsset` borrowed,
+    /// and its principal of 0 is read as served.
+    #[tokio::test]
+    async fn a_charge_converted_into_bnb_is_in_bnb() {
+        let server = MockServer::start().await;
+        let now = Utc::now();
+        let mut row = interest_row(1, now - TimeDelta::hours(1), None);
+        row["asset"] = json!("BNB");
+        row["principal"] = json!("0");
+        row["interest"] = json!("0.00002");
+        row["type"] = json!("PERIODIC_CONVERTED");
+        mount(&server, INTEREST_PATH, page(vec![row])).await;
+        let client = margin_client_at(&server, false);
+
+        let flows = client
+            .fetch_margin_interest(now - TimeDelta::days(1), now)
+            .await
+            .unwrap()
+            .flows;
+
+        let [flow] = flows.as_slice() else {
+            panic!("one flow: {flows:?}");
+        };
+        assert_eq!(flow.asset, AssetNameExchange::new("BNB"));
+        assert_eq!(flow.amount, dec!(-0.00002));
+        let CashFlowKind::MarginInterest {
+            principal, timing, ..
+        } = &flow.kind
+        else {
+            panic!("margin interest: {flow:?}");
+        };
+        assert_eq!(*principal, Some(Decimal::ZERO));
+        assert_eq!(*timing, Some(InterestTiming::Periodic));
     }
 
     #[tokio::test]
