@@ -629,6 +629,16 @@ mod tests {
         assert_eq!(clock.time(), max);
     }
 
+    /// `Debug` shows the instant held, as the clock's only state.
+    #[test]
+    fn historical_clock_debug_shows_its_instant() {
+        let clock = HistoricalClock::new(DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(
+            format!("{clock:?}"),
+            "HistoricalClock { time_exchange_last: 1970-01-01T00:00:00Z }"
+        );
+    }
+
     /// Clones share one instant: advancing either, by `advance_to` or by `process`, advances both.
     /// A clock built separately with the same seed does not.
     #[test]
