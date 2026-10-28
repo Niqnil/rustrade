@@ -139,10 +139,11 @@ pub(super) fn classify_notice(code: i32) -> Option<ConnectivityNotice> {
 /// Whether `execution` answers an executions request, rather than reporting a fill as it happens.
 ///
 /// TWS tags a live execution with request id `-1`. `ibapi` numbers its own requests upward from
-/// 1,500,000,000. `ibapi` also copies every execution it receives to the order update stream, including
-/// those answering [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades)
-/// and fill recovery, so the stream worker uses this to skip them. Otherwise each such call would
-/// replay every execution in its span onto the stream.
+/// 1,500,000,000. `ibapi` also copies every execution of this client's orders it receives to the
+/// order update stream, including those answering
+/// [`ExecutionClient::fetch_trades`](crate::client::ExecutionClient::fetch_trades) and fill
+/// recovery, so the stream worker uses this to skip them. Otherwise each such call would replay
+/// every execution of this client's orders in its span onto the stream.
 pub(super) fn is_replayed_execution(execution: &ExecutionData) -> bool {
     execution.request_id > 0
 }

@@ -265,7 +265,8 @@ pub(super) fn wire_order(
         OrderKind::Market
         | OrderKind::TrailingStop { .. }
         | OrderKind::TrailingStopLimit { .. }
-        | OrderKind::TrailingStopFixedLimit { .. } => Err(WireOrderError::UnsupportedKind),
+        | OrderKind::TrailingStopFixedLimit { .. }
+        | OrderKind::ConditionalUnresolved { .. } => Err(WireOrderError::UnsupportedKind),
     }
 }
 
@@ -608,6 +609,17 @@ mod tests {
                     offset: dec!(1),
                     offset_type: crate::order::TrailingOffsetType::Percentage,
                     activation_price: None,
+                },
+                Some(dec!(100)),
+                dec!(1)
+            ),
+            WireOrderError::UnsupportedKind
+        );
+        assert_eq!(
+            refused(
+                OrderKind::ConditionalUnresolved {
+                    family: crate::order::ConditionalFamily::StopLimit,
+                    trigger_price: Some(dec!(95)),
                 },
                 Some(dec!(100)),
                 dec!(1)

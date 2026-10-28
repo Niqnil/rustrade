@@ -186,6 +186,15 @@ impl OrderRules {
             } => (price, activation_price, true),
             // The venue prices it from its stop and offset: there is no price to read.
             OrderKind::TrailingStopLimit { .. } => (None, None, false),
+            // Never placed, but its prices are the venue's and so on its grids.
+            OrderKind::ConditionalUnresolved {
+                family,
+                trigger_price,
+            } => (
+                price.filter(|_| family.has_limit_price()),
+                trigger_price,
+                family.has_limit_price(),
+            ),
         };
 
         if let Some(price) = limit_price {
@@ -210,7 +219,7 @@ impl OrderRules {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::order::TrailingOffsetType;
+    use crate::order::{ConditionalFamily, TrailingOffsetType};
     use rust_decimal_macros::dec;
 
     type Error = OrderError<(), ()>;
@@ -540,6 +549,43 @@ mod tests {
             Err(bounds(OrderField::Notional, Bound::Min, dec!(5), dec!(1)))
         );
         assert_eq!(check(kind(None), Some(dec!(100)), dec!(1)), Ok(()));
+    }
+
+    /// An unresolved kind is checked as its family: a limit family's price and notional, and
+    /// any trigger. A stop family ignores a request price.
+    #[test]
+    fn an_unresolved_kind_is_checked_as_its_family() {
+        let kind = |family, trigger_price| OrderKind::ConditionalUnresolved {
+            family,
+            trigger_price,
+        };
+        let stop_limit = |trigger| kind(ConditionalFamily::StopLimit, trigger);
+        assert_eq!(
+            check(stop_limit(Some(dec!(100.001))), Some(dec!(100)), dec!(1)),
+            Err(off_grid(
+                OrderField::TriggerPrice,
+                dec!(100.001),
+                dec!(0.01)
+            ))
+        );
+        assert_eq!(
+            check(stop_limit(None), Some(dec!(100.001)), dec!(1)),
+            Err(off_grid(OrderField::Price, dec!(100.001), dec!(0.01)))
+        );
+        assert_eq!(
+            check(stop_limit(None), Some(dec!(1)), dec!(1)),
+            Err(bounds(OrderField::Notional, Bound::Min, dec!(5), dec!(1)))
+        );
+        assert_eq!(check(stop_limit(None), Some(dec!(100)), dec!(1)), Ok(()));
+        // A stop family carries no limit: an off-grid request price is not read, and no notional.
+        assert_eq!(
+            check(
+                kind(ConditionalFamily::Stop, Some(dec!(1))),
+                Some(dec!(1.001)),
+                dec!(1)
+            ),
+            Ok(())
+        );
     }
 
     #[test]

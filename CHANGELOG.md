@@ -7,6 +7,263 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-10-28
+
+### Added
+
+- **The simulated venue can lend at least an asset's minimum borrow** (`rustrade-execution`,
+  #749). `SpotMarginConfig::with_min_borrow(asset, min_borrow)` sets a per-asset minimum, read
+  back with `SpotMarginConfig::min_borrow`, and serialised as a `min_borrow` map of decimal
+  strings. A `MarginEffect::Borrow` order whose shortfall is below the minimum borrows the minimum,
+  as Binance raises a `MARGIN_BUY` loan to the asset's `userMinBorrow`. The part above the
+  shortfall stays free balance, owed. With `auto_repay_at_cancel` it is repaid with the rest of
+  the loan if the order ends before it fills in full, and it stays owed once the order fills. An
+  order whose minimum is more than the venue will lend is refused, and its reason names the
+  minimum (`Minimum Borrow: …`) beside what the venue would lend. No asset has a minimum by
+  default, so existing configurations lend as before.
+
+- **Margin debt changes are streamed as `AccountEventKind::MarginDebt`** (`rustrade-execution`,
+  `rustrade`, #755).
+  - **The event.** A `MarginDebtUpdate` carries:
+    - the asset;
+    - the isolated pair it belongs to, if any;
+    - the principal and interest owed after the change, both totals (`MarginDetails`);
+    - a `MarginDebtKind` (`Borrow`, `Repay`, `Interest`, `Other`) and the venue's own name for the
+      change;
+    - the venue's time.
+  - **`BinanceMargin`** forwards each asset a `liabilityChange` lists as one, instead of only
+    logging the change (see the v2 stream under Changed).
+    - Binance's principal and interest are the asset's totals after the change, as observed live
+      (its docs do not say).
+    - Binance has not been seen to send the event for an isolated pair, whose debt is therefore
+      read from `account_snapshot`. One that did arrive would name its pair.
+    - A change with no asset, or whose totals or time cannot be read, is dropped with a `warn`; the
+      next account snapshot restates the debt.
+  - **The engine** applies an update that names no instrument to the asset's `Balance::margin`,
+    so `net_asset` follows debt between account snapshots.
+    - Debt is ordered by its own time against earlier debt alone. A newer free/locked update does
+      not block it, and an older balance snapshot no longer overwrites it.
+    - An update for an asset with no balance yet opens one holding nothing, which the first
+      statement of its holdings replaces, whatever that statement's time.
+    - An update naming an isolated pair changes no engine state.
+  - **`SimulatedVenue`** on a spot-margin account follows each balance restatement whose loan
+    changed with the same event.
+
+- **`OrderKind::ConditionalUnresolved` and `BinanceMargin::recall_order_kinds`**
+  (`rustrade-execution`, `binance` feature for the method, #763).
+  - **The kind.** A conditional order a venue reports without saying whether its trigger is fixed
+    or trails. It carries a `ConditionalFamily` (`Stop`, `StopLimit`, `TakeProfit`,
+    `TakeProfitLimit`) and the trigger price the venue reports, the activation price of a trailing
+    order. It is only read back, never placed: every client refuses it with
+    `OrderError::UnsupportedOrderType`. `OrderKind` is `#[non_exhaustive]`, so code matching it
+    outside the crate keeps compiling.
+  - **The method.** `recall_order_kinds` takes `(ClientOrderId, OrderKind)` pairs, such as after a
+    restart, when the client has not seen its orders placed. A recalled kind is reported for its
+    order where Binance's report leaves the kind unresolved and the client has learned no resolved
+    kind itself. It is kept until the order is seen to end. The client persists nothing.
+
+- **`EngineState::free_base` reads the base an account holds outside its spot positions**
+  (`rustrade`, #764). For an asset on one exchange: the balance's `total`, less borrowed principal
+  and interest, less the signed net quantity of every spot instrument there whose base it is,
+  capped at `free`. A derivative's contracts are not taken out. It is signed, so a sell sized at a
+  long plus it sells no more than the account holds, and with a short open it reads negative by
+  the interest owed in base, so a buy sized at the short plus that also covers the interest. It
+  is `None` with no
+  balance for the asset. It
+  does not take out an open the venue has not acknowledged, and does not cover isolated margin,
+  whose balances the engine does not store. Its rustdoc says how a long-only account sweeps a
+  base-asset fee's remainder (see the `ReduceOnly` entry under Changed), with an example, and that
+  repaying debt is usually the better use while a cross-margin short of the asset is open.
+
+### Changed
+
+- **Breaking: a base-asset fee's sub-step remainder is held, not written off** (`rustrade`,
+  #764). A spot fill whose base-asset fee leaves the holding off the quantity step still rounds
+  the position toward zero to the step, but the remainder is no longer charged as part of the
+  fill's fee. PnL is charged the venue's fee alone, so a position's PnL agrees with the account at
+  the fill's price; what the remainder gains or loses afterwards is the account's.
+  - `TearSheet::dust` is now `dust_value`: the remainder valued at each fill's price, signed
+    (positive for base a long leaves out, negative for base a short still owes, which used to
+    count zero). `TearSheet::dust_quantity` sums it in base. A tear sheet serialised with `dust`
+    loads it as `dust_value`.
+  - A spot buy from flat that holds less than one step now charges `fees_unattributed` its fee
+    alone, and the rest it bought is dust.
+  - The instrument table's "Dust Written Off" row is replaced by "Dust Held" and "Dust Held
+    Value".
+
+- **Breaking: `RequestOpen::reduce_only` is a `ReduceOnly`, which can also say to trade free
+  base** (`rustrade-execution`, `rustrade`, #764). `No`, `Position` (the old `true`) or
+  `PositionAndFreeBase`. A serialised `true` or `false` still loads, as `Position` or `No`.
+  - **Venues.** Adapters send both reduce-only values the same intent or flag, through
+    `ReduceOnly::is_reduce_only`: Alpaca's close intents and Hyperliquid's `reduce_only`.
+  - **The engine** cuts a fill of either value so the position it reduces lands flat, as before.
+    For `PositionAndFreeBase` on a spot instrument, it reads the excess as free base the order was
+    sized to trade: a sell past a long, or from flat, sells it; a buy past a short, or from flat,
+    buys base the account owes, such as a short's interest. A fill that only grows the position,
+    a buy while long or a sell while short, is on the wrong side and stays a mistake. A free-base
+    fill is logged at INFO instead of WARN, and counted on the new
+    `TearSheet::fills_free_base_traded` and `free_base_traded` (summed on
+    `TradingSummary::fills_free_base_traded`, shown as "Free Base Traded") instead of
+    `fills_reduce_only_capped`. Its share of the fee still goes to `fees_unattributed`. On a
+    derivative the excess is a mistake, as for `Position`.
+  - `ReduceOnlyCapped` has new `reduce_only` and `trades_free_base` fields, and is emitted for a
+    free-base trade too: a handler that treats a cut as a fault checks `trades_free_base` first.
+  - `ReduceOnly` is `#[non_exhaustive]`; adapters read `is_reduce_only` rather than matching it.
+    Its `Deserialize` takes a flag only in a human-readable format; a binary one reads the
+    variant's index.
+  - `EngineState::replay_account` takes `(TradeId, ReduceOnly)` pairs, so the audit replica counts
+    each cut fill as the engine did. `Trade::holding_move` takes a `ReduceOnly`.
+  - `ReduceOnlyBook::register` takes a `ReduceOnly`, `BookedOrder::reduce_only` is one, and a
+    retired order keeps it. A book serialised with flags and bare retired venue ids still loads.
+
+- **Breaking: `AssetState` has a new `debt_time` field** (`rustrade`, #755). It holds when the debt
+  in `balance`'s `margin` was stated, so `AssetState::new` takes it as a fourth argument (`None`
+  for a fresh state).
+  - `AssetState::update_from_balance` now restates the holdings and the debt each as far as the
+    snapshot is newer. Before, a snapshot older than the held balance changed nothing.
+  - On a spot-margin `SimulatedVenue`, a restatement whose loan changed is now followed by an
+    `AccountEventKind::MarginDebt`, so a consumer that reads the venue's events by position sees
+    one more.
+
+- **Breaking: `BinanceMargin`'s account stream reads Binance's v2 margin user-data stream**
+  (`rustrade-execution`, `binance` feature, #759). Since 2026-10-14 Binance refuses the earlier
+  margin streams' credentials (`POST /sapi/v1/userListenToken` and `POST
+  /sapi/v1/margin/listen-key`) with `-3086` for new accounts and for accounts it has migrated,
+  which it is doing gradually.
+  - **One listen key, one stream.** `account_stream` gets a key from `POST
+    /sapi/v2/margin/listen-key`, keeps it alive as each connection opens and every 30 minutes
+    after, and reads
+    `wss://fstream.binance.com/private/ws`, sending the key in a subscribe frame rather than in
+    the URL. One key covers the cross account and every isolated pair, and each frame says which
+    it is about, so a client keeps only the frames of the account it is configured for. An
+    isolated client no longer opens one token and subscription per pair, and a cross client no
+    longer also reads the Risk Data Stream.
+  - **Event names.** Margin debt arrives as `liabilityChange` (was `USER_LIABILITY_CHANGE`) and
+    margin notices as `marginLevelChange` (was `MARGIN_LEVEL_STATUS_CHANGE`), still delivered as
+    `AccountEventKind::MarginDebt` and `AccountEventKind::Notice`.
+  - **Isolated notices name no instrument.** A `marginLevelChange` does not say which pair it is
+    about, so an isolated client delivers each with no instrument, logged at `warn`, whichever
+    isolated pair of the account it is about, one the client is not configured for included.
+    Before, it named the pair whose subscription carried it. A cross client does not receive an
+    isolated pair's notice.
+  - **Isolated debt is not streamed.** Binance has not been seen to send `liabilityChange` for an
+    isolated pair, so an isolated client gets no `AccountEventKind::MarginDebt`; its debt comes
+    from `account_snapshot`.
+  - **Frames that do not say which account they are about.** An `executionReport` without it is
+    kept by its symbol, with a one-time `warn`. A balance or debt frame without it is dropped
+    with a `warn`.
+  - **Key expiry.** When Binance says the key has expired (`listenKeyExpired`), the stream
+    reconnects with a new one, which spends a reconnect attempt. The planned reconnect before a
+    token's expiry is gone, and the key is not closed when the stream ends.
+  - **Heartbeat.** The client pings the stream at each heartbeat check, since Binance sends on it
+    only when the account changes, and the pong keeps a quiet connection alive.
+  - **An empty trailing delta.** The stream sends `"d": ""` on every order that does not trail.
+    It reads as no trailing delta, without a warning, so a stop or take-profit reported that way
+    is the fixed-trigger order it is.
+
+- **Binance margin's `-3116` refusal is `OrderError::UnsupportedOrderType`** (`rustrade-execution`,
+  `binance` feature, #760). Since 2026-10-14 Binance margin refuses `STOP_LOSS` and
+  `TAKE_PROFIT` orders "for this account", which hits a `BinanceMargin` `Stop`, `TakeProfit` and
+  `TrailingStop`. The refusal used to come back as `OrderError::Rejected`, like any other; it now
+  says the order type is the problem, as `-3111` already did, so a caller can place the limit form
+  (`StopLimit`, `TakeProfitLimit`, `TrailingStopFixedLimit`) instead. Both variants are
+  non-transient. The orders are still sent, so they go through again once Binance takes them.
+
+- **Breaking: the simulated venue's minimum borrow changes its config error and ledger types**
+  (`rustrade-execution`, #749).
+  - `SpotMarginConfigError` is no longer `Copy`, and gains `NegativeMinBorrow { asset,
+    min_borrow }`, returned by `with_min_borrow` and by deserialising a negative minimum.
+  - `AccountState::commit` takes the paying asset's minimum borrow after `borrowable`.
+  - `Committed` and `Reservation` have a new `excess_borrowed` field: what the minimum lent beyond
+    the shortfall, which is free rather than held. `Committed::borrowed` stays the whole loan;
+    `Committed::shortfall_borrowed` is the rest. `Reservation::loan` is what a cancel repays.
+  - `BalanceInsufficient` has a new `min_borrow` field: the minimum, when it is what the venue
+    would not lend.
+
+- **`ibapi` 5.1.0 → 5.2.0** (`rustrade-execution`, `rustrade-data`, `rustrade-instrument`, feature
+  `ibkr`). The bytes sent for every order are unchanged. Four changes reach the compiled code:
+  - Another API client's order frames no longer reach this client's order placement or the
+    account stream. Before, while an open-orders listing was read, another client's status for an
+    IB order id this client had also used could reach this client's placement and answer it with
+    that order's fill or cancel.
+  - An order this client is placing is now included when `fetch_open_orders` or `account_snapshot`
+    reads the open-orders listing at the same moment. Before, it could be missing from that listing.
+  - `account_snapshot` ends with `ConnectivityError::Timeout`, which is transient, when
+    TWS/Gateway does not answer its accounts request within 30 seconds. Before, it waited forever.
+  - `account_stream` no longer reports a live execution that IB tags with another API client's ID,
+    even one IB flags as a liquidation. IB is not known to send another client's executions live.
+    Fill recovery and `fetch_trades` still read such an execution.
+
+- **`binance-sdk` 76.0.0 → 77.0.0** (`rustrade-execution`, `binance` feature). The SDK's common
+  layer, which the margin user-data stream couples to, and its spot module are unchanged, so the
+  three internals hold as before. The margin module adds bindings for the v2 margin listen-key
+  endpoints, which the margin account stream now uses (see below). The bump itself changes no
+  behaviour.
+
+### Fixed
+
+- **`BinanceMargin` reports every live conditional order, and an isolated account's trailing
+  orders as trailing** (`rustrade-execution`, `binance` feature, #763). Binance's margin REST
+  order queries never say whether a `STOP_LOSS`, `STOP_LOSS_LIMIT`, `TAKE_PROFIT` or
+  `TAKE_PROFIT_LIMIT` order trails, and an isolated account's stream sends `"d": ""` for every
+  order, trailing or not.
+  - `fetch_open_orders` and `account_snapshot` used to leave such a live order out. They now list
+    it, so `account_snapshot` no longer reports those listings incomplete.
+  - An isolated account's stream used to report a trailing stop with an activation price as a
+    fixed `StopLimit` at that price, and to drop one without an activation price. It now reports
+    it with the kind it was placed with.
+  - Each now reports the kind the client knows the order by, from placing it (from the moment
+    the order is sent, so a stream report that arrives before the answer takes it too), from a
+    report that described it, or from `recall_order_kinds`, and otherwise
+    `OrderKind::ConditionalUnresolved`, with a sampled `warn`. An ended order the client does not
+    know, which `fetch_ended_orders` and the stream's reconnect check used to report with its fixed
+    trigger, or not at all without one, is reported unresolved too.
+  - A cross account's stream, whose order reports say they are not isolated, is unchanged: it
+    reports the trailing delta. An order report with an empty `d` that does not say which account
+    it is from is read as an isolated one is: its trailing delta unknown.
+
+- **`MarginEffect::Borrow` states how much Binance lends** (`rustrade-execution`, #749). Its
+  rustdoc said a `MARGIN_BUY` order borrows the shortfall, and only the shortfall. Binance lends
+  the shortfall or the asset's minimum borrow (`userMinBorrow`), whichever is more, so a small
+  order on an empty balance can borrow more than it pays. The `SpotMarginConfig` and
+  `BinanceMargin` rustdoc now say the same.
+
+- **A Binance order or cancel answer without a readable `transactTime` is logged** (#744).
+  `BinanceMargin::open_margin_order` (and so `open_order`), `BinanceSpot::open_order` and
+  `BinanceSpot::cancel_order` still read such an answer at the local time, but now log a `warn!`
+  instead of doing so silently, as an execution report or a queried order without a time already
+  is.
+
+- **A Binance balance update without a readable update time falls back to its event time, with a
+  warning** (`rustrade-execution`). `outboundAccountPosition` on `BinanceSpot` and `BinanceMargin`
+  (cross and isolated) was silently stamped with the local clock when its `u` was missing or
+  unreadable. It now uses the frame's event time `E`, and the local clock only when that is
+  unreadable too, logging a `warn!` either way.
+
+- **`BinanceMargin::cancel_order` reports Binance's cancel time** (#753). The cancel answer
+  carries `transactTime`, but binance-sdk's response type has no field for it, so every margin
+  cancel was stamped with the local receive time. The client now decodes the answer itself and
+  uses its `transactTime`. An answer without one is read at the local time with a `warn!`, as the
+  open paths do. The order id is accepted as a string, as Binance sends it in this answer, or as a
+  number.
+
+- **Binance execution reports for cancels, self-trade prevention and amends** (#751). These fixes
+  apply to `BinanceSpot` and `BinanceMargin`, whose account streams share one converter:
+  - A cancelled order's `OrderCancelled` now carries that order's client order id. A cancel report
+    holds the cancel request's own id in `c`, which is random when the request sent none, and the
+    order's id in `C`. Before, the event was keyed by the cancel request's id, so it did not reach
+    the order it ended.
+  - An order that self-trade prevention expires (`x=TRADE_PREVENTION`, order status
+    `EXPIRED_IN_MATCH`) is reported as `OrderCancelled`, as an `EXPIRED` order is. Before, the
+    report was ignored and the order stayed open in engine state. When prevention leaves the order
+    live with less to fill (the `DECREMENT` mode), or the report names a status not known to end
+    the order, a `warn!` is logged and no event is emitted.
+  - An amend (`x=REPLACED`) no longer goes unnoticed. The order is still live, but the amend
+    changes its quantity and, unless the amend named one, its client order id. This library sends
+    no amends and the engine cannot follow the new id, so a `warn!` is logged and no event is
+    emitted. The converter used to match `REPLACE`, which Binance never sends, and would have
+    removed the still-live order.
+
 ## [0.16.0] - 2026-10-26
 
 ### Added

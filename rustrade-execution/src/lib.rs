@@ -109,6 +109,8 @@ pub use margin::{
     InterestCharge, InterestDue, InterestSchedule, MarginEffect, MarginInterestModel,
     PeriodicMarginInterest, SpotMarginConfig, SpotMarginConfigError,
 };
+pub mod margin_debt;
+pub use margin_debt::{MarginDebtKind, MarginDebtUpdate};
 pub mod market;
 pub use market::{MarketBar, MarketDepth, MarketObservation, MarketSnapshot};
 pub mod notice;
@@ -239,7 +241,8 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// Sourced from an exchange WS user-data stream (e.g. Binance `outboundAccountPosition`). It
     /// carries **no** margin debt, so applying it updates `free`/`locked` while **preserving** any
     /// existing [`MarginDetails`](balance::MarginDetails) — debt cannot be silently clobbered by a
-    /// stream update. Debt totals remain as fresh as the last [`BalanceSnapshot`](Self::BalanceSnapshot).
+    /// stream update. Debt totals remain as fresh as the last [`BalanceSnapshot`](Self::BalanceSnapshot)
+    /// or [`MarginDebt`](Self::MarginDebt).
     BalanceStreamUpdate(Snapshot<AssetBalanceUpdate<AssetKey>>),
 
     /// Live per-instrument isolated-margin balance update (`free`/`locked` of one asset of a pair).
@@ -252,8 +255,8 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     ///
     /// The engine deliberately does **not** store this (the per-asset balance state is informational
     /// only and the engine never reads it for sizing/gating); a consumer reads it off the account
-    /// event feed. Debt totals stay as fresh as the last
-    /// [`BalanceSnapshot`](Self::BalanceSnapshot) per the debt-freshness contract.
+    /// event feed. A pair's debt arrives apart, as a [`MarginDebt`](Self::MarginDebt) naming the
+    /// pair, from a venue that streams it.
     InstrumentBalanceUpdate(InstrumentBalanceUpdate<AssetKey, InstrumentKey>),
 
     /// Single [`Order`] snapshot - used to upsert existing order state if it's more recent.
@@ -327,6 +330,17 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// about it is the consumer's policy. A notice sent while the stream was disconnected is not
     /// recovered. See [`AccountNotice`] for which venues send it.
     Notice(notice::AccountNotice<InstrumentKey>),
+
+    /// What a margin account owes in one asset changed: a borrow, a repay or an interest charge.
+    ///
+    /// Carries the principal and interest owed **after** the change, both totals, so applying one
+    /// replaces the debt held and applying it twice changes nothing. The engine applies an update
+    /// that names no instrument to the asset's [`Balance::margin`](balance::Balance::margin),
+    /// ordered by its time against earlier debt alone, and leaves `free`/`locked` as they are. An
+    /// update that names an isolated pair changes no engine state; a consumer reads it off the
+    /// account event feed. See [`MarginDebtUpdate`] for which venues
+    /// send it.
+    MarginDebt(margin_debt::MarginDebtUpdate<AssetKey, InstrumentKey>),
 }
 
 impl<ExchangeKey, AssetKey, InstrumentKey> AccountEvent<ExchangeKey, AssetKey, InstrumentKey>
@@ -455,7 +469,8 @@ pub struct IsolatedInstrumentState<AssetKey = AssetIndex> {
 /// These are **snapshot-only**: authoritative as of the last `account_snapshot` and refreshed on
 /// snapshot. Unlike balances, there is **no live-stream twin** — the WS `outboundAccountPosition`
 /// frame carries no margin-level / liquidation data. The live signal for risk crossing a threshold
-/// is the venue's `MARGIN_LEVEL_STATUS_CHANGE` event (surfaced observably, not accumulated here).
+/// is the venue's margin-level notice, such as Binance's `marginLevelChange` (surfaced as an
+/// [`AccountEventKind::Notice`], not accumulated here).
 #[derive(
     Debug,
     Copy,

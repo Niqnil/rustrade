@@ -18,7 +18,7 @@ use rustrade_instrument::{
     asset::name::AssetNameExchange, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
 };
 use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
+use std::{collections::BTreeMap, fmt::Debug};
 use thiserror::Error;
 
 /// What an order does to a margin account's loans: borrow what it lacks, repay from what it
@@ -47,8 +47,15 @@ pub enum MarginEffect {
     /// debt unless the caller asks.
     #[default]
     NoSideEffect,
-    /// Borrow what the order lacks, as Binance's `MARGIN_BUY` does: the shortfall, and only the
-    /// shortfall, of the asset it pays with (base for a sell, which opens or extends a short).
+    /// Borrow what the order lacks, as Binance's `MARGIN_BUY` does, in the asset it pays with
+    /// (base for a sell, which opens or extends a short).
+    ///
+    /// Binance lends the shortfall, or the asset's minimum borrow if that is more: **loan =
+    /// max(shortfall, minimum borrow)**, where the minimum is the asset's `userMinBorrow` in
+    /// `GET /sapi/v1/margin/allAssets`. A sell's shortfall is its quantity less the free base; a
+    /// limit buy's is its quantity times its limit price less the free quote. Nothing caps the
+    /// loan at the order's size, so a small order on an empty balance can borrow more than it
+    /// pays, and what it does not pay stays free balance, owed.
     ///
     /// The loan is taken when the order is placed, not when it fills, and nothing repays it from
     /// the order's proceeds: close it with a [`Repay`](Self::Repay) order. Whether a loan
@@ -56,8 +63,8 @@ pub enum MarginEffect {
     /// option.
     ///
     /// # Warning
-    /// A **mis-sized order takes on debt**: one larger than the free balance borrows the shortfall
-    /// without any further opt-in, and interest accrues on it.
+    /// A **mis-sized order takes on debt**: one larger than the free balance borrows the shortfall,
+    /// or the asset's minimum borrow, without any further opt-in, and interest accrues on it.
     Borrow,
     /// Repay the loan of the asset the order receives from what it receives, interest first, as
     /// Binance's `AUTO_REPAY` does. It borrows nothing: an order the free balance cannot pay for
@@ -112,18 +119,22 @@ pub struct MarginPlacement {
 /// # What it lends, and when
 /// Each spot order has a [`MarginEffect`]: its request's `margin_effect`, else this
 /// configuration's [`margin_effect`](Self::margin_effect). An order with [`MarginEffect::Borrow`]
-/// that the account cannot pay for with its free balance borrows the shortfall, and only the
-/// shortfall, of the asset it pays with: base for a sell, quote for a buy. It borrows when the
-/// venue accepts the order, as Binance does, so a resting limit order or a held market order is
-/// lent its shortfall at once, and the venue holds it against the order as it holds any other
-/// balance. An asset the account has never held is opened with the loan.
+/// that the account cannot pay for with its free balance borrows the shortfall of the asset it
+/// pays with (base for a sell, quote for a buy), or that asset's
+/// [`min_borrow`](Self::min_borrow) if it is more, as Binance does. It borrows when the venue
+/// accepts the order, as Binance does, so a resting limit order or a held market order is lent its
+/// shortfall at once, and the venue holds it against the order as it holds any other balance. What
+/// a minimum borrow lends beyond the shortfall is not held: it is free balance, owed. An asset the
+/// account has never held is opened with the loan.
 ///
 /// An order that is cancelled, expires or is refused at its fill before it fills repays what it
 /// borrowed, interest first, and a held market order that fills for less than was held repays the
 /// part of its loan it no longer needs, if [`auto_repay_at_cancel`](Self::auto_repay_at_cancel)
 /// is on (the default, as on Binance). One that fills in part and rests the remainder pays for the
 /// part that filled with the account's own balance first, so the loan is held against the
-/// remainder and repaid if the remainder is cancelled.
+/// remainder and repaid if the remainder is cancelled. What a minimum borrow lent beyond the
+/// shortfall is repaid with the rest if the order ends before it fills in full, and stays owed
+/// once it does.
 ///
 /// An order with [`MarginEffect::NoSideEffect`] or [`MarginEffect::Repay`] lends nothing: one it
 /// cannot pay for is rejected as on a cash account. A loan already in the venue's initial state
@@ -148,8 +159,9 @@ pub struct MarginPlacement {
 ///   lends nothing while it cannot value a debt, and never lends an asset it cannot value.
 ///
 /// An order that needs more than that is rejected as unaffordable, with a reason that says how
-/// much the venue would lend. A `max_leverage` of one lends nothing, but still reports each
-/// balance's loan.
+/// much the venue would lend. So is one whose asset's [`min_borrow`](Self::min_borrow) is more
+/// than that, since the venue never lends less than the minimum, and its reason names the minimum
+/// too. A `max_leverage` of one lends nothing, but still reports each balance's loan.
 ///
 /// # What it repays
 /// Under [`MarginEffect::Repay`], whatever a fill delivers into an asset the account owes repays
@@ -163,13 +175,16 @@ pub struct MarginPlacement {
 /// - **Liquidation.** An account whose debt grows past its equity keeps trading; nothing closes
 ///   its positions.
 /// - **Isolated margin.** One pool of balances backs every instrument.
-/// - **Per-asset borrow limits and the venue's lending pool.** Only the leverage limit applies.
+/// - **Per-asset borrow limits and the venue's lending pool.** Only the leverage limit, and each
+///   asset's minimum borrow, apply.
 /// - **Interest**, by this configuration alone. A venue given a [`MarginInterestModel`] charges
 ///   it; see that trait.
 ///
-/// [`new`](Self::new) refuses a `max_leverage` below one, and so does deserialising one, so a
-/// configuration that exists is one the venue can apply. Serialised, `max_leverage` is a decimal
-/// string (`"3"`), as the crate writes decimals elsewhere, so no precision is lost to a float.
+/// [`new`](Self::new) refuses a `max_leverage` below one, [`with_min_borrow`](Self::with_min_borrow)
+/// a negative minimum, and so does deserialising either, so a configuration that exists is one the
+/// venue can apply. Serialised, `max_leverage` and each minimum borrow are decimal strings (`"3"`),
+/// as the crate writes decimals elsewhere, so no precision is lost to a float. `min_borrow` is a
+/// map from asset to minimum, left out when empty.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(try_from = "SpotMarginRepr", into = "SpotMarginRepr")]
 pub struct SpotMarginConfig(SpotMarginRepr);
@@ -183,6 +198,8 @@ struct SpotMarginRepr {
     margin_effect: MarginEffect,
     #[serde(default = "default_auto_repay_at_cancel")]
     auto_repay_at_cancel: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    min_borrow: BTreeMap<AssetNameExchange, Decimal>,
 }
 
 /// Serde default for `auto_repay_at_cancel`, here and on `BinanceMarginConfig`: on, as Binance's
@@ -211,6 +228,7 @@ impl SpotMarginConfig {
             max_leverage,
             margin_effect,
             auto_repay_at_cancel: default_auto_repay_at_cancel(),
+            min_borrow: BTreeMap::new(),
         })
     }
 
@@ -247,15 +265,57 @@ impl SpotMarginConfig {
     pub fn auto_repay_at_cancel(&self) -> bool {
         self.0.auto_repay_at_cancel
     }
+
+    /// This configuration, never lending less than `min_borrow` of `asset`: a loan of `asset`
+    /// below it is raised to it, as Binance raises a `MARGIN_BUY` loan to the asset's
+    /// `userMinBorrow`. A minimum of zero removes it. Replaces any minimum `asset` had.
+    ///
+    /// No asset has one by default, so each loan is exactly its order's shortfall. An order its
+    /// free balance covers borrows nothing, whatever the minimum.
+    ///
+    /// # Errors
+    /// Returns [`SpotMarginConfigError::NegativeMinBorrow`] if `min_borrow` is negative.
+    pub fn with_min_borrow(
+        mut self,
+        asset: AssetNameExchange,
+        min_borrow: Decimal,
+    ) -> Result<Self, SpotMarginConfigError> {
+        self.0.min_borrow.insert(asset, min_borrow);
+        Self::try_from(self.0)
+    }
+
+    /// The least the venue lends of `asset` in one loan, zero if it has no minimum. See
+    /// [`with_min_borrow`](Self::with_min_borrow).
+    pub fn min_borrow(&self, asset: &AssetNameExchange) -> Decimal {
+        self.0
+            .min_borrow
+            .get(asset)
+            .copied()
+            .unwrap_or(Decimal::ZERO)
+    }
 }
 
 impl TryFrom<SpotMarginRepr> for SpotMarginConfig {
     type Error = SpotMarginConfigError;
 
-    fn try_from(repr: SpotMarginRepr) -> Result<Self, Self::Error> {
+    fn try_from(mut repr: SpotMarginRepr) -> Result<Self, Self::Error> {
         if repr.max_leverage < Decimal::ONE {
             return Err(SpotMarginConfigError::LeverageBelowOne(repr.max_leverage));
         }
+        if let Some((asset, min_borrow)) = repr
+            .min_borrow
+            .iter()
+            .find(|(_, min_borrow)| **min_borrow < Decimal::ZERO)
+        {
+            return Err(SpotMarginConfigError::NegativeMinBorrow {
+                asset: asset.clone(),
+                min_borrow: *min_borrow,
+            });
+        }
+        // A zero minimum is no minimum, so it is not kept: two configurations that lend alike
+        // compare equal.
+        repr.min_borrow
+            .retain(|_, min_borrow| !min_borrow.is_zero());
         Ok(Self(repr))
     }
 }
@@ -267,12 +327,21 @@ impl From<SpotMarginConfig> for SpotMarginRepr {
 }
 
 /// Why a [`SpotMarginConfig`] was refused.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum SpotMarginConfigError {
     /// A `max_leverage` below one, which would allow less than the account's own equity.
     #[error("spot margin max_leverage {0} is below 1; a leverage of 1 lends nothing")]
     LeverageBelowOne(Decimal),
+    /// A negative minimum borrow for `asset`.
+    #[error("spot margin min_borrow {min_borrow} of {asset} is negative")]
+    #[non_exhaustive]
+    NegativeMinBorrow {
+        /// The asset given the minimum.
+        asset: AssetNameExchange,
+        /// The minimum given, below zero.
+        min_borrow: Decimal,
+    },
 }
 
 /// Charges interest on a simulated margin loan: once when the loan is taken, and at boundaries in
@@ -535,6 +604,91 @@ mod tests {
         assert!(config.auto_repay_at_cancel());
         assert_eq!(config.max_leverage(), dec!(3));
         assert_eq!(config.valuation_asset(), &AssetNameExchange::new("usdt"));
+    }
+
+    #[test]
+    fn a_minimum_borrow_is_per_asset_and_zero_where_none_is_set() {
+        let config = SpotMarginConfig::new(
+            AssetNameExchange::new("usdt"),
+            dec!(3),
+            MarginEffect::Borrow,
+        )
+        .unwrap()
+        .with_min_borrow(AssetNameExchange::new("btc"), dec!(0.00006))
+        .unwrap();
+
+        assert_eq!(
+            config.min_borrow(&AssetNameExchange::new("btc")),
+            dec!(0.00006)
+        );
+        assert_eq!(
+            config.min_borrow(&AssetNameExchange::new("usdt")),
+            Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn a_negative_minimum_borrow_is_refused_by_the_builder_and_by_deserialising() {
+        let config = SpotMarginConfig::new(
+            AssetNameExchange::new("usdt"),
+            dec!(3),
+            MarginEffect::Borrow,
+        )
+        .unwrap();
+        assert_eq!(
+            config.with_min_borrow(AssetNameExchange::new("btc"), dec!(-0.1)),
+            Err(SpotMarginConfigError::NegativeMinBorrow {
+                asset: AssetNameExchange::new("btc"),
+                min_borrow: dec!(-0.1),
+            })
+        );
+
+        let json = r#"{"valuation_asset":"usdt","max_leverage":"3","margin_effect":"borrow","min_borrow":{"btc":"-0.1"}}"#;
+        assert!(serde_json::from_str::<SpotMarginConfig>(json).is_err());
+    }
+
+    #[test]
+    fn a_zero_minimum_borrow_removes_the_minimum() {
+        let plain = SpotMarginConfig::new(
+            AssetNameExchange::new("usdt"),
+            dec!(3),
+            MarginEffect::Borrow,
+        )
+        .unwrap();
+        let cleared = plain
+            .clone()
+            .with_min_borrow(AssetNameExchange::new("btc"), dec!(5))
+            .unwrap()
+            .with_min_borrow(AssetNameExchange::new("btc"), Decimal::ZERO)
+            .unwrap();
+
+        assert_eq!(cleared, plain);
+        assert_eq!(
+            cleared.min_borrow(&AssetNameExchange::new("btc")),
+            Decimal::ZERO
+        );
+    }
+
+    #[test]
+    fn a_minimum_borrow_round_trips_as_a_map_of_decimal_strings() {
+        let config = SpotMarginConfig::new(
+            AssetNameExchange::new("usdt"),
+            dec!(3),
+            MarginEffect::Borrow,
+        )
+        .unwrap()
+        .with_min_borrow(AssetNameExchange::new("btc"), dec!(0.00006))
+        .unwrap();
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(
+            json,
+            r#"{"valuation_asset":"usdt","max_leverage":"3","margin_effect":"borrow","auto_repay_at_cancel":true,"min_borrow":{"btc":"0.00006"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SpotMarginConfig>(&json).unwrap(),
+            config
+        );
     }
 
     #[test]

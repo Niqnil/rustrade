@@ -102,7 +102,7 @@ pub struct Balance {
     /// This differs from [`MarginDetails::interest`], which is interest owed on a loan of the
     /// asset and is paid out of a later repayment, not added to cash.
     ///
-    /// Like debt, it is only as fresh as the last
+    /// It is only as fresh as the last
     /// [`BalanceSnapshot`](crate::AccountEventKind::BalanceSnapshot) for the asset: a
     /// [`BalanceUpdate`] carries none, and [`Balance::apply_stream_update`] keeps the prior value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -158,11 +158,11 @@ impl Balance {
     ///
     /// # Freshness
     /// The returned value reflects debt only as fresh as the last
-    /// [`BalanceSnapshot`](crate::AccountEventKind::BalanceSnapshot) for this asset. WS partial
-    /// updates keep `free`/`locked` live but never carry debt, so a position **borrowed since the
-    /// last snapshot** reads as zero-debt (`net_asset == total`) until the next snapshot. Consumers
-    /// needing exact live debt should react to the venue's borrow/repay event by refreshing the
-    /// account snapshot.
+    /// [`BalanceSnapshot`](crate::AccountEventKind::BalanceSnapshot) or
+    /// [`MarginDebt`](crate::AccountEventKind::MarginDebt) for this asset. WS partial updates keep
+    /// `free`/`locked` live but never carry debt, so on a venue that streams no debt changes a
+    /// position **borrowed since the last snapshot** reads as zero-debt (`net_asset == total`)
+    /// until the next snapshot. Each venue client says whether it streams debt changes.
     pub fn net_asset(&self) -> Decimal {
         match self.margin {
             Some(margin) => self.total - margin.borrowed,
@@ -196,8 +196,9 @@ impl Balance {
 /// user-data streams (e.g. Binance `outboundAccountPosition`, which reports `a`/`f`/`l` only).
 ///
 /// Deliberately has **no** `margin` field: applying a `BalanceUpdate` therefore *structurally
-/// cannot* clobber known per-asset debt. Authoritative `borrowed`/`interest` totals arrive only via
-/// the REST [`BalanceSnapshot`](crate::AccountEventKind::BalanceSnapshot).
+/// cannot* clobber known per-asset debt. `borrowed`/`interest` totals arrive via the REST
+/// [`BalanceSnapshot`](crate::AccountEventKind::BalanceSnapshot), and from a venue that streams
+/// them, via [`MarginDebt`](crate::AccountEventKind::MarginDebt).
 #[derive(
     Debug,
     Copy,

@@ -124,6 +124,30 @@ impl SharedKnownLiveOrders {
         }
     }
 
+    /// Hold `kind` as the kind of the order `cid` while it is placed, so that a report of the
+    /// order that arrives before the answer to placing it is described by it: a venue may report
+    /// a new order on its account stream first. An unresolved kind is not held.
+    ///
+    /// Call it as the order's request is sent, and [`SendingKind::sent`] once the answer is read.
+    /// When the answer leaves the outcome unknown, or the guard is dropped before it is read, as
+    /// when the placing future is cancelled, the order may be live: its kind is then kept as
+    /// [recalled](KnownLiveOrders::recall) until the order is seen to end.
+    ///
+    /// A client order id is taken to name one placement at a time: a second placement under the
+    /// same id while the first is out replaces its kind, and the first one's answer releases it.
+    // Only Binance margin's reports cannot always describe an order's kind.
+    #[cfg_attr(not(feature = "binance"), allow(dead_code))]
+    pub(crate) fn sending(&self, cid: &ClientOrderId, kind: OrderKind) -> SendingKind {
+        let cid = (!kind.is_conditional_unresolved()).then(|| {
+            self.lock().sending(cid, kind);
+            cid.clone()
+        });
+        SendingKind {
+            known: self.clone(),
+            cid,
+        }
+    }
+
     /// How many handles share the set: a test's check that a dropped stream released its own.
     #[cfg(test)]
     pub(crate) fn holders(&self) -> usize {
@@ -194,6 +218,55 @@ impl Drop for ForgottenLog {
     }
 }
 
+/// The kind of an order being placed, held by [`SharedKnownLiveOrders::sending`] until the answer
+/// to placing it is read.
+#[must_use = "dropped at once, it treats the placement's outcome as unknown"]
+#[derive(Debug)]
+pub(crate) struct SendingKind {
+    known: SharedKnownLiveOrders,
+    /// The order's id, until the kind is released. `None` when no kind was held.
+    cid: Option<ClientOrderId>,
+}
+
+// Only Binance margin's reports cannot always describe an order's kind.
+#[cfg_attr(not(feature = "binance"), allow(dead_code))]
+impl SendingKind {
+    /// Release the kind once the answer to placing the order is read, as `state`. The answer
+    /// itself is recorded by [`KnownLiveOrders::placed`], before this. When it leaves the outcome
+    /// unknown, the kind is kept as recalled.
+    pub(crate) fn sent(mut self, state: &UnindexedOrderState) {
+        if let Some(cid) = self.cid.take() {
+            Self::release(&self.known, &cid, state.is_outcome_unknown());
+        }
+    }
+
+    fn release(known: &SharedKnownLiveOrders, cid: &ClientOrderId, outcome_unknown: bool) {
+        // The guard is dropped at the end of the statement, so the warning waits for no lock.
+        let (ignored, exchange) = {
+            let mut known = known.lock();
+            (known.sent(cid, outcome_unknown), known.exchange)
+        };
+        if ignored {
+            warn!(
+                %exchange,
+                %cid,
+                limit = MAX_KNOWN_LIVE_ORDERS,
+                "The kind of an order whose placement's outcome is unknown is past the limit of \
+                 recalled kinds and is not kept: a report that cannot describe the order will \
+                 leave its kind unresolved"
+            );
+        }
+    }
+}
+
+impl Drop for SendingKind {
+    fn drop(&mut self) {
+        if let Some(cid) = self.cid.take() {
+            Self::release(&self.known, &cid, true);
+        }
+    }
+}
+
 /// An order [`KnownLiveOrders`] forgot to make room, to log once its lock is released.
 #[derive(Debug)]
 struct Forgotten {
@@ -236,6 +309,13 @@ pub(crate) struct KnownLiveOrders {
     /// Every held order by when it was added, oldest first.
     by_age: BTreeMap<u64, ClientOrderId>,
     recently_ended: LruCache<ClientOrderId, ()>,
+    /// Kinds known for orders whose venue reports may not describe them, until each order is seen
+    /// to end (see [`recall`](Self::recall)): ones the caller supplied, and ones kept from a
+    /// placement whose outcome is unknown (see [`SharedKnownLiveOrders::sending`]).
+    recalled: FnvHashMap<ClientOrderId, OrderKind>,
+    /// The kinds of orders being placed, each from when its request is sent until its answer is
+    /// read (see [`SharedKnownLiveOrders::sending`]).
+    sending: FnvHashMap<ClientOrderId, OrderKind>,
     next_seq: u64,
     /// Whether the set is forgetting orders, so that it warns once per episode, not per order.
     forgetting: bool,
@@ -256,6 +336,8 @@ impl KnownLiveOrders {
             by_instrument: OrdersByInstrument::default(),
             by_age: BTreeMap::new(),
             recently_ended: LruCache::new(RECENTLY_ENDED),
+            recalled: FnvHashMap::default(),
+            sending: FnvHashMap::default(),
             next_seq: 0,
             forgetting: false,
             forgotten: Vec::new(),
@@ -287,6 +369,9 @@ impl KnownLiveOrders {
         let order_id = open.id.assigned();
         if let Some(known) = self.orders.get_mut(cid) {
             known.quantity = quantity;
+            if known.kind.is_conditional_unresolved() && !kind.is_conditional_unresolved() {
+                known.kind = kind;
+            }
             let moved = known.instrument != key.instrument;
             let new_id = order_id.filter(|id| known.order_id.as_ref() != Some(*id));
             // The common case, such as a partial fill: nothing to re-index. The entry under its
@@ -328,6 +413,10 @@ impl KnownLiveOrders {
             self.by_order_id
                 .insert((key.instrument.clone(), order_id.clone()), cid.clone());
         }
+        let kind = match self.supplied_kind(cid) {
+            Some(supplied) if kind.is_conditional_unresolved() => supplied,
+            _ => kind,
+        };
         self.orders.insert(
             cid.clone(),
             KnownLive {
@@ -338,6 +427,61 @@ impl KnownLiveOrders {
                 seq,
             },
         );
+    }
+
+    /// Record kinds known for orders whose venue reports may not describe them: kinds the caller
+    /// supplies, such as after a restart, when the client has not seen the orders placed, and the
+    /// kind of an order whose placement's outcome is unknown.
+    ///
+    /// A recalled kind is reported for an order only when the venue's report leaves its kind
+    /// unresolved and the client has not learned a resolved one itself, from placing the order or
+    /// from a report that described it. An entry is dropped once its order is seen to end, and one
+    /// for an order already seen to end is not kept. An unresolved kind recorded here is ignored,
+    /// since it says nothing, as is anything past [`MAX_KNOWN_LIVE_ORDERS`] entries. Returns how
+    /// many were ignored for that limit, for the caller to log once the lock is released.
+    // Only Binance margin's reports cannot always describe an order's kind.
+    #[cfg_attr(not(feature = "binance"), allow(dead_code))]
+    pub(crate) fn recall(
+        &mut self,
+        kinds: impl IntoIterator<Item = (ClientOrderId, OrderKind)>,
+    ) -> usize {
+        let mut ignored = 0usize;
+        for (cid, kind) in kinds {
+            if kind.is_conditional_unresolved() || self.recently_ended.contains(&cid) {
+                continue;
+            }
+            self.resolve_held(&cid, kind);
+            if self.recalled.len() >= MAX_KNOWN_LIVE_ORDERS && !self.recalled.contains_key(&cid) {
+                ignored += 1;
+                continue;
+            }
+            self.recalled.insert(cid, kind);
+        }
+        ignored
+    }
+
+    /// Give the order `cid`, if held with an unresolved kind, the resolved `kind`.
+    fn resolve_held(&mut self, cid: &ClientOrderId, kind: OrderKind) {
+        if let Some(known) = self.orders.get_mut(cid)
+            && known.kind.is_conditional_unresolved()
+        {
+            known.kind = kind;
+        }
+    }
+
+    /// Hold the resolved `kind` as that of the order `cid`, about to be sent.
+    fn sending(&mut self, cid: &ClientOrderId, kind: OrderKind) {
+        self.resolve_held(cid, kind);
+        self.sending.insert(cid.clone(), kind);
+    }
+
+    /// Release the kind held for the order `cid` while it was sent, keeping it as recalled when
+    /// the outcome is unknown. Returns whether that kind was ignored for the limit.
+    fn sent(&mut self, cid: &ClientOrderId, outcome_unknown: bool) -> bool {
+        match self.sending.remove(cid) {
+            Some(kind) if outcome_unknown => self.recall([(cid.clone(), kind)]) > 0,
+            _ => false,
+        }
     }
 
     /// Record what the response to placing the order under `key`, of `quantity` and `kind`, said:
@@ -380,6 +524,7 @@ impl KnownLiveOrders {
     /// Record that the order `cid` has ended. Returns whether it was held as live.
     pub(crate) fn ended(&mut self, cid: &ClientOrderId) -> bool {
         self.recently_ended.put(cid.clone(), ());
+        self.recalled.remove(cid);
         self.remove(cid)
     }
 
@@ -438,21 +583,38 @@ impl KnownLiveOrders {
         }
     }
 
-    /// The kind of the order `cid`, if it is held as live.
+    /// The kind the client knows the order `cid` by: the kind it is held as live with, or else
+    /// the kind it is being placed with (see [`SharedKnownLiveOrders::sending`]), or else one
+    /// [recalled](Self::recall) for it.
     ///
-    /// For a lookup whose venue answer cannot describe the order's kind, such as a Binance margin
-    /// conditional order, whose REST row does not say whether it trails: the order still ends
-    /// with the kind it was placed or reported with, rather than staying held.
+    /// For a report whose venue answer cannot describe the order's kind, such as a Binance margin
+    /// conditional order, whose REST row does not say whether it trails: the order is still
+    /// reported with the kind it was placed, reported or recalled with.
     ///
-    /// It is the kind first recorded for `cid`: a later report of the order as live does not
-    /// change it. That assumes a client order id names one order for as long as it is held: an id
-    /// reused for an order of another kind while held would keep the first kind. An id named
-    /// again once its order has ended (see [`placing`](Self::placing)) is recorded afresh, since
-    /// an order that ends is no longer held.
-    // Only Binance margin's lookups cannot always describe an order's kind.
+    /// It is the kind first recorded for `cid`, except that an
+    /// [unresolved](OrderKind::ConditionalUnresolved) kind is replaced by the first resolved one
+    /// learned: a later report of the order as live does not change it otherwise. That assumes a
+    /// client order id names one order for as long as it is held: an id reused for an order of
+    /// another kind while held would keep the first kind. An id named again once its order has
+    /// ended (see [`placing`](Self::placing)) is recorded afresh, since an order that ends is no
+    /// longer held.
+    // Only Binance margin's reports cannot always describe an order's kind.
     #[cfg_attr(not(feature = "binance"), allow(dead_code))]
     pub(crate) fn kind_of(&self, cid: &ClientOrderId) -> Option<OrderKind> {
-        self.orders.get(cid).map(|known| known.kind)
+        // A held order already has any kind supplied for it in place of an unresolved one:
+        // `sending` and `recall` upgrade it, and `live` takes the supplied kind on adding it.
+        self.orders
+            .get(cid)
+            .map(|known| known.kind)
+            .or_else(|| self.supplied_kind(cid))
+    }
+
+    /// The kind the order `cid` is being placed with, or else one recalled for it.
+    fn supplied_kind(&self, cid: &ClientOrderId) -> Option<OrderKind> {
+        self.sending
+            .get(cid)
+            .or_else(|| self.recalled.get(cid))
+            .copied()
     }
 
     /// Whether the order `cid` is held as live.
@@ -1219,7 +1381,7 @@ fn order_check_failed(
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)] // Test code: panics on bad input are acceptable
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         error::{ConnectivityError, OrderError},
@@ -1333,6 +1495,247 @@ mod tests {
 
         known.ended(&order.cid);
         assert_eq!(known.kind_of(&order.cid), None);
+    }
+
+    fn unresolved() -> OrderKind {
+        OrderKind::ConditionalUnresolved {
+            family: crate::order::ConditionalFamily::StopLimit,
+            trigger_price: Some(dec!(96)),
+        }
+    }
+
+    fn trailing_fixed_limit() -> OrderKind {
+        OrderKind::TrailingStopFixedLimit {
+            offset: dec!(25),
+            offset_type: crate::order::TrailingOffsetType::BasisPoints,
+            activation_price: Some(dec!(96)),
+        }
+    }
+
+    /// An order first learned with an unresolved kind takes the first resolved kind reported for
+    /// it, and a resolved kind is never replaced by an unresolved one.
+    #[test]
+    fn an_unresolved_kind_is_replaced_by_a_resolved_one_and_never_the_reverse() {
+        let mut known = KnownLiveOrders::new(ExchangeId::BinanceMargin);
+        let order = key("BTCUSDT", "stop");
+        known.live(&order, dec!(2), unresolved(), &open("7", Decimal::ZERO));
+        assert_eq!(known.kind_of(&order.cid), Some(unresolved()));
+
+        known.live(
+            &order,
+            dec!(2),
+            trailing_fixed_limit(),
+            &open("7", Decimal::ZERO),
+        );
+        assert_eq!(known.kind_of(&order.cid), Some(trailing_fixed_limit()));
+
+        known.live(&order, dec!(2), unresolved(), &open("7", dec!(1)));
+        assert_eq!(known.kind_of(&order.cid), Some(trailing_fixed_limit()));
+    }
+
+    /// A recalled kind is the order's known kind until the client learns a resolved one itself:
+    /// it stands in for an unresolved report, held or not, but not for a resolved one, and it is
+    /// dropped with the order's end.
+    #[test]
+    fn a_recalled_kind_stands_in_for_an_unresolved_one_until_the_order_ends() {
+        let mut known = KnownLiveOrders::new(ExchangeId::BinanceMargin);
+        let held = key("BTCUSDT", "held");
+        let new = key("BTCUSDT", "new");
+        let placed = key("BTCUSDT", "placed");
+        let fixed = OrderKind::StopLimit {
+            trigger_price: dec!(96),
+        };
+        known.live(&held, dec!(2), unresolved(), &open("1", Decimal::ZERO));
+        known.placed(
+            &placed,
+            dec!(2),
+            fixed,
+            &OrderState::active(open("3", Decimal::ZERO)),
+        );
+        known.recall([
+            (held.cid.clone(), trailing_fixed_limit()),
+            (new.cid.clone(), trailing_fixed_limit()),
+            (placed.cid.clone(), trailing_fixed_limit()),
+        ]);
+
+        // A held unresolved order takes it at once; one not yet seen has it before it is seen,
+        // and keeps it once seen unresolved.
+        assert_eq!(known.kind_of(&held.cid), Some(trailing_fixed_limit()));
+        assert_eq!(known.kind_of(&new.cid), Some(trailing_fixed_limit()));
+        known.live(&new, dec!(2), unresolved(), &open("2", Decimal::ZERO));
+        assert_eq!(known.kind_of(&new.cid), Some(trailing_fixed_limit()));
+        // The client's own resolved kind wins, whether learned before the recall or after.
+        assert_eq!(known.kind_of(&placed.cid), Some(fixed));
+        let placed_later = key("BTCUSDT", "placed later");
+        known.recall([(placed_later.cid.clone(), trailing_fixed_limit())]);
+        known.placed(
+            &placed_later,
+            dec!(2),
+            fixed,
+            &OrderState::active(open("4", Decimal::ZERO)),
+        );
+        assert_eq!(known.kind_of(&placed_later.cid), Some(fixed));
+
+        known.ended(&new.cid);
+        assert_eq!(known.kind_of(&new.cid), None);
+        assert!(!known.recalled.contains_key(&new.cid));
+    }
+
+    /// A recall is ignored for an order already seen to end and for an unresolved kind, and past
+    /// the limit.
+    #[test]
+    fn a_recall_ignores_ended_orders_unresolved_kinds_and_entries_past_the_limit() {
+        let mut known = KnownLiveOrders::new(ExchangeId::BinanceMargin);
+        let ended = ClientOrderId::new("ended");
+        known.ended(&ended);
+        let ignored = known.recall([
+            (ended.clone(), trailing_fixed_limit()),
+            (ClientOrderId::new("unresolved"), unresolved()),
+        ]);
+        assert!(known.recalled.is_empty());
+        assert_eq!(ignored, 0, "only what the limit leaves out is counted");
+
+        let ignored = known.recall((0..MAX_KNOWN_LIVE_ORDERS + 2).map(|n| {
+            (
+                ClientOrderId::new(format!("cid-{n}")),
+                trailing_fixed_limit(),
+            )
+        }));
+        assert_eq!(ignored, 2);
+        assert_eq!(known.recalled.len(), MAX_KNOWN_LIVE_ORDERS);
+        assert!(
+            !known
+                .recalled
+                .contains_key(&ClientOrderId::new(format!("cid-{MAX_KNOWN_LIVE_ORDERS}")))
+        );
+        // A kind already held is updated, at the limit too.
+        known.recall([(ClientOrderId::new("cid-0"), unresolved())]);
+        let fixed = OrderKind::StopLimit {
+            trigger_price: dec!(1),
+        };
+        assert_eq!(known.recall([(ClientOrderId::new("cid-0"), fixed)]), 0);
+        assert_eq!(known.kind_of(&ClientOrderId::new("cid-0")), Some(fixed));
+    }
+
+    /// The kind an order is being placed with describes a report of it that arrives before the
+    /// answer to placing it, and the order stays held with that kind once the answer is read.
+    #[test]
+    fn a_kind_being_placed_describes_a_report_that_arrives_before_the_answer() {
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceMargin);
+        let order = key("BTCUSDT", "racing");
+
+        let sending = known.sending(&order.cid, trailing_fixed_limit());
+        assert_eq!(
+            known.lock().kind_of(&order.cid),
+            Some(trailing_fixed_limit())
+        );
+        known
+            .lock()
+            .live(&order, dec!(2), unresolved(), &open("7", Decimal::ZERO));
+        assert_eq!(
+            known.lock().kind_of(&order.cid),
+            Some(trailing_fixed_limit())
+        );
+
+        let answer = OrderState::active(open("7", Decimal::ZERO));
+        known
+            .lock()
+            .placed(&order, dec!(2), trailing_fixed_limit(), &answer);
+        sending.sent(&answer);
+        let held = known.lock();
+        assert!(held.sending.is_empty() && held.recalled.is_empty());
+        assert_eq!(held.kind_of(&order.cid), Some(trailing_fixed_limit()));
+    }
+
+    /// An order already held with an unresolved kind, such as under an id placed again, takes the
+    /// kind it is being placed with.
+    #[test]
+    fn a_kind_being_placed_resolves_a_held_unresolved_one() {
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceMargin);
+        let order = key("BTCUSDT", "held");
+        known
+            .lock()
+            .live(&order, dec!(2), unresolved(), &open("7", Decimal::ZERO));
+
+        let sending = known.sending(&order.cid, trailing_fixed_limit());
+        assert_eq!(
+            known.lock().kind_of(&order.cid),
+            Some(trailing_fixed_limit())
+        );
+        sending.sent(&OrderState::active(open("7", Decimal::ZERO)));
+        assert_eq!(
+            known.lock().kind_of(&order.cid),
+            Some(trailing_fixed_limit())
+        );
+    }
+
+    /// Once the answer is read, the kind an order was placed with is kept only when the order may
+    /// be live: the outcome is unknown, or the guard was dropped unread. An unresolved kind is
+    /// never held.
+    #[test]
+    fn a_placed_kind_is_kept_after_the_answer_only_when_the_outcome_is_unknown() {
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceMargin);
+        let cid = |name: &str| ClientOrderId::new(name);
+
+        known
+            .sending(&cid("rejected"), trailing_fixed_limit())
+            .sent(&OrderState::inactive(OrderError::Rejected(
+                ApiError::OrderRejected("refused".to_string()),
+            )));
+        assert_eq!(known.lock().kind_of(&cid("rejected")), None);
+
+        known
+            .sending(&cid("unknown"), trailing_fixed_limit())
+            .sent(&OrderState::inactive(OrderError::Connectivity(
+                ConnectivityError::Timeout,
+            )));
+        assert_eq!(
+            known.lock().kind_of(&cid("unknown")),
+            Some(trailing_fixed_limit())
+        );
+        known.lock().ended(&cid("unknown"));
+        assert_eq!(known.lock().kind_of(&cid("unknown")), None);
+
+        drop(known.sending(&cid("cancelled"), trailing_fixed_limit()));
+        assert_eq!(
+            known.lock().kind_of(&cid("cancelled")),
+            Some(trailing_fixed_limit())
+        );
+
+        let sending = known.sending(&cid("unresolved"), unresolved());
+        assert_eq!(known.lock().kind_of(&cid("unresolved")), None);
+        drop(sending);
+        assert_eq!(known.lock().kind_of(&cid("unresolved")), None);
+        assert!(known.lock().sending.is_empty());
+    }
+
+    /// A kind kept for an unknown outcome past the limit of recalled kinds is warned of, once the
+    /// lock is released.
+    #[test]
+    fn a_placed_kind_past_the_limit_is_warned_of_with_the_lock_released() {
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceMargin);
+        known.lock().recall((0..MAX_KNOWN_LIVE_ORDERS).map(|n| {
+            (
+                ClientOrderId::new(format!("cid-{n}")),
+                trailing_fixed_limit(),
+            )
+        }));
+        let past = ClientOrderId::new("past");
+
+        let seen = logged_with_lock_free(&known, || {
+            drop(known.sending(&past, trailing_fixed_limit()));
+        });
+        assert_eq!(seen, vec![(tracing::Level::WARN, true)]);
+        assert_eq!(known.lock().kind_of(&past), None);
+
+        let seen = logged_with_lock_free(&known, || {
+            known
+                .sending(&ClientOrderId::new("cid-0"), trailing_fixed_limit())
+                .sent(&OrderState::inactive(OrderError::Connectivity(
+                    ConnectivityError::Timeout,
+                )));
+        });
+        assert_eq!(seen, vec![], "a kind already recalled is within the limit");
     }
 
     /// An id whose order ended is not held again by a late report of it as live, but a new order
@@ -1574,7 +1977,7 @@ mod tests {
 
     /// Run `f`, returning the level of every event it logged on this thread and whether `known`'s
     /// lock was free when it was logged.
-    fn logged_with_lock_free(
+    pub(crate) fn logged_with_lock_free(
         known: &SharedKnownLiveOrders,
         f: impl FnOnce(),
     ) -> Vec<(tracing::Level, bool)> {

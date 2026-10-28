@@ -43,11 +43,12 @@ use super::shared::{
     HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal, MyTradesFrom, ORDER_EXECUTIONS_BUDGET,
     OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
-    UnsubscribeOnDrop, UserDataFrame, WeightPool, binance_filled_qty, classify_order_kind_tif,
-    classify_rest_query_error, classify_ws_order_error, convert_ended_order,
-    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
-    dedup_key_from_event, disconnect_error, drop_after, frame_excerpt, gap_failed, gap_time,
-    is_duplicate, is_unknown_order, log_unhandled_event, log_unrecognised_frame, new_dedup_cache,
+    UnsubscribeOnDrop, UserDataFrame, WeightPool, account_position_time, answer_time,
+    binance_filled_qty, classify_order_kind_tif, classify_rest_query_error,
+    classify_ws_order_error, convert_ended_order, convert_execution_report,
+    convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
+    disconnect_error, drop_after, frame_excerpt, gap_failed, gap_time, is_duplicate,
+    is_unknown_order, log_unhandled_event, log_unrecognised_frame, new_dedup_cache,
     parse_user_data_frame, placed_order_state, recovered_order_cids, recovered_order_totals,
     response_decode_error, rest_call_with_retry, retry_or_end, trailing_params, unix_ms,
     unreadable_answer,
@@ -366,6 +367,10 @@ impl WsApiUnavailable {
 /// [reconnect budget](super#account-stream-reconnection) as any failure does; a 418, an IP ban,
 /// starts Binance's shortest ban, 2 minutes, and so ends the stream.
 ///
+/// # Order and cancel times
+/// The time of a placed or cancelled order is the `transactTime` of Binance's answer. An answer
+/// without a readable one is still read, at the local time, and logged with a `warn!`.
+///
 /// # Fills of other clients' orders
 /// The account stream, fill recovery and `fetch_trades` report every fill on the account, whoever
 /// placed the order, and Binance does not say who did. A consumer that also trades the account
@@ -592,7 +597,11 @@ async fn fetch_open_orders_for_instrument(
 
     let orders_data = response.data().await.map_err(response_decode_error)?;
 
-    let listing = convert_open_order_listing(&orders_data, ExchangeId::BinanceSpot, &instrument);
+    // Spot rows report every order's trailingDelta, so none is left unresolved.
+    let listing =
+        convert_open_order_listing(&orders_data, ExchangeId::BinanceSpot, &instrument, &|_| {
+            None
+        });
 
     Ok((instrument, listing))
 }
@@ -618,7 +627,8 @@ async fn fetch_all_open_orders(
 
     let orders = orders_data
         .into_iter()
-        .filter_map(|o| convert_open_order_owned_symbol(&o, ExchangeId::BinanceSpot))
+        // Spot rows report every order's trailingDelta, so none is left unresolved.
+        .filter_map(|o| convert_open_order_owned_symbol(&o, ExchangeId::BinanceSpot, &|_| None))
         .collect();
 
     Ok(orders)
@@ -1195,10 +1205,12 @@ impl ExecutionClient for BinanceSpot {
         match result {
             Ok(response) => match response.data() {
                 Ok(data) => {
-                    let time_exchange = data
-                        .transact_time
-                        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-                        .unwrap_or_else(Utc::now);
+                    let time_exchange = answer_time(
+                        ExchangeId::BinanceSpot,
+                        &instrument,
+                        "cancel_order",
+                        data.transact_time,
+                    );
 
                     let exchange_order_id = match data.order_id {
                         Some(id) => OrderId(format_smolstr!("{id}")),
@@ -1403,12 +1415,13 @@ impl ExecutionClient for BinanceSpot {
             | OrderKind::TakeProfitLimit { trigger_price } => {
                 params_builder = params_builder.price(price).stop_price(trigger_price);
             }
-            // Trailing orders are set above. Market sends no price, and TrailingStopLimit is
-            // rejected by convert_order_kind_tif before this.
+            // Trailing orders are set above. Market sends no price, and TrailingStopLimit and
+            // ConditionalUnresolved are rejected by convert_order_kind_tif before this.
             OrderKind::TrailingStop { .. }
             | OrderKind::TrailingStopFixedLimit { .. }
             | OrderKind::Market
-            | OrderKind::TrailingStopLimit { .. } => {}
+            | OrderKind::TrailingStopLimit { .. }
+            | OrderKind::ConditionalUnresolved { .. } => {}
         }
 
         if let Some(tif) = binance_tif {
@@ -1443,10 +1456,12 @@ impl ExecutionClient for BinanceSpot {
         match result {
             Ok(response) => match response.data() {
                 Ok(data) => {
-                    let time_exchange = data
-                        .transact_time
-                        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-                        .unwrap_or_else(Utc::now);
+                    let time_exchange = answer_time(
+                        ExchangeId::BinanceSpot,
+                        &instrument,
+                        "open_order",
+                        data.transact_time,
+                    );
 
                     let exchange_order_id = match data.order_id {
                         Some(id) => OrderId(format_smolstr!("{id}")),
@@ -1841,7 +1856,7 @@ async fn connection_manager(
         // subscription; that task processes events sequentially from an internal channel,
         // so FnMut callbacks are never invoked concurrently per subscription. If the SDK
         // changes to concurrent callbacks, these `Option::take()` calls would need a Mutex.
-        // verified against binance-sdk =50.0.0. Re-verify on SDK upgrade.
+        // verified against binance-sdk =77.0.0. Re-verify on SDK upgrade.
         let subscription = ws.subscribe_on_ws_events(move |event| {
             let Some(ref sender) = event_tx else { return };
             match event {
@@ -2037,10 +2052,12 @@ async fn connection_manager(
         // --- Cleanup current connection ---
         // must explicitly unsubscribe — Subscription::drop only detaches the
         // internal JoinHandle, it doesn't abort it.
-        // assumption (verified against binance-sdk =50.0.0): unsubscribe() stops
-        // the callback task before returning, so no further invocations of the FnMut
-        // callback occur after this point. The old `heartbeat_flag` Arc is therefore
-        // safe to drop here. Re-verify on SDK upgrade if the callback invocation model changes.
+        // unsubscribe() aborts the callback task without waiting for it (verified against
+        // binance-sdk =77.0.0): a callback already running finishes, and none starts once the
+        // task sees the abort. That is benign: the callback holds its own clone of the
+        // `heartbeat_flag` Arc, so dropping ours here is safe, and an event it still forwards
+        // reaches the consumer through the dedup cache like any other from this connection.
+        // Re-verify on SDK upgrade if the callback invocation model changes.
         subscription.unsubscribe();
         // binance-sdk WebsocketApi has no Drop impl that closes the TCP connection. Disconnect
         // explicitly to report the result; the guard's drop is the fallback.
@@ -2522,12 +2539,10 @@ fn convert_account_position(
     position: binance_sdk::spot::websocket_api::OutboundAccountPosition,
     buf: &mut Vec<UnindexedAccountEvent>,
 ) {
-    // Use field `u` (last account update time) rather than `E` (event time)
-    // for more accurate balance timestamps
-    let time_exchange = position
-        .u
-        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-        .unwrap_or_else(Utc::now);
+    // `u` (last account update time) rather than `E` (event time), for more accurate balance
+    // timestamps.
+    let time_exchange =
+        account_position_time(ExchangeId::BinanceSpot, position.u, position.e_uppercase);
 
     for b in position.b_uppercase.unwrap_or_default() {
         let asset = match b.a {
@@ -3603,17 +3618,29 @@ mod tests {
         }
     }
 
+    /// A position is at its update time `u`, or at its event time `E` when it has no `u`.
     #[test]
-    fn test_convert_account_position_u_field_none_uses_now() {
-        // When `u` is None the function falls back to Utc::now() — just verify it doesn't panic
-        let position = binance_sdk::spot::websocket_api::OutboundAccountPosition {
-            u: None,
-            b_uppercase: Some(vec![make_balance_inner("ETH", "2.0", "0.0")]),
-            ..Default::default()
+    fn test_convert_account_position_is_at_u_else_at_e() {
+        let time_of = |u, e| {
+            let position = binance_sdk::spot::websocket_api::OutboundAccountPosition {
+                u,
+                e_uppercase: e,
+                b_uppercase: Some(vec![make_balance_inner("ETH", "2.0", "0.0")]),
+                ..Default::default()
+            };
+            let mut buf = Vec::new();
+            convert_account_position(position, &mut buf);
+            match &buf[..] {
+                [event] => match &event.kind {
+                    AccountEventKind::BalanceStreamUpdate(snap) => snap.0.time_exchange,
+                    other => panic!("expected BalanceStreamUpdate, got {other:?}"),
+                },
+                other => panic!("expected one event, got {other:?}"),
+            }
         };
-        let mut buf = Vec::new();
-        convert_account_position(position, &mut buf);
-        assert_eq!(buf.len(), 1);
+        let at = |ms| Utc.timestamp_millis_opt(ms).unwrap();
+        assert_eq!(time_of(Some(2_000), Some(3_000)), at(2_000));
+        assert_eq!(time_of(None, Some(3_000)), at(3_000));
     }
 
     #[test]
@@ -4034,6 +4061,49 @@ mod tests {
         );
     }
 
+    /// A cancel report's `c` is the cancel request's id, so the cancel is keyed by the order's own
+    /// id in `C`, and by `c` only when `C` is empty or absent.
+    #[test]
+    fn a_cancel_report_is_keyed_by_the_cancelled_orders_id() {
+        let cancelled_cid = |orig: Option<&str>| {
+            let report = ExecutionReport {
+                execution_type: Some("CANCELED".to_string()),
+                client_order_id: Some("cancel-request".to_string()),
+                orig_client_order_id: orig.map(str::to_string),
+                ..make_base_report()
+            };
+            let event = sole_event(convert(report)).expect("CANCELED should produce Some");
+            let AccountEventKind::OrderCancelled(response) = event.kind else {
+                panic!("expected OrderCancelled, got {:?}", event.kind);
+            };
+            response.key.cid
+        };
+
+        assert_eq!(
+            cancelled_cid(Some("client-1")),
+            ClientOrderId::new("client-1")
+        );
+        assert_eq!(
+            cancelled_cid(Some("")),
+            ClientOrderId::new("cancel-request")
+        );
+        assert_eq!(cancelled_cid(None), ClientOrderId::new("cancel-request"));
+    }
+
+    /// Only a cancel report names the order in `C`: every other report names it in `c`, an amend
+    /// by the id the amend gave it.
+    #[test]
+    fn only_a_cancel_report_reads_the_orders_id_from_c_upper() {
+        for exec_type in ["NEW", "TRADE", "EXPIRED", "TRADE_PREVENTION", "REPLACED"] {
+            let report = ExecutionReport {
+                execution_type: Some(exec_type.to_string()),
+                orig_client_order_id: Some("client-0".to_string()),
+                ..make_base_report()
+            };
+            assert_eq!(report.order_client_id(), Some("client-1"), "{exec_type}");
+        }
+    }
+
     /// A cancel report carries what filled (`z`), and an unknown one stays unknown, not zero.
     #[test]
     fn a_cancel_report_carries_its_fill_or_none() {
@@ -4072,17 +4142,47 @@ mod tests {
         );
     }
 
+    /// Self-trade prevention that ends an order removes it; one that leaves it live (the
+    /// `DECREMENT` mode), or names no status or an unknown one, produces nothing.
     #[test]
-    fn test_convert_execution_report_expired_in_match() {
+    fn a_trade_prevention_report_removes_the_order_only_once_it_has_ended() {
+        let prevented = |status: Option<&str>| {
+            convert(ExecutionReport {
+                execution_type: Some("TRADE_PREVENTION".to_string()),
+                order_status: status.map(str::to_string),
+                ..make_base_report()
+            })
+        };
+
+        for ended in ["EXPIRED_IN_MATCH", "EXPIRED", "FILLED"] {
+            let event = sole_event(prevented(Some(ended))).expect(ended);
+            let AccountEventKind::OrderCancelled(response) = event.kind else {
+                panic!("{ended}: expected OrderCancelled, got {:?}", event.kind);
+            };
+            assert_eq!(response.key.cid, ClientOrderId::new("client-1"), "{ended}");
+            let Ok(cancelled) = response.state else {
+                panic!("{ended}: expected Ok, got {:?}", response.state);
+            };
+            assert_eq!(cancelled.id, OrderId::new("12345"), "{ended}");
+        }
+        for not_ended in [
+            Some("NEW"),
+            Some("PARTIALLY_FILLED"),
+            Some("SOME_FUTURE_STATUS"),
+            None,
+        ] {
+            assert!(prevented(not_ended).is_empty(), "{not_ended:?}");
+        }
+    }
+
+    /// `EXPIRED_IN_MATCH` is an order status, never an execution type.
+    #[test]
+    fn expired_in_match_as_an_execution_type_produces_nothing() {
         let report = ExecutionReport {
             execution_type: Some("EXPIRED_IN_MATCH".to_string()),
             ..make_base_report()
         };
-        let event = sole_event(convert(report)).expect("EXPIRED_IN_MATCH should produce Some");
-        assert!(
-            matches!(event.kind, AccountEventKind::OrderCancelled(ref r) if r.state.is_ok()),
-            "EXPIRED_IN_MATCH should yield OrderCancelled with Ok state"
-        );
+        assert!(convert(report).is_empty());
     }
 
     #[test]
@@ -4186,19 +4286,18 @@ mod tests {
         );
     }
 
+    /// An amended order is still live, so an amend report must not retire it.
     #[test]
-    fn test_convert_execution_report_replace_yields_cancelled() {
-        let report = ExecutionReport {
-            execution_type: Some("REPLACE".to_string()),
-            ..make_base_report()
-        };
-        // REPLACE describes the cancelled original order (field `i` = original order ID).
-        // The replacement order arrives as a subsequent NEW execution report.
-        let event = sole_event(convert(report)).expect("REPLACE should produce Some");
-        assert!(
-            matches!(event.kind, AccountEventKind::OrderCancelled(ref r) if r.state.is_ok()),
-            "REPLACE should yield OrderCancelled with Ok state"
-        );
+    fn an_amend_report_produces_nothing() {
+        for exec_type in ["REPLACED", "REPLACE"] {
+            let report = ExecutionReport {
+                execution_type: Some(exec_type.to_string()),
+                order_status: Some("NEW".to_string()),
+                orig_client_order_id: Some("client-0".to_string()),
+                ..make_base_report()
+            };
+            assert!(convert(report).is_empty(), "{exec_type}");
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -4458,12 +4557,14 @@ mod tests {
             status: Some("NEW".to_string()),
             ..Default::default()
         };
-        let from_all_orders = convert_open_order(&all_orders, ExchangeId::BinanceSpot, &instrument)
-            .expect("valid order should convert");
+        let from_all_orders =
+            convert_open_order(&all_orders, ExchangeId::BinanceSpot, &instrument, &|_| None)
+                .expect("valid order should convert");
         let from_open_orders = convert_open_order(
             &make_base_open_order(),
             ExchangeId::BinanceSpot,
             &instrument,
+            &|_| None,
         )
         .expect("valid order should convert");
         assert_eq!(from_all_orders, from_open_orders);
@@ -4500,7 +4601,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                convert_open_order(&row, ExchangeId::BinanceSpot, &instrument),
+                convert_open_order(&row, ExchangeId::BinanceSpot, &instrument, &|_| None),
                 None,
                 "{status}"
             );
@@ -4516,7 +4617,7 @@ mod tests {
                 ..make_base_open_order()
             };
             assert!(
-                convert_open_order(&o, ExchangeId::BinanceSpot, &instrument).is_some(),
+                convert_open_order(&o, ExchangeId::BinanceSpot, &instrument, &|_| None).is_some(),
                 "{status}"
             );
         }
@@ -4539,13 +4640,14 @@ mod tests {
             &[make_base_open_order(), second()],
             ExchangeId::BinanceSpot,
             &instrument,
+            &|_| None,
         );
         assert_eq!(listing.orders.len(), 2);
         assert!(listing.complete);
 
         let empty = convert_open_order_listing::<
             binance_sdk::spot::rest_api::GetOpenOrdersResponseInner,
-        >(&[], ExchangeId::BinanceSpot, &instrument);
+        >(&[], ExchangeId::BinanceSpot, &instrument, &|_| None);
         assert!(empty.orders.is_empty());
         assert!(empty.complete, "no open orders is a complete answer");
 
@@ -4557,6 +4659,7 @@ mod tests {
             &[make_base_open_order(), dropped],
             ExchangeId::BinanceSpot,
             &instrument,
+            &|_| None,
         );
         assert_eq!(listing.orders.len(), 1);
         assert!(!listing.complete, "a dropped row may be a live order");
@@ -4569,6 +4672,7 @@ mod tests {
             &[make_base_open_order(), without_cid],
             ExchangeId::BinanceSpot,
             &instrument,
+            &|_| None,
         );
         assert_eq!(listing.orders.len(), 2, "the row is still converted");
         assert!(
@@ -4584,7 +4688,7 @@ mod tests {
             status: None,
             ..make_base_open_order()
         };
-        assert!(convert_open_order(&o, ExchangeId::BinanceSpot, &instrument).is_none());
+        assert!(convert_open_order(&o, ExchangeId::BinanceSpot, &instrument, &|_| None).is_none());
     }
 
     /// A REST order snapshot is stamped with when the order last changed, not when it was created.
@@ -4600,7 +4704,7 @@ mod tests {
             update_time: Some(1_700_000_005_000),
             ..make_base_open_order()
         };
-        let order = convert_open_order(&updated, ExchangeId::BinanceSpot, &instrument)
+        let order = convert_open_order(&updated, ExchangeId::BinanceSpot, &instrument, &|_| None)
             .expect("valid order should convert");
         assert_eq!(
             order.state.time_exchange,
@@ -4616,6 +4720,7 @@ mod tests {
             &make_base_open_order(),
             ExchangeId::BinanceSpot,
             &instrument,
+            &|_| None,
         )
         .expect("valid order should convert");
         assert_eq!(
@@ -4634,6 +4739,7 @@ mod tests {
             &make_base_open_order(),
             ExchangeId::BinanceSpot,
             &instrument,
+            &|_| None,
         )
         .expect("valid order should convert");
         assert_eq!(order.key.instrument, instrument);
@@ -4651,7 +4757,7 @@ mod tests {
             symbol: Some("ETHUSDT".to_string()),
             ..make_base_open_order()
         };
-        let order = convert_open_order_owned_symbol(&o, ExchangeId::BinanceSpot)
+        let order = convert_open_order_owned_symbol(&o, ExchangeId::BinanceSpot, &|_| None)
             .expect("valid order should convert");
         assert_eq!(order.key.instrument.name().as_str(), "ETHUSDT");
         assert_eq!(order.side, Side::Buy);
@@ -4662,7 +4768,7 @@ mod tests {
         // make_base_open_order() leaves `symbol` unset — drop rather than guess the instrument.
         let o = make_base_open_order();
         assert!(o.symbol.is_none());
-        assert!(convert_open_order_owned_symbol(&o, ExchangeId::BinanceSpot).is_none());
+        assert!(convert_open_order_owned_symbol(&o, ExchangeId::BinanceSpot, &|_| None).is_none());
     }
 
     #[test]
@@ -4673,7 +4779,7 @@ mod tests {
             ..make_base_open_order()
         };
         assert!(
-            convert_open_order(&o, ExchangeId::BinanceSpot, &instrument).is_none(),
+            convert_open_order(&o, ExchangeId::BinanceSpot, &instrument, &|_| None).is_none(),
             "missing orderId should return None"
         );
     }
@@ -4686,7 +4792,7 @@ mod tests {
             ..make_base_open_order()
         };
         assert!(
-            convert_open_order(&o, ExchangeId::BinanceSpot, &instrument).is_none(),
+            convert_open_order(&o, ExchangeId::BinanceSpot, &instrument, &|_| None).is_none(),
             "missing side should return None"
         );
     }
@@ -4699,7 +4805,7 @@ mod tests {
             ..make_base_open_order()
         };
         assert!(
-            convert_open_order(&o, ExchangeId::BinanceSpot, &instrument).is_none(),
+            convert_open_order(&o, ExchangeId::BinanceSpot, &instrument, &|_| None).is_none(),
             "missing type should return None"
         );
     }
@@ -4711,7 +4817,7 @@ mod tests {
             executed_qty: None,
             ..make_base_open_order()
         };
-        let order = convert_open_order(&o, ExchangeId::BinanceSpot, &instrument)
+        let order = convert_open_order(&o, ExchangeId::BinanceSpot, &instrument, &|_| None)
             .expect("None executedQty should still convert");
         assert_eq!(
             order.state.filled_quantity,
@@ -4727,7 +4833,7 @@ mod tests {
             executed_qty: Some("bad-value".to_string()),
             ..make_base_open_order()
         };
-        let order = convert_open_order(&o, ExchangeId::BinanceSpot, &instrument)
+        let order = convert_open_order(&o, ExchangeId::BinanceSpot, &instrument, &|_| None)
             .expect("unparseable executedQty should still convert");
         assert_eq!(
             order.state.filled_quantity,

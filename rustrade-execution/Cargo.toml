@@ -1,6 +1,6 @@
 [package]
 name = "rustrade-execution"
-version = "0.16.0"
+version = "0.17.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -31,9 +31,9 @@ binance = [
     "dep:serde_json",
     "serde_json/raw_value", # RawValue borrow for zero-copy WS user-data frame parsing
     "dep:anyhow",
-    # Only to name `reqwest::Method` for the hand-rolled userListenToken POST, which reuses the
-    # SDK's `common::utils::send_request` (and its own reqwest client). No new crate enters the
-    # graph — reqwest is already a workspace dep and a binance-sdk transitive dep.
+    # Only to name `reqwest::Method` for the margin new-order and cancel requests, which go
+    # through the SDK's `common::utils::send_request` (and its own reqwest client). No new crate
+    # enters the graph — reqwest is already a workspace dep and a binance-sdk transitive dep.
     "dep:reqwest",
 ]
 ibkr = [
@@ -100,7 +100,7 @@ reqwest = { workspace = true, optional = true } # HTTP client for Alpaca REST AP
 # `margin_trading` is bundled with `spot` under the single `binance` feature (one feature per
 # exchange, matching alpaca/ibkr/hyperliquid). It ships ahead of the BinanceMargin client being
 # fully wired so spot + margin compile together; spot-only users pay the margin module's build cost.
-binance-sdk = { version = "=76.0.0", features = ["spot", "margin_trading"], optional = true }
+binance-sdk = { version = "=77.0.0", features = ["spot", "margin_trading"], optional = true }
 anyhow = { workspace = true, optional = true }                              # Required: binance-sdk's public API returns anyhow::Result
 
 # Shared between "alpaca" and "binance" features
@@ -109,7 +109,7 @@ lru = { workspace = true }         # Event deduplication cache for reconnect res
 parking_lot = { workspace = true } # Lighter mutex for dedup cache (no poisoning, no OS thread park)
 
 # IBKR (optional, behind "ibkr" feature)
-ibapi = { version = "=5.1.0", optional = true, default-features = false, features = [
+ibapi = { version = "=5.2.0", optional = true, default-features = false, features = [
     "sync",
 ] }
 chrono-tz = { workspace = true, optional = true }
@@ -163,6 +163,14 @@ required-features = ["binance"]
 
 [[test]]
 name = "binance_margin_records"
+required-features = ["binance"]
+
+[[test]]
+name = "binance_margin_real_money"
+required-features = ["binance"]
+
+[[test]]
+name = "binance_margin_stream"
 required-features = ["binance"]
 
 [[test]]

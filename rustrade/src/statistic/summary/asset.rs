@@ -46,9 +46,9 @@ pub enum BalanceBasis {
     ///
     /// # Freshness
     /// [`Balance::net_asset`] excludes accrued interest and reflects debt only as fresh as the last
-    /// [`BalanceSnapshot`](rustrade_execution::AccountEventKind::BalanceSnapshot): WS partial
-    /// updates carry no debt, so between snapshots `net_asset == total` and the value steps at
-    /// snapshot boundaries.
+    /// [`BalanceSnapshot`](rustrade_execution::AccountEventKind::BalanceSnapshot) or
+    /// [`MarginDebt`](rustrade_execution::AccountEventKind::MarginDebt): WS partial updates carry no
+    /// debt, so on a venue that streams no debt changes the value steps at snapshot boundaries.
     NetAsset,
 }
 

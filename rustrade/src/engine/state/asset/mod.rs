@@ -3,10 +3,14 @@ use crate::{
     engine::state::asset::filter::AssetFilter,
     statistic::summary::asset::{BalanceBasis, TearSheetAssetGenerator},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use derive_more::Constructor;
 use itertools::Either;
-use rustrade_execution::balance::{AssetBalance, AssetBalanceUpdate, Balance};
+use rust_decimal::Decimal;
+use rustrade_execution::{
+    MarginDebtUpdate,
+    balance::{AssetBalance, AssetBalanceUpdate, Balance},
+};
 use rustrade_instrument::{
     asset::{
         Asset, AssetIndex, ExchangeAsset,
@@ -114,25 +118,107 @@ pub struct AssetState {
     pub statistics: TearSheetAssetGenerator,
 
     /// Current balance of the asset and associated exchange timestamp.
+    ///
+    /// The timestamp is that of the holdings (`total`/`free`). Its
+    /// [`margin`](Balance::margin) is ordered apart, by [`debt_time`](Self::debt_time). It is
+    /// [`DateTime::<Utc>::MIN_UTC`] while only debt has been stated (see
+    /// [`apply_margin_debt`](Self::apply_margin_debt)).
     pub balance: Option<Timed<Balance>>,
+
+    /// When the venue stated the debt held in [`balance`](Self::balance)'s
+    /// [`margin`](Balance::margin): the time of the last
+    /// [`BalanceSnapshot`](rustrade_execution::AccountEventKind::BalanceSnapshot) or
+    /// [`MarginDebt`](rustrade_execution::AccountEventKind::MarginDebt) applied to it, `None`
+    /// before either.
+    ///
+    /// Debt has a time of its own because it reaches the engine apart from the holdings: a venue
+    /// can stream debt changes on a channel unordered against its balance updates, so a debt
+    /// change is ordered against earlier debt only, and a newer holdings update neither blocks it
+    /// nor is blocked by it.
+    #[serde(default)]
+    pub debt_time: Option<DateTime<Utc>>,
 }
 
 impl AssetState {
-    /// Updates the `AssetState` from an [`AssetBalance`] snapshot, if the snapshot is more recent.
+    /// Updates the `AssetState` from an [`AssetBalance`] snapshot, as far as the snapshot is more
+    /// recent.
     ///
-    /// This method ensures temporal consistency by only applying updates from snapshots that
-    /// are at least as recent as the current state.
+    /// The holdings (`total`/`free`) are replaced when the snapshot is at least as recent as the
+    /// held ones, and the debt ([`Balance::margin`]) when it is at least as recent as
+    /// [`debt_time`](Self::debt_time). Each is judged apart, so a snapshot older than a streamed
+    /// debt change still restates the holdings, and a snapshot older than the held holdings still
+    /// restates an older debt.
     pub fn update_from_balance<AssetKey>(&mut self, snapshot: Snapshot<&AssetBalance<AssetKey>>) {
+        let time = snapshot.value().time_exchange;
+        let stated = snapshot.value().balance;
+        let debt_current = self.debt_time.is_none_or(|debt_time| debt_time <= time);
+        if debt_current {
+            self.debt_time = Some(time);
+        }
+
         let Some(balance) = &mut self.balance else {
-            self.balance = Some(Timed::new(snapshot.0.balance, snapshot.0.time_exchange));
-            self.statistics.update_from_balance(snapshot);
+            self.balance = Some(Timed::new(stated, time));
+            self.statistics.update_from_balance_parts(stated, time);
             return;
         };
 
-        if balance.time <= snapshot.value().time_exchange {
-            balance.time = snapshot.value().time_exchange;
-            balance.value = snapshot.value().balance;
-            self.statistics.update_from_balance(snapshot);
+        let holdings_current = balance.time <= time;
+        match (holdings_current, debt_current) {
+            (true, true) => {
+                balance.time = time;
+                balance.value = stated;
+            }
+            (true, false) => {
+                let margin = balance.value.margin;
+                balance.time = time;
+                balance.value = stated;
+                balance.value.margin = margin;
+            }
+            (false, true) => balance.value.margin = stated.margin,
+            (false, false) => return,
+        }
+        // At the holdings' time, which never goes back, as the drawdown generator requires.
+        self.statistics
+            .update_from_balance_parts(balance.value, balance.time);
+    }
+
+    /// Applies a [`MarginDebtUpdate`]'s debt to [`Balance::margin`], if it is at least as recent as
+    /// [`debt_time`](Self::debt_time).
+    ///
+    /// The update states the whole debt, so it replaces the margin held, and leaves the holdings
+    /// (`total`/`free`) as they are.
+    ///
+    /// An asset with no balance yet gets one holding nothing, stamped at
+    /// [`DateTime::<Utc>::MIN_UTC`] because no holdings were stated: the first balance snapshot or
+    /// update replaces them, whatever its time, and keeps this debt unless it states a newer one.
+    /// The drawdown statistics are fed from that first statement of holdings on.
+    ///
+    /// The caller passes only an update of the account as a whole: one naming an isolated pair is
+    /// that pair's debt, not the asset's.
+    pub fn apply_margin_debt<AssetKey, InstrumentKey>(
+        &mut self,
+        update: &MarginDebtUpdate<AssetKey, InstrumentKey>,
+    ) {
+        if self
+            .debt_time
+            .is_some_and(|debt_time| debt_time > update.time_exchange)
+        {
+            return;
+        }
+        self.debt_time = Some(update.time_exchange);
+
+        let balance = self.balance.get_or_insert_with(|| {
+            Timed::new(
+                Balance::new(Decimal::ZERO, Decimal::ZERO),
+                DateTime::<Utc>::MIN_UTC,
+            )
+        });
+        balance.value.margin = Some(update.debt);
+        // At the holdings' time, which never goes back, as the drawdown generator requires; not
+        // before any holdings are stated, or the drawdown would start from a balance never held.
+        if balance.time != DateTime::<Utc>::MIN_UTC {
+            self.statistics
+                .update_from_balance_parts(balance.value, balance.time);
         }
     }
 
@@ -141,8 +227,9 @@ impl AssetState {
     /// Updates `free` and recomputes `total = free + locked`, while **preserving** any existing
     /// [`MarginDetails`](rustrade_execution::balance::MarginDetails) — a stream update carries no
     /// debt, so this path structurally cannot clobber known `borrowed`/`interest`. On a cold start
-    /// (no prior balance) the merged balance has `margin: None`, consistent with the debt-freshness
-    /// contract (debt becomes known only via a [`BalanceSnapshot`](rustrade_execution::AccountEventKind::BalanceSnapshot)).
+    /// (no prior balance) the merged balance has `margin: None`: debt becomes known only via a
+    /// [`BalanceSnapshot`](rustrade_execution::AccountEventKind::BalanceSnapshot) or a
+    /// [`MarginDebt`](rustrade_execution::AccountEventKind::MarginDebt).
     ///
     /// Like [`Self::update_from_balance`], stale updates (older than the current state) are ignored.
     pub fn apply_balance_update<AssetKey>(
@@ -172,12 +259,19 @@ impl AssetState {
     }
 }
 
+/// The asset's balance as held, stamped with its holdings' time.
+///
+/// An asset whose balance only a debt update has stated reads as holding nothing at
+/// [`DateTime::<Utc>::MIN_UTC`], with that debt (see [`AssetState::apply_margin_debt`]), so any
+/// statement of its holdings supersedes it. An asset with no balance at all reads as holding
+/// nothing, now.
 impl From<&AssetState> for AssetBalance<AssetNameExchange> {
     fn from(value: &AssetState) -> Self {
         let AssetState {
             asset,
             statistics: _,
             balance,
+            debt_time: _,
         } = value;
 
         let (balance, time_exchange) = match balance {
@@ -220,6 +314,7 @@ pub fn generate_empty_indexed_asset_states(
                             ..Default::default()
                         },
                         None,
+                        None,
                     ),
                 )
             })
@@ -247,6 +342,7 @@ mod tests {
             },
             statistics: Default::default(),
             balance: None,
+            debt_time: None,
         };
 
         let snapshot = Snapshot(AssetBalance {
@@ -455,6 +551,207 @@ mod tests {
         assert_eq!(balance.net_asset(), dec!(0.0)); // 1.5 total - 1.5 borrowed
     }
 
+    fn at(secs: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(secs, 0).unwrap()
+    }
+
+    fn btc_debt(
+        borrowed: Decimal,
+        interest: Decimal,
+        time: DateTime<Utc>,
+    ) -> MarginDebtUpdate<AssetNameExchange, AssetNameExchange> {
+        MarginDebtUpdate::new(
+            AssetNameExchange::new("btc"),
+            None,
+            MarginDetails::new(borrowed, interest),
+            rustrade_execution::MarginDebtKind::Borrow,
+            smol_str::SmolStr::new("BORROW"),
+            time,
+        )
+    }
+
+    fn btc_margin_snapshot(
+        total: Decimal,
+        borrowed: Decimal,
+        time: DateTime<Utc>,
+    ) -> AssetBalance<AssetNameExchange> {
+        AssetBalance {
+            asset: AssetNameExchange::new("btc"),
+            balance: Balance::new_margin(total, total, borrowed, Decimal::ZERO),
+            time_exchange: time,
+        }
+    }
+
+    /// A debt update replaces the debt and leaves the holdings, even when it is older than the
+    /// last holdings update: it is ordered against earlier debt alone.
+    #[test]
+    fn a_debt_update_replaces_the_debt_whatever_the_holdings_time() {
+        let mut state = asset_state("btc", 0.0, 0.0, at(1000));
+        state.update_from_balance(Snapshot(&btc_margin_snapshot(dec!(2), dec!(1), at(1000))));
+        state.apply_balance_update(Snapshot(&btc_balance_update(1.0, 0.5, at(3000))));
+
+        state.apply_margin_debt(&btc_debt(dec!(0.5), dec!(0.01), at(2000)));
+
+        let balance = state.balance.unwrap();
+        assert_eq!(balance.time, at(3000));
+        assert_eq!(balance.value.total, dec!(1.5));
+        assert_eq!(balance.value.free, dec!(1.0));
+        assert_eq!(
+            balance.value.margin,
+            Some(MarginDetails::new(dec!(0.5), dec!(0.01)))
+        );
+        assert_eq!(state.debt_time, Some(at(2000)));
+    }
+
+    /// An update older than the debt held is ignored; one at the same time is applied.
+    #[test]
+    fn a_debt_update_older_than_the_debt_held_is_ignored() {
+        let mut state = asset_state("btc", 0.0, 0.0, at(1000));
+        state.apply_margin_debt(&btc_debt(dec!(1), dec!(0), at(2000)));
+
+        state.apply_margin_debt(&btc_debt(dec!(5), dec!(0), at(1500)));
+        assert_eq!(
+            state.balance.unwrap().value.margin,
+            Some(MarginDetails::new(dec!(1), dec!(0)))
+        );
+
+        state.apply_margin_debt(&btc_debt(dec!(0), dec!(0), at(2000)));
+        assert_eq!(
+            state.balance.unwrap().value.margin,
+            Some(MarginDetails::new(dec!(0), dec!(0)))
+        );
+    }
+
+    /// A balance snapshot restates the holdings and the debt each as far as it is newer: one older
+    /// than a streamed debt change keeps that debt, and one older than the holdings still
+    /// restates an older debt.
+    #[test]
+    fn a_balance_snapshot_restates_holdings_and_debt_apart() {
+        let mut state = asset_state("btc", 0.0, 0.0, at(1000));
+        state.apply_margin_debt(&btc_debt(dec!(0.5), dec!(0), at(2000)));
+
+        state.update_from_balance(Snapshot(&btc_margin_snapshot(dec!(3), dec!(9), at(1500))));
+        let balance = state.balance.unwrap();
+        assert_eq!(balance.value.total, dec!(3));
+        assert_eq!(balance.time, at(1500));
+        assert_eq!(
+            balance.value.margin,
+            Some(MarginDetails::new(dec!(0.5), dec!(0)))
+        );
+        assert_eq!(state.debt_time, Some(at(2000)));
+
+        let mut state = asset_state("btc", 4.0, 4.0, at(3000));
+        state.debt_time = Some(at(1000));
+        state.update_from_balance(Snapshot(&btc_margin_snapshot(dec!(3), dec!(2), at(2000))));
+        let balance = state.balance.unwrap();
+        assert_eq!(balance.value.total, dec!(4));
+        assert_eq!(balance.time, at(3000));
+        assert_eq!(
+            balance.value.margin,
+            Some(MarginDetails::new(dec!(2), dec!(0)))
+        );
+        assert_eq!(state.debt_time, Some(at(2000)));
+    }
+
+    fn btc_state_with_no_balance() -> AssetState {
+        AssetState {
+            asset: Asset {
+                name_internal: AssetNameInternal::new("btc"),
+                name_exchange: AssetNameExchange::new("btc"),
+            },
+            statistics: Default::default(),
+            balance: None,
+            debt_time: None,
+        }
+    }
+
+    /// A debt update for an asset with no balance yet gives it one holding nothing, with the debt,
+    /// and stated at no time: no holdings were, so the statistics are not fed.
+    #[test]
+    fn a_debt_update_before_any_balance_opens_one_holding_nothing() {
+        let mut state = btc_state_with_no_balance();
+        state.apply_margin_debt(&btc_debt(dec!(0.00006), dec!(0.00000001), at(1000)));
+        state.apply_margin_debt(&btc_debt(dec!(0.00006), dec!(0.00000002), at(2000)));
+
+        let balance = state.balance.unwrap();
+        assert_eq!(balance.time, DateTime::<Utc>::MIN_UTC);
+        assert_eq!(balance.value.total, dec!(0));
+        assert_eq!(balance.value.free, dec!(0));
+        assert_eq!(
+            balance.value.margin,
+            Some(MarginDetails::new(dec!(0.00006), dec!(0.00000002)))
+        );
+        assert_eq!(balance.value.net_asset(), dec!(-0.00006));
+        assert_eq!(state.debt_time, Some(at(2000)));
+        assert_eq!(state.statistics.balance_now, None);
+    }
+
+    /// The holdings first stated after a debt update opened the balance replace its placeholder
+    /// even when stated earlier than the debt change, which they keep.
+    #[test]
+    fn holdings_stated_after_a_debt_update_opened_the_balance_replace_its_placeholder() {
+        let held = MarginDetails::new(dec!(0.5), dec!(0));
+
+        let mut state = btc_state_with_no_balance();
+        state.apply_margin_debt(&btc_debt(dec!(0.5), dec!(0), at(2000)));
+        state.update_from_balance(Snapshot(&btc_margin_snapshot(dec!(3), dec!(9), at(1500))));
+        let balance = state.balance.unwrap();
+        assert_eq!(balance.time, at(1500));
+        assert_eq!(balance.value.total, dec!(3));
+        assert_eq!(balance.value.margin, Some(held));
+        assert_eq!(state.statistics.balance_now, Some(balance.value));
+
+        let mut state = btc_state_with_no_balance();
+        state.apply_margin_debt(&btc_debt(dec!(0.5), dec!(0), at(2000)));
+        state.apply_balance_update(Snapshot(&btc_balance_update(1.0, 0.5, at(1500))));
+        let balance = state.balance.unwrap();
+        assert_eq!(balance.time, at(1500));
+        assert_eq!(balance.value.total, dec!(1.5));
+        assert_eq!(balance.value.margin, Some(held));
+        assert_eq!(state.statistics.balance_now, Some(balance.value));
+    }
+
+    /// A debt update on held holdings feeds the statistics the new debt.
+    #[test]
+    fn a_debt_update_feeds_the_statistics() {
+        let mut state = asset_state("btc", 2.0, 2.0, at(1000));
+        state.apply_margin_debt(&btc_debt(dec!(0.5), dec!(0.01), at(2000)));
+        assert_eq!(
+            state.statistics.balance_now,
+            Some(state.balance.unwrap().value)
+        );
+    }
+
+    /// A snapshot older than both the holdings and the debt held changes nothing, and one at the
+    /// same time as both restates both.
+    #[test]
+    fn a_balance_snapshot_older_than_both_changes_nothing() {
+        let mut state = asset_state("btc", 4.0, 4.0, at(2000));
+        state.apply_margin_debt(&btc_debt(dec!(1), dec!(0), at(2000)));
+        let before = state.clone();
+
+        state.update_from_balance(Snapshot(&btc_margin_snapshot(dec!(3), dec!(2), at(1500))));
+        assert_eq!(state, before);
+
+        state.update_from_balance(Snapshot(&btc_margin_snapshot(dec!(3), dec!(2), at(2000))));
+        let balance = state.balance.unwrap();
+        assert_eq!(balance.value.total, dec!(3));
+        assert_eq!(
+            balance.value.margin,
+            Some(MarginDetails::new(dec!(2), dec!(0)))
+        );
+    }
+
+    /// State saved before the debt time existed loads with none, so the next snapshot states the
+    /// debt.
+    #[test]
+    fn asset_state_saved_without_a_debt_time_loads_with_none() {
+        let mut json = serde_json::to_value(asset_state("btc", 1.0, 1.0, at(1000))).unwrap();
+        json.as_object_mut().unwrap().remove("debt_time").unwrap();
+        let state: AssetState = serde_json::from_value(json).unwrap();
+        assert_eq!(state.debt_time, None);
+    }
+
     #[test]
     fn test_apply_balance_update_cold_start_has_no_margin() {
         // First-ever event is a WS partial → margin is None (debt unknown until a snapshot).
@@ -466,6 +763,7 @@ mod tests {
             },
             statistics: Default::default(),
             balance: None,
+            debt_time: None,
         };
         let update = btc_balance_update(3.0, 1.0, time);
         state.apply_balance_update(Snapshot(&update));

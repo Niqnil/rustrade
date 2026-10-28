@@ -98,11 +98,11 @@ that breaks the symbol's tick, lot or notional rules from `exchangeInfo`
 `pre_send_rules` to `PreSendRules::Off` to let Binance decide. `BinanceMargin` matches Binance
 spot, except that a cross margin account refuses a `TrailingStop` (a trailing `STOP_LOSS`) with
 `OrderError::UnsupportedOrderType`: place a `TrailingStopFixedLimit` there. Its REST order
-queries do not report a trailing delta, so `fetch_open_orders` and `account_snapshot` leave out
-its conditional orders (stop, stop-limit, take-profit and take-profit-limit). `account_snapshot`
-reports such a listing incomplete; `fetch_open_orders` has no completeness flag, so there only a
-warning shows it.
-The account stream reports these orders in full.
+queries, and an isolated account's stream, do not say whether a conditional order (stop,
+stop-limit, take-profit and take-profit-limit) trails. The client reports such an order with the
+kind it knows it by: from placing it, from a report that described it, or, after a restart, from
+`BinanceMargin::recall_order_kinds`. Otherwise it reports `OrderKind::ConditionalUnresolved`,
+with a warning. A cross account's stream reports these orders in full.
 
 `RequestOpen::margin_effect` says whether one order borrows (`MarginEffect::Borrow`), repays
 (`Repay`) or does neither (`NoSideEffect`); `None` takes the client's default. `BinanceMargin`

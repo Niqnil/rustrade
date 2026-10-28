@@ -16,7 +16,9 @@
 //! This module is exchange-agnostic: it operates on rustrade's own
 //! [`UnindexedAccountEvent`], never on any SDK's wire types.
 
-use crate::{AccountEventKind, UnindexedAccountEvent, order::state::OrderState};
+use crate::{
+    AccountEventKind, UnindexedAccountEvent, margin_debt::MarginDebtKind, order::state::OrderState,
+};
 use lru::LruCache;
 use rust_decimal::Decimal;
 use smol_str::SmolStr;
@@ -64,9 +66,25 @@ pub(crate) enum DedupEventKind {
     Funding,
     /// An account notice, keyed on its instrument (empty for the account as a whole), the venue's
     /// status and the time the venue sent it, since a notice has no id. A venue that sends one
-    /// notice on two streams sends it with the same time, so the second is dropped.
+    /// notice twice, such as on two streams, sends it with the same time, so the second is
+    /// dropped.
     Notice {
         time_exchange_ms: i64,
+    },
+    /// A margin debt update, keyed on its instrument (empty for the account as a whole), its asset,
+    /// the time the venue made the change, what changed it and the totals after it, since an update
+    /// has no id. A venue that sends one update twice, such as on two streams, sends it with the
+    /// same time and totals, so the second is dropped.
+    ///
+    /// The kind and totals are part of the discriminant because two changes to one asset can share
+    /// a millisecond, such as a repay that settles several loans at once. Each states the debt
+    /// after it, so dropping the second would leave the earlier total held. `Decimal`'s `Hash`
+    /// and `Eq` are numeric, as for [`OrderState`](Self::OrderState).
+    MarginDebt {
+        time_exchange_ms: i64,
+        kind: MarginDebtKind,
+        borrowed: Decimal,
+        interest: Decimal,
     },
 }
 
@@ -84,6 +102,9 @@ pub(crate) enum DedupEventKind {
 ///   `DedupEventKind::Funding`, since a payment has no id
 /// - For account notices: instrument (empty when the notice names none) + the venue's status +
 ///   `DedupEventKind::Notice`, carrying the time the venue sent it
+/// - For margin debt updates: instrument (empty when the update names none) + the asset +
+///   `DedupEventKind::MarginDebt`, carrying the time the venue made the change, its kind and the
+///   totals after it
 #[derive(Debug, Hash, Eq, PartialEq)]
 pub(crate) struct DedupKey {
     pub(crate) instrument: SmolStr,
@@ -164,6 +185,20 @@ pub(crate) fn dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<Dedu
             id: notice.status.clone(),
             kind: DedupEventKind::Notice {
                 time_exchange_ms: notice.time_exchange.timestamp_millis(),
+            },
+        }),
+        AccountEventKind::MarginDebt(update) => Some(DedupKey {
+            instrument: update
+                .instrument
+                .as_ref()
+                .map(|instrument| instrument.name().clone())
+                .unwrap_or_default(),
+            id: update.asset.name().clone(),
+            kind: DedupEventKind::MarginDebt {
+                time_exchange_ms: update.time_exchange.timestamp_millis(),
+                kind: update.kind,
+                borrowed: update.debt.borrowed,
+                interest: update.debt.interest,
             },
         }),
         // CashFlow has none here: a venue may give a flow no id, and what identifies one then is
@@ -324,5 +359,47 @@ mod tests {
         assert!(dedup_key_from_event(&notice()).is_some());
         assert!(!deduper.is_duplicate(&notice()));
         assert!(!deduper.is_duplicate(&notice()));
+    }
+
+    /// A copy of a debt update keys alike, but a second change to the same asset in the same
+    /// millisecond does not: it states a different debt, which must reach the consumer.
+    #[test]
+    fn only_a_copy_of_a_margin_debt_update_keys_alike() {
+        use crate::{
+            balance::MarginDetails,
+            margin_debt::{MarginDebtKind, MarginDebtUpdate},
+        };
+
+        let update = |kind, borrowed: i64, interest: i64| {
+            dedup_key_from_event(&UnindexedAccountEvent {
+                exchange: ExchangeId::BinanceMargin,
+                kind: AccountEventKind::MarginDebt(MarginDebtUpdate::new(
+                    AssetNameExchange::new("BTC"),
+                    None,
+                    MarginDetails::new(Decimal::new(borrowed, 8), Decimal::new(interest, 8)),
+                    kind,
+                    "VENUE".into(),
+                    DateTime::UNIX_EPOCH,
+                )),
+            })
+        };
+
+        assert!(update(MarginDebtKind::Repay, 6_000, 2).is_some());
+        assert_eq!(
+            update(MarginDebtKind::Repay, 6_000, 2),
+            update(MarginDebtKind::Repay, 6_000, 2)
+        );
+        assert_ne!(
+            update(MarginDebtKind::Repay, 6_000, 2),
+            update(MarginDebtKind::Repay, 3_000, 2)
+        );
+        assert_ne!(
+            update(MarginDebtKind::Repay, 6_000, 2),
+            update(MarginDebtKind::Repay, 6_000, 0)
+        );
+        assert_ne!(
+            update(MarginDebtKind::Repay, 6_000, 2),
+            update(MarginDebtKind::Interest, 6_000, 2)
+        );
     }
 }

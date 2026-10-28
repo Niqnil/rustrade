@@ -106,10 +106,15 @@ impl BinanceMargin {
     ///
     /// - [`asset`](CashFlow::asset) is the `asset` field of Binance's record. Binance charges
     ///   interest in the asset borrowed, or converts it into BNB for an account that pays interest
-    ///   in BNB. A converted record also names the asset borrowed, in a separate field, and Binance
-    ///   does not document which of the two fields holds BNB. Check a converted record before
-    ///   relying on its asset.
-    /// - [`principal`](CashFlowKind::MarginInterest::principal) is the loan the charge was on.
+    ///   in BNB: a `_CONVERTED` record's `asset` is BNB, so its flow does not name the asset
+    ///   borrowed. Binance names that asset in a separate `rawAsset` field, which this method does
+    ///   not read, and which Binance does not return on an isolated record.
+    /// - [`principal`](CashFlowKind::MarginInterest::principal) is the loan the charge was on. On a
+    ///   `_CONVERTED` record it can read 0, and Binance's documentation does not say when.
+    ///   Binance's support points to its borrow and repay history
+    ///   (`GET /sapi/v1/margin/borrow-repay`) for the loan. A converted record's flow does not
+    ///   carry the asset borrowed, so that history cannot be narrowed to it by asset from the flow
+    ///   alone.
     /// - [`rate`](CashFlowKind::MarginInterest::rate) is Binance's `interestRate`, a **daily** rate
     ///   even on an hourly charge: an hourly charge is about the rate divided by 24 of the
     ///   principal. Binance's API documentation does not state the unit; it is read off the rates
@@ -121,9 +126,11 @@ impl BinanceMargin {
     ///   [`Periodic`](InterestTiming::Periodic), `ON_BORROW` (and `ON_BORROW_CONVERTED`) is
     ///   [`OnBorrow`](InterestTiming::OnBorrow), and any other value is
     ///   [`Other`](InterestTiming::Other) with Binance's own name. `None` when the record has no
-    ///   `type`. An `ON_BORROW` charge is stamped at the start of the hour the loan was taken in, so
-    ///   its [`time_exchange`](CashFlow::time_exchange) can precede the opening of the position it
-    ///   belongs to.
+    ///   `type`.
+    /// - [`time_exchange`](CashFlow::time_exchange) is Binance's `interestAccuredTime`, the period
+    ///   the charge is for, not when Binance posted it (see [Delivery](#delivery)): for an hourly
+    ///   charge, the start of its hour. An `ON_BORROW` charge is stamped at the start of the hour
+    ///   the loan was taken in, so it can precede the opening of the position it belongs to.
     /// - [`id`](CashFlow::id) is Binance's transaction id for the charge.
     ///
     /// The engine adds a flow attributed to an instrument to the carry of its open position, in
@@ -138,6 +145,22 @@ impl BinanceMargin {
     /// each charge appears once: a charge read twice, as one stamped on a window's boundary is, is
     /// kept the first time its id is seen in its asset and pair, or, without an id, once per
     /// identical record.
+    ///
+    /// A charge is posted some time after the period it is for, by a delay Binance does not
+    /// document and that may vary, and is then served stamped at that period. A read whose span
+    /// ends near the present can therefore miss a charge that a later read returns at a time
+    /// inside the earlier span. A caller that polls by time should start each read before the
+    /// previous read's `end`, by at least the longest posting delay it is prepared to allow for,
+    /// and drop the charges it has already counted by id within their asset and pair. A charge
+    /// with no id can be matched only by its whole record, which cannot tell it from an identical
+    /// charge.
+    ///
+    /// The records need not add up to the interest owed. On a live account, a loan was charged
+    /// interest when it was taken, yet a read served only the hourly charge that followed, with no
+    /// `ON_BORROW` record. Whether such a record is posted later, or never, is not known. The
+    /// account's balance, which reports the interest owed (see
+    /// [`MarginDetails::interest`](crate::balance::MarginDetails::interest)), is the figure to rely
+    /// on for what is owed.
     ///
     /// # Span
     /// - Binance serves interest charged in the last 90 days only. A `start` before that is moved
@@ -784,6 +807,41 @@ mod tests {
             panic!("margin interest: {flow:?}");
         };
         assert_eq!(*timing, Some(InterestTiming::OnBorrow));
+    }
+
+    /// A charge converted into BNB is in BNB, from `asset` rather than the `rawAsset` borrowed,
+    /// and its principal of 0 is read as served.
+    #[tokio::test]
+    async fn a_charge_converted_into_bnb_is_in_bnb() {
+        let server = MockServer::start().await;
+        let now = Utc::now();
+        let mut row = interest_row(1, now - TimeDelta::hours(1), None);
+        row["asset"] = json!("BNB");
+        row["principal"] = json!("0");
+        row["interest"] = json!("0.00002");
+        row["type"] = json!("PERIODIC_CONVERTED");
+        mount(&server, INTEREST_PATH, page(vec![row])).await;
+        let client = margin_client_at(&server, false);
+
+        let flows = client
+            .fetch_margin_interest(now - TimeDelta::days(1), now)
+            .await
+            .unwrap()
+            .flows;
+
+        let [flow] = flows.as_slice() else {
+            panic!("one flow: {flows:?}");
+        };
+        assert_eq!(flow.asset, AssetNameExchange::new("BNB"));
+        assert_eq!(flow.amount, dec!(-0.00002));
+        let CashFlowKind::MarginInterest {
+            principal, timing, ..
+        } = &flow.kind
+        else {
+            panic!("margin interest: {flow:?}");
+        };
+        assert_eq!(*principal, Some(Decimal::ZERO));
+        assert_eq!(*timing, Some(InterestTiming::Periodic));
     }
 
     #[tokio::test]

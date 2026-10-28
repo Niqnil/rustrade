@@ -14,17 +14,21 @@ use crate::engine::{
 };
 use derive_more::Constructor;
 use fnv::FnvHashMap;
+use rust_decimal::Decimal;
 use rustrade_data::event::MarketEvent;
 use rustrade_execution::{
     AccountEvent, AccountEventKind, AccountSnapshot, UnindexedAccountSnapshot,
-    balance::AssetBalance, market::MarketSnapshot, order::id::ClientOrderId, trade::TradeId,
+    balance::AssetBalance,
+    market::MarketSnapshot,
+    order::{id::ClientOrderId, request::ReduceOnly},
+    trade::TradeId,
 };
 use rustrade_instrument::{
     Keyed,
     asset::AssetIndex,
     exchange::{ExchangeId, ExchangeIndex},
     index::IndexedInstruments,
-    instrument::{Instrument, InstrumentIndex},
+    instrument::{Instrument, InstrumentIndex, kind::InstrumentKind},
 };
 use rustrade_integration::collection::{one_or_many::OneOrMany, snapshot::Snapshot};
 use serde::{Deserialize, Serialize};
@@ -275,6 +279,104 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
         Ok(())
     }
 
+    /// The base `asset` the account holds outside every spot position on its exchange: what is
+    /// left of its balance once its debt and the positions are taken out, capped at what is free
+    /// to trade. `None` while this state holds no balance for `asset`.
+    ///
+    /// It is the balance's `total`, less [`MarginDetails`](rustrade_execution::balance::MarginDetails)
+    /// `borrowed` and `interest` where the venue reports debt, less the signed net quantity
+    /// ([`PositionManager::quantity_net`](position::PositionManager::quantity_net)) of every
+    /// [`InstrumentKind::Spot`] instrument whose base is `asset`, then capped at the balance's
+    /// `free`. An [`AssetIndex`] names an asset on one exchange, so only that exchange's
+    /// instruments count. A derivative's position is counted in contracts, not held in the base,
+    /// so it is not taken out.
+    ///
+    /// Signed. It is negative when the account owes base outside its positions, or the positions
+    /// count more base than it holds net of debt:
+    /// - **A short's interest.** On margin, interest on a short's loan that the venue charges in
+    ///   base is owed outside the short, which does not count it. With a short open it reads
+    ///   negative by that interest, so a buy sized at the short plus its negative closes the
+    ///   short and covers the interest.
+    /// - **Timing or drift.** A fill has reached a position but not yet the balance, or the
+    ///   positions have drifted from the venue's. A sell sized at a long plus this then still
+    ///   sells no more than the account holds.
+    ///
+    /// # What it leaves out
+    /// - **Orders in flight.** Base a resting order locks is already out of `free`, but an open
+    ///   the venue has not yet acknowledged is not taken out. Nor is a fill whose balance update
+    ///   has not arrived. Read it while no order on `asset` is working, or after an account
+    ///   snapshot. Through the cap at `free`, a resting order that locks more base than the
+    ///   positions hold lowers the read by the difference. One that locks no more, such as a
+    ///   resting sell that only closes a long, leaves it unchanged.
+    /// - **Pairs quoted in the asset.** Only positions whose base is `asset` are taken out. What
+    ///   a pair quoted in it holds, such as a short of `ETHBTC`'s proceeds in BTC, reads as free.
+    /// - **Isolated margin.** The engine stores no isolated balances, so a position in an
+    ///   isolated margin pair is taken out of a balance that does not hold it. Do not read it for
+    ///   an asset traded isolated.
+    /// - **Debt freshness.** The debt is as fresh as [`Balance::net_asset`](rustrade_execution::balance::Balance::net_asset)'s:
+    ///   see its rustdoc for a venue that streams no debt changes.
+    ///
+    /// # The base-fee remainder
+    /// A spot fill whose fee the venue charges in base leaves the position rounded toward zero to
+    /// the quantity step (see the base-asset fee section of
+    /// [`InstrumentState::update_from_trade`](instrument::InstrumentState::update_from_trade)).
+    /// The sub-step remainder stays in the balance, outside the position, and is held rather than
+    /// charged to PnL. Over many fills it gathers, and once a step or more of it has gathered it
+    /// can be sold.
+    /// - **A long-only account sweeps it** with its close: a sell sized at the long plus this,
+    ///   rounded toward zero to the step, sent
+    ///   [`ReduceOnly::PositionAndFreeBase`].
+    ///   The engine closes the long and books the rest as free base sold, at INFO, rather than as
+    ///   a reduce-only mistake. Below one step there is nothing to sweep. The same close, sized
+    ///   from a short, is a buy that also covers the base the account owes outside it.
+    /// - **With a short of the asset open on cross margin**, base the account holds lowers the
+    ///   loan: a sale that borrows sells free base before it borrows, and a repayment can spend
+    ///   it. Repaying the debt with it is then usually the better use, though which to do is the
+    ///   caller's choice.
+    ///
+    /// ```rust
+    /// use rust_decimal::Decimal;
+    /// use rustrade::engine::state::EngineState;
+    /// use rustrade_instrument::instrument::{InstrumentIndex, round_toward_zero_to_step};
+    ///
+    /// /// What a long-only account sells to close its long on `instrument` and sweep the free base
+    /// /// the long leaves out, to send with `ReduceOnly::PositionAndFreeBase`. `None` when there
+    /// /// is nothing to sell.
+    /// fn sweep_quantity<GlobalData, InstrumentData>(
+    ///     state: &EngineState<GlobalData, InstrumentData>,
+    ///     instrument: &InstrumentIndex,
+    /// ) -> Option<Decimal> {
+    ///     let held = state.instruments.instrument_index(instrument);
+    ///     let free_base = state.free_base(&held.instrument.underlying.base)?;
+    ///     let quantity = held.position.quantity_net() + free_base;
+    ///     let quantity = held
+    ///         .instrument
+    ///         .quantity_step()
+    ///         .map_or(quantity, |step| round_toward_zero_to_step(quantity, step));
+    ///     (quantity > Decimal::ZERO).then_some(quantity)
+    /// }
+    /// ```
+    ///
+    /// # Panics
+    /// Panics if this state does not track `asset`, as [`AssetStates::asset_index`] does.
+    pub fn free_base(&self, asset: &AssetIndex) -> Option<Decimal> {
+        let balance = self.assets.asset_index(asset).balance.as_ref()?.value;
+        let interest = balance
+            .margin
+            .map_or(Decimal::ZERO, |margin| margin.interest);
+        let positions: Decimal = self
+            .instruments
+            .0
+            .values()
+            .filter(|state| {
+                matches!(state.instrument.kind, InstrumentKind::Spot)
+                    && state.instrument.underlying.base == *asset
+            })
+            .map(|state| state.position.quantity_net())
+            .sum();
+        Some((balance.net_asset() - interest - positions).min(balance.free))
+    }
+
     /// Each instrument whose position `snapshot` reports and differs from this state's.
     ///
     /// Only an instrument the venue reported as
@@ -416,17 +518,19 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     }
 
     /// [`Self::update_from_account`] for an event the `Engine` already processed, as a replica
-    /// of its state does, taking the fills `reduce_only_fills` names as reduce-only.
+    /// of its state does, taking the fills `reduce_only_fills` names as sent as each says.
     ///
     /// A replica records no requests in flight, so it cannot tell a reduce-only order's fill from
     /// another. Pass the [`ReduceOnlyCapped::trade_id`](instrument::ReduceOnlyCapped::trade_id)
-    /// of every [`EngineOutput::ReduceOnlyCapped`](crate::engine::EngineOutput::ReduceOnlyCapped)
-    /// the `Engine` emitted for this event, and the replica cuts those fills as the `Engine` did.
+    /// and [`ReduceOnlyCapped::reduce_only`](instrument::ReduceOnlyCapped::reduce_only) of every
+    /// [`EngineOutput::ReduceOnlyCapped`](crate::engine::EngineOutput::ReduceOnlyCapped) the
+    /// `Engine` emitted for this event, and the replica cuts and counts those fills as the
+    /// `Engine` did.
     /// [`StateReplicaManager`](crate::engine::audit::state_replica::StateReplicaManager) does so.
     pub fn replay_account(
         &mut self,
         event: &AccountEvent,
-        reduce_only_fills: &[TradeId],
+        reduce_only_fills: &[(TradeId, ReduceOnly)],
     ) -> FillsApplied<AssetIndex>
     where
         GlobalData: for<'a> Processor<&'a AccountEvent>,
@@ -619,6 +723,24 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                         time_exchange = %notice.time_exchange,
                         "venue reported a change in the account's margin state",
                     );
+                }
+                FillsApplied::default()
+            }
+            AccountEventKind::MarginDebt(update) => {
+                match &update.instrument {
+                    None => self
+                        .assets
+                        .asset_index_mut(&update.asset)
+                        .apply_margin_debt(update),
+                    // An isolated pair's debt: the engine stores no isolated balances, as it
+                    // stores no `InstrumentBalanceUpdate`. A consumer reads it off the feed.
+                    Some(instrument) => debug!(
+                        exchange = ?event.exchange,
+                        ?instrument,
+                        asset = ?update.asset,
+                        kind = %update.kind,
+                        "isolated margin debt update received — not applied to asset balances",
+                    ),
                 }
                 FillsApplied::default()
             }
@@ -969,6 +1091,57 @@ mod tests {
         assert_eq!(state.trading, before.trading);
     }
 
+    /// An account-level debt update replaces its asset's debt and fills nothing; one naming an
+    /// isolated pair changes no state.
+    #[test]
+    fn a_margin_debt_update_reaches_only_an_account_level_asset_balance() {
+        use crate::engine::state::{
+            global::DefaultGlobalData, instrument::data::DefaultInstrumentMarketData,
+        };
+        use chrono::{DateTime, Utc};
+        use rust_decimal_macros::dec;
+        use rustrade_execution::{MarginDebtKind, MarginDebtUpdate, balance::MarginDetails};
+        use smol_str::SmolStr;
+
+        let instruments = IndexedInstruments::new([test_instrument(EXECUTION, "btc", "usdt")]);
+        let base = instruments.instruments()[0].value.underlying.base;
+        let mut state: EngineState<DefaultGlobalData, DefaultInstrumentMarketData> =
+            EngineState::builder(&instruments, DefaultGlobalData, |_| {
+                DefaultInstrumentMarketData::default()
+            })
+            .build();
+        let debt = MarginDetails::new(dec!(0.00006), dec!(0.00000002));
+        let update = |instrument| {
+            AccountEvent::new(
+                ExchangeIndex::new(0),
+                AccountEventKind::MarginDebt(MarginDebtUpdate::new(
+                    base,
+                    instrument,
+                    debt,
+                    MarginDebtKind::Interest,
+                    SmolStr::new("INTEREST"),
+                    DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+                )),
+            )
+        };
+
+        let before = state.clone();
+        assert_eq!(
+            state.update_from_account(&update(Some(InstrumentIndex::new(0)))),
+            FillsApplied::default()
+        );
+        assert_eq!(state.assets, before.assets);
+
+        assert_eq!(
+            state.update_from_account(&update(None)),
+            FillsApplied::default()
+        );
+        let balance = state.assets.asset_index(&base).balance.unwrap();
+        assert_eq!(balance.value.margin, Some(debt));
+        assert_eq!(state.instruments, before.instruments);
+        assert_eq!(state.trading, before.trading);
+    }
+
     /// A cash flow attributed to an instrument reaches its open position's carry and nothing
     /// else; an account-level one changes no state.
     #[test]
@@ -1040,5 +1213,174 @@ mod tests {
         let position = positions.values().next().unwrap();
         assert_eq!(position.carry, dec!(0.75));
         assert_eq!(position.pnl_realised, Decimal::ZERO);
+    }
+
+    /// Instruments on `EXECUTION`: `btc_usdt` spot, a `btc_usdc` perpetual and `eth_btc` spot,
+    /// and `btc_usdt` spot on `DATA`, with a signed position on each `(exchange, name)` listed,
+    /// and `balance` for btc on `EXECUTION`.
+    fn free_base_state(
+        positions: &[(ExchangeId, &str, Decimal)],
+        balance: Option<rustrade_execution::balance::Balance>,
+    ) -> (EngineState<(), ()>, AssetIndex) {
+        use crate::Timed;
+        use chrono::{DateTime, Utc};
+        use rustrade_execution::{
+            order::id::{OrderId, StrategyId},
+            trade::{AssetFees, Trade},
+        };
+        use rustrade_instrument::{
+            Side,
+            instrument::{kind::perpetual::PerpetualContract, name::InstrumentNameInternal},
+            test_utils::asset,
+        };
+
+        let mut perpetual = test_instrument(EXECUTION, "btc", "usdc");
+        perpetual.kind = InstrumentKind::Perpetual(PerpetualContract {
+            contract_size: Decimal::ONE,
+            settlement_asset: asset("usdc"),
+        });
+        let instruments = IndexedInstruments::new([
+            test_instrument(EXECUTION, "btc", "usdt"),
+            perpetual,
+            test_instrument(EXECUTION, "eth", "btc"),
+            test_instrument(DATA, "btc", "usdt"),
+        ]);
+        let btc = instruments
+            .find_asset_index(EXECUTION, &"btc".into())
+            .unwrap();
+        let mut state: EngineState<(), ()> = EngineState::builder(&instruments, (), |_| ()).build();
+
+        for (exchange, name, quantity) in positions {
+            let index = instruments
+                .find_instrument_index(
+                    *exchange,
+                    &InstrumentNameInternal::new_from_exchange(*exchange, *name),
+                )
+                .unwrap();
+            let instrument = state.instruments.instrument_index_mut(&index);
+            let quote = instrument.instrument.underlying.quote;
+            let (side, quantity) = if quantity.is_sign_negative() {
+                (Side::Sell, -*quantity)
+            } else {
+                (Side::Buy, *quantity)
+            };
+            let _ = instrument.update_from_trade(&Trade::new(
+                TradeId::new(format!("t{index}")),
+                OrderId::new(format!("o{index}")),
+                index,
+                StrategyId::new("s"),
+                DateTime::<Utc>::MIN_UTC,
+                side,
+                Decimal::ONE_HUNDRED,
+                quantity,
+                None,
+                AssetFees {
+                    asset: quote,
+                    fees: Decimal::ZERO,
+                    fees_quote: Some(Decimal::ZERO),
+                },
+            ));
+        }
+        state.assets.asset_index_mut(&btc).balance =
+            balance.map(|balance| Timed::new(balance, DateTime::<Utc>::MIN_UTC));
+        (state, btc)
+    }
+
+    /// The base held outside the spot positions with that base on the asset's exchange: not a
+    /// derivative's contracts, a pair that quotes in it, or another exchange's pair.
+    #[test]
+    fn free_base_takes_out_only_the_spot_positions_on_the_asset() {
+        use rust_decimal_macros::dec;
+        use rustrade_execution::balance::Balance;
+
+        let (state, btc) = free_base_state(
+            &[
+                (EXECUTION, "btc_usdt", dec!(1)),
+                (EXECUTION, "btc_usdc", dec!(5)),
+                (EXECUTION, "eth_btc", dec!(3)),
+                (DATA, "btc_usdt", dec!(2)),
+            ],
+            Some(Balance::new(dec!(1.00991), dec!(1.00991))),
+        );
+
+        assert_eq!(state.free_base(&btc), Some(dec!(0.00991)));
+    }
+
+    /// Base locked by a resting order is not free to trade, so the read is capped at `free`.
+    #[test]
+    fn free_base_is_capped_at_what_is_free() {
+        use rust_decimal_macros::dec;
+        use rustrade_execution::balance::Balance;
+
+        let (state, btc) = free_base_state(
+            &[(EXECUTION, "btc_usdt", dec!(1))],
+            Some(Balance::new(dec!(1.5), dec!(0.3))),
+        );
+
+        assert_eq!(state.free_base(&btc), Some(dec!(0.3)));
+    }
+
+    /// With a cross-margin short open, the debt and its interest come out, and the short's own
+    /// quantity goes back in: what is left is the base the short does not owe.
+    #[test]
+    fn free_base_takes_out_debt_and_interest_against_a_short() {
+        use rust_decimal_macros::dec;
+        use rustrade_execution::balance::Balance;
+
+        let (state, btc) = free_base_state(
+            &[(EXECUTION, "btc_usdt", dec!(-1))],
+            Some(Balance::new_margin(
+                dec!(0.00991),
+                dec!(0.00991),
+                dec!(1),
+                dec!(0.001),
+            )),
+        );
+
+        assert_eq!(state.free_base(&btc), Some(dec!(0.00891)));
+    }
+
+    /// A short holding no base of its own reads negative by its interest: the base owed outside
+    /// it, which a buy sized at the short plus the read covers.
+    #[test]
+    fn free_base_reads_a_shorts_interest_as_owed() {
+        use rust_decimal_macros::dec;
+        use rustrade_execution::balance::Balance;
+
+        let (state, btc) = free_base_state(
+            &[(EXECUTION, "btc_usdt", dec!(-1))],
+            Some(Balance::new_margin(
+                Decimal::ZERO,
+                Decimal::ZERO,
+                dec!(1),
+                dec!(0.001),
+            )),
+        );
+
+        assert_eq!(state.free_base(&btc), Some(dec!(-0.001)));
+    }
+
+    /// Positions that count more than the account holds read negative, so a sweep sized from it
+    /// sells no more than is held.
+    #[test]
+    fn free_base_is_negative_when_the_positions_count_more_than_is_held() {
+        use rust_decimal_macros::dec;
+        use rustrade_execution::balance::Balance;
+
+        let (state, btc) = free_base_state(
+            &[(EXECUTION, "btc_usdt", dec!(1))],
+            Some(Balance::new(dec!(0.99), dec!(0.99))),
+        );
+
+        assert_eq!(state.free_base(&btc), Some(dec!(-0.01)));
+    }
+
+    #[test]
+    fn free_base_is_none_without_a_balance() {
+        use rust_decimal_macros::dec;
+
+        let (state, btc) = free_base_state(&[(EXECUTION, "btc_usdt", dec!(1))], None);
+
+        assert_eq!(state.free_base(&btc), None);
     }
 }

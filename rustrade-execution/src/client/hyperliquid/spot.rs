@@ -845,6 +845,12 @@ impl ExecutionClient for HyperliquidSpotClient {
                     "Hyperliquid does not support trailing stop orders".to_string(),
                 );
             }
+            OrderKind::ConditionalUnresolved { .. } => {
+                return make_unsupported(
+                    "an unresolved order kind is only read back from a venue, never placed"
+                        .to_string(),
+                );
+            }
             OrderKind::Limit
             | OrderKind::Stop { .. }
             | OrderKind::StopLimit { .. }
@@ -942,7 +948,7 @@ impl ExecutionClient for HyperliquidSpotClient {
         let order_request = ClientOrderRequest {
             asset: coin,
             is_buy,
-            reduce_only: request.state.reduce_only,
+            reduce_only: request.state.reduce_only.is_reduce_only(),
             limit_px: wire.limit_px,
             sz: wire.sz,
             cloid: Some(cloid),

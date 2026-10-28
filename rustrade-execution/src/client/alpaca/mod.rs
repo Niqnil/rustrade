@@ -68,7 +68,7 @@ use crate::{
             BracketOrderResult as UnifiedBracketOrderResult,
         },
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
-        request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
+        request::{OrderRequestCancel, OrderRequestOpen, ReduceOnly, UnindexedOrderResponseCancel},
         state::{
             ActiveOrderState, Cancelled, Expired, Filled, InactiveOrderState, Open, OrderState,
             UnindexedOrderState,
@@ -1838,12 +1838,12 @@ impl ExecutionClient for AlpacaClient {
     /// Alpaca options/equities require explicit `position_intent`. This impl derives
     /// intent from `RequestOpen::reduce_only` and `side`:
     ///
-    /// | reduce_only | side | intent       | use case                          |
-    /// |-------------|------|--------------|-----------------------------------|
-    /// | false       | Buy  | BuyToOpen    | open long / add to long position  |
-    /// | false       | Sell | SellToOpen   | open short / write option         |
-    /// | true        | Buy  | BuyToClose   | close short position              |
-    /// | true        | Sell | SellToClose  | close long position               |
+    /// | reduce_only     | side | intent       | use case                          |
+    /// |-----------------|------|--------------|-----------------------------------|
+    /// | `No`            | Buy  | BuyToOpen    | open long / add to long position  |
+    /// | `No`            | Sell | SellToOpen   | open short / write option         |
+    /// | any other value | Buy  | BuyToClose   | close short position              |
+    /// | any other value | Sell | SellToClose  | close long position               |
     ///
     /// For explicit control, use [`AlpacaClient::open_order_with_intent`].
     ///
@@ -2370,7 +2370,7 @@ impl AlpacaClient {
             trail_price: None,
             client_order_id: Some(request.cid.0.as_str()),
             position_intent: if is_options_or_equity_symbol(request.instrument.name().as_str()) {
-                Some(map_position_intent(request.side, false))
+                Some(map_position_intent(request.side, ReduceOnly::No))
             } else {
                 None
             },
@@ -2556,7 +2556,8 @@ impl AlpacaClient {
             | OrderKind::TakeProfit { .. }
             | OrderKind::TakeProfitLimit { .. }
             | OrderKind::TrailingStopLimit { .. }
-            | OrderKind::TrailingStopFixedLimit { .. } => (None, None, None),
+            | OrderKind::TrailingStopFixedLimit { .. }
+            | OrderKind::ConditionalUnresolved { .. } => (None, None, None),
         };
 
         let body = AlpacaOrderRequest {
@@ -5264,7 +5265,7 @@ fn map_order_kind(kind: OrderKind) -> Option<&'static str> {
             ..
         } => Some("trailing_stop"),
         // Alpaca has no take-profit, trailing stop-limit or fixed-limit trailing order, and no
-        // activation price on a trailing stop.
+        // activation price on a trailing stop. An unresolved kind is never placed.
         OrderKind::TakeProfit { .. }
         | OrderKind::TakeProfitLimit { .. }
         | OrderKind::TrailingStop {
@@ -5272,7 +5273,8 @@ fn map_order_kind(kind: OrderKind) -> Option<&'static str> {
             ..
         }
         | OrderKind::TrailingStopLimit { .. }
-        | OrderKind::TrailingStopFixedLimit { .. } => None,
+        | OrderKind::TrailingStopFixedLimit { .. }
+        | OrderKind::ConditionalUnresolved { .. } => None,
     }
 }
 
@@ -5320,16 +5322,16 @@ fn is_options_or_equity_symbol(symbol: &str) -> bool {
     !symbol.contains('/')
 }
 
-/// Derives Alpaca's `position_intent` from the generic `reduce_only` flag and `side`.
+/// Derives Alpaca's `position_intent` from the generic [`ReduceOnly`] and `side`.
 ///
-/// | reduce_only | side | intent       | use case                          |
-/// |-------------|------|--------------|-----------------------------------|
-/// | false       | Buy  | BuyToOpen    | open long / add to long position  |
-/// | false       | Sell | SellToOpen   | open short / write option         |
-/// | true        | Buy  | BuyToClose   | close short position              |
-/// | true        | Sell | SellToClose  | close long position               |
-fn map_position_intent(side: Side, reduce_only: bool) -> AlpacaPositionIntent {
-    match (reduce_only, side) {
+/// | reduce_only     | side | intent       | use case                          |
+/// |-----------------|------|--------------|-----------------------------------|
+/// | `No`            | Buy  | BuyToOpen    | open long / add to long position  |
+/// | `No`            | Sell | SellToOpen   | open short / write option         |
+/// | any other value | Buy  | BuyToClose   | close short position              |
+/// | any other value | Sell | SellToClose  | close long position               |
+fn map_position_intent(side: Side, reduce_only: ReduceOnly) -> AlpacaPositionIntent {
+    match (reduce_only.is_reduce_only(), side) {
         (false, Side::Buy) => AlpacaPositionIntent::BuyToOpen,
         (false, Side::Sell) => AlpacaPositionIntent::SellToOpen,
         (true, Side::Buy) => AlpacaPositionIntent::BuyToClose,
@@ -5931,6 +5933,14 @@ mod tests {
                 offset_type: TrailingOffsetType::Percentage,
                 stop_price: Decimal::from_str("95.0").unwrap(),
                 limit_offset: Decimal::from_str("1.0").unwrap(),
+            }),
+            None
+        );
+        // An unresolved kind is only read back from a venue, never placed.
+        assert_eq!(
+            map_order_kind(OrderKind::ConditionalUnresolved {
+                family: crate::order::ConditionalFamily::Stop,
+                trigger_price: None,
             }),
             None
         );
@@ -7779,7 +7789,7 @@ mod tests {
     #[test]
     fn map_position_intent_open_buy_maps_to_buy_to_open() {
         assert_eq!(
-            map_position_intent(Side::Buy, false),
+            map_position_intent(Side::Buy, ReduceOnly::No),
             AlpacaPositionIntent::BuyToOpen
         );
     }
@@ -7787,7 +7797,7 @@ mod tests {
     #[test]
     fn map_position_intent_open_sell_maps_to_sell_to_open() {
         assert_eq!(
-            map_position_intent(Side::Sell, false),
+            map_position_intent(Side::Sell, ReduceOnly::No),
             AlpacaPositionIntent::SellToOpen
         );
     }
@@ -7795,7 +7805,7 @@ mod tests {
     #[test]
     fn map_position_intent_reduce_buy_maps_to_buy_to_close() {
         assert_eq!(
-            map_position_intent(Side::Buy, true),
+            map_position_intent(Side::Buy, ReduceOnly::Position),
             AlpacaPositionIntent::BuyToClose
         );
     }
@@ -7803,8 +7813,20 @@ mod tests {
     #[test]
     fn map_position_intent_reduce_sell_maps_to_sell_to_close() {
         assert_eq!(
-            map_position_intent(Side::Sell, true),
+            map_position_intent(Side::Sell, ReduceOnly::Position),
             AlpacaPositionIntent::SellToClose
+        );
+    }
+
+    #[test]
+    fn map_position_intent_maps_a_free_base_close_as_any_other_close() {
+        assert_eq!(
+            map_position_intent(Side::Sell, ReduceOnly::PositionAndFreeBase),
+            AlpacaPositionIntent::SellToClose
+        );
+        assert_eq!(
+            map_position_intent(Side::Buy, ReduceOnly::PositionAndFreeBase),
+            AlpacaPositionIntent::BuyToClose
         );
     }
 
@@ -8635,7 +8657,7 @@ mod tests {
                 AlpacaConfig::with_base_url("test-key".into(), "test-secret".into(), server.uri());
             let client = AlpacaClient::new(config);
 
-            // Create a Sell order with reduce_only=true (should map to SellToClose)
+            // Create a Sell order with reduce_only Position (should map to SellToClose)
             let request = OrderRequestOpen {
                 key: OrderKey {
                     exchange: ExchangeId::AlpacaBroker,
@@ -8650,7 +8672,7 @@ mod tests {
                     OrderKind::Market,
                     TimeInForce::ImmediateOrCancel,
                 )
-                .with_reduce_only(true), // This should map to SellToClose
+                .with_reduce_only(ReduceOnly::Position), // This should map to SellToClose
             };
 
             // Call open_order (borrows instrument)
@@ -8681,11 +8703,11 @@ mod tests {
             assert_eq!(
                 body.get("position_intent").and_then(|v| v.as_str()),
                 Some("sell_to_close"),
-                "reduce_only=true + Side::Sell should produce position_intent=sell_to_close, got: {body}"
+                "reduce_only Position + Side::Sell should produce position_intent=sell_to_close, got: {body}"
             );
         }
 
-        /// Verifies that reduce_only=false + Buy produces BuyToOpen intent.
+        /// Verifies that reduce_only No + Buy produces BuyToOpen intent.
         #[tokio::test]
         async fn open_order_not_reduce_only_buy_sends_buy_to_open_intent() {
             use crate::client::ExecutionClient;
@@ -8763,7 +8785,7 @@ mod tests {
             assert_eq!(
                 body.get("position_intent").and_then(|v| v.as_str()),
                 Some("buy_to_open"),
-                "reduce_only=false + Side::Buy should produce position_intent=buy_to_open, got: {body}"
+                "reduce_only No + Side::Buy should produce position_intent=buy_to_open, got: {body}"
             );
         }
 

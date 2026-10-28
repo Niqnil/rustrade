@@ -58,7 +58,8 @@ use rustrade_execution::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, PositionId, StrategyId, VenueOrderId},
         request::{
-            OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, RequestCancel, RequestOpen,
+            OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, ReduceOnly, RequestCancel,
+            RequestOpen,
         },
         state::{ActiveOrderState, Cancelled, Filled, Open, OrderState},
     },
@@ -395,7 +396,7 @@ fn test_engine_process_engine_event_with_audit() {
             TimeInForce::ImmediateOrCancel,
         )
         .with_position_id(PositionId::NETTING)
-        .with_reduce_only(true) // closing position
+        .with_reduce_only(ReduceOnly::Position) // closing position
         // A close is stamped like any other open the Engine emits.
         .with_market(MarketSnapshot::from_last_price(Some(dec!(20000)))),
     };
@@ -561,7 +562,7 @@ fn test_engine_process_engine_event_with_audit() {
         )
         // No market: a caller outside the Engine cannot know what the Engine has processed. The
         // Engine stamps its own before sending.
-        .with_reduce_only(true), // closing position
+        .with_reduce_only(ReduceOnly::Position), // closing position
     };
     // What the Engine actually sends: the same request, stamped with the market it observed as it
     // emitted it -- the last trade instrument 1 processed above, and no book because the feed
@@ -4896,7 +4897,7 @@ fn send_open_order_with_position_id(
     position_id: PositionId,
     side: Side,
     price: Decimal,
-    reduce_only: bool,
+    reduce_only: ReduceOnly,
 ) {
     let request = OrderRequestOpen {
         key: OrderKey {
@@ -5030,7 +5031,7 @@ fn test_hedging_fill_routing_to_correct_position_id() {
         pos_id_a.clone(),
         Side::Buy,
         dec!(1_000),
-        false,
+        ReduceOnly::No,
     );
 
     // Verify CID→PositionId was recorded.
@@ -5160,7 +5161,7 @@ fn drive_fill_after_terminal_snapshot(
         pos_id.clone(),
         Side::Buy,
         dec!(1_000),
-        false,
+        ReduceOnly::No,
     );
     send_order_ack(engine, cid.clone(), exchange_id.clone(), Side::Buy);
 
@@ -5171,7 +5172,7 @@ fn drive_fill_after_terminal_snapshot(
             PositionId::new("leg-concurrent"),
             Side::Buy,
             dec!(1_000),
-            false,
+            ReduceOnly::No,
         );
     }
 
@@ -5424,7 +5425,7 @@ fn test_hedging_late_fill_routes_after_a_later_order_prunes_the_live_entry() {
         pos_id_a.clone(),
         Side::Buy,
         dec!(1_000),
-        false,
+        ReduceOnly::No,
     );
     send_order_ack(&mut engine, cid_a.clone(), exchange_id_a.clone(), Side::Buy);
     send_fully_filled_snapshot(&mut engine, cid_a.clone(), exchange_id_a.clone());
@@ -5439,7 +5440,7 @@ fn test_hedging_late_fill_routes_after_a_later_order_prunes_the_live_entry() {
         PositionId::new("leg-b"),
         Side::Buy,
         dec!(1_000),
-        false,
+        ReduceOnly::No,
     );
     send_order_ack(&mut engine, cid_b.clone(), exchange_id_b, Side::Buy);
 
@@ -5494,7 +5495,7 @@ fn test_hedging_position_ids_cleanup_on_position_exit() {
         pos_id_a.clone(),
         Side::Buy,
         dec!(1_000),
-        false,
+        ReduceOnly::No,
     );
     send_order_ack(&mut engine, cid_a.clone(), exchange_id_a.clone(), Side::Buy);
     send_fill(&mut engine, exchange_id_a.clone(), Side::Buy, dec!(1_000));
@@ -5511,7 +5512,7 @@ fn test_hedging_position_ids_cleanup_on_position_exit() {
         pos_id_b_same,
         Side::Sell,
         dec!(2_000),
-        true,
+        ReduceOnly::Position,
     );
     send_order_ack(
         &mut engine,
@@ -5554,7 +5555,7 @@ fn test_hedging_position_ids_cleanup_on_position_exit() {
         PositionId::new("leg-c"),
         Side::Buy,
         dec!(1_000),
-        false,
+        ReduceOnly::No,
     );
     send_order_ack(&mut engine, cid_c, OrderId::new("exch-c"), Side::Buy);
 
@@ -5596,7 +5597,7 @@ fn test_contract_expiry_hedging_multi_position() {
         pos_id_a.clone(),
         Side::Buy,
         dec!(2_000),
-        false,
+        ReduceOnly::No,
     );
     send_order_ack(&mut engine, cid_a, exchange_id_a.clone(), Side::Buy);
     send_fill(&mut engine, exchange_id_a, Side::Buy, dec!(2_000));
@@ -5607,7 +5608,7 @@ fn test_contract_expiry_hedging_multi_position() {
         pos_id_b.clone(),
         Side::Buy,
         dec!(3_000),
-        false,
+        ReduceOnly::No,
     );
     send_order_ack(&mut engine, cid_b, exchange_id_b.clone(), Side::Buy);
     send_fill(&mut engine, exchange_id_b, Side::Buy, dec!(3_000));
@@ -5811,7 +5812,7 @@ fn test_hedging_pending_fill_replayed_on_ack() {
         pos_id.clone(),
         Side::Buy,
         dec!(1_000),
-        false,
+        ReduceOnly::No,
     );
 
     // Step 2: Fill arrives BEFORE ack — should be buffered in pending_fills.
@@ -5868,7 +5869,7 @@ fn test_hedging_pending_fill_drained_on_cancel_ack() {
         pos_id.clone(),
         Side::Buy,
         dec!(1_000),
-        false,
+        ReduceOnly::No,
     );
 
     // Step 2: Fill arrives before any ack — buffered.
@@ -5917,7 +5918,7 @@ fn test_contract_expiry_clears_pending_fills() {
         pos_id.clone(),
         Side::Buy,
         dec!(1_000),
-        false,
+        ReduceOnly::No,
     );
     send_fill(&mut engine, exchange_id.clone(), Side::Buy, dec!(1_000));
 
@@ -6350,7 +6351,7 @@ fn test_corporate_action_floor_to_zero_prunes_hedging_routing() {
         pos_id.clone(),
         Side::Buy,
         dec!(100),
-        false,
+        ReduceOnly::No,
     );
     send_order_ack(&mut engine, cid.clone(), exchange_id.clone(), Side::Buy);
     send_fill(&mut engine, exchange_id.clone(), Side::Buy, dec!(100));
@@ -7683,7 +7684,7 @@ fn test_hedging_pending_fill_replayed_on_fully_filled_ack() {
         pos_id.clone(),
         Side::Buy,
         dec!(1_000),
-        false,
+        ReduceOnly::No,
     );
 
     // Fill arrives BEFORE the ack — buffered, exactly as the Open-ack test asserts.
@@ -8195,9 +8196,16 @@ fn test_open_timed_out_by_the_manager_is_tracked_when_the_venue_reports_it() {
 
 /// A reduce-only order's fill larger than the short it closes is cut, and the engine emits the
 /// cut before the exit it causes. The audit replica, which never records the order request, cuts
-/// the same fill from that output, so its positions and PnL stay the engine's.
+/// the same fill from that output, so its positions and PnL stay the engine's. An order sent to
+/// trade free base past the position is cut the same, and both count it as free base traded.
 #[test]
 fn test_reduce_only_fill_is_cut_and_the_replica_cuts_it_too() {
+    for reduce_only in [ReduceOnly::Position, ReduceOnly::PositionAndFreeBase] {
+        reduce_only_fill_is_cut_and_the_replica_cuts_it_too(reduce_only);
+    }
+}
+
+fn reduce_only_fill_is_cut_and_the_replica_cuts_it_too(reduce_only: ReduceOnly) {
     use rustrade::engine::audit::{context::EngineContext, state_replica::StateReplicaManager};
 
     let (execution_tx, _execution_rx) = mpsc_unbounded();
@@ -8220,7 +8228,7 @@ fn test_reduce_only_fill_is_cut_and_the_replica_cuts_it_too() {
     let mut replica = StateReplicaManager::new(seed_tick, dummy_updates);
 
     let mut repay = open_request(instrument, "repay");
-    repay.state.reduce_only = true;
+    repay.state.reduce_only = reduce_only;
     repay.state.quantity = dec!(1.5);
     process_live_and_replica!(
         &mut engine,
@@ -8259,6 +8267,11 @@ fn test_reduce_only_fill_is_cut_and_the_replica_cuts_it_too() {
         panic!("expected the cut, then the exit; got {outputs:?}");
     };
     assert_eq!(capped.client_order_id, Some(ClientOrderId::new("repay")));
+    let trades_free_base = reduce_only == ReduceOnly::PositionAndFreeBase;
+    assert_eq!(
+        (capped.reduce_only, capped.trades_free_base),
+        (reduce_only, trades_free_base)
+    );
     assert_eq!(
         (capped.held, capped.excess, capped.excess_value),
         (dec!(-1), dec!(0.5), dec!(10_000))
@@ -8275,13 +8288,23 @@ fn test_reduce_only_fill_is_cut_and_the_replica_cuts_it_too() {
         .instrument_index(&instrument);
     assert_eq!(mirrored.position, live.position);
     assert_eq!(mirrored.tear_sheet.pnl_returns, live.tear_sheet.pnl_returns);
-    assert_eq!(
-        (
-            mirrored.tear_sheet.fills_reduce_only_capped,
-            mirrored.tear_sheet.reduce_only_excess
-        ),
-        (1, dec!(10_000))
-    );
+    let (cut, free_base) = if trades_free_base {
+        ((0, Decimal::ZERO), (1, dec!(10_000)))
+    } else {
+        ((1, dec!(10_000)), (0, Decimal::ZERO))
+    };
+    for sheet in [&live.tear_sheet, &mirrored.tear_sheet] {
+        assert_eq!(
+            (sheet.fills_reduce_only_capped, sheet.reduce_only_excess),
+            cut,
+            "{reduce_only:?}"
+        );
+        assert_eq!(
+            (sheet.fills_free_base_traded, sheet.free_base_traded),
+            free_base,
+            "{reduce_only:?}"
+        );
+    }
 }
 
 /// A fill on `ETHBTC` whose fee is charged in USDT, a third asset there.
