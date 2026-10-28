@@ -605,7 +605,8 @@ impl BinanceMargin {
     ///   report that arrives before the answer is described by it. If the future is dropped after
     ///   the request was sent, the order may be live: its kind is kept until the client sees the
     ///   order end, as one from [`recall_order_kinds`](Self::recall_order_kinds) is, and counts
-    ///   toward the same limit.
+    ///   toward the same limit. That includes a drop while waiting to retry a rate-limited
+    ///   request, which Binance refused, since the client cannot tell the two apart.
     pub async fn open_margin_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
@@ -687,7 +688,7 @@ impl BinanceMargin {
         // is placed with is held from the request's first dispatch, after any wait on the rate
         // limiter, for such a report to take. A placement dropped before then sent nothing.
         let mut sending = None;
-        // Every `return` below leaves this block, so the kind is released whatever the answer.
+        // Every `return` below leaves this block, so a held kind is released whatever the answer.
         let placement = async {
             // Sent through `send_request` with the SDK's own query, so that the answer decodes into
             // `NewOrderAnswer` (see there) rather than the SDK's response type.
@@ -6479,12 +6480,22 @@ mod tests {
         assert_eq!(kind_of("waiting"), None);
 
         let fresh = margin_client_at(&server, true);
-        let sent = tokio::time::timeout(
-            Duration::from_millis(200),
-            fresh.open_order(margin_open_request(&btcusdt, "sent")),
-        )
-        .await;
-        assert!(sent.is_err(), "still waiting on the answer");
+        // The placement is dropped once its request has reached the server, however long that
+        // takes, and never answered.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                placed = fresh.open_order(margin_open_request(&btcusdt, "sent")) => {
+                    panic!("the answer is held back: {placed:?}")
+                }
+                () = async {
+                    while orders_sent().await == 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .expect("the request reaches the server");
         assert_eq!(orders_sent().await, 1);
         assert_eq!(
             fresh.known_live.lock().kind_of(&ClientOrderId::new("sent")),
