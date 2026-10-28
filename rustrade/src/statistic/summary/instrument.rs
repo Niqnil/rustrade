@@ -581,7 +581,7 @@ impl TearSheetGenerator {
         let sharpe_ratio = SharpeRatio::calculate(
             risk_free_return,
             self.pnl_returns.total.mean,
-            self.pnl_returns.total.dispersion.std_dev,
+            self.pnl_returns.total.std_dev(),
             trading_period,
         )
         .scale(interval);
@@ -589,7 +589,7 @@ impl TearSheetGenerator {
         let sortino_ratio = SortinoRatio::calculate(
             risk_free_return,
             self.pnl_returns.total.mean,
-            self.pnl_returns.losses.dispersion.std_dev,
+            self.pnl_returns.losses.std_dev(),
             trading_period,
         )
         .scale(interval);
