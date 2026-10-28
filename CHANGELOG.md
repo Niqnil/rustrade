@@ -47,6 +47,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **`SimulatedVenue`** on a spot-margin account follows each balance restatement whose loan
     changed with the same event.
 
+- **`OrderKind::ConditionalUnresolved` and `BinanceMargin::recall_order_kinds`**
+  (`rustrade-execution`, `binance` feature for the method, #763).
+  - **The kind.** A conditional order a venue reports without saying whether its trigger is fixed
+    or trails. It carries a `ConditionalFamily` (`Stop`, `StopLimit`, `TakeProfit`,
+    `TakeProfitLimit`) and the trigger price the venue reports, the activation price of a trailing
+    order. It is only read back, never placed: every client refuses it with
+    `OrderError::UnsupportedOrderType`. `OrderKind` is `#[non_exhaustive]`, so code matching it
+    outside the crate keeps compiling.
+  - **The method.** `recall_order_kinds` takes `(ClientOrderId, OrderKind)` pairs, such as after a
+    restart, when the client has not seen its orders placed. A recalled kind is reported for its
+    order where Binance's report leaves the kind unresolved and the client has learned no resolved
+    kind itself. It is kept until the order is seen to end. The client persists nothing.
+
 ### Changed
 
 - **Breaking: `AssetState` has a new `debt_time` field** (`rustrade`, #755). It holds when the debt
@@ -134,6 +147,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behaviour.
 
 ### Fixed
+
+- **`BinanceMargin` reports every live conditional order, and an isolated account's trailing
+  orders as trailing** (`rustrade-execution`, `binance` feature, #763). Binance's margin REST
+  order queries never say whether a `STOP_LOSS`, `STOP_LOSS_LIMIT`, `TAKE_PROFIT` or
+  `TAKE_PROFIT_LIMIT` order trails, and an isolated account's stream sends `"d": ""` for every
+  order, trailing or not.
+  - `fetch_open_orders` and `account_snapshot` used to leave such a live order out. They now list
+    it, so `account_snapshot` no longer reports those listings incomplete.
+  - An isolated account's stream used to report a trailing stop with an activation price as a
+    fixed `StopLimit` at that price, and to drop one without an activation price. It now reports
+    it with the kind it was placed with.
+  - Each now reports the kind the client knows the order by, from placing it (from the moment
+    the order is sent, so a stream report that arrives before the answer takes it too), from a
+    report that described it, or from `recall_order_kinds`, and otherwise
+    `OrderKind::ConditionalUnresolved`, with a sampled `warn`. An ended order the client does not
+    know, which `fetch_ended_orders` and the stream's reconnect check used to report with its fixed
+    trigger, or not at all without one, is reported unresolved too.
+  - A cross account's stream, whose order reports say they are not isolated, is unchanged: it
+    reports the trailing delta. An order report with an empty `d` that does not say which account
+    it is from is read as an isolated one is: its trailing delta unknown.
 
 - **`MarginEffect::Borrow` states how much Binance lends** (`rustrade-execution`, #749). Its
   rustdoc said a `MARGIN_BUY` order borrows the shortfall, and only the shortfall. Binance lends

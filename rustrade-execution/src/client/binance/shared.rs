@@ -27,8 +27,8 @@ use crate::{
     },
     fill_recovery::{FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope},
     order::{
-        Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType, UnindexedInactiveOrder,
-        UnindexedOrderKey,
+        ConditionalFamily, Order, OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
+        UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::UnindexedOrderResponseCancel,
         state::{
@@ -1373,20 +1373,21 @@ impl TrailingDelta {
 /// - `STOP_LOSS` and `STOP_LOSS_LIMIT` with a trailing delta are an [`OrderKind::TrailingStop`] and
 ///   an [`OrderKind::TrailingStopFixedLimit`] of that many basis points, whichever offset type
 ///   they were placed with. A positive `stopPrice` alongside is their `activation_price`.
+/// - A conditional order whose trailing delta is [`TrailingDelta::Unknown`] could be either a fixed
+///   or a trailing order: it is an [`OrderKind::ConditionalUnresolved`] of its type's family, with
+///   a positive `stopPrice` as its `trigger_price`. A caller that knows the order's kind
+///   reports that instead (see [`resolve_kind`]).
 ///
 /// Returns `None`, with a warning, for an order this cannot describe faithfully, so that it is
 /// dropped and its listing reads as incomplete rather than describing a different order:
 /// - a type this version does not know;
 /// - a fixed-trigger order without a positive `stopPrice`;
 /// - a trailing take-profit, which no [`OrderKind`] describes;
-/// - a conditional order whose trailing delta is [`TrailingDelta::Unknown`], which could be either
-///   a fixed or a trailing order;
 /// - a trailing order whose `stopPrice` does not parse, whose activation price is then unknown.
 ///
-/// The warnings for the trailing take-profit and the unknown trailing delta come from the venue's
-/// shape, not from one bad order, and recur on every listing and report of the same live order;
-/// each warns on its first occurrence and every 1000th after (see [`sampled`]), and logs the rest
-/// at `debug`.
+/// The warning for the trailing take-profit comes from the venue's shape, not from one bad order,
+/// and recurs on every listing and report of the same live order: it warns on its first
+/// occurrence and every 1000th after (see [`sampled`]), and logs the rest at `debug`.
 pub(crate) fn decode_order_kind(
     exchange: ExchangeId,
     order_id: Option<i64>,
@@ -1406,18 +1407,21 @@ pub(crate) fn decode_order_kind(
         }
         stop_price.map(kind)
     };
+    // Logged by `resolve_kind`, and only when the caller does not know the kind either.
+    let unresolved = |family| {
+        Some(OrderKind::ConditionalUnresolved {
+            family,
+            trigger_price: stop_price,
+        })
+    };
     match (order_type, trailing_delta) {
         ("MARKET", _) => Some(OrderKind::Market),
         ("LIMIT" | "LIMIT_MAKER", _) => Some(OrderKind::Limit),
-        (_, TrailingDelta::Unknown) if is_conditional_order_type(order_type) => {
-            static SEEN: AtomicU64 = AtomicU64::new(0);
-            let (count, warns) = sampled(&SEEN);
-            if warns {
-                warn!(%exchange, ?order_id, order_type, count, "Binance conditional order may be a trailing one and its trailingDelta is unknown, dropping it; further ones are logged at debug, with a warning every 1000th");
-            } else {
-                debug!(%exchange, ?order_id, order_type, count, "Binance conditional order may be a trailing one and its trailingDelta is unknown, dropping it");
-            }
-            None
+        ("STOP_LOSS", TrailingDelta::Unknown) => unresolved(ConditionalFamily::Stop),
+        ("STOP_LOSS_LIMIT", TrailingDelta::Unknown) => unresolved(ConditionalFamily::StopLimit),
+        ("TAKE_PROFIT", TrailingDelta::Unknown) => unresolved(ConditionalFamily::TakeProfit),
+        ("TAKE_PROFIT_LIMIT", TrailingDelta::Unknown) => {
+            unresolved(ConditionalFamily::TakeProfitLimit)
         }
         ("STOP_LOSS", TrailingDelta::Absent) => {
             triggered(|trigger_price| OrderKind::Stop { trigger_price })
@@ -1466,20 +1470,101 @@ pub(crate) fn decode_order_kind(
     }
 }
 
+/// The kind to report for an order whose report decoded to `decoded`, with what to log about it.
+///
+/// A report that describes the order fully is reported as it is, and `known` is not called. One
+/// that leaves it [`OrderKind::ConditionalUnresolved`] is reported with the kind `known` returns,
+/// the kind the client knows the order by, when it knows one: from placing it, from an earlier
+/// report that described it, or from the caller (`BinanceMargin::recall_order_kinds`). Otherwise
+/// it stays unresolved.
+///
+/// Nothing is logged here, so a caller can resolve under the lock `known` reads: it logs the
+/// [`KindNote`] once the lock is released.
+pub(crate) fn resolve_kind(
+    exchange: ExchangeId,
+    cid: &ClientOrderId,
+    decoded: OrderKind,
+    known: impl FnOnce() -> Option<OrderKind>,
+) -> (OrderKind, Option<KindNote>) {
+    if !decoded.is_conditional_unresolved() {
+        return (decoded, None);
+    }
+    let (kind, resolved) = match known().filter(|kind| !kind.is_conditional_unresolved()) {
+        Some(kind) => (kind, true),
+        None => (decoded, false),
+    };
+    let note = KindNote {
+        exchange,
+        cid: cid.clone(),
+        kind,
+        resolved,
+    };
+    (kind, Some(note))
+}
+
+/// What [`resolve_kind`] has to log about a report that left its order's kind unresolved, logged
+/// by [`log`](Self::log) once the caller holds no lock.
+#[must_use = "a note is only logged by calling `log`"]
+#[derive(Debug)]
+pub(crate) struct KindNote {
+    exchange: ExchangeId,
+    cid: ClientOrderId,
+    /// The kind reported.
+    kind: OrderKind,
+    /// Whether the client knew the order's kind, so `kind` is it rather than the unresolved one.
+    resolved: bool,
+}
+
+impl KindNote {
+    /// Log the note: at `debug` when the client knew the order's kind; otherwise at `warn` on the
+    /// first occurrence and every 1000th after (see [`sampled`]), and the rest at `debug`, since
+    /// it recurs on every report of the same live order.
+    pub(crate) fn log(self) {
+        let Self {
+            exchange,
+            cid,
+            kind,
+            resolved,
+        } = self;
+        if resolved {
+            debug!(%exchange, %cid, %kind, "Binance order report cannot tell whether the order trails; reporting the kind the client knows it by");
+            return;
+        }
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let (count, warns) = sampled(&SEEN);
+        if warns {
+            warn!(%exchange, %cid, %kind, count, "Binance order report cannot tell whether the order trails, and the client does not know its kind: reporting it unresolved; further ones are logged at debug, with a warning every 1000th");
+        } else {
+            debug!(%exchange, %cid, %kind, count, "Binance order report cannot tell whether the order trails, and the client does not know its kind: reporting it unresolved");
+        }
+    }
+}
+
+/// Report an account stream's order snapshot with the kind the client knows the order by, when its
+/// report left the kind unresolved (see [`resolve_kind`]). Any other event is left as it is.
+/// Returns what to log about it, once the lock `known` reads is released.
+pub(crate) fn resolve_snapshot_kind(
+    exchange: ExchangeId,
+    event: &mut UnindexedAccountEvent,
+    known: KnownKinds<'_>,
+) -> Option<KindNote> {
+    let AccountEventKind::OrderSnapshot(snapshot) = &mut event.kind else {
+        return None;
+    };
+    let order = &mut snapshot.0;
+    let (kind, note) = resolve_kind(exchange, &order.key.cid, order.kind, || {
+        known(&order.key.cid)
+    });
+    order.kind = kind;
+    note
+}
+
 /// Count one more occurrence of a recurring condition on `seen`, a process-wide counter per
 /// condition, and say whether it warns: the first does, and every 1000th after it, as in
 /// [`log_unrecognised_frame`]. Returns the running count with it.
 fn sampled(seen: &AtomicU64) -> (u64, bool) {
     let count = seen.fetch_add(1, Ordering::Relaxed) + 1;
     (count, count == 1 || count.is_multiple_of(1000))
-}
-
-/// Whether a Binance order `type` is conditional, and so may carry a `trailingDelta`.
-fn is_conditional_order_type(order_type: &str) -> bool {
-    matches!(
-        order_type,
-        "STOP_LOSS" | "STOP_LOSS_LIMIT" | "TAKE_PROFIT" | "TAKE_PROFIT_LIMIT"
-    )
 }
 
 /// Whether orders of `kind` carry a limit price in Binance's `price` field, which reads zero on
@@ -1495,6 +1580,7 @@ fn kind_has_limit_price(kind: &OrderKind) -> bool {
         | OrderKind::Stop { .. }
         | OrderKind::TakeProfit { .. }
         | OrderKind::TrailingStop { .. } => false,
+        OrderKind::ConditionalUnresolved { family, .. } => family.has_limit_price(),
     }
 }
 
@@ -1640,6 +1726,7 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
     o: &T,
     exchange: ExchangeId,
     instrument: &InstrumentNameExchange,
+    known: KnownKinds<'_>,
 ) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
     match o.status() {
         Some(status) if rest_order_is_open(status) => {}
@@ -1652,7 +1739,7 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
             return None;
         }
     }
-    let row = convert_order_row(o, exchange, instrument, UnknownTrailingDelta::Drop)?;
+    let row = convert_order_row(o, exchange, instrument, known)?;
     Some(row.map_state(|row| {
         // A live order's fill only grows, so an unknown one reads as nothing filled until the
         // account stream reports more.
@@ -1681,9 +1768,7 @@ pub(crate) fn convert_open_order<T: BinanceOrderFields>(
 /// rather than left unretired: what matters of an order that has ended is that it ended, and an
 /// order held as live after it fired is a protective stop that is not there. It is reported with
 /// `recorded_kind`, the kind the client holds the order with, when the caller has one; otherwise
-/// with its fixed-trigger kind at `stopPrice`, with a warning, since it may have trailed. Without
-/// a recorded kind, one without a positive `stopPrice`, which can only be a trailing order, has no
-/// kind to report and still reads as not ended.
+/// as [`OrderKind::ConditionalUnresolved`] (see [`resolve_kind`]).
 pub(crate) fn convert_ended_order<T: BinanceOrderFields>(
     o: &T,
     exchange: ExchangeId,
@@ -1698,14 +1783,7 @@ pub(crate) fn convert_ended_order<T: BinanceOrderFields>(
     if rest_order_is_open(status) {
         return None;
     }
-    let row = convert_order_row(
-        o,
-        exchange,
-        instrument,
-        UnknownTrailingDelta::Ended {
-            recorded: recorded_kind,
-        },
-    )?;
+    let row = convert_order_row(o, exchange, instrument, &|_| recorded_kind)?;
     let Some(state) = ended_order_state(
         status,
         row.state.order_id.clone(),
@@ -1955,17 +2033,10 @@ struct OrderRow {
     filled_qty: Option<Decimal>,
 }
 
-/// How [`convert_order_row`] reads a conditional order whose trailing delta is
-/// [`TrailingDelta::Unknown`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UnknownTrailingDelta {
-    /// Drop the row: a live order described wrongly misleads whatever acts on it.
-    Drop,
-    /// The order has ended (see [`convert_ended_order`]): report it with `recorded`, the kind the
-    /// client holds it with, or failing that read it as a fixed-trigger order, since the kind of an
-    /// order that has ended no longer steers anything.
-    Ended { recorded: Option<OrderKind> },
-}
+/// The kind the client knows an order by, from its client order id: from placing it, from an
+/// earlier report that described it, or from the caller. `None` when it knows none. A converter
+/// reports it for an order whose row leaves the kind unresolved (see [`resolve_kind`]).
+pub(crate) type KnownKinds<'a> = &'a dyn Fn(&ClientOrderId) -> Option<OrderKind>;
 
 /// Convert the fields of a REST order row that do not depend on its status, shared by
 /// [`convert_open_order`] and [`convert_ended_order`]. Returns `None`, with a warning, when a field
@@ -1974,7 +2045,7 @@ fn convert_order_row<T: BinanceOrderFields>(
     o: &T,
     exchange: ExchangeId,
     instrument: &InstrumentNameExchange,
-    unknown_trailing_delta: UnknownTrailingDelta,
+    known: KnownKinds<'_>,
 ) -> Option<Order<ExchangeId, InstrumentNameExchange, OrderRow>> {
     let Some(order_id_raw) = o.order_id() else {
         warn!(%exchange, %instrument, "Binance order missing orderId");
@@ -2006,32 +2077,20 @@ fn convert_order_row<T: BinanceOrderFields>(
     let filled_qty = binance_filled_qty(exchange, &order_id, o.executed_qty());
     let kind = match o.order_type() {
         Some(t) => {
-            let trailing_delta = o.trailing_delta();
             // decode_order_kind already logs a warning on what it cannot describe
-            let decode = |trailing_delta| {
-                decode_order_kind(
-                    exchange,
-                    Some(order_id_raw),
-                    t,
-                    o.stop_price(),
-                    trailing_delta,
-                )
-            };
-            let undescribed =
-                trailing_delta == TrailingDelta::Unknown && is_conditional_order_type(t);
-            match unknown_trailing_delta {
-                UnknownTrailingDelta::Ended {
-                    recorded: Some(recorded),
-                } if undescribed => {
-                    debug!(%exchange, %instrument, order_id = %order_id_raw, order_type = t, kind = %recorded, "Binance order has ended and its row cannot tell whether it trailed; reporting it with the kind it was held with");
-                    recorded
-                }
-                UnknownTrailingDelta::Ended { recorded: None } if undescribed => {
-                    warn!(%exchange, %instrument, order_id = %order_id_raw, order_type = t, "Binance order has ended and may have been a trailing one, which its row cannot tell; reporting it with its fixed trigger");
-                    decode(TrailingDelta::Absent)?
-                }
-                _ => decode(trailing_delta)?,
+            let decoded = decode_order_kind(
+                exchange,
+                Some(order_id_raw),
+                t,
+                o.stop_price(),
+                o.trailing_delta(),
+            )?;
+            // Each lookup takes and releases its own lock, so the note logs with none held.
+            let (kind, note) = resolve_kind(exchange, &cid, decoded, || known(&cid));
+            if let Some(note) = note {
+                note.log();
             }
+            kind
         }
         None => {
             warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance order missing type");
@@ -2106,12 +2165,13 @@ pub(crate) fn convert_open_order_listing<T: BinanceOrderFields>(
     rows: &[T],
     exchange: ExchangeId,
     instrument: &InstrumentNameExchange,
+    known: KnownKinds<'_>,
 ) -> OpenOrderListing {
     let mut complete = true;
     let orders = rows
         .iter()
         .filter_map(|row| {
-            let order = convert_open_order(row, exchange, instrument);
+            let order = convert_open_order(row, exchange, instrument, known);
             complete &= order.is_some() && row.client_order_id().is_some();
             order
         })
@@ -2126,6 +2186,7 @@ pub(crate) fn convert_open_order_listing<T: BinanceOrderFields>(
 pub(crate) fn convert_open_order_owned_symbol<T: BinanceOrderFields>(
     o: &T,
     exchange: ExchangeId,
+    known: KnownKinds<'_>,
 ) -> Option<Order<ExchangeId, InstrumentNameExchange, Open>> {
     let instrument = match o.symbol() {
         Some(s) => InstrumentNameExchange::new(s),
@@ -2134,7 +2195,7 @@ pub(crate) fn convert_open_order_owned_symbol<T: BinanceOrderFields>(
             return None;
         }
     };
-    convert_open_order(o, exchange, &instrument)
+    convert_open_order(o, exchange, &instrument, known)
 }
 
 // ---------------------------------------------------------------------------
@@ -2518,11 +2579,15 @@ pub(crate) struct ExecutionReport {
     /// kinds that carry neither.
     #[serde(rename = "P")]
     pub(crate) stop_price: Option<String>,
-    /// `d`: the trailing delta in basis points, sent only for a trailing order. Binance's docs show
-    /// a number, but the margin SDK model declared a string until 74.1.1, and margin has no
-    /// testnet to confirm which the live stream sends, so either is accepted.
+    /// `d`: the trailing delta in basis points. Binance's docs show a number, but the margin SDK
+    /// model declared a string until 74.1.1, so either is accepted. Spot sends it only for a
+    /// trailing order. Margin sends `""` for an order that does not trail on a cross account, and
+    /// for every order, trailing or not, on an isolated one.
     #[serde(rename = "d")]
     pub(crate) trailing_delta: Option<WireInt>,
+    /// `is`: whether the report is about an isolated-margin account. Margin only; spot sends none.
+    #[serde(rename = "is")]
+    pub(crate) is_isolated: Option<bool>,
 }
 
 impl ExecutionReport {
@@ -2937,8 +3002,13 @@ fn convert_order_snapshot(
     let trailing_delta = match &report.trailing_delta {
         None => TrailingDelta::Absent,
         Some(WireInt::Int(delta)) => TrailingDelta::from_reported(Some(*delta)),
-        // Binance's margin stream sends `"d": ""` on every order that does not trail.
-        Some(WireInt::Unreadable(raw)) if raw.is_empty() => TrailingDelta::Absent,
+        // Binance's cross-margin stream sends `"d": ""` on an order that does not trail. Its
+        // isolated-margin stream sends it on a trailing order too, so there it says nothing, and
+        // a report that does not say which account it is about could be either.
+        Some(WireInt::Unreadable(raw)) if raw.is_empty() => match report.is_isolated {
+            Some(false) => TrailingDelta::Absent,
+            Some(true) | None => TrailingDelta::Unknown,
+        },
         Some(WireInt::Unreadable(raw)) => {
             // A shape Binance sends one way recurs on every report of the order, so sample it.
             static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -3495,6 +3565,7 @@ pub(crate) enum BinanceTimeInForce {
 /// `trailingDelta` from [`trailing_delta_basis_points`] and an activation price as `stopPrice`.
 /// `TrailingStopLimit` classifies to `None`: Binance's trailing `STOP_LOSS_LIMIT` keeps its limit
 /// price fixed while the stop trails, where `TrailingStopLimit`'s limit follows the stop.
+/// `ConditionalUnresolved`, which is only read back, classifies to `None` too.
 pub(crate) fn classify_order_kind_tif(
     kind: OrderKind,
     tif: TimeInForce,
@@ -3594,6 +3665,10 @@ pub(crate) fn classify_order_kind_tif(
         // stop as TrailingStopLimit's does: that is TrailingStopFixedLimit.
         OrderKind::TrailingStopLimit { .. } => {
             warn!("Binance does not support TrailingStopLimit orders");
+            None
+        }
+        OrderKind::ConditionalUnresolved { .. } => {
+            warn!("an unresolved order kind is only read back from a venue, never placed");
             None
         }
     }
@@ -3726,7 +3801,8 @@ pub(crate) fn trailing_params(
         | OrderKind::StopLimit { .. }
         | OrderKind::TakeProfit { .. }
         | OrderKind::TakeProfitLimit { .. }
-        | OrderKind::TrailingStopLimit { .. } => return Ok(None),
+        | OrderKind::TrailingStopLimit { .. }
+        | OrderKind::ConditionalUnresolved { .. } => return Ok(None),
     };
     let trailing_delta =
         trailing_delta_basis_points(offset, offset_type).map_err(TrailingOrderError::Delta)?;
@@ -4434,9 +4510,8 @@ mod tests {
         }
     }
 
-    /// A trailing take-profit has no `OrderKind`, a conditional order whose trailing delta is
-    /// unknown could be either fixed or trailing, and a trailing order whose stopPrice does not
-    /// parse has an unknown activation price: all are dropped rather than misdescribed.
+    /// A trailing take-profit has no `OrderKind`, and a trailing order whose stopPrice does not
+    /// parse has an unknown activation price: both are dropped rather than misdescribed.
     #[test]
     fn conditional_orders_that_cannot_be_described_are_dropped() {
         for order_type in ["STOP_LOSS", "STOP_LOSS_LIMIT"] {
@@ -4453,18 +4528,92 @@ mod tests {
                 "{order_type}"
             );
         }
-        for order_type in [
-            "STOP_LOSS",
-            "STOP_LOSS_LIMIT",
-            "TAKE_PROFIT",
-            "TAKE_PROFIT_LIMIT",
+    }
+
+    /// A conditional order whose trailing delta is unknown could be either fixed or trailing: it
+    /// is its type's unresolved family, with a positive `stopPrice` as its trigger and none
+    /// otherwise, since a trailing order placed without an activation price reports `"0"`.
+    #[test]
+    fn a_conditional_order_with_an_unknown_trailing_delta_is_unresolved() {
+        use rust_decimal_macros::dec;
+        for (order_type, family) in [
+            ("STOP_LOSS", ConditionalFamily::Stop),
+            ("STOP_LOSS_LIMIT", ConditionalFamily::StopLimit),
+            ("TAKE_PROFIT", ConditionalFamily::TakeProfit),
+            ("TAKE_PROFIT_LIMIT", ConditionalFamily::TakeProfitLimit),
         ] {
-            assert_eq!(
-                decode(order_type, Some("100"), TrailingDelta::Unknown),
-                None,
-                "{order_type}"
-            );
+            for (stop_price, trigger_price) in [
+                (Some("100"), Some(dec!(100))),
+                (Some("0"), None),
+                (None, None),
+            ] {
+                assert_eq!(
+                    decode(order_type, stop_price, TrailingDelta::Unknown),
+                    Some(OrderKind::ConditionalUnresolved {
+                        family,
+                        trigger_price
+                    }),
+                    "{order_type} {stop_price:?}"
+                );
+            }
         }
+        // A limit or market order never trails, so an unknown delta leaves it described.
+        assert_eq!(
+            decode("LIMIT", None, TrailingDelta::Unknown),
+            Some(OrderKind::Limit)
+        );
+        // A type this version does not know is dropped, not taken for a conditional one.
+        assert_eq!(
+            decode("NEW_TYPE", Some("100"), TrailingDelta::Unknown),
+            None
+        );
+    }
+
+    /// An unresolved kind is reported as the kind the client knows the order by, unless that is
+    /// unresolved too; a kind the report describes is reported as it is, whatever the client
+    /// knows.
+    #[test]
+    fn resolve_kind_takes_the_known_kind_only_for_an_unresolved_report() {
+        use rust_decimal_macros::dec;
+        let cid = ClientOrderId::new("cid");
+        let unresolved = OrderKind::ConditionalUnresolved {
+            family: ConditionalFamily::StopLimit,
+            trigger_price: Some(dec!(100)),
+        };
+        let trailing = OrderKind::TrailingStopFixedLimit {
+            offset: dec!(25),
+            offset_type: TrailingOffsetType::BasisPoints,
+            activation_price: Some(dec!(100)),
+        };
+        let fixed = OrderKind::StopLimit {
+            trigger_price: dec!(100),
+        };
+        let resolve = |decoded, known: Option<OrderKind>| {
+            let (kind, note) = resolve_kind(ExchangeId::BinanceMargin, &cid, decoded, || known);
+            (kind, note.map(|note| note.resolved))
+        };
+        assert_eq!(resolve(unresolved, Some(trailing)), (trailing, Some(true)));
+        assert_eq!(resolve(unresolved, None), (unresolved, Some(false)));
+        assert_eq!(
+            resolve(unresolved, Some(unresolved)),
+            (unresolved, Some(false))
+        );
+        assert_eq!(resolve(fixed, Some(trailing)), (fixed, None));
+        // A described report does not look up the known kind, which may take a lock.
+        let (kind, note) = resolve_kind(ExchangeId::BinanceMargin, &cid, fixed, || {
+            panic!("looked up for a described report")
+        });
+        assert_eq!((kind, note.is_none()), (fixed, true));
+
+        // A note logs once: at debug when the client knew the kind; the unresolved one sampled.
+        use crate::client::order_recovery::{KnownLiveOrders, tests::logged_with_lock_free};
+        let logged = |known| {
+            let (_, note) = resolve_kind(ExchangeId::BinanceMargin, &cid, unresolved, || known);
+            let set = KnownLiveOrders::shared(ExchangeId::BinanceMargin);
+            logged_with_lock_free(&set, || note.unwrap().log())
+        };
+        assert_eq!(logged(Some(trailing)), [(tracing::Level::DEBUG, true)]);
+        assert_eq!(logged(None).len(), 1);
     }
 
     #[test]
@@ -4589,7 +4738,8 @@ mod tests {
                     "trailingDelta": 25, "trailingTime": -1, "price": "95", "stopPrice": stop_price,
                 }),
             ))];
-            let listing = convert_open_order_listing(&rows, ExchangeId::BinanceSpot, &btc);
+            let listing =
+                convert_open_order_listing(&rows, ExchangeId::BinanceSpot, &btc, &|_| None);
             let [order] = listing.orders.as_slice() else {
                 panic!("one order: {:?}", listing.orders);
             };
@@ -4701,7 +4851,7 @@ mod tests {
                 serde_json::json!({"clientOrderId": "cid-9", "stopPrice": "96"}),
             )),
         ];
-        let listing = convert_open_order_listing(&rows, ExchangeId::BinanceSpot, &btc);
+        let listing = convert_open_order_listing(&rows, ExchangeId::BinanceSpot, &btc, &|_| None);
         assert!(listing.complete);
         let described: Vec<_> = listing
             .orders
@@ -4739,39 +4889,71 @@ mod tests {
     }
 
     /// Margin rows do not report `trailingDelta`, so a live conditional row could be a trailing
-    /// order: it is left out and the listing reads incomplete, while plain rows list as before.
+    /// order: it is listed with the kind the client knows it by, or else unresolved, and the
+    /// listing stays complete. Plain rows list as before.
     #[test]
-    fn margin_listings_leave_out_conditional_rows_and_read_incomplete() {
+    fn margin_listings_report_conditional_rows_with_their_known_or_unresolved_kind() {
+        use rust_decimal_macros::dec;
         let btc = InstrumentNameExchange::new("BTCUSDT");
-        for order_type in [
-            "STOP_LOSS",
-            "STOP_LOSS_LIMIT",
-            "TAKE_PROFIT",
-            "TAKE_PROFIT_LIMIT",
+        let trailing = OrderKind::TrailingStopFixedLimit {
+            offset: dec!(25),
+            offset_type: TrailingOffsetType::BasisPoints,
+            activation_price: Some(dec!(96)),
+        };
+        let known = |cid: &ClientOrderId| (cid.0.as_str() == "cid-3").then_some(trailing);
+        for (order_type, family) in [
+            ("STOP_LOSS", ConditionalFamily::Stop),
+            ("STOP_LOSS_LIMIT", ConditionalFamily::StopLimit),
+            ("TAKE_PROFIT", ConditionalFamily::TakeProfit),
+            ("TAKE_PROFIT_LIMIT", ConditionalFamily::TakeProfitLimit),
         ] {
+            let conditional = |cid: &str| {
+                margin_row(order_row(
+                    order_type,
+                    "NEW",
+                    serde_json::json!({"clientOrderId": cid, "price": "95", "stopPrice": "96"}),
+                ))
+            };
             let rows = [
                 margin_row(order_row(
                     "LIMIT",
                     "NEW",
                     serde_json::json!({"clientOrderId": "cid-1", "price": "95"}),
                 )),
-                margin_row(order_row(
-                    order_type,
-                    "NEW",
-                    serde_json::json!({"price": "95", "stopPrice": "96"}),
-                )),
+                conditional("cid-2"),
+                conditional("cid-3"),
             ];
-            let listing = convert_open_order_listing(&rows, ExchangeId::BinanceMargin, &btc);
-            assert!(!listing.complete, "{order_type}");
-            assert_eq!(listing.orders.len(), 1, "{order_type}");
-            assert_eq!(listing.orders[0].kind, OrderKind::Limit);
+            let listing =
+                convert_open_order_listing(&rows, ExchangeId::BinanceMargin, &btc, &known);
+            assert!(listing.complete, "{order_type}");
+            let kinds: Vec<_> = listing
+                .orders
+                .iter()
+                .map(|order| (order.key.cid.0.as_str(), order.kind, order.price))
+                .collect();
+            let limit = family.has_limit_price().then_some(dec!(95));
+            assert_eq!(
+                kinds,
+                [
+                    ("cid-1", OrderKind::Limit, Some(dec!(95))),
+                    (
+                        "cid-2",
+                        OrderKind::ConditionalUnresolved {
+                            family,
+                            trigger_price: Some(dec!(96))
+                        },
+                        limit
+                    ),
+                    ("cid-3", trailing, Some(dec!(95))),
+                ],
+                "{order_type}"
+            );
         }
     }
 
     /// A margin conditional order that has ended is still reported as ended, so it is not held as
-    /// live: with the kind the client holds it with, or failing that with its fixed trigger,
-    /// without which it cannot be described. The held kind stands in only for what the row cannot
-    /// tell.
+    /// live: with the kind the client holds it with, or failing that unresolved, with its trigger
+    /// when it has one. The held kind stands in only for what the row cannot tell.
     #[test]
     fn an_ended_margin_conditional_order_reports_its_ending() {
         let key = UnindexedOrderKey::new(
@@ -4785,19 +4967,21 @@ mod tests {
             "CANCELED",
             serde_json::json!({"stopPrice": "96"}),
         ));
-        let Some(order) = convert_ended_order(&row, ExchangeId::BinanceMargin, &key, None) else {
-            panic!("an ended stop should be reported");
-        };
-        assert_eq!(
-            order.kind,
-            OrderKind::Stop {
-                trigger_price: Decimal::from(96)
-            }
-        );
-        assert!(matches!(order.state, InactiveOrderState::Cancelled(_)));
-
         let untriggered = margin_row(order_row("STOP_LOSS", "CANCELED", serde_json::json!({})));
-        assert!(convert_ended_order(&untriggered, ExchangeId::BinanceMargin, &key, None).is_none());
+        for (row, trigger_price) in [(&row, Some(Decimal::from(96))), (&untriggered, None)] {
+            let Some(order) = convert_ended_order(row, ExchangeId::BinanceMargin, &key, None)
+            else {
+                panic!("an ended stop should be reported");
+            };
+            assert_eq!(
+                order.kind,
+                OrderKind::ConditionalUnresolved {
+                    family: ConditionalFamily::Stop,
+                    trigger_price
+                }
+            );
+            assert!(matches!(order.state, InactiveOrderState::Cancelled(_)));
+        }
 
         // With the kind the client holds the order with, that kind is reported, trigger or not.
         let trailing_stop = OrderKind::TrailingStop {

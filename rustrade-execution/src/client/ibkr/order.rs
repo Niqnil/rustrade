@@ -939,13 +939,15 @@ pub fn build_ib_order(
         // IBKR does not have native take-profit order types. Callers should use
         // bracket orders or manage TP logic at the strategy level. Its trailing orders take no
         // activation price, and its trailing limit follows the stop rather than staying fixed.
+        // An unresolved kind is only read back from a venue, never placed.
         OrderKind::TakeProfit { .. }
         | OrderKind::TakeProfitLimit { .. }
         | OrderKind::TrailingStop {
             activation_price: Some(_),
             ..
         }
-        | OrderKind::TrailingStopFixedLimit { .. } => {
+        | OrderKind::TrailingStopFixedLimit { .. }
+        | OrderKind::ConditionalUnresolved { .. } => {
             return Err(OrderMappingError::UnsupportedOrderKind(*kind));
         }
     };
@@ -1779,6 +1781,23 @@ mod tests {
                 TrailingOffsetType::BasisPoints
             ))
         ));
+    }
+
+    /// An unresolved kind is only read back from a venue, never placed.
+    #[test]
+    fn test_build_unresolved_kind_unsupported() {
+        let kind = OrderKind::ConditionalUnresolved {
+            family: crate::order::ConditionalFamily::StopLimit,
+            trigger_price: Some(Decimal::from(95)),
+        };
+        let result = build_ib_order(
+            rustrade_instrument::Side::Sell,
+            100.0,
+            &kind,
+            Some(Decimal::from(94)),
+            &TimeInForce::GoodUntilCancelled { post_only: false },
+        );
+        assert!(matches!(result, Err(OrderMappingError::UnsupportedOrderKind(k)) if k == kind));
     }
 
     #[test]

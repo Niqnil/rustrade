@@ -2556,7 +2556,8 @@ impl AlpacaClient {
             | OrderKind::TakeProfit { .. }
             | OrderKind::TakeProfitLimit { .. }
             | OrderKind::TrailingStopLimit { .. }
-            | OrderKind::TrailingStopFixedLimit { .. } => (None, None, None),
+            | OrderKind::TrailingStopFixedLimit { .. }
+            | OrderKind::ConditionalUnresolved { .. } => (None, None, None),
         };
 
         let body = AlpacaOrderRequest {
@@ -5264,7 +5265,7 @@ fn map_order_kind(kind: OrderKind) -> Option<&'static str> {
             ..
         } => Some("trailing_stop"),
         // Alpaca has no take-profit, trailing stop-limit or fixed-limit trailing order, and no
-        // activation price on a trailing stop.
+        // activation price on a trailing stop. An unresolved kind is never placed.
         OrderKind::TakeProfit { .. }
         | OrderKind::TakeProfitLimit { .. }
         | OrderKind::TrailingStop {
@@ -5272,7 +5273,8 @@ fn map_order_kind(kind: OrderKind) -> Option<&'static str> {
             ..
         }
         | OrderKind::TrailingStopLimit { .. }
-        | OrderKind::TrailingStopFixedLimit { .. } => None,
+        | OrderKind::TrailingStopFixedLimit { .. }
+        | OrderKind::ConditionalUnresolved { .. } => None,
     }
 }
 
@@ -5931,6 +5933,14 @@ mod tests {
                 offset_type: TrailingOffsetType::Percentage,
                 stop_price: Decimal::from_str("95.0").unwrap(),
                 limit_offset: Decimal::from_str("1.0").unwrap(),
+            }),
+            None
+        );
+        // An unresolved kind is only read back from a venue, never placed.
+        assert_eq!(
+            map_order_kind(OrderKind::ConditionalUnresolved {
+                family: crate::order::ConditionalFamily::Stop,
+                trigger_price: None,
             }),
             None
         );
