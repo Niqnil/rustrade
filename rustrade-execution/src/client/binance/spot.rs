@@ -597,7 +597,11 @@ async fn fetch_open_orders_for_instrument(
 
     let orders_data = response.data().await.map_err(response_decode_error)?;
 
-    let listing = convert_open_order_listing(&orders_data, ExchangeId::BinanceSpot, &instrument);
+    // Spot rows report every order's trailingDelta, so none is left unresolved.
+    let listing =
+        convert_open_order_listing(&orders_data, ExchangeId::BinanceSpot, &instrument, &|_| {
+            None
+        });
 
     Ok((instrument, listing))
 }
@@ -623,7 +627,8 @@ async fn fetch_all_open_orders(
 
     let orders = orders_data
         .into_iter()
-        .filter_map(|o| convert_open_order_owned_symbol(&o, ExchangeId::BinanceSpot))
+        // Spot rows report every order's trailingDelta, so none is left unresolved.
+        .filter_map(|o| convert_open_order_owned_symbol(&o, ExchangeId::BinanceSpot, &|_| None))
         .collect();
 
     Ok(orders)
@@ -1410,12 +1415,13 @@ impl ExecutionClient for BinanceSpot {
             | OrderKind::TakeProfitLimit { trigger_price } => {
                 params_builder = params_builder.price(price).stop_price(trigger_price);
             }
-            // Trailing orders are set above. Market sends no price, and TrailingStopLimit is
-            // rejected by convert_order_kind_tif before this.
+            // Trailing orders are set above. Market sends no price, and TrailingStopLimit and
+            // ConditionalUnresolved are rejected by convert_order_kind_tif before this.
             OrderKind::TrailingStop { .. }
             | OrderKind::TrailingStopFixedLimit { .. }
             | OrderKind::Market
-            | OrderKind::TrailingStopLimit { .. } => {}
+            | OrderKind::TrailingStopLimit { .. }
+            | OrderKind::ConditionalUnresolved { .. } => {}
         }
 
         if let Some(tif) = binance_tif {
@@ -4551,12 +4557,14 @@ mod tests {
             status: Some("NEW".to_string()),
             ..Default::default()
         };
-        let from_all_orders = convert_open_order(&all_orders, ExchangeId::BinanceSpot, &instrument)
-            .expect("valid order should convert");
+        let from_all_orders =
+            convert_open_order(&all_orders, ExchangeId::BinanceSpot, &instrument, &|_| None)
+                .expect("valid order should convert");
         let from_open_orders = convert_open_order(
             &make_base_open_order(),
             ExchangeId::BinanceSpot,
             &instrument,
+            &|_| None,
         )
         .expect("valid order should convert");
         assert_eq!(from_all_orders, from_open_orders);
@@ -4593,7 +4601,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                convert_open_order(&row, ExchangeId::BinanceSpot, &instrument),
+                convert_open_order(&row, ExchangeId::BinanceSpot, &instrument, &|_| None),
                 None,
                 "{status}"
             );
@@ -4609,7 +4617,7 @@ mod tests {
                 ..make_base_open_order()
             };
             assert!(
-                convert_open_order(&o, ExchangeId::BinanceSpot, &instrument).is_some(),
+                convert_open_order(&o, ExchangeId::BinanceSpot, &instrument, &|_| None).is_some(),
                 "{status}"
             );
         }
@@ -4632,13 +4640,14 @@ mod tests {
             &[make_base_open_order(), second()],
             ExchangeId::BinanceSpot,
             &instrument,
+            &|_| None,
         );
         assert_eq!(listing.orders.len(), 2);
         assert!(listing.complete);
 
         let empty = convert_open_order_listing::<
             binance_sdk::spot::rest_api::GetOpenOrdersResponseInner,
-        >(&[], ExchangeId::BinanceSpot, &instrument);
+        >(&[], ExchangeId::BinanceSpot, &instrument, &|_| None);
         assert!(empty.orders.is_empty());
         assert!(empty.complete, "no open orders is a complete answer");
 
@@ -4650,6 +4659,7 @@ mod tests {
             &[make_base_open_order(), dropped],
             ExchangeId::BinanceSpot,
             &instrument,
+            &|_| None,
         );
         assert_eq!(listing.orders.len(), 1);
         assert!(!listing.complete, "a dropped row may be a live order");
@@ -4662,6 +4672,7 @@ mod tests {
             &[make_base_open_order(), without_cid],
             ExchangeId::BinanceSpot,
             &instrument,
+            &|_| None,
         );
         assert_eq!(listing.orders.len(), 2, "the row is still converted");
         assert!(
@@ -4677,7 +4688,7 @@ mod tests {
             status: None,
             ..make_base_open_order()
         };
-        assert!(convert_open_order(&o, ExchangeId::BinanceSpot, &instrument).is_none());
+        assert!(convert_open_order(&o, ExchangeId::BinanceSpot, &instrument, &|_| None).is_none());
     }
 
     /// A REST order snapshot is stamped with when the order last changed, not when it was created.
@@ -4693,7 +4704,7 @@ mod tests {
             update_time: Some(1_700_000_005_000),
             ..make_base_open_order()
         };
-        let order = convert_open_order(&updated, ExchangeId::BinanceSpot, &instrument)
+        let order = convert_open_order(&updated, ExchangeId::BinanceSpot, &instrument, &|_| None)
             .expect("valid order should convert");
         assert_eq!(
             order.state.time_exchange,
@@ -4709,6 +4720,7 @@ mod tests {
             &make_base_open_order(),
             ExchangeId::BinanceSpot,
             &instrument,
+            &|_| None,
         )
         .expect("valid order should convert");
         assert_eq!(
@@ -4727,6 +4739,7 @@ mod tests {
             &make_base_open_order(),
             ExchangeId::BinanceSpot,
             &instrument,
+            &|_| None,
         )
         .expect("valid order should convert");
         assert_eq!(order.key.instrument, instrument);
@@ -4744,7 +4757,7 @@ mod tests {
             symbol: Some("ETHUSDT".to_string()),
             ..make_base_open_order()
         };
-        let order = convert_open_order_owned_symbol(&o, ExchangeId::BinanceSpot)
+        let order = convert_open_order_owned_symbol(&o, ExchangeId::BinanceSpot, &|_| None)
             .expect("valid order should convert");
         assert_eq!(order.key.instrument.name().as_str(), "ETHUSDT");
         assert_eq!(order.side, Side::Buy);
@@ -4755,7 +4768,7 @@ mod tests {
         // make_base_open_order() leaves `symbol` unset — drop rather than guess the instrument.
         let o = make_base_open_order();
         assert!(o.symbol.is_none());
-        assert!(convert_open_order_owned_symbol(&o, ExchangeId::BinanceSpot).is_none());
+        assert!(convert_open_order_owned_symbol(&o, ExchangeId::BinanceSpot, &|_| None).is_none());
     }
 
     #[test]
@@ -4766,7 +4779,7 @@ mod tests {
             ..make_base_open_order()
         };
         assert!(
-            convert_open_order(&o, ExchangeId::BinanceSpot, &instrument).is_none(),
+            convert_open_order(&o, ExchangeId::BinanceSpot, &instrument, &|_| None).is_none(),
             "missing orderId should return None"
         );
     }
@@ -4779,7 +4792,7 @@ mod tests {
             ..make_base_open_order()
         };
         assert!(
-            convert_open_order(&o, ExchangeId::BinanceSpot, &instrument).is_none(),
+            convert_open_order(&o, ExchangeId::BinanceSpot, &instrument, &|_| None).is_none(),
             "missing side should return None"
         );
     }
@@ -4792,7 +4805,7 @@ mod tests {
             ..make_base_open_order()
         };
         assert!(
-            convert_open_order(&o, ExchangeId::BinanceSpot, &instrument).is_none(),
+            convert_open_order(&o, ExchangeId::BinanceSpot, &instrument, &|_| None).is_none(),
             "missing type should return None"
         );
     }
@@ -4804,7 +4817,7 @@ mod tests {
             executed_qty: None,
             ..make_base_open_order()
         };
-        let order = convert_open_order(&o, ExchangeId::BinanceSpot, &instrument)
+        let order = convert_open_order(&o, ExchangeId::BinanceSpot, &instrument, &|_| None)
             .expect("None executedQty should still convert");
         assert_eq!(
             order.state.filled_quantity,
@@ -4820,7 +4833,7 @@ mod tests {
             executed_qty: Some("bad-value".to_string()),
             ..make_base_open_order()
         };
-        let order = convert_open_order(&o, ExchangeId::BinanceSpot, &instrument)
+        let order = convert_open_order(&o, ExchangeId::BinanceSpot, &instrument, &|_| None)
             .expect("unparseable executedQty should still convert");
         assert_eq!(
             order.state.filled_quantity,

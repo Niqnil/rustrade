@@ -82,7 +82,8 @@ use crate::{
     client::{
         BorrowCapacityClient, ExecutionClient, OrderStatusClient, ShortabilityClient,
         order_recovery::{
-            KnownLiveOrders, OpenListing, OrderLookup, SharedKnownLiveOrders, UncheckedOrders,
+            KnownLiveOrders, MAX_KNOWN_LIVE_ORDERS, OpenListing, OrderLookup,
+            SharedKnownLiveOrders, UncheckedOrders,
             fetch_ended_by_key, recover_ended_orders,
         },
     },
@@ -388,26 +389,31 @@ impl BinanceMarginConfig {
 /// which is not affected. The client does not refuse these orders unsent, so they go through
 /// again once Binance takes them.
 ///
-/// # Conditional orders read back over REST
+/// # Conditional orders Binance does not describe
 /// Binance margin accepts a `trailingDelta` on its conditional types (`STOP_LOSS`,
-/// `STOP_LOSS_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`), though a cross account refuses a
-/// trailing `STOP_LOSS` (see "Trailing stops" above), and the REST order queries this client
-/// reads (`openOrders` and `order`) do not report it: Binance returns neither `trailingDelta` nor
-/// `trailingTime` there (#541). A trailing order placed without an activation price reads
-/// `stopPrice` `"0"`. A conditional order read over REST could therefore be a fixed or a trailing
-/// order, so [`fetch_open_orders`](Self::fetch_open_orders) and
-/// [`account_snapshot`](Self::account_snapshot) leave a live one out rather than describe it
-/// wrongly. `account_snapshot` reports such a listing incomplete; `fetch_open_orders` has no way
-/// to, so there the omission shows only in the log. The [`account_stream`](Self::account_stream)
-/// reports these orders in full: its `executionReport` carries the trailing delta.
+/// `STOP_LOSS_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`), on cross and isolated accounts, though
+/// a cross account refuses a trailing `STOP_LOSS` (see "Trailing stops" above). Two of its reports
+/// never say whether such an order trails:
+/// - the REST order queries this client reads (`openOrders`, `order`, `allOrders`) return neither
+///   `trailingDelta` nor `trailingTime` (#541), on either account;
+/// - an isolated account's stream sends an empty trailing delta (`"d": ""`) for every order,
+///   trailing or not. A cross account's stream sends the delta of a trailing order, and an empty
+///   one only for an order that does not trail.
 ///
-/// An order that has ended is still reported as ended by
-/// [`fetch_ended_orders`](crate::client::OrderStatusClient::fetch_ended_orders) and by the stream's
-/// check after a reconnect, so that a stop that fired is not held as live. Its kind is the one this
-/// client holds it with: every order it placed, listed or saw on its stream while live. An order
-/// it does not hold is reported with its fixed-trigger kind at `stopPrice`, which a trailing order
-/// it really was does not match, and one of those without a positive `stopPrice` cannot be
-/// described at all and reads as not ended, with a warning.
+/// A trailing order placed without an activation price reads `stopPrice` `"0"` in both.
+///
+/// Such an order is reported with the kind this client knows it by: the kind it was placed with,
+/// or the one a report that did describe it gave, for every order the client placed, listed or
+/// saw while live, or else a kind the caller supplied with
+/// [`recall_order_kinds`](Self::recall_order_kinds). An order it knows no kind for, such as one
+/// placed elsewhere or before a restart, is reported as [`OrderKind::ConditionalUnresolved`], with
+/// its type's family and its `stopPrice` as `trigger_price`, logged at `warn`, rather than
+/// described as a fixed or a trailing order it may not be. So
+/// [`fetch_open_orders`](Self::fetch_open_orders), [`account_snapshot`](Self::account_snapshot),
+/// the [`account_stream`](Self::account_stream) and
+/// [`fetch_ended_orders`](crate::client::OrderStatusClient::fetch_ended_orders) list every live
+/// conditional order, and report every ended one as ended, so that a stop that fired is not held
+/// as live.
 ///
 /// # User-data stream
 /// [`account_stream`](Self::account_stream) reads Binance's margin user-data stream with a listen
@@ -500,6 +506,37 @@ impl std::fmt::Debug for BinanceMargin {
 }
 
 impl BinanceMargin {
+    /// Tell the client the kinds of orders it may not know, by client order id, such as after a
+    /// restart, so that it reports them with these kinds where Binance's reports cannot describe
+    /// them.
+    ///
+    /// Binance's margin REST order queries never say whether a conditional order (`STOP_LOSS`,
+    /// `STOP_LOSS_LIMIT`, `TAKE_PROFIT`, `TAKE_PROFIT_LIMIT`) trails, and neither does an
+    /// isolated account's stream. The client reports such an order with the kind it knows it by,
+    /// from placing it or from a report that described it, and otherwise as
+    /// [`OrderKind::ConditionalUnresolved`]. A kind recalled here fills that gap: it is reported
+    /// for its order when Binance's report leaves the kind unresolved and the client has learned
+    /// no resolved kind itself. Call it before [`account_snapshot`](ExecutionClient::account_snapshot),
+    /// [`fetch_open_orders`](ExecutionClient::fetch_open_orders) or
+    /// [`account_stream`](ExecutionClient::account_stream) to have their first reports use it.
+    /// It can be called again at any time, and adds to what earlier calls supplied.
+    ///
+    /// A kind is kept until its order is seen to end, and one for an order this client has
+    /// already seen end is ignored. So is an unresolved kind, and anything past 4096 held kinds,
+    /// with a warning. The client keeps nothing across restarts: persisting the kinds of the
+    /// orders it places is the caller's.
+    pub fn recall_order_kinds(&self, kinds: impl IntoIterator<Item = (ClientOrderId, OrderKind)>) {
+        // The guard is dropped at the end of the statement, so the warning waits for no lock.
+        let ignored = self.known_live.lock().recall(kinds);
+        if ignored > 0 {
+            warn!(
+                ignored,
+                limit = MAX_KNOWN_LIVE_ORDERS,
+                "Binance margin: recalled order kinds past the limit are ignored"
+            );
+        }
+    }
+
     /// Load the order rules of `instruments` from Binance now, and hold them for
     /// [`open_order`](ExecutionClient::open_order) to check against.
     ///
@@ -837,6 +874,7 @@ impl BinanceMargin {
                 fetch_margin_open_orders_for_instrument(
                     self.rest.clone(),
                     self.rate_limiter.clone(),
+                    self.known_live.clone(),
                     instrument,
                     true,
                     RequestKind::Query,
@@ -1135,6 +1173,7 @@ impl ExecutionClient for BinanceMargin {
                 fetch_margin_open_orders_for_instrument(
                     self.rest.clone(),
                     self.rate_limiter.clone(),
+                    self.known_live.clone(),
                     instrument,
                     // Cross path only: isolated returns early via `isolated_account_snapshot`.
                     false,
@@ -1217,13 +1256,9 @@ impl ExecutionClient for BinanceMargin {
     /// `instruments` → configured `isolated_symbols`; out-of-set instruments skipped with a warning);
     /// never issues a no-symbol isolated call.
     ///
-    /// **Conditional orders are omitted** (`STOP_LOSS`, `STOP_LOSS_LIMIT`, `TAKE_PROFIT`,
-    /// `TAKE_PROFIT_LIMIT`, so every `Stop`, `StopLimit`, `TakeProfit`, `TakeProfitLimit` and
-    /// `TrailingStop`): the REST row cannot tell a fixed from a trailing one (#541). This returns
-    /// no completeness flag, so the omission shows only in the log. A caller that needs to know
-    /// whether the result is the whole book reads [`account_snapshot`](Self::account_snapshot),
-    /// which reports such a listing incomplete, and tracks these orders from the
-    /// [`account_stream`](Self::account_stream). See the type-level docs.
+    /// **A conditional order is listed with the kind this client knows it by**, or else as
+    /// [`OrderKind::ConditionalUnresolved`]: the REST row cannot tell a fixed from a trailing one
+    /// (#541). See the type-level docs and [`recall_order_kinds`](Self::recall_order_kinds).
     async fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
@@ -1240,6 +1275,7 @@ impl ExecutionClient for BinanceMargin {
                 fetch_margin_open_orders_for_instrument(
                     self.rest.clone(),
                     self.rate_limiter.clone(),
+                    self.known_live.clone(),
                     instrument,
                     true,
                     RequestKind::Query,
@@ -1261,9 +1297,13 @@ impl ExecutionClient for BinanceMargin {
         // Cross: empty slice = "return all" sentinel — a single no-symbol query is both correct
         // (the contract requires all instruments) and far cheaper than enumerating every symbol.
         if instruments.is_empty() {
-            let orders =
-                fetch_margin_all_open_orders(self.rest.clone(), self.rate_limiter.clone(), false)
-                    .await?;
+            let orders = fetch_margin_all_open_orders(
+                self.rest.clone(),
+                self.rate_limiter.clone(),
+                self.known_live.clone(),
+                false,
+            )
+            .await?;
             self.remember_live(&orders);
             return Ok(orders);
         }
@@ -1271,6 +1311,7 @@ impl ExecutionClient for BinanceMargin {
             fetch_margin_open_orders_for_instrument(
                 self.rest.clone(),
                 self.rate_limiter.clone(),
+                self.known_live.clone(),
                 instrument,
                 false,
                 RequestKind::Query,
@@ -2256,6 +2297,7 @@ fn build_base_quote_map(
 async fn fetch_margin_open_orders_for_instrument(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
+    known: SharedKnownLiveOrders,
     instrument: InstrumentNameExchange,
     is_isolated: bool,
     kind: RequestKind,
@@ -2279,7 +2321,12 @@ async fn fetch_margin_open_orders_for_instrument(
 
     let orders_data = response.data().await.map_err(response_decode_error)?;
 
-    let listing = convert_open_order_listing(&orders_data, ExchangeId::BinanceMargin, &instrument);
+    let listing = convert_open_order_listing(
+        &orders_data,
+        ExchangeId::BinanceMargin,
+        &instrument,
+        &|cid| known.lock().kind_of(cid),
+    );
 
     Ok((instrument, listing))
 }
@@ -2293,6 +2340,7 @@ async fn fetch_margin_open_orders_for_instrument(
 async fn fetch_margin_all_open_orders(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
+    known: SharedKnownLiveOrders,
     is_isolated: bool,
 ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError> {
     let isolated = QueryMarginAccountsOpenOrdersIsIsolatedEnum::from_flag(is_isolated);
@@ -2312,7 +2360,11 @@ async fn fetch_margin_all_open_orders(
 
     let orders = orders_data
         .into_iter()
-        .filter_map(|o| convert_open_order_owned_symbol(&o, ExchangeId::BinanceMargin))
+        .filter_map(|o| {
+            convert_open_order_owned_symbol(&o, ExchangeId::BinanceMargin, &|cid| {
+                known.lock().kind_of(cid)
+            })
+        })
         .collect();
 
     Ok(orders)
@@ -2323,7 +2375,7 @@ async fn fetch_margin_all_open_orders(
 ///
 /// `recorded_kind` is the kind the client holds the order with, if it does. The row cannot say
 /// whether a conditional order trailed (#541), so an ended one is reported with that kind, or
-/// failing it with its fixed trigger (see [`convert_ended_order`]).
+/// failing it as an unresolved kind (see [`convert_ended_order`]).
 async fn fetch_margin_order_lookup(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
@@ -2410,6 +2462,7 @@ async fn fetch_margin_order_cid(
 async fn listed_margin_open_cids(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
+    known: SharedKnownLiveOrders,
     instruments: Vec<InstrumentNameExchange>,
     is_isolated: bool,
 ) -> Result<FnvHashSet<ClientOrderId>, UnindexedClientError> {
@@ -2418,6 +2471,7 @@ async fn listed_margin_open_cids(
         let (_, listing) = fetch_margin_open_orders_for_instrument(
             rest.clone(),
             rate_limiter.clone(),
+            known.clone(),
             instrument,
             is_isolated,
             RequestKind::Essential,
@@ -2447,7 +2501,13 @@ async fn recover_margin_ended_orders(
         tx,
         OpenListing::PerInstrument,
         |instruments| {
-            listed_margin_open_cids(rest.clone(), rate_limiter.clone(), instruments, is_isolated)
+            listed_margin_open_cids(
+                rest.clone(),
+                rate_limiter.clone(),
+                known.clone(),
+                instruments,
+                is_isolated,
+            )
         },
         |key| {
             // Held as live, so the client knows its kind, which the row may not show.
@@ -3174,12 +3234,13 @@ fn build_new_order_params(
         OrderKind::StopLimit { trigger_price } | OrderKind::TakeProfitLimit { trigger_price } => {
             builder = builder.price(price).stop_price(trigger_price);
         }
-        // Trailing orders are set above. Market carries no price, and TrailingStopLimit is
-        // rejected by convert_order_kind_tif_margin before this.
+        // Trailing orders are set above. Market carries no price, and TrailingStopLimit and
+        // ConditionalUnresolved are rejected by convert_order_kind_tif_margin before this.
         OrderKind::TrailingStop { .. }
         | OrderKind::TrailingStopFixedLimit { .. }
         | OrderKind::Market
-        | OrderKind::TrailingStopLimit { .. } => {}
+        | OrderKind::TrailingStopLimit { .. }
+        | OrderKind::ConditionalUnresolved { .. } => {}
     }
 
     builder
@@ -3964,6 +4025,19 @@ mod tests {
             trailing_stop_limit,
             Err(BuildOrderError::Unsupported)
         ));
+
+        // Only read back from a venue, never placed.
+        let unresolved = params(
+            Side::Sell,
+            Some(Decimal::from(100)),
+            OrderKind::ConditionalUnresolved {
+                family: crate::order::ConditionalFamily::StopLimit,
+                trigger_price: Some(Decimal::from(95)),
+            },
+            gtc(),
+            MarginEffect::Borrow,
+        );
+        assert!(matches!(unresolved, Err(BuildOrderError::Unsupported)));
     }
 
     /// An offset that is not a whole number of basis points is refused, not rounded.
@@ -3986,6 +4060,39 @@ mod tests {
                 crate::client::binance::shared::TrailingDeltaError::Invalid(_)
             )))
         ));
+    }
+
+    /// The kinds recalled through the client are the ones it then knows its orders by, and what
+    /// the limit leaves out is warned of once the lock is released, and only then.
+    #[test]
+    fn recalled_order_kinds_are_known_and_those_past_the_limit_warned_of() {
+        use crate::client::order_recovery::tests::logged_with_lock_free;
+
+        let client = BinanceMargin::new(BinanceMarginConfig::cross_margin(
+            "k".to_string(),
+            "s".to_string(),
+        ));
+        let trailing = OrderKind::TrailingStopFixedLimit {
+            offset: Decimal::from(100),
+            offset_type: TrailingOffsetType::BasisPoints,
+            activation_price: None,
+        };
+        let cid = |n: usize| ClientOrderId::new(format!("cid-{n}"));
+
+        let seen = logged_with_lock_free(&client.known_live, || {
+            client.recall_order_kinds((0..MAX_KNOWN_LIVE_ORDERS).map(|n| (cid(n), trailing)));
+        });
+        assert!(seen.is_empty(), "nothing past the limit: {seen:?}");
+        assert_eq!(client.known_live.lock().kind_of(&cid(0)), Some(trailing));
+
+        let seen = logged_with_lock_free(&client.known_live, || {
+            client.recall_order_kinds([(cid(MAX_KNOWN_LIVE_ORDERS), trailing)]);
+        });
+        assert_eq!(seen, [(tracing::Level::WARN, true)]);
+        assert_eq!(
+            client.known_live.lock().kind_of(&cid(MAX_KNOWN_LIVE_ORDERS)),
+            None
+        );
     }
 
     #[test]
@@ -4401,6 +4508,7 @@ mod tests {
             &open_order(Some(42), "BUY"),
             ExchangeId::BinanceMargin,
             &inst,
+            &|_| None,
         )
         .expect("convert");
         assert_eq!(order.key.exchange, ExchangeId::BinanceMargin);
@@ -4423,15 +4531,20 @@ mod tests {
         let inst = InstrumentNameExchange::new("BTCUSDT");
         let mut o = open_order(Some(42), "BUY");
         o.status = Some("CANCELED".to_string());
-        assert!(convert_open_order(&o, ExchangeId::BinanceMargin, &inst).is_none());
+        assert!(convert_open_order(&o, ExchangeId::BinanceMargin, &inst, &|_| None).is_none());
     }
 
     #[test]
     fn margin_open_order_missing_order_id_is_dropped() {
         let inst = InstrumentNameExchange::new("BTCUSDT");
         assert!(
-            convert_open_order(&open_order(None, "BUY"), ExchangeId::BinanceMargin, &inst)
-                .is_none()
+            convert_open_order(
+                &open_order(None, "BUY"),
+                ExchangeId::BinanceMargin,
+                &inst,
+                &|_| None
+            )
+            .is_none()
         );
     }
 
@@ -4446,8 +4559,8 @@ mod tests {
 
         let mut updated = open_order(Some(42), "BUY");
         updated.update_time = Some(1_700_000_005_000);
-        let order =
-            convert_open_order(&updated, ExchangeId::BinanceMargin, &inst).expect("convert");
+        let order = convert_open_order(&updated, ExchangeId::BinanceMargin, &inst, &|_| None)
+            .expect("convert");
         assert_eq!(
             order.state.time_exchange,
             Utc.timestamp_millis_opt(1_700_000_005_000)
@@ -4465,7 +4578,8 @@ mod tests {
 
         let base = open_order(Some(42), "BUY");
         assert!(base.update_time.is_none(), "fixture must omit update_time");
-        let order = convert_open_order(&base, ExchangeId::BinanceMargin, &inst).expect("convert");
+        let order = convert_open_order(&base, ExchangeId::BinanceMargin, &inst, &|_| None)
+            .expect("convert");
         assert_eq!(
             order.state.time_exchange,
             Utc.timestamp_millis_opt(1_700_000_000_000)
@@ -4480,8 +4594,8 @@ mod tests {
         // The no-symbol "return all" path derives the instrument from each order's own `symbol`.
         let mut o = open_order(Some(42), "SELL");
         o.symbol = Some("ETHUSDT".to_string());
-        let order =
-            convert_open_order_owned_symbol(&o, ExchangeId::BinanceMargin).expect("convert");
+        let order = convert_open_order_owned_symbol(&o, ExchangeId::BinanceMargin, &|_| None)
+            .expect("convert");
         assert_eq!(order.key.instrument.name().as_str(), "ETHUSDT");
         assert_eq!(order.key.exchange, ExchangeId::BinanceMargin);
         assert_eq!(order.side, Side::Sell);
@@ -4492,7 +4606,9 @@ mod tests {
         // open_order() leaves `symbol` unset — the return-all path must drop it rather than guess.
         let o = open_order(Some(42), "BUY");
         assert!(o.symbol.is_none());
-        assert!(convert_open_order_owned_symbol(&o, ExchangeId::BinanceMargin).is_none());
+        assert!(
+            convert_open_order_owned_symbol(&o, ExchangeId::BinanceMargin, &|_| None).is_none()
+        );
     }
 
     fn trade(id: Option<i64>, is_buyer: Option<bool>) -> QueryMarginAccountsTradeListResponseInner {
@@ -5020,9 +5136,14 @@ mod tests {
             ));
             let tracker = Arc::new(RateLimitTracker::new(WeightPool::Sapi));
 
-            fetch_margin_all_open_orders(rest, Arc::clone(&tracker), false)
-                .await
-                .unwrap();
+            fetch_margin_all_open_orders(
+                rest,
+                Arc::clone(&tracker),
+                KnownLiveOrders::shared(ExchangeId::BinanceMargin),
+                false,
+            )
+            .await
+            .unwrap();
 
             let query_waits = tokio::time::timeout(
                 Duration::from_millis(50),

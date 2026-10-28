@@ -845,6 +845,12 @@ impl ExecutionClient for HyperliquidSpotClient {
                     "Hyperliquid does not support trailing stop orders".to_string(),
                 );
             }
+            OrderKind::ConditionalUnresolved { .. } => {
+                return make_unsupported(
+                    "an unresolved order kind is only read back from a venue, never placed"
+                        .to_string(),
+                );
+            }
             OrderKind::Limit
             | OrderKind::Stop { .. }
             | OrderKind::StopLimit { .. }

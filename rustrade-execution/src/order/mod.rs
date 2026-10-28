@@ -336,6 +336,54 @@ pub enum OrderKind {
         /// As [`TrailingStop`](Self::TrailingStop)'s `activation_price`.
         activation_price: Option<Decimal>,
     },
+    /// A conditional order a venue reported without saying whether its trigger is fixed or
+    /// trails: one of [`family`](ConditionalFamily)'s fixed-trigger kind or its trailing
+    /// counterpart, which the report cannot tell apart.
+    ///
+    /// Only read back from a venue, never placed: a client refuses one with
+    /// [`OrderError::UnsupportedOrderType`](crate::error::OrderError::UnsupportedOrderType). A
+    /// client reports it only for a live or ended order whose kind it does not know otherwise.
+    /// When it knows the kind, from placing the order, from an earlier report that described it,
+    /// or from the caller, it reports that kind instead. The order's client order id, venue id,
+    /// side, quantity and any limit price are on the [`Order`] as usual, so a caller can match it
+    /// to its own records.
+    ///
+    /// Binance margin is the venue that needs it: its REST order queries never report a trailing
+    /// delta, and its isolated-margin account stream reports none even for a trailing order.
+    #[display("ConditionalUnresolved({family}, trigger: {trigger_price:?})")]
+    ConditionalUnresolved {
+        family: ConditionalFamily,
+        /// The price the venue reports for the order's trigger: the trigger of a fixed-trigger
+        /// order, or the activation price of a trailing one. `None` when the venue reports none,
+        /// as for a trailing order placed without an activation price.
+        trigger_price: Option<Decimal>,
+    },
+}
+
+/// Which conditional order an [`OrderKind::ConditionalUnresolved`] is, before whether its trigger
+/// trails is known.
+#[derive(
+    Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Display,
+)]
+pub enum ConditionalFamily {
+    /// [`OrderKind::Stop`] or [`OrderKind::TrailingStop`].
+    Stop,
+    /// [`OrderKind::StopLimit`] or a trailing stop with a limit, such as
+    /// [`OrderKind::TrailingStopFixedLimit`].
+    StopLimit,
+    /// [`OrderKind::TakeProfit`] or a trailing take-profit, which no other [`OrderKind`]
+    /// describes.
+    TakeProfit,
+    /// [`OrderKind::TakeProfitLimit`] or a trailing take-profit with a limit, which no other
+    /// [`OrderKind`] describes.
+    TakeProfitLimit,
+}
+
+impl ConditionalFamily {
+    /// Whether orders of this family carry a limit price.
+    pub fn has_limit_price(self) -> bool {
+        matches!(self, Self::StopLimit | Self::TakeProfitLimit)
+    }
 }
 
 #[derive(

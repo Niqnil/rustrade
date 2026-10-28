@@ -16,7 +16,8 @@ use crate::client::binance::shared::{
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
     account_position_time, classify_rest_query_error, convert_execution_report,
     dedup_key_from_event, disconnect_error, frame_excerpt, is_duplicate, log_unhandled_event,
-    log_unrecognised_frame, response_decode_error, rest_call_with_retry, retry_or_end,
+    log_unrecognised_frame, resolve_snapshot_kind, response_decode_error, rest_call_with_retry,
+    retry_or_end,
 };
 use crate::{
     AccountEventKind, InstrumentBalanceUpdate, UnindexedAccountEvent,
@@ -1242,7 +1243,7 @@ impl<K: ListenKeys> MarginStream<K> {
         buf: &mut Vec<UnindexedAccountEvent>,
     ) -> Result<FrameOutcome, SessionEnd> {
         let outcome = convert_stream_frame(text, listen_key, &self.account, buf);
-        for event in buf.drain(..) {
+        for mut event in buf.drain(..) {
             if let Some(key) = dedup_key_from_event(&event)
                 && is_duplicate(&self.dedup, key)
             {
@@ -1251,9 +1252,13 @@ impl<K: ListenKeys> MarginStream<K> {
             }
             // Held across the send, so an order this reports ending and a reconnect's check of it
             // reach the stream in the order they were decided, and the check reports only an order
-            // not already reported.
+            // not already reported. An isolated account's report never says whether a conditional
+            // order trails, so it takes the kind the client knows the order by.
             let held = KnownLiveOrders::observes(&event.kind).then(|| {
                 let mut held = self.known.lock();
+                resolve_snapshot_kind(ExchangeId::BinanceMargin, &mut event, &|cid| {
+                    held.kind_of(cid)
+                });
                 held.observe(&event);
                 held
             });
@@ -1283,7 +1288,7 @@ mod tests {
     use crate::{
         client::dedup::new_dedup_cache,
         order::{
-            OrderKind, TrailingOffsetType,
+            ConditionalFamily, OrderKind, TrailingOffsetType,
             id::ClientOrderId,
             state::{ActiveOrderState, OrderState},
         },
@@ -1673,7 +1678,62 @@ mod tests {
         // possibly trailing, so it is not described as a fixed stop-limit.
         let unreadable = frame.replace(r#""d":"""#, r#""d":"x""#);
         assert_ne!(unreadable, frame);
-        assert!(delivered(&unreadable, &StreamAccount::Cross).is_empty());
+        assert_eq!(
+            snapshot_kind(&delivered(&unreadable, &StreamAccount::Cross)),
+            unresolved_stop_limit()
+        );
+    }
+
+    /// An isolated account's stream sends `"d": ""` on a trailing order too, and so does a report
+    /// that does not say which account it is about: there the empty `d` leaves the kind
+    /// unresolved, with the order's trigger, rather than describing a fixed stop-limit.
+    #[test]
+    fn an_empty_trailing_delta_on_an_isolated_report_leaves_the_kind_unresolved() {
+        let event = serde_json::json!({
+            "e": "executionReport", "S": "SELL", "o": "STOP_LOSS_LIMIT",
+            "x": "NEW", "X": "NEW", "i": 7_i64, "c": "cid-2", "d": "",
+            "p": "47000", "P": "48000", "q": "1", "f": "GTC", "z": "0",
+            "T": 1_700_000_000_000_i64,
+        });
+        let isolated_frame = push_isolated("BTCUSDT", event.clone());
+        let buf = delivered(&isolated_frame, &isolated());
+        assert_eq!(snapshot_kind(&buf), unresolved_stop_limit());
+        let AccountEventKind::OrderSnapshot(snap) = &buf[0].kind else {
+            unreachable!("checked by snapshot_kind")
+        };
+        assert_eq!(
+            snap.0.price,
+            Some(Decimal::from(47_000)),
+            "a stop-limit keeps its limit"
+        );
+
+        let mut unlabelled = event;
+        unlabelled["s"] = serde_json::json!("BTCUSDT");
+        let unlabelled = unlabelled.to_string();
+        assert!(!unlabelled.contains(r#""is""#));
+        assert_eq!(
+            snapshot_kind(&delivered(&unlabelled, &StreamAccount::Cross)),
+            unresolved_stop_limit()
+        );
+    }
+
+    /// The kind of the one order snapshot in `buf`.
+    fn snapshot_kind(buf: &[UnindexedAccountEvent]) -> OrderKind {
+        let [event] = buf else {
+            panic!("expected one event, got {buf:?}")
+        };
+        let AccountEventKind::OrderSnapshot(snap) = &event.kind else {
+            panic!("expected OrderSnapshot, got {:?}", event.kind)
+        };
+        snap.0.kind
+    }
+
+    /// The unresolved kind of a `STOP_LOSS_LIMIT` triggered at 48000.
+    fn unresolved_stop_limit() -> OrderKind {
+        OrderKind::ConditionalUnresolved {
+            family: ConditionalFamily::StopLimit,
+            trigger_price: Some(Decimal::from(48_000)),
+        }
     }
 
     /// A cancel report names the cancel request in `c` and the cancelled order in `C`, and the
@@ -2967,6 +3027,100 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(notice_kind(&event), NoticeKind::MarginCall);
+    }
+
+    /// An isolated account's report of a conditional order never says whether it trails, so the
+    /// stream delivers it with the kind the client knows the order by: the kind it was placed
+    /// with, or one the caller recalled. An order it does not know stays unresolved.
+    #[tokio::test]
+    async fn an_isolated_conditional_report_takes_the_kind_the_client_knows() {
+        use rust_decimal_macros::dec;
+        let (listener, url) = listen().await;
+        let keys = Arc::new(FakeKeys::default());
+        let (stream, mut rx) = margin_stream(&keys, url, isolated());
+        let placed_kind = OrderKind::TrailingStopFixedLimit {
+            offset: dec!(1000),
+            offset_type: TrailingOffsetType::BasisPoints,
+            activation_price: Some(dec!(48000)),
+        };
+        let recalled_kind = OrderKind::TrailingStopFixedLimit {
+            offset: dec!(500),
+            offset_type: TrailingOffsetType::BasisPoints,
+            activation_price: None,
+        };
+        {
+            let mut known = stream.known.lock();
+            known.placed(
+                &crate::order::OrderKey::new(
+                    ExchangeId::BinanceMargin,
+                    btcusdt(),
+                    crate::order::id::StrategyId::unknown(),
+                    ClientOrderId::new("placed"),
+                ),
+                dec!(1),
+                placed_kind,
+                &OrderState::active(crate::order::state::Open::new(
+                    crate::order::id::VenueOrderId::Assigned(crate::order::id::OrderId::new("1")),
+                    Utc::now(),
+                    Decimal::ZERO,
+                )),
+            );
+            known.recall([(ClientOrderId::new("recalled"), recalled_kind)]);
+        }
+        let report = |order_id: i64, cid: &str, stop_price: &str| {
+            push_isolated(
+                "BTCUSDT",
+                serde_json::json!({
+                    "e": "executionReport", "S": "BUY", "o": "STOP_LOSS_LIMIT",
+                    "x": "NEW", "X": "NEW", "i": order_id, "c": cid, "d": "",
+                    "p": "48000", "P": stop_price, "q": "1", "f": "GTC", "z": "0",
+                    "T": 1_700_000_000_000_i64,
+                }),
+            )
+        };
+        let frames = vec![
+            report(1, "placed", "48000"),
+            report(2, "recalled", "0"),
+            report(3, "unknown", "48000"),
+        ];
+        let server = async { serve(&listener, "key-1", vec![], frames, After::Answer).await };
+        let run = async {
+            let session = stream.open().await.unwrap();
+            stream.run(session).await;
+        };
+        let received = async {
+            let mut kinds = Vec::new();
+            while kinds.len() < 3 {
+                let event = rx.recv().await.unwrap();
+                if let AccountEventKind::OrderSnapshot(snapshot) = &event.kind {
+                    kinds.push((snapshot.0.key.cid.0.to_string(), snapshot.0.kind));
+                }
+            }
+            kinds
+        };
+        let kinds = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                () = server => panic!("the server stopped before the reports arrived"),
+                () = run => panic!("the stream ended"),
+                kinds = received => kinds,
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            kinds,
+            [
+                ("placed".to_owned(), placed_kind),
+                ("recalled".to_owned(), recalled_kind),
+                (
+                    "unknown".to_owned(),
+                    OrderKind::ConditionalUnresolved {
+                        family: ConditionalFamily::StopLimit,
+                        trigger_price: Some(dec!(48000)),
+                    }
+                ),
+            ]
+        );
     }
 
     /// A refused subscription fails the open with the venue's reason, the key masked.
