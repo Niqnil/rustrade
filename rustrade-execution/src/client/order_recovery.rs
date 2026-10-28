@@ -128,10 +128,13 @@ impl SharedKnownLiveOrders {
     /// order that arrives before the answer to placing it is described by it: a venue may report
     /// a new order on its account stream first. An unresolved kind is not held.
     ///
-    /// Call it just before sending the order, and [`SendingKind::sent`] once the answer is read.
+    /// Call it as the order's request is sent, and [`SendingKind::sent`] once the answer is read.
     /// When the answer leaves the outcome unknown, or the guard is dropped before it is read, as
     /// when the placing future is cancelled, the order may be live: its kind is then kept as
     /// [recalled](KnownLiveOrders::recall) until the order is seen to end.
+    ///
+    /// A client order id is taken to name one placement at a time: a second placement under the
+    /// same id while the first is out replaces its kind, and the first one's answer releases it.
     // Only Binance margin's reports cannot always describe an order's kind.
     #[cfg_attr(not(feature = "binance"), allow(dead_code))]
     pub(crate) fn sending(&self, cid: &ClientOrderId, kind: OrderKind) -> SendingKind {
@@ -306,11 +309,12 @@ pub(crate) struct KnownLiveOrders {
     /// Every held order by when it was added, oldest first.
     by_age: BTreeMap<u64, ClientOrderId>,
     recently_ended: LruCache<ClientOrderId, ()>,
-    /// Kinds the caller supplied for orders whose venue reports may not describe them (see
-    /// [`recall`](Self::recall)), until each order is seen to end.
+    /// Kinds known for orders whose venue reports may not describe them, until each order is seen
+    /// to end (see [`recall`](Self::recall)): ones the caller supplied, and ones kept from a
+    /// placement whose outcome is unknown (see [`SharedKnownLiveOrders::sending`]).
     recalled: FnvHashMap<ClientOrderId, OrderKind>,
-    /// The kinds of orders being placed, each from just before its request is sent until its
-    /// answer is read (see [`SharedKnownLiveOrders::sending`]).
+    /// The kinds of orders being placed, each from when its request is sent until its answer is
+    /// read (see [`SharedKnownLiveOrders::sending`]).
     sending: FnvHashMap<ClientOrderId, OrderKind>,
     next_seq: u64,
     /// Whether the set is forgetting orders, so that it warns once per episode, not per order.
@@ -425,13 +429,14 @@ impl KnownLiveOrders {
         );
     }
 
-    /// Record kinds the caller knows orders by, for orders whose venue reports may not describe
-    /// them, such as after a restart, when the client has not seen the orders placed.
+    /// Record kinds known for orders whose venue reports may not describe them: kinds the caller
+    /// supplies, such as after a restart, when the client has not seen the orders placed, and the
+    /// kind of an order whose placement's outcome is unknown.
     ///
     /// A recalled kind is reported for an order only when the venue's report leaves its kind
     /// unresolved and the client has not learned a resolved one itself, from placing the order or
     /// from a report that described it. An entry is dropped once its order is seen to end, and one
-    /// for an order already seen to end is not kept. An unresolved kind supplied here is ignored,
+    /// for an order already seen to end is not kept. An unresolved kind recorded here is ignored,
     /// since it says nothing, as is anything past [`MAX_KNOWN_LIVE_ORDERS`] entries. Returns how
     /// many were ignored for that limit, for the caller to log once the lock is released.
     // Only Binance margin's reports cannot always describe an order's kind.
@@ -1640,6 +1645,28 @@ pub(crate) mod tests {
         let held = known.lock();
         assert!(held.sending.is_empty() && held.recalled.is_empty());
         assert_eq!(held.kind_of(&order.cid), Some(trailing_fixed_limit()));
+    }
+
+    /// An order already held with an unresolved kind, such as under an id placed again, takes the
+    /// kind it is being placed with.
+    #[test]
+    fn a_kind_being_placed_resolves_a_held_unresolved_one() {
+        let known = KnownLiveOrders::shared(ExchangeId::BinanceMargin);
+        let order = key("BTCUSDT", "held");
+        known
+            .lock()
+            .live(&order, dec!(2), unresolved(), &open("7", Decimal::ZERO));
+
+        let sending = known.sending(&order.cid, trailing_fixed_limit());
+        assert_eq!(
+            known.lock().kind_of(&order.cid),
+            Some(trailing_fixed_limit())
+        );
+        sending.sent(&OrderState::active(open("7", Decimal::ZERO)));
+        assert_eq!(
+            known.lock().kind_of(&order.cid),
+            Some(trailing_fixed_limit())
+        );
     }
 
     /// Once the answer is read, the kind an order was placed with is kept only when the order may

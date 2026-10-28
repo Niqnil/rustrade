@@ -601,6 +601,11 @@ impl BinanceMargin {
     ///   and its outcome is unknown rather than refused.
     /// - The order's time is the answer's `transactTime`. An answer without a readable one is
     ///   still read, at the local time, and logged with a `warn!`.
+    /// - The order's kind is known to the client from the moment its request is sent, so a stream
+    ///   report that arrives before the answer is described by it. If the future is dropped after
+    ///   the request was sent, the order may be live: its kind is kept until the client sees the
+    ///   order end, as one from [`recall_order_kinds`](Self::recall_order_kinds) is, and counts
+    ///   toward the same limit.
     pub async fn open_margin_order(
         &self,
         request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
@@ -679,8 +684,9 @@ impl BinanceMargin {
 
         // The stream may report the order before the answer to placing it arrives, and an
         // isolated account's report cannot say whether a conditional order trails: the kind it
-        // is placed with is held from here, for such a report to take.
-        let sending = self.known_live.sending(&cid, kind);
+        // is placed with is held from the request's first dispatch, after any wait on the rate
+        // limiter, for such a report to take. A placement dropped before then sent nothing.
+        let mut sending = None;
         // Every `return` below leaves this block, so the kind is released whatever the answer.
         let placement = async {
             // Sent through `send_request` with the SDK's own query, so that the answer decodes into
@@ -691,6 +697,7 @@ impl BinanceMargin {
                 &self.rate_limiter,
                 RequestKind::Order,
                 |cfg| {
+                    sending.get_or_insert_with(|| self.known_live.sending(&cid, kind));
                     let query = query.clone();
                     Box::pin(async move {
                         binance_sdk::common::utils::send_request::<NewOrderAnswer>(
@@ -788,7 +795,9 @@ impl BinanceMargin {
             }
         }
         .await;
-        sending.sent(&placement.order.state);
+        if let Some(sending) = sending {
+            sending.sent(&placement.order.state);
+        }
         placement
     }
 
@@ -6428,6 +6437,58 @@ mod tests {
                 .lock()
                 .kind_of(&ClientOrderId::new("racing")),
             None
+        );
+    }
+
+    /// A margin placement dropped while it waits on the rate limiter sent nothing, so keeps no
+    /// kind. One dropped once its request is out may have placed the order, so keeps its kind
+    /// until the order is seen to end.
+    #[tokio::test]
+    async fn a_dropped_margin_placement_keeps_its_kind_only_once_its_request_is_out() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({}))
+                    .set_delay(Duration::from_secs(3_600)),
+            )
+            .mount(&server)
+            .await;
+        let client = margin_client_at(&server, true);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+        let kind_of = |cid: &str| client.known_live.lock().kind_of(&ClientOrderId::new(cid));
+        let orders_sent = || async {
+            let requests = server.received_requests().await.unwrap();
+            requests
+                .iter()
+                .filter(|request| request.method == wiremock::http::Method::POST)
+                .count()
+        };
+
+        client
+            .rate_limiter
+            .on_rate_limited(Some(Duration::from_secs(5)));
+        let waiting = tokio::time::timeout(
+            Duration::from_millis(100),
+            client.open_order(margin_open_request(&btcusdt, "waiting")),
+        )
+        .await;
+        assert!(waiting.is_err(), "still waiting on the rate limiter");
+        assert_eq!(orders_sent().await, 0);
+        assert_eq!(kind_of("waiting"), None);
+
+        let fresh = margin_client_at(&server, true);
+        let sent = tokio::time::timeout(
+            Duration::from_millis(200),
+            fresh.open_order(margin_open_request(&btcusdt, "sent")),
+        )
+        .await;
+        assert!(sent.is_err(), "still waiting on the answer");
+        assert_eq!(orders_sent().await, 1);
+        assert_eq!(
+            fresh.known_live.lock().kind_of(&ClientOrderId::new("sent")),
+            Some(OrderKind::Limit)
         );
     }
 
