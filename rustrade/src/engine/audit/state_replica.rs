@@ -14,7 +14,7 @@ use crate::{
 use rustrade_integration::collection::none_one_or_many::NoneOneOrMany;
 // (used by `update_from_event` to inspect the live engine's outputs)
 use rustrade_data::{event::MarketEvent, streams::consumer::MarketStreamEvent};
-use rustrade_execution::{AccountEvent, trade::TradeId};
+use rustrade_execution::{AccountEvent, order::request::ReduceOnly, trade::TradeId};
 use rustrade_instrument::{
     corporate_action::CorporateActionKind,
     instrument::{InstrumentIndex, kind::InstrumentKind},
@@ -210,13 +210,16 @@ where
                         .replica_engine_state_mut()
                         .update_from_account_reconnecting(&exchange);
                 }
-                // The fills the live engine cut as reduce-only: the replica records no request in
-                // flight, so it cannot find the flag itself (see `replay_account`).
+                // The fills the live engine cut as reduce-only, and what their orders were sent
+                // as: the replica records no request in flight, so it cannot find either itself
+                // (see `replay_account`).
                 AccountStreamEvent::Item(event) => {
-                    let reduce_only_fills: Vec<TradeId> = outputs
+                    let reduce_only_fills: Vec<(TradeId, ReduceOnly)> = outputs
                         .iter()
                         .filter_map(|output| match output {
-                            EngineOutput::ReduceOnlyCapped(capped) => Some(capped.trade_id.clone()),
+                            EngineOutput::ReduceOnlyCapped(capped) => {
+                                Some((capped.trade_id.clone(), capped.reduce_only))
+                            }
                             _ => None,
                         })
                         .collect();

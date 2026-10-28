@@ -183,11 +183,18 @@ where
         self.add_instrument_metric_row(&mut table, "Unattributed Fees", |ts| {
             format!("{:.2}", ts.fees_unattributed)
         });
-        self.add_instrument_metric_row(&mut table, "Dust Written Off", |ts| {
-            format!("{:.2}", ts.dust)
+        // In base, and often below a cent's worth, so shown in full rather than to 2 places.
+        self.add_instrument_metric_row(&mut table, "Dust Held", |ts| {
+            ts.dust_quantity.normalize().to_string()
+        });
+        self.add_instrument_metric_row(&mut table, "Dust Held Value", |ts| {
+            format!("{:.2}", ts.dust_value)
         });
         self.add_instrument_metric_row(&mut table, "Reduce-Only Excess", |ts| {
             format!("{:.2}", ts.reduce_only_excess)
+        });
+        self.add_instrument_metric_row(&mut table, "Free Base Traded", |ts| {
+            format!("{:.2}", ts.free_base_traded)
         });
         self.add_instrument_metric_row(&mut table, &format!("Return {interval}"), |ts| {
             format_percentage(ts.pnl_return.value, 2)
@@ -384,6 +391,7 @@ mod tests {
             fills_unallocated: 0,
             fills_dust: 0,
             fills_reduce_only_capped: 0,
+            fills_free_base_traded: 0,
             fills_fee_unconverted: 0,
         }
     }
@@ -447,6 +455,7 @@ mod tests {
             fills_unallocated: 0,
             fills_dust: 0,
             fills_reduce_only_capped: 0,
+            fills_free_base_traded: 0,
             fills_fee_unconverted: 0,
         }
     }
@@ -503,11 +512,11 @@ mod tests {
         assert!(row("PnL").contains("-12.50"));
     }
 
-    /// The instrument table shows the value of the dust written off.
+    /// The instrument table shows the dust held, in full, and its value.
     #[test]
-    fn instrument_table_shows_dust_written_off() {
+    fn instrument_table_shows_dust_held() {
         let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
-        generator.record_fill_dust(dec!(0.9));
+        generator.record_fill_dust(dec!(0.00000991), dec!(0.9));
         let mut summary = summary_with_fallback(0, 0, None);
         summary.instruments.insert(
             InstrumentNameInternal::new("btc_usdt"),
@@ -515,11 +524,15 @@ mod tests {
         );
 
         let rendered = summary.instrument_table().to_string();
-        let row = rendered
-            .lines()
-            .find(|line| line.contains("Dust Written Off"))
-            .unwrap_or_else(|| panic!("no Dust Written Off row in:\n{rendered}"));
-        assert!(row.contains("0.90"));
+        let row = |name: &str| {
+            rendered
+                .lines()
+                .find(|line| line.contains(name))
+                .unwrap_or_else(|| panic!("no {name} row in:\n{rendered}"))
+                .to_owned()
+        };
+        assert!(row("Dust Held Value").contains("0.90"));
+        assert!(row("Dust Held ").contains("0.00000991"));
     }
 
     /// The instrument table shows the value of the reduce-only fills' excess.
@@ -539,6 +552,25 @@ mod tests {
             .find(|line| line.contains("Reduce-Only Excess"))
             .unwrap_or_else(|| panic!("no Reduce-Only Excess row in:\n{rendered}"));
         assert!(row.contains("49.00"));
+    }
+
+    /// The instrument table shows the value of the free base traded past positions.
+    #[test]
+    fn instrument_table_shows_free_base_traded() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fill_free_base_traded(dec!(0.75));
+        let mut summary = summary_with_fallback(0, 0, None);
+        summary.instruments.insert(
+            InstrumentNameInternal::new("btc_usdt"),
+            generator.generate(Decimal::ZERO, Annual365),
+        );
+
+        let rendered = summary.instrument_table().to_string();
+        let row = rendered
+            .lines()
+            .find(|line| line.contains("Free Base Traded"))
+            .unwrap_or_else(|| panic!("no Free Base Traded row in:\n{rendered}"));
+        assert!(row.contains("0.75"));
     }
 
     #[test]

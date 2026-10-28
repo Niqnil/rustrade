@@ -1137,7 +1137,7 @@ impl ExecutionClient for HyperliquidClient {
         let order_request = ClientOrderRequest {
             asset: coin,
             is_buy,
-            reduce_only: request.state.reduce_only,
+            reduce_only: request.state.reduce_only.is_reduce_only(),
             limit_px: wire.limit_px,
             sz: wire.sz,
             cloid: Some(cloid),

@@ -102,7 +102,7 @@ pub struct TradingSummary<Interval> {
 
     /// Spot fills this session whose base-asset fee left dust out of the position, summed over
     /// every instrument. Routine where a venue charges fees in the base asset; each instrument's
-    /// value written off is its [`TearSheet::dust`](instrument::TearSheet::dust). See
+    /// dust held is its [`TearSheet::dust_quantity`](instrument::TearSheet::dust_quantity). See
     /// [`TearSheet::fills_dust`](instrument::TearSheet::fills_dust).
     #[serde(default)]
     pub fills_dust: usize,
@@ -114,6 +114,13 @@ pub struct TradingSummary<Interval> {
     /// [`TearSheet::fills_reduce_only_capped`](instrument::TearSheet::fills_reduce_only_capped).
     #[serde(default)]
     pub fills_reduce_only_capped: usize,
+
+    /// Fills of orders sent to trade free base past their position this session, summed over
+    /// every instrument. Each instrument's value traded is its
+    /// [`TearSheet::free_base_traded`](instrument::TearSheet::free_base_traded). See
+    /// [`TearSheet::fills_free_base_traded`](instrument::TearSheet::fills_free_base_traded).
+    #[serde(default)]
+    pub fills_free_base_traded: usize,
 
     /// Fills this session whose fee was charged in a third asset the engine could not value in
     /// quote, summed over every instrument. Non-zero means the PnL in this summary is gross of
@@ -311,6 +318,7 @@ impl TradingSummaryGenerator {
             fills_unallocated: total(|g| g.fills_unallocated),
             fills_dust: total(|g| g.fills_dust),
             fills_reduce_only_capped: total(|g| g.fills_reduce_only_capped),
+            fills_free_base_traded: total(|g| g.fills_free_base_traded),
             fills_fee_unconverted: total(|g| g.fills_fee_unconverted),
         }
     }
@@ -480,6 +488,7 @@ mod tests {
             generator.fills_dust = 7 * base;
             generator.fills_reduce_only_capped = 8 * base;
             generator.fills_fee_unconverted = 9 * base;
+            generator.fills_free_base_traded = 10 * base;
             instruments.insert(InstrumentNameInternal::new(name), generator);
         }
 
@@ -503,8 +512,9 @@ mod tests {
                 summary.fills_dust,
                 summary.fills_reduce_only_capped,
                 summary.fills_fee_unconverted,
+                summary.fills_free_base_traded,
             ],
-            [101, 202, 303, 404, 505, 606, 707, 808, 909]
+            [101, 202, 303, 404, 505, 606, 707, 808, 909, 1010]
         );
     }
 

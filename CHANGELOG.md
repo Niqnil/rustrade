@@ -60,7 +60,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     order where Binance's report leaves the kind unresolved and the client has learned no resolved
     kind itself. It is kept until the order is seen to end. The client persists nothing.
 
+- **`EngineState::free_base` reads the base an account holds outside its spot positions**
+  (`rustrade`, #764). For an asset on one exchange: the balance's `total`, less borrowed principal
+  and interest, less the signed net quantity of every spot instrument there whose base it is,
+  capped at `free`. A derivative's contracts are not taken out. It is signed, so a sell sized at a
+  long plus it sells no more than the account holds, and with a short open it reads negative by
+  the interest owed in base, so a buy sized at the short plus that also covers the interest. It
+  is `None` with no
+  balance for the asset. It
+  does not take out an open the venue has not acknowledged, and does not cover isolated margin,
+  whose balances the engine does not store. Its rustdoc says how a long-only account sweeps a
+  base-asset fee's remainder (see the `ReduceOnly` entry under Changed), with an example, and that
+  repaying debt is usually the better use while a cross-margin short of the asset is open.
+
 ### Changed
+
+- **Breaking: a base-asset fee's sub-step remainder is held, not written off** (`rustrade`,
+  #764). A spot fill whose base-asset fee leaves the holding off the quantity step still rounds
+  the position toward zero to the step, but the remainder is no longer charged as part of the
+  fill's fee. PnL is charged the venue's fee alone, so a position's PnL agrees with the account at
+  the fill's price; what the remainder gains or loses afterwards is the account's.
+  - `TearSheet::dust` is now `dust_value`: the remainder valued at each fill's price, signed
+    (positive for base a long leaves out, negative for base a short still owes, which used to
+    count zero). `TearSheet::dust_quantity` sums it in base. A tear sheet serialised with `dust`
+    loads it as `dust_value`.
+  - A spot buy from flat that holds less than one step now charges `fees_unattributed` its fee
+    alone, and the rest it bought is dust.
+  - The instrument table's "Dust Written Off" row is replaced by "Dust Held" and "Dust Held
+    Value".
+
+- **Breaking: `RequestOpen::reduce_only` is a `ReduceOnly`, which can also say to trade free
+  base** (`rustrade-execution`, `rustrade`, #764). `No`, `Position` (the old `true`) or
+  `PositionAndFreeBase`. A serialised `true` or `false` still loads, as `Position` or `No`.
+  - **Venues.** Adapters send both reduce-only values the same intent or flag, through
+    `ReduceOnly::is_reduce_only`: Alpaca's close intents and Hyperliquid's `reduce_only`.
+  - **The engine** cuts a fill of either value so the position it reduces lands flat, as before.
+    For `PositionAndFreeBase` on a spot instrument, it reads the excess as free base the order was
+    sized to trade: a sell past a long, or from flat, sells it; a buy past a short, or from flat,
+    buys base the account owes, such as a short's interest. A fill that only grows the position,
+    a buy while long or a sell while short, is on the wrong side and stays a mistake. A free-base
+    fill is logged at INFO instead of WARN, and counted on the new
+    `TearSheet::fills_free_base_traded` and `free_base_traded` (summed on
+    `TradingSummary::fills_free_base_traded`, shown as "Free Base Traded") instead of
+    `fills_reduce_only_capped`. Its share of the fee still goes to `fees_unattributed`. On a
+    derivative the excess is a mistake, as for `Position`.
+  - `ReduceOnlyCapped` has new `reduce_only` and `trades_free_base` fields, and is emitted for a
+    free-base trade too: a handler that treats a cut as a fault checks `trades_free_base` first.
+  - `ReduceOnly` is `#[non_exhaustive]`; adapters read `is_reduce_only` rather than matching it.
+    Its `Deserialize` takes a flag only in a human-readable format; a binary one reads the
+    variant's index.
+  - `EngineState::replay_account` takes `(TradeId, ReduceOnly)` pairs, so the audit replica counts
+    each cut fill as the engine did. `Trade::holding_move` takes a `ReduceOnly`.
+  - `ReduceOnlyBook::register` takes a `ReduceOnly`, `BookedOrder::reduce_only` is one, and a
+    retired order keeps it. A book serialised with flags and bare retired venue ids still loads.
 
 - **Breaking: `AssetState` has a new `debt_time` field** (`rustrade`, #755). It holds when the debt
   in `balance`'s `margin` was stated, so `AssetState::new` takes it as a fourth argument (`None`
