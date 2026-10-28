@@ -64,7 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`rustrade`, #764). For an asset on one exchange: the balance's `total`, less borrowed principal
   and interest, less the signed net quantity of every spot instrument there whose base it is,
   capped at `free`. A derivative's contracts are not taken out. It is signed, so a sell sized at a
-  long plus it sells no more than the account holds, and `None` with no balance for the asset. It
+  long plus it sells no more than the account holds, and with a short open it reads negative by
+  the interest owed in base, so a buy sized at the short plus that also covers the interest. It
+  is `None` with no
+  balance for the asset. It
   does not take out an open the venue has not acknowledged, and does not cover isolated margin,
   whose balances the engine does not store. Its rustdoc says how a long-only account sweeps a
   base-asset fee's remainder (see the `ReduceOnly` entry under Changed), with an example, and that
@@ -93,18 +96,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `ReduceOnly::is_reduce_only`: Alpaca's close intents and Hyperliquid's `reduce_only`.
   - **The engine** cuts a fill of either value so the position it reduces lands flat, as before.
     For `PositionAndFreeBase` on a spot instrument, it reads the excess as free base the order was
-    sized to trade: a sell past a long, or from flat, sells it; a buy past a short buys base into
-    the balance. That fill is logged at INFO instead of WARN, and counted on the new
+    sized to trade: a sell past a long, or from flat, sells it; a buy past a short, or from flat,
+    buys base the account owes, such as a short's interest. A fill that only grows the position,
+    a buy while long or a sell while short, is on the wrong side and stays a mistake. A free-base
+    fill is logged at INFO instead of WARN, and counted on the new
     `TearSheet::fills_free_base_traded` and `free_base_traded` (summed on
     `TradingSummary::fills_free_base_traded`, shown as "Free Base Traded") instead of
     `fills_reduce_only_capped`. Its share of the fee still goes to `fees_unattributed`. On a
     derivative the excess is a mistake, as for `Position`.
   - `ReduceOnlyCapped` has new `reduce_only` and `trades_free_base` fields, and is emitted for a
     free-base trade too: a handler that treats a cut as a fault checks `trades_free_base` first.
-    `ReduceOnly` is `#[non_exhaustive]`; adapters read `is_reduce_only` rather than matching it.
+  - `ReduceOnly` is `#[non_exhaustive]`; adapters read `is_reduce_only` rather than matching it.
     Its `Deserialize` takes a flag only in a human-readable format; a binary one reads the
-    variant.
-    `EngineState::replay_account` takes `(TradeId, ReduceOnly)` pairs, so the audit replica counts
+    variant's index.
+  - `EngineState::replay_account` takes `(TradeId, ReduceOnly)` pairs, so the audit replica counts
     each cut fill as the engine did. `Trade::holding_move` takes a `ReduceOnly`.
   - `ReduceOnlyBook::register` takes a `ReduceOnly`, `BookedOrder::reduce_only` is one, and a
     retired order keeps it. A book serialised with flags and bare retired venue ids still loads.

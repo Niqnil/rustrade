@@ -237,7 +237,9 @@ impl RequestOpen {
 /// - for [`Position`](Self::Position), reads the excess as a mistake: logged at WARN, and
 ///   counted as a reduce-only fill cut;
 /// - for [`PositionAndFreeBase`](Self::PositionAndFreeBase) on a spot instrument, reads it as a
-///   trade of free base the order was sized to make: logged at INFO, and counted apart.
+///   trade of free base the order was sized to make, when the fill moved against the position or
+///   the position was flat: logged at INFO, and counted apart. A fill that only grows the
+///   position is read as a mistake, as for [`Position`](Self::Position).
 ///
 /// # Serialised form
 /// `"no"`, `"position"` or `"position_and_free_base"`. In a human-readable format such as JSON, a
@@ -248,8 +250,7 @@ impl RequestOpen {
 /// `#[non_exhaustive]`, so a value can be added without breaking a caller. An adapter reads
 /// [`Self::is_reduce_only`] rather than matching the values.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum ReduceOnly {
     /// The order may open or grow a position.
     #[default]
@@ -259,11 +260,17 @@ pub enum ReduceOnly {
     /// The order reduces the position it closes, and may trade base beyond it out of, or into,
     /// the account's free balance. Meant for spot instruments, spot margin included.
     ///
-    /// A sell above a long, or from flat, sells free base: the base-fee remainder that a spot
-    /// position leaves out (see the `rustrade` engine's `EngineState::free_base`), or base the
-    /// account holds for another reason. A buy above a short buys base into the balance, as one
-    /// sized to cover a loan's interest does. Size it from the base the account holds outside
-    /// the position, so the excess never sells more than the account has.
+    /// The excess must continue the way the order reduces: past the position, or from flat.
+    /// - A sell above a long, or from flat, sells free base: the base-fee remainder that a spot
+    ///   position leaves out (see the `rustrade` engine's `EngineState::free_base`), or base the
+    ///   account holds for another reason.
+    /// - A buy above a short, or from flat, buys base the account owes outside the position, as
+    ///   one sized to cover a short's loan and its interest in base does.
+    ///
+    /// Size it from the base the account holds, or owes, outside the position, so the excess
+    /// never sells more than the account has. The engine does not check the size: it takes the
+    /// excess as the order was sized. A fill that only grows the position, a buy while long or a
+    /// sell while short, reduces nothing, and is booked as for [`Position`](Self::Position).
     ///
     /// A venue that enforces reduce-only itself, rather than ignoring it, may refuse or trim
     /// the excess. On a derivative, which has no free base, the engine books excess as for
@@ -279,14 +286,26 @@ impl ReduceOnly {
     }
 }
 
-/// [`ReduceOnly`]'s values as serde derives them, for a format that is not human-readable. In the
-/// same order, so a variant index reads back as the value it was written from.
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// [`ReduceOnly`]'s serialised form: every value is written through it, and read back through it
+/// in a format that is not human-readable. A binary format stores a variant's index, so a value
+/// is only ever added at the end, and never reordered or removed.
+#[derive(Deserialize, Serialize)]
+#[serde(rename = "ReduceOnly", rename_all = "snake_case")]
 enum ReduceOnlyVariant {
     No,
     Position,
     PositionAndFreeBase,
+}
+
+// Matched exhaustively, so a value added to `ReduceOnly` does not build until it is added here.
+impl From<ReduceOnly> for ReduceOnlyVariant {
+    fn from(reduce_only: ReduceOnly) -> Self {
+        match reduce_only {
+            ReduceOnly::No => Self::No,
+            ReduceOnly::Position => Self::Position,
+            ReduceOnly::PositionAndFreeBase => Self::PositionAndFreeBase,
+        }
+    }
 }
 
 impl From<ReduceOnlyVariant> for ReduceOnly {
@@ -296,6 +315,12 @@ impl From<ReduceOnlyVariant> for ReduceOnly {
             ReduceOnlyVariant::Position => Self::Position,
             ReduceOnlyVariant::PositionAndFreeBase => Self::PositionAndFreeBase,
         }
+    }
+}
+
+impl Serialize for ReduceOnly {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ReduceOnlyVariant::from(*self).serialize(serializer)
     }
 }
 
@@ -445,12 +470,12 @@ mod tests {
         );
     }
 
-    /// A deserializer that reads `value` as a binary format would: not human-readable, so it
-    /// reads a value by the shape asked for, as an enum.
-    struct NotHumanReadable<'a>(&'a serde_json::Value);
+    /// A deserializer that reads its inner one as a binary format would: not human-readable, so
+    /// it reads a value by the shape asked for, as an enum.
+    struct NotHumanReadable<D>(D);
 
-    impl<'de, 'a: 'de> Deserializer<'de> for NotHumanReadable<'a> {
-        type Error = serde_json::Error;
+    impl<'de, D: Deserializer<'de>> Deserializer<'de> for NotHumanReadable<D> {
+        type Error = D::Error;
 
         fn deserialize_any<V: serde::de::Visitor<'de>>(
             self,
@@ -497,6 +522,21 @@ mod tests {
         }
         // A flag has no variant to read.
         assert!(ReduceOnly::deserialize(NotHumanReadable(&serde_json::Value::Bool(true))).is_err());
+    }
+
+    /// A binary format stores a variant's index, not its name, so the indices are pinned: a
+    /// reordered value would read stored data back as another.
+    #[test]
+    #[allow(clippy::unwrap_used)] // Test code: panics are the correct failure mode
+    fn a_binary_format_reads_reduce_only_by_its_variant_index() {
+        use serde::de::value::{Error, U32Deserializer};
+
+        let read =
+            |index| ReduceOnly::deserialize(NotHumanReadable(U32Deserializer::<Error>::new(index)));
+        assert_eq!(read(0).unwrap(), ReduceOnly::No);
+        assert_eq!(read(1).unwrap(), ReduceOnly::Position);
+        assert_eq!(read(2).unwrap(), ReduceOnly::PositionAndFreeBase);
+        assert!(read(3).is_err());
     }
 
     #[test]

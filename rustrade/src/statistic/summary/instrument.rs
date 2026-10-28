@@ -113,8 +113,9 @@ pub struct TearSheet<Interval> {
     /// traded past the position they reduce, valued at each fill's price, in the instrument's
     /// quote asset, as a size. See [`Self::fills_free_base_traded`].
     ///
-    /// Reported only, not charged to `pnl`: the base was the account's, outside every position,
-    /// and the quote a sale of it brings in is the account's too.
+    /// Reported only, not charged to `pnl`: the base was the account's, or owed by it, outside
+    /// every position, and the quote a sale of it brings in, or a purchase of it spends, is the
+    /// account's too.
     ///
     /// `#[serde(default)]` so tear sheets serialised before this field existed still load.
     #[serde(default)]
@@ -225,7 +226,9 @@ pub struct TearSheet<Interval> {
     /// Fills of orders sent
     /// [`ReduceOnly::PositionAndFreeBase`](rustrade_execution::order::request::ReduceOnly::PositionAndFreeBase)
     /// on a spot instrument that traded base past the position they reduce, as they were sized
-    /// to: from flat, or past a long for a sell, past a short for a buy.
+    /// to: from flat, or past a long for a sell, past a short for a buy. A fill that only grows
+    /// the position, a buy while long or a sell while short, is on the wrong side, and counted on
+    /// [`Self::fills_reduce_only_capped`] instead.
     ///
     /// The engine cuts such a fill to land the position flat, as it does any reduce-only fill,
     /// but reads the excess as intended: it is logged at INFO, counted here rather than on

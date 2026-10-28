@@ -291,17 +291,23 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     /// instruments count. A derivative's position is counted in contracts, not held in the base,
     /// so it is not taken out.
     ///
-    /// Signed. It is negative when the spot positions count more base than the account holds net
-    /// of debt, as when a fill has reached a position but not yet the balance, or the positions
-    /// have drifted from the venue's. A sell sized at a long plus this then still sells no more
-    /// than the account holds.
+    /// Signed. It is negative when the account owes base outside its positions, or the positions
+    /// count more base than it holds net of debt:
+    /// - **A short's interest.** On margin, interest on a short's loan that the venue charges in
+    ///   base is owed outside the short, which does not count it. With a short open it reads
+    ///   negative by that interest, so a buy sized at the short plus its negative closes the
+    ///   short and covers the interest.
+    /// - **Timing or drift.** A fill has reached a position but not yet the balance, or the
+    ///   positions have drifted from the venue's. A sell sized at a long plus this then still
+    ///   sells no more than the account holds.
     ///
     /// # What it leaves out
     /// - **Orders in flight.** Base a resting order locks is already out of `free`, but an open
     ///   the venue has not yet acknowledged is not taken out. Nor is a fill whose balance update
     ///   has not arrived. Read it while no order on `asset` is working, or after an account
-    ///   snapshot. That includes an order closing the position itself: a resting sell of a long
-    ///   locks its base out of `free`, so the read falls by it.
+    ///   snapshot. Through the cap at `free`, a resting order that locks more base than the
+    ///   positions hold lowers the read by the difference. One that locks no more, such as a
+    ///   resting sell that only closes a long, leaves it unchanged.
     /// - **Pairs quoted in the asset.** Only positions whose base is `asset` are taken out. What
     ///   a pair quoted in it holds, such as a short of `ETHBTC`'s proceeds in BTC, reads as free.
     /// - **Isolated margin.** The engine stores no isolated balances, so a position in an
@@ -321,7 +327,8 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     ///   rounded toward zero to the step, sent
     ///   [`ReduceOnly::PositionAndFreeBase`].
     ///   The engine closes the long and books the rest as free base sold, at INFO, rather than as
-    ///   a reduce-only mistake. Below one step there is nothing to sweep.
+    ///   a reduce-only mistake. Below one step there is nothing to sweep. The same close, sized
+    ///   from a short, is a buy that also covers the base the account owes outside it.
     /// - **With a short of the asset open on cross margin**, base the account holds lowers the
     ///   loan: a sale that borrows sells free base before it borrows, and a repayment can spend
     ///   it. Repaying the debt with it is then usually the better use, though which to do is the
@@ -1331,6 +1338,26 @@ mod tests {
         );
 
         assert_eq!(state.free_base(&btc), Some(dec!(0.00891)));
+    }
+
+    /// A short holding no base of its own reads negative by its interest: the base owed outside
+    /// it, which a buy sized at the short plus the read covers.
+    #[test]
+    fn free_base_reads_a_shorts_interest_as_owed() {
+        use rust_decimal_macros::dec;
+        use rustrade_execution::balance::Balance;
+
+        let (state, btc) = free_base_state(
+            &[(EXECUTION, "btc_usdt", dec!(-1))],
+            Some(Balance::new_margin(
+                Decimal::ZERO,
+                Decimal::ZERO,
+                dec!(1),
+                dec!(0.001),
+            )),
+        );
+
+        assert_eq!(state.free_base(&btc), Some(dec!(-0.001)));
     }
 
     /// Positions that count more than the account holds read negative, so a sweep sized from it

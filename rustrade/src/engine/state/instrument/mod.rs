@@ -613,13 +613,16 @@ pub struct ReduceOnlyCapped<InstrumentKey = InstrumentIndex> {
     #[serde(default = "reduce_only_position")]
     pub reduce_only: ReduceOnly,
     /// Whether the excess is free base the order was sized to trade: an order sent
-    /// [`ReduceOnly::PositionAndFreeBase`] on a spot instrument. Logged at INFO and counted on
+    /// [`ReduceOnly::PositionAndFreeBase`] on a spot instrument, whose fill moved against the
+    /// position or found it flat. A fill that only grows the position trades none. Logged at
+    /// INFO and counted on
     /// [`TearSheet::fills_free_base_traded`](crate::statistic::summary::instrument::TearSheet::fills_free_base_traded)
     /// if so, and otherwise at WARN and on
     /// [`TearSheet::fills_reduce_only_capped`](crate::statistic::summary::instrument::TearSheet::fills_reduce_only_capped).
     ///
-    /// It follows from [`Self::reduce_only`] and the instrument's kind, and is carried because a
-    /// consumer of the output has no instrument to read the kind from.
+    /// It follows from [`Self::reduce_only`], the instrument's kind, and the signs of
+    /// [`Self::held`] and [`Self::excess`], and is carried because a consumer of the output has
+    /// no instrument to read the kind from.
     ///
     /// `#[serde(default)]` so outputs serialised before this field existed still load, as
     /// `false`.
@@ -1831,9 +1834,11 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             .map(|order| order.cid)
             .or(trade.client_order_id.as_ref())
             .cloned();
-        // Free base exists only on spot: a derivative's excess is a mistake whatever was sent.
+        // Free base exists only on spot: a derivative's excess is a mistake whatever was sent. A
+        // fill on the position's own side reduced nothing, so its excess is a mistake too.
         let trades_free_base = reduce_only == ReduceOnly::PositionAndFreeBase
-            && matches!(self.instrument.kind, InstrumentKind::Spot);
+            && matches!(self.instrument.kind, InstrumentKind::Spot)
+            && (held.is_zero() || held.is_sign_negative() != excess.is_sign_negative());
         if trades_free_base {
             info!(
                 instrument = ?trade.instrument,
@@ -2091,14 +2096,18 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// - The fill is returned in [`FillsApplied::capped`], which the `Engine` emits as
     ///   [`EngineOutput::ReduceOnlyCapped`](crate::engine::EngineOutput::ReduceOnlyCapped), and
     ///   logged and counted by what its order was sent as:
-    ///   - [`ReduceOnly::PositionAndFreeBase`] on a spot instrument: the excess is free base the
-    ///     order was sized to trade, such as the base-fee remainder above, or base the account
-    ///     holds for another reason. Logged at INFO, counted on
+    ///   - [`ReduceOnly::PositionAndFreeBase`] on a spot instrument, when the fill moved against
+    ///     the position or found it flat: the excess is free base the order was sized to trade.
+    ///     A sell's is base the account holds outside the position, such as the base-fee
+    ///     remainder above; a buy's is base it owes outside a short, such as the loan's interest.
+    ///     The size is the order's: the engine does not check it against the balance. Logged at
+    ///     INFO, counted on
     ///     [`TearSheet::fills_free_base_traded`](crate::statistic::summary::instrument::TearSheet::fills_free_base_traded),
     ///     with its excess's value summed on
     ///     [`TearSheet::free_base_traded`](crate::statistic::summary::instrument::TearSheet::free_base_traded).
-    ///   - Otherwise, [`ReduceOnly::Position`] or a derivative: the excess is a mistake, or a
-    ///     repayment sized above its loan. Logged at WARN, counted on
+    ///   - Otherwise, [`ReduceOnly::Position`], a derivative, or a fill that only grows the
+    ///     position it is routed to: the excess is a mistake, or a repayment sized above its
+    ///     loan. Logged at WARN, counted on
     ///     [`TearSheet::fills_reduce_only_capped`](crate::statistic::summary::instrument::TearSheet::fills_reduce_only_capped),
     ///     with its excess's value summed on
     ///     [`TearSheet::reduce_only_excess`](crate::statistic::summary::instrument::TearSheet::reduce_only_excess).
@@ -5800,8 +5809,8 @@ mod tests {
 
     /// A fill of an order sent to trade free base is cut at the position like any reduce-only
     /// fill, but its excess is read as intended: no WARN, and counted apart from the reduce-only
-    /// fills cut. A sell past a long sells free base; a buy past a short buys base into the
-    /// balance. The excess's share of the fee goes to the tear sheet.
+    /// fills cut. A sell past a long sells free base; a buy past a short buys base owed outside
+    /// it. The excess's share of the fee goes to the tear sheet.
     #[test]
     fn a_fill_sized_to_trade_free_base_is_cut_at_the_position_and_counted_apart() {
         for (held_side, side) in [(Side::Buy, Side::Sell), (Side::Sell, Side::Buy)] {
@@ -5868,48 +5877,97 @@ mod tests {
         }
     }
 
-    /// From flat, all of a fill sized to trade free base is free base: no position takes any of
-    /// it, and all its fee goes to the tear sheet.
+    /// From flat, all of a fill sized to trade free base is free base, on either side: no
+    /// position takes any of it, and all its fee goes to the tear sheet. A sell sweeps base a
+    /// closed long left; a buy covers base still owed after a short closed.
     #[test]
     fn a_fill_sized_to_trade_free_base_from_flat_is_all_free_base() {
-        let mut state = instrument_state(OmsMode::Netting);
-        let quote = state.instrument.underlying.quote;
-        let exchange_id = OrderId::new("ex-sweep");
-        send_order(
-            &mut state,
-            &ClientOrderId::new("sweep"),
-            &exchange_id,
-            ReduceOnly::PositionAndFreeBase,
-        );
+        for (side, excess) in [(Side::Sell, dec!(-0.01)), (Side::Buy, dec!(0.01))] {
+            let mut state = instrument_state(OmsMode::Netting);
+            let quote = state.instrument.underlying.quote;
+            let exchange_id = OrderId::new("ex-sweep");
+            send_order(
+                &mut state,
+                &ClientOrderId::new("sweep"),
+                &exchange_id,
+                ReduceOnly::PositionAndFreeBase,
+            );
 
-        let (applied, warnings) = count_warnings(|| {
-            state.update_from_trade(&charged(
-                fill(exchange_id, Side::Sell, dec!(0.01)),
-                quote,
-                dec!(0.001),
-                dec!(0.001),
-            ))
-        });
+            let (applied, warnings) = count_warnings(|| {
+                state.update_from_trade(&charged(
+                    fill(exchange_id, side, dec!(0.01)),
+                    quote,
+                    dec!(0.001),
+                    dec!(0.001),
+                ))
+            });
 
-        assert_eq!(warnings, 0);
-        assert!(applied.exited.is_none());
-        assert!(state.position.positions.is_empty());
-        assert_eq!(
-            applied
-                .capped
-                .iter()
-                .map(|capped| (capped.excess, capped.trades_free_base))
-                .collect::<Vec<_>>(),
-            vec![(dec!(-0.01), true)]
-        );
-        assert_eq!(
-            (
-                state.tear_sheet.fills_free_base_traded,
-                state.tear_sheet.free_base_traded,
-                state.tear_sheet.pnl_returns.fees_unattributed
-            ),
-            (1, dec!(1), dec!(0.001))
-        );
+            assert_eq!(warnings, 0, "{side}");
+            assert!(applied.exited.is_none(), "{side}");
+            assert!(state.position.positions.is_empty(), "{side}");
+            assert_eq!(
+                applied
+                    .capped
+                    .iter()
+                    .map(|capped| (capped.excess, capped.trades_free_base))
+                    .collect::<Vec<_>>(),
+                vec![(excess, true)],
+                "{side}"
+            );
+            assert_eq!(
+                (
+                    state.tear_sheet.fills_free_base_traded,
+                    state.tear_sheet.free_base_traded,
+                    state.tear_sheet.pnl_returns.fees_unattributed
+                ),
+                (1, dec!(1), dec!(0.001)),
+                "{side}"
+            );
+        }
+    }
+
+    /// A fill sized to trade free base that only grows the position, a buy while long or a sell
+    /// while short, reduces nothing: whatever its order was sent as, the order is on the wrong
+    /// side. It is applied to no position, and its excess is a mistake: WARN, and counted as a
+    /// reduce-only fill cut.
+    #[test]
+    fn a_fill_sized_to_trade_free_base_that_grows_the_position_is_a_mistake() {
+        for (side, excess) in [(Side::Buy, dec!(0.5)), (Side::Sell, dec!(-0.5))] {
+            let mut state = instrument_state(OmsMode::Netting);
+            let _ = state.update_from_trade(&fill(OrderId::new("open"), side, dec!(1)));
+            let exchange_id = OrderId::new("ex-wrong-side");
+            send_order(
+                &mut state,
+                &ClientOrderId::new("wrong-side"),
+                &exchange_id,
+                ReduceOnly::PositionAndFreeBase,
+            );
+
+            let (applied, warnings) =
+                count_warnings(|| state.update_from_trade(&fill(exchange_id, side, dec!(0.5))));
+
+            assert_eq!(warnings, 1, "{side}");
+            let position = netting_position(&state).expect("the position stays open");
+            assert_eq!(
+                (position.side, position.quantity_abs),
+                (side, dec!(1)),
+                "{side}"
+            );
+            let [capped] = applied.capped.as_slice() else {
+                panic!("{side}: one cut, got {:?}", applied.capped);
+            };
+            assert_eq!(
+                (capped.excess, capped.reduce_only, capped.trades_free_base),
+                (excess, ReduceOnly::PositionAndFreeBase, false),
+                "{side}"
+            );
+            let sheet = &state.tear_sheet;
+            assert_eq!(
+                (sheet.fills_reduce_only_capped, sheet.fills_free_base_traded),
+                (1, 0),
+                "{side}"
+            );
+        }
     }
 
     /// A derivative has no free base, so the excess of a fill sent to trade it is a mistake, as
