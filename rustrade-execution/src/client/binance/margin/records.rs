@@ -106,12 +106,14 @@ impl BinanceMargin {
     ///
     /// - [`asset`](CashFlow::asset) is the `asset` field of Binance's record. Binance charges
     ///   interest in the asset borrowed, or converts it into BNB for an account that pays interest
-    ///   in BNB: a `_CONVERTED` record's `asset` is BNB. The flow does not name the asset borrowed.
-    ///   Binance gives it only in a cross record's separate `rawAsset` field, and not at all on an
-    ///   isolated record.
+    ///   in BNB: a `_CONVERTED` record's `asset` is BNB, so its flow does not name the asset
+    ///   borrowed. Binance names that asset in a separate `rawAsset` field, which this method does
+    ///   not read, and which Binance does not return on an isolated record.
     /// - [`principal`](CashFlowKind::MarginInterest::principal) is the loan the charge was on. On a
-    ///   `_CONVERTED` record it can read 0, and Binance does not document when it does. The loan
-    ///   itself is in Binance's borrow and repay records (`GET /sapi/v1/margin/borrow-repay`).
+    ///   `_CONVERTED` record it can read 0, and Binance does not document when it does. The loans
+    ///   taken and repaid can be looked up in Binance's borrow and repay history
+    ///   (`GET /sapi/v1/margin/borrow-repay`), from which the loan at the charged hour can be
+    ///   rebuilt.
     /// - [`rate`](CashFlowKind::MarginInterest::rate) is Binance's `interestRate`, a **daily** rate
     ///   even on an hourly charge: an hourly charge is about the rate divided by 24 of the
     ///   principal. Binance's API documentation does not state the unit; it is read off the rates
