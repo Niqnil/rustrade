@@ -48,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     changed with the same event.
 
 - **`OrderKind::ConditionalUnresolved` and `BinanceMargin::recall_order_kinds`**
-  (`rustrade-execution`, `binance` feature for the method, #PRNUM).
+  (`rustrade-execution`, `binance` feature for the method, #763).
   - **The kind.** A conditional order a venue reports without saying whether its trigger is fixed
     or trails. It carries a `ConditionalFamily` (`Stop`, `StopLimit`, `TakeProfit`,
     `TakeProfitLimit`) and the trigger price the venue reports, the activation price of a trailing
@@ -149,7 +149,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **`BinanceMargin` reports every live conditional order, and an isolated account's trailing
-  orders as trailing** (`rustrade-execution`, `binance` feature, #PRNUM). Binance's margin REST
+  orders as trailing** (`rustrade-execution`, `binance` feature, #763). Binance's margin REST
   order queries never say whether a `STOP_LOSS`, `STOP_LOSS_LIMIT`, `TAKE_PROFIT` or
   `TAKE_PROFIT_LIMIT` order trails, and an isolated account's stream sends `"d": ""` for every
   order, trailing or not.
