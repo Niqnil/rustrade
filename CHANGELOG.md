@@ -160,12 +160,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     it with the kind it was placed with.
   - Each now reports the kind the client knows the order by, from placing it, from a report that
     described it, or from `recall_order_kinds`, and otherwise `OrderKind::ConditionalUnresolved`,
-    with a sampled `warn`. An ended order the client does not know, which `fetch_ended_orders` and the
-    stream's reconnect check used to report with its fixed trigger, or not at all without one, is
-    reported unresolved too.
-  - A cross account's stream, whose reports say they are not isolated, is unchanged: it reports
-    the trailing delta. A report that does not say which account it is from is read as
-    isolated.
+    with a sampled `warn`. An ended order the client does not know, which `fetch_ended_orders` and
+    the stream's reconnect check used to report with its fixed trigger, or not at all without one,
+    is reported unresolved too.
+  - A cross account's stream, whose order reports say they are not isolated, is unchanged: it
+    reports the trailing delta. An order report with an empty `d` that does not say which account
+    it is from is read as an isolated one is: its trailing delta unknown.
 
 - **`MarginEffect::Borrow` states how much Binance lends** (`rustrade-execution`, #749). Its
   rustdoc said a `MARGIN_BUY` order borrows the shortfall, and only the shortfall. Binance lends
