@@ -2,7 +2,8 @@ use crate::statistic::{algorithm::welford_online, summary::dataset::dispersion::
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-/// Utilities for analysing a datasets measured of dispersion - range, variance & standard deviation.
+/// A dataset's dispersion: the range, and the Welford recurrence relation M from which the variance
+/// and standard deviation are derived.
 pub mod dispersion;
 
 /// Maintains running statistical summaries of a dataset using Welford's online algorithm.

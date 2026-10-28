@@ -9,8 +9,8 @@
 //!   turn) and settles it, so every step fills.
 //! - `build`: a fresh session, which every episode needs.
 //!
-//! Each `hold` and `round_trip` iteration runs `STEPS` one-second bars on a fresh session,
-//! building it excluded. `build` times the construction alone.
+//! Each `hold` and `round_trip` iteration runs `STEPS` one-second bars on a fresh session; building
+//! the session is excluded. `build` times the construction alone.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use criterion::{BatchSize, Criterion, Throughput};
