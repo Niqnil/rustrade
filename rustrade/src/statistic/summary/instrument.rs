@@ -107,6 +107,18 @@ pub struct TearSheet<Interval> {
     #[serde(default)]
     pub reduce_only_excess: Decimal,
 
+    /// The free base that fills of orders sent
+    /// [`ReduceOnly::PositionAndFreeBase`](rustrade_execution::order::request::ReduceOnly::PositionAndFreeBase)
+    /// traded past the position they reduce, valued at each fill's price, in the instrument's
+    /// quote asset, as a size. See [`Self::fills_free_base_traded`].
+    ///
+    /// Reported only, not charged to `pnl`: the base was the account's, outside every position,
+    /// and the quote a sale of it brings in is the account's too.
+    ///
+    /// `#[serde(default)]` so tear sheets serialised before this field existed still load.
+    #[serde(default)]
+    pub free_base_traded: Decimal,
+
     pub pnl_return: RateOfReturn<Interval>,
     pub sharpe_ratio: SharpeRatio<Interval>,
     pub sortino_ratio: SortinoRatio<Interval>,
@@ -209,6 +221,20 @@ pub struct TearSheet<Interval> {
     #[serde(default)]
     pub fills_reduce_only_capped: usize,
 
+    /// Fills of orders sent
+    /// [`ReduceOnly::PositionAndFreeBase`](rustrade_execution::order::request::ReduceOnly::PositionAndFreeBase)
+    /// on a spot instrument that traded base past the position they reduce, as they were sized
+    /// to: from flat, or past a long for a sell, past a short for a buy.
+    ///
+    /// The engine cuts such a fill to land the position flat, as it does any reduce-only fill,
+    /// but reads the excess as intended: it is logged at INFO, counted here rather than on
+    /// [`Self::fills_reduce_only_capped`], and its value summed in [`Self::free_base_traded`].
+    /// Its share of the fill's fees is charged to [`Self::fees_unattributed`]. See the
+    /// reduce-only section of
+    /// [`InstrumentState::update_from_trade`](crate::engine::state::instrument::InstrumentState::update_from_trade).
+    #[serde(default)]
+    pub fills_free_base_traded: usize,
+
     /// Fills whose fee was charged in a third asset, neither the instrument's base nor its quote,
     /// that the engine could not value in quote, so their fees are left out of `pnl`.
     ///
@@ -307,6 +333,15 @@ pub struct TearSheetGenerator {
     #[serde(default)]
     pub reduce_only_excess: Decimal,
 
+    /// Fills that traded free base past their position. See
+    /// [`TearSheet::fills_free_base_traded`].
+    #[serde(default)]
+    pub fills_free_base_traded: usize,
+
+    /// Value of the free base those fills traded. See [`TearSheet::free_base_traded`].
+    #[serde(default)]
+    pub free_base_traded: Decimal,
+
     /// Fills whose third-asset fee was left out of PnL. See [`TearSheet::fills_fee_unconverted`].
     #[serde(default)]
     pub fills_fee_unconverted: usize,
@@ -342,6 +377,8 @@ impl TearSheetGenerator {
             dust_value: Decimal::ZERO,
             fills_reduce_only_capped: 0,
             reduce_only_excess: Decimal::ZERO,
+            fills_free_base_traded: 0,
+            free_base_traded: Decimal::ZERO,
             fills_fee_unconverted: 0,
             first_fallback_detail: None,
             fallback_positions: Vec::new(),
@@ -430,6 +467,22 @@ impl TearSheetGenerator {
     /// [`TearSheet::fills_fee_unconverted`].
     pub fn record_fill_fee_unconverted(&mut self) {
         self.fills_fee_unconverted = self.fills_fee_unconverted.saturating_add(1);
+    }
+
+    /// Record a fill that traded free base past the position it reduces, and the value of that
+    /// excess, as a size. See [`TearSheet::fills_free_base_traded`].
+    ///
+    /// Holds its last-good total on overflow and emits a `warn!`, as the PnL totals do.
+    pub fn record_fill_free_base_traded(&mut self, excess_value: Decimal) {
+        self.fills_free_base_traded = self.fills_free_base_traded.saturating_add(1);
+        match self.free_base_traded.checked_add(excess_value) {
+            Some(new_total) => self.free_base_traded = new_total,
+            None => warn!(
+                free_base_traded = %self.free_base_traded,
+                %excess_value,
+                "free base traded accumulation overflowed Decimal; holding last-good value"
+            ),
+        }
     }
 
     /// Record a reduce-only fill the engine cut, and its excess's value, as a size. See
@@ -578,6 +631,7 @@ impl TearSheetGenerator {
             dust_quantity: self.dust_quantity,
             dust_value: self.dust_value,
             reduce_only_excess: self.reduce_only_excess,
+            free_base_traded: self.free_base_traded,
             pnl_return,
             pnl_drawdown: current_pnl_drawdown,
             pnl_drawdown_mean,
@@ -593,6 +647,7 @@ impl TearSheetGenerator {
             fills_unallocated: self.fills_unallocated,
             fills_dust: self.fills_dust,
             fills_reduce_only_capped: self.fills_reduce_only_capped,
+            fills_free_base_traded: self.fills_free_base_traded,
             fills_fee_unconverted: self.fills_fee_unconverted,
             first_fallback_detail: self.first_fallback_detail.clone(),
             fallback_positions: self.fallback_positions.clone(),
@@ -692,6 +747,44 @@ mod tests {
         let loaded: TearSheet<Annual365> = serde_json::from_value(value).unwrap();
         assert_eq!(
             (loaded.fills_reduce_only_capped, loaded.reduce_only_excess),
+            (0, Decimal::ZERO)
+        );
+    }
+
+    #[test]
+    fn a_tear_sheet_serialised_before_free_base_traded_loads_with_zero() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fill_free_base_traded(dec!(0.5));
+        let mut value = serde_json::to_value(generator.generate(Decimal::ZERO, Annual365)).unwrap();
+        let fields = value.as_object_mut().unwrap();
+        fields.remove("free_base_traded").unwrap();
+        fields.remove("fills_free_base_traded").unwrap();
+
+        let loaded: TearSheet<Annual365> = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            (loaded.fills_free_base_traded, loaded.free_base_traded),
+            (0, Decimal::ZERO)
+        );
+    }
+
+    /// A free base traded total that would overflow holds its last-good value, and the fill is
+    /// still counted, apart from the reduce-only fills cut.
+    #[test]
+    fn free_base_traded_holds_its_last_good_total_on_overflow() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fill_free_base_traded(Decimal::MAX);
+
+        generator.record_fill_free_base_traded(Decimal::ONE);
+
+        assert_eq!(
+            (generator.fills_free_base_traded, generator.free_base_traded),
+            (2, Decimal::MAX)
+        );
+        assert_eq!(
+            (
+                generator.fills_reduce_only_capped,
+                generator.reduce_only_excess
+            ),
             (0, Decimal::ZERO)
         );
     }

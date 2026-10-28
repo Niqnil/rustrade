@@ -1,4 +1,7 @@
-use crate::order::id::{ClientOrderId, OrderId, StrategyId};
+use crate::order::{
+    id::{ClientOrderId, OrderId, StrategyId},
+    request::ReduceOnly,
+};
 use chrono::{DateTime, Utc};
 use derive_more::{Constructor, From};
 use rust_decimal::Decimal;
@@ -234,9 +237,11 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
     ///
     /// `held` is the position the fill applies to, as it stands before the fill, signed: positive
     /// for a long, negative for a short, zero for none. In an account holding a long and a short
-    /// at once, it is the one position the fill is routed to. `reduce_only` is whether the fill's
-    /// order was sent to reduce a position only, as
-    /// [`RequestOpen::reduce_only`](crate::order::request::RequestOpen::reduce_only) says.
+    /// at once, it is the one position the fill is routed to. `reduce_only` is what the fill's
+    /// order was sent as, its
+    /// [`RequestOpen::reduce_only`](crate::order::request::RequestOpen::reduce_only). Both
+    /// reduce-only values move the position alike: they differ only in how the engine books the
+    /// excess (see [`ReduceOnly`]).
     ///
     /// # The rule
     ///
@@ -249,7 +254,8 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
     ///   and an inverse contract pays its fees in the settlement coin, so a fee there never
     ///   changes the quantity. A fee in quote or a third asset, such as BNB, and a fee of zero
     ///   are not netted.
-    /// - **A reduce-only move never grows or flips the position.** With `reduce_only`, a netted
+    /// - **A reduce-only move never grows or flips the position.** When
+    ///   [`ReduceOnly::is_reduce_only`], a netted
     ///   move larger than the opposite position `held` is cut to land it flat, and one that does
     ///   not reduce it at all, because `held` is zero or on the move's side, moves nothing. What
     ///   is cut off is [`HoldingMove::excess`]. A cut move is not rounded below: flat is on any
@@ -279,10 +285,11 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
     /// - **Only the fee the venue reported** is netted. A fee the caller computes itself, as the
     ///   engine's fee model does, is in quote, and reaches PnL alone.
     /// - **The excess and its share of the fee.** No position takes the excess: the account
-    ///   holds it, or the venue spent it, as on a margin repayment sized to cover interest. The
-    ///   engine charges the position the share of the fill's fees that the move is of the netted
-    ///   move, and the rest to its tear sheet as fees no position carries. It reports the excess
-    ///   without charging its value to PnL.
+    ///   holds it, or the venue spent it, as on a margin repayment sized to cover interest, or it
+    ///   was free base the order was sized to trade, under [`ReduceOnly::PositionAndFreeBase`].
+    ///   The engine charges the position the share of the fill's fees that the move is of the
+    ///   netted move, and the rest to its tear sheet as fees no position carries. It reports the
+    ///   excess without charging its value to PnL.
     /// - **A settlement fill larger than its position, in a hedged account.** Where an account
     ///   can hold a long and a short at once (the engine's `OmsMode::Hedging`), the engine does not
     ///   call this for a settlement fill, such as a liquidation, that matches none of its orders
@@ -295,7 +302,7 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
         &self,
         instrument: &Instrument<ExchangeKey, AssetKey>,
         held: Decimal,
-        reduce_only: bool,
+        reduce_only: ReduceOnly,
     ) -> Option<HoldingMove>
     where
         AssetKey: PartialEq,
@@ -311,7 +318,9 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
             };
         let (netted_side, _) = unsigned(netted, self.side);
 
-        if reduce_only && let Some(moved) = reduced_by(held, netted) {
+        if reduce_only.is_reduce_only()
+            && let Some(moved) = reduced_by(held, netted)
+        {
             let (side, quantity) = unsigned(moved, netted_side);
             return Some(HoldingMove {
                 side,
@@ -853,7 +862,7 @@ mod tests {
 
         for (case, instrument, fill) in cases {
             assert_eq!(
-                fill.holding_move(&instrument, Decimal::ZERO, false),
+                fill.holding_move(&instrument, Decimal::ZERO, ReduceOnly::No),
                 None,
                 "{case}"
             );
@@ -892,7 +901,11 @@ mod tests {
         ];
 
         for (case, fill, expected) in cases {
-            assert_eq!(fill.holding_move(&spot, dec!(2), false), expected, "{case}");
+            assert_eq!(
+                fill.holding_move(&spot, dec!(2), ReduceOnly::No),
+                expected,
+                "{case}"
+            );
         }
     }
 
@@ -943,7 +956,11 @@ mod tests {
         ];
 
         for (case, held, fill, expected) in cases {
-            assert_eq!(fill.holding_move(&spot, held, false), expected, "{case}");
+            assert_eq!(
+                fill.holding_move(&spot, held, ReduceOnly::No),
+                expected,
+                "{case}"
+            );
         }
     }
 
@@ -968,7 +985,11 @@ mod tests {
         ];
 
         for (case, held, fill, expected) in cases {
-            assert_eq!(fill.holding_move(&spot, held, false), expected, "{case}");
+            assert_eq!(
+                fill.holding_move(&spot, held, ReduceOnly::No),
+                expected,
+                "{case}"
+            );
         }
     }
 
@@ -1012,8 +1033,15 @@ mod tests {
             ),
         ];
 
+        // Both reduce-only values move the position alike.
         for (case, held, fill, expected) in cases {
-            assert_eq!(fill.holding_move(&spot, held, true), expected, "{case}");
+            for reduce_only in [ReduceOnly::Position, ReduceOnly::PositionAndFreeBase] {
+                assert_eq!(
+                    fill.holding_move(&spot, held, reduce_only),
+                    expected,
+                    "{case}, {reduce_only:?}"
+                );
+            }
         }
     }
 
@@ -1062,8 +1090,15 @@ mod tests {
             ),
         ];
 
+        // Both reduce-only values move the position alike.
         for (case, held, fill, expected) in cases {
-            assert_eq!(fill.holding_move(&spot, held, true), expected, "{case}");
+            for reduce_only in [ReduceOnly::Position, ReduceOnly::PositionAndFreeBase] {
+                assert_eq!(
+                    fill.holding_move(&spot, held, reduce_only),
+                    expected,
+                    "{case}, {reduce_only:?}"
+                );
+            }
         }
     }
 
@@ -1078,11 +1113,17 @@ mod tests {
         let fill = fill(Side::Buy, dec!(3), "btc", dec!(0.001));
 
         assert_eq!(
-            fill.holding_move(&perpetual, dec!(-2), true),
+            fill.holding_move(&perpetual, dec!(-2), ReduceOnly::Position),
             cut(Side::Buy, dec!(2), dec!(1))
         );
-        assert_eq!(fill.holding_move(&perpetual, dec!(-3), true), None);
-        assert_eq!(fill.holding_move(&perpetual, dec!(-2), false), None);
+        assert_eq!(
+            fill.holding_move(&perpetual, dec!(-3), ReduceOnly::Position),
+            None
+        );
+        assert_eq!(
+            fill.holding_move(&perpetual, dec!(-2), ReduceOnly::No),
+            None
+        );
     }
 
     #[test]

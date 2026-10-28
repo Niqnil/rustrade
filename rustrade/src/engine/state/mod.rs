@@ -17,7 +17,10 @@ use fnv::FnvHashMap;
 use rustrade_data::event::MarketEvent;
 use rustrade_execution::{
     AccountEvent, AccountEventKind, AccountSnapshot, UnindexedAccountSnapshot,
-    balance::AssetBalance, market::MarketSnapshot, order::id::ClientOrderId, trade::TradeId,
+    balance::AssetBalance,
+    market::MarketSnapshot,
+    order::{id::ClientOrderId, request::ReduceOnly},
+    trade::TradeId,
 };
 use rustrade_instrument::{
     Keyed,
@@ -416,17 +419,19 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     }
 
     /// [`Self::update_from_account`] for an event the `Engine` already processed, as a replica
-    /// of its state does, taking the fills `reduce_only_fills` names as reduce-only.
+    /// of its state does, taking the fills `reduce_only_fills` names as sent as each says.
     ///
     /// A replica records no requests in flight, so it cannot tell a reduce-only order's fill from
     /// another. Pass the [`ReduceOnlyCapped::trade_id`](instrument::ReduceOnlyCapped::trade_id)
-    /// of every [`EngineOutput::ReduceOnlyCapped`](crate::engine::EngineOutput::ReduceOnlyCapped)
-    /// the `Engine` emitted for this event, and the replica cuts those fills as the `Engine` did.
+    /// and [`ReduceOnlyCapped::reduce_only`](instrument::ReduceOnlyCapped::reduce_only) of every
+    /// [`EngineOutput::ReduceOnlyCapped`](crate::engine::EngineOutput::ReduceOnlyCapped) the
+    /// `Engine` emitted for this event, and the replica cuts and counts those fills as the
+    /// `Engine` did.
     /// [`StateReplicaManager`](crate::engine::audit::state_replica::StateReplicaManager) does so.
     pub fn replay_account(
         &mut self,
         event: &AccountEvent,
-        reduce_only_fills: &[TradeId],
+        reduce_only_fills: &[(TradeId, ReduceOnly)],
     ) -> FillsApplied<AssetIndex>
     where
         GlobalData: for<'a> Processor<&'a AccountEvent>,

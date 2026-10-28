@@ -193,6 +193,9 @@ where
         self.add_instrument_metric_row(&mut table, "Reduce-Only Excess", |ts| {
             format!("{:.2}", ts.reduce_only_excess)
         });
+        self.add_instrument_metric_row(&mut table, "Free Base Traded", |ts| {
+            format!("{:.2}", ts.free_base_traded)
+        });
         self.add_instrument_metric_row(&mut table, &format!("Return {interval}"), |ts| {
             format_percentage(ts.pnl_return.value, 2)
         });
@@ -388,6 +391,7 @@ mod tests {
             fills_unallocated: 0,
             fills_dust: 0,
             fills_reduce_only_capped: 0,
+            fills_free_base_traded: 0,
             fills_fee_unconverted: 0,
         }
     }
@@ -451,6 +455,7 @@ mod tests {
             fills_unallocated: 0,
             fills_dust: 0,
             fills_reduce_only_capped: 0,
+            fills_free_base_traded: 0,
             fills_fee_unconverted: 0,
         }
     }
@@ -547,6 +552,25 @@ mod tests {
             .find(|line| line.contains("Reduce-Only Excess"))
             .unwrap_or_else(|| panic!("no Reduce-Only Excess row in:\n{rendered}"));
         assert!(row.contains("49.00"));
+    }
+
+    /// The instrument table shows the value of the free base traded past positions.
+    #[test]
+    fn instrument_table_shows_free_base_traded() {
+        let mut generator = TearSheetGenerator::init(DateTime::<Utc>::MIN_UTC);
+        generator.record_fill_free_base_traded(dec!(0.75));
+        let mut summary = summary_with_fallback(0, 0, None);
+        summary.instruments.insert(
+            InstrumentNameInternal::new("btc_usdt"),
+            generator.generate(Decimal::ZERO, Annual365),
+        );
+
+        let rendered = summary.instrument_table().to_string();
+        let row = rendered
+            .lines()
+            .find(|line| line.contains("Free Base Traded"))
+            .unwrap_or_else(|| panic!("no Free Base Traded row in:\n{rendered}"));
+        assert!(row.contains("0.75"));
     }
 
     #[test]

@@ -7,7 +7,7 @@ use rust_decimal::Decimal;
 use rustrade_execution::order::{
     OrderKey, OrderKind, TimeInForce,
     id::{ClientOrderId, PositionId, StrategyId},
-    request::{OrderRequestCancel, OrderRequestOpen, RequestOpen},
+    request::{OrderRequestCancel, OrderRequestOpen, ReduceOnly, RequestOpen},
 };
 use rustrade_instrument::{
     Side,
@@ -180,7 +180,7 @@ where
             TimeInForce::ImmediateOrCancel,
         )
         // No position_id: the caller sets one when hedging-mode routing is required.
-        .with_reduce_only(true), // closing existing position
+        .with_reduce_only(ReduceOnly::Position), // closing existing position
     })
 }
 
@@ -230,7 +230,7 @@ mod tests {
 
         assert_eq!(request.state.side, Side::Sell);
         assert_eq!(request.state.quantity, dec!(0.99));
-        assert!(request.state.reduce_only);
+        assert_eq!(request.state.reduce_only, ReduceOnly::Position);
     }
 
     #[test]
