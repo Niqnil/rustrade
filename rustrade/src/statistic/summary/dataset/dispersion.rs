@@ -3,24 +3,21 @@ use rust_decimal::{Decimal, MathematicalOps};
 use serde::{Deserialize, Serialize};
 
 /// Representation of a dataset using measures of dispersion - range, variance & standard deviation.
+///
+/// Holds the range and the Welford recurrence relation M, the running sum of squared deviations
+/// from the mean. The variance and standard deviation are derived from M when read, not on each
+/// update: [`std_dev`](Self::std_dev) takes a `Decimal` square root, which would otherwise cost
+/// every update far more than the update itself.
 #[derive(Debug, Clone, PartialEq, PartialOrd, Default, Deserialize, Serialize)]
 pub struct Dispersion {
     pub range: Range,
     pub recurrence_relation_m: Decimal,
-    pub variance: Decimal,
-    pub std_dev: Decimal,
 }
 
 impl Dispersion {
-    /// Iteratively updates the measures of Dispersion given the previous mean, new mean, new value,
-    /// and the dataset count.
-    pub fn update(
-        &mut self,
-        prev_mean: Decimal,
-        new_mean: Decimal,
-        new_value: Decimal,
-        value_count: Decimal,
-    ) {
+    /// Iteratively updates the measures of Dispersion given the previous mean, new mean and new
+    /// value.
+    pub fn update(&mut self, prev_mean: Decimal, new_mean: Decimal, new_value: Decimal) {
         // Update Range
         self.range.update(new_value);
 
@@ -31,21 +28,25 @@ impl Dispersion {
             new_value,
             new_mean,
         );
+    }
 
-        // Update Population Variance
-        self.variance =
-            welford_online::calculate_population_variance(self.recurrence_relation_m, value_count);
+    /// The population variance of a dataset of `count` values, the count this `Dispersion` was
+    /// updated with. Zero for an empty dataset.
+    pub fn variance(&self, count: Decimal) -> Decimal {
+        welford_online::calculate_population_variance(self.recurrence_relation_m, count)
+    }
 
-        // Update Standard Deviation
+    /// The population standard deviation of a dataset of `count` values, the count this
+    /// `Dispersion` was updated with. Zero for an empty dataset.
+    ///
+    /// Computed on each call, with a `Decimal` square root.
+    #[allow(clippy::expect_used)] // sqrt fails only on a negative input, which abs() rules out
+    pub fn std_dev(&self, count: Decimal) -> Decimal {
         // Welford variance can be slightly negative due to Decimal rounding; abs() guards sqrt input
-        #[allow(clippy::expect_used)]
-        {
-            self.std_dev = self
-                .variance
-                .abs()
-                .sqrt()
-                .expect("abs() ensures non-negative input");
-        }
+        self.variance(count)
+            .abs()
+            .sqrt()
+            .expect("abs() ensures non-negative input")
     }
 }
 
@@ -154,8 +155,6 @@ mod tests {
                 low: dec!(1.1),
             },
             recurrence_relation_m: dec!(0.0),
-            variance: dec!(0.0),
-            std_dev: dec!(0.0),
         };
 
         let output_2 = Dispersion {
@@ -165,8 +164,6 @@ mod tests {
                 low: dec!(1.1),
             },
             recurrence_relation_m: dec!(0.005),
-            variance: dec!(0.0025),
-            std_dev: dec!(0.05),
         };
 
         let output_3 = Dispersion {
@@ -176,8 +173,6 @@ mod tests {
                 low: dec!(1.1),
             },
             recurrence_relation_m: dec!(0.02),
-            variance: Decimal::from_str("0.006666666667").unwrap(),
-            std_dev: Decimal::from_str("0.081649658092").unwrap(),
         };
 
         let output_4 = Dispersion {
@@ -187,8 +182,6 @@ mod tests {
                 low: dec!(1.1),
             },
             recurrence_relation_m: dec!(0.05),
-            variance: dec!(0.0125),
-            std_dev: Decimal::from_str("0.111803398875").unwrap(),
         };
 
         let output_5 = Dispersion {
@@ -198,19 +191,31 @@ mod tests {
                 low: dec!(0.6),
             },
             recurrence_relation_m: dec!(0.388),
-            variance: dec!(0.0776),
-            std_dev: Decimal::from_str("0.278567765544").unwrap(),
         };
 
-        let outputs = vec![output_1, output_2, output_3, output_4, output_5];
+        // (dispersion, variance, std dev) after each value
+        let outputs = vec![
+            (output_1, dec!(0.0), dec!(0.0)),
+            (output_2, dec!(0.0025), dec!(0.05)),
+            (
+                output_3,
+                Decimal::from_str("0.006666666667").unwrap(),
+                Decimal::from_str("0.081649658092").unwrap(),
+            ),
+            (
+                output_4,
+                dec!(0.0125),
+                Decimal::from_str("0.111803398875").unwrap(),
+            ),
+            (
+                output_5,
+                dec!(0.0776),
+                Decimal::from_str("0.278567765544").unwrap(),
+            ),
+        ];
 
-        for (input, out) in inputs.into_iter().zip(outputs) {
-            dispersion.update(
-                input.prev_mean,
-                input.new_mean,
-                input.new_value,
-                input.value_count,
-            );
+        for (input, (out, variance, std_dev)) in inputs.into_iter().zip(outputs) {
+            dispersion.update(input.prev_mean, input.new_mean, input.new_value);
 
             // Range checks - exact equality since these are simple operations
             assert_eq!(dispersion.range.activated, out.range.activated);
@@ -228,14 +233,14 @@ mod tests {
                 recurrence_diff
             );
 
-            let variance_diff = (dispersion.variance - out.variance).abs();
+            let variance_diff = (dispersion.variance(input.value_count) - variance).abs();
             assert!(
                 variance_diff <= tolerance,
                 "Variance difference {} exceeds tolerance",
                 variance_diff
             );
 
-            let std_dev_diff = (dispersion.std_dev - out.std_dev).abs();
+            let std_dev_diff = (dispersion.std_dev(input.value_count) - std_dev).abs();
             assert!(
                 std_dev_diff <= tolerance,
                 "Standard deviation difference {} exceeds tolerance",
