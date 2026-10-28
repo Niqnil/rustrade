@@ -5,6 +5,9 @@
 //!
 //! The seqlock's source is compiled here against `loom`'s atomics: it takes them from its parent's
 //! `sync` module, which is this file's below.
+//!
+//! Weakening any ordering or check in the seqlock makes `racing_advances_end_at_the_later_instant`
+//! fail; the single-writer model is a sanity check beside it.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use loom::{sync::Arc, thread};
@@ -21,7 +24,7 @@ mod sync {
     }
 }
 
-use seqlock::SeqLockInstant;
+use seqlock::{RawInstant, SeqLockInstant};
 
 /// Instants that differ in both seconds and nanoseconds, so a read mixing two of them is none of
 /// them.
@@ -40,7 +43,7 @@ fn a_read_overlapping_an_advance_sees_one_instant() {
 
         let writer = {
             let clock = Arc::clone(&clock);
-            thread::spawn(move || clock.advance(instant(1)))
+            thread::spawn(move || clock.advance(instant(1).into()))
         };
 
         let first = clock.load();
@@ -49,7 +52,7 @@ fn a_read_overlapping_an_advance_sees_one_instant() {
         assert!(second == instant(0) || second == instant(1), "{second:?}");
         assert!(second >= first, "{second:?} read after {first:?}");
 
-        assert_eq!(writer.join().unwrap(), instant(0));
+        assert_eq!(writer.join().unwrap(), RawInstant::from(instant(0)));
         assert_eq!(clock.load(), instant(1));
     });
 }
@@ -65,7 +68,7 @@ fn racing_advances_end_at_the_later_instant() {
             .into_iter()
             .map(|time| {
                 let clock = Arc::clone(&clock);
-                thread::spawn(move || clock.advance(time))
+                thread::spawn(move || clock.advance(time.into()))
             })
             .collect();
 
@@ -79,7 +82,7 @@ fn racing_advances_end_at_the_later_instant() {
 
         let held_before: Vec<_> = writers
             .into_iter()
-            .map(|writer| writer.join().unwrap())
+            .map(|writer| writer.join().unwrap().to_datetime())
             .collect();
         // Advancing to 2 saw 0 or 1 held; advancing to 1 saw 0 or 2.
         assert!(

@@ -2,7 +2,7 @@ use crate::{EngineEvent, engine::Processor, execution::AccountStreamEvent};
 use chrono::{DateTime, Utc};
 use rustrade_data::streams::consumer::MarketStreamEvent;
 use rustrade_execution::AccountEventKind;
-use seqlock::SeqLockInstant;
+use seqlock::{RawInstant, SeqLockInstant};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, sync::Arc};
 use tracing::{debug, error, warn};
@@ -146,10 +146,11 @@ impl<Event> Processor<&Event> for TokioClock {
 ///
 /// Clones share one instant, so advancing any clone advances them all.
 /// - [`time`](EngineClock::time) never takes a lock. A read that overlaps an advance retries, and
-///   never blocks the advance.
+///   never blocks the advance. A read that finds an advance storing spins until it is done, which
+///   takes a few stores, unless the advancing thread is descheduled in between.
 /// - Advances ([`advance_to`](EngineClock::advance_to) and [`process`](Processor::process))
 ///   serialise among themselves: one waits, spinning, while another on a clone is storing. An
-///   advance to an instant no later than the current one stores nothing and waits for nothing.
+///   advance to an instant no later than the current one stores nothing and takes no lock.
 /// - Monotonic: whatever order advances on several threads arrive in, the clock ends at the
 ///   latest instant any of them was given, and a reader never sees it move backwards.
 /// - Every `DateTime<Utc>` is held exactly, from [`DateTime::<Utc>::MIN_UTC`] to
@@ -188,7 +189,7 @@ impl EngineClock for HistoricalClock {
 
     fn advance_to(&self, time: DateTime<Utc>) {
         // Monotonic: an earlier or equal `time` leaves the clock where it is.
-        self.inner.advance(time);
+        self.inner.advance(time.into());
     }
 }
 
@@ -205,19 +206,22 @@ where
         };
 
         // Decided and stored at once, so that another clone's concurrent advance cannot fall
-        // between the comparison and the store. Logged after, outside the store.
-        let time_exchange_last = self.inner.advance(time_event_exchange);
+        // between the comparison and the store. Logged after, outside the store. Compared as raw
+        // instants: the held instant is rebuilt as a `DateTime` only to be logged.
+        let time_event = RawInstant::from(time_event_exchange);
+        let held = self.inner.advance(time_event);
 
         // Input event is as recent or more recent
-        if time_event_exchange >= time_exchange_last {
+        if time_event >= held {
             debug!(
                 ?event,
-                time_exchange_last_current = ?time_exchange_last,
+                time_exchange_last_current = ?held.to_datetime(),
                 time_update = ?time_event_exchange,
                 "HistoricalClock updating based on input event time_exchange"
             );
             return;
         };
+        let time_exchange_last = held.to_datetime();
 
         // Input event is older, so log at varying degrees of severity
         let time_diff_secs = time_event_exchange
@@ -556,6 +560,47 @@ mod tests {
             let mut clock = HistoricalClock::new(DateTime::<Utc>::MIN_UTC);
             clock.process(&market_event(time));
             assert_eq!(clock.time(), time, "processed an event at {time:?}");
+        }
+    }
+
+    /// The seqlock compares instants as seconds then nanoseconds, which must order them exactly as
+    /// `DateTime<Utc>` does, around a leap second and at both ends of the range too.
+    #[test]
+    fn raw_instants_order_as_their_datetimes() {
+        use chrono::NaiveDate;
+
+        let at = |h, m, s, nanos| {
+            NaiveDate::from_ymd_opt(2016, 12, 31)
+                .unwrap()
+                .and_hms_nano_opt(h, m, s, nanos)
+                .unwrap()
+                .and_utc()
+        };
+        let times = [
+            DateTime::<Utc>::MIN_UTC,
+            DateTime::<Utc>::MIN_UTC + TimeDelta::nanoseconds(1),
+            DateTime::<Utc>::from_timestamp(-1, 999_999_999).unwrap(),
+            DateTime::<Utc>::UNIX_EPOCH,
+            at(23, 59, 58, 999_999_999),
+            at(23, 59, 59, 0),
+            at(23, 59, 59, 999_999_999),
+            // The leap second.
+            at(23, 59, 59, 1_000_000_000),
+            at(23, 59, 59, 1_999_999_999),
+            at(0, 0, 0, 0) + TimeDelta::days(1),
+            DateTime::<Utc>::MAX_UTC - TimeDelta::nanoseconds(1),
+            DateTime::<Utc>::MAX_UTC,
+        ];
+
+        for a in times {
+            assert_eq!(RawInstant::from(a).to_datetime(), a, "{a:?} round trip");
+            for b in times {
+                assert_eq!(
+                    RawInstant::from(a).cmp(&RawInstant::from(b)),
+                    a.cmp(&b),
+                    "{a:?} against {b:?}"
+                );
+            }
         }
     }
 
