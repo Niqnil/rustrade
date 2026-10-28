@@ -202,11 +202,6 @@ struct Forgotten {
     first: bool,
 }
 
-/// Whether `kind` leaves open whether the order trails (see [`OrderKind::ConditionalUnresolved`]).
-fn is_unresolved(kind: OrderKind) -> bool {
-    matches!(kind, OrderKind::ConditionalUnresolved { .. })
-}
-
 /// What [`KnownLiveOrders`] keeps about one order.
 #[derive(Debug)]
 struct KnownLive {
@@ -296,7 +291,7 @@ impl KnownLiveOrders {
         let order_id = open.id.assigned();
         if let Some(known) = self.orders.get_mut(cid) {
             known.quantity = quantity;
-            if is_unresolved(known.kind) && !is_unresolved(kind) {
+            if known.kind.is_conditional_unresolved() && !kind.is_conditional_unresolved() {
                 known.kind = kind;
             }
             let moved = known.instrument != key.instrument;
@@ -341,7 +336,7 @@ impl KnownLiveOrders {
                 .insert((key.instrument.clone(), order_id.clone()), cid.clone());
         }
         let kind = match self.recalled.get(cid) {
-            Some(recalled) if is_unresolved(kind) => *recalled,
+            Some(recalled) if kind.is_conditional_unresolved() => *recalled,
             _ => kind,
         };
         self.orders.insert(
@@ -373,11 +368,11 @@ impl KnownLiveOrders {
     ) -> usize {
         let mut ignored = 0usize;
         for (cid, kind) in kinds {
-            if is_unresolved(kind) || self.recently_ended.contains(&cid) {
+            if kind.is_conditional_unresolved() || self.recently_ended.contains(&cid) {
                 continue;
             }
             if let Some(known) = self.orders.get_mut(&cid)
-                && is_unresolved(known.kind)
+                && known.kind.is_conditional_unresolved()
             {
                 known.kind = kind;
             }

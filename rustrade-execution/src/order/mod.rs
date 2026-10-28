@@ -360,11 +360,22 @@ pub enum OrderKind {
     },
 }
 
+impl OrderKind {
+    /// Whether this is an [`OrderKind::ConditionalUnresolved`], which leaves open whether the
+    /// order trails.
+    pub(crate) fn is_conditional_unresolved(&self) -> bool {
+        matches!(self, Self::ConditionalUnresolved { .. })
+    }
+}
+
 /// Which conditional order an [`OrderKind::ConditionalUnresolved`] is, before whether its trigger
 /// trails is known.
+///
+/// `#[non_exhaustive]`, so a family another venue needs can be added without breaking a caller.
 #[derive(
     Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Display,
 )]
+#[non_exhaustive]
 pub enum ConditionalFamily {
     /// [`OrderKind::Stop`] or [`OrderKind::TrailingStop`].
     Stop,

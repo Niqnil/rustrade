@@ -1470,54 +1470,93 @@ pub(crate) fn decode_order_kind(
     }
 }
 
-/// The kind to report for an order whose report decoded to `decoded`.
+/// The kind to report for an order whose report decoded to `decoded`, with what to log about it.
 ///
-/// A report that describes the order fully is reported as it is. One that leaves it
-/// [`OrderKind::ConditionalUnresolved`] is reported with `known`, the kind the client knows the
-/// order by, when it knows one: from placing it, from an earlier report that described it, or from
-/// the caller (`BinanceMargin::recall_order_kinds`). Otherwise it stays unresolved, logged at
-/// `warn` on its first occurrence and every 1000th after (see [`sampled`]), since it recurs on
-/// every report of the same live order.
+/// A report that describes the order fully is reported as it is, and `known` is not called. One
+/// that leaves it [`OrderKind::ConditionalUnresolved`] is reported with the kind `known` returns,
+/// the kind the client knows the order by, when it knows one: from placing it, from an earlier
+/// report that described it, or from the caller (`BinanceMargin::recall_order_kinds`). Otherwise
+/// it stays unresolved.
+///
+/// Nothing is logged here, so a caller can resolve under the lock `known` reads: it logs the
+/// [`KindNote`] once the lock is released.
 pub(crate) fn resolve_kind(
     exchange: ExchangeId,
     cid: &ClientOrderId,
     decoded: OrderKind,
-    known: Option<OrderKind>,
-) -> OrderKind {
-    if !matches!(decoded, OrderKind::ConditionalUnresolved { .. }) {
-        return decoded;
+    known: impl FnOnce() -> Option<OrderKind>,
+) -> (OrderKind, Option<KindNote>) {
+    if !decoded.is_conditional_unresolved() {
+        return (decoded, None);
     }
-    match known.filter(|kind| !matches!(kind, OrderKind::ConditionalUnresolved { .. })) {
-        Some(kind) => {
+    let (kind, resolved) = match known().filter(|kind| !kind.is_conditional_unresolved()) {
+        Some(kind) => (kind, true),
+        None => (decoded, false),
+    };
+    let note = KindNote {
+        exchange,
+        cid: cid.clone(),
+        kind,
+        resolved,
+    };
+    (kind, Some(note))
+}
+
+/// What [`resolve_kind`] has to log about a report that left its order's kind unresolved, logged
+/// by [`log`](Self::log) once the caller holds no lock.
+#[must_use = "a note is only logged by calling `log`"]
+#[derive(Debug)]
+pub(crate) struct KindNote {
+    exchange: ExchangeId,
+    cid: ClientOrderId,
+    /// The kind reported.
+    kind: OrderKind,
+    /// Whether the client knew the order's kind, so `kind` is it rather than the unresolved one.
+    resolved: bool,
+}
+
+impl KindNote {
+    /// Log the note: at `debug` when the client knew the order's kind; otherwise at `warn` on the
+    /// first occurrence and every 1000th after (see [`sampled`]), and the rest at `debug`, since
+    /// it recurs on every report of the same live order.
+    pub(crate) fn log(self) {
+        let Self {
+            exchange,
+            cid,
+            kind,
+            resolved,
+        } = self;
+        if resolved {
             debug!(%exchange, %cid, %kind, "Binance order report cannot tell whether the order trails; reporting the kind the client knows it by");
-            kind
+            return;
         }
-        None => {
-            static SEEN: AtomicU64 = AtomicU64::new(0);
-            let (count, warns) = sampled(&SEEN);
-            if warns {
-                warn!(%exchange, %cid, kind = %decoded, count, "Binance order report cannot tell whether the order trails, and the client does not know its kind: reporting it unresolved; further ones are logged at debug, with a warning every 1000th");
-            } else {
-                debug!(%exchange, %cid, kind = %decoded, count, "Binance order report cannot tell whether the order trails, and the client does not know its kind: reporting it unresolved");
-            }
-            decoded
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        let (count, warns) = sampled(&SEEN);
+        if warns {
+            warn!(%exchange, %cid, %kind, count, "Binance order report cannot tell whether the order trails, and the client does not know its kind: reporting it unresolved; further ones are logged at debug, with a warning every 1000th");
+        } else {
+            debug!(%exchange, %cid, %kind, count, "Binance order report cannot tell whether the order trails, and the client does not know its kind: reporting it unresolved");
         }
     }
 }
 
 /// Report an account stream's order snapshot with the kind the client knows the order by, when its
 /// report left the kind unresolved (see [`resolve_kind`]). Any other event is left as it is.
+/// Returns what to log about it, once the lock `known` reads is released.
 pub(crate) fn resolve_snapshot_kind(
     exchange: ExchangeId,
     event: &mut UnindexedAccountEvent,
     known: KnownKinds<'_>,
-) {
-    if let AccountEventKind::OrderSnapshot(snapshot) = &mut event.kind
-        && matches!(snapshot.0.kind, OrderKind::ConditionalUnresolved { .. })
-    {
-        let order = &mut snapshot.0;
-        order.kind = resolve_kind(exchange, &order.key.cid, order.kind, known(&order.key.cid));
-    }
+) -> Option<KindNote> {
+    let AccountEventKind::OrderSnapshot(snapshot) = &mut event.kind else {
+        return None;
+    };
+    let order = &mut snapshot.0;
+    let (kind, note) = resolve_kind(exchange, &order.key.cid, order.kind, || {
+        known(&order.key.cid)
+    });
+    order.kind = kind;
+    note
 }
 
 /// Count one more occurrence of a recurring condition on `seen`, a process-wide counter per
@@ -2046,7 +2085,12 @@ fn convert_order_row<T: BinanceOrderFields>(
                 o.stop_price(),
                 o.trailing_delta(),
             )?;
-            resolve_kind(exchange, &cid, decoded, known(&cid))
+            // Each lookup takes and releases its own lock, so the note logs with none held.
+            let (kind, note) = resolve_kind(exchange, &cid, decoded, || known(&cid));
+            if let Some(note) = note {
+                note.log();
+            }
+            kind
         }
         None => {
             warn!(%exchange, %instrument, order_id = %order_id_raw, "Binance order missing type");
@@ -4544,12 +4588,32 @@ mod tests {
         let fixed = OrderKind::StopLimit {
             trigger_price: dec!(100),
         };
-        let resolve =
-            |decoded, known| resolve_kind(ExchangeId::BinanceMargin, &cid, decoded, known);
-        assert_eq!(resolve(unresolved, Some(trailing)), trailing);
-        assert_eq!(resolve(unresolved, None), unresolved);
-        assert_eq!(resolve(unresolved, Some(unresolved)), unresolved);
-        assert_eq!(resolve(fixed, Some(trailing)), fixed);
+        let resolve = |decoded, known: Option<OrderKind>| {
+            let (kind, note) = resolve_kind(ExchangeId::BinanceMargin, &cid, decoded, || known);
+            (kind, note.map(|note| note.resolved))
+        };
+        assert_eq!(resolve(unresolved, Some(trailing)), (trailing, Some(true)));
+        assert_eq!(resolve(unresolved, None), (unresolved, Some(false)));
+        assert_eq!(
+            resolve(unresolved, Some(unresolved)),
+            (unresolved, Some(false))
+        );
+        assert_eq!(resolve(fixed, Some(trailing)), (fixed, None));
+        // A described report does not look up the known kind, which may take a lock.
+        let (kind, note) = resolve_kind(ExchangeId::BinanceMargin, &cid, fixed, || {
+            panic!("looked up for a described report")
+        });
+        assert_eq!((kind, note.is_none()), (fixed, true));
+
+        // A note logs once: at debug when the client knew the kind; the unresolved one sampled.
+        use crate::client::order_recovery::{KnownLiveOrders, tests::logged_with_lock_free};
+        let logged = |known| {
+            let (_, note) = resolve_kind(ExchangeId::BinanceMargin, &cid, unresolved, || known);
+            let set = KnownLiveOrders::shared(ExchangeId::BinanceMargin);
+            logged_with_lock_free(&set, || note.unwrap().log())
+        };
+        assert_eq!(logged(Some(trailing)), [(tracing::Level::DEBUG, true)]);
+        assert_eq!(logged(None).len(), 1);
     }
 
     #[test]

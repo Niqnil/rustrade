@@ -1254,16 +1254,22 @@ impl<K: ListenKeys> MarginStream<K> {
             // reach the stream in the order they were decided, and the check reports only an order
             // not already reported. An isolated account's report never says whether a conditional
             // order trails, so it takes the kind the client knows the order by.
+            // What resolving the kind has to say is logged once the lock is released.
+            let mut note = None;
             let held = KnownLiveOrders::observes(&event.kind).then(|| {
                 let mut held = self.known.lock();
-                resolve_snapshot_kind(ExchangeId::BinanceMargin, &mut event, &|cid| {
+                note = resolve_snapshot_kind(ExchangeId::BinanceMargin, &mut event, &|cid| {
                     held.kind_of(cid)
                 });
                 held.observe(&event);
                 held
             });
-            if self.tx.send(event).is_err() {
-                drop(held);
+            let sent = self.tx.send(event);
+            drop(held);
+            if let Some(note) = note {
+                note.log();
+            }
+            if sent.is_err() {
                 debug!("BinanceMargin account_stream receiver dropped");
                 return Err(SessionEnd::ConsumerDropped);
             }
@@ -3120,6 +3126,44 @@ mod tests {
                     }
                 ),
             ]
+        );
+    }
+
+    /// The stream resolves a report's kind under the lock it holds over the order set, and logs
+    /// what it has to say about it once that lock is released.
+    #[test]
+    fn an_unresolved_report_is_logged_with_the_lock_released() {
+        use crate::client::order_recovery::tests::logged_with_lock_free;
+        let keys = Arc::new(FakeKeys::default());
+        let (stream, mut rx) = margin_stream(&keys, "ws://127.0.0.1:9".to_owned(), isolated());
+        let frame = push_isolated(
+            "BTCUSDT",
+            serde_json::json!({
+                "e": "executionReport", "S": "BUY", "o": "STOP_LOSS_LIMIT",
+                "x": "NEW", "X": "NEW", "i": 1, "c": "unknown", "d": "",
+                "p": "48000", "P": "48000", "q": "1", "f": "GTC", "z": "0",
+                "T": 1_700_000_000_000_i64,
+            }),
+        );
+
+        let mut buf = Vec::new();
+        let seen = logged_with_lock_free(&stream.known, || {
+            stream.forward_frame(&frame, LISTEN_KEY, &mut buf).unwrap();
+        });
+
+        let event = rx.try_recv().unwrap();
+        assert!(
+            matches!(
+                &event.kind,
+                AccountEventKind::OrderSnapshot(snapshot)
+                    if snapshot.0.kind.is_conditional_unresolved()
+            ),
+            "{event:?}"
+        );
+        // Sampled across the process, so the note may be at `warn` or `debug`.
+        assert!(
+            !seen.is_empty() && seen.iter().all(|(_, free)| *free),
+            "{seen:?}"
         );
     }
 

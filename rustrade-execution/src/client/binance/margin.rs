@@ -83,8 +83,7 @@ use crate::{
         BorrowCapacityClient, ExecutionClient, OrderStatusClient, ShortabilityClient,
         order_recovery::{
             KnownLiveOrders, MAX_KNOWN_LIVE_ORDERS, OpenListing, OrderLookup,
-            SharedKnownLiveOrders, UncheckedOrders,
-            fetch_ended_by_key, recover_ended_orders,
+            SharedKnownLiveOrders, UncheckedOrders, fetch_ended_by_key, recover_ended_orders,
         },
     },
     error::{ApiError, OrderError, UnindexedClientError},
@@ -521,11 +520,19 @@ impl BinanceMargin {
     /// [`account_stream`](ExecutionClient::account_stream) to have their first reports use it.
     /// It can be called again at any time, and adds to what earlier calls supplied.
     ///
-    /// A kind is kept until its order is seen to end, and one for an order this client has
-    /// already seen end is ignored. So is an unresolved kind, and anything past 4096 held kinds,
-    /// with a warning. The client keeps nothing across restarts: persisting the kinds of the
-    /// orders it places is the caller's.
+    /// Each kind must be the one its order was placed with: it is reported as given, unchecked
+    /// against the order's Binance type.
+    ///
+    /// A kind is kept until the client sees its order end: on its account stream, on cancelling
+    /// it, or in the check the stream runs after a reconnect.
+    /// [`fetch_ended_orders`](OrderStatusClient::fetch_ended_orders) does not drop it. One for an
+    /// order this client has recently seen end is ignored. So is an unresolved kind, and anything
+    /// past 4096 held kinds, with a warning. The client keeps nothing across restarts: persisting
+    /// the kinds of the orders it places is the caller's.
+    ///
+    /// `kinds` is collected before the client's order set is locked, so it may call this client.
     pub fn recall_order_kinds(&self, kinds: impl IntoIterator<Item = (ClientOrderId, OrderKind)>) {
+        let kinds: Vec<_> = kinds.into_iter().collect();
         // The guard is dropped at the end of the statement, so the warning waits for no lock.
         let ignored = self.known_live.lock().recall(kinds);
         if ignored > 0 {
@@ -4090,7 +4097,10 @@ mod tests {
         });
         assert_eq!(seen, [(tracing::Level::WARN, true)]);
         assert_eq!(
-            client.known_live.lock().kind_of(&cid(MAX_KNOWN_LIVE_ORDERS)),
+            client
+                .known_live
+                .lock()
+                .kind_of(&cid(MAX_KNOWN_LIVE_ORDERS)),
             None
         );
     }
@@ -5693,6 +5703,77 @@ mod tests {
             );
         }
         known
+    }
+
+    /// A live conditional row, which cannot say whether it trails, is listed by both listings and
+    /// the reconnect check, unresolved until the client knows its kind, then with that kind.
+    #[tokio::test]
+    async fn a_live_conditional_margin_order_is_listed_with_the_kind_the_client_knows() {
+        use crate::order::ConditionalFamily;
+        let server = wiremock::MockServer::start().await;
+        let mut row = margin_order_row("conditional", "NEW");
+        row["type"] = "STOP_LOSS_LIMIT".into();
+        row["price"] = "94".into();
+        row["stopPrice"] = "95".into();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/openOrders"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([row])),
+            )
+            .mount(&server)
+            .await;
+        let client = margin_client_at(&server, false);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+        let cid = ClientOrderId::new("conditional");
+        let kinds = |orders: Vec<Order<ExchangeId, InstrumentNameExchange, Open>>| {
+            orders
+                .into_iter()
+                .map(|order| (order.key.cid, order.kind))
+                .collect::<Vec<_>>()
+        };
+
+        let unresolved = OrderKind::ConditionalUnresolved {
+            family: ConditionalFamily::StopLimit,
+            trigger_price: Some(Decimal::from(95)),
+        };
+        assert_eq!(
+            kinds(client.fetch_open_orders(&[]).await.unwrap()),
+            [(cid.clone(), unresolved)]
+        );
+        assert_eq!(
+            kinds(
+                client
+                    .fetch_open_orders(std::slice::from_ref(&btcusdt))
+                    .await
+                    .unwrap()
+            ),
+            [(cid.clone(), unresolved)]
+        );
+        let listed = listed_margin_open_cids(
+            margin_rest_at(&server),
+            Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
+            client.known_live.clone(),
+            vec![btcusdt.clone()],
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(listed.contains(&cid), "{listed:?}");
+
+        let trailing = OrderKind::TrailingStopFixedLimit {
+            offset: Decimal::from(25),
+            offset_type: TrailingOffsetType::BasisPoints,
+            activation_price: Some(Decimal::from(95)),
+        };
+        client.recall_order_kinds([(cid.clone(), trailing)]);
+        assert_eq!(
+            kinds(client.fetch_open_orders(&[]).await.unwrap()),
+            [(cid.clone(), trailing)]
+        );
+        assert_eq!(
+            kinds(client.fetch_open_orders(&[btcusdt]).await.unwrap()),
+            [(cid, trailing)]
+        );
     }
 
     /// A margin trailing stop's row cannot say that it trailed (#541), and carries no positive
