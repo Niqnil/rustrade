@@ -402,8 +402,9 @@ impl BinanceMarginConfig {
 /// A trailing order placed without an activation price reads `stopPrice` `"0"` in both.
 ///
 /// Such an order is reported with the kind this client knows it by: the kind it was placed with,
-/// or the one a report that did describe it gave, for every order the client placed, listed or
-/// saw while live, or else a kind the caller supplied with
+/// known from the moment the order is sent, since the stream may report it before the answer to
+/// placing it arrives, or the one a report that did describe it gave, for every order the client
+/// placed, listed or saw while live, or else a kind the caller supplied with
 /// [`recall_order_kinds`](Self::recall_order_kinds). An order it knows no kind for, such as one
 /// placed elsewhere or before a restart, is reported as [`OrderKind::ConditionalUnresolved`], with
 /// its type's family and its `stopPrice` as `trigger_price`, logged at `warn`, rather than
@@ -676,108 +677,119 @@ impl BinanceMargin {
             return inactive(OrderState::inactive(refused));
         }
 
-        // Sent through `send_request` with the SDK's own query, so that the answer decodes into
-        // `NewOrderAnswer` (see there) rather than the SDK's response type.
-        let query = new_order_query(params);
-        let response = match rest_call_with_retry(
-            &self.rest_config,
-            &self.rate_limiter,
-            RequestKind::Order,
-            |cfg| {
-                let query = query.clone();
-                Box::pin(async move {
-                    binance_sdk::common::utils::send_request::<NewOrderAnswer>(
-                        &cfg,
-                        ORDER_PATH,
-                        reqwest::Method::POST,
-                        query,
-                        BTreeMap::new(),
-                        None,
-                        true,
-                    )
-                    .await
-                })
-            },
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                return inactive(OrderState::inactive(classify_rest_order_error(
-                    &e,
-                    &instrument,
-                )));
-            }
-        };
+        // The stream may report the order before the answer to placing it arrives, and an
+        // isolated account's report cannot say whether a conditional order trails: the kind it
+        // is placed with is held from here, for such a report to take.
+        let sending = self.known_live.sending(&cid, kind);
+        // Every `return` below leaves this block, so the kind is released whatever the answer.
+        let placement = async {
+            // Sent through `send_request` with the SDK's own query, so that the answer decodes into
+            // `NewOrderAnswer` (see there) rather than the SDK's response type.
+            let query = new_order_query(params);
+            let response = match rest_call_with_retry(
+                &self.rest_config,
+                &self.rate_limiter,
+                RequestKind::Order,
+                |cfg| {
+                    let query = query.clone();
+                    Box::pin(async move {
+                        binance_sdk::common::utils::send_request::<NewOrderAnswer>(
+                            &cfg,
+                            ORDER_PATH,
+                            reqwest::Method::POST,
+                            query,
+                            BTreeMap::new(),
+                            None,
+                            true,
+                        )
+                        .await
+                    })
+                },
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(e) => {
+                    return inactive(OrderState::inactive(classify_rest_order_error(
+                        &e,
+                        &instrument,
+                    )));
+                }
+            };
 
-        let data = match response.data().await {
-            Ok(data) => data,
-            Err(e) => {
-                return inactive(OrderState::inactive(unreadable_answer(
-                    ExchangeId::BinanceMargin,
-                    &e.to_string(),
-                )));
-            }
-        };
+            let data = match response.data().await {
+                Ok(data) => data,
+                Err(e) => {
+                    return inactive(OrderState::inactive(unreadable_answer(
+                        ExchangeId::BinanceMargin,
+                        &e.to_string(),
+                    )));
+                }
+            };
 
-        let time_exchange = answer_time(
-            ExchangeId::BinanceMargin,
-            &instrument,
-            "open_order",
-            data.transact_time,
-        );
+            let time_exchange = answer_time(
+                ExchangeId::BinanceMargin,
+                &instrument,
+                "open_order",
+                data.transact_time,
+            );
 
-        let exchange_order_id = match data.order_id {
-            Some(id) => OrderId(format_smolstr!("{id}")),
-            None => {
-                return inactive(OrderState::inactive(unreadable_answer(
-                    ExchangeId::BinanceMargin,
-                    "open_order answer has no orderId",
-                )));
-            }
-        };
+            let exchange_order_id = match data.order_id {
+                Some(id) => OrderId(format_smolstr!("{id}")),
+                None => {
+                    return inactive(OrderState::inactive(unreadable_answer(
+                        ExchangeId::BinanceMargin,
+                        "open_order answer has no orderId",
+                    )));
+                }
+            };
 
-        let borrowed = match (data.margin_buy_borrow_amount, data.margin_buy_borrow_asset) {
-            (Some(amount), Some(asset)) => Some(MarginBorrow::new(asset, amount)),
-            (None, None) => None,
-            (Some(_), None) | (None, Some(_)) => {
-                return inactive(OrderState::inactive(unreadable_answer(
-                    ExchangeId::BinanceMargin,
-                    "open_order answer has a borrowed amount or asset without the other",
-                )));
-            }
-        };
+            let borrowed = match (data.margin_buy_borrow_amount, data.margin_buy_borrow_asset) {
+                (Some(amount), Some(asset)) => Some(MarginBorrow::new(asset, amount)),
+                (None, None) => None,
+                (Some(_), None) | (None, Some(_)) => {
+                    return inactive(OrderState::inactive(unreadable_answer(
+                        ExchangeId::BinanceMargin,
+                        "open_order answer has a borrowed amount or asset without the other",
+                    )));
+                }
+            };
 
-        // Read from the response's status, so an order that ended in it (an IOC or FOK order
-        // that expired) is not reported, or held, as live.
-        let state = placed_order_state(
-            ExchangeId::BinanceMargin,
-            &instrument,
-            quantity,
-            PlacementResponse {
-                status: data.status.as_deref(),
-                order_id: exchange_order_id,
-                time_exchange,
-                executed_qty: data.executed_qty.as_deref(),
-                cumulative_quote_qty: data.cummulative_quote_qty.as_deref(),
-            },
-        );
-        self.known_live
-            .lock()
-            .placed(&order_key, quantity, kind, &state);
-
-        MarginPlacement {
-            order: Order {
-                key: order_key,
-                side,
-                price,
+            // Read from the response's status, so an order that ended in it (an IOC or FOK order
+            // that expired) is not reported, or held, as live.
+            let state = placed_order_state(
+                ExchangeId::BinanceMargin,
+                &instrument,
                 quantity,
-                kind,
-                time_in_force,
-                state,
-            },
-            borrowed,
+                PlacementResponse {
+                    status: data.status.as_deref(),
+                    order_id: exchange_order_id,
+                    time_exchange,
+                    executed_qty: data.executed_qty.as_deref(),
+                    cumulative_quote_qty: data.cummulative_quote_qty.as_deref(),
+                },
+            );
+            self.known_live
+                .lock()
+                .placed(&order_key, quantity, kind, &state);
+
+            MarginPlacement {
+                order: Order {
+                    // Cloned: the block holds `inactive`, which borrows the key, to its end.
+                    key: order_key.clone(),
+                    side,
+                    price,
+                    quantity,
+                    kind,
+                    time_in_force,
+                    state,
+                },
+                borrowed,
+            }
         }
+        .await;
+        sending.sent(&placement.order.state);
+        placement
     }
 
     /// Hold each of `orders` as live, for a reconnect to ask about if the stream misses its end.
@@ -6369,6 +6381,53 @@ mod tests {
                 .known_live
                 .lock()
                 .contains(&ClientOrderId::new("placed"))
+        );
+    }
+
+    /// The kind a margin order is placed with is known while its request is out, for a stream
+    /// report that arrives before the answer, and dropped when the order is refused.
+    #[tokio::test]
+    async fn a_margin_order_kind_is_known_while_it_is_placed() {
+        struct KindWhenAsked {
+            known: SharedKnownLiveOrders,
+            seen: Arc<parking_lot::Mutex<Option<OrderKind>>>,
+        }
+        impl wiremock::Respond for KindWhenAsked {
+            fn respond(&self, _: &wiremock::Request) -> wiremock::ResponseTemplate {
+                *self.seen.lock() = self.known.lock().kind_of(&ClientOrderId::new("racing"));
+                wiremock::ResponseTemplate::new(400).set_body_json(
+                    serde_json::json!({"code": -2010, "msg": "Account has insufficient balance."}),
+                )
+            }
+        }
+
+        let server = wiremock::MockServer::start().await;
+        let client = margin_client_at(&server, true);
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+            .respond_with(KindWhenAsked {
+                known: client.known_live.clone(),
+                seen: Arc::clone(&seen),
+            })
+            .mount(&server)
+            .await;
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+
+        let refused = client
+            .open_order(margin_open_request(&btcusdt, "racing"))
+            .await;
+        assert!(
+            matches!(refused.state, OrderState::Inactive(_)) && !refused.state.is_outcome_unknown(),
+            "{refused:?}"
+        );
+        assert_eq!(*seen.lock(), Some(OrderKind::Limit));
+        assert_eq!(
+            client
+                .known_live
+                .lock()
+                .kind_of(&ClientOrderId::new("racing")),
+            None
         );
     }
 
