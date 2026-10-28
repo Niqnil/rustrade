@@ -150,7 +150,8 @@ impl<Event> Processor<&Event> for TokioClock {
 ///   takes a few stores, unless the advancing thread is descheduled in between.
 /// - Advances ([`advance_to`](EngineClock::advance_to) and [`process`](Processor::process))
 ///   serialise among themselves: one waits, spinning, while another on a clone is storing. An
-///   advance to an instant no later than the current one stores nothing and takes no lock.
+///   advance to an instant no later than the current one stores nothing and takes no lock: it
+///   waits only as a read does.
 /// - Monotonic: whatever order advances on several threads arrive in, the clock ends at the
 ///   latest instant any of them was given, and a reader never sees it move backwards.
 /// - Every `DateTime<Utc>` is held exactly, from [`DateTime::<Utc>::MIN_UTC`] to
@@ -627,6 +628,58 @@ mod tests {
         let mut clock = HistoricalClock::new(earlier);
         clock.process(&market_event(max));
         assert_eq!(clock.time(), max);
+    }
+
+    /// `process` logs an event at the clock's instant or later at `DEBUG`, and an older one by how
+    /// much older it is: `DEBUG` within a second, `WARN` within 30 seconds, `ERROR` beyond.
+    #[test]
+    fn historical_clock_logs_an_older_event_by_how_late_it_is() {
+        use tracing::Level;
+
+        let base = DateTime::<Utc>::UNIX_EPOCH + TimeDelta::days(1);
+        let cases = [
+            ("a minute later", TimeDelta::seconds(60), Level::DEBUG),
+            ("at the same instant", TimeDelta::zero(), Level::DEBUG),
+            (
+                "half a second older",
+                -TimeDelta::milliseconds(500),
+                Level::DEBUG,
+            ),
+            ("10 seconds older", -TimeDelta::seconds(10), Level::WARN),
+            ("a minute older", -TimeDelta::seconds(60), Level::ERROR),
+        ];
+
+        for (name, offset, expected) in cases {
+            let mut clock = HistoricalClock::new(base);
+            let levels = levels_logged(|| clock.process(&market_event(base + offset)));
+            assert_eq!(levels, [expected], "an event {name}");
+            assert_eq!(clock.time(), base.max(base + offset), "an event {name}");
+        }
+    }
+
+    /// Runs `f` and returns the level of each `tracing` event it emitted on this thread.
+    fn levels_logged(f: impl FnOnce()) -> Vec<tracing::Level> {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Default)]
+        struct Levels(Arc<Mutex<Vec<tracing::Level>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Levels {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.lock().unwrap().push(*event.metadata().level());
+            }
+        }
+
+        let layer = Levels::default();
+        let levels = Arc::clone(&layer.0);
+        // Thread-local, so other tests running in parallel are not recorded.
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), f);
+        levels.lock().unwrap().clone()
     }
 
     /// `Debug` shows the instant held, as the clock's only state.
