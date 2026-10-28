@@ -401,6 +401,17 @@ mod tests {
         json["reduce_only"] = "sometimes".into();
         let error = serde_json::from_value::<RequestOpen>(json).unwrap_err();
         assert!(error.to_string().contains("sometimes"), "{error}");
+
+        // Neither a name nor a flag: the error says what would have been read.
+        let mut json = serde_json::to_value(limit()).unwrap();
+        json["reduce_only"] = 1.into();
+        let error = serde_json::from_value::<RequestOpen>(json).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(r#""no", "position", "position_and_free_base", or a bool"#),
+            "{error}"
+        );
     }
 
     #[test]

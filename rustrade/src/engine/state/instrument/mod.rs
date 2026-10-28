@@ -5253,6 +5253,40 @@ mod tests {
         trade
     }
 
+    /// A cut serialised before it said what its order was sent as loads as `Position`, the only
+    /// reduce-only value there was, and as trading no free base.
+    #[test]
+    fn a_reduce_only_cut_serialised_without_what_its_order_was_sent_as_loads_as_position() {
+        let capped = ReduceOnlyCapped {
+            instrument: InstrumentIndex(0),
+            trade_id: TradeId::new("t"),
+            order_id: OrderId::new("o"),
+            client_order_id: None,
+            position_id: PositionId::NETTING,
+            held: dec!(1),
+            excess: dec!(-0.5),
+            excess_value: dec!(50),
+            fees_unattributed: Decimal::ZERO,
+            reduce_only: ReduceOnly::PositionAndFreeBase,
+            trades_free_base: true,
+        };
+        let mut json = serde_json::to_value(&capped).unwrap();
+        let fields = json.as_object_mut().unwrap();
+        fields.remove("reduce_only").unwrap();
+        fields.remove("trades_free_base").unwrap();
+
+        let loaded: ReduceOnlyCapped = serde_json::from_value(json).unwrap();
+
+        assert_eq!(
+            loaded,
+            ReduceOnlyCapped {
+                reduce_only: ReduceOnly::Position,
+                trades_free_base: false,
+                ..capped
+            }
+        );
+    }
+
     /// A repayment buy sized above the short it closes: its base fee is netted first, then the
     /// move is cut at the short. The short closes flat, the excess is reported, and the fee is
     /// split between the position and the tear sheet in proportion.
