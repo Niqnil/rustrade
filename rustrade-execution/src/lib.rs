@@ -469,7 +469,8 @@ pub struct IsolatedInstrumentState<AssetKey = AssetIndex> {
 /// These are **snapshot-only**: authoritative as of the last `account_snapshot` and refreshed on
 /// snapshot. Unlike balances, there is **no live-stream twin** — the WS `outboundAccountPosition`
 /// frame carries no margin-level / liquidation data. The live signal for risk crossing a threshold
-/// is the venue's `MARGIN_LEVEL_STATUS_CHANGE` event (surfaced observably, not accumulated here).
+/// is the venue's margin-level notice, such as Binance's `marginLevelChange` (surfaced as an
+/// [`AccountEventKind::Notice`], not accumulated here).
 #[derive(
     Debug,
     Copy,

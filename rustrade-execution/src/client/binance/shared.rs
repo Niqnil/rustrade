@@ -58,6 +58,7 @@ use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, exchange::ExchangeId,
     instrument::name::InstrumentNameExchange,
 };
+use rustrade_integration::protocol::websocket::WsError;
 use serde::{
     Deserialize, Deserializer,
     de::{self, Visitor},
@@ -1221,11 +1222,20 @@ impl HandshakeRefusal {
     /// The refusal a failed WebSocket connect was, or `None` when Binance did not refuse the
     /// handshake for rate limiting.
     ///
-    /// depends on the SDK reporting a refused handshake as `WebsocketError::Handshake` holding
-    /// tungstenite's `HTTP error: <status>` text (not a public API contract).
+    /// Reads either connection's error: tungstenite's own, from a plain connection (the margin
+    /// user-data stream), or the SDK's `WebsocketError::Handshake`, which holds tungstenite's
+    /// `HTTP error: <status>` text (not a public API contract).
     pub(crate) fn of(e: &anyhow::Error) -> Option<Self> {
-        e.chain()
-            .find_map(|cause| match cause.downcast_ref::<WebsocketError>()? {
+        let of_status = |status: u16| match status {
+            429 => Some(Self::Throttled),
+            418 => Some(Self::Banned),
+            _ => None,
+        };
+        e.chain().find_map(|cause| {
+            if let Some(WsError::Http(response)) = cause.downcast_ref::<WsError>() {
+                return of_status(response.status().as_u16());
+            }
+            match cause.downcast_ref::<WebsocketError>()? {
                 WebsocketError::Handshake(msg) if msg.contains("HTTP error: 429") => {
                     Some(Self::Throttled)
                 }
@@ -1233,7 +1243,8 @@ impl HandshakeRefusal {
                     Some(Self::Banned)
                 }
                 _ => None,
-            })
+            }
+        })
     }
 
     /// The wait the refusal starts a cooldown for. The SDK drops the handshake's `Retry-After`,
@@ -2926,6 +2937,8 @@ fn convert_order_snapshot(
     let trailing_delta = match &report.trailing_delta {
         None => TrailingDelta::Absent,
         Some(WireInt::Int(delta)) => TrailingDelta::from_reported(Some(*delta)),
+        // Binance's margin stream sends `"d": ""` on every order that does not trail.
+        Some(WireInt::Unreadable(raw)) if raw.is_empty() => TrailingDelta::Absent,
         Some(WireInt::Unreadable(raw)) => {
             // A shape Binance sends one way recurs on every report of the order, so sample it.
             static SEEN: AtomicU64 = AtomicU64::new(0);
@@ -3204,11 +3217,13 @@ pub(crate) fn parse_binance_api_error(
 /// purpose: should a message ever carry both a venue-failure code and an auth or throttle marker,
 /// "status unknown" is the label that cannot hide a fill.
 ///
-/// `-3111` (TRAILING_STOP_LIMIT_ONLY, "Trailing stop order only supports limit type") →
-/// [`OrderError::UnsupportedOrderType`]: the venue does not take this order type here, so the
-/// caller can place another one (a trailing stop-limit) instead. A cross margin account answers
-/// a trailing `STOP_LOSS` this way. Binance lists the code, with this one meaning, among its
-/// margin (SAPI) errors.
+/// Two margin (SAPI) codes say the venue does not take this order type here, so the caller can
+/// place another one instead, and map to [`OrderError::UnsupportedOrderType`]:
+/// - `-3111` (TRAILING_STOP_LIMIT_ONLY, "Trailing stop order only supports limit type"): a cross
+///   margin account answers a trailing `STOP_LOSS` this way. Place a trailing stop-limit.
+/// - `-3116` ("STOP_LOSS and TAKE_PROFIT orders, … are not supported for this account"): margin
+///   refuses the stop types without a limit price, since 2026-10-14 and until Binance says
+///   otherwise. Place the limit form (`STOP_LOSS_LIMIT`, `TAKE_PROFIT_LIMIT`).
 ///
 /// Everything else is a rejection, mapped by [`parse_binance_api_error`].
 pub(crate) fn parse_binance_order_rejection(
@@ -3217,7 +3232,7 @@ pub(crate) fn parse_binance_order_rejection(
 ) -> UnindexedOrderError {
     if has_venue_failure_code(&msg) {
         OrderError::Connectivity(ConnectivityError::Socket(msg))
-    } else if contains_error_code(&msg, "-3111") {
+    } else if contains_error_code(&msg, "-3111") || contains_error_code(&msg, "-3116") {
         OrderError::UnsupportedOrderType(msg)
     } else {
         OrderError::Rejected(parse_binance_api_error(msg, instrument))
@@ -5845,6 +5860,34 @@ mod tests {
                 &ws,
                 Some(OrderError::UnsupportedOrderType(text))
                     if text.contains("-3111") && text.contains(msg)
+            ),
+            "WS API: got {ws:?}"
+        );
+    }
+
+    /// Margin refuses a `STOP_LOSS` or `TAKE_PROFIT` with `-3116` since 2026-10-14. The order type
+    /// is not taken for this account, so it is [`OrderError::UnsupportedOrderType`] carrying the
+    /// venue's message, over REST and over the WS API, and a retry cannot cure it.
+    #[test]
+    fn a_stop_without_a_limit_refusal_is_an_unsupported_order_type() {
+        let msg = "STOP_LOSS and TAKE_PROFIT orders, whether placed standalone or as a leg of an \
+                   order list, are not supported for this account.";
+        let rest = classify_err(ConnectorError::BadRequestError {
+            msg: msg.to_string(),
+            code: Some(-3116),
+        });
+        assert_eq!(
+            rest,
+            OrderError::UnsupportedOrderType(format!("-3116 {msg}"))
+        );
+        assert!(!rest.is_transient());
+
+        let ws = classify_ws(-3116, msg);
+        assert!(
+            matches!(
+                &ws,
+                Some(OrderError::UnsupportedOrderType(text))
+                    if text.contains("-3116") && text.contains(msg)
             ),
             "WS API: got {ws:?}"
         );

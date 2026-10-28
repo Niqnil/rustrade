@@ -34,8 +34,9 @@ use std::fmt::{Display, Formatter};
 /// # Producers
 ///
 /// Known producers, as of writing:
-/// - Binance margin (`BinanceMargin`): `USER_LIABILITY_CHANGE`. See the client's rustdoc for which
-///   streams it is read from, and how an isolated account names the pair.
+/// - Binance margin (`BinanceMargin`): `liabilityChange`, one update per asset it lists. See the
+///   client's rustdoc for how its type maps to a [`MarginDebtKind`], and why an isolated pair's
+///   debt is not known to be streamed.
 /// - The simulated venue (`SimulatedVenue`) on a spot-margin account, after each borrow, repay and
 ///   interest charge.
 #[non_exhaustive]
