@@ -1393,11 +1393,11 @@ impl ExecutionClient for BinanceMargin {
     /// with auto-reconnect, exponential backoff, heartbeat monitoring and fill recovery (mirroring
     /// [`BinanceSpot`](super::spot::BinanceSpot)). The key is kept alive as each connection
     /// opens and every 30 minutes after (`PUT`, weight 1), since Binance hands back a key that is
-    /// still live without saying how long it has left; a failed keepalive is logged at `warn`, and if the key lapses anyway
-    /// Binance says so on the stream, and the stream reconnects with a new one. The key is not
-    /// closed when the stream ends: it lapses 60 minutes after its last keepalive. The stream ends
-    /// once 10 reconnects in a row have failed or a rate-limit cooldown outlasts what it waits
-    /// through: see the [module docs](super#account-stream-reconnection).
+    /// still live without saying how long it has left; a failed keepalive is logged at `warn`,
+    /// and if the key lapses anyway Binance says so on the stream, and the stream reconnects with
+    /// a new one. The key is not closed when the stream ends: it lapses 60 minutes after its last
+    /// keepalive. The stream ends once 10 reconnects in a row have failed or a rate-limit cooldown
+    /// outlasts what it waits through: see the [module docs](super#account-stream-reconnection).
     ///
     /// Binance sends on this stream only when the account changes, so the client pings it at each
     /// heartbeat check, and the pong is what proves a quiet connection alive.

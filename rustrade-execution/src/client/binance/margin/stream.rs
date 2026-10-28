@@ -2875,6 +2875,75 @@ mod tests {
             .unwrap();
     }
 
+    /// After a reconnect, the fills missed in the gap are read from the stream's own account: an
+    /// isolated stream asks for its pair's isolated trades, a cross stream for cross trades.
+    #[tokio::test]
+    async fn a_reconnect_recovers_fills_from_the_streams_own_account() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        for (account, expected) in [(StreamAccount::Cross, "FALSE"), (isolated(), "TRUE")] {
+            let venue = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/sapi/v1/margin/myTrades"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+                .mount(&venue)
+                .await;
+            let (listener, url) = listen().await;
+            let keys = Arc::new(FakeKeys::default());
+            let (mut stream, rx) = margin_stream(&keys, url, account);
+            stream.rest = Arc::new(MarginTradingRestApi::from_config(
+                ConfigurationRestApi::builder()
+                    .api_key("key")
+                    .api_secret("secret")
+                    .base_path(venue.uri())
+                    .build()
+                    .unwrap(),
+            ));
+            stream.instruments = vec![btcusdt()];
+
+            let task = tokio::spawn(async move {
+                let session = stream.open().await.unwrap();
+                stream.run(session).await;
+            });
+            let expired = push(serde_json::json!({ "e": "listenKeyExpired", "E": 1 }));
+            serve(&listener, "key-1", vec![], vec![expired], After::Answer).await;
+            let server = serve(&listener, "key-2", vec![], vec![], After::Answer);
+            let recovered = async {
+                loop {
+                    let requests = venue.received_requests().await.unwrap_or_default();
+                    if let Some(request) = requests.first() {
+                        break request
+                            .url
+                            .query_pairs()
+                            .into_owned()
+                            .collect::<HashMap<_, _>>();
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            let query = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    () = server => panic!("the server stopped before the fills were recovered"),
+                    query = recovered => query,
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(query.get("symbol").map(String::as_str), Some("BTCUSDT"));
+            assert_eq!(
+                query.get("isIsolated").map(String::as_str),
+                Some(expected),
+                "{query:?}"
+            );
+
+            drop(rx);
+            task.abort();
+        }
+    }
+
     /// An event the venue sends before acknowledging the subscription is still delivered.
     #[tokio::test]
     async fn an_event_before_the_subscribe_ack_is_delivered() {
