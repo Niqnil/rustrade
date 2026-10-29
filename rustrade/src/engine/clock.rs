@@ -4,7 +4,11 @@ use rustrade_data::streams::consumer::MarketStreamEvent;
 use rustrade_execution::AccountEventKind;
 use seqlock::{RawInstant, SeqLockInstant};
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    fmt::Debug,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tracing::{debug, error, warn};
 
 mod seqlock;
@@ -29,8 +33,28 @@ mod sync {
 /// that order — from each event's `time_exchange`. For aggregated payloads such as
 /// candles, `time_exchange` must be the period **end** (`close_time`) to avoid
 /// lookahead; see [`rustrade_data::event::MarketEvent::time_exchange`].
+///
+/// # Two readings
+/// [`time`](Self::time) stamps things: when a request was sent, when a run started.
+/// [`instant`](Self::instant) measures how long things take, such as an order's in-flight
+/// deadline. For a live clock the two differ: wall time can step back or jump forward when the
+/// host's clock is set, and a duration measured across such a step comes out wrong.
 pub trait EngineClock {
     fn time(&self) -> DateTime<Utc>;
+
+    /// A reading of the clock's monotonic time, for measuring how long something takes.
+    ///
+    /// A later reading is never earlier than an earlier one, and the time between two readings is
+    /// the time that passed on this clock. Only readings of one clock, or of its clones, compare
+    /// meaningfully: each clock counts from its own origin.
+    ///
+    /// The default reads [`time`](Self::time), which suits a clock whose time only moves forward,
+    /// such as one driven by event timestamps. A clock that follows the host's wall clock should
+    /// override it with a monotonic source, as [`LiveClock`] does: otherwise a step of the host's
+    /// clock moves the reading too.
+    fn instant(&self) -> EngineInstant {
+        EngineInstant::from_time(self.time())
+    }
 
     /// Advance the clock's notion of "current time" to `time`, if `time` is later than the
     /// current time (**monotonic** — never regresses).
@@ -55,6 +79,75 @@ pub trait EngineClock {
     fn advance_to(&self, _time: DateTime<Utc>) {}
 }
 
+/// A reading of an [`EngineClock`]'s monotonic time: see [`EngineClock::instant`].
+///
+/// It is the time elapsed since the clock's origin, so readings of one clock order by when they
+/// were taken and differ by the time between them. Readings of different clocks do not compare.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct EngineInstant {
+    /// Nanoseconds since the clock's origin. Signed, so that an instant estimated from a wall
+    /// time older than the origin, as the in-flight watch makes for an order it was not told of,
+    /// can lie before it. Any `Duration` either way fits.
+    nanos: i128,
+}
+
+impl EngineInstant {
+    const NANOS_PER_SEC: i128 = 1_000_000_000;
+
+    /// The reading `elapsed` after the clock's origin.
+    ///
+    /// For an [`EngineClock`] that keeps its own monotonic source: count from a fixed origin, such
+    /// as the instant the clock was created at.
+    pub const fn from_elapsed(elapsed: Duration) -> Self {
+        Self {
+            nanos: nanos(elapsed),
+        }
+    }
+
+    /// The reading of a clock whose monotonic time is its time: the time since
+    /// [`DateTime::<Utc>::MIN_UTC`]. What [`EngineClock::instant`] returns by default.
+    fn from_time(time: DateTime<Utc>) -> Self {
+        // `MIN_UTC` is the earliest `DateTime`, so the difference is never negative.
+        Self::from_elapsed(
+            time.signed_duration_since(DateTime::<Utc>::MIN_UTC)
+                .to_std()
+                .unwrap_or_default(),
+        )
+    }
+
+    /// The reading `duration` after this one.
+    pub fn saturating_add(self, duration: Duration) -> Self {
+        Self {
+            nanos: self.nanos.saturating_add(nanos(duration)),
+        }
+    }
+
+    /// The time from `earlier` to this reading, or zero if `earlier` is later, or
+    /// [`Duration::MAX`] if it is longer than that.
+    pub fn saturating_duration_since(self, earlier: Self) -> Duration {
+        let since = self.nanos.saturating_sub(earlier.nanos).max(0);
+        let Ok(secs) = u64::try_from(since / Self::NANOS_PER_SEC) else {
+            return Duration::MAX;
+        };
+        // A remainder of a division by a billion always fits: the fallback is never taken.
+        let subsec = u32::try_from(since % Self::NANOS_PER_SEC).unwrap_or_default();
+        Duration::new(secs, subsec)
+    }
+
+    /// The reading `duration` before this one, which may be before the clock's origin.
+    pub(crate) fn saturating_sub(self, duration: Duration) -> Self {
+        Self {
+            nanos: self.nanos.saturating_sub(nanos(duration)),
+        }
+    }
+}
+
+/// `duration` in nanoseconds. Any `Duration` fits an `i128`: at most about 1.8e28.
+const fn nanos(duration: Duration) -> i128 {
+    // Widening casts: `u64` and `u32` both fit an `i128`.
+    duration.as_secs() as i128 * EngineInstant::NANOS_PER_SEC + duration.subsec_nanos() as i128
+}
+
 /// Defines how to extract an "exchange timestamp" from an event.
 ///
 /// Used by a [`HistoricalClock`] to assist deriving the "current" `Engine` time.
@@ -66,12 +159,31 @@ pub trait TimeExchange {
 }
 
 /// Live `Clock` using `Utc::now()`.
+///
+/// Its [`time`](EngineClock::time) follows the host's wall clock, unadjusted. That clock can step
+/// back or jump forward: an NTP step, a manual change, a virtual machine resumed after a pause. So
+/// two stamps from it can be out of order, and the difference between them is not the time that
+/// passed. Keep the host's clock synchronised, and slewed rather than stepped where possible.
+///
+/// Durations, such as an order's in-flight deadline, are measured on its
+/// [`instant`](EngineClock::instant) instead: the host's monotonic clock
+/// ([`std::time::Instant`]), which no setting of the wall clock moves. On some platforms, Linux
+/// among them, the monotonic clock does not advance while the host is suspended, so a duration
+/// that spans a suspension leaves it out.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct LiveClock;
 
 impl EngineClock for LiveClock {
     fn time(&self) -> DateTime<Utc> {
         Utc::now()
+    }
+
+    /// The time since the process first read a `LiveClock`'s instant.
+    fn instant(&self) -> EngineInstant {
+        static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
+        // The origin is read first, so `now` is never before it.
+        let origin = *ORIGIN.get_or_init(std::time::Instant::now);
+        EngineInstant::from_elapsed(std::time::Instant::now().saturating_duration_since(origin))
     }
 }
 
@@ -118,6 +230,12 @@ impl EngineClock for TokioClock {
             .and_then(|elapsed| self.anchor_time.checked_add_signed(elapsed))
             .unwrap_or(DateTime::<Utc>::MAX_UTC)
     }
+
+    /// The [`tokio::time::Instant`] time elapsed since the clock was created, so paused time
+    /// controls it as it does [`time`](EngineClock::time).
+    fn instant(&self) -> EngineInstant {
+        EngineInstant::from_elapsed(self.anchor_instant.elapsed())
+    }
 }
 
 impl<Event> Processor<&Event> for TokioClock {
@@ -139,6 +257,9 @@ impl<Event> Processor<&Event> for TokioClock {
 /// standing still for as long as the data does. That is the correct reading of simulated time — no
 /// simulated time passes where no data does — but it differs from a wall clock, and code that
 /// measures elapsed time by differencing `time()` will measure the data rather than itself.
+///
+/// Its [`instant`](EngineClock::instant) is its time, so durations such as an order's in-flight
+/// deadline are measured in simulated time too.
 ///
 /// Note that this cannot be initialised without a starting `last_exchange_timestamp`.
 ///
@@ -845,5 +966,93 @@ mod tests {
 
         tokio::time::advance(std::time::Duration::from_millis(1_500)).await;
         assert_eq!(clock.time(), start + chrono::TimeDelta::milliseconds(1_500));
+    }
+
+    /// A `TokioClock`'s instant counts tokio's time from the clock's creation, so paused time
+    /// controls deadlines as it does stamps.
+    #[tokio::test(start_paused = true)]
+    async fn a_tokio_clocks_instant_moves_with_tokios_clock() {
+        let clock = TokioClock::starting_at(DateTime::<Utc>::UNIX_EPOCH);
+        let copy = clock;
+        assert_eq!(clock.instant(), EngineInstant::from_elapsed(Duration::ZERO));
+
+        tokio::time::advance(Duration::from_millis(1_500)).await;
+        assert_eq!(
+            clock.instant(),
+            EngineInstant::from_elapsed(Duration::from_millis(1_500))
+        );
+        assert_eq!(
+            copy.instant(),
+            clock.instant(),
+            "a copy counts from the same origin"
+        );
+    }
+
+    /// A `LiveClock`'s instant never moves back, and every `LiveClock` counts from one origin.
+    #[test]
+    fn a_live_clocks_instant_moves_forward() {
+        let first = LiveClock.instant();
+        std::thread::sleep(Duration::from_millis(2));
+        let second = LiveClock.instant();
+        assert!(
+            second.saturating_duration_since(first) >= Duration::from_millis(2),
+            "{first:?} then {second:?}"
+        );
+    }
+
+    /// A `HistoricalClock`'s instant is its time, so it moves with the events and never back.
+    #[test]
+    fn a_historical_clocks_instant_is_its_time() {
+        let base = DateTime::<Utc>::MIN_UTC;
+        let clock = HistoricalClock::new(base);
+        assert_eq!(clock.instant(), EngineInstant::from_elapsed(Duration::ZERO));
+
+        clock.advance_to(base + TimeDelta::days(1));
+        let day = Duration::from_secs(24 * 60 * 60);
+        assert_eq!(clock.instant(), EngineInstant::from_elapsed(day));
+        clock.advance_to(base);
+        assert_eq!(clock.instant(), EngineInstant::from_elapsed(day));
+
+        let latest = HistoricalClock::new(DateTime::<Utc>::MAX_UTC).instant();
+        assert!(latest > clock.instant(), "the whole range maps in order");
+    }
+
+    #[test]
+    fn engine_instants_add_and_subtract_saturating() {
+        let five = EngineInstant::from_elapsed(Duration::from_secs(5));
+        let seven = five.saturating_add(Duration::from_secs(2));
+        assert_eq!(seven, EngineInstant::from_elapsed(Duration::from_secs(7)));
+        assert_eq!(
+            seven.saturating_duration_since(five),
+            Duration::from_secs(2)
+        );
+        assert_eq!(five.saturating_duration_since(seven), Duration::ZERO);
+        assert_eq!(
+            five.saturating_sub(Duration::from_secs(2)),
+            EngineInstant::from_elapsed(Duration::from_secs(3))
+        );
+        let before_origin = five.saturating_sub(Duration::from_secs(9));
+        assert!(before_origin < EngineInstant::from_elapsed(Duration::ZERO));
+        assert_eq!(
+            five.saturating_duration_since(before_origin),
+            Duration::from_secs(9)
+        );
+
+        let latest = EngineInstant::from_elapsed(Duration::MAX);
+        assert_eq!(
+            latest.saturating_duration_since(EngineInstant::from_elapsed(Duration::ZERO)),
+            Duration::MAX
+        );
+        assert_eq!(
+            latest.saturating_duration_since(before_origin),
+            Duration::MAX,
+            "longer than a Duration holds"
+        );
+        let sub_second = Duration::new(3, 999_999_999);
+        assert_eq!(
+            EngineInstant::from_elapsed(sub_second)
+                .saturating_duration_since(EngineInstant::from_elapsed(Duration::ZERO)),
+            sub_second
+        );
     }
 }

@@ -15,7 +15,7 @@ use rustrade::{
             send_requests::{SendCancelsAndOpensOutput, SendRequestsOutput},
         },
         audit::{AuditTick, EngineAudit},
-        clock::HistoricalClock,
+        clock::{EngineClock, EngineInstant, HistoricalClock},
         command::Command,
         error::{EngineError, RecoverableEngineError},
         execution_tx::MultiExchangeTxMap,
@@ -91,7 +91,10 @@ use rustrade_integration::{
     channel::{UnboundedRx, UnboundedTx, mpsc_unbounded},
     collection::{none_one_or_many::NoneOneOrMany, one_or_many::OneOrMany, snapshot::Snapshot},
 };
-use std::time::Duration;
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 const STARTING_TIMESTAMP: DateTime<Utc> = DateTime::<Utc>::MIN_UTC;
 const RISK_FREE_RETURN: Decimal = dec!(0.05);
@@ -999,9 +1002,9 @@ impl ClosePositionsStrategy for TestBuyAndHoldStrategy {
 
 #[derive(Debug, Clone, PartialEq)]
 struct OnDisconnectOutput;
-impl
+impl<Clock>
     OnDisconnectStrategy<
-        HistoricalClock,
+        Clock,
         EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
         MultiExchangeTxMap<UnboundedTx<ExecutionRequest>>,
         DefaultRiskManager<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>,
@@ -1011,7 +1014,7 @@ impl
 
     fn on_disconnect(
         _: &mut Engine<
-            HistoricalClock,
+            Clock,
             EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
             MultiExchangeTxMap<UnboundedTx<ExecutionRequest>>,
             Self,
@@ -1025,9 +1028,9 @@ impl
 
 #[derive(Debug, Clone, PartialEq)]
 struct OnTradingDisabledOutput;
-impl
+impl<Clock>
     OnTradingDisabled<
-        HistoricalClock,
+        Clock,
         EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
         MultiExchangeTxMap<UnboundedTx<ExecutionRequest>>,
         DefaultRiskManager<EngineState<DefaultGlobalData, DefaultInstrumentMarketData>>,
@@ -1037,7 +1040,7 @@ impl
 
     fn on_trading_disabled(
         _: &mut Engine<
-            HistoricalClock,
+            Clock,
             EngineState<DefaultGlobalData, DefaultInstrumentMarketData>,
             MultiExchangeTxMap<UnboundedTx<ExecutionRequest>>,
             Self,
@@ -8070,6 +8073,92 @@ fn test_in_flight_deadline_reflags_once_after_restore() {
     assert_eq!(in_flight_overdue(audit).len(), 1, "flagged once more");
     let audit = process_with_audit(&mut restored, market_event_trade(4, 0, dec!(50_000)));
     assert!(in_flight_overdue(audit).is_empty(), "and only once");
+}
+
+/// A live-like clock whose wall time and instant the test sets apart, so its wall time can step
+/// the way a host's clock can while its instant moves steadily on.
+#[derive(Debug, Clone)]
+struct SteppingClock(Arc<Mutex<(DateTime<Utc>, EngineInstant)>>);
+
+impl SteppingClock {
+    fn set(&self, time: DateTime<Utc>, instant_secs: u64) {
+        *self.0.lock().unwrap() = (
+            time,
+            EngineInstant::from_elapsed(Duration::from_secs(instant_secs)),
+        );
+    }
+}
+
+impl EngineClock for SteppingClock {
+    fn time(&self) -> DateTime<Utc> {
+        self.0.lock().unwrap().0
+    }
+
+    fn instant(&self) -> EngineInstant {
+        self.0.lock().unwrap().1
+    }
+}
+
+impl<Event> Processor<&Event> for SteppingClock {
+    type Audit = ();
+
+    fn process(&mut self, _: &Event) -> Self::Audit {}
+}
+
+/// Under a clock whose wall time steps back and then jumps forward, an order is flagged exactly
+/// when its deadline passes on the clock's instant, and stamped with the wall time it was sent at.
+#[test]
+fn test_in_flight_deadline_runs_on_the_instant_through_wall_clock_steps() {
+    const DEADLINE: Duration = Duration::from_secs(10);
+    let sent = time_plus_days(STARTING_TIMESTAMP, 10);
+    let (engine, _execution_rx) = engine_with_two_day_deadline();
+    let clock = SteppingClock(Arc::new(Mutex::new((
+        sent,
+        EngineInstant::from_elapsed(Duration::ZERO),
+    ))));
+    let (execution_tx, _stepping_execution_rx) = mpsc_unbounded();
+    let mut engine = Engine::new(
+        clock.clone(),
+        engine.state,
+        MultiExchangeTxMap::from_iter([(ExchangeId::BinanceSpot, Some(execution_tx))]),
+        InFlightDeadlines::default().with(ExchangeIndex(0), DEADLINE),
+        TestBuyAndHoldStrategy { id: strategy_id() },
+        DefaultRiskManager::default(),
+    );
+
+    let audit = process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(open_request(
+            InstrumentIndex(0),
+            "stranded",
+        )))),
+    );
+    assert!(in_flight_overdue(audit).is_empty());
+
+    // The wall clock steps back an hour, five seconds on: a wall-time deadline would be an hour
+    // and ten seconds away.
+    clock.set(sent - TimeDelta::hours(1), 5);
+    let audit = process_with_audit(&mut engine, market_event_trade(0, 0, dec!(50_000)));
+    assert!(in_flight_overdue(audit).is_empty());
+
+    // It jumps forward a day, nine seconds on: a wall-time deadline would have passed.
+    clock.set(time_plus_days(sent, 1), 9);
+    let audit = process_with_audit(&mut engine, market_event_trade(0, 0, dec!(50_000)));
+    assert!(
+        in_flight_overdue(audit).is_empty(),
+        "nine seconds in flight"
+    );
+
+    clock.set(time_plus_days(sent, 1), 10);
+    let audit = process_with_audit(&mut engine, market_event_trade(0, 0, dec!(50_000)));
+    let overdue = in_flight_overdue(audit);
+    assert_eq!(overdue.len(), 1, "{overdue:?}");
+    assert_eq!(overdue[0].time_sent, sent);
+    assert_eq!(overdue[0].elapsed, DEADLINE);
+
+    clock.set(time_plus_days(sent, 9), 11);
+    let audit = process_with_audit(&mut engine, market_event_trade(0, 0, dec!(50_000)));
+    assert!(in_flight_overdue(audit).is_empty(), "flagged once");
 }
 
 /// An open the `ExecutionManager` timed out may still have reached the venue. The engine keeps it

@@ -52,6 +52,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **In-flight deadlines run on a monotonic clock, not the host's wall clock** (`rustrade`, #771).
+  The engine measured an order's in-flight deadline from its `time_sent`, on `LiveClock`'s wall
+  time. A step of the host's clock back delayed every `InFlightOverdue` by the size of the step,
+  and one larger than a deadline lost the flag for orders sent after it. A jump forward of at
+  least a deadline flagged every order in flight at once. Now:
+  - `EngineClock::instant` gives a monotonic reading, an `EngineInstant`, and the deadlines run
+    on it. `LiveClock` reads `std::time::Instant`, and `TokioClock` reads tokio's clock, so paused
+    time still controls deadlines in a test. `HistoricalClock` and the default implementation
+    read the clock's `time()`, so a backtest's deadlines stay in simulated time and an existing
+    `EngineClock` implementation keeps compiling and behaving as before. A clock that follows the
+    host's wall clock should override it.
+  - `time_sent` stays the wall-clock stamp. `InFlightOverdue::elapsed` is now measured on the
+    monotonic reading.
+  - An order the engine started from already in flight is measured from its wall-clock age when
+    first checked, as before, and on the monotonic reading after that.
+  - `LiveClock`'s rustdoc states that its time follows the host's wall clock and can step back
+    or jump forward.
+
 - **Missed-fill recovery reads its span on the venue's clock, not this host's** (`rustrade`,
   #770). When the `ExecutionManager` reopened an account stream, the read of the fills it missed
   started from the host time the last event arrived, less up to `max_clock_skew`, and ended at
