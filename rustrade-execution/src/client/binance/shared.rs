@@ -35,7 +35,7 @@ use crate::{
             Cancelled, Expired, Filled, InactiveOrderState, Open, OrderState, UnindexedOrderState,
         },
     },
-    trade::{AssetFees, Trade, TradeId},
+    trade::{AssetFees, TimeSource, Trade, TradeId},
 };
 
 // Deduplication moved to `client::dedup` when Hyperliquid needed the same machinery; re-exported
@@ -1882,28 +1882,32 @@ pub(crate) fn answer_time(
 }
 
 /// When an `outboundAccountPosition` says its balances were last updated: its `u`, else its event
-/// time `E`, else the local clock.
+/// time `E`, else `None`, and the frame is dropped.
 ///
-/// Binance stamps every such frame with both, so either falling back is logged with a `warn!`. The
-/// balances are still delivered, because they state what the account holds whatever their time.
+/// Binance stamps every such frame with both, so either falling back is logged with a `warn!`.
 /// `E` is when the frame was sent, so it can be a little later than the change it reports; a
 /// consumer that orders balances by time may then take the next frame, if its `u` falls in between,
 /// as the older one.
+///
+/// A frame with neither is not stamped with this host's clock: the engine orders balances by their
+/// time, so a host time ahead of the venue's would hold back the venue's next updates, and the
+/// stream's estimate of the venue's clock would read it as the venue's. The balances it stated
+/// are restated by the account's next update.
 pub(crate) fn account_position_time(
     exchange: ExchangeId,
     last_update: Option<i64>,
     event_time: Option<i64>,
-) -> DateTime<Utc> {
+) -> Option<DateTime<Utc>> {
     let read = |ms: Option<i64>| ms.and_then(|ms| Utc.timestamp_millis_opt(ms).single());
     if let Some(time) = read(last_update) {
-        return time;
+        return Some(time);
     }
     if let Some(time) = read(event_time) {
         warn!(%exchange, ?last_update, "Binance outboundAccountPosition missing/unparseable update time (u), using its event time (E)");
-        return time;
+        return Some(time);
     }
-    warn!(%exchange, ?last_update, ?event_time, "Binance outboundAccountPosition missing/unparseable update time (u) and event time (E), using now");
-    Utc::now()
+    warn!(%exchange, ?last_update, ?event_time, "Binance outboundAccountPosition missing/unparseable update time (u) and event time (E), dropping");
+    None
 }
 
 /// The fields of Binance's response to placing an order that say what became of it.
@@ -2503,9 +2507,9 @@ pub(crate) fn order_running_totals<T: BinanceExecutionFields>(
 /// Every field is optional: which keys a report carries depends on its execution type, and each
 /// use below says what it does without one.
 ///
-/// Unlike `d`, the keys read as integers, `i`, `T` and `t`, are integers in Binance's docs and in
-/// both SDK models, so they are read strictly. A report carrying one of them in another shape
-/// still fails to decode whole; the stream handlers log it with an excerpt of the frame.
+/// Unlike `d`, the keys read as integers, `i`, `E`, `T` and `t`, are integers in Binance's docs
+/// and in both SDK models, so they are read strictly. A report carrying one of them in another
+/// shape still fails to decode whole; the stream handlers log it with an excerpt of the frame.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 // Tests build stream frames from reports.
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -2540,6 +2544,10 @@ pub(crate) struct ExecutionReport {
     /// `T`: transaction time, in milliseconds.
     #[serde(rename = "T")]
     pub(crate) transaction_time: Option<i64>,
+    /// `E`: when Binance sent the report, in milliseconds. Read only for a report without a
+    /// readable `T`, as the nearest time the venue stamped.
+    #[serde(rename = "E")]
+    pub(crate) event_time: Option<i64>,
     /// `t`: the execution's own id, present only on a `TRADE`.
     #[serde(rename = "t")]
     pub(crate) trade_id: Option<i64>,
@@ -2700,6 +2708,28 @@ fn trade_order_is_live(status: &str) -> bool {
     matches!(status, "PARTIALLY_FILLED" | "FILLED")
 }
 
+/// When an `executionReport`'s execution happened, and whose clock says so: its transaction time
+/// `T`, else its event time `E`, else this host's clock, as [`TimeSource::Host`].
+///
+/// Binance stamps every report with both, so either falling back is logged with a `warn!`. `E` is
+/// when the report was sent, so it can be a little later than the execution.
+fn execution_report_time(
+    report: &ExecutionReport,
+    exchange: ExchangeId,
+    symbol: &InstrumentNameExchange,
+) -> (DateTime<Utc>, TimeSource) {
+    let read = |ms: Option<i64>| ms.and_then(|ms| Utc.timestamp_millis_opt(ms).single());
+    if let Some(time) = read(report.transaction_time) {
+        return (time, TimeSource::Venue);
+    }
+    if let Some(time) = read(report.event_time) {
+        warn!(%exchange, %symbol, transaction_time = ?report.transaction_time, "Binance executionReport missing/unparseable transaction time (T), using its event time (E)");
+        return (time, TimeSource::Venue);
+    }
+    warn!(%exchange, %symbol, transaction_time = ?report.transaction_time, event_time = ?report.event_time, "Binance executionReport missing/unparseable transaction time (T) and event time (E), using now");
+    (Utc::now(), TimeSource::Host)
+}
+
 /// Convert a Binance `executionReport` into rustrade account events, appended to `buf`.
 ///
 /// A `TRADE` report genuinely carries two facts -- the execution print (`l`/`L`) and the order's
@@ -2739,16 +2769,7 @@ pub(crate) fn convert_execution_report(
         None => ClientOrderId::new(order_id.0.as_str()),
     };
 
-    let time_exchange = match report
-        .transaction_time
-        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-    {
-        Some(t) => t,
-        None => {
-            warn!(%exchange, %symbol, "Binance executionReport missing/unparseable transaction time (T), using now");
-            Utc::now()
-        }
-    };
+    let (time_exchange, time_source) = execution_report_time(report, exchange, &symbol);
 
     match exec_type {
         "NEW" => {
@@ -2836,7 +2857,8 @@ pub(crate) fn convert_execution_report(
                 last_qty,
                 order_filled_quantity,
                 AssetFees::new(fee_asset, commission, None),
-            );
+            )
+            .with_time_source(time_source);
             // Only the order's own id: `cid` falls back to the exchange id without one.
             let trade = match report.order_client_id() {
                 Some(c) if !c.is_empty() => trade.with_client_order_id(cid.clone()),
@@ -4132,22 +4154,17 @@ mod tests {
         }
     }
 
-    /// An account position is at its update time `u`, else its event time `E`, else now.
+    /// An account position is at its update time `u`, else its event time `E`, else it has none.
     #[test]
-    fn an_account_positions_time_is_its_update_time_then_its_event_time_then_now() {
-        let at = |ms| Utc.timestamp_millis_opt(ms).unwrap();
+    fn an_account_positions_time_is_its_update_time_then_its_event_time_then_none() {
+        let at = |ms| Some(Utc.timestamp_millis_opt(ms).unwrap());
         let time = |u, e| account_position_time(ExchangeId::BinanceSpot, u, e);
 
         assert_eq!(time(Some(2_000), Some(3_000)), at(2_000));
         assert_eq!(time(None, Some(3_000)), at(3_000));
         assert_eq!(time(Some(i64::MAX), Some(3_000)), at(3_000));
         for event_time in [None, Some(i64::MAX)] {
-            let before = Utc::now();
-            let now = time(None, event_time);
-            assert!(
-                (before..=Utc::now()).contains(&now),
-                "{event_time:?} gave {now}"
-            );
+            assert_eq!(time(None, event_time), None, "{event_time:?}");
         }
     }
 

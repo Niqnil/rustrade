@@ -23,7 +23,7 @@ use rustrade_execution::{
     client::venue_clock::VenueClock,
     error::UnindexedClientError,
     fill_recovery::{FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope},
-    trade::{Trade, TradesRead},
+    trade::{TimeSource, Trade, TradesRead},
 };
 use rustrade_instrument::{
     asset::name::AssetNameExchange, instrument::name::InstrumentNameExchange,
@@ -155,14 +155,16 @@ impl Watermark {
     /// leaves the watermark where the last event before it put it. A loss the stream delivers
     /// further events after, without ending, is not seen here.
     ///
-    /// A fill's time is the only one taken for the venue's clock: every client stamps fills with
-    /// the venue's time, but some stamp other events with this host's. A fill stamped `max_span`
-    /// or more before `now` is not taken either: it is an old fill delivered late, such as one a
-    /// venue replays on subscribing, and a read placed by it would start further back than any
-    /// read covers. A replayed fill younger than that is taken, because it cannot be told apart
-    /// from a venue clock that far behind. Until a fill delivered on time replaces it, each read
-    /// starts as far back as its stamp, and the clock difference it implies is warned of. The
-    /// read is longer, but misses nothing.
+    /// A fill's time is the only one taken for the venue's clock, as some clients stamp other
+    /// events with this host's time. A fill whose [`time_source`](Trade::time_source) is
+    /// [`TimeSource::Host`] is not taken: its time is this host's, filled in for a fill the venue
+    /// sent without one, and would read as a venue clock skewed as far as this host's is. A fill
+    /// stamped `max_span` or more before `now` is not taken either: it is an old fill delivered
+    /// late, such as one a venue replays on subscribing, and a read placed by it would start
+    /// further back than any read covers. A replayed fill younger than that is taken, because it
+    /// cannot be told apart from a venue clock that far behind. Until a fill delivered on time
+    /// replaces it, each read starts as far back as its stamp, and the clock difference it implies
+    /// is warned of. The read is longer, but misses nothing.
     pub(crate) fn delivered<K, A, I>(
         &mut self,
         now: DateTime<Utc>,
@@ -172,7 +174,7 @@ impl Watermark {
     ) {
         match &event.kind {
             AccountEventKind::StreamTerminated(_) => return,
-            AccountEventKind::Trade(trade) => {
+            AccountEventKind::Trade(trade) if trade.time_source == TimeSource::Venue => {
                 let recent = to_delta(config.max_span)
                     .is_none_or(|span| now.signed_duration_since(trade.time_exchange) < span);
                 if recent {
@@ -779,6 +781,23 @@ mod tests {
         watermark.delivered(at(100_000), base, &fill(100_000 - 86_400), &config);
 
         assert_eq!(watermark.read_from(&config), at(100_000 - 30 - 2));
+    }
+
+    /// A fill stamped with this host's time, for one the venue sent without a time, says nothing
+    /// of the venue's clock: the read starts as with no fill delivered.
+    #[test]
+    fn a_fill_stamped_with_this_hosts_time_is_not_taken_for_the_venues_clock() {
+        let config = FillRecoveryConfig::default();
+        let base = Instant::now();
+        let mut watermark = Watermark::opened(at(200), base);
+        let mut host_stamped = fill(10);
+        if let AccountEventKind::Trade(trade) = host_stamped.kind {
+            host_stamped.kind = AccountEventKind::Trade(trade.with_time_source(TimeSource::Host));
+        }
+
+        watermark.delivered(at(200), base, &host_stamped, &config);
+
+        assert_eq!(watermark.read_from(&config), at(200 - 30 - 2));
     }
 
     #[test]

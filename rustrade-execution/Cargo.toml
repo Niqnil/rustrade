@@ -39,6 +39,7 @@ binance = [
 ibkr = [
     "dep:ibapi",
     "dep:chrono-tz",
+    "dep:time-tz",
     "rustrade-instrument/ibkr",
 ]
 hyperliquid = [
@@ -113,6 +114,10 @@ ibapi = { version = "=5.2.0", optional = true, default-features = false, feature
     "sync",
 ] }
 chrono-tz = { workspace = true, optional = true }
+# Only for `TimeZone::name` on the gateway's zone (`ibapi`'s `Client::time_zone`), a `time-tz`
+# type. Already in the graph through `ibapi`, at the same version: the caret requirement keeps it
+# one copy, which the trait needs.
+time-tz = { version = "2", optional = true }
 
 # Hyperliquid (optional, behind "hyperliquid" feature)
 hyperliquid_rust_sdk = { version = "0.6", optional = true }

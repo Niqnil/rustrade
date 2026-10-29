@@ -14,7 +14,7 @@
 use super::shared::{REST_BALANCE_LAG, balance_read_time};
 use crate::{
     AccountEventKind, UnindexedAccountEvent, client::venue_clock::VenueClock,
-    error::UnindexedClientError,
+    error::UnindexedClientError, trade::TimeSource,
 };
 use chrono::{DateTime, Utc};
 use std::{fmt::Display, future::Future, sync::Arc, time::Duration};
@@ -49,16 +49,18 @@ impl StreamClock {
     /// for an event the clock learns from.
     ///
     /// A fill's, balance update's or debt change's time is the venue's and samples its clock. A
-    /// balance update's or debt change's time is also the latest balance time when it is later
-    /// than the one held: the engine orders balance state by it, so a restatement stamped before
-    /// it would be dropped.
+    /// fill whose time is this host's ([`TimeSource::Host`]) is skipped. A balance update's or debt
+    /// change's time is also the latest balance time when it is later than the one held: the
+    /// engine orders balance state by it, so a restatement stamped before it would be dropped.
     pub(crate) fn observe(
         clock: &SharedStreamClock,
         event: &UnindexedAccountEvent,
         arrived: Instant,
     ) {
         let (time, balance) = match &event.kind {
-            AccountEventKind::Trade(trade) => (trade.time_exchange, false),
+            AccountEventKind::Trade(trade) if trade.time_source == TimeSource::Venue => {
+                (trade.time_exchange, false)
+            }
             AccountEventKind::BalanceStreamUpdate(update) => (update.0.time_exchange, true),
             AccountEventKind::InstrumentBalanceUpdate(update) => {
                 (update.balance.time_exchange, true)
@@ -364,7 +366,8 @@ mod tests {
     }
 
     /// Only a later balance or debt time moves the latest balance time, whether a cross balance's,
-    /// an isolated pair's, or a debt's; a fill samples the clock only, and a REST read neither.
+    /// an isolated pair's, or a debt's; a fill samples the clock only, unless its time is this
+    /// host's, and a REST read neither.
     #[tokio::test(start_paused = true)]
     async fn the_latest_balance_time_is_the_latest_balance_or_debt_event() {
         let clock = SharedStreamClock::default();
@@ -414,21 +417,41 @@ mod tests {
         );
         assert_eq!(clock.lock().last_balance, Some(at(120)), "a debt's");
 
-        let fill = crate::trade::Trade::new(
-            crate::trade::TradeId::new("t-1"),
-            crate::order::id::OrderId::new("o-1"),
-            rustrade_instrument::instrument::name::InstrumentNameExchange::new("BTCUSDT"),
-            crate::order::id::StrategyId::unknown(),
-            at(150),
-            rustrade_instrument::Side::Buy,
-            Decimal::ONE,
-            Decimal::ONE,
-            None,
-            crate::trade::AssetFees::new(AssetNameExchange::new("BTC"), Decimal::ZERO, None),
-        );
+        let fill = |time| {
+            crate::trade::Trade::new(
+                crate::trade::TradeId::new("t-1"),
+                crate::order::id::OrderId::new("o-1"),
+                rustrade_instrument::instrument::name::InstrumentNameExchange::new("BTCUSDT"),
+                crate::order::id::StrategyId::unknown(),
+                time,
+                rustrade_instrument::Side::Buy,
+                Decimal::ONE,
+                Decimal::ONE,
+                None,
+                crate::trade::AssetFees::new(AssetNameExchange::new("BTC"), Decimal::ZERO, None),
+            )
+        };
+        let host_stamped = fill(at(300)).with_time_source(TimeSource::Host);
         StreamClock::observe(
             &clock,
-            &UnindexedAccountEvent::new(ExchangeId::BinanceMargin, AccountEventKind::Trade(fill)),
+            &UnindexedAccountEvent::new(
+                ExchangeId::BinanceMargin,
+                AccountEventKind::Trade(host_stamped),
+            ),
+            now,
+        );
+        assert_eq!(
+            clock.lock().venue.earliest_at(now),
+            Some(at(120)),
+            "a fill stamped with this host's time does not sample the clock"
+        );
+
+        StreamClock::observe(
+            &clock,
+            &UnindexedAccountEvent::new(
+                ExchangeId::BinanceMargin,
+                AccountEventKind::Trade(fill(at(150))),
+            ),
             now,
         );
         assert_eq!(

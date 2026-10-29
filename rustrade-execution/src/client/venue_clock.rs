@@ -33,7 +33,9 @@ const DRIFT_DIVISOR: u32 = 10_000;
 ///
 /// - Observe only times the venue itself stamped. A time filled in from this host's clock, for
 ///   an event that arrived without one, is not the venue's: if this host's clock is ahead, it
-///   reads as a venue clock that is ahead too, and every bound taken from it is late.
+///   reads as a venue clock that is ahead too, and every bound taken from it is late. A
+///   [`Trade`](crate::trade::Trade) says which it is in its
+///   [`time_source`](crate::trade::Trade::time_source).
 /// - Pass the instant the event arrived, read from [`Instant::now`]. That is tokio's clock, so a
 ///   test runtime with a paused clock controls it.
 ///

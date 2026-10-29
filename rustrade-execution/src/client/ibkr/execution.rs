@@ -1,8 +1,8 @@
 use crate::{
     order::id::{ClientOrderId, OrderId, StrategyId},
-    trade::{AssetFees, Trade, TradeId, TradeOrigin},
+    trade::{AssetFees, TimeSource, Trade, TradeId, TradeOrigin},
 };
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use fnv::FnvHashMap;
 use ibapi::orders::{CommissionReport, Execution, ExecutionData, ExecutionFilter, ExecutionSide};
@@ -15,8 +15,8 @@ use smol_str::{SmolStr, format_smolstr};
 use std::{cell::RefCell, collections::hash_map::Entry, sync::Arc, time::Duration};
 use tracing::{debug, warn};
 
-// Thread-local cache for parsed IANA timezones. IB uses per-exchange timezones,
-// but most portfolios only see a handful (US/Eastern, Europe/London, etc.).
+// Thread-local cache of the zones IB's times name, as resolved. IB names the gateway host's zone,
+// so a gateway's times usually name one.
 //
 // Note: This cache is per-thread. In the dedicated `ibkr-order-stream` thread
 // spawned by `account_stream`, the cache is fully effective. In `spawn_blocking`
@@ -94,6 +94,9 @@ pub(super) struct ResolvedExecution {
     pub(super) instrument: InstrumentNameExchange,
     pub(super) order_id: OrderId,
     pub(super) origin: TradeOrigin,
+    /// The execution's time, read by [`parse_ib_timestamp`] in the gateway's session zone, or
+    /// `None` where it does not read.
+    pub(super) time: Option<DateTime<Utc>>,
 }
 
 impl ExecutionBuffer {
@@ -198,7 +201,7 @@ impl ExecutionBuffer {
 
         let max_age_secs = i64::try_from(max_age.as_secs()).unwrap_or(i64::MAX);
         inner.pending.retain(|_, pending| {
-            if let Some(exec_time) = parse_ib_timestamp(&pending.execution.execution.time) {
+            if let Some(exec_time) = pending.resolved.time {
                 let age = now.signed_duration_since(exec_time);
                 age.num_seconds() < max_age_secs
             } else {
@@ -382,13 +385,21 @@ fn trade_with_fees(
     let price = parse_decimal_or_warn(exec.price, "exec.price");
     let quantity = parse_decimal_or_warn(exec.shares, "exec.shares");
 
-    let time_exchange = parse_ib_timestamp(&exec.time).unwrap_or_else(Utc::now);
-
     let ResolvedExecution {
         instrument,
         order_id,
         origin,
+        time,
     } = pending.resolved;
+    // Kept without a time it can read, rather than lost: stamped with this host's clock, and
+    // marked so.
+    let (time_exchange, time_source) = match time {
+        Some(time) => (time, TimeSource::Venue),
+        None => {
+            warn!(exec_id = %exec.execution_id, time = %exec.time, "IBKR execution time unreadable, using now");
+            (Utc::now(), TimeSource::Host)
+        }
+    };
     Trade {
         id: TradeId::new(&exec.execution_id),
         // For this client's order, the id its `Open` state carries, which is what a fill is
@@ -413,6 +424,7 @@ fn trade_with_fees(
         // Another client's order carries whatever reference that client gave it, if any.
         client_order_id: (!exec.order_reference.is_empty())
             .then(|| ClientOrderId::new(exec.order_reference.as_str())),
+        time_source,
     }
 }
 
@@ -442,55 +454,94 @@ pub fn try_decimal_or_warn(value: f64, field_name: impl std::fmt::Display) -> Op
         .ok()
 }
 
-/// Parse IB timestamp format (YYYYMMDD HH:MM:SS timezone).
+/// Reads IB's text time, as on an execution or a completed order, as an instant.
 ///
-/// IB sends timestamps like "20250418 10:30:00 US/Eastern". This function
-/// parses the timezone and converts to UTC.
+/// IB writes such a time as a wall-clock reading and the zone it is in, such as
+/// `20261027 12:48:41 Asia/Singapore`, where the zone is the gateway host's, or as
+/// `20261027-04:48:41`, which is UTC.
 ///
-/// # Fallback Behavior
-///
-/// - Unknown timezone string: treats as UTC (logs warning)
-/// - DST-ambiguous time (during "fall back" transition): returns `None`, caller
-///   typically falls back to `Utc::now()`. This affects ~1 second per timezone
-///   per year and is unlikely to occur in practice.
-pub fn parse_ib_timestamp(s: &str) -> Option<DateTime<Utc>> {
-    // Use iterator to avoid Vec allocation
-    let mut parts = s.split_whitespace();
-    let date_part = parts.next()?;
-    let time_part = parts.next()?;
-    let tz_part = parts.next();
-
-    // Find the space between date and time by byte offset to avoid format! allocation
-    let datetime_end = date_part.len() + 1 + time_part.len();
-    let datetime_str = &s[..datetime_end.min(s.len())];
-
-    let naive = NaiveDateTime::parse_from_str(datetime_str, "%Y%m%d %H:%M:%S").ok()?;
-
-    // Try to parse timezone, fall back to UTC
-    if let Some(tz_str) = tz_part {
-        // Use cached timezone to avoid re-parsing IANA database on every call
-        let tz_opt = TZ_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            if let Some(tz) = cache.get(tz_str) {
-                return Some(*tz);
-            }
-            if let Ok(tz) = tz_str.parse::<Tz>() {
-                cache.insert(SmolStr::new(tz_str), tz);
-                return Some(tz);
-            }
-            None
-        });
-
-        if let Some(tz) = tz_opt {
-            return tz
-                .from_local_datetime(&naive)
-                .single()
-                .map(|dt| dt.with_timezone(&Utc));
-        }
-        warn!(timezone = %tz_str, "Unknown timezone in IB timestamp, treating as UTC");
+/// - **The zone is a tz database name**, such as `Asia/Singapore`, or one of its aliases, such as
+///   `US/Eastern` or `MET`.
+/// - **A time that names no zone is read in `session_zone`**, the gateway's zone from the
+///   connection handshake (see [`IbkrClient::session_zone`](super::IbkrClient::session_zone)).
+///   Without one, it is `None`.
+/// - **A zone that is not a tz database name is `None`**, with a `warn!`. Read in a guessed zone,
+///   such as UTC, the instant would be off by the zone's offset, possibly by hours.
+/// - **A reading in a repeated hour**, as clocks go back, is the earlier of its two instants. One
+///   in a skipped hour, as clocks go forward, never showed on a clock, and is `None`.
+/// - Anything else that does not read as one of these forms is `None`.
+pub fn parse_ib_timestamp(s: &str, session_zone: Option<Tz>) -> Option<DateTime<Utc>> {
+    let s = s.trim();
+    let (date, rest) = s
+        .split_once(char::is_whitespace)
+        .map_or((s, ""), |(date, rest)| (date, rest.trim_start()));
+    if let Some((date, time)) = date.split_once('-') {
+        return rest
+            .is_empty()
+            .then(|| naive_ib_time(date, time))
+            .flatten()
+            .map(|naive| naive.and_utc());
     }
+    let (time, zone) = rest
+        .split_once(char::is_whitespace)
+        .map_or((rest, None), |(time, zone)| (time, Some(zone.trim())));
+    let naive = naive_ib_time(date, time)?;
+    let zone = match zone {
+        Some(name) => {
+            let zone = resolve_zone(name);
+            if zone.is_none() {
+                warn!(
+                    timezone = name,
+                    time = s,
+                    "Unknown time zone in IB time; not reading it"
+                );
+            }
+            zone?
+        }
+        None => session_zone?,
+    };
+    zone.from_local_datetime(&naive)
+        .earliest()
+        .map(|time| time.with_timezone(&Utc))
+}
 
-    Some(naive.and_utc())
+/// `date` (`YYYYMMDD`) and `time` (`HH:MM:SS`) as a wall-clock reading.
+fn naive_ib_time(date: &str, time: &str) -> Option<NaiveDateTime> {
+    Some(NaiveDateTime::new(
+        NaiveDate::parse_from_str(date, "%Y%m%d").ok()?,
+        NaiveTime::parse_from_str(time, "%H:%M:%S").ok()?,
+    ))
+}
+
+/// The tz database zone `name` names, or `None`.
+fn resolve_zone(name: &str) -> Option<Tz> {
+    if let Some(zone) = TZ_CACHE.with(|cache| cache.borrow().get(name).copied()) {
+        return Some(zone);
+    }
+    let zone = name.parse::<Tz>().ok()?;
+    TZ_CACHE.with(|cache| cache.borrow_mut().insert(SmolStr::new(name), zone));
+    Some(zone)
+}
+
+/// The gateway's zone, as `ibapi` read it from the connection handshake, as a `chrono_tz` zone:
+/// `None` when `ibapi` did not recognise it (it warns at connect), or with a `warn!` when
+/// `chrono_tz` does not know its name.
+pub(super) fn session_zone(client: &ibapi::client::blocking::Client) -> Option<Tz> {
+    client.time_zone().and_then(chrono_zone)
+}
+
+/// `zone`, a zone `ibapi` resolved, as the `chrono_tz` zone of its name, or `None` with a
+/// `warn!` when `chrono_tz` does not know the name.
+fn chrono_zone(zone: &time_tz::Tz) -> Option<Tz> {
+    let name = time_tz::TimeZone::name(zone);
+    name.parse()
+        .inspect_err(|_| {
+            warn!(
+                timezone = name,
+                "IB Gateway's time zone unknown to chrono-tz"
+            )
+        })
+        .ok()
 }
 
 /// How many days of executions a read asks IB for. With no day count, IB lists only the current
@@ -527,29 +578,187 @@ pub(super) fn executions_held_since(
 #[allow(clippy::unwrap_used)] // Test code: panics are the correct failure mode
 mod tests {
     use super::*;
-    use chrono::{Datelike, Timelike};
 
+    fn utc(time: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(time).unwrap().to_utc()
+    }
+
+    /// A time is read in the zone it names, a tz database name or one of its aliases, whatever
+    /// the session's zone.
     #[test]
-    fn test_parse_ib_timestamp_with_timezone() {
-        // US/Eastern is UTC-4 during daylight saving time (April)
-        let ts = parse_ib_timestamp("20250418 10:30:00 US/Eastern");
-        assert!(ts.is_some());
-        let dt = ts.unwrap();
-        assert_eq!(dt.year(), 2025);
-        assert_eq!(dt.month(), 4);
-        assert_eq!(dt.day(), 18);
-        // 10:30 Eastern = 14:30 UTC (EDT is UTC-4)
-        assert_eq!(dt.hour(), 14);
-        assert_eq!(dt.minute(), 30);
+    fn an_ib_time_is_read_in_the_zone_it_names() {
+        let session = Some(chrono_tz::Asia::Tokyo);
+        for (time, expected) in [
+            ("20261027 12:48:41 Asia/Singapore", "2026-10-27T04:48:41Z"),
+            // Daylight saving time: UTC-4 in April, UTC-5 in December.
+            ("20250418 10:30:00 US/Eastern", "2025-04-18T14:30:00Z"),
+            ("20251218 10:30:00 America/New_York", "2025-12-18T15:30:00Z"),
+            ("20260929 14:00:00 UTC", "2026-09-29T14:00:00Z"),
+            ("20260115 09:00:00 MET", "2026-01-15T08:00:00Z"),
+        ] {
+            assert_eq!(
+                parse_ib_timestamp(time, session),
+                Some(utc(expected)),
+                "{time}"
+            );
+        }
+    }
+
+    /// A time that names no zone is read in the session's, and without one is not read: UTC
+    /// would be a guess.
+    #[test]
+    fn an_ib_time_without_a_zone_is_read_in_the_sessions() {
+        let time = "20261027 12:48:41";
+        assert_eq!(
+            parse_ib_timestamp(time, Some(chrono_tz::Asia::Singapore)),
+            Some(utc("2026-10-27T04:48:41Z"))
+        );
+        assert_eq!(
+            parse_ib_timestamp("20261027  12:48:41", Some(chrono_tz::Asia::Singapore)),
+            Some(utc("2026-10-27T04:48:41Z")),
+            "older gateways put two spaces between the date and the time"
+        );
+        assert_eq!(parse_ib_timestamp(time, None), None);
+    }
+
+    /// A zone that is not a tz database name is not read, in UTC or the session's zone.
+    #[test]
+    fn an_ib_time_in_an_unknown_zone_is_not_read() {
+        for time in [
+            "20261027 12:48:41 Some Standard Time",
+            "20261027 12:48:41 Nowhere/Atlantis",
+        ] {
+            assert_eq!(
+                parse_ib_timestamp(time, Some(chrono_tz::UTC)),
+                None,
+                "{time}"
+            );
+        }
+    }
+
+    /// `YYYYMMDD-HH:MM:SS` is UTC, whatever the session's zone.
+    #[test]
+    fn an_ib_time_with_a_hyphen_is_utc() {
+        assert_eq!(
+            parse_ib_timestamp("20261027-04:48:41", Some(chrono_tz::Asia::Singapore)),
+            Some(utc("2026-10-27T04:48:41Z"))
+        );
+        assert_eq!(parse_ib_timestamp("20261027-04:48:41 UTC", None), None);
+    }
+
+    /// A reading in a repeated hour is its earlier instant, and one in a skipped hour is not read.
+    #[test]
+    fn an_ib_time_in_a_daylight_saving_change() {
+        // US clocks went back at 02:00 EDT on 2025-11-02, so 01:30 came twice.
+        assert_eq!(
+            parse_ib_timestamp("20251102 01:30:00 US/Eastern", None),
+            Some(utc("2025-11-02T05:30:00Z"))
+        );
+        // And forward at 02:00 EST on 2025-03-09, so 02:30 never showed.
+        assert_eq!(
+            parse_ib_timestamp("20250309 02:30:00 US/Eastern", None),
+            None
+        );
     }
 
     #[test]
-    fn test_parse_ib_timestamp_no_timezone() {
-        // Without timezone, treat as UTC
-        let ts = parse_ib_timestamp("20250418 10:30:00");
-        assert!(ts.is_some());
-        let dt = ts.unwrap();
-        assert_eq!(dt.hour(), 10);
+    fn an_ib_time_that_is_no_time_is_not_read() {
+        for time in [
+            "",
+            "invalid",
+            "20261027",
+            "20261027 25:00:00 UTC",
+            "20261327 12:00:00 UTC",
+        ] {
+            assert_eq!(
+                parse_ib_timestamp(time, Some(chrono_tz::UTC)),
+                None,
+                "{time:?}"
+            );
+        }
+    }
+
+    /// A fill whose time reads is the venue's; one whose time does not is kept, at this host's
+    /// time, and marked so.
+    #[test]
+    fn a_fill_without_a_time_it_can_read_is_marked_as_this_hosts() {
+        let buffer = ExecutionBuffer::new();
+        let at = utc("2026-10-27T04:48:41Z");
+        for (exec_id, time) in [("read", Some(at)), ("unread", None)] {
+            buffer.add_execution(
+                ExecutionData {
+                    execution: ibapi::orders::Execution {
+                        execution_id: exec_id.to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ResolvedExecution {
+                    instrument: InstrumentNameExchange::new("AAPL"),
+                    order_id: ib_order_id(1),
+                    origin: TradeOrigin::Order,
+                    time,
+                },
+            );
+        }
+
+        let before = Utc::now();
+        let mut trades = buffer.take_without_commission();
+        trades.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(trades[0].id, TradeId::new("read"));
+        assert_eq!(
+            (trades[0].time_exchange, trades[0].time_source),
+            (at, TimeSource::Venue)
+        );
+        assert_eq!(trades[1].time_source, TimeSource::Host);
+        assert!((before..=Utc::now()).contains(&trades[1].time_exchange));
+    }
+
+    /// The zone `ibapi` resolves a gateway's zone name to is the `chrono_tz` zone of that name.
+    #[test]
+    fn a_zone_ibapi_resolved_is_the_chrono_zone_of_its_name() {
+        assert_eq!(
+            chrono_zone(time_tz::timezones::db::asia::SINGAPORE),
+            Some(chrono_tz::Asia::Singapore)
+        );
+        assert_eq!(
+            chrono_zone(time_tz::timezones::db::america::NEW_YORK),
+            Some(chrono_tz::America::New_York)
+        );
+    }
+
+    /// An execution waiting for its commission report longer than `max_age` is cleared, and so is
+    /// one whose time does not read, which no age would ever clear.
+    #[test]
+    fn clear_stale_clears_executions_older_than_the_age_and_those_without_a_time() {
+        let buffer = ExecutionBuffer::new();
+        let now = Utc::now();
+        for (exec_id, time) in [
+            ("old", Some(now - chrono::Duration::hours(2))),
+            ("recent", Some(now - chrono::Duration::minutes(1))),
+            ("unread", None),
+        ] {
+            buffer.add_execution(
+                ExecutionData {
+                    execution: ibapi::orders::Execution {
+                        execution_id: exec_id.to_string(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ResolvedExecution {
+                    instrument: InstrumentNameExchange::new("AAPL"),
+                    order_id: ib_order_id(1),
+                    origin: TradeOrigin::Order,
+                    time,
+                },
+            );
+        }
+
+        assert_eq!(buffer.clear_stale(Duration::from_secs(3_600)), 2);
+        let kept = buffer.take_without_commission();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].id, TradeId::new("recent"));
     }
 
     /// A fill reports the order reference as its client order id: this client places each order
@@ -571,6 +780,7 @@ mod tests {
                     instrument: InstrumentNameExchange::new("AAPL"),
                     order_id: ib_order_id(1),
                     origin: TradeOrigin::Order,
+                    time: None,
                 },
             );
         }
@@ -600,6 +810,7 @@ mod tests {
                     instrument: InstrumentNameExchange::new("AAPL"),
                     order_id: ib_order_id(1),
                     origin: TradeOrigin::Order,
+                    time: None,
                 },
             );
         };
@@ -665,6 +876,7 @@ mod tests {
             origin: TradeOrigin::Order,
             position_side: None,
             client_order_id: None,
+            time_source: TimeSource::Venue,
         }
     }
 
@@ -692,12 +904,6 @@ mod tests {
                 ("plain", Decimal::from(300)),
             ]
         );
-    }
-
-    #[test]
-    fn test_parse_ib_timestamp_invalid() {
-        assert!(parse_ib_timestamp("invalid").is_none());
-        assert!(parse_ib_timestamp("").is_none());
     }
 
     #[test]

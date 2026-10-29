@@ -71,6 +71,8 @@ pub struct Trade<AssetKey, InstrumentKey> {
     pub order_id: OrderId,
     pub instrument: InstrumentKey,
     pub strategy: StrategyId,
+    /// When the fill happened, as the venue stamped it, unless
+    /// [`time_source`](Self::time_source) says this host's clock filled it in.
     pub time_exchange: DateTime<Utc>,
     pub side: Side,
     pub price: Decimal,
@@ -163,6 +165,13 @@ pub struct Trade<AssetKey, InstrumentKey> {
     /// `None`.
     #[serde(default)]
     pub client_order_id: Option<ClientOrderId>,
+    /// Whose clock [`time_exchange`](Self::time_exchange) was read from. See [`TimeSource`] for
+    /// when a producer fills in this host's.
+    ///
+    /// `#[serde(default)]` so trades serialised before this field existed still deserialise, as
+    /// [`TimeSource::Venue`].
+    #[serde(default)]
+    pub time_source: TimeSource,
 }
 
 impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
@@ -195,6 +204,7 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
             origin: TradeOrigin::Order,
             position_side: None,
             client_order_id: None,
+            time_source: TimeSource::Venue,
         }
     }
 
@@ -218,6 +228,15 @@ impl<AssetKey, InstrumentKey> Trade<AssetKey, InstrumentKey> {
     pub fn with_client_order_id(self, client_order_id: ClientOrderId) -> Self {
         Self {
             client_order_id: Some(client_order_id),
+            ..self
+        }
+    }
+
+    /// This trade with its [`time_source`](Self::time_source) set.
+    #[must_use]
+    pub fn with_time_source(self, time_source: TimeSource) -> Self {
+        Self {
+            time_source,
             ..self
         }
     }
@@ -570,6 +589,45 @@ impl Display for TradeOrigin {
     }
 }
 
+/// Whose clock an event's time was read from.
+///
+/// A venue stamps its events with its own clock. When one arrives without a readable stamp, a
+/// producer that keeps the event fills in this host's clock as it converts it, and says so with
+/// [`Host`](Self::Host). The two clocks differ by however far this host's is skewed, so a time from
+/// one does not compare with a time from the other: a host time can read seconds, or more, ahead
+/// of the venue's, and an estimate of the venue's clock taken from it is late by as much.
+///
+/// What each producer does with a fill it has no venue time for, as of writing:
+///
+/// | Source | Without a venue time |
+/// |---|---|
+/// | Binance Spot / Margin `executionReport` | the report's event time (`E`), else [`Host`](Self::Host) |
+/// | Alpaca `trade_updates` | the order's `updated_at`, else [`Host`](Self::Host) |
+/// | Alpaca account-activities REST | [`Host`](Self::Host) |
+/// | Interactive Brokers executions | [`Host`](Self::Host), also when the time's zone is unknown; `fetch_trades`, which selects by time, skips such a fill |
+/// | Hyperliquid `userFills` | the fill is dropped, with a `warn!` |
+/// | [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue) | always [`Venue`](Self::Venue): its clock is the venue's |
+///
+/// Each fallback to this host's clock logs a `warn!`.
+///
+/// # Serialised form and ordering
+///
+/// Serialised as the variant's name (`"Host"`). The names are a stored format: they are not
+/// renamed, and new variants are added after the existing ones. `Ord` follows declaration order.
+/// It exists so [`Trade`] can derive `Ord`, and carries no meaning beyond that.
+#[non_exhaustive]
+#[derive(
+    Debug, Copy, Clone, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize,
+)]
+pub enum TimeSource {
+    /// The venue stamped it.
+    #[default]
+    Venue,
+    /// This host's clock, read when the event was converted, because the venue sent no readable
+    /// time.
+    Host,
+}
+
 /// A venue's notice that a trade it reported earlier was busted or corrected.
 ///
 /// Sent as [`AccountEventKind::TradeAmended`](crate::AccountEventKind::TradeAmended). The
@@ -607,7 +665,8 @@ pub struct TradeAmendment<AssetKey, InstrumentKey> {
     pub instrument: InstrumentKey,
     /// The order whose trade was amended.
     pub order_id: OrderId,
-    /// When the venue amended the trade, or when it was received where the venue does not say.
+    /// When the venue amended the trade, or this host's time when it was received where the venue
+    /// does not say: IBKR does not say when it corrected an execution.
     pub time_exchange: DateTime<Utc>,
     /// The [`TradeId`] of the trade amended, as the venue named it. `None` when the venue's notice
     /// did not name it: match it to a trade of [`order_id`](Self::order_id) yourself, or
@@ -763,6 +822,20 @@ mod tests {
 
         let read: Trade<AssetNameExchange, InstrumentNameExchange> =
             serde_json::from_value(json).unwrap();
+        assert_eq!(read, trade());
+    }
+
+    /// A trade serialised before `time_source` existed still loads, as stamped by the venue, and
+    /// the source is stored by its variant's name.
+    #[test]
+    fn a_trade_without_a_time_source_deserialises_as_the_venues() {
+        let mut json = serde_json::to_value(trade().with_time_source(TimeSource::Host)).unwrap();
+        assert_eq!(json["time_source"], "Host");
+        json.as_object_mut().unwrap().remove("time_source");
+
+        let read: Trade<AssetNameExchange, InstrumentNameExchange> =
+            serde_json::from_value(json).unwrap();
+        assert_eq!(read.time_source, TimeSource::Venue);
         assert_eq!(read, trade());
     }
 

@@ -2616,8 +2616,11 @@ fn convert_account_position(
 ) {
     // `u` (last account update time) rather than `E` (event time), for more accurate balance
     // timestamps.
-    let time_exchange =
-        account_position_time(ExchangeId::BinanceSpot, position.u, position.e_uppercase);
+    let Some(time_exchange) =
+        account_position_time(ExchangeId::BinanceSpot, position.u, position.e_uppercase)
+    else {
+        return;
+    };
 
     for b in position.b_uppercase.unwrap_or_default() {
         let asset = match b.a {
@@ -3785,6 +3788,26 @@ mod tests {
         );
     }
 
+    /// A frame with neither an update time `u` nor an event time `E` is dropped, rather than
+    /// stamped with this host's time; one with either is delivered.
+    #[test]
+    fn an_account_position_without_a_venue_time_is_dropped() {
+        let converted = |u, e_uppercase| {
+            let position = binance_sdk::spot::websocket_api::OutboundAccountPosition {
+                u,
+                e_uppercase,
+                b_uppercase: Some(vec![make_balance_inner("USDT", "100.0", "0.0")]),
+            };
+            let mut buf = Vec::new();
+            convert_account_position(position, &mut buf);
+            buf.len()
+        };
+        assert_eq!(converted(None, None), 0);
+        assert_eq!(converted(Some(i64::MAX), None), 0);
+        assert_eq!(converted(Some(1_700_000_000_000), None), 1);
+        assert_eq!(converted(None, Some(1_700_000_000_000)), 1);
+    }
+
     #[test]
     fn test_convert_account_position_b_field_none() {
         let position = binance_sdk::spot::websocket_api::OutboundAccountPosition {
@@ -3963,6 +3986,47 @@ mod tests {
             }
             other => panic!("TRADE should yield Trade, got {other:?}"),
         }
+    }
+
+    /// A fill is at its transaction time `T`, else at its report's event time `E`, both the
+    /// venue's; with neither it is at this host's time, and says so.
+    #[test]
+    fn a_fills_time_is_its_transaction_time_then_its_event_time_then_this_hosts() {
+        let trade = |transaction_time, event_time| {
+            let report = ExecutionReport {
+                execution_type: Some("TRADE".to_string()),
+                side: Some("BUY".to_string()),
+                trade_id: Some(9999),
+                last_executed_price: Some("50000.00".to_string()),
+                last_executed_quantity: Some("0.01".to_string()),
+                transaction_time,
+                event_time,
+                ..make_base_report()
+            };
+            match sole_event(convert(report)).map(|event| event.kind) {
+                Some(AccountEventKind::Trade(trade)) => trade,
+                other => panic!("TRADE should yield Trade, got {other:?}"),
+            }
+        };
+        let at = |ms| Utc.timestamp_millis_opt(ms).unwrap();
+
+        let fill = trade(Some(1_700_000_000_000), Some(1_700_000_000_005));
+        assert_eq!(
+            (fill.time_exchange, fill.time_source),
+            (at(1_700_000_000_000), crate::trade::TimeSource::Venue)
+        );
+        for transaction_time in [None, Some(i64::MAX)] {
+            let fill = trade(transaction_time, Some(1_700_000_000_005));
+            assert_eq!(
+                (fill.time_exchange, fill.time_source),
+                (at(1_700_000_000_005), crate::trade::TimeSource::Venue),
+                "{transaction_time:?}"
+            );
+        }
+        let before = Utc::now();
+        let fill = trade(None, None);
+        assert_eq!(fill.time_source, crate::trade::TimeSource::Host);
+        assert!((before..=Utc::now()).contains(&fill.time_exchange));
     }
 
     /// The `(Trade, OrderSnapshot)` pair a fill report must produce, in that order.

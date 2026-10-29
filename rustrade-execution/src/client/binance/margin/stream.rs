@@ -466,8 +466,11 @@ pub(super) fn convert_margin_account_position(
     position: OutboundAccountPosition,
     buf: &mut Vec<UnindexedAccountEvent>,
 ) {
-    let time_exchange =
-        account_position_time(ExchangeId::BinanceMargin, position.u, position.e_uppercase);
+    let Some(time_exchange) =
+        account_position_time(ExchangeId::BinanceMargin, position.u, position.e_uppercase)
+    else {
+        return;
+    };
 
     for b in position.b_uppercase.unwrap_or_default() {
         let asset = match b.a {
@@ -518,8 +521,11 @@ fn route_isolated_account_position(
     quote_asset: &AssetNameExchange,
     buf: &mut Vec<UnindexedAccountEvent>,
 ) {
-    let time_exchange =
-        account_position_time(ExchangeId::BinanceMargin, position.u, position.e_uppercase);
+    let Some(time_exchange) =
+        account_position_time(ExchangeId::BinanceMargin, position.u, position.e_uppercase)
+    else {
+        return;
+    };
 
     for b in position.b_uppercase.unwrap_or_default() {
         let Some(asset) = b.a.as_deref() else {

@@ -623,12 +623,12 @@ pub(crate) fn order_shape_from_ib(order: &Order) -> Result<OrderShape, String> {
 }
 
 /// Parse IB's good-till-date field: the form [`format_gtd_datetime`] sends, in UTC, or IB's
-/// `yyyyMMdd HH:mm:ss` with an optional zone.
+/// `yyyyMMdd HH:mm:ss` with a zone, or without one, read as UTC.
 fn parse_gtd_datetime(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::NaiveDateTime::parse_from_str(value, GTD_FORMAT)
         .map(|naive| naive.and_utc())
         .ok()
-        .or_else(|| super::execution::parse_ib_timestamp(value))
+        .or_else(|| super::execution::parse_ib_timestamp(value, Some(chrono_tz::UTC)))
 }
 
 /// Error when mapping rustrade order types to IB.
