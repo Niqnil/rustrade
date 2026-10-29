@@ -89,12 +89,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Now each balance is stamped with this host's time taken before the request that read it was
   sent. On Binance that is the retry, for a request retried after a rate limit. On Binance spot
   and margin, cross and isolated, the stamp is also 5 s earlier, to cover the REST view trailing
-  the stream. Alpaca,
-  IBKR and Hyperliquid stream no balances, so they subtract nothing. The rule is stated on
-  `ExecutionClient::fetch_balances` and `AssetBalance::time_exchange`. Erring early costs little:
-  a stream event from between the stamp and the read that arrives after the snapshot applies
-  over it. A host clock ahead of the venue's still carries into the stamp, and keeping the two
-  within bounds is the caller's obligation.
+  the stream. Alpaca, IBKR and Hyperliquid stream no balances, so they subtract nothing. The rule
+  is stated on `ExecutionClient::fetch_balances` and `AssetBalance::time_exchange`. Erring early
+  costs little: a stream event from between the stamp and the read that arrives after the
+  snapshot applies over it. A host clock ahead of the venue's still carries into the stamp, and
+  keeping the two within bounds is the caller's obligation.
 
 ## [0.17.0] - 2026-10-28
 
