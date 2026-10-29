@@ -73,8 +73,12 @@ impl ValueRule {
     /// It does not clamp to [`min`](Self::min) or [`max`](Self::max): rounding down can take a
     /// value below the minimum, down to zero, so check the result before sending it.
     ///
+    /// The result keeps the scale of `value` or `step`, whichever is finer, so it may carry
+    /// trailing zeros: `0.19000` rounds down to `0.15000` on a step of `0.05`.
+    ///
     /// Returns `None` only when a [`Decimal`] cannot hold the result: within a step of the ends
     /// of its range, or where the result needs more digits than it has.
+    #[must_use]
     pub fn round_down(&self, value: Decimal) -> Option<Decimal> {
         round_down_to(value, self.grid())
     }
@@ -83,6 +87,7 @@ impl ValueRule {
     /// [`round_down`](Self::round_down) otherwise: rounding up can take a value above the maximum.
     ///
     /// Returns `None` only when a [`Decimal`] cannot hold the result, as for `round_down`.
+    #[must_use]
     pub fn round_up(&self, value: Decimal) -> Option<Decimal> {
         round_up_to(value, self.grid())
     }
@@ -91,17 +96,6 @@ impl ValueRule {
     /// no grid: `%` would panic on zero.
     fn grid(&self) -> Option<Decimal> {
         self.step.filter(|step| *step > Decimal::ZERO)
-    }
-
-    /// This rule's range alone, without its step, each bound divided by `divisor`: the range in
-    /// a unit `divisor` times larger.
-    fn range_in_units_of(&self, divisor: Decimal) -> Self {
-        let scale = |bound: Option<Decimal>| bound.and_then(|bound| bound.checked_div(divisor));
-        Self {
-            min: scale(self.min),
-            max: scale(self.max),
-            step: None,
-        }
     }
 
     /// `Ok` when `value` is on the grid and in the range, else the first rule it breaks, grid
@@ -226,7 +220,7 @@ pub struct OrderRules {
     /// [`check`](Self::check) never applies it: a market order has no price of its own, and the
     /// venue measures its notional at a price of its own choosing, such as a reference price or
     /// an average of recent trades, that the check cannot know. A caller that holds a price it
-    /// trusts can check a market order's notional against it.
+    /// trusts can compare that price times the quantity with this rule's `min` and `max`.
     #[serde(default)]
     pub market_notional: ValueRule,
     /// The range of a trailing order's offset, in basis points, when its trigger trails above the
@@ -261,6 +255,7 @@ impl OrderRules {
     }
 
     /// These rules with [`market_notional`](Self::market_notional) as given.
+    #[must_use]
     pub fn with_market_notional(self, market_notional: ValueRule) -> Self {
         Self {
             market_notional,
@@ -270,6 +265,7 @@ impl OrderRules {
 
     /// These rules with [`trailing_offset_above`](Self::trailing_offset_above) and
     /// [`trailing_offset_below`](Self::trailing_offset_below) as given.
+    #[must_use]
     pub fn with_trailing_offsets(self, above: ValueRule, below: ValueRule) -> Self {
         Self {
             trailing_offset_above: above,
@@ -297,12 +293,14 @@ impl OrderRules {
     ///
     /// Returns `None` when a [`Decimal`] cannot hold the result, as for
     /// [`ValueRule::round_down`], or cannot hold the step of the grid the two steps share.
+    #[must_use]
     pub fn round_quantity_down(&self, kind: OrderKind, quantity: Decimal) -> Option<Decimal> {
         round_down_to(quantity, self.quantity_grid(kind)?)
     }
 
     /// The smallest quantity at or above `quantity` that an order of `kind` may have on the grid.
     /// As [`round_quantity_down`](Self::round_quantity_down) otherwise.
+    #[must_use]
     pub fn round_quantity_up(&self, kind: OrderKind, quantity: Decimal) -> Option<Decimal> {
         round_up_to(quantity, self.quantity_grid(kind)?)
     }
@@ -441,9 +439,19 @@ impl OrderRules {
             Side::Buy => &self.trailing_offset_above,
             Side::Sell => &self.trailing_offset_below,
         };
+        // A percent is 100 basis points. Dividing by 100 cannot overflow.
+        let percent = |bound: Option<Decimal>| bound.map(|bound| bound / Decimal::ONE_HUNDRED);
+        // The range alone: the step is not used.
         let range = match offset_type {
-            TrailingOffsetType::BasisPoints => basis_points.range_in_units_of(Decimal::ONE),
-            TrailingOffsetType::Percentage => basis_points.range_in_units_of(Decimal::ONE_HUNDRED),
+            TrailingOffsetType::BasisPoints => ValueRule {
+                step: None,
+                ..*basis_points
+            },
+            TrailingOffsetType::Percentage => ValueRule {
+                min: percent(basis_points.min),
+                max: percent(basis_points.max),
+                step: None,
+            },
             TrailingOffsetType::Absolute => return Ok(()),
         };
         range.check(OrderField::TrailingOffset, offset)
@@ -906,6 +914,12 @@ mod tests {
         assert_eq!(rule.round_up(dec!(1.07)), Some(dec!(1.10)));
         assert_eq!(rule.round_down(dec!(0.04)), Some(dec!(0)));
         assert_eq!(rule.round_up(dec!(0.01)), Some(dec!(0.05)));
+        // The input's finer scale is kept.
+        assert_eq!(
+            rule.round_down(dec!(0.19000))
+                .map(|value| value.to_string()),
+            Some("0.15000".to_owned())
+        );
     }
 
     #[test]

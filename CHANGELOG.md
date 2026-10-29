@@ -16,8 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an offset outside its side's range with `OrderError::OutOfBounds` on
   `OrderField::TrailingOffset`, naming the limit in the offset's own unit (percent for a
   `Percentage` offset); an `Absolute` offset is not checked. The Binance clients read them from
-  `TRAILING_DELTA`. `OrderRules` gains public fields, so code that builds one with a struct
-  literal must add them; `OrderRules::new` keeps its four arguments and leaves the new parts off.
+  `TRAILING_DELTA`. `OrderRules::new` keeps its four arguments and leaves the new parts off.
 
 - **Breaking: IBKR times are read in the zone they name, or the gateway's, and never in a
   guessed one** (`rustrade-execution`, #775). `parse_ib_timestamp` takes the gateway's session
