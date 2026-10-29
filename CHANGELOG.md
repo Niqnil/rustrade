@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`EngineClock::instant` and `EngineInstant`** (`rustrade`, #771). A clock's monotonic reading,
+  for measuring durations, beside `time()`, which stamps. The method has a default that reads
+  `time()`, so existing implementations keep compiling. A custom clock that follows the host's
+  wall clock should override it with a monotonic source. `EngineInstant` adds a `Duration`
+  (`saturating_add`), measures the time since an earlier reading (`saturating_duration_since`),
+  and orders. Readings of different clocks do not compare.
+
 - **`VenueClock`** (`rustrade-execution`, `client::venue_clock`). It estimates the earliest a
   venue's clock can read at a given moment, from the times the venue stamped on its events. Each
   event's stamp is paired with the tokio `Instant` it arrived at, and the estimate counts on from
@@ -51,6 +58,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and quote after it reconnects. The engine does not store it, as with `InstrumentBalanceUpdate`.
 
 ### Fixed
+
+- **In-flight deadlines run on a monotonic clock, not the host's wall clock** (`rustrade`, #771).
+  The engine measured an order's in-flight deadline from its `time_sent`, on `LiveClock`'s wall
+  time. A step of the host's clock back delayed every `InFlightOverdue` by the size of the step,
+  and one larger than a deadline lost the flag for orders sent after it. A jump forward of at
+  least a deadline flagged every order in flight at once. Now:
+  - The deadlines run on the new `EngineClock::instant` (see Added). `LiveClock` reads
+    `std::time::Instant`, and `TokioClock` reads tokio's clock, so paused time still controls
+    deadlines in a test. `HistoricalClock` and the default implementation read the clock's
+    `time()`, so a backtest's deadlines stay in simulated time and an existing `EngineClock`
+    implementation behaves as before.
+  - `time_sent` stays the wall-clock stamp. `InFlightOverdue::elapsed` is now measured on the
+    monotonic reading.
+  - An order the engine started from already in flight is measured from its wall-clock age when
+    first checked, as before, and on the monotonic reading after that.
+  - `LiveClock`'s rustdoc states that its time follows the host's wall clock and can step back
+    or jump forward.
 
 - **Missed-fill recovery reads its span on the venue's clock, not this host's** (`rustrade`,
   #770). When the `ExecutionManager` reopened an account stream, the read of the fills it missed

@@ -177,8 +177,9 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
     ///
     /// Mock exchanges get no deadline by default (see
     /// [`ExecutionBuilder::add_mock`]). Set one here to check a mock run on a live clock, as in
-    /// paper trading. The deadline is measured on the engine's clock, so on a simulated clock it
-    /// is in simulated time.
+    /// paper trading. The deadline is measured on the engine clock's
+    /// [`instant`](crate::engine::clock::EngineClock::instant), so on a simulated clock it is in
+    /// simulated time.
     ///
     /// # Errors
     /// [`build`](Self::build) returns [`BarterError::InFlightDeadline`] if `exchange` has no

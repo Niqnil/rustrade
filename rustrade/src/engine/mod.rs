@@ -319,6 +319,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     {
         let clock = &self.clock;
         self.in_flight.check(
+            || clock.instant(),
             || clock.time(),
             self.state.instruments.instruments(&InstrumentFilter::None),
         )
