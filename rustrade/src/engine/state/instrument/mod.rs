@@ -4393,33 +4393,12 @@ mod tests {
     /// Whether a flow left out of carry is a WARN or a DEBUG is the observable contract, so the
     /// returned [`CarryUpdate`] alone cannot tell them apart.
     fn count_warnings<T>(f: impl FnOnce() -> T) -> (T, usize) {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        };
-        use tracing_subscriber::layer::SubscriberExt;
-
-        #[derive(Default)]
-        struct CountWarnings(Arc<AtomicUsize>);
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountWarnings {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                if *event.metadata().level() == tracing::Level::WARN {
-                    self.0.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-
-        let layer = CountWarnings::default();
-        let count = Arc::clone(&layer.0);
-        // Thread-local, so other tests running in parallel are not counted.
-        let value =
-            tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), f);
-        (value, count.load(Ordering::Relaxed))
+        let (value, events) = rustrade_instrument::test_utils::logs::capture(f);
+        let warnings = events
+            .iter()
+            .filter(|event| event.level == tracing::Level::WARN)
+            .count();
+        (value, warnings)
     }
 
     /// `seconds` after [`TIME`], the session start and the harness fills' time.

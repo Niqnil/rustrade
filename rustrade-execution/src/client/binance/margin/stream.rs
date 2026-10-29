@@ -1411,7 +1411,7 @@ mod tests {
     /// at any level. These arms report only through logs, so asserting on the return value alone
     /// could not tell which arm handled a frame.
     fn log_messages<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
-        logged(f, |field| field.name() == "message")
+        logged(f, |name| name == "message")
     }
 
     /// Run `f`, returning its value and every field of every log event it emitted on this thread,
@@ -1420,58 +1420,17 @@ mod tests {
         logged(f, |_| true)
     }
 
-    fn logged<T>(
-        f: impl FnOnce() -> T,
-        keep: fn(&tracing::field::Field) -> bool,
-    ) -> (T, Vec<String>) {
-        use tracing_subscriber::layer::SubscriberExt;
-
-        struct Capture {
-            lines: Arc<Mutex<Vec<String>>>,
-            keep: fn(&tracing::field::Field) -> bool,
-        }
-
-        struct Visit<'a> {
-            lines: &'a mut Vec<String>,
-            keep: fn(&tracing::field::Field) -> bool,
-        }
-
-        impl tracing::field::Visit for Visit<'_> {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                if (self.keep)(field) {
-                    self.lines.push(if field.name() == "message" {
-                        format!("{value:?}")
-                    } else {
-                        format!("{}={value:?}", field.name())
-                    });
-                }
-            }
-        }
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                let mut lines = Vec::new();
-                event.record(&mut Visit {
-                    lines: &mut lines,
-                    keep: self.keep,
-                });
-                self.lines.lock().unwrap().extend(lines);
-            }
-        }
-
-        let lines = Arc::new(Mutex::new(Vec::new()));
-        let layer = Capture {
-            lines: Arc::clone(&lines),
-            keep,
-        };
-        // Thread-local, so other tests running in parallel are not captured.
-        let value =
-            tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), f);
-        let lines = lines.lock().unwrap().clone();
+    fn logged<T>(f: impl FnOnce() -> T, keep: fn(&str) -> bool) -> (T, Vec<String>) {
+        let (value, events) = rustrade_instrument::test_utils::logs::capture(f);
+        let lines = events
+            .iter()
+            .flat_map(|event| &event.fields)
+            .filter(|(name, _)| keep(name))
+            .map(|(name, value)| match *name {
+                "message" => value.clone(),
+                _ => format!("{name}={value}"),
+            })
+            .collect();
         (value, lines)
     }
 

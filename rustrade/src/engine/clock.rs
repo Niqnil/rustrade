@@ -662,27 +662,8 @@ mod tests {
 
     /// Runs `f` and returns the level of each `tracing` event it emitted on this thread.
     fn levels_logged(f: impl FnOnce()) -> Vec<tracing::Level> {
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::layer::SubscriberExt;
-
-        #[derive(Default)]
-        struct Levels(Arc<Mutex<Vec<tracing::Level>>>);
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Levels {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                self.0.lock().unwrap().push(*event.metadata().level());
-            }
-        }
-
-        let layer = Levels::default();
-        let levels = Arc::clone(&layer.0);
-        // Thread-local, so other tests running in parallel are not recorded.
-        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), f);
-        levels.lock().unwrap().clone()
+        let ((), events) = rustrade_instrument::test_utils::logs::capture(f);
+        events.iter().map(|event| event.level).collect()
     }
 
     /// `Debug` shows the instant held, as the clock's only state.
