@@ -204,7 +204,7 @@ pub(crate) fn dedup_key_from_event(event: &UnindexedAccountEvent) -> Option<Dedu
         // CashFlow has none here: a venue may give a flow no id, and what identifies one then is
         // the producer's to say, so each producer keys its own (Hyperliquid's funding on coin and
         // time).
-        _ => None, // BalanceSnapshot, BalanceStreamUpdate, InstrumentBalanceUpdate, Snapshot, StreamTerminated, FillRecoveryGaveUp, TradeAmended, ReinitFailed, CashFlow — no dedup needed
+        _ => None, // BalanceSnapshot, BalanceStreamUpdate, InstrumentBalanceUpdate, InstrumentBalanceSnapshot, Snapshot, StreamTerminated, FillRecoveryGaveUp, TradeAmended, ReinitFailed, CashFlow — no dedup needed
     }
 }
 

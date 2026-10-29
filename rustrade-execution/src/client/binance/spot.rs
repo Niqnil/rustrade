@@ -37,8 +37,7 @@
 //   quantity is settled instead by the terminal report's own z, or by fetch_open_orders.
 
 use super::restatement::{
-    BalanceRestatement, RESTATEMENT_TIMEOUT, ReadStart, SharedStreamClock, StreamClock,
-    restatement_time,
+    BalanceRestatement, SharedStreamClock, StreamClock, restate, restatement_time,
 };
 use super::rules::RulesLoader;
 use super::shared::{
@@ -960,7 +959,8 @@ impl ExecutionClient for BinanceSpot {
     ///
     /// The stream reconnects by itself, and ends once 10 reconnects in a row have failed or a
     /// rate-limit cooldown outlasts what it waits through. See the
-    /// [module docs](super#account-stream-reconnection).
+    /// [module docs](super#account-stream-reconnection). After each reconnect it restates the
+    /// account's balances: see [there](super#balance-restatement-after-a-reconnect).
     ///
     /// # Startup Race Window
     ///
@@ -1809,7 +1809,7 @@ async fn connection_manager(
     // The balances a reconnect has yet to restate, read once its fills have been recovered.
     let mut restatement = BalanceRestatement::default();
     // The venue's clock and the latest balance time, from the events the stream delivers.
-    let clock = StreamClock::shared();
+    let clock = SharedStreamClock::default();
     let mut current_ws = initial_ws;
 
     loop {
@@ -1905,9 +1905,7 @@ async fn connection_manager(
                             known.observe(&ev);
                             known
                         });
-                        clock_callback
-                            .lock()
-                            .observe(&ev, tokio::time::Instant::now());
+                        StreamClock::observe(&clock_callback, &ev, tokio::time::Instant::now());
                         if sender.send(ev).is_err() {
                             drop(known);
                             warn!("BinanceSpot account_stream receiver dropped, suppressing further sends");
@@ -1998,14 +1996,9 @@ async fn connection_manager(
             let retry_gaps = async {
                 loop {
                     // First, the restatement a reconnect has just opened, due at once.
-                    restate_spot_balances(
-                        &rest,
-                        &rate_limiter,
-                        &assets,
-                        &clock,
-                        &mut restatement,
-                        &tx,
-                    )
+                    restate("BinanceSpot", &clock, &mut restatement, &tx, |floor| {
+                        read_spot_restatement(&rest, &rate_limiter, &assets, &clock, floor)
+                    })
                     .await;
                     let next_check = unchecked.next_due(&unrecovered);
                     match unrecovered
@@ -2126,81 +2119,40 @@ async fn connection_manager(
     }
 }
 
-/// Restate the stream's balances if a reconnect owes it and it is due: read them over REST and
-/// send each of `assets` (all of them when empty) as a
-/// [`BalanceSnapshot`](AccountEventKind::BalanceSnapshot).
-///
-/// The read starts no sooner than [`StreamClock::read_start`] allows, and its balances are stamped
-/// by [`restatement_time`]. One that fails or does not finish within [`RESTATEMENT_TIMEOUT`] is
-/// logged and retried after a backoff ([`BalanceRestatement::failed`]).
-async fn restate_spot_balances(
+/// Read the spot account's balances to restate after a reconnect, as a
+/// [`BalanceSnapshot`](AccountEventKind::BalanceSnapshot) for each of `assets` (all of them when
+/// empty), stamped by [`restatement_time`] for a read started with `floor` (see [`restate`]).
+async fn read_spot_restatement(
     rest: &Arc<RestApi>,
     rate_limiter: &Arc<RateLimitTracker>,
     assets: &[AssetNameExchange],
     clock: &SharedStreamClock,
-    restatement: &mut BalanceRestatement,
-    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
-) {
-    let now = tokio::time::Instant::now();
-    if !restatement.is_due(now) {
-        return;
-    }
-    let floor = match clock.lock().read_start(now) {
-        ReadStart::Now { floor } => floor,
-        ReadStart::At(start) => {
-            restatement.defer(start);
-            return;
-        }
-    };
-    let read = async {
-        let sent_at = tokio::time::Instant::now();
-        let (response, sent) =
-            rest_read_with_retry(rest, rate_limiter, RequestKind::Query, |rest| {
-                Box::pin(async move {
-                    let params = GetAccountParams::builder().build()?;
-                    rest.get_account(params).await
-                })
-            })
-            .await
-            .map_err(|e| classify_rest_query_error(&e, None))?;
-        let account = response.data().await.map_err(response_decode_error)?;
-        let time = restatement_time(&clock.lock(), sent, sent_at, floor);
-        Ok::<_, UnindexedClientError>(filter_and_convert_balances(
-            account.balances.unwrap_or_default(),
-            assets,
-            time,
-        ))
-    };
-    match tokio::time::timeout(RESTATEMENT_TIMEOUT, read).await {
-        Ok(Ok(balances)) => {
-            let count = balances.len();
-            for balance in balances {
-                let event = UnindexedAccountEvent::new(
+    floor: Option<DateTime<Utc>>,
+) -> Result<Vec<UnindexedAccountEvent>, UnindexedClientError> {
+    let sent_at = tokio::time::Instant::now();
+    let (response, sent) = rest_read_with_retry(rest, rate_limiter, RequestKind::Query, |rest| {
+        Box::pin(async move {
+            let params = GetAccountParams::builder().build()?;
+            rest.get_account(params).await
+        })
+    })
+    .await
+    .map_err(|e| classify_rest_query_error(&e, None))?;
+    let account = response.data().await.map_err(response_decode_error)?;
+    let time = restatement_time(&clock.lock(), sent, sent_at, floor);
+    Ok(
+        filter_and_convert_balances(account.balances.unwrap_or_default(), assets, time)
+            .into_iter()
+            .map(|balance| {
+                UnindexedAccountEvent::new(
                     ExchangeId::BinanceSpot,
                     AccountEventKind::BalanceSnapshot(
                         rustrade_integration::collection::snapshot::Snapshot(balance),
                     ),
-                );
-                if tx.send(event).is_err() {
-                    return;
-                }
-            }
-            restatement.restated();
-            info!(count, "BinanceSpot balances restated after a reconnect");
-        }
-        failure => {
-            let error = match failure {
-                Ok(Err(e)) => e.to_string(),
-                _ => format!("no answer within {}s", RESTATEMENT_TIMEOUT.as_secs()),
-            };
-            let retry_in = restatement.failed().unwrap_or_default();
-            warn!(
-                %error,
-                retry_in_secs = retry_in.as_secs(),
-                "BinanceSpot balance restatement after a reconnect failed, will retry"
-            );
-        }
-    }
+                )
+            })
+            .collect(),
+    )
 }
 
 /// Recover the fills of every gap in `unrecovered` that is due: the fills missed while the stream
@@ -5396,10 +5348,10 @@ mod tests {
         }
     }
 
-    /// A spot client whose WS-API order session connects to `ws_url`. Its pre-send rules are off,
-    /// so an open reads no `exchangeInfo` from the production REST API.
-    /// A client whose WebSocket API is `ws_url`, and whose REST calls go nowhere: a stream's
-    /// reconnect reads the account over REST, which must not reach Binance from a test.
+    /// A spot client whose WS-API order session and account stream connect to `ws_url`, and which
+    /// reaches no Binance REST API: its pre-send rules are off, so an open reads no
+    /// `exchangeInfo`, and its REST calls go to a closed local port, so a stream's reconnect reads
+    /// its fills and balances from nowhere unless a test points `rest` at a mock.
     fn client_with_ws_api(ws_url: String) -> BinanceSpot {
         let mut client = <BinanceSpot as ExecutionClient>::new(
             BinanceSpotConfig::new("key".into(), "secret".into())
@@ -6008,10 +5960,10 @@ mod tests {
         assert_eq!(restated.balance, Balance::new(Decimal::ONE, Decimal::ONE));
     }
 
-    /// A balance event the stream delivered sets the floor of the restatement after the next
-    /// reconnect. Here the venue's clock reads 60 s ahead of this host's: the read waits until the
-    /// venue's clock is the REST lag past that event, and is stamped at its time, not this host's
-    /// time less the lag, which the engine would judge older than the event and drop.
+    /// The latest balance event the stream delivered sets the floor of the restatement after the
+    /// next reconnect. Here the venue's clock reads 60 s ahead of this host's: the read waits until
+    /// the venue's clock is the REST lag past that event, and is stamped at its time, not this
+    /// host's time less the lag, which the engine would judge older than the event and drop.
     #[tokio::test]
     async fn a_restatement_is_stamped_no_earlier_than_the_last_balance_delivered() {
         use crate::client::binance::shared::REST_BALANCE_LAG;
@@ -6070,8 +6022,11 @@ mod tests {
         .expect("the balances are restated after the reconnect");
 
         assert_eq!(restated.0, pushed.0);
+        // This test receives the balance event a little after the stream does, which is when the
+        // wait starts; without the wait, the read would follow the reconnect at once.
+        let allowance = Duration::from_millis(250);
         assert!(
-            restated.1 >= pushed.1 + REST_BALANCE_LAG.to_std().unwrap(),
+            restated.1 + allowance >= pushed.1 + REST_BALANCE_LAG.to_std().unwrap(),
             "restated {:?} after the balance event, before the REST lag",
             restated.1 - pushed.1
         );
@@ -7371,14 +7326,18 @@ mod tests {
         within(snapshot.balances[0].time_exchange, retried, after);
     }
 
-    /// A restatement owed after a reconnect reads the account and sends each requested balance as
-    /// a balance snapshot, stamped the REST lag before the read was sent, and settles it; with
-    /// none owed, nothing is read.
+    /// A restatement read gets the account and returns each requested balance as a balance
+    /// snapshot, stamped the REST lag before the read was sent; a read the venue fails is an error.
     #[tokio::test]
-    async fn a_restatement_sends_the_requested_balances_as_snapshots() {
-        use super::super::restatement::{BalanceRestatement, StreamClock};
+    async fn a_restatement_read_returns_the_requested_balances_as_snapshots() {
         use crate::client::binance::shared::REST_BALANCE_LAG;
         let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/account"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api/v3/account"))
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
@@ -7393,20 +7352,18 @@ mod tests {
             rest_at(&server),
             Arc::new(RateLimitTracker::new(WeightPool::Spot)),
         );
-        let clock = StreamClock::shared();
-        let mut restatement = BalanceRestatement::default();
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let clock = SharedStreamClock::default();
         let btc = [AssetNameExchange::new("BTC")];
 
-        restate_spot_balances(&rest, &limiter, &btc, &clock, &mut restatement, &tx).await;
-        assert!(server.received_requests().await.unwrap().is_empty());
+        let failed = read_spot_restatement(&rest, &limiter, &btc, &clock, None).await;
+        assert!(failed.is_err(), "{failed:?}");
 
-        restatement.open();
         let before = Utc::now();
-        restate_spot_balances(&rest, &limiter, &btc, &clock, &mut restatement, &tx).await;
+        let sent = read_spot_restatement(&rest, &limiter, &btc, &clock, None)
+            .await
+            .unwrap();
         let after = Utc::now();
 
-        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         let [event] = sent.as_slice() else {
             panic!("one balance: {sent:?}");
         };
@@ -7424,7 +7381,6 @@ mod tests {
             before <= read && read <= after,
             "{read} not within {before} ..= {after}"
         );
-        assert_eq!(restatement.next_due(), None);
     }
 
     #[tokio::test]

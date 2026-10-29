@@ -11,10 +11,12 @@
 //! its margin level as `marginLevelChange`.
 
 use super::{
-    open_reconnect_recovery, recover_margin_ended_orders, recover_margin_fills,
-    restate_margin_balances,
+    open_reconnect_recovery, read_margin_restatement, recover_margin_ended_orders,
+    recover_margin_fills,
 };
-use crate::client::binance::restatement::{BalanceRestatement, SharedStreamClock};
+use crate::client::binance::restatement::{
+    BalanceRestatement, SharedStreamClock, StreamClock, restate,
+};
 use crate::client::binance::shared::{
     CONNECT_TIMEOUT_SECS, ExecutionReport, HEARTBEAT_TIMEOUT_SECS, RateLimitTracker, RequestKind,
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
@@ -1126,16 +1128,22 @@ impl<K: ListenKeys> MarginStream<K> {
                     is_isolated,
                 )
                 .await;
-                restate_margin_balances(
-                    &self.rest,
-                    &self.rate_limiter,
-                    is_isolated,
-                    &self.instruments,
-                    &self.assets,
-                    &self.clock,
-                    restatement,
-                    &self.tx,
-                )
+                let account = if is_isolated {
+                    "BinanceMargin isolated"
+                } else {
+                    "BinanceMargin cross"
+                };
+                restate(account, &self.clock, restatement, &self.tx, |floor| {
+                    read_margin_restatement(
+                        &self.rest,
+                        &self.rate_limiter,
+                        is_isolated,
+                        &self.instruments,
+                        &self.assets,
+                        &self.clock,
+                        floor,
+                    )
+                })
                 .await;
                 let next_check = unchecked.next_due(unrecovered);
                 match unrecovered
@@ -1302,7 +1310,7 @@ impl<K: ListenKeys> MarginStream<K> {
                 held.observe(&event);
                 held
             });
-            self.clock.lock().observe(&event, Instant::now());
+            StreamClock::observe(&self.clock, &event, Instant::now());
             let sent = self.tx.send(event);
             drop(held);
             if let Some(note) = note {
@@ -2861,7 +2869,7 @@ mod tests {
             account,
             instruments: Vec::new(),
             assets: Vec::new(),
-            clock: crate::client::binance::restatement::StreamClock::shared(),
+            clock: SharedStreamClock::default(),
             tx,
             dedup: new_dedup_cache(),
         };

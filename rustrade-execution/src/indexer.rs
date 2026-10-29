@@ -1130,6 +1130,57 @@ mod tests {
         ));
     }
 
+    /// An isolated pair's balance snapshot indexes both its instrument and its asset; either one
+    /// unknown rejects it, an unknown asset included, since the balance is the pair's.
+    #[test]
+    fn an_instrument_balance_snapshot_indexes_its_instrument_and_asset() {
+        let indexer = binance_indexer();
+        let snapshot = |instrument: &str, asset: &str| {
+            UnindexedAccountEvent::new(
+                ExchangeId::BinanceSpot,
+                AccountEventKind::InstrumentBalanceSnapshot(InstrumentBalanceSnapshot::new(
+                    InstrumentNameExchange::new(instrument),
+                    AssetBalance::new(
+                        AssetNameExchange::new(asset),
+                        crate::balance::Balance::new(Decimal::ONE, Decimal::ONE),
+                        DateTime::<Utc>::MIN_UTC,
+                    ),
+                )),
+            )
+        };
+
+        let indexed = indexer
+            .index_account_event(snapshot("BTC_USDT", "usdt"))
+            .unwrap();
+        let AccountEventKind::InstrumentBalanceSnapshot(indexed) = indexed.kind else {
+            panic!("{indexed:?}");
+        };
+        let map = &indexer.map;
+        assert_eq!(
+            indexed.instrument,
+            map.find_instrument_index(&InstrumentNameExchange::new("BTC_USDT"))
+                .unwrap()
+        );
+        assert_eq!(
+            indexed.balance.asset,
+            map.find_asset_index(&AssetNameExchange::new("usdt"))
+                .unwrap()
+        );
+        assert_eq!(
+            indexed.balance.balance,
+            crate::balance::Balance::new(Decimal::ONE, Decimal::ONE)
+        );
+
+        assert!(matches!(
+            indexer.index_account_event(snapshot("ETH_USDT", "usdt")),
+            Err(AccountIndexError::Rejected(IndexError::InstrumentIndex(_)))
+        ));
+        assert!(matches!(
+            indexer.index_account_event(snapshot("BTC_USDT", "bnb")),
+            Err(AccountIndexError::Rejected(IndexError::AssetIndex(_)))
+        ));
+    }
+
     /// `StreamTerminated` carries no asset/instrument keys, so it must index by mapping only the
     /// exchange and passing the reason through verbatim.
     #[test]

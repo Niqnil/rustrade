@@ -828,6 +828,33 @@ mod tests {
         assert_eq!(event.time_exchange(), Some(time));
     }
 
+    /// An isolated pair's balance snapshot is stamped with the time of the state it reads, so a
+    /// historical clock advances on one as it does on an account-wide balance snapshot.
+    #[test]
+    fn an_instrument_balance_snapshot_reports_its_time_exchange() {
+        use rustrade_execution::{
+            AccountEvent, AccountEventKind, InstrumentBalanceSnapshot,
+            balance::{AssetBalance, Balance},
+        };
+        use rustrade_instrument::{asset::AssetIndex, exchange::ExchangeIndex};
+
+        let time = DateTime::<Utc>::MIN_UTC + TimeDelta::hours(1);
+        let event: EngineEvent<()> =
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent::new(
+                ExchangeIndex(0),
+                AccountEventKind::InstrumentBalanceSnapshot(InstrumentBalanceSnapshot::new(
+                    InstrumentIndex::new(0),
+                    AssetBalance::new(
+                        AssetIndex(0),
+                        Balance::new(Decimal::ONE, Decimal::ONE),
+                        time,
+                    ),
+                )),
+            )));
+
+        assert_eq!(event.time_exchange(), Some(time));
+    }
+
     /// A `TokioClock` reads its start, then moves exactly as far as tokio's clock does.
     #[tokio::test(start_paused = true)]
     async fn a_tokio_clock_moves_with_tokios_clock() {

@@ -9,12 +9,17 @@
 //!   delivered, from the events it forwards.
 //! - [`BalanceRestatement`] is the restatement a reconnect owes, with its retry schedule.
 //! - [`restatement_time`] is the time the read's balances are stamped with.
+//! - [`restate`] runs the restatement owed once it is due, with the account's own read.
 
 use super::shared::{REST_BALANCE_LAG, balance_read_time};
-use crate::{AccountEventKind, UnindexedAccountEvent, client::venue_clock::VenueClock};
+use crate::{
+    AccountEventKind, UnindexedAccountEvent, client::venue_clock::VenueClock,
+    error::UnindexedClientError,
+};
 use chrono::{DateTime, Utc};
-use std::{sync::Arc, time::Duration};
-use tokio::time::Instant;
+use std::{fmt::Display, future::Future, sync::Arc, time::Duration};
+use tokio::{sync::mpsc, time::Instant};
+use tracing::{info, warn};
 
 /// The first wait before a failed restatement is read again. Each failure in a row doubles it, up
 /// to [`RESTATEMENT_RETRY_MAX`].
@@ -27,7 +32,7 @@ pub(crate) const RESTATEMENT_RETRY_MAX: Duration = Duration::from_secs(120);
 pub(crate) const RESTATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A [`StreamClock`] shared between the code that forwards a stream's events and the code that
-/// restates its balances.
+/// restates its balances. A new stream starts with the default, which has seen nothing.
 pub(crate) type SharedStreamClock = Arc<parking_lot::Mutex<StreamClock>>;
 
 /// The venue's clock as an account stream's events show it, and the latest balance or debt time
@@ -40,18 +45,18 @@ pub(crate) struct StreamClock {
 }
 
 impl StreamClock {
-    /// A clock shared by a new stream.
-    pub(crate) fn shared() -> SharedStreamClock {
-        Arc::new(parking_lot::Mutex::new(Self::default()))
-    }
-
-    /// Record `event`, which the stream delivered at `arrived`.
+    /// Record `event`, which the stream delivered at `arrived`, in `clock`. The lock is taken only
+    /// for an event the clock learns from.
     ///
     /// A fill's, balance update's or debt change's time is the venue's and samples its clock. A
     /// balance update's or debt change's time is also the latest balance time when it is later
     /// than the one held: the engine orders balance state by it, so a restatement stamped before
     /// it would be dropped.
-    pub(crate) fn observe(&mut self, event: &UnindexedAccountEvent, arrived: Instant) {
+    pub(crate) fn observe(
+        clock: &SharedStreamClock,
+        event: &UnindexedAccountEvent,
+        arrived: Instant,
+    ) {
         let (time, balance) = match &event.kind {
             AccountEventKind::Trade(trade) => (trade.time_exchange, false),
             AccountEventKind::BalanceStreamUpdate(update) => (update.0.time_exchange, true),
@@ -61,6 +66,11 @@ impl StreamClock {
             AccountEventKind::MarginDebt(update) => (update.time_exchange, true),
             _ => return,
         };
+        clock.lock().sample(time, balance, arrived);
+    }
+
+    /// Record the venue's `time`, seen at `arrived`, which is a balance or debt time if `balance`.
+    fn sample(&mut self, time: DateTime<Utc>, balance: bool, arrived: Instant) {
         self.venue.observe(time, arrived);
         if balance && self.last_balance.is_none_or(|last| last < time) {
             self.last_balance = Some(time);
@@ -132,6 +142,73 @@ pub(crate) fn restatement_time(
     floor.map_or(time, |floor| time.max(floor))
 }
 
+/// Restate the balances if a reconnect owes it and it is due: run `read` and send the events it
+/// returns, which state the `account`'s balances.
+///
+/// `read` is started with the floor [`StreamClock::read_start`] gave, to stamp its balances by
+/// [`restatement_time`]; a read not yet allowed to start defers the restatement instead. A read
+/// that fails, or does not finish within [`RESTATEMENT_TIMEOUT`] (rate-limit waits included), is
+/// logged at `warn` and retried after a backoff ([`BalanceRestatement::failed`]).
+///
+/// The restatement stays owed when this future is dropped before the read ends, or when the
+/// consumer has gone and the events cannot be sent.
+pub(crate) async fn restate<Read>(
+    account: &'static str,
+    clock: &SharedStreamClock,
+    restatement: &mut BalanceRestatement,
+    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
+    read: impl FnOnce(Option<DateTime<Utc>>) -> Read,
+) where
+    Read: Future<Output = Result<Vec<UnindexedAccountEvent>, UnindexedClientError>>,
+{
+    let now = Instant::now();
+    if !restatement.is_due(now) {
+        return;
+    }
+    let read_start = clock.lock().read_start(now);
+    let floor = match read_start {
+        ReadStart::Now { floor } => floor,
+        ReadStart::At(start) => {
+            restatement.defer(start);
+            return;
+        }
+    };
+    let events = match tokio::time::timeout(RESTATEMENT_TIMEOUT, read(floor)).await {
+        Ok(Ok(events)) => events,
+        Ok(Err(error)) => return retry(account, restatement, &error),
+        Err(_) => {
+            let secs = RESTATEMENT_TIMEOUT.as_secs();
+            return retry(
+                account,
+                restatement,
+                &format_args!("unfinished after {secs}s"),
+            );
+        }
+    };
+    let count = events.len();
+    for event in events {
+        if tx.send(event).is_err() {
+            return;
+        }
+    }
+    restatement.restated();
+    info!(
+        account,
+        count, "Binance balances restated after a reconnect"
+    );
+}
+
+/// Record that the `account`'s restatement read failed with `error`, to retry after a backoff.
+fn retry(account: &'static str, restatement: &mut BalanceRestatement, error: &dyn Display) {
+    let retry_in = restatement.failed().unwrap_or_default();
+    warn!(
+        account,
+        %error,
+        retry_in_secs = retry_in.as_secs(),
+        "Binance balance restatement after a reconnect failed, will retry"
+    );
+}
+
 /// The balance restatement a reconnect owes the consumer, if any, and when it is next due.
 ///
 /// A reconnect [`open`](Self::open)s one, due at once, replacing one still owed: one read restates
@@ -196,8 +273,10 @@ impl BalanceRestatement {
 mod tests {
     use super::*;
     use crate::{
-        AccountEventKind, UnindexedAccountEvent,
-        balance::{AssetBalanceUpdate, BalanceUpdate},
+        AccountEventKind, InstrumentBalanceUpdate, UnindexedAccountEvent,
+        balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate, MarginDetails},
+        error::ConnectivityError,
+        margin_debt::{MarginDebtKind, MarginDebtUpdate},
     };
     use chrono::TimeZone;
     use rust_decimal::Decimal;
@@ -223,11 +302,11 @@ mod tests {
     /// host's time.
     #[tokio::test(start_paused = true)]
     async fn a_read_with_nothing_delivered_starts_at_once_stamped_the_lag_before_the_host() {
-        let clock = StreamClock::default();
+        let clock = SharedStreamClock::default();
         let now = Instant::now();
-        assert_eq!(clock.read_start(now), ReadStart::Now { floor: None });
+        assert_eq!(clock.lock().read_start(now), ReadStart::Now { floor: None });
         assert_eq!(
-            restatement_time(&clock, at(100), now, None),
+            restatement_time(&clock.lock(), at(100), now, None),
             at(100) - REST_BALANCE_LAG
         );
     }
@@ -236,11 +315,11 @@ mod tests {
     /// delivered, and is stamped no earlier than that time, though this host's clock is behind.
     #[tokio::test(start_paused = true)]
     async fn a_read_waits_out_the_lag_after_the_last_balance_and_is_stamped_no_earlier() {
-        let mut clock = StreamClock::default();
+        let clock = SharedStreamClock::default();
         let arrived = Instant::now();
-        clock.observe(&balance_update(at(100)), arrived);
+        StreamClock::observe(&clock, &balance_update(at(100)), arrived);
 
-        let ReadStart::At(start) = clock.read_start(arrived + Duration::from_secs(2)) else {
+        let ReadStart::At(start) = clock.lock().read_start(arrived + Duration::from_secs(2)) else {
             panic!("a read 2 s after the balance must wait");
         };
         assert!(
@@ -248,44 +327,91 @@ mod tests {
             "{start:?}"
         );
         assert!(start <= arrived + Duration::from_secs(5) + Duration::from_millis(2));
-        let ReadStart::Now { floor } = clock.read_start(start) else {
+        let ReadStart::Now { floor } = clock.lock().read_start(start) else {
             panic!("the wait must have ended at {start:?}");
         };
         assert_eq!(floor, Some(at(100)));
 
         // This host reads 60 s behind the venue: the stamp is the delivered balance's time.
-        assert_eq!(restatement_time(&clock, at(50), start, floor), at(100));
+        assert_eq!(
+            restatement_time(&clock.lock(), at(50), start, floor),
+            at(100)
+        );
 
         // A balance delivered during the read does not raise its stamp: the floor was taken at
         // the read's start.
-        clock.observe(&balance_update(at(200)), start);
-        assert_eq!(restatement_time(&clock, at(50), start, floor), at(100));
+        StreamClock::observe(&clock, &balance_update(at(200)), start);
+        assert_eq!(
+            restatement_time(&clock.lock(), at(50), start, floor),
+            at(100)
+        );
     }
 
     /// A host clock ahead of the venue's does not carry into the stamp: the venue's estimate,
     /// less the lag, is used.
     #[tokio::test(start_paused = true)]
     async fn a_host_clock_ahead_of_the_venue_does_not_carry_into_the_stamp() {
-        let mut clock = StreamClock::default();
+        let clock = SharedStreamClock::default();
         let arrived = Instant::now();
-        clock.observe(&balance_update(at(100)), arrived);
+        StreamClock::observe(&clock, &balance_update(at(100)), arrived);
 
         let sent_at = arrived + Duration::from_secs(20);
-        let stamp = restatement_time(&clock, at(500), sent_at, Some(at(100)));
+        let stamp = restatement_time(&clock.lock(), at(500), sent_at, Some(at(100)));
         // The venue reads about 120 s then; the host's 500 s is ignored.
         assert!(stamp <= at(120) - REST_BALANCE_LAG, "{stamp}");
         assert!(stamp >= at(119) - REST_BALANCE_LAG, "{stamp}");
     }
 
-    /// Only a later balance or debt time moves the latest balance time; a fill samples the clock
-    /// only.
+    /// Only a later balance or debt time moves the latest balance time, whether a cross balance's,
+    /// an isolated pair's, or a debt's; a fill samples the clock only, and a REST read neither.
     #[tokio::test(start_paused = true)]
     async fn the_latest_balance_time_is_the_latest_balance_or_debt_event() {
-        let mut clock = StreamClock::default();
+        let clock = SharedStreamClock::default();
         let now = Instant::now();
-        clock.observe(&balance_update(at(100)), now);
-        clock.observe(&balance_update(at(90)), now);
-        assert_eq!(clock.last_balance, Some(at(100)));
+        StreamClock::observe(&clock, &balance_update(at(100)), now);
+        StreamClock::observe(&clock, &balance_update(at(90)), now);
+        assert_eq!(clock.lock().last_balance, Some(at(100)));
+        StreamClock::observe(&clock, &balance_update(at(105)), now);
+        assert_eq!(clock.lock().last_balance, Some(at(105)));
+
+        let pair = || rustrade_instrument::instrument::name::InstrumentNameExchange::new("BTCUSDT");
+        let AccountEventKind::BalanceStreamUpdate(Snapshot(update)) = balance_update(at(110)).kind
+        else {
+            unreachable!()
+        };
+        StreamClock::observe(
+            &clock,
+            &UnindexedAccountEvent::new(
+                ExchangeId::BinanceMargin,
+                AccountEventKind::InstrumentBalanceUpdate(InstrumentBalanceUpdate::new(
+                    pair(),
+                    update,
+                )),
+            ),
+            now,
+        );
+        assert_eq!(
+            clock.lock().last_balance,
+            Some(at(110)),
+            "an isolated pair's"
+        );
+
+        StreamClock::observe(
+            &clock,
+            &UnindexedAccountEvent::new(
+                ExchangeId::BinanceMargin,
+                AccountEventKind::MarginDebt(MarginDebtUpdate::new(
+                    AssetNameExchange::new("BTC"),
+                    Some(pair()),
+                    MarginDetails::new(Decimal::ONE, Decimal::ZERO),
+                    MarginDebtKind::Borrow,
+                    "BORROW".into(),
+                    at(120),
+                )),
+            ),
+            now,
+        );
+        assert_eq!(clock.lock().last_balance, Some(at(120)), "a debt's");
 
         let fill = crate::trade::Trade::new(
             crate::trade::TradeId::new("t-1"),
@@ -299,16 +425,40 @@ mod tests {
             None,
             crate::trade::AssetFees::new(AssetNameExchange::new("BTC"), Decimal::ZERO, None),
         );
-        clock.observe(
+        StreamClock::observe(
+            &clock,
             &UnindexedAccountEvent::new(ExchangeId::BinanceMargin, AccountEventKind::Trade(fill)),
             now,
         );
-        assert_eq!(clock.last_balance, Some(at(100)), "a fill is no balance");
         assert_eq!(
-            clock.venue.earliest_at(now),
+            clock.lock().last_balance,
+            Some(at(120)),
+            "a fill is no balance"
+        );
+        assert_eq!(
+            clock.lock().venue.earliest_at(now),
             Some(at(150)),
             "but it samples the clock"
         );
+
+        StreamClock::observe(
+            &clock,
+            &UnindexedAccountEvent::new(
+                ExchangeId::BinanceMargin,
+                AccountEventKind::BalanceSnapshot(Snapshot(AssetBalance::new(
+                    AssetNameExchange::new("BTC"),
+                    Balance::new(Decimal::ONE, Decimal::ONE),
+                    at(200),
+                ))),
+            ),
+            now,
+        );
+        assert_eq!(
+            clock.lock().last_balance,
+            Some(at(120)),
+            "a REST read is ignored"
+        );
+        assert_eq!(clock.lock().venue.earliest_at(now), Some(at(150)));
     }
 
     /// A failed restatement backs off from the base, doubling up to the cap; a reconnect makes a
@@ -345,5 +495,118 @@ mod tests {
         restatement.defer(now + Duration::from_secs(3));
         restatement.defer(now + Duration::from_secs(1));
         assert_eq!(restatement.next_due(), Some(now + Duration::from_secs(3)));
+    }
+
+    /// What a fake restatement read returns: one balance, stamped at its floor.
+    fn restated_btc(floor: Option<DateTime<Utc>>) -> Vec<UnindexedAccountEvent> {
+        vec![balance_update(floor.unwrap_or(at(0)))]
+    }
+
+    /// A due restatement runs the read and sends its events, and is settled; one not owed, or not
+    /// due, reads nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_due_restatement_sends_the_read_and_is_settled() {
+        let clock = SharedStreamClock::default();
+        let mut restatement = BalanceRestatement::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let unread = |_| async { panic!("nothing is due") };
+
+        restate("test", &clock, &mut restatement, &tx, unread).await;
+        restatement.open();
+        restatement.failed();
+        restate("test", &clock, &mut restatement, &tx, unread).await;
+
+        restatement.open();
+        StreamClock::observe(&clock, &balance_update(at(100)), Instant::now());
+        tokio::time::advance(REST_BALANCE_LAG.to_std().unwrap() + Duration::from_secs(1)).await;
+        restate("test", &clock, &mut restatement, &tx, |floor| async move {
+            assert_eq!(floor, Some(at(100)));
+            Ok(restated_btc(floor))
+        })
+        .await;
+        assert_eq!(rx.try_recv().unwrap(), restated_btc(Some(at(100)))[0]);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(restatement.next_due(), None);
+    }
+
+    /// A restatement right after a balance event is deferred until its read may start, reading
+    /// nothing before then.
+    #[tokio::test(start_paused = true)]
+    async fn a_restatement_not_yet_allowed_to_start_is_deferred() {
+        let clock = SharedStreamClock::default();
+        StreamClock::observe(&clock, &balance_update(at(100)), Instant::now());
+        let mut restatement = BalanceRestatement::default();
+        restatement.open();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        restate("test", &clock, &mut restatement, &tx, |_| async {
+            panic!("the read may not start yet")
+        })
+        .await;
+        let ReadStart::At(start) = clock.lock().read_start(Instant::now()) else {
+            panic!("the read must wait");
+        };
+        assert_eq!(restatement.next_due(), Some(start));
+    }
+
+    /// A read that fails, or does not finish in time, sends nothing and is due again after the
+    /// backoff.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_or_unfinished_read_is_retried_after_the_backoff() {
+        let clock = SharedStreamClock::default();
+        let mut restatement = BalanceRestatement::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        restatement.open();
+        restate("test", &clock, &mut restatement, &tx, |_| async {
+            Err(UnindexedClientError::Connectivity(
+                ConnectivityError::Timeout,
+            ))
+        })
+        .await;
+        assert_eq!(
+            restatement.next_due(),
+            Some(Instant::now() + RESTATEMENT_RETRY_BASE)
+        );
+
+        tokio::time::advance(RESTATEMENT_RETRY_BASE).await;
+        let started = Instant::now();
+        restate("test", &clock, &mut restatement, &tx, |_| {
+            std::future::pending()
+        })
+        .await;
+        assert_eq!(Instant::now(), started + RESTATEMENT_TIMEOUT);
+        assert_eq!(
+            restatement.next_due(),
+            Some(Instant::now() + 2 * RESTATEMENT_RETRY_BASE)
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// A restatement stays owed when its read is dropped part-way, and when the consumer has gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_restatement_not_delivered_stays_owed() {
+        let clock = SharedStreamClock::default();
+        let mut restatement = BalanceRestatement::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        restatement.open();
+        let due = restatement.next_due();
+
+        let dropped = tokio::time::timeout(
+            Duration::from_secs(1),
+            restate("test", &clock, &mut restatement, &tx, |_| {
+                std::future::pending()
+            }),
+        )
+        .await;
+        assert!(dropped.is_err());
+        assert_eq!(restatement.next_due(), due);
+
+        drop(rx);
+        restate("test", &clock, &mut restatement, &tx, |floor| async move {
+            Ok(restated_btc(floor))
+        })
+        .await;
+        assert_eq!(restatement.next_due(), due);
     }
 }
