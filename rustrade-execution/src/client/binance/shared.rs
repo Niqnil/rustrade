@@ -3518,8 +3518,9 @@ where
     // net — the loop body always returns before exhaustion.
     for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
         rate_limiter.wait_if_blocked(kind).await?;
-        let sent_ms = unix_ms();
+        // One reading: the weight tracker's send time and the read's time are the same instant.
         let sent = Utc::now();
+        let sent_ms = u128::try_from(sent.timestamp_millis()).unwrap_or_default();
         match make_call(Arc::clone(rest)).await {
             Ok(response) => {
                 rate_limiter.observe_rest(&response, sent_ms);
@@ -4081,6 +4082,13 @@ mod tests {
     use super::*;
     use crate::client::reconnect_budget::BackoffLimits;
     use futures::FutureExt as _;
+
+    /// Both clients' rustdoc state the REST balance lag allowance as a number, since public docs
+    /// cannot link the crate-private constant. Change it only together with those docs.
+    #[test]
+    fn the_rest_balance_lag_is_as_documented() {
+        assert_eq!(REST_BALANCE_LAG, TimeDelta::seconds(5));
+    }
 
     /// The module docs and both clients' rustdoc state the heartbeat window and the longest
     /// cooldown waited through as numbers. Change these only together with those docs. The
