@@ -3435,7 +3435,9 @@ fn process_ws_text(
                 }
             };
 
-            // Read once: it samples the clock here, and stamps the events built below.
+            // Read once: it samples the clock here, and stamps the events built below. Read before
+            // the duplicate gate, so a frame without Alpaca's time warns even when it is then
+            // dropped as a duplicate or an event type this client ignores.
             let time = trade_update_time(&update);
             if time.1 == TimeSource::Venue {
                 clock.observe(time.0, tokio::time::Instant::now());
@@ -4695,7 +4697,8 @@ fn trade_amendment_event(
 /// When a `trade_updates` event happened, and whose clock says so: its `timestamp`, else its
 /// order's `updated_at`, else this host's clock, as [`TimeSource::Host`].
 ///
-/// Alpaca stamps every event, so either falling back is logged with a `warn!`. `updated_at` is
+/// Alpaca stamps every event, so either falling back is logged with a `warn!`, once per frame,
+/// whether or not the frame then delivers an event. `updated_at` is
 /// when the order last changed as of the event, which for a fill is the fill. Either is a time on
 /// Alpaca's clock no later than when it sent the event, as [`VenueClock::observe`] needs.
 fn trade_update_time(update: &AlpacaTradeUpdate<'_>) -> (DateTime<Utc>, TimeSource) {
@@ -9686,6 +9689,7 @@ mod tests {
                 None,
             ));
 
+            // Activities are read only on a reconnect, so the first read is the reconnect's.
             let after = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     let requests = rest.received_requests().await.unwrap_or_default();
