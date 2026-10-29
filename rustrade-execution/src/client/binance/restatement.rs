@@ -72,8 +72,9 @@ impl StreamClock {
     /// Record the venue's `time`, seen at `arrived`, which is a balance or debt time if `balance`.
     fn sample(&mut self, time: DateTime<Utc>, balance: bool, arrived: Instant) {
         self.venue.observe(time, arrived);
-        if balance && self.last_balance.is_none_or(|last| last < time) {
-            self.last_balance = Some(time);
+        if balance {
+            // `None` orders before any time.
+            self.last_balance = self.last_balance.max(Some(time));
         }
     }
 
