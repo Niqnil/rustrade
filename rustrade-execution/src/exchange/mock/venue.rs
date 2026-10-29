@@ -559,9 +559,10 @@ pub struct SimulatedVenue {
     /// collide between the two. A real venue mints trade ids independently for the same reason;
     /// the link back to the order is [`Trade::order_id`], which is typed rather than parsed.
     trade_sequence: u64,
-    /// Read via [`time_exchange`](Self::time_exchange), set only by
-    /// [`advance_time`](Self::advance_time), and never below
-    /// [`accrued_through`](Self::accrued_through).
+    /// Read via [`time_exchange`](Self::time_exchange), and set only by
+    /// [`advance_time`](Self::advance_time), which never sets it below
+    /// [`accrued_through`](Self::accrued_through). An [`apply_market`](Self::apply_market) since
+    /// can have raised that mark past it, until the next `advance_time` catches up.
     time_exchange_latest: DateTime<Utc>,
     /// Which price source this venue has. Private: it is fixed at construction, and a consumer
     /// flipping it on a venue already holding resting orders would leave them unmatchable with no
@@ -894,7 +895,7 @@ impl SimulatedVenue {
     /// # The clock never moves back
     /// An instant earlier than the latest this venue has reached, through this call or through
     /// [`apply_market`](Self::apply_market), is taken as that latest instant. It charges nothing
-    /// again, and the balances it restamps and whatever a request goes on to produce are stamped no
+    /// again, and the balances it restamps and whatever a request after it produces are stamped no
     /// earlier than what this venue has already reported. A consumer keeping the latest stamp of
     /// each balance would otherwise drop such a restatement as older than one it holds.
     ///
@@ -1383,8 +1384,8 @@ impl SimulatedVenue {
         events
     }
 
-    /// The instant this venue's clock was last advanced to, which stamps what a request produces:
-    /// see [`advance_time`](Self::advance_time). The Unix epoch until the clock first moves.
+    /// The instant [`advance_time`](Self::advance_time) last set, which stamps what a request
+    /// produces. The Unix epoch until `advance_time` is first called.
     pub fn time_exchange(&self) -> DateTime<Utc> {
         self.time_exchange_latest
     }

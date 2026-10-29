@@ -63,9 +63,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SimulatedVenue::advance_time` took whatever instant it was given. An instant earlier than one
   the venue had reached moved its clock back: it restamped every balance and stamped the fills
   of later requests earlier than what it had already reported, and the engine drops a balance
-  older than the one it holds. That happened when a request-priced `MockExchange` stamped
-  requests from a wall clock that stepped back, or when a request arrived behind a later
-  `apply_market` tick. Now:
+  older than the one it holds. That could happen when a request-priced `MockExchange` stamped
+  requests from a wall clock that stepped back, or when a consumer driving the venue directly
+  advanced it behind a later `apply_market` tick. Now:
   - `advance_time` holds an earlier instant at the latest one either input, `advance_time` or
     `apply_market`, has reached. It charges nothing again, and what follows is stamped at that
     instant. The venue clamps it itself, whichever driver calls it.
