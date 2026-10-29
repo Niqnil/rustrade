@@ -625,9 +625,10 @@ pub(crate) fn order_shape_from_ib(order: &Order) -> Result<OrderShape, String> {
 /// Parse IB's good-till-date field: the form [`format_gtd_datetime`] sends, in UTC, or IB's
 /// `yyyyMMdd HH:mm:ss` with a zone, or without one, read as UTC.
 ///
-/// Unlike an execution's time, a good-till-date that names a zone this crate cannot read is still
-/// read, as UTC, with a `warn!`: it is an order's parameter, which this client writes in UTC, and
-/// an order whose expiry cannot be read cannot be reported from a listing at all.
+/// Unlike an execution's time, a good-till-date that cannot be read in the zone it names, as one
+/// this crate does not know, is still read, as UTC, with a `warn!`: it is an order's parameter,
+/// which this client writes in UTC, and an order whose expiry cannot be read cannot be reported
+/// from a listing at all.
 fn parse_gtd_datetime(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::NaiveDateTime::parse_from_str(value, GTD_FORMAT)
         .map(|naive| naive.and_utc())
@@ -640,7 +641,7 @@ fn parse_gtd_datetime(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
             let time = super::execution::parse_ib_timestamp(&wall_clock, Some(chrono_tz::UTC))?;
             tracing::warn!(
                 good_till_date = value,
-                "IBKR good-till-date in an unreadable zone; read as UTC"
+                "IBKR good-till-date could not be read in its zone; read as UTC"
             );
             Some(time)
         })
