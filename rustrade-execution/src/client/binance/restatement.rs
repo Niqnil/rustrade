@@ -313,6 +313,22 @@ mod tests {
         )
     }
 
+    /// A frame's event time samples the stream's clock, so a restatement stamped after it takes
+    /// Binance's time when this host's clock is ahead, though no fill or balance was delivered.
+    #[tokio::test(start_paused = true)]
+    async fn a_frames_event_time_samples_the_clock_the_stamp_is_taken_from() {
+        let clock = SharedStreamClock::default();
+        let arrived = Instant::now();
+        StreamClock::observe_sent(&clock, at(100), arrived);
+
+        assert_eq!(clock.lock().venue().earliest_at(arrived), Some(at(100)));
+        // The host reads 60 s ahead of Binance.
+        assert_eq!(
+            restatement_time(&clock.lock(), at(160), arrived, None),
+            at(100) - REST_BALANCE_LAG
+        );
+    }
+
     /// With nothing delivered, a read may start at once, and is stamped the REST lag before the
     /// host's time.
     #[tokio::test(start_paused = true)]

@@ -2082,17 +2082,11 @@ async fn connection_manager(
         // small margin to cover Tokio scheduling jitter between the WS close event and
         // the monitor task seeing it. Dedup cache handles any resulting duplicates.
         if should_reconnect {
-            let signal = chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS);
-            let lookback = match reason {
-                DisconnectReason::HeartbeatTimeout => {
-                    chrono::Duration::seconds(HEARTBEAT_TIMEOUT_SECS as i64) + signal
-                }
-                _ => signal,
-            };
+            let heartbeat_timed_out = matches!(reason, DisconnectReason::HeartbeatTimeout);
             disconnect = Some(Disconnect::seen(
                 clock.lock().venue(),
                 HostMoment::now(),
-                lookback,
+                disconnect_lookback(heartbeat_timed_out),
             ));
         }
 
@@ -2126,6 +2120,18 @@ async fn connection_manager(
             emit_stream_terminated(&tx, ExchangeId::BinanceSpot, reason);
             break;
         }
+    }
+}
+
+/// How far before the moment a disconnect is seen the gap it leaves begins: a short lookback for
+/// scheduling jitter, and after a heartbeat timeout a heartbeat window more, since the connection
+/// may have died that long before it was declared dead.
+fn disconnect_lookback(heartbeat_timed_out: bool) -> chrono::Duration {
+    let signal = chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS);
+    if heartbeat_timed_out {
+        chrono::Duration::seconds(HEARTBEAT_TIMEOUT_SECS as i64) + signal
+    } else {
+        signal
     }
 }
 
@@ -5287,6 +5293,19 @@ mod tests {
         buf.clear();
         assert!(!convert_user_data_events(bare, &mut buf).terminated);
         assert!(buf.is_empty());
+    }
+
+    /// A disconnect's gap begins a short lookback before it was seen, and after a heartbeat
+    /// timeout a 30 s window earlier still.
+    #[test]
+    fn a_disconnect_looks_back_further_after_a_heartbeat_timeout() {
+        let signal = chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS);
+        assert!(signal > chrono::Duration::zero());
+        assert_eq!(disconnect_lookback(false), signal);
+        assert_eq!(
+            disconnect_lookback(true),
+            chrono::Duration::seconds(30) + signal
+        );
     }
 
     /// Every pushed event's `E` is returned to sample the stream's clock, an order's as much as

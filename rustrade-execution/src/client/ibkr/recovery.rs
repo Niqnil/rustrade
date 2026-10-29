@@ -1015,6 +1015,25 @@ mod tests {
         );
     }
 
+    /// A connectivity notice reaches the tracker: a restoration makes recovery due, and a notice
+    /// that says nothing about delivery does not.
+    #[test]
+    fn a_connectivity_notice_reaches_the_tracker() {
+        let notice = |code| ibapi::Notice {
+            request_id: None,
+            code,
+            message: String::new(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        };
+        let mut tracker = GapTracker::new(HostMoment::now());
+        observe_notice(&mut tracker, &notice(2104));
+        assert_eq!(tracker.recovery_floor(true, &VenueClock::new()), None);
+
+        observe_notice(&mut tracker, &notice(CODE_LINK_RESTORED_DATA_KEPT));
+        assert!(tracker.recovery_floor(true, &VenueClock::new()).is_some());
+    }
+
     /// The stream's clock is the one the sink samples, and starts with no sample.
     #[test]
     fn the_sinks_clock_holds_what_it_observed() {
