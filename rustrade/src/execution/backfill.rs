@@ -9,10 +9,18 @@
 //! overlap, so a fill made right at the edge is read twice rather than missed. Reading a fill
 //! twice is harmless because the manager drops duplicates with an
 //! [`AccountEventDeduper`](rustrade_execution::client::dedup::AccountEventDeduper).
+//!
+//! The venue reads the span on its own clock, which can differ from this host's. So the span is
+//! placed on the venue's clock, as a
+//! [`VenueClock`](rustrade_execution::client::venue_clock::VenueClock) estimates it from the
+//! times the venue stamped on the fills delivered, counted on from there on tokio's monotonic
+//! clock. A step of this
+//! host's wall clock, before the stream ended or while it was down, does not move the span.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use rustrade_execution::{
     AccountEvent, AccountEventKind,
+    client::venue_clock::VenueClock,
     error::UnindexedClientError,
     fill_recovery::{FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope},
     trade::{Trade, TradesRead},
@@ -46,13 +54,17 @@ pub struct FillRecoveryConfig {
     /// How far before the watermark the read starts. Covers the delay between a fill and its
     /// delivery, so a fill delivered just before the stream ended is read again, not missed.
     pub overlap: Duration,
-    /// The most the venue's clock is assumed to lag this host's. The watermark can sit up to this
-    /// much before the local time the last event arrived, to follow the exchange's clock when the
-    /// last fill carries an earlier time than the local clock says. Beyond it the local time is
-    /// trusted, so an old last fill does not stretch the read. The span still starts at the last
-    /// event delivered, so a stream that was quiet for hours reads those hours (up to `max_span`).
-    /// A venue clock ahead of this host's is not allowed for: a fill stamped after the read began
-    /// is the new stream's to deliver.
+    /// The difference between this host's clock and the venue's that is allowed for without
+    /// a warning, and the margin for it where it cannot be measured:
+    /// - Once a fill has been delivered, the venue's clock is estimated from the time it stamped
+    ///   on it, and the read is placed on that clock. A difference beyond this allowance is
+    ///   logged as a warning at each reopening, and the read still covers it.
+    /// - Before any fill, the venue's clock is unknown, and the read starts this much before the
+    ///   local time the last event arrived. A host clock further ahead of the venue's than this
+    ///   can then miss fills.
+    /// - The read runs this much past the later of the local time and the venue's estimated
+    ///   time, to cover a venue clock ahead of the estimate. A fill it reads that the new stream
+    ///   also delivers is delivered once.
     pub max_clock_skew: Duration,
     /// The time the whole read may take, across all its calls. Measured on the tokio clock, not
     /// on the manager's [`Clock`](super::manager::Clock).
@@ -117,52 +129,108 @@ impl FillRecoveryConfig {
 /// has delivered.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Watermark {
-    /// When this host last received an event, or opened the stream before any arrived.
+    /// When this host last received an event, or opened the stream before any arrived, by the
+    /// manager's clock.
     receipt: DateTime<Utc>,
-    /// The latest time the exchange stamped on a fill delivered, if any.
-    exchange: Option<DateTime<Utc>>,
+    /// The same moment on tokio's monotonic clock.
+    received: Instant,
+    /// The venue's clock, from the times it stamped on the fills delivered.
+    venue: VenueClock,
 }
 
 impl Watermark {
-    /// A stream opened at `now`, with nothing delivered yet.
-    pub(crate) fn opened(now: DateTime<Utc>) -> Self {
+    /// A stream opened at `now`, read at `instant` on tokio's clock, with nothing delivered yet.
+    pub(crate) fn opened(now: DateTime<Utc>, instant: Instant) -> Self {
         Self {
             receipt: now,
-            exchange: None,
+            received: instant,
+            venue: VenueClock::new(),
         }
     }
 
-    /// Records an event delivered at `now`.
+    /// Records an event delivered at `now`, read at `instant` on tokio's clock.
     ///
     /// A [`StreamTerminated`](AccountEventKind::StreamTerminated) is not a sign of sync but the
     /// end of it: the stream can have lost events before it says so, as on a lagged buffer, so it
     /// leaves the watermark where the last event before it put it. A loss the stream delivers
     /// further events after, without ending, is not seen here.
-    pub(crate) fn delivered<K, A, I>(&mut self, now: DateTime<Utc>, event: &AccountEvent<K, A, I>) {
+    ///
+    /// A fill's time is the only one taken for the venue's clock: every client stamps fills with
+    /// the venue's time, but some stamp other events with this host's. A fill stamped `max_span`
+    /// or more before `now` is not taken either: it is an old fill delivered late, such as one a
+    /// venue replays on subscribing, and a read placed by it would start further back than any
+    /// read covers.
+    pub(crate) fn delivered<K, A, I>(
+        &mut self,
+        now: DateTime<Utc>,
+        instant: Instant,
+        event: &AccountEvent<K, A, I>,
+        config: &FillRecoveryConfig,
+    ) {
         match &event.kind {
             AccountEventKind::StreamTerminated(_) => return,
             AccountEventKind::Trade(trade) => {
-                self.exchange = self.exchange.max(Some(trade.time_exchange));
+                let recent = to_delta(config.max_span)
+                    .is_none_or(|span| now.signed_duration_since(trade.time_exchange) < span);
+                if recent {
+                    self.venue.observe(trade.time_exchange, instant);
+                }
             }
             _ => {}
         }
         self.receipt = now;
+        self.received = instant;
     }
 
-    /// Where a read to cover everything missed starts.
+    /// Where a read to cover everything missed starts, less `overlap`.
     ///
-    /// The earlier of the local receipt time and the exchange's time of the last fill, so a local
-    /// clock ahead of the venue's does not push the start past fills the venue stamped earlier,
-    /// less `overlap`. The exchange's time counts only within `max_clock_skew` of the receipt
-    /// time: a fill from long ago says nothing of this host's clock.
+    /// The venue's time when the last event arrived, as estimated from the fills delivered, or
+    /// the local time it arrived if that is earlier, as on a local clock behind the venue's or a
+    /// simulated one. With no fill delivered the venue's clock is unknown, and the read starts
+    /// `max_clock_skew` before the local time instead.
     pub(crate) fn read_from(&self, config: &FillRecoveryConfig) -> DateTime<Utc> {
-        let floor = self.receipt - config.max_clock_skew;
-        let bound = match self.exchange {
-            Some(exchange) if exchange < self.receipt => exchange.max(floor),
-            _ => self.receipt,
+        let bound = match self.venue.earliest_at(self.received) {
+            Some(venue) => venue.min(self.receipt),
+            None => self.receipt - config.max_clock_skew,
         };
         bound - config.overlap
     }
+
+    /// Where a read started at `now`, read at `instant` on tokio's clock, ends: `max_clock_skew`
+    /// past the later of `now` and the venue's estimated time, so a local clock behind the
+    /// venue's does not cut the read short.
+    pub(crate) fn read_to(
+        &self,
+        now: DateTime<Utc>,
+        instant: Instant,
+        config: &FillRecoveryConfig,
+    ) -> DateTime<Utc> {
+        let venue = self.venue.earliest_at(instant).unwrap_or(now);
+        venue.max(now) + config.max_clock_skew
+    }
+
+    /// How far this host's clock leads the venue's at `now`, read at `instant` on tokio's clock,
+    /// when that is beyond `max_clock_skew` either way, or `None` within it or with no fill
+    /// delivered.
+    ///
+    /// A lead is overstated by the delivery delay of the fill it was measured from, never
+    /// understated, so a host clock behind the venue's is reported only when it is surely beyond
+    /// the allowance.
+    pub(crate) fn skew_beyond_allowance(
+        &self,
+        now: DateTime<Utc>,
+        instant: Instant,
+        config: &FillRecoveryConfig,
+    ) -> Option<TimeDelta> {
+        let lead = self.venue.host_lead(now, instant)?;
+        let allowance = to_delta(config.max_clock_skew)?;
+        (lead.abs() > allowance).then_some(lead)
+    }
+}
+
+/// `duration` as a [`TimeDelta`], or `None` beyond its range.
+fn to_delta(duration: Duration) -> Option<TimeDelta> {
+    TimeDelta::from_std(duration).ok()
 }
 
 /// What one [`backfill`] read: the fills it got, oldest first, and the spans it gave up on.
@@ -172,7 +240,7 @@ pub(crate) struct Backfill {
     pub(crate) gaps: Vec<FillRecoveryGap<InstrumentNameExchange>>,
 }
 
-/// Reads `[start, now]` within `config`'s budget, one call of `fetch(from, to)` per page: the
+/// Reads `[start, end]` within `config`'s budget, one call of `fetch(from, to)` per page: the
 /// client's [`fetch_trades`](rustrade_execution::client::ExecutionClient::fetch_trades) for
 /// `instruments`. An empty `instruments` means every instrument.
 ///
@@ -182,7 +250,7 @@ pub(crate) async fn backfill<Fetch, Fut>(
     mut fetch: Fetch,
     instruments: &[InstrumentNameExchange],
     start: DateTime<Utc>,
-    now: DateTime<Utc>,
+    end: DateTime<Utc>,
     config: &FillRecoveryConfig,
 ) -> Backfill
 where
@@ -211,7 +279,7 @@ where
 
     let oldest = chrono::Duration::from_std(config.max_span)
         .ok()
-        .and_then(|span| now.checked_sub_signed(span))
+        .and_then(|span| end.checked_sub_signed(span))
         .unwrap_or(start);
     let mut cursor = if start < oldest {
         result.gaps.push(gap(
@@ -229,12 +297,12 @@ where
     let mut pages = 0;
     loop {
         pages += 1;
-        let read = match tokio::time::timeout_at(deadline, fetch(cursor, now)).await {
+        let read = match tokio::time::timeout_at(deadline, fetch(cursor, end)).await {
             Ok(Ok(read)) => read,
             Ok(Err(error)) => {
                 result.gaps.push(gap(
                     cursor,
-                    now,
+                    end,
                     FillRecoveryFailure::Request(error.to_string()),
                 ));
                 break;
@@ -242,7 +310,7 @@ where
             Err(_) => {
                 result.gaps.push(gap(
                     cursor,
-                    now,
+                    end,
                     FillRecoveryFailure::TimedOut {
                         timeout_secs: config.read_timeout.as_secs(),
                     },
@@ -268,7 +336,7 @@ where
             // A call that read on from `cursor` and came back no further is not progress.
             result.gaps.push(gap(
                 cursor,
-                now,
+                end,
                 FillRecoveryFailure::Truncated {
                     fills_read: result.trades.len(),
                 },
@@ -279,7 +347,7 @@ where
         if pages >= config.max_pages {
             result.gaps.push(gap(
                 cursor,
-                now,
+                end,
                 FillRecoveryFailure::PageLimit {
                     max_pages: config.max_pages,
                 },
@@ -525,49 +593,10 @@ mod tests {
         assert_eq!(gap.scope, FillRecoveryScope::AllInstruments);
     }
 
-    #[test]
-    fn the_watermark_reads_from_the_receipt_time_less_the_overlap_until_a_fill_is_delivered() {
-        let config = FillRecoveryConfig::default();
-
-        let watermark = Watermark::opened(at(100));
-
-        assert_eq!(watermark.read_from(&config), at(98));
-    }
-
-    #[test]
-    fn a_fill_stamped_before_the_receipt_time_pulls_the_watermark_back_within_the_skew() {
-        let config = FillRecoveryConfig::default();
-        let mut watermark = Watermark::opened(at(100));
-        watermark.exchange = Some(at(90));
-
-        // 10 s before the receipt time, inside the 30 s skew allowance.
-        assert_eq!(watermark.read_from(&config), at(88));
-    }
-
-    #[test]
-    fn a_fill_stamped_long_before_the_receipt_time_is_held_to_the_skew_allowance() {
-        let config = FillRecoveryConfig::default();
-        let mut watermark = Watermark::opened(at(10_000));
-        watermark.exchange = Some(at(0));
-
-        assert_eq!(watermark.read_from(&config), at(10_000 - 30 - 2));
-    }
-
-    #[test]
-    fn a_fill_stamped_after_the_receipt_time_does_not_push_the_watermark_forward() {
-        let config = FillRecoveryConfig::default();
-        let mut watermark = Watermark::opened(at(100));
-        watermark.exchange = Some(at(150));
-
-        assert_eq!(watermark.read_from(&config), at(98));
-    }
-
-    #[test]
-    fn delivering_a_trade_moves_the_receipt_time_and_keeps_the_latest_fill_time() {
-        let mut watermark = Watermark::opened(at(0));
-        let event = |secs| AccountEvent {
+    fn fill(secs: i64) -> AccountEvent<usize, usize, usize> {
+        AccountEvent {
             exchange: 0usize,
-            kind: AccountEventKind::<usize, usize, usize>::Trade(Trade::new(
+            kind: AccountEventKind::Trade(Trade::new(
                 TradeId::new("t"),
                 OrderId::new("o"),
                 0,
@@ -579,18 +608,152 @@ mod tests {
                 None,
                 AssetFees::new(0, Decimal::ZERO, None),
             )),
-        };
+        }
+    }
 
-        watermark.delivered(at(100), &event(95));
-        watermark.delivered(at(200), &event(80));
+    /// An event that carries no time of the venue's.
+    fn snapshot() -> AccountEvent<usize, usize, usize> {
+        AccountEvent {
+            exchange: 0usize,
+            kind: AccountEventKind::Snapshot(rustrade_execution::AccountSnapshot::new(
+                0,
+                vec![],
+                vec![],
+            )),
+        }
+    }
 
-        assert_eq!(watermark.receipt, at(200));
-        assert_eq!(watermark.exchange, Some(at(95)));
+    fn secs(secs: u64) -> Duration {
+        Duration::from_secs(secs)
+    }
+
+    /// The venue's time `secs` after the sample stamped `stamped`, less the 100 ppm drift
+    /// allowance.
+    fn counted_on(stamped: i64, secs: u64) -> DateTime<Utc> {
+        let elapsed = Duration::from_secs(secs);
+        at(stamped) + (elapsed - elapsed / 10_000)
+    }
+
+    #[test]
+    fn with_no_fill_delivered_the_read_starts_the_skew_allowance_before_the_receipt_time() {
+        let config = FillRecoveryConfig::default();
+
+        let watermark = Watermark::opened(at(100), Instant::now());
+
+        assert_eq!(watermark.read_from(&config), at(100 - 30 - 2));
+    }
+
+    /// The issue this watermark exists for: a host clock 190 s ahead of the venue's, far beyond
+    /// the 30 s allowance, still places the read on the venue's clock.
+    #[test]
+    fn a_host_clock_ahead_of_the_venue_beyond_the_allowance_reads_from_the_venues_time() {
+        let config = FillRecoveryConfig::default();
+        let base = Instant::now();
+        let mut watermark = Watermark::opened(at(200), base);
+
+        watermark.delivered(at(200), base, &fill(10), &config);
+        // The last event, 5 s later, carries no venue time.
+        watermark.delivered(at(205), base + secs(5), &snapshot(), &config);
+
+        assert_eq!(watermark.read_from(&config), counted_on(10, 5) - secs(2));
+    }
+
+    #[test]
+    fn a_host_clock_behind_the_venue_reads_from_the_receipt_time() {
+        let config = FillRecoveryConfig::default();
+        let base = Instant::now();
+        let mut watermark = Watermark::opened(at(0), base);
+
+        watermark.delivered(at(0), base, &fill(500), &config);
+
+        assert_eq!(watermark.read_from(&config), at(0) - secs(2));
+    }
+
+    #[test]
+    fn a_host_clock_stepped_forward_after_the_last_event_does_not_move_the_start() {
+        let config = FillRecoveryConfig::default();
+        let base = Instant::now();
+        let mut watermark = Watermark::opened(at(100), base);
+        watermark.delivered(at(100), base, &fill(100), &config);
+
+        // The read is placed after the host clock jumped an hour ahead.
+        let start = watermark.read_from(&config);
+
+        assert_eq!(start, at(98));
+        assert_eq!(
+            watermark.read_to(at(3_700), base + secs(10), &config),
+            at(3_700) + secs(30)
+        );
+    }
+
+    /// The issue's second case: the host clock steps back before the reconnect, so its "now" is
+    /// before the outage ended. The read still runs past the venue's time.
+    #[test]
+    fn a_host_clock_stepped_back_before_the_reconnect_still_reads_to_the_venues_time() {
+        let config = FillRecoveryConfig::default();
+        let base = Instant::now();
+        let mut watermark = Watermark::opened(at(100), base);
+        watermark.delivered(at(100), base, &fill(100), &config);
+
+        // 60 s later the host clock reads 100 s earlier than at the fill.
+        let end = watermark.read_to(at(0), base + secs(60), &config);
+
+        assert_eq!(end, counted_on(100, 60) + secs(30));
+        assert!(end > at(160), "{end} ends before the venue's 160");
+    }
+
+    #[test]
+    fn with_no_fill_delivered_the_read_ends_the_allowance_past_now() {
+        let config = FillRecoveryConfig::default();
+        let base = Instant::now();
+        let watermark = Watermark::opened(at(100), base);
+
+        assert_eq!(
+            watermark.read_to(at(150), base + secs(50), &config),
+            at(180)
+        );
+    }
+
+    #[test]
+    fn a_fill_stamped_further_back_than_the_span_is_not_taken_for_the_venues_clock() {
+        let config = FillRecoveryConfig::default();
+        let base = Instant::now();
+        let mut watermark = Watermark::opened(at(100_000), base);
+
+        // A day and a second old: a replayed fill, not a venue clock a day behind.
+        watermark.delivered(at(100_000), base, &fill(100_000 - 86_401), &config);
+
+        assert_eq!(watermark.read_from(&config), at(100_000 - 30 - 2));
+    }
+
+    #[test]
+    fn a_fill_stamped_just_within_the_span_is_taken_for_the_venues_clock() {
+        let config = FillRecoveryConfig::default();
+        let base = Instant::now();
+        let mut watermark = Watermark::opened(at(100_000), base);
+
+        watermark.delivered(at(100_000), base, &fill(100_000 - 86_399), &config);
+
+        assert_eq!(watermark.read_from(&config), at(100_000 - 86_399 - 2));
+    }
+
+    #[test]
+    fn delivering_an_event_moves_the_receipt_time_on_both_clocks() {
+        let config = FillRecoveryConfig::default();
+        let base = Instant::now();
+        let mut watermark = Watermark::opened(at(0), base);
+
+        watermark.delivered(at(100), base + secs(1), &snapshot(), &config);
+
+        assert_eq!(watermark.receipt, at(100));
+        assert_eq!(watermark.received, base + secs(1));
     }
 
     #[test]
     fn a_stream_terminated_leaves_the_watermark_where_it_was() {
-        let mut watermark = Watermark::opened(at(0));
+        let config = FillRecoveryConfig::default();
+        let base = Instant::now();
+        let mut watermark = Watermark::opened(at(0), base);
         let terminated = AccountEvent {
             exchange: 0usize,
             kind: AccountEventKind::<usize, usize, usize>::StreamTerminated(
@@ -598,10 +761,38 @@ mod tests {
             ),
         };
 
-        watermark.delivered(at(100), &terminated);
+        watermark.delivered(at(100), base + secs(1), &terminated, &config);
 
         assert_eq!(watermark.receipt, at(0));
-        assert_eq!(watermark.exchange, None);
+        assert_eq!(watermark.received, base);
+        assert_eq!(watermark.venue, VenueClock::new());
+    }
+
+    #[test]
+    fn the_skew_warning_fires_above_the_allowance_and_not_at_or_below_it() {
+        let config = FillRecoveryConfig::default();
+        let base = Instant::now();
+        let mut watermark = Watermark::opened(at(0), base);
+        watermark.delivered(at(0), base, &fill(100), &config);
+        let beyond = |host: i64| watermark.skew_beyond_allowance(at(host), base, &config);
+
+        assert_eq!(beyond(131), Some(TimeDelta::seconds(31)));
+        assert_eq!(beyond(130), None);
+        assert_eq!(beyond(100), None);
+        assert_eq!(beyond(70), None);
+        assert_eq!(beyond(69), Some(TimeDelta::seconds(-31)));
+    }
+
+    #[test]
+    fn with_no_fill_delivered_no_skew_is_reported() {
+        let config = FillRecoveryConfig::default();
+        let base = Instant::now();
+        let watermark = Watermark::opened(at(0), base);
+
+        assert_eq!(
+            watermark.skew_beyond_allowance(at(10_000), base, &config),
+            None
+        );
     }
 
     #[tokio::test(start_paused = true)]

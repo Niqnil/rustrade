@@ -2578,7 +2578,8 @@ enum MarginTradesQuery {
 impl MarginTradesQuery {
     /// The first request of a walk from `from`, or `None` when a walk by time starts after
     /// `now_ms` and so has nothing to read. `now_ms` is where a walk by time stops stepping by
-    /// window: the call's start, or a span's end if earlier.
+    /// window: a span's end, cut to one window past the call's start (see
+    /// [`paginate_margin_my_trades`]).
     fn first(from: MyTradesFrom, now_ms: i64) -> Option<Self> {
         match from {
             MyTradesFrom::Span { start, .. } => {
@@ -2632,7 +2633,9 @@ impl MarginTradesQuery {
 ///   bare `startTime` — without `fromId` it returns only 24 hours of trades, and it rejects a
 ///   `startTime`..`endTime` span of 24 hours or more. So the walk first steps forward in windows
 ///   of [`MARGIN_MY_TRADES_WINDOW_MS`], each bounded by `startTime` and `endTime`, from the span's
-///   start to its end or the call's start by the local clock, whichever is earlier. At the first
+///   start to its end. An end past the local clock is kept, because the venue's clock can be
+///   ahead of it, but cut to one window past the call's start, so an empty walk does not step
+///   on through windows no fill can be stamped in. At the first
 ///   window holding a trade it switches to `from_id = last_id + 1` and reads on until a short
 ///   page, unless that window was the last and read a short page, and stops at the first page
 ///   reaching past the span's end, without the executions after it.
@@ -2664,7 +2667,11 @@ async fn paginate_margin_my_trades(
     // A walk by time reads up to here. A trade after it is left to the caller's next read (or, on
     // reconnect, to the stream), unless the walk is already paging by id.
     let now_ms = match from {
-        MyTradesFrom::Span { end, .. } => end.min(Utc::now().timestamp_millis()),
+        MyTradesFrom::Span { end, .. } => end.min(
+            Utc::now()
+                .timestamp_millis()
+                .saturating_add(MARGIN_MY_TRADES_WINDOW_MS),
+        ),
         MyTradesFrom::Order(_) => Utc::now().timestamp_millis(),
     };
     let mut all_pages = Vec::new();
@@ -4778,11 +4785,11 @@ mod tests {
         }
     }
 
-    /// A walk by time from `start` with no end: every trade from `start` on.
+    /// A walk by time from `start` to the local clock's present.
     fn since(start: i64) -> MyTradesFrom {
         MyTradesFrom::Span {
             start,
-            end: i64::MAX,
+            end: Utc::now().timestamp_millis(),
         }
     }
 
@@ -5036,6 +5043,44 @@ mod tests {
 
         assert_eq!(ids, vec![9]);
         assert_eq!(requests.len(), 1);
+    }
+
+    /// A span ending past the local clock, as a read placed on a venue clock ahead of it ends,
+    /// reads a fill the venue stamped after the local clock's present.
+    #[tokio::test]
+    async fn margin_trades_read_past_the_local_clock_to_the_spans_end() {
+        let now = Utc::now().timestamp_millis();
+        let span = MyTradesFrom::Span {
+            start: now - HOUR_MS,
+            end: now + HOUR_MS,
+        };
+        let (ids, requests) = read_margin_trades(venue(vec![(4, now + HOUR_MS / 2)]), span).await;
+
+        assert_eq!(ids, vec![4]);
+        assert_eq!(requests.len(), 1);
+    }
+
+    /// An end far past the local clock is cut to one window past it: an empty walk steps through
+    /// the windows up to there and stops, rather than on toward the end.
+    #[tokio::test]
+    async fn margin_trades_to_a_far_end_stop_one_window_past_the_local_clock() {
+        let now = Utc::now().timestamp_millis();
+        let span = MyTradesFrom::Span {
+            start: now - HOUR_MS,
+            end: i64::MAX,
+        };
+        let (ids, requests) = read_margin_trades(venue(Vec::new()), span).await;
+
+        assert!(ids.is_empty());
+        // Windows from 1 hour before the local clock to 22 hours after it, then to 23 hours.
+        assert_eq!(requests.len(), 2);
+        let last_end = requests[1]["endTime"].parse::<i64>().unwrap();
+        let cut = now + MARGIN_MY_TRADES_WINDOW_MS;
+        // The cut is taken from the clock when the walk starts, a moment after `now`.
+        assert!(
+            (cut..cut + 60_000).contains(&last_end),
+            "the last window ends at {last_end}, not one window past {now}"
+        );
     }
 
     /// A walk from a time after the call's start has nothing to read and sends nothing.

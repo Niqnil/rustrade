@@ -93,6 +93,10 @@ pub mod dedup;
 ))]
 pub(crate) mod order_recovery;
 
+// An estimate of a venue's clock from the times it stamps on its events. Always compiled: the
+// execution manager's fill recovery uses it whatever the client.
+pub mod venue_clock;
+
 // The account streams' reconnect budget. Gated on the clients that use it.
 #[cfg(any(feature = "alpaca", feature = "binance"))]
 pub(crate) mod reconnect_budget;
@@ -622,6 +626,11 @@ where
     ///
     /// The caller owns the loop, and with it how many calls, and how long, it spends on a span.
     /// A `start` after `end` is an empty span, read as no trades and `resume: None`.
+    ///
+    /// `end` can lie past this host's present. A read placed on the venue's clock, as the
+    /// execution manager's missed-fill recovery is, ends past it to cover a venue clock ahead of
+    /// this host's. Implementations read to `end` or the venue's present, whichever is earlier,
+    /// and must not cut `end` to this host's clock.
     ///
     /// # Venue limits
     ///

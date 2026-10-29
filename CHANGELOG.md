@@ -35,6 +35,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     allocator placed them. On 16 threads, an advance and three reads now take about 60 ns per
     thread, where the previous clock took up to 158 ns. Most of that gain is the alignment.
 
+### Added
+
+- **`VenueClock`** (`rustrade-execution`, `client::venue_clock`). It estimates the earliest a
+  venue's clock can read at a given moment, from the times the venue stamped on its events. Each
+  event's stamp is paired with the tokio `Instant` it arrived at, and the estimate counts on from
+  there on that monotonic clock, so a step of this host's wall clock does not move it. The sample
+  that bounds the venue's time tightest is kept, with an allowance of 100 ppm for drift between
+  the two clocks. An old event delivered late, such as a replayed fill, never displaces a better
+  sample. `host_lead` gives how far this host's clock can lead the venue's.
+
+### Fixed
+
+- **Missed-fill recovery reads its span on the venue's clock, not this host's** (`rustrade`,
+  #770). When the `ExecutionManager` reopened an account stream, the read of the fills it missed
+  started from the host time the last event arrived, less up to `max_clock_skew`, and ended at
+  the host's present. A host clock more than `max_clock_skew` + `overlap` ahead of the venue's,
+  or any amount ahead before the first fill, started the read after fills the venue stamped
+  during the outage. A host clock that stepped back before the reconnect ended it too early. In
+  both cases those fills were lost with no `FillRecoveryGaveUp`. Now:
+  - The read starts at the venue's time when the last event arrived, as a `VenueClock` estimates
+    it from the fills delivered, or at the local time if that is earlier, less `overlap`.
+  - It ends `max_clock_skew` past the later of the local time and the venue's estimated time. A
+    fill the read and the new stream both deliver is still delivered once.
+  - A clock difference beyond `max_clock_skew` is logged as a warning at each reopening.
+  - Until a fill has been delivered the venue's clock is unknown, so the read starts
+    `max_clock_skew` before the local time instead of `overlap` before it.
+  - A fill stamped `max_span` or more before it arrived is an old fill replayed, not a sample of
+    the venue's clock.
+
+- **Binance margin `fetch_trades` reads to an end past the local clock** (`rustrade-execution`).
+  It used to cut the span's end to this host's clock, so a read placed on a venue clock ahead of
+  this host's missed the fills stamped in between. The end is now cut only at one 23-hour
+  window past the local clock. The `ExecutionClient::fetch_trades` rustdoc now states that `end`
+  can lie past the present and must not be cut to the host's clock.
+
 ## [0.17.0] - 2026-10-28
 
 ### Added

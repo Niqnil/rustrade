@@ -68,9 +68,13 @@ pub struct AccountStreamOptions {
     pub reconnect: ReconnectionBackoffPolicy,
     /// The budget for reading the fills missed while the stream was down.
     pub fill_recovery: FillRecoveryConfig,
-    /// Where "now" comes from: for the end of a read's span, and for the watermark it starts
-    /// from. It must be the clock the venue stamps its fills on, so on a simulated venue it is
-    /// the simulation's.
+    /// Where "now" comes from: the local time each event arrived and each read is made. A read
+    /// starts no later than this clock's time at the last event delivered, and ends no earlier
+    /// than its time at the read, whatever the venue's clock is estimated to read. On a simulated
+    /// venue it must be the simulation's: the estimate counts on from the venue's last fill time
+    /// on tokio's clock, which a simulation does not drive, so it can warn of a clock difference
+    /// that is the simulation's pace, while this clock keeps the read covering the simulated
+    /// span.
     pub clock: Clock,
     /// How an open request whose outcome is unknown is settled, by looking the order up at the
     /// venue.
@@ -266,6 +270,14 @@ where
     /// gap is the caller's policy. The first open reads nothing, because the snapshot is its
     /// starting point.
     ///
+    /// The read is a span of the venue's clock, which can differ from this host's, so it is
+    /// placed on the venue's clock: estimated from the times the venue stamped on the fills
+    /// delivered, and counted on from there on tokio's monotonic clock. A step of this host's
+    /// wall clock, before the stream ended or while it was down, does not move it. A difference
+    /// between the two clocks beyond `options.fill_recovery.max_clock_skew` is logged as a
+    /// warning at each re-initialisation. Until a fill has been delivered the venue's clock is
+    /// unknown, and the read allows for that much difference instead.
+    ///
     /// Fills are deduplicated by instrument and trade id, across the read and the new stream and
     /// across re-initialisations, with the 10,000 most recent kept. An order that ended without a
     /// fill in the gap is the snapshot's to show, as before.
@@ -323,14 +335,11 @@ where
 
                 // When this attempt began: what the watermark is on a first open, so a fill made
                 // while the snapshot is fetched is inside the span of the next read.
-                let opened = clock.now();
+                let opened = (clock.now(), Instant::now());
 
-                // Where this open reads from: `None` on the first open. Taken before the stream
+                // What this open reads from: `None` on the first open. Taken before the stream
                 // opens, so the span runs from the last event delivered to the moment it reads.
-                let read_from = watermark
-                    .lock()
-                    .as_ref()
-                    .map(|watermark| watermark.read_from(&fill_recovery));
+                let last = *watermark.lock();
 
                 // Initialise AccountStream & apply indexing. Opened before the read, so a fill
                 // made during it arrives on the stream.
@@ -344,13 +353,25 @@ where
                 .await?;
 
                 // Fills missed while the stream was down, before the snapshot that follows them.
-                let missed = match read_from {
-                    Some(start) => {
+                let missed = match last {
+                    Some(last) => {
+                        let (now, instant) = (clock.now(), Instant::now());
+                        if let Some(lead) = last.skew_beyond_allowance(now, instant, &fill_recovery)
+                        {
+                            warn!(
+                                exchange_id = %indexer.map.exchange.value,
+                                host_lead_ms = lead.num_milliseconds(),
+                                max_clock_skew = ?fill_recovery.max_clock_skew,
+                                "AccountStream fill recovery: this host's clock differs from \
+                                 the venue's by more than the allowance; the read is placed \
+                                 on the venue's clock"
+                            );
+                        }
                         let read = backfill(
                             |from, to| client.fetch_trades(from, to, &instruments),
                             &instruments,
-                            start,
-                            clock.now(),
+                            last.read_from(&fill_recovery),
+                            last.read_to(now, instant, &fill_recovery),
                             &fill_recovery,
                         )
                         .await;
@@ -384,7 +405,9 @@ where
 
                 // Nothing delivered counts until it is delivered: the watermark moves as events
                 // pass, so an attempt that fails above leaves it where it was.
-                watermark.lock().get_or_insert(Watermark::opened(opened));
+                watermark
+                    .lock()
+                    .get_or_insert(Watermark::opened(opened.0, opened.1));
 
                 // It's expected downstream consumers (eg/ EngineState will sync updates)
                 // Boxed: the chain is named by every layer above it, once per client type.
@@ -393,7 +416,7 @@ where
                     .chain(updates)
                     .inspect(move |event| {
                         if let Some(watermark) = watermark.lock().as_mut() {
-                            watermark.delivered(clock.now(), event);
+                            watermark.delivered(clock.now(), Instant::now(), event, &fill_recovery);
                         }
                     })
                     .boxed())
@@ -1637,8 +1660,9 @@ mod tests {
     }
 
     /// The fills read for the span a stream was down come before the snapshot that follows them,
-    /// the read starts at the watermark less the overlap and runs to now, and a fill the new
-    /// stream sends again, read already, is delivered once.
+    /// and a fill the new stream sends again, read already, is delivered once. With no fill
+    /// delivered before the stream ended, the venue's clock is unknown, so the read allows the
+    /// 30 s skew allowance on both sides of the local clock, and 2 s of overlap before it.
     #[tokio::test]
     async fn a_reopened_stream_delivers_the_missed_fills_before_its_snapshot() {
         let client = FlakyAccountClient {
@@ -1672,8 +1696,8 @@ mod tests {
             ]
         );
         let at = |secs: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap();
-        // The first open reads nothing; the re-init reads from the watermark less 2 s to now.
-        assert_eq!(*fetched.lock().unwrap(), [(at(98), at(100))]);
+        // The first open reads nothing; the re-init reads around the watermark.
+        assert_eq!(*fetched.lock().unwrap(), [(at(68), at(130))]);
     }
 
     /// A read that fails does not stop the stream opening: its span is reported and the snapshot
@@ -1718,7 +1742,8 @@ mod tests {
     async fn the_read_starts_from_the_last_event_delivered_not_from_the_open() {
         let client = FlakyAccountClient {
             open_from: 1,
-            ending: vec![live_trade("x", 0)],
+            // Stamped when the venue's clock is at the stepping clock's third reading.
+            ending: vec![live_trade("x", 2000)],
             ..FlakyAccountClient::default()
         };
         let fetched = Arc::clone(&client.fetched);
@@ -1738,6 +1763,79 @@ mod tests {
             panic!("one read")
         };
         assert!(start > opened, "{start} is not after the open at {opened}");
+    }
+
+    /// A host clock 190 s ahead of the venue's, far beyond the 30 s allowance, still reads the
+    /// fill the venue stamped while the stream was down: the read is placed on the venue's clock,
+    /// from the time it stamped on the last fill delivered.
+    #[tokio::test]
+    async fn a_host_clock_ahead_of_the_venue_beyond_the_allowance_still_recovers_the_missed_fill() {
+        let client = FlakyAccountClient {
+            open_from: 1,
+            ending: vec![live_trade("x", 10)],
+            reads: Arc::new(std::sync::Mutex::new(
+                [Ok(TradesRead::complete(vec![missed_trade("m", 15)]))].into(),
+            )),
+            ..FlakyAccountClient::default()
+        };
+        let fetched = Arc::clone(&client.fetched);
+        let Ok(manager) = init_flaky_recovering(client, at_clock(200)).await else {
+            panic!("the first attempt succeeds, so init should too");
+        };
+
+        let events = manager.account_stream.take(5).collect::<Vec<_>>().await;
+
+        assert_eq!(
+            events.iter().map(describe).collect::<Vec<_>>(),
+            ["snapshot", "trade x", "reconnecting", "trade m", "snapshot"]
+        );
+        let at = |secs: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap();
+        let [(start, end)] = fetched.lock().unwrap().clone()[..] else {
+            panic!("one read")
+        };
+        assert!(
+            start <= at(15) && at(15) <= end,
+            "[{start}, {end}] misses the fill at {}",
+            at(15)
+        );
+    }
+
+    /// A host clock that steps back 100 s while the stream is down reads, at the reopening, a
+    /// time before the outage began. The read still runs past the venue's time: the end is
+    /// counted on from the last fill on tokio's clock, which does not step.
+    #[tokio::test]
+    async fn a_host_clock_stepped_back_before_the_reopening_still_reads_to_the_venues_time() {
+        let client = FlakyAccountClient {
+            open_from: 1,
+            ending: vec![live_trade("x", 100)],
+            ..FlakyAccountClient::default()
+        };
+        let fetched = Arc::clone(&client.fetched);
+        // 100 until the stream reopens (the second open), then 0.
+        let attempts = Arc::clone(&client.attempts);
+        let clock = Clock::new(move || {
+            let reopened = attempts.load(std::sync::atomic::Ordering::Relaxed) >= 2;
+            DateTime::<Utc>::from_timestamp(1_800_000_000 + if reopened { 0 } else { 100 }, 0)
+                .unwrap()
+        });
+        let Ok(manager) = init_flaky_recovering(client, clock).await else {
+            panic!("the first attempt succeeds, so init should too");
+        };
+
+        let events = manager.account_stream.take(4).collect::<Vec<_>>().await;
+
+        assert_eq!(
+            events.iter().map(describe).collect::<Vec<_>>(),
+            ["snapshot", "trade x", "reconnecting", "snapshot"]
+        );
+        let at = |secs: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap();
+        let [(start, end)] = fetched.lock().unwrap().clone()[..] else {
+            panic!("one read")
+        };
+        // From the fill, at the time both clocks agreed on, less the overlap.
+        assert_eq!(start, at(98));
+        // Past the venue's time of the fill by the skew allowance, not ended at the host's 0.
+        assert!(end >= at(130), "the read ends at {end}");
     }
 
     /// A re-init whose snapshot fails after the read leaves the watermark where it was and marks

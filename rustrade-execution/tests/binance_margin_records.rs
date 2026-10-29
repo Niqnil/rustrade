@@ -8,7 +8,9 @@
 //!   says: a record converted into BNB holds BNB in `asset`, and an isolated record has no
 //!   `rawAsset`;
 //! - whether a cross forced-liquidation query returns records marked isolated;
-//! - whether the forced-liquidation endpoint refuses a span of two years.
+//! - whether the forced-liquidation endpoint refuses a span of two years;
+//! - whether a margin trades read accepts an `endTime` past Binance's clock, as a fill-recovery
+//!   read placed on the venue's clock sends one.
 //!
 //! The reads cost about 20 of Binance's per-IP request weight, of the 12000 a minute allows, plus
 //! one per page of records.
@@ -39,6 +41,7 @@ use rustrade_execution::{
         binance::{BinanceMargin, BinanceMarginConfig},
     },
 };
+use rustrade_instrument::instrument::name::InstrumentNameExchange;
 use std::collections::BTreeMap;
 
 fn env(name: &str) -> String {
@@ -189,4 +192,28 @@ async fn margin_history_endpoints_answer_what_the_docs_do_not() {
         ),
         Err(error) => println!("forceLiquidationRec, 730 days: refused: {error}"),
     }
+}
+
+/// A margin trades read whose span ends an hour past the present: its last window sends an
+/// `endTime` past Binance's clock, which the read must accept rather than refuse.
+#[tokio::test]
+#[ignore]
+async fn margin_trades_read_to_an_end_past_the_venues_clock() {
+    let (api_key, secret_key) = credentials();
+    let client = BinanceMargin::new(BinanceMarginConfig::cross_margin(api_key, secret_key));
+    let now = Utc::now();
+    let symbol = std::env::var("BINANCE_MARGIN_TRADES_SYMBOL").unwrap_or_else(|_| "BTCUSDT".into());
+
+    let read = client
+        .fetch_trades(
+            now - TimeDelta::hours(1),
+            now + TimeDelta::hours(1),
+            &[InstrumentNameExchange::new(symbol.as_str())],
+        )
+        .await
+        .expect("a read to an end past the venue's clock");
+    println!(
+        "fetch_trades to an hour ahead, {symbol}: accepted, {} trades",
+        read.trades.len()
+    );
 }
