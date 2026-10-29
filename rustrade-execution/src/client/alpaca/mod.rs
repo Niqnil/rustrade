@@ -1534,6 +1534,8 @@ impl ExecutionClient for AlpacaClient {
         // URLs are extracted before the closures to avoid re-allocating on each retry attempt.
         let account_url = format!("{base}/v2/account");
         let positions_url = format!("{base}/v2/positions");
+        // The balances' time: the reads describe the account no earlier than this.
+        let sent = Utc::now();
         let (account, positions): (Option<AlpacaAccount>, Vec<AlpacaPosition>) = tokio::try_join!(
             async {
                 if wants_usd {
@@ -1548,10 +1550,10 @@ impl ExecutionClient for AlpacaClient {
         )?;
 
         let mut balances = account
-            .map(|account| convert_account_to_balances(&account, assets))
+            .map(|account| convert_account_to_balances(&account, assets, sent))
             .unwrap_or_default();
         if wants_non_usd {
-            balances.extend(convert_positions_to_balances(&positions, assets));
+            balances.extend(convert_positions_to_balances(&positions, assets, sent));
         }
 
         // Converted before the open orders are fetched, so a position that cannot be converted
@@ -1884,9 +1886,10 @@ impl ExecutionClient for AlpacaClient {
         if wants_usd {
             // Pre-allocate URL to avoid re-allocation on each retry attempt.
             let account_url = format!("{base}/v2/account");
+            let sent = Utc::now();
             let account: AlpacaAccount =
                 rest_with_retry(&self.rate_limiter, || http.get(&account_url)).await?;
-            result.extend(convert_account_to_balances(&account, assets));
+            result.extend(convert_account_to_balances(&account, assets, sent));
         }
 
         // Fetch positions for non-USD asset balances (e.g., BTC, ETH from crypto holdings).
@@ -1894,9 +1897,10 @@ impl ExecutionClient for AlpacaClient {
         if wants_non_usd {
             // Pre-allocate URL to avoid re-allocation on each retry attempt.
             let positions_url = format!("{base}/v2/positions");
+            let sent = Utc::now();
             let positions: Vec<AlpacaPosition> =
                 rest_with_retry(&self.rate_limiter, || http.get(&positions_url)).await?;
-            result.extend(convert_positions_to_balances(&positions, assets));
+            result.extend(convert_positions_to_balances(&positions, assets, sent));
         }
 
         Ok(result)
@@ -4084,10 +4088,11 @@ fn is_usd(asset: &AssetNameExchange) -> bool {
 ///
 /// The balance is named [`USD`], however the caller spelled it. If `assets` is non-empty, it is
 /// returned only when USD is among them, matched ignoring case. An empty `assets` slice returns it
-/// unconditionally.
+/// unconditionally. It is stamped `time`.
 fn convert_account_to_balances(
     account: &AlpacaAccount,
     assets: &[AssetNameExchange],
+    time: DateTime<Utc>,
 ) -> Vec<AssetBalance<AssetNameExchange>> {
     if !assets.is_empty() && !assets.iter().any(is_usd) {
         return Vec::new();
@@ -4099,7 +4104,7 @@ fn convert_account_to_balances(
             account.cash,
             account.cash.min(account.non_marginable_buying_power),
         ),
-        Utc::now(),
+        time,
     )]
 }
 
@@ -4113,12 +4118,12 @@ fn convert_account_to_balances(
 /// - `free`  = qty_available (base currency units not locked in open orders)
 ///
 /// If `assets` is non-empty, only positions whose base asset name matches an
-/// entry in the slice (case-insensitive) are returned.
+/// entry in the slice (case-insensitive) are returned. Each is stamped `time`.
 fn convert_positions_to_balances(
     positions: &[AlpacaPosition],
     assets: &[AssetNameExchange],
+    time: DateTime<Utc>,
 ) -> Vec<AssetBalance<AssetNameExchange>> {
-    let now = Utc::now();
     positions
         .iter()
         .filter(|p| is_crypto_position(p))
@@ -4140,7 +4145,7 @@ fn convert_positions_to_balances(
             Some(AssetBalance::new(
                 asset_name,
                 Balance::new(p.qty, p.qty_available),
-                now,
+                time,
             ))
         })
         .collect()
@@ -6313,7 +6318,7 @@ mod tests {
             "non_marginable_buying_power": "8500.25",
         }))
         .unwrap();
-        let balances = convert_account_to_balances(&account, &[]);
+        let balances = convert_account_to_balances(&account, &[], Utc::now());
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].asset, AssetNameExchange::new("USD"));
         assert_eq!(balances[0].balance.total, dec!(9000.50), "total is cash");
@@ -6336,7 +6341,7 @@ mod tests {
             "non_marginable_buying_power": "75000",
         }))
         .unwrap();
-        let balances = convert_account_to_balances(&account, &[]);
+        let balances = convert_account_to_balances(&account, &[], Utc::now());
         assert_eq!(balances[0].balance.total, dec!(50000));
         assert_eq!(balances[0].balance.free, dec!(50000));
     }
@@ -6352,7 +6357,7 @@ mod tests {
             "non_marginable_buying_power": "9900",
         }))
         .unwrap();
-        let balances = convert_account_to_balances(&account, &[]);
+        let balances = convert_account_to_balances(&account, &[], Utc::now());
         assert_eq!(balances[0].balance.total, dec!(10200));
         assert_eq!(balances[0].balance.free, dec!(9900));
     }
@@ -6366,7 +6371,7 @@ mod tests {
             "non_marginable_buying_power": "1250.00",
         }))
         .unwrap();
-        let balances = convert_account_to_balances(&account, &[]);
+        let balances = convert_account_to_balances(&account, &[], Utc::now());
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].balance.total, dec!(-2500.75));
         assert_eq!(
@@ -6392,12 +6397,12 @@ mod tests {
             non_marginable_buying_power: dec!(10000.00),
         };
         let usd = vec![AssetNameExchange::new("USD")];
-        let balances = convert_account_to_balances(&account, &usd);
+        let balances = convert_account_to_balances(&account, &usd, Utc::now());
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].asset, AssetNameExchange::new("USD"));
 
         let non_usd = vec![AssetNameExchange::new("BTC")];
-        let balances = convert_account_to_balances(&account, &non_usd);
+        let balances = convert_account_to_balances(&account, &non_usd, Utc::now());
         assert!(balances.is_empty());
     }
 
@@ -6409,7 +6414,8 @@ mod tests {
             cash: dec!(12000.00),
             non_marginable_buying_power: dec!(10000.00),
         };
-        let balances = convert_account_to_balances(&account, &[AssetNameExchange::new("usd")]);
+        let balances =
+            convert_account_to_balances(&account, &[AssetNameExchange::new("usd")], Utc::now());
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].asset, AssetNameExchange::new("USD"));
     }
@@ -6890,7 +6896,7 @@ mod tests {
         ];
 
         // All crypto assets
-        let balances = convert_positions_to_balances(&positions, &[]);
+        let balances = convert_positions_to_balances(&positions, &[], Utc::now());
         assert_eq!(balances.len(), 2, "only crypto positions returned");
         assert_eq!(balances[0].asset.name().as_str(), "BTC");
         assert_eq!(balances[1].asset.name().as_str(), "ETH");
@@ -6900,7 +6906,7 @@ mod tests {
 
         // Filter to BTC only: matches the `BTCUSD` position
         let btc_only = vec![AssetNameExchange::new("btc")];
-        let balances = convert_positions_to_balances(&positions, &btc_only);
+        let balances = convert_positions_to_balances(&positions, &btc_only, Utc::now());
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].asset.name().as_str(), "BTC");
     }
@@ -7073,7 +7079,7 @@ mod tests {
         assert_eq!(positions[0].side, AlpacaPositionSide::Unknown);
         assert_eq!(positions[1].side, AlpacaPositionSide::Unknown);
 
-        let balances = convert_positions_to_balances(&positions, &[]);
+        let balances = convert_positions_to_balances(&positions, &[], Utc::now());
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].balance.total, dec!(0.5));
 
@@ -8364,59 +8370,73 @@ mod tests {
         /// Mounts `/v2/account`, `/v2/positions` and an empty `/v2/orders` on `server`.
         /// Synthetic values only; no provider data.
         async fn mount_account_and_positions(server: &MockServer) {
+            mount_account_and_positions_answering_after(server, Duration::ZERO).await;
+        }
+
+        /// [`mount_account_and_positions`], answering the account and positions reads `delay`
+        /// after each arrives.
+        async fn mount_account_and_positions_answering_after(server: &MockServer, delay: Duration) {
             Mock::given(method("GET"))
                 .and(path("/v2/account"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "status": "ACTIVE",
-                    "currency": "USD",
-                    "cash": "-1500.50",
-                    "equity": "4000.00",
-                    "buying_power": "5000.00",
-                    "options_buying_power": "2000.00",
-                    "non_marginable_buying_power": "1000.00",
-                })))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({
+                            "status": "ACTIVE",
+                            "currency": "USD",
+                            "cash": "-1500.50",
+                            "equity": "4000.00",
+                            "buying_power": "5000.00",
+                            "options_buying_power": "2000.00",
+                            "non_marginable_buying_power": "1000.00",
+                        }))
+                        .set_delay(delay),
+                )
                 .mount(server)
                 .await;
             Mock::given(method("GET"))
                 .and(path("/v2/positions"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                    {
-                        "symbol": "XYZ",
-                        "asset_class": "us_equity",
-                        "side": "short",
-                        "qty": "-10",
-                        "qty_available": "-10",
-                        "avg_entry_price": "20.00",
-                        "unrealized_pl": "15.50",
-                    },
-                    {
-                        "symbol": "XYZ271217C00025000",
-                        "asset_class": "us_option",
-                        "side": "long",
-                        "qty": "3",
-                        "qty_available": "3",
-                        "avg_entry_price": "0.85",
-                        "unrealized_pl": "-45",
-                    },
-                    {
-                        "symbol": "ABC",
-                        "asset_class": "us_equity",
-                        "side": "long",
-                        "qty": "2.5",
-                        "qty_available": "2.5",
-                        "avg_entry_price": "40.00",
-                        "unrealized_pl": "1.25",
-                    },
-                    {
-                        "symbol": "BTCUSD",
-                        "asset_class": "crypto",
-                        "side": "long",
-                        "qty": "0.75",
-                        "qty_available": "0.5",
-                        "avg_entry_price": "50000",
-                        "unrealized_pl": "0",
-                    },
-                ])))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([
+                            {
+                                "symbol": "XYZ",
+                                "asset_class": "us_equity",
+                                "side": "short",
+                                "qty": "-10",
+                                "qty_available": "-10",
+                                "avg_entry_price": "20.00",
+                                "unrealized_pl": "15.50",
+                            },
+                            {
+                                "symbol": "XYZ271217C00025000",
+                                "asset_class": "us_option",
+                                "side": "long",
+                                "qty": "3",
+                                "qty_available": "3",
+                                "avg_entry_price": "0.85",
+                                "unrealized_pl": "-45",
+                            },
+                            {
+                                "symbol": "ABC",
+                                "asset_class": "us_equity",
+                                "side": "long",
+                                "qty": "2.5",
+                                "qty_available": "2.5",
+                                "avg_entry_price": "40.00",
+                                "unrealized_pl": "1.25",
+                            },
+                            {
+                                "symbol": "BTCUSD",
+                                "asset_class": "crypto",
+                                "side": "long",
+                                "qty": "0.75",
+                                "qty_available": "0.5",
+                                "avg_entry_price": "50000",
+                                "unrealized_pl": "0",
+                            },
+                        ]))
+                        .set_delay(delay),
+                )
                 .mount(server)
                 .await;
             Mock::given(method("GET"))
@@ -8489,6 +8509,43 @@ mod tests {
                 ],
                 "short equity, option and fractional positions; no crypto position"
             );
+        }
+
+        /// Balances are stamped no later than the requests that read them were sent, never when
+        /// the answers arrive: the engine orders balance state by that time, so a later one would
+        /// shut out events from between the two.
+        #[tokio::test]
+        async fn balances_are_stamped_before_their_reads_were_sent() {
+            use crate::client::ExecutionClient;
+
+            const ANSWER_DELAY: Duration = Duration::from_millis(200);
+            let server = MockServer::start().await;
+            mount_account_and_positions_answering_after(&server, ANSWER_DELAY).await;
+            let client = client_for(&server);
+
+            let before = Utc::now();
+            let fetched = client.fetch_balances(&[]).await.unwrap();
+            let between = Utc::now();
+            let snapshot = client.account_snapshot(&[], &[]).await.unwrap();
+            let after = Utc::now();
+
+            assert_eq!((fetched.len(), snapshot.balances.len()), (2, 2));
+            // `fetch_balances` reads the account, then the positions: the account's balance was
+            // sent for before both answers.
+            assert_eq!(fetched[0].asset.name().as_str(), USD);
+            assert!(fetched[0].time_exchange + 2 * ANSWER_DELAY <= between);
+            // Each read's balances against the span its requests were sent in.
+            for (balances, from, to) in [
+                (&fetched, before, between),
+                (&snapshot.balances, between, after),
+            ] {
+                for balance in balances {
+                    assert!(
+                        from <= balance.time_exchange && balance.time_exchange + ANSWER_DELAY <= to,
+                        "{balance:?} not within {from} ..= {to} - {ANSWER_DELAY:?}"
+                    );
+                }
+            }
         }
 
         /// A USD-only request still fetches positions, since they back the instrument

@@ -9,6 +9,16 @@ use serde::{Deserialize, Serialize};
 pub struct AssetBalance<AssetKey> {
     pub asset: AssetKey,
     pub balance: Balance,
+    /// A time no later than when the venue's account held this balance.
+    ///
+    /// Balance state is ordered by it: a balance replaces one held only if it is at least as
+    /// recent, and a stream update older than the balance held is dropped. So it errs early,
+    /// never late. A balance read over REST is stamped no later than the moment its request was
+    /// sent, less how far the venue's REST view can trail its stream (see
+    /// [`ExecutionClient::fetch_balances`](crate::client::ExecutionClient::fetch_balances)): its
+    /// state can be older than the read, never newer. Erring early costs little: a stream event
+    /// from between the stamp and the read that arrives after the balance applies over it, and
+    /// restates what the balance already held, or older holdings until the next event.
     pub time_exchange: DateTime<Utc>,
 }
 

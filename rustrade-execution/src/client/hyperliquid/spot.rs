@@ -327,6 +327,8 @@ impl ExecutionClient for HyperliquidSpotClient {
     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
         let address = self.wallet_h160();
 
+        // The balances' time: the read describes the account no earlier than this.
+        let sent = Utc::now();
         // Fetch spot token balances and open orders concurrently
         let (token_balances, open_orders) = tokio::try_join!(
             async {
@@ -338,8 +340,7 @@ impl ExecutionClient for HyperliquidSpotClient {
             open_orders(&self.info_client, address)
         )?;
 
-        let now = Utc::now();
-        let balances = spot_balances(&token_balances.balances, now).collect();
+        let balances = spot_balances(&token_balances.balances, sent).collect();
 
         let coins = open_orders.iter().map(|order| order.coin.as_str());
         let pairs = self.spot_coins.covering(coins.clone()).await;
@@ -1061,14 +1062,15 @@ impl ExecutionClient for HyperliquidSpotClient {
     ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
         let address = self.wallet_h160();
 
+        // The balances' time: the read describes the account no earlier than this.
+        let sent = Utc::now();
         let token_balances = self
             .info_client
             .user_token_balances(address)
             .await
             .map_err(map_sdk_error)?;
 
-        let now = Utc::now();
-        Ok(spot_balances(&token_balances.balances, now).collect())
+        Ok(spot_balances(&token_balances.balances, sent).collect())
     }
 
     async fn fetch_open_orders(
@@ -1657,6 +1659,59 @@ mod tests {
                 known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidSpot),
             };
             (server, client)
+        }
+
+        /// Balances are stamped no later than the request that read them was sent, never when
+        /// the answer arrives, by both reads.
+        #[tokio::test]
+        async fn balances_are_stamped_before_their_reads_were_sent() {
+            use wiremock::matchers::body_partial_json;
+            const ANSWER_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+            let (server, client) = resting_client().await;
+            for (request, answer) in [
+                (
+                    serde_json::json!({"type": "spotClearinghouseState"}),
+                    serde_json::json!({"balances": [
+                        {"coin": "USDC", "token": 0, "total": "10", "hold": "0", "entryNtl": "0"}
+                    ]}),
+                ),
+                (
+                    serde_json::json!({"type": "openOrders"}),
+                    serde_json::json!([]),
+                ),
+            ] {
+                Mock::given(method("POST"))
+                    .and(path("/info"))
+                    .and(body_partial_json(request))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .set_body_json(answer)
+                            .set_delay(ANSWER_DELAY),
+                    )
+                    .with_priority(1)
+                    .mount(&server)
+                    .await;
+            }
+
+            let before = Utc::now();
+            let fetched = client.fetch_balances(&[]).await.unwrap();
+            let between = Utc::now();
+            let snapshot = client.account_snapshot(&[], &[]).await.unwrap();
+            let after = Utc::now();
+
+            assert_eq!((fetched.len(), snapshot.balances.len()), (1, 1));
+            // Each read's balances against the span its requests were sent in.
+            for (balances, from, to) in [
+                (&fetched, before, between),
+                (&snapshot.balances, between, after),
+            ] {
+                for balance in balances {
+                    assert!(
+                        from <= balance.time_exchange && balance.time_exchange + ANSWER_DELAY <= to,
+                        "{balance:?} not within {from} ..= {to} - {ANSWER_DELAY:?}"
+                    );
+                }
+            }
         }
 
         /// A spot order refused for want of balance is a balance shortfall, as on other venues;

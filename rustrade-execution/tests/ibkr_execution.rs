@@ -363,13 +363,22 @@ async fn test_fetch_balances() {
     let client = connect_client(config).await.expect("connection failed");
 
     let assets: Vec<AssetNameExchange> = vec![];
+    let before = chrono::Utc::now();
     let result = client.fetch_balances(&assets).await;
+    let after = chrono::Utc::now();
 
     assert!(result.is_ok(), "fetch_balances failed: {:?}", result.err());
 
     let balances = result.unwrap();
     println!("Fetched {} balance(s)", balances.len());
+    // A paper account always holds cash.
+    assert!(!balances.is_empty(), "no balance returned");
     for balance in &balances {
+        // Stamped when the summary was asked for: within the call, never after it.
+        assert!(
+            before <= balance.time_exchange && balance.time_exchange <= after,
+            "{balance:?} not stamped within {before} ..= {after}"
+        );
         println!(
             "  {}: total={}, free={}, accrued={:?}",
             balance.asset, balance.balance.total, balance.balance.free, balance.balance.accrued

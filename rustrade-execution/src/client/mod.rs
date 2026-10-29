@@ -459,6 +459,8 @@ where
     /// lets you ask, which saves bandwidth. A balance for another asset is not an error: the
     /// `ExecutionManager` drops it and logs the asset names once per snapshot.
     ///
+    /// Balances are stamped as [`fetch_balances`](Self::fetch_balances) describes.
+    ///
     /// # Order completeness
     ///
     /// Each [`InstrumentAccountSnapshot`](crate::InstrumentAccountSnapshot) states through
@@ -591,6 +593,19 @@ where
     ///
     /// An empty `assets` slice is the "return all" sentinel: implementations must return
     /// balances for every asset held. When non-empty, only the listed assets are returned.
+    ///
+    /// # Balance time
+    ///
+    /// Each balance's `time_exchange` must be no later than the state it describes, because the
+    /// engine orders balance and debt state by it: a balance stamped later than its state would
+    /// block the stream's balance and debt events from between the two (see
+    /// [`AssetBalance::time_exchange`]). Stamp a balance with this host's time taken before the
+    /// request that returned it was sent, less how far the venue's REST view can trail its
+    /// account stream where the stream carries balances, never with a time taken after the
+    /// response. A time the venue states for the account's state can be used instead.
+    ///
+    /// That time is on this host's clock, so a host clock ahead of the venue's carries into it:
+    /// keeping the two within bounds is the caller's obligation.
     fn fetch_balances(
         &self,
         assets: &[AssetNameExchange],

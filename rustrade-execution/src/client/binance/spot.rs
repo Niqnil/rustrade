@@ -44,14 +44,14 @@ use super::shared::{
     OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
     UnsubscribeOnDrop, UserDataFrame, WeightPool, account_position_time, answer_time,
-    binance_filled_qty, classify_order_kind_tif, classify_rest_query_error,
+    balance_read_time, binance_filled_qty, classify_order_kind_tif, classify_rest_query_error,
     classify_ws_order_error, convert_ended_order, convert_execution_report,
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
     disconnect_error, drop_after, frame_excerpt, gap_failed, gap_time, is_duplicate,
     is_unknown_order, log_unhandled_event, log_unrecognised_frame, new_dedup_cache,
     parse_user_data_frame, placed_order_state, recovered_order_cids, recovered_order_totals,
-    response_decode_error, rest_call_with_retry, retry_or_end, trailing_params, unix_ms,
-    unreadable_answer,
+    response_decode_error, rest_call_with_retry, rest_read_with_retry, retry_or_end,
+    trailing_params, unix_ms, unreadable_answer,
 };
 use crate::rules::{OrderRules, PreSendRules};
 use crate::{
@@ -881,8 +881,8 @@ impl ExecutionClient for BinanceSpot {
         instruments: &[InstrumentNameExchange],
     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
         // Fetch account info via REST (with rate-limit retry)
-        let response =
-            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+        let (response, sent) =
+            rest_read_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
                 Box::pin(async move {
                     let params = GetAccountParams::builder().build()?;
                     rest.get_account(params).await
@@ -894,7 +894,11 @@ impl ExecutionClient for BinanceSpot {
         let account = response.data().await.map_err(response_decode_error)?;
 
         // Convert balances, filtering to requested assets
-        let balances = filter_and_convert_balances(account.balances.unwrap_or_default(), assets);
+        let balances = filter_and_convert_balances(
+            account.balances.unwrap_or_default(),
+            assets,
+            balance_read_time(sent),
+        );
 
         // Fetch open orders for all instruments concurrently (with retry)
         // limit concurrency to avoid bursting Binance's request weight limits
@@ -1568,12 +1572,16 @@ impl ExecutionClient for BinanceSpot {
         }
     }
 
+    /// Each balance is stamped 5 s before its request was sent, as is each in
+    /// [`account_snapshot`](Self::account_snapshot): Binance's REST account view can trail its
+    /// account stream, and a stream balance event the read may not yet show must still be more
+    /// recent than the read.
     async fn fetch_balances(
         &self,
         assets: &[AssetNameExchange],
     ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
-        let response =
-            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+        let (response, sent) =
+            rest_read_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
                 Box::pin(async move {
                     let params = GetAccountParams::builder().build()?;
                     rest.get_account(params).await
@@ -1587,6 +1595,7 @@ impl ExecutionClient for BinanceSpot {
         Ok(filter_and_convert_balances(
             account.balances.unwrap_or_default(),
             assets,
+            balance_read_time(sent),
         ))
     }
 
@@ -2312,16 +2321,18 @@ fn convert_balance_entry(
     ))
 }
 
+/// Filter `balances` to `assets` (all of them when `assets` is empty) and convert them, each
+/// stamped `time`.
 fn filter_and_convert_balances(
     balances: Vec<binance_sdk::spot::rest_api::GetAccountResponseBalancesInner>,
     assets: &[AssetNameExchange],
+    time: chrono::DateTime<Utc>,
 ) -> Vec<AssetBalance<AssetNameExchange>> {
-    let now = Utc::now();
     // Empty assets slice means "return all" — skip building the set entirely.
     if assets.is_empty() {
         return balances
             .into_iter()
-            .filter_map(|b| convert_balance_entry(b, now))
+            .filter_map(|b| convert_balance_entry(b, time))
             .collect();
     }
     // For small slices (≤16 assets), linear scan avoids allocation and hashing overhead.
@@ -2334,7 +2345,7 @@ fn filter_and_convert_balances(
                 if !assets.iter().any(|a| a.name().as_str() == asset_name_str) {
                     return None;
                 }
-                convert_balance_entry(b, now)
+                convert_balance_entry(b, time)
             })
             .collect();
     }
@@ -2347,7 +2358,7 @@ fn filter_and_convert_balances(
             if !asset_set.contains(asset_name_str) {
                 return None;
             }
-            convert_balance_entry(b, now)
+            convert_balance_entry(b, time)
         })
         .collect()
 }
@@ -4322,7 +4333,7 @@ mod tests {
             make_balance("BTC", "1.0", "0.0"),
             make_balance("USDT", "500.0", "50.0"),
         ];
-        let result = filter_and_convert_balances(balances, &[]);
+        let result = filter_and_convert_balances(balances, &[], Utc::now());
         assert_eq!(result.len(), 2, "empty filter should return all balances");
     }
 
@@ -4333,7 +4344,7 @@ mod tests {
             make_balance("ETH", "10.0", "0.0"),
         ];
         let assets = vec![AssetNameExchange::new("BTC")];
-        let result = filter_and_convert_balances(balances, &assets);
+        let result = filter_and_convert_balances(balances, &assets, Utc::now());
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].asset, AssetNameExchange::new("BTC"));
         // total = free + locked = 1.5 + 0.5
@@ -4348,7 +4359,7 @@ mod tests {
             make_balance("ETH", "2.0", "0.0"),
         ];
         let assets = vec![AssetNameExchange::new("USDT")];
-        let result = filter_and_convert_balances(balances, &assets);
+        let result = filter_and_convert_balances(balances, &assets, Utc::now());
         assert!(
             result.is_empty(),
             "non-matching asset should be filtered out"
@@ -4365,7 +4376,7 @@ mod tests {
             },
             make_balance("USDT", "100.0", "0.0"),
         ];
-        let result = filter_and_convert_balances(balances, &[]);
+        let result = filter_and_convert_balances(balances, &[], Utc::now());
         assert_eq!(
             result.len(),
             1,
@@ -4383,7 +4394,7 @@ mod tests {
                 locked: Some("0.0".to_string()),
             },
         ];
-        let result = filter_and_convert_balances(balances, &[]);
+        let result = filter_and_convert_balances(balances, &[], Utc::now());
         assert!(
             result.is_empty(),
             "unparseable free field should be skipped"
@@ -4398,7 +4409,7 @@ mod tests {
             make_balance("BTC", "0.00000000", "0.00000000"),
             make_balance("USDT", "100.0", "0.0"),
         ];
-        let result = filter_and_convert_balances(balances, &[]);
+        let result = filter_and_convert_balances(balances, &[], Utc::now());
         assert_eq!(result.len(), 2, "zero-balance entries must be included");
         let btc = result
             .iter()
@@ -4417,7 +4428,7 @@ mod tests {
             make_balance("BTC", "1.0", "0.0"),
             make_balance("BTC", "2.0", "0.0"),
         ];
-        let result = filter_and_convert_balances(balances, &[]);
+        let result = filter_and_convert_balances(balances, &[], Utc::now());
         assert_eq!(
             result.len(),
             2,
@@ -7065,6 +7076,64 @@ mod tests {
                     .map(|(_, value)| value.into_owned())
             })
             .collect()
+    }
+
+    /// A balance read is stamped [`REST_BALANCE_LAG`] before the request that read it was sent,
+    /// never when the answer arrives: Binance's REST view can trail its stream, and a stream
+    /// event the read does not yet show must stay more recent than it. A read refused for a rate
+    /// limit and retried is stamped by the retry, the request that read the balances.
+    #[tokio::test]
+    async fn a_balance_read_is_stamped_the_rest_lag_before_its_request_was_sent() {
+        use crate::client::binance::shared::REST_BALANCE_LAG;
+        const ANSWER_DELAY: Duration = Duration::from_millis(200);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/account"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(429)
+                    .insert_header("retry-after", "1")
+                    .set_body_json(serde_json::json!({ "code": -1003, "msg": "Too much weight." })),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/account"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "balances": [{ "asset": "BTC", "free": "1", "locked": "0" }],
+                    }))
+                    .set_delay(ANSWER_DELAY),
+            )
+            .mount(&server)
+            .await;
+        let mut client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
+            "key".into(),
+            "secret".into(),
+        ));
+        client.rest = rest_at(&server);
+
+        let before = Utc::now();
+        let fetched = client.fetch_balances(&[]).await.unwrap();
+        let retried = Utc::now();
+        let snapshot = client.account_snapshot(&[], &[]).await.unwrap();
+        let after = Utc::now();
+
+        let within = |time, from, to| {
+            assert!(
+                from <= time + REST_BALANCE_LAG && time + REST_BALANCE_LAG + ANSWER_DELAY <= to,
+                "{time} + the lag not within {from} ..= {to} - {ANSWER_DELAY:?}"
+            );
+        };
+        assert_eq!((fetched.len(), snapshot.balances.len()), (1, 1));
+        // Sent no sooner than the second after the refusal.
+        within(
+            fetched[0].time_exchange,
+            before + Duration::from_secs(1),
+            retried,
+        );
+        within(snapshot.balances[0].time_exchange, retried, after);
     }
 
     #[tokio::test]
