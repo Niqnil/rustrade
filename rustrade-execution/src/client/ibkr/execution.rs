@@ -730,8 +730,8 @@ mod tests {
         );
     }
 
-    /// An execution waiting for its commission report longer than `max_age` is cleared. One whose
-    /// time does not read is aged by when it was buffered, so a fresh one is kept.
+    /// An execution waiting for its commission report for `max_age` or longer is cleared. One
+    /// whose time does not read is aged by when it was buffered, so a fresh one is kept.
     #[test]
     fn clear_stale_clears_executions_older_than_the_age() {
         let buffer = ExecutionBuffer::new();
@@ -751,6 +751,7 @@ mod tests {
         };
         for (exec_id, time) in [
             ("old", Some(now - chrono::Duration::hours(2))),
+            ("at-age", Some(now - chrono::Duration::hours(1))),
             ("recent", Some(now - chrono::Duration::minutes(1))),
             ("unread", None),
         ] {
@@ -765,7 +766,7 @@ mod tests {
             },
         );
 
-        assert_eq!(buffer.clear_stale(Duration::from_secs(3_600)), 2);
+        assert_eq!(buffer.clear_stale(Duration::from_secs(3_600)), 3);
         let mut kept: Vec<_> = buffer
             .take_without_commission()
             .into_iter()
