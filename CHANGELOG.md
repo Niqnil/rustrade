@@ -54,6 +54,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`VenueClock::span_start`, `VenueClock::span_end` and `HostMoment`** (`rustrade-execution`,
+  #774). Where a read of a span the venue stamped starts and ends, placed on the venue's clock as
+  estimated: the start is the earlier of the venue's and this host's time at a moment, and the
+  end the latest of both now and the start counted on on tokio's clock. A `HostMoment` pairs a
+  wall-clock time with its instant on tokio's clock, built with `HostMoment::new` or
+  `HostMoment::now`.
+
 - **`Trade::time_source` and `TimeSource`** (`rustrade-execution`, #775). Whether a fill's
   `time_exchange` is the venue's, or this host's, filled in because the venue sent no readable
   time. `Trade::with_time_source` sets it, and a trade serialised before the field existed loads
@@ -81,6 +88,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and quote after it reconnects. The engine does not store it, as with `InstrumentBalanceUpdate`.
 
 ### Fixed
+
+- **The clients' own fill recovery after a reconnect reads its span on the venue's clock**
+  (`rustrade-execution`, #774). Alpaca, Binance Spot and Margin, and IBKR each recover the fills
+  missed while their account stream was down, and bounded that span by this host's clock. A host
+  clock ahead of the venue's by more than the client's lookback (1.5 s on Alpaca, 30 s on IBKR)
+  started the read after fills the venue stamped during the outage, and a host clock stepped back
+  before the reconnect ended a Binance gap early. Those fills were lost with no
+  `FillRecoveryGaveUp`. (On Binance a host clock more than about a second ahead fails every
+  signed request, so its recovery failed visibly.) Each stream now keeps a `VenueClock`, sampled from the times the venue
+  stamped on the events it delivered: every Binance event's `E`, every Alpaca `trade_updates`
+  event, and IBKR's executions. The span starts at the venue's or the host's time at the
+  disconnect, whichever is earlier, less the lookback, and ends past the latest of the host's
+  time, the venue's estimated time, and the disconnect counted on on a monotonic clock. A
+  `FillRecoveryGaveUp` reports the span on the same clock. Before an Alpaca stream has seen an
+  event, Alpaca's clock is unknown, and its read now starts 30 s further back.
 
 - **A fill stamped with this host's time no longer skews the venue-clock estimate**
   (`rustrade`, `rustrade-execution`, #775). The `ExecutionManager`'s fill recovery, and the Binance

@@ -20,7 +20,7 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use rustrade_execution::{
     AccountEvent, AccountEventKind,
-    client::venue_clock::VenueClock,
+    client::venue_clock::{HostMoment, VenueClock},
     error::UnindexedClientError,
     fill_recovery::{FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope},
     trade::{TimeSource, Trade, TradesRead},
@@ -129,11 +129,9 @@ impl FillRecoveryConfig {
 /// has delivered.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Watermark {
-    /// When this host last received an event, or opened the stream before any arrived, by the
-    /// manager's clock.
-    receipt: DateTime<Utc>,
-    /// The same moment on tokio's monotonic clock.
-    received: Instant,
+    /// When this host last received an event, or opened the stream before any arrived: by the
+    /// manager's clock, and on tokio's monotonic clock.
+    last: HostMoment,
     /// The venue's clock, from the times it stamped on the fills delivered.
     venue: VenueClock,
 }
@@ -142,8 +140,7 @@ impl Watermark {
     /// A stream opened at `now`, read at `instant` on tokio's clock, with nothing delivered yet.
     pub(crate) fn opened(now: DateTime<Utc>, instant: Instant) -> Self {
         Self {
-            receipt: now,
-            received: instant,
+            last: HostMoment::new(now, instant),
             venue: VenueClock::new(),
         }
     }
@@ -164,7 +161,10 @@ impl Watermark {
     /// further back than any read covers. A replayed fill younger than that is taken, because it
     /// cannot be told apart from a venue clock that far behind. Until a fill delivered on time
     /// replaces it, each read starts as far back as its stamp, and the clock difference it implies
-    /// is warned of. The read is longer, but misses nothing.
+    /// is warned of. The read is longer, but misses nothing. The same holds for the fills a
+    /// client redelivers after reconnecting by itself, such as those its own recovery reads or
+    /// those a venue's resubscription snapshot carries: each is older than the venue's clock when
+    /// it arrives, so it never displaces a sample delivered on time.
     pub(crate) fn delivered<K, A, I>(
         &mut self,
         now: DateTime<Utc>,
@@ -183,8 +183,7 @@ impl Watermark {
             }
             _ => {}
         }
-        self.receipt = now;
-        self.received = instant;
+        self.last = HostMoment::new(now, instant);
     }
 
     /// Where a read to cover everything missed starts, less `overlap`.
@@ -194,10 +193,10 @@ impl Watermark {
     /// simulated one. With no fill delivered the venue's clock is unknown, and the read starts
     /// `max_clock_skew` before the local time instead.
     pub(crate) fn read_from(&self, config: &FillRecoveryConfig) -> DateTime<Utc> {
-        let bound = match self.venue.earliest_at(self.received) {
-            Some(venue) => venue.min(self.receipt),
-            None => earlier(self.receipt, config.max_clock_skew),
-        };
+        let bound = self
+            .venue
+            .span_start(self.last)
+            .unwrap_or_else(|| earlier(self.last.time, config.max_clock_skew));
         earlier(bound, config.overlap)
     }
 
@@ -211,12 +210,10 @@ impl Watermark {
         instant: Instant,
         config: &FillRecoveryConfig,
     ) -> DateTime<Utc> {
-        let counted_on = later(
-            self.receipt,
-            instant.saturating_duration_since(self.received),
-        );
-        let venue = self.venue.earliest_at(instant).unwrap_or(now);
-        later(venue.max(now).max(counted_on), config.max_clock_skew)
+        let end = self
+            .venue
+            .span_end(self.last, HostMoment::new(now, instant));
+        later(end, config.max_clock_skew)
     }
 
     /// How far this host's clock leads the venue's at `now`, read at `instant` on tokio's clock,
@@ -819,8 +816,7 @@ mod tests {
 
         watermark.delivered(at(100), base + secs(1), &snapshot(), &config);
 
-        assert_eq!(watermark.receipt, at(100));
-        assert_eq!(watermark.received, base + secs(1));
+        assert_eq!(watermark.last, HostMoment::new(at(100), base + secs(1)));
     }
 
     #[test]
@@ -837,8 +833,7 @@ mod tests {
 
         watermark.delivered(at(100), base + secs(1), &terminated, &config);
 
-        assert_eq!(watermark.receipt, at(0));
-        assert_eq!(watermark.received, base);
+        assert_eq!(watermark.last, HostMoment::new(at(0), base));
         assert_eq!(watermark.venue, VenueClock::new());
     }
 

@@ -2295,8 +2295,8 @@ async fn recover_margin_fills(
     }
 }
 
-/// Open what a reconnect after a disconnect at `disconnected` recovers: a fill gap on each of the
-/// stream's `instruments`, and a check of how the orders held as live ended on each of them that
+/// Open what a reconnect recovers for the gap from `start` to `end` a disconnect left (see
+/// [`Disconnect`](super::shared::Disconnect)): a fill gap on each of the stream's `instruments`, and a check of how the orders held as live ended on each of them that
 /// has one. Only the stream's instruments are checked, since only their fills are recovered, and
 /// an instrument is checked once its fills are.
 fn open_reconnect_recovery(
@@ -2304,9 +2304,10 @@ fn open_reconnect_recovery(
     unchecked: &mut UncheckedOrders,
     known: &SharedKnownLiveOrders,
     instruments: &[InstrumentNameExchange],
-    disconnected: DateTime<Utc>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
 ) {
-    unrecovered.open(instruments, disconnected, Utc::now());
+    unrecovered.open(instruments, start, end);
     let held = known.lock().instruments_among(instruments);
     unchecked.open(held);
 }
@@ -7254,6 +7255,7 @@ mod tests {
             &known,
             &[btc.clone(), eth.clone()],
             Utc::now() - chrono::Duration::minutes(1),
+            Utc::now(),
         );
 
         assert!(unrecovered.covers(&btc) && unrecovered.covers(&eth));

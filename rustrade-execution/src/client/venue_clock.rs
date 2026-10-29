@@ -8,6 +8,10 @@
 //! [`VenueClock`] does not read the host's wall clock. It keeps one time the venue stamped,
 //! paired with the moment the event arrived on tokio's monotonic clock, and counts on from there
 //! on that clock, which a step of the wall clock does not move.
+//!
+//! A read of a span the venue stamped, such as the fills missed while a stream was down, is
+//! placed with [`VenueClock::span_start`] and [`VenueClock::span_end`], from the [`HostMoment`]s
+//! that bound it on this host.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use std::time::Duration;
@@ -57,6 +61,32 @@ const DRIFT_DIVISOR: u32 = 10_000;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VenueClock {
     sample: Option<Sample>,
+}
+
+/// A moment on this host: the time its wall clock read then, and the same moment on tokio's
+/// monotonic clock.
+///
+/// The instant lets a span bounded by the moment be counted on from it on the monotonic clock, so
+/// a step of the wall clock after it does not move the span (see [`VenueClock::span_end`]).
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HostMoment {
+    /// This host's wall-clock time at the moment.
+    pub time: DateTime<Utc>,
+    /// The same moment on tokio's clock.
+    pub instant: Instant,
+}
+
+impl HostMoment {
+    /// The moment this host's wall clock read `time` and tokio's clock read `instant`.
+    pub const fn new(time: DateTime<Utc>, instant: Instant) -> Self {
+        Self { time, instant }
+    }
+
+    /// Now, by [`Utc::now`] and [`Instant::now`].
+    pub fn now() -> Self {
+        Self::new(Utc::now(), Instant::now())
+    }
 }
 
 /// A time the venue stamped and the moment its event arrived.
@@ -114,6 +144,34 @@ impl VenueClock {
     pub fn host_lead(&self, host_time: DateTime<Utc>, at: Instant) -> Option<TimeDelta> {
         self.earliest_at(at)
             .map(|earliest| host_time.signed_duration_since(earliest))
+    }
+
+    /// Where a read of what the venue stamped from `moment` on starts: the earliest the venue's
+    /// clock can read at `moment`, or this host's time then if that is earlier, as on a host clock
+    /// behind the venue's. `None` before any sample, when the caller has to allow for the
+    /// difference between the clocks itself.
+    ///
+    /// A host clock ahead of the venue's does not make the start late, and one behind it costs a
+    /// read that starts that much earlier. Less a caller's own margin, for the delay between an
+    /// event and its arrival, this is where a read of what was missed after `moment` begins.
+    pub fn span_start(&self, moment: HostMoment) -> Option<DateTime<Utc>> {
+        self.earliest_at(moment.instant)
+            .map(|venue| venue.min(moment.time))
+    }
+
+    /// Where a read that has to reach `now` ends, for a span that began at `since`: the latest of
+    /// this host's time at `now`, the earliest the venue's clock can read then, and `since`'s host
+    /// time counted on to `now` on tokio's clock. Before any sample the venue's time is left out.
+    ///
+    /// So neither a host clock behind the venue's nor one stepped back since `since` ends the read
+    /// early. The venue's clock can still read later than this, as an estimate is a lower bound:
+    /// add a margin for that.
+    pub fn span_end(&self, since: HostMoment, now: HostMoment) -> DateTime<Utc> {
+        let counted_on = to_delta(now.instant.saturating_duration_since(since.instant))
+            .and_then(|delta| since.time.checked_add_signed(delta))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        let venue = self.earliest_at(now.instant).unwrap_or(now.time);
+        venue.max(now.time).max(counted_on)
     }
 }
 
@@ -198,6 +256,70 @@ mod tests {
         // The held sample still bounds the time it arrived at; the new one would bound it 2 s
         // earlier, counting back with the drift allowance added.
         assert_eq!(clock.earliest_at(base), Some(at(100)));
+    }
+
+    #[test]
+    fn a_span_with_no_sample_has_no_start_and_ends_at_the_later_host_time() {
+        let base = Instant::now();
+        let clock = VenueClock::new();
+
+        assert_eq!(clock.span_start(HostMoment::new(at(100), base)), None);
+        // 10 s on by tokio's clock, but the wall clock stepped back an hour.
+        let since = HostMoment::new(at(100), base);
+        let now = HostMoment::new(at(110 - 3_600), base + secs(10));
+        assert_eq!(clock.span_end(since, now), at(110));
+    }
+
+    #[test]
+    fn a_span_from_a_host_clock_ahead_of_the_venue_starts_at_the_venues_time() {
+        let base = Instant::now();
+        let mut clock = VenueClock::new();
+        clock.observe(at(100), base);
+
+        // The host reads 60 s ahead of the venue.
+        assert_eq!(
+            clock.span_start(HostMoment::new(at(160), base)),
+            Some(at(100))
+        );
+    }
+
+    #[test]
+    fn a_span_from_a_host_clock_behind_the_venue_starts_at_the_hosts_time() {
+        let base = Instant::now();
+        let mut clock = VenueClock::new();
+        clock.observe(at(100), base);
+
+        assert_eq!(
+            clock.span_start(HostMoment::new(at(40), base)),
+            Some(at(40))
+        );
+    }
+
+    #[test]
+    fn a_span_ends_at_the_latest_of_the_host_the_venue_and_the_start_counted_on() {
+        let base = Instant::now();
+        let mut clock = VenueClock::new();
+        clock.observe(at(100), base);
+        let since = HostMoment::new(at(100), base);
+
+        // A host clock behind the venue's: the venue's time, 10 s on.
+        let behind = HostMoment::new(at(50), base + secs(10));
+        assert_eq!(clock.span_end(since, behind), at(110));
+        // A host clock ahead of both: its own time.
+        let ahead = HostMoment::new(at(200), base + secs(10));
+        assert_eq!(clock.span_end(since, ahead), at(200));
+    }
+
+    #[test]
+    fn a_span_end_counts_on_from_its_start_when_the_venue_estimate_is_earlier() {
+        let base = Instant::now();
+        let mut clock = VenueClock::new();
+        // A venue 50 s behind the host's start, and a host clock stepped back since.
+        clock.observe(at(50), base);
+        let since = HostMoment::new(at(100), base);
+        let now = HostMoment::new(at(0), base + secs(10));
+
+        assert_eq!(clock.span_end(since, now), at(110));
     }
 
     #[test]

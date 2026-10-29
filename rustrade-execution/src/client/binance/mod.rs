@@ -50,6 +50,12 @@
 //! and order endings the stream missed (see each client's `account_stream`), then restates its
 //! balances (see [below](#balance-restatement-after-a-reconnect)).
 //!
+//! The span of fills a reconnect recovers is placed on Binance's clock, as the times Binance
+//! stamped on the stream's events show it (each event's `E`), counted on from their arrival on a
+//! monotonic clock. So a host clock ahead of Binance's does not start the span after fills Binance
+//! stamped during the outage, and one stepped back before the reconnect does not end it early.
+//! Before the stream's first event the span starts from this host's time.
+//!
 //! - **Attempts.** A dropped connection, and each reconnect that fails after it, spends one
 //!   attempt: a wait, then a reconnect. A reconnect fails when its connect, its user-data
 //!   subscribe, or for [`BinanceMargin`] its listen-key request fails. The waits double from 1 s

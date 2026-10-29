@@ -1057,6 +1057,11 @@ fn forward_order_updates(
                     continue;
                 }
                 let time = execution::parse_ib_timestamp(&exec.execution.time, session_zone);
+                // IB stamped it, whoever the execution is for: it samples the stream's clock,
+                // which places fill recovery's span on IB's clock.
+                if let Some(time) = time {
+                    sink.observe_stamp(time);
+                }
                 let Some(resolved) = resolve_execution(&exec, scope, contracts, time) else {
                     continue;
                 };
