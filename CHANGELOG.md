@@ -74,6 +74,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window past the local clock. The `ExecutionClient::fetch_trades` rustdoc now states that `end`
   can lie past the present and must not be cut to the host's clock.
 
+- **A balance read over REST is stamped no later than the state it describes**
+  (`rustrade-execution`, #777). Every client stamped the balances from `fetch_balances` and
+  `account_snapshot` with this host's time taken after the response arrived. The engine orders
+  balance and debt state by that time, so a snapshot stamped later than its state shut out
+  stream balance and debt events from between the two: they were judged stale and dropped, and
+  the engine kept the snapshot's holdings until the next event. Two ways this happened:
+  - **The REST view trailed the stream.** A Binance cross-margin account read straight after a
+    fill has returned the pre-trade balances, so the fill's own balance and debt events were
+    dropped.
+  - **This host's clock ran ahead of the venue's.** Such a snapshot blocked every stream event
+    for that long.
+
+  Now each balance is stamped with this host's time taken before the request that read it was
+  sent. That is the retry for a request retried after a rate limit. On Binance spot and margin,
+  cross and isolated, it is also 5 s earlier, to cover the REST view trailing the stream. Alpaca,
+  IBKR and Hyperliquid stream no balances, so they subtract nothing. The rule is stated on
+  `ExecutionClient::fetch_balances` and `AssetBalance::time_exchange`. Erring early costs little:
+  a stream event from between the stamp and the read that arrives after the snapshot applies
+  over it. A host clock ahead of the venue's still carries into the stamp, and keeping the two
+  within bounds is the caller's obligation.
+
 ## [0.17.0] - 2026-10-28
 
 ### Added

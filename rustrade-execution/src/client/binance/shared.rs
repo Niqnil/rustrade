@@ -52,7 +52,7 @@ use binance_sdk::common::{
     models::{Interval, ParamBuildError, RateLimitType, RestApiResponse, WebsocketApiRateLimit},
     websocket::Subscription,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, exchange::ExchangeId,
@@ -3467,12 +3467,46 @@ pub(crate) async fn rest_call_with_retry<R, D>(
     rest: &Arc<R>,
     rate_limiter: &RateLimitTracker,
     kind: RequestKind,
-    mut make_call: impl FnMut(
+    make_call: impl FnMut(
         Arc<R>,
     ) -> Pin<
         Box<dyn std::future::Future<Output = anyhow::Result<RestApiResponse<D>>> + Send>,
     >,
 ) -> anyhow::Result<RestApiResponse<D>>
+where
+    R: Send + Sync,
+{
+    rest_read_with_retry(rest, rate_limiter, kind, make_call)
+        .await
+        .map(|(response, _)| response)
+}
+
+/// How far Binance's REST account view can trail its account stream, as the allowance a balance
+/// read is stamped back by ([`balance_read_time`]).
+///
+/// A cross-margin account read straight after a fill has returned the pre-trade balances, and
+/// was current about 2 s later.
+pub(crate) const REST_BALANCE_LAG: TimeDelta = TimeDelta::seconds(5);
+
+/// The time a REST balance read whose request was sent at `sent` is stamped with: `sent` less
+/// [`REST_BALANCE_LAG`], so it is no later than the state the read can return, even one that
+/// trails the account stream. A later stream event then still applies over it.
+pub(crate) fn balance_read_time(sent: DateTime<Utc>) -> DateTime<Utc> {
+    sent - REST_BALANCE_LAG
+}
+
+/// [`rest_call_with_retry`], also returning when the request that succeeded was sent, by this
+/// host's clock: a read describes the venue's state no earlier than that.
+pub(crate) async fn rest_read_with_retry<R, D>(
+    rest: &Arc<R>,
+    rate_limiter: &RateLimitTracker,
+    kind: RequestKind,
+    mut make_call: impl FnMut(
+        Arc<R>,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<RestApiResponse<D>>> + Send>,
+    >,
+) -> anyhow::Result<(RestApiResponse<D>, DateTime<Utc>)>
 where
     // `Arc<R>` is moved into the `+ Send` future, which requires `R: Send + Sync`. Both SDK
     // RestApi types satisfy this; stating it here surfaces the constraint at the definition
@@ -3485,10 +3519,11 @@ where
     for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
         rate_limiter.wait_if_blocked(kind).await?;
         let sent_ms = unix_ms();
+        let sent = Utc::now();
         match make_call(Arc::clone(rest)).await {
             Ok(response) => {
                 rate_limiter.observe_rest(&response, sent_ms);
-                return Ok(response);
+                return Ok((response, sent));
             }
             Err(e) if is_rate_limit_error(&e) => {
                 let refusal = e.downcast_ref::<ConnectorError>();

@@ -457,6 +457,8 @@ impl ExecutionClient for HyperliquidClient {
         let info_client = &*self.info_client;
         let dexes = &*self.dexes;
 
+        // The balances' time: the reads describe the account no earlier than this.
+        let sent = Utc::now();
         let (mode, states, open_orders) = tokio::try_join!(
             account_mode(info_client, address),
             dex_states(info_client, address, dexes),
@@ -464,7 +466,7 @@ impl ExecutionClient for HyperliquidClient {
         )?;
         let now = Utc::now();
         let balances =
-            perp_account::snapshot_balances(info_client, address, dexes, mode, &states, now)
+            perp_account::snapshot_balances(info_client, address, dexes, mode, &states, sent)
                 .await?;
 
         let instrument_filter = InstrumentFilter::new(instruments);
@@ -1788,6 +1790,29 @@ mod tests {
             exchange_client: Arc::new(exchange_client_against(server.uri(), coin_to_asset).await),
             dexes: Arc::new(dexes),
             known_live: KnownLiveOrders::shared(ExchangeId::HyperliquidPerp),
+        }
+    }
+
+    /// An account snapshot's balances are stamped no later than the first request that read
+    /// them was sent, never when the answers arrive, in either account mode.
+    #[tokio::test]
+    async fn account_snapshot_balances_are_stamped_before_their_reads_were_sent() {
+        const ANSWER_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+        for mode in ["unifiedAccount", "default"] {
+            let server =
+                perp_account::tests::balance_server_answering_after(mode, ANSWER_DELAY).await;
+            let client = client_against(&server, HashMap::new()).await;
+            let before = Utc::now();
+            let snapshot = client.account_snapshot(&[], &[]).await.unwrap();
+            let after = Utc::now();
+            assert!(!snapshot.balances.is_empty(), "{mode}");
+            for balance in snapshot.balances {
+                assert!(
+                    before <= balance.time_exchange
+                        && balance.time_exchange + ANSWER_DELAY <= after,
+                    "{mode}: {balance:?} not within {before} ..= {after} - {ANSWER_DELAY:?}"
+                );
+            }
         }
     }
 

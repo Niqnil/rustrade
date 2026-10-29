@@ -653,6 +653,36 @@ mod tests {
         assert_eq!(state.debt_time, Some(at(2000)));
     }
 
+    /// A REST snapshot is stamped before its read was sent, less the venue's REST lag, so a
+    /// stream balance update and a debt change from after that stamp, which the read may not
+    /// show, still apply when they arrive after it, and a later snapshot still restates both.
+    #[test]
+    fn stream_events_from_after_a_rest_snapshots_stamp_apply_over_it() {
+        // Read sent at 10 s, with a 5 s lag: stamped at 5 s. Pre-fill holdings and debt.
+        let mut state = asset_state("btc", 0.0, 0.0, at(1));
+        state.update_from_balance(Snapshot(&btc_margin_snapshot(dec!(2), dec!(0), at(5))));
+
+        // A fill and its borrow at 8 s, which the read trailed, streamed after it.
+        state.apply_balance_update(Snapshot(&btc_balance_update(3.0, 0.0, at(8))));
+        state.apply_margin_debt(&btc_debt(dec!(1), dec!(0), at(8)));
+
+        let balance = state.balance.unwrap();
+        assert_eq!((balance.time, balance.value.total), (at(8), dec!(3)));
+        assert_eq!(
+            (state.debt_time, balance.value.margin),
+            (Some(at(8)), Some(MarginDetails::new(dec!(1), dec!(0))))
+        );
+
+        // The next read, sent at 20 s, is stamped at 15 s and restates both.
+        state.update_from_balance(Snapshot(&btc_margin_snapshot(dec!(4), dec!(2), at(15))));
+        let balance = state.balance.unwrap();
+        assert_eq!((balance.time, balance.value.total), (at(15), dec!(4)));
+        assert_eq!(
+            (state.debt_time, balance.value.margin),
+            (Some(at(15)), Some(MarginDetails::new(dec!(2), dec!(0))))
+        );
+    }
+
     fn btc_state_with_no_balance() -> AssetState {
         AssetState {
             asset: Asset {

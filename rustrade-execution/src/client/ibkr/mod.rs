@@ -3160,9 +3160,9 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Limitations
     ///
-    /// The `time_exchange` field in returned balances uses `Utc::now()`, not
-    /// the actual IB server timestamp. IB's account summary endpoint does not
-    /// provide timestamps per balance update.
+    /// IB's account summary carries no time, so each balance's `time_exchange` is this host's
+    /// time when the request was sent, as the [`ExecutionClient::fetch_balances`] contract
+    /// describes.
     ///
     /// # Errors
     ///
@@ -3181,6 +3181,8 @@ impl ExecutionClient for IbkrClient {
         };
 
         tokio::task::spawn_blocking(move || {
+            // The balances' time: the summary describes the account no earlier than this.
+            let sent = Utc::now();
             // IB's reqAccountSummary expects a group name ("All" for all linked accounts),
             // not an account ID. Using account ID causes error 321 "Unified group name is invalid".
             // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
@@ -3193,7 +3195,7 @@ impl ExecutionClient for IbkrClient {
                 || client.is_connected(),
                 |timeout| sub.next_timeout(timeout),
             )?
-            .to_balances();
+            .to_balances(sent);
 
             if let Some(ref filter) = assets_filter {
                 balances.retain(|b| filter.contains(&b.asset));
@@ -5457,7 +5459,7 @@ mod order_reader_tests {
                 Ok(SubscriptionItem::Data(AccountSummaryResult::End)),
             ])
             .unwrap()
-            .to_balances();
+            .to_balances(Utc::now());
             assert_eq!(balances.len(), 1, "{balances:?}");
             let cut_short = read(vec![summary()]);
             assert!(
