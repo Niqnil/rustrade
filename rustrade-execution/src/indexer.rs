@@ -1,7 +1,7 @@
 use crate::{
     AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
-    InstrumentBalanceUpdate, IsolatedInstrumentState, UnindexedAccountEvent,
-    UnindexedAccountSnapshot,
+    InstrumentBalanceSnapshot, InstrumentBalanceUpdate, IsolatedInstrumentState,
+    UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate},
     cash_flow::CashFlow,
     error::{
@@ -109,6 +109,11 @@ impl AccountEventIndexer {
             }
             AccountEventKind::InstrumentBalanceUpdate(update) => {
                 AccountEventKind::InstrumentBalanceUpdate(self.instrument_balance_update(update)?)
+            }
+            AccountEventKind::InstrumentBalanceSnapshot(snapshot) => {
+                AccountEventKind::InstrumentBalanceSnapshot(
+                    self.instrument_balance_snapshot(snapshot)?,
+                )
             }
             AccountEventKind::OrderSnapshot(snapshot) => {
                 AccountEventKind::OrderSnapshot(self.order_snapshot(snapshot.0).map(Snapshot)?)
@@ -473,6 +478,21 @@ impl AccountEventIndexer {
         Ok(InstrumentBalanceUpdate {
             instrument: self.map.find_instrument_index(&instrument)?,
             balance: self.asset_balance_update(balance)?,
+        })
+    }
+
+    pub fn instrument_balance_snapshot(
+        &self,
+        snapshot: InstrumentBalanceSnapshot<AssetNameExchange, InstrumentNameExchange>,
+    ) -> Result<InstrumentBalanceSnapshot, IndexError> {
+        let InstrumentBalanceSnapshot {
+            instrument,
+            balance,
+        } = snapshot;
+
+        Ok(InstrumentBalanceSnapshot {
+            instrument: self.map.find_instrument_index(&instrument)?,
+            balance: self.asset_balance(balance)?,
         })
     }
 
@@ -1107,6 +1127,57 @@ mod tests {
         assert!(matches!(
             indexer.index_account_event(wrong_exchange),
             Err(AccountIndexError::Rejected(IndexError::ExchangeIndex(_)))
+        ));
+    }
+
+    /// An isolated pair's balance snapshot indexes both its instrument and its asset; either one
+    /// unknown rejects it, an unknown asset included, since the balance is the pair's.
+    #[test]
+    fn an_instrument_balance_snapshot_indexes_its_instrument_and_asset() {
+        let indexer = binance_indexer();
+        let snapshot = |instrument: &str, asset: &str| {
+            UnindexedAccountEvent::new(
+                ExchangeId::BinanceSpot,
+                AccountEventKind::InstrumentBalanceSnapshot(InstrumentBalanceSnapshot::new(
+                    InstrumentNameExchange::new(instrument),
+                    AssetBalance::new(
+                        AssetNameExchange::new(asset),
+                        crate::balance::Balance::new(Decimal::ONE, Decimal::ONE),
+                        DateTime::<Utc>::MIN_UTC,
+                    ),
+                )),
+            )
+        };
+
+        let indexed = indexer
+            .index_account_event(snapshot("BTC_USDT", "usdt"))
+            .unwrap();
+        let AccountEventKind::InstrumentBalanceSnapshot(indexed) = indexed.kind else {
+            panic!("{indexed:?}");
+        };
+        let map = &indexer.map;
+        assert_eq!(
+            indexed.instrument,
+            map.find_instrument_index(&InstrumentNameExchange::new("BTC_USDT"))
+                .unwrap()
+        );
+        assert_eq!(
+            indexed.balance.asset,
+            map.find_asset_index(&AssetNameExchange::new("usdt"))
+                .unwrap()
+        );
+        assert_eq!(
+            indexed.balance.balance,
+            crate::balance::Balance::new(Decimal::ONE, Decimal::ONE)
+        );
+
+        assert!(matches!(
+            indexer.index_account_event(snapshot("ETH_USDT", "usdt")),
+            Err(AccountIndexError::Rejected(IndexError::InstrumentIndex(_)))
+        ));
+        assert!(matches!(
+            indexer.index_account_event(snapshot("BTC_USDT", "bnb")),
+            Err(AccountIndexError::Rejected(IndexError::AssetIndex(_)))
         ));
     }
 

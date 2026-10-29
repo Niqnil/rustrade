@@ -259,6 +259,15 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// pair, from a venue that streams it.
     InstrumentBalanceUpdate(InstrumentBalanceUpdate<AssetKey, InstrumentKey>),
 
+    /// One asset's full balance in a pair's isolated sub-account, debt included, read over REST.
+    ///
+    /// The per-instrument counterpart of [`BalanceSnapshot`](Self::BalanceSnapshot), and the event
+    /// form of one side of [`InstrumentAccountSnapshot::isolated`]: an account stream that
+    /// reconnects by itself reads its isolated pairs' balances and emits one of these for each
+    /// pair's base and quote, so a change it missed while disconnected is restated. Like
+    /// [`InstrumentBalanceUpdate`](Self::InstrumentBalanceUpdate), the engine does not store it.
+    InstrumentBalanceSnapshot(InstrumentBalanceSnapshot<AssetKey, InstrumentKey>),
+
     /// Single [`Order`] snapshot - used to upsert existing order state if it's more recent.
     ///
     /// This variant covers general order updates, and open order responses.
@@ -516,6 +525,22 @@ pub struct InstrumentBalanceUpdate<AssetKey = AssetIndex, InstrumentKey = Instru
     pub instrument: InstrumentKey,
     /// `free`/`locked` of one of the pair's assets in its isolated sub-account.
     pub balance: AssetBalanceUpdate<AssetKey>,
+}
+
+/// One asset's full balance in a pair's isolated sub-account, debt included (the
+/// [`AccountEventKind::InstrumentBalanceSnapshot`] payload).
+///
+/// The balance replaces what is held for the `(instrument, asset)` it names, debt included, as far
+/// as it is at least as recent; the pair's other asset is unaffected. Its `time_exchange` is a
+/// REST read's, so it errs early (see [`AssetBalance::time_exchange`]).
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize, Constructor,
+)]
+pub struct InstrumentBalanceSnapshot<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
+    /// Instrument (isolated pair) the balance is held in.
+    pub instrument: InstrumentKey,
+    /// The full balance of one of the pair's assets in its isolated sub-account.
+    pub balance: AssetBalance<AssetKey>,
 }
 
 impl<ExchangeKey, AssetKey, InstrumentKey> AccountSnapshot<ExchangeKey, AssetKey, InstrumentKey> {

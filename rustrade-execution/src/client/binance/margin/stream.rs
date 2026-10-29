@@ -10,7 +10,13 @@
 //! payloads of the earlier margin streams. What the account owes arrives as `liabilityChange`, and
 //! its margin level as `marginLevelChange`.
 
-use super::{open_reconnect_recovery, recover_margin_ended_orders, recover_margin_fills};
+use super::{
+    open_reconnect_recovery, read_margin_restatement, recover_margin_ended_orders,
+    recover_margin_fills,
+};
+use crate::client::binance::restatement::{
+    BalanceRestatement, SharedStreamClock, StreamClock, restate,
+};
 use crate::client::binance::shared::{
     CONNECT_TIMEOUT_SECS, ExecutionReport, HEARTBEAT_TIMEOUT_SECS, RateLimitTracker, RequestKind,
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
@@ -699,7 +705,7 @@ fn margin_debt_kind(kind: &str) -> MarginDebtKind {
 /// An asset with no name, or whose principal or interest is missing or unreadable, is left out,
 /// logged at `warn`: a total that cannot be read cannot replace the debt held. A change with no
 /// readable time (`E`) is left out whole, as it could not be ordered against the debt held. A REST
-/// snapshot restates the debt.
+/// snapshot restates the debt, as the stream does after each reconnect.
 fn liability_debt_updates(
     change: LiabilityChange,
     instrument: Option<InstrumentNameExchange>,
@@ -919,8 +925,13 @@ pub(super) struct MarginStream<K> {
     pub(super) rate_limiter: Arc<RateLimitTracker>,
     pub(super) known: SharedKnownLiveOrders,
     pub(super) account: StreamAccount,
-    /// The instruments whose fills and order endings a reconnect recovers.
+    /// The instruments whose fills and order endings a reconnect recovers. On an isolated account,
+    /// also the pairs whose balances a reconnect restates.
     pub(super) instruments: Vec<InstrumentNameExchange>,
+    /// The assets whose cross balances a reconnect restates; empty for all of them.
+    pub(super) assets: Vec<AssetNameExchange>,
+    /// The venue's clock and the latest balance time, from the events the stream delivers.
+    pub(super) clock: SharedStreamClock,
     pub(super) tx: mpsc::UnboundedSender<UnindexedAccountEvent>,
     pub(super) dedup: SharedDedupCache,
 }
@@ -989,6 +1000,8 @@ impl<K: ListenKeys> MarginStream<K> {
         let mut unrecovered = UnrecoveredFills::default();
         // Instruments whose known-live orders a reconnect has yet to check, likewise.
         let mut unchecked = UncheckedOrders::default();
+        // The balances a reconnect has yet to restate, read once its fills have been recovered.
+        let mut restatement = BalanceRestatement::default();
         let mut current = Some(initial);
 
         loop {
@@ -1032,9 +1045,16 @@ impl<K: ListenKeys> MarginStream<K> {
                     &self.instruments,
                     disconnected,
                 );
+                restatement.open();
             }
             let end = self
-                .session(session, &mut budget, &mut unrecovered, &mut unchecked)
+                .session(
+                    session,
+                    &mut budget,
+                    &mut unrecovered,
+                    &mut unchecked,
+                    &mut restatement,
+                )
                 .await;
 
             let Some(gap_start) = end.gap_start(Utc::now()) else {
@@ -1063,6 +1083,7 @@ impl<K: ListenKeys> MarginStream<K> {
         budget: &mut ReconnectBudget,
         unrecovered: &mut UnrecoveredFills,
         unchecked: &mut UncheckedOrders,
+        restatement: &mut BalanceRestatement,
     ) -> SessionEnd {
         let Session {
             listen_key,
@@ -1079,10 +1100,12 @@ impl<K: ListenKeys> MarginStream<K> {
 
         let is_isolated = self.is_isolated();
         // Fills first, then how the orders held as live ended: an order whose fills are not all
-        // recovered is not checked yet. Run beside the socket, so live frames keep flowing; a gap
-        // or check not finished is retried as it falls due. It never completes, and dropping it
-        // when the session ends loses nothing: each gap, and each instrument's order check, is
-        // settled in one step as soon as its read ends.
+        // recovered is not checked yet. Then the balances, so they state the account after the
+        // fills recovered; a gap whose read failed does not hold them back. Run beside the socket,
+        // so live frames keep flowing; a gap, check or restatement not finished is retried as it
+        // falls due. It never completes, and dropping it when the session ends loses nothing:
+        // each gap, each instrument's order check, and the restatement is settled in one step as
+        // soon as its read ends.
         let recovery = async {
             loop {
                 recover_margin_fills(
@@ -1105,8 +1128,31 @@ impl<K: ListenKeys> MarginStream<K> {
                     is_isolated,
                 )
                 .await;
+                let account = if is_isolated {
+                    "BinanceMargin isolated"
+                } else {
+                    "BinanceMargin cross"
+                };
+                restate(account, &self.clock, restatement, &self.tx, |floor| {
+                    read_margin_restatement(
+                        &self.rest,
+                        &self.rate_limiter,
+                        is_isolated,
+                        &self.instruments,
+                        &self.assets,
+                        &self.clock,
+                        floor,
+                    )
+                })
+                .await;
                 let next_check = unchecked.next_due(unrecovered);
-                match unrecovered.next_due().into_iter().chain(next_check).min() {
+                match unrecovered
+                    .next_due()
+                    .into_iter()
+                    .chain(next_check)
+                    .chain(restatement.next_due())
+                    .min()
+                {
                     Some(due) => tokio::time::sleep_until(due).await,
                     None => std::future::pending::<()>().await,
                 }
@@ -1264,6 +1310,7 @@ impl<K: ListenKeys> MarginStream<K> {
                 held.observe(&event);
                 held
             });
+            StreamClock::observe(&self.clock, &event, Instant::now());
             let sent = self.tx.send(event);
             drop(held);
             if let Some(note) = note {
@@ -2821,6 +2868,8 @@ mod tests {
             known: KnownLiveOrders::shared(ExchangeId::BinanceMargin),
             account,
             instruments: Vec::new(),
+            assets: Vec::new(),
+            clock: SharedStreamClock::default(),
             tx,
             dedup: new_dedup_cache(),
         };
@@ -3008,6 +3057,232 @@ mod tests {
             drop(rx);
             task.abort();
         }
+    }
+
+    /// After a reconnect, the stream reads its account's balances, debt included, and delivers
+    /// them, once the gap's fills have been read: a cross stream each cross balance as a balance
+    /// snapshot, an isolated stream each side of its pair as an instrument balance snapshot. Each
+    /// is stamped the REST lag before the read was sent.
+    #[tokio::test]
+    async fn a_reconnect_restates_the_balances_after_recovering_the_fills() {
+        use crate::client::binance::shared::REST_BALANCE_LAG;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let asset = |name: &str| {
+            serde_json::json!({
+                "asset": name, "free": "1", "locked": "0", "borrowed": "0.25", "interest": "0.01",
+                "netAsset": "0.74",
+            })
+        };
+        for (account, account_path, body) in [
+            (
+                StreamAccount::Cross,
+                "/sapi/v1/margin/account",
+                serde_json::json!({ "userAssets": [asset("BTC"), asset("ETH")] }),
+            ),
+            (
+                isolated(),
+                "/sapi/v1/margin/isolated/account",
+                serde_json::json!({ "assets": [{
+                    "symbol": "BTCUSDT", "baseAsset": asset("BTC"), "quoteAsset": asset("USDT"),
+                }] }),
+            ),
+        ] {
+            let is_isolated = matches!(account, StreamAccount::Isolated { .. });
+            let venue = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/sapi/v1/margin/myTrades"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+                .mount(&venue)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(account_path))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&venue)
+                .await;
+            let (listener, url) = listen().await;
+            let keys = Arc::new(FakeKeys::default());
+            let (mut stream, mut rx) = margin_stream(&keys, url, account);
+            stream.rest = Arc::new(MarginTradingRestApi::from_config(
+                ConfigurationRestApi::builder()
+                    .api_key("key")
+                    .api_secret("secret")
+                    .base_path(venue.uri())
+                    .build()
+                    .unwrap(),
+            ));
+            stream.instruments = vec![btcusdt()];
+            // Only BTC of the cross account; an isolated pair restates both its sides.
+            stream.assets = vec![AssetNameExchange::new("BTC")];
+
+            let task = tokio::spawn(async move {
+                let session = stream.open().await.unwrap();
+                stream.run(session).await;
+            });
+            let expired = push(serde_json::json!({ "e": "listenKeyExpired", "E": 1 }));
+            serve(&listener, "key-1", vec![], vec![expired], After::Answer).await;
+            let reconnected = Utc::now();
+            let server = serve(&listener, "key-2", vec![], vec![], After::Answer);
+            let restated = async {
+                let mut restated = Vec::new();
+                while restated.len() < if is_isolated { 2 } else { 1 } {
+                    let event = rx.recv().await.unwrap();
+                    match event.kind {
+                        AccountEventKind::BalanceSnapshot(balance) => {
+                            restated.push((None, balance.0));
+                        }
+                        AccountEventKind::InstrumentBalanceSnapshot(snapshot) => {
+                            restated.push((Some(snapshot.instrument), snapshot.balance));
+                        }
+                        _ => {}
+                    }
+                }
+                restated
+            };
+            let restated = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    () = server => panic!("the server stopped before the balances were restated"),
+                    restated = restated => restated,
+                }
+            })
+            .await
+            .unwrap();
+            let received = Utc::now();
+
+            let expected_assets: &[&str] = if is_isolated {
+                &["BTC", "USDT"]
+            } else {
+                &["BTC"]
+            };
+            let assets: Vec<_> = restated
+                .iter()
+                .map(|(_, balance)| balance.asset.name().as_str())
+                .collect();
+            assert_eq!(assets, expected_assets, "is_isolated: {is_isolated}");
+            for (pair, balance) in &restated {
+                assert_eq!(pair.as_ref(), is_isolated.then(btcusdt).as_ref());
+                assert_eq!(
+                    balance.balance.margin,
+                    Some(MarginDetails {
+                        borrowed: Decimal::new(25, 2),
+                        interest: Decimal::new(1, 2),
+                    })
+                );
+                let sent = balance.time_exchange + REST_BALANCE_LAG;
+                assert!(
+                    reconnected <= sent && sent <= received,
+                    "{balance:?}: sent at {sent}, not within {reconnected} ..= {received}"
+                );
+            }
+            let paths: Vec<_> = venue
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .map(|request| request.url.path().to_owned())
+                .collect();
+            let read = |wanted: &str| {
+                paths
+                    .iter()
+                    .position(|path| path == wanted)
+                    .unwrap_or_else(|| panic!("{wanted} never read: {paths:?}"))
+            };
+            assert!(
+                read("/sapi/v1/margin/myTrades") < read(account_path),
+                "the fills are read before the balances: {paths:?}"
+            );
+
+            drop(rx);
+            task.abort();
+        }
+    }
+
+    /// A balance event the stream delivered sets the floor of the restatement after the next
+    /// reconnect. Here the venue's clock reads 60 s ahead of this host's: the read waits until the
+    /// venue's clock is the REST lag past that event, and is stamped at its time, not this host's
+    /// time less the lag, which the engine would judge older than the event and drop.
+    #[tokio::test]
+    async fn a_restatement_is_stamped_no_earlier_than_the_last_balance_delivered() {
+        use crate::client::binance::shared::REST_BALANCE_LAG;
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let venue = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sapi/v1/margin/account"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "userAssets": [{
+                    "asset": "BTC", "free": "1", "locked": "0", "borrowed": "0",
+                    "interest": "0", "netAsset": "1",
+                }],
+            })))
+            .mount(&venue)
+            .await;
+        let (listener, url) = listen().await;
+        let keys = Arc::new(FakeKeys::default());
+        let (mut stream, mut rx) = margin_stream(&keys, url, StreamAccount::Cross);
+        stream.rest = Arc::new(MarginTradingRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(venue.uri())
+                .build()
+                .unwrap(),
+        ));
+
+        let task = tokio::spawn(async move {
+            let session = stream.open().await.unwrap();
+            stream.run(session).await;
+        });
+        let ahead_ms = (Utc::now() + chrono::Duration::seconds(60)).timestamp_millis();
+        let position = push(serde_json::json!({
+            "e": "outboundAccountPosition", "E": ahead_ms, "u": ahead_ms,
+            "B": [{ "a": "BTC", "f": "1", "l": "0" }],
+        }));
+        let expired = push(serde_json::json!({ "e": "listenKeyExpired", "E": 1 }));
+        let delivered = tokio::time::Instant::now();
+        serve(
+            &listener,
+            "key-1",
+            vec![],
+            vec![position, expired],
+            After::Answer,
+        )
+        .await;
+        let server = serve(&listener, "key-2", vec![], vec![], After::Answer);
+        let restated = async {
+            loop {
+                if let AccountEventKind::BalanceSnapshot(balance) = rx.recv().await.unwrap().kind {
+                    break (balance.0, tokio::time::Instant::now());
+                }
+            }
+        };
+        let (balance, at) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::select! {
+                () = server => panic!("the server stopped before the balances were restated"),
+                restated = restated => restated,
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            balance.time_exchange,
+            Utc.timestamp_millis_opt(ahead_ms).unwrap()
+        );
+        assert!(
+            at >= delivered + REST_BALANCE_LAG.to_std().unwrap(),
+            "restated {:?} after the balance event, before the REST lag",
+            at - delivered
+        );
+
+        drop(rx);
+        task.abort();
     }
 
     /// An event the venue sends before acknowledging the subscription is still delivered.

@@ -29,7 +29,8 @@ use std::fmt::{Display, Formatter};
 /// A venue may send these on a channel of their own, unordered against the account's fills and
 /// balance updates. Order them by [`time_exchange`](Self::time_exchange), not by arrival, and
 /// against debt alone: a newer free/locked balance update says nothing about debt. An update can
-/// be missed while a stream is disconnected; a REST account snapshot restates the debt.
+/// be missed while a stream is disconnected; a REST account snapshot restates the debt, as does a
+/// stream that restates its balances after reconnecting by itself (Binance's do).
 ///
 /// # Producers
 ///

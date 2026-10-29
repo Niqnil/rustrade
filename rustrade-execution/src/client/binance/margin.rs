@@ -61,6 +61,7 @@ mod stream;
 
 pub use records::MarginForcedLiquidation;
 
+use super::restatement::{SharedStreamClock, restatement_time};
 use super::rules::RulesLoader;
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
@@ -77,7 +78,8 @@ use super::shared::{
 use crate::rules::{OrderRules, PreSendRules};
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
-    IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent, UnindexedAccountSnapshot,
+    InstrumentBalanceSnapshot, IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent,
+    UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
     borrow_capacity::BorrowCapacity,
     client::{
@@ -1483,6 +1485,8 @@ impl ExecutionClient for BinanceMargin {
     /// a new one. The key is not closed when the stream ends: it lapses 60 minutes after its last
     /// keepalive. The stream ends once 10 reconnects in a row have failed or a rate-limit cooldown
     /// outlasts what it waits through: see the [module docs](super#account-stream-reconnection).
+    /// After each reconnect it restates the account's balances, debt included: see
+    /// [there](super#balance-restatement-after-a-reconnect).
     ///
     /// Binance sends on this stream only when the account changes, so the client pings it at each
     /// heartbeat check, and the pong is what proves a quiet connection alive.
@@ -1612,7 +1616,10 @@ impl ExecutionClient for BinanceMargin {
     ///
     /// Debt totals (`borrowed`/`interest`) are not known to be streamed for an isolated pair (see
     /// "Margin debt" above), so they come from
-    /// [`account_snapshot`](ExecutionClient::account_snapshot).
+    /// [`account_snapshot`](ExecutionClient::account_snapshot), and from the
+    /// [`InstrumentBalanceSnapshot`](AccountEventKind::InstrumentBalanceSnapshot)s the stream
+    /// restates after each reconnect (see the
+    /// [module docs](super#balance-restatement-after-a-reconnect)).
     ///
     /// **Consumption contract (important):** the engine deliberately does **not** store
     /// `InstrumentBalanceUpdate` — it falls through `update_from_account`'s `_ => None` wildcard,
@@ -1626,9 +1633,10 @@ impl ExecutionClient for BinanceMargin {
     /// engine-queryable per-instrument balances uses the `InstrumentData` extension point instead.
     async fn account_stream(
         &self,
-        // _assets is intentionally ignored — Binance pushes outboundAccountPosition for all account
-        // assets regardless of any filter (mirrors spot). See account_snapshot for filtering.
-        _assets: &[AssetNameExchange],
+        // Only a reconnect's balance restatement uses `assets`: Binance pushes
+        // outboundAccountPosition for every asset of the account, whatever is asked for (mirrors
+        // spot).
+        assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
     ) -> Result<Self::AccountStream, UnindexedClientError> {
         let (tx, rx) = mpsc::unbounded_channel::<UnindexedAccountEvent>();
@@ -1678,6 +1686,8 @@ impl ExecutionClient for BinanceMargin {
             known: self.known_live.clone(),
             account,
             instruments,
+            assets: assets.to_vec(),
+            clock: SharedStreamClock::default(),
             tx,
             dedup: new_dedup_cache(),
         };
@@ -2299,6 +2309,68 @@ fn open_reconnect_recovery(
     unrecovered.open(instruments, disconnected, Utc::now());
     let held = known.lock().instruments_among(instruments);
     unchecked.open(held);
+}
+
+/// Read the margin account's balances to restate after a reconnect, debt included, stamped by
+/// [`restatement_time`] for a read started with `floor` (see
+/// [`restate`](super::restatement::restate)).
+///
+/// A cross account's are each of `assets` (all of them when empty), as a
+/// [`BalanceSnapshot`](AccountEventKind::BalanceSnapshot). An isolated account's are the base and
+/// quote of each pair in `pairs`, in that order, as an
+/// [`InstrumentBalanceSnapshot`](AccountEventKind::InstrumentBalanceSnapshot); the pairs come in
+/// no particular order.
+async fn read_margin_restatement(
+    rest: &Arc<RestApi>,
+    rate_limiter: &Arc<RateLimitTracker>,
+    is_isolated: bool,
+    pairs: &[InstrumentNameExchange],
+    assets: &[AssetNameExchange],
+    clock: &SharedStreamClock,
+    floor: Option<DateTime<Utc>>,
+) -> Result<Vec<UnindexedAccountEvent>, UnindexedClientError> {
+    let event = |kind| UnindexedAccountEvent::new(ExchangeId::BinanceMargin, kind);
+    let sent_at = tokio::time::Instant::now();
+    if is_isolated {
+        let reads =
+            fetch_isolated_margin_account_info(rest.clone(), rate_limiter.clone(), pairs.to_vec())
+                .await?;
+        let clock = clock.lock();
+        return Ok(reads
+            .into_iter()
+            .flat_map(|read| {
+                let time = restatement_time(&clock, read.sent, sent_at, floor);
+                convert_isolated_margin_assets(read.assets, time)
+            })
+            .flat_map(|(pair, state)| {
+                [state.base, state.quote].map(|balance| {
+                    event(AccountEventKind::InstrumentBalanceSnapshot(
+                        InstrumentBalanceSnapshot::new(pair.clone(), balance),
+                    ))
+                })
+            })
+            .collect());
+    }
+    let (response, sent) = rest_read_with_retry(rest, rate_limiter, RequestKind::Query, |rest| {
+        Box::pin(async move {
+            let params = QueryCrossMarginAccountDetailsParams::builder().build()?;
+            rest.query_cross_margin_account_details(params).await
+        })
+    })
+    .await
+    .map_err(|e| classify_rest_query_error(&e, None))?;
+    let account = response.data().await.map_err(response_decode_error)?;
+    let time = restatement_time(&clock.lock(), sent, sent_at, floor);
+    Ok(
+        filter_and_convert_margin_balances(account.user_assets.unwrap_or_default(), assets, time)
+            .into_iter()
+            .map(|balance| {
+                event(AccountEventKind::BalanceSnapshot(
+                    rustrade_integration::collection::snapshot::Snapshot(balance),
+                ))
+            })
+            .collect(),
+    )
 }
 
 /// Extract the invariant `instrument → (base_asset, quote_asset)` map from an isolated
@@ -5810,6 +5882,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A cross restatement read the venue fails is an error; the next returns each balance, debt
+    /// included, as a balance snapshot.
+    #[tokio::test]
+    async fn a_cross_restatement_read_returns_the_balances_as_snapshots() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/account"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/account"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "userAssets": [{
+                    "asset": "BTC", "free": "1", "locked": "0", "borrowed": "0.5", "interest": "0",
+                    "netAsset": "0.5",
+                }] }),
+            ))
+            .mount(&server)
+            .await;
+        let (rest, limiter) = (
+            margin_rest_at(&server),
+            Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
+        );
+        let clock = SharedStreamClock::default();
+        // The cross account's balances, all of them.
+        let read = || read_margin_restatement(&rest, &limiter, false, &[], &[], &clock, None);
+
+        let failed = read().await;
+        assert!(failed.is_err(), "{failed:?}");
+
+        let restated = read().await.unwrap();
+        let [event] = restated.as_slice() else {
+            panic!("one balance: {restated:?}");
+        };
+        assert_eq!(event.exchange, ExchangeId::BinanceMargin);
+        let AccountEventKind::BalanceSnapshot(balance) = &event.kind else {
+            panic!("a balance snapshot: {event:?}");
+        };
+        assert_eq!(balance.0.asset, AssetNameExchange::new("BTC"));
+        assert_eq!(
+            balance.0.balance.margin,
+            Some(crate::balance::MarginDetails::new(
+                Decimal::new(5, 1),
+                Decimal::ZERO
+            ))
+        );
     }
 
     #[tokio::test]

@@ -271,6 +271,9 @@ impl<MarketEventKind: Debug> TimeExchange for EngineEvent<MarketEventKind> {
                     // its asset-keyed sibling `BalanceStreamUpdate`.
                     Some(update.balance.time_exchange)
                 }
+                AccountEventKind::InstrumentBalanceSnapshot(snapshot) => {
+                    Some(snapshot.balance.time_exchange)
+                }
                 AccountEventKind::OrderSnapshot(order) => order.0.state.time_exchange(),
                 AccountEventKind::OrderCancelled(response) => response
                     .state
@@ -819,6 +822,33 @@ mod tests {
                     MarginDebtKind::Borrow,
                     "BORROW".into(),
                     time,
+                )),
+            )));
+
+        assert_eq!(event.time_exchange(), Some(time));
+    }
+
+    /// An isolated pair's balance snapshot is stamped with the time of the state it reads, so a
+    /// historical clock advances on one as it does on an account-wide balance snapshot.
+    #[test]
+    fn an_instrument_balance_snapshot_reports_its_time_exchange() {
+        use rustrade_execution::{
+            AccountEvent, AccountEventKind, InstrumentBalanceSnapshot,
+            balance::{AssetBalance, Balance},
+        };
+        use rustrade_instrument::{asset::AssetIndex, exchange::ExchangeIndex};
+
+        let time = DateTime::<Utc>::MIN_UTC + TimeDelta::hours(1);
+        let event: EngineEvent<()> =
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent::new(
+                ExchangeIndex(0),
+                AccountEventKind::InstrumentBalanceSnapshot(InstrumentBalanceSnapshot::new(
+                    InstrumentIndex::new(0),
+                    AssetBalance::new(
+                        AssetIndex(0),
+                        Balance::new(Decimal::ONE, Decimal::ONE),
+                        time,
+                    ),
                 )),
             )));
 

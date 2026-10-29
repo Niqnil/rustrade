@@ -47,7 +47,8 @@
 //! connection drops or goes silent. The heartbeat is checked every 30 s: a check that finds no
 //! frame or ping since the last one reconnects, except the first check on each connection, which
 //! is a grace. Silence is therefore noticed after 30 to 60 s. Each reconnect recovers the fills
-//! and order endings the stream missed (see each client's `account_stream`).
+//! and order endings the stream missed (see each client's `account_stream`), then restates its
+//! balances (see [below](#balance-restatement-after-a-reconnect)).
 //!
 //! - **Attempts.** A dropped connection, and each reconnect that fails after it, spends one
 //!   attempt: a wait, then a reconnect. A reconnect fails when its connect, its user-data
@@ -73,6 +74,35 @@
 //! expired, which spends an attempt like any other failure. Its key is kept alive as each
 //! connection opens and every 30 minutes after, which Binance documents as enough to keep it
 //! valid.
+//!
+//! # Balance restatement after a reconnect
+//!
+//! A balance or debt event the venue sends while an account stream is down is lost, so each
+//! reconnect restates the account's balances. Once the gap's fills have been read, the stream
+//! reads the balances over REST and delivers each of the `assets` it was opened for (all of them
+//! when empty) as a [`BalanceSnapshot`](crate::AccountEventKind::BalanceSnapshot), debt included.
+//! An isolated margin stream delivers its pairs' base and quote as
+//! [`InstrumentBalanceSnapshot`](crate::AccountEventKind::InstrumentBalanceSnapshot)s instead:
+//! each pair's base, then its quote, the pairs in no particular order.
+//!
+//! - **Stamp.** The earlier of this host's time and the venue's time at the read's start, as the
+//!   stream's own events show the venue's clock, less 5 s for Binance's REST view trailing its
+//!   stream. A stream event newer than the state the read shows then still applies over it. The
+//!   read starts no sooner than 5 s, on the venue's clock, after the latest balance or debt event
+//!   the stream delivered, and its stamp is never earlier than that event's: an earlier one would
+//!   leave the engine keeping that event's state.
+//! - **Failure.** A read that fails, or does not finish within 30 s (waits for rate limits
+//!   included), is logged at `warn` and retried while connected, after 5 s and then twice as long
+//!   each time, up to 2 minutes. It is never given up. A later reconnect replaces it with a read
+//!   due at once.
+//! - **Fills not yet recovered.** A gap whose fill read failed does not hold the restatement
+//!   back, so the balances can include fills the stream has yet to deliver. They follow when the
+//!   gap's retry reads them, or never if it is given up (see
+//!   [`FillRecoveryGaveUp`](crate::AccountEventKind::FillRecoveryGaveUp)).
+//! - **Retries wait on it.** The restatement, the gaps' fill reads and the order checks are retried
+//!   one at a time, so a restatement read can delay a retry due meanwhile by up to its 30 s.
+//! - **Cost.** One account read per reconnect: weight 20 on spot, 10 on cross margin, and 10 per
+//!   five isolated pairs.
 //!
 //! # Logging: `binance_sdk` writes request credentials at `DEBUG`
 //!
@@ -108,6 +138,7 @@
 //! an explicit request.
 
 mod margin;
+mod restatement;
 mod rules;
 mod shared;
 mod spot;

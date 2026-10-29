@@ -7088,6 +7088,10 @@ pub(super) mod test_ws_api {
         Silent(Duration),
         /// Closes after this long, pinging every second meanwhile.
         Pinging(Duration),
+        /// Closes after this long, sending the frame `push` builds every 100 ms meanwhile. The
+        /// first may arrive before the client has registered for it, and be dropped; a later one
+        /// is delivered.
+        Pushing(fn() -> String, Duration),
     }
 
     /// Starts a WS API answering every request with `answer`, whose `n`th connection (from 0)
@@ -7126,19 +7130,28 @@ pub(super) mod test_ws_api {
                         {
                             return;
                         }
-                        let (after, pinging) = match lifetime {
+                        let (after, pinging, push) = match lifetime {
                             Lifetime::Open => continue,
-                            Lifetime::Silent(after) => (after, false),
-                            Lifetime::Pinging(after) => (after, true),
+                            Lifetime::Silent(after) => (after, false, None),
+                            Lifetime::Pinging(after) => (after, true, None),
+                            Lifetime::Pushing(push, after) => (after, false, Some(push)),
                         };
                         let closes = tokio::time::sleep(after);
                         tokio::pin!(closes);
                         let mut pings = tokio::time::interval(Duration::from_secs(1));
+                        let mut pushes = tokio::time::interval(Duration::from_millis(100));
                         loop {
                             tokio::select! {
                                 () = &mut closes => break,
                                 _ = pings.tick(), if pinging => {
                                     if ws.send(Message::Ping(Default::default())).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                _ = pushes.tick(), if push.is_some() => {
+                                    if let Some(push) = push
+                                        && ws.send(Message::text(push())).await.is_err()
+                                    {
                                         return;
                                     }
                                 }
