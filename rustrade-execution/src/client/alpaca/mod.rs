@@ -77,7 +77,7 @@ use crate::{
     parse_env_bool,
     position::{Position, PositionReport},
     shortability::Shortability,
-    trade::{AssetFees, Trade, TradeAmendmentKind, TradeId, TradeOrigin, TradesRead},
+    trade::{AssetFees, TimeSource, Trade, TradeAmendmentKind, TradeId, TradeOrigin, TradesRead},
 };
 use chrono::{DateTime, NaiveDate, NaiveTime, SecondsFormat, TimeDelta, Utc};
 use fnv::{FnvHashMap, FnvHashSet};
@@ -1038,6 +1038,10 @@ struct AlpacaOrderWs<'a> {
     #[serde(borrow)]
     trail_price: Option<&'a str>,
     status: SmolStr,
+    /// When the order last changed, as of this event. Read only for an event without a readable
+    /// `timestamp`, as the nearest time the venue stamped.
+    #[serde(borrow, default)]
+    updated_at: Option<&'a str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -4449,31 +4453,39 @@ fn convert_activity_to_trade(
     // `None` when Alpaca omitted the field or sent something unparseable, which is the honest
     // report: the venue did not tell us where the order stands, rather than "nothing is filled".
     let order_filled_quantity = a.cum_qty.as_deref().and_then(|s| Decimal::from_str(s).ok());
-    let time_exchange = parse_timestamp(&a.transaction_time).unwrap_or_else(|| {
-        warn!(id = %a.id, "Alpaca activity: unparseable transaction_time, using now");
-        Utc::now()
-    });
+    // The activity carries no other time, so without `transaction_time` the fill is kept, stamped
+    // with this host's clock and marked so.
+    let (time_exchange, time_source) = match parse_timestamp(&a.transaction_time) {
+        Some(time) => (time, TimeSource::Venue),
+        None => {
+            warn!(id = %a.id, "Alpaca activity: unparseable transaction_time, using now");
+            (Utc::now(), TimeSource::Host)
+        }
+    };
 
     // Alpaca equities and options are commission-free. Crypto trades incur
     // maker/taker fees (currently 0.15–0.25%) charged in the credited asset,
     // but fee info is not available in trade responses — use Activities API
     // for end-of-day fee reconciliation.
-    Some(Trade::new(
-        trade_id,
-        order_id,
-        instrument,
-        StrategyId::unknown(),
-        time_exchange,
-        side,
-        price,
-        quantity,
-        order_filled_quantity,
-        AssetFees::new(
-            AssetNameExchange::from(USD),
-            Decimal::ZERO,
-            Some(Decimal::ZERO),
-        ),
-    ))
+    Some(
+        Trade::new(
+            trade_id,
+            order_id,
+            instrument,
+            StrategyId::unknown(),
+            time_exchange,
+            side,
+            price,
+            quantity,
+            order_filled_quantity,
+            AssetFees::new(
+                AssetNameExchange::from(USD),
+                Decimal::ZERO,
+                Some(Decimal::ZERO),
+            ),
+        )
+        .with_time_source(time_source),
+    )
 }
 
 /// Build an `OrderSnapshot` event from the order payload embedded in a `trade_updates` frame.
@@ -4569,10 +4581,7 @@ fn trade_amendment_event(
     order_id: OrderId,
 ) -> UnindexedAccountEvent {
     let order = &update.order;
-    let time_exchange = update
-        .timestamp
-        .and_then(parse_timestamp)
-        .unwrap_or_else(Utc::now);
+    let (time_exchange, time_source) = trade_update_time(update);
     let original = update
         .previous_execution_id
         .filter(|id| !id.is_empty())
@@ -4608,7 +4617,8 @@ fn trade_amendment_event(
                                 Decimal::ZERO,
                                 Some(Decimal::ZERO),
                             ),
-                        ),
+                        )
+                        .with_time_source(time_source),
                         order.client_order_id.as_ref(),
                     ),
                 }
@@ -4631,6 +4641,24 @@ fn trade_amendment_event(
             kind,
         )),
     )
+}
+
+/// When a `trade_updates` event happened, and whose clock says so: its `timestamp`, else its
+/// order's `updated_at`, else this host's clock, as [`TimeSource::Host`].
+///
+/// Alpaca stamps every event, so either falling back is logged with a `warn!`. `updated_at` is
+/// when the order last changed as of the event, which for a fill is the fill.
+fn trade_update_time(update: &AlpacaTradeUpdate<'_>) -> (DateTime<Utc>, TimeSource) {
+    if let Some(time) = update.timestamp.and_then(parse_timestamp) {
+        return (time, TimeSource::Venue);
+    }
+    let order = &update.order;
+    if let Some(time) = order.updated_at.and_then(parse_timestamp) {
+        warn!(order_id = %order.id, event = %update.event, timestamp = ?update.timestamp, "Alpaca WS: event missing/unparseable timestamp, using its order's updated_at");
+        return (time, TimeSource::Venue);
+    }
+    warn!(order_id = %order.id, event = %update.event, timestamp = ?update.timestamp, updated_at = ?order.updated_at, "Alpaca WS: event missing/unparseable timestamp and order updated_at, using now");
+    (Utc::now(), TimeSource::Host)
 }
 
 /// Convert a WebSocket trade_update event into rustrade AccountEvents.
@@ -4680,10 +4708,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
             ) else {
                 return [None, None];
             };
-            let time_exchange = update
-                .timestamp
-                .and_then(parse_timestamp)
-                .unwrap_or_else(Utc::now);
+            let (time_exchange, time_source) = trade_update_time(&update);
 
             // If filled_qty is unparseable (API regression), cum_qty falls back to zero: the
             // trade reports a cumulative of 0, and a fill without an execution id is deduplicated
@@ -4735,7 +4760,8 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
                     Decimal::ZERO,
                     Some(Decimal::ZERO),
                 ),
-            );
+            )
+            .with_time_source(time_source);
             let trade = with_reported_cid(trade, order.client_order_id.as_ref());
             let trade_event = UnindexedAccountEvent::new(
                 ExchangeId::AlpacaBroker,
@@ -4764,10 +4790,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
             // Order acknowledged by Alpaca, or done for the day: Alpaca stops working a
             // `done_for_day` order until the next trading day but has not ended it, so it is
             // reported open with what it has filled, never retired.
-            let time_exchange = update
-                .timestamp
-                .and_then(parse_timestamp)
-                .unwrap_or_else(Utc::now);
+            let (time_exchange, _) = trade_update_time(&update);
 
             [
                 ws_order_snapshot(order, instrument, cid, order_id, time_exchange),
@@ -4783,10 +4806,7 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
             // the original as cancelled, but callers must call `fetch_open_orders` to
             // discover the replacement order (which has a new ID and won't appear in OMS
             // state automatically).
-            let time_exchange = update
-                .timestamp
-                .and_then(parse_timestamp)
-                .unwrap_or_else(Utc::now);
+            let (time_exchange, _) = trade_update_time(&update);
             let filled_qty = alpaca_filled_qty(&order.id, order.filled_qty);
             let cancelled = Cancelled::new(order_id, time_exchange, filled_qty);
             let response = crate::order::request::OrderResponseCancel {
@@ -6485,6 +6505,7 @@ mod tests {
             trail_percent: None,
             trail_price: None,
             status: SmolStr::new("partially_filled"),
+            updated_at: None,
         }
     }
 
@@ -6547,6 +6568,49 @@ mod tests {
         };
         let (trade, _order) = fill_events(convert_trade_update(update));
         assert_eq!(trade.client_order_id, Some(ClientOrderId::new("outside-1")));
+    }
+
+    /// A fill is at its frame's `timestamp`, else at its order's `updated_at`, both the venue's;
+    /// with neither it is at this host's time, and says so. An order snapshot takes the same time.
+    #[test]
+    fn a_fills_time_is_its_timestamp_then_its_orders_update_time_then_this_hosts() {
+        let fill = |timestamp, updated_at| {
+            let mut order = make_order_ws("ord-1", "SPY", "buy", "1");
+            order.updated_at = updated_at;
+            let update = AlpacaTradeUpdate {
+                event: SmolStr::new("fill"),
+                execution_id: Some("exec-1"),
+                previous_execution_id: None,
+                order,
+                price: Some("150.00"),
+                qty: Some("1"),
+                timestamp,
+            };
+            let (trade, order) = fill_events(convert_trade_update(update));
+            let OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) = order.state
+            else {
+                panic!("expected an Open snapshot, got {:?}", order.state);
+            };
+            assert_eq!(open.time_exchange, trade.time_exchange);
+            (trade.time_exchange, trade.time_source)
+        };
+        let at = |time| parse_timestamp(time).unwrap();
+
+        assert_eq!(
+            fill(Some("2025-04-18T14:30:00Z"), Some("2025-04-18T14:30:01Z")),
+            (at("2025-04-18T14:30:00Z"), TimeSource::Venue)
+        );
+        for timestamp in [None, Some("not a time")] {
+            assert_eq!(
+                fill(timestamp, Some("2025-04-18T14:30:01Z")),
+                (at("2025-04-18T14:30:01Z"), TimeSource::Venue),
+                "{timestamp:?}"
+            );
+        }
+        let before = Utc::now();
+        let (time, source) = fill(None, None);
+        assert_eq!(source, TimeSource::Host);
+        assert!((before..=Utc::now()).contains(&time));
     }
 
     #[test]
@@ -6619,6 +6683,7 @@ mod tests {
             // make_order_ws reports qty=2; a cumulative filled of 2 completes it.
             order: AlpacaOrderWs {
                 status: SmolStr::new("filled"),
+                updated_at: None,
                 ..make_order_ws("ord-full", "SPY", "buy", "2")
             },
             price: Some("150.00"),
@@ -6655,6 +6720,7 @@ mod tests {
                 previous_execution_id: None,
                 order: AlpacaOrderWs {
                     status: SmolStr::new(status),
+                    updated_at: None,
                     ..make_order_ws("ord-late", "SPY", "buy", "1")
                 },
                 price: Some("150.00"),
@@ -6720,6 +6786,7 @@ mod tests {
                 trail_percent: None,
                 trail_price: None,
                 status: SmolStr::new("new"),
+                updated_at: None,
             },
             price: None,
             qty: None,
@@ -6861,6 +6928,35 @@ mod tests {
             updated_at: None,
         };
         assert!(convert_open_order(&order).is_none());
+    }
+
+    /// A FILL activity is at its `transaction_time`, the venue's; without one it is kept, at this
+    /// host's time, and says so.
+    #[test]
+    fn an_activity_without_a_transaction_time_is_at_this_hosts_time() {
+        let activity = |transaction_time: &str| AlpacaActivity {
+            id: "act-1".to_string(),
+            order_id: "ord-1".to_string(),
+            symbol: "SPY".to_string(),
+            side: "buy".to_string(),
+            price: "150.00".to_string(),
+            qty: "1".to_string(),
+            transaction_time: transaction_time.to_string(),
+            cum_qty: Some("1".to_string()),
+        };
+
+        let trade = convert_activity_to_trade(&activity("2025-04-18T14:30:00Z")).unwrap();
+        assert_eq!(
+            (trade.time_exchange, trade.time_source),
+            (
+                parse_timestamp("2025-04-18T14:30:00Z").unwrap(),
+                TimeSource::Venue
+            )
+        );
+        let before = Utc::now();
+        let trade = convert_activity_to_trade(&activity("not a time")).unwrap();
+        assert_eq!(trade.time_source, TimeSource::Host);
+        assert!((before..=Utc::now()).contains(&trade.time_exchange));
     }
 
     #[test]
@@ -7469,6 +7565,7 @@ mod tests {
                 trail_percent: None,
                 trail_price: None,
                 status: SmolStr::new("filled"),
+                updated_at: None,
             },
             price: Some("100.00"),
             qty: Some("10"),
@@ -7495,6 +7592,7 @@ mod tests {
                 trail_percent: None,
                 trail_price: None,
                 status: SmolStr::new("filled"),
+                updated_at: None,
             },
             price: Some("100.00"),
             qty: Some("10"),
@@ -7521,6 +7619,7 @@ mod tests {
                 trail_percent: None,
                 trail_price: None,
                 status: SmolStr::new("filled"),
+                updated_at: None,
             },
             price: Some("100.00"),
             qty: Some("10"),

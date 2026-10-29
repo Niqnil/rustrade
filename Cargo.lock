@@ -4579,6 +4579,7 @@ dependencies = [
  "smol_str",
  "temp-env",
  "thiserror 2.0.21",
+ "time-tz",
  "tokio",
  "tokio-stream",
  "tokio-tungstenite 0.30.0",

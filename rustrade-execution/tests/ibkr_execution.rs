@@ -68,6 +68,7 @@
 //! | `test_place_loo_order_premarket` | Limit-on-Open (timing-sensitive) |
 //! | `test_orders_found_by_client_order_id_across_a_restart` | Snapshot orders, adoption after a restart, ended-order lookup |
 //! | `test_account_values_raw` | Print every account summary tag and account update value, and the positions. Asserts nothing |
+//! | `test_event_time_formats_raw` | Print the session's time zone and the raw time text of the last 7 days' executions and of completed orders. Read only; asserts nothing |
 //! | `test_open_paper_short` | Sell `IBKR_SHORT_QTY` (default 100) of `IBKR_SHORT_SYMBOL` (default AAPL) at market. Regular trading hours only |
 //! | `test_close_paper_short` | Buy the same back at market. Regular trading hours only |
 //!
@@ -2068,6 +2069,91 @@ fn test_account_values_raw() {
         |item| matches!(item, AccountUpdate::End),
     );
     updates.cancel();
+}
+
+/// Prints the time zone IB Gateway gave in the connection handshake, then the time text, exactly
+/// as sent, of each execution of the last 7 days and of each completed order, so the formats the
+/// time parsing must read can be seen. Read only: it places nothing, and prints no account id or
+/// amount. Asserts nothing.
+#[test]
+#[ignore]
+#[serial]
+fn test_event_time_formats_raw() {
+    init_logging();
+
+    let config = test_config(28);
+    let client = ibapi::client::blocking::Client::connect(
+        &format!("{}:{}", config.host, config.port),
+        config.client_id,
+    )
+    .expect("connection failed");
+    println!(
+        "session: time_zone {:?}, connection_time {:?}",
+        client.time_zone(),
+        client.connection_time()
+    );
+
+    let executions = client
+        .executions(ibapi::orders::ExecutionFilter {
+            last_n_days: 7,
+            ..Default::default()
+        })
+        .expect("executions failed");
+    let mut count = 0;
+    while let Some(item) = executions.next_timeout(Duration::from_secs(10)) {
+        match item {
+            Ok(SubscriptionItem::Data(ibapi::orders::Executions::ExecutionData(data))) => {
+                count += 1;
+                println!(
+                    "execution: {:?} {} {} time {:?}",
+                    data.contract.security_type,
+                    data.contract.symbol,
+                    data.execution.exchange,
+                    data.execution.time
+                );
+            }
+            Ok(SubscriptionItem::Data(_)) => {}
+            Ok(item) => {
+                println!("executions: {item:?}");
+                break;
+            }
+            Err(e) => {
+                println!("executions: error {e}");
+                break;
+            }
+        }
+    }
+    println!("executions: {count} listed");
+    executions.cancel();
+
+    let completed = client
+        .completed_orders(false)
+        .expect("completed_orders failed");
+    let mut count = 0;
+    while let Some(item) = completed.next_timeout(Duration::from_secs(10)) {
+        match item {
+            Ok(SubscriptionItem::Data(ibapi::orders::Orders::OrderData(data))) => {
+                count += 1;
+                println!(
+                    "completed: {:?} {} status {:?} completed_time {:?}",
+                    data.contract.security_type,
+                    data.contract.symbol,
+                    data.order_state.completed_status,
+                    data.order_state.completed_time
+                );
+            }
+            Ok(SubscriptionItem::Data(_)) => {}
+            Ok(item) => {
+                println!("completed: {item:?}");
+                break;
+            }
+            Err(e) => {
+                println!("completed: error {e}");
+                break;
+            }
+        }
+    }
+    println!("completed: {count} listed");
 }
 
 /// The stock and quantity [`test_open_paper_short`] and [`test_close_paper_short`] trade.

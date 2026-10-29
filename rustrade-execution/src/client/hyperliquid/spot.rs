@@ -112,7 +112,7 @@ use crate::{
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Filled, Open, OrderState, UnindexedOrderState},
     },
-    trade::{AssetFees, Trade, TradeId, TradeOrigin, TradesRead},
+    trade::{AssetFees, TimeSource, Trade, TradeId, TradeOrigin, TradesRead},
 };
 use chrono::{DateTime, Utc};
 use ethers::signers::Signer;
@@ -1344,6 +1344,7 @@ fn spot_trades(
             origin: TradeOrigin::Order,
             position_side: None,
             client_order_id: fill.cloid.as_deref().and_then(cloid_to_cid),
+            time_source: TimeSource::Venue,
         });
     }
 
@@ -1397,6 +1398,7 @@ fn fill_to_account_event(
         origin: TradeOrigin::Order,
         position_side: None,
         client_order_id: fill.cloid.as_deref().and_then(cloid_to_cid),
+        time_source: TimeSource::Venue,
     };
 
     Some(AccountEvent::new(

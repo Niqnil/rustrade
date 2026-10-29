@@ -34,7 +34,7 @@ use super::{
     ended_orders::{EarlierCompletions, EndedOrderReader, release_ended},
     execution::{
         ExecutionBuffer, ExecutionRevision, ExecutionScope, executions_filter,
-        executions_held_since, revision_of,
+        executions_held_since, revision_of, session_zone,
     },
     listed_cids,
     order::{OrderIdMap, PendingCancels},
@@ -445,6 +445,8 @@ pub(super) struct RecoveredFills<'a> {
     floor: DateTime<Utc>,
     scope: ExecutionScope,
     contracts: &'a ContractRegistry,
+    /// The gateway's zone, for an execution time that names none.
+    session_zone: Option<chrono_tz::Tz>,
     awaiting_commission: ExecutionBuffer,
     trades: Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
     /// Executions kept although their timestamp did not parse.
@@ -456,11 +458,13 @@ impl<'a> RecoveredFills<'a> {
         floor: DateTime<Utc>,
         scope: ExecutionScope,
         contracts: &'a ContractRegistry,
+        session_zone: Option<chrono_tz::Tz>,
     ) -> Self {
         Self {
             floor,
             scope,
             contracts,
+            session_zone,
             awaiting_commission: ExecutionBuffer::new(),
             trades: Vec::new(),
             unparseable: 0,
@@ -470,10 +474,15 @@ impl<'a> RecoveredFills<'a> {
     pub(super) fn push(&mut self, item: Executions) {
         match item {
             Executions::ExecutionData(execution) => {
-                // An execution whose time does not parse (a DST-ambiguous local time, or a
-                // format change) is kept: dropping it could lose a fill from the gap, while
-                // keeping one the stream already delivered costs nothing past the dedup cache.
-                match super::execution::parse_ib_timestamp(&execution.execution.time) {
+                // An execution whose time does not read (an unknown zone, a local time in a
+                // skipped hour, or a format change) is kept: dropping it could lose a fill from
+                // the gap, while keeping one the stream already delivered costs nothing past the
+                // dedup cache.
+                let time = super::execution::parse_ib_timestamp(
+                    &execution.execution.time,
+                    self.session_zone,
+                );
+                match time {
                     Some(time) if time < self.floor => return,
                     Some(_) => {}
                     None => {
@@ -485,7 +494,9 @@ impl<'a> RecoveredFills<'a> {
                         self.unparseable += 1;
                     }
                 }
-                if let Some(resolved) = resolve_execution(&execution, self.scope, self.contracts) {
+                if let Some(resolved) =
+                    resolve_execution(&execution, self.scope, self.contracts, time)
+                {
                     self.awaiting_commission.add_execution(execution, resolved);
                 }
             }
@@ -583,7 +594,7 @@ fn recover_fills(
         .executions(executions_filter())
         .map_err(RecoveryError::Ibapi)?;
     let deadline = Instant::now() + RECOVERY_TIMEOUT;
-    let mut fills = RecoveredFills::new(floor, scope, contracts);
+    let mut fills = RecoveredFills::new(floor, scope, contracts, session_zone(client));
 
     loop {
         if !sink.is_open() {
@@ -1083,6 +1094,7 @@ mod tests {
             origin: TradeOrigin::Order,
             position_side: None,
             client_order_id: None,
+            time_source: crate::trade::TimeSource::Venue,
         }
     }
 
@@ -1406,7 +1418,7 @@ mod tests {
     fn recovered_fills_keep_the_window_and_this_clients_orders() {
         let contracts = registered();
         let pending = ExecutionBuffer::new();
-        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts);
+        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts, None);
 
         for item in [
             // Before the window: the stream delivered it, or it predates the stream.
@@ -1465,7 +1477,8 @@ mod tests {
         let read = |scope: ExecutionScope| {
             let contracts = registered();
             let pending = ExecutionBuffer::new();
-            let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), scope, &contracts);
+            let mut fills =
+                RecoveredFills::new(at("2026-09-29T14:00:00Z"), scope, &contracts, None);
             for item in [
                 other("external", 4242, 0),
                 commission("external"),
@@ -1528,7 +1541,7 @@ mod tests {
     fn recovered_execution_with_unparseable_time_is_kept() {
         let contracts = registered();
         let pending = ExecutionBuffer::new();
-        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts);
+        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts, None);
         fills.push(execution("garbled", IB_ORDER_ID, "not a time"));
         fills.push(commission("garbled"));
 
@@ -1544,7 +1557,7 @@ mod tests {
     fn recovered_fills_put_an_execution_ahead_of_its_corrections() {
         let contracts = registered();
         let pending = ExecutionBuffer::new();
-        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts);
+        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts, None);
         for item in [
             execution("x.01.02", IB_ORDER_ID, "20260929 14:00:00 UTC"),
             commission("x.01.02"),
@@ -1570,7 +1583,7 @@ mod tests {
     fn recovered_execution_without_commission_moves_to_the_stream_buffer() {
         let contracts = registered();
         let pending = ExecutionBuffer::new();
-        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts);
+        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts, None);
         fills.push(execution("late", IB_ORDER_ID, "20260929 14:00:30 UTC"));
 
         assert!(fills.finish(&pending).is_empty());

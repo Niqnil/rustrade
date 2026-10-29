@@ -25,7 +25,7 @@ use crate::{
     position::{Position, PositionReport},
     shortability::ShortabilityProvider,
     slippage::Slippage,
-    trade::{AssetFees, Trade, TradeId, TradeOrigin},
+    trade::{AssetFees, TimeSource, Trade, TradeId, TradeOrigin},
 };
 use chrono::{DateTime, Utc};
 use fnv::{FnvHashMap, FnvHashSet};
@@ -2193,6 +2193,7 @@ impl SimulatedVenue {
             origin: TradeOrigin::Order,
             position_side: None,
             client_order_id: Some(order.key.cid.clone()),
+            time_source: TimeSource::Venue,
         };
 
         self.account.ack_trade(trade.clone());
@@ -3775,6 +3776,7 @@ impl SimulatedVenue {
             origin: TradeOrigin::Order,
             position_side: None,
             client_order_id: Some(request.key.cid.clone()),
+            time_source: TimeSource::Venue,
         };
 
         // Booked here rather than by the caller, so that whatever this order became is decided in

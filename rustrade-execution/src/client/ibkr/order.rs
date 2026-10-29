@@ -623,12 +623,28 @@ pub(crate) fn order_shape_from_ib(order: &Order) -> Result<OrderShape, String> {
 }
 
 /// Parse IB's good-till-date field: the form [`format_gtd_datetime`] sends, in UTC, or IB's
-/// `yyyyMMdd HH:mm:ss` with an optional zone.
+/// `yyyyMMdd HH:mm:ss` with a zone, or without one, read as UTC.
+///
+/// Unlike an execution's time, a good-till-date that cannot be read in the zone it names, as one
+/// this crate does not know, is still read, as UTC, with a `warn!`: it is an order's parameter,
+/// which this client writes in UTC, and an order whose expiry cannot be read cannot be reported
+/// from a listing at all.
 fn parse_gtd_datetime(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::NaiveDateTime::parse_from_str(value, GTD_FORMAT)
         .map(|naive| naive.and_utc())
         .ok()
-        .or_else(|| super::execution::parse_ib_timestamp(value))
+        .or_else(|| super::execution::parse_ib_timestamp(value, Some(chrono_tz::UTC)))
+        .or_else(|| {
+            let mut parts = value.split_whitespace();
+            let wall_clock = format!("{} {}", parts.next()?, parts.next()?);
+            parts.next()?;
+            let time = super::execution::parse_ib_timestamp(&wall_clock, Some(chrono_tz::UTC))?;
+            tracing::warn!(
+                good_till_date = value,
+                "IBKR good-till-date could not be read in its zone; read as UTC"
+            );
+            Some(time)
+        })
 }
 
 /// Error when mapping rustrade order types to IB.
@@ -2088,6 +2104,24 @@ mod tests {
         assert_eq!(order.order_type, "LMT");
         assert_eq!(order.tif, IbTimeInForce::GoodTillDate);
         assert_eq!(order.good_till_date, "20250630-23:59:59");
+    }
+
+    #[test]
+    fn a_good_till_date_is_read_in_its_zone_or_as_utc() {
+        let utc = |time: &str| Some(chrono::DateTime::parse_from_rfc3339(time).unwrap().to_utc());
+        for (value, expected) in [
+            ("20261027-04:48:41", "2026-10-27T04:48:41Z"),
+            ("20261027 04:48:41", "2026-10-27T04:48:41Z"),
+            ("20261027 12:48:41 Asia/Singapore", "2026-10-27T04:48:41Z"),
+            // A zone this crate cannot read: the wall-clock reading, as UTC.
+            (
+                "20261027 04:48:41 Some Standard Time",
+                "2026-10-27T04:48:41Z",
+            ),
+        ] {
+            assert_eq!(parse_gtd_datetime(value), utc(expected), "{value}");
+        }
+        assert_eq!(parse_gtd_datetime("not a date"), None);
     }
 
     #[test]

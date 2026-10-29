@@ -23,6 +23,7 @@ use crate::{
     },
 };
 use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use fnv::FnvHashMap;
 use ibapi::{
     client::blocking::Client,
@@ -98,13 +99,14 @@ impl CompletedOrders {
     fn from_listing(listing: impl IntoIterator<Item = Orders>, api_client_id: i32) -> Self {
         let mut orders = Self::default();
         for item in listing {
-            orders.push(item, api_client_id);
+            orders.push(item, api_client_id, None);
         }
         orders
     }
 
-    /// Take in one item of the listing, as IB sends it.
-    pub(super) fn push(&mut self, item: Orders, api_client_id: i32) {
+    /// Take in one item of the listing, as IB sends it. A completion time that names no zone is
+    /// read in `session_zone`, the gateway's.
+    pub(super) fn push(&mut self, item: Orders, api_client_id: i32, session_zone: Option<Tz>) {
         let Orders::OrderData(data) = item else {
             return;
         };
@@ -113,7 +115,7 @@ impl CompletedOrders {
             return;
         }
         let order = CompletedOrder {
-            time: execution::parse_ib_timestamp(&data.order_state.completed_time),
+            time: execution::parse_ib_timestamp(&data.order_state.completed_time, session_zone),
             data,
         };
         match self.0.get(order.data.order.order_ref.as_str()) {
@@ -435,9 +437,11 @@ impl<'a> EndedOrderReader<'a> {
             Some(completed) => completed,
             None => {
                 let api_client_id = self.client.client_id();
+                let session_zone = execution::session_zone(self.client);
                 let mut completed = CompletedOrders::default();
-                self.listings
-                    .completed_orders(self.client, |item| completed.push(item, api_client_id))?;
+                self.listings.completed_orders(self.client, |item| {
+                    completed.push(item, api_client_id, session_zone)
+                })?;
                 self.completed.get_or_init(|| completed)
             }
         };

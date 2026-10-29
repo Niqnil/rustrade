@@ -99,7 +99,7 @@ use crate::{
     },
     position::PositionReport,
     shortability::Shortability,
-    trade::{AssetFees, Trade, TradeId, TradesRead},
+    trade::{AssetFees, TimeSource, Trade, TradeId, TradesRead},
 };
 use binance_sdk::{
     common::{config::ConfigurationRestApi, constants::MARGIN_TRADING_REST_API_PROD_URL},
@@ -3168,11 +3168,16 @@ fn convert_margin_trade(
         .as_deref()
         .and_then(|s| Decimal::from_str(s).ok())
         .unwrap_or(Decimal::ZERO);
-    let time_exchange = match t.time.and_then(|ms| Utc.timestamp_millis_opt(ms).single()) {
-        Some(ts) => ts,
+    // The trade carries no other time, so without `time` it is kept, stamped with this host's
+    // clock and marked so.
+    let (time_exchange, time_source) = match t
+        .time
+        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+    {
+        Some(ts) => (ts, TimeSource::Venue),
         None => {
             warn!(%instrument, trade_id = %trade_id_raw, "BinanceMargin trade missing/unparseable time, using now");
-            Utc::now()
+            (Utc::now(), TimeSource::Host)
         }
     };
 
@@ -3186,19 +3191,22 @@ fn convert_margin_trade(
         .map(AssetNameExchange::from)
         .unwrap_or_else(|| AssetNameExchange::from("UNKNOWN"));
 
-    Some(Trade::new(
-        trade_id,
-        order_id,
-        instrument.clone(),
-        StrategyId::unknown(), // Binance doesn't carry strategy IDs
-        time_exchange,
-        side,
-        price,
-        quantity,
-        // `myTrades` reports executions only -- no cumulative, no order status.
-        None,
-        AssetFees::new(fee_asset, commission, None),
-    ))
+    Some(
+        Trade::new(
+            trade_id,
+            order_id,
+            instrument.clone(),
+            StrategyId::unknown(), // Binance doesn't carry strategy IDs
+            time_exchange,
+            side,
+            price,
+            quantity,
+            // `myTrades` reports executions only -- no cumulative, no order status.
+            None,
+            AssetFees::new(fee_asset, commission, None),
+        )
+        .with_time_source(time_source),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4769,6 +4777,27 @@ mod tests {
         // Third-party fee asset (BNB) preserved verbatim; fees_quote left for the indexer.
         assert_eq!(tr.fees.asset.name().as_str(), "BNB");
         assert_eq!(tr.fees.fees, Decimal::new(1, 3));
+    }
+
+    /// A trade is at its `time`, the venue's; without one it is kept, at this host's time, and
+    /// says so.
+    #[test]
+    fn a_margin_trade_without_a_time_is_at_this_hosts_time() {
+        let inst = InstrumentNameExchange::new("BTCUSDT");
+        let tr = convert_margin_trade(&trade(Some(11), Some(false)), &inst).unwrap();
+        assert_eq!(
+            (tr.time_exchange, tr.time_source),
+            (
+                Utc.timestamp_millis_opt(1_700_000_000_000).unwrap(),
+                TimeSource::Venue
+            )
+        );
+        let before = Utc::now();
+        let mut untimed = trade(Some(11), Some(false));
+        untimed.time = None;
+        let tr = convert_margin_trade(&untimed, &inst).unwrap();
+        assert_eq!(tr.time_source, TimeSource::Host);
+        assert!((before..=Utc::now()).contains(&tr.time_exchange));
     }
 
     #[test]
