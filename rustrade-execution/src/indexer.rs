@@ -1,7 +1,7 @@
 use crate::{
     AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
-    InstrumentBalanceUpdate, IsolatedInstrumentState, UnindexedAccountEvent,
-    UnindexedAccountSnapshot,
+    InstrumentBalanceSnapshot, InstrumentBalanceUpdate, IsolatedInstrumentState,
+    UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate},
     cash_flow::CashFlow,
     error::{
@@ -109,6 +109,11 @@ impl AccountEventIndexer {
             }
             AccountEventKind::InstrumentBalanceUpdate(update) => {
                 AccountEventKind::InstrumentBalanceUpdate(self.instrument_balance_update(update)?)
+            }
+            AccountEventKind::InstrumentBalanceSnapshot(snapshot) => {
+                AccountEventKind::InstrumentBalanceSnapshot(
+                    self.instrument_balance_snapshot(snapshot)?,
+                )
             }
             AccountEventKind::OrderSnapshot(snapshot) => {
                 AccountEventKind::OrderSnapshot(self.order_snapshot(snapshot.0).map(Snapshot)?)
@@ -473,6 +478,21 @@ impl AccountEventIndexer {
         Ok(InstrumentBalanceUpdate {
             instrument: self.map.find_instrument_index(&instrument)?,
             balance: self.asset_balance_update(balance)?,
+        })
+    }
+
+    pub fn instrument_balance_snapshot(
+        &self,
+        snapshot: InstrumentBalanceSnapshot<AssetNameExchange, InstrumentNameExchange>,
+    ) -> Result<InstrumentBalanceSnapshot, IndexError> {
+        let InstrumentBalanceSnapshot {
+            instrument,
+            balance,
+        } = snapshot;
+
+        Ok(InstrumentBalanceSnapshot {
+            instrument: self.map.find_instrument_index(&instrument)?,
+            balance: self.asset_balance(balance)?,
         })
     }
 

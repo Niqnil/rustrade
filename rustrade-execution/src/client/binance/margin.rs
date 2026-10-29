@@ -61,6 +61,10 @@ mod stream;
 
 pub use records::MarginForcedLiquidation;
 
+use super::restatement::{
+    BalanceRestatement, RESTATEMENT_TIMEOUT, ReadStart, SharedStreamClock, StreamClock,
+    restatement_time,
+};
 use super::rules::RulesLoader;
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
@@ -77,7 +81,8 @@ use super::shared::{
 use crate::rules::{OrderRules, PreSendRules};
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
-    IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent, UnindexedAccountSnapshot,
+    InstrumentBalanceSnapshot, IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent,
+    UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
     borrow_capacity::BorrowCapacity,
     client::{
@@ -1612,7 +1617,9 @@ impl ExecutionClient for BinanceMargin {
     ///
     /// Debt totals (`borrowed`/`interest`) are not known to be streamed for an isolated pair (see
     /// "Margin debt" above), so they come from
-    /// [`account_snapshot`](ExecutionClient::account_snapshot).
+    /// [`account_snapshot`](ExecutionClient::account_snapshot), and from the
+    /// [`InstrumentBalanceSnapshot`](AccountEventKind::InstrumentBalanceSnapshot)s the stream
+    /// restates after each reconnect (see the [module docs](super#account-stream-reconnection)).
     ///
     /// **Consumption contract (important):** the engine deliberately does **not** store
     /// `InstrumentBalanceUpdate` — it falls through `update_from_account`'s `_ => None` wildcard,
@@ -1626,9 +1633,10 @@ impl ExecutionClient for BinanceMargin {
     /// engine-queryable per-instrument balances uses the `InstrumentData` extension point instead.
     async fn account_stream(
         &self,
-        // _assets is intentionally ignored — Binance pushes outboundAccountPosition for all account
-        // assets regardless of any filter (mirrors spot). See account_snapshot for filtering.
-        _assets: &[AssetNameExchange],
+        // Only a reconnect's balance restatement uses `assets`: Binance pushes
+        // outboundAccountPosition for every asset of the account, whatever is asked for (mirrors
+        // spot).
+        assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
     ) -> Result<Self::AccountStream, UnindexedClientError> {
         let (tx, rx) = mpsc::unbounded_channel::<UnindexedAccountEvent>();
@@ -1678,6 +1686,8 @@ impl ExecutionClient for BinanceMargin {
             known: self.known_live.clone(),
             account,
             instruments,
+            assets: assets.to_vec(),
+            clock: StreamClock::shared(),
             tx,
             dedup: new_dedup_cache(),
         };
@@ -2299,6 +2309,123 @@ fn open_reconnect_recovery(
     unrecovered.open(instruments, disconnected, Utc::now());
     let held = known.lock().instruments_among(instruments);
     unchecked.open(held);
+}
+
+/// Restate the stream's balances, debt included, if a reconnect owes it and it is due: read them
+/// over REST and send each, as a [`BalanceSnapshot`](AccountEventKind::BalanceSnapshot) for the
+/// cross account's `assets` (all of them when empty), or an
+/// [`InstrumentBalanceSnapshot`](AccountEventKind::InstrumentBalanceSnapshot) for the base and
+/// quote of each isolated pair in `pairs`.
+///
+/// The read starts no sooner than [`StreamClock::read_start`] allows, and its balances are stamped
+/// by [`restatement_time`]. One that fails or does not finish within [`RESTATEMENT_TIMEOUT`] is
+/// logged and retried after a backoff ([`BalanceRestatement::failed`]).
+#[allow(clippy::too_many_arguments)] // The stream's parts the read uses; a struct would only rename them.
+async fn restate_margin_balances(
+    rest: &Arc<RestApi>,
+    rate_limiter: &Arc<RateLimitTracker>,
+    is_isolated: bool,
+    pairs: &[InstrumentNameExchange],
+    assets: &[AssetNameExchange],
+    clock: &SharedStreamClock,
+    restatement: &mut BalanceRestatement,
+    tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
+) {
+    let now = tokio::time::Instant::now();
+    if !restatement.is_due(now) {
+        return;
+    }
+    let floor = match clock.lock().read_start(now) {
+        ReadStart::Now { floor } => floor,
+        ReadStart::At(start) => {
+            restatement.defer(start);
+            return;
+        }
+    };
+    let read =
+        read_margin_restatement(rest, rate_limiter, is_isolated, pairs, assets, clock, floor);
+    match tokio::time::timeout(RESTATEMENT_TIMEOUT, read).await {
+        Ok(Ok(events)) => {
+            let count = events.len();
+            for event in events {
+                if tx.send(event).is_err() {
+                    return;
+                }
+            }
+            restatement.restated();
+            info!(
+                is_isolated,
+                count, "BinanceMargin balances restated after a reconnect"
+            );
+        }
+        failure => {
+            let error = match failure {
+                Ok(Err(e)) => e.to_string(),
+                _ => format!("no answer within {}s", RESTATEMENT_TIMEOUT.as_secs()),
+            };
+            let retry_in = restatement.failed().unwrap_or_default();
+            warn!(
+                is_isolated,
+                %error,
+                retry_in_secs = retry_in.as_secs(),
+                "BinanceMargin balance restatement after a reconnect failed, will retry"
+            );
+        }
+    }
+}
+
+/// Read the balances [`restate_margin_balances`] sends, stamped for a read started with `floor`.
+async fn read_margin_restatement(
+    rest: &Arc<RestApi>,
+    rate_limiter: &Arc<RateLimitTracker>,
+    is_isolated: bool,
+    pairs: &[InstrumentNameExchange],
+    assets: &[AssetNameExchange],
+    clock: &SharedStreamClock,
+    floor: Option<DateTime<Utc>>,
+) -> Result<Vec<UnindexedAccountEvent>, UnindexedClientError> {
+    let event = |kind| UnindexedAccountEvent::new(ExchangeId::BinanceMargin, kind);
+    let sent_at = tokio::time::Instant::now();
+    if is_isolated {
+        let reads =
+            fetch_isolated_margin_account_info(rest.clone(), rate_limiter.clone(), pairs.to_vec())
+                .await?;
+        let clock = clock.lock();
+        return Ok(reads
+            .into_iter()
+            .flat_map(|read| {
+                let time = restatement_time(&clock, read.sent, sent_at, floor);
+                convert_isolated_margin_assets(read.assets, time)
+            })
+            .flat_map(|(pair, state)| {
+                [state.base, state.quote].map(|balance| {
+                    event(AccountEventKind::InstrumentBalanceSnapshot(
+                        InstrumentBalanceSnapshot::new(pair.clone(), balance),
+                    ))
+                })
+            })
+            .collect());
+    }
+    let (response, sent) = rest_read_with_retry(rest, rate_limiter, RequestKind::Query, |rest| {
+        Box::pin(async move {
+            let params = QueryCrossMarginAccountDetailsParams::builder().build()?;
+            rest.query_cross_margin_account_details(params).await
+        })
+    })
+    .await
+    .map_err(|e| classify_rest_query_error(&e, None))?;
+    let account = response.data().await.map_err(response_decode_error)?;
+    let time = restatement_time(&clock.lock(), sent, sent_at, floor);
+    Ok(
+        filter_and_convert_margin_balances(account.user_assets.unwrap_or_default(), assets, time)
+            .into_iter()
+            .map(|balance| {
+                event(AccountEventKind::BalanceSnapshot(
+                    rustrade_integration::collection::snapshot::Snapshot(balance),
+                ))
+            })
+            .collect(),
+    )
 }
 
 /// Extract the invariant `instrument → (base_asset, quote_asset)` map from an isolated
@@ -5810,6 +5937,126 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A restatement read that fails sends nothing and stays owed, due after the first backoff;
+    /// the next read that succeeds sends the balances and settles it.
+    #[tokio::test]
+    async fn a_failed_restatement_stays_owed_and_the_next_read_restates() {
+        use super::super::restatement::RESTATEMENT_RETRY_BASE;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/account"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/account"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "userAssets": [{
+                    "asset": "BTC", "free": "1", "locked": "0", "borrowed": "0", "interest": "0",
+                    "netAsset": "1",
+                }] }),
+            ))
+            .mount(&server)
+            .await;
+        let (rest, limiter) = (
+            margin_rest_at(&server),
+            Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
+        );
+        let clock = StreamClock::shared();
+        let mut restatement = BalanceRestatement::default();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        // Restates the cross account's balances, all of them.
+        macro_rules! restate {
+            () => {
+                restate_margin_balances(
+                    &rest,
+                    &limiter,
+                    false,
+                    &[],
+                    &[],
+                    &clock,
+                    &mut restatement,
+                    &tx,
+                )
+                .await
+            };
+        }
+
+        // Nothing owed: nothing read.
+        restate!();
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        restatement.open();
+        let failed_at = tokio::time::Instant::now();
+        restate!();
+        assert!(rx.try_recv().is_err(), "a failed read sends nothing");
+        let due = restatement.next_due().expect("still owed");
+        assert!(due >= failed_at + RESTATEMENT_RETRY_BASE, "{due:?}");
+
+        // Not yet due: not read again.
+        restate!();
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+        restatement.open();
+        restate!();
+        let event = rx.try_recv().unwrap();
+        assert!(
+            matches!(event.kind, AccountEventKind::BalanceSnapshot(_)),
+            "{event:?}"
+        );
+        assert_eq!(restatement.next_due(), None);
+    }
+
+    /// A restatement owed straight after a balance event waits until the venue's clock is the
+    /// REST lag past it, reading nothing before then.
+    #[tokio::test]
+    async fn a_restatement_right_after_a_balance_event_waits_out_the_rest_lag() {
+        use crate::{
+            balance::{AssetBalanceUpdate, BalanceUpdate},
+            client::binance::shared::REST_BALANCE_LAG,
+        };
+        let server = wiremock::MockServer::start().await;
+        let clock = StreamClock::shared();
+        let delivered = tokio::time::Instant::now();
+        clock.lock().observe(
+            &UnindexedAccountEvent::new(
+                ExchangeId::BinanceMargin,
+                AccountEventKind::BalanceStreamUpdate(
+                    rustrade_integration::collection::snapshot::Snapshot(AssetBalanceUpdate::new(
+                        AssetNameExchange::new("BTC"),
+                        BalanceUpdate::new(Decimal::ONE, Decimal::ZERO),
+                        Utc::now(),
+                    )),
+                ),
+            ),
+            delivered,
+        );
+        let mut restatement = BalanceRestatement::default();
+        restatement.open();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        restate_margin_balances(
+            &margin_rest_at(&server),
+            &Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
+            false,
+            &[],
+            &[],
+            &clock,
+            &mut restatement,
+            &tx,
+        )
+        .await;
+
+        assert!(server.received_requests().await.unwrap().is_empty());
+        assert!(rx.try_recv().is_err());
+        let due = restatement.next_due().unwrap();
+        assert!(
+            due >= delivered + REST_BALANCE_LAG.to_std().unwrap(),
+            "{due:?} vs {delivered:?}"
+        );
     }
 
     #[tokio::test]

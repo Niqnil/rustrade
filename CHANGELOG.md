@@ -45,6 +45,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the two clocks. An old event delivered late, such as a replayed fill, never displaces a better
   sample. `host_lead` gives how far this host's clock can lead the venue's.
 
+- **`AccountEventKind::InstrumentBalanceSnapshot`** (`rustrade-execution`). One asset's full
+  balance in a pair's isolated sub-account, debt included, read over REST: the per-pair
+  counterpart of `BalanceSnapshot`. A Binance isolated margin stream emits it for each pair's base
+  and quote after it reconnects. The engine does not store it, as with `InstrumentBalanceUpdate`.
+
 ### Fixed
 
 - **Missed-fill recovery reads its span on the venue's clock, not this host's** (`rustrade`,
@@ -94,6 +99,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   costs little: a stream event from between the stamp and the read that arrives after the
   snapshot applies over it. A host clock ahead of the venue's still carries into the stamp, and
   keeping the two within bounds is the caller's obligation.
+
+- **A Binance account stream restates its balances after it reconnects by itself**
+  (`rustrade-execution`, #778). The spot and margin streams recover the fills and order endings
+  they missed while disconnected, but no balances. A balance update or margin debt change sent in
+  the gap was lost, and the engine's balances and debt stayed wrong until the next REST snapshot,
+  which a long-running process may never take.
+  - **The read.** Once the gap's fills have been read, the stream now reads the account's balances
+    over REST and delivers each of the assets it was opened for (all of them when that list is
+    empty) as a `BalanceSnapshot`, debt included on margin. An isolated margin stream delivers
+    each pair's base and quote as an `InstrumentBalanceSnapshot`.
+  - **The stamp.** Each is stamped with the earlier of this host's time and the venue's time at
+    the read's start, less 5 s. The venue's time comes from a `VenueClock` fed by the stream's own
+    events, so a host clock ahead of the venue's does not carry into it. The read waits until the
+    venue's clock is 5 s past the latest balance or debt event the stream delivered, and is never
+    stamped earlier than that event, which the engine would otherwise keep.
+  - **Failure.** A read that fails, or takes more than 30 s, is logged at `warn` and retried while
+    connected, after 5 s and then twice as long each time, up to 2 minutes. It is never given up,
+    and a later reconnect replaces it.
+  - **Cost.** One account read per reconnect.
+  - **Other clients.** Alpaca's, IBKR's and Hyperliquid's streams carry no balance events, so they
+    lose none in a gap.
 
 ## [0.17.0] - 2026-10-28
 

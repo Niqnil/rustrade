@@ -271,6 +271,9 @@ impl<MarketEventKind: Debug> TimeExchange for EngineEvent<MarketEventKind> {
                     // its asset-keyed sibling `BalanceStreamUpdate`.
                     Some(update.balance.time_exchange)
                 }
+                AccountEventKind::InstrumentBalanceSnapshot(snapshot) => {
+                    Some(snapshot.balance.time_exchange)
+                }
                 AccountEventKind::OrderSnapshot(order) => order.0.state.time_exchange(),
                 AccountEventKind::OrderCancelled(response) => response
                     .state

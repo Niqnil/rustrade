@@ -7088,6 +7088,9 @@ pub(super) mod test_ws_api {
         Silent(Duration),
         /// Closes after this long, pinging every second meanwhile.
         Pinging(Duration),
+        /// Sends the frame `push` builds a moment after its first answer, once the client has
+        /// registered for it, then closes after this long.
+        Pushing(fn() -> String, Duration),
     }
 
     /// Starts a WS API answering every request with `answer`, whose `n`th connection (from 0)
@@ -7130,6 +7133,13 @@ pub(super) mod test_ws_api {
                             Lifetime::Open => continue,
                             Lifetime::Silent(after) => (after, false),
                             Lifetime::Pinging(after) => (after, true),
+                            Lifetime::Pushing(push, after) => {
+                                tokio::time::sleep(Duration::from_millis(200)).await;
+                                if ws.send(Message::text(push())).await.is_err() {
+                                    return;
+                                }
+                                (after, false)
+                            }
                         };
                         let closes = tokio::time::sleep(after);
                         tokio::pin!(closes);

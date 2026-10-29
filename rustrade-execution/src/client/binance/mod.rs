@@ -49,6 +49,25 @@
 //! is a grace. Silence is therefore noticed after 30 to 60 s. Each reconnect recovers the fills
 //! and order endings the stream missed (see each client's `account_stream`).
 //!
+//! Each reconnect then restates the account's balances, since a balance or debt event the venue
+//! sent while the stream was down is lost. Once the gap's fills have been read, the stream reads
+//! the balances over REST and delivers each of the `assets` it was opened for (all of them when
+//! empty) as a [`BalanceSnapshot`](crate::AccountEventKind::BalanceSnapshot), debt included. An
+//! isolated margin stream delivers its pairs' base and quote as
+//! [`InstrumentBalanceSnapshot`](crate::AccountEventKind::InstrumentBalanceSnapshot)s instead.
+//!
+//! - **Stamp.** The earlier of this host's time and the venue's time at the read's start, as the
+//!   stream's own events show the venue's clock, less 5 s for Binance's REST view trailing its
+//!   stream. A stream event newer than the state the read shows then still applies over it. The
+//!   read starts no sooner than 5 s, on the venue's clock, after the latest balance or debt event
+//!   the stream delivered, and its stamp is never earlier than that event's: an earlier one would
+//!   leave the engine keeping that event's state.
+//! - **Failure.** A read that fails, or takes more than 30 s, is logged at `warn` and retried
+//!   while connected, after 5 s and then twice as long each time, up to 2 minutes. It is never
+//!   given up. A later reconnect replaces it with a read due at once.
+//! - **Cost.** One account read per reconnect: weight 20 on spot, 10 on cross margin, and 10 per
+//!   five isolated pairs.
+//!
 //! - **Attempts.** A dropped connection, and each reconnect that fails after it, spends one
 //!   attempt: a wait, then a reconnect. A reconnect fails when its connect, its user-data
 //!   subscribe, or for [`BinanceMargin`] its listen-key request fails. The waits double from 1 s
@@ -108,6 +127,7 @@
 //! an explicit request.
 
 mod margin;
+mod restatement;
 mod rules;
 mod shared;
 mod spot;
