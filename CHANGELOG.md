@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this host's time and marked `TimeSource::Host`. A time that names no zone is read in the
   gateway's zone from the connection handshake. A reading in a repeated daylight-saving hour is
   its earlier instant, rather than not read, and IB's `YYYYMMDD-HH:MM:SS` form is read as UTC.
+  `IbkrClient::clear_stale_executions` ages an execution whose time does not read by when it was
+  buffered, rather than clearing it at once, before its commission report could arrive.
 
 - **Binance balance updates without a venue time are dropped** (`rustrade-execution`, #775). An
   `outboundAccountPosition` with neither its update time `u` nor its event time `E` readable was
@@ -87,7 +89,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a host clock ahead of the venue's read as a venue clock ahead too, and the recovery read after a
   reconnect started late. They now skip `TimeSource::Host` fills. Each client also falls back to
   another time the venue stamped before this host's: a Binance `executionReport` to its event time
-  `E`, and an Alpaca `trade_updates` event to its order's `updated_at`.
+  `E`, and an Alpaca `trade_updates` event to its order's `updated_at`. Every fill still stamped
+  with this host's time, such as a Binance or Alpaca REST trade without one, is marked so.
 
 - **The simulated venue's clock never moves back** (`rustrade-execution`, #772).
   `SimulatedVenue::advance_time` took whatever instant it was given. An instant earlier than one

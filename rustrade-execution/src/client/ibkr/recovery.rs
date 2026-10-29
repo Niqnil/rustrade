@@ -478,10 +478,11 @@ impl<'a> RecoveredFills<'a> {
                 // skipped hour, or a format change) is kept: dropping it could lose a fill from
                 // the gap, while keeping one the stream already delivered costs nothing past the
                 // dedup cache.
-                match super::execution::parse_ib_timestamp(
+                let time = super::execution::parse_ib_timestamp(
                     &execution.execution.time,
                     self.session_zone,
-                ) {
+                );
+                match time {
                     Some(time) if time < self.floor => return,
                     Some(_) => {}
                     None => {
@@ -494,7 +495,7 @@ impl<'a> RecoveredFills<'a> {
                     }
                 }
                 if let Some(resolved) =
-                    resolve_execution(&execution, self.scope, self.contracts, self.session_zone)
+                    resolve_execution(&execution, self.scope, self.contracts, time)
                 {
                     self.awaiting_commission.add_execution(execution, resolved);
                 }

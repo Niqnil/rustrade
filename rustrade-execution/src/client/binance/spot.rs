@@ -83,7 +83,7 @@ use crate::{
     },
     parse_env_bool,
     position::PositionReport,
-    trade::{AssetFees, Trade, TradeId, TradesRead},
+    trade::{AssetFees, TimeSource, Trade, TradeId, TradesRead},
 };
 use binance_sdk::{
     common::{
@@ -2479,11 +2479,16 @@ fn convert_my_trade(
         .as_deref()
         .and_then(|s| Decimal::from_str(s).ok())
         .unwrap_or(Decimal::ZERO);
-    let time_exchange = match t.time.and_then(|ms| Utc.timestamp_millis_opt(ms).single()) {
-        Some(ts) => ts,
+    // The trade carries no other time, so without `time` it is kept, stamped with this host's
+    // clock and marked so.
+    let (time_exchange, time_source) = match t
+        .time
+        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+    {
+        Some(ts) => (ts, TimeSource::Venue),
         None => {
             warn!(%instrument, trade_id = %trade_id_raw, "BinanceSpot trade missing/unparseable time, using now");
-            Utc::now()
+            (Utc::now(), TimeSource::Host)
         }
     };
 
@@ -2498,19 +2503,22 @@ fn convert_my_trade(
         .map(AssetNameExchange::from)
         .unwrap_or_else(|| AssetNameExchange::from("UNKNOWN"));
 
-    Some(Trade::new(
-        trade_id,
-        order_id,
-        instrument.clone(),
-        StrategyId::unknown(), // Binance doesn't carry strategy IDs
-        time_exchange,
-        side,
-        price,
-        quantity,
-        // `myTrades` reports executions only -- no cumulative, no order status.
-        None,
-        AssetFees::new(fee_asset, commission, None),
-    ))
+    Some(
+        Trade::new(
+            trade_id,
+            order_id,
+            instrument.clone(),
+            StrategyId::unknown(), // Binance doesn't carry strategy IDs
+            time_exchange,
+            side,
+            price,
+            quantity,
+            // `myTrades` reports executions only -- no cumulative, no order status.
+            None,
+            AssetFees::new(fee_asset, commission, None),
+        )
+        .with_time_source(time_source),
+    )
 }
 
 /// Convert a raw BinanceSpot user-data WS frame to rustrade AccountEvents.
@@ -4590,6 +4598,29 @@ mod tests {
         assert_eq!(trade.side, Side::Buy);
         assert_eq!(trade.price, Decimal::from_str("50000.00").unwrap());
         assert_eq!(trade.quantity, Decimal::from_str("0.01").unwrap());
+    }
+
+    /// A trade is at its `time`, the venue's; without one it is kept, at this host's time, and
+    /// says so.
+    #[test]
+    fn a_rest_trade_without_a_time_is_at_this_hosts_time() {
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        let trade = convert_my_trade(&make_base_trade(), &instrument).unwrap();
+        assert_eq!(
+            (trade.time_exchange, trade.time_source),
+            (
+                Utc.timestamp_millis_opt(1_700_000_000_000).unwrap(),
+                TimeSource::Venue
+            )
+        );
+        let before = Utc::now();
+        let t = binance_sdk::spot::rest_api::MyTradesResponseInner {
+            time: None,
+            ..make_base_trade()
+        };
+        let trade = convert_my_trade(&t, &instrument).unwrap();
+        assert_eq!(trade.time_source, TimeSource::Host);
+        assert!((before..=Utc::now()).contains(&trade.time_exchange));
     }
 
     #[test]

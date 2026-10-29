@@ -602,6 +602,7 @@ impl Display for TradeOrigin {
 /// | Source | Without a venue time |
 /// |---|---|
 /// | Binance Spot / Margin `executionReport` | the report's event time (`E`), else [`Host`](Self::Host) |
+/// | Binance Spot / Margin `myTrades` REST (`fetch_trades`, fill recovery) | [`Host`](Self::Host) |
 /// | Alpaca `trade_updates` | the order's `updated_at`, else [`Host`](Self::Host) |
 /// | Alpaca account-activities REST | [`Host`](Self::Host) |
 /// | Interactive Brokers executions | [`Host`](Self::Host), also when the time's zone is unknown; `fetch_trades`, which selects by time, skips such a fill |

@@ -15,8 +15,9 @@ use smol_str::{SmolStr, format_smolstr};
 use std::{cell::RefCell, collections::hash_map::Entry, sync::Arc, time::Duration};
 use tracing::{debug, warn};
 
-// Thread-local cache of the zones IB's times name, as resolved. IB names the gateway host's zone,
-// so a gateway's times usually name one.
+// Thread-local cache of the zones IB's times name, as resolved, or `None` for a name that is not a
+// tz database name, so that one is warned of once per thread rather than on every time. IB names
+// the gateway host's zone, so a gateway's times usually name one.
 //
 // Note: This cache is per-thread. In the dedicated `ibkr-order-stream` thread
 // spawned by `account_stream`, the cache is fully effective. In `spawn_blocking`
@@ -24,7 +25,8 @@ use tracing::{debug, warn};
 // maintains its own cache — still beneficial but less effective than a single
 // dedicated thread.
 thread_local! {
-    static TZ_CACHE: RefCell<FnvHashMap<SmolStr, Tz>> = RefCell::new(FnvHashMap::default());
+    static TZ_CACHE: RefCell<FnvHashMap<SmolStr, Option<Tz>>> =
+        RefCell::new(FnvHashMap::default());
 }
 
 /// Buffers IB executions until their commission reports arrive.
@@ -46,6 +48,9 @@ struct ExecutionBufferInner {
 struct PendingExecution {
     execution: ExecutionData,
     resolved: ResolvedExecution,
+    /// This host's time when the execution was buffered, which ages it in
+    /// [`ExecutionBuffer::clear_stale`] when its own time does not read.
+    buffered_at: DateTime<Utc>,
 }
 
 /// Which API clients' executions this client reports, and how it tells its own from theirs.
@@ -115,6 +120,7 @@ impl ExecutionBuffer {
             PendingExecution {
                 execution,
                 resolved,
+                buffered_at: Utc::now(),
             },
         );
 
@@ -187,6 +193,9 @@ impl ExecutionBuffer {
 
     /// Clear stale executions older than the given duration.
     ///
+    /// An execution is aged by its own time, or, when that does not read, by when it was
+    /// buffered, so one waiting on its commission report is not cleared for its time alone.
+    ///
     /// Returns number of cleared entries.
     ///
     /// # Caller Responsibility
@@ -201,13 +210,8 @@ impl ExecutionBuffer {
 
         let max_age_secs = i64::try_from(max_age.as_secs()).unwrap_or(i64::MAX);
         inner.pending.retain(|_, pending| {
-            if let Some(exec_time) = pending.resolved.time {
-                let age = now.signed_duration_since(exec_time);
-                age.num_seconds() < max_age_secs
-            } else {
-                // Evict entries with unparseable timestamps to prevent memory leak
-                false
-            }
+            let time = pending.resolved.time.unwrap_or(pending.buffered_at);
+            now.signed_duration_since(time).num_seconds() < max_age_secs
         });
 
         before - inner.pending.len()
@@ -464,12 +468,15 @@ pub fn try_decimal_or_warn(value: f64, field_name: impl std::fmt::Display) -> Op
 ///   `US/Eastern` or `MET`.
 /// - **A time that names no zone is read in `session_zone`**, the gateway's zone from the
 ///   connection handshake (see [`IbkrClient::session_zone`](super::IbkrClient::session_zone)).
-///   Without one, it is `None`.
-/// - **A zone that is not a tz database name is `None`**, with a `warn!`. Read in a guessed zone,
-///   such as UTC, the instant would be off by the zone's offset, possibly by hours.
+///   Without one, it is `None`. A time that names a zone is read in it, whatever
+///   `session_zone` is.
+/// - **A zone that is not a tz database name is `None`**, with a `warn!` the first time on each
+///   thread. Read in a guessed zone, such as UTC, the instant would be off by the zone's offset,
+///   possibly by hours.
 /// - **A reading in a repeated hour**, as clocks go back, is the earlier of its two instants. One
 ///   in a skipped hour, as clocks go forward, never showed on a clock, and is `None`.
-/// - Anything else that does not read as one of these forms is `None`.
+/// - Anything else that does not read as one of these forms is `None`, including the `-` form
+///   followed by a zone.
 pub fn parse_ib_timestamp(s: &str, session_zone: Option<Tz>) -> Option<DateTime<Utc>> {
     let s = s.trim();
     let (date, rest) = s
@@ -487,17 +494,7 @@ pub fn parse_ib_timestamp(s: &str, session_zone: Option<Tz>) -> Option<DateTime<
         .map_or((rest, None), |(time, zone)| (time, Some(zone.trim())));
     let naive = naive_ib_time(date, time)?;
     let zone = match zone {
-        Some(name) => {
-            let zone = resolve_zone(name);
-            if zone.is_none() {
-                warn!(
-                    timezone = name,
-                    time = s,
-                    "Unknown time zone in IB time; not reading it"
-                );
-            }
-            zone?
-        }
+        Some(name) => resolve_zone(name)?,
         None => session_zone?,
     };
     zone.from_local_datetime(&naive)
@@ -513,14 +510,20 @@ fn naive_ib_time(date: &str, time: &str) -> Option<NaiveDateTime> {
     ))
 }
 
-/// The tz database zone `name` names, or `None`.
+/// The tz database zone `name` names, or `None`, with a `warn!` the first time on this thread.
 fn resolve_zone(name: &str) -> Option<Tz> {
     if let Some(zone) = TZ_CACHE.with(|cache| cache.borrow().get(name).copied()) {
-        return Some(zone);
+        return zone;
     }
-    let zone = name.parse::<Tz>().ok()?;
+    let zone = name.parse::<Tz>().ok();
+    if zone.is_none() {
+        warn!(
+            timezone = name,
+            "Unknown time zone in IB times; not reading them"
+        );
+    }
     TZ_CACHE.with(|cache| cache.borrow_mut().insert(SmolStr::new(name), zone));
-    Some(zone)
+    zone
 }
 
 /// The gateway's zone, as `ibapi` read it from the connection handshake, as a `chrono_tz` zone:
@@ -727,38 +730,49 @@ mod tests {
         );
     }
 
-    /// An execution waiting for its commission report longer than `max_age` is cleared, and so is
-    /// one whose time does not read, which no age would ever clear.
+    /// An execution waiting for its commission report longer than `max_age` is cleared. One whose
+    /// time does not read is aged by when it was buffered, so a fresh one is kept.
     #[test]
-    fn clear_stale_clears_executions_older_than_the_age_and_those_without_a_time() {
+    fn clear_stale_clears_executions_older_than_the_age() {
         let buffer = ExecutionBuffer::new();
         let now = Utc::now();
+        let resolved = |time| ResolvedExecution {
+            instrument: InstrumentNameExchange::new("AAPL"),
+            order_id: ib_order_id(1),
+            origin: TradeOrigin::Order,
+            time,
+        };
+        let execution = |exec_id: &str| ExecutionData {
+            execution: ibapi::orders::Execution {
+                execution_id: exec_id.to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         for (exec_id, time) in [
             ("old", Some(now - chrono::Duration::hours(2))),
             ("recent", Some(now - chrono::Duration::minutes(1))),
             ("unread", None),
         ] {
-            buffer.add_execution(
-                ExecutionData {
-                    execution: ibapi::orders::Execution {
-                        execution_id: exec_id.to_string(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-                ResolvedExecution {
-                    instrument: InstrumentNameExchange::new("AAPL"),
-                    order_id: ib_order_id(1),
-                    origin: TradeOrigin::Order,
-                    time,
-                },
-            );
+            buffer.add_execution(execution(exec_id), resolved(time));
         }
+        buffer.inner.lock().pending.insert(
+            "unread-old".to_string(),
+            PendingExecution {
+                execution: execution("unread-old"),
+                resolved: resolved(None),
+                buffered_at: now - chrono::Duration::hours(2),
+            },
+        );
 
         assert_eq!(buffer.clear_stale(Duration::from_secs(3_600)), 2);
-        let kept = buffer.take_without_commission();
-        assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].id, TradeId::new("recent"));
+        let mut kept: Vec<_> = buffer
+            .take_without_commission()
+            .into_iter()
+            .map(|trade| trade.id)
+            .collect();
+        kept.sort();
+        assert_eq!(kept, [TradeId::new("recent"), TradeId::new("unread")]);
     }
 
     /// A fill reports the order reference as its client order id: this client places each order

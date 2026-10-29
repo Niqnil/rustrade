@@ -580,12 +580,13 @@ fn is_transport_loss(e: &ibapi::Error) -> bool {
 /// registered.
 ///
 /// An execution of this client's own order is reported even if the client no longer tracks the
-/// order: after a restart, or once its id was reaped, it is still this client's fill.
+/// order: after a restart, or once its id was reaped, it is still this client's fill. `time` is
+/// its time as [`parse_ib_timestamp`] read it, carried to the trade.
 fn resolve_execution(
     execution: &ibapi::orders::ExecutionData,
     scope: ExecutionScope,
     contracts: &ContractRegistry,
-    session_zone: Option<chrono_tz::Tz>,
+    time: Option<DateTime<Utc>>,
 ) -> Option<ResolvedExecution> {
     let ib_order_id = execution.execution.order_id;
     let con_id = execution.contract.contract_id;
@@ -627,7 +628,7 @@ fn resolve_execution(
         instrument,
         order_id,
         origin,
-        time: execution::parse_ib_timestamp(&execution.execution.time, session_zone),
+        time,
     })
 }
 
@@ -1055,8 +1056,8 @@ fn forward_order_updates(
                     );
                     continue;
                 }
-                let Some(resolved) = resolve_execution(&exec, scope, contracts, session_zone)
-                else {
+                let time = execution::parse_ib_timestamp(&exec.execution.time, session_zone);
+                let Some(resolved) = resolve_execution(&exec, scope, contracts, time) else {
                     continue;
                 };
                 // Logged on arrival, so the correction is seen even if no commission report
@@ -5950,6 +5951,33 @@ mod order_reader_tests {
                     ("7", crate::trade::TradeOrigin::Order),
                     ("client:905:7", crate::trade::TradeOrigin::External)
                 ]
+            );
+
+            // A read selects by time, so an execution whose time does not read is skipped:
+            // in a zone that is not a tz database name, or naming none without a session zone.
+            // With the session's zone, one naming none is read in it.
+            let untimed = |session_zone| {
+                trades_from_executions(
+                    [
+                        executed(API_CLIENT, 7, "unknown-zone", "20261007 10:00:00 Nowhere"),
+                        commission("unknown-zone"),
+                        executed(API_CLIENT, 7, "no-zone", "20261007 18:00:00"),
+                        commission("no-zone"),
+                    ],
+                    scope(API_CLIENT),
+                    &contracts(),
+                    session_zone,
+                    at("2026-10-07T10:00:00Z")..=at("2026-10-07T11:00:00Z"),
+                    None,
+                )
+                .into_iter()
+                .map(|trade| (trade.id.0.to_string(), trade.time_exchange))
+                .collect::<Vec<_>>()
+            };
+            assert_eq!(untimed(None), []);
+            assert_eq!(
+                untimed(Some(chrono_tz::Asia::Singapore)),
+                [("no-zone".to_string(), at("2026-10-07T10:00:00Z"))]
             );
         }
     }
