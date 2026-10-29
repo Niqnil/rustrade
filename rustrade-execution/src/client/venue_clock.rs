@@ -46,10 +46,10 @@ const DRIFT_DIVISOR: u32 = 10_000;
 /// - A venue clock that steps back is followed only as fast as the drift allowance lets the old
 ///   sample go, about 0.36 s an hour.
 /// - Before the first sample there is no bound: [`earliest_at`](Self::earliest_at) is `None`.
-/// - The monotonic clock is not free of the host's time keeping. It does not advance while the
-///   host is suspended, which makes the bound earlier than it could be: safe for a read's start,
-///   but no help for its end. NTP can also slew it, up to 500 ppm or more while it corrects an
-///   offset, beyond the drift allowance. A slew that speeds it up corrects a wall clock that is
+/// - The monotonic clock is not free of the host's time keeping. On some platforms, such as
+///   Linux, it does not advance while the host is suspended, which makes the bound earlier than
+///   it could be: safe for a read's start, but no help for its end. NTP can also slew it, up to
+///   500 ppm or more while it corrects an offset, beyond the drift allowance. A slew that speeds it up corrects a wall clock that is
 ///   behind, so a caller that also bounds a read's start by the wall clock, taking the earlier of
 ///   the two, stays covered.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

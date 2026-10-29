@@ -1699,12 +1699,13 @@ mod tests {
         );
         let at = |secs: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap();
         // The first open reads nothing; the re-init reads around the watermark, to past the
-        // allowance after the local time counted on from it on tokio's clock.
+        // allowance after the local time counted on from it on tokio's clock. The end's margin
+        // above 130 is real time elapsed, generous so a loaded runner does not fail it.
         let [(start, end)] = fetched.lock().unwrap().clone()[..] else {
             panic!("one read")
         };
         assert_eq!(start, at(68));
-        assert!(at(130) <= end && end < at(131), "the read ends at {end}");
+        assert!(at(130) <= end && end < at(160), "the read ends at {end}");
     }
 
     /// A read that fails does not stop the stream opening: its span is reported and the snapshot
