@@ -252,8 +252,10 @@ pub enum VenueRegime {
 /// - **When.** At each model's boundaries, as the clock reaches them. This venue has no timer, so
 ///   a boundary is charged when a driver next moves the clock to or past it, through
 ///   [`advance_time`](Self::advance_time) or [`apply_market`](Self::apply_market). Several
-///   boundaries passed at once are each charged, in time order. A driver that moves the clock to
-///   [`next_deadline`](Self::next_deadline) charges each one when it falls, as `SimRunner` does.
+///   boundaries passed at once are each charged once, in time order, however far the clock
+///   jumped, and a clock moved back charges nothing (see [`advance_time`](Self::advance_time)). A
+///   driver that moves the clock to [`next_deadline`](Self::next_deadline) charges each one when
+///   it falls, as `SimRunner` does.
 ///   Charging starts at the instant the clock first moves, so a position a configured
 ///   `initial_state` seeds is charged from there, and never for the time before the run.
 /// - **What.** The position held across the boundary, valued at the mid of this venue's market,
@@ -557,8 +559,9 @@ pub struct SimulatedVenue {
     /// collide between the two. A real venue mints trade ids independently for the same reason;
     /// the link back to the order is [`Trade::order_id`], which is typed rather than parsed.
     trade_sequence: u64,
-    /// Read via [`time_exchange`](Self::time_exchange), advanced only by
-    /// [`advance_time`](Self::advance_time).
+    /// Read via [`time_exchange`](Self::time_exchange), set only by
+    /// [`advance_time`](Self::advance_time), and never below
+    /// [`accrued_through`](Self::accrued_through).
     time_exchange_latest: DateTime<Utc>,
     /// Which price source this venue has. Private: it is fixed at construction, and a consumer
     /// flipping it on a venue already holding resting orders would leave them unmatchable with no
@@ -575,6 +578,9 @@ pub struct SimulatedVenue {
     /// a charge idempotent however often the clock is moved to one instant. It starts unset
     /// rather than at the epoch, so a venue charges from the first instant it is driven to, not
     /// for every boundary since 1970.
+    ///
+    /// Both inputs raise it and nothing lowers it, so it is also the latest instant this venue's
+    /// clock has reached, which [`advance_time`](Self::advance_time) holds its clock to.
     accrued_through: Option<DateTime<Utc>>,
     /// The earliest holding-cost boundary after [`accrued_through`](Self::accrued_through) of any
     /// position held, or `None` if there is none.
@@ -885,11 +891,33 @@ impl SimulatedVenue {
     /// the type's `# Holding costs` and `# Spot margin`. They precede the expiries, which are
     /// stamped at `time_exchange`.
     ///
+    /// # The clock never moves back
+    /// An instant earlier than the latest this venue has reached, through this call or through
+    /// [`apply_market`](Self::apply_market), is taken as that latest instant. It charges nothing
+    /// again, and the balances it restamps and whatever a request goes on to produce are stamped no
+    /// earlier than what this venue has already reported. A consumer keeping the latest stamp of
+    /// each balance would otherwise drop such a restatement as older than one it holds.
+    ///
+    /// The venue clamps the instant itself, so this holds whichever driver calls it, including one
+    /// stamping requests from a wall clock that stepped back. A request that arrives behind a later
+    /// market tick is therefore stamped at that tick.
+    ///
+    /// # A forward jump charges every boundary it crosses
+    /// However far one call moves the clock, each boundary in between is charged once, at its own
+    /// stamp, on what was held and owed across it: a live paper venue whose host resumes after
+    /// hours asleep charges every hour it slept through. That is what a venue that kept running
+    /// would have charged, since funding and interest fall due at a boundary whether or not anyone
+    /// is watching. Each is valued at the market as it stood before the jump, since this venue saw
+    /// none in between.
+    ///
     /// # Panics
     /// If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract: a
     /// boundary not after the instant it was asked from, or a negative interest.
     #[must_use]
     pub fn advance_time(&mut self, time_exchange: DateTime<Utc>) -> Vec<UnindexedAccountEvent> {
+        let time_exchange = self
+            .accrued_through
+            .map_or(time_exchange, |reached| reached.max(time_exchange));
         // Charged before the balances are restamped, so each restatement it emits keeps its own
         // boundary's stamp and the ledger still ends stamped at `time_exchange`.
         let mut events = self.accrue(time_exchange);
@@ -1355,6 +1383,8 @@ impl SimulatedVenue {
         events
     }
 
+    /// The instant this venue's clock was last advanced to, which stamps what a request produces:
+    /// see [`advance_time`](Self::advance_time). The Unix epoch until the clock first moves.
     pub fn time_exchange(&self) -> DateTime<Utc> {
         self.time_exchange_latest
     }
@@ -5346,7 +5376,7 @@ mod tests {
         assert_eq!(trades[0].price, d("50000"));
     }
 
-    /// `advance_time` is the venue's only clock input, and it stamps everything produced after it.
+    /// `advance_time` sets the instant everything a request produces after it is stamped with.
     #[test]
     fn a_fill_is_stamped_with_the_instant_the_venue_was_last_advanced() {
         let mut venue = make_venue("100", "10000000");
@@ -5358,6 +5388,43 @@ mod tests {
         let outcome = venue.open_order(buy_request("0.01", market_prices("50000")));
         assert_eq!(filled_trade(&outcome).time_exchange, time_exchange);
         assert_eq!(filled_balance(&outcome).time_exchange, time_exchange);
+    }
+
+    /// A run may start before 1970: the first instant is taken as given, not held at the epoch
+    /// the clock reads before it first moves.
+    #[test]
+    fn the_first_instant_may_precede_the_epoch() {
+        let mut venue = make_venue("100", "10000000");
+        let start = "1965-03-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        advance(&mut venue, start);
+
+        assert_eq!(venue.time_exchange(), start);
+    }
+
+    /// A request arriving behind a market tick the venue has already applied is stamped at the
+    /// tick, so nothing it reports is older than what the tick could have reported.
+    #[test]
+    fn a_request_behind_a_later_market_tick_is_stamped_at_the_tick() {
+        let mut venue = make_cfd_venue_charging("200000", Vec::new());
+        let tick = time(10);
+        let fills = venue.apply_market(
+            &cfd_instrument_name(),
+            MarketObservation::new(MarketSnapshot {
+                best_bid: Some(d("5000")),
+                best_ask: Some(d("5000")),
+                last_price: Some(d("5000")),
+            }),
+            tick,
+        );
+        assert!(fills.is_empty());
+
+        assert!(venue.advance_time(time(5)).is_empty());
+        assert_eq!(venue.time_exchange(), tick, "the clock is held at the tick");
+
+        let outcome = venue.open_order(cfd_request(Side::Buy, "1", None));
+        assert_eq!(filled_trade(&outcome).time_exchange, tick);
+        assert_eq!(filled_balance(&outcome).time_exchange, tick);
     }
 
     /// A resting order's arrival stamp survives the clock moving past it.
@@ -10187,6 +10254,39 @@ mod tests {
             "the clock moving back"
         );
         assert_eq!(free_usd(&venue), d("75000") + d("37.5"));
+    }
+
+    /// An earlier instant is held at the latest one: it charges nothing, the balances keep their
+    /// stamp, and the next boundary is charged once, as if the earlier instant had never come.
+    #[test]
+    fn an_earlier_instant_moves_neither_the_clock_nor_the_accrual_back() {
+        let mut venue = make_cfd_venue_charging("200000", vec![hourly_funding("0.0001")]);
+        assert!(cfd_market(&mut venue, "5000", "5000", "5000").is_empty());
+        cfd_market_fill(&mut venue, Side::Sell, "1");
+        let reached = boundary(1) + TimeDelta::seconds(1);
+        assert_eq!(charges(&venue.advance_time(reached)).len(), 2);
+        let free = free_usd(&venue);
+
+        assert!(
+            venue.advance_time(boundary(0)).is_empty(),
+            "nothing is charged again"
+        );
+        assert_eq!(venue.time_exchange(), reached);
+        assert!(
+            venue
+                .account
+                .balances()
+                .all(|balance| balance.time_exchange == reached),
+            "no balance is restamped earlier than the venue has reported"
+        );
+        assert_eq!(free_usd(&venue), free);
+
+        let events = venue.advance_time(boundary(2));
+        let stamps: Vec<_> = charges(&events)
+            .iter()
+            .map(|(_, flow)| flow.time_exchange)
+            .collect();
+        assert_eq!(stamps, vec![boundary(2)]);
     }
 
     /// Charging starts where the clock first moves, not at the epoch the clock starts at. A venue

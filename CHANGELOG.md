@@ -59,6 +59,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The simulated venue's clock never moves back** (`rustrade-execution`, #772).
+  `SimulatedVenue::advance_time` took whatever instant it was given. An instant earlier than one
+  the venue had reached moved its clock back: it restamped every balance and stamped the fills
+  of later requests earlier than what it had already reported, and the engine drops a balance
+  older than the one it holds. That happened when a request-priced `MockExchange` stamped
+  requests from a wall clock that stepped back, or when a request arrived behind a later
+  `apply_market` tick. Now:
+  - `advance_time` holds an earlier instant at the latest one either input, `advance_time` or
+    `apply_market`, has reached. It charges nothing again, and what follows is stamped at that
+    instant. The venue clamps it itself, whichever driver calls it.
+  - The jump policy is documented on `advance_time` and the type's `# Holding costs`: a forward
+    move, however large, charges every funding and interest boundary it crosses once each, at
+    its own stamp, on what was held across it. A live paper venue whose host slept through
+    several hours therefore charges each of them, as a running venue would have.
+
 - **In-flight deadlines run on a monotonic clock, not the host's wall clock** (`rustrade`, #771).
   The engine measured an order's in-flight deadline from its `time_sent`, on `LiveClock`'s wall
   time. A step of the host's clock back delayed every `InFlightOverdue` by the size of the step,
