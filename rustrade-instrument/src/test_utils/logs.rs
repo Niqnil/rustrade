@@ -70,6 +70,7 @@ where
 /// For an async test, whose futures a current-thread runtime polls on the test's thread. An event
 /// logged on another thread, such as a `spawn_blocking` task's or a multi-thread runtime
 /// worker's, is not recorded.
+#[derive(Debug)]
 #[must_use = "events are recorded only while the capture is held"]
 pub struct Capture {
     events: Arc<Mutex<Vec<Logged>>>,
@@ -92,14 +93,6 @@ impl Capture {
     /// The events recorded so far, in the order they were logged.
     pub fn events(&self) -> Vec<Logged> {
         lock(&self.events).clone()
-    }
-}
-
-impl fmt::Debug for Capture {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Capture")
-            .field("events", &self.events)
-            .finish_non_exhaustive()
     }
 }
 
@@ -190,5 +183,15 @@ mod tests {
         let events = lock(&events);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].level, Level::ERROR);
+    }
+
+    /// Outside a capture, a thread with no subscriber of its own enables nothing, once the
+    /// process-wide subscriber is installed.
+    #[test]
+    fn a_thread_without_a_capture_enables_nothing() {
+        let _ = capture(|| ());
+        std::thread::spawn(|| assert!(!tracing::enabled!(Level::ERROR)))
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     }
 }
