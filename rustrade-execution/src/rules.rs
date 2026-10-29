@@ -73,8 +73,9 @@ impl ValueRule {
     /// It does not clamp to [`min`](Self::min) or [`max`](Self::max): rounding down can take a
     /// value below the minimum, down to zero, so check the result before sending it.
     ///
-    /// The result keeps the scale of `value` or `step`, whichever is finer, so it may carry
-    /// trailing zeros: `0.19000` rounds down to `0.15000` on a step of `0.05`.
+    /// A value already on the grid comes back as it is. One that has to move takes the scale of
+    /// `value` or `step`, whichever is finer, so it may carry trailing zeros: `0.19000` rounds
+    /// down to `0.15000` on a step of `0.05`.
     ///
     /// Returns `None` only when a [`Decimal`] cannot hold the result: within a step of the ends
     /// of its range, or where the result needs more digits than it has.
@@ -914,11 +915,17 @@ mod tests {
         assert_eq!(rule.round_up(dec!(1.07)), Some(dec!(1.10)));
         assert_eq!(rule.round_down(dec!(0.04)), Some(dec!(0)));
         assert_eq!(rule.round_up(dec!(0.01)), Some(dec!(0.05)));
-        // The input's finer scale is kept.
+        // A value that moves takes the finer scale; one on the grid keeps its own.
         assert_eq!(
             rule.round_down(dec!(0.19000))
                 .map(|value| value.to_string()),
             Some("0.15000".to_owned())
+        );
+        assert_eq!(
+            stepped(dec!(0.005))
+                .round_down(dec!(0.10))
+                .map(|value| value.to_string()),
+            Some("0.10".to_owned())
         );
     }
 
