@@ -10274,39 +10274,12 @@ mod tests {
 
     /// Run `f`, returning its value and the message of every WARN it logged on this thread.
     fn warnings<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
-        use std::sync::Mutex;
-        use tracing_subscriber::layer::SubscriberExt;
-
-        struct Warnings(Arc<Mutex<Vec<String>>>);
-
-        struct Message<'a>(&'a mut String);
-
-        impl tracing::field::Visit for Message<'_> {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    *self.0 = format!("{value:?}");
-                }
-            }
-        }
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                if *event.metadata().level() == tracing::Level::WARN {
-                    let mut message = String::new();
-                    event.record(&mut Message(&mut message));
-                    self.0.lock().unwrap().push(message);
-                }
-            }
-        }
-
-        let warnings = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(Warnings(Arc::clone(&warnings)));
-        let value = tracing::subscriber::with_default(subscriber, f);
-        let warnings = warnings.lock().unwrap().clone();
+        let (value, events) = rustrade_instrument::test_utils::logs::capture(f);
+        let warnings = events
+            .iter()
+            .filter(|event| event.level == tracing::Level::WARN)
+            .map(|event| event.message().to_owned())
+            .collect();
         (value, warnings)
     }
 

@@ -1982,7 +1982,6 @@ pub(crate) mod tests {
         f: impl FnOnce(),
     ) -> Vec<(tracing::Level, bool)> {
         use std::sync::Mutex;
-        use tracing_subscriber::layer::SubscriberExt;
 
         struct LockFree {
             known: SharedKnownLiveOrders,
@@ -2008,8 +2007,7 @@ pub(crate) mod tests {
             known: known.clone(),
             seen: Arc::clone(&seen),
         };
-        // Thread-local, so other tests running in parallel are not captured.
-        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), f);
+        rustrade_instrument::test_utils::logs::with_layer(layer, f);
         seen.lock().unwrap().clone()
     }
 

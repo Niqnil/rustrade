@@ -1881,43 +1881,9 @@ mod tests {
     /// How many `WARN` events the manager's fill recovery logs about the clock difference while
     /// `client`'s stream is read for `events` events, on `clock`.
     async fn clock_warnings(client: FlakyAccountClient, clock: Clock, events: usize) -> usize {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tracing_subscriber::layer::SubscriberExt;
-
-        #[derive(Clone)]
-        struct Count(Arc<AtomicUsize>);
-
-        struct Message(String);
-
-        impl tracing::field::Visit for Message {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
-                if field.name() == "message" {
-                    self.0 = format!("{value:?}");
-                }
-            }
-        }
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                let mut message = Message(String::new());
-                event.record(&mut message);
-                if *event.metadata().level() == tracing::Level::WARN
-                    && message.0.contains("differs from the venue's")
-                {
-                    self.0.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-
-        let count = Count(Arc::new(AtomicUsize::new(0)));
-        // The current-thread test runtime polls the stream on this thread, so a thread default
-        // sees every event.
-        let _guard =
-            tracing::subscriber::set_default(tracing_subscriber::registry().with(count.clone()));
+        // The current-thread test runtime polls the stream on this thread, so the capture sees
+        // every event.
+        let capture = rustrade_instrument::test_utils::logs::Capture::start();
         let Ok(manager) = init_flaky_recovering(client, clock).await else {
             panic!("the first attempt succeeds, so init should too");
         };
@@ -1926,7 +1892,14 @@ mod tests {
             .take(events)
             .collect::<Vec<_>>()
             .await;
-        count.0.load(Ordering::Relaxed)
+        capture
+            .events()
+            .iter()
+            .filter(|event| {
+                event.level == tracing::Level::WARN
+                    && event.message().contains("differs from the venue's")
+            })
+            .count()
     }
 
     /// The warning fires at the reopening when the host's clock leads the venue's by 190 s, and
@@ -2211,35 +2184,13 @@ mod tests {
     /// Run `f`, returning its result and how many `WARN`, `DEBUG` and `ERROR` events it logged:
     /// `(result, warn, debug, error)`.
     fn with_log_counts<R>(f: impl FnOnce() -> R) -> (R, usize, usize, usize) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tracing_subscriber::layer::SubscriberExt;
-
-        #[derive(Default, Clone)]
-        struct Counts([Arc<AtomicUsize>; 3]);
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Counts {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                let slot = match *event.metadata().level() {
-                    tracing::Level::WARN => 0,
-                    tracing::Level::DEBUG => 1,
-                    tracing::Level::ERROR => 2,
-                    _ => return,
-                };
-                self.0[slot].fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        let counts = Counts::default();
-        // Thread-local, so tests running in parallel are not counted.
-        let result = tracing::subscriber::with_default(
-            tracing_subscriber::registry().with(counts.clone()),
-            f,
-        );
-        let [warn, debug, error] = counts.0.each_ref().map(|n| n.load(Ordering::Relaxed));
+        let (result, events) = rustrade_instrument::test_utils::logs::capture(f);
+        let [warn, debug, error] = [
+            tracing::Level::WARN,
+            tracing::Level::DEBUG,
+            tracing::Level::ERROR,
+        ]
+        .map(|level| events.iter().filter(|event| event.level == level).count());
         (result, warn, debug, error)
     }
 
