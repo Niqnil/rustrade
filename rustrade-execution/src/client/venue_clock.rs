@@ -185,10 +185,12 @@ mod tests {
         let base = Instant::now();
         let mut clock = VenueClock::new();
         clock.observe(at(100), base);
-        let held = clock;
-        clock.observe(at(100), base);
+        // Exactly the held sample's bound 10 000 s on: 10 000 s less 1 s of drift.
+        clock.observe(at(10_099), base + secs(10_000));
 
-        assert_eq!(clock, held);
+        // The held sample still bounds the time it arrived at; the new one would bound it 2 s
+        // earlier, counting back with the drift allowance added.
+        assert_eq!(clock.earliest_at(base), Some(at(100)));
     }
 
     #[test]

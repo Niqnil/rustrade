@@ -715,13 +715,13 @@ mod tests {
     }
 
     #[test]
-    fn a_fill_stamped_further_back_than_the_span_is_not_taken_for_the_venues_clock() {
+    fn a_fill_stamped_the_span_back_is_not_taken_for_the_venues_clock() {
         let config = FillRecoveryConfig::default();
         let base = Instant::now();
         let mut watermark = Watermark::opened(at(100_000), base);
 
-        // A day and a second old: a replayed fill, not a venue clock a day behind.
-        watermark.delivered(at(100_000), base, &fill(100_000 - 86_401), &config);
+        // Exactly a day old: a replayed fill, not a venue clock a day behind.
+        watermark.delivered(at(100_000), base, &fill(100_000 - 86_400), &config);
 
         assert_eq!(watermark.read_from(&config), at(100_000 - 30 - 2));
     }
