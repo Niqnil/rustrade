@@ -45,37 +45,62 @@ pub(crate) struct StreamClock {
 }
 
 impl StreamClock {
-    /// Record `event`, which the stream delivered at `arrived`, in `clock`. The lock is taken only
-    /// for an event the clock learns from.
+    /// Record a frame the stream received at `arrived` in `clock`: `sent`, the time `E` Binance
+    /// stamped on it, and the `events` converted from it. The lock is taken once, and only when
+    /// the clock learns something.
     ///
-    /// A fill's, balance update's or debt change's time is the venue's and samples its clock. A
-    /// fill whose time is this host's ([`TimeSource::Host`]) is skipped. A balance update's or debt
-    /// change's time is also the latest balance time when it is later than the one held: the
-    /// engine orders balance state by it, so a restatement stamped before it would be dropped.
+    /// Every event Binance pushes carries an `E`, an order's too, so the clock is sampled before
+    /// the stream's first fill. A fill's, balance update's or debt change's own time is the
+    /// venue's too and samples the clock as well; a fill whose time is this host's
+    /// ([`TimeSource::Host`]) is skipped. A balance update's or debt change's time is also the
+    /// latest balance time when it is later than the one held: the engine orders balance state by
+    /// it, so a restatement stamped before it would be dropped.
+    ///
+    /// Record a frame before sending its events: a restatement read that starts after one is sent
+    /// must see its balance time.
+    pub(crate) fn observe_frame(
+        clock: &SharedStreamClock,
+        sent: Option<DateTime<Utc>>,
+        events: &[UnindexedAccountEvent],
+        arrived: Instant,
+    ) {
+        let mut samples = events.iter().filter_map(Self::sample_of).peekable();
+        if sent.is_none() && samples.peek().is_none() {
+            return;
+        }
+        let mut clock = clock.lock();
+        if let Some(sent) = sent {
+            clock.venue.observe(sent, arrived);
+        }
+        for (time, balance) in samples {
+            clock.sample(time, balance, arrived);
+        }
+    }
+
+    /// [`observe_frame`](Self::observe_frame) for one event, with no frame time.
+    #[cfg(test)]
     pub(crate) fn observe(
         clock: &SharedStreamClock,
         event: &UnindexedAccountEvent,
         arrived: Instant,
     ) {
-        let (time, balance) = match &event.kind {
-            AccountEventKind::Trade(trade) if trade.time_source == TimeSource::Venue => {
-                (trade.time_exchange, false)
-            }
-            AccountEventKind::BalanceStreamUpdate(update) => (update.0.time_exchange, true),
-            AccountEventKind::InstrumentBalanceUpdate(update) => {
-                (update.balance.time_exchange, true)
-            }
-            AccountEventKind::MarginDebt(update) => (update.time_exchange, true),
-            _ => return,
-        };
-        clock.lock().sample(time, balance, arrived);
+        Self::observe_frame(clock, None, std::slice::from_ref(event), arrived);
     }
 
-    /// Record `time`, the time `E` Binance stamped on a frame the stream received at `arrived`,
-    /// in `clock`. Every event Binance pushes carries one, an order's too, so the clock is sampled
-    /// before the stream's first fill.
-    pub(crate) fn observe_sent(clock: &SharedStreamClock, time: DateTime<Utc>, arrived: Instant) {
-        clock.lock().venue.observe(time, arrived);
+    /// The venue's time `event` carries, and whether it is a balance or debt time, or `None` for
+    /// an event the clock does not learn from.
+    fn sample_of(event: &UnindexedAccountEvent) -> Option<(DateTime<Utc>, bool)> {
+        match &event.kind {
+            AccountEventKind::Trade(trade) if trade.time_source == TimeSource::Venue => {
+                Some((trade.time_exchange, false))
+            }
+            AccountEventKind::BalanceStreamUpdate(update) => Some((update.0.time_exchange, true)),
+            AccountEventKind::InstrumentBalanceUpdate(update) => {
+                Some((update.balance.time_exchange, true))
+            }
+            AccountEventKind::MarginDebt(update) => Some((update.time_exchange, true)),
+            _ => None,
+        }
     }
 
     /// The venue's clock, as the stream's events show it.
@@ -319,7 +344,7 @@ mod tests {
     async fn a_frames_event_time_samples_the_clock_the_stamp_is_taken_from() {
         let clock = SharedStreamClock::default();
         let arrived = Instant::now();
-        StreamClock::observe_sent(&clock, at(100), arrived);
+        StreamClock::observe_frame(&clock, Some(at(100)), &[], arrived);
 
         assert_eq!(clock.lock().venue().earliest_at(arrived), Some(at(100)));
         // The host reads 60 s ahead of Binance.

@@ -68,6 +68,7 @@ pub struct VenueClock {
 ///
 /// The instant lets a span bounded by the moment be counted on from it on the monotonic clock, so
 /// a step of the wall clock after it does not move the span (see [`VenueClock::span_end`]).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostMoment {
     /// This host's wall-clock time at the moment.

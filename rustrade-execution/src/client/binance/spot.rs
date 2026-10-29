@@ -1890,9 +1890,12 @@ async fn connection_manager(
                     // RPC responses (the subscribe ack) are ignored inside the converter, and
                     // unrecognised frames are logged there (throttled warn).
                     let outcome = convert_user_data_events(&json_str, &mut event_buf);
-                    if let Some(sent) = outcome.event_time {
-                        StreamClock::observe_sent(&clock_callback, sent, tokio::time::Instant::now());
-                    }
+                    StreamClock::observe_frame(
+                        &clock_callback,
+                        outcome.event_time,
+                        &event_buf,
+                        tokio::time::Instant::now(),
+                    );
                     let stream_terminated = outcome.terminated;
                     for ev in event_buf.drain(..) {
                         // Dedup check
@@ -1910,7 +1913,6 @@ async fn connection_manager(
                             known.observe(&ev);
                             known
                         });
-                        StreamClock::observe(&clock_callback, &ev, tokio::time::Instant::now());
                         if sender.send(ev).is_err() {
                             drop(known);
                             warn!("BinanceSpot account_stream receiver dropped, suppressing further sends");

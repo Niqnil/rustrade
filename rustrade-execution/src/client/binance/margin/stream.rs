@@ -22,8 +22,8 @@ use crate::client::binance::shared::{
     RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
     account_position_time, classify_rest_query_error, convert_execution_report,
     dedup_key_from_event, disconnect_error, event_time_from_ms, frame_excerpt, is_duplicate,
-    log_unhandled_event, log_unrecognised_frame, resolve_snapshot_kind, response_decode_error,
-    rest_call_with_retry, retry_or_end,
+    lenient_millis, log_unhandled_event, log_unrecognised_frame, resolve_snapshot_kind,
+    response_decode_error, rest_call_with_retry, retry_or_end,
 };
 use crate::client::venue_clock::HostMoment;
 use crate::{
@@ -239,8 +239,8 @@ struct FrameHeader<'a> {
     /// The isolated pair, on every event type but `marginLevelChange`, where it is the status.
     #[serde(borrow, default)]
     s: Option<Cow<'a, str>>,
-    /// When Binance sent the event, in epoch milliseconds.
-    #[serde(rename = "E", default)]
+    /// When Binance sent the event, in epoch milliseconds; `None` when it is not an integer.
+    #[serde(rename = "E", default, deserialize_with = "lenient_millis")]
     event_time: Option<i64>,
 }
 
@@ -1073,7 +1073,8 @@ impl<K: ListenKeys> MarginStream<K> {
                     &mut unchecked,
                     &self.known,
                     &self.instruments,
-                    (disconnect.start, end),
+                    disconnect.start,
+                    end,
                 );
                 restatement.open();
             }
@@ -1323,13 +1324,11 @@ impl<K: ListenKeys> MarginStream<K> {
         buf: &mut Vec<UnindexedAccountEvent>,
     ) -> Result<FrameOutcome, SessionEnd> {
         let outcome = convert_stream_frame(text, listen_key, &self.account, buf);
-        if let FrameOutcome::Pushed {
-            event_time: Some(sent),
-            ..
-        } = outcome
-        {
-            StreamClock::observe_sent(&self.clock, sent, Instant::now());
-        }
+        let sent = match outcome {
+            FrameOutcome::Pushed { event_time, .. } => event_time,
+            FrameOutcome::Response => None,
+        };
+        StreamClock::observe_frame(&self.clock, sent, buf, Instant::now());
         for mut event in buf.drain(..) {
             if let Some(key) = dedup_key_from_event(&event)
                 && is_duplicate(&self.dedup, key)
@@ -1351,7 +1350,6 @@ impl<K: ListenKeys> MarginStream<K> {
                 held.observe(&event);
                 held
             });
-            StreamClock::observe(&self.clock, &event, Instant::now());
             let sent = self.tx.send(event);
             drop(held);
             if let Some(note) = note {
@@ -1597,6 +1595,20 @@ mod tests {
             expected
         );
         assert_eq!(sent("not json", &StreamAccount::Cross), None);
+        // A malformed `E` costs only the sample, not the event.
+        let mut buf = Vec::new();
+        assert_eq!(
+            convert_stream_frame(
+                r#"{"e":"listenKeyExpired","E":"soon"}"#,
+                LISTEN_KEY,
+                &StreamAccount::Cross,
+                &mut buf
+            ),
+            FrameOutcome::Pushed {
+                key_expired: true,
+                event_time: None
+            }
+        );
     }
 
     #[test]
@@ -3105,6 +3117,90 @@ mod tests {
             drop(rx);
             task.abort();
         }
+    }
+
+    /// A reconnect's gap is placed on Binance's clock as the stream's frames show it: with this
+    /// host's clock two minutes ahead of Binance's, the read starts at Binance's time at the
+    /// disconnect, not this host's, so the fills Binance stamped during the outage are read.
+    #[tokio::test]
+    async fn a_reconnect_reads_the_gap_from_binances_time_when_the_host_is_ahead() {
+        use wiremock::{
+            Mock, MockServer, ResponseTemplate,
+            matchers::{method, path},
+        };
+
+        let venue = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sapi/v1/margin/myTrades"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&venue)
+            .await;
+        let (listener, url) = listen().await;
+        let keys = Arc::new(FakeKeys::default());
+        let (mut stream, rx) = margin_stream(&keys, url, StreamAccount::Cross);
+        stream.rest = Arc::new(MarginTradingRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path(venue.uri())
+                .build()
+                .unwrap(),
+        ));
+        stream.instruments = vec![btcusdt()];
+
+        let task = tokio::spawn(async move {
+            let session = stream.open().await.unwrap();
+            stream.run(session).await;
+        });
+        // Binance's clock reads two minutes behind this host's.
+        let sent = Utc::now() - chrono::Duration::seconds(120);
+        let expired =
+            push(serde_json::json!({ "e": "listenKeyExpired", "E": sent.timestamp_millis() }));
+        serve(&listener, "key-1", vec![], vec![expired], After::Answer).await;
+        let reconnected = Utc::now();
+        let server = serve(&listener, "key-2", vec![], vec![], After::Answer);
+        let recovered = async {
+            loop {
+                let requests = venue.received_requests().await.unwrap_or_default();
+                if let Some(request) = requests.first() {
+                    break request
+                        .url
+                        .query_pairs()
+                        .into_owned()
+                        .collect::<HashMap<_, _>>();
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let query = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                () = server => panic!("the server stopped before the fills were recovered"),
+                query = recovered => query,
+            }
+        })
+        .await
+        .unwrap();
+        let millis = |name: &str| -> i64 { query[name].parse().unwrap() };
+
+        // Binance's time at the disconnect, less the lookback, and not this host's.
+        let lookback = SIGNAL_RECOVERY_LOOKBACK_MS;
+        let start = millis("startTime");
+        assert!(
+            start <= sent.timestamp_millis() + 1_000 - lookback,
+            "{query:?}"
+        );
+        assert!(
+            start >= sent.timestamp_millis() - 1_000 - lookback,
+            "{query:?}"
+        );
+        // The end is past this host's time at the reconnect.
+        assert!(
+            millis("endTime") >= reconnected.timestamp_millis(),
+            "{query:?}"
+        );
+
+        drop(rx);
+        task.abort();
     }
 
     /// After a reconnect, the stream reads its account's balances, debt included, and delivers

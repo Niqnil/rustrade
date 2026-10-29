@@ -345,7 +345,10 @@ impl UnrecoveredFills {
     /// kept gap covers that part and keeps its retry schedule, so no span is read twice and a
     /// reconnect never brings a retry forward. Disconnects come in time order, so an earlier part
     /// of the new gap that no kept gap covers is from before the previous disconnect, when the
-    /// stream was live.
+    /// stream was live. That holds as long as both gaps were placed on the same clock: a gap
+    /// opened before the stream saw any event starts at this host's time, and a later one placed
+    /// on Binance's clock can start before it when this host's clock is ahead. Binance fails every
+    /// signed request from a host clock more than about a second ahead, so that part is small.
     pub(crate) fn open(
         &mut self,
         instruments: &[InstrumentNameExchange],
@@ -353,7 +356,11 @@ impl UnrecoveredFills {
         end: DateTime<Utc>,
     ) {
         let start_ms = start.timestamp_millis();
-        let end_ms = (end + chrono::Duration::seconds(GAP_END_SLACK_SECS)).timestamp_millis();
+        // Saturating: `end` follows the venue's stamps, which this host does not bound.
+        let end_ms = end
+            .checked_add_signed(chrono::Duration::seconds(GAP_END_SLACK_SECS))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+            .timestamp_millis();
         let due = tokio::time::Instant::now();
         for instrument in instruments {
             let kept = self.0.get(instrument).map_or(&[][..], Vec::as_slice);
@@ -648,7 +655,7 @@ pub(crate) fn parse_user_data_frame(frame: &str) -> UserDataFrame<'_> {
     struct EventTag<'a> {
         #[serde(borrow, default)]
         e: Option<&'a str>,
-        #[serde(rename = "E", default)]
+        #[serde(rename = "E", default, deserialize_with = "lenient_millis")]
         event_time: Option<i64>,
     }
 
@@ -676,6 +683,26 @@ pub(crate) fn parse_user_data_frame(frame: &str) -> UserDataFrame<'_> {
         event,
         event_time: event_time.and_then(event_time_from_ms),
     }
+}
+
+/// An event's time `E`, in epoch milliseconds, or `None` when it is not an integer: it only
+/// samples the stream's clock, so a malformed one must not cost the event itself.
+pub(crate) fn lenient_millis<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Millis {
+        Integer(i64),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(
+        match <Option<Millis> as serde::Deserialize>::deserialize(deserializer)? {
+            Some(Millis::Integer(ms)) => Some(ms),
+            Some(Millis::Other(_)) | None => None,
+        },
+    )
 }
 
 /// A user-data event's time `E`, in epoch milliseconds, as a time, or `None` out of range.
@@ -5360,6 +5387,18 @@ mod tests {
                 event_type: "outboundAccountPosition",
                 event: r#"{"e":"outboundAccountPosition","E":1}"#,
                 event_time: Some(DateTime::<Utc>::from_timestamp_millis(1).unwrap()),
+            }
+        );
+        // A malformed `E` costs only the event's time, not the event.
+        assert_eq!(
+            parse_user_data_frame(
+                r#"{"subscriptionId":4,"event":{"e":"outboundAccountPosition","E":"soon"}}"#
+            ),
+            UserDataFrame::Event {
+                subscription_id: Some(4),
+                event_type: "outboundAccountPosition",
+                event: r#"{"e":"outboundAccountPosition","E":"soon"}"#,
+                event_time: None,
             }
         );
         // A frame with both `id` and `event` is a response.

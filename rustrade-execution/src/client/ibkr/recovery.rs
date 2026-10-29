@@ -210,19 +210,20 @@ impl GapTracker {
     }
 
     /// The instant to recover executions from, if recovery is due and the transport is up:
-    /// [`RECOVERY_LOOKBACK`] before IB's time at the gap's start, as `venue` estimates it, or this
-    /// host's time then if that is earlier ([`VenueClock::span_start`]). Before the stream has
-    /// delivered an execution IB stamped, from this host's time.
+    /// [`RECOVERY_LOOKBACK`] before IB's time at the gap's start, as the clock `venue` returns
+    /// estimates it, or this host's time then if that is earlier ([`VenueClock::span_start`]).
+    /// Before the stream has delivered an execution IB stamped, from this host's time. `venue` is
+    /// called only when recovery is due, as it reads a clock another thread shares.
     pub(super) fn recovery_floor(
         &self,
         connected: bool,
-        venue: &VenueClock,
+        venue: impl FnOnce() -> VenueClock,
     ) -> Option<DateTime<Utc>> {
         if !(self.recovery_due && connected) {
             return None;
         }
         self.gap_start.map(|start| {
-            venue
+            venue()
                 .span_start(start)
                 .unwrap_or(start.time)
                 .checked_sub_signed(RECOVERY_LOOKBACK)
@@ -271,8 +272,8 @@ pub(super) struct EventSink {
     /// The latest revision delivered of each execution, by [`ExecutionRevision::execution`].
     /// Bounded like the dedup cache, so it forgets the oldest execution rather than grow.
     ///
-    /// Lock order: `revisions`, then `known`, then `tx`; `dedup` is taken and released on its
-    /// own. Nothing takes `revisions` while holding another, nor `known` while holding `tx`.
+    /// Lock order: `revisions`, then `known`, then `tx`; `dedup` and `venue` are each taken and
+    /// released on their own. Nothing takes `revisions` while holding another, nor `known` while holding `tx`.
     revisions: Arc<Mutex<LruCache<SmolStr, DeliveredRevision>>>,
     /// The orders the client holds as live. Held across each send of an event it learns from,
     /// as the order check holds it across its own, so an order this stream reports ending and
@@ -718,7 +719,7 @@ impl RecoveryWatcher {
                 observe_notice(&mut tracker, &notice);
             }
 
-            if let Some(floor) = tracker.recovery_floor(connected, &self.sink.venue_clock()) {
+            if let Some(floor) = tracker.recovery_floor(connected, || self.sink.venue_clock()) {
                 match self.recover(&mut tracker, floor) {
                     // Every order held as live may have ended during the gap. Checked after the
                     // fills, so an order's fills reach the stream before how it ended.
@@ -793,10 +794,11 @@ impl RecoveryWatcher {
                     AccountEventKind::FillRecoveryGaveUp(FillRecoveryGap::new(
                         FillRecoveryScope::AllInstruments,
                         floor,
+                        // A floor comes only from a gap open, so the end is there: the gap is
+                        // cleared below, once reported.
                         tracker
                             .gap_end(&self.sink.venue_clock(), HostMoment::now())
-                            .unwrap_or_else(Utc::now)
-                            .max(floor),
+                            .map_or(floor, |end| end.max(floor)),
                         MAX_RECOVERY_FAILURES,
                         e.failure(),
                     )),
@@ -943,7 +945,7 @@ mod tests {
     fn tracker_is_quiet_without_a_gap() {
         let mut tracker = GapTracker::new(host("2026-09-29T14:00:00Z"));
         tracker.observe_connection(true, host("2026-09-29T14:00:01Z"));
-        assert_eq!(tracker.recovery_floor(true, &VenueClock::new()), None);
+        assert_eq!(tracker.recovery_floor(true, VenueClock::new), None);
     }
 
     #[test]
@@ -953,13 +955,13 @@ mod tests {
         tracker.observe_connection(false, host("2026-09-29T14:00:11Z"));
         tracker.observe_connection(false, host("2026-09-29T14:05:00Z"));
         // Still down: nothing is due until delivery is restored.
-        assert_eq!(tracker.recovery_floor(false, &VenueClock::new()), None);
+        assert_eq!(tracker.recovery_floor(false, VenueClock::new), None);
 
         tracker.observe_connection(true, host("2026-09-29T14:05:01Z"));
         tracker.observe_notice(ConnectivityNotice::Restored, host("2026-09-29T14:05:01Z"));
 
         assert_eq!(
-            tracker.recovery_floor(true, &VenueClock::new()),
+            tracker.recovery_floor(true, VenueClock::new),
             Some(at("2026-09-29T14:00:10Z") - RECOVERY_LOOKBACK)
         );
     }
@@ -980,7 +982,7 @@ mod tests {
         tracker.observe_connection(false, host("2026-09-29T14:00:11Z"));
         tracker.observe_connection(true, host("2026-09-29T14:05:00Z"));
 
-        let floor = tracker.recovery_floor(true, &venue).unwrap();
+        let floor = tracker.recovery_floor(true, || venue).unwrap();
 
         // IB's 13:58:20, less the drift allowed for over 10 s, less the lookback.
         assert!(
@@ -1028,10 +1030,10 @@ mod tests {
         };
         let mut tracker = GapTracker::new(HostMoment::now());
         observe_notice(&mut tracker, &notice(2104));
-        assert_eq!(tracker.recovery_floor(true, &VenueClock::new()), None);
+        assert_eq!(tracker.recovery_floor(true, VenueClock::new), None);
 
         observe_notice(&mut tracker, &notice(CODE_LINK_RESTORED_DATA_KEPT));
-        assert!(tracker.recovery_floor(true, &VenueClock::new()).is_some());
+        assert!(tracker.recovery_floor(true, VenueClock::new).is_some());
     }
 
     /// The stream's clock is the one the sink samples, and starts with no sample.
@@ -1061,7 +1063,7 @@ mod tests {
         tracker.observe_connection(true, host("2026-09-29T14:00:40Z"));
 
         assert_eq!(
-            tracker.recovery_floor(true, &VenueClock::new()),
+            tracker.recovery_floor(true, VenueClock::new),
             Some(at("2026-09-29T14:00:10Z") - RECOVERY_LOOKBACK)
         );
     }
@@ -1075,7 +1077,7 @@ mod tests {
         tracker.observe_notice(ConnectivityNotice::Restored, host("2026-09-29T14:00:11Z"));
 
         assert_eq!(
-            tracker.recovery_floor(true, &VenueClock::new()),
+            tracker.recovery_floor(true, VenueClock::new),
             Some(at("2026-09-29T14:00:11Z") - RECOVERY_LOOKBACK)
         );
     }
@@ -1086,11 +1088,11 @@ mod tests {
         tracker.observe_notice(ConnectivityNotice::Lost, host("2026-09-29T14:01:00Z"));
         // TWS's link to IB is down but the socket is up: nothing to recover yet.
         tracker.observe_connection(true, host("2026-09-29T14:02:00Z"));
-        assert_eq!(tracker.recovery_floor(true, &VenueClock::new()), None);
+        assert_eq!(tracker.recovery_floor(true, VenueClock::new), None);
 
         tracker.observe_notice(ConnectivityNotice::Restored, host("2026-09-29T14:03:00Z"));
         assert_eq!(
-            tracker.recovery_floor(true, &VenueClock::new()),
+            tracker.recovery_floor(true, VenueClock::new),
             Some(at("2026-09-29T14:01:00Z") - RECOVERY_LOOKBACK)
         );
     }
@@ -1160,8 +1162,8 @@ mod tests {
     fn recovery_waits_for_the_transport() {
         let mut tracker = GapTracker::new(host("2026-09-29T14:00:00Z"));
         tracker.observe_notice(ConnectivityNotice::Restored, host("2026-09-29T14:00:05Z"));
-        assert_eq!(tracker.recovery_floor(false, &VenueClock::new()), None);
-        assert!(tracker.recovery_floor(true, &VenueClock::new()).is_some());
+        assert_eq!(tracker.recovery_floor(false, VenueClock::new), None);
+        assert!(tracker.recovery_floor(true, VenueClock::new).is_some());
     }
 
     #[test]
@@ -1169,14 +1171,14 @@ mod tests {
         let mut tracker = GapTracker::new(host("2026-09-29T14:00:00Z"));
         tracker.observe_notice(ConnectivityNotice::Restored, host("2026-09-29T14:00:05Z"));
         tracker.recovered();
-        assert_eq!(tracker.recovery_floor(true, &VenueClock::new()), None);
+        assert_eq!(tracker.recovery_floor(true, VenueClock::new), None);
 
         // A later gap starts afresh rather than from the recovered one.
         tracker.observe_connection(true, host("2026-09-29T15:00:00Z"));
         tracker.observe_connection(false, host("2026-09-29T15:00:01Z"));
         tracker.observe_notice(ConnectivityNotice::Restored, host("2026-09-29T15:00:30Z"));
         assert_eq!(
-            tracker.recovery_floor(true, &VenueClock::new()),
+            tracker.recovery_floor(true, VenueClock::new),
             Some(at("2026-09-29T15:00:00Z") - RECOVERY_LOOKBACK)
         );
     }
@@ -1186,14 +1188,14 @@ mod tests {
         let mut tracker = GapTracker::new(host("2026-09-29T14:00:00Z"));
         tracker.observe_connection(false, host("2026-09-29T14:00:01Z"));
         tracker.observe_notice(ConnectivityNotice::Restored, host("2026-09-29T14:01:00Z"));
-        let floor = tracker.recovery_floor(true, &VenueClock::new());
+        let floor = tracker.recovery_floor(true, VenueClock::new);
 
         for _ in 0..MAX_RECOVERY_FAILURES * 2 {
             assert!(!tracker.recovery_failed(true));
         }
         // The second drop is later than the first; the gap still starts at the first.
         tracker.observe_connection(false, host("2026-09-29T14:01:01Z"));
-        assert_eq!(tracker.recovery_floor(true, &VenueClock::new()), floor);
+        assert_eq!(tracker.recovery_floor(true, VenueClock::new), floor);
     }
 
     #[test]

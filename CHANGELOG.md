@@ -58,7 +58,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #774). Where a read of a span the venue stamped starts and ends, placed on the venue's clock as
   estimated: the start is the earlier of the venue's and this host's time at a moment, and the
   end the latest of both now and the start counted on on tokio's clock. A `HostMoment` pairs a
-  wall-clock time with its instant on tokio's clock.
+  wall-clock time with its instant on tokio's clock, built with `HostMoment::new` or
+  `HostMoment::now`.
 
 - **`Trade::time_source` and `TimeSource`** (`rustrade-execution`, #775). Whether a fill's
   `time_exchange` is the venue's, or this host's, filled in because the venue sent no readable
