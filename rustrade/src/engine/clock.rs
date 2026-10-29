@@ -163,7 +163,7 @@ pub trait TimeExchange {
 /// Its [`time`](EngineClock::time) follows the host's wall clock, unadjusted. That clock can step
 /// back or jump forward: an NTP step, a manual change, a virtual machine resumed after a pause. So
 /// two stamps from it can be out of order, and the difference between them is not the time that
-/// passed. Keep the host's clock synchronised, and slewed rather than stepped where possible.
+/// passed.
 ///
 /// Durations, such as an order's in-flight deadline, are measured on its
 /// [`instant`](EngineClock::instant) instead: the host's monotonic clock

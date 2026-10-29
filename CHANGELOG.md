@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`EngineClock::instant` and `EngineInstant`** (`rustrade`, #771). A clock's monotonic reading,
+  for measuring durations, beside `time()`, which stamps. The method has a default that reads
+  `time()`, so existing implementations keep compiling. A custom clock that follows the host's
+  wall clock should override it with a monotonic source. `EngineInstant` adds a `Duration`
+  (`saturating_add`), measures the time since an earlier reading (`saturating_duration_since`),
+  and orders. Readings of different clocks do not compare.
+
 - **`VenueClock`** (`rustrade-execution`, `client::venue_clock`). It estimates the earliest a
   venue's clock can read at a given moment, from the times the venue stamped on its events. Each
   event's stamp is paired with the tokio `Instant` it arrived at, and the estimate counts on from
@@ -57,12 +64,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   time. A step of the host's clock back delayed every `InFlightOverdue` by the size of the step,
   and one larger than a deadline lost the flag for orders sent after it. A jump forward of at
   least a deadline flagged every order in flight at once. Now:
-  - `EngineClock::instant` gives a monotonic reading, an `EngineInstant`, and the deadlines run
-    on it. `LiveClock` reads `std::time::Instant`, and `TokioClock` reads tokio's clock, so paused
-    time still controls deadlines in a test. `HistoricalClock` and the default implementation
-    read the clock's `time()`, so a backtest's deadlines stay in simulated time and an existing
-    `EngineClock` implementation keeps compiling and behaving as before. A clock that follows the
-    host's wall clock should override it.
+  - The deadlines run on the new `EngineClock::instant` (see Added). `LiveClock` reads
+    `std::time::Instant`, and `TokioClock` reads tokio's clock, so paused time still controls
+    deadlines in a test. `HistoricalClock` and the default implementation read the clock's
+    `time()`, so a backtest's deadlines stay in simulated time and an existing `EngineClock`
+    implementation behaves as before.
   - `time_sent` stays the wall-clock stamp. `InFlightOverdue::elapsed` is now measured on the
     monotonic reading.
   - An order the engine started from already in flight is measured from its wall-clock age when
