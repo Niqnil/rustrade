@@ -18,13 +18,14 @@ use crate::client::binance::restatement::{
     BalanceRestatement, SharedStreamClock, StreamClock, restate,
 };
 use crate::client::binance::shared::{
-    CONNECT_TIMEOUT_SECS, ExecutionReport, HEARTBEAT_TIMEOUT_SECS, RateLimitTracker, RequestKind,
-    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
+    CONNECT_TIMEOUT_SECS, Disconnect, ExecutionReport, HEARTBEAT_TIMEOUT_SECS, RateLimitTracker,
+    RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
     account_position_time, classify_rest_query_error, convert_execution_report,
-    dedup_key_from_event, disconnect_error, frame_excerpt, is_duplicate, log_unhandled_event,
-    log_unrecognised_frame, resolve_snapshot_kind, response_decode_error, rest_call_with_retry,
-    retry_or_end,
+    dedup_key_from_event, disconnect_error, event_time_from_ms, frame_excerpt, is_duplicate,
+    log_unhandled_event, log_unrecognised_frame, resolve_snapshot_kind, response_decode_error,
+    rest_call_with_retry, retry_or_end,
 };
+use crate::client::venue_clock::HostMoment;
 use crate::{
     AccountEventKind, InstrumentBalanceUpdate, UnindexedAccountEvent,
     balance::{AssetBalanceUpdate, BalanceUpdate, MarginDetails},
@@ -216,7 +217,12 @@ pub(super) enum FrameOutcome {
     /// A reply to a request, such as a late subscribe acknowledgement.
     Response,
     /// An event the venue pushed; `key_expired` when it said the listen key lapsed.
-    Pushed { key_expired: bool },
+    Pushed {
+        key_expired: bool,
+        /// The event's time `E`, when Binance sent it, by Binance's clock. `None` for a frame
+        /// without a readable event type.
+        event_time: Option<DateTime<Utc>>,
+    },
 }
 
 /// The fields every frame is read for before its type's own pass.
@@ -233,6 +239,9 @@ struct FrameHeader<'a> {
     /// The isolated pair, on every event type but `marginLevelChange`, where it is the status.
     #[serde(borrow, default)]
     s: Option<Cow<'a, str>>,
+    /// When Binance sent the event, in epoch milliseconds.
+    #[serde(rename = "E", default)]
+    event_time: Option<i64>,
 }
 
 /// Convert one stream frame for `account`, pushing what it reports onto `buf`.
@@ -264,19 +273,29 @@ pub(super) fn convert_stream_frame(
     static UNRECOGNISED: AtomicU64 = AtomicU64::new(0);
     static UNHANDLED: UnhandledEvents = UnhandledEvents::new();
     let logged = || redact_listen_key(frame, listen_key);
-    let pushed = FrameOutcome::Pushed { key_expired: false };
+    let unrecognised = FrameOutcome::Pushed {
+        key_expired: false,
+        event_time: None,
+    };
 
     let header = match serde_json::from_str::<FrameHeader<'_>>(frame) {
         Ok(header) if header.id.is_some() => return FrameOutcome::Response,
         Ok(header) => header,
         Err(_) => {
             log_unrecognised_frame("BinanceMargin", &UNRECOGNISED, &logged());
-            return pushed;
+            return unrecognised;
         }
     };
     let Some(event_type) = header.e.as_deref() else {
         log_unrecognised_frame("BinanceMargin", &UNRECOGNISED, &logged());
-        return pushed;
+        return unrecognised;
+    };
+    // Sampled for the stream's clock whatever the frame's scope: every account's events are
+    // stamped by the same venue clock.
+    let event_time = header.event_time.and_then(event_time_from_ms);
+    let pushed = FrameOutcome::Pushed {
+        key_expired: false,
+        event_time,
     };
     let pair = header.s.as_deref();
 
@@ -428,7 +447,10 @@ pub(super) fn convert_stream_frame(
             warn!(
                 "BinanceMargin user-data stream: the listen key expired, reconnecting with a new one"
             );
-            return FrameOutcome::Pushed { key_expired: true };
+            return FrameOutcome::Pushed {
+                key_expired: true,
+                event_time,
+            };
         }
         "listStatus" => {
             // OCO/OTO list status: this client places no order lists, and each leg's own
@@ -895,12 +917,13 @@ enum SessionEnd {
 }
 
 impl SessionEnd {
-    /// Where the gap this end leaves begins, for fill recovery: a short lookback before `now`,
-    /// and for a heartbeat timeout two heartbeat windows more. A check that finds proof of life
-    /// only says the connection was alive at some point in the window before it, so a connection
-    /// that died just after one check is declared dead two checks later. `None` when the
-    /// consumer dropped the stream, which leaves nothing to recover.
-    fn gap_start(self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    /// How far before the moment this end is seen the gap it leaves begins, for fill recovery
+    /// (see [`Disconnect::seen`]): a short lookback, and for a heartbeat timeout two heartbeat
+    /// windows more. A check that finds proof of life only says the connection was alive at some
+    /// point in the window before it, so a connection that died just after one check is declared
+    /// dead two checks later. `None` when the consumer dropped the stream, which leaves nothing to
+    /// recover.
+    fn gap_lookback(self) -> Option<chrono::Duration> {
         let lookback = match self {
             Self::ConsumerDropped => return None,
             Self::HeartbeatTimeout => {
@@ -911,7 +934,7 @@ impl SessionEnd {
                 chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS)
             }
         };
-        Some(now - lookback)
+        Some(lookback)
     }
 
     /// The failure this end is reported as, should the reconnect budget run out after it.
@@ -1001,7 +1024,7 @@ impl<K: ListenKeys> MarginStream<K> {
     /// [`AccountEventKind::StreamTerminated`].
     pub(super) async fn run(self, initial: Session) {
         let mut budget = ReconnectBudget::new("Binance", BackoffLimits::ACCOUNT_STREAM);
-        let mut disconnect_time: Option<DateTime<Utc>> = None;
+        let mut disconnect: Option<Disconnect> = None;
         // Gaps not yet recovered: read at reconnect, and retried on a timer while connected.
         let mut unrecovered = UnrecoveredFills::default();
         // Instruments whose known-live orders a reconnect has yet to check, likewise.
@@ -1043,13 +1066,14 @@ impl<K: ListenKeys> MarginStream<K> {
             // once would then be retried at the first backoff wait forever. The session resets it
             // once the connection survives a heartbeat window.
 
-            if let Some(disconnected) = disconnect_time.take() {
+            if let Some(disconnect) = disconnect.take() {
+                let end = disconnect.end(self.clock.lock().venue(), HostMoment::now());
                 open_reconnect_recovery(
                     &mut unrecovered,
                     &mut unchecked,
                     &self.known,
                     &self.instruments,
-                    disconnected,
+                    (disconnect.start, end),
                 );
                 restatement.open();
             }
@@ -1063,11 +1087,15 @@ impl<K: ListenKeys> MarginStream<K> {
                 )
                 .await;
 
-            let Some(gap_start) = end.gap_start(Utc::now()) else {
+            let Some(lookback) = end.gap_lookback() else {
                 debug!("BinanceMargin connection manager exiting");
                 return;
             };
-            disconnect_time = Some(gap_start);
+            disconnect = Some(Disconnect::seen(
+                self.clock.lock().venue(),
+                HostMoment::now(),
+                lookback,
+            ));
             if self.tx.is_closed() {
                 debug!("BinanceMargin connection manager exiting");
                 return;
@@ -1295,6 +1323,13 @@ impl<K: ListenKeys> MarginStream<K> {
         buf: &mut Vec<UnindexedAccountEvent>,
     ) -> Result<FrameOutcome, SessionEnd> {
         let outcome = convert_stream_frame(text, listen_key, &self.account, buf);
+        if let FrameOutcome::Pushed {
+            event_time: Some(sent),
+            ..
+        } = outcome
+        {
+            StreamClock::observe_sent(&self.clock, sent, Instant::now());
+        }
         for mut event in buf.drain(..) {
             if let Some(key) = dedup_key_from_event(&event)
                 && is_duplicate(&self.dedup, key)
@@ -1328,7 +1363,9 @@ impl<K: ListenKeys> MarginStream<K> {
             }
         }
         match outcome {
-            FrameOutcome::Pushed { key_expired: true } => Err(SessionEnd::KeyExpired),
+            FrameOutcome::Pushed {
+                key_expired: true, ..
+            } => Err(SessionEnd::KeyExpired),
             outcome => Ok(outcome),
         }
     }
@@ -1397,7 +1434,7 @@ mod tests {
     /// Convert `frame` for a cross client. Returns whether it said the key expired.
     fn cross_frame(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> bool {
         match convert_stream_frame(frame, LISTEN_KEY, &StreamAccount::Cross, buf) {
-            FrameOutcome::Pushed { key_expired } => key_expired,
+            FrameOutcome::Pushed { key_expired, .. } => key_expired,
             FrameOutcome::Response => panic!("{frame} is not a reply"),
         }
     }
@@ -1405,9 +1442,14 @@ mod tests {
     /// What `frame` delivers to `account`.
     fn delivered(frame: &str, account: &StreamAccount) -> Vec<UnindexedAccountEvent> {
         let mut buf = Vec::new();
-        assert_eq!(
-            convert_stream_frame(frame, LISTEN_KEY, account, &mut buf),
-            FrameOutcome::Pushed { key_expired: false },
+        assert!(
+            matches!(
+                convert_stream_frame(frame, LISTEN_KEY, account, &mut buf),
+                FrameOutcome::Pushed {
+                    key_expired: false,
+                    ..
+                }
+            ),
             "{frame}"
         );
         buf
@@ -1517,6 +1559,44 @@ mod tests {
             &mut buf
         ));
         assert!(buf.is_empty());
+    }
+
+    /// Every pushed event's `E` is returned to sample the stream's clock, one of another margin
+    /// account's included: Binance stamps every account's events by the same clock.
+    #[test]
+    fn a_pushed_frame_reports_the_events_time_whatever_its_scope() {
+        let sent = |frame: &str, account: &StreamAccount| match convert_stream_frame(
+            frame,
+            LISTEN_KEY,
+            account,
+            &mut Vec::new(),
+        ) {
+            FrameOutcome::Pushed { event_time, .. } => event_time,
+            FrameOutcome::Response => panic!("{frame} is not a reply"),
+        };
+        let expected = DateTime::<Utc>::from_timestamp_millis(1_700_000_002_000);
+        let new_order = serde_json::json!({
+            "e": "executionReport", "E": 1_700_000_002_000_i64, "s": "BTCUSDT", "S": "BUY",
+            "o": "LIMIT", "x": "NEW", "X": "NEW", "i": 1_i64, "c": "cid-1",
+        });
+
+        assert_eq!(
+            sent(&push(new_order.clone()), &StreamAccount::Cross),
+            expected
+        );
+        // An isolated pair's frame on the cross stream: skipped, but still Binance's time.
+        assert_eq!(
+            sent(&push_isolated("ETHUSDT", new_order), &StreamAccount::Cross),
+            expected
+        );
+        assert_eq!(
+            sent(
+                r#"{"e":"listenKeyExpired","E":1700000002000}"#,
+                &StreamAccount::Cross
+            ),
+            expected
+        );
+        assert_eq!(sent("not json", &StreamAccount::Cross), None);
     }
 
     #[test]
@@ -2702,16 +2782,15 @@ mod tests {
     /// 30 s windows earlier still. A consumer that left leaves no gap.
     #[test]
     fn a_session_end_sets_where_its_gap_begins() {
-        let now = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
         let lookback = chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS);
         assert!(lookback > chrono::Duration::zero());
-        assert_eq!(SessionEnd::ConsumerDropped.gap_start(now), None);
+        assert_eq!(SessionEnd::ConsumerDropped.gap_lookback(), None);
         for end in [SessionEnd::Disconnected, SessionEnd::KeyExpired] {
-            assert_eq!(end.gap_start(now), Some(now - lookback), "{end:?}");
+            assert_eq!(end.gap_lookback(), Some(lookback), "{end:?}");
         }
         assert_eq!(
-            SessionEnd::HeartbeatTimeout.gap_start(now),
-            Some(now - chrono::Duration::seconds(60) - lookback)
+            SessionEnd::HeartbeatTimeout.gap_lookback(),
+            Some(chrono::Duration::seconds(60) + lookback)
         );
     }
 
@@ -2915,7 +2994,9 @@ mod tests {
             stream.run(session).await;
         });
         let call = notice("MARGIN_CALL", 1_700_000_000_000);
-        let expired = push(serde_json::json!({ "e": "listenKeyExpired", "E": 1 }));
+        let expired = push(
+            serde_json::json!({ "e": "listenKeyExpired", "E": Utc::now().timestamp_millis() }),
+        );
         // Ends when the client closes the socket, for the expired key.
         serve(
             &listener,
@@ -2988,7 +3069,9 @@ mod tests {
                 let session = stream.open().await.unwrap();
                 stream.run(session).await;
             });
-            let expired = push(serde_json::json!({ "e": "listenKeyExpired", "E": 1 }));
+            let expired = push(
+                serde_json::json!({ "e": "listenKeyExpired", "E": Utc::now().timestamp_millis() }),
+            );
             serve(&listener, "key-1", vec![], vec![expired], After::Answer).await;
             let server = serve(&listener, "key-2", vec![], vec![], After::Answer);
             let recovered = async {
@@ -3087,7 +3170,9 @@ mod tests {
                 let session = stream.open().await.unwrap();
                 stream.run(session).await;
             });
-            let expired = push(serde_json::json!({ "e": "listenKeyExpired", "E": 1 }));
+            let expired = push(
+                serde_json::json!({ "e": "listenKeyExpired", "E": Utc::now().timestamp_millis() }),
+            );
             serve(&listener, "key-1", vec![], vec![expired], After::Answer).await;
             let reconnected = Utc::now();
             let server = serve(&listener, "key-2", vec![], vec![], After::Answer);
@@ -3209,7 +3294,9 @@ mod tests {
             "e": "outboundAccountPosition", "E": ahead_ms, "u": ahead_ms,
             "B": [{ "a": "BTC", "f": "1", "l": "0" }],
         }));
-        let expired = push(serde_json::json!({ "e": "listenKeyExpired", "E": 1 }));
+        let expired = push(
+            serde_json::json!({ "e": "listenKeyExpired", "E": Utc::now().timestamp_millis() }),
+        );
         let delivered = tokio::time::Instant::now();
         serve(
             &listener,

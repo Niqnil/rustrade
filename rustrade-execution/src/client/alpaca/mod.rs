@@ -22,7 +22,8 @@
 //   backoff (1 s → 30 s, max 10 attempts)
 // - Heartbeat monitoring: reconnects if no WS message for HEARTBEAT_TIMEOUT_SECS
 // - Fill recovery: after reconnect, fetches missed fills via GET /v2/account/activities
-//   since disconnect_time; sent through the dedup cache to filter duplicates. A read that fails,
+//   since the last message, placed on Alpaca's clock as the times it stamped on the stream's
+//   events show it (see fill_recovery_start); sent through the dedup cache to filter duplicates. A read that fails,
 //   times out or truncates is reported as AccountEventKind::FillRecoveryGaveUp
 // - Dedup cache: LRU keyed on each fill's execution id (with "{order_id}:{cumulative_filled_qty}"
 //   for a fill without one) prevents duplicate fills arising from the overlap between WS events
@@ -54,6 +55,7 @@ use crate::{
             UncheckedOrders, fetch_ended_by_key, recover_ended_orders,
         },
         reconnect_budget::{BackoffLimits, ReconnectBudget},
+        venue_clock::{HostMoment, VenueClock},
     },
     emit_stream_terminated,
     error::{
@@ -107,9 +109,13 @@ use tracing::{debug, error, info, trace, warn};
 const HEARTBEAT_TIMEOUT_SECS: u64 = 35;
 /// Timeout for fill recovery REST queries after reconnect.
 const FILL_RECOVERY_TIMEOUT_SECS: u64 = 30;
-/// Extra lookback from disconnect timestamp to cover Tokio scheduling jitter and
-/// client/server clock drift on cloud VMs. The dedup cache absorbs resulting duplicates.
+/// Extra lookback from the disconnect to cover the delay between a fill and its delivery, and
+/// Tokio scheduling jitter. The dedup cache absorbs resulting duplicates.
 const SIGNAL_RECOVERY_LOOKBACK_MS: i64 = 1_500;
+/// How much further back fill recovery starts before the stream has seen a time Alpaca stamped,
+/// when Alpaca's clock is unknown: the difference between this host's clock and Alpaca's that is
+/// allowed for then. Alpaca's requests are not signed with a timestamp, so nothing else bounds it.
+const UNSAMPLED_CLOCK_SKEW: TimeDelta = TimeDelta::seconds(30);
 /// Alpaca's activity page size limit.
 const ALPACA_MAX_ACTIVITIES: usize = 100;
 /// Cooldown when rate-limited without a readable wait, and the longest wait read from Alpaca's
@@ -1621,9 +1627,15 @@ impl ExecutionClient for AlpacaClient {
     /// This gap also applies on every **reconnect**: during the auth+subscribe handshake
     /// (`connect_and_subscribe`), any `trade_updates` messages that arrive are consumed
     /// by the handshake loop and not forwarded. Fill events in this window are recovered
-    /// via the REST activities endpoint (anchored to `disconnect_time`). How an order held as live
-    /// ended in this window is recovered too (see below); a lifecycle event of any other order,
-    /// such as `new` for one placed elsewhere, is not.
+    /// via the REST activities endpoint, from the last message before the disconnect. How an
+    /// order held as live ended in this window is recovered too (see below); a lifecycle event of
+    /// any other order, such as `new` for one placed elsewhere, is not.
+    ///
+    /// The read is placed on Alpaca's clock, as the times Alpaca stamped on the stream's
+    /// `trade_updates` events show it, counted on from their arrival on a monotonic clock, so a
+    /// host clock ahead of Alpaca's does not start it after fills Alpaca stamped during the
+    /// outage. Before the stream's first such event, Alpaca's clock is unknown, and the read
+    /// starts 30 s further back to allow for a difference between the clocks.
     ///
     /// # Fill recovery ordering
     ///
@@ -2925,7 +2937,10 @@ async fn connection_manager(
     initial_ws: Option<WebSocket>,
 ) {
     let mut budget = ReconnectBudget::new("Alpaca", BackoffLimits::ACCOUNT_STREAM);
-    let mut disconnect_time: Option<DateTime<Utc>> = None;
+    // The last message before the stream dropped, which fill recovery reads on from.
+    let mut disconnected: Option<HostMoment> = None;
+    // Alpaca's clock, from the times it stamped on the events the stream received.
+    let mut clock = VenueClock::new();
     // Instruments whose known-live orders a reconnect has yet to check: checked after the fills,
     // and retried on a timer while connected, once due.
     let mut unchecked = UncheckedOrders::default();
@@ -2966,13 +2981,16 @@ async fn connection_manager(
         // Runs before the event loop so live events arriving during recovery are
         // captured by the already-connected WS session. The dedup cache prevents
         // duplicates between recovered REST fills and live WS events.
-        if let Some(dt) = disconnect_time.take() {
+        if let Some(last) = disconnected.take() {
+            // The live stream is already subscribed, so every fill Alpaca stamps after `end`
+            // arrives live.
+            let end = clock.span_end(last, HostMoment::now());
             recover_fills_or_report(
                 &http,
                 &rate_limiter,
                 &instruments,
                 config.rest_base_url(),
-                dt,
+                (fill_recovery_start(&clock, last), end),
                 Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS),
                 &tx,
                 &dedup,
@@ -2998,12 +3016,12 @@ async fn connection_manager(
         //
         // The timer is pinned once and reset in-place via Sleep::reset(), avoiding
         // a new Sleep allocation and Tokio timer-wheel registration per loop iteration.
-        // Track the wall-clock time of the last received message. Used to anchor
-        // fill recovery after a heartbeat timeout: Utc::now() at reconnect time
+        // Track the moment of the last received message. Used to anchor
+        // fill recovery after a heartbeat timeout: the time at reconnect
         // would be ~HEARTBEAT_TIMEOUT_SECS after the last real message, causing
         // the recovery window to miss fills in that silent period.
 
-        let mut last_message_time = Utc::now();
+        let mut last_message = HostMoment::now();
         let heartbeat = tokio::time::sleep(Duration::from_secs(HEARTBEAT_TIMEOUT_SECS));
         tokio::pin!(heartbeat);
         // A connection still receiving a heartbeat window after the stream loop starts is proven
@@ -3018,7 +3036,7 @@ async fn connection_manager(
             run_order_checks(&http, &rate_limiter, &config, &known, &mut unchecked, &tx);
         tokio::pin!(order_checks);
 
-        // Resets the rolling heartbeat deadline, records the wall-clock receive time, and clears
+        // Resets the rolling heartbeat deadline, records the receive moment, and clears
         // the backoff once the connection is proven stable.
         // Pin<&mut Sleep> cannot be passed to a regular function, so a macro avoids
         // repeating the same block across every message-bearing select! arm.
@@ -3029,7 +3047,7 @@ async fn connection_manager(
                 heartbeat
                     .as_mut()
                     .reset(now + Duration::from_secs(HEARTBEAT_TIMEOUT_SECS));
-                last_message_time = Utc::now();
+                last_message = HostMoment::new(Utc::now(), now);
                 if now >= stable_from {
                     budget.reset();
                 }
@@ -3053,14 +3071,14 @@ async fn connection_manager(
                             reset_heartbeat!();
                         }
                         Some(Ok(WsMessage::Text(text))) => {
-                            process_ws_text(text.as_str(), &tx, &dedup, &known);
+                            process_ws_text(text.as_str(), &tx, &dedup, &known, &mut clock);
                             reset_heartbeat!();
                         }
                         Some(Ok(WsMessage::Binary(bytes))) => {
                             // Alpaca paper trading sends binary-framed JSON.
                             match std::str::from_utf8(&bytes) {
                                 Ok(text) => {
-                                    process_ws_text(text, &tx, &dedup, &known);
+                                    process_ws_text(text, &tx, &dedup, &known, &mut clock);
                                     // Only reset heartbeat for valid UTF-8 frames that may carry
                                     // real events. A corrupt binary frame (e.g. from a proxy)
                                     // must not keep the watchdog from firing.
@@ -3106,12 +3124,11 @@ async fn connection_manager(
             }
         };
 
-        // --- Record disconnect time for fill recovery ---
-        // Anchor to last_message_time, not Utc::now(). For heartbeat-triggered
-        // disconnects, Utc::now() would be ~HEARTBEAT_TIMEOUT_SECS after the last
+        // --- Record the disconnect for fill recovery ---
+        // Anchor to the last message, not now. For heartbeat-triggered
+        // disconnects, now would be ~HEARTBEAT_TIMEOUT_SECS after the last
         // real message, causing the recovery window to miss fills in that gap.
-        disconnect_time =
-            Some(last_message_time - chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS));
+        disconnected = Some(last_message);
 
         // --- Close stale WS ---
         let _ =
@@ -3376,11 +3393,16 @@ fn check_listen_ack(text: &str) -> bool {
 /// Each event is applied to `known` before it is sent, under the lock, so an order this reports
 /// ending and a reconnect's check of it reach the consumer in the order they were decided, and the
 /// check reports only an order not already reported.
+///
+/// The time Alpaca stamped on a `trade_updates` event, of any kind, samples `clock` (see
+/// [`trade_update_stamp`]), duplicates included: each was stamped by Alpaca's clock before it
+/// arrived.
 fn process_ws_text(
     text: &str,
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: &SharedDedupCache,
     known: &SharedKnownLiveOrders,
+    clock: &mut VenueClock,
 ) {
     let msg: AlpacaStreamMessage<'_> = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -3411,6 +3433,10 @@ fn process_ws_text(
                     return;
                 }
             };
+
+            if let Some(stamp) = trade_update_stamp(&update) {
+                clock.observe(stamp, tokio::time::Instant::now());
+            }
 
             // PERF: Check dedup BEFORE constructing the full event for fill events.
             // This avoids heap allocations (Trade, InstrumentNameExchange, TradeId) on
@@ -3532,22 +3558,41 @@ struct UnreadFills {
     reason: FillRecoveryFailure,
 }
 
-/// Recover the fills missed since `disconnect` ([`recover_fills`]) within `timeout`, and send an
+/// Where the read of the fills missed after `last`, the last message the stream received, starts:
+/// Alpaca's or this host's time then, whichever is earlier ([`VenueClock::span_start`]), less
+/// [`SIGNAL_RECOVERY_LOOKBACK_MS`]. Before the stream has seen a time Alpaca stamped, from this
+/// host's time less [`UNSAMPLED_CLOCK_SKEW`] too.
+///
+/// So a host clock ahead of Alpaca's does not start the read after fills Alpaca stamped during the
+/// outage, once the stream has seen an event.
+fn fill_recovery_start(clock: &VenueClock, last: HostMoment) -> DateTime<Utc> {
+    let earlier = |time: DateTime<Utc>, by: TimeDelta| {
+        time.checked_sub_signed(by)
+            .unwrap_or(DateTime::<Utc>::MIN_UTC)
+    };
+    let at = clock
+        .span_start(last)
+        .unwrap_or_else(|| earlier(last.time, UNSAMPLED_CLOCK_SKEW));
+    earlier(at, TimeDelta::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS))
+}
+
+/// Recover the fills missed in `(start, end)` ([`recover_fills`]) within `timeout`, and send an
 /// [`AccountEventKind::FillRecoveryGaveUp`] for those the read did not deliver, after the fills
 /// it did.
+///
+/// The read runs from `start` to now. `end` is where the live stream takes over, by Alpaca's
+/// clock as estimated (see [`VenueClock::span_end`]): it only ends a gap reported.
 async fn recover_fills_or_report(
     http: &reqwest::Client,
     rate_limiter: &RateLimitTracker,
     instruments: &[InstrumentNameExchange],
     base: &str,
-    disconnect: DateTime<Utc>,
+    (start, end): (DateTime<Utc>, DateTime<Utc>),
     timeout: Duration,
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: &SharedDedupCache,
     known: &SharedKnownLiveOrders,
 ) {
-    // The live stream is already subscribed, so every fill after this arrives live.
-    let recovery_start = Utc::now();
     let outcome = match tokio::time::timeout(
         timeout,
         recover_fills(
@@ -3555,7 +3600,7 @@ async fn recover_fills_or_report(
             rate_limiter,
             instruments,
             base,
-            disconnect,
+            start,
             tx,
             dedup,
             known,
@@ -3578,7 +3623,7 @@ async fn recover_fills_or_report(
                  any of the instruments (every instrument when the list is empty)"
             );
             Err(UnreadFills {
-                start: disconnect,
+                start,
                 reason: FillRecoveryFailure::TimedOut {
                     timeout_secs: timeout.as_secs(),
                 },
@@ -3587,19 +3632,19 @@ async fn recover_fills_or_report(
     };
     if let Err(unread) = outcome
         && tx
-            .send(fill_recovery_gave_up(instruments, unread, recovery_start))
+            .send(fill_recovery_gave_up(instruments, unread, end))
             .is_err()
     {
         debug!("Alpaca fill recovery: consumer dropped before the give-up was sent");
     }
 }
 
-/// The [`AccountEventKind::FillRecoveryGaveUp`] for `unread`, whose recovery began at `end`,
-/// on a stream opened with `instruments`, every instrument when empty. Alpaca does not retry the
-/// read, so it was read once.
+/// The [`AccountEventKind::FillRecoveryGaveUp`] for `unread`, a recovery whose span ended at
+/// `end`, on a stream opened with `instruments`, every instrument when empty. Alpaca does not
+/// retry the read, so it was read once.
 ///
 /// A truncated read can return fills stamped after `end`, by Alpaca's clock, which may run ahead
-/// of this host's. The span then ends at its start rather than before it: the event is still
+/// of its estimate. The span then ends at its start rather than before it: the event is still
 /// sent, since a report with nothing left to read costs the consumer one read, while a report
 /// withheld on a clock comparison would be a silent loss.
 fn fill_recovery_gave_up(
@@ -4641,6 +4686,16 @@ fn trade_amendment_event(
             kind,
         )),
     )
+}
+
+/// The time Alpaca stamped on a `trade_updates` event: its `timestamp`, else its order's
+/// `updated_at`, or `None` without either. Each is a time on Alpaca's clock no later than when it
+/// sent the event, as [`VenueClock::observe`] needs.
+fn trade_update_stamp(update: &AlpacaTradeUpdate<'_>) -> Option<DateTime<Utc>> {
+    update
+        .timestamp
+        .and_then(parse_timestamp)
+        .or_else(|| update.order.updated_at.and_then(parse_timestamp))
 }
 
 /// When a `trade_updates` event happened, and whose clock says so: its `timestamp`, else its
@@ -7458,6 +7513,81 @@ mod tests {
         assert!(!snapshots[3].orders_complete);
     }
 
+    fn epoch(secs: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap()
+    }
+
+    /// Fill recovery is placed on Alpaca's clock once the stream has seen a time it stamped, so a
+    /// host clock ahead of Alpaca's beyond the lookback still reads the fills Alpaca stamped
+    /// during the outage.
+    #[test]
+    fn fill_recovery_from_a_host_clock_ahead_starts_at_alpacas_time() {
+        let base = tokio::time::Instant::now();
+        let mut clock = VenueClock::new();
+        clock.observe(epoch(0), base);
+        // The last message arrived as Alpaca's clock read 0 s; the host reads 60 s ahead.
+        let last = HostMoment::new(epoch(60), base);
+
+        assert_eq!(
+            fill_recovery_start(&clock, last),
+            epoch(0) - TimeDelta::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS)
+        );
+    }
+
+    /// Before the stream has seen a time Alpaca stamped, the read starts further back by the skew
+    /// allowed for.
+    #[test]
+    fn fill_recovery_with_no_sample_allows_for_the_unsampled_skew() {
+        let last = HostMoment::new(epoch(60), tokio::time::Instant::now());
+
+        assert_eq!(
+            fill_recovery_start(&VenueClock::new(), last),
+            epoch(30) - TimeDelta::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS)
+        );
+        assert_eq!(UNSAMPLED_CLOCK_SKEW, TimeDelta::seconds(30));
+    }
+
+    /// Any `trade_updates` event samples the stream's clock with the time Alpaca stamped on it:
+    /// its `timestamp`, else its order's `updated_at`. An order's event counts as a fill's does.
+    #[test]
+    fn a_trade_update_samples_the_streams_clock() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+        let frame = |stamps: &str| {
+            format!(
+                r#"{{"stream":"trade_updates","data":{{"event":"new",{stamps}"order":{{"id":"id-a","client_order_id":"a","symbol":"SPY","qty":"2","filled_qty":"0","side":"buy","type":"limit","time_in_force":"gtc","limit_price":"100","status":"new"{order_stamp}}}}}}}"#,
+                order_stamp = if stamps.is_empty() {
+                    r#","updated_at":"2027-01-15T08:00:05Z""#
+                } else {
+                    ""
+                },
+            )
+        };
+        let stamped = |frame: &str| {
+            let mut clock = VenueClock::new();
+            let before = tokio::time::Instant::now();
+            process_ws_text(frame, &tx, &new_dedup_cache(), &known, &mut clock);
+            clock.earliest_at(before)
+        };
+        let utc = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+
+        let by_timestamp = stamped(&frame(r#""timestamp":"2027-01-15T08:00:00Z","#)).unwrap();
+        assert!(
+            by_timestamp <= utc("2027-01-15T08:00:00Z"),
+            "{by_timestamp}"
+        );
+        assert!(by_timestamp > utc("2027-01-15T07:59:59Z"), "{by_timestamp}");
+        let by_updated_at = stamped(&frame("")).unwrap();
+        assert!(
+            by_updated_at <= utc("2027-01-15T08:00:05Z"),
+            "{by_updated_at}"
+        );
+        assert!(
+            by_updated_at > utc("2027-01-15T08:00:04Z"),
+            "{by_updated_at}"
+        );
+    }
+
     /// Verifies that the dedup key synthesised by `recover_fills` (REST path) matches
     /// the key produced by `convert_trade_update` (WS path) for the same partial fills.
     ///
@@ -7641,7 +7771,7 @@ mod tests {
         let json = r#"{"stream":"trade_updates","data":{"event":"rejected","order":{"id":"test-rej-id","client_order_id":"test-cid","symbol":"AAPL","qty":"10","side":"buy","type":"limit","time_in_force":"day","limit_price":"100.00","status":"rejected"}}}"#;
 
         let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
-        process_ws_text(json, &tx, &dedup, &known);
+        process_ws_text(json, &tx, &dedup, &known, &mut VenueClock::new());
 
         // The event must NOT be silently dropped — an OrderCancelled must be emitted.
         let event = rx.try_recv()
@@ -7674,7 +7804,13 @@ mod tests {
         for (field, expected) in cases {
             let (tx, mut rx) = mpsc::unbounded_channel();
             let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
-            process_ws_text(&frame(field), &tx, &new_dedup_cache(), &known);
+            process_ws_text(
+                &frame(field),
+                &tx,
+                &new_dedup_cache(),
+                &known,
+                &mut VenueClock::new(),
+            );
             let Ok(UnindexedAccountEvent {
                 kind: AccountEventKind::Trade(trade),
                 ..
@@ -7700,7 +7836,7 @@ mod tests {
         let dedup = new_dedup_cache();
         let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
         for frame in frames {
-            process_ws_text(frame, &tx, &dedup, &known);
+            process_ws_text(frame, &tx, &dedup, &known, &mut VenueClock::new());
         }
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
     }
@@ -9690,7 +9826,7 @@ mod tests {
                 &RateLimitTracker::new(),
                 instruments,
                 &server.uri(),
-                recovery_after(),
+                (recovery_after(), Utc::now()),
                 timeout,
                 &tx,
                 &new_dedup_cache(),
@@ -10886,6 +11022,7 @@ mod tests {
                 &tx,
                 &dedup,
                 &known,
+                &mut VenueClock::new(),
             );
 
             drive_recover_fills_with(
@@ -11571,13 +11708,31 @@ mod tests {
             };
             let cid = ClientOrderId::new("a");
 
-            process_ws_text(&frame("new", "0"), &tx, &dedup, &known);
+            process_ws_text(
+                &frame("new", "0"),
+                &tx,
+                &dedup,
+                &known,
+                &mut VenueClock::new(),
+            );
             assert!(known.lock().contains(&cid), "acknowledged");
 
-            process_ws_text(&frame("done_for_day", "1"), &tx, &dedup, &known);
+            process_ws_text(
+                &frame("done_for_day", "1"),
+                &tx,
+                &dedup,
+                &known,
+                &mut VenueClock::new(),
+            );
             assert!(known.lock().contains(&cid), "done for the day is not ended");
 
-            process_ws_text(&frame("canceled", "1"), &tx, &dedup, &known);
+            process_ws_text(
+                &frame("canceled", "1"),
+                &tx,
+                &dedup,
+                &known,
+                &mut VenueClock::new(),
+            );
             assert!(!known.lock().contains(&cid), "cancelled");
 
             let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();

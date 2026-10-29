@@ -71,6 +71,18 @@ impl StreamClock {
         clock.lock().sample(time, balance, arrived);
     }
 
+    /// Record `time`, the time `E` Binance stamped on a frame the stream received at `arrived`,
+    /// in `clock`. Every event Binance pushes carries one, an order's too, so the clock is sampled
+    /// before the stream's first fill.
+    pub(crate) fn observe_sent(clock: &SharedStreamClock, time: DateTime<Utc>, arrived: Instant) {
+        clock.lock().venue.observe(time, arrived);
+    }
+
+    /// The venue's clock, as the stream's events show it.
+    pub(crate) fn venue(&self) -> &VenueClock {
+        &self.venue
+    }
+
     /// Record the venue's `time`, seen at `arrived`, which is a balance or debt time if `balance`.
     fn sample(&mut self, time: DateTime<Utc>, balance: bool, arrived: Instant) {
         self.venue.observe(time, arrived);

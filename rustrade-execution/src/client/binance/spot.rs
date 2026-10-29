@@ -42,9 +42,9 @@ use super::restatement::{
 use super::rules::RulesLoader;
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
-    CONNECT_TIMEOUT_SECS, DisconnectOnDrop, ExecutionReport, FILL_RECOVERY_TIMEOUT_SECS,
-    HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal, MyTradesFrom, ORDER_EXECUTIONS_BUDGET,
-    OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
+    CONNECT_TIMEOUT_SECS, Disconnect, DisconnectOnDrop, ExecutionReport,
+    FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal, MyTradesFrom,
+    ORDER_EXECUTIONS_BUDGET, OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
     UnsubscribeOnDrop, UserDataFrame, WeightPool, account_position_time, answer_time,
     balance_read_time, binance_filled_qty, classify_order_kind_tif, classify_rest_query_error,
@@ -56,6 +56,7 @@ use super::shared::{
     response_decode_error, rest_call_with_retry, rest_read_with_retry, retry_or_end,
     trailing_params, unix_ms, unreadable_answer,
 };
+use crate::client::venue_clock::HostMoment;
 use crate::rules::{OrderRules, PreSendRules};
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -1801,7 +1802,7 @@ async fn connection_manager(
     initial_ws: Option<DisconnectOnDrop<WebsocketApi>>,
 ) {
     let mut budget = ReconnectBudget::new("Binance", BackoffLimits::ACCOUNT_STREAM);
-    let mut disconnect_time: Option<DateTime<Utc>> = None;
+    let mut disconnect: Option<Disconnect> = None;
     // Gaps not yet recovered: read at reconnect, and retried on a timer while connected, once due.
     let mut unrecovered = UnrecoveredFills::default();
     // Instruments whose known-live orders a reconnect has yet to check, likewise.
@@ -1888,7 +1889,11 @@ async fn connection_manager(
                     // Borrowed discriminator + matched-variant parse (no full Value DOM).
                     // RPC responses (the subscribe ack) are ignored inside the converter, and
                     // unrecognised frames are logged there (throttled warn).
-                    let stream_terminated = convert_user_data_events(&json_str, &mut event_buf);
+                    let outcome = convert_user_data_events(&json_str, &mut event_buf);
+                    if let Some(sent) = outcome.event_time {
+                        StreamClock::observe_sent(&clock_callback, sent, tokio::time::Instant::now());
+                    }
+                    let stream_terminated = outcome.terminated;
                     for ev in event_buf.drain(..) {
                         // Dedup check
                         if let Some(key) = dedup_key_from_event(&ev)
@@ -1959,8 +1964,9 @@ async fn connection_manager(
         // Fills first, then how the orders held as live ended: an order whose fills are not all
         // recovered is not checked yet. Each gap and check is opened before it is read, so one
         // that fails or times out is kept for a retry.
-        if let Some(dt) = disconnect_time.take() {
-            unrecovered.open(&instruments, dt, Utc::now());
+        if let Some(disconnect) = disconnect.take() {
+            let end = disconnect.end(clock.lock().venue(), HostMoment::now());
+            unrecovered.open(&instruments, disconnect.start, end);
             // Only the instruments this stream recovers fills for, so fills-first holds for each.
             let held = known.lock().instruments_among(&instruments);
             unchecked.open(held);
@@ -2069,21 +2075,25 @@ async fn connection_manager(
         };
         let should_reconnect = !matches!(reason, DisconnectReason::ConsumerDropped);
 
-        // record disconnect time BEFORE cleanup so fill recovery covers
+        // record the disconnect BEFORE cleanup so fill recovery covers
         // the full gap. For heartbeat timeouts the connection may have died up to
-        // HEARTBEAT_TIMEOUT_SECS ago, so subtract that as a safety margin.
-        // For signal-based disconnects (WS close/error/stream terminated), subtract a
+        // HEARTBEAT_TIMEOUT_SECS ago, so look back that far as a safety margin.
+        // For signal-based disconnects (WS close/error/stream terminated), look back a
         // small margin to cover Tokio scheduling jitter between the WS close event and
-        // the monitor task recording Utc::now(). Dedup cache handles any resulting duplicates.
+        // the monitor task seeing it. Dedup cache handles any resulting duplicates.
         if should_reconnect {
-            disconnect_time = Some(match reason {
+            let signal = chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS);
+            let lookback = match reason {
                 DisconnectReason::HeartbeatTimeout => {
-                    Utc::now()
-                        - chrono::Duration::seconds(HEARTBEAT_TIMEOUT_SECS as i64)
-                        - chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS)
+                    chrono::Duration::seconds(HEARTBEAT_TIMEOUT_SECS as i64) + signal
                 }
-                _ => Utc::now() - chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS),
-            });
+                _ => signal,
+            };
+            disconnect = Some(Disconnect::seen(
+                clock.lock().venue(),
+                HostMoment::now(),
+                lookback,
+            ));
         }
 
         // --- Cleanup current connection ---
@@ -2527,7 +2537,8 @@ fn convert_my_trade(
 /// A single Binance event (e.g., outboundAccountPosition) may map to multiple
 /// rustrade events (one per asset balance).
 ///
-/// Returns `true` if the stream should be considered terminated (requires reconnect).
+/// Returns whether the stream should be considered terminated (requires reconnect), and the
+/// event's time `E`, when Binance sent it, to sample the stream's clock with.
 ///
 /// # Frame shape
 ///
@@ -2545,18 +2556,43 @@ fn convert_my_trade(
 /// the matched variant straight from the inner event slice — avoiding the full
 /// `serde_json::Value` DOM that `UserDataStreamEventsResponse`'s `#[serde(try_from = "Value")]`
 /// would build for every inbound frame.
-fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> bool {
-    let (event_type, event) = match parse_user_data_frame(frame) {
-        UserDataFrame::Response => return false,
+fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> UserDataOutcome {
+    let (event_type, event, event_time) = match parse_user_data_frame(frame) {
+        UserDataFrame::Response => return UserDataOutcome::default(),
         UserDataFrame::Event {
-            event_type, event, ..
-        } => (event_type, event),
+            event_type,
+            event,
+            event_time,
+            ..
+        } => (event_type, event, event_time),
         UserDataFrame::Unrecognised => {
             static SEEN: AtomicU64 = AtomicU64::new(0);
             log_unrecognised_frame("BinanceSpot", &SEEN, frame);
-            return false;
+            return UserDataOutcome::default();
         }
     };
+    UserDataOutcome {
+        terminated: convert_user_data_event(event_type, event, buf),
+        event_time,
+    }
+}
+
+/// What [`convert_user_data_events`] found in a frame.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct UserDataOutcome {
+    /// The venue ended the stream: reconnect.
+    terminated: bool,
+    /// The event's time `E`, by Binance's clock.
+    event_time: Option<DateTime<Utc>>,
+}
+
+/// Convert one user-data event of type `event_type`, appending its events to `buf`. Returns `true`
+/// if the stream should be considered terminated.
+fn convert_user_data_event(
+    event_type: &str,
+    event: &str,
+    buf: &mut Vec<UnindexedAccountEvent>,
+) -> bool {
     // Tag values match `UserDataStreamEventsResponse`'s `try_from = "Value"` arms (binance-sdk).
     match event_type {
         "executionReport" => {
@@ -5151,7 +5187,7 @@ mod tests {
         };
         let frame = user_data_frame("executionReport", &report);
         let mut buf = Vec::new();
-        let terminated = convert_user_data_events(&frame, &mut buf);
+        let terminated = convert_user_data_events(&frame, &mut buf).terminated;
         assert!(
             !terminated,
             "ExecutionReport should not signal stream termination"
@@ -5169,7 +5205,7 @@ mod tests {
         };
         let frame = user_data_frame("outboundAccountPosition", &position);
         let mut buf = Vec::new();
-        let terminated = convert_user_data_events(&frame, &mut buf);
+        let terminated = convert_user_data_events(&frame, &mut buf).terminated;
         assert!(
             !terminated,
             "OutboundAccountPosition should not signal stream termination"
@@ -5188,7 +5224,7 @@ mod tests {
         };
         let frame = user_data_frame("balanceUpdate", &update);
         let mut buf = Vec::new();
-        let terminated = convert_user_data_events(&frame, &mut buf);
+        let terminated = convert_user_data_events(&frame, &mut buf).terminated;
         assert!(
             !terminated,
             "BalanceUpdate should not signal stream termination"
@@ -5202,7 +5238,7 @@ mod tests {
         let frame =
             r#"{"subscriptionId":0,"event":{"e":"eventStreamTerminated","E":1700000000000}}"#;
         let mut buf = Vec::new();
-        let terminated = convert_user_data_events(frame, &mut buf);
+        let terminated = convert_user_data_events(frame, &mut buf).terminated;
         assert!(
             terminated,
             "eventStreamTerminated must signal stream termination"
@@ -5222,7 +5258,7 @@ mod tests {
                 r#"{{"subscriptionId":0,"event":{{"e":"{e}","E":1700000000000,"s":"BTCUSDT"}}}}"#
             );
             let mut buf = Vec::new();
-            let terminated = convert_user_data_events(&frame, &mut buf);
+            let terminated = convert_user_data_events(&frame, &mut buf).terminated;
             assert!(!terminated, "{e} must not signal termination");
             assert!(buf.is_empty(), "{e} should push no events");
         }
@@ -5239,7 +5275,7 @@ mod tests {
             "x":"TRADE","X":"FILLED","i":777,"l":"0.5","z":"0.5","L":"40000","n":"0.02",
             "N":"USDT","T":1700000001000,"t":888}}"#;
         let mut buf = Vec::new();
-        assert!(!convert_user_data_events(fill, &mut buf));
+        assert!(!convert_user_data_events(fill, &mut buf).terminated);
         assert!(
             buf.iter()
                 .any(|ev| matches!(ev.kind, AccountEventKind::Trade(_))),
@@ -5249,8 +5285,26 @@ mod tests {
         // The pre-fix fixture shape: a bare event with no envelope is not an event frame.
         let bare = r#"{"e":"executionReport","s":"BTCUSDT","i":777,"x":"NEW","X":"NEW"}"#;
         buf.clear();
-        assert!(!convert_user_data_events(bare, &mut buf));
+        assert!(!convert_user_data_events(bare, &mut buf).terminated);
         assert!(buf.is_empty());
+    }
+
+    /// Every pushed event's `E` is returned to sample the stream's clock, an order's as much as
+    /// a fill's, so the clock has a sample before the stream's first fill.
+    #[test]
+    fn test_convert_user_data_events_returns_the_events_time() {
+        let new_order = r#"{"subscriptionId":3,"event":{"e":"executionReport","E":1700000002000,
+            "s":"BTCUSDT","c":"client-1","S":"BUY","o":"LIMIT","f":"GTC","q":"0.5","p":"40000",
+            "x":"NEW","X":"NEW","i":777,"l":"0","z":"0","L":"0","n":"0","T":1700000001000}}"#;
+        let mut buf = Vec::new();
+        let outcome = convert_user_data_events(new_order, &mut buf);
+        assert_eq!(
+            outcome.event_time,
+            DateTime::<Utc>::from_timestamp_millis(1_700_000_002_000)
+        );
+
+        let ack = r#"{"id":"abc","status":200,"result":[]}"#;
+        assert_eq!(convert_user_data_events(ack, &mut buf).event_time, None);
     }
 
     #[test]
@@ -5258,7 +5312,7 @@ mod tests {
         // RPC responses such as the subscribe ack carry a top-level `id` — ignored, not mis-parsed.
         let frame = r#"{"id":"abc","status":200,"result":[]}"#;
         let mut buf = Vec::new();
-        let terminated = convert_user_data_events(frame, &mut buf);
+        let terminated = convert_user_data_events(frame, &mut buf).terminated;
         assert!(
             !terminated,
             "non-user-data frame must not signal termination"

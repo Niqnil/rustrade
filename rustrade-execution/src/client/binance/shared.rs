@@ -47,6 +47,7 @@ use crate::client::order_recovery::{
     GAP_RETRY_BASE_SECS, GapFailure, MAX_GAP_RETRIES, PendingFills,
 };
 use crate::client::reconnect_budget::ReconnectBudget;
+use crate::client::venue_clock::{HostMoment, VenueClock};
 use binance_sdk::common::{
     errors::{ConnectorError, WebsocketError},
     models::{Interval, ParamBuildError, RateLimitType, RestApiResponse, WebsocketApiRateLimit},
@@ -295,7 +296,7 @@ pub(crate) const GAP_END_SLACK_SECS: i64 = 10;
 /// A span of one instrument's fills that a reconnect's recovery has not yet forwarded.
 ///
 /// It runs from the disconnect to just after the recovery that opened it began
-/// ([`GAP_END_SLACK_SECS`]). The live stream delivers every fill after that, so reading the gap
+/// ([`GAP_END_SLACK_SECS`]), both on Binance's clock as estimated (see [`Disconnect`]). The live stream delivers every fill after that, so reading the gap
 /// never re-reads a fill the stream already delivered, however long the gap waits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FillGap {
@@ -334,8 +335,11 @@ impl PendingFills for UnrecoveredFills {
 }
 
 impl UnrecoveredFills {
-    /// Open a gap for each of `instruments`, from `disconnect_time` to just after `now`, the start
-    /// of the recovery that will read it, due at once.
+    /// Open a gap for each of `instruments`, from `start` to just after `end`, due at once.
+    ///
+    /// `end` is where the recovery that will read the gap, which starts now, has to read to: a
+    /// [`Disconnect`]'s [`end`](Disconnect::end). The live stream delivers what Binance stamps
+    /// after it.
     ///
     /// Where the new gap overlaps one the instrument already has, it starts after it instead: the
     /// kept gap covers that part and keeps its retry schedule, so no span is read twice and a
@@ -345,11 +349,11 @@ impl UnrecoveredFills {
     pub(crate) fn open(
         &mut self,
         instruments: &[InstrumentNameExchange],
-        disconnect_time: DateTime<Utc>,
-        now: DateTime<Utc>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
     ) {
-        let start_ms = disconnect_time.timestamp_millis();
-        let end_ms = (now + chrono::Duration::seconds(GAP_END_SLACK_SECS)).timestamp_millis();
+        let start_ms = start.timestamp_millis();
+        let end_ms = (end + chrono::Duration::seconds(GAP_END_SLACK_SECS)).timestamp_millis();
         let due = tokio::time::Instant::now();
         for instrument in instruments {
             let kept = self.0.get(instrument).map_or(&[][..], Vec::as_slice);
@@ -449,6 +453,44 @@ impl UnrecoveredFills {
     }
 }
 
+/// Where an account stream's disconnect leaves the fills it missed to start, and the moment it was
+/// seen, from which the recovery after the reconnect counts on to where it ends.
+///
+/// Both are placed on Binance's clock as the stream's [`VenueClock`] estimates it, from the times
+/// Binance stamped on the events the stream delivered. So a host clock ahead of Binance's does not
+/// start the gap after fills Binance stamped during the outage, and one stepped back before the
+/// reconnect does not end it before the outage's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Disconnect {
+    /// The first moment of the gap.
+    pub(crate) start: DateTime<Utc>,
+    /// When the disconnect was seen.
+    seen: HostMoment,
+}
+
+impl Disconnect {
+    /// A disconnect seen at `seen`, whose gap starts `lookback` before Binance's time then, or
+    /// this host's if that is earlier ([`VenueClock::span_start`]). Before the stream has seen a
+    /// time Binance stamped, from this host's time: a host clock more than about a second ahead
+    /// of Binance's fails every signed request, the gap's reads included, so that is seen too.
+    pub(crate) fn seen(venue: &VenueClock, seen: HostMoment, lookback: TimeDelta) -> Self {
+        let at = venue.span_start(seen).unwrap_or(seen.time);
+        Self {
+            start: at
+                .checked_sub_signed(lookback)
+                .unwrap_or(DateTime::<Utc>::MIN_UTC),
+            seen,
+        }
+    }
+
+    /// Where a recovery of the gap that starts at `now` has to read to: the later of this host's
+    /// and Binance's time at `now`, or the moment it was seen counted on to `now` on tokio's clock
+    /// ([`VenueClock::span_end`]). [`UnrecoveredFills::open`] adds [`GAP_END_SLACK_SECS`].
+    pub(crate) fn end(&self, venue: &VenueClock, now: HostMoment) -> DateTime<Utc> {
+        venue.span_end(self.seen, now)
+    }
+}
+
 /// A gap boundary in epoch milliseconds, as a time for a log line.
 pub(crate) fn gap_time(ms: i64) -> DateTime<Utc> {
     Utc.timestamp_millis_opt(ms).single().unwrap_or_default()
@@ -529,7 +571,7 @@ const _: () = assert!(
     "CONNECT_TIMEOUT_SECS overflows i64"
 );
 /// Extra lookback subtracted from Signal disconnect timestamps to cover Tokio scheduling
-/// jitter between the actual WS close and when the monitor task records Utc::now().
+/// jitter between the actual WS close and when the monitor task sees it.
 /// The dedup cache absorbs any resulting duplicate fills.
 pub(crate) const SIGNAL_RECOVERY_LOOKBACK_MS: i64 = 500;
 /// Maximum trades per Binance REST query.
@@ -573,6 +615,8 @@ pub(crate) enum UserDataFrame<'a> {
         event_type: &'a str,
         /// The inner event, unparsed, for the matched branch's one typed pass.
         event: &'a str,
+        /// The inner event's time `E`: when Binance sent it, by Binance's clock.
+        event_time: Option<DateTime<Utc>>,
     },
     /// A frame shape this client does not know: neither of the above, or an event whose `e` tag
     /// is missing or not a plain string. Its caller logs it through [`log_unrecognised_frame`],
@@ -604,6 +648,8 @@ pub(crate) fn parse_user_data_frame(frame: &str) -> UserDataFrame<'_> {
     struct EventTag<'a> {
         #[serde(borrow, default)]
         e: Option<&'a str>,
+        #[serde(rename = "E", default)]
+        event_time: Option<i64>,
     }
 
     let Ok(envelope) = serde_json::from_str::<Envelope<'_>>(frame) else {
@@ -618,9 +664,9 @@ pub(crate) fn parse_user_data_frame(frame: &str) -> UserDataFrame<'_> {
     let event = event.get();
     // A missing tag, or one that cannot be borrowed (escaped, or not a string), is unrecognised
     // rather than an empty type: an unknown type is ignored quietly, and this must not be.
-    let Some(event_type) = serde_json::from_str::<EventTag<'_>>(event)
+    let Some((event_type, event_time)) = serde_json::from_str::<EventTag<'_>>(event)
         .ok()
-        .and_then(|tag| tag.e)
+        .and_then(|tag| Some((tag.e?, tag.event_time)))
     else {
         return UserDataFrame::Unrecognised;
     };
@@ -628,7 +674,13 @@ pub(crate) fn parse_user_data_frame(frame: &str) -> UserDataFrame<'_> {
         subscription_id: envelope.subscription_id,
         event_type,
         event,
+        event_time: event_time.and_then(event_time_from_ms),
     }
+}
+
+/// A user-data event's time `E`, in epoch milliseconds, as a time, or `None` out of range.
+pub(crate) fn event_time_from_ms(ms: i64) -> Option<DateTime<Utc>> {
+    Utc.timestamp_millis_opt(ms).single()
 }
 
 /// Log an [`UserDataFrame::Unrecognised`] frame: at `warn` for the first, and for every 1000th
@@ -5201,6 +5253,49 @@ mod tests {
         assert!(unrecovered.is_empty(), "and no longer kept");
     }
 
+    /// A disconnect's gap is placed on Binance's clock as the stream's events show it, so a host
+    /// clock ahead of Binance's beyond the lookback still starts the gap before the fills Binance
+    /// stamped during the outage.
+    #[test]
+    fn a_disconnect_seen_by_a_host_clock_ahead_starts_its_gap_at_binances_time() {
+        let at = |secs: i64| Utc.timestamp_millis_opt(secs * 1_000).unwrap();
+        let base = tokio::time::Instant::now();
+        let mut venue = VenueClock::new();
+        // Binance stamped an event at 1 000 s as it arrived; the host reads 60 s ahead.
+        venue.observe(at(1_000), base);
+        let seen = HostMoment::new(at(1_060), base);
+
+        let disconnect = Disconnect::seen(&venue, seen, TimeDelta::seconds(1));
+
+        assert_eq!(disconnect.start, at(999));
+    }
+
+    /// Before the stream has seen a time Binance stamped, the gap starts from this host's time.
+    #[test]
+    fn a_disconnect_with_no_sample_starts_its_gap_from_the_hosts_time() {
+        let at = |secs: i64| Utc.timestamp_millis_opt(secs * 1_000).unwrap();
+        let seen = HostMoment::new(at(1_060), tokio::time::Instant::now());
+
+        let disconnect = Disconnect::seen(&VenueClock::new(), seen, TimeDelta::seconds(1));
+
+        assert_eq!(disconnect.start, at(1_059));
+    }
+
+    /// A host clock stepped back between the disconnect and the reconnect does not end the gap
+    /// before the outage does: the moment the disconnect was seen counts on on tokio's clock.
+    #[test]
+    fn a_host_clock_stepped_back_before_the_reconnect_still_ends_the_gap_past_the_outage() {
+        let at = |secs: i64| Utc.timestamp_millis_opt(secs * 1_000).unwrap();
+        let base = tokio::time::Instant::now();
+        let seen = HostMoment::new(at(1_000), base);
+        let disconnect = Disconnect::seen(&VenueClock::new(), seen, TimeDelta::zero());
+
+        // 120 s later by tokio's clock, but the host clock reads an hour back.
+        let now = HostMoment::new(at(1_120 - 3_600), base + Duration::from_secs(120));
+
+        assert_eq!(disconnect.end(&VenueClock::new(), now), at(1_120));
+    }
+
     /// A new gap that overlaps a kept one starts after it, so the kept one keeps its retry
     /// schedule and no span is read twice; a gap wholly covered is not opened.
     #[tokio::test]
@@ -5264,6 +5359,7 @@ mod tests {
                 subscription_id: Some(4),
                 event_type: "outboundAccountPosition",
                 event: r#"{"e":"outboundAccountPosition","E":1}"#,
+                event_time: Some(DateTime::<Utc>::from_timestamp_millis(1).unwrap()),
             }
         );
         // A frame with both `id` and `event` is a response.
