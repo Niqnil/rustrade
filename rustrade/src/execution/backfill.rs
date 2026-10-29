@@ -159,7 +159,10 @@ impl Watermark {
     /// the venue's time, but some stamp other events with this host's. A fill stamped `max_span`
     /// or more before `now` is not taken either: it is an old fill delivered late, such as one a
     /// venue replays on subscribing, and a read placed by it would start further back than any
-    /// read covers.
+    /// read covers. A replayed fill younger than that is taken, because it cannot be told apart
+    /// from a venue clock that far behind. Until a fill delivered on time replaces it, each read
+    /// starts as far back as its stamp, and the clock difference it implies is warned of. The
+    /// read is longer, but misses nothing.
     pub(crate) fn delivered<K, A, I>(
         &mut self,
         now: DateTime<Utc>,
@@ -191,22 +194,27 @@ impl Watermark {
     pub(crate) fn read_from(&self, config: &FillRecoveryConfig) -> DateTime<Utc> {
         let bound = match self.venue.earliest_at(self.received) {
             Some(venue) => venue.min(self.receipt),
-            None => self.receipt - config.max_clock_skew,
+            None => earlier(self.receipt, config.max_clock_skew),
         };
-        bound - config.overlap
+        earlier(bound, config.overlap)
     }
 
     /// Where a read started at `now`, read at `instant` on tokio's clock, ends: `max_clock_skew`
-    /// past the later of `now` and the venue's estimated time, so a local clock behind the
-    /// venue's does not cut the read short.
+    /// past the latest of `now`, the venue's estimated time, and the local time of the last event
+    /// counted on to `instant` on tokio's clock. So neither a local clock behind the venue's nor
+    /// one stepped back since the last event cuts the read short, with or without a fill.
     pub(crate) fn read_to(
         &self,
         now: DateTime<Utc>,
         instant: Instant,
         config: &FillRecoveryConfig,
     ) -> DateTime<Utc> {
+        let counted_on = later(
+            self.receipt,
+            instant.saturating_duration_since(self.received),
+        );
         let venue = self.venue.earliest_at(instant).unwrap_or(now);
-        venue.max(now) + config.max_clock_skew
+        later(venue.max(now).max(counted_on), config.max_clock_skew)
     }
 
     /// How far this host's clock leads the venue's at `now`, read at `instant` on tokio's clock,
@@ -215,7 +223,8 @@ impl Watermark {
     ///
     /// A lead is overstated by the delivery delay of the fill it was measured from, never
     /// understated, so a host clock behind the venue's is reported only when it is surely beyond
-    /// the allowance.
+    /// the allowance. A replayed fill taken for the venue's clock (see
+    /// [`delivered`](Self::delivered)) overstates it by its age.
     pub(crate) fn skew_beyond_allowance(
         &self,
         now: DateTime<Utc>,
@@ -231,6 +240,20 @@ impl Watermark {
 /// `duration` as a [`TimeDelta`], or `None` beyond its range.
 fn to_delta(duration: Duration) -> Option<TimeDelta> {
     TimeDelta::from_std(duration).ok()
+}
+
+/// `duration` after `time`, or the latest time held if that is beyond it.
+fn later(time: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {
+    to_delta(duration)
+        .and_then(|delta| time.checked_add_signed(delta))
+        .unwrap_or(DateTime::<Utc>::MAX_UTC)
+}
+
+/// `duration` before `time`, or the earliest time held if that is beyond it.
+fn earlier(time: DateTime<Utc>, duration: Duration) -> DateTime<Utc> {
+    to_delta(duration)
+        .and_then(|delta| time.checked_sub_signed(delta))
+        .unwrap_or(DateTime::<Utc>::MIN_UTC)
 }
 
 /// What one [`backfill`] read: the fills it got, oldest first, and the spans it gave up on.
@@ -687,19 +710,51 @@ mod tests {
     }
 
     /// The issue's second case: the host clock steps back before the reconnect, so its "now" is
-    /// before the outage ended. The read still runs past the venue's time.
+    /// before the outage ended. The read still runs past the venue's time, here 50 s ahead of the
+    /// host's even before the step.
     #[test]
     fn a_host_clock_stepped_back_before_the_reconnect_still_reads_to_the_venues_time() {
         let config = FillRecoveryConfig::default();
         let base = Instant::now();
         let mut watermark = Watermark::opened(at(100), base);
-        watermark.delivered(at(100), base, &fill(100), &config);
+        watermark.delivered(at(100), base, &fill(150), &config);
 
         // 60 s later the host clock reads 100 s earlier than at the fill.
         let end = watermark.read_to(at(0), base + secs(60), &config);
 
-        assert_eq!(end, counted_on(100, 60) + secs(30));
-        assert!(end > at(160), "{end} ends before the venue's 160");
+        assert_eq!(end, counted_on(150, 60) + secs(30));
+        assert!(end > at(210), "{end} ends before the venue's 210");
+    }
+
+    /// With no fill the venue's clock is unknown, but the host's own time is counted on from the
+    /// last event on tokio's clock, so a step back since then does not end the read early.
+    #[test]
+    fn with_no_fill_delivered_a_host_clock_stepped_back_still_reads_past_the_outage() {
+        let config = FillRecoveryConfig::default();
+        let base = Instant::now();
+        let mut watermark = Watermark::opened(at(100), base);
+        watermark.delivered(at(100), base, &snapshot(), &config);
+
+        // 60 s later the host clock reads 100 s earlier than at the last event.
+        assert_eq!(
+            watermark.read_to(at(0), base + secs(60), &config),
+            at(160 + 30)
+        );
+    }
+
+    #[test]
+    fn an_allowance_beyond_the_time_range_saturates_rather_than_panics() {
+        let config = FillRecoveryConfig::default()
+            .with_max_clock_skew(Duration::MAX)
+            .with_overlap(Duration::MAX);
+        let base = Instant::now();
+        let watermark = Watermark::opened(at(100), base);
+
+        assert_eq!(watermark.read_from(&config), DateTime::<Utc>::MIN_UTC);
+        assert_eq!(
+            watermark.read_to(at(100), base, &config),
+            DateTime::<Utc>::MAX_UTC
+        );
     }
 
     #[test]

@@ -1,14 +1,13 @@
 //! An estimate of a venue's clock, read from the times the venue stamps on its events.
 //!
 //! A venue's timestamps and this host's wall clock differ by an unknown amount that changes: the
-//! host clock can be skewed, drift, or step, as on an NTP correction, a manual change or a VM
-//! resume. A span read from the venue by time, such as the fills missed while a stream was down,
-//! is a span on the venue's clock, so a bound taken from the host's wall clock can miss part of
-//! it.
+//! host clock can be skewed, drift, or step, as on an NTP step or a manual change. A span read
+//! from the venue by time, such as the fills missed while a stream was down, is a span on the
+//! venue's clock, so a bound taken from the host's wall clock can miss part of it.
 //!
 //! [`VenueClock`] does not read the host's wall clock. It keeps one time the venue stamped,
 //! paired with the moment the event arrived on tokio's monotonic clock, and counts on from there
-//! on that clock, which never steps.
+//! on that clock, which a step of the wall clock does not move.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use std::time::Duration;
@@ -47,6 +46,12 @@ const DRIFT_DIVISOR: u32 = 10_000;
 /// - A venue clock that steps back is followed only as fast as the drift allowance lets the old
 ///   sample go, about 0.36 s an hour.
 /// - Before the first sample there is no bound: [`earliest_at`](Self::earliest_at) is `None`.
+/// - The monotonic clock is not free of the host's time keeping. It does not advance while the
+///   host is suspended, which makes the bound earlier than it could be: safe for a read's start,
+///   but no help for its end. NTP can also slew it, up to 500 ppm or more while it corrects an
+///   offset, beyond the drift allowance. A slew that speeds it up corrects a wall clock that is
+///   behind, so a caller that also bounds a read's start by the wall clock, taking the earlier of
+///   the two, stays covered.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VenueClock {
     sample: Option<Sample>,

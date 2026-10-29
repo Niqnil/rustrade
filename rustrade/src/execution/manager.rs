@@ -363,8 +363,9 @@ where
                                 host_lead_ms = lead.num_milliseconds(),
                                 max_clock_skew = ?fill_recovery.max_clock_skew,
                                 "AccountStream fill recovery: this host's clock differs from \
-                                 the venue's by more than the allowance; the read is placed \
-                                 on the venue's clock"
+                                 the venue's by more than the allowance, or the last fill \
+                                 sampled was delivered late (a replay); the read is placed on \
+                                 the venue's clock"
                             );
                         }
                         let read = backfill(
@@ -415,8 +416,9 @@ where
                     .chain(futures::stream::once(std::future::ready(snapshot)))
                     .chain(updates)
                     .inspect(move |event| {
+                        let (now, instant) = (clock.now(), Instant::now());
                         if let Some(watermark) = watermark.lock().as_mut() {
-                            watermark.delivered(clock.now(), Instant::now(), event, &fill_recovery);
+                            watermark.delivered(now, instant, event, &fill_recovery);
                         }
                     })
                     .boxed())
@@ -1696,8 +1698,13 @@ mod tests {
             ]
         );
         let at = |secs: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap();
-        // The first open reads nothing; the re-init reads around the watermark.
-        assert_eq!(*fetched.lock().unwrap(), [(at(68), at(130))]);
+        // The first open reads nothing; the re-init reads around the watermark, to past the
+        // allowance after the local time counted on from it on tokio's clock.
+        let [(start, end)] = fetched.lock().unwrap().clone()[..] else {
+            panic!("one read")
+        };
+        assert_eq!(start, at(68));
+        assert!(at(130) <= end && end < at(131), "the read ends at {end}");
     }
 
     /// A read that fails does not stop the stream opening: its span is reported and the snapshot
@@ -1836,6 +1843,108 @@ mod tests {
         assert_eq!(start, at(98));
         // Past the venue's time of the fill by the skew allowance, not ended at the host's 0.
         assert!(end >= at(130), "the read ends at {end}");
+    }
+
+    /// As the test above, on a stream that delivered no fill: the venue's clock is unknown, but
+    /// the read still ends past the host's time at the last event, counted on on tokio's clock.
+    #[tokio::test]
+    async fn a_host_clock_stepped_back_before_the_reopening_with_no_fill_still_reads_past_it() {
+        let client = FlakyAccountClient {
+            open_from: 1,
+            ..FlakyAccountClient::default()
+        };
+        let fetched = Arc::clone(&client.fetched);
+        let attempts = Arc::clone(&client.attempts);
+        let clock = Clock::new(move || {
+            let reopened = attempts.load(std::sync::atomic::Ordering::Relaxed) >= 2;
+            DateTime::<Utc>::from_timestamp(1_800_000_000 + if reopened { 0 } else { 100 }, 0)
+                .unwrap()
+        });
+        let Ok(manager) = init_flaky_recovering(client, clock).await else {
+            panic!("the first attempt succeeds, so init should too");
+        };
+
+        let events = manager.account_stream.take(3).collect::<Vec<_>>().await;
+
+        assert_eq!(
+            events.iter().map(describe).collect::<Vec<_>>(),
+            ["snapshot", "reconnecting", "snapshot"]
+        );
+        let at = |secs: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap();
+        let [(_, end)] = fetched.lock().unwrap().clone()[..] else {
+            panic!("one read")
+        };
+        assert!(end >= at(130), "the read ends at {end}");
+    }
+
+    /// How many `WARN` events the manager's fill recovery logs about the clock difference while
+    /// `client`'s stream is read for `events` events, on `clock`.
+    async fn clock_warnings(client: FlakyAccountClient, clock: Clock, events: usize) -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone)]
+        struct Count(Arc<AtomicUsize>);
+
+        struct Message(String);
+
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                if *event.metadata().level() == tracing::Level::WARN
+                    && message.0.contains("differs from the venue's")
+                {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let count = Count(Arc::new(AtomicUsize::new(0)));
+        // The current-thread test runtime polls the stream on this thread, so a thread default
+        // sees every event.
+        let _guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(count.clone()));
+        let Ok(manager) = init_flaky_recovering(client, clock).await else {
+            panic!("the first attempt succeeds, so init should too");
+        };
+        let _ = manager
+            .account_stream
+            .take(events)
+            .collect::<Vec<_>>()
+            .await;
+        count.0.load(Ordering::Relaxed)
+    }
+
+    /// The warning fires at the reopening when the host's clock leads the venue's by 190 s, and
+    /// not when they agree.
+    #[tokio::test]
+    async fn the_manager_warns_of_a_clock_difference_beyond_the_allowance_only() {
+        let ahead = FlakyAccountClient {
+            open_from: 1,
+            ending: vec![live_trade("x", 10)],
+            ..FlakyAccountClient::default()
+        };
+        let agreeing = FlakyAccountClient {
+            open_from: 1,
+            ending: vec![live_trade("x", 200)],
+            ..FlakyAccountClient::default()
+        };
+
+        assert_eq!(clock_warnings(ahead, at_clock(200), 4).await, 1);
+        assert_eq!(clock_warnings(agreeing, at_clock(200), 4).await, 0);
     }
 
     /// A re-init whose snapshot fails after the read leaves the watermark where it was and marks

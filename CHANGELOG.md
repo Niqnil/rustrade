@@ -56,13 +56,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   both cases those fills were lost with no `FillRecoveryGaveUp`. Now:
   - The read starts at the venue's time when the last event arrived, as a `VenueClock` estimates
     it from the fills delivered, or at the local time if that is earlier, less `overlap`.
-  - It ends `max_clock_skew` past the later of the local time and the venue's estimated time. A
-    fill the read and the new stream both deliver is still delivered once.
+  - It ends `max_clock_skew` past the latest of the local time, the venue's estimated time, and
+    the local time of the last event counted on on tokio's clock, so a clock stepped back since
+    then does not end it early, with or without a fill. A fill the read and the new stream both
+    deliver is still delivered once.
   - A clock difference beyond `max_clock_skew` is logged as a warning at each reopening.
   - Until a fill has been delivered the venue's clock is unknown, so the read starts
     `max_clock_skew` before the local time instead of `overlap` before it.
   - A fill stamped `max_span` or more before it arrived is an old fill replayed, not a sample of
-    the venue's clock.
+    the venue's clock. A younger replayed fill, such as one a venue replays on subscribing, is
+    taken for one until a fill delivered on time replaces it: the reads in between start as far
+    back as its stamp, and warn of the clock difference it implies.
 
 - **Binance margin `fetch_trades` reads to an end past the local clock** (`rustrade-execution`).
   It used to cut the span's end to this host's clock, so a read placed on a venue clock ahead of
