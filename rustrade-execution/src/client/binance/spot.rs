@@ -6023,8 +6023,9 @@ mod tests {
 
         assert_eq!(restated.0, pushed.0);
         // This test receives the balance event a little after the stream does, which is when the
-        // wait starts; without the wait, the read would follow the reconnect at once.
-        let allowance = Duration::from_millis(250);
+        // wait starts. A second's allowance for that still tells the 5 s wait from none: without
+        // it, the read would follow the reconnect, 300 ms after the event, at once.
+        let allowance = Duration::from_secs(1);
         assert!(
             restated.1 + allowance >= pushed.1 + REST_BALANCE_LAG.to_std().unwrap(),
             "restated {:?} after the balance event, before the REST lag",
