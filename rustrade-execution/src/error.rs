@@ -583,10 +583,10 @@ pub enum OrderError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     ///
     /// Non-transient — change the request. Unlike [`InvalidPrecision`](Self::InvalidPrecision),
     /// which says a value is badly formed, this says a well-formed value is too small or too
-    /// large: below a minimum price, quantity or notional, or above a maximum. The error carries
-    /// the limit that was broken, so the caller can resize the order. A client checks only the
-    /// rules it has loaded (see [`OrderRules`](crate::rules::OrderRules)); a request that passes
-    /// can still be rejected by the venue.
+    /// large: below a minimum price, quantity, notional or trailing offset, or above a maximum.
+    /// The error carries the limit that was broken, so the caller can resize the order. A client
+    /// checks only the rules it has loaded (see [`OrderRules`](crate::rules::OrderRules)); a
+    /// request that passes can still be rejected by the venue.
     #[error("out of bounds: {0}")]
     OutOfBounds(BoundsViolation),
 

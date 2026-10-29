@@ -680,7 +680,7 @@ impl BinanceMargin {
 
         if let Err(refused) = self
             .rules
-            .check(instrument.name(), kind, price, quantity)
+            .check(instrument.name(), side, kind, price, quantity)
             .await
         {
             return inactive(OrderState::inactive(refused));
@@ -6503,6 +6503,63 @@ mod tests {
         assert!(
             matches!(placed.state, OrderState::Active(ActiveOrderState::Open(_))),
             "{placed:?}"
+        );
+    }
+
+    /// A trailing stop's offset is held to `TRAILING_DELTA`'s range for its side, the range above
+    /// for a buy and below for a sell, and refused unsent.
+    #[tokio::test]
+    async fn a_trailing_offset_outside_its_sides_range_is_refused_unsent() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/exchangeInfo"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"symbols": [{
+                    "symbol": "BTCUSDT", "status": "TRADING",
+                    "filters": [
+                        {"filterType": "TRAILING_DELTA", "minTrailingAboveDelta": 10,
+                         "maxTrailingAboveDelta": 2000, "minTrailingBelowDelta": 10,
+                         "maxTrailingBelowDelta": 1000},
+                    ],
+                }]}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_order_accepted(&server, 0).await;
+        let client = margin_client_at(&server, false);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+        let order = |cid: &str, side: Side, offset: Decimal| {
+            let mut request = margin_open_request(&btcusdt, cid);
+            request.state.side = side;
+            request.state.price = None;
+            request.state.kind = OrderKind::TrailingStop {
+                offset,
+                offset_type: crate::order::TrailingOffsetType::BasisPoints,
+                activation_price: None,
+            };
+            request
+        };
+
+        let buy = client.open_order(order("a", Side::Buy, dec!(2500))).await;
+        assert_eq!(
+            buy.state,
+            OrderState::inactive(OrderError::OutOfBounds(BoundsViolation::new(
+                OrderField::TrailingOffset,
+                Bound::Max,
+                dec!(2000),
+                dec!(2500)
+            )))
+        );
+        let sell = client.open_order(order("b", Side::Sell, dec!(1500))).await;
+        assert_eq!(
+            sell.state,
+            OrderState::inactive(OrderError::OutOfBounds(BoundsViolation::new(
+                OrderField::TrailingOffset,
+                Bound::Max,
+                dec!(1000),
+                dec!(1500)
+            )))
         );
     }
 

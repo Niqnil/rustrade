@@ -12,9 +12,9 @@
 //!
 //! # Orders are checked against the symbol's rules before they are sent
 //!
-//! Each client reads the symbol's tick, lot and notional rules from Binance's spot `exchangeInfo`
-//! on the symbol's first order, and refuses an order that breaks them without sending it: a price
-//! or quantity off its grid as [`OrderError::InvalidPrecision`](crate::error::OrderError::InvalidPrecision)
+//! Each client reads the symbol's tick, lot, notional and trailing-offset rules from Binance's
+//! spot `exchangeInfo` on the symbol's first order, and refuses an order that breaks them without
+//! sending it: a price or quantity off its grid as [`OrderError::InvalidPrecision`](crate::error::OrderError::InvalidPrecision)
 //! with [`NotOnGrid`](crate::error::PrecisionLimit::NotOnGrid), and one outside its range as
 //! [`OrderError::OutOfBounds`](crate::error::OrderError::OutOfBounds). Nothing is rounded.
 //!

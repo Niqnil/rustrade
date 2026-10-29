@@ -18,11 +18,20 @@
 //!
 //! # What is read
 //!
-//! `PRICE_FILTER`, `LOT_SIZE`, `MARKET_LOT_SIZE` and `NOTIONAL` (or the older `MIN_NOTIONAL`).
-//! Each part is optional and a zero means off, as the venue means it. The filters that need a
-//! reference price the library does not have (`PERCENT_PRICE`, and the average price behind a
-//! market order's notional) and the ones that depend on account state (`MAX_NUM_ORDERS`,
-//! `MAX_POSITION`, ...) are not read, so the venue still enforces them.
+//! `PRICE_FILTER`, `LOT_SIZE`, `MARKET_LOT_SIZE`, `NOTIONAL` (or the older `MIN_NOTIONAL`) and
+//! `TRAILING_DELTA`. Each part is optional and a zero means off, as the venue means it.
+//! - `NOTIONAL`'s `applyMinToMarket` and `applyMaxToMarket` (`MIN_NOTIONAL`'s `applyToMarket`)
+//!   say which of its limits also hold for a market order: those fill
+//!   [`OrderRules::market_notional`], which the check does not apply. Binance measures a market
+//!   order's notional at the symbol's reference price (`GET /api/v3/referencePrice`) when it has
+//!   one, else at the average price over the filter's `avgPriceMins` (`GET /api/v3/avgPrice`).
+//! - `TRAILING_DELTA`'s above range holds for a trailing `STOP_LOSS` or `STOP_LOSS_LIMIT` buy,
+//!   its below range for a sell: [`OrderRules::trailing_offset_above`] and
+//!   [`OrderRules::trailing_offset_below`].
+//!
+//! The filters that need a reference price the library does not have (`PERCENT_PRICE`) and the
+//! ones that depend on account state (`MAX_NUM_ORDERS`, `MAX_POSITION`, ...) are not read, so
+//! the venue still enforces them.
 
 use super::shared::{
     RateLimitTracker, RequestKind, classify_rest_query_error, rest_call_with_retry,
@@ -38,6 +47,7 @@ use binance_sdk::spot::rest_api::{
 };
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
+use rustrade_instrument::Side;
 use rustrade_instrument::instrument::name::InstrumentNameExchange;
 use smol_str::SmolStr;
 use std::{collections::HashMap, future::Future, str::FromStr, sync::Arc, time::Duration};
@@ -208,6 +218,7 @@ impl RulesLoader {
     pub(crate) async fn check<AssetKey, InstrumentKey>(
         &self,
         symbol: &str,
+        side: Side,
         kind: OrderKind,
         price: Option<Decimal>,
         quantity: Decimal,
@@ -223,7 +234,7 @@ impl RulesLoader {
             })
             .await;
         match rules {
-            Some(rules) => rules.check(kind, price, quantity),
+            Some(rules) => rules.check(side, kind, price, quantity),
             None => Ok(()),
         }
     }
@@ -291,6 +302,15 @@ pub(crate) fn parse_symbol_rules(symbol: &ExchangeInfoResponseSymbolsInner) -> O
             .and_then(|text| Decimal::from_str(text).ok())
             .unwrap_or(Decimal::ZERO)
     };
+    // A market flag that is absent leaves its limit off for market orders.
+    let applied = |value: Decimal, to_market: Option<bool>| {
+        if to_market == Some(true) {
+            value
+        } else {
+            Decimal::ZERO
+        }
+    };
+    let basis_points = |value: Option<i64>| value.map(Decimal::from).unwrap_or(Decimal::ZERO);
     let mut rules = OrderRules::default();
     // MIN_NOTIONAL is the older form of NOTIONAL, which wins when a symbol lists both.
     let mut min_notional = None;
@@ -318,23 +338,39 @@ pub(crate) fn parse_symbol_rules(symbol: &ExchangeInfoResponseSymbolsInner) -> O
                 );
             }
             MyFiltersResponseSymbolFiltersInner::Notional(filter) => {
-                rules.notional = ValueRule::new(
-                    parse(&filter.min_notional),
-                    parse(&filter.max_notional),
+                let (min, max) = (parse(&filter.min_notional), parse(&filter.max_notional));
+                rules.notional = ValueRule::new(min, max, Decimal::ZERO);
+                rules.market_notional = ValueRule::new(
+                    applied(min, filter.apply_min_to_market),
+                    applied(max, filter.apply_max_to_market),
                     Decimal::ZERO,
                 );
             }
             MyFiltersResponseSymbolFiltersInner::MinNotional(filter) => {
-                min_notional = Some(parse(&filter.min_notional));
+                min_notional = Some((parse(&filter.min_notional), filter.apply_to_market));
+            }
+            MyFiltersResponseSymbolFiltersInner::TrailingDelta(filter) => {
+                rules.trailing_offset_above = ValueRule::new(
+                    basis_points(filter.min_trailing_above_delta),
+                    basis_points(filter.max_trailing_above_delta),
+                    Decimal::ZERO,
+                );
+                rules.trailing_offset_below = ValueRule::new(
+                    basis_points(filter.min_trailing_below_delta),
+                    basis_points(filter.max_trailing_below_delta),
+                    Decimal::ZERO,
+                );
             }
             // Every other filter needs a reference price or account state.
             _ => {}
         }
     }
     if rules.notional.is_off()
-        && let Some(min) = min_notional
+        && let Some((min, to_market)) = min_notional
     {
         rules.notional = ValueRule::new(min, Decimal::ZERO, Decimal::ZERO);
+        rules.market_notional =
+            ValueRule::new(applied(min, to_market), Decimal::ZERO, Decimal::ZERO);
     }
     rules
 }
@@ -381,6 +417,8 @@ mod tests {
                 ValueRule::new(dec!(0), dec!(100), dec!(0)),
                 ValueRule::new(dec!(5), dec!(9000000), dec!(0)),
             )
+            // `applyMinToMarket` only: the maximum does not hold for a market order.
+            .with_market_notional(ValueRule::new(dec!(5), dec!(0), dec!(0)))
         );
         assert_eq!(rules.market_quantity.min, None, "a zero minimum is off");
         assert_eq!(rules.market_quantity.step, None, "a zero step is off");
@@ -409,6 +447,101 @@ mod tests {
                 "{order:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_notional_market_flags_choose_the_market_notional_limits() {
+        let market_notional = |apply_min: serde_json::Value, apply_max: serde_json::Value| {
+            let mut filter = serde_json::json!({
+                "filterType": "NOTIONAL", "minNotional": "5", "maxNotional": "9000", "avgPriceMins": 5,
+            });
+            for (key, flag) in [
+                ("applyMinToMarket", apply_min),
+                ("applyMaxToMarket", apply_max),
+            ] {
+                if !flag.is_null() {
+                    filter[key] = flag;
+                }
+            }
+            parse_symbol_rules(&symbol(serde_json::json!([filter]))).market_notional
+        };
+        use serde_json::Value::{Bool, Null};
+        assert_eq!(
+            market_notional(Bool(true), Bool(true)),
+            ValueRule::new(dec!(5), dec!(9000), dec!(0))
+        );
+        assert_eq!(
+            market_notional(Bool(false), Bool(true)),
+            ValueRule::new(dec!(0), dec!(9000), dec!(0))
+        );
+        assert_eq!(
+            market_notional(Bool(true), Bool(false)),
+            ValueRule::new(dec!(5), dec!(0), dec!(0))
+        );
+        assert!(market_notional(Bool(false), Bool(false)).is_off());
+        assert!(
+            market_notional(Null, Null).is_off(),
+            "an absent flag leaves the limit off for market orders"
+        );
+    }
+
+    #[test]
+    fn min_notionals_apply_to_market_flag_chooses_the_market_minimum() {
+        let market_notional = |apply_to_market: bool| {
+            parse_symbol_rules(&symbol(serde_json::json!([
+                {"filterType": "MIN_NOTIONAL", "minNotional": "10.0", "applyToMarket": apply_to_market, "avgPriceMins": 5},
+            ])))
+            .market_notional
+        };
+        assert_eq!(
+            market_notional(true),
+            ValueRule::new(dec!(10), dec!(0), dec!(0))
+        );
+        assert!(market_notional(false).is_off());
+        // NOTIONAL wins over MIN_NOTIONAL for the market limits too.
+        let both = parse_symbol_rules(&symbol(serde_json::json!([
+            {"filterType": "MIN_NOTIONAL", "minNotional": "10.0", "applyToMarket": true, "avgPriceMins": 5},
+            {"filterType": "NOTIONAL", "minNotional": "5.0", "applyMinToMarket": false, "maxNotional": "0", "applyMaxToMarket": false, "avgPriceMins": 5},
+        ])));
+        assert!(both.market_notional.is_off());
+    }
+
+    #[test]
+    fn trailing_delta_becomes_the_trailing_offset_ranges() {
+        let rules = parse_symbol_rules(&symbol(serde_json::json!([
+            {"filterType": "TRAILING_DELTA", "minTrailingAboveDelta": 10, "maxTrailingAboveDelta": 2000, "minTrailingBelowDelta": 20, "maxTrailingBelowDelta": 1000},
+        ])));
+        assert_eq!(
+            rules.trailing_offset_above,
+            ValueRule::new(dec!(10), dec!(2000), dec!(0))
+        );
+        assert_eq!(
+            rules.trailing_offset_below,
+            ValueRule::new(dec!(20), dec!(1000), dec!(0))
+        );
+        // A buy trailing stop is held to the range above, a sell to the range below.
+        let kind = OrderKind::TrailingStop {
+            offset: dec!(15),
+            offset_type: crate::order::TrailingOffsetType::BasisPoints,
+            activation_price: None,
+        };
+        assert_eq!(
+            rules.check::<(), ()>(Side::Buy, kind, None, dec!(1)),
+            Ok(())
+        );
+        assert!(
+            rules
+                .check::<(), ()>(Side::Sell, kind, None, dec!(1))
+                .is_err()
+        );
+        let partial = parse_symbol_rules(&symbol(serde_json::json!([
+            {"filterType": "TRAILING_DELTA", "minTrailingAboveDelta": 10},
+        ])));
+        assert_eq!(
+            partial.trailing_offset_above,
+            ValueRule::new(dec!(10), dec!(0), dec!(0))
+        );
+        assert!(partial.trailing_offset_below.is_off());
     }
 
     #[test]
