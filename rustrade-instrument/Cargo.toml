@@ -48,7 +48,8 @@ derive_more = { workspace = true, features = ["display"] }
 thiserror = { workspace = true }
 
 # Runs alone in its own process: a capture opened by a test running beside it would hide the
-# race it checks for.
+# race it checks for. Like the `logs` unit tests, it runs only with `--features test-utils` (or
+# `--all-features`, as CI does): a bare `cargo test` skips it.
 [[test]]
 name = "log_capture"
 required-features = ["test-utils"]

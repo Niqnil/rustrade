@@ -32,6 +32,7 @@ use tracing_subscriber::{
 /// One event logged on the capturing thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Logged {
+    /// The event's level.
     pub level: Level,
     /// Every field in the order it was recorded, the message as `message`, each value rendered
     /// with `Debug`.
@@ -78,6 +79,7 @@ pub struct Capture {
 }
 
 impl Capture {
+    /// Starts recording this thread's events, until the capture is dropped.
     pub fn start() -> Self {
         install_floor();
         let events = Arc::default();
