@@ -36,6 +36,7 @@
 //   report cannot resurrect a retired order as a resting one. That order's filled
 //   quantity is settled instead by the terminal report's own z, or by fetch_open_orders.
 
+use super::commission::{CommissionRates, fetch_commission_rates};
 use super::restatement::{
     BalanceRestatement, SharedStreamClock, StreamClock, restate, restatement_time,
 };
@@ -425,6 +426,24 @@ impl BinanceSpot {
         instruments: &[InstrumentNameExchange],
     ) -> Result<HashMap<InstrumentNameExchange, OrderRules>, UnindexedClientError> {
         self.rules.load(instruments).await
+    }
+
+    /// The account's commission rates on `instrument`: `GET /api/v3/account/commission`, at 20
+    /// of Binance's per-IP request weight. [`CommissionRates`] says how Binance combines them.
+    ///
+    /// Spot Testnet reports every rate as zero, and no discount asset, unless the account has
+    /// chosen to be charged commissions there.
+    ///
+    /// # Errors
+    ///
+    /// - [`ApiError::InstrumentInvalid`] for a symbol Binance does not list.
+    /// - [`UnindexedClientError::Internal`] for an answer missing a rate, with a rate that does
+    ///   not read as a decimal, or for another symbol.
+    pub async fn fetch_commission_rates(
+        &self,
+        instrument: &InstrumentNameExchange,
+    ) -> Result<CommissionRates, UnindexedClientError> {
+        fetch_commission_rates(&self.rest, &self.rate_limiter, instrument).await
     }
 
     /// Hold each of `orders` as live, for a reconnect to ask about if the stream misses its end.
@@ -8011,5 +8030,95 @@ mod tests {
                 .is_some_and(|due| due <= tokio::time::Instant::now()),
             "still due, not charged a failure"
         );
+    }
+
+    /// Binance's documented `account/commission` answer for `symbol`, with distinct rates.
+    fn commission_answer(symbol: &str) -> serde_json::Value {
+        let part = |maker: &str, taker: &str, buyer: &str, seller: &str| serde_json::json!({"maker": maker, "taker": taker, "buyer": buyer, "seller": seller});
+        serde_json::json!({
+            "symbol": symbol,
+            "standardCommission": part("0.00000010", "0.00000020", "0.00000030", "0.00000040"),
+            "specialCommission": part("0.01000000", "0.02000000", "0.03000000", "0.04000000"),
+            "taxCommission": part("0.00000112", "0.00000114", "0.00000118", "0.00000116"),
+            "discount": {
+                "enabledForAccount": true,
+                "enabledForSymbol": true,
+                "discountAsset": "BNB",
+                "discount": "0.75000000"
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn spot_commission_rates_are_read_signed_for_the_symbol() {
+        use crate::client::binance::{CommissionDiscount, CommissionPart};
+        use rust_decimal_macros::dec;
+        use rustrade_instrument::asset::name::AssetNameExchange;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/account/commission"))
+            .and(wiremock::matchers::query_param("symbol", "BTCUSDT"))
+            .and(wiremock::matchers::header("X-MBX-APIKEY", "key"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(commission_answer("BTCUSDT")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
+            "key".into(),
+            "secret".into(),
+        ));
+        client.rest = rest_at(&server);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+
+        let rates = client.fetch_commission_rates(&btcusdt).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests[0]
+                .url
+                .query_pairs()
+                .any(|(key, _)| key == "signature"),
+            "signed: {}",
+            requests[0].url
+        );
+        assert_eq!(rates.instrument, btcusdt);
+        assert_eq!(
+            rates.special,
+            CommissionPart::new(dec!(0.01), dec!(0.02), dec!(0.03), dec!(0.04))
+        );
+        assert_eq!(
+            rates.discount,
+            Some(CommissionDiscount::new(
+                true,
+                true,
+                Some(AssetNameExchange::new("BNB")),
+                dec!(0.75)
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn spot_commission_rates_of_an_unlisted_symbol_name_it() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v3/account/commission"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"code": -1121, "msg": "Invalid symbol."})),
+            )
+            .mount(&server)
+            .await;
+        let mut client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
+            "key".into(),
+            "secret".into(),
+        ));
+        client.rest = rest_at(&server);
+        let nope = InstrumentNameExchange::new("NOPEUSDT");
+        match client.fetch_commission_rates(&nope).await {
+            Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(instrument, _))) => {
+                assert_eq!(instrument, nope);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

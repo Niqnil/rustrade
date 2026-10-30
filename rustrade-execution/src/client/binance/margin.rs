@@ -61,6 +61,7 @@ mod stream;
 
 pub use records::MarginForcedLiquidation;
 
+use super::commission::{CommissionRates, fetch_commission_rates};
 use super::restatement::{SharedStreamClock, restatement_time};
 use super::rules::RulesLoader;
 use super::shared::{
@@ -71,9 +72,9 @@ use super::shared::{
     classify_order_kind_tif, classify_rest_order_error, classify_rest_query_error,
     convert_ended_order, convert_open_order_listing, convert_open_order_owned_symbol,
     dedup_key_from_event, drop_after, gap_failed, gap_time, is_duplicate, is_unknown_order,
-    new_dedup_cache, placed_order_state, recovered_order_cids, recovered_order_totals,
-    response_decode_error, rest_call_with_retry, rest_read_with_retry, trailing_params,
-    unreadable_answer,
+    new_dedup_cache, optional_decimal, placed_order_state, recovered_order_cids,
+    recovered_order_totals, response_decode_error, rest_call_with_retry, rest_read_with_retry,
+    trailing_params, unreadable_answer,
 };
 use crate::rules::{OrderRules, PreSendRules};
 use crate::{
@@ -496,6 +497,10 @@ pub struct BinanceMargin {
     // The pairs' tick, lot and notional rules, loaded on each pair's first order from the spot
     // `exchangeInfo`. Shared by every clone.
     rules: Arc<RulesLoader>,
+    // Spot REST client for the spot endpoints margin has no counterpart of (`exchangeInfo` for
+    // `rules`, the account's commission rates), with its own tracker for the spot weight pool.
+    spot_rest: Arc<binance_sdk::spot::rest_api::RestApi>,
+    spot_rate_limiter: Arc<RateLimitTracker>,
 }
 
 impl std::fmt::Debug for BinanceMargin {
@@ -560,6 +565,91 @@ impl BinanceMargin {
         instruments: &[InstrumentNameExchange],
     ) -> Result<HashMap<InstrumentNameExchange, OrderRules>, UnindexedClientError> {
         self.rules.load(instruments).await
+    }
+
+    /// The next hourly interest rate of each of `assets` on this client's cross or isolated
+    /// margin: `GET /sapi/v1/margin/next-hourly-interest-rate`.
+    ///
+    /// Each rate is a fraction of the amount borrowed, per hour, at this account's VIP level, for
+    /// the next hourly charge; Binance can change it before then. It is not annualised:
+    /// [`fetch_shortability`](ShortabilityClient::fetch_shortability) reports the base asset's
+    /// rate × 24 × 365.
+    ///
+    /// An asset Binance does not answer for is absent from the map. An asset named twice is asked
+    /// for once, and an empty `assets` sends nothing.
+    ///
+    /// # Cost
+    ///
+    /// Binance takes at most 20 assets a request, so the assets are read 20 at a time, one
+    /// request after another, each costing 100 of Binance's per-IP request weight.
+    ///
+    /// # Errors
+    ///
+    /// Whatever error any of the requests returns: a failed request fails the whole read, rather
+    /// than return a map that silently lacks its assets. [`UnindexedClientError::Internal`] for a
+    /// rate that does not read as a decimal.
+    pub async fn fetch_next_hourly_interest_rates(
+        &self,
+        assets: &[AssetNameExchange],
+    ) -> Result<HashMap<AssetNameExchange, Decimal>, UnindexedClientError> {
+        let mut seen = FnvHashSet::default();
+        let unique: Vec<&str> = assets
+            .iter()
+            .map(|asset| asset.name().as_str())
+            .filter(|name| seen.insert(*name))
+            .collect();
+        let is_isolated = self.config.is_isolated;
+        let mut rates = HashMap::with_capacity(unique.len());
+        for chunk in unique.chunks(HOURLY_RATE_ASSETS_PER_REQUEST) {
+            let requested = chunk.join(",");
+            let response =
+                rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                    let requested = requested.clone();
+                    Box::pin(async move {
+                        let params = GetFutureHourlyInterestRateParams::builder(
+                            requested,
+                            IsolatedFlag::from_flag(is_isolated),
+                        )
+                        .build()?;
+                        rest.get_future_hourly_interest_rate(params).await
+                    })
+                })
+                .await
+                .map_err(|e| classify_rest_query_error(&e, None))?;
+            for listed in response.data().await.map_err(response_decode_error)? {
+                let Some(asset) = listed.asset.filter(|asset| chunk.contains(&asset.as_str()))
+                else {
+                    continue;
+                };
+                let rate = optional_decimal(
+                    "nextHourlyInterestRate",
+                    listed.next_hourly_interest_rate.as_deref(),
+                )?;
+                if let Some(rate) = rate {
+                    rates.insert(AssetNameExchange::new(asset), rate);
+                }
+            }
+        }
+        Ok(rates)
+    }
+
+    /// The account's commission rates on `instrument`, read from the spot
+    /// `GET /api/v3/account/commission` at 20 of Binance's per-IP spot request weight.
+    ///
+    /// Binance margin has no commission endpoint of its own. A margin trade has been seen to pay
+    /// the account's spot rates, which is what this reads; Binance does not document that, so
+    /// treat it as observed, not guaranteed. [`CommissionRates`] says how Binance combines them.
+    ///
+    /// # Errors
+    ///
+    /// - [`ApiError::InstrumentInvalid`] for a symbol Binance does not list.
+    /// - [`UnindexedClientError::Internal`] for an answer missing a rate, with a rate that does
+    ///   not read as a decimal, or for another symbol.
+    pub async fn fetch_commission_rates(
+        &self,
+        instrument: &InstrumentNameExchange,
+    ) -> Result<CommissionRates, UnindexedClientError> {
+        fetch_commission_rates(&self.spot_rest, &self.spot_rate_limiter, instrument).await
     }
 
     /// Submit a margin order over the SAPI `POST /sapi/v1/margin/order` endpoint, and report
@@ -997,15 +1087,18 @@ impl ExecutionClient for BinanceMargin {
         // clones from building it twice.
         let rest_config = Self::build_rest_config(&config);
         let rest = Arc::new(MarginTradingRestApi::production(rest_config.clone()));
-        // The rules come from the spot `exchangeInfo`, a public endpoint on the spot weight pool.
-        // Its tracker is this client's own: a `BinanceSpot` in the same process keeps another for
-        // the same IP pool, which is cheap, as rules load once per pair an hour.
+        // The rules come from the spot `exchangeInfo`, a public endpoint on the spot weight pool,
+        // and the commission rates from the spot account. Their tracker is this client's own: a
+        // `BinanceSpot` in the same process keeps another for the same IP pool, which is cheap,
+        // as rules load once per pair an hour and rates are read on request.
+        let spot_rest = Arc::new(binance_sdk::spot::SpotRestApi::production(
+            rest_config.clone(),
+        ));
+        let spot_rate_limiter = Arc::new(RateLimitTracker::new(WeightPool::Spot));
         let rules = Arc::new(RulesLoader::new(
             config.pre_send_rules,
-            Arc::new(binance_sdk::spot::SpotRestApi::production(
-                rest_config.clone(),
-            )),
-            Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+            spot_rest.clone(),
+            spot_rate_limiter.clone(),
         ));
         let rest_config = Arc::new(rest_config);
         Self {
@@ -1015,6 +1108,8 @@ impl ExecutionClient for BinanceMargin {
             rate_limiter: Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
             known_live: KnownLiveOrders::shared(ExchangeId::BinanceMargin),
             rules,
+            spot_rest,
+            spot_rate_limiter,
         }
     }
 
@@ -1745,6 +1840,9 @@ impl OrderStatusClient for BinanceMargin {
 /// Hours in the 365-day year a Binance hourly interest rate is annualised over.
 const HOURS_PER_YEAR: u32 = 24 * 365;
 
+/// The most assets Binance takes in one `GET /sapi/v1/margin/next-hourly-interest-rate`.
+const HOURLY_RATE_ASSETS_PER_REQUEST: usize = 20;
+
 impl ShortabilityClient for BinanceMargin {
     /// Reads the pair, its base asset, the base asset's next hourly interest rate and Binance's
     /// margin delisting schedule, which cost 202 of Binance's per-IP request weight on cross
@@ -2046,54 +2144,16 @@ impl BinanceMargin {
     }
 
     /// `asset`'s next hourly interest rate on this client's cross or isolated margin, a fraction
-    /// per hour: `/sapi/v1/margin/next-hourly-interest-rate` (weight 100). Unknown if Binance does
-    /// not answer for it.
+    /// per hour (weight 100). Unknown if Binance does not answer for it.
     async fn fetch_next_hourly_interest_rate(
         &self,
         asset: &AssetNameExchange,
     ) -> Result<Option<Decimal>, UnindexedClientError> {
-        let name = asset.name().to_string();
-        let is_isolated = self.config.is_isolated;
-        let response =
-            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
-                let name = name.clone();
-                Box::pin(async move {
-                    let params = GetFutureHourlyInterestRateParams::builder(
-                        name,
-                        IsolatedFlag::from_flag(is_isolated),
-                    )
-                    .build()?;
-                    rest.get_future_hourly_interest_rate(params).await
-                })
-            })
-            .await
-            .map_err(|e| classify_rest_query_error(&e, None))?;
-        let rate = response
-            .data()
-            .await
-            .map_err(response_decode_error)?
-            .into_iter()
-            .find(|listed| listed.asset.as_deref() == Some(name.as_str()))
-            .and_then(|listed| listed.next_hourly_interest_rate);
-        optional_decimal("nextHourlyInterestRate", rate.as_deref())
+        let mut rates = self
+            .fetch_next_hourly_interest_rates(std::slice::from_ref(asset))
+            .await?;
+        Ok(rates.remove(asset))
     }
-}
-
-/// A decimal Binance may leave out: absent is `None`, but present and unreadable is an error, so a
-/// malformed amount is not mistaken for an unreported one.
-fn optional_decimal(
-    field: &str,
-    value: Option<&str>,
-) -> Result<Option<Decimal>, UnindexedClientError> {
-    value
-        .map(|value| {
-            Decimal::from_str(value).map_err(|error| {
-                UnindexedClientError::Internal(format!(
-                    "decoding Binance response: {field} {value:?}: {error}"
-                ))
-            })
-        })
-        .transpose()
 }
 
 // ---------------------------------------------------------------------------
@@ -5752,23 +5812,19 @@ mod tests {
         let mut client = <BinanceMargin as ExecutionClient>::new(config);
         client.rest = margin_rest_at(server);
         client.rest_config = Arc::new(margin_rest_config_at(server));
-        client.rules = rules_at(server, mode);
+        client.spot_rest = Arc::new(binance_sdk::spot::SpotRestApi::from_config(
+            margin_rest_config_at(server),
+        ));
+        client.rules = rules_over(&client, mode);
         client
     }
 
-    /// Rules loaded from the spot `exchangeInfo` that `server` answers.
-    fn rules_at(server: &wiremock::MockServer, mode: PreSendRules) -> Arc<RulesLoader> {
+    /// Rules loaded from the spot `exchangeInfo` that `client`'s spot REST client reads.
+    fn rules_over(client: &BinanceMargin, mode: PreSendRules) -> Arc<RulesLoader> {
         Arc::new(RulesLoader::new(
             mode,
-            Arc::new(binance_sdk::spot::SpotRestApi::from_config(
-                ConfigurationRestApi::builder()
-                    .api_key("key")
-                    .api_secret("secret")
-                    .base_path(server.uri())
-                    .build()
-                    .unwrap(),
-            )),
-            Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+            client.spot_rest.clone(),
+            client.spot_rate_limiter.clone(),
         ))
     }
 
@@ -6574,7 +6630,7 @@ mod tests {
             .await;
         mount_order_accepted(&server, 1).await;
         let mut client = margin_client_at(&server, false);
-        client.rules = rules_at(&server, PreSendRules::Off);
+        client.rules = rules_over(&client, PreSendRules::Off);
         let btcusdt = InstrumentNameExchange::new("BTCUSDT");
         let mut request = margin_open_request(&btcusdt, "x");
         request.state.price = Some(dec!(100.001));
@@ -7873,5 +7929,222 @@ mod tests {
             "API: request rejected: BTCUSDT: -11001 Isolated margin account does not exist."
         );
         assert!(!err.is_transient());
+    }
+
+    const HOURLY_RATE_ROUTE: &str = "/sapi/v1/margin/next-hourly-interest-rate";
+
+    fn assets(names: &[&str]) -> Vec<AssetNameExchange> {
+        names
+            .iter()
+            .map(|name| AssetNameExchange::new(*name))
+            .collect()
+    }
+
+    /// The `assets` of each next-hourly-rate request `server` received, in order.
+    async fn hourly_rate_requests(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == HOURLY_RATE_ROUTE)
+            .filter_map(|request| {
+                request
+                    .url
+                    .query_pairs()
+                    .find(|(key, _)| key == "assets")
+                    .map(|(_, value)| value.into_owned())
+            })
+            .collect()
+    }
+
+    /// Answer each next-hourly-rate request with a rate of 0.0001 for every asset it names, or
+    /// with Binance's `-1102` when it names `refused`.
+    async fn mount_echoed_hourly_rates(
+        server: &wiremock::MockServer,
+        refused: Option<&'static str>,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::path(HOURLY_RATE_ROUTE))
+            .respond_with(move |request: &wiremock::Request| {
+                let requested = request
+                    .url
+                    .query_pairs()
+                    .find(|(key, _)| key == "assets")
+                    .map(|(_, value)| value.into_owned())
+                    .unwrap_or_default();
+                if refused.is_some_and(|refused| requested.split(',').any(|a| a == refused)) {
+                    return margin_venue_error(-1102);
+                }
+                let answer: Vec<_> = requested
+                    .split(',')
+                    .map(|asset| {
+                        serde_json::json!({"asset": asset, "nextHourlyInterestRate": "0.0001"})
+                    })
+                    .collect();
+                wiremock::ResponseTemplate::new(200).set_body_json(answer)
+            })
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn margin_hourly_rates_are_read_once_per_asset_for_the_clients_margin() {
+        use rust_decimal_macros::dec;
+        for (is_isolated, flag) in [(false, "FALSE"), (true, "TRUE")] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(HOURLY_RATE_ROUTE))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!([
+                        {"asset": "BTC", "nextHourlyInterestRate": "0.00000571"},
+                        {"asset": "ETH", "nextHourlyInterestRate": "0.0001"},
+                        {"asset": "USDT", "nextHourlyInterestRate": null},
+                        {"asset": "XRP", "nextHourlyInterestRate": "0.5"},
+                        {"nextHourlyInterestRate": "0.5"},
+                    ]),
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = margin_client_at(&server, is_isolated);
+
+            let rates = client
+                .fetch_next_hourly_interest_rates(&assets(&["BTC", "ETH", "BTC", "USDT", "SOL"]))
+                .await
+                .unwrap();
+            assert_eq!(
+                rates,
+                HashMap::from([
+                    (AssetNameExchange::new("BTC"), dec!(0.00000571)),
+                    (AssetNameExchange::new("ETH"), dec!(0.0001)),
+                ]),
+                "no rate, no answer, or an asset not asked for is absent"
+            );
+            assert_eq!(hourly_rate_requests(&server).await, ["BTC,ETH,USDT,SOL"]);
+            assert_eq!(
+                query_value(&server, HOURLY_RATE_ROUTE, "isIsolated")
+                    .await
+                    .as_deref(),
+                Some(flag)
+            );
+            assert!(
+                query_value(&server, HOURLY_RATE_ROUTE, "signature")
+                    .await
+                    .is_some(),
+                "signed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn margin_hourly_rates_past_twenty_assets_are_read_twenty_at_a_time() {
+        let server = wiremock::MockServer::start().await;
+        mount_echoed_hourly_rates(&server, None).await;
+        let client = margin_client_at(&server, false);
+        let names: Vec<String> = (0..45).map(|i| format!("A{i}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        let rates = client
+            .fetch_next_hourly_interest_rates(&assets(&names))
+            .await
+            .unwrap();
+        assert_eq!(rates.len(), 45);
+        assert_eq!(
+            hourly_rate_requests(&server).await,
+            [
+                names[..20].join(","),
+                names[20..40].join(","),
+                names[40..].join(",")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn margin_hourly_rates_fail_whole_when_one_request_fails() {
+        let server = wiremock::MockServer::start().await;
+        mount_echoed_hourly_rates(&server, Some("A20")).await;
+        let client = margin_client_at(&server, false);
+        let names: Vec<String> = (0..25).map(|i| format!("A{i}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        let read = client
+            .fetch_next_hourly_interest_rates(&assets(&names))
+            .await;
+        assert!(
+            matches!(
+                read,
+                Err(UnindexedClientError::Api(ApiError::RequestRejected(_)))
+            ),
+            "{read:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn margin_hourly_rates_refuse_an_unreadable_rate_and_send_nothing_for_no_assets() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path(HOURLY_RATE_ROUTE))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!([{"asset": "BTC", "nextHourlyInterestRate": "0.0.1"}]),
+            ))
+            .mount(&server)
+            .await;
+        let client = margin_client_at(&server, false);
+
+        let none = client.fetch_next_hourly_interest_rates(&[]).await.unwrap();
+        assert!(none.is_empty());
+        assert!(
+            hourly_rate_requests(&server).await.is_empty(),
+            "nothing sent"
+        );
+
+        match client
+            .fetch_next_hourly_interest_rates(&assets(&["BTC"]))
+            .await
+        {
+            Err(UnindexedClientError::Internal(message)) => {
+                assert!(
+                    message.contains("nextHourlyInterestRate \"0.0.1\""),
+                    "{message}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn margin_commission_rates_are_the_spot_accounts() {
+        use crate::client::binance::CommissionPart;
+        use rust_decimal_macros::dec;
+        let part = |rate: &str| serde_json::json!({"maker": rate, "taker": rate, "buyer": "0", "seller": "0"});
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/account/commission"))
+            .and(wiremock::matchers::query_param("symbol", "BTCUSDT"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "symbol": "BTCUSDT",
+                    "standardCommission": part("0.001"),
+                    "specialCommission": part("0"),
+                    "taxCommission": part("0"),
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = margin_client_at(&server, true);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+
+        let rates = client.fetch_commission_rates(&btcusdt).await.unwrap();
+        assert_eq!(
+            rates.standard,
+            CommissionPart::new(dec!(0.001), dec!(0.001), dec!(0), dec!(0))
+        );
+        assert_eq!(rates.discount, None);
+        assert!(
+            query_value(&server, "/api/v3/account/commission", "signature")
+                .await
+                .is_some(),
+            "signed"
+        );
     }
 }

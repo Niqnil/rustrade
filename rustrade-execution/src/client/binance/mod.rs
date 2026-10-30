@@ -143,11 +143,13 @@
 //! `EnvFilter::from_default_env().add_directive(..)`, gets this backwards: it silently overrides
 //! an explicit request.
 
+mod commission;
 mod margin;
 mod restatement;
 mod rules;
 mod shared;
 mod spot;
 
+pub use commission::{CommissionDiscount, CommissionPart, CommissionRates};
 pub use margin::{BinanceMargin, BinanceMarginConfig, MarginForcedLiquidation};
 pub use spot::{BinanceSpot, BinanceSpotConfig, BinanceSpotConfigError};
