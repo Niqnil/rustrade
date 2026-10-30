@@ -18,7 +18,7 @@ use rustrade_instrument::{
 pub trait CashFlowAttributionStrategy {
     /// State used to decide the attribution.
     ///
-    /// For Barter ecosystem strategies, this is the full `EngineState` of the trading system.
+    /// Typically the full `EngineState` of the trading system.
     ///
     /// eg/ `EngineState<DefaultGlobalData, DefaultInstrumentMarketData>`
     type State;
@@ -32,7 +32,9 @@ pub trait CashFlowAttributionStrategy {
     ///
     /// On `Some(instrument)`, the `Engine` sets the flow's `instrument` and the flow goes to that
     /// instrument's open position's carry, exactly as a flow the venue attributed would. Since the
-    /// audit records the attributed flow, a state replica applies it the same way.
+    /// audit records the attributed flow, a state replica applies it the same way. If that
+    /// instrument holds no open position, the flow keeps the instrument but changes no carry, as a
+    /// venue-attributed flow would.
     ///
     /// # Caller obligations
     /// Return an instrument that `state` tracks on `exchange`. The `Engine` ignores any other
@@ -93,11 +95,14 @@ pub fn route_to_base<GlobalData, InstrumentData>(
     exchange: ExchangeIndex,
     flow: &CashFlow<AssetIndex, InstrumentIndex>,
 ) -> Option<InstrumentIndex> {
-    let filter = InstrumentFilter::exchanges([exchange]);
-    let mut held = state.instruments.instruments(&filter).filter(|instrument| {
-        instrument.instrument.underlying.base == flow.asset
-            && !instrument.position.positions.is_empty()
-    });
+    let mut held = state
+        .instruments
+        .instruments(&InstrumentFilter::None)
+        .filter(|instrument| {
+            instrument.instrument.exchange == exchange
+                && instrument.instrument.underlying.base == flow.asset
+                && !instrument.position.positions.is_empty()
+        });
     match (held.next(), held.next()) {
         (Some(only), None) => Some(only.key),
         _ => None,

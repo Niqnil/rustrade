@@ -281,6 +281,28 @@ fn an_answer_naming_no_tracked_instrument_is_ignored() {
 }
 
 #[test]
+fn an_answer_naming_an_instrument_holding_no_position_names_it_but_changes_no_carry() {
+    let mut engine = engine(&[], Some(BTC_USDT));
+    let btc = base(&engine.state, BTC_USDT);
+
+    let audit = engine.process(account(
+        BINANCE,
+        AccountEventKind::CashFlow(flow(btc, dec!(-0.0001), None)),
+    ));
+
+    assert_eq!(audited_instrument(&audit), Some(BTC_USDT));
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&BTC_USDT)
+            .position
+            .positions
+            .is_empty()
+    );
+}
+
+#[test]
 fn a_replica_fed_the_audit_applies_the_attributed_flow_as_the_engine_did() {
     let mut engine = engine(&[BTC_USDT], Some(BTC_USDT));
     let btc = base(&engine.state, BTC_USDT);
