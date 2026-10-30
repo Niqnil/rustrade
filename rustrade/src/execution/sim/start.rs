@@ -898,6 +898,16 @@ mod tests {
                 positions: dec!(-1),
             }
         );
+        // 1 held and 1 owed is flat, not the short.
+        assert_eq!(
+            resolve(StartBalance::new(asset("btc"), dec!(1)).with_loan(dec!(1), dec!(0)))
+                .unwrap_err(),
+            SimStartError::BaseBalanceConflict {
+                asset: asset("btc"),
+                listed: dec!(0),
+                positions: dec!(-1),
+            }
+        );
     }
 
     #[test]
@@ -996,14 +1006,14 @@ mod tests {
             ),
             unpriced("btc")
         );
-        // Interest alone is a debt.
+        // Interest alone is a debt. BTC quoted in ETH prices ETH in BTC, not in USDT.
         assert_eq!(
             refused(
                 vec![
                     usdt(dec!(1000)),
                     StartBalance::new(asset("eth"), dec!(0)).with_loan(dec!(0), dec!(1)),
                 ],
-                vec![],
+                vec![seed("binance_spot-btc_eth", Side::Buy, dec!(1), dec!(15))],
             ),
             unpriced("eth")
         );
