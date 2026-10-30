@@ -59,8 +59,9 @@ use thiserror::Error;
 ///   `(max_leverage − 1) × equity`, valued in the configuration's valuation asset. No market
 ///   exists yet, so the start is valued at its own prices: the valuation asset at one, and an asset
 ///   a spot position pairs with the valuation asset, in either direction, at that position's
-///   entry price. An asset with no such price adds nothing to equity, as the venue values an
-///   asset it has no market for, and a debt in one is refused, since it could be any size.
+///   entry price, if positive. An asset with no such price adds nothing to equity, as the venue
+///   values an asset it has no market for, and a debt in one is refused, since it could be any
+///   size.
 ///
 ///   The check stops there. Once markets arrive, the venue values the account at them, and lends
 ///   nothing more while the account is over its limit. It does not liquidate.
@@ -965,23 +966,39 @@ mod tests {
             ),
             over_leveraged(dec!(33000), dec!(7000), dec!(4), &[])
         );
+
+        // Leverage 1 lends nothing, however large the equity.
+        assert_eq!(
+            refused(vec![usdt(dec!(1000000))], dec!(1)),
+            over_leveraged(dec!(30000), dec!(970000), dec!(1), &[])
+        );
+        assert!(
+            SimStart::new(vec![usdt(dec!(1000))], vec![])
+                .resolve(EXCHANGE, &venue_instruments(), Some(&lends(dec!(1))))
+                .is_ok(),
+            "owing nothing is within any limit"
+        );
     }
 
     #[test]
     fn an_asset_the_start_gives_no_price_for_adds_nothing_to_equity_and_is_named() {
         let resolve = |quote| {
             SimStart::new(
-                vec![usdt(quote), StartBalance::new(asset("eth"), dec!(10))],
+                vec![
+                    usdt(quote),
+                    StartBalance::new(asset("spx500"), dec!(1)),
+                    StartBalance::new(asset("eth"), dec!(10)),
+                ],
                 vec![short_btc(dec!(1))],
             )
             .resolve(EXCHANGE, &venue_instruments(), Some(&lends(dec!(4))))
         };
 
-        // At the limit without the ETH, so holding it refuses nothing.
+        // At the limit without the ETH and SPX500, so holding them refuses nothing.
         assert!(resolve(dec!(40000)).is_ok());
         assert_eq!(
             resolve(dec!(39000)).unwrap_err(),
-            over_leveraged(dec!(30000), dec!(9000), dec!(4), &["eth"])
+            over_leveraged(dec!(30000), dec!(9000), dec!(4), &["eth", "spx500"])
         );
     }
 

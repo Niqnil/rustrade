@@ -1166,25 +1166,24 @@ fn a_start_holding_a_cfd_closes_against_its_entry_and_pays_back_its_margin() {
     assert_eq!(balance(&s.engine, "usdt"), dec!(5100));
 }
 
-#[test]
-fn a_start_short_on_a_venue_that_lends_owes_its_base_and_pays_interest_from_the_next_boundary() {
-    let config = MockExecutionConfig {
+/// A venue lending spot margin up to `max_leverage`, valued in USDT.
+fn lending(max_leverage: Decimal) -> MockExecutionConfig {
+    MockExecutionConfig {
         spot_margin: Some(
             SpotMarginConfig::new(
                 AssetNameExchange::new("usdt"),
-                dec!(4),
+                max_leverage,
                 MarginEffect::Borrow,
             )
             .unwrap(),
         ),
         ..config(0)
-    };
-    // 87.6% a year on BTC loans, exactly 0.01% an hour.
-    let interest = PeriodicMarginInterest::new(TimeDelta::hours(1), DayCount::Act365).with_rates(
-        AssetNameExchange::new("btc"),
-        RateSeries::constant(dec!(0.876)),
-    );
-    let start = SimStart::new(
+    }
+}
+
+/// Short 1 BTC at 30000, with 40000 USDT: 10000 of equity owing 30000.
+fn short_one_btc() -> SimStart {
+    SimStart::new(
         vec![StartBalance::new(
             AssetNameExchange::new("usdt"),
             dec!(40000),
@@ -1196,11 +1195,20 @@ fn a_start_short_on_a_venue_that_lends_owes_its_base_and_pays_interest_from_the_
             dec!(30000),
             at(0),
         )],
+    )
+}
+
+#[test]
+fn a_start_short_on_a_venue_that_lends_owes_its_base_and_pays_interest_from_the_next_boundary() {
+    // 87.6% a year on BTC loans, exactly 0.01% an hour.
+    let interest = PeriodicMarginInterest::new(TimeDelta::hours(1), DayCount::Act365).with_rates(
+        AssetNameExchange::new("btc"),
+        RateSeries::constant(dec!(0.876)),
     );
     let mut s = session_modelling(
-        config,
+        lending(dec!(4)),
         SimVenueOptions::default().with_margin_interest(Arc::new(interest)),
-        start,
+        short_one_btc(),
         None,
         DefaultStrategy::default(),
     );
@@ -1235,6 +1243,36 @@ fn a_start_short_on_a_venue_that_lends_owes_its_base_and_pays_interest_from_the_
     assert_eq!(
         loan(&s.engine, "btc"),
         Some(MarginDetails::new(dec!(1), dec!(0.0001)))
+    );
+}
+
+#[test]
+fn a_start_at_the_venues_lending_limit_is_lent_nothing_more() {
+    let loan_after_selling_more = |max_leverage| {
+        let mut s = session_modelling(
+            lending(max_leverage),
+            SimVenueOptions::default(),
+            short_one_btc(),
+            None,
+            DefaultStrategy::default(),
+        );
+        s.stepper
+            .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(30000))])
+            .unwrap();
+        s.engine.action(&order(BTC, Side::Sell, dec!(0.1), "more"));
+        s.stepper.settle(&mut s.engine).unwrap();
+        loan(&s.engine, "btc")
+    };
+
+    // At leverage 4 the start's 30000 of debt is exactly 3 × its 10000 of equity, the most the
+    // start accepts and the most the venue lends.
+    assert_eq!(
+        loan_after_selling_more(dec!(4)),
+        Some(MarginDetails::new(dec!(1), dec!(0)))
+    );
+    assert_eq!(
+        loan_after_selling_more(dec!(5)),
+        Some(MarginDetails::new(dec!(1.1), dec!(0)))
     );
 }
 
