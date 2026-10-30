@@ -82,6 +82,8 @@ pub(super) struct CompletedOrder {
     data: OrderData,
     /// When IB says it completed, or `None` when that does not parse.
     time: Option<DateTime<Utc>>,
+    /// The gateway's zone, in which a time the order's listing gives without one is read.
+    session_zone: Option<Tz>,
 }
 
 /// The account's completed orders that may be this API client's, by the client order id their
@@ -104,8 +106,8 @@ impl CompletedOrders {
         orders
     }
 
-    /// Take in one item of the listing, as IB sends it. A completion time that names no zone is
-    /// read in `session_zone`, the gateway's.
+    /// Take in one item of the listing, as IB sends it. A completion time or good-till-date that
+    /// names no zone is read in `session_zone`, the gateway's.
     pub(super) fn push(&mut self, item: Orders, api_client_id: i32, session_zone: Option<Tz>) {
         let Orders::OrderData(data) = item else {
             return;
@@ -117,6 +119,7 @@ impl CompletedOrders {
         let order = CompletedOrder {
             time: execution::parse_ib_timestamp(&data.order_state.completed_time, session_zone),
             data,
+            session_zone,
         };
         match self.0.get(order.data.order.order_ref.as_str()) {
             // Listed in completion order, so a later one with no time is taken as later.
@@ -294,7 +297,7 @@ pub(super) fn ended_order<E>(
     }
     let context = match tracked {
         Some(tracked) => tracked.context.clone(),
-        None => match order::order_shape_from_ib(&data.order) {
+        None => match order::order_shape_from_ib(&data.order, completed.session_zone) {
             Ok(shape) => {
                 // IB lists a filled order with a total quantity of zero.
                 let quantity = if data.order.total_quantity > 0.0 {
@@ -779,6 +782,44 @@ mod tests {
 
     /// An adopted order's placement is unknown, so finding none of its executions says nothing
     /// of its fill.
+    /// An ended order this client does not track, whose good-till-date names no zone, has it read
+    /// in the session's zone, as its completion time is.
+    #[test]
+    fn an_untracked_orders_good_till_date_without_a_zone_is_read_in_the_sessions() {
+        use chrono::TimeZone as _;
+        let Orders::OrderData(mut data) = completed(
+            API_CLIENT,
+            "a",
+            OrderStatusKind::Cancelled,
+            "20261009 17:00:00",
+            "",
+        ) else {
+            unreachable!()
+        };
+        data.order.tif = ibapi::orders::TimeInForce::GoodTillDate;
+        data.order.good_till_date = "20261009 16:00:00".to_owned();
+        let mut orders = CompletedOrders::default();
+        orders.push(
+            Orders::OrderData(data),
+            API_CLIENT,
+            Some(chrono_tz::Asia::Singapore),
+        );
+        let order = orders.0.into_values().next().unwrap();
+
+        let found = ended(
+            ended_order(&key("a"), &order, None, &EarlierCompletions::new(), || {
+                Ok::<_, ()>(None)
+            })
+            .unwrap(),
+        );
+        assert_eq!(
+            found.time_in_force,
+            TimeInForce::GoodTillDate {
+                expiry: Utc.with_ymd_and_hms(2026, 10, 9, 8, 0, 0).unwrap()
+            }
+        );
+    }
+
     #[test]
     fn an_adopted_orders_fill_without_executions_is_unknown() {
         let order = one(completed(
