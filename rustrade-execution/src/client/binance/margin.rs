@@ -5820,7 +5820,6 @@ mod tests {
         assert_eq!(filled.avg_price, None, "no negative average price");
     }
 
-    /// A REST config whose requests go to `server`.
     /// `new` keeps the client's signing clock read from Binance's server time on both of its
     /// trackers, unless `server_time_sync` is off; `host_clock_lead` reports the reads.
     #[tokio::test(start_paused = true)]
@@ -5855,6 +5854,7 @@ mod tests {
         );
     }
 
+    /// A REST config whose requests go to `server`.
     fn margin_rest_config_at(server: &wiremock::MockServer) -> ConfigurationRestApi {
         ConfigurationRestApi::builder()
             .api_key("key")

@@ -124,9 +124,14 @@
 //!   logged at `warn`, and requests are stamped with this host's clock until a read succeeds.
 //! - **Refresh.** A request that finds the last read 5 minutes old starts another in the
 //!   background, and is sent without waiting for it.
-//! - **`-1021`.** The client drops its reading and reads again before it returns the error, so a
-//!   retry is stamped on the new reading. The error is unchanged: a transient connectivity error
-//!   for a query, a rejection for an order. Whether to retry stays the caller's decision.
+//! - **Suspend.** The monotonic clock does not advance while the host is suspended. A request
+//!   that finds this host's wall clock gone more than 1 s further than it since the last read
+//!   waits for a new read.
+//! - **`-1021`.** The client reads again before it returns the error, and the answer replaces its
+//!   reading, so a retry is stamped on the new one. Until the answer arrives, or if the read
+//!   fails, the reading held stays. No read is made during a rate-limit cooldown. The error is
+//!   unchanged: a transient connectivity error for a query, a rejection for an order. Whether to
+//!   retry stays the caller's decision.
 //! - **Observing it.** `host_clock_lead` on each client reports how far this host's clock leads
 //!   Binance's, negative when it trails. A read that finds the clocks 1 s or more apart logs at
 //!   `warn`.

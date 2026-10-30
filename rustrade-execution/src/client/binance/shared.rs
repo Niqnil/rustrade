@@ -18,6 +18,7 @@
 //! Event deduplication lives in [`crate::client::dedup`], shared with the other clients that
 //! need it, and is re-exported here so Binance call sites keep a single import site.
 
+use super::server_time::{ServerTime, SigningClock};
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
     error::{
@@ -40,7 +41,6 @@ use crate::{
 
 // Deduplication moved to `client::dedup` when Hyperliquid needed the same machinery; re-exported
 // here so the spot and margin call sites keep naming one module.
-use super::server_time::{ServerTime, SigningClock};
 pub(crate) use crate::client::dedup::{
     SharedDedupCache, dedup_key_from_event, is_duplicate, new_dedup_cache,
 };
@@ -941,12 +941,14 @@ impl RateLimitTracker {
         self.server_time.as_ref().and_then(ServerTime::host_lead)
     }
 
-    /// After a request failed with `e`: when Binance refused its timestamp (`-1021`), drop the
-    /// signing clock's estimate and wait for a fresh server-time read, so that a retry is stamped
-    /// on the clock as read again. Nothing for any other failure, or without server-time sync.
+    /// After a request failed with `e`: when Binance refused its timestamp (`-1021`), wait for a
+    /// fresh server-time read to replace the signing clock's estimate, so that a retry is stamped
+    /// on the clock as read again. Nothing for any other failure, during a rate-limit cooldown,
+    /// when the read would be refused too, or without server-time sync.
     pub(crate) async fn after_failure(&self, e: &anyhow::Error) {
         if let Some(server_time) = &self.server_time
             && is_timestamp_rejection(e)
+            && self.cooldown_remaining().is_none()
         {
             server_time.after_rejection().await;
         }

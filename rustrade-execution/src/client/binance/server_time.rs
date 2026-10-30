@@ -7,9 +7,11 @@
 //! clock, and behind it by about the time the answer took to arrive.
 //!
 //! The estimate counts on from its sample on tokio's monotonic clock, so a step of this host's
-//! wall clock between reads does not move the stamps.
+//! wall clock between reads does not move the stamps. That clock does not advance while the host
+//! is suspended, which would leave the stamps behind by the time it was; a request that finds the
+//! wall clock gone further than the monotonic one since the last read waits for a new read first.
 
-use crate::client::venue_clock::VenueClock;
+use crate::client::venue_clock::{HostMoment, VenueClock};
 use binance_sdk::{common::config::TimestampProvider, spot::rest_api::RestApi};
 use chrono::{DateTime, TimeDelta, Utc};
 use futures::future::BoxFuture;
@@ -36,6 +38,11 @@ pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// How far this host's clock may lead or trail Binance's before a read warns: Binance refuses a
 /// request stamped this far ahead of its clock.
 const LEAD_WARN: TimeDelta = TimeDelta::seconds(1);
+
+/// How much further this host's wall clock may have gone than its monotonic clock since the last
+/// read before a request waits for a new one: a suspend of the host, or a forward step of its wall
+/// clock. Each leaves the monotonic estimate behind Binance's clock by the difference.
+const PAUSE_ALLOWANCE: TimeDelta = TimeDelta::seconds(1);
 
 /// Serde default for each Binance config's `server_time_sync`: on.
 pub(crate) const fn default_server_time_sync() -> bool {
@@ -73,7 +80,7 @@ pub(crate) struct SigningClock {
 struct Estimate {
     clock: VenueClock,
     /// When the last read finished, whether or not it succeeded.
-    read_at: Option<Instant>,
+    last_read: Option<HostMoment>,
 }
 
 impl SigningClock {
@@ -117,8 +124,15 @@ impl SigningClock {
 /// - **Refresh.** A request that finds the last read [`RESYNC_AFTER`] old or older starts one
 ///   read in the background, and is sent without waiting for it. A read whose answer took longer
 ///   than the one held does not replace it (see [`VenueClock::observe`]).
-/// - **`-1021`.** [`after_rejection`](Self::after_rejection) drops the estimate and waits for a
-///   new read, as the estimate itself may be what Binance refused.
+/// - **Suspend.** A request that finds this host's wall clock gone more than [`PAUSE_ALLOWANCE`]
+///   further than its monotonic clock since the last read waits for a new read.
+/// - **`-1021`.** [`after_rejection`](Self::after_rejection) waits for a new read, whose answer
+///   replaces the estimate rather than adding to it, as the estimate itself may be what Binance
+///   refused. Until the answer arrives, and if the read fails, the estimate held stays.
+///
+/// The reads go through no rate-limit wait of their own: each is started by a request that has
+/// passed its own, and weighs 1. Their weight is not counted, and a refusal of one starts no
+/// cooldown.
 #[derive(Clone)]
 pub(crate) struct ServerTime {
     inner: Arc<Inner>,
@@ -146,21 +160,37 @@ impl ServerTime {
         }
     }
 
-    /// Called before each request: waits for the first read, and starts a background read when
-    /// the last one is [`RESYNC_AFTER`] old.
+    /// Called before each request: waits for the first read, or for a new one after a suspend
+    /// (see the type's docs), and starts a background read when the last one is [`RESYNC_AFTER`]
+    /// old.
     pub(crate) async fn ready(&self) {
-        let asked = Instant::now();
-        let Some(read_at) = self.read_at() else {
-            self.read_unless_read_since(asked, false).await;
+        self.ready_at(HostMoment::now()).await;
+    }
+
+    async fn ready_at(&self, asked: HostMoment) {
+        let Some(last) = self.last_read() else {
+            self.read_unless_read_since(asked.instant, false).await;
             return;
         };
-        if asked.saturating_duration_since(read_at) >= RESYNC_AFTER {
+        let monotonic = asked.instant.saturating_duration_since(last.instant);
+        let wall = asked.time.signed_duration_since(last.time);
+        let paused =
+            TimeDelta::from_std(monotonic).map_or(TimeDelta::zero(), |monotonic| wall - monotonic);
+        if paused > PAUSE_ALLOWANCE {
+            debug!(
+                paused_ms = paused.num_milliseconds(),
+                "This host's wall clock has gone further than its monotonic clock since the last \
+                 Binance server time read; reading it again before the request"
+            );
+            self.read_unless_read_since(asked.instant, false).await;
+        } else if monotonic >= RESYNC_AFTER {
             self.refresh_in_background();
         }
     }
 
-    /// Drops the estimate and reads Binance's server time afresh, after Binance refused a
-    /// request's timestamp (`-1021`). Returns once the read has finished or failed.
+    /// Reads Binance's server time afresh, replacing the estimate with the answer, after Binance
+    /// refused a request's timestamp (`-1021`). Returns once the read has finished or failed.
+    /// Dropped before then, it leaves the estimate as it was.
     ///
     /// A read that finished after this was called serves it, so concurrent refusals share one.
     pub(crate) async fn after_rejection(&self) {
@@ -184,21 +214,18 @@ impl ServerTime {
         &self.inner.clock
     }
 
-    fn read_at(&self) -> Option<Instant> {
-        self.inner.clock.estimate.lock().read_at
+    fn last_read(&self) -> Option<HostMoment> {
+        self.inner.clock.estimate.lock().last_read
     }
 
     /// Reads, unless a read finished at or after `since` while this waited for the one before.
-    /// With `replace`, the estimate held is dropped first.
+    /// With `replace`, a successful answer replaces the estimate held.
     async fn read_unless_read_since(&self, since: Instant, replace: bool) {
         let _reading = self.inner.reading.lock().await;
-        if self.read_at().is_some_and(|read_at| read_at >= since) {
+        if self.last_read().is_some_and(|last| last.instant >= since) {
             return;
         }
-        if replace {
-            self.inner.clock.estimate.lock().clock = VenueClock::new();
-        }
-        self.read().await;
+        self.read(replace).await;
     }
 
     /// Starts a read in the background, unless one is already in flight.
@@ -215,14 +242,16 @@ impl ServerTime {
         });
     }
 
-    /// One read, recorded in the estimate. The caller holds `reading`.
-    async fn read(&self) {
+    /// One read, recorded in the estimate, whose answer replaces the estimate held with
+    /// `replace`. The caller holds `reading`.
+    async fn read(&self, replace: bool) {
         let sent = Instant::now();
         let result = tokio::time::timeout(READ_TIMEOUT, (self.inner.read)()).await;
-        let received = Instant::now();
-        let round_trip = received.saturating_duration_since(sent);
+        let received = HostMoment::now();
+        let round_trip = received.instant.saturating_duration_since(sent);
         let mut estimate = self.inner.clock.estimate.lock();
-        estimate.read_at = Some(received);
+        estimate.last_read = Some(received);
+        let received = received.instant;
         let millis = match result {
             Ok(Ok(millis)) => millis,
             Ok(Err(error)) => {
@@ -255,6 +284,9 @@ impl ServerTime {
             warn!(millis, "Binance server time is out of range; ignored");
             return;
         };
+        if replace {
+            estimate.clock = VenueClock::new();
+        }
         // Stamped before the answer arrived, so a bound on Binance's clock at its arrival.
         estimate.clock.observe(server_time, received);
         let lead = estimate.clock.host_lead(Utc::now(), received);
@@ -347,6 +379,7 @@ mod tests {
     fn the_resync_interval_and_warning_threshold_are_as_documented() {
         assert_eq!(RESYNC_AFTER, Duration::from_secs(300));
         assert_eq!(LEAD_WARN, TimeDelta::seconds(1));
+        assert_eq!(PAUSE_ALLOWANCE, TimeDelta::seconds(1));
     }
 
     #[tokio::test(start_paused = true)]
@@ -469,6 +502,68 @@ mod tests {
         assert_eq!(clock.stamp_ms(), u64::try_from(SERVER_MS - 60_000).unwrap());
     }
 
+    /// A rejection whose read is dropped before its answer, or fails, leaves the estimate held:
+    /// it is replaced only by an answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_rejection_keeps_the_estimate_until_a_new_answer_replaces_it() {
+        let clock = SigningClock::default();
+        let answers = Arc::new(parking_lot::Mutex::new(vec![
+            Err(anyhow::anyhow!("unreachable")),
+            Ok(SERVER_MS + 60_000),
+            Ok(SERVER_MS),
+        ]));
+        let read: ReadServerTime = Arc::new(move || {
+            let answer = answers.lock().pop().unwrap();
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                answer
+            })
+        });
+        let server_time = ServerTime::new(clock.clone(), read);
+        server_time.ready().await;
+        let held = clock.stamp_ms();
+
+        // Dropped mid-read: the read's answer, a minute ahead, never arrives.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let dropped =
+            tokio::time::timeout(Duration::from_millis(10), server_time.after_rejection()).await;
+        assert!(dropped.is_err());
+        // 11 ms on, less the drift allowance, in whole milliseconds.
+        assert_eq!(clock.stamp_ms(), held + 10);
+
+        // A read that fails.
+        let reads_before = server_time.last_read();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        server_time.after_rejection().await;
+        assert_ne!(server_time.last_read(), reads_before);
+        assert_eq!(clock.stamp_ms(), held + 51);
+    }
+
+    /// The monotonic clock stops while the host is suspended: a request that finds the wall clock
+    /// gone more than a second further since the last read waits for a new one.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_after_a_suspend_waits_for_a_new_read() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (_, server_time) = source(Instant::now(), Duration::ZERO, Arc::clone(&reads));
+        server_time.ready().await;
+        let last = server_time.last_read().unwrap();
+        let after = |wall_ms: i64| {
+            HostMoment::new(
+                last.time + TimeDelta::milliseconds(wall_ms),
+                last.instant + Duration::from_secs(1),
+            )
+        };
+
+        // 1 s on the monotonic clock, and 2 s on the wall clock: within the allowance.
+        server_time.ready_at(after(2_000)).await;
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+
+        // A suspend of a minute.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        server_time.ready_at(after(61_000)).await;
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn concurrent_rejections_share_one_read() {
         let reads = Arc::new(AtomicUsize::new(0));
@@ -504,7 +599,7 @@ mod tests {
         // Counted on from the held sample through the 5 s timeout: 305 s less 30.5 ms of drift
         // allowance, in whole milliseconds.
         assert_eq!(clock.stamp_ms(), held + 305_000 - 31);
-        assert!(slow.read_at().is_some());
+        assert!(slow.last_read().is_some());
     }
 
     #[tokio::test(start_paused = true)]

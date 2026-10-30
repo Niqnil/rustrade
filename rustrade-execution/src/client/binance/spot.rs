@@ -5947,6 +5947,67 @@ mod tests {
         assert_eq!(requests.load(Ordering::SeqCst), 1);
     }
 
+    /// A WS-API answer refusing any request's timestamp (`-1021`).
+    fn refused_timestamp(request: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": request["id"],
+            "status": 400,
+            "error": {
+                "code": -1021,
+                "msg": "Timestamp for this request was 1000ms ahead of the server's time.",
+            },
+        })
+    }
+
+    /// An order or cancel the WS API refuses with `-1021` reads Binance's server time again before
+    /// its answer returns, so a retry is stamped on the new reading.
+    #[tokio::test]
+    async fn a_ws_api_refused_timestamp_reads_the_server_time_again() {
+        let (url, _) = ws_api_answering(refused_timestamp).await;
+        let mut client = client_with_ws_api(url);
+        let reads = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let read: crate::client::binance::server_time::ReadServerTime = {
+            let reads = Arc::clone(&reads);
+            Arc::new(move || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(i64::try_from(unix_ms()).unwrap()) })
+            })
+        };
+        client.rate_limiter = Arc::new(
+            RateLimitTracker::new(WeightPool::Spot)
+                .with_server_time(Some(ServerTime::new(SigningClock::default(), read))),
+        );
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        let open = crate::order::OrderEvent {
+            key: OrderKey {
+                exchange: ExchangeId::BinanceSpot,
+                instrument: &instrument,
+                strategy: StrategyId::new("strategy"),
+                cid: ClientOrderId::new("cid"),
+            },
+            state: crate::order::request::RequestOpen::new(
+                Side::Buy,
+                Some(Decimal::new(50_000, 0)),
+                Decimal::new(1, 3),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilCancelled { post_only: false },
+            ),
+        };
+
+        let order = client.open_order(open).await;
+        assert!(
+            matches!(order.state, OrderState::Inactive(_)),
+            "{:?}",
+            order.state
+        );
+        // The first request's read, and the read after the refusal.
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+
+        let cancel = client.cancel_order(cancel_request(&instrument)).await;
+        assert!(cancel.state.is_err(), "{:?}", cancel.state);
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+    }
+
     /// A WS-API success whose result has no `orderId`.
     fn answered_without_an_order_id(request: &serde_json::Value) -> serde_json::Value {
         serde_json::json!({

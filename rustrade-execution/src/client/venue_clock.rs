@@ -117,7 +117,7 @@ impl VenueClock {
 
     /// Records the sample `other` holds, as [`observe`](Self::observe) would, so that this clock
     /// learns from another source of the same venue's times, such as a read of its server time.
-    pub fn merge(&mut self, other: &VenueClock) {
+    pub(crate) fn merge(&mut self, other: &VenueClock) {
         if let Some(Sample { stamp, received }) = other.sample {
             self.observe(stamp, received);
         }

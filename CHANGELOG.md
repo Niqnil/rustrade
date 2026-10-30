@@ -79,16 +79,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   move the stamps.
   - The first request waits for one read. A failed read is logged at `warn`, and requests are
     stamped with this host's clock until one succeeds. A request that finds the last read 5
-    minutes old starts another in the background.
-  - A `-1021` drops the reading and reads again before the error returns, so the caller's retry
-    is stamped on the new reading. The error itself is unchanged.
+    minutes old starts another in the background, and one that finds the wall clock gone more
+    than 1 s further than the monotonic clock since then, as after a suspend, waits for one.
+  - A `-1021` reads again before the error returns, and the answer replaces the reading, so the
+    caller's retry is stamped on the new one. The error itself is unchanged.
   - `BinanceSpot::host_clock_lead` and `BinanceMargin::host_clock_lead` report how far this host's
     clock leads Binance's. A read that finds them 1 s or more apart logs at `warn`.
   - The account streams also take the reads as a bound on Binance's clock, so fill recovery and
     balance restatement are placed on Binance's time before a stream's first event too.
   - `server_time_sync` on `BinanceSpotConfig` and `BinanceMarginConfig` (`true` by default, also
     `with_server_time_sync`) turns it off.
-  - New `VenueClock::merge` takes another clock's sample of the same venue.
 
 - **A Binance account's commission rates** (`rustrade-execution`, #789).
   `BinanceSpot::fetch_commission_rates` and `BinanceMargin::fetch_commission_rates` read
