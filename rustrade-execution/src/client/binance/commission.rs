@@ -71,7 +71,7 @@ pub struct CommissionDiscount {
     /// Whether the symbol allows paying in [`asset`](Self::asset).
     pub enabled_for_symbol: bool,
     /// The asset a discounted commission is paid in. `None` when Binance names none, as Spot
-    /// Testnet does.
+    /// Testnet does for an account not charged commissions there.
     pub asset: Option<AssetNameExchange>,
     /// What the standard part is multiplied by when paid in [`asset`](Self::asset): 0.75 charges
     /// 75% of it. Binance's `discount`, which is this multiplier, not the share taken off.
@@ -382,7 +382,7 @@ mod tests {
         let rates = commission_rates(&btcusdt(), answer(body)).unwrap();
         assert_eq!(rates.discount, None);
 
-        // Spot Testnet's answer: every rate zero and no discount asset.
+        // Spot Testnet's answer for an account not charged commissions there: no discount asset.
         let mut body = documented();
         body["discount"]["discountAsset"] = serde_json::Value::Null;
         let rates = commission_rates(&btcusdt(), answer(body)).unwrap();

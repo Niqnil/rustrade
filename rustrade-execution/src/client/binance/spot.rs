@@ -431,7 +431,8 @@ impl BinanceSpot {
     /// The account's commission rates on `instrument`: `GET /api/v3/account/commission`, at 20
     /// of Binance's per-IP request weight. [`CommissionRates`] says how Binance combines them.
     ///
-    /// Spot Testnet reports every rate as zero.
+    /// Spot Testnet reports every rate as zero, and no discount asset, unless the account has
+    /// chosen to be charged commissions there.
     ///
     /// # Errors
     ///
