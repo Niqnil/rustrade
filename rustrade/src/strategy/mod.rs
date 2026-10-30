@@ -8,14 +8,18 @@ use crate::{
     },
     strategy::{
         algo::AlgoStrategy,
+        cash_flow_attribution::CashFlowAttributionStrategy,
         close_positions::{ClosePositionsStrategy, close_open_positions_with_market_orders},
         on_disconnect::OnDisconnectStrategy,
         on_trading_disabled::OnTradingDisabled,
     },
 };
-use rustrade_execution::order::{
-    id::{ClientOrderId, StrategyId},
-    request::{OrderRequestCancel, OrderRequestOpen},
+use rustrade_execution::{
+    cash_flow::CashFlow,
+    order::{
+        id::{ClientOrderId, StrategyId},
+        request::{OrderRequestCancel, OrderRequestOpen},
+    },
 };
 use rustrade_instrument::{
     asset::AssetIndex,
@@ -27,6 +31,10 @@ use std::marker::PhantomData;
 /// Defines a strategy interface for generating algorithmic open and cancel order requests based
 /// on the current `EngineState`.
 pub mod algo;
+
+/// Defines a strategy interface for attributing a cash flow on the account as a whole to a
+/// position.
+pub mod cash_flow_attribution;
 
 /// Defines a strategy interface for generating open and cancel order requests that close open
 /// positions.
@@ -48,7 +56,9 @@ pub mod on_trading_disabled;
 /// - Generates no algorithmic orders (AlgoStrategy).
 /// - Closes positions via the naive [`close_open_positions_with_market_orders`] logic (ClosePositionsStrategy).
 /// - Does nothing when an exchange disconnects (OnDisconnectStrategy).
-/// - Does nothing when trading state is set to disabled (OnDisconnectStrategy).
+/// - Does nothing when trading state is set to disabled (OnTradingDisabled).
+/// - Leaves every cash flow on the account as a whole on the account
+///   (CashFlowAttributionStrategy).
 #[derive(Debug, Clone)]
 pub struct DefaultStrategy<State> {
     pub id: StrategyId,
@@ -126,5 +136,18 @@ impl<Clock, State, ExecutionTxs, Risk> OnTradingDisabled<Clock, State, Execution
     fn on_trading_disabled(
         _: &mut Engine<Clock, State, ExecutionTxs, Self, Risk>,
     ) -> Self::OnTradingDisabled {
+    }
+}
+
+impl<State> CashFlowAttributionStrategy for DefaultStrategy<State> {
+    type State = State;
+
+    fn attribute_cash_flow(
+        &mut self,
+        _: &Self::State,
+        _: ExchangeIndex,
+        _: &CashFlow<AssetIndex, InstrumentIndex>,
+    ) -> Option<InstrumentIndex> {
+        None
     }
 }

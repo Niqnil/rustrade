@@ -33,8 +33,9 @@ use crate::{
     shutdown::{Shutdown, SyncShutdown},
     statistic::summary::TradingSummaryGenerator,
     strategy::{
-        algo::AlgoStrategy, close_positions::ClosePositionsStrategy,
-        on_disconnect::OnDisconnectStrategy, on_trading_disabled::OnTradingDisabled,
+        algo::AlgoStrategy, cash_flow_attribution::CashFlowAttributionStrategy,
+        close_positions::ClosePositionsStrategy, on_disconnect::OnDisconnectStrategy,
+        on_trading_disabled::OnTradingDisabled,
     },
 };
 use chrono::{DateTime, Utc};
@@ -61,7 +62,7 @@ use rustrade_integration::collection::FnvIndexMap;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::fmt::Debug;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Defines how the [`Engine`] actions a [`Command`], and the associated outputs.
 pub mod action;
@@ -178,7 +179,8 @@ where
     Strategy: OnTradingDisabled<Clock, EngineState<GlobalData, InstrumentData>, ExecutionTxs, Risk>
         + OnDisconnectStrategy<Clock, EngineState<GlobalData, InstrumentData>, ExecutionTxs, Risk>
         + AlgoStrategy<State = EngineState<GlobalData, InstrumentData>>
-        + ClosePositionsStrategy<State = EngineState<GlobalData, InstrumentData>>,
+        + ClosePositionsStrategy<State = EngineState<GlobalData, InstrumentData>>
+        + CashFlowAttributionStrategy<State = EngineState<GlobalData, InstrumentData>>,
     Risk: RiskManager<State = EngineState<GlobalData, InstrumentData>>,
 {
     type Audit = EngineAudit<
@@ -186,8 +188,14 @@ where
         EngineOutput<Strategy::OnTradingDisabled, Strategy::OnDisconnect>,
     >;
 
-    fn process(&mut self, event: EngineEvent<InstrumentData::MarketEventKind>) -> Self::Audit {
+    fn process(&mut self, mut event: EngineEvent<InstrumentData::MarketEventKind>) -> Self::Audit {
         self.clock.process(&event);
+
+        // Before the event updates the state or is recorded in the audit, so a replica replaying
+        // the audit applies the attributed flow as this engine does.
+        if let EngineEvent::Account(AccountStreamEvent::Item(account)) = &mut event {
+            self.attribute_cash_flow(account);
+        }
 
         // Whether this event may provoke new algo orders. `ContractExpiry` and `CorporateAction`
         // are engine-driven settlements that apply regardless of `TradingState` and never do.
@@ -312,6 +320,57 @@ where
 impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     Engine<Clock, EngineState<GlobalData, InstrumentData>, ExecutionTxs, Strategy, Risk>
 {
+    /// Ask the `Strategy` which position an account-level [`CashFlow`](AccountEventKind::CashFlow)
+    /// belongs to, and set its `instrument` to the answer.
+    ///
+    /// Does nothing for any other event, or for a flow that already names an instrument. An answer
+    /// that names no instrument this state tracks on the flow's exchange is logged and ignored.
+    /// See [`CashFlowAttributionStrategy::attribute_cash_flow`].
+    fn attribute_cash_flow(&mut self, event: &mut AccountEvent)
+    where
+        Strategy: CashFlowAttributionStrategy<State = EngineState<GlobalData, InstrumentData>>,
+    {
+        let AccountEvent {
+            exchange,
+            kind: AccountEventKind::CashFlow(flow),
+        } = event
+        else {
+            return;
+        };
+        if flow.instrument.is_some() {
+            return;
+        }
+        let Some(instrument) = self
+            .strategy
+            .attribute_cash_flow(&self.state, *exchange, flow)
+        else {
+            return;
+        };
+        match self.state.instruments.get_index(&instrument) {
+            Some(state) if state.instrument.exchange == *exchange => {
+                debug!(
+                    ?exchange,
+                    ?instrument,
+                    kind = ?flow.kind,
+                    asset = ?flow.asset,
+                    amount = %flow.amount,
+                    "strategy attributed account-level cash flow to instrument",
+                );
+                flow.instrument = Some(instrument);
+            }
+            tracked => warn!(
+                ?exchange,
+                ?instrument,
+                instrument_exchange = ?tracked.map(|state| state.instrument.exchange),
+                kind = ?flow.kind,
+                asset = ?flow.asset,
+                amount = %flow.amount,
+                "strategy attributed account-level cash flow to an instrument not tracked on its \
+                 exchange — left on the account",
+            ),
+        }
+    }
+
     /// Flag the orders whose request has newly passed its exchange's in-flight deadline.
     fn flag_overdue_in_flight(&mut self) -> Vec<InFlightOverdue>
     where
@@ -403,6 +462,10 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     ///
     /// If the input `AccountStreamEvent` indicates the exchange execution link has disconnected,
     /// the `Engine` will call the configured [`OnDisconnectStrategy`] strategy logic.
+    ///
+    /// Asks no [`CashFlowAttributionStrategy`]: [`Engine::process`](Processor::process) does that
+    /// before calling this, so a cash flow on the account as a whole passed here directly stays on
+    /// the account unless its `instrument` is already set.
     pub fn update_from_account_stream(
         &mut self,
         event: &AccountStreamEvent,

@@ -40,6 +40,7 @@ use rustrade::{
     statistic::time::Annual365,
     strategy::{
         algo::AlgoStrategy,
+        cash_flow_attribution::CashFlowAttributionStrategy,
         close_positions::{ClosePositionsStrategy, close_open_positions_with_market_orders},
         on_disconnect::OnDisconnectStrategy,
         on_trading_disabled::OnTradingDisabled,
@@ -54,6 +55,7 @@ use rustrade_execution::{
     AccountEvent, AccountEventKind, AccountSnapshot, FeeModelConfig, InstrumentAccountSnapshot,
     MarketSnapshot, PerContractFeeModel,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
+    cash_flow::CashFlow,
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, PositionId, StrategyId, VenueOrderId},
@@ -997,6 +999,19 @@ impl ClosePositionsStrategy for TestBuyAndHoldStrategy {
         close_open_positions_with_market_orders(&self.id, state, filter, |_, pos_id| {
             ClientOrderId::new(pos_id.0.as_str())
         })
+    }
+}
+
+impl CashFlowAttributionStrategy for TestBuyAndHoldStrategy {
+    type State = EngineState<DefaultGlobalData, DefaultInstrumentMarketData>;
+
+    fn attribute_cash_flow(
+        &mut self,
+        _: &Self::State,
+        _: ExchangeIndex,
+        _: &CashFlow<AssetIndex, InstrumentIndex>,
+    ) -> Option<InstrumentIndex> {
+        None
     }
 }
 
