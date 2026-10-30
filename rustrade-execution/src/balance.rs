@@ -159,15 +159,19 @@ impl Balance {
 
     /// Net asset value: gross holdings less everything owed on the asset's loan.
     ///
-    /// Returns `total` when [`Balance::margin`] is `None` (a cash / no-debt context, where net
-    /// asset is simply the gross holding) and `total - borrowed - interest` when `Some`, as
-    /// Binance defines its margin accounts' `netAsset`. The result can be **negative**: a short
-    /// position is a negative net holding in the borrowed (base) asset.
+    /// Returns `total` when [`Balance::margin`] is `None` and `total - borrowed - interest` when
+    /// `Some`, as Binance defines its margin accounts' `netAsset`. The result can be
+    /// **negative**: a short position is a negative net holding in the borrowed (base) asset.
     ///
-    /// Accrued [`MarginDetails::interest`] is owed as the principal is, so it is deducted as it
-    /// accrues, not when it is repaid. Repaying the loan out of the asset's holdings leaves the
-    /// result unchanged, since `total` falls by what the debt does. For the principal alone, read
-    /// [`MarginDetails::borrowed`].
+    /// `None` is a cash / no-debt context, where net asset is simply the gross holding, except on
+    /// a venue whose margin is account-level (Alpaca, IBKR): there `total` is already the
+    /// account's cash, negative while it borrows (see [`Balance::total`]), and the result is that
+    /// figure, with no loan or interest itemised.
+    ///
+    /// Accrued [`MarginDetails::interest`] is owed as the principal is, so it is deducted once
+    /// the venue reports it accrued, not when it is repaid. Repaying the loan out of the asset's
+    /// holdings leaves the result unchanged, since `total` falls by what the debt does. For the
+    /// principal alone, read [`MarginDetails::borrowed`].
     ///
     /// [`Balance::accrued`] is not counted: it is carry the venue posts to `total` later, not a
     /// debt of the loan.
@@ -178,7 +182,9 @@ impl Balance {
     /// [`MarginDebt`](crate::AccountEventKind::MarginDebt) for this asset. WS partial updates keep
     /// `free`/`locked` live but never carry debt, so on a venue that streams no debt changes a
     /// position **borrowed since the last snapshot** reads as zero-debt (`net_asset == total`)
-    /// until the next snapshot. Each venue client says whether it streams debt changes.
+    /// until the next snapshot. Interest is likewise held at its last reported total: it falls in
+    /// steps as snapshots or debt events report it, not continuously as the venue accrues it.
+    /// Each venue client says whether it streams debt changes.
     pub fn net_asset(&self) -> Decimal {
         match self.margin {
             Some(margin) => self.total - margin.borrowed - margin.interest,

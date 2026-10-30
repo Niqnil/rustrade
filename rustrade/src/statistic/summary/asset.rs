@@ -45,9 +45,9 @@ pub enum BalanceBasis {
     /// asset strictly positive (or interpreting the drawdown metrics accordingly).
     ///
     /// # Freshness
-    /// [`Balance::net_asset`] deducts interest as it accrues, so a repayment out of holdings does
-    /// not move it. It reflects debt only as fresh as the last
-    /// [`BalanceSnapshot`](rustrade_execution::AccountEventKind::BalanceSnapshot) or
+    /// [`Balance::net_asset`] deducts interest once the venue reports it accrued, so a repayment
+    /// out of holdings does not move it. It reflects debt, interest included, only as fresh as the
+    /// last [`BalanceSnapshot`](rustrade_execution::AccountEventKind::BalanceSnapshot) or
     /// [`MarginDebt`](rustrade_execution::AccountEventKind::MarginDebt): WS partial updates carry no
     /// debt, so on a venue that streams no debt changes the value steps at snapshot boundaries.
     NetAsset,
