@@ -1255,7 +1255,7 @@ impl SimulatedVenue {
                 }
                 continue;
             };
-            equity += (balance.balance.total - owed) * price;
+            equity += balance.balance.net_asset() * price;
             debt += owed * price;
         }
 

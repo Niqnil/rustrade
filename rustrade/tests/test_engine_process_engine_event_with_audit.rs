@@ -905,8 +905,8 @@ fn test_engine_process_balance_stream_update_with_audit() {
             time_plus_days(STARTING_TIMESTAMP, 3)
         )
     );
-    // net_asset reflects the preserved debt: total - borrowed = 2 - 1.
-    assert_eq!(btc.value.net_asset(), dec!(1.0));
+    // net_asset reflects the preserved debt: total - borrowed - interest = 2 - 1 - 0.01.
+    assert_eq!(btc.value.net_asset(), dec!(0.99));
 }
 
 struct TestBuyAndHoldStrategy {

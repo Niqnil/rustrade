@@ -171,8 +171,8 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
     ///
     /// Defaults to [`BalanceBasis::Gross`] (drawdown and end-of-session balance computed from gross
     /// `Balance::total`), which is unchanged behaviour for existing and cash users. Set to
-    /// [`BalanceBasis::NetAsset`] to compute them from net asset value (`total - borrowed`) on
-    /// margin accounts.
+    /// [`BalanceBasis::NetAsset`] to compute them from net asset value (`total - borrowed - interest`)
+    /// on margin accounts.
     ///
     /// # Precondition (`NetAsset`)
     /// Net-asset drawdown is only well-defined while net asset stays **strictly positive**; see
