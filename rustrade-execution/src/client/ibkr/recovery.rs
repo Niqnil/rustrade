@@ -37,7 +37,7 @@ use super::{
     ended_orders::{EarlierCompletions, EndedOrderReader, release_ended},
     execution::{
         ExecutionBuffer, ExecutionRevision, ExecutionScope, executions_filter,
-        executions_held_since, revision_of, session_zone,
+        executions_held_since, revision_of,
     },
     listed_cids,
     order::{OrderIdMap, PendingCancels},
@@ -617,12 +617,13 @@ fn report_retention_gap(sink: &EventSink, floor: DateTime<Utc>, now: DateTime<Ut
 }
 
 /// Ask TWS for the last [`EXECUTION_DAYS`](super::execution::EXECUTION_DAYS) days of executions
-/// and return the fills from `floor` on.
+/// and return the fills from `floor` on, reading a time that names no zone in `session_zone`.
 fn recover_fills(
     client: &Client,
     floor: DateTime<Utc>,
     scope: ExecutionScope,
     contracts: &ContractRegistry,
+    session_zone: Option<chrono_tz::Tz>,
     pending: &ExecutionBuffer,
     sink: &EventSink,
 ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, RecoveryError> {
@@ -635,7 +636,7 @@ fn recover_fills(
         .executions(executions_filter())
         .map_err(RecoveryError::Ibapi)?;
     let deadline = Instant::now() + RECOVERY_TIMEOUT;
-    let mut fills = RecoveredFills::new(floor, scope, contracts, session_zone(client));
+    let mut fills = RecoveredFills::new(floor, scope, contracts, session_zone);
 
     loop {
         if !sink.is_open() {
@@ -760,6 +761,7 @@ impl RecoveryWatcher {
             floor,
             self.scope,
             &self.contracts,
+            self.session_zone,
             &self.pending,
             &self.sink,
         ) {

@@ -117,6 +117,7 @@ impl VenueClock {
 
     /// Records the sample `other` holds, as [`observe`](Self::observe) would, so that this clock
     /// learns from another source of the same venue's times, such as a read of its server time.
+    #[cfg(feature = "binance")]
     pub(crate) fn merge(&mut self, other: &VenueClock) {
         if let Some(Sample { stamp, received }) = other.sample {
             self.observe(stamp, received);
@@ -267,6 +268,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "binance")]
     fn a_merged_clock_keeps_whichever_sample_bounds_the_venue_later() {
         let base = Instant::now();
         let mut tighter = VenueClock::new();
