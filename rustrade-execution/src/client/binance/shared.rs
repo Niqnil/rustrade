@@ -3537,6 +3537,23 @@ pub(crate) fn response_decode_error(e: ConnectorError) -> UnindexedClientError {
     UnindexedClientError::Internal(format!("decoding Binance response: {e}"))
 }
 
+/// A decimal Binance may leave out: absent is `None`, but present and unreadable is an error, so a
+/// malformed amount is not mistaken for an unreported one.
+pub(crate) fn optional_decimal(
+    field: &str,
+    value: Option<&str>,
+) -> Result<Option<Decimal>, UnindexedClientError> {
+    value
+        .map(|value| {
+            Decimal::from_str(value).map_err(|error| {
+                UnindexedClientError::Internal(format!(
+                    "decoding Binance response: {field} {value:?}: {error}"
+                ))
+            })
+        })
+        .transpose()
+}
+
 // ---------------------------------------------------------------------------
 // REST call retry wrapper
 // ---------------------------------------------------------------------------

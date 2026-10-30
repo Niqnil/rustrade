@@ -63,6 +63,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A Binance account's commission rates** (`rustrade-execution`, #789).
+  `BinanceSpot::fetch_commission_rates` and `BinanceMargin::fetch_commission_rates` read
+  `GET /api/v3/account/commission` for a symbol into `CommissionRates`: the standard, special and
+  tax parts kept apart (`CommissionPart`, each with maker, taker, buyer and seller rates), and the
+  BNB discount (`CommissionDiscount`, whose `multiplier` is Binance's `discount`, the share of the
+  standard part charged). `CommissionRates::rate(side, liquidity)` sums the three parts' rates for
+  a trade not paid in BNB; paid in BNB, only the standard part is discounted, as the rustdoc
+  details. A missing or unreadable rate is an error, never zero. Margin has no commission endpoint
+  of its own; the margin method reads the spot rates, which margin trades have been seen to pay.
+
+- **The next hour's margin borrow rate for a list of assets** (`rustrade-execution`, #788).
+  `BinanceMargin::fetch_next_hourly_interest_rates(assets)` reads
+  `GET /sapi/v1/margin/next-hourly-interest-rate` on the client's cross or isolated margin, and
+  returns each asset's rate per hour. Binance takes 20 assets a request, so a longer list is read
+  20 at a time (100 request weight each), and one failed request fails the whole read. An asset
+  Binance does not answer for is absent from the map.
+
 - **Rounding onto an order rule's grid** (`rustrade-execution`, #786). `ValueRule::round_down`
   and `round_up` return the nearest multiple of the rule's step at or below, or at or above, a
   value, counted from zero as the pre-send check counts it; a value on the grid, or any value when
