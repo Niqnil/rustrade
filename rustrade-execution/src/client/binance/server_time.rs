@@ -32,7 +32,7 @@ use tracing::{debug, warn};
 pub(crate) const RESYNC_AFTER: Duration = Duration::from_secs(300);
 
 /// The most a server-time read may take. A request waits on a read only before the client's
-/// first signed request and after a `-1021`.
+/// first signed request, after a suspend (see [`PAUSE_ALLOWANCE`]) and after a `-1021`.
 pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How far this host's clock may lead or trail Binance's before a read warns: Binance refuses a
@@ -41,7 +41,9 @@ const LEAD_WARN: TimeDelta = TimeDelta::seconds(1);
 
 /// How much further this host's wall clock may have gone than its monotonic clock since the last
 /// read before a request waits for a new one: a suspend of the host, or a forward step of its wall
-/// clock. Each leaves the monotonic estimate behind Binance's clock by the difference.
+/// clock. Each leaves the monotonic estimate behind Binance's clock by the difference. NTP slewing
+/// the wall clock (up to 500 ppm, 1.8 s an hour) can also reach it, but only after half an hour
+/// or more without a read, which the background refresh normally prevents.
 const PAUSE_ALLOWANCE: TimeDelta = TimeDelta::seconds(1);
 
 /// Serde default for each Binance config's `server_time_sync`: on.
@@ -125,7 +127,8 @@ impl SigningClock {
 ///   read in the background, and is sent without waiting for it. A read whose answer took longer
 ///   than the one held does not replace it (see [`VenueClock::observe`]).
 /// - **Suspend.** A request that finds this host's wall clock gone more than [`PAUSE_ALLOWANCE`]
-///   further than its monotonic clock since the last read waits for a new read.
+///   further than its monotonic clock since the last read waits for a new read. If that read
+///   fails, the next is the background refresh's or a `-1021`'s.
 /// - **`-1021`.** [`after_rejection`](Self::after_rejection) waits for a new read, whose answer
 ///   replaces the estimate rather than adding to it, as the estimate itself may be what Binance
 ///   refused. Until the answer arrives, and if the read fails, the estimate held stays.
@@ -268,7 +271,7 @@ impl ServerTime {
                 let held = estimate.clock.earliest_at(received).is_some();
                 drop(estimate);
                 warn!(
-                    timeout_ms = millis_u64(READ_TIMEOUT),
+                    timeout_ms = READ_TIMEOUT.as_millis(),
                     signing_on = if held {
                         "the previous estimate"
                     } else {
@@ -292,8 +295,8 @@ impl ServerTime {
         let lead = estimate.clock.host_lead(Utc::now(), received);
         drop(estimate);
         let host_lead_ms = lead.map(|lead| lead.num_milliseconds());
-        let round_trip_ms = millis_u64(round_trip);
-        if lead.is_some_and(|lead| lead.abs() >= LEAD_WARN) {
+        let round_trip_ms = round_trip.as_millis();
+        if lead.is_some_and(clocks_apart) {
             warn!(
                 host_lead_ms,
                 round_trip_ms,
@@ -306,6 +309,12 @@ impl ServerTime {
     }
 }
 
+/// Whether a host clock leading Binance's by `lead` (trailing when negative) is far enough off it
+/// for a read to warn: as far as Binance refuses a stamp ahead of its clock.
+fn clocks_apart(lead: TimeDelta) -> bool {
+    lead.abs() >= LEAD_WARN
+}
+
 /// Clears its flag when dropped.
 struct ClearOnDrop<'a>(&'a AtomicBool);
 
@@ -313,10 +322,6 @@ impl Drop for ClearOnDrop<'_> {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
-}
-
-fn millis_u64(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -327,7 +332,7 @@ mod tests {
         RateLimitTracker, RequestKind, WeightPool, is_timestamp_rejection, rest_read_with_retry,
     };
     use binance_sdk::{
-        common::config::ConfigurationRestApi,
+        common::{config::ConfigurationRestApi, errors::ConnectorError},
         spot::{SpotRestApi, rest_api::GetAccountParams},
     };
     use serde_json::json;
@@ -737,46 +742,6 @@ mod tests {
         assert_eq!(requests_to(&server, "/api/v3/time").await.len(), 1);
     }
 
-    /// What a subscriber at `WARN` writes, captured.
-    #[derive(Clone, Default)]
-    struct Captured(Arc<parking_lot::Mutex<Vec<u8>>>);
-
-    impl Captured {
-        fn text(&self) -> String {
-            String::from_utf8(self.0.lock().clone()).unwrap()
-        }
-    }
-
-    impl std::io::Write for Captured {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-        type Writer = Self;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    /// Captures this thread's warnings while the guard lives.
-    fn capture_warnings() -> (Captured, tracing::subscriber::DefaultGuard) {
-        let captured = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(captured.clone())
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish();
-        (captured, tracing::subscriber::set_default(subscriber))
-    }
-
     /// A server answering this host's time less `behind_ms`, 40 ms after it is asked.
     fn behind_host(behind_ms: i64) -> ServerTime {
         let read: ReadServerTime = Arc::new(move || {
@@ -788,21 +753,43 @@ mod tests {
         ServerTime::new(SigningClock::default(), read)
     }
 
+    #[test]
+    fn a_read_warns_from_a_second_apart_either_way() {
+        for (lead_ms, apart) in [
+            (0, false),
+            (999, false),
+            (1_000, true),
+            (-999, false),
+            (-1_000, true),
+        ] {
+            assert_eq!(
+                clocks_apart(TimeDelta::milliseconds(lead_ms)),
+                apart,
+                "{lead_ms} ms"
+            );
+        }
+    }
+
+    /// A `-1021` during a rate-limit cooldown reads nothing: the read would be refused too.
     #[tokio::test(start_paused = true)]
-    async fn a_read_warns_when_the_clocks_are_a_second_or_more_apart() {
-        let (captured, _guard) = capture_warnings();
+    async fn a_refused_timestamp_during_a_cooldown_reads_nothing() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (_, server_time) = source(Instant::now(), Duration::ZERO, Arc::clone(&reads));
+        let tracker = RateLimitTracker::new(WeightPool::Spot).with_server_time(Some(server_time));
+        tracker.wait_if_blocked(RequestKind::Order).await.unwrap();
+        let refused = anyhow::Error::new(ConnectorError::BadRequestError {
+            msg: "Timestamp for this request is outside of the recvWindow.".to_owned(),
+            code: Some(-1021),
+        });
 
-        behind_host(0).ready().await;
-        assert_eq!(captured.text(), "");
+        tracker.on_rate_limited(Some(Duration::from_secs(60)));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tracker.after_failure(&refused).await;
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
 
-        behind_host(2_000).ready().await;
-        let warning = captured.text();
-        assert!(
-            warning.contains("off Binance's by 1 s or more"),
-            "{warning}"
-        );
-        assert!(warning.contains("round_trip_ms=40"), "{warning}");
-        assert!(warning.contains("host_lead_ms=2"), "{warning}");
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tracker.after_failure(&refused).await;
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
     }
 
     /// The tracker's signing clock is the one its server time reads into, which the account
