@@ -5821,6 +5821,40 @@ mod tests {
     }
 
     /// A REST config whose requests go to `server`.
+    /// `new` keeps the client's signing clock read from Binance's server time on both of its
+    /// trackers, unless `server_time_sync` is off; `host_clock_lead` reports the reads.
+    #[tokio::test(start_paused = true)]
+    async fn the_host_clock_lead_is_the_clients_server_time_reads() {
+        let config = BinanceMarginConfig::cross_margin("k".to_string(), "s".to_string());
+        assert!(config.server_time_sync);
+        let synced = BinanceMargin::new(config.clone());
+        assert!(synced.rate_limiter.signing_clock().is_some());
+        assert!(synced.spot_rate_limiter.signing_clock().is_some());
+        let mut client = BinanceMargin::new(config.with_server_time_sync(false));
+        assert!(client.rate_limiter.signing_clock().is_none());
+        assert!(client.spot_rate_limiter.signing_clock().is_none());
+        assert_eq!(client.host_clock_lead(), None);
+
+        let host_ms = Utc::now().timestamp_millis();
+        let read: crate::client::binance::server_time::ReadServerTime =
+            Arc::new(move || Box::pin(async move { Ok(host_ms - 2_000) }));
+        client.rate_limiter = Arc::new(
+            RateLimitTracker::new(WeightPool::Sapi)
+                .with_server_time(Some(ServerTime::new(SigningClock::default(), read))),
+        );
+        client
+            .rate_limiter
+            .wait_if_blocked(RequestKind::Query)
+            .await
+            .unwrap();
+
+        let lead = client.host_clock_lead().unwrap();
+        assert!(
+            lead >= TimeDelta::seconds(2) && lead < TimeDelta::seconds(3),
+            "{lead}"
+        );
+    }
+
     fn margin_rest_config_at(server: &wiremock::MockServer) -> ConfigurationRestApi {
         ConfigurationRestApi::builder()
             .api_key("key")

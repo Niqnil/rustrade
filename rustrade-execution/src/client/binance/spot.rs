@@ -7555,6 +7555,42 @@ mod tests {
         assert!(!is_unknown_order(&anyhow::anyhow!("-2013 in text only")));
     }
 
+    /// `new` keeps the client's signing clock read from Binance's server time, unless
+    /// `server_time_sync` is off; `host_clock_lead` reports the reads.
+    #[tokio::test(start_paused = true)]
+    async fn the_host_clock_lead_is_the_clients_server_time_reads() {
+        let config = BinanceSpotConfig::testnet("key".into(), "secret".into());
+        assert!(config.server_time_sync);
+        assert!(
+            BinanceSpot::new(config.clone())
+                .rate_limiter
+                .signing_clock()
+                .is_some()
+        );
+        let mut client = BinanceSpot::new(config.with_server_time_sync(false));
+        assert!(client.rate_limiter.signing_clock().is_none());
+        assert_eq!(client.host_clock_lead(), None);
+
+        let host_ms = Utc::now().timestamp_millis();
+        let read: crate::client::binance::server_time::ReadServerTime =
+            Arc::new(move || Box::pin(async move { Ok(host_ms - 2_000) }));
+        client.rate_limiter = Arc::new(
+            RateLimitTracker::new(WeightPool::Spot)
+                .with_server_time(Some(ServerTime::new(SigningClock::default(), read))),
+        );
+        client
+            .rate_limiter
+            .wait_if_blocked(RequestKind::Query)
+            .await
+            .unwrap();
+
+        let lead = client.host_clock_lead().unwrap();
+        assert!(
+            lead >= TimeDelta::seconds(2) && lead < TimeDelta::seconds(3),
+            "{lead}"
+        );
+    }
+
     fn rest_at(server: &wiremock::MockServer) -> Arc<RestApi> {
         Arc::new(SpotRestApi::from_config(
             ConfigurationRestApi::builder()

@@ -133,14 +133,6 @@ struct Inner {
     refreshing: AtomicBool,
 }
 
-impl std::fmt::Debug for ServerTime {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServerTime")
-            .field("clock", &self.inner.clock)
-            .finish_non_exhaustive()
-    }
-}
-
 impl ServerTime {
     /// Keeps `clock` read by `read`.
     pub(crate) fn new(clock: SigningClock, read: ReadServerTime) -> Self {
@@ -648,5 +640,93 @@ mod tests {
 
         assert!(!is_timestamp_rejection(&error), "{error:#}");
         assert_eq!(requests_to(&server, "/api/v3/time").await.len(), 1);
+    }
+
+    /// What a subscriber at `WARN` writes, captured.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().clone()).unwrap()
+        }
+    }
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Captures this thread's warnings while the guard lives.
+    fn capture_warnings() -> (Captured, tracing::subscriber::DefaultGuard) {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        (captured, tracing::subscriber::set_default(subscriber))
+    }
+
+    /// A server answering this host's time less `behind_ms`, 40 ms after it is asked.
+    fn behind_host(behind_ms: i64) -> ServerTime {
+        let read: ReadServerTime = Arc::new(move || {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                Ok(Utc::now().timestamp_millis() - behind_ms)
+            })
+        });
+        ServerTime::new(SigningClock::default(), read)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_warns_when_the_clocks_are_a_second_or_more_apart() {
+        let (captured, _guard) = capture_warnings();
+
+        behind_host(0).ready().await;
+        assert_eq!(captured.text(), "");
+
+        behind_host(2_000).ready().await;
+        let warning = captured.text();
+        assert!(
+            warning.contains("off Binance's by 1 s or more"),
+            "{warning}"
+        );
+        assert!(warning.contains("round_trip_ms=40"), "{warning}");
+        assert!(warning.contains("host_lead_ms=2"), "{warning}");
+    }
+
+    /// The tracker's signing clock is the one its server time reads into, which the account
+    /// streams bound the venue's clock by.
+    #[tokio::test(start_paused = true)]
+    async fn the_trackers_signing_clock_is_the_one_read() {
+        let tracker =
+            RateLimitTracker::new(WeightPool::Spot).with_server_time(Some(behind_host(0)));
+        assert_eq!(tracker.host_clock_lead(), None);
+
+        tracker.wait_if_blocked(RequestKind::Order).await.unwrap();
+
+        let signing = tracker.signing_clock().unwrap();
+        assert!(signing.venue().earliest_at(Instant::now()).is_some());
+        assert!(tracker.host_clock_lead().unwrap().abs() < TimeDelta::seconds(1));
+        assert!(
+            RateLimitTracker::new(WeightPool::Spot)
+                .signing_clock()
+                .is_none()
+        );
     }
 }
