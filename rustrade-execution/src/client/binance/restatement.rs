@@ -11,7 +11,10 @@
 //! - [`restatement_time`] is the time the read's balances are stamped with.
 //! - [`restate`] runs the restatement owed once it is due, with the account's own read.
 
-use super::shared::{REST_BALANCE_LAG, balance_read_time};
+use super::{
+    server_time::SigningClock,
+    shared::{REST_BALANCE_LAG, balance_read_time},
+};
 use crate::{
     AccountEventKind, UnindexedAccountEvent, client::venue_clock::VenueClock,
     error::UnindexedClientError, trade::TimeSource,
@@ -32,19 +35,33 @@ pub(crate) const RESTATEMENT_RETRY_MAX: Duration = Duration::from_secs(120);
 pub(crate) const RESTATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A [`StreamClock`] shared between the code that forwards a stream's events and the code that
-/// restates its balances. A new stream starts with the default, which has seen nothing.
+/// restates its balances. A new stream starts with one that has seen nothing
+/// ([`StreamClock::shared`]).
 pub(crate) type SharedStreamClock = Arc<parking_lot::Mutex<StreamClock>>;
 
-/// The venue's clock as an account stream's events show it, and the latest balance or debt time
-/// the stream delivered.
+/// The venue's clock as an account stream's events and its client's server-time reads show it,
+/// and the latest balance or debt time the stream delivered.
 #[derive(Debug, Default)]
 pub(crate) struct StreamClock {
+    /// The venue's clock as the stream's events show it.
     venue: VenueClock,
+    /// The clock the client signs its requests with, read from the venue's server time, when it
+    /// keeps one: a bound on the venue's clock before the stream's first event, and between them.
+    server: Option<SigningClock>,
     /// The latest `time_exchange` of a balance or debt event the stream delivered.
     last_balance: Option<DateTime<Utc>>,
 }
 
 impl StreamClock {
+    /// A clock for a new stream, which has seen nothing, and also bounds the venue's clock by
+    /// `server`, the client's signing clock, when it keeps one.
+    pub(crate) fn shared(server: Option<SigningClock>) -> SharedStreamClock {
+        Arc::new(parking_lot::Mutex::new(Self {
+            server,
+            ..Self::default()
+        }))
+    }
+
     /// Record a frame the stream received at `arrived` in `clock`: `sent`, the time `E` Binance
     /// stamped on it, and the `events` converted from it. The lock is taken once, and only when
     /// the clock learns something.
@@ -103,9 +120,14 @@ impl StreamClock {
         }
     }
 
-    /// The venue's clock, as the stream's events show it.
-    pub(crate) fn venue(&self) -> &VenueClock {
-        &self.venue
+    /// The venue's clock, as the stream's events and the client's server-time reads show it:
+    /// whichever bounds it the later.
+    pub(crate) fn venue(&self) -> VenueClock {
+        let mut venue = self.venue;
+        if let Some(server) = &self.server {
+            venue.merge(&server.venue());
+        }
+        venue
     }
 
     /// Record the venue's `time`, seen at `arrived`, which is a balance or debt time if `balance`.
@@ -134,7 +156,7 @@ impl StreamClock {
         };
         let target = last + REST_BALANCE_LAG;
         let short = self
-            .venue
+            .venue()
             .earliest_at(now)
             .map_or(Duration::ZERO, |earliest| {
                 (target - earliest).to_std().unwrap_or(Duration::ZERO)
@@ -175,7 +197,7 @@ pub(crate) fn restatement_time(
     floor: Option<DateTime<Utc>>,
 ) -> DateTime<Utc> {
     let earliest = clock
-        .venue
+        .venue()
         .earliest_at(sent_at)
         .map_or(sent, |venue| venue.min(sent));
     let time = balance_read_time(earliest);
@@ -352,6 +374,24 @@ mod tests {
             restatement_time(&clock.lock(), at(160), arrived, None),
             at(100) - REST_BALANCE_LAG
         );
+    }
+
+    /// The client's server-time reads bound the venue's clock too, before the stream's first
+    /// event: a restatement then takes Binance's time when this host's clock is ahead.
+    #[tokio::test(start_paused = true)]
+    async fn the_server_time_read_bounds_the_clock_before_the_streams_first_event() {
+        let arrived = Instant::now();
+        let clock = StreamClock::shared(Some(SigningClock::sampled(at(100), arrived)));
+
+        assert_eq!(clock.lock().venue().earliest_at(arrived), Some(at(100)));
+        // The host reads 60 s ahead of Binance.
+        assert_eq!(
+            restatement_time(&clock.lock(), at(160), arrived, None),
+            at(100) - REST_BALANCE_LAG
+        );
+        // A later event bounds it later: whichever bounds it the later is kept.
+        StreamClock::observe_frame(&clock, Some(at(105)), &[], arrived);
+        assert_eq!(clock.lock().venue().earliest_at(arrived), Some(at(105)));
     }
 
     /// With nothing delivered, a read may start at once, and is stamped the REST lag before the

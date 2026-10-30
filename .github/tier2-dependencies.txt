@@ -464,7 +464,7 @@ ibapi=5.2.0  # 2026-10-27 | Financial protocol, community-maintained, no officia
 # to disconnect; the same run order reproduces that on =5.1.0, so it is the paper account's permissions, not
 # this bump. Not exercised: a fill of this client's own order (outside regular hours), an automatic reconnect, a
 # liquidation.
-binance-sdk=77.0.0  # 2026-10-27 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
+binance-sdk=77.2.0  # 2026-10-30 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
 #   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
 #   3. common::utils::send_request                        — signature + HMAC signing + X-MBX-APIKEY header (hand-rolled `userListenToken` POST, which the SDK binds no endpoint for; and the margin new-order POST, decoded into our own answer type)
@@ -915,6 +915,50 @@ binance-sdk=77.0.0  # 2026-10-27 | Exchange SDK, signing/IO. PINNED: margin user
 # Dependency surface: the dependency tables are identical (32 direct deps); Cargo.toml differs only in
 # `version` and the `[[example]]` entries. Our Cargo.lock delta is binance-sdk's version + checksum alone.
 # CONSUMER-SIDE API CHURN: NONE.
+#
+# Re-verified against the =77.2.0 crates.io source on 2026-10-30 (77.0.0 -> 77.2.0). .crate sha256
+# b193f2f00dabd41539ba21afde0da32f28fc123fca016d74a9e7557b98b25c6d matches the index; publisher unchanged
+# (solutionsGH); published from git aec7a9d054821889474737ddba6cc0f38dbcf3cb. No CHANGELOG ships in the crate.
+# `src/margin_trading/` is BYTE-IDENTICAL to 77.0.0. In `src/spot/`, four generated API files add a
+# `CancelOnly` ("CANCEL_ONLY") variant to their symbol-status enums; we match on none of them. In
+# `src/common/`, config.rs, utils.rs (md5 1c10f43b0137e1a80103e91307f90f6a) and websocket.rs
+# (5a3f1bef28da1ae79c19172b327269f7) changed. All 3 internals HOLD:
+#   1. `send_message` (websocket.rs:2121) same signature, no hunk touches it; WebsocketMessageSendOptions
+#      (:1885) still exactly with_api_key / is_signed / is_session_logon / is_session_logout.
+#   2. `WebsocketEventEmitter::subscribe` (websocket.rs:138-157) unchanged: one task, one unbounded
+#      channel, sequential `while let Some(event) = rx.recv().await { callback(event) }`.
+#      `Subscription::unsubscribe` still `handle.abort()`.
+#   3. `send_request` (utils.rs:991) unchanged, 7 args; it still injects `timestamp` when signed
+#      (:1006-1009), signs via `signature_gen.get_signature` (:1012), appends `signature` and sets
+#      `X-MBX-APIKEY`. The only change: the timestamp now comes from `get_timestamp_from` (below).
+# The disconnected-connection property holds: `begin_reconnect` rejects a close-initiated connection
+# (websocket.rs:316), `init_connect` skips renewal and reconnect once close is initiated (:1255-1263), and
+# the new retry path never retries after a close (:601). Still pinned by
+# `a_disconnected_connection_leaves_no_task_behind` (client/binance/shared.rs).
+# What changed in common/, and why it matters to us:
+#   - NEW `TimestampProvider = Arc<dyn Fn() -> u64 + Send + Sync>` (config.rs:117), an
+#     `Option<TimestampProvider>` on ConfigurationRestApi / ConfigurationWebsocketApi /
+#     ConfigurationWebsocketStreams (:217, :351, :482), default None. `get_timestamp_from` (utils.rs:539)
+#     calls it, else host `SystemTime` as before, from `send_request` (:1007), signed WS API messages
+#     (`build_websocket_api_message`, :1420; session relogon websocket.rs:2321) and signed stream URLs
+#     (websocket.rs:2781). The clients now set it (server-time sync). A panic in the provider is not
+#     caught, and a value above i64::MAX panics on the WS path (`expect`); ours returns
+#     `timestamp_millis` clamped to >= 0.
+#   - A failed automatic reconnect is now retried with exponential backoff and jitter (1 s base, 60 s
+#     cap), serialised per connection by a `recovery_lock`; 77.0.0 only logged it. A stale renewal is
+#     dropped rather than replacing a newer socket. The writer task now stops on a CancellationToken
+#     with a 5 s close timeout. `init_connect`'s fallback connection is no longer evaluated eagerly.
+# Outside the compiled modules: sub_account adds a create-API-key v2 endpoint, not compiled under
+# `spot` + `margin_trading`.
+# Security: PASS. `unsafe` is the same 10 test-only blocks in utils.rs (after `#[cfg(test)]` at :1444);
+# build.rs identical; no hosts added; env read still only `BINANCE_CONNECTOR_RUST_USER_AGENT`
+# (utils.rs:458); no new filesystem, process, signing-key or encoded-blob sites. Both standing caveats carry
+# forward (the full signed WS API request at DEBUG, now websocket.rs:2156; the UA env read). No OSV/RUSTSEC
+# advisory.
+# Dependency surface: Cargo.toml differs only in `version` and one `[[example]]` entry (32 direct deps,
+# `[features]` identical). Our Cargo.lock delta is binance-sdk's version + checksum alone.
+# CONSUMER-SIDE API CHURN: NONE (we use the configuration builders only, so the new pub field breaks no
+# struct literal).
 quick-xml  # 2026-07-08 | New direct dep (XML parsing of broker Flex statements). Reviewed @ 0.41.0: #![forbid(unsafe_code)] crate-wide, zero net-new transitive deps (serde+memchr only, both already in tree), no RUSTSEC advisories, de-facto-standard parser. Not pinned — any version bump still needs review.
 #   Re-reviewed @ 0.42.0 (2026-09-16), the review this entry's "any version bump still needs
 #   review" mandates. All four properties recorded at 0.41.0 re-verified and still hold:

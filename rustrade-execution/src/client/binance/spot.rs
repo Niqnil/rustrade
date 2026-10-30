@@ -41,6 +41,7 @@ use super::restatement::{
     BalanceRestatement, SharedStreamClock, StreamClock, restate, restatement_time,
 };
 use super::rules::RulesLoader;
+use super::server_time::{ServerTime, SigningClock, default_server_time_sync, read_server_time};
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     CONNECT_TIMEOUT_SECS, Disconnect, DisconnectOnDrop, ExecutionReport,
@@ -104,7 +105,7 @@ use binance_sdk::{
         },
     },
 };
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use fnv::FnvHashSet;
 use futures::stream::BoxStream;
 use rust_decimal::Decimal;
@@ -150,6 +151,12 @@ pub struct BinanceSpotConfig {
     /// [`BinanceSpot::open_order`](crate::client::ExecutionClient::open_order).
     #[serde(default)]
     pub pre_send_rules: PreSendRules,
+
+    /// Whether signed requests are stamped with Binance's clock, read from its server time,
+    /// rather than this host's. Defaults to `true`. See
+    /// [`BinanceSpot::host_clock_lead`](crate::client::binance::BinanceSpot::host_clock_lead).
+    #[serde(default = "crate::client::binance::server_time::default_server_time_sync")]
+    pub server_time_sync: bool,
 }
 
 /// Serde default for [`BinanceSpotConfig::testnet`]: an absent `testnet` field deserializes to the
@@ -169,6 +176,7 @@ impl std::fmt::Debug for BinanceSpotConfig {
             .field("secret_key", &"***")
             .field("testnet", &self.testnet)
             .field("pre_send_rules", &self.pre_send_rules)
+            .field("server_time_sync", &self.server_time_sync)
             .finish()
     }
 }
@@ -187,6 +195,7 @@ impl BinanceSpotConfig {
             secret_key,
             testnet: true,
             pre_send_rules: PreSendRules::default(),
+            server_time_sync: default_server_time_sync(),
         }
     }
 
@@ -194,6 +203,14 @@ impl BinanceSpotConfig {
     #[must_use]
     pub fn with_pre_send_rules(mut self, pre_send_rules: PreSendRules) -> Self {
         self.pre_send_rules = pre_send_rules;
+        self
+    }
+
+    /// Set whether signed requests are stamped with Binance's clock, read from its server time
+    /// ([`server_time_sync`](Self::server_time_sync)).
+    #[must_use]
+    pub fn with_server_time_sync(mut self, server_time_sync: bool) -> Self {
+        self.server_time_sync = server_time_sync;
         self
     }
 
@@ -207,6 +224,7 @@ impl BinanceSpotConfig {
             secret_key,
             testnet: false,
             pre_send_rules: PreSendRules::default(),
+            server_time_sync: default_server_time_sync(),
         }
     }
 
@@ -446,6 +464,17 @@ impl BinanceSpot {
         fetch_commission_rates(&self.rest, &self.rate_limiter, instrument).await
     }
 
+    /// The most this host's clock leads Binance's, from the client's reads of Binance's server
+    /// time; negative when it trails. `None` when
+    /// [`server_time_sync`](BinanceSpotConfig::server_time_sync) is off, or before a read has
+    /// succeeded.
+    ///
+    /// An upper bound: the true lead, plus the time the kept read's answer took to arrive and the
+    /// drift allowed for since. A read logs at `warn` when it finds the clocks 1 s or more apart.
+    pub fn host_clock_lead(&self) -> Option<TimeDelta> {
+        self.rate_limiter.host_clock_lead()
+    }
+
     /// Hold each of `orders` as live, for a reconnect to ask about if the stream misses its end.
     fn remember_live<'a>(
         &self,
@@ -460,10 +489,14 @@ impl BinanceSpot {
     /// # Panics
     /// Panics if the binance-sdk configuration builder fails (invalid credentials format).
     #[allow(clippy::expect_used)] // Documented panic: invalid credentials detected at startup
-    fn build_rest(config: &BinanceSpotConfig) -> Arc<RestApi> {
-        let rest_config = ConfigurationRestApi::builder()
+    fn build_rest(config: &BinanceSpotConfig, signing: Option<&SigningClock>) -> Arc<RestApi> {
+        let mut builder = ConfigurationRestApi::builder()
             .api_key(config.api_key.clone())
-            .api_secret(config.secret_key.clone())
+            .api_secret(config.secret_key.clone());
+        if let Some(signing) = signing {
+            builder = builder.timestamp_provider(signing.provider());
+        }
+        let rest_config = builder
             .build()
             .expect("failed to build Binance REST configuration");
 
@@ -477,10 +510,17 @@ impl BinanceSpot {
     /// # Panics
     /// Panics if the binance-sdk configuration builder fails (invalid credentials format).
     #[allow(clippy::expect_used)] // Documented panic: invalid credentials detected at startup
-    fn build_ws_handle(config: &BinanceSpotConfig) -> WebsocketApiHandle {
-        let ws_config = ConfigurationWebsocketApi::builder()
+    fn build_ws_handle(
+        config: &BinanceSpotConfig,
+        signing: Option<&SigningClock>,
+    ) -> WebsocketApiHandle {
+        let mut builder = ConfigurationWebsocketApi::builder()
             .api_key(config.api_key.clone())
-            .api_secret(config.secret_key.clone())
+            .api_secret(config.secret_key.clone());
+        if let Some(signing) = signing {
+            builder = builder.timestamp_provider(signing.provider());
+        }
+        let ws_config = builder
             .build()
             .expect("failed to build Binance WebSocket configuration");
 
@@ -879,9 +919,14 @@ impl ExecutionClient for BinanceSpot {
     /// Panics if the binance-sdk REST or WebSocket configuration builder fails
     /// (e.g. empty or malformed API key/secret).
     fn new(config: Self::Config) -> Self {
-        let rest = Self::build_rest(&config);
-        let ws_handle = Self::build_ws_handle(&config);
-        let rate_limiter = Arc::new(RateLimitTracker::new(WeightPool::Spot));
+        let signing = config.server_time_sync.then(SigningClock::default);
+        let rest = Self::build_rest(&config, signing.as_ref());
+        let ws_handle = Self::build_ws_handle(&config, signing.as_ref());
+        // `GET /api/v3/time` is unsigned, so the client that signs with the clock reads it.
+        let server_time =
+            signing.map(|signing| ServerTime::new(signing, read_server_time(Arc::clone(&rest))));
+        let rate_limiter =
+            Arc::new(RateLimitTracker::new(WeightPool::Spot).with_server_time(server_time));
         let rules = Arc::new(RulesLoader::new(
             config.pre_send_rules,
             Arc::clone(&rest),
@@ -1128,6 +1173,7 @@ impl ExecutionClient for BinanceSpot {
                     }
                     Ok(Ok(())) => {}
                 }
+                self.rate_limiter.after_failure(&e).await;
                 return Err(self
                     .rate_limiter
                     .stream_open_error(&e, |e| UnindexedClientError::Internal(e.to_string())));
@@ -1280,6 +1326,8 @@ impl ExecutionClient for BinanceSpot {
                 // Check the venue response first (zero-alloc downcast) — order rejections are
                 // the common case; rate limits during placement are rare.
                 if let Some(order_err) = classify_ws_order_error(&e, &instrument) {
+                    // A refused timestamp reads Binance's time before the caller can retry.
+                    self.rate_limiter.after_failure(&e).await;
                     // Venue response — WS session is healthy, don't tear it down. A throttle
                     // (429, -1003, a WAF 403) backs off the shared limiter for the wait Binance
                     // sent, so REST calls and later orders back off too.
@@ -1562,6 +1610,8 @@ impl ExecutionClient for BinanceSpot {
                 // Check the venue response first (zero-alloc downcast) — order rejections are
                 // the common case; rate limits during placement are rare.
                 if let Some(order_err) = classify_ws_order_error(&e, &instrument) {
+                    // A refused timestamp reads Binance's time before the caller can retry.
+                    self.rate_limiter.after_failure(&e).await;
                     // Venue response — WS session is healthy, don't tear it down. A throttle
                     // (429, -1003, a WAF 403) backs off the shared limiter for the wait Binance
                     // sent, so REST calls and later orders back off too.
@@ -1829,7 +1879,7 @@ async fn connection_manager(
     // The balances a reconnect has yet to restate, read once its fills have been recovered.
     let mut restatement = BalanceRestatement::default();
     // The venue's clock and the latest balance time, from the events the stream delivers.
-    let clock = SharedStreamClock::default();
+    let clock = StreamClock::shared(rate_limiter.signing_clock());
     let mut current_ws = initial_ws;
 
     loop {
@@ -1854,6 +1904,8 @@ async fn connection_manager(
                         error!(%e, "BinanceSpot WS connect/subscribe failed");
                         // A rate-limit refusal starts a cooldown, so REST and orders back off too.
                         rate_limiter.on_stream_refused(&e);
+                        // A refused subscribe timestamp reads Binance's time before the retry.
+                        rate_limiter.after_failure(&e).await;
                         if let Err(reason) =
                             retry_or_end(&mut budget, &rate_limiter, || e.to_string()).await
                         {
@@ -1897,7 +1949,7 @@ async fn connection_manager(
         // subscription; that task processes events sequentially from an internal channel,
         // so FnMut callbacks are never invoked concurrently per subscription. If the SDK
         // changes to concurrent callbacks, these `Option::take()` calls would need a Mutex.
-        // verified against binance-sdk =77.0.0. Re-verify on SDK upgrade.
+        // verified against binance-sdk =77.2.0. Re-verify on SDK upgrade.
         let subscription = ws.subscribe_on_ws_events(move |event| {
             let Some(ref sender) = event_tx else { return };
             match event {
@@ -1986,7 +2038,7 @@ async fn connection_manager(
         // recovered is not checked yet. Each gap and check is opened before it is read, so one
         // that fails or times out is kept for a retry.
         if let Some(disconnect) = disconnect.take() {
-            let end = disconnect.end(clock.lock().venue(), HostMoment::now());
+            let end = disconnect.end(&clock.lock().venue(), HostMoment::now());
             unrecovered.open(&instruments, disconnect.start, end);
             // Only the instruments this stream recovers fills for, so fills-first holds for each.
             let held = known.lock().instruments_among(&instruments);
@@ -2105,7 +2157,7 @@ async fn connection_manager(
         if should_reconnect {
             let heartbeat_timed_out = matches!(reason, DisconnectReason::HeartbeatTimeout);
             disconnect = Some(Disconnect::seen(
-                clock.lock().venue(),
+                &clock.lock().venue(),
                 HostMoment::now(),
                 disconnect_lookback(heartbeat_timed_out),
             ));
@@ -2115,7 +2167,7 @@ async fn connection_manager(
         // must explicitly unsubscribe — Subscription::drop only detaches the
         // internal JoinHandle, it doesn't abort it.
         // unsubscribe() aborts the callback task without waiting for it (verified against
-        // binance-sdk =77.0.0): a callback already running finishes, and none starts once the
+        // binance-sdk =77.2.0): a callback already running finishes, and none starts once the
         // task sees the abort. That is benign: the callback holds its own clone of the
         // `heartbeat_flag` Arc, so dropping ours here is safe, and an event it still forwards
         // reaches the consumer through the dedup cache like any other from this connection.
@@ -2831,7 +2883,9 @@ mod tests {
             order::{request::RequestOpen, state::InactiveOrderState},
         };
 
-        let client = BinanceSpot::new(BinanceSpotConfig::testnet("key".into(), "secret".into()));
+        let client = BinanceSpot::new(
+            BinanceSpotConfig::testnet("key".into(), "secret".into()).with_server_time_sync(false),
+        );
         let instrument = InstrumentNameExchange::new("BTCUSDT");
 
         for effect in [MarginEffect::Borrow, MarginEffect::Repay] {
@@ -2881,8 +2935,9 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        let mut client =
-            BinanceSpot::new(BinanceSpotConfig::testnet("key".into(), "secret".into()));
+        let mut client = BinanceSpot::new(
+            BinanceSpotConfig::testnet("key".into(), "secret".into()).with_server_time_sync(false),
+        );
         client.rules = Arc::new(RulesLoader::new(
             PreSendRules::Enforce,
             Arc::new(SpotRestApi::from_config(
@@ -2929,8 +2984,9 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let mut client =
-            BinanceSpot::new(BinanceSpotConfig::testnet("key".into(), "secret".into()));
+        let mut client = BinanceSpot::new(
+            BinanceSpotConfig::testnet("key".into(), "secret".into()).with_server_time_sync(false),
+        );
         client.rules = Arc::new(RulesLoader::new(
             PreSendRules::Enforce,
             Arc::new(SpotRestApi::from_config(
@@ -3005,8 +3061,9 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let mut client =
-            BinanceSpot::new(BinanceSpotConfig::testnet("key".into(), "secret".into()));
+        let mut client = BinanceSpot::new(
+            BinanceSpotConfig::testnet("key".into(), "secret".into()).with_server_time_sync(false),
+        );
         client.rules = Arc::new(RulesLoader::new(
             PreSendRules::Enforce,
             Arc::new(SpotRestApi::from_config(
@@ -5637,6 +5694,7 @@ mod tests {
     fn client_with_ws_api(ws_url: String) -> BinanceSpot {
         let mut client = <BinanceSpot as ExecutionClient>::new(
             BinanceSpotConfig::new("key".into(), "secret".into())
+                .with_server_time_sync(false)
                 .with_pre_send_rules(PreSendRules::Off),
         );
         client.rest = Arc::new(SpotRestApi::from_config(
@@ -5693,10 +5751,9 @@ mod tests {
     /// rate-limit rejection, without a handshake.
     #[tokio::test]
     async fn cancel_without_a_session_during_a_cooldown_is_rejected_unsent() {
-        let client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
-            "key".into(),
-            "secret".into(),
-        ));
+        let client = <BinanceSpot as ExecutionClient>::new(
+            BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+        );
         client
             .rate_limiter
             .on_rate_limited(Some(Duration::from_secs(60)));
@@ -7176,10 +7233,9 @@ mod tests {
             ]))
             .mount(&server)
             .await;
-        let mut client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
-            "key".into(),
-            "secret".into(),
-        ));
+        let mut client = <BinanceSpot as ExecutionClient>::new(
+            BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+        );
         client.rest = Arc::new(SpotRestApi::from_config(
             ConfigurationRestApi::builder()
                 .api_key("key")
@@ -7581,10 +7637,9 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let mut client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
-            "key".into(),
-            "secret".into(),
-        ));
+        let mut client = <BinanceSpot as ExecutionClient>::new(
+            BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+        );
         client.rest = rest_at(&server);
 
         let before = Utc::now();
@@ -7674,10 +7729,9 @@ mod tests {
         mount_order(&server, "live", row_response("live", "PARTIALLY_FILLED")).await;
         mount_order(&server, "unknown", venue_error(-2013)).await;
         mount_order(&server, "no-symbol", venue_error(-1121)).await;
-        let mut client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
-            "key".into(),
-            "secret".into(),
-        ));
+        let mut client = <BinanceSpot as ExecutionClient>::new(
+            BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+        );
         client.rest = rest_at(&server);
         let keys = ["filled", "cancelled", "live", "unknown"].map(|cid| spot_key("BTCUSDT", cid));
 
@@ -7709,10 +7763,9 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         mount_order(&server, "cancelled", row_response("cancelled", "CANCELED")).await;
         mount_order(&server, "refused", venue_error(-1100)).await;
-        let mut client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
-            "key".into(),
-            "secret".into(),
-        ));
+        let mut client = <BinanceSpot as ExecutionClient>::new(
+            BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+        );
         client.rest = rest_at(&server);
 
         let result = client
@@ -8065,10 +8118,9 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let mut client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
-            "key".into(),
-            "secret".into(),
-        ));
+        let mut client = <BinanceSpot as ExecutionClient>::new(
+            BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+        );
         client.rest = rest_at(&server);
         let btcusdt = InstrumentNameExchange::new("BTCUSDT");
 
@@ -8108,10 +8160,9 @@ mod tests {
             )
             .mount(&server)
             .await;
-        let mut client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
-            "key".into(),
-            "secret".into(),
-        ));
+        let mut client = <BinanceSpot as ExecutionClient>::new(
+            BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+        );
         client.rest = rest_at(&server);
         let nope = InstrumentNameExchange::new("NOPEUSDT");
         match client.fetch_commission_rates(&nope).await {

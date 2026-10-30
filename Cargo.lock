@@ -259,9 +259,9 @@ checksum = "d86b93f97252c47b41663388e6d155714a9d0c398b99f1005cbc5f978b29f445"
 
 [[package]]
 name = "binance-sdk"
-version = "77.0.0"
+version = "77.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07615c59a122db3f1edd66e63b5e5639cffaee0abd79c0ec70188dace1e07fcc"
+checksum = "b193f2f00dabd41539ba21afde0da32f28fc123fca016d74a9e7557b98b25c6d"
 dependencies = [
  "anyhow",
  "async-trait",
