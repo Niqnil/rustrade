@@ -398,6 +398,8 @@ pub(super) struct EndedOrderReader<'a> {
     order_ids: &'a OrderIdMap,
     pending_cancels: &'a PendingCancels,
     earlier: &'a EarlierCompletions,
+    /// The gateway's zone, in which a completed order's time that names none is read.
+    session_zone: Option<Tz>,
     completed: OnceCell<CompletedOrders>,
     executed: OnceCell<ExecutedQuantities>,
 }
@@ -410,6 +412,7 @@ impl<'a> EndedOrderReader<'a> {
         order_ids: &'a OrderIdMap,
         pending_cancels: &'a PendingCancels,
         earlier: &'a EarlierCompletions,
+        session_zone: Option<Tz>,
     ) -> Self {
         Self {
             client,
@@ -418,6 +421,7 @@ impl<'a> EndedOrderReader<'a> {
             order_ids,
             pending_cancels,
             earlier,
+            session_zone,
             completed: OnceCell::new(),
             executed: OnceCell::new(),
         }
@@ -440,10 +444,9 @@ impl<'a> EndedOrderReader<'a> {
             Some(completed) => completed,
             None => {
                 let api_client_id = self.client.client_id();
-                let session_zone = execution::session_zone(self.client);
                 let mut completed = CompletedOrders::default();
                 self.listings.completed_orders(self.client, |item| {
-                    completed.push(item, api_client_id, session_zone)
+                    completed.push(item, api_client_id, self.session_zone)
                 })?;
                 self.completed.get_or_init(|| completed)
             }
@@ -780,8 +783,6 @@ mod tests {
         assert_eq!(filled(None, Some(dec!(2))), Some(dec!(2)));
     }
 
-    /// An adopted order's placement is unknown, so finding none of its executions says nothing
-    /// of its fill.
     /// An ended order this client does not track, whose good-till-date names no zone, has it read
     /// in the session's zone, as its completion time is.
     #[test]
@@ -820,6 +821,8 @@ mod tests {
         );
     }
 
+    /// An adopted order's placement is unknown, so finding none of its executions says nothing
+    /// of its fill.
     #[test]
     fn an_adopted_orders_fill_without_executions_is_unknown() {
         let order = one(completed(

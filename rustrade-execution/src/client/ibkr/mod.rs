@@ -2771,6 +2771,7 @@ impl ExecutionClient for IbkrClient {
             known: self.known_live.clone(),
             listings: self.listings.clone(),
             earlier_completions: self.earlier_completions.clone(),
+            session_zone: self.session_zone,
             sink: sink.clone(),
             runtime: tokio::runtime::Handle::current(),
             scope,
@@ -4020,6 +4021,7 @@ impl OrderStatusClient for IbkrClient {
         let order_ids = self.order_ids.clone();
         let pending_cancels = self.pending_cancels.clone();
         let earlier_completions = self.earlier_completions.clone();
+        let session_zone = self.session_zone;
         tokio::task::spawn_blocking(move || {
             let reader = ended_orders::EndedOrderReader::new(
                 &client,
@@ -4028,6 +4030,7 @@ impl OrderStatusClient for IbkrClient {
                 &order_ids,
                 &pending_cancels,
                 &earlier_completions,
+                session_zone,
             );
             // Each lookup is answered from listings read on this thread, so the futures are
             // ready at once and nothing awaits the runtime.
