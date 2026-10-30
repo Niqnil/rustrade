@@ -169,6 +169,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Binance REST balance reads are stamped no later than Binance's time when this host's clock
+  leads** (`rustrade-execution`, #796). `fetch_balances` and `account_snapshot`, on spot and on
+  cross and isolated margin, stamped each balance with this host's time before the request, less
+  the 5 s REST lag allowance. The engine orders balance and debt state by that stamp, so one ahead
+  of Binance's time had it drop the stream's balance and debt events until Binance's clock caught
+  up. A host clock more than a second ahead used to fail every signed read, which kept the stamp
+  within the allowance; since #773 such reads succeed. They now take the earlier of this host's
+  time and the signing clock's estimate of Binance's time when the request was sent, as the
+  balance restatement after a reconnect already did. That restatement now times its read at the
+  request's send, after any rate-limit wait, rather than before. With `server_time_sync` off,
+  balance reads are stamped from this host's time as before.
+
 - **The clients' own fill recovery after a reconnect reads its span on the venue's clock**
   (`rustrade-execution`, #774). Alpaca, Binance Spot and Margin, and IBKR each recover the fills
   missed while their account stream was down, and bounded that span by this host's clock. A host

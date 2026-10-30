@@ -91,12 +91,13 @@
 //! [`InstrumentBalanceSnapshot`](crate::AccountEventKind::InstrumentBalanceSnapshot)s instead:
 //! each pair's base, then its quote, the pairs in no particular order.
 //!
-//! - **Stamp.** The earlier of this host's time and the venue's time at the read's start, as the
-//!   stream's own events show the venue's clock, less 5 s for Binance's REST view trailing its
-//!   stream. A stream event newer than the state the read shows then still applies over it. The
-//!   read starts no sooner than 5 s, on the venue's clock, after the latest balance or debt event
-//!   the stream delivered, and its stamp is never earlier than that event's: an earlier one would
-//!   leave the engine keeping that event's state.
+//! - **Stamp.** The earlier of this host's time and the venue's time when the read's request was
+//!   sent, as the stream's own events and the server-time reads show the venue's clock (see
+//!   below), less 5 s for Binance's REST view trailing its stream. A stream event newer than the
+//!   state the read shows then still applies over it. The read starts no sooner than 5 s, on the
+//!   venue's clock, after the latest balance or debt event the stream delivered, and its stamp is
+//!   never earlier than that event's: an earlier one would leave the engine keeping that event's
+//!   state.
 //! - **Failure.** A read that fails, or does not finish within 30 s (waits for rate limits
 //!   included), is logged at `warn` and retried while connected, after 5 s and then twice as long
 //!   each time, up to 2 minutes. It is never given up. A later reconnect replaces it with a read
@@ -138,8 +139,16 @@
 //! - **Account streams.** The reads also bound Binance's clock for the account streams, which place
 //!   fill recovery and balance restatement on Binance's time (see above), before a stream's first
 //!   event as well as after.
+//! - **Balance reads.** `fetch_balances` and `account_snapshot` stamp each balance with the
+//!   earlier of this host's time and Binance's, as the reads bound it, when the request was sent,
+//!   less 5 s. A host clock ahead of Binance's then does not carry into the stamp: a stamp ahead
+//!   of Binance's time would have the engine drop the stream's balance and debt events until
+//!   Binance's clock caught up with it. Before the first read succeeds, the stamp is taken from
+//!   this host's time.
 //! - **Turning it off.** `server_time_sync` on each config, `true` by default, set to `false`
-//!   stamps signed requests with this host's clock.
+//!   stamps signed requests with this host's clock, and balance reads from it alone: a host clock
+//!   ahead of Binance's then carries into their stamps, and keeping the two within bounds is the
+//!   caller's obligation.
 //!
 //! # Logging: `binance_sdk` writes request credentials at `DEBUG`
 //!

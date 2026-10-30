@@ -604,8 +604,10 @@ where
     /// account stream where the stream carries balances, never with a time taken after the
     /// response. A time the venue states for the account's state can be used instead.
     ///
-    /// That time is on this host's clock, so a host clock ahead of the venue's carries into it:
-    /// keeping the two within bounds is the caller's obligation.
+    /// A host clock ahead of the venue's carries into a stamp taken from this host's time. An
+    /// implementation that keeps an estimate of the venue's clock that is never ahead of it takes
+    /// the earlier of the two times instead, and says so in its docs. Otherwise keeping the two
+    /// clocks within bounds is the caller's obligation.
     fn fetch_balances(
         &self,
         assets: &[AssetNameExchange],

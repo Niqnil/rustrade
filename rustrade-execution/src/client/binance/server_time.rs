@@ -43,7 +43,8 @@ const LEAD_WARN: TimeDelta = TimeDelta::seconds(1);
 /// read before a request waits for a new one: a suspend of the host, or a forward step of its wall
 /// clock. Each leaves the monotonic estimate behind Binance's clock by the difference. NTP slewing
 /// the wall clock (up to 500 ppm, 1.8 s an hour) can also reach it, but only after half an hour
-/// or more without a read, which the background refresh normally prevents.
+/// or more without a read, which the refresh a request starts normally prevents while requests
+/// keep arriving; after a longer idle, the next request waits for a read, as after a suspend.
 const PAUSE_ALLOWANCE: TimeDelta = TimeDelta::seconds(1);
 
 /// Serde default for each Binance config's `server_time_sync`: on.
@@ -210,6 +211,15 @@ impl ServerTime {
             .lock()
             .clock
             .host_lead(Utc::now(), Instant::now())
+    }
+
+    /// A clock read from a server whose time is always `lead` behind this host's.
+    #[cfg(test)]
+    pub(crate) fn behind_host(lead: TimeDelta) -> Self {
+        let lead_ms = lead.num_milliseconds();
+        let read: ReadServerTime =
+            Arc::new(move || Box::pin(async move { Ok(Utc::now().timestamp_millis() - lead_ms) }));
+        Self::new(SigningClock::default(), read)
     }
 
     /// The clock this keeps read.

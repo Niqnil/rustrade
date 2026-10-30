@@ -965,7 +965,7 @@ impl ExecutionClient for BinanceSpot {
         let balances = filter_and_convert_balances(
             account.balances.unwrap_or_default(),
             assets,
-            balance_read_time(sent),
+            balance_read_time(sent, &self.rate_limiter.venue_clock()),
         );
 
         // Fetch open orders for all instruments concurrently (with retry)
@@ -1650,7 +1650,8 @@ impl ExecutionClient for BinanceSpot {
     /// Each balance is stamped 5 s before its request was sent, as is each in
     /// [`account_snapshot`](Self::account_snapshot): Binance's REST account view can trail its
     /// account stream, and a stream balance event the read may not yet show must still be more
-    /// recent than the read.
+    /// recent than the read. The send is timed on Binance's clock when this host's is ahead of it
+    /// (see the [module docs](super#signed-requests-are-stamped-on-binances-clock)).
     async fn fetch_balances(
         &self,
         assets: &[AssetNameExchange],
@@ -1670,7 +1671,7 @@ impl ExecutionClient for BinanceSpot {
         Ok(filter_and_convert_balances(
             account.balances.unwrap_or_default(),
             assets,
-            balance_read_time(sent),
+            balance_read_time(sent, &self.rate_limiter.venue_clock()),
         ))
     }
 
@@ -2218,7 +2219,6 @@ async fn read_spot_restatement(
     clock: &SharedStreamClock,
     floor: Option<DateTime<Utc>>,
 ) -> Result<Vec<UnindexedAccountEvent>, UnindexedClientError> {
-    let sent_at = tokio::time::Instant::now();
     let (response, sent) = rest_read_with_retry(rest, rate_limiter, RequestKind::Query, |rest| {
         Box::pin(async move {
             let params = GetAccountParams::builder().build()?;
@@ -2228,7 +2228,7 @@ async fn read_spot_restatement(
     .await
     .map_err(|e| classify_rest_query_error(&e, None))?;
     let account = response.data().await.map_err(response_decode_error)?;
-    let time = restatement_time(&clock.lock(), sent, sent_at, floor);
+    let time = restatement_time(&clock.lock(), sent, floor);
     Ok(
         filter_and_convert_balances(account.balances.unwrap_or_default(), assets, time)
             .into_iter()
@@ -7759,6 +7759,62 @@ mod tests {
             retried,
         );
         within(snapshot.balances[0].time_exchange, retried, after);
+    }
+
+    /// With this host's clock ahead of Binance's, a balance read is stamped the REST lag before
+    /// Binance's time when its request was sent, as the client's server-time reads bound it, not
+    /// before this host's time: a stamp ahead of Binance's would have the engine drop the stream's
+    /// balance events until Binance's clock caught up with it. So is a restatement read.
+    #[tokio::test]
+    async fn a_balance_read_is_stamped_on_binances_clock_when_the_host_clock_leads() {
+        use crate::client::binance::shared::REST_BALANCE_LAG;
+        const LEAD: TimeDelta = TimeDelta::seconds(60);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/account"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "balances": [{ "asset": "BTC", "free": "1", "locked": "0" }] }),
+            ))
+            .mount(&server)
+            .await;
+        let mut client = <BinanceSpot as ExecutionClient>::new(
+            BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+        );
+        client.rest = rest_at(&server);
+        client.rate_limiter = Arc::new(
+            RateLimitTracker::new(WeightPool::Spot)
+                .with_server_time(Some(ServerTime::behind_host(LEAD))),
+        );
+        let clock = StreamClock::shared(client.rate_limiter.signing_clock());
+
+        let before = Utc::now();
+        let fetched = client.fetch_balances(&[]).await.unwrap();
+        let snapshot = client.account_snapshot(&[], &[]).await.unwrap();
+        let restated = read_spot_restatement(&client.rest, &client.rate_limiter, &[], &clock, None)
+            .await
+            .unwrap();
+        let after = Utc::now();
+
+        let [restated] = restated.as_slice() else {
+            panic!("one balance: {restated:?}");
+        };
+        let AccountEventKind::BalanceSnapshot(restated) = &restated.kind else {
+            panic!("a balance snapshot: {restated:?}");
+        };
+        assert_eq!((fetched.len(), snapshot.balances.len()), (1, 1));
+        for time in [
+            fetched[0].time_exchange,
+            snapshot.balances[0].time_exchange,
+            restated.0.time_exchange,
+        ] {
+            // Binance's time when the request was sent, by this host's clock. The server time
+            // is in whole milliseconds, which can put it up to one before `before`.
+            let sent = time + REST_BALANCE_LAG + LEAD;
+            assert!(
+                before - TimeDelta::milliseconds(1) <= sent && sent <= after,
+                "{time} + the lag and the lead not within {before} ..= {after}"
+            );
+        }
     }
 
     /// A restatement read gets the account and returns each requested balance as a balance

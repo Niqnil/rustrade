@@ -90,6 +90,7 @@ use crate::{
             KnownLiveOrders, MAX_KNOWN_LIVE_ORDERS, OpenListing, OrderLookup,
             SharedKnownLiveOrders, UncheckedOrders, fetch_ended_by_key, recover_ended_orders,
         },
+        venue_clock::HostMoment,
     },
     error::{ApiError, OrderError, UnindexedClientError},
     margin::{MarginBorrow, MarginEffect, MarginPlacement},
@@ -1015,16 +1016,17 @@ impl BinanceMargin {
         // Per-pair isolated balances + risk (chunked ≤5 symbols/request), keyed by instrument,
         // each chunk's stamped by when its request was sent.
         let mut balances_by_symbol = HashMap::with_capacity(effective.len());
-        for read in fetch_isolated_margin_account_info(
+        let reads = fetch_isolated_margin_account_info(
             self.rest.clone(),
             self.rate_limiter.clone(),
             effective.clone(),
         )
-        .await?
-        {
+        .await?;
+        let venue = self.rate_limiter.venue_clock();
+        for read in reads {
             balances_by_symbol.extend(convert_isolated_margin_assets(
                 read.assets,
-                balance_read_time(read.sent),
+                balance_read_time(read.sent, &venue),
             ));
         }
 
@@ -1318,7 +1320,8 @@ impl ExecutionClient for BinanceMargin {
     ///
     /// So each balance is stamped 5 s before its request was sent: a stream balance or debt
     /// event the read may not yet show is then still more recent than the read, and applies over
-    /// it.
+    /// it. The send is timed on Binance's clock when this host's is ahead of it (see the
+    /// [module docs](super#signed-requests-are-stamped-on-binances-clock)).
     async fn account_snapshot(
         &self,
         assets: &[AssetNameExchange],
@@ -1342,7 +1345,7 @@ impl ExecutionClient for BinanceMargin {
         let balances = filter_and_convert_margin_balances(
             account.user_assets.unwrap_or_default(),
             assets,
-            balance_read_time(sent),
+            balance_read_time(sent, &self.rate_limiter.venue_clock()),
         );
 
         // Fetch open orders for all instruments concurrently (with retry), limiting concurrency
@@ -1424,7 +1427,7 @@ impl ExecutionClient for BinanceMargin {
         Ok(filter_and_convert_margin_balances(
             account.user_assets.unwrap_or_default(),
             assets,
-            balance_read_time(sent),
+            balance_read_time(sent, &self.rate_limiter.venue_clock()),
         ))
     }
 
@@ -2433,7 +2436,6 @@ async fn read_margin_restatement(
     floor: Option<DateTime<Utc>>,
 ) -> Result<Vec<UnindexedAccountEvent>, UnindexedClientError> {
     let event = |kind| UnindexedAccountEvent::new(ExchangeId::BinanceMargin, kind);
-    let sent_at = tokio::time::Instant::now();
     if is_isolated {
         let reads =
             fetch_isolated_margin_account_info(rest.clone(), rate_limiter.clone(), pairs.to_vec())
@@ -2442,7 +2444,7 @@ async fn read_margin_restatement(
         return Ok(reads
             .into_iter()
             .flat_map(|read| {
-                let time = restatement_time(&clock, read.sent, sent_at, floor);
+                let time = restatement_time(&clock, read.sent, floor);
                 convert_isolated_margin_assets(read.assets, time)
             })
             .flat_map(|(pair, state)| {
@@ -2463,7 +2465,7 @@ async fn read_margin_restatement(
     .await
     .map_err(|e| classify_rest_query_error(&e, None))?;
     let account = response.data().await.map_err(response_decode_error)?;
-    let time = restatement_time(&clock.lock(), sent, sent_at, floor);
+    let time = restatement_time(&clock.lock(), sent, floor);
     Ok(
         filter_and_convert_margin_balances(account.user_assets.unwrap_or_default(), assets, time)
             .into_iter()
@@ -3173,7 +3175,7 @@ fn chunk_symbols(symbols: &[InstrumentNameExchange]) -> Vec<String> {
 /// request was sent ([`rest_read_with_retry`]).
 struct IsolatedAccountRead {
     assets: Vec<QueryIsolatedMarginAccountInfoResponseAssetsInner>,
-    sent: DateTime<Utc>,
+    sent: HostMoment,
 }
 
 /// Fetch isolated-margin account info for `symbols`, chunked at the venue's max-5-symbols/request
@@ -5952,20 +5954,45 @@ mod tests {
     /// recent than it.
     #[tokio::test]
     async fn a_cross_balance_read_is_stamped_the_rest_lag_before_its_request_was_sent() {
-        margin_balance_reads_are_stamped_the_rest_lag_before_their_requests(false).await;
+        margin_balance_reads_are_stamped_the_rest_lag_before_their_requests(false, None).await;
     }
 
     /// As for the cross account, for an isolated pair's balances, which come only on its
     /// instrument snapshot.
     #[tokio::test]
     async fn an_isolated_balance_read_is_stamped_the_rest_lag_before_its_request_was_sent() {
-        margin_balance_reads_are_stamped_the_rest_lag_before_their_requests(true).await;
+        margin_balance_reads_are_stamped_the_rest_lag_before_their_requests(true, None).await;
+    }
+
+    /// With this host's clock ahead of Binance's, a cross balance read is stamped the REST lag
+    /// before Binance's time when its request was sent, as the client's server-time reads bound
+    /// it, not before this host's time: a stamp ahead of Binance's would have the engine drop the
+    /// stream's balance and debt events until Binance's clock caught up with it.
+    #[tokio::test]
+    async fn a_cross_balance_read_is_stamped_on_binances_clock_when_the_host_clock_leads() {
+        margin_balance_reads_are_stamped_the_rest_lag_before_their_requests(
+            false,
+            Some(TimeDelta::seconds(60)),
+        )
+        .await;
+    }
+
+    /// As for the cross account, for an isolated pair's balances.
+    #[tokio::test]
+    async fn an_isolated_balance_read_is_stamped_on_binances_clock_when_the_host_clock_leads() {
+        margin_balance_reads_are_stamped_the_rest_lag_before_their_requests(
+            true,
+            Some(TimeDelta::seconds(60)),
+        )
+        .await;
     }
 
     /// Read the account's balances with both `fetch_balances` and `account_snapshot`, each answer
-    /// delayed, and check every balance's time.
+    /// delayed, and check every balance's time: on this host's clock, or with a `lead`, signed on
+    /// a server time read that far behind it.
     async fn margin_balance_reads_are_stamped_the_rest_lag_before_their_requests(
         is_isolated: bool,
+        lead: Option<TimeDelta>,
     ) {
         use crate::client::binance::shared::REST_BALANCE_LAG;
         const ANSWER_DELAY: Duration = Duration::from_millis(200);
@@ -6003,7 +6030,14 @@ mod tests {
             .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
             .mount(&server)
             .await;
-        let client = margin_client_at(&server, is_isolated);
+        let mut client = margin_client_at(&server, is_isolated);
+        if let Some(lead) = lead {
+            client.rate_limiter = Arc::new(
+                RateLimitTracker::new(WeightPool::Sapi)
+                    .with_server_time(Some(ServerTime::behind_host(lead))),
+            );
+        }
+        let lead = lead.unwrap_or_default();
 
         let before = Utc::now();
         let fetched = client.fetch_balances(&[]).await.unwrap();
@@ -6039,9 +6073,12 @@ mod tests {
         for (times, from, to) in reads {
             assert!(!times.is_empty());
             for time in times {
+                // When the request was sent, by this host's clock. A server time is in whole
+                // milliseconds, which can put it up to one before `from`.
+                let sent = time + REST_BALANCE_LAG + lead;
                 assert!(
-                    from <= time + REST_BALANCE_LAG && time + REST_BALANCE_LAG + ANSWER_DELAY <= to,
-                    "{time} + the lag not within {from} ..= {to} - {ANSWER_DELAY:?}"
+                    from - TimeDelta::milliseconds(1) <= sent && sent + ANSWER_DELAY <= to,
+                    "{time} + the lag and {lead} not within {from} ..= {to} - {ANSWER_DELAY:?}"
                 );
             }
         }
