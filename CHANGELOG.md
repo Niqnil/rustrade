@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: `OrderRules::check` takes the order's side, and checks a trailing order's offset**
+  (`rustrade-execution`, #787). New `OrderRules::trailing_offset_above` and
+  `trailing_offset_below` hold the range of a trailing offset, in basis points, for a trigger that
+  trails above the market (a buy trailing stop) and below it (a sell). The pre-send check refuses
+  an offset outside its side's range with `OrderError::OutOfBounds` on
+  `OrderField::TrailingOffset`, naming the limit in the offset's own unit (percent for a
+  `Percentage` offset); an `Absolute` offset is not checked. The Binance clients read them from
+  `TRAILING_DELTA`. `OrderRules::new` keeps its four arguments and leaves the new parts off.
+
 - **Breaking: IBKR times are read in the zone they name, or the gateway's, and never in a
   guessed one** (`rustrade-execution`, #775). `parse_ib_timestamp` takes the gateway's session
   zone as a second argument. A time that names a zone that is not a tz database name, or names
@@ -53,6 +62,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     thread, where the previous clock took up to 158 ns. Most of that gain is the alignment.
 
 ### Added
+
+- **Rounding onto an order rule's grid** (`rustrade-execution`, #786). `ValueRule::round_down`
+  and `round_up` return the nearest multiple of the rule's step at or below, or at or above, a
+  value, counted from zero as the pre-send check counts it; a value on the grid, or any value when
+  there is no step, comes back unchanged. `OrderRules::round_quantity_down` and
+  `round_quantity_up` take the order's kind: a market order's quantity rounds to the grid that
+  `quantity` and `market_quantity`'s steps share. None of them clamps to the rule's range, so the
+  result may still be refused, and each returns `None` only when a `Decimal` cannot hold the
+  result.
+
+- **The notional limits a venue applies to market orders** (`rustrade-execution`, #787).
+  `OrderRules::market_notional` holds the part of `notional` that also holds for a market order,
+  read on Binance from `NOTIONAL`'s `applyMinToMarket` / `applyMaxToMarket` or `MIN_NOTIONAL`'s
+  `applyToMarket`. The pre-send check does not apply it: the venue measures a market order's
+  notional at a price of its own, such as a reference or average price. Build rules with it with
+  `OrderRules::with_market_notional`, and with trailing offset ranges with
+  `OrderRules::with_trailing_offsets`.
 
 - **`VenueClock::span_start`, `VenueClock::span_end` and `HostMoment`** (`rustrade-execution`,
   #774). Where a read of a span the venue stamped starts and ends, placed on the venue's clock as

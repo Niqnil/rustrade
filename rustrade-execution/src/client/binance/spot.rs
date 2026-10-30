@@ -1324,7 +1324,7 @@ impl ExecutionClient for BinanceSpot {
 
         if let Err(refused) = self
             .rules
-            .check(instrument.name(), kind, price, quantity)
+            .check(instrument.name(), side, kind, price, quantity)
             .await
         {
             return Order {
@@ -2957,6 +2957,99 @@ mod tests {
                 )
             ),
             "{order:?}"
+        );
+    }
+
+    /// A trailing stop's offset is held to `TRAILING_DELTA`'s range for its side, the range above
+    /// for a buy and below for a sell, and refused unsent.
+    #[tokio::test]
+    async fn open_order_refuses_a_trailing_offset_outside_its_sides_range_unsent() {
+        use crate::{
+            client::ExecutionClient,
+            error::{Bound, BoundsViolation, OrderField},
+            order::{TrailingOffsetType, request::RequestOpen, state::InactiveOrderState},
+        };
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/exchangeInfo"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"symbols": [{
+                    "symbol": "BTCUSDT", "status": "TRADING",
+                    "filters": [
+                        {"filterType": "TRAILING_DELTA", "minTrailingAboveDelta": 10,
+                         "maxTrailingAboveDelta": 2000, "minTrailingBelowDelta": 10,
+                         "maxTrailingBelowDelta": 1000},
+                    ],
+                }]}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client =
+            BinanceSpot::new(BinanceSpotConfig::testnet("key".into(), "secret".into()));
+        client.rules = Arc::new(RulesLoader::new(
+            PreSendRules::Enforce,
+            Arc::new(SpotRestApi::from_config(
+                ConfigurationRestApi::builder()
+                    .api_key("key")
+                    .api_secret("secret")
+                    .base_path(server.uri())
+                    .build()
+                    .unwrap(),
+            )),
+            Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+        ));
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        let order = |cid: &str, side: Side, offset: Decimal| OrderRequestOpen {
+            key: OrderKey::new(
+                ExchangeId::BinanceSpot,
+                &instrument,
+                StrategyId::new("strategy"),
+                ClientOrderId::new(cid),
+            ),
+            state: RequestOpen::new(
+                side,
+                None,
+                Decimal::ONE,
+                OrderKind::TrailingStop {
+                    offset,
+                    offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price: None,
+                },
+                TimeInForce::GoodUntilCancelled { post_only: false },
+            ),
+        };
+        let refused_at = |order: Order<_, _, _>| match order.state {
+            OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::OutOfBounds(
+                violation,
+            ))) => Some(violation),
+            _ => None,
+        };
+
+        let buy = client
+            .open_order(order("a", Side::Buy, Decimal::from(2500)))
+            .await;
+        assert_eq!(
+            refused_at(buy),
+            Some(BoundsViolation::new(
+                OrderField::TrailingOffset,
+                Bound::Max,
+                Decimal::from(2000),
+                Decimal::from(2500),
+            ))
+        );
+        let sell = client
+            .open_order(order("b", Side::Sell, Decimal::from(1500)))
+            .await;
+        assert_eq!(
+            refused_at(sell),
+            Some(BoundsViolation::new(
+                OrderField::TrailingOffset,
+                Bound::Max,
+                Decimal::from(1000),
+                Decimal::from(1500),
+            ))
         );
     }
 
