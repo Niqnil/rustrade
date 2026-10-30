@@ -73,12 +73,14 @@ use rustrade::{
     risk::DefaultRiskManager,
     statistic::{summary::TradingSummary, time::Daily},
     strategy::{
-        algo::AlgoStrategy, close_positions::ClosePositionsStrategy,
-        on_disconnect::OnDisconnectStrategy, on_trading_disabled::OnTradingDisabled,
+        algo::AlgoStrategy, cash_flow_attribution::CashFlowAttributionStrategy,
+        close_positions::ClosePositionsStrategy, on_disconnect::OnDisconnectStrategy,
+        on_trading_disabled::OnTradingDisabled,
     },
     system::config::SystemConfig,
 };
 use rustrade_data::{event::DataKind, streams::consumer::MarketStreamEvent};
+use rustrade_execution::cash_flow::CashFlow;
 use rustrade_execution::order::{
     OrderKey, OrderKind, TimeInForce,
     id::{ClientOrderId, StrategyId},
@@ -219,6 +221,19 @@ impl ClosePositionsStrategy for MetronomeStrategy {
         InstrumentIndex: 'a,
     {
         (std::iter::empty(), std::iter::empty())
+    }
+}
+
+impl CashFlowAttributionStrategy for MetronomeStrategy {
+    type State = ProbeState;
+
+    fn attribute_cash_flow(
+        &mut self,
+        _: &Self::State,
+        _: ExchangeIndex,
+        _: &CashFlow<AssetIndex, InstrumentIndex>,
+    ) -> Option<InstrumentIndex> {
+        None
     }
 }
 

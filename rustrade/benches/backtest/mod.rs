@@ -34,6 +34,7 @@ use rustrade::{
     statistic::time::Daily,
     strategy::{
         algo::AlgoStrategy,
+        cash_flow_attribution::CashFlowAttributionStrategy,
         close_positions::{ClosePositionsStrategy, close_open_positions_with_market_orders},
         on_disconnect::OnDisconnectStrategy,
         on_trading_disabled::OnTradingDisabled,
@@ -50,6 +51,7 @@ use rustrade_data::{
 };
 use rustrade_execution::{
     AccountEvent,
+    cash_flow::CashFlow,
     order::{
         OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, StrategyId},
@@ -643,6 +645,19 @@ impl ClosePositionsStrategy for NoOpStrategy {
     }
 }
 
+impl CashFlowAttributionStrategy for NoOpStrategy {
+    type State = SeamState;
+
+    fn attribute_cash_flow(
+        &mut self,
+        _: &Self::State,
+        _: ExchangeIndex,
+        _: &CashFlow<AssetIndex, InstrumentIndex>,
+    ) -> Option<InstrumentIndex> {
+        None
+    }
+}
+
 impl
     OnDisconnectStrategy<
         HistoricalClock,
@@ -799,6 +814,19 @@ impl ClosePositionsStrategy for LoseMoneyStrategy {
         close_open_positions_with_market_orders(&self.id, state, filter, |_, _| {
             ClientOrderId::random()
         })
+    }
+}
+
+impl CashFlowAttributionStrategy for LoseMoneyStrategy {
+    type State = EngineState<DefaultGlobalData, LoseMoneyInstrumentData>;
+
+    fn attribute_cash_flow(
+        &mut self,
+        _: &Self::State,
+        _: ExchangeIndex,
+        _: &CashFlow<AssetIndex, InstrumentIndex>,
+    ) -> Option<InstrumentIndex> {
+        None
     }
 }
 

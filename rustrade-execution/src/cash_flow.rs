@@ -50,9 +50,9 @@ pub struct CashFlow<AssetKey, InstrumentKey> {
     /// The instrument whose position caused the flow, when the venue attributes it to one, as it
     /// does funding. `None` for a flow on the account as a whole, such as cross-margin interest.
     ///
-    /// The `rustrade` engine applies a `None` flow to no position, and does not guess one. A
-    /// consumer that knows which position a flow belongs to sets this before the engine sees the
-    /// event. See `EngineState::update_from_account` in `rustrade` for why and how.
+    /// The `rustrade` engine does not guess an instrument for a `None` flow: it asks the
+    /// strategy's `CashFlowAttributionStrategy`, and applies the flow to no position when that
+    /// names none. See `EngineState::update_from_account` in `rustrade` for why.
     pub instrument: Option<InstrumentKey>,
     /// When the venue posted the flow.
     pub time_exchange: DateTime<Utc>,

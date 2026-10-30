@@ -470,33 +470,12 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     ///   borrowing that no open position caused.
     /// - Interest on a quote asset is shared by every pair quoted in it.
     ///
-    /// A consumer whose account rules out these cases can route a flow itself, before the event
-    /// reaches the engine. For example, it can give the flow to the only instrument on the
-    /// exchange whose base asset is the flow's asset and that has an open position, and leave the
-    /// flow on the account otherwise:
-    /// ```rust
-    /// use rustrade::engine::state::{EngineState, instrument::filter::InstrumentFilter};
-    /// use rustrade_execution::{AccountEvent, AccountEventKind};
-    ///
-    /// fn route_to_base<GlobalData, InstrumentData>(
-    ///     state: &EngineState<GlobalData, InstrumentData>,
-    ///     event: &mut AccountEvent,
-    /// ) {
-    ///     let filter = InstrumentFilter::exchanges([event.exchange]);
-    ///     let AccountEventKind::CashFlow(flow) = &mut event.kind else { return };
-    ///     if flow.instrument.is_some() {
-    ///         return;
-    ///     }
-    ///     let asset = flow.asset;
-    ///     let mut held = state.instruments.instruments(&filter).filter(|instrument| {
-    ///         instrument.instrument.underlying.base == asset
-    ///             && !instrument.position.positions.is_empty()
-    ///     });
-    ///     if let (Some(only), None) = (held.next(), held.next()) {
-    ///         flow.instrument = Some(only.key);
-    ///     }
-    /// }
-    /// ```
+    /// The [`Engine`](crate::engine::Engine) asks its strategy's
+    /// [`CashFlowAttributionStrategy`](crate::strategy::cash_flow_attribution::CashFlowAttributionStrategy)
+    /// for an instrument before such a flow reaches this method, so a strategy whose account rules
+    /// out these cases supplies its own rule there, in live trading, a backtest and a stepped
+    /// simulation alike. [`route_to_base`](crate::strategy::cash_flow_attribution::route_to_base)
+    /// is one such rule. Called directly, this method asks no strategy.
     ///
     /// This method:
     /// - Sets the account [`ConnectivityState`](connectivity::ConnectivityState) to

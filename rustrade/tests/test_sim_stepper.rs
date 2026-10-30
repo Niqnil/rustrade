@@ -49,8 +49,12 @@ use rustrade::{
     risk::DefaultRiskManager,
     shutdown::{Shutdown, SyncShutdown},
     strategy::{
-        DefaultStrategy, algo::AlgoStrategy, close_positions::ClosePositionsStrategy,
-        on_disconnect::OnDisconnectStrategy, on_trading_disabled::OnTradingDisabled,
+        DefaultStrategy,
+        algo::AlgoStrategy,
+        cash_flow_attribution::{CashFlowAttributionStrategy, route_to_base},
+        close_positions::ClosePositionsStrategy,
+        on_disconnect::OnDisconnectStrategy,
+        on_trading_disabled::OnTradingDisabled,
     },
 };
 use rustrade_data::{
@@ -62,7 +66,7 @@ use rustrade_execution::{
     AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, MarginEffect,
     PeriodicMarginInterest, SpotMarginConfig,
     balance::{AssetBalance, Balance, MarginDetails},
-    cash_flow::CashFlowKind,
+    cash_flow::{CashFlow, CashFlowKind},
     client::mock::MockExecutionConfig,
     fill::{MarketOrderTiming, NextBarPrice, StaleMarketPolicy},
     holding_cost::{DayCount, RateSeries},
@@ -409,6 +413,17 @@ fn position<Strategy>(
                 position.price_entry_average,
             )
         })
+}
+
+/// The base asset carry of the `Engine`'s position in `instrument`, if it holds one.
+fn carry_base<Strategy>(engine: &TestEngine<Strategy>, instrument: usize) -> Option<Decimal> {
+    engine
+        .state
+        .instruments
+        .instruments(&InstrumentFilter::None)
+        .nth(instrument)
+        .and_then(|state| state.position.positions.values().next())
+        .map(|position| position.carry_assets.base)
 }
 
 fn price<Strategy>(engine: &TestEngine<Strategy>, instrument: usize) -> Option<Decimal> {
@@ -1244,6 +1259,51 @@ fn a_start_short_on_a_venue_that_lends_owes_its_base_and_pays_interest_from_the_
         loan(&s.engine, "btc"),
         Some(MarginDetails::new(dec!(1), dec!(0.0001)))
     );
+    assert_eq!(
+        carry_base(&s.engine, BTC),
+        Some(Decimal::ZERO),
+        "the default strategy leaves account-level interest on the account"
+    );
+}
+
+#[test]
+fn a_strategy_routing_interest_to_its_base_puts_the_venues_interest_on_the_shorts_carry() {
+    let interest = PeriodicMarginInterest::new(TimeDelta::hours(1), DayCount::Act365).with_rates(
+        AssetNameExchange::new("btc"),
+        RateSeries::constant(dec!(0.876)),
+    );
+    let mut s = session_modelling(
+        lending(dec!(4)),
+        SimVenueOptions::default().with_margin_interest(Arc::new(interest)),
+        short_one_btc(),
+        None,
+        RoutesToBase,
+    );
+    s.stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(30000))])
+        .unwrap();
+
+    let boundary = s
+        .stepper
+        .step(&mut s.engine, at(3600), [bar(BTC, 3600, dec!(30000))])
+        .unwrap();
+
+    let attributed = events(&boundary)
+        .into_iter()
+        .filter_map(|event| match event {
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                kind: AccountEventKind::CashFlow(flow),
+                ..
+            })) => Some((flow.amount, flow.instrument)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attributed,
+        vec![(dec!(-0.0001), Some(InstrumentIndex(BTC)))],
+        "the audit records the flow as attributed"
+    );
+    assert_eq!(carry_base(&s.engine, BTC), Some(dec!(-0.0001)));
 }
 
 #[test]
@@ -1472,6 +1532,19 @@ impl ClosePositionsStrategy for ShutsDownWhenDisabled {
     }
 }
 
+impl CashFlowAttributionStrategy for ShutsDownWhenDisabled {
+    type State = State;
+
+    fn attribute_cash_flow(
+        &mut self,
+        _: &Self::State,
+        _: ExchangeIndex,
+        _: &CashFlow<AssetIndex, InstrumentIndex>,
+    ) -> Option<InstrumentIndex> {
+        None
+    }
+}
+
 impl OnDisconnectStrategy<HistoricalClock, State, MultiExchangeTxMap, DefaultRiskManager<State>>
     for ShutsDownWhenDisabled
 {
@@ -1488,6 +1561,73 @@ impl OnTradingDisabled<HistoricalClock, State, MultiExchangeTxMap, DefaultRiskMa
     fn on_trading_disabled(engine: &mut TestEngine<Self>) -> Self::OnTradingDisabled {
         engine.shutdown();
     }
+}
+
+/// Trades nothing, and gives each account-level cash flow to [`route_to_base`]'s answer.
+#[derive(Debug, Default)]
+struct RoutesToBase;
+
+impl AlgoStrategy for RoutesToBase {
+    type State = State;
+
+    fn generate_algo_orders(
+        &self,
+        _state: &Self::State,
+    ) -> (
+        impl IntoIterator<Item = OrderRequestCancel<ExchangeIndex, InstrumentIndex>>,
+        impl IntoIterator<Item = OrderRequestOpen<ExchangeIndex, InstrumentIndex>>,
+    ) {
+        (std::iter::empty(), std::iter::empty())
+    }
+}
+
+impl ClosePositionsStrategy for RoutesToBase {
+    type State = State;
+
+    fn close_positions_requests<'a>(
+        &'a self,
+        _state: &'a Self::State,
+        _filter: &'a InstrumentFilter,
+    ) -> (
+        impl IntoIterator<Item = OrderRequestCancel<ExchangeIndex, InstrumentIndex>> + 'a,
+        impl IntoIterator<Item = OrderRequestOpen<ExchangeIndex, InstrumentIndex>> + 'a,
+    )
+    where
+        ExchangeIndex: 'a,
+        AssetIndex: 'a,
+        InstrumentIndex: 'a,
+    {
+        (std::iter::empty(), std::iter::empty())
+    }
+}
+
+impl CashFlowAttributionStrategy for RoutesToBase {
+    type State = State;
+
+    fn attribute_cash_flow(
+        &mut self,
+        state: &Self::State,
+        exchange: ExchangeIndex,
+        flow: &CashFlow<AssetIndex, InstrumentIndex>,
+    ) -> Option<InstrumentIndex> {
+        route_to_base(state, exchange, flow)
+    }
+}
+
+impl OnDisconnectStrategy<HistoricalClock, State, MultiExchangeTxMap, DefaultRiskManager<State>>
+    for RoutesToBase
+{
+    type OnDisconnect = ();
+
+    fn on_disconnect(_: &mut TestEngine<Self>, _: ExchangeId) -> Self::OnDisconnect {}
+}
+
+impl OnTradingDisabled<HistoricalClock, State, MultiExchangeTxMap, DefaultRiskManager<State>>
+    for RoutesToBase
+{
+    type OnTradingDisabled = ();
+
+    fn on_trading_disabled(_: &mut TestEngine<Self>) -> Self::OnTradingDisabled {}
 }
 
 #[test]
@@ -1722,6 +1862,19 @@ impl ClosePositionsStrategy for EveryBar {
         InstrumentIndex: 'a,
     {
         (std::iter::empty(), std::iter::empty())
+    }
+}
+
+impl CashFlowAttributionStrategy for EveryBar {
+    type State = State;
+
+    fn attribute_cash_flow(
+        &mut self,
+        _: &Self::State,
+        _: ExchangeIndex,
+        _: &CashFlow<AssetIndex, InstrumentIndex>,
+    ) -> Option<InstrumentIndex> {
+        None
     }
 }
 

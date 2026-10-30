@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: the strategy can attribute a cash flow on the account as a whole to a position**
+  (`rustrade`, #800). A new strategy trait, `CashFlowAttributionStrategy`, has one method,
+  `attribute_cash_flow`. `Engine::process` calls it for each account `CashFlow` whose
+  `instrument` is `None`, such as cross-margin interest, before the flow updates the state or is
+  recorded in the audit. It sees the engine state, the exchange and the flow:
+  - `Some(instrument)` sets the flow's `instrument`, and the flow goes to that instrument's open
+    position's carry, as a flow the venue attributed does. A state replica applies it the same way
+    from the audit.
+  - `None` leaves the flow on the account, as before.
+  - An instrument the state does not track on the flow's exchange is ignored with a `warn!`.
+
+  The engine asks in one place, so one rule serves live trading, `backtest` and `SimStepper`.
+  Before, a flow could be attributed only before the event reached the engine, which none of those
+  three let a caller do. The new `route_to_base` helper is one such rule, opt in: the only
+  instrument on the exchange whose base asset is the flow's asset and that holds an open position.
+  Every strategy used with the `Engine` must implement the trait; returning `None` keeps today's
+  behaviour, and `DefaultStrategy` does that.
+
 - **Breaking: a `SimStart` can open a simulated spot margin account already short, or owing a
   loan** (`rustrade`, #794). On a venue whose `MockExecutionConfig::spot_margin` is set:
   - A spot short seeds the venue with a loan of its base asset, holding none of it, and seeds the
