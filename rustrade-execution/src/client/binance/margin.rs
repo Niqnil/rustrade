@@ -69,7 +69,7 @@ use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     FILL_RECOVERY_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
     PlacementResponse, RateLimitTracker, RequestKind, SharedDedupCache, TrailingOrderError,
-    UnrecoveredFills, WeightPool, WireInt, answer_time, balance_read_time, binance_filled_qty,
+    UnrecoveredFills, WeightPool, WireInt, answer_time, binance_filled_qty,
     classify_order_kind_tif, classify_rest_order_error, classify_rest_query_error,
     convert_ended_order, convert_open_order_listing, convert_open_order_owned_symbol,
     dedup_key_from_event, drop_after, gap_failed, gap_time, is_duplicate, is_unknown_order,
@@ -1022,11 +1022,10 @@ impl BinanceMargin {
             effective.clone(),
         )
         .await?;
-        let venue = self.rate_limiter.venue_clock();
         for read in reads {
             balances_by_symbol.extend(convert_isolated_margin_assets(
                 read.assets,
-                balance_read_time(read.sent, &venue),
+                self.rate_limiter.balance_read_time(read.sent),
             ));
         }
 
@@ -1345,7 +1344,7 @@ impl ExecutionClient for BinanceMargin {
         let balances = filter_and_convert_margin_balances(
             account.user_assets.unwrap_or_default(),
             assets,
-            balance_read_time(sent, &self.rate_limiter.venue_clock()),
+            self.rate_limiter.balance_read_time(sent),
         );
 
         // Fetch open orders for all instruments concurrently (with retry), limiting concurrency
@@ -1427,7 +1426,7 @@ impl ExecutionClient for BinanceMargin {
         Ok(filter_and_convert_margin_balances(
             account.user_assets.unwrap_or_default(),
             assets,
-            balance_read_time(sent, &self.rate_limiter.venue_clock()),
+            self.rate_limiter.balance_read_time(sent),
         ))
     }
 
@@ -6034,7 +6033,7 @@ mod tests {
         if let Some(lead) = lead {
             client.rate_limiter = Arc::new(
                 RateLimitTracker::new(WeightPool::Sapi)
-                    .with_server_time(Some(ServerTime::behind_host(lead))),
+                    .with_server_time(Some(ServerTime::trailing_host(lead))),
             );
         }
         let lead = lead.unwrap_or_default();

@@ -49,7 +49,7 @@ use super::shared::{
     ORDER_EXECUTIONS_BUDGET, OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
     SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
     UnsubscribeOnDrop, UserDataFrame, WeightPool, account_position_time, answer_time,
-    balance_read_time, binance_filled_qty, classify_order_kind_tif, classify_rest_query_error,
+    binance_filled_qty, classify_order_kind_tif, classify_rest_query_error,
     classify_ws_order_error, convert_ended_order, convert_execution_report,
     convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
     disconnect_error, drop_after, frame_excerpt, gap_failed, gap_time, is_duplicate,
@@ -965,7 +965,7 @@ impl ExecutionClient for BinanceSpot {
         let balances = filter_and_convert_balances(
             account.balances.unwrap_or_default(),
             assets,
-            balance_read_time(sent, &self.rate_limiter.venue_clock()),
+            self.rate_limiter.balance_read_time(sent),
         );
 
         // Fetch open orders for all instruments concurrently (with retry)
@@ -1671,7 +1671,7 @@ impl ExecutionClient for BinanceSpot {
         Ok(filter_and_convert_balances(
             account.balances.unwrap_or_default(),
             assets,
-            balance_read_time(sent, &self.rate_limiter.venue_clock()),
+            self.rate_limiter.balance_read_time(sent),
         ))
     }
 
@@ -7783,7 +7783,7 @@ mod tests {
         client.rest = rest_at(&server);
         client.rate_limiter = Arc::new(
             RateLimitTracker::new(WeightPool::Spot)
-                .with_server_time(Some(ServerTime::behind_host(LEAD))),
+                .with_server_time(Some(ServerTime::trailing_host(LEAD))),
         );
         let clock = StreamClock::shared(client.rate_limiter.signing_clock());
 

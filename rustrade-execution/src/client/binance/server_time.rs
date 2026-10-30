@@ -213,9 +213,9 @@ impl ServerTime {
             .host_lead(Utc::now(), Instant::now())
     }
 
-    /// A clock read from a server whose time is always `lead` behind this host's.
+    /// A clock read, at once, from a server whose time is always `lead` behind this host's.
     #[cfg(test)]
-    pub(crate) fn behind_host(lead: TimeDelta) -> Self {
+    pub(crate) fn trailing_host(lead: TimeDelta) -> Self {
         let lead_ms = lead.num_milliseconds();
         let read: ReadServerTime =
             Arc::new(move || Box::pin(async move { Ok(Utc::now().timestamp_millis() - lead_ms) }));

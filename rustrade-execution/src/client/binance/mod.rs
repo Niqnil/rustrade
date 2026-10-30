@@ -143,8 +143,8 @@
 //!   earlier of this host's time and Binance's, as the reads bound it, when the request was sent,
 //!   less 5 s. A host clock ahead of Binance's then does not carry into the stamp: a stamp ahead
 //!   of Binance's time would have the engine drop the stream's balance and debt events until
-//!   Binance's clock caught up with it. Before the first read succeeds, the stamp is taken from
-//!   this host's time.
+//!   Binance's clock caught up with it. While no read has succeeded, as after a failed first
+//!   read, the stamp is taken from this host's time.
 //! - **Turning it off.** `server_time_sync` on each config, `true` by default, set to `false`
 //!   stamps signed requests with this host's clock, and balance reads from it alone: a host clock
 //!   ahead of Binance's then carries into their stamps, and keeping the two within bounds is the

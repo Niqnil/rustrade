@@ -935,9 +935,17 @@ impl RateLimitTracker {
             .map(|server| server.clock().clone())
     }
 
-    /// Binance's clock as the client's server-time reads bound it, for stamping a REST read
-    /// ([`balance_read_time`]). Without a sample when the client keeps no signing clock, or
-    /// before a read has succeeded.
+    /// The time a REST balance read whose request was sent at `sent` is stamped with:
+    /// [`balance_read_time`] on [`venue_clock`](Self::venue_clock).
+    pub(crate) fn balance_read_time(&self, sent: HostMoment) -> DateTime<Utc> {
+        balance_read_time(sent, &self.venue_clock())
+    }
+
+    /// Binance's clock as the client's server-time reads bound it. Without a sample when the
+    /// client keeps no signing clock, or no read has succeeded.
+    ///
+    /// Taken after a read, it still bounds Binance's time at the read's send: the bound counts
+    /// back from a later sample ([`VenueClock::earliest_at`]).
     pub(crate) fn venue_clock(&self) -> VenueClock {
         self.server_time
             .as_ref()
