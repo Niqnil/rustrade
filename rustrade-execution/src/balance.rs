@@ -157,14 +157,24 @@ impl Balance {
         self.total - self.free
     }
 
-    /// Net asset value after deducting borrowed principal.
+    /// Net asset value: gross holdings less everything owed on the asset's loan.
     ///
-    /// Returns `total` when [`Balance::margin`] is `None` (a cash / no-debt context, where net
-    /// asset is simply the gross holding) and `total - borrowed` when `Some`. The result can be
-    /// **negative** — a short position is a negative net holding in the borrowed (base) asset.
+    /// Returns `total` when [`Balance::margin`] is `None` and `total - borrowed - interest` when
+    /// `Some`, as Binance defines its margin accounts' `netAsset`. The result can be
+    /// **negative**: a short position is a negative net holding in the borrowed (base) asset.
     ///
-    /// Accrued [`MarginDetails::interest`] is intentionally **excluded**: it is tracked separately
-    /// and does not reduce net holdings until the venue actually deducts it.
+    /// `None` is a cash / no-debt context, where net asset is simply the gross holding, except on
+    /// a venue whose margin is account-level (Alpaca, IBKR): there `total` is already the
+    /// account's cash, negative while it borrows (see [`Balance::total`]), and the result is that
+    /// figure, with no loan or interest itemised.
+    ///
+    /// Accrued [`MarginDetails::interest`] is owed as the principal is, so it is deducted once
+    /// the venue reports it accrued, not when it is repaid. Repaying the loan out of the asset's
+    /// holdings leaves the result unchanged, since `total` falls by what the debt does. For the
+    /// principal alone, read [`MarginDetails::borrowed`].
+    ///
+    /// [`Balance::accrued`] is not counted: it is carry the venue posts to `total` later, not a
+    /// debt of the loan.
     ///
     /// # Freshness
     /// The returned value reflects debt only as fresh as the last
@@ -172,10 +182,12 @@ impl Balance {
     /// [`MarginDebt`](crate::AccountEventKind::MarginDebt) for this asset. WS partial updates keep
     /// `free`/`locked` live but never carry debt, so on a venue that streams no debt changes a
     /// position **borrowed since the last snapshot** reads as zero-debt (`net_asset == total`)
-    /// until the next snapshot. Each venue client says whether it streams debt changes.
+    /// until the next snapshot. Interest is likewise held at its last reported total: it falls in
+    /// steps as snapshots or debt events report it, not continuously as the venue accrues it.
+    /// Each venue client says whether it streams debt changes.
     pub fn net_asset(&self) -> Decimal {
         match self.margin {
-            Some(margin) => self.total - margin.borrowed,
+            Some(margin) => self.total - margin.borrowed - margin.interest,
             None => self.total,
         }
     }
@@ -265,10 +277,10 @@ mod tests {
     }
 
     #[test]
-    fn net_asset_margin_deducts_borrowed() {
-        // total - borrowed; interest does not affect net asset.
+    fn net_asset_margin_deducts_borrowed_and_interest() {
+        // total - borrowed - interest.
         let balance = Balance::new_margin(dec!(100), dec!(100), dec!(30), dec!(2));
-        assert_eq!(balance.net_asset(), dec!(70));
+        assert_eq!(balance.net_asset(), dec!(68));
     }
 
     #[test]
@@ -276,7 +288,18 @@ mod tests {
         // A short borrows the base asset and sells it: holdings are ~0 but debt remains, so net
         // asset is negative.
         let balance = Balance::new_margin(dec!(0), dec!(0), dec!(1.5), dec!(0.001));
-        assert_eq!(balance.net_asset(), dec!(-1.5));
+        assert_eq!(balance.net_asset(), dec!(-1.501));
+    }
+
+    #[test]
+    fn net_asset_is_unchanged_by_a_repayment_and_ignores_accrued() {
+        // 100 held, 30 borrowed, 2 interest: repaying all 32 out of holdings leaves 68 either way.
+        let owing = Balance::new_margin(dec!(100), dec!(100), dec!(30), dec!(2));
+        let repaid = Balance::new_margin(dec!(68), dec!(68), dec!(0), dec!(0));
+        assert_eq!(owing.net_asset(), repaid.net_asset());
+
+        // Accrued carry posts to `total` later; it is not a debt of the loan.
+        assert_eq!(owing.with_accrued(dec!(-5)).net_asset(), dec!(68));
     }
 
     #[test]

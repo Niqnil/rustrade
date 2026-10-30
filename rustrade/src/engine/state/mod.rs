@@ -283,11 +283,11 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     /// left of its balance once its debt and the positions are taken out, capped at what is free
     /// to trade. `None` while this state holds no balance for `asset`.
     ///
-    /// It is the balance's `total`, less [`MarginDetails`](rustrade_execution::balance::MarginDetails)
-    /// `borrowed` and `interest` where the venue reports debt, less the signed net quantity
-    /// ([`PositionManager::quantity_net`](position::PositionManager::quantity_net)) of every
-    /// [`InstrumentKind::Spot`] instrument whose base is `asset`, then capped at the balance's
-    /// `free`. An [`AssetIndex`] names an asset on one exchange, so only that exchange's
+    /// It is the balance's [`net_asset`](rustrade_execution::balance::Balance::net_asset) (its
+    /// `total`, less `borrowed` and `interest` where the venue reports debt), less the signed net
+    /// quantity ([`PositionManager::quantity_net`](position::PositionManager::quantity_net)) of
+    /// every [`InstrumentKind::Spot`] instrument whose base is `asset`, then capped at the
+    /// balance's `free`. An [`AssetIndex`] names an asset on one exchange, so only that exchange's
     /// instruments count. A derivative's position is counted in contracts, not held in the base,
     /// so it is not taken out.
     ///
@@ -361,9 +361,6 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     /// Panics if this state does not track `asset`, as [`AssetStates::asset_index`] does.
     pub fn free_base(&self, asset: &AssetIndex) -> Option<Decimal> {
         let balance = self.assets.asset_index(asset).balance.as_ref()?.value;
-        let interest = balance
-            .margin
-            .map_or(Decimal::ZERO, |margin| margin.interest);
         let positions: Decimal = self
             .instruments
             .0
@@ -374,7 +371,7 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
             })
             .map(|state| state.position.quantity_net())
             .sum();
-        Some((balance.net_asset() - interest - positions).min(balance.free))
+        Some((balance.net_asset() - positions).min(balance.free))
     }
 
     /// Each instrument whose position `snapshot` reports and differs from this state's.

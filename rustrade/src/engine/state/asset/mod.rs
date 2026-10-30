@@ -548,7 +548,7 @@ mod tests {
             balance.margin,
             Some(MarginDetails::new(dec!(1.5), dec!(0.01)))
         );
-        assert_eq!(balance.net_asset(), dec!(0.0)); // 1.5 total - 1.5 borrowed
+        assert_eq!(balance.net_asset(), dec!(-0.01)); // 1.5 total - 1.5 borrowed - 0.01 interest
     }
 
     fn at(secs: i64) -> DateTime<Utc> {
@@ -711,7 +711,7 @@ mod tests {
             balance.value.margin,
             Some(MarginDetails::new(dec!(0.00006), dec!(0.00000002)))
         );
-        assert_eq!(balance.value.net_asset(), dec!(-0.00006));
+        assert_eq!(balance.value.net_asset(), dec!(-0.00006002));
         assert_eq!(state.debt_time, Some(at(2000)));
         assert_eq!(state.statistics.balance_now, None);
     }

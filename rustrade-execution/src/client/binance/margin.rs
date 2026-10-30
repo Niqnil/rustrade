@@ -445,19 +445,19 @@ impl BinanceMarginConfig {
 ///
 /// # Margin balances & debt-freshness
 /// Balances carry per-asset margin debt: [`Balance::net_asset`](crate::balance::Balance::net_asset)
-/// returns `total - borrowed`, with `borrowed`/`interest` exposed via
-/// [`MarginDetails`](crate::balance::MarginDetails). Authoritative debt totals come from the REST
-/// [`account_snapshot`](Self::account_snapshot) (`BalanceSnapshot`). The WS stream keeps
-/// `free`/`locked` live via `BalanceStreamUpdate`, which **never** clobbers debt, and keeps debt
-/// live via [`AccountEventKind::MarginDebt`], one per asset a `liabilityChange` lists, on a cross
-/// account: Binance has not been seen to send that event for an isolated pair. A debt change sent
-/// while the stream is down is not recovered, so call `account_snapshot` at startup and after a
-/// reconnect (see [`account_stream`](Self::account_stream)'s cold-start note).
+/// returns `total - borrowed - interest`, as Binance's `netAsset` does, with `borrowed`/`interest`
+/// exposed via [`MarginDetails`](crate::balance::MarginDetails). Authoritative debt totals come
+/// from the REST [`account_snapshot`](Self::account_snapshot) (`BalanceSnapshot`). The WS stream
+/// keeps `free`/`locked` live via `BalanceStreamUpdate`, which **never** clobbers debt, and keeps
+/// debt live via [`AccountEventKind::MarginDebt`], one per asset a `liabilityChange` lists, on a
+/// cross account: Binance has not been seen to send that event for an isolated pair. A debt change
+/// sent while the stream is down is not recovered, so call `account_snapshot` at startup and after
+/// a reconnect (see [`account_stream`](Self::account_stream)'s cold-start note).
 ///
 /// As Binance documents it, margin interest is charged hourly on what is borrowed and accrues as
 /// the asset's unpaid `interest`, which comes out of `total` only when it is repaid. `net_asset`
-/// deducts `borrowed` alone, so until then `interest` is the only figure that holds it, as fresh
-/// as the rest of the debt. Fills carry no interest, so PnL computed from them excludes it.
+/// deducts it as it accrues, as fresh as the rest of the debt. Fills carry no interest, so PnL
+/// computed from them excludes it.
 ///
 /// # Rate limits
 /// Once a `/sapi` response reports at least 90% of the documented per-IP weight limit (12000 per
@@ -4378,7 +4378,8 @@ mod tests {
 
     #[test]
     fn margin_balance_entry_maps_debt() {
-        // free=10, locked=2 → total=12; borrowed=3, interest=0.5 → net_asset = total - borrowed = 9.
+        // free=10, locked=2 → total=12; borrowed=3, interest=0.5 → net_asset = 8.5, which is
+        // Binance's own `netAsset` for the same row.
         let ab =
             convert_margin_balance_entry(user_asset("USDT", "10", "2", "3", "0.5"), Utc::now())
                 .expect("convert");
@@ -4389,8 +4390,7 @@ mod tests {
             ab.balance.margin.is_some(),
             "REST snapshot must populate margin"
         );
-        // net_asset deducts borrowed principal (interest is tracked separately, not deducted here).
-        assert_eq!(ab.balance.net_asset(), Decimal::from(9));
+        assert_eq!(ab.balance.net_asset(), Decimal::new(85, 1));
     }
 
     #[test]
@@ -4549,8 +4549,8 @@ mod tests {
 
     #[test]
     fn isolated_assets_map_base_quote_and_risk() {
-        // base: free 0.5 + locked 0.1 = total 0.6, borrowed 0.2 → net 0.4.
-        // quote: free 1000 + locked 50 = total 1050, borrowed 300 → net 750.
+        // base: free 0.5 + locked 0.1 = total 0.6, borrowed 0.2, interest 0.001 → net 0.399.
+        // quote: free 1000 + locked 50 = total 1050, borrowed 300, interest 1.5 → net 748.5.
         let entry = iso_entry(
             "BTCUSDT",
             iso_base("BTC", "0.5", "0.1", "0.2", "0.001"),
@@ -4567,11 +4567,11 @@ mod tests {
         assert_eq!(state.base.asset.name().as_str(), "BTC");
         assert_eq!(state.base.balance.total, d("0.6"));
         assert_eq!(state.base.balance.free, d("0.5"));
-        assert_eq!(state.base.balance.net_asset(), d("0.4"));
+        assert_eq!(state.base.balance.net_asset(), d("0.399"));
 
         assert_eq!(state.quote.asset.name().as_str(), "USDT");
         assert_eq!(state.quote.balance.total, d("1050"));
-        assert_eq!(state.quote.balance.net_asset(), d("750"));
+        assert_eq!(state.quote.balance.net_asset(), d("748.5"));
 
         assert_eq!(state.risk.margin_level, Some(d("3.5")));
         assert_eq!(state.risk.margin_ratio, Some(d("0.12")));
@@ -4580,7 +4580,7 @@ mod tests {
 
     #[test]
     fn isolated_base_short_is_negative_net() {
-        // A short on the base side: total 0, borrowed 1.5 → net_asset = -1.5.
+        // A short on the base side: total 0, borrowed 1.5, interest 0.001 → net_asset = -1.501.
         let entry = iso_entry(
             "BTCUSDT",
             iso_base("BTC", "0", "0", "1.5", "0.001"),
@@ -4591,7 +4591,7 @@ mod tests {
         );
         let map = convert_isolated_margin_assets(vec![entry], Utc::now());
         let state = map.get(&InstrumentNameExchange::new("BTCUSDT")).unwrap();
-        assert_eq!(state.base.balance.net_asset(), d("-1.5"));
+        assert_eq!(state.base.balance.net_asset(), d("-1.501"));
     }
 
     #[test]

@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: `Balance::net_asset` deducts accrued interest** (`rustrade-execution`). It returns
+  `total - borrowed - interest` for a margin balance, as Binance defines its margin accounts'
+  `netAsset`, where it returned `total - borrowed`. The signature is unchanged, so a caller that
+  subtracted `MarginDetails::interest` itself now subtracts it twice. Interest is owed as the
+  principal is, so the figure falls as interest accrues, and a repayment out of the asset's
+  holdings no longer moves it. `BalanceBasis::NetAsset` follows (`rustrade`): net-asset drawdown
+  and end-of-session balance count interest as it accrues, rather than as a step when the loan is
+  repaid, which the simulated venue's margin account showed. A cash balance (`margin: None`) still
+  returns `total`, and `Balance::accrued` is not counted.
+
 - **`binance-sdk` 77.0.0 → 77.2.0** (`rustrade-execution`, `binance` feature, #773). It adds the
   timestamp provider the clients now sign with (see Added). The three `binance_sdk::common`
   internals the margin user-data stream couples to hold, and the margin module is unchanged. Two
