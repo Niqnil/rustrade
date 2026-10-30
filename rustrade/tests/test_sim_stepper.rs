@@ -9,9 +9,9 @@
 //! positions holds them on both sides; and stepping books exactly what a backtest over the same
 //! data books.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use fnv::FnvHashMap;
 use futures::{StreamExt, stream};
 use rust_decimal::Decimal;
@@ -59,10 +59,13 @@ use rustrade_data::{
     subscription::candle::Candle,
 };
 use rustrade_execution::{
-    AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
-    balance::{AssetBalance, Balance},
+    AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, MarginEffect,
+    PeriodicMarginInterest, SpotMarginConfig,
+    balance::{AssetBalance, Balance, MarginDetails},
+    cash_flow::CashFlowKind,
     client::mock::MockExecutionConfig,
     fill::{MarketOrderTiming, NextBarPrice, StaleMarketPolicy},
+    holding_cost::{DayCount, RateSeries},
     order::{
         OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, StrategyId},
@@ -239,9 +242,26 @@ fn session_configured<Strategy>(
     engine_positions: Option<Vec<PositionSeed>>,
     strategy: Strategy,
 ) -> Session<Strategy> {
+    session_modelling(
+        config,
+        SimVenueOptions::default(),
+        start,
+        engine_positions,
+        strategy,
+    )
+}
+
+/// [`session_configured`], for a venue also modelling what `options` add.
+fn session_modelling<Strategy>(
+    config: MockExecutionConfig,
+    options: SimVenueOptions,
+    start: SimStart,
+    engine_positions: Option<Vec<PositionSeed>>,
+    strategy: Strategy,
+) -> Session<Strategy> {
     let instruments = instruments();
     let build = SimExecutionBuilder::new(&instruments)
-        .add_venue_with_start(config, SimVenueOptions::default(), start)
+        .add_venue_with_start(config, options, start)
         .unwrap()
         .build();
     let seeds = engine_positions.unwrap_or_else(|| build.position_seeds());
@@ -340,6 +360,35 @@ fn balance<Strategy>(engine: &TestEngine<Strategy>, asset: &str) -> Decimal {
         .and_then(|state| state.balance.as_ref())
         .map(|balance| balance.value.total)
         .unwrap_or_default()
+}
+
+/// What the `Engine` holds `asset`'s balance owing, if it reports a loan.
+fn loan<Strategy>(engine: &TestEngine<Strategy>, asset: &str) -> Option<MarginDetails> {
+    engine
+        .state
+        .assets
+        .assets()
+        .find(|state| state.asset.name_internal.as_ref() == asset)
+        .and_then(|state| state.balance.as_ref())
+        .and_then(|balance| balance.value.margin)
+}
+
+/// `(amount, time)` of each margin interest charge among `events`.
+fn interest_charged<'a>(
+    events: impl IntoIterator<Item = &'a EngineEvent<DataKind>>,
+) -> Vec<(Decimal, DateTime<Utc>)> {
+    events
+        .into_iter()
+        .filter_map(|event| match event {
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                kind: AccountEventKind::CashFlow(flow),
+                ..
+            })) if matches!(flow.kind, CashFlowKind::MarginInterest { .. }) => {
+                Some((flow.amount, flow.time_exchange))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// `(side, quantity, entry price)` of the `Engine`'s position in `instrument`, if it holds one.
@@ -1115,6 +1164,78 @@ fn a_start_holding_a_cfd_closes_against_its_entry_and_pays_back_its_margin() {
 
     assert_eq!(position(&s.engine, SPX), None);
     assert_eq!(balance(&s.engine, "usdt"), dec!(5100));
+}
+
+#[test]
+fn a_start_short_on_a_venue_that_lends_owes_its_base_and_pays_interest_from_the_next_boundary() {
+    let config = MockExecutionConfig {
+        spot_margin: Some(
+            SpotMarginConfig::new(
+                AssetNameExchange::new("usdt"),
+                dec!(4),
+                MarginEffect::Borrow,
+            )
+            .unwrap(),
+        ),
+        ..config(0)
+    };
+    // 87.6% a year on BTC loans, exactly 0.01% an hour.
+    let interest = PeriodicMarginInterest::new(TimeDelta::hours(1), DayCount::Act365).with_rates(
+        AssetNameExchange::new("btc"),
+        RateSeries::constant(dec!(0.876)),
+    );
+    let start = SimStart::new(
+        vec![StartBalance::new(
+            AssetNameExchange::new("usdt"),
+            dec!(40000),
+        )],
+        vec![PositionSeed::new(
+            "binance_spot-btc_usdt",
+            Side::Sell,
+            dec!(1),
+            dec!(30000),
+            at(0),
+        )],
+    );
+    let mut s = session_modelling(
+        config,
+        SimVenueOptions::default().with_margin_interest(Arc::new(interest)),
+        start,
+        None,
+        DefaultStrategy::default(),
+    );
+
+    let opening = s
+        .stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(30000))])
+        .unwrap();
+    assert_eq!(
+        position(&s.engine, BTC),
+        Some((Side::Sell, dec!(1), dec!(30000)))
+    );
+    assert_eq!(balance(&s.engine, "btc"), Decimal::ZERO);
+    assert_eq!(
+        loan(&s.engine, "btc"),
+        Some(MarginDetails::new(dec!(1), dec!(0)))
+    );
+    assert_eq!(
+        interest_charged(events(&opening)),
+        vec![],
+        "the loan was taken before the start"
+    );
+
+    let boundary = s
+        .stepper
+        .step(&mut s.engine, at(3600), [bar(BTC, 3600, dec!(30000))])
+        .unwrap();
+    assert_eq!(
+        interest_charged(events(&boundary)),
+        vec![(dec!(-0.0001), at(3600))]
+    );
+    assert_eq!(
+        loan(&s.engine, "btc"),
+        Some(MarginDetails::new(dec!(1), dec!(0.0001)))
+    );
 }
 
 #[test]
