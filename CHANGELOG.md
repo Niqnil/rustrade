@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: a `SimStart` can open a simulated spot margin account already short, or owing a
+  loan** (`rustrade`, #794). On a venue whose `MockExecutionConfig::spot_margin` is set:
+  - A spot short seeds the venue with a loan of its base asset, holding none of it, and seeds the
+    `Engine` with the short at its entry price, as a long is seeded. Spot positions on one base
+    asset net, as a cross margin account nets them: a net long is held, a net short is borrowed.
+  - `StartBalance` carries a loan, borrowed principal and interest owed, set with the new
+    `StartBalance::with_loan`. That lets a start hold a long bought partly with borrowed quote,
+    interest already owed, or a base loan larger than the net short. A listed base asset must hold
+    its spot positions' net quantity net of its borrowed principal.
+    `SimStartError::BaseBalanceConflict` reports that figure as `listed`, where it had a
+    `balance` field. `StartBalance` is now `#[non_exhaustive]`: build it with
+    `StartBalance::new`.
+  - The short's proceeds are listed in `SimStart::balances`, as a long's leftover cash is.
+    Interest on what the start owes is charged from the interest model's first boundary after the
+    venue's clock first moves, with no charge for the borrow.
+  - The start's debt may not exceed what the venue lends, `(max_leverage − 1) × equity`, valued
+    at the start's own prices, since no market exists yet: the valuation asset at one, and an
+    asset a spot position pairs with it at that position's entry price. An asset with no such
+    price adds nothing to equity, and a debt in one is refused.
+
+  A venue that does not lend still refuses a spot short (`SimStartError::SpotShort`), and refuses
+  a loan with the new `SimStartError::LoanWithoutMargin`. Other new variants: `NegativeLoan`,
+  `UnpricedDebt` and `OverLeveraged`, which names the assets held but valued at zero.
+
 - **Breaking: `Balance::net_asset` deducts accrued interest** (`rustrade-execution`). It returns
   `total - borrowed - interest` for a margin balance, as Binance defines its margin accounts'
   `netAsset`, where it returned `total - borrowed`. The signature is unchanged, so a caller that
