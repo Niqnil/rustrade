@@ -935,6 +935,24 @@ impl RateLimitTracker {
             .map(|server| server.clock().clone())
     }
 
+    /// The time a REST balance read whose request was sent at `sent` is stamped with:
+    /// [`balance_read_time`] on [`venue_clock`](Self::venue_clock).
+    pub(crate) fn balance_read_time(&self, sent: HostMoment) -> DateTime<Utc> {
+        balance_read_time(sent, &self.venue_clock())
+    }
+
+    /// Binance's clock as the client's server-time reads bound it. Without a sample when the
+    /// client keeps no signing clock, or no read has succeeded.
+    ///
+    /// Taken after a read, it still bounds Binance's time at the read's send: the bound counts
+    /// back from a later sample ([`VenueClock::earliest_at`]).
+    pub(crate) fn venue_clock(&self) -> VenueClock {
+        self.server_time
+            .as_ref()
+            .map(|server| server.clock().venue())
+            .unwrap_or_default()
+    }
+
     /// The most this host's clock leads Binance's, from the server-time reads so far; negative
     /// when it trails. `None` without server-time sync, or before a read has succeeded.
     pub(crate) fn host_clock_lead(&self) -> Option<TimeDelta> {
@@ -3663,15 +3681,20 @@ where
 /// was current about 2 s later.
 pub(crate) const REST_BALANCE_LAG: TimeDelta = TimeDelta::seconds(5);
 
-/// The time a REST balance read whose request was sent at `sent` is stamped with: `sent` less
-/// [`REST_BALANCE_LAG`], so it is no later than the state the read can return, even one that
-/// trails the account stream. A later stream event then still applies over it.
-pub(crate) fn balance_read_time(sent: DateTime<Utc>) -> DateTime<Utc> {
-    sent - REST_BALANCE_LAG
+/// The time a REST balance read whose request was sent at `sent` is stamped with: the earlier of
+/// this host's time then and the earliest `venue`, an estimate of Binance's clock, can read then
+/// ([`VenueClock::span_start`]), less [`REST_BALANCE_LAG`]. From this host's time alone before
+/// `venue` has a sample.
+///
+/// So the stamp is no later than the state the read can return, even one that trails the
+/// account stream, and a host clock ahead of Binance's does not carry into it. A later stream
+/// event then still applies over it.
+pub(crate) fn balance_read_time(sent: HostMoment, venue: &VenueClock) -> DateTime<Utc> {
+    venue.span_start(sent).unwrap_or(sent.time) - REST_BALANCE_LAG
 }
 
-/// [`rest_call_with_retry`], also returning when the request that succeeded was sent, by this
-/// host's clock: a read describes the venue's state no earlier than that.
+/// [`rest_call_with_retry`], also returning when the request that succeeded was sent, on this
+/// host's wall and monotonic clocks: a read describes the venue's state no earlier than that.
 pub(crate) async fn rest_read_with_retry<R, D>(
     rest: &Arc<R>,
     rate_limiter: &RateLimitTracker,
@@ -3681,7 +3704,7 @@ pub(crate) async fn rest_read_with_retry<R, D>(
     ) -> Pin<
         Box<dyn std::future::Future<Output = anyhow::Result<RestApiResponse<D>>> + Send>,
     >,
-) -> anyhow::Result<(RestApiResponse<D>, DateTime<Utc>)>
+) -> anyhow::Result<(RestApiResponse<D>, HostMoment)>
 where
     // `Arc<R>` is moved into the `+ Send` future, which requires `R: Send + Sync`. Both SDK
     // RestApi types satisfy this; stating it here surfaces the constraint at the definition
@@ -3694,8 +3717,8 @@ where
     for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
         rate_limiter.wait_if_blocked(kind).await?;
         // One reading: the weight tracker's send time and the read's time are the same instant.
-        let sent = Utc::now();
-        let sent_ms = u128::try_from(sent.timestamp_millis()).unwrap_or_default();
+        let sent = HostMoment::now();
+        let sent_ms = u128::try_from(sent.time.timestamp_millis()).unwrap_or_default();
         match make_call(Arc::clone(rest)).await {
             Ok(response) => {
                 rate_limiter.observe_rest(&response, sent_ms);
@@ -4287,6 +4310,32 @@ mod tests {
     #[test]
     fn the_rest_balance_lag_is_as_documented() {
         assert_eq!(REST_BALANCE_LAG, TimeDelta::seconds(5));
+    }
+
+    /// A balance read is stamped the REST lag before the earlier of this host's time at the send
+    /// and the earliest Binance's clock can read then, or before this host's time without an
+    /// estimate of Binance's clock.
+    #[test]
+    fn a_balance_read_is_stamped_the_lag_before_the_earlier_of_the_two_clocks() {
+        let at = |secs: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap();
+        let sampled = tokio::time::Instant::now();
+        let mut venue = VenueClock::new();
+        let sent = |secs| HostMoment::new(at(secs), sampled);
+
+        assert_eq!(
+            balance_read_time(sent(100), &venue),
+            at(100) - REST_BALANCE_LAG
+        );
+        venue.observe(at(100), sampled);
+        // This host reads 60 s ahead of Binance, then 60 s behind it.
+        assert_eq!(
+            balance_read_time(sent(160), &venue),
+            at(100) - REST_BALANCE_LAG
+        );
+        assert_eq!(
+            balance_read_time(sent(40), &venue),
+            at(40) - REST_BALANCE_LAG
+        );
     }
 
     /// The module docs and both clients' rustdoc state the heartbeat window and the longest

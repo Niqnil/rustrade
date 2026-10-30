@@ -16,8 +16,10 @@ use super::{
     shared::{REST_BALANCE_LAG, balance_read_time},
 };
 use crate::{
-    AccountEventKind, UnindexedAccountEvent, client::venue_clock::VenueClock,
-    error::UnindexedClientError, trade::TimeSource,
+    AccountEventKind, UnindexedAccountEvent,
+    client::venue_clock::{HostMoment, VenueClock},
+    error::UnindexedClientError,
+    trade::TimeSource,
 };
 use chrono::{DateTime, Utc};
 use std::{fmt::Display, future::Future, sync::Arc, time::Duration};
@@ -182,25 +184,19 @@ pub(crate) enum ReadStart {
 }
 
 /// The time a restatement read's balances are stamped with, for a read whose request was sent at
-/// `sent` by this host's clock, no earlier than `sent_at` by tokio's, and started when
-/// [`StreamClock::read_start`] gave `floor`.
+/// `sent` and started when [`StreamClock::read_start`] gave `floor`.
 ///
-/// The earlier of the host's time and the venue's estimated time at the read's start, less the
-/// venue's REST lag, so a host clock ahead of the venue's does not carry into the stamp. Raised to
-/// `floor`, the latest balance time delivered before the read: the read shows that state or
-/// later, and a stamp earlier than it would have the engine drop the restatement for the assets
-/// it updated.
+/// [`balance_read_time`] on the venue's clock as the stream and the client's server-time reads
+/// show it ([`StreamClock::venue`]), so a host clock ahead of the venue's does not carry into the
+/// stamp. Raised to `floor`, the latest balance time delivered before the read: the read shows
+/// that state or later, and a stamp earlier than it would have the engine drop the restatement
+/// for the assets it updated.
 pub(crate) fn restatement_time(
     clock: &StreamClock,
-    sent: DateTime<Utc>,
-    sent_at: Instant,
+    sent: HostMoment,
     floor: Option<DateTime<Utc>>,
 ) -> DateTime<Utc> {
-    let earliest = clock
-        .venue()
-        .earliest_at(sent_at)
-        .map_or(sent, |venue| venue.min(sent));
-    let time = balance_read_time(earliest);
+    let time = balance_read_time(sent, &clock.venue());
     floor.map_or(time, |floor| time.max(floor))
 }
 
@@ -371,7 +367,7 @@ mod tests {
         assert_eq!(clock.lock().venue().earliest_at(arrived), Some(at(100)));
         // The host reads 60 s ahead of Binance.
         assert_eq!(
-            restatement_time(&clock.lock(), at(160), arrived, None),
+            restatement_time(&clock.lock(), HostMoment::new(at(160), arrived), None),
             at(100) - REST_BALANCE_LAG
         );
     }
@@ -386,7 +382,7 @@ mod tests {
         assert_eq!(clock.lock().venue().earliest_at(arrived), Some(at(100)));
         // The host reads 60 s ahead of Binance.
         assert_eq!(
-            restatement_time(&clock.lock(), at(160), arrived, None),
+            restatement_time(&clock.lock(), HostMoment::new(at(160), arrived), None),
             at(100) - REST_BALANCE_LAG
         );
         // A later event bounds it later: whichever bounds it the later is kept.
@@ -402,7 +398,7 @@ mod tests {
         let now = Instant::now();
         assert_eq!(clock.lock().read_start(now), ReadStart::Now { floor: None });
         assert_eq!(
-            restatement_time(&clock.lock(), at(100), now, None),
+            restatement_time(&clock.lock(), HostMoment::new(at(100), now), None),
             at(100) - REST_BALANCE_LAG
         );
     }
@@ -430,7 +426,7 @@ mod tests {
 
         // This host reads 60 s behind the venue: the stamp is the delivered balance's time.
         assert_eq!(
-            restatement_time(&clock.lock(), at(50), start, floor),
+            restatement_time(&clock.lock(), HostMoment::new(at(50), start), floor),
             at(100)
         );
 
@@ -438,7 +434,7 @@ mod tests {
         // the read's start.
         StreamClock::observe(&clock, &balance_update(at(200)), start);
         assert_eq!(
-            restatement_time(&clock.lock(), at(50), start, floor),
+            restatement_time(&clock.lock(), HostMoment::new(at(50), start), floor),
             at(100)
         );
     }
@@ -452,7 +448,11 @@ mod tests {
         StreamClock::observe(&clock, &balance_update(at(100)), arrived);
 
         let sent_at = arrived + Duration::from_secs(20);
-        let stamp = restatement_time(&clock.lock(), at(500), sent_at, Some(at(100)));
+        let stamp = restatement_time(
+            &clock.lock(),
+            HostMoment::new(at(500), sent_at),
+            Some(at(100)),
+        );
         // The venue reads about 120 s then; the host's 500 s is ignored.
         assert!(stamp <= at(120) - REST_BALANCE_LAG, "{stamp}");
         assert!(stamp >= at(119) - REST_BALANCE_LAG, "{stamp}");
