@@ -110,6 +110,37 @@
 //! - **Cost.** One account read per reconnect: weight 20 on spot, 10 on cross margin, and 10 per
 //!   five isolated pairs.
 //!
+//! # Signed requests are stamped on Binance's clock
+//!
+//! Binance refuses a signed request stamped 1 s or more ahead of its clock, or more than
+//! `recvWindow` (5 s) behind it, with `-1021`. So both clients stamp their signed requests with
+//! Binance's clock as read from `GET /api/v3/time` (weight 1), rather than with this host's: the
+//! earliest Binance's clock can read, counted on from the read on a monotonic clock. A stamp is
+//! then never ahead of Binance's clock, trails it by about the time the read's answer took to
+//! arrive, and does not move when this host's wall clock steps. [`BinanceMargin`] reads the time
+//! from the spot API, as margin has no endpoint for it.
+//!
+//! - **First request.** Each client's first request waits for one read. If the read fails, it is
+//!   logged at `warn`, and requests are stamped with this host's clock until a read succeeds.
+//! - **Refresh.** A request that finds the last read 5 minutes old starts another in the
+//!   background, and is sent without waiting for it.
+//! - **Suspend.** The monotonic clock does not advance while the host is suspended. A request
+//!   that finds this host's wall clock gone more than 1 s further than it since the last read
+//!   waits for a new read.
+//! - **`-1021`.** The client reads again before it returns the error, and the answer replaces its
+//!   reading, so a retry is stamped on the new one. Until the answer arrives, or if the read
+//!   fails, the reading held stays. No read is made during a rate-limit cooldown. The error is
+//!   unchanged: a transient connectivity error for a query, a rejection for an order. Whether to
+//!   retry stays the caller's decision.
+//! - **Observing it.** `host_clock_lead` on each client reports how far this host's clock leads
+//!   Binance's, negative when it trails. A read that finds the clocks 1 s or more apart logs at
+//!   `warn`.
+//! - **Account streams.** The reads also bound Binance's clock for the account streams, which place
+//!   fill recovery and balance restatement on Binance's time (see above), before a stream's first
+//!   event as well as after.
+//! - **Turning it off.** `server_time_sync` on each config, `true` by default, set to `false`
+//!   stamps signed requests with this host's clock.
+//!
 //! # Logging: `binance_sdk` writes request credentials at `DEBUG`
 //!
 //! Both clients run on the `binance-sdk` crate, whose WebSocket API client logs every outgoing
@@ -147,6 +178,7 @@ mod commission;
 mod margin;
 mod restatement;
 mod rules;
+mod server_time;
 mod shared;
 mod spot;
 

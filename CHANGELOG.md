@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`binance-sdk` 77.0.0 → 77.2.0** (`rustrade-execution`, `binance` feature, #773). It adds the
+  timestamp provider the clients now sign with (see Added). The three `binance_sdk::common`
+  internals the margin user-data stream couples to hold, and the margin module is unchanged. Two
+  changes reach the compiled code: a failed automatic reconnect of an SDK WebSocket connection is
+  now retried with a backoff from 1 s to 60 s, where 77.0.0 only logged it, and still stops once
+  the connection is closed; and spot symbol statuses gain `CANCEL_ONLY`, which these clients do
+  not read.
+
 - **Breaking: `OrderRules::check` takes the order's side, and checks a trailing order's offset**
   (`rustrade-execution`, #787). New `OrderRules::trailing_offset_above` and
   `trailing_offset_below` hold the range of a trailing offset, in basis points, for a trigger that
@@ -62,6 +70,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     thread, where the previous clock took up to 158 ns. Most of that gain is the alignment.
 
 ### Added
+
+- **Binance signed requests are stamped on Binance's clock** (`rustrade-execution`, #773). Both
+  clients read `GET /api/v3/time` and stamp each signed request with the earliest Binance's clock
+  can read, counted on from the read on a monotonic clock, instead of with this host's clock. A
+  host clock off Binance's by more than Binance accepts (1 s ahead, or `recvWindow`, 5 s, behind)
+  no longer fails every signed request with `-1021`, and a wall-clock step between reads does not
+  move the stamps.
+  - The first request waits for one read. A failed read is logged at `warn`, and requests are
+    stamped with this host's clock until one succeeds. A request that finds the last read 5
+    minutes old starts another in the background, and one that finds the wall clock gone more
+    than 1 s further than the monotonic clock since then, as after a suspend, waits for one.
+  - A `-1021` reads again before the error returns, and the answer replaces the reading, so the
+    caller's retry is stamped on the new one. The error itself is unchanged.
+  - `BinanceSpot::host_clock_lead` and `BinanceMargin::host_clock_lead` report how far this host's
+    clock leads Binance's. A read that finds them 1 s or more apart logs at `warn`.
+  - The account streams also take the reads as a bound on Binance's clock, so fill recovery and
+    balance restatement are placed on Binance's time before a stream's first event too.
+  - `server_time_sync` on `BinanceSpotConfig` and `BinanceMarginConfig` (`true` by default, also
+    `with_server_time_sync`) turns it off.
 
 - **A Binance account's commission rates** (`rustrade-execution`, #789).
   `BinanceSpot::fetch_commission_rates` and `BinanceMargin::fetch_commission_rates` read

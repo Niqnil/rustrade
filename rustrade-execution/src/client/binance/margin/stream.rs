@@ -1067,7 +1067,7 @@ impl<K: ListenKeys> MarginStream<K> {
             // once the connection survives a heartbeat window.
 
             if let Some(disconnect) = disconnect.take() {
-                let end = disconnect.end(self.clock.lock().venue(), HostMoment::now());
+                let end = disconnect.end(&self.clock.lock().venue(), HostMoment::now());
                 open_reconnect_recovery(
                     &mut unrecovered,
                     &mut unchecked,
@@ -1093,7 +1093,7 @@ impl<K: ListenKeys> MarginStream<K> {
                 return;
             };
             disconnect = Some(Disconnect::seen(
-                self.clock.lock().venue(),
+                &self.clock.lock().venue(),
                 HostMoment::now(),
                 lookback,
             ));

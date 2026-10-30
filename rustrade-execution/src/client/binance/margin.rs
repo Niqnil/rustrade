@@ -62,8 +62,9 @@ mod stream;
 pub use records::MarginForcedLiquidation;
 
 use super::commission::{CommissionRates, fetch_commission_rates};
-use super::restatement::{SharedStreamClock, restatement_time};
+use super::restatement::{SharedStreamClock, StreamClock, restatement_time};
 use super::rules::RulesLoader;
+use super::server_time::{ServerTime, SigningClock, default_server_time_sync, read_server_time};
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     FILL_RECOVERY_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
@@ -125,7 +126,7 @@ use binance_sdk::{
         },
     },
 };
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use fnv::FnvHashSet;
 use futures::stream::BoxStream;
 use rust_decimal::Decimal;
@@ -231,6 +232,10 @@ pub struct BinanceMarginConfig {
     /// a margin order obeys.
     #[serde(default)]
     pub pre_send_rules: PreSendRules,
+    /// Whether signed requests are stamped with Binance's clock, read from its server time,
+    /// rather than this host's. Defaults to `true`. See [`BinanceMargin::host_clock_lead`].
+    #[serde(default = "crate::client::binance::server_time::default_server_time_sync")]
+    pub server_time_sync: bool,
 }
 
 // custom Debug to avoid leaking credentials in logs
@@ -245,6 +250,7 @@ impl std::fmt::Debug for BinanceMarginConfig {
             .field("margin_effect", &self.margin_effect)
             .field("auto_repay_at_cancel", &self.auto_repay_at_cancel)
             .field("pre_send_rules", &self.pre_send_rules)
+            .field("server_time_sync", &self.server_time_sync)
             .finish()
     }
 }
@@ -278,6 +284,7 @@ impl BinanceMarginConfig {
             margin_effect,
             auto_repay_at_cancel,
             pre_send_rules: PreSendRules::default(),
+            server_time_sync: default_server_time_sync(),
         }
     }
 
@@ -285,6 +292,14 @@ impl BinanceMarginConfig {
     #[must_use]
     pub fn with_pre_send_rules(mut self, pre_send_rules: PreSendRules) -> Self {
         self.pre_send_rules = pre_send_rules;
+        self
+    }
+
+    /// Set whether signed requests are stamped with Binance's clock, read from its server time
+    /// ([`server_time_sync`](Self::server_time_sync)).
+    #[must_use]
+    pub fn with_server_time_sync(mut self, server_time_sync: bool) -> Self {
+        self.server_time_sync = server_time_sync;
         self
     }
 
@@ -652,6 +667,17 @@ impl BinanceMargin {
         fetch_commission_rates(&self.spot_rest, &self.spot_rate_limiter, instrument).await
     }
 
+    /// The most this host's clock leads Binance's, from the client's reads of Binance's server
+    /// time; negative when it trails. `None` when
+    /// [`server_time_sync`](BinanceMarginConfig::server_time_sync) is off, or before a read has
+    /// succeeded.
+    ///
+    /// An upper bound: the true lead, plus the time the kept read's answer took to arrive and the
+    /// drift allowed for since. A read logs at `warn` when it finds the clocks 1 s or more apart.
+    pub fn host_clock_lead(&self) -> Option<TimeDelta> {
+        self.rate_limiter.host_clock_lead()
+    }
+
     /// Submit a margin order over the SAPI `POST /sapi/v1/margin/order` endpoint, and report
     /// what it borrowed.
     ///
@@ -915,11 +941,18 @@ impl BinanceMargin {
     /// # Panics
     /// Panics if the binance-sdk configuration builder fails (invalid credentials format).
     #[allow(clippy::expect_used)] // Documented panic: invalid credentials detected at startup
-    fn build_rest_config(config: &BinanceMarginConfig) -> ConfigurationRestApi {
-        ConfigurationRestApi::builder()
+    fn build_rest_config(
+        config: &BinanceMarginConfig,
+        signing: Option<&SigningClock>,
+    ) -> ConfigurationRestApi {
+        let mut builder = ConfigurationRestApi::builder()
             .api_key(config.api_key.clone())
             .api_secret(config.secret_key.clone())
-            .base_path(MARGIN_TRADING_REST_API_PROD_URL)
+            .base_path(MARGIN_TRADING_REST_API_PROD_URL);
+        if let Some(signing) = signing {
+            builder = builder.timestamp_provider(signing.provider());
+        }
+        builder
             .build()
             .expect("failed to build Binance margin REST configuration")
     }
@@ -1085,7 +1118,8 @@ impl ExecutionClient for BinanceMargin {
         // for the new-order and cancel requests via `send_request`. `ConfigurationRestApi: Clone`
         // and is cheap to copy (its `reqwest::Client` is `Arc`-backed), avoiding redundant credential
         // clones from building it twice.
-        let rest_config = Self::build_rest_config(&config);
+        let signing = config.server_time_sync.then(SigningClock::default);
+        let rest_config = Self::build_rest_config(&config, signing.as_ref());
         let rest = Arc::new(MarginTradingRestApi::production(rest_config.clone()));
         // The rules come from the spot `exchangeInfo`, a public endpoint on the spot weight pool,
         // and the commission rates from the spot account. Their tracker is this client's own: a
@@ -1094,7 +1128,13 @@ impl ExecutionClient for BinanceMargin {
         let spot_rest = Arc::new(binance_sdk::spot::SpotRestApi::production(
             rest_config.clone(),
         ));
-        let spot_rate_limiter = Arc::new(RateLimitTracker::new(WeightPool::Spot));
+        // Binance's server time is read from the spot API: margin has no endpoint of its own, and
+        // the read is unsigned. Both trackers hold it, so that a request on either waits for the
+        // first read.
+        let server_time =
+            signing.map(|signing| ServerTime::new(signing, read_server_time(spot_rest.clone())));
+        let spot_rate_limiter =
+            Arc::new(RateLimitTracker::new(WeightPool::Spot).with_server_time(server_time.clone()));
         let rules = Arc::new(RulesLoader::new(
             config.pre_send_rules,
             spot_rest.clone(),
@@ -1105,7 +1145,9 @@ impl ExecutionClient for BinanceMargin {
             config: Arc::new(config),
             rest,
             rest_config,
-            rate_limiter: Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
+            rate_limiter: Arc::new(
+                RateLimitTracker::new(WeightPool::Sapi).with_server_time(server_time),
+            ),
             known_live: KnownLiveOrders::shared(ExchangeId::BinanceMargin),
             rules,
             spot_rest,
@@ -1782,7 +1824,7 @@ impl ExecutionClient for BinanceMargin {
             account,
             instruments,
             assets: assets.to_vec(),
-            clock: SharedStreamClock::default(),
+            clock: StreamClock::shared(self.rate_limiter.signing_clock()),
             tx,
             dedup: new_dedup_cache(),
         };
@@ -4265,10 +4307,10 @@ mod tests {
     fn recalled_order_kinds_are_known_and_those_past_the_limit_warned_of() {
         use crate::client::order_recovery::tests::logged_with_lock_free;
 
-        let client = BinanceMargin::new(BinanceMarginConfig::cross_margin(
-            "k".to_string(),
-            "s".to_string(),
-        ));
+        let client = BinanceMargin::new(
+            BinanceMarginConfig::cross_margin("k".to_string(), "s".to_string())
+                .with_server_time_sync(false),
+        );
         let trailing = OrderKind::TrailingStopFixedLimit {
             offset: Decimal::from(100),
             offset_type: TrailingOffsetType::BasisPoints,
@@ -4493,7 +4535,7 @@ mod tests {
                 .map(|s| InstrumentNameExchange::new(*s))
                 .collect(),
         );
-        BinanceMargin::new(config)
+        BinanceMargin::new(config.with_server_time_sync(false))
     }
 
     #[test]
@@ -5778,6 +5820,40 @@ mod tests {
         assert_eq!(filled.avg_price, None, "no negative average price");
     }
 
+    /// `new` keeps the client's signing clock read from Binance's server time on both of its
+    /// trackers, unless `server_time_sync` is off; `host_clock_lead` reports the reads.
+    #[tokio::test(start_paused = true)]
+    async fn the_host_clock_lead_is_the_clients_server_time_reads() {
+        let config = BinanceMarginConfig::cross_margin("k".to_string(), "s".to_string());
+        assert!(config.server_time_sync);
+        let synced = BinanceMargin::new(config.clone());
+        assert!(synced.rate_limiter.signing_clock().is_some());
+        assert!(synced.spot_rate_limiter.signing_clock().is_some());
+        let mut client = BinanceMargin::new(config.with_server_time_sync(false));
+        assert!(client.rate_limiter.signing_clock().is_none());
+        assert!(client.spot_rate_limiter.signing_clock().is_none());
+        assert_eq!(client.host_clock_lead(), None);
+
+        let host_ms = Utc::now().timestamp_millis();
+        let read: crate::client::binance::server_time::ReadServerTime =
+            Arc::new(move || Box::pin(async move { Ok(host_ms - 2_000) }));
+        client.rate_limiter = Arc::new(
+            RateLimitTracker::new(WeightPool::Sapi)
+                .with_server_time(Some(ServerTime::new(SigningClock::default(), read))),
+        );
+        client
+            .rate_limiter
+            .wait_if_blocked(RequestKind::Query)
+            .await
+            .unwrap();
+
+        let lead = client.host_clock_lead().unwrap();
+        assert!(
+            lead >= TimeDelta::seconds(2) && lead < TimeDelta::seconds(3),
+            "{lead}"
+        );
+    }
+
     /// A REST config whose requests go to `server`.
     fn margin_rest_config_at(server: &wiremock::MockServer) -> ConfigurationRestApi {
         ConfigurationRestApi::builder()
@@ -5809,7 +5885,8 @@ mod tests {
             BinanceMarginConfig::cross_margin("key".into(), "secret".into())
         };
         let mode = config.pre_send_rules;
-        let mut client = <BinanceMargin as ExecutionClient>::new(config);
+        let mut client =
+            <BinanceMargin as ExecutionClient>::new(config.with_server_time_sync(false));
         client.rest = margin_rest_at(server);
         client.rest_config = Arc::new(margin_rest_config_at(server));
         client.spot_rest = Arc::new(binance_sdk::spot::SpotRestApi::from_config(

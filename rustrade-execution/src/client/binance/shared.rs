@@ -18,6 +18,7 @@
 //! Event deduplication lives in [`crate::client::dedup`], shared with the other clients that
 //! need it, and is re-exported here so Binance call sites keep a single import site.
 
+use super::server_time::{ServerTime, SigningClock};
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
     error::{
@@ -286,11 +287,10 @@ pub(crate) const FILL_RECOVERY_TIMEOUT_SECS: u64 = 30;
 /// How far past the start of the recovery that opens it a [`FillGap`] reaches.
 ///
 /// Recovery starts after the live stream is subscribed, so a fill after that moment arrives live.
-/// Binance stamps fills by its own clock, which may run ahead of this host's. Binance rejects a
-/// signed request stamped more than `recvWindow` (5 s by default) from its clock, so a skew past
-/// this margin would already fail every REST call. The overlap with live delivery it leaves is
-/// seconds long, and the dedup cache absorbs it, as long as those fills have not left it by the
-/// time the gap is read.
+/// The end is placed no earlier than Binance's time as estimated ([`Disconnect::end`]), which is a
+/// lower bound: this margin covers the delay it trails by. The overlap with live delivery it
+/// leaves is seconds long, and the dedup cache absorbs it, as long as those fills have not left it
+/// by the time the gap is read.
 pub(crate) const GAP_END_SLACK_SECS: i64 = 10;
 
 /// A span of one instrument's fills that a reconnect's recovery has not yet forwarded.
@@ -477,9 +477,11 @@ pub(crate) struct Disconnect {
 
 impl Disconnect {
     /// A disconnect seen at `seen`, whose gap starts `lookback` before Binance's time then, or
-    /// this host's if that is earlier ([`VenueClock::span_start`]). Before the stream has seen a
-    /// time Binance stamped, from this host's time: a host clock more than about a second ahead
-    /// of Binance's fails every signed request, the gap's reads included, so that is seen too.
+    /// this host's if that is earlier ([`VenueClock::span_start`]). Before Binance's time is
+    /// known, from the stream's events or the client's server-time reads, from this host's time.
+    /// Signed requests are then stamped with this host's clock too, and one more than about a
+    /// second ahead of Binance's fails every signed request, the gap's reads included, so that is
+    /// seen too.
     pub(crate) fn seen(venue: &VenueClock, seen: HostMoment, lookback: TimeDelta) -> Self {
         let at = venue.span_start(seen).unwrap_or(seen.time);
         Self {
@@ -894,12 +896,18 @@ struct Deadlines {
 ///   from successful responses ([`observe_rest`](Self::observe_rest),
 ///   [`observe_ws_api`](Self::observe_ws_api)); a rejected request's response is not observed,
 ///   so usage can only be under-counted.
+///
+/// Every request passes [`wait_if_blocked`](Self::wait_if_blocked) before it is sent, so the
+/// tracker also holds the client's [`ServerTime`], when it keeps one: the wait then includes the
+/// client's first server-time read, and starts a refresh when the last read is old.
 pub(crate) struct RateLimitTracker {
     // parking_lot::Mutex — never poisons, consistent with SharedDedupCache
     deadlines: parking_lot::Mutex<Deadlines>,
     pool: WeightPool,
     /// The pool's per-minute weight limit.
     weight_limit: AtomicU32,
+    /// The clock signed requests are stamped with, kept read from Binance's server time.
+    server_time: Option<ServerTime>,
 }
 
 impl RateLimitTracker {
@@ -908,6 +916,41 @@ impl RateLimitTracker {
             deadlines: parking_lot::Mutex::new(Deadlines::default()),
             pool,
             weight_limit: AtomicU32::new(pool.default_limit()),
+            server_time: None,
+        }
+    }
+
+    /// The tracker, keeping `server_time` read before the requests it lets through.
+    #[must_use]
+    pub(crate) fn with_server_time(mut self, server_time: Option<ServerTime>) -> Self {
+        self.server_time = server_time;
+        self
+    }
+
+    /// The clock signed requests are stamped with, when the client keeps one read from
+    /// Binance's server time.
+    pub(crate) fn signing_clock(&self) -> Option<SigningClock> {
+        self.server_time
+            .as_ref()
+            .map(|server| server.clock().clone())
+    }
+
+    /// The most this host's clock leads Binance's, from the server-time reads so far; negative
+    /// when it trails. `None` without server-time sync, or before a read has succeeded.
+    pub(crate) fn host_clock_lead(&self) -> Option<TimeDelta> {
+        self.server_time.as_ref().and_then(ServerTime::host_lead)
+    }
+
+    /// After a request failed with `e`: when Binance refused its timestamp (`-1021`), wait for a
+    /// fresh server-time read to replace the signing clock's estimate, so that a retry is stamped
+    /// on the clock as read again. Nothing for any other failure, during a rate-limit cooldown,
+    /// when the read would be refused too, or without server-time sync.
+    pub(crate) async fn after_failure(&self, e: &anyhow::Error) {
+        if let Some(server_time) = &self.server_time
+            && is_timestamp_rejection(e)
+            && self.cooldown_remaining().is_none()
+        {
+            server_time.after_rejection().await;
         }
     }
 
@@ -920,7 +963,19 @@ impl RateLimitTracker {
     ///
     /// Loops after waking to re-check the deadline: another task may have extended it while this
     /// task was sleeping.
+    ///
+    /// Then, with server-time sync, waits for the client's first server-time read, or starts a
+    /// refresh when the last read is old ([`ServerTime::ready`]).
     pub(crate) async fn wait_if_blocked(&self, kind: RequestKind) -> Result<(), CooldownActive> {
+        self.wait_for_deadlines(kind).await?;
+        if let Some(server_time) = &self.server_time {
+            server_time.ready().await;
+        }
+        Ok(())
+    }
+
+    /// The rate-limit waits of [`wait_if_blocked`](Self::wait_if_blocked).
+    async fn wait_for_deadlines(&self, kind: RequestKind) -> Result<(), CooldownActive> {
         loop {
             let (blocked_until, deadline) = {
                 let deadlines = self.deadlines.lock();
@@ -3423,8 +3478,10 @@ pub(crate) fn parse_binance_order_rejection(
 /// - a venue failure ([`has_venue_failure_code`]) → [`ConnectivityError::Socket`]: the venue
 ///   failed the request, not the other way round, and Binance says to retry.
 /// - `-1021` (timestamp outside `recvWindow`) → [`ConnectivityError::Socket`]: the request took
-///   too long to arrive, or the local clock drifted. The SDK stamps each attempt afresh, so a
-///   retry can succeed; a clock that stays wrong keeps failing, so callers should bound retries.
+///   too long to arrive, or its stamp was off Binance's clock. The SDK stamps each attempt
+///   afresh, and with server-time sync the client reads Binance's time again before returning
+///   ([`RateLimitTracker::after_failure`]), so a retry can succeed. A clock that stays wrong
+///   keeps failing, so callers should bound retries.
 /// - `-1121` → [`ApiError::InstrumentInvalid`] when the request named one instrument; otherwise
 ///   there is no instrument to attach, so it falls through.
 /// - anything else → [`ApiError::RequestRejected`], prefixed with the symbol when the request
@@ -3672,7 +3729,10 @@ where
                     return Err(e);
                 }
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                rate_limiter.after_failure(&e).await;
+                return Err(e);
+            }
         }
     }
     unreachable!("Binance REST retries exhausted: loop invariant violated")
@@ -4140,6 +4200,27 @@ pub(crate) fn classify_rest_order_error(
     order_error_from(classify_connector_error(ce), instrument)
 }
 
+/// Whether `e` is Binance refusing a request's timestamp (`-1021`): one `recvWindow` or more
+/// behind its clock, or 1 s or more ahead of it. Read from the code of a REST
+/// [`ConnectorError`] or a WS-API [`WebsocketError::ResponseError`], which context layers do not
+/// hide.
+pub(crate) fn is_timestamp_rejection(e: &anyhow::Error) -> bool {
+    const INVALID_TIMESTAMP: i64 = -1021;
+    if let Some(WebsocketError::ResponseError { code, .. }) = e.downcast_ref::<WebsocketError>() {
+        return *code == INVALID_TIMESTAMP;
+    }
+    matches!(
+        e.downcast_ref::<ConnectorError>(),
+        Some(
+            ConnectorError::BadRequestError { code, .. }
+                | ConnectorError::UnauthorizedError { code, .. }
+                | ConnectorError::ForbiddenError { code, .. }
+                | ConnectorError::NotFoundError { code, .. }
+                | ConnectorError::ConnectorClientError { code, .. }
+        ) if *code == Some(INVALID_TIMESTAMP)
+    )
+}
+
 /// Classify an `anyhow::Error` from a WS-API order/cancel request.
 ///
 /// binance-sdk returns both transport failures and venue responses with status >= 400 through
@@ -4215,6 +4296,38 @@ mod tests {
     fn the_heartbeat_and_cooldown_are_as_documented() {
         assert_eq!(HEARTBEAT_TIMEOUT_SECS, 30);
         assert_eq!(MAX_COOLDOWN_SLEEP, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_timestamp_rejection_is_read_from_the_code_of_either_api() {
+        let rest = |code| {
+            anyhow::Error::new(ConnectorError::BadRequestError {
+                msg: "Timestamp for this request is outside of the recvWindow.".to_owned(),
+                code,
+            })
+        };
+        let ws = |code| {
+            anyhow::Error::new(WebsocketError::ResponseError {
+                code,
+                message: "Timestamp for this request was 1000ms ahead of the server's time."
+                    .to_owned(),
+                retry_after: None,
+            })
+        };
+
+        assert!(is_timestamp_rejection(&rest(Some(-1021))));
+        assert!(is_timestamp_rejection(&ws(-1021)));
+        // Context layers do not hide it.
+        assert!(is_timestamp_rejection(&ws(-1021).context("order.place")));
+        assert!(is_timestamp_rejection(
+            &rest(Some(-1021)).context("get_account")
+        ));
+        assert!(!is_timestamp_rejection(&rest(Some(-1022))));
+        assert!(!is_timestamp_rejection(&rest(None)));
+        assert!(!is_timestamp_rejection(&ws(-1022)));
+        assert!(!is_timestamp_rejection(&anyhow::Error::new(
+            ConnectorError::NetworkError("-1021".to_owned())
+        )));
     }
 
     #[test]

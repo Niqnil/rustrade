@@ -115,6 +115,14 @@ impl VenueClock {
         }
     }
 
+    /// Records the sample `other` holds, as [`observe`](Self::observe) would, so that this clock
+    /// learns from another source of the same venue's times, such as a read of its server time.
+    pub(crate) fn merge(&mut self, other: &VenueClock) {
+        if let Some(Sample { stamp, received }) = other.sample {
+            self.observe(stamp, received);
+        }
+    }
+
     /// The earliest the venue's clock can read at `at`, or `None` before any sample.
     ///
     /// Counts from the sample on tokio's clock, less the drift allowance, so the venue's clock
@@ -256,6 +264,24 @@ mod tests {
         // The held sample still bounds the time it arrived at; the new one would bound it 2 s
         // earlier, counting back with the drift allowance added.
         assert_eq!(clock.earliest_at(base), Some(at(100)));
+    }
+
+    #[test]
+    fn a_merged_clock_keeps_whichever_sample_bounds_the_venue_later() {
+        let base = Instant::now();
+        let mut tighter = VenueClock::new();
+        tighter.observe(at(110), base);
+        let mut looser = VenueClock::new();
+        looser.observe(at(100), base);
+
+        let mut clock = looser;
+        clock.merge(&tighter);
+        assert_eq!(clock.earliest_at(base), Some(at(110)));
+
+        let mut clock = tighter;
+        clock.merge(&looser);
+        clock.merge(&VenueClock::new());
+        assert_eq!(clock.earliest_at(base), Some(at(110)));
     }
 
     #[test]
