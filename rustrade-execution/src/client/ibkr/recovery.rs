@@ -681,6 +681,8 @@ pub(super) struct RecoveryWatcher {
     pub(super) known: SharedKnownLiveOrders,
     pub(super) listings: ListingLock,
     pub(super) earlier_completions: EarlierCompletions,
+    /// The gateway's zone, in which an order's time that names none is read.
+    pub(super) session_zone: Option<chrono_tz::Tz>,
     pub(super) sink: EventSink,
     /// The runtime the order check, which is shared with the other venues, runs its timers on.
     pub(super) runtime: tokio::runtime::Handle,
@@ -830,6 +832,7 @@ impl RecoveryWatcher {
             &self.order_ids,
             &self.pending_cancels,
             &self.earlier_completions,
+            self.session_zone,
         );
         let list_open = |_instruments: Vec<_>| std::future::ready(self.listed_cids());
         let lookup = |key| {

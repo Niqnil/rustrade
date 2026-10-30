@@ -513,8 +513,12 @@ pub(crate) struct OrderShape {
 /// # Errors
 /// A description of what does not map: an order type or time in force [`build_ib_order`] never
 /// sends, a price the type needs that IB did not list, or a good-till-date time that does not
-/// parse.
-pub(crate) fn order_shape_from_ib(order: &Order) -> Result<OrderShape, String> {
+/// parse. A good-till-date that names no zone is read in `session_zone`, the gateway's (see
+/// [`parse_gtd_datetime`]).
+pub(crate) fn order_shape_from_ib(
+    order: &Order,
+    session_zone: Option<chrono_tz::Tz>,
+) -> Result<OrderShape, String> {
     let order_type = order.order_type.as_str();
     let decimal = |value: Option<f64>, field: &str| -> Result<Decimal, String> {
         let value = value.ok_or_else(|| format!("{order_type} order without {field}"))?;
@@ -528,7 +532,7 @@ pub(crate) fn order_shape_from_ib(order: &Order) -> Result<OrderShape, String> {
         IbTimeInForce::FillOrKill => TimeInForce::FillOrKill,
         IbTimeInForce::OnOpen => TimeInForce::AtOpen,
         IbTimeInForce::GoodTillDate => TimeInForce::GoodTillDate {
-            expiry: parse_gtd_datetime(&order.good_till_date).ok_or_else(|| {
+            expiry: parse_gtd_datetime(&order.good_till_date, session_zone).ok_or_else(|| {
                 format!(
                     "good-till-date time {:?} does not parse",
                     order.good_till_date
@@ -622,26 +626,33 @@ pub(crate) fn order_shape_from_ib(order: &Order) -> Result<OrderShape, String> {
     })
 }
 
-/// Parse IB's good-till-date field: the form [`format_gtd_datetime`] sends, in UTC, or IB's
-/// `yyyyMMdd HH:mm:ss` with a zone, or without one, read as UTC.
+/// Parse IB's good-till-date field: the form [`format_gtd_datetime`] sends,
+/// `yyyyMMdd-HH:mm:ss`, in UTC, or IB's `yyyyMMdd HH:mm:ss`, in the zone it names, or else in
+/// `session_zone`, the gateway's, as IB reads it.
 ///
-/// Unlike an execution's time, a good-till-date that cannot be read in the zone it names, as one
-/// this crate does not know, is still read, as UTC, with a `warn!`: it is an order's parameter,
-/// which this client writes in UTC, and an order whose expiry cannot be read cannot be reported
-/// from a listing at all.
-fn parse_gtd_datetime(value: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+/// Unlike an execution's time, a good-till-date that cannot be read in its zone is still read,
+/// as UTC, with a `warn!`. That is so when the zone it names is not one this crate knows, when it
+/// names none and `session_zone` is `None`, and when the wall-clock time does not exist in the
+/// zone, falling in the hour skipped as clocks go forward. A good-till-date is an order's
+/// parameter, which this client writes in UTC, and an order whose expiry cannot be read cannot be
+/// reported from a listing at all.
+fn parse_gtd_datetime(
+    value: &str,
+    session_zone: Option<chrono_tz::Tz>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::NaiveDateTime::parse_from_str(value, GTD_FORMAT)
         .map(|naive| naive.and_utc())
         .ok()
-        .or_else(|| super::execution::parse_ib_timestamp(value, Some(chrono_tz::UTC)))
+        .or_else(|| super::execution::parse_ib_timestamp(value, session_zone))
         .or_else(|| {
             let mut parts = value.split_whitespace();
             let wall_clock = format!("{} {}", parts.next()?, parts.next()?);
-            parts.next()?;
             let time = super::execution::parse_ib_timestamp(&wall_clock, Some(chrono_tz::UTC))?;
             tracing::warn!(
                 good_till_date = value,
-                "IBKR good-till-date could not be read in its zone; read as UTC"
+                session_zone = session_zone.map(|zone| zone.name()),
+                "IBKR good-till-date could not be read in the zone it names or, naming none, in \
+                 the session's; read as UTC"
             );
             Some(time)
         })
@@ -2106,22 +2117,52 @@ mod tests {
         assert_eq!(order.good_till_date, "20250630-23:59:59");
     }
 
+    /// A good-till-date is read in the zone it names, in the session's when it names none, and as
+    /// UTC in the dash form this client sends. One that cannot be read in its zone, as an unknown
+    /// zone, no session zone, or a time in the hour skipped as clocks go forward, is the
+    /// wall-clock reading as UTC.
     #[test]
-    fn a_good_till_date_is_read_in_its_zone_or_as_utc() {
+    fn a_good_till_date_is_read_in_its_zone_or_the_sessions_or_as_utc() {
+        use chrono_tz::{America::New_York, Asia::Singapore};
         let utc = |time: &str| Some(chrono::DateTime::parse_from_rfc3339(time).unwrap().to_utc());
-        for (value, expected) in [
-            ("20261027-04:48:41", "2026-10-27T04:48:41Z"),
-            ("20261027 04:48:41", "2026-10-27T04:48:41Z"),
-            ("20261027 12:48:41 Asia/Singapore", "2026-10-27T04:48:41Z"),
-            // A zone this crate cannot read: the wall-clock reading, as UTC.
+        for (value, session_zone, expected) in [
+            ("20261027-04:48:41", None, "2026-10-27T04:48:41Z"),
+            ("20261027-04:48:41", Some(Singapore), "2026-10-27T04:48:41Z"),
+            ("20261027 12:48:41", Some(Singapore), "2026-10-27T04:48:41Z"),
             (
-                "20261027 04:48:41 Some Standard Time",
+                "20261027 12:48:41 Asia/Singapore",
+                None,
                 "2026-10-27T04:48:41Z",
             ),
+            (
+                "20261027 12:48:41 Asia/Singapore",
+                Some(New_York),
+                "2026-10-27T04:48:41Z",
+            ),
+            // No zone named and none known for the session.
+            ("20261027 04:48:41", None, "2026-10-27T04:48:41Z"),
+            // A zone this crate cannot read.
+            (
+                "20261027 04:48:41 Some Standard Time",
+                Some(Singapore),
+                "2026-10-27T04:48:41Z",
+            ),
+            // In the hour New York skips as clocks go forward, named or the session's.
+            (
+                "20260308 02:30:00 America/New_York",
+                None,
+                "2026-03-08T02:30:00Z",
+            ),
+            ("20260308 02:30:00", Some(New_York), "2026-03-08T02:30:00Z"),
         ] {
-            assert_eq!(parse_gtd_datetime(value), utc(expected), "{value}");
+            assert_eq!(
+                parse_gtd_datetime(value, session_zone),
+                utc(expected),
+                "{value} in {session_zone:?}"
+            );
         }
-        assert_eq!(parse_gtd_datetime("not a date"), None);
+        assert_eq!(parse_gtd_datetime("not a date", Some(Singapore)), None);
+        assert_eq!(parse_gtd_datetime("20261027-04:48:41 UTC", None), None);
     }
 
     #[test]
@@ -2419,7 +2460,7 @@ mod tests {
             for time_in_force in tifs {
                 let order = build_ib_order(Side::Buy, 1.0, &kind, price, &time_in_force).unwrap();
                 assert_eq!(
-                    order_shape_from_ib(&order),
+                    order_shape_from_ib(&order, None),
                     Ok(OrderShape {
                         kind,
                         price,
@@ -2438,7 +2479,7 @@ mod tests {
             let order =
                 build_ib_order(Side::Sell, 1.0, &kind, price, &TimeInForce::AtClose).unwrap();
             assert_eq!(
-                order_shape_from_ib(&order),
+                order_shape_from_ib(&order, None),
                 Ok(OrderShape {
                     kind,
                     price,
@@ -2460,9 +2501,23 @@ mod tests {
             ..Order::default()
         };
         assert_eq!(
-            order_shape_from_ib(&order).unwrap().time_in_force,
+            order_shape_from_ib(&order, None).unwrap().time_in_force,
             TimeInForce::GoodTillDate {
                 expiry: chrono::Utc.with_ymd_and_hms(2026, 10, 9, 20, 0, 0).unwrap()
+            }
+        );
+
+        // Without a zone, in the session's, as IB reads it.
+        let order = Order {
+            good_till_date: "20261009 16:00:00".to_owned(),
+            ..order
+        };
+        assert_eq!(
+            order_shape_from_ib(&order, Some(chrono_tz::Asia::Singapore))
+                .unwrap()
+                .time_in_force,
+            TimeInForce::GoodTillDate {
+                expiry: chrono::Utc.with_ymd_and_hms(2026, 10, 9, 8, 0, 0).unwrap()
             }
         );
     }
@@ -2517,7 +2572,7 @@ mod tests {
                 "not positive",
             ),
         ] {
-            let error = order_shape_from_ib(&order).unwrap_err();
+            let error = order_shape_from_ib(&order, None).unwrap_err();
             assert!(error.contains(reason), "{error:?} should name {reason:?}");
         }
     }

@@ -169,6 +169,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **An IBKR good-till-date that names no zone is read in the gateway session's zone**
+  (`rustrade-execution`, #797). Listing open orders, or reading how an order ended, reads back the
+  good-till-date of an order this client did not place, or no longer tracks. A `yyyyMMdd HH:mm:ss`
+  with no zone was read as UTC, but IB reads such a time in the TWS/Gateway session's zone, so the
+  expiry came back off by that zone's offset (8 h on an `Asia/Singapore` session). It is now read
+  in `IbkrClient::session_zone`, as execution and completion times already are. The dash form
+  `yyyyMMdd-HH:mm:ss`, which this client sends, stays UTC, and a named zone stays that zone. A
+  good-till-date that cannot be read in its zone is still read as UTC, with a `warn!`, so its order
+  can be listed: an unknown zone, no session zone, or a time in the hour skipped as clocks go
+  forward, in the named zone or the session's. The rustdoc now names each of these causes.
+
 - **Binance REST balance reads are stamped no later than Binance's time when this host's clock
   leads** (`rustrade-execution`, #796). `fetch_balances` and `account_snapshot`, on spot and on
   cross and isolated margin, stamped each balance with this host's time before the request, less
