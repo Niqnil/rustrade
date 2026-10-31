@@ -64,7 +64,7 @@
 //! | `test_place_and_cancel_bracket_order` | Bracket order with OCA |
 //! | `test_bracket_order_oca_group_linkage` | Verify OCA group linkage |
 //! | `test_place_and_cancel_gtd_order` | Good-Till-Date order |
-//! | `test_gtd_expiry_reads_back_after_a_restart` | A GTD expiry read back by the placing client, after a restart, and once ended |
+//! | `test_gtd_expiry_reads_back_after_a_restart` | A GTD expiry parsed from IB's open and completed orders by clients that never saw the order |
 //! | `test_place_moo_order_premarket` | Market-on-Open (timing-sensitive) |
 //! | `test_place_loo_order_premarket` | Limit-on-Open (timing-sensitive) |
 //! | `test_orders_found_by_client_order_id_across_a_restart` | Snapshot orders, adoption after a restart, ended-order lookup |
@@ -1590,14 +1590,32 @@ async fn test_place_and_cancel_gtd_order() {
     }
 }
 
-/// A good-till-date order's expiry reads back as the instant it was placed with: from the client
-/// that placed it, from a new client under the same API client id after a restart, which knows
-/// only what IB lists, and from `fetch_ended_orders` once it is cancelled.
+/// A new client under `resolved_aapl_config(client_id_offset)`, once IB has released the API
+/// client id of the one just disconnected, which takes it a moment.
+async fn reconnect(client_id_offset: i32) -> IbkrClient {
+    let mut restarted = Err(String::new());
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        restarted = connect_client(resolved_aapl_config(client_id_offset)).await;
+        if restarted.is_ok() {
+            break;
+        }
+    }
+    restarted.expect("reconnection failed")
+}
+
+/// A good-till-date order's expiry, parsed from what IB lists, reads back as the instant it was
+/// placed with: from IB's open orders, by a new client under the same API client id after a
+/// restart, and from IB's completed orders once it is cancelled, by another new client.
+///
+/// Each read is by a client that has never seen the order. The client that places or adopts an
+/// order answers from what it tracks, and never parses IB's good-till-date for it.
 ///
 /// The expiry is five days out: IB rejects a good-till-date that falls before the next market
 /// open (error 201, "Order will be expired before market opens"), which two days out from a Friday
-/// evening does. Five days out it can also fall across a daylight saving change in the session's
-/// zone, as it does when run in the days before one.
+/// evening does. Run in the days before a daylight saving change in the session's zone, five days
+/// is also long enough to cross it, which reads the expiry across the change of offset. The test
+/// does not pick such a date.
 #[tokio::test]
 #[ignore]
 #[serial]
@@ -1645,30 +1663,9 @@ async fn test_gtd_expiry_reads_back_after_a_restart() {
         "{placed:?}"
     );
 
-    let open = client
-        .fetch_open_orders(std::slice::from_ref(&aapl))
-        .await
-        .expect("fetch_open_orders failed");
-    let listed = open
-        .iter()
-        .find(|order| order.key.cid == cid)
-        .expect("the order is listed");
-    assert_eq!(
-        listed.time_in_force, time_in_force,
-        "read by the placing client"
-    );
-
     // A restart: a new client under the same API client id, which has never seen the order.
     client.disconnect();
-    let mut restarted = Err(String::new());
-    for _ in 0..15 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        restarted = connect_client(resolved_aapl_config(30)).await;
-        if restarted.is_ok() {
-            break;
-        }
-    }
-    let restarted = restarted.expect("reconnection failed");
+    let restarted = reconnect(30).await;
 
     let open = restarted
         .fetch_open_orders(std::slice::from_ref(&aapl))
@@ -1706,9 +1703,12 @@ async fn test_gtd_expiry_reads_back_after_a_restart() {
     // Asserted after the cancel, so a wrong read does not leave the order working.
     assert_eq!(
         listed.time_in_force, time_in_force,
-        "read from IB's listing"
+        "read from IB's open orders"
     );
 
+    // Another restart, since the client that adopted the order answers from what it tracks.
+    restarted.disconnect();
+    let restarted = reconnect(30).await;
     let ended = ended_eventually(
         &restarted,
         OrderKey {
@@ -2070,15 +2070,7 @@ async fn test_orders_found_by_client_order_id_across_a_restart() {
     // A restart: a new client under the same API client id, which has never seen the order.
     // `disconnect` closes the socket, and IB then takes a moment to release the id.
     client.disconnect();
-    let mut restarted = Err(String::new());
-    for _ in 0..15 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        restarted = connect_client(resolved_aapl_config(21)).await;
-        if restarted.is_ok() {
-            break;
-        }
-    }
-    let restarted = restarted.expect("reconnection failed");
+    let restarted = reconnect(21).await;
 
     let open = restarted
         .fetch_open_orders(std::slice::from_ref(&aapl))
