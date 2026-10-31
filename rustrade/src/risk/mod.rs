@@ -30,6 +30,30 @@ pub trait RiskManager<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentInd
     /// eg/ `EngineState<DefaultGlobalData, DefaultInstrumentMarketData>`
     type State;
 
+    /// Reviews one batch of the order requests an
+    /// [`AlgoStrategy`](super::strategy::algo::AlgoStrategy) generated, returning each as approved
+    /// or refused: approved cancels, approved opens, refused cancels, refused opens.
+    ///
+    /// The [`Engine`](crate::engine::Engine) calls it after each event it processes, except a
+    /// contract expiry or a corporate action, while trading is enabled and no drain is in
+    /// progress, with the batch its strategy generated from `state`.
+    /// It sends only the approved requests, cancels first, and reports the refused ones, with
+    /// their reasons, in [`GenerateAlgoOrdersOutput`]. Commands to close positions or cancel
+    /// orders do not pass through it.
+    ///
+    /// # Caller obligations
+    /// - **Return each request once, approved or refused.** The engine does not check this: a
+    ///   request in neither output is neither sent nor reported, and one in both is sent and
+    ///   reported as refused.
+    /// - **An approved request is sent as returned**, so a check that adjusts one, such as
+    ///   reducing its quantity, returns the adjusted request.
+    /// - **A refusal is final for this batch.** A refused request is not retried. Whatever its
+    ///   reason, it does not stop the engine: [`RiskRefused`] implements
+    ///   [`Unrecoverable`], but the engine does not act on it.
+    ///
+    /// The engine collects all four outputs before it sends anything, so they may borrow `state`.
+    ///
+    /// [`GenerateAlgoOrdersOutput`]: crate::engine::action::generate_algo_orders::GenerateAlgoOrdersOutput
     fn check(
         &self,
         state: &Self::State,
