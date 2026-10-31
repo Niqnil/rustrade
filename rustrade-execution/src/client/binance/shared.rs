@@ -275,11 +275,11 @@ impl Drop for UnsubscribeOnDrop {
 
 /// If no WS activity (messages, ping, pong) for this duration, force reconnect.
 pub(crate) const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
-// Compile-time guard: reconnect sites cast this to i64 (`chrono::Duration::seconds`); ensure it
-// never overflows.
+// Compile-time guard: reconnect sites cast this to i64 (`chrono::Duration::seconds`), and spot's
+// disconnect lookback doubles it; ensure neither overflows.
 const _: () = assert!(
-    HEARTBEAT_TIMEOUT_SECS <= i64::MAX as u64,
-    "HEARTBEAT_TIMEOUT_SECS overflows i64"
+    HEARTBEAT_TIMEOUT_SECS <= (i64::MAX / 2) as u64,
+    "2 * HEARTBEAT_TIMEOUT_SECS overflows i64"
 );
 /// Timeout for fill recovery REST queries after reconnect.
 pub(crate) const FILL_RECOVERY_TIMEOUT_SECS: u64 = 30;

@@ -211,6 +211,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Binance spot fill recovery after a heartbeat timeout reaches back to the last frame**
+  (`rustrade-execution`). The account stream checks for activity once every 30 s window and
+  declares a timeout at the end of the first window without a frame, so the connection can have
+  died almost 60 s before. Recovery after a heartbeat timeout started its gap only 30 s (plus a
+  short margin) before the timeout, so fills from earlier in that span could be missed. It now
+  reaches back two windows. Fills read twice are dropped by the stream's dedup, as before.
+
 - **An IBKR good-till-date that names no zone is read in the gateway session's zone**
   (`rustrade-execution`, #797). Listing open orders, or reading how an order ended, reads back the
   good-till-date of an order this client did not place, or no longer tracks. A `yyyyMMdd HH:mm:ss`

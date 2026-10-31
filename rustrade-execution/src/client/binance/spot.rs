@@ -2150,8 +2150,8 @@ async fn connection_manager(
         let should_reconnect = !matches!(reason, DisconnectReason::ConsumerDropped);
 
         // record the disconnect BEFORE cleanup so fill recovery covers
-        // the full gap. For heartbeat timeouts the connection may have died up to
-        // HEARTBEAT_TIMEOUT_SECS ago, so look back that far as a safety margin.
+        // the full gap. For heartbeat timeouts the connection may have died up to two
+        // heartbeat windows ago, so look back that far (see `disconnect_lookback`).
         // For signal-based disconnects (WS close/error/stream terminated), look back a
         // small margin to cover Tokio scheduling jitter between the WS close event and
         // the monitor task seeing it. Dedup cache handles any resulting duplicates.
@@ -2198,12 +2198,16 @@ async fn connection_manager(
 }
 
 /// How far before the moment a disconnect is seen the gap it leaves begins: a short lookback for
-/// scheduling jitter, and after a heartbeat timeout a heartbeat window more, since the connection
-/// may have died that long before it was declared dead.
+/// scheduling jitter, and after a heartbeat timeout two heartbeat windows more, since the
+/// connection may have died that long before it was declared dead.
+///
+/// The monitor reads the activity flag once a window, so a timeout is declared at the end of the
+/// first window without a frame. A connection that dies just after the frame which set the flag
+/// at the start of the window before is declared dead almost two windows later.
 fn disconnect_lookback(heartbeat_timed_out: bool) -> chrono::Duration {
     let signal = chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS);
     if heartbeat_timed_out {
-        chrono::Duration::seconds(HEARTBEAT_TIMEOUT_SECS as i64) + signal
+        chrono::Duration::seconds(2 * HEARTBEAT_TIMEOUT_SECS as i64) + signal
     } else {
         signal
     }
@@ -5473,7 +5477,8 @@ mod tests {
     }
 
     /// A disconnect's gap begins a short lookback before it was seen, and after a heartbeat
-    /// timeout a 30 s window earlier still.
+    /// timeout two 30 s windows earlier still: the last frame can come that long before the
+    /// timeout is declared.
     #[test]
     fn a_disconnect_looks_back_further_after_a_heartbeat_timeout() {
         let signal = chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS);
@@ -5481,7 +5486,7 @@ mod tests {
         assert_eq!(disconnect_lookback(false), signal);
         assert_eq!(
             disconnect_lookback(true),
-            chrono::Duration::seconds(30) + signal
+            chrono::Duration::seconds(60) + signal
         );
     }
 
