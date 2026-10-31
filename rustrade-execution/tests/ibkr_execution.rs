@@ -1608,14 +1608,15 @@ async fn reconnect(client_id_offset: i32) -> IbkrClient {
 /// placed with: from IB's open orders, by a new client under the same API client id after a
 /// restart, and from IB's completed orders once it is cancelled, by another new client.
 ///
-/// Each read is by a client that has never seen the order. The client that places or adopts an
-/// order answers from what it tracks, and never parses IB's good-till-date for it.
+/// Each read is a client's first read of an order it has never seen, which is the read that parses
+/// IB's good-till-date. Once a client has placed or adopted an order, it answers from what it
+/// tracks.
 ///
 /// The expiry is five days out: IB rejects a good-till-date that falls before the next market
 /// open (error 201, "Order will be expired before market opens"), which two days out from a Friday
 /// evening does. Run in the days before a daylight saving change in the session's zone, five days
-/// is also long enough to cross it, which reads the expiry across the change of offset. The test
-/// does not pick such a date.
+/// is also long enough to cross it, which reads the expiry across the change of offset. That
+/// happens only when the test is run in such a window; the test does not control it.
 #[tokio::test]
 #[ignore]
 #[serial]
