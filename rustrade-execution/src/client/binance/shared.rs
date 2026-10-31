@@ -275,11 +275,11 @@ impl Drop for UnsubscribeOnDrop {
 
 /// If no WS activity (messages, ping, pong) for this duration, force reconnect.
 pub(crate) const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
-// Compile-time guard: reconnect sites cast this to i64 (`chrono::Duration::seconds`); ensure it
-// never overflows.
+// Compile-time guard: reconnect sites cast this to i64 (`chrono::Duration::seconds`), and spot's
+// disconnect lookback doubles it; ensure neither overflows.
 const _: () = assert!(
-    HEARTBEAT_TIMEOUT_SECS <= i64::MAX as u64,
-    "HEARTBEAT_TIMEOUT_SECS overflows i64"
+    HEARTBEAT_TIMEOUT_SECS <= (i64::MAX / 2) as u64,
+    "2 * HEARTBEAT_TIMEOUT_SECS overflows i64"
 );
 /// Timeout for fill recovery REST queries after reconnect.
 pub(crate) const FILL_RECOVERY_TIMEOUT_SECS: u64 = 30;
@@ -1445,6 +1445,23 @@ pub(crate) async fn retry_or_end(
         attempts: budget.attempts(),
         last_error: last_error(),
     })
+}
+
+/// How far before the moment an account stream's disconnect is seen the gap it leaves begins, for
+/// fill recovery (see [`Disconnect::seen`]): a short lookback, [`SIGNAL_RECOVERY_LOOKBACK_MS`], for
+/// scheduling jitter and timer lateness, and after a heartbeat timeout two heartbeat windows more.
+///
+/// A stream reads its proof of life once every [`HEARTBEAT_TIMEOUT_SECS`] window and declares a
+/// timeout at the end of the first window without one. A read that finds proof of life says only
+/// that the connection was alive at some point in the window before it, so a connection that died
+/// just after one read is declared dead almost two windows later.
+pub(crate) fn disconnect_lookback(heartbeat_timed_out: bool) -> chrono::Duration {
+    let signal = chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS);
+    if heartbeat_timed_out {
+        chrono::Duration::seconds(2 * HEARTBEAT_TIMEOUT_SECS as i64) + signal
+    } else {
+        signal
+    }
 }
 
 /// What a reconnect budget spent on dropped connections reports as its last error: a heartbeat
@@ -6537,6 +6554,20 @@ mod tests {
         assert_eq!(
             disconnect_error(false),
             "WebSocket disconnected (server close/error)"
+        );
+    }
+
+    /// A disconnect's gap begins a short lookback before it was seen, and after a heartbeat
+    /// timeout two 30 s windows earlier still: the last proof of life can come that long before
+    /// the timeout is declared.
+    #[test]
+    fn a_disconnect_looks_back_further_after_a_heartbeat_timeout() {
+        let signal = chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS);
+        assert!(signal > chrono::Duration::zero());
+        assert_eq!(disconnect_lookback(false), signal);
+        assert_eq!(
+            disconnect_lookback(true),
+            chrono::Duration::seconds(60) + signal
         );
     }
 
