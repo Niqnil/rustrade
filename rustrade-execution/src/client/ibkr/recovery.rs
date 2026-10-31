@@ -1347,11 +1347,15 @@ mod tests {
     /// A gap given up is reported with why its last read failed.
     #[test]
     fn a_failed_recovery_states_why() {
+        // Not `RECOVERY_TIMEOUT`: the timeout the read ran out is stated, whatever it was.
+        let timed_out = RecoveryError::TimedOut(Duration::from_secs(7));
         assert_eq!(
-            RecoveryError::TimedOut(RECOVERY_TIMEOUT).failure(),
-            FillRecoveryFailure::TimedOut {
-                timeout_secs: RECOVERY_TIMEOUT.as_secs()
-            }
+            timed_out.failure(),
+            FillRecoveryFailure::TimedOut { timeout_secs: 7 }
+        );
+        assert_eq!(
+            timed_out.to_string(),
+            "executions request did not complete within 7s"
         );
         assert!(matches!(
             RecoveryError::Ibapi(ibapi::Error::Simple("refused".into())).failure(),
