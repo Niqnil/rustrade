@@ -171,9 +171,13 @@ pub struct MarginPlacement {
 /// other two effects a fill repays nothing: as on Binance, a repay is per order, and nothing
 /// repays a loan automatically.
 ///
+/// # Liquidation
+/// Off by default: an account whose debt grows past its equity keeps trading, and nothing closes
+/// its positions. Configured with [`with_liquidation`](Self::with_liquidation), the venue repays
+/// every debt once the account's margin level falls to the configured level, selling what the
+/// account holds as needed. See [`SpotMarginLiquidation`].
+///
 /// # What it does not model
-/// - **Liquidation.** An account whose debt grows past its equity keeps trading; nothing closes
-///   its positions.
 /// - **Isolated margin.** One pool of balances backs every instrument.
 /// - **Per-asset borrow limits and the venue's lending pool.** Only the leverage limit, and each
 ///   asset's minimum borrow, apply.
@@ -181,10 +185,12 @@ pub struct MarginPlacement {
 ///   it; see that trait.
 ///
 /// [`new`](Self::new) refuses a `max_leverage` below one, [`with_min_borrow`](Self::with_min_borrow)
-/// a negative minimum, and so does deserialising either, so a configuration that exists is one the
-/// venue can apply. Serialised, `max_leverage` and each minimum borrow are decimal strings (`"3"`),
-/// as the crate writes decimals elsewhere, so no precision is lost to a float. `min_borrow` is a
-/// map from asset to minimum, left out when empty.
+/// a negative minimum, [`with_liquidation`](Self::with_liquidation) a liquidation the leverage
+/// limit could reach, and so does deserialising any of them, so a configuration that exists is
+/// one the venue can apply. Serialised, `max_leverage` and each minimum borrow are decimal strings
+/// (`"3"`), as the crate writes decimals elsewhere, so no precision is lost to a float.
+/// `min_borrow` is a map from asset to minimum, left out when empty, and `liquidation` is left out
+/// when off.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(try_from = "SpotMarginRepr", into = "SpotMarginRepr")]
 pub struct SpotMarginConfig(SpotMarginRepr);
@@ -200,6 +206,8 @@ struct SpotMarginRepr {
     auto_repay_at_cancel: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     min_borrow: BTreeMap<AssetNameExchange, Decimal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    liquidation: Option<SpotMarginLiquidation>,
 }
 
 /// Serde default for `auto_repay_at_cancel`, here and on `BinanceMarginConfig`: on, as Binance's
@@ -229,6 +237,7 @@ impl SpotMarginConfig {
             margin_effect,
             auto_repay_at_cancel: default_auto_repay_at_cancel(),
             min_borrow: BTreeMap::new(),
+            liquidation: None,
         })
     }
 
@@ -293,6 +302,28 @@ impl SpotMarginConfig {
             .copied()
             .unwrap_or(Decimal::ZERO)
     }
+
+    /// This configuration, liquidating the account as `liquidation` says. Replaces any
+    /// liquidation it had.
+    ///
+    /// # Errors
+    /// Returns [`SpotMarginConfigError::LiquidationWithinLeverage`] if a borrow the leverage limit
+    /// allows could leave the account at the liquidation level: if `max_leverage` is above one
+    /// and the level is at least `max_leverage / (max_leverage − 1)`, the margin level of an
+    /// account borrowed to the limit.
+    pub fn with_liquidation(
+        mut self,
+        liquidation: SpotMarginLiquidation,
+    ) -> Result<Self, SpotMarginConfigError> {
+        self.0.liquidation = Some(liquidation);
+        Self::try_from(self.0)
+    }
+
+    /// When the venue liquidates the account, or `None` if it never does. See
+    /// [`with_liquidation`](Self::with_liquidation).
+    pub fn liquidation(&self) -> Option<&SpotMarginLiquidation> {
+        self.0.liquidation.as_ref()
+    }
 }
 
 impl TryFrom<SpotMarginRepr> for SpotMarginConfig {
@@ -311,6 +342,18 @@ impl TryFrom<SpotMarginRepr> for SpotMarginConfig {
                 asset: asset.clone(),
                 min_borrow: *min_borrow,
             });
+        }
+        if let Some(liquidation) = &repr.liquidation {
+            // An account borrowed to the limit has `debt = (max_leverage − 1) × equity`, so a
+            // margin level of `max_leverage / (max_leverage − 1)`. One lending nothing has no limit
+            // to reach.
+            let limit = repr.max_leverage - Decimal::ONE;
+            if limit > Decimal::ZERO && liquidation.level() * limit >= repr.max_leverage {
+                return Err(SpotMarginConfigError::LiquidationWithinLeverage {
+                    level: liquidation.level(),
+                    max_leverage: repr.max_leverage,
+                });
+            }
         }
         // A zero minimum is no minimum, so it is not kept: two configurations that lend alike
         // compare equal.
@@ -342,6 +385,200 @@ pub enum SpotMarginConfigError {
         /// The minimum given, below zero.
         min_borrow: Decimal,
     },
+    /// A liquidation level below one, at which an account would already owe more than it holds.
+    #[error("spot margin liquidation level {0} is below 1")]
+    LiquidationLevelBelowOne(Decimal),
+    /// A liquidation fee rate outside `[0, 1)`.
+    #[error("spot margin liquidation fee rate {0} is outside [0, 1)")]
+    LiquidationFeeOutOfRange(Decimal),
+    /// A margin-call level not above the liquidation level, so it could never be reached first.
+    #[error(
+        "spot margin margin-call level {margin_call} is not above the liquidation level {level}"
+    )]
+    #[non_exhaustive]
+    MarginCallNotAboveLiquidation {
+        /// The margin-call level given.
+        margin_call: Decimal,
+        /// The liquidation level it must be above.
+        level: Decimal,
+    },
+    /// A liquidation level an account borrowed to the leverage limit would already be at.
+    #[error(
+        "spot margin liquidation level {level} is reached by a borrow max_leverage {max_leverage} \
+         allows; it must be below max_leverage / (max_leverage - 1)"
+    )]
+    #[non_exhaustive]
+    LiquidationWithinLeverage {
+        /// The liquidation level given.
+        level: Decimal,
+        /// The configuration's leverage limit.
+        max_leverage: Decimal,
+    },
+}
+
+/// When the simulated venue liquidates a spot margin account, what it charges for it, and whether
+/// it warns first. Set by [`SpotMarginConfig::with_liquidation`].
+///
+/// # When
+/// The venue checks the account's **margin level** after each of its inputs, a market tick or a
+/// move of its clock, since those are what change it: prices move, and interest falls due. The
+/// level is the value of everything the account holds over the value of what it owes, loans plus
+/// interest, both valued as the leverage limit values them (see [`SpotMarginConfig`]'s
+/// `# How much it lends`): at the mid of a spot instrument pairing each asset with the valuation
+/// asset, else its last price. There is no index price, so a market's own mid stands in for the
+/// one a venue liquidates on. An asset the venue cannot value counts for nothing, which can bring
+/// a liquidation forward but never put one off. While it cannot value a debt it does not check,
+/// and warns once.
+///
+/// At or below [`level`](Self::level) it liquidates.
+///
+/// # How
+/// It sends an [`AccountNotice`](crate::notice::AccountNotice) of
+/// [`NoticeKind::Liquidation`](crate::notice::NoticeKind::Liquidation), then closes every debt:
+/// 1. It cancels every open order, resting or held, releasing what each held.
+/// 2. It repays each debt from the asset's own free balance, interest first.
+/// 3. It repays what is still owed of the valuation asset with the proceeds of selling the
+///    account's other assets, each on a spot instrument pairing it with the valuation asset, in
+///    name order, as much of each as is needed.
+/// 4. It buys back what is still owed of each other asset, in name order, on a spot instrument
+///    pairing it with the valuation asset, selling other assets for the valuation asset first as
+///    in step 3 when the account holds too little of it. What a buy delivers repays the debt.
+/// 5. It charges the fee: [`fee_rate`](Self::fee_rate) times the value of the debt this repaid,
+///    in the valuation asset, raised as in step 3 if the account holds too little of it.
+///
+/// Each forced trade fills as a market order would on arrival, as a taker: priced by the venue's
+/// fill model at its current market, slipped, limited by the depth on offer, and charged the
+/// venue's fee. It is reported as `[balance.., trade]`, the [`Trade`](crate::trade::Trade)
+/// carrying [`TradeOrigin::Liquidation`](crate::trade::TradeOrigin::Liquidation), no client order
+/// id and an unknown strategy, with no order snapshot, since no client placed it. It is never
+/// held for a bar or a fresh market. The fee is reported as `[balance, cash flow]`, a
+/// [`CashFlowKind::LiquidationFee`](crate::cash_flow::CashFlowKind::LiquidationFee) with no
+/// instrument.
+///
+/// # When it cannot close every debt
+/// The liquidation continues on each later input until no debt is left, without another notice:
+/// each input cancels whatever the account has since placed, repays what it can, and charges the
+/// fee on what it repaid. A debt can
+/// outlast an input when the depth on offer is too thin, when an asset has no market to trade
+/// on, or when the account holds too little to repay it. The venue then warns once, and leaves
+/// the rest owed: it has no insurance fund, and nothing floors the account's balances. A fee the
+/// account cannot pay takes the valuation asset's free balance below zero.
+///
+/// # Margin call
+/// Off by default. With [`with_margin_call`](Self::with_margin_call), the venue sends
+/// [`NoticeKind::MarginCall`](crate::notice::NoticeKind::MarginCall) when the margin level falls
+/// to or below that level, and
+/// [`NoticeKind::MarginRestored`](crate::notice::NoticeKind::MarginRestored) when it rises back
+/// above it or the account no longer owes anything, once per crossing. A liquidation ends a margin
+/// call without a notice.
+///
+/// Each notice carries the margin level that caused it, `None` for an account that owes nothing,
+/// and its kind's name as its status.
+///
+/// # Not liquidated
+/// A CFD position: its margin is posted from the quote asset, outside the spot margin account.
+///
+/// # Serialised form
+/// `level`, `fee_rate` and `margin_call_level` are decimal strings, and `margin_call_level` is
+/// left out when off. Deserialising refuses what the constructors refuse.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(
+    try_from = "SpotMarginLiquidationRepr",
+    into = "SpotMarginLiquidationRepr"
+)]
+pub struct SpotMarginLiquidation(SpotMarginLiquidationRepr);
+
+/// The serialised form of a [`SpotMarginLiquidation`], before validation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+struct SpotMarginLiquidationRepr {
+    #[serde(with = "rust_decimal::serde::str")]
+    level: Decimal,
+    #[serde(with = "rust_decimal::serde::str")]
+    fee_rate: Decimal,
+    #[serde(
+        default,
+        with = "rust_decimal::serde::str_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    margin_call_level: Option<Decimal>,
+}
+
+impl SpotMarginLiquidation {
+    /// Liquidation at a margin level of `level` or below, charging `fee_rate` of the debt it
+    /// repays, with no margin call.
+    ///
+    /// For example, a level of 1.1 and a fee rate of 0.02 liquidate an account whose holdings are
+    /// worth 1.1 times its debt or less, and charge 2 % of what it repays.
+    ///
+    /// # Errors
+    /// [`SpotMarginConfigError::LiquidationLevelBelowOne`] for a `level` below one, and
+    /// [`SpotMarginConfigError::LiquidationFeeOutOfRange`] for a `fee_rate` below zero or not
+    /// below one.
+    pub fn new(level: Decimal, fee_rate: Decimal) -> Result<Self, SpotMarginConfigError> {
+        Self::try_from(SpotMarginLiquidationRepr {
+            level,
+            fee_rate,
+            margin_call_level: None,
+        })
+    }
+
+    /// This liquidation, with a margin call at `margin_call_level`. See `# Margin call`.
+    ///
+    /// # Errors
+    /// [`SpotMarginConfigError::MarginCallNotAboveLiquidation`] if `margin_call_level` is not
+    /// above the liquidation [`level`](Self::level).
+    pub fn with_margin_call(
+        mut self,
+        margin_call_level: Decimal,
+    ) -> Result<Self, SpotMarginConfigError> {
+        self.0.margin_call_level = Some(margin_call_level);
+        Self::try_from(self.0)
+    }
+
+    /// The margin level at or below which the venue liquidates.
+    pub fn level(&self) -> Decimal {
+        self.0.level
+    }
+
+    /// The fee, as a fraction of the value of the debt a liquidation repays.
+    pub fn fee_rate(&self) -> Decimal {
+        self.0.fee_rate
+    }
+
+    /// The margin level at or below which the venue sends a margin call, or `None` for none.
+    pub fn margin_call_level(&self) -> Option<Decimal> {
+        self.0.margin_call_level
+    }
+}
+
+impl TryFrom<SpotMarginLiquidationRepr> for SpotMarginLiquidation {
+    type Error = SpotMarginConfigError;
+
+    fn try_from(repr: SpotMarginLiquidationRepr) -> Result<Self, Self::Error> {
+        if repr.level < Decimal::ONE {
+            return Err(SpotMarginConfigError::LiquidationLevelBelowOne(repr.level));
+        }
+        if repr.fee_rate < Decimal::ZERO || repr.fee_rate >= Decimal::ONE {
+            return Err(SpotMarginConfigError::LiquidationFeeOutOfRange(
+                repr.fee_rate,
+            ));
+        }
+        if let Some(margin_call) = repr.margin_call_level
+            && margin_call <= repr.level
+        {
+            return Err(SpotMarginConfigError::MarginCallNotAboveLiquidation {
+                margin_call,
+                level: repr.level,
+            });
+        }
+        Ok(Self(repr))
+    }
+}
+
+impl From<SpotMarginLiquidation> for SpotMarginLiquidationRepr {
+    fn from(liquidation: SpotMarginLiquidation) -> Self {
+        liquidation.0
+    }
 }
 
 /// Charges interest on a simulated margin loan: once when the loan is taken, and at boundaries in
@@ -710,6 +947,75 @@ mod tests {
             serde_json::from_str::<SpotMarginConfig>(&json).unwrap(),
             config
         );
+    }
+
+    #[test]
+    fn a_liquidation_round_trips_and_is_left_out_when_off() {
+        let config = SpotMarginConfig::new(
+            AssetNameExchange::new("usdt"),
+            dec!(3),
+            MarginEffect::Borrow,
+        )
+        .unwrap()
+        .with_liquidation(
+            SpotMarginLiquidation::new(dec!(1.1), dec!(0.02))
+                .unwrap()
+                .with_margin_call(dec!(1.3))
+                .unwrap(),
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(
+            json,
+            r#"{"valuation_asset":"usdt","max_leverage":"3","margin_effect":"borrow","auto_repay_at_cancel":true,"liquidation":{"level":"1.1","fee_rate":"0.02","margin_call_level":"1.3"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SpotMarginConfig>(&json).unwrap(),
+            config
+        );
+
+        let without_call = r#"{"level":"1.1","fee_rate":"0"}"#;
+        let liquidation = serde_json::from_str::<SpotMarginLiquidation>(without_call).unwrap();
+        assert_eq!(liquidation.margin_call_level(), None);
+        assert_eq!(serde_json::to_string(&liquidation).unwrap(), without_call);
+    }
+
+    #[test]
+    fn a_liquidation_out_of_range_is_refused_by_its_constructors_and_by_deserialising() {
+        assert_eq!(
+            SpotMarginLiquidation::new(dec!(0.99), dec!(0)),
+            Err(SpotMarginConfigError::LiquidationLevelBelowOne(dec!(0.99)))
+        );
+        assert!(SpotMarginLiquidation::new(dec!(1), dec!(0)).is_ok());
+        for fee_rate in [dec!(-0.01), dec!(1)] {
+            assert_eq!(
+                SpotMarginLiquidation::new(dec!(1.1), fee_rate),
+                Err(SpotMarginConfigError::LiquidationFeeOutOfRange(fee_rate))
+            );
+        }
+        assert_eq!(
+            SpotMarginLiquidation::new(dec!(1.1), dec!(0))
+                .unwrap()
+                .with_margin_call(dec!(1.1)),
+            Err(SpotMarginConfigError::MarginCallNotAboveLiquidation {
+                margin_call: dec!(1.1),
+                level: dec!(1.1),
+            })
+        );
+
+        for json in [
+            r#"{"level":"0.5","fee_rate":"0"}"#,
+            r#"{"level":"1.1","fee_rate":"1"}"#,
+            r#"{"level":"1.1","fee_rate":"0","margin_call_level":"1"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<SpotMarginLiquidation>(json).is_err(),
+                "{json}"
+            );
+        }
+        let within_leverage = r#"{"valuation_asset":"usdt","max_leverage":"3","margin_effect":"borrow","liquidation":{"level":"1.5","fee_rate":"0"}}"#;
+        assert!(serde_json::from_str::<SpotMarginConfig>(within_leverage).is_err());
     }
 
     #[test]

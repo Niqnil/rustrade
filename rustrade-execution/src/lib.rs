@@ -107,7 +107,7 @@ pub mod map;
 pub mod margin;
 pub use margin::{
     InterestCharge, InterestDue, InterestSchedule, MarginEffect, MarginInterestModel,
-    PeriodicMarginInterest, SpotMarginConfig, SpotMarginConfigError,
+    PeriodicMarginInterest, SpotMarginConfig, SpotMarginConfigError, SpotMarginLiquidation,
 };
 pub mod margin_debt;
 pub use margin_debt::{MarginDebtKind, MarginDebtUpdate};

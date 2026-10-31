@@ -28,6 +28,10 @@ use std::fmt::{Display, Formatter};
 /// Known producers, as of writing:
 /// - Binance margin (`BinanceMargin`): `marginLevelChange`. See the client's rustdoc for how
 ///   its status maps to a [`NoticeKind`], and which instrument an isolated pair's notice names.
+/// - The simulated venue
+///   ([`SimulatedVenue`](crate::exchange::mock::SimulatedVenue)), when its spot margin account is
+///   configured with a [`SpotMarginLiquidation`](crate::margin::SpotMarginLiquidation): a
+///   liquidation, and an optional margin call and its restoration, for the account as a whole.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, Constructor)]
 pub struct AccountNotice<InstrumentKey> {
