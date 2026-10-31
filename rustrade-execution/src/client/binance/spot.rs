@@ -3294,8 +3294,6 @@ mod tests {
 
     #[test]
     fn test_convert_order_kind_tif() {
-        use rust_decimal::Decimal;
-
         // binance-sdk enums don't derive PartialEq, so use matches!
         assert!(matches!(
             convert_order_kind_tif(OrderKind::Market, TimeInForce::ImmediateOrCancel),
@@ -3335,8 +3333,12 @@ mod tests {
         // GoodUntilEndOfDay is unsupported on Binance (no native EOD order) — surfaced as
         // unsupported rather than silently coerced to GTC, which would drop the EOD semantics.
         assert!(convert_order_kind_tif(OrderKind::Limit, TimeInForce::GoodUntilEndOfDay).is_none());
+    }
 
-        // Conditional orders
+    #[test]
+    fn test_convert_order_kind_tif_conditional() {
+        use rust_decimal::Decimal;
+
         assert!(matches!(
             convert_order_kind_tif(
                 OrderKind::Stop {
@@ -3379,6 +3381,11 @@ mod tests {
                 Some(OrderPlaceTimeInForceEnum::Fok)
             ))
         ));
+    }
+
+    #[test]
+    fn test_convert_order_kind_tif_trailing() {
+        use rust_decimal::Decimal;
 
         // TrailingStop with BasisPoints/Percentage → StopLoss (trailingDelta set separately)
         assert!(matches!(
@@ -3921,6 +3928,9 @@ mod tests {
     #[test]
     fn test_convert_account_position_is_at_u_else_at_e() {
         let time_of = |u, e| {
+            // The update sets no field today, but keeps this compiling when the SDK's generated
+            // model gains one.
+            #[allow(clippy::needless_update)]
             let position = binance_sdk::spot::websocket_api::OutboundAccountPosition {
                 u,
                 e_uppercase: e,
