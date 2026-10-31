@@ -63,8 +63,8 @@ use chrono::{DateTime, Utc};
 use fnv::FnvHashSet;
 use ibapi::{
     TRANSPORT_RECONNECT_CODE,
-    client::blocking::{Client, NoticeStream},
-    orders::{ExecutionData, Executions},
+    client::blocking::{Client, NoticeStream, Subscription},
+    orders::{ExecutionData, ExecutionFilter, Executions},
     subscriptions::SubscriptionItem,
 };
 use lru::LruCache;
@@ -616,27 +616,58 @@ fn report_retention_gap(sink: &EventSink, floor: DateTime<Utc>, now: DateTime<Ut
     })
 }
 
-/// Ask TWS for the last [`EXECUTION_DAYS`](super::execution::EXECUTION_DAYS) days of executions
-/// and return the fills from `floor` on, reading a time that names no zone in `session_zone`.
+/// Where [`recover_fills`] reads executions from: TWS, through `ibapi`'s client, or a scripted
+/// source in tests.
+trait ExecutionSource {
+    /// Request the executions `filter` selects.
+    fn executions(&self, filter: ExecutionFilter) -> Result<impl ExecutionReplies, ibapi::Error>;
+}
+
+/// The replies to one executions request.
+trait ExecutionReplies {
+    /// The next reply, waiting at most `timeout`. As with `ibapi`'s
+    /// [`Subscription::next_timeout`], `None` means either the end marker or that the time ran
+    /// out.
+    fn next_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Option<Result<SubscriptionItem<Executions>, ibapi::Error>>;
+}
+
+impl ExecutionSource for Client {
+    fn executions(&self, filter: ExecutionFilter) -> Result<impl ExecutionReplies, ibapi::Error> {
+        Client::executions(self, filter)
+    }
+}
+
+impl ExecutionReplies for Subscription<Executions> {
+    fn next_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Option<Result<SubscriptionItem<Executions>, ibapi::Error>> {
+        Subscription::next_timeout(self, timeout)
+    }
+}
+
+/// Ask `source` for the last [`EXECUTION_DAYS`](super::execution::EXECUTION_DAYS) days of
+/// executions and return the fills `fills` keeps, within `timeout` ([`RECOVERY_TIMEOUT`] outside
+/// tests).
 fn recover_fills(
-    client: &Client,
-    floor: DateTime<Utc>,
-    scope: ExecutionScope,
-    contracts: &ContractRegistry,
-    session_zone: Option<chrono_tz::Tz>,
+    source: &impl ExecutionSource,
+    mut fills: RecoveredFills<'_>,
     pending: &ExecutionBuffer,
     sink: &EventSink,
+    timeout: Duration,
 ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, RecoveryError> {
     // A day count and nothing else, since with none TWS lists only the current day's executions
     // and a gap across its midnight would lose the fills before it. Not on time: TWS reads
     // `ExecutionFilter::time` in a zone of its own choosing, so `RecoveredFills` applies the
     // window. Not on the client either: `scope` reports a liquidation of another client's order whatever it is set
     // to, so which executions are reported is decided by `ExecutionScope::classify`.
-    let subscription = client
+    let subscription = source
         .executions(executions_filter())
         .map_err(RecoveryError::Ibapi)?;
-    let deadline = Instant::now() + RECOVERY_TIMEOUT;
-    let mut fills = RecoveredFills::new(floor, scope, contracts, session_zone);
+    let deadline = Instant::now() + timeout;
 
     loop {
         if !sink.is_open() {
@@ -757,13 +788,11 @@ impl RecoveryWatcher {
         // Taken before the read: IB's retention applied when it was requested.
         let requested_at = Utc::now();
         match recover_fills(
-            &self.client,
-            floor,
-            self.scope,
-            &self.contracts,
-            self.session_zone,
+            &*self.client,
+            RecoveredFills::new(floor, self.scope, &self.contracts, self.session_zone),
             &self.pending,
             &self.sink,
+            RECOVERY_TIMEOUT,
         ) {
             Ok(trades) => {
                 info!(
@@ -1744,5 +1773,155 @@ mod tests {
         };
         let trade = pending.complete_with_commission(&report).unwrap();
         assert_eq!(trade.id.0.as_str(), "late");
+    }
+
+    type Reply = Result<SubscriptionItem<Executions>, ibapi::Error>;
+
+    /// An executions request answered from a script, read as TWS answers one.
+    struct Script {
+        /// Why the request itself fails, if it does.
+        refusal: Mutex<Option<ibapi::Error>>,
+        replies: Mutex<std::collections::VecDeque<Reply>>,
+        /// Whether the replies end with TWS's end marker, rather than going silent.
+        ends: bool,
+    }
+
+    impl Script {
+        fn new(replies: impl IntoIterator<Item = Reply>, ends: bool) -> Self {
+            Self {
+                refusal: Mutex::new(None),
+                replies: Mutex::new(replies.into_iter().collect()),
+                ends,
+            }
+        }
+
+        fn refused(refusal: ibapi::Error) -> Self {
+            Self {
+                refusal: Mutex::new(Some(refusal)),
+                ..Self::new([], true)
+            }
+        }
+    }
+
+    impl ExecutionSource for Script {
+        fn executions(&self, _: ExecutionFilter) -> Result<impl ExecutionReplies, ibapi::Error> {
+            match self.refusal.lock().take() {
+                Some(refusal) => Err(refusal),
+                None => Ok(self),
+            }
+        }
+    }
+
+    impl ExecutionReplies for &Script {
+        fn next_timeout(&self, timeout: Duration) -> Option<Reply> {
+            if let Some(reply) = self.replies.lock().pop_front() {
+                return Some(reply);
+            }
+            // Past the end marker `ibapi` answers at once; a silent TWS lets the time run out.
+            if !self.ends {
+                std::thread::sleep(timeout);
+            }
+            None
+        }
+    }
+
+    fn data(item: Executions) -> Reply {
+        Ok(SubscriptionItem::Data(item))
+    }
+
+    const SINGAPORE: Option<chrono_tz::Tz> = Some(chrono_tz::Asia::Singapore);
+
+    fn recover(
+        script: &Script,
+        sink: &EventSink,
+        timeout: Duration,
+    ) -> Result<Vec<String>, RecoveryError> {
+        let contracts = registered();
+        let fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts, SINGAPORE);
+        let trades = recover_fills(script, fills, &ExecutionBuffer::new(), sink, timeout)?;
+        Ok(trades
+            .into_iter()
+            .map(|trade| format!("{} at {}", trade.id.0, trade.time_exchange.to_rfc3339()))
+            .collect())
+    }
+
+    #[test]
+    fn recovery_reads_the_replies_to_the_end_marker() {
+        let (sink, _rx) = sink();
+        let script = Script::new(
+            [
+                Ok(SubscriptionItem::Notice(ibapi::Notice {
+                    request_id: Some(9001),
+                    code: 2176,
+                    message: "a warning bound to the request".to_string(),
+                    error_time: None,
+                    advanced_order_reject_json: String::new(),
+                })),
+                // Times that name no zone, read in the session's: one second before the floor,
+                // and at it.
+                data(execution("before", IB_ORDER_ID, "20260929 21:59:59")),
+                data(commission("before")),
+                data(execution("gap", IB_ORDER_ID, "20260929 22:00:00")),
+                data(commission("gap")),
+            ],
+            true,
+        );
+
+        let recovered = recover(&script, &sink, RECOVERY_TIMEOUT).unwrap();
+        assert_eq!(recovered, ["gap at 2026-09-29T14:00:00+00:00"]);
+    }
+
+    #[test]
+    fn recovery_fails_when_the_request_is_refused() {
+        let (sink, _rx) = sink();
+        let script = Script::refused(ibapi::Error::ConnectionFailed);
+        assert!(matches!(
+            recover(&script, &sink, RECOVERY_TIMEOUT),
+            Err(RecoveryError::Ibapi(ibapi::Error::ConnectionFailed))
+        ));
+    }
+
+    #[test]
+    fn recovery_fails_on_an_error_reply() {
+        let (sink, _rx) = sink();
+        let script = Script::new(
+            [
+                data(execution("gap", IB_ORDER_ID, "20260929 22:00:00")),
+                Err(ibapi::Error::ConnectionReset),
+                data(commission("gap")),
+            ],
+            true,
+        );
+        assert!(matches!(
+            recover(&script, &sink, RECOVERY_TIMEOUT),
+            Err(RecoveryError::Ibapi(ibapi::Error::ConnectionReset))
+        ));
+    }
+
+    #[test]
+    fn recovery_times_out_when_tws_goes_silent() {
+        let (sink, _rx) = sink();
+        let script = Script::new(
+            [data(execution("gap", IB_ORDER_ID, "20260929 22:00:00"))],
+            false,
+        );
+        assert!(matches!(
+            recover(&script, &sink, Duration::from_millis(50)),
+            Err(RecoveryError::TimedOut)
+        ));
+    }
+
+    #[test]
+    fn recovery_stops_when_the_consumer_goes() {
+        let (sink, rx) = sink();
+        drop(rx);
+        let script = Script::new(
+            [data(execution("gap", IB_ORDER_ID, "20260929 22:00:00"))],
+            true,
+        );
+        assert!(matches!(
+            recover(&script, &sink, RECOVERY_TIMEOUT),
+            Err(RecoveryError::StreamClosed)
+        ));
     }
 }
