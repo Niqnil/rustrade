@@ -47,16 +47,15 @@ use super::shared::{
     CONNECT_TIMEOUT_SECS, Disconnect, DisconnectOnDrop, ExecutionReport,
     FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal, MyTradesFrom,
     ORDER_EXECUTIONS_BUDGET, OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
-    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
-    UnsubscribeOnDrop, UserDataFrame, WeightPool, account_position_time, answer_time,
-    binance_filled_qty, classify_order_kind_tif, classify_rest_query_error,
-    classify_ws_order_error, convert_ended_order, convert_execution_report,
-    convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
-    disconnect_error, drop_after, frame_excerpt, gap_failed, gap_time, is_duplicate,
-    is_unknown_order, log_unhandled_event, log_unrecognised_frame, new_dedup_cache,
-    parse_user_data_frame, placed_order_state, recovered_order_cids, recovered_order_totals,
-    response_decode_error, rest_call_with_retry, rest_read_with_retry, retry_or_end,
-    trailing_params, unix_ms, unreadable_answer,
+    SharedDedupCache, UnhandledEvents, UnrecoveredFills, UnsubscribeOnDrop, UserDataFrame,
+    WeightPool, account_position_time, answer_time, binance_filled_qty, classify_order_kind_tif,
+    classify_rest_query_error, classify_ws_order_error, convert_ended_order,
+    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
+    dedup_key_from_event, disconnect_error, disconnect_lookback, drop_after, frame_excerpt,
+    gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
+    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
+    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
+    rest_read_with_retry, retry_or_end, trailing_params, unix_ms, unreadable_answer,
 };
 use crate::client::venue_clock::HostMoment;
 use crate::rules::{OrderRules, PreSendRules};
@@ -2194,22 +2193,6 @@ async fn connection_manager(
             emit_stream_terminated(&tx, ExchangeId::BinanceSpot, reason);
             break;
         }
-    }
-}
-
-/// How far before the moment a disconnect is seen the gap it leaves begins: a short lookback for
-/// scheduling jitter, and after a heartbeat timeout two heartbeat windows more, since the
-/// connection may have died that long before it was declared dead.
-///
-/// The monitor reads the activity flag once a window, so a timeout is declared at the end of the
-/// first window without a frame. A connection that dies just after the frame which set the flag
-/// at the start of the window before is declared dead almost two windows later.
-fn disconnect_lookback(heartbeat_timed_out: bool) -> chrono::Duration {
-    let signal = chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS);
-    if heartbeat_timed_out {
-        chrono::Duration::seconds(2 * HEARTBEAT_TIMEOUT_SECS as i64) + signal
-    } else {
-        signal
     }
 }
 
@@ -5474,20 +5457,6 @@ mod tests {
         buf.clear();
         assert!(!convert_user_data_events(bare, &mut buf).terminated);
         assert!(buf.is_empty());
-    }
-
-    /// A disconnect's gap begins a short lookback before it was seen, and after a heartbeat
-    /// timeout two 30 s windows earlier still: the last frame can come that long before the
-    /// timeout is declared.
-    #[test]
-    fn a_disconnect_looks_back_further_after_a_heartbeat_timeout() {
-        let signal = chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS);
-        assert!(signal > chrono::Duration::zero());
-        assert_eq!(disconnect_lookback(false), signal);
-        assert_eq!(
-            disconnect_lookback(true),
-            chrono::Duration::seconds(60) + signal
-        );
     }
 
     /// Every pushed event's `E` is returned to sample the stream's clock, an order's as much as

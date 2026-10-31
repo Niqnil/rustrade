@@ -19,11 +19,11 @@ use crate::client::binance::restatement::{
 };
 use crate::client::binance::shared::{
     CONNECT_TIMEOUT_SECS, Disconnect, ExecutionReport, HEARTBEAT_TIMEOUT_SECS, RateLimitTracker,
-    RequestKind, SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
-    account_position_time, classify_rest_query_error, convert_execution_report,
-    dedup_key_from_event, disconnect_error, event_time_from_ms, frame_excerpt, is_duplicate,
-    lenient_millis, log_unhandled_event, log_unrecognised_frame, resolve_snapshot_kind,
-    response_decode_error, rest_call_with_retry, retry_or_end,
+    RequestKind, SharedDedupCache, UnhandledEvents, UnrecoveredFills, account_position_time,
+    classify_rest_query_error, convert_execution_report, dedup_key_from_event, disconnect_error,
+    disconnect_lookback, event_time_from_ms, frame_excerpt, is_duplicate, lenient_millis,
+    log_unhandled_event, log_unrecognised_frame, resolve_snapshot_kind, response_decode_error,
+    rest_call_with_retry, retry_or_end,
 };
 use crate::client::venue_clock::HostMoment;
 use crate::{
@@ -917,24 +917,15 @@ enum SessionEnd {
 }
 
 impl SessionEnd {
-    /// How far before the moment this end is seen the gap it leaves begins, for fill recovery
-    /// (see [`Disconnect::seen`]): a short lookback, and for a heartbeat timeout two heartbeat
-    /// windows more. A check that finds proof of life only says the connection was alive at some
-    /// point in the window before it, so a connection that died just after one check is declared
-    /// dead two checks later. `None` when the consumer dropped the stream, which leaves nothing to
-    /// recover.
+    /// How far before the moment this end is seen the gap it leaves begins, for fill recovery:
+    /// [`disconnect_lookback`]. `None` when the consumer dropped the stream, which leaves nothing
+    /// to recover.
     fn gap_lookback(self) -> Option<chrono::Duration> {
-        let lookback = match self {
-            Self::ConsumerDropped => return None,
-            Self::HeartbeatTimeout => {
-                chrono::Duration::seconds(2 * HEARTBEAT_TIMEOUT_SECS as i64)
-                    + chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS)
-            }
-            Self::Disconnected | Self::KeyExpired => {
-                chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS)
-            }
-        };
-        Some(lookback)
+        match self {
+            Self::ConsumerDropped => None,
+            Self::HeartbeatTimeout => Some(disconnect_lookback(true)),
+            Self::Disconnected | Self::KeyExpired => Some(disconnect_lookback(false)),
+        }
     }
 
     /// The failure this end is reported as, should the reconnect budget run out after it.
@@ -1380,7 +1371,7 @@ async fn close(ws: &mut WebSocket) {
 mod tests {
     use super::*;
     use crate::{
-        client::dedup::new_dedup_cache,
+        client::{binance::shared::SIGNAL_RECOVERY_LOOKBACK_MS, dedup::new_dedup_cache},
         order::{
             ConditionalFamily, OrderKind, TrailingOffsetType,
             id::ClientOrderId,
