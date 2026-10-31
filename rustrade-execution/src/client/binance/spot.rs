@@ -3928,14 +3928,10 @@ mod tests {
     #[test]
     fn test_convert_account_position_is_at_u_else_at_e() {
         let time_of = |u, e| {
-            // The update sets no field today, but keeps this compiling when the SDK's generated
-            // model gains one.
-            #[allow(clippy::needless_update)]
             let position = binance_sdk::spot::websocket_api::OutboundAccountPosition {
                 u,
                 e_uppercase: e,
                 b_uppercase: Some(vec![make_balance_inner("ETH", "2.0", "0.0")]),
-                ..Default::default()
             };
             let mut buf = Vec::new();
             convert_account_position(position, &mut buf);

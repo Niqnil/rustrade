@@ -22,6 +22,12 @@ pub mod check;
 /// * `ExchangeKey` - Type used to identify an exchange (defaults to [`ExchangeIndex`]).
 /// * `InstrumentKey` - Type used to identify an instrument (defaults to [`InstrumentIndex`]).
 pub trait RiskManager<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> {
+    /// State used by the `RiskManager` to check the open and cancel requests.
+    ///
+    /// For a risk manager run by the [`Engine`](crate::engine::Engine), this is the full
+    /// `EngineState` of the trading system.
+    ///
+    /// eg/ `EngineState<DefaultGlobalData, DefaultInstrumentMarketData>`
     type State;
 
     fn check(
