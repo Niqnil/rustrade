@@ -149,7 +149,7 @@ impl SharedKnownLiveOrders {
     }
 
     /// How many handles share the set: a test's check that a dropped stream released its own.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "binance"))]
     pub(crate) fn holders(&self) -> usize {
         Arc::strong_count(&self.0)
     }
