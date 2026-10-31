@@ -276,6 +276,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `advance_time` holds an earlier instant at the latest one either input, `advance_time` or
     `apply_market`, has reached. It charges nothing again, and what follows is stamped at that
     instant. The venue clamps it itself, whichever driver calls it.
+  - `apply_market` clamps its tick the same way. A tick behind that instant is applied at it, so
+    the fills it causes, the balances they restate, the expiries it sweeps and the market it
+    stores (`time_exchange`, `fresh_at`) are stamped no earlier than what the venue has already
+    reported. Drivers that feed their ticks in order, as `SimRunner` and a market-driven
+    `MockExchange` do, see no change.
   - The jump policy is documented on `advance_time` and the type's `# Holding costs`: a forward
     move, however large, charges every funding and interest boundary it crosses once each, at
     its own stamp, on what was held across it. A live paper venue whose host slept through

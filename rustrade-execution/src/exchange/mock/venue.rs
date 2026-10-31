@@ -581,7 +581,8 @@ pub struct SimulatedVenue {
     /// for every boundary since 1970.
     ///
     /// Both inputs raise it and nothing lowers it, so it is also the latest instant this venue's
-    /// clock has reached, which [`advance_time`](Self::advance_time) holds its clock to.
+    /// clock has reached, which both inputs hold the instant they are given to — see
+    /// [`not_before_reached`](Self::not_before_reached).
     accrued_through: Option<DateTime<Utc>>,
     /// The earliest holding-cost boundary after [`accrued_through`](Self::accrued_through) of any
     /// position held, or `None` if there is none.
@@ -901,7 +902,8 @@ impl SimulatedVenue {
     ///
     /// The venue clamps the instant itself, so this holds whichever driver calls it, including one
     /// stamping requests from a wall clock that stepped back. A request that arrives behind a later
-    /// market tick is therefore stamped at that tick.
+    /// market tick is therefore stamped at that tick. [`apply_market`](Self::apply_market) clamps
+    /// its tick the same way.
     ///
     /// # A forward jump charges every boundary it crosses
     /// However far one call moves the clock, each boundary in between is charged once, at its own
@@ -916,9 +918,7 @@ impl SimulatedVenue {
     /// boundary not after the instant it was asked from, or a negative interest.
     #[must_use]
     pub fn advance_time(&mut self, time_exchange: DateTime<Utc>) -> Vec<UnindexedAccountEvent> {
-        let time_exchange = self
-            .accrued_through
-            .map_or(time_exchange, |reached| reached.max(time_exchange));
+        let time_exchange = self.not_before_reached(time_exchange);
         // Charged before the balances are restamped, so each restatement it emits keeps its own
         // boundary's stamp and the ledger still ends stamped at `time_exchange`.
         let mut events = self.accrue(time_exchange);
@@ -928,6 +928,14 @@ impl SimulatedVenue {
         self.refresh_next_interest_if_loans_changed();
         self.report_debt_changes(&mut events);
         events
+    }
+
+    /// `time_exchange`, or the latest instant this venue has reached if that is later, which is
+    /// how both inputs keep the clock from moving back. See `advance_time`'s
+    /// `# The clock never moves back`.
+    fn not_before_reached(&self, time_exchange: DateTime<Utc>) -> DateTime<Utc> {
+        self.accrued_through
+            .map_or(time_exchange, |reached| reached.max(time_exchange))
     }
 
     /// Charges every holding-cost and interest boundary in `(accrued_through, now]`, the first
@@ -1473,6 +1481,19 @@ impl SimulatedVenue {
     /// `#[must_use]` because a driver that applies the market and drops the result has silently
     /// eaten the fills, leaving its client holding an order the venue no longer has.
     ///
+    /// # The clock never moves back
+    /// A `time_exchange` earlier than the latest instant this venue has reached, through this call
+    /// or through [`advance_time`](Self::advance_time), is taken as that latest instant, as
+    /// `advance_time` takes one. It charges nothing again, and everything the tick stamps is
+    /// stamped no earlier than what this venue has already reported: the market it stores, the
+    /// instant it counts as [`fresh`](MarketObservation::fresh) from, the expiries it sweeps, and
+    /// the fills it causes with the balances they restate. A consumer keeping the latest stamp of
+    /// each balance would otherwise drop a fill's restatement as older than one it holds.
+    ///
+    /// The venue clamps the instant itself, so this holds whichever driver calls it. A driver that
+    /// feeds its ticks in order, never behind an instant it has already advanced to, sees no
+    /// difference.
+    ///
     /// # Panics
     /// If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract: a
     /// boundary not after the instant it was asked from, or a negative interest.
@@ -1483,6 +1504,7 @@ impl SimulatedVenue {
         observation: MarketObservation,
         time_exchange: DateTime<Utc>,
     ) -> Vec<UnindexedAccountEvent> {
+        let time_exchange = self.not_before_reached(time_exchange);
         // Charged before the snapshot is replaced, so a boundary this tick passed is valued at the
         // market as of that boundary rather than at a price observed after it.
         let mut events = self.accrue(time_exchange);
@@ -5428,6 +5450,42 @@ mod tests {
         let outcome = venue.open_order(cfd_request(Side::Buy, "1", None));
         assert_eq!(filled_trade(&outcome).time_exchange, tick);
         assert_eq!(filled_balance(&outcome).time_exchange, tick);
+    }
+
+    /// A market tick behind an instant the venue has already reached is applied at that instant,
+    /// so the fill it causes, the balances it restates and the market it stores are stamped no
+    /// earlier than what the venue has already reported.
+    #[test]
+    fn a_market_tick_behind_the_clock_is_applied_at_the_clock() {
+        let (mut venue, _) = venue_resting_one_buy("48000");
+        let reached = time(10);
+        advance(&mut venue, reached);
+
+        let events = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("47800", "47900")),
+            time(5),
+        );
+
+        assert_eq!(
+            events.len(),
+            4,
+            "the tick still crosses the resting order: two balances, a trade, an order"
+        );
+        assert_eq!(balance_of(&events[0]).time_exchange, reached);
+        assert_eq!(balance_of(&events[1]).time_exchange, reached);
+        assert_eq!(trade_of(&events[2]).time_exchange, reached);
+        assert!(
+            venue
+                .account
+                .balances()
+                .all(|balance| balance.time_exchange == reached),
+            "no balance is restamped earlier than the venue has reported"
+        );
+        let market = venue.market(&instrument_name()).unwrap();
+        assert_eq!(market.time_exchange, reached);
+        assert_eq!(market.fresh_at, Some(reached));
+        assert_eq!(venue.time_exchange(), reached);
     }
 
     /// A resting order's arrival stamp survives the clock moving past it.
