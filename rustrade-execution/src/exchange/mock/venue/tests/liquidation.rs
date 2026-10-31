@@ -1018,3 +1018,50 @@ fn a_dust_debt_that_values_at_zero_is_not_liquidated() {
         d("0.00000000000000000001")
     );
 }
+
+#[test]
+fn while_a_liquidation_is_under_way_the_venue_lends_nothing() {
+    let mut venue = short_one_btc(liquidation("1.1", "0.02"));
+    let at = |venue: &mut SimulatedVenue, price: &str, ask: &str, seconds| {
+        venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(traded(price))
+                .with_depth(MarketDepth::new(Some(d("1")), Some(d(ask)))),
+            time(seconds),
+        )
+    };
+    // 0.6 of the 1 BTC owed bought back at 18,200, leaving 8,861.6 USDT free.
+    assert_eq!(
+        notices(&at(&mut venue, "18200", "0.6", 2)),
+        [NoticeKind::Liquidation]
+    );
+    // BTC falls to 10,000 with nothing offered, so the liquidation is still under way, though
+    // 8,861.6 held against 4,000 owed is a margin level of 2.2, within the leverage limit.
+    assert!(trades(&at(&mut venue, "10000", "0", 3)).is_empty());
+    assert_eq!(balance_now(&venue, quote()).free, d("8861.6"));
+
+    // 9,000 needs a loan of 138.4, which the leverage limit allows, but nothing is lent.
+    let refused = venue.open_order(gtc_limit("borrows", Side::Buy, "1", "9000"));
+    match &refused.response.state {
+        OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+            ApiError::BalanceInsufficient(Some(asset), reason),
+        ))) => {
+            assert_eq!(*asset, quote());
+            assert!(reason.contains("Borrowable: 0"), "{reason}");
+        }
+        other => panic!("expected BalanceInsufficient, got: {other:?}"),
+    }
+    rested_open(&venue.open_order(gtc_limit("pays", Side::Buy, "0.1", "9000")));
+
+    // The rest bought back at 10,000, and the order it could pay for cancelled.
+    let closed = at(&mut venue, "10000", "1", 4);
+    assert!(shape(&closed).contains(&"order pays".to_owned()));
+    assert_eq!(balance_now(&venue, quote()).free, d("4781.6"));
+
+    // 5,400 needs a loan of 618.4, which the venue lends again now that nothing is owed.
+    rested_open(&venue.open_order(gtc_limit("borrows-after", Side::Buy, "0.6", "9000")));
+    assert_eq!(
+        balance_now(&venue, quote()).margin.unwrap().borrowed,
+        d("618.4")
+    );
+}

@@ -163,6 +163,8 @@ pub struct MarginPlacement {
 /// than that, since the venue never lends less than the minimum, and its reason names the minimum
 /// too. A `max_leverage` of one lends nothing, but still reports each balance's loan.
 ///
+/// It lends nothing while a liquidation is under way: see [`SpotMarginLiquidation`].
+///
 /// # What it repays
 /// Under [`MarginEffect::Repay`], whatever a fill delivers into an asset the account owes repays
 /// that asset's loan, interest first, then principal, and only the rest becomes free balance. What
@@ -457,13 +459,22 @@ pub enum SpotMarginConfigError {
 /// instrument.
 ///
 /// # When it cannot close every debt
+/// A debt can outlast an input when the depth on offer is too thin, when an asset has no market
+/// to trade on, or when the account holds too little to repay it. The venue then warns once, and
+/// leaves the rest owed: it has no insurance fund, and nothing floors the account's balances.
+///
 /// The liquidation continues on each later input until no debt is left, without another notice:
 /// each input cancels whatever the account has since placed, repays what it can, and charges the
-/// fee on what it repaid. A debt can
-/// outlast an input when the depth on offer is too thin, when an asset has no market to trade
-/// on, or when the account holds too little to repay it. The venue then warns once, and leaves
-/// the rest owed: it has no insurance fund, and nothing floors the account's balances. A fee the
-/// account cannot pay takes the valuation asset's free balance below zero.
+/// fee on what it repaid.
+///
+/// Each pass charges its fee before any debt it leaves owed, selling for it as in step 3, as a
+/// venue takes its fee out of the proceeds of the liquidation's trades. So a pass that cannot
+/// close every debt leaves the next one that much less to sell. A fee the account cannot pay
+/// takes the valuation asset's free balance below zero.
+///
+/// While the liquidation is under way the venue lends nothing. An order that would need a loan is
+/// rejected as unaffordable, its reason showing nothing borrowable. One the account can pay for
+/// from its own balance is accepted, and cancelled by the next input if it is still open.
 ///
 /// # Margin call
 /// Off by default. With [`with_margin_call`](Self::with_margin_call), the venue sends

@@ -139,8 +139,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The fee is the rate times the value of the debt repaid, charged in the valuation asset and
     reported as a new `CashFlowKind::LiquidationFee { rate, repaid }`.
   - A debt it cannot close at once (thin depth, no market, too little to sell) is left owed with a
-    `warn!`, and the liquidation continues on later inputs without another notice. There is no
-    insurance fund: a fee the account cannot pay takes its free balance below zero.
+    `warn!`, and the liquidation continues on later inputs without another notice. Each pass
+    charges its fee on what it repaid, before any debt it leaves owed. There is no insurance fund:
+    a fee the account cannot pay takes its free balance below zero.
+  - While a liquidation is under way the venue lends nothing, so an order that would need a loan
+    is rejected as unaffordable. One the account can pay for itself is accepted, and cancelled by
+    the next input if it is still open.
   - `SpotMarginLiquidation::with_margin_call(level)` also sends `NoticeKind::MarginCall` when the
     margin level falls to that level and `NoticeKind::MarginRestored` when it rises back above it,
     once per crossing.

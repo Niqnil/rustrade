@@ -1244,8 +1244,8 @@ impl SimulatedVenue {
     /// instrument with `terms`: see [`SpotMarginConfig`]'s `# How much it lends`.
     ///
     /// Zero unless spot margin lends, the order's `effect` is [`Borrow`](MarginEffect::Borrow),
-    /// the instrument is spot, and `free` falls short of the debit, so a venue that lends nothing,
-    /// or an order that needs no loan, values nothing.
+    /// the instrument is spot, no liquidation is under way, and `free` falls short of the debit,
+    /// so a venue that lends nothing, or an order that needs no loan, values nothing.
     /// `market` is the snapshot the order is priced from, used to value an asset on an instrument
     /// this venue holds no market for, as on a [`RequestPriced`](VenueRegime::RequestPriced)
     /// venue.
@@ -1261,6 +1261,7 @@ impl SimulatedVenue {
         };
         if effect != MarginEffect::Borrow
             || terms.cash_settled
+            || self.liquidation.under_way()
             || self.account.free(&debit.asset) >= debit.settled + debit.reserved
         {
             return Decimal::ZERO;

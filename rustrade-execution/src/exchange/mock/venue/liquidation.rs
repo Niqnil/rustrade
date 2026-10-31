@@ -37,6 +37,14 @@ pub(super) struct LiquidationState {
     warned_shortfall: bool,
 }
 
+impl LiquidationState {
+    /// Whether a liquidation has started and still leaves debt owed, during which the venue lends
+    /// nothing.
+    pub(super) fn under_way(&self) -> bool {
+        self.under_way
+    }
+}
+
 /// One forced trade: paying [`pay`](Self::pay) for the other asset of
 /// [`instrument`](Self::instrument), at [`price`](Self::price).
 struct Leg {
@@ -95,7 +103,8 @@ impl SimulatedVenue {
             return;
         };
         // Each asset owed is valued at a positive price, but a dust debt at a tiny price can
-        // still value at zero, which leaves nothing to liquidate.
+        // still value at zero, which leaves nothing to liquidate. The state is left as it was
+        // until the debt values above zero.
         if debt <= Decimal::ZERO {
             return;
         }
