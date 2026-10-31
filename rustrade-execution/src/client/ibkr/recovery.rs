@@ -455,8 +455,9 @@ impl EventSender for EventSink {
 pub(super) enum RecoveryError {
     #[error("executions request failed: {0}")]
     Ibapi(#[source] ibapi::Error),
-    #[error("executions request did not complete within {}s", RECOVERY_TIMEOUT.as_secs())]
-    TimedOut,
+    /// The executions did not all arrive within the read's timeout, which this holds.
+    #[error("executions request did not complete within {}s", .0.as_secs())]
+    TimedOut(Duration),
     /// The stream ended, or its consumer went, while recovery was reading.
     #[error("account stream ended during recovery")]
     StreamClosed,
@@ -470,8 +471,8 @@ impl RecoveryError {
     /// How [`AccountEventKind::FillRecoveryGaveUp`] states this failure.
     fn failure(&self) -> FillRecoveryFailure {
         match self {
-            Self::TimedOut => FillRecoveryFailure::TimedOut {
-                timeout_secs: RECOVERY_TIMEOUT.as_secs(),
+            Self::TimedOut(timeout) => FillRecoveryFailure::TimedOut {
+                timeout_secs: timeout.as_secs(),
             },
             Self::Ibapi(_) | Self::StreamClosed => FillRecoveryFailure::Request(self.to_string()),
         }
@@ -650,8 +651,8 @@ impl ExecutionReplies for Subscription<Executions> {
 }
 
 /// Ask `source` for the last [`EXECUTION_DAYS`](super::execution::EXECUTION_DAYS) days of
-/// executions and return the fills `fills` keeps, within `timeout` ([`RECOVERY_TIMEOUT`] outside
-/// tests).
+/// executions and return the fills `fills` keeps, within `timeout` (the watcher's is
+/// [`RECOVERY_TIMEOUT`]).
 fn recover_fills(
     source: &impl ExecutionSource,
     mut fills: RecoveredFills<'_>,
@@ -684,7 +685,7 @@ fn recover_fills(
             }
             Some(Err(e)) => return Err(RecoveryError::Ibapi(e)),
             // `next_timeout` answers `None` both at the end marker and when the slice runs out.
-            None if Instant::now() >= deadline => return Err(RecoveryError::TimedOut),
+            None if Instant::now() >= deadline => return Err(RecoveryError::TimedOut(timeout)),
             None if returned_early(waited.elapsed(), slice) => break,
             None => {}
         }
@@ -1347,7 +1348,7 @@ mod tests {
     #[test]
     fn a_failed_recovery_states_why() {
         assert_eq!(
-            RecoveryError::TimedOut.failure(),
+            RecoveryError::TimedOut(RECOVERY_TIMEOUT).failure(),
             FillRecoveryFailure::TimedOut {
                 timeout_secs: RECOVERY_TIMEOUT.as_secs()
             }
@@ -1907,7 +1908,7 @@ mod tests {
         );
         assert!(matches!(
             recover(&script, &sink, Duration::from_millis(50)),
-            Err(RecoveryError::TimedOut)
+            Err(RecoveryError::TimedOut(timeout)) if timeout == Duration::from_millis(50)
         ));
     }
 
