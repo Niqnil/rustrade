@@ -146,9 +146,7 @@ impl SimulatedVenue {
         }
 
         let owed = self.owed_of(valuation);
-        if owed > Decimal::ZERO {
-            self.raise(valuation, owed, time_exchange, events);
-        }
+        self.raise(valuation, owed, time_exchange, events);
 
         for asset in self.owed_assets() {
             if asset != *valuation {

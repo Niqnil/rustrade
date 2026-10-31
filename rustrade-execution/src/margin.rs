@@ -345,10 +345,9 @@ impl TryFrom<SpotMarginRepr> for SpotMarginConfig {
         }
         if let Some(liquidation) = &repr.liquidation {
             // An account borrowed to the limit has `debt = (max_leverage − 1) × equity`, so a
-            // margin level of `max_leverage / (max_leverage − 1)`. One lending nothing has no limit
-            // to reach.
-            let limit = repr.max_leverage - Decimal::ONE;
-            if limit > Decimal::ZERO && liquidation.level() * limit >= repr.max_leverage {
+            // margin level of `max_leverage / (max_leverage − 1)`. One lending nothing, at a
+            // `max_leverage` of one, has no limit to reach, and passes: the product is zero.
+            if liquidation.level() * (repr.max_leverage - Decimal::ONE) >= repr.max_leverage {
                 return Err(SpotMarginConfigError::LiquidationWithinLeverage {
                     level: liquidation.level(),
                     max_leverage: repr.max_leverage,
