@@ -63,7 +63,7 @@ impl SimulatedVenue {
         let Some(config) = self.spot_margin.as_ref() else {
             return;
         };
-        let Some(liquidation) = config.liquidation().cloned() else {
+        let Some(liquidation) = config.liquidation() else {
             return;
         };
         let valuation = config.valuation_asset().clone();
@@ -94,7 +94,11 @@ impl SimulatedVenue {
             }
             return;
         };
-        // Each asset owed is valued at a positive price, so an account that owes has a debt.
+        // Each asset owed is valued at a positive price, but a dust debt at a tiny price can
+        // still value at zero, which leaves nothing to liquidate.
+        if debt <= Decimal::ZERO {
+            return;
+        }
         let level = (equity + debt) / debt;
 
         if self.liquidation.under_way || level <= liquidation.level() {

@@ -1481,8 +1481,8 @@ impl SimulatedVenue {
     /// They are preceded by the holding costs of every boundary since the clock last moved and the
     /// expiries this tick reached, exactly as [`advance_time`](Self::advance_time) reports them.
     /// The costs are valued at the market as it stood before this tick replaced it. They are
-    /// followed by what the margin check after every fill causes, as for `advance_time`, valued at
-    /// the market this tick set.
+    /// followed by what the margin check at the end of the tick causes, as for `advance_time`,
+    /// valued at the market this tick set.
     ///
     /// # A bar releases the orders held for it
     /// Under [`MarketOrderTiming::NextBar`], an observation carrying a

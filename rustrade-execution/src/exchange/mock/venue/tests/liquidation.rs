@@ -937,3 +937,84 @@ fn a_leg_whose_fee_takes_all_it_delivers_is_not_traded() {
         "{warned:?}"
     );
 }
+
+#[test]
+fn held_and_resting_orders_are_all_cancelled_in_client_order_id_order() {
+    // Owes 1 BTC and holds 20,000 USDT, on a venue holding market orders for the next bar.
+    let config = MockExecutionConfig {
+        market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
+        ..liquidating_config(
+            vec![
+                AssetBalance::new(
+                    base(),
+                    Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("1"), Decimal::ZERO),
+                    Utc::now(),
+                ),
+                funded(quote(), d("20000")),
+            ],
+            liquidation("1.1", "0"),
+        )
+    };
+    let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+    advance(&mut venue, time(1));
+    assert!(feed_bar(&mut venue, 1, ohlc("10000", "10000", "10000", "10000")).is_empty());
+    rested_open(&venue.open_order(gtc_limit("c-resting", Side::Buy, "0.1", "9000")));
+    let held = venue.open_order(ioc_buy("b-held", "0.1"));
+    assert!(
+        matches!(held.response.state, OrderState::Active(_)),
+        "held for the next bar: {:?}",
+        held.response.state
+    );
+    rested_open(&venue.open_order(gtc_limit("a-resting", Side::Buy, "0.1", "9000")));
+
+    // 20,000 against 18,200 owed, and a trade price is no bar, so the held order is still held.
+    let events = tick(&mut venue, "18200", 2);
+
+    assert_eq!(
+        shape(&events)[..7],
+        [
+            "notice liquidation",
+            "balance USDT",
+            "order a-resting",
+            "balance USDT",
+            "order b-held",
+            "balance USDT",
+            "order c-resting",
+        ],
+        "each releases what it held, by client order id"
+    );
+    assert!(venue.account.orders().is_empty());
+    assert_eq!(
+        traded_legs(&events),
+        [(instrument_name(), Side::Buy, d("1"))]
+    );
+}
+
+#[test]
+fn a_dust_debt_that_values_at_zero_is_not_liquidated() {
+    // Owes 1e-20 BTC, which at 1e-10 USDT is worth less than `Decimal` can hold.
+    let config = liquidating_config(
+        vec![
+            AssetBalance::new(
+                base(),
+                Balance::new_margin(
+                    Decimal::ZERO,
+                    Decimal::ZERO,
+                    d("0.00000000000000000001"),
+                    Decimal::ZERO,
+                ),
+                Utc::now(),
+            ),
+            funded(quote(), d("1")),
+        ],
+        liquidation("1.1", "0"),
+    );
+    let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+    advance(&mut venue, time(1));
+
+    assert!(tick(&mut venue, "0.0000000001", 1).is_empty());
+    assert_eq!(
+        balance_now(&venue, base()).margin.unwrap().borrowed,
+        d("0.00000000000000000001")
+    );
+}

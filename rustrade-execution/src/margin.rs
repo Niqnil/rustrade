@@ -321,8 +321,8 @@ impl SpotMarginConfig {
 
     /// When the venue liquidates the account, or `None` if it never does. See
     /// [`with_liquidation`](Self::with_liquidation).
-    pub fn liquidation(&self) -> Option<&SpotMarginLiquidation> {
-        self.0.liquidation.as_ref()
+    pub fn liquidation(&self) -> Option<SpotMarginLiquidation> {
+        self.0.liquidation
     }
 }
 
@@ -450,7 +450,9 @@ pub enum SpotMarginConfigError {
 /// venue's fee. It is reported as `[balance.., trade]`, the [`Trade`](crate::trade::Trade)
 /// carrying [`TradeOrigin::Liquidation`](crate::trade::TradeOrigin::Liquidation), no client order
 /// id and an unknown strategy, with no order snapshot, since no client placed it. It is never
-/// held for a bar or a fresh market. The fee is reported as `[balance, cash flow]`, a
+/// held for a bar or a fresh market. Once priced it has drawn from the venue's slippage stream,
+/// even if it then trades nothing, so a liquidation that runs over several inputs draws on each.
+/// The fee is reported as `[balance, cash flow]`, a
 /// [`CashFlowKind::LiquidationFee`](crate::cash_flow::CashFlowKind::LiquidationFee) with no
 /// instrument.
 ///
@@ -480,7 +482,7 @@ pub enum SpotMarginConfigError {
 /// # Serialised form
 /// `level`, `fee_rate` and `margin_call_level` are decimal strings, and `margin_call_level` is
 /// left out when off. Deserialising refuses what the constructors refuse.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(
     try_from = "SpotMarginLiquidationRepr",
     into = "SpotMarginLiquidationRepr"
@@ -488,7 +490,7 @@ pub enum SpotMarginConfigError {
 pub struct SpotMarginLiquidation(SpotMarginLiquidationRepr);
 
 /// The serialised form of a [`SpotMarginLiquidation`], before validation.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 struct SpotMarginLiquidationRepr {
     #[serde(with = "rust_decimal::serde::str")]
     level: Decimal,
