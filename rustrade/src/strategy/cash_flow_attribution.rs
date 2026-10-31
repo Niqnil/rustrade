@@ -18,7 +18,8 @@ use rustrade_instrument::{
 pub trait CashFlowAttributionStrategy {
     /// State used to decide the attribution.
     ///
-    /// Typically the full `EngineState` of the trading system.
+    /// For a strategy run by the [`Engine`](crate::engine::Engine), this is the full `EngineState`
+    /// of the trading system.
     ///
     /// eg/ `EngineState<DefaultGlobalData, DefaultInstrumentMarketData>`
     type State;

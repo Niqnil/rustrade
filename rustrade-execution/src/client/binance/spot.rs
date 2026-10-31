@@ -3294,8 +3294,6 @@ mod tests {
 
     #[test]
     fn test_convert_order_kind_tif() {
-        use rust_decimal::Decimal;
-
         // binance-sdk enums don't derive PartialEq, so use matches!
         assert!(matches!(
             convert_order_kind_tif(OrderKind::Market, TimeInForce::ImmediateOrCancel),
@@ -3335,8 +3333,12 @@ mod tests {
         // GoodUntilEndOfDay is unsupported on Binance (no native EOD order) — surfaced as
         // unsupported rather than silently coerced to GTC, which would drop the EOD semantics.
         assert!(convert_order_kind_tif(OrderKind::Limit, TimeInForce::GoodUntilEndOfDay).is_none());
+    }
 
-        // Conditional orders
+    #[test]
+    fn test_convert_order_kind_tif_conditional() {
+        use rust_decimal::Decimal;
+
         assert!(matches!(
             convert_order_kind_tif(
                 OrderKind::Stop {
@@ -3379,6 +3381,11 @@ mod tests {
                 Some(OrderPlaceTimeInForceEnum::Fok)
             ))
         ));
+    }
+
+    #[test]
+    fn test_convert_order_kind_tif_trailing() {
+        use rust_decimal::Decimal;
 
         // TrailingStop with BasisPoints/Percentage → StopLoss (trailingDelta set separately)
         assert!(matches!(
@@ -3925,7 +3932,6 @@ mod tests {
                 u,
                 e_uppercase: e,
                 b_uppercase: Some(vec![make_balance_inner("ETH", "2.0", "0.0")]),
-                ..Default::default()
             };
             let mut buf = Vec::new();
             convert_account_position(position, &mut buf);
