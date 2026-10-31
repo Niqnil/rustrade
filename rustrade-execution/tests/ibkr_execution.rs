@@ -64,6 +64,7 @@
 //! | `test_place_and_cancel_bracket_order` | Bracket order with OCA |
 //! | `test_bracket_order_oca_group_linkage` | Verify OCA group linkage |
 //! | `test_place_and_cancel_gtd_order` | Good-Till-Date order |
+//! | `test_gtd_expiry_reads_back_after_a_restart` | A GTD expiry read back by the placing client, after a restart, and once ended |
 //! | `test_place_moo_order_premarket` | Market-on-Open (timing-sensitive) |
 //! | `test_place_loo_order_premarket` | Limit-on-Open (timing-sensitive) |
 //! | `test_orders_found_by_client_order_id_across_a_restart` | Snapshot orders, adoption after a restart, ended-order lookup |
@@ -1587,6 +1588,146 @@ async fn test_place_and_cancel_gtd_order() {
             panic!("Unexpected order state: {:?}", other);
         }
     }
+}
+
+/// A good-till-date order's expiry reads back as the instant it was placed with: from the client
+/// that placed it, from a new client under the same API client id after a restart, which knows
+/// only what IB lists, and from `fetch_ended_orders` once it is cancelled.
+///
+/// The expiry is five days out: IB rejects a good-till-date that falls before the next market
+/// open (error 201, "Order will be expired before market opens"), which two days out from a Friday
+/// evening does. Five days out it can also fall across a daylight saving change in the session's
+/// zone, as it does when run in the days before one.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_gtd_expiry_reads_back_after_a_restart() {
+    init_logging();
+
+    let aapl = aapl_instrument();
+    let strategy = StrategyId::new("test-gtd-read-back");
+    let client = connect_client(resolved_aapl_config(30))
+        .await
+        .expect("connection failed");
+
+    // Whole seconds: IB's good-till-date carries no finer precision.
+    let expiry = chrono::DateTime::from_timestamp(
+        (chrono::Utc::now() + chrono::Duration::days(5)).timestamp(),
+        0,
+    )
+    .unwrap();
+    let time_in_force = TimeInForce::GoodTillDate { expiry };
+    let cid = ClientOrderId::new(format!(
+        "gtd-read-back-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    let key = OrderKey {
+        exchange: ExchangeId::Ibkr,
+        instrument: &aapl,
+        strategy: strategy.clone(),
+        cid: cid.clone(),
+    };
+    println!("Placing GTD limit order: BUY 1 AAPL @ $1.00, expires {expiry}");
+    let placed = client
+        .open_order(rustrade_execution::order::OrderEvent {
+            key: key.clone(),
+            state: RequestOpen::new(
+                Side::Buy,
+                Some(dec!(1.00)),
+                dec!(1),
+                OrderKind::Limit,
+                time_in_force,
+            ),
+        })
+        .await;
+    assert!(
+        matches!(placed.state, OrderState::Active(ActiveOrderState::Open(_))),
+        "{placed:?}"
+    );
+
+    let open = client
+        .fetch_open_orders(std::slice::from_ref(&aapl))
+        .await
+        .expect("fetch_open_orders failed");
+    let listed = open
+        .iter()
+        .find(|order| order.key.cid == cid)
+        .expect("the order is listed");
+    assert_eq!(
+        listed.time_in_force, time_in_force,
+        "read by the placing client"
+    );
+
+    // A restart: a new client under the same API client id, which has never seen the order.
+    client.disconnect();
+    let mut restarted = Err(String::new());
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        restarted = connect_client(resolved_aapl_config(30)).await;
+        if restarted.is_ok() {
+            break;
+        }
+    }
+    let restarted = restarted.expect("reconnection failed");
+
+    let open = restarted
+        .fetch_open_orders(std::slice::from_ref(&aapl))
+        .await
+        .expect("fetch_open_orders failed");
+    let listed = open
+        .iter()
+        .find(|order| order.key.cid == cid)
+        .expect("the order is listed under its client order id");
+    println!("Listed after the restart: {:?}", listed.time_in_force);
+
+    // Orders an earlier, failed run left open.
+    for leftover in open
+        .iter()
+        .filter(|order| order.key.cid != cid && order.key.cid.0.starts_with("gtd-read-back-"))
+    {
+        let _ = restarted
+            .cancel_order(rustrade_execution::order::OrderEvent {
+                key: OrderKey {
+                    cid: leftover.key.cid.clone(),
+                    ..key.clone()
+                },
+                state: rustrade_execution::order::request::RequestCancel { id: None },
+            })
+            .await;
+    }
+
+    let cancelled = restarted
+        .cancel_order(rustrade_execution::order::OrderEvent {
+            key: key.clone(),
+            state: rustrade_execution::order::request::RequestCancel { id: None },
+        })
+        .await;
+    assert!(cancelled.state.is_ok(), "{cancelled:?}");
+    // Asserted after the cancel, so a wrong read does not leave the order working.
+    assert_eq!(
+        listed.time_in_force, time_in_force,
+        "read from IB's listing"
+    );
+
+    let ended = ended_eventually(
+        &restarted,
+        OrderKey {
+            exchange: ExchangeId::Ibkr,
+            instrument: aapl.clone(),
+            strategy,
+            cid,
+        },
+    )
+    .await;
+    assert!(
+        matches!(ended.state, InactiveOrderState::Cancelled(_)),
+        "{:?}",
+        ended.state
+    );
+    assert_eq!(
+        ended.time_in_force, time_in_force,
+        "read from IB's completed orders"
+    );
 }
 
 /// Test placing a Market-on-Open (MOO) order during pre-market.
