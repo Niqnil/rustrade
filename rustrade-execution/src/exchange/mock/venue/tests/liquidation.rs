@@ -322,7 +322,7 @@ fn a_debt_the_account_cannot_cover_is_left_owed_and_the_liquidation_continues_wi
     let mut venue = short_one_btc(liquidation("1.1", "0.02"));
 
     // 20,000 buys back only 0.8 of the BTC owed at 25,000.
-    let events = tick(&mut venue, "25000", 2);
+    let (events, warned) = warnings(|| tick(&mut venue, "25000", 2));
 
     assert_eq!(trades(&events)[0].quantity, d("0.8"));
     assert_eq!(
@@ -335,9 +335,23 @@ fn a_debt_the_account_cannot_cover_is_left_owed_and_the_liquidation_continues_wi
         Balance::new_margin(d("-400"), d("-400"), Decimal::ZERO, Decimal::ZERO)
     );
 
+    let shortfall = |warned: &[String]| {
+        warned
+            .iter()
+            .filter(|message| message.contains("could not repay every debt"))
+            .count()
+    };
+    assert_eq!(shortfall(&warned), 1, "{warned:?}");
+
+    let (events, warned) = warnings(|| tick(&mut venue, "25000", 3));
     assert!(
-        tick(&mut venue, "25000", 3).is_empty(),
+        events.is_empty(),
         "nothing more can be repaid, and the liquidation under way sends no second notice"
+    );
+    assert_eq!(
+        shortfall(&warned),
+        0,
+        "warned once per liquidation: {warned:?}"
     );
 }
 
@@ -375,20 +389,24 @@ fn a_debt_the_book_is_too_thin_to_close_is_closed_by_later_inputs() {
         MarginDetails::default()
     );
 
-    let fees = [&first, &second].map(|events| {
-        events
+    let [first_fee, second_fee] = [&first, &second].map(|events| {
+        let flows = events
             .iter()
             .filter_map(|event| match &event.kind {
-                AccountEventKind::CashFlow(flow) => Some(flow.amount),
+                AccountEventKind::CashFlow(flow) => Some(flow.clone()),
                 _ => None,
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        assert_eq!(flows.len(), 1, "{:?}", shape(events));
+        flows[0].clone()
     });
     assert_eq!(
-        fees,
-        [vec![d("-218.4")], vec![d("-145.6")]],
+        (first_fee.amount, second_fee.amount),
+        (d("-218.4"), d("-145.6")),
         "each pass is charged on what it repaid"
     );
+    assert!(first_fee.id.is_some());
+    assert_ne!(first_fee.id, second_fee.id, "each fee has an id of its own");
     assert!(thin(&mut venue, 4).is_empty());
 }
 
@@ -440,8 +458,14 @@ fn a_debt_the_venue_cannot_value_is_not_checked() {
     );
     let mut venue = SimulatedVenue::new(&config, spot_instruments());
 
-    assert!(venue.advance_time(time(1)).is_empty());
-    assert!(venue.advance_time(time(2)).is_empty());
+    let (events, warned) = warnings(|| venue.advance_time(time(1)));
+    assert!(events.is_empty());
+    assert_eq!(warned.len(), 1, "{warned:?}");
+    assert!(warned[0].contains("cannot value a debt"), "{warned:?}");
+
+    let (events, warned) = warnings(|| venue.advance_time(time(2)));
+    assert!(events.is_empty());
+    assert!(warned.is_empty(), "warned once per venue: {warned:?}");
     assert_eq!(balance_now(&venue, base()).margin.unwrap().borrowed, d("1"));
 }
 
@@ -622,5 +646,294 @@ fn collateral_is_sold_in_name_order_and_only_as_much_as_the_debt_and_fee_need() 
     assert!(
         (eth_left - (d("2") - d("1040") / d("600"))).abs() < d("0.000000000000000000001"),
         "{eth_left}"
+    );
+}
+
+/// A short of 1 ETH sold at 1,000 against `btc` held and `usdt` of the account's own, on a venue
+/// trading BTCUSDT at 10,000 and ETHUSDT at 1,000, charging `fee_model`'s fees in
+/// `spot_fee_asset`, and liquidating at 1.1 for a fee of 2 %.
+fn short_one_eth(
+    fee_model: FeeModelConfig,
+    spot_fee_asset: SpotFeeAsset,
+    btc: &str,
+    usdt: &str,
+) -> SimulatedVenue {
+    let config = MockExecutionConfig {
+        fee_model,
+        spot_fee_asset,
+        ..liquidating_config(
+            vec![
+                funded(base(), d(btc)),
+                funded(eth(), Decimal::ZERO),
+                funded(quote(), d(usdt)),
+            ],
+            liquidation("1.1", "0.02"),
+        )
+    };
+    let mut venue = SimulatedVenue::new_market_driven(&config, btc_and_eth_instruments());
+    advance(&mut venue, time(1));
+    assert!(tick(&mut venue, "10000", 1).is_empty());
+    assert!(eth_tick(&mut venue, "1000", 1).is_empty());
+    let sold = venue.open_order(request(eth_instrument_name(), Side::Sell, "1", None));
+    assert_eq!(filled_trade(&sold).quantity, d("1"));
+    venue
+}
+
+/// A trade on ETHUSDT at `price`, and nothing else, observed at `time(seconds)`.
+fn eth_tick(venue: &mut SimulatedVenue, price: &str, seconds: i64) -> Vec<UnindexedAccountEvent> {
+    venue.apply_market(
+        &eth_instrument_name(),
+        MarketObservation::new(traded(price)),
+        time(seconds),
+    )
+}
+
+/// Each trade's instrument, side and quantity.
+fn traded_legs(events: &[UnindexedAccountEvent]) -> Vec<(InstrumentNameExchange, Side, Decimal)> {
+    trades(events)
+        .into_iter()
+        .map(|trade| (trade.instrument.clone(), trade.side, trade.quantity))
+        .collect()
+}
+
+#[test]
+fn a_fee_the_free_balance_covers_in_part_sells_collateral_for_only_the_rest() {
+    let mut venue = short_one_eth(FeeModelConfig::default(), SpotFeeAsset::Quote, "0.1", "10");
+
+    // 80 of BTC and 1,010 USDT against 1,000 of ETH owed: a margin level of 1.09.
+    let events = tick(&mut venue, "800", 2);
+
+    assert_eq!(
+        traded_legs(&events),
+        [
+            (eth_instrument_name(), Side::Buy, d("1")),
+            (instrument_name(), Side::Sell, d("0.0125")),
+        ],
+        "the ETH bought back on its own pair, not on BTCUSDT, which is also quoted in USDT; then \
+         10 of the 20 fee raised from BTC, since 10 USDT is left free"
+    );
+    assert_eq!(
+        balance_now(&venue, eth()),
+        Balance::new_margin(Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO)
+    );
+    assert_eq!(balance_now(&venue, quote()).total, Decimal::ZERO);
+    assert_eq!(balance_now(&venue, base()).total, d("0.0875"));
+}
+
+#[test]
+fn a_buy_back_costing_more_than_the_free_balance_sells_collateral_first() {
+    let mut venue = short_one_eth(
+        FeeModelConfig::Percentage(PercentageFeeModel::new(d("0.001"))),
+        SpotFeeAsset::Received,
+        "0.1",
+        "0",
+    );
+    assert_eq!(balance_now(&venue, quote()).total, d("999"));
+
+    // 1,000 of BTC and 999 USDT against 1,900 of ETH owed: a margin level of 1.05.
+    let events = eth_tick(&mut venue, "1900", 2);
+
+    let legs = traded_legs(&events);
+    assert_eq!(
+        legs.iter()
+            .map(|(instrument, side, _)| (instrument.clone(), *side))
+            .collect::<Vec<_>>(),
+        [
+            (instrument_name(), Side::Sell),
+            (eth_instrument_name(), Side::Buy),
+            (instrument_name(), Side::Sell),
+        ],
+        "BTC sold for what the buy-back lacks, the ETH bought back, then BTC sold for the fee"
+    );
+    // The buy-back costs 1 / 0.999 ETH at 1,900, of which 999 USDT is free; a BTC sale delivers
+    // 9,990 USDT per BTC, net of its fee.
+    let lacked = d("1") / d("0.999") * d("1900") - d("999");
+    assert!(
+        (legs[0].2 - lacked / d("9990")).abs() < d("0.000000000000000000001"),
+        "{legs:?}"
+    );
+    assert_eq!(
+        balance_now(&venue, eth()).margin.unwrap(),
+        MarginDetails::default(),
+        "the buy-back, grossed up for its fee in ETH, repays all of the ETH owed"
+    );
+}
+
+#[test]
+fn a_buy_back_the_balance_cannot_quite_afford_trades_a_digit_less() {
+    let mut venue = short_one_btc(liquidation("1.1", "0"));
+
+    // 20,000 buys 2/3 of a BTC at 30,000, which rounds up to more than the account holds.
+    let events = tick(&mut venue, "30000", 2);
+
+    let bought = trades(&events);
+    assert_eq!(bought.len(), 1, "{:?}", shape(&events));
+    assert_eq!(bought[0].quantity, d("0.6666666666666666666666666666"));
+    let usdt = balance_now(&venue, quote());
+    assert!(
+        usdt.free >= Decimal::ZERO && usdt.free < d("0.00000000000000000001"),
+        "{usdt:?}"
+    );
+}
+
+#[test]
+fn a_sale_whose_quantity_rounds_down_is_nudged_up_to_raise_the_whole_fee() {
+    let mut venue = liquidating_venue(
+        vec![funded(base(), Decimal::ZERO), funded(quote(), d("10000"))],
+        liquidation("1.1", "0.02"),
+        "10000",
+    );
+    let outcome = venue.open_order(buy_request("2.5", None));
+    assert_eq!(filled_trade(&outcome).quantity, d("2.5"));
+
+    // 2.5 BTC at 6,300 against 15,000 owed: a margin level of 1.05. The fee is 300, and
+    // 300 / 6,300 rounds down, so that quantity sells for a little less than the fee.
+    let events = tick(&mut venue, "6300", 2);
+
+    let sold = trades(&events);
+    assert_eq!(sold.len(), 2, "{:?}", shape(&events));
+    assert!(
+        d("300") / d("6300") * d("6300") < d("300"),
+        "the case this test is for"
+    );
+    assert!(sold[1].quantity > d("300") / d("6300"), "{:?}", sold[1]);
+    let usdt = balance_now(&venue, quote());
+    assert_eq!(usdt.margin.unwrap(), MarginDetails::default());
+    assert!(
+        usdt.free >= Decimal::ZERO && usdt.free < d("0.00000000000000000001"),
+        "the fee is raised in full, so it leaves no negative balance: {usdt:?}"
+    );
+    assert!(
+        tick(&mut venue, "6300", 3).is_empty(),
+        "the loan and the fee are repaid in one pass, so no liquidation continues"
+    );
+}
+
+/// Prices every fill at the last trade, recording what it was asked to price.
+#[derive(Debug, Default)]
+struct Recording(std::sync::Mutex<Vec<(Side, Decimal, Option<Decimal>)>>);
+
+impl Recording {
+    /// The side, quantity and last price of each fill priced since the last call.
+    fn take(&self) -> Vec<(Side, Decimal, Option<Decimal>)> {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
+
+impl FillModel for Recording {
+    fn fill_price(&self, fill: &FillContext<'_>) -> Option<Decimal> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((fill.side, fill.quantity, fill.market.last_price));
+        fill.market.last_price
+    }
+}
+
+#[test]
+fn a_leg_is_priced_for_the_base_it_trades_and_only_for_an_asset_the_account_holds() {
+    let config = liquidating_config(
+        vec![
+            funded(base(), Decimal::ZERO),
+            funded(eth(), Decimal::ZERO),
+            funded(quote(), d("1000")),
+        ],
+        liquidation("1.1", "0.02"),
+    );
+    let recording = Arc::new(Recording::default());
+    let mut venue = SimulatedVenue::new_market_driven(&config, btc_and_eth_instruments())
+        .with_fill_model(recording.clone());
+    advance(&mut venue, time(1));
+    assert!(tick(&mut venue, "10000", 1).is_empty());
+    assert!(eth_tick(&mut venue, "1000", 1).is_empty());
+    let bought = venue.open_order(request(eth_instrument_name(), Side::Buy, "2.5", None));
+    assert_eq!(filled_trade(&bought).quantity, d("2.5"));
+    recording.take();
+
+    // 2.5 ETH at 625 against 1,500 USDT owed: a margin level of 1.04.
+    let events = eth_tick(&mut venue, "625", 2);
+
+    assert_eq!(
+        recording.take(),
+        [
+            (Side::Sell, d("2.4"), Some(d("625"))),
+            (Side::Sell, d("0.048"), Some(d("625"))),
+        ],
+        "the ETH the loan and then the fee need, in ETH; the BTC the account does not hold is \
+         never priced"
+    );
+    assert_eq!(
+        traded_legs(&events),
+        [
+            (eth_instrument_name(), Side::Sell, d("2.4")),
+            (eth_instrument_name(), Side::Sell, d("0.048")),
+        ]
+    );
+}
+
+#[test]
+fn a_pair_without_a_market_is_passed_over_for_one_with_a_market() {
+    // A second BTC/USDT pair, first by name, that the venue is never fed.
+    let unfed = InstrumentNameExchange::new("BTC-USDT");
+    let mut instruments = spot_instruments();
+    let mut alias = instruments[&instrument_name()].clone();
+    alias.name_exchange = unfed.clone();
+    alias.name_internal = InstrumentNameInternal::new("btc-usdt");
+    instruments.insert(unfed, alias);
+    let config = liquidating_config(
+        vec![funded(base(), Decimal::ZERO), funded(quote(), d("10000"))],
+        liquidation("1.1", "0"),
+    );
+    let mut venue = SimulatedVenue::new_market_driven(&config, instruments);
+    advance(&mut venue, time(1));
+    assert!(tick(&mut venue, "10000", 1).is_empty());
+    assert_eq!(
+        filled_trade(&venue.open_order(sell_request("1", None))).quantity,
+        d("1")
+    );
+
+    let events = tick(&mut venue, "18200", 2);
+
+    assert_eq!(
+        traded_legs(&events),
+        [(instrument_name(), Side::Buy, d("1"))]
+    );
+}
+
+#[test]
+fn a_leg_whose_fee_takes_all_it_delivers_is_not_traded() {
+    // Owes 11,000 USDT against 2 BTC, and a sale's fee is 6,000 per BTC.
+    let config = MockExecutionConfig {
+        fee_model: FeeModelConfig::PerContract(PerContractFeeModel {
+            commission_per_contract: d("6000"),
+        }),
+        ..liquidating_config(
+            vec![
+                funded(base(), d("2")),
+                AssetBalance::new(
+                    quote(),
+                    Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("11000"), Decimal::ZERO),
+                    Utc::now(),
+                ),
+            ],
+            liquidation("1.1", "0.02"),
+        )
+    };
+    let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+
+    // At 6,000 a margin level of 1.09, and a sale delivers nothing net of its fee.
+    let (events, warned) = warnings(|| tick(&mut venue, "6000", 1));
+
+    assert_eq!(shape(&events), ["notice liquidation"]);
+    assert_eq!(
+        balance_now(&venue, quote()).margin.unwrap().borrowed,
+        d("11000")
+    );
+    assert_eq!(balance_now(&venue, base()).total, d("2"));
+    assert!(
+        warned
+            .iter()
+            .any(|message| message.contains("could not repay every debt")),
+        "{warned:?}"
     );
 }

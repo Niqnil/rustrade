@@ -1278,10 +1278,7 @@ impl SimulatedVenue {
 
         let headroom = (config.max_leverage() - Decimal::ONE) * equity - debt;
         // `price_in` never values an asset at zero, so the division is safe.
-        match headroom > Decimal::ZERO {
-            true => headroom / asset_price,
-            false => Decimal::ZERO,
-        }
+        headroom.max(Decimal::ZERO) / asset_price
     }
 
     /// The account's equity and debt, valued in `valuation` as [`SpotMarginConfig`]'s

@@ -213,7 +213,8 @@ impl SimulatedVenue {
     }
 
     /// Sells the account's other assets for `need` of `valuation`, in name order and as much of
-    /// each as is needed, stopping when it has raised `need` or run out of assets to sell.
+    /// each as is needed, stopping when it has raised `need` or run out of assets to sell. Nothing
+    /// when `need` is not positive.
     fn raise(
         &mut self,
         valuation: &AssetNameExchange,
@@ -257,9 +258,7 @@ impl SimulatedVenue {
         };
         let cost = owed / leg.delivered_per_unit * leg.paid_per_unit;
         let short = cost - self.account.free(valuation);
-        if short > Decimal::ZERO {
-            self.raise(valuation, short, time_exchange, events);
-        }
+        self.raise(valuation, short, time_exchange, events);
         self.fill_leg(&leg, owed, time_exchange, events);
     }
 
@@ -276,9 +275,7 @@ impl SimulatedVenue {
         events: &mut Vec<UnindexedAccountEvent>,
     ) {
         let short = fee - self.account.free(valuation);
-        if short > Decimal::ZERO {
-            self.raise(valuation, short, time_exchange, events);
-        }
+        self.raise(valuation, short, time_exchange, events);
 
         // A delivery that takes, opening the balance in an account that never held the
         // valuation asset, and taking `free` below zero rather than being refused, as a charge
@@ -411,12 +408,14 @@ impl SimulatedVenue {
         }
         let mut quantity = (want / leg.delivered_per_unit).min(cap);
 
-        // The division rounds, so the quantity is nudged by its last digit until it delivers all
-        // of `want` without costing more than the account holds, else left a digit short.
-        let mut settlement = None;
+        // The divisions round, so the quantity is nudged by its last digit until it delivers all
+        // of `want` without costing more than the account holds. A quantity that costs too much
+        // lowers the cap, so the nudge never climbs back to it. The largest affordable quantity
+        // tried is traded, which may deliver a digit short of `want`.
+        let mut affordable = None;
         for _ in 0..4 {
             if quantity <= Decimal::ZERO {
-                return Decimal::ZERO;
+                break;
             }
             let priced = self.fill_settlement(
                 &leg.terms,
@@ -428,15 +427,18 @@ impl SimulatedVenue {
             );
             let step = Decimal::new(1, quantity.scale());
             if priced.amount > budget {
-                quantity -= step;
-            } else if delivered(&priced.credit) < want && quantity + step <= cap {
-                quantity += step;
-            } else {
-                settlement = Some(priced);
+                cap = quantity - step;
+                quantity = cap;
+                continue;
+            }
+            let short = delivered(&priced.credit) < want && quantity + step <= cap;
+            affordable = Some((quantity, priced));
+            if !short {
                 break;
             }
+            quantity += step;
         }
-        let Some(settlement) = settlement.filter(|priced| priced.amount <= budget) else {
+        let Some((quantity, settlement)) = affordable else {
             return Decimal::ZERO;
         };
 
