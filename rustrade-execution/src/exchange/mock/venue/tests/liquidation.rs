@@ -1166,3 +1166,48 @@ fn while_a_liquidation_is_under_way_a_held_order_whose_fill_needs_a_loan_is_canc
         MarginDetails::default()
     );
 }
+
+#[test]
+fn an_order_a_liquidation_cancels_reports_the_interest_its_loan_was_charged_when_it_rested() {
+    let mut venue = liquidating_venue(
+        vec![funded(base(), Decimal::ZERO), funded(quote(), d("10000"))],
+        liquidation("1.1", "0"),
+        "10000",
+    )
+    .with_margin_interest(Arc::new(hourly_interest(base())));
+    assert_eq!(
+        filled_trade(&venue.open_order(sell_request("1", None))).quantity,
+        d("1")
+    );
+    // A sell resting above the market borrows the 0.1 BTC it would deliver, charged 0.00001.
+    rested_open(&venue.open_order(gtc_limit("resting", Side::Sell, "0.1", "20000")));
+
+    let events = tick(&mut venue, "18200", 2);
+
+    assert_eq!(
+        shape(&events)[..5],
+        [
+            "notice liquidation",
+            "balance BTC",
+            "debt BTC",
+            "cash flow",
+            "order resting"
+        ],
+        "the released hold and the loan it repaid, the charge it never reported, then the cancel: \
+         {:?}",
+        shape(&events)
+    );
+    assert_eq!(
+        *liquidation_fee(&events[3]),
+        interest_flow(
+            base(),
+            "0.1",
+            "0.00001",
+            time(2),
+            InterestTiming::OnBorrow,
+            "1"
+        ),
+        "stamped at the cancel; the short's own charge was the first"
+    );
+    assert_cancelled(order_named(&events, "resting"));
+}

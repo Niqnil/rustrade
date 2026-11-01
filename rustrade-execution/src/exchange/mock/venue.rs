@@ -1416,7 +1416,10 @@ impl SimulatedVenue {
         RestingOrder { order, reservation }: RestingOrder,
         time_exchange: DateTime<Utc>,
     ) -> Vec<UnindexedAccountEvent> {
-        let mut events = Vec::with_capacity(2);
+        let flows = reservation
+            .as_ref()
+            .map_or(0, |reservation| reservation.unreported_interest.len());
+        let mut events = Vec::with_capacity(2 + flows);
 
         // Released before the terminal snapshot, so a consumer applying them in order never sees
         // an order retired against a balance that still holds its reservation. An order the venue
@@ -1881,7 +1884,9 @@ impl SimulatedVenue {
 
     /// Cancels every immediate-or-cancel and fill-or-kill market order held on `instrument` for a
     /// bar that has arrived with nothing traded in it, leaving the rest held for the next one — see
-    /// [`StaleMarketPolicy::Wait`]. Per order the events are `[balance, order]`.
+    /// [`StaleMarketPolicy::Wait`]. Per order the events are `[balance, cash flow.., order]`, the
+    /// cash flows reporting the interest its hold was charged, if it borrowed — see
+    /// [`cancel_unfilled`](Self::cancel_unfilled).
     fn cancel_held_immediate(
         &mut self,
         instrument: &InstrumentNameExchange,
@@ -1915,7 +1920,8 @@ impl SimulatedVenue {
     }
 
     /// Fills one held market order, as a taker arriving at the price `release` gives it, and
-    /// returns `[balance.., trade, order]`, or `[balance, order]` for one it cancels.
+    /// returns `[balance.., trade, cash flow.., order]`, or `[balance, cash flow.., order]` for one
+    /// it cancels, the cash flows reporting the interest its loans were charged, if any.
     ///
     /// What the order would cost was held when it arrived, at the price the venue held then. The
     /// release's price is another, so the hold is released and the fill costed afresh, as a
@@ -2049,8 +2055,10 @@ impl SimulatedVenue {
     }
 
     /// Releases one limit order held on a stale market, as if it had arrived to the market
-    /// `release` gives it, and returns `[balance.., trade, order]` for one that trades,
-    /// `[balance, order]` for one that joins the book whole or that it cancels.
+    /// `release` gives it, and returns `[balance.., trade, cash flow.., order]` for one that
+    /// trades, `[balance, order]` for one that joins the book whole, and `[balance, cash flow..,
+    /// order]` for one it cancels. The cash flows report the interest its loans were charged, if
+    /// any. One that joins the book whole has traded nothing, so its reservation keeps them.
     ///
     /// Decided against that market as an arriving limit order is decided against the market it
     /// arrives to:
@@ -2199,15 +2207,16 @@ impl SimulatedVenue {
                     time_in_force: order.time_in_force,
                     state: open,
                 };
-                // A release that traded reports every charge after its trade. One that did not leaves
-                // them with no position to belong to, so they wait with the remainder, as on
-                // arrival.
+                // A release that traded reports every charge after its trade. One that did not
+                // leaves them with no position to belong to, so they wait with the remainder, as
+                // on arrival.
                 let unreported_interest = match trade {
                     Some(_) => Vec::new(),
-                    None => std::mem::take(&mut committed.held_interest)
-                        .into_iter()
-                        .chain(committed.interest.take().map(|flow| *flow))
-                        .collect(),
+                    None => {
+                        let mut held = std::mem::take(&mut committed.held_interest);
+                        held.extend(committed.interest.take().map(|flow| *flow));
+                        held
+                    }
                 };
                 self.book_rested(
                     rested.clone(),
@@ -2634,7 +2643,10 @@ impl SimulatedVenue {
         released: Option<Released>,
         time_exchange: DateTime<Utc>,
     ) -> Vec<UnindexedAccountEvent> {
-        let mut events = Vec::with_capacity(2);
+        let flows = released
+            .as_ref()
+            .map_or(0, |released| released.interest.len());
+        let mut events = Vec::with_capacity(2 + flows);
         if let Some(Released { balance, interest }) = released {
             events.push(self.build_account_event(Snapshot(balance)));
             self.push_interest(&mut events, interest, time_exchange);
@@ -3467,6 +3479,8 @@ impl SimulatedVenue {
         let effect = self.margin_effect(request.state.margin_effect);
         let (committed, interest) =
             match self.commit(&debit, None, effect, terms, market.as_ref(), time_exchange) {
+                // A fresh commitment holds no earlier order's interest, so `held_interest` is
+                // empty.
                 Ok(Commitment {
                     committed,
                     interest,
@@ -4160,7 +4174,8 @@ impl SimulatedVenue {
         let effect = self.margin_effect(request.state.margin_effect);
         let (committed, interest) =
             match self.commit(&debit, None, effect, terms, market.as_ref(), time_exchange) {
-                // Nothing traded, so nothing is delivered: the one balance is the hold.
+                // Nothing traded, so nothing is delivered: the one balance is the hold. A fresh
+                // commitment holds no earlier order's interest, so `held_interest` is empty.
                 Ok(Commitment {
                     committed,
                     interest,
@@ -5071,6 +5086,7 @@ impl From<Committed> for Commitment {
 /// What releasing an order's hold restated, and the interest its loan was charged when the order
 /// was placed, which the order's end now reports.
 #[derive(Debug)]
+#[must_use = "its interest must be reported, or carried into the order's next reservation"]
 struct Released {
     balance: AssetBalance<AssetNameExchange>,
     /// See [`Reservation::unreported_interest`].
@@ -14326,6 +14342,118 @@ mod tests {
             ),
             "carried to the book, and reported at the order's end"
         );
+    }
+
+    #[test]
+    fn a_held_limit_that_trades_in_part_at_its_release_reports_its_interest_once_after_the_trade() {
+        let config = MockExecutionConfig {
+            stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
+            ..margin_config("0", "100", "2")
+        };
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments())
+            .with_margin_interest(Arc::new(hourly_interest(quote())));
+        advance(&mut venue, time(1));
+        assert!(observe(&mut venue, 1, traded("100")).is_empty());
+        advance(&mut venue, time(12));
+        // 1.5 at the stale 100 lacks 50 of the 150, which is lent and charged 0.005.
+        let outcome = venue.open_order(gtc_limit("partial", Side::Buy, "1.5", "100"));
+        assert_eq!(sans_debt(&outcome.events).len(), 1, "{:?}", outcome.events);
+
+        // A fresh market offering 0.5 under the limit: 0.5 trades and the other 1 joins the book.
+        let events = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("98", "99")).with_depth(sized("0.5")),
+            time(20),
+        );
+        let events = sans_debt(&events);
+        let traded_at = events
+            .iter()
+            .position(|event| matches!(event.kind, AccountEventKind::Trade(_)))
+            .unwrap_or_else(|| panic!("a trade: {events:?}"));
+        assert_eq!(trade_of(events[traded_at]).quantity, d("0.5"));
+        assert_eq!(
+            *cash_flow_of(events[traded_at + 1]),
+            interest_flow(
+                quote(),
+                "50",
+                "0.005",
+                time(20),
+                InterestTiming::OnBorrow,
+                "0"
+            ),
+            "the hold's charge after the trade, stamped at it: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, AccountEventKind::CashFlow(_)))
+                .count(),
+            1,
+            "reported once: {events:?}"
+        );
+
+        advance(&mut venue, time(30));
+        let cancelled = venue.cancel_order(OrderRequestCancel {
+            key: gtc_limit("partial", Side::Buy, "1.5", "100").key,
+            state: RequestCancel { id: None },
+        });
+        assert!(
+            !cancelled
+                .events
+                .iter()
+                .any(|event| matches!(event.kind, AccountEventKind::CashFlow(_))),
+            "the remainder carries no charge already reported: {:?}",
+            cancelled.events
+        );
+    }
+
+    #[test]
+    fn a_held_immediate_order_an_idle_bar_cancels_reports_its_interest_with_its_cancel() {
+        let config = MockExecutionConfig {
+            market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
+            stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
+            ..margin_config("0", "100", "2")
+        };
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments())
+            .with_margin_interest(Arc::new(hourly_interest(quote())));
+        advance(&mut venue, time(1));
+        assert!(feed_bar(&mut venue, 1, ohlc("95", "105", "90", "100")).is_empty());
+        // 150 at the close of 100: 50 borrowed, charged 0.005, held for the next bar.
+        let outcome = venue.open_order(market_order(
+            "immediate",
+            Side::Buy,
+            "1.5",
+            TimeInForce::ImmediateOrCancel,
+        ));
+        assert_eq!(sans_debt(&outcome.events).len(), 1, "{:?}", outcome.events);
+
+        let bar = ohlc("100", "100", "100", "100");
+        let events = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(MarketSnapshot::from_last_price(Some(bar.close)))
+                .with_bar(Some(bar))
+                .with_fresh(false),
+            time(2),
+        );
+        let events = sans_debt(&events);
+
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(
+            *cash_flow_of(events[1]),
+            interest_flow(
+                quote(),
+                "50",
+                "0.005",
+                time(2),
+                InterestTiming::OnBorrow,
+                "0"
+            ),
+            "the order never traded, so its cancel reports the charge, stamped then"
+        );
+        assert!(matches!(
+            order_of(events[2]).state,
+            OrderState::Inactive(InactiveOrderState::Cancelled(_))
+        ));
     }
 
     /// A margin venue also holding `eth`, which no instrument values, owing `eth_owed` of it.

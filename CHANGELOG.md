@@ -25,7 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - It is stamped at that instant, not when the charge was made, because the engine applies no
     flow stamped before the position it belongs to.
 
-  The order's balance still shows the charge from the moment it rests.
+  The order's balance still shows the charge from the moment it rests. An order still open when
+  a run stops has not reported it: cancel open orders at the end of a run to report it.
 
   Breaking: `exchange::mock::orders::Reservation` gains a public `unreported_interest` field,
   which holds that cash flow. Code that builds a `Reservation` must set it (`Vec::new()` for none).

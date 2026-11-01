@@ -52,12 +52,17 @@ pub struct Reservation {
     /// was placed to.
     pub effect: MarginEffect,
     /// The interest a margin account charged on [`borrowed`](Self::borrowed) when it lent it, not
-    /// yet reported. Empty when the order borrowed nothing, or traded when it borrowed.
+    /// yet reported. Empty unless the order borrowed when it rested or was held and has traded
+    /// nothing since: the interest on a loan a fill takes is reported after that fill.
     ///
     /// The balance restated when the order rested already includes the charge. Its cash flow is
     /// held back because nothing has traded: no position exists yet for it to belong to. The
-    /// venue reports it after the order's first fill, or with the order's end if it never fills,
+    /// venue takes it from here and reports it after the order's first fill, or with the order's
+    /// end if it never fills (a cancel, an expiry, or a fill the account can no longer afford),
     /// stamped at that instant.
+    ///
+    /// An order still open when a run stops has reported neither. Its balance includes the charge,
+    /// but no cash flow reports it until the order is cancelled or expires.
     pub unreported_interest: Vec<CashFlow<AssetNameExchange, InstrumentNameExchange>>,
 }
 

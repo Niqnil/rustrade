@@ -144,7 +144,9 @@ impl AccountState {
     ///
     /// The caller records how it ended, with [`ack_cancelled`](Self::ack_cancelled),
     /// [`ack_filled`](Self::ack_filled) or [`ack_expired`](Self::ack_expired). Booking is only
-    /// through [`book`](Self::book), which keeps an id in at most one place.
+    /// through [`book`](Self::book), which keeps an id in at most one place. The caller also
+    /// reports the reservation's [`unreported_interest`](Reservation::unreported_interest), or
+    /// carries it into the order's next reservation: dropped, that charge is never reported.
     pub fn remove_order(&mut self, cid: &ClientOrderId) -> Option<RestingOrder> {
         self.orders_open.remove(cid)
     }
