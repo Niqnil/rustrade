@@ -6037,7 +6037,7 @@ mod tests {
             );
         }
         // Signed on a server time read, a request can be stamped up to `TRAILING_HOST_BEHIND`
-        // before it was sent. On this host's clock, only the old millisecond is allowed.
+        // before it was sent. On this host's clock, only 1 ms is allowed.
         let behind = match lead {
             Some(_) => ServerTime::TRAILING_HOST_BEHIND,
             None => TimeDelta::milliseconds(1),
