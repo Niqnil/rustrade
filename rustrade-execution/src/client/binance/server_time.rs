@@ -213,13 +213,13 @@ impl ServerTime {
             .host_lead(Utc::now(), Instant::now())
     }
 
-    /// How far behind Binance's true time, as `lead` sets it, a request [`trailing_host`]'s clock
-    /// signs can be stamped, for a test's lower bound. The server time is in whole milliseconds, so
-    /// up to 1 ms is truncated. And the estimate dates that server time to the moment its answer
-    /// is received, so whatever delay falls between the read and that moment (polling,
-    /// scheduling, the read's timeout) also puts the stamp behind. That delay is a few µs on an
-    /// idle host but grows under load, so 50 ms is allowed for it. Every one of these makes the
-    /// stamp earlier, never later.
+    /// How far behind Binance's true time a request signed by [`trailing_host`]'s clock can be
+    /// stamped, for a test's lower bound. The server time is in whole milliseconds, so up to 1 ms
+    /// is truncated. The estimate dates that server time to the moment its answer is received, so
+    /// the task scheduling and polling between the server time's `Utc::now()` and that moment also
+    /// put the stamp behind: a few µs on an idle host, more under load, so 50 ms is allowed for
+    /// them. The clock's drift allowance takes off a little more, negligible over a test. Every one
+    /// of these makes the stamp earlier, never later.
     ///
     /// [`trailing_host`]: Self::trailing_host
     #[cfg(test)]

@@ -6036,6 +6036,12 @@ mod tests {
                     .with_server_time(Some(ServerTime::trailing_host(lead))),
             );
         }
+        // Signed on a server time read, a request can be stamped up to `TRAILING_HOST_BEHIND`
+        // before it was sent. On this host's clock, only the old millisecond is allowed.
+        let behind = match lead {
+            Some(_) => ServerTime::TRAILING_HOST_BEHIND,
+            None => TimeDelta::milliseconds(1),
+        };
         let lead = lead.unwrap_or_default();
 
         let before = Utc::now();
@@ -6072,11 +6078,10 @@ mod tests {
         for (times, from, to) in reads {
             assert!(!times.is_empty());
             for time in times {
-                // When the request was sent, by this host's clock. Signed on a server time read,
-                // as with a `lead`, it can be up to `TRAILING_HOST_BEHIND` before `from`.
+                // When the request was sent, by this host's clock, up to `behind` before `from`.
                 let sent = time + REST_BALANCE_LAG + lead;
                 assert!(
-                    from - ServerTime::TRAILING_HOST_BEHIND <= sent && sent + ANSWER_DELAY <= to,
+                    from - behind <= sent && sent + ANSWER_DELAY <= to,
                     "{time} + the lag and {lead} not within {from} ..= {to} - {ANSWER_DELAY:?}"
                 );
             }
