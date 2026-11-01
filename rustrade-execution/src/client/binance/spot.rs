@@ -7787,11 +7787,11 @@ mod tests {
             snapshot.balances[0].time_exchange,
             restated.0.time_exchange,
         ] {
-            // Binance's time when the request was sent, by this host's clock. The server time
-            // is in whole milliseconds, which can put it up to one before `before`.
+            // Binance's time when the request was sent, by this host's clock. Signed on a server
+            // time read, it can be up to `TRAILING_HOST_BEHIND` before `before`.
             let sent = time + REST_BALANCE_LAG + LEAD;
             assert!(
-                before - TimeDelta::milliseconds(1) <= sent && sent <= after,
+                before - ServerTime::TRAILING_HOST_BEHIND <= sent && sent <= after,
                 "{time} + the lag and the lead not within {before} ..= {after}"
             );
         }

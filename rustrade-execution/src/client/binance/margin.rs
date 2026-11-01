@@ -6072,11 +6072,11 @@ mod tests {
         for (times, from, to) in reads {
             assert!(!times.is_empty());
             for time in times {
-                // When the request was sent, by this host's clock. A server time is in whole
-                // milliseconds, which can put it up to one before `from`.
+                // When the request was sent, by this host's clock. Signed on a server time read,
+                // as with a `lead`, it can be up to `TRAILING_HOST_BEHIND` before `from`.
                 let sent = time + REST_BALANCE_LAG + lead;
                 assert!(
-                    from - TimeDelta::milliseconds(1) <= sent && sent + ANSWER_DELAY <= to,
+                    from - ServerTime::TRAILING_HOST_BEHIND <= sent && sent + ANSWER_DELAY <= to,
                     "{time} + the lag and {lead} not within {from} ..= {to} - {ANSWER_DELAY:?}"
                 );
             }
