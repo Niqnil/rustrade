@@ -114,7 +114,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after construction would leave the index stale, and the account valued wrongly with no sign of
   it. Which instrument values an asset is unchanged: the first by name that has a positive price.
   The new `sim_margin_valuation` benchmark measures one market input with the liquidation check
-  on and off.
+  on and off. The check's cost per input now grows with the assets held, not with the
+  instruments traded. At 1,000 instruments and 100 assets held it fell from about 235 µs to
+  about 6.4 µs.
 
 - **`HistoricalClock` reads its instant without a lock** (`rustrade`, #768). Its instant is held
   in a sequence lock over the seconds and nanoseconds instead of a `parking_lot::RwLock`. A read
