@@ -467,14 +467,16 @@ pub enum SpotMarginConfigError {
 /// each input cancels whatever the account has since placed, repays what it can, and charges the
 /// fee on what it repaid.
 ///
-/// Each pass charges its fee before any debt it leaves owed, selling for it as in step 3, as a
-/// venue takes its fee out of the proceeds of the liquidation's trades. So a pass that cannot
-/// close every debt leaves the next one that much less to sell. A fee the account cannot pay
-/// takes the valuation asset's free balance below zero.
+/// Each pass's fee is charged out of the account's remaining assets after that pass's
+/// repayments, selling for it as in step 3, as a venue takes its fee out of the proceeds of the
+/// liquidation's trades. So a debt a pass leaves owed has that much less to be repaid from on the
+/// next pass. A fee the account cannot pay takes the valuation asset's free balance below zero.
 ///
 /// While the liquidation is under way the venue lends nothing. An order that would need a loan is
-/// rejected as unaffordable, its reason showing nothing borrowable. One the account can pay for
-/// from its own balance is accepted, and cancelled by the next input if it is still open.
+/// rejected as unaffordable, its reason showing nothing borrowable, and so is the fill of a held
+/// order that would need one. One the account can pay for from its own balance is accepted, and
+/// cancelled by the next input if it is still open. A debt the venue cannot trade out of, for want
+/// of a market or of anything left to sell, keeps lending off until the account repays it.
 ///
 /// # Margin call
 /// Off by default. With [`with_margin_call`](Self::with_margin_call), the venue sends

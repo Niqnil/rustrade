@@ -120,6 +120,49 @@ fn trades(
         .collect()
 }
 
+/// The snapshot `events` report of the order `cid`.
+fn order_named<'a>(
+    events: &'a [UnindexedAccountEvent],
+    cid: &str,
+) -> &'a Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+    events
+        .iter()
+        .find_map(|event| match &event.kind {
+            AccountEventKind::OrderSnapshot(order)
+                if order.0.key.cid == ClientOrderId::new(cid) =>
+            {
+                Some(&order.0)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no snapshot of order {cid} in {:?}", shape(events)))
+}
+
+fn assert_cancelled(order: &Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>) {
+    assert!(
+        matches!(
+            order.state,
+            OrderState::Inactive(InactiveOrderState::Cancelled(_))
+        ),
+        "{}: {:?}",
+        order.key.cid,
+        order.state
+    );
+}
+
+/// Asserts `outcome` was refused for want of `asset`, with nothing borrowable.
+fn assert_refused_a_loan(outcome: &OpenOutcome, asset: AssetNameExchange) {
+    match &outcome.response.state {
+        OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+            ApiError::BalanceInsufficient(Some(refused), reason),
+        ))) => {
+            assert_eq!(*refused, asset);
+            assert!(reason.contains("Borrowable: 0"), "{reason}");
+        }
+        other => panic!("expected BalanceInsufficient, got: {other:?}"),
+    }
+}
+
 fn liquidation_fee(
     event: &UnindexedAccountEvent,
 ) -> &CashFlow<AssetNameExchange, InstrumentNameExchange> {
@@ -1042,20 +1085,15 @@ fn while_a_liquidation_is_under_way_the_venue_lends_nothing() {
 
     // 9,000 needs a loan of 138.4, which the leverage limit allows, but nothing is lent.
     let refused = venue.open_order(gtc_limit("borrows", Side::Buy, "1", "9000"));
-    match &refused.response.state {
-        OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
-            ApiError::BalanceInsufficient(Some(asset), reason),
-        ))) => {
-            assert_eq!(*asset, quote());
-            assert!(reason.contains("Borrowable: 0"), "{reason}");
-        }
-        other => panic!("expected BalanceInsufficient, got: {other:?}"),
-    }
+    assert_refused_a_loan(&refused, quote());
+    // Nor is BTC lent to a market sale, which the bid on offer would fill at once.
+    let refused = venue.open_order(sell_request("0.1", None));
+    assert_refused_a_loan(&refused, base());
     rested_open(&venue.open_order(gtc_limit("pays", Side::Buy, "0.1", "9000")));
 
     // The rest bought back at 10,000, and the order it could pay for cancelled.
     let closed = at(&mut venue, "10000", "1", 4);
-    assert!(shape(&closed).contains(&"order pays".to_owned()));
+    assert_cancelled(order_named(&closed, "pays"));
     assert_eq!(balance_now(&venue, quote()).free, d("4781.6"));
 
     // 5,400 needs a loan of 618.4, which the venue lends again now that nothing is owed.
@@ -1063,5 +1101,68 @@ fn while_a_liquidation_is_under_way_the_venue_lends_nothing() {
     assert_eq!(
         balance_now(&venue, quote()).margin.unwrap().borrowed,
         d("618.4")
+    );
+}
+
+#[test]
+fn while_a_liquidation_is_under_way_a_held_order_whose_fill_needs_a_loan_is_cancelled() {
+    // Owes 1 BTC and holds 20,000 USDT, on a venue holding market orders for the next bar.
+    let config = MockExecutionConfig {
+        market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
+        ..liquidating_config(
+            vec![
+                AssetBalance::new(
+                    base(),
+                    Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("1"), Decimal::ZERO),
+                    Utc::now(),
+                ),
+                funded(quote(), d("20000")),
+            ],
+            liquidation("1.1", "0.02"),
+        )
+    };
+    let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+    advance(&mut venue, time(1));
+    assert!(feed_bar(&mut venue, 1, ohlc("10000", "10000", "10000", "10000")).is_empty());
+    let at = |venue: &mut SimulatedVenue, price: &str, ask: &str, seconds| {
+        venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(traded(price))
+                .with_depth(MarketDepth::new(Some(d("1")), Some(d(ask)))),
+            time(seconds),
+        )
+    };
+    // 0.6 of the 1 BTC owed bought back at 18,200, leaving 8,861.6 USDT free; then BTC falls to
+    // 10,000 with nothing offered, so the liquidation is still under way.
+    assert_eq!(
+        notices(&at(&mut venue, "18200", "0.6", 2)),
+        [NoticeKind::Liquidation]
+    );
+    assert!(trades(&at(&mut venue, "10000", "0", 3)).is_empty());
+    assert_eq!(balance_now(&venue, quote()).free, d("8861.6"));
+
+    // 0.85 at 10,000 is 8,500, which the account pays for itself, so it is held.
+    let held = venue.open_order(ioc_buy("held", "0.85"));
+    assert!(
+        matches!(held.response.state, OrderState::Active(_)),
+        "held for the next bar: {:?}",
+        held.response.state
+    );
+
+    // The bar opens at 11,000, where the fill costs 9,350: a loan of 488.4 that the leverage
+    // limit allows, but nothing is lent, so the order is cancelled. The liquidation then buys
+    // back the 0.4 still owed at 11,000, charging 2% of 4,400.
+    let events = feed_bar(&mut venue, 4, ohlc("11000", "11000", "11000", "11000"));
+
+    assert_cancelled(order_named(&events, "held"));
+    assert_eq!(
+        traded_legs(&events),
+        [(instrument_name(), Side::Buy, d("0.4"))]
+    );
+    assert!(venue.account.orders().is_empty());
+    assert_eq!(balance_now(&venue, quote()).free, d("4373.6"));
+    assert_eq!(
+        balance_now(&venue, quote()).margin.unwrap(),
+        MarginDetails::default()
     );
 }
