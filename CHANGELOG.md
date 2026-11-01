@@ -123,6 +123,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The simulated venue can liquidate its spot margin account** (`rustrade-execution`, #803). Off
+  by default. `SpotMarginConfig::with_liquidation(SpotMarginLiquidation)` sets a liquidation
+  level (a margin level, the value of what the account holds over what it owes, at least 1) and a
+  fee rate in `[0, 1)`.
+  - The venue checks the margin level after every market tick and clock move, valued as the
+    leverage limit values the account: mid, else last price, of a spot pair with the valuation
+    asset. There is no index price. A debt it cannot value is not checked, with a `warn!` once.
+  - At or below the level it sends an `AccountNotice` of `NoticeKind::Liquidation`, cancels every
+    open order, and closes every debt: from each asset's own free balance first, then by selling
+    the account's other assets for the valuation asset (in name order, as much as needed), then
+    by buying back each other asset owed. Each forced trade fills as a market order on arrival
+    would, as a taker, and is reported as a `Trade` with `TradeOrigin::Liquidation`, no client
+    order id and no order snapshot.
+  - The fee is the rate times the value of the debt repaid, charged in the valuation asset and
+    reported as a new `CashFlowKind::LiquidationFee { rate, repaid }`.
+  - A debt it cannot close at once (thin depth, no market, too little to sell) is left owed with a
+    `warn!`, and the liquidation continues on later inputs without another notice. Each pass
+    charges its fee on what it repaid, out of what the account holds after that pass's
+    repayments, so a debt it leaves owed has that much less to be repaid from. There is no
+    insurance fund: a fee the account cannot pay takes its free balance below zero.
+  - While a liquidation is under way the venue lends nothing, so an order that would need a loan
+    is rejected as unaffordable, and a held order whose fill would need one is cancelled. One the
+    account can pay for itself is accepted, and cancelled by the next input if it is still open.
+    A debt the venue cannot trade out of keeps lending off until the account repays it.
+  - `SpotMarginLiquidation::with_margin_call(level)` also sends `NoticeKind::MarginCall` when the
+    margin level falls to that level and `NoticeKind::MarginRestored` when it rises back above it,
+    once per crossing.
+  - `with_liquidation` refuses a level that an account borrowed to the leverage limit would
+    already be at (`SpotMarginConfigError::LiquidationWithinLeverage`). CFD positions are not
+    liquidated. Configurations without `liquidation` deserialise as before.
+
 - **Binance signed requests are stamped on Binance's clock** (`rustrade-execution`, #773). Both
   clients read `GET /api/v3/time` and stamp each signed request with the earliest Binance's clock
   can read, counted on from the read on a monotonic clock, instead of with this host's clock. A

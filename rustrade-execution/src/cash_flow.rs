@@ -36,8 +36,10 @@ use std::fmt::{Display, Formatter};
 ///   The caller drops what it has already read.
 /// - The simulated venue: whatever its configured
 ///   [`HoldingCostModel`](crate::holding_cost::HoldingCostModel)s and
-///   [`MarginInterestModel`](crate::margin::MarginInterestModel) charge, each flow once, with an
-///   id from its own sequence.
+///   [`MarginInterestModel`](crate::margin::MarginInterestModel) charge, and the
+///   [`LiquidationFee`](CashFlowKind::LiquidationFee) of a configured
+///   [`SpotMarginLiquidation`](crate::margin::SpotMarginLiquidation), each flow once, with an id
+///   from its own sequence.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, Constructor)]
 pub struct CashFlow<AssetKey, InstrumentKey> {
@@ -107,6 +109,18 @@ pub enum CashFlowKind {
     },
     /// A rebate paid to the account, such as on cash collateral for a short sale.
     Rebate,
+    /// The fee a venue charged for liquidating the account, on the debt the liquidation repaid.
+    ///
+    /// Charged on the debt a liquidation repaid rather than on each forced fill, so it is not
+    /// part of any trade's fees. The forced fills themselves carry
+    /// [`TradeOrigin::Liquidation`](crate::trade::TradeOrigin::Liquidation).
+    LiquidationFee {
+        /// The fee rate, as a fraction of `repaid`.
+        rate: Option<Decimal>,
+        /// The value of the debt the liquidation repaid, in the flow's asset, which the fee was
+        /// charged on.
+        repaid: Option<Decimal>,
+    },
     /// A flow of a kind no other variant names, with the venue's own name for it.
     Other(String),
 }

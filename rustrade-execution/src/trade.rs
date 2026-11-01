@@ -512,7 +512,7 @@ where
 /// | Binance Spot / Margin | `Order` only |
 /// | Hyperliquid | `Order` only |
 /// | Alpaca | `Order` on fills; [`Expiry`](Self::Expiry), [`Exercise`](Self::Exercise), [`Assignment`](Self::Assignment) and [`External`](Self::External) from `AlpacaClient::fetch_option_events` |
-/// | [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue) | `Order` only |
+/// | [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue) | [`Liquidation`](Self::Liquidation) (opt-in), `Order` |
 /// | The `rustrade` engine's expiry settlement | [`Expiry`](Self::Expiry) |
 ///
 /// - **Interactive Brokers** flags a fill of an IB-initiated liquidation. Another API client's
@@ -524,7 +524,9 @@ where
 /// - **Hyperliquid** fills carry a liquidation marker, but the SDK this crate uses drops it.
 /// - **Alpaca** marks no liquidation. Option assignment, exercise and expiry are account
 ///   activities, which this crate does not read.
-/// - The **simulated venue** models no liquidation.
+/// - The **simulated venue** reports the forced trades of a spot margin liquidation, which
+///   [`SpotMarginLiquidation`](crate::margin::SpotMarginLiquidation) opts into, with no client
+///   order id.
 ///
 /// A forced variant takes precedence over [`External`](Self::External): a liquidation is
 /// reported as a liquidation whoever placed the order it closed.

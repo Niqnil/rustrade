@@ -42,6 +42,8 @@ use smol_str::ToSmolStr;
 use std::{sync::Arc, time::Duration};
 use tracing::warn;
 
+mod liquidation;
+
 /// Everything one request obliges a driver to deliver, in the order it must deliver it.
 ///
 /// # Ordering obligation
@@ -211,6 +213,12 @@ pub enum VenueRegime {
 /// carries [`InterestTiming::OnBorrow`] and one at a boundary [`InterestTiming::Periodic`]. A venue that books such
 /// interest at the start of its hour stamps it earlier than this venue does.
 ///
+/// It liquidates the account only when the configuration says so, with
+/// [`SpotMarginConfig::with_liquidation`]: then, after each input, an account whose margin level
+/// has fallen to the configured level has its open orders cancelled and every debt closed by
+/// forced trades, reported as [`TradeOrigin::Liquidation`] fills, and is charged a fee. See
+/// [`SpotMarginLiquidation`](crate::margin::SpotMarginLiquidation).
+///
 /// [`Balance::margin`]: crate::balance::Balance::margin
 ///
 /// # How a CFD is accounted
@@ -232,8 +240,9 @@ pub enum VenueRegime {
 /// The position is reported by [`account_snapshot`](Self::account_snapshot), and a position that
 /// a configured `initial_state` reports for a CFD is where this venue starts.
 ///
-/// Not modelled: liquidation. A short closed at more than twice its entry has lost more than its
-/// margin, and pays the shortfall as a debit. Carry is charged only when configured: see
+/// Not modelled: liquidation of a CFD position, even on a venue that liquidates its spot margin
+/// account. A short closed at more than twice its entry has lost more than its margin, and pays
+/// the shortfall as a debit. Carry is charged only when configured: see
 /// `# Holding costs`.
 ///
 /// [`Perpetual`](InstrumentKind::Perpetual), [`Future`](InstrumentKind::Future) and
@@ -269,7 +278,7 @@ pub enum VenueRegime {
 ///   with a [`CashFlowId`] from this venue's own sequence. The engine adds the flow to the
 ///   position's `carry`, as it does a live venue's. A charge the account cannot cover is still
 ///   made, and takes `free` below zero, with a WARN on the charge that does so, since this venue
-///   models no liquidation.
+///   liquidates no CFD position.
 ///
 /// # Locates and the short-sale restriction
 /// This venue lends no stock: a spot sell delivers base the account must hold, so a short sale of
@@ -633,6 +642,10 @@ pub struct SimulatedVenue {
     /// restatement whose debt differs is followed by an [`AccountEventKind::MarginDebt`]. Seeded
     /// with the debt the account starts with.
     reported_debt: FnvHashMap<AssetNameExchange, MarginDetails>,
+    /// Where a spot margin account stands against its configured
+    /// [`SpotMarginLiquidation`](crate::margin::SpotMarginLiquidation): whether a liquidation is
+    /// under way, and whether a margin call is outstanding.
+    liquidation: liquidation::LiquidationState,
 }
 
 impl SimulatedVenue {
@@ -723,6 +736,7 @@ impl SimulatedVenue {
             next_interest: None,
             next_interest_loans: 0,
             reported_debt,
+            liquidation: Default::default(),
         }
     }
 
@@ -893,6 +907,12 @@ impl SimulatedVenue {
     /// the type's `# Holding costs` and `# Spot margin`. They precede the expiries, which are
     /// stamped at `time_exchange`.
     ///
+    /// # And the liquidation it caused
+    /// Last, a spot margin account configured with a
+    /// [`SpotMarginLiquidation`](crate::margin::SpotMarginLiquidation) is checked at
+    /// `time_exchange`, and the notices, cancels, forced trades and fee that check causes follow
+    /// everything else, stamped there too.
+    ///
     /// # The clock never moves back
     /// An instant earlier than the latest this venue has reached, through this call or through
     /// [`apply_market`](Self::apply_market), is taken as that latest instant. It charges nothing
@@ -925,6 +945,7 @@ impl SimulatedVenue {
         self.time_exchange_latest = time_exchange;
         self.account.update_time_exchange(time_exchange);
         events.append(&mut self.sweep_expired(time_exchange));
+        self.check_margin(time_exchange, &mut events);
         self.refresh_next_interest_if_loans_changed();
         self.report_debt_changes(&mut events);
         events
@@ -1131,7 +1152,7 @@ impl SimulatedVenue {
                 free = %balance.balance.free,
                 %boundary,
                 "SimulatedVenue charged a holding cost the account could not cover: free balance \
-                 is negative, and this venue models no liquidation"
+                 is negative, and this venue liquidates no CFD position"
             );
         }
 
@@ -1223,8 +1244,8 @@ impl SimulatedVenue {
     /// instrument with `terms`: see [`SpotMarginConfig`]'s `# How much it lends`.
     ///
     /// Zero unless spot margin lends, the order's `effect` is [`Borrow`](MarginEffect::Borrow),
-    /// the instrument is spot, and `free` falls short of the debit, so a venue that lends nothing,
-    /// or an order that needs no loan, values nothing.
+    /// the instrument is spot, no liquidation is under way, and `free` falls short of the debit,
+    /// so a venue that lends nothing, or an order that needs no loan, values nothing.
     /// `market` is the snapshot the order is priced from, used to value an asset on an instrument
     /// this venue holds no market for, as on a [`RequestPriced`](VenueRegime::RequestPriced)
     /// venue.
@@ -1240,6 +1261,7 @@ impl SimulatedVenue {
         };
         if effect != MarginEffect::Borrow
             || terms.cash_settled
+            || self.liquidation.under_way()
             || self.account.free(&debit.asset) >= debit.settled + debit.reserved
         {
             return Decimal::ZERO;
@@ -1250,29 +1272,39 @@ impl SimulatedVenue {
         let Some(asset_price) = self.price_in(&debit.asset, valuation, priced) else {
             return Decimal::ZERO;
         };
-
-        let mut equity = Decimal::ZERO;
-        let mut debt = Decimal::ZERO;
-        for balance in self.account.balances() {
-            let margin = balance.balance.margin.unwrap_or_default();
-            let owed = margin.borrowed + margin.interest;
-            let Some(price) = self.price_in(&balance.asset, valuation, priced) else {
-                // A debt this venue cannot value could be any size, so it lends nothing more.
-                if owed > Decimal::ZERO {
-                    return Decimal::ZERO;
-                }
-                continue;
-            };
-            equity += balance.balance.net_asset() * price;
-            debt += owed * price;
-        }
+        // A debt this venue cannot value could be any size, so it lends nothing more.
+        let Some(Valued { equity, debt }) = self.valued(valuation, priced) else {
+            return Decimal::ZERO;
+        };
 
         let headroom = (config.max_leverage() - Decimal::ONE) * equity - debt;
         // `price_in` never values an asset at zero, so the division is safe.
-        match headroom > Decimal::ZERO {
-            true => headroom / asset_price,
-            false => Decimal::ZERO,
+        headroom.max(Decimal::ZERO) / asset_price
+    }
+
+    /// The account's equity and debt, valued in `valuation` as [`SpotMarginConfig`]'s
+    /// `# How much it lends` says, or `None` if it owes an asset this venue cannot value.
+    ///
+    /// `priced` is as for [`price_in`](Self::price_in). Shared by the leverage limit and the
+    /// liquidation check, so the two value an account alike.
+    fn valued(
+        &self,
+        valuation: &AssetNameExchange,
+        priced: Option<(&Underlying<AssetNameExchange>, &MarketSnapshot)>,
+    ) -> Option<Valued> {
+        let mut valued = Valued::default();
+        for balance in self.account.balances() {
+            let owed = owed(balance);
+            let Some(price) = self.price_in(&balance.asset, valuation, priced) else {
+                if owed > Decimal::ZERO {
+                    return None;
+                }
+                continue;
+            };
+            valued.equity += balance.balance.net_asset() * price;
+            valued.debt += owed * price;
         }
+        Some(valued)
     }
 
     /// What one unit of `asset` is worth in `valuation`: one for `valuation` itself, else the mid
@@ -1449,7 +1481,9 @@ impl SimulatedVenue {
     ///
     /// They are preceded by the holding costs of every boundary since the clock last moved and the
     /// expiries this tick reached, exactly as [`advance_time`](Self::advance_time) reports them.
-    /// The costs are valued at the market as it stood before this tick replaced it.
+    /// The costs are valued at the market as it stood before this tick replaced it. They are
+    /// followed by what the margin check at the end of the tick causes, as for `advance_time`,
+    /// valued at the market this tick set.
     ///
     /// # A bar releases the orders held for it
     /// Under [`MarketOrderTiming::NextBar`], an observation carrying a
@@ -1563,6 +1597,7 @@ impl SimulatedVenue {
                 }
             }
         }
+        self.check_margin(time_exchange, &mut events);
         self.refresh_next_interest_if_loans_changed();
         self.report_debt_changes(&mut events);
         events
@@ -4560,6 +4595,23 @@ fn insufficient_error(insufficient: BalanceInsufficient) -> UnindexedApiError {
         ),
     };
     ApiError::BalanceInsufficient(Some(asset), message)
+}
+
+/// What `balance` owes: its loan and the interest on it, zero on a cash account.
+fn owed(balance: &AssetBalance<AssetNameExchange>) -> Decimal {
+    balance
+        .balance
+        .margin
+        .map_or(Decimal::ZERO, |margin| margin.borrowed + margin.interest)
+}
+
+/// A margin account's equity and debt, in its valuation asset. See [`SimulatedVenue::valued`].
+#[derive(Debug, Clone, Copy, Default)]
+struct Valued {
+    /// The value of what the account holds, net of what it owes.
+    equity: Decimal,
+    /// The value of what it owes, loans plus interest.
+    debt: Decimal,
 }
 
 /// The mid of `snapshot`'s best bid and ask, else its last price.
@@ -15460,4 +15512,6 @@ mod tests {
         assert_eq!(filled_trade(&outcome).fees.asset, usd());
         assert_eq!(balance_now(&venue, bnb()).total, d("10"));
     }
+
+    mod liquidation;
 }
