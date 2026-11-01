@@ -136,6 +136,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     allocator placed them. On 16 threads, an advance and three reads now take about 60 ns per
     thread, where the previous clock took up to 158 ns. Most of that gain is the alignment.
 
+- **Breaking: `RiskRefused` no longer implements `Unrecoverable`, and its reason is a `String`**
+  (`rustrade`). The type loses its `Reason` parameter: it is now `RiskRefused<T>`, with
+  `reason: String`. `RiskManager::check` could only ever return a `String` reason, which is never
+  unrecoverable, and the engine never asked. So the impl could not affect anything. A refusal
+  concerns only the request it refuses: the engine does not send it, reports it, and carries on.
+  To stop the strategy generating orders, send `TradingState::Disabled`, which still lets
+  cancels and position closes through. The serialized form is unchanged.
+
 ### Added
 
 - **The simulated venue can liquidate its spot margin account** (`rustrade-execution`, #803). Off

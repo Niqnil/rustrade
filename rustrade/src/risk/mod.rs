@@ -1,7 +1,6 @@
 use derive_more::{Constructor, Display, From};
 use rustrade_execution::order::request::{OrderRequestCancel, OrderRequestOpen};
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
-use rustrade_integration::Unrecoverable;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, hash::Hash, marker::PhantomData};
 
@@ -47,9 +46,10 @@ pub trait RiskManager<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentInd
     ///   reported as refused.
     /// - **An approved request is sent as returned**, so a check that adjusts one, such as
     ///   reducing its quantity, returns the adjusted request.
-    /// - **A refusal is final for this batch.** A refused request is not retried. Whatever its
-    ///   reason, it does not stop the engine: [`RiskRefused`] implements
-    ///   [`Unrecoverable`], but the engine does not act on it.
+    /// - **A refusal is final for this batch.** A refused request is not retried, and no refusal
+    ///   stops the engine or disables trading. To stop the strategy generating orders, send
+    ///   [`TradingState::Disabled`](crate::engine::state::trading::TradingState::Disabled), for
+    ///   example with [`System::trading_state`](crate::system::System::trading_state).
     ///
     /// The engine collects all four outputs before it sends anything, so they may borrow `state`.
     ///
@@ -90,12 +90,16 @@ impl<T> RiskApproved<T> {
     }
 }
 
-/// Type that wraps order requests that have failed [`RiskManager`] checks, including the
-/// failure reason.
+/// An order request a [`RiskManager`] refused, and why.
+///
+/// A refusal concerns that one request only: the engine does not send it, reports it, and carries
+/// on. See [`RiskManager::check`].
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
-pub struct RiskRefused<T, Reason = String> {
+pub struct RiskRefused<T> {
+    /// The refused request.
     pub item: T,
-    pub reason: Reason,
+    /// Why it was refused.
+    pub reason: String,
 }
 
 impl<T> RiskRefused<T> {
@@ -105,20 +109,9 @@ impl<T> RiskRefused<T> {
             reason: reason.into(),
         }
     }
-}
 
-impl<T, Reason> RiskRefused<T, Reason> {
     pub fn into_item(self) -> T {
         self.item
-    }
-}
-
-impl<T, Reason> Unrecoverable for RiskRefused<T, Reason>
-where
-    Reason: Unrecoverable,
-{
-    fn is_unrecoverable(&self) -> bool {
-        self.reason.is_unrecoverable()
     }
 }
 
