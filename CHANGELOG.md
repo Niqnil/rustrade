@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-01
+
 ### Changed
 
 - **Breaking: the strategy can attribute a cash flow on the account as a whole to a position**
