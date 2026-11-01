@@ -49,6 +49,11 @@ name = "clock"
 path = "benches/clock/mod.rs"
 harness = false
 
+[[bench]]
+name = "sim_margin_valuation"
+path = "benches/sim_margin_valuation/mod.rs"
+harness = false
+
 [dev-dependencies]
 rustrade-instrument = { workspace = true, features = ["test-utils"] }
 rust_decimal_macros = { workspace = true }

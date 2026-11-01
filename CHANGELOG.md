@@ -103,6 +103,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   take a `Decimal` square root, twice for a loss, though only `TearSheetGenerator::generate`
   reads the result. That was about 30% of a simulated step that fills an order.
 
+- **Breaking: a `SimulatedVenue`'s instruments are fixed when it is constructed**
+  (`rustrade-execution`, #813). Its public `instruments` field is now private. Read it with the
+  new `SimulatedVenue::instruments` and `SimulatedVenue::instrument`; to trade a different set of
+  instruments, construct a new venue. The venue now indexes its spot instruments by the two assets
+  each one pairs, once, at construction. Valuing a spot margin account no longer scans every
+  instrument for each balance, and neither does choosing a liquidation's trades. The valuation is
+  what the leverage limit checks on each borrowing order, and what the liquidation check runs at
+  the end of every market input and clock move while the account owes anything. A map changed
+  after construction would leave the index stale, and the account valued wrongly with no sign of
+  it. Which instrument values an asset is unchanged: the first by name that has a positive price.
+  The new `sim_margin_valuation` benchmark measures one market input with the liquidation check
+  on and off. The check's cost per input now grows with the assets held, not with the
+  instruments traded. At 1,000 instruments and 100 assets held it fell from about 235 µs to
+  about 6.4 µs.
+
 - **`HistoricalClock` reads its instant without a lock** (`rustrade`, #768). Its instant is held
   in a sequence lock over the seconds and nanoseconds instead of a `parking_lot::RwLock`. A read
   that overlaps an advance retries rather than blocking it, and advances on clones serialise
