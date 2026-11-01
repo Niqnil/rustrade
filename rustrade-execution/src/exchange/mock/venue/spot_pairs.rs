@@ -16,13 +16,13 @@ use rustrade_instrument::{
 ///
 /// Built once, from the instrument map the venue is constructed with, which the venue never
 /// changes afterwards.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub(super) struct SpotPairs(
     FnvHashMap<AssetNameExchange, FnvHashMap<AssetNameExchange, Vec<SpotPair>>>,
 );
 
 /// One spot instrument, seen from one of the two assets it pairs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(super) struct SpotPair {
     /// The instrument's name.
     pub instrument: InstrumentNameExchange,
