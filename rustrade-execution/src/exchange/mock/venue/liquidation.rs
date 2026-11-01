@@ -217,7 +217,7 @@ impl SimulatedVenue {
             if let Some(resting) = self.account.remove_order(&cid) {
                 let released = resting
                     .reservation
-                    .map(|reservation| self.release_reservation(&reservation, time_exchange));
+                    .map(|reservation| self.release_reservation(reservation, time_exchange));
                 events.extend(self.cancel_unfilled(resting.order, released, time_exchange));
             }
         }
@@ -484,8 +484,7 @@ impl SimulatedVenue {
         };
         self.account.ack_trade(trade.clone());
 
-        self.push_committed(events, commitment);
-        events.push(self.build_account_event(AccountEventKind::Trade(trade)));
+        self.push_committed(events, commitment, Some(trade));
         delivered(&settlement.credit)
     }
 

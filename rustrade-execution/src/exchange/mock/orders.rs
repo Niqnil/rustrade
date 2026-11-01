@@ -1,5 +1,6 @@
 //! Resting orders, held in the order a venue would match them.
 
+use crate::cash_flow::CashFlow;
 use crate::margin::MarginEffect;
 use crate::order::{
     Order, TimeInForce, UnindexedOrder,
@@ -50,6 +51,14 @@ pub struct Reservation {
     /// default at placement, so that a resting order's later fill borrows or repays as it
     /// was placed to.
     pub effect: MarginEffect,
+    /// The interest a margin account charged on [`borrowed`](Self::borrowed) when it lent it, not
+    /// yet reported. Empty when the order borrowed nothing, or traded when it borrowed.
+    ///
+    /// The balance restated when the order rested already includes the charge. Its cash flow is
+    /// held back because nothing has traded: no position exists yet for it to belong to. The
+    /// venue reports it after the order's first fill, or with the order's end if it never fills,
+    /// stamped at that instant.
+    pub unreported_interest: Vec<CashFlow<AssetNameExchange, InstrumentNameExchange>>,
 }
 
 impl Reservation {
@@ -662,6 +671,7 @@ mod tests {
             borrowed: Decimal::ZERO,
             excess_borrowed: Decimal::ZERO,
             effect: MarginEffect::NoSideEffect,
+            unreported_interest: Vec::new(),
         };
 
         let Err(AlreadyResting(refused)) = open.insert(

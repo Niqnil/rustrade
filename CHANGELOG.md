@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Breaking: the simulated venue reports a new loan's interest after the fill it pays for**
+  (`rustrade-execution`, #821). A margin order that borrows is charged interest at once
+  (`InterestTiming::OnBorrow`). The venue reported that `CashFlow` before the trade that opened the
+  position. So a `CashFlowAttributionStrategy` found no position to attribute it to, and
+  `route_to_base` returned `None` for the first charge of every short. The order is now
+  `[balance.., trade, cash flow]`. The balances still come before the fill, and they already
+  include the interest.
+
+  An order that borrows when it rests on the book, or when it is held for a later bar
+  (`MarketOrderTiming::NextBar`) or a fresh market (`StaleMarketPolicy::Wait`), has not traded
+  yet. Its cash flow now waits:
+  - It is reported after the order's first fill, or with the order's end if it never fills (a
+    cancel, an expiry, or a release it cannot afford).
+  - It is stamped at that instant, not when the charge was made, because the engine applies no
+    flow stamped before the position it belongs to.
+
+  The order's balance still shows the charge from the moment it rests.
+
+  Breaking: `exchange::mock::orders::Reservation` gains a public `unreported_interest` field,
+  which holds that cash flow. Code that builds a `Reservation` must set it (`Vec::new()` for none).
+
 ## [0.18.0] - 2026-11-01
 
 ### Changed
