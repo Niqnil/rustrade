@@ -25,8 +25,9 @@ use crate::{
     risk::RiskManager,
     statistic::time::TimeInterval,
     strategy::{
-        algo::AlgoStrategy, close_positions::ClosePositionsStrategy,
-        on_disconnect::OnDisconnectStrategy, on_trading_disabled::OnTradingDisabled,
+        algo::AlgoStrategy, cash_flow_attribution::CashFlowAttributionStrategy,
+        close_positions::ClosePositionsStrategy, on_disconnect::OnDisconnectStrategy,
+        on_trading_disabled::OnTradingDisabled,
     },
     system::config::ExecutionConfig,
 };
@@ -159,6 +160,7 @@ where
     SummaryInterval: TimeInterval,
     Strategy: AlgoStrategy<State = EngineState<GlobalData, InstrumentData>>
         + ClosePositionsStrategy<State = EngineState<GlobalData, InstrumentData>>
+        + CashFlowAttributionStrategy<State = EngineState<GlobalData, InstrumentData>>
         + OnTradingDisabled<
             HistoricalClock,
             EngineState<GlobalData, InstrumentData>,
@@ -314,6 +316,7 @@ where
     SummaryInterval: TimeInterval,
     Strategy: AlgoStrategy<State = EngineState<GlobalData, InstrumentData>>
         + ClosePositionsStrategy<State = EngineState<GlobalData, InstrumentData>>
+        + CashFlowAttributionStrategy<State = EngineState<GlobalData, InstrumentData>>
         + OnTradingDisabled<
             HistoricalClock,
             EngineState<GlobalData, InstrumentData>,

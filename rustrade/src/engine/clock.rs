@@ -2,9 +2,26 @@ use crate::{EngineEvent, engine::Processor, execution::AccountStreamEvent};
 use chrono::{DateTime, Utc};
 use rustrade_data::streams::consumer::MarketStreamEvent;
 use rustrade_execution::AccountEventKind;
+use seqlock::{RawInstant, SeqLockInstant};
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, sync::Arc};
+use std::{
+    fmt::Debug,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tracing::{debug, error, warn};
+
+mod seqlock;
+
+/// The atomics [`seqlock`] is built from: the standard library's here, a model checker's in its
+/// test.
+mod sync {
+    pub(super) use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering, fence};
+
+    pub(super) fn spin() {
+        std::hint::spin_loop();
+    }
+}
 
 /// Defines how an [`Engine`](super::Engine) will determine the current time.
 ///
@@ -16,8 +33,28 @@ use tracing::{debug, error, warn};
 /// that order — from each event's `time_exchange`. For aggregated payloads such as
 /// candles, `time_exchange` must be the period **end** (`close_time`) to avoid
 /// lookahead; see [`rustrade_data::event::MarketEvent::time_exchange`].
+///
+/// # Two readings
+/// [`time`](Self::time) stamps things: when a request was sent, when a run started.
+/// [`instant`](Self::instant) measures how long things take, such as an order's in-flight
+/// deadline. For a live clock the two differ: wall time can step back or jump forward when the
+/// host's clock is set, and a duration measured across such a step comes out wrong.
 pub trait EngineClock {
     fn time(&self) -> DateTime<Utc>;
+
+    /// A reading of the clock's monotonic time, for measuring how long something takes.
+    ///
+    /// A later reading is never earlier than an earlier one, and the time between two readings is
+    /// the time that passed on this clock. Only readings of one clock, or of its clones, compare
+    /// meaningfully: each clock counts from its own origin.
+    ///
+    /// The default reads [`time`](Self::time), which suits a clock whose time only moves forward,
+    /// such as one driven by event timestamps. A clock that follows the host's wall clock should
+    /// override it with a monotonic source, as [`LiveClock`] does: otherwise a step of the host's
+    /// clock moves the reading too.
+    fn instant(&self) -> EngineInstant {
+        EngineInstant::from_time(self.time())
+    }
 
     /// Advance the clock's notion of "current time" to `time`, if `time` is later than the
     /// current time (**monotonic** — never regresses).
@@ -42,6 +79,75 @@ pub trait EngineClock {
     fn advance_to(&self, _time: DateTime<Utc>) {}
 }
 
+/// A reading of an [`EngineClock`]'s monotonic time: see [`EngineClock::instant`].
+///
+/// It is the time elapsed since the clock's origin, so readings of one clock order by when they
+/// were taken and differ by the time between them. Readings of different clocks do not compare.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct EngineInstant {
+    /// Nanoseconds since the clock's origin. Signed, so that an instant estimated from a wall
+    /// time older than the origin, as the in-flight watch makes for an order it was not told of,
+    /// can lie before it. Any `Duration` either way fits.
+    nanos: i128,
+}
+
+impl EngineInstant {
+    const NANOS_PER_SEC: i128 = 1_000_000_000;
+
+    /// The reading `elapsed` after the clock's origin.
+    ///
+    /// For an [`EngineClock`] that keeps its own monotonic source: count from a fixed origin, such
+    /// as the instant the clock was created at.
+    pub const fn from_elapsed(elapsed: Duration) -> Self {
+        Self {
+            nanos: nanos(elapsed),
+        }
+    }
+
+    /// The reading of a clock whose monotonic time is its time: the time since
+    /// [`DateTime::<Utc>::MIN_UTC`]. What [`EngineClock::instant`] returns by default.
+    fn from_time(time: DateTime<Utc>) -> Self {
+        // `MIN_UTC` is the earliest `DateTime`, so the difference is never negative.
+        Self::from_elapsed(
+            time.signed_duration_since(DateTime::<Utc>::MIN_UTC)
+                .to_std()
+                .unwrap_or_default(),
+        )
+    }
+
+    /// The reading `duration` after this one.
+    pub fn saturating_add(self, duration: Duration) -> Self {
+        Self {
+            nanos: self.nanos.saturating_add(nanos(duration)),
+        }
+    }
+
+    /// The time from `earlier` to this reading, or zero if `earlier` is later, or
+    /// [`Duration::MAX`] if it is longer than that.
+    pub fn saturating_duration_since(self, earlier: Self) -> Duration {
+        let since = self.nanos.saturating_sub(earlier.nanos).max(0);
+        let Ok(secs) = u64::try_from(since / Self::NANOS_PER_SEC) else {
+            return Duration::MAX;
+        };
+        // A remainder of a division by a billion always fits: the fallback is never taken.
+        let subsec = u32::try_from(since % Self::NANOS_PER_SEC).unwrap_or_default();
+        Duration::new(secs, subsec)
+    }
+
+    /// The reading `duration` before this one, which may be before the clock's origin.
+    pub(crate) fn saturating_sub(self, duration: Duration) -> Self {
+        Self {
+            nanos: self.nanos.saturating_sub(nanos(duration)),
+        }
+    }
+}
+
+/// `duration` in nanoseconds. Any `Duration` fits an `i128`: at most about 1.8e28.
+const fn nanos(duration: Duration) -> i128 {
+    // Widening casts: `u64` and `u32` both fit an `i128`.
+    duration.as_secs() as i128 * EngineInstant::NANOS_PER_SEC + duration.subsec_nanos() as i128
+}
+
 /// Defines how to extract an "exchange timestamp" from an event.
 ///
 /// Used by a [`HistoricalClock`] to assist deriving the "current" `Engine` time.
@@ -53,12 +159,31 @@ pub trait TimeExchange {
 }
 
 /// Live `Clock` using `Utc::now()`.
+///
+/// Its [`time`](EngineClock::time) follows the host's wall clock, unadjusted. That clock can step
+/// back or jump forward: an NTP step, a manual change, a virtual machine resumed after a pause. So
+/// two stamps from it can be out of order, and the difference between them is not the time that
+/// passed.
+///
+/// Durations, such as an order's in-flight deadline, are measured on its
+/// [`instant`](EngineClock::instant) instead: the host's monotonic clock
+/// ([`std::time::Instant`]), which no setting of the wall clock moves. On some platforms, Linux
+/// among them, the monotonic clock does not advance while the host is suspended, so a duration
+/// that spans a suspension leaves it out.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct LiveClock;
 
 impl EngineClock for LiveClock {
     fn time(&self) -> DateTime<Utc> {
         Utc::now()
+    }
+
+    /// The time since the process first read a `LiveClock`'s instant.
+    fn instant(&self) -> EngineInstant {
+        static ORIGIN: OnceLock<std::time::Instant> = OnceLock::new();
+        // The origin is read first, so `now` is never before it.
+        let origin = *ORIGIN.get_or_init(std::time::Instant::now);
+        EngineInstant::from_elapsed(std::time::Instant::now().saturating_duration_since(origin))
     }
 }
 
@@ -105,6 +230,12 @@ impl EngineClock for TokioClock {
             .and_then(|elapsed| self.anchor_time.checked_add_signed(elapsed))
             .unwrap_or(DateTime::<Utc>::MAX_UTC)
     }
+
+    /// The [`tokio::time::Instant`] time elapsed since the clock was created, so paused time
+    /// controls it as it does [`time`](EngineClock::time).
+    fn instant(&self) -> EngineInstant {
+        EngineInstant::from_elapsed(self.anchor_instant.elapsed())
+    }
 }
 
 impl<Event> Processor<&Event> for TokioClock {
@@ -127,24 +258,43 @@ impl<Event> Processor<&Event> for TokioClock {
 /// simulated time passes where no data does — but it differs from a wall clock, and code that
 /// measures elapsed time by differencing `time()` will measure the data rather than itself.
 ///
+/// Its [`instant`](EngineClock::instant) is its time, so durations such as an order's in-flight
+/// deadline are measured in simulated time too.
+///
 /// Note that this cannot be initialised without a starting `last_exchange_timestamp`.
-#[derive(Debug, Clone)]
+///
+/// # Sharing between threads
+///
+/// Clones share one instant, so advancing any clone advances them all.
+/// - [`time`](EngineClock::time) never takes a lock. A read that overlaps an advance retries, and
+///   never blocks the advance. A read that finds an advance storing spins until it is done, which
+///   takes a few stores, unless the advancing thread is descheduled in between.
+/// - Advances ([`advance_to`](EngineClock::advance_to) and [`process`](Processor::process))
+///   serialise among themselves: one waits, spinning, while another on a clone is storing. An
+///   advance to an instant no later than the current one stores nothing and takes no lock: it
+///   waits only as a read does.
+/// - Monotonic: whatever order advances on several threads arrive in, the clock ends at the
+///   latest instant any of them was given, and a reader never sees it move backwards.
+/// - Every `DateTime<Utc>` is held exactly, from [`DateTime::<Utc>::MIN_UTC`] to
+///   [`DateTime::<Utc>::MAX_UTC`], leap seconds and nanoseconds included.
+#[derive(Clone)]
 pub struct HistoricalClock {
-    inner: Arc<parking_lot::RwLock<HistoricalClockInner>>,
+    inner: Arc<SeqLockInstant>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
-struct HistoricalClockInner {
-    time_exchange_last: DateTime<Utc>,
+impl Debug for HistoricalClock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HistoricalClock")
+            .field("time_exchange_last", &self.inner.load())
+            .finish()
+    }
 }
 
 impl HistoricalClock {
     /// Construct a new `HistoricalClock` using the provided `last_exchange_time` as a seed.
     pub fn new(last_exchange_time: DateTime<Utc>) -> Self {
         Self {
-            inner: Arc::new(parking_lot::RwLock::new(HistoricalClockInner {
-                time_exchange_last: last_exchange_time,
-            })),
+            inner: Arc::new(SeqLockInstant::new(last_exchange_time)),
         }
     }
 
@@ -156,18 +306,12 @@ impl HistoricalClock {
 
 impl EngineClock for HistoricalClock {
     fn time(&self) -> DateTime<Utc> {
-        self.inner.read().time_exchange_last
+        self.inner.load()
     }
 
     fn advance_to(&self, time: DateTime<Utc>) {
-        let mut lock = self.inner.write();
-        // Monotonic: only advance strictly forwards, so the clock never regresses. An earlier — or
-        // equal — `time` is a no-op. This is stricter than `process`'s in-order branch (`>=`), but
-        // equivalent in effect: assigning `time_exchange_last` a value it already holds changes
-        // nothing now that no wall-clock anchor is re-based alongside it.
-        if time > lock.time_exchange_last {
-            lock.time_exchange_last = time;
-        }
+        // Monotonic: an earlier or equal `time` leaves the clock where it is.
+        self.inner.advance(time.into());
     }
 }
 
@@ -183,31 +327,34 @@ where
             return;
         };
 
-        // Obtain lock
-        let mut lock = self.inner.write();
+        // Decided and stored at once, so that another clone's concurrent advance cannot fall
+        // between the comparison and the store. Logged after, outside the store. Compared as raw
+        // instants: the held instant is rebuilt as a `DateTime` only to be logged.
+        let time_event = RawInstant::from(time_event_exchange);
+        let held = self.inner.advance(time_event);
 
-        // Input event is more recent
-        if time_event_exchange >= lock.time_exchange_last {
+        // Input event is as recent or more recent
+        if time_event >= held {
             debug!(
                 ?event,
-                time_exchange_last_current = ?lock.time_exchange_last,
+                time_exchange_last_current = ?held.to_datetime(),
                 time_update = ?time_event_exchange,
                 "HistoricalClock updating based on input event time_exchange"
             );
-            lock.time_exchange_last = time_event_exchange;
             return;
         };
+        let time_exchange_last = held.to_datetime();
 
         // Input event is older, so log at varying degrees of severity
         let time_diff_secs = time_event_exchange
-            .signed_duration_since(lock.time_exchange_last)
+            .signed_duration_since(time_exchange_last)
             .num_seconds()
             .abs();
 
         if time_diff_secs < 1 {
             debug!(
                 ?event,
-                time_exchange_last_current = ?lock.time_exchange_last,
+                time_exchange_last_current = ?time_exchange_last,
                 time_update = ?time_event_exchange,
                 time_diff_secs,
                 "HistoricalClock received out-of-order events"
@@ -215,7 +362,7 @@ where
         } else if time_diff_secs < 30 {
             warn!(
                 ?event,
-                time_exchange_last_current = ?lock.time_exchange_last,
+                time_exchange_last_current = ?time_exchange_last,
                 time_update = ?time_event_exchange,
                 time_diff_secs,
                 "HistoricalClock received out-of-order events"
@@ -223,7 +370,7 @@ where
         } else {
             error!(
                 ?event,
-                time_exchange_last_current = ?lock.time_exchange_last,
+                time_exchange_last_current = ?time_exchange_last,
                 time_update = ?time_event_exchange,
                 time_diff_secs,
                 "HistoricalClock received out-of-order events"
@@ -244,6 +391,9 @@ impl<MarketEventKind: Debug> TimeExchange for EngineEvent<MarketEventKind> {
                     // Per-pair isolated balance update — advance on its event time, consistent with
                     // its asset-keyed sibling `BalanceStreamUpdate`.
                     Some(update.balance.time_exchange)
+                }
+                AccountEventKind::InstrumentBalanceSnapshot(snapshot) => {
+                    Some(snapshot.balance.time_exchange)
                 }
                 AccountEventKind::OrderSnapshot(order) => order.0.state.time_exchange(),
                 AccountEventKind::OrderCancelled(response) => response
@@ -386,7 +536,7 @@ mod tests {
             }
 
             assert_eq!(
-                clock.inner.read().time_exchange_last,
+                clock.time(),
                 test.expected_time_exchange_last,
                 "TC{} ({}) failed - incorrect time_exchange_last",
                 index,
@@ -467,18 +617,18 @@ mod tests {
         // advances to the split, then monotonically through the intraday prints.
         let mut clock = HistoricalClock::new(effective - TimeDelta::days(1));
         clock.process(&corporate_action_event(effective));
-        assert_eq!(clock.inner.read().time_exchange_last, effective);
+        assert_eq!(clock.time(), effective);
         clock.process(&market_event(intraday_open));
-        assert_eq!(clock.inner.read().time_exchange_last, intraday_open);
+        assert_eq!(clock.time(), intraday_open);
         clock.process(&market_event(intraday_later));
-        assert_eq!(clock.inner.read().time_exchange_last, intraday_later);
+        assert_eq!(clock.time(), intraday_later);
 
         // Out-of-order safety: a midnight split arriving after that day's intraday events
         // must not regress the clock (same monotonic guard as any other event).
         let mut clock = HistoricalClock::new(intraday_later);
         clock.process(&corporate_action_event(effective));
         assert_eq!(
-            clock.inner.read().time_exchange_last,
+            clock.time(),
             intraday_later,
             "an earlier midnight split must not regress time_exchange_last"
         );
@@ -493,13 +643,230 @@ mod tests {
         // jump the clock to a far-future contract expiry before stamping the settlement fill).
         let clock = HistoricalClock::new(base);
         clock.advance_to(later);
-        assert_eq!(clock.inner.read().time_exchange_last, later);
+        assert_eq!(clock.time(), later);
 
         // Advancing to an earlier — or equal — instant is a no-op: the clock never regresses.
         clock.advance_to(base);
-        assert_eq!(clock.inner.read().time_exchange_last, later);
+        assert_eq!(clock.time(), later);
         clock.advance_to(later);
-        assert_eq!(clock.inner.read().time_exchange_last, later);
+        assert_eq!(clock.time(), later);
+    }
+
+    /// Every `DateTime<Utc>` round-trips through the clock exactly: the extremes, which builders
+    /// seed it with, and a leap second, whose nanoseconds exceed one second.
+    #[test]
+    fn historical_clock_holds_every_instant_exactly() {
+        use chrono::NaiveDate;
+
+        let leap_second = NaiveDate::from_ymd_opt(2016, 12, 31)
+            .unwrap()
+            .and_hms_nano_opt(23, 59, 59, 1_500_000_000)
+            .unwrap()
+            .and_utc();
+        let sub_microsecond = DateTime::<Utc>::from_timestamp(-1, 999_999_999).unwrap();
+
+        for time in [
+            DateTime::<Utc>::MIN_UTC,
+            DateTime::<Utc>::MAX_UTC,
+            DateTime::<Utc>::UNIX_EPOCH,
+            leap_second,
+            sub_microsecond,
+        ] {
+            assert_eq!(
+                HistoricalClock::new(time).time(),
+                time,
+                "seeded with {time:?}"
+            );
+
+            let clock = HistoricalClock::new(DateTime::<Utc>::MIN_UTC);
+            clock.advance_to(time);
+            assert_eq!(clock.time(), time, "advanced to {time:?}");
+
+            let mut clock = HistoricalClock::new(DateTime::<Utc>::MIN_UTC);
+            clock.process(&market_event(time));
+            assert_eq!(clock.time(), time, "processed an event at {time:?}");
+        }
+    }
+
+    /// The seqlock compares instants as seconds then nanoseconds, which must order them exactly as
+    /// `DateTime<Utc>` does, around a leap second and at both ends of the range too.
+    #[test]
+    fn raw_instants_order_as_their_datetimes() {
+        use chrono::NaiveDate;
+
+        let at = |h, m, s, nanos| {
+            NaiveDate::from_ymd_opt(2016, 12, 31)
+                .unwrap()
+                .and_hms_nano_opt(h, m, s, nanos)
+                .unwrap()
+                .and_utc()
+        };
+        let times = [
+            DateTime::<Utc>::MIN_UTC,
+            DateTime::<Utc>::MIN_UTC + TimeDelta::nanoseconds(1),
+            DateTime::<Utc>::from_timestamp(-1, 999_999_999).unwrap(),
+            DateTime::<Utc>::UNIX_EPOCH,
+            at(23, 59, 58, 999_999_999),
+            at(23, 59, 59, 0),
+            at(23, 59, 59, 999_999_999),
+            // The leap second.
+            at(23, 59, 59, 1_000_000_000),
+            at(23, 59, 59, 1_999_999_999),
+            at(0, 0, 0, 0) + TimeDelta::days(1),
+            DateTime::<Utc>::MAX_UTC - TimeDelta::nanoseconds(1),
+            DateTime::<Utc>::MAX_UTC,
+        ];
+
+        for a in times {
+            assert_eq!(RawInstant::from(a).to_datetime(), a, "{a:?} round trip");
+            for b in times {
+                assert_eq!(
+                    RawInstant::from(a).cmp(&RawInstant::from(b)),
+                    a.cmp(&b),
+                    "{a:?} against {b:?}"
+                );
+            }
+        }
+    }
+
+    /// Neither `advance_to` nor `process` moves the clock backwards, including from the largest
+    /// instant, and an event at the current instant leaves it there.
+    #[test]
+    fn historical_clock_never_moves_backwards() {
+        let max = DateTime::<Utc>::MAX_UTC;
+        let earlier = max - TimeDelta::nanoseconds(1);
+
+        let mut clock = HistoricalClock::new(max);
+        clock.advance_to(earlier);
+        assert_eq!(clock.time(), max);
+        clock.process(&market_event(earlier));
+        assert_eq!(clock.time(), max);
+        clock.process(&market_event(DateTime::<Utc>::MIN_UTC));
+        assert_eq!(clock.time(), max);
+
+        // An event at the current instant is accepted, and changes nothing.
+        clock.process(&market_event(max));
+        assert_eq!(clock.time(), max);
+
+        // One nanosecond later is an advance.
+        let mut clock = HistoricalClock::new(earlier);
+        clock.process(&market_event(max));
+        assert_eq!(clock.time(), max);
+    }
+
+    /// `process` logs an event at the clock's instant or later at `DEBUG`, and an older one by how
+    /// much older it is: `DEBUG` within a second, `WARN` within 30 seconds, `ERROR` beyond.
+    #[test]
+    fn historical_clock_logs_an_older_event_by_how_late_it_is() {
+        use tracing::Level;
+
+        let base = DateTime::<Utc>::UNIX_EPOCH + TimeDelta::days(1);
+        let cases = [
+            ("a minute later", TimeDelta::seconds(60), Level::DEBUG),
+            ("at the same instant", TimeDelta::zero(), Level::DEBUG),
+            (
+                "half a second older",
+                -TimeDelta::milliseconds(500),
+                Level::DEBUG,
+            ),
+            ("10 seconds older", -TimeDelta::seconds(10), Level::WARN),
+            ("a minute older", -TimeDelta::seconds(60), Level::ERROR),
+        ];
+
+        for (name, offset, expected) in cases {
+            let mut clock = HistoricalClock::new(base);
+            let levels = levels_logged(|| clock.process(&market_event(base + offset)));
+            assert_eq!(levels, [expected], "an event {name}");
+            assert_eq!(clock.time(), base.max(base + offset), "an event {name}");
+        }
+    }
+
+    /// Runs `f` and returns the level of each `tracing` event it emitted on this thread.
+    fn levels_logged(f: impl FnOnce()) -> Vec<tracing::Level> {
+        let ((), events) = rustrade_instrument::test_utils::logs::capture(f);
+        events.iter().map(|event| event.level).collect()
+    }
+
+    /// `Debug` shows the instant held, as the clock's only state.
+    #[test]
+    fn historical_clock_debug_shows_its_instant() {
+        let clock = HistoricalClock::new(DateTime::<Utc>::UNIX_EPOCH);
+        assert_eq!(
+            format!("{clock:?}"),
+            "HistoricalClock { time_exchange_last: 1970-01-01T00:00:00Z }"
+        );
+    }
+
+    /// Clones share one instant: advancing either, by `advance_to` or by `process`, advances both.
+    /// A clock built separately with the same seed does not.
+    #[test]
+    fn historical_clock_clones_share_one_instant() {
+        let base = DateTime::<Utc>::UNIX_EPOCH;
+        let mut clock = HistoricalClock::new(base);
+        let clone = clock.clone();
+        let separate = HistoricalClock::new(base);
+
+        assert!(clock.is_shared_with(&clone));
+        assert!(clone.is_shared_with(&clock));
+        assert!(!clock.is_shared_with(&separate));
+
+        clone.advance_to(base + TimeDelta::seconds(1));
+        assert_eq!(clock.time(), base + TimeDelta::seconds(1));
+
+        clock.process(&market_event(base + TimeDelta::seconds(2)));
+        assert_eq!(clone.time(), base + TimeDelta::seconds(2));
+
+        assert_eq!(separate.time(), base);
+    }
+
+    /// Clones advanced from several threads end at the latest instant any of them was given, and a
+    /// reader running alongside never sees the clock move backwards or read an instant no writer
+    /// stored.
+    #[test]
+    fn historical_clock_advances_from_several_threads() {
+        // Few iterations under Miri, which interprets every step.
+        const STEPS: i64 = if cfg!(miri) { 20 } else { 2_000 };
+        const WRITERS: i64 = 4;
+
+        let base = DateTime::<Utc>::UNIX_EPOCH;
+        // Writer `w` stores `base + (step * WRITERS + w)` seconds and as many nanoseconds, so a
+        // read mixing two writes' seconds and nanoseconds does not have this shape.
+        let instant = |n: i64| base + TimeDelta::seconds(n) + TimeDelta::nanoseconds(n);
+        let clock = HistoricalClock::new(base);
+
+        std::thread::scope(|scope| {
+            for writer in 0..WRITERS {
+                let mut clock = clock.clone();
+                scope.spawn(move || {
+                    for step in 0..STEPS {
+                        let n = step * WRITERS + writer;
+                        if n % 2 == 0 {
+                            clock.advance_to(instant(n));
+                        } else {
+                            clock.process(&market_event(instant(n)));
+                        }
+                    }
+                });
+            }
+
+            let reader = clock.clone();
+            scope.spawn(move || {
+                let mut previous = base;
+                for _ in 0..STEPS * WRITERS {
+                    let time = reader.time();
+                    assert!(time >= previous, "{time:?} read after {previous:?}");
+                    let elapsed = time - base;
+                    assert_eq!(
+                        elapsed.subsec_nanos() as i64,
+                        elapsed.num_seconds(),
+                        "{time:?} mixes two writes"
+                    );
+                    previous = time;
+                }
+            });
+        });
+
+        assert_eq!(clock.time(), instant(STEPS * WRITERS - 1));
     }
 
     /// A cash flow is stamped with the venue's time, so a historical clock advances on one as it
@@ -563,6 +930,33 @@ mod tests {
         assert_eq!(event.time_exchange(), Some(time));
     }
 
+    /// An isolated pair's balance snapshot is stamped with the time of the state it reads, so a
+    /// historical clock advances on one as it does on an account-wide balance snapshot.
+    #[test]
+    fn an_instrument_balance_snapshot_reports_its_time_exchange() {
+        use rustrade_execution::{
+            AccountEvent, AccountEventKind, InstrumentBalanceSnapshot,
+            balance::{AssetBalance, Balance},
+        };
+        use rustrade_instrument::{asset::AssetIndex, exchange::ExchangeIndex};
+
+        let time = DateTime::<Utc>::MIN_UTC + TimeDelta::hours(1);
+        let event: EngineEvent<()> =
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent::new(
+                ExchangeIndex(0),
+                AccountEventKind::InstrumentBalanceSnapshot(InstrumentBalanceSnapshot::new(
+                    InstrumentIndex::new(0),
+                    AssetBalance::new(
+                        AssetIndex(0),
+                        Balance::new(Decimal::ONE, Decimal::ONE),
+                        time,
+                    ),
+                )),
+            )));
+
+        assert_eq!(event.time_exchange(), Some(time));
+    }
+
     /// A `TokioClock` reads its start, then moves exactly as far as tokio's clock does.
     #[tokio::test(start_paused = true)]
     async fn a_tokio_clock_moves_with_tokios_clock() {
@@ -572,5 +966,93 @@ mod tests {
 
         tokio::time::advance(std::time::Duration::from_millis(1_500)).await;
         assert_eq!(clock.time(), start + chrono::TimeDelta::milliseconds(1_500));
+    }
+
+    /// A `TokioClock`'s instant counts tokio's time from the clock's creation, so paused time
+    /// controls deadlines as it does stamps.
+    #[tokio::test(start_paused = true)]
+    async fn a_tokio_clocks_instant_moves_with_tokios_clock() {
+        let clock = TokioClock::starting_at(DateTime::<Utc>::UNIX_EPOCH);
+        let copy = clock;
+        assert_eq!(clock.instant(), EngineInstant::from_elapsed(Duration::ZERO));
+
+        tokio::time::advance(Duration::from_millis(1_500)).await;
+        assert_eq!(
+            clock.instant(),
+            EngineInstant::from_elapsed(Duration::from_millis(1_500))
+        );
+        assert_eq!(
+            copy.instant(),
+            clock.instant(),
+            "a copy counts from the same origin"
+        );
+    }
+
+    /// A `LiveClock`'s instant never moves back, and every `LiveClock` counts from one origin.
+    #[test]
+    fn a_live_clocks_instant_moves_forward() {
+        let first = LiveClock.instant();
+        std::thread::sleep(Duration::from_millis(2));
+        let second = LiveClock.instant();
+        assert!(
+            second.saturating_duration_since(first) >= Duration::from_millis(2),
+            "{first:?} then {second:?}"
+        );
+    }
+
+    /// A `HistoricalClock`'s instant is its time, so it moves with the events and never back.
+    #[test]
+    fn a_historical_clocks_instant_is_its_time() {
+        let base = DateTime::<Utc>::MIN_UTC;
+        let clock = HistoricalClock::new(base);
+        assert_eq!(clock.instant(), EngineInstant::from_elapsed(Duration::ZERO));
+
+        clock.advance_to(base + TimeDelta::days(1));
+        let day = Duration::from_secs(24 * 60 * 60);
+        assert_eq!(clock.instant(), EngineInstant::from_elapsed(day));
+        clock.advance_to(base);
+        assert_eq!(clock.instant(), EngineInstant::from_elapsed(day));
+
+        let latest = HistoricalClock::new(DateTime::<Utc>::MAX_UTC).instant();
+        assert!(latest > clock.instant(), "the whole range maps in order");
+    }
+
+    #[test]
+    fn engine_instants_add_and_subtract_saturating() {
+        let five = EngineInstant::from_elapsed(Duration::from_secs(5));
+        let seven = five.saturating_add(Duration::from_secs(2));
+        assert_eq!(seven, EngineInstant::from_elapsed(Duration::from_secs(7)));
+        assert_eq!(
+            seven.saturating_duration_since(five),
+            Duration::from_secs(2)
+        );
+        assert_eq!(five.saturating_duration_since(seven), Duration::ZERO);
+        assert_eq!(
+            five.saturating_sub(Duration::from_secs(2)),
+            EngineInstant::from_elapsed(Duration::from_secs(3))
+        );
+        let before_origin = five.saturating_sub(Duration::from_secs(9));
+        assert!(before_origin < EngineInstant::from_elapsed(Duration::ZERO));
+        assert_eq!(
+            five.saturating_duration_since(before_origin),
+            Duration::from_secs(9)
+        );
+
+        let latest = EngineInstant::from_elapsed(Duration::MAX);
+        assert_eq!(
+            latest.saturating_duration_since(EngineInstant::from_elapsed(Duration::ZERO)),
+            Duration::MAX
+        );
+        assert_eq!(
+            latest.saturating_duration_since(before_origin),
+            Duration::MAX,
+            "longer than a Duration holds"
+        );
+        let sub_second = Duration::new(3, 999_999_999);
+        assert_eq!(
+            EngineInstant::from_elapsed(sub_second)
+                .saturating_duration_since(EngineInstant::from_elapsed(Duration::ZERO)),
+            sub_second
+        );
     }
 }

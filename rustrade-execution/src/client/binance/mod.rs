@@ -12,9 +12,9 @@
 //!
 //! # Orders are checked against the symbol's rules before they are sent
 //!
-//! Each client reads the symbol's tick, lot and notional rules from Binance's spot `exchangeInfo`
-//! on the symbol's first order, and refuses an order that breaks them without sending it: a price
-//! or quantity off its grid as [`OrderError::InvalidPrecision`](crate::error::OrderError::InvalidPrecision)
+//! Each client reads the symbol's tick, lot, notional and trailing-offset rules from Binance's
+//! spot `exchangeInfo` on the symbol's first order, and refuses an order that breaks them without
+//! sending it: a price or quantity off its grid as [`OrderError::InvalidPrecision`](crate::error::OrderError::InvalidPrecision)
 //! with [`NotOnGrid`](crate::error::PrecisionLimit::NotOnGrid), and one outside its range as
 //! [`OrderError::OutOfBounds`](crate::error::OrderError::OutOfBounds). Nothing is rounded.
 //!
@@ -47,7 +47,14 @@
 //! connection drops or goes silent. The heartbeat is checked every 30 s: a check that finds no
 //! frame or ping since the last one reconnects, except the first check on each connection, which
 //! is a grace. Silence is therefore noticed after 30 to 60 s. Each reconnect recovers the fills
-//! and order endings the stream missed (see each client's `account_stream`).
+//! and order endings the stream missed (see each client's `account_stream`), then restates its
+//! balances (see [below](#balance-restatement-after-a-reconnect)).
+//!
+//! The span of fills a reconnect recovers is placed on Binance's clock, as the times Binance
+//! stamped on the stream's events show it (each event's `E`), counted on from their arrival on a
+//! monotonic clock. So a host clock ahead of Binance's does not start the span after fills Binance
+//! stamped during the outage, and one stepped back before the reconnect does not end it early.
+//! Before the stream's first event the span starts from this host's time.
 //!
 //! - **Attempts.** A dropped connection, and each reconnect that fails after it, spends one
 //!   attempt: a wait, then a reconnect. A reconnect fails when its connect, its user-data
@@ -73,6 +80,75 @@
 //! expired, which spends an attempt like any other failure. Its key is kept alive as each
 //! connection opens and every 30 minutes after, which Binance documents as enough to keep it
 //! valid.
+//!
+//! # Balance restatement after a reconnect
+//!
+//! A balance or debt event the venue sends while an account stream is down is lost, so each
+//! reconnect restates the account's balances. Once the gap's fills have been read, the stream
+//! reads the balances over REST and delivers each of the `assets` it was opened for (all of them
+//! when empty) as a [`BalanceSnapshot`](crate::AccountEventKind::BalanceSnapshot), debt included.
+//! An isolated margin stream delivers its pairs' base and quote as
+//! [`InstrumentBalanceSnapshot`](crate::AccountEventKind::InstrumentBalanceSnapshot)s instead:
+//! each pair's base, then its quote, the pairs in no particular order.
+//!
+//! - **Stamp.** The earlier of this host's time and the venue's time when the read's request was
+//!   sent, as the stream's own events and the server-time reads show the venue's clock (see
+//!   below), less 5 s for Binance's REST view trailing its stream. A stream event newer than the
+//!   state the read shows then still applies over it. The read starts no sooner than 5 s, on the
+//!   venue's clock, after the latest balance or debt event the stream delivered, and its stamp is
+//!   never earlier than that event's: an earlier one would leave the engine keeping that event's
+//!   state.
+//! - **Failure.** A read that fails, or does not finish within 30 s (waits for rate limits
+//!   included), is logged at `warn` and retried while connected, after 5 s and then twice as long
+//!   each time, up to 2 minutes. It is never given up. A later reconnect replaces it with a read
+//!   due at once.
+//! - **Fills not yet recovered.** A gap whose fill read failed does not hold the restatement
+//!   back, so the balances can include fills the stream has yet to deliver. They follow when the
+//!   gap's retry reads them, or never if it is given up (see
+//!   [`FillRecoveryGaveUp`](crate::AccountEventKind::FillRecoveryGaveUp)).
+//! - **Retries wait on it.** The restatement, the gaps' fill reads and the order checks are retried
+//!   one at a time, so a restatement read can delay a retry due meanwhile by up to its 30 s.
+//! - **Cost.** One account read per reconnect: weight 20 on spot, 10 on cross margin, and 10 per
+//!   five isolated pairs.
+//!
+//! # Signed requests are stamped on Binance's clock
+//!
+//! Binance refuses a signed request stamped 1 s or more ahead of its clock, or more than
+//! `recvWindow` (5 s) behind it, with `-1021`. So both clients stamp their signed requests with
+//! Binance's clock as read from `GET /api/v3/time` (weight 1), rather than with this host's: the
+//! earliest Binance's clock can read, counted on from the read on a monotonic clock. A stamp is
+//! then never ahead of Binance's clock, trails it by about the time the read's answer took to
+//! arrive, and does not move when this host's wall clock steps. [`BinanceMargin`] reads the time
+//! from the spot API, as margin has no endpoint for it.
+//!
+//! - **First request.** Each client's first request waits for one read. If the read fails, it is
+//!   logged at `warn`, and requests are stamped with this host's clock until a read succeeds.
+//! - **Refresh.** A request that finds the last read 5 minutes old starts another in the
+//!   background, and is sent without waiting for it.
+//! - **Suspend.** The monotonic clock does not advance while the host is suspended. A request
+//!   that finds this host's wall clock gone more than 1 s further than it since the last read
+//!   waits for a new read.
+//! - **`-1021`.** The client reads again before it returns the error, and the answer replaces its
+//!   reading, so a retry is stamped on the new one. Until the answer arrives, or if the read
+//!   fails, the reading held stays. No read is made during a rate-limit cooldown. The error is
+//!   unchanged: a transient connectivity error for a query, a rejection for an order. Whether to
+//!   retry stays the caller's decision.
+//! - **Observing it.** `host_clock_lead` on each client reports how far this host's clock leads
+//!   Binance's, negative when it trails. A read that finds the clocks 1 s or more apart logs at
+//!   `warn`.
+//! - **Account streams.** The reads also bound Binance's clock for the account streams, which place
+//!   fill recovery and balance restatement on Binance's time (see above), before a stream's first
+//!   event as well as after.
+//! - **Balance reads.** `fetch_balances` and `account_snapshot` stamp each balance with the
+//!   earlier of this host's time and Binance's, as the reads bound it, when the request was sent,
+//!   less 5 s. A host clock ahead of Binance's then does not carry into the stamp: a stamp ahead
+//!   of Binance's time would have the engine drop the stream's balance and debt events until
+//!   Binance's clock caught up with it. While no read has succeeded, as after a failed first
+//!   read, the stamp is taken from this host's time.
+//! - **Turning it off.** `server_time_sync` on each config, `true` by default, set to `false`
+//!   stamps signed requests with this host's clock, and balance reads from it alone: a host clock
+//!   ahead of Binance's then carries into their stamps, and keeping the two within bounds is the
+//!   caller's obligation.
 //!
 //! # Logging: `binance_sdk` writes request credentials at `DEBUG`
 //!
@@ -107,10 +183,14 @@
 //! `EnvFilter::from_default_env().add_directive(..)`, gets this backwards: it silently overrides
 //! an explicit request.
 
+mod commission;
 mod margin;
+mod restatement;
 mod rules;
+mod server_time;
 mod shared;
 mod spot;
 
+pub use commission::{CommissionDiscount, CommissionPart, CommissionRates};
 pub use margin::{BinanceMargin, BinanceMarginConfig, MarginForcedLiquidation};
 pub use spot::{BinanceSpot, BinanceSpotConfig, BinanceSpotConfigError};

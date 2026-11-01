@@ -325,6 +325,40 @@ async fn test_fetch_trades() {
     }
 }
 
+/// A read whose span ends an hour past the present, as a fill-recovery read placed on the
+/// venue's clock can: the venue must accept an end past its clock, and read the same fills as a
+/// read ending now.
+#[tokio::test]
+#[ignore]
+async fn test_fetch_trades_to_an_end_past_the_venues_clock() {
+    init_logging();
+
+    let config = test_config();
+    let client = HyperliquidClient::connect(config)
+        .await
+        .expect("Failed to connect");
+
+    let now = chrono::Utc::now();
+    let since = now - chrono::Duration::days(7);
+    let instruments: Vec<InstrumentNameExchange> = vec![];
+
+    let to_now = client
+        .fetch_trades(since, now, &instruments)
+        .await
+        .expect("a read ending now");
+    let ahead = client
+        .fetch_trades(since, now + chrono::Duration::hours(1), &instruments)
+        .await
+        .expect("a read ending an hour ahead");
+
+    println!(
+        "Trades to now: {}, to an hour ahead: {}",
+        to_now.trades.len(),
+        ahead.trades.len()
+    );
+    assert!(ahead.trades.len() >= to_now.trades.len());
+}
+
 // ============================================================================
 // Order Lifecycle Tests
 // ============================================================================

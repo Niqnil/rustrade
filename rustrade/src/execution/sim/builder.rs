@@ -311,6 +311,7 @@ impl<'a> SimExecutionBuilder<'a> {
         let (initial_state, seeds) = start.resolve(
             exchange,
             &generate_mock_exchange_instruments(self.instruments, exchange),
+            config.spot_margin.as_ref(),
         )?;
         config.initial_state = initial_state;
 

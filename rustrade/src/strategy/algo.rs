@@ -31,7 +31,8 @@ use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
 pub trait AlgoStrategy<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> {
     /// State used by the `AlgoStrategy` to determine what open and cancel requests to generate.
     ///
-    /// For Barter ecosystem strategies, this is the full `EngineState` of the trading system.
+    /// For a strategy run by the [`Engine`](crate::engine::Engine), this is the full `EngineState`
+    /// of the trading system.
     ///
     /// eg/ `EngineState<DefaultGlobalData, DefaultInstrumentMarketData>`
     type State;

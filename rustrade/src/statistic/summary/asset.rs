@@ -30,7 +30,7 @@ pub enum BalanceBasis {
     #[default]
     Gross,
 
-    /// Net asset value ([`Balance::net_asset`], `total - borrowed`).
+    /// Net asset value ([`Balance::net_asset`], `total - borrowed - interest`).
     ///
     /// # Caller precondition — net must stay strictly positive
     /// Drawdown is only well-defined while net asset stays **strictly above zero**. The underlying
@@ -45,8 +45,9 @@ pub enum BalanceBasis {
     /// asset strictly positive (or interpreting the drawdown metrics accordingly).
     ///
     /// # Freshness
-    /// [`Balance::net_asset`] excludes accrued interest and reflects debt only as fresh as the last
-    /// [`BalanceSnapshot`](rustrade_execution::AccountEventKind::BalanceSnapshot) or
+    /// [`Balance::net_asset`] deducts interest once the venue reports it accrued, so a repayment
+    /// out of holdings does not move it. It reflects debt, interest included, only as fresh as the
+    /// last [`BalanceSnapshot`](rustrade_execution::AccountEventKind::BalanceSnapshot) or
     /// [`MarginDebt`](rustrade_execution::AccountEventKind::MarginDebt): WS partial updates carry no
     /// debt, so on a venue that streams no debt changes the value steps at snapshot boundaries.
     NetAsset,
@@ -455,10 +456,10 @@ mod tests {
         assert_eq!(BalanceBasis::Gross.value(cash), dec!(100.0));
         assert_eq!(BalanceBasis::NetAsset.value(cash), dec!(100.0));
 
-        // Margin: net deducts borrowed principal (interest excluded).
+        // Margin: net deducts borrowed principal and accrued interest.
         let margin = Balance::new_margin(dec!(200.0), dec!(50.0), dec!(150.0), dec!(5.0));
         assert_eq!(BalanceBasis::Gross.value(margin), dec!(200.0));
-        assert_eq!(BalanceBasis::NetAsset.value(margin), dec!(50.0));
+        assert_eq!(BalanceBasis::NetAsset.value(margin), dec!(45.0));
 
         // Short: net asset is negative (borrowed base asset exceeds holdings).
         let short = Balance::new_margin(dec!(0.0), dec!(0.0), dec!(10.0), dec!(0.0));
@@ -548,6 +549,33 @@ mod tests {
         let tear_sheet = generator.generate();
         assert_eq!(tear_sheet.drawdown.unwrap().value, dec!(0.4)); // (50 - 30) / 50
         assert_eq!(tear_sheet.balance_end.unwrap().total, dec!(180.0));
+    }
+
+    /// Under NetAsset, interest is a loss as it accrues (50 -> 45 = 10% drawdown), and repaying the
+    /// loan and its interest out of holdings moves nothing further.
+    #[test]
+    fn net_asset_drawdown_counts_interest_as_it_accrues() {
+        let base_time = DateTime::<Utc>::MIN_UTC;
+        let seed = Timed::new(
+            Balance::new_margin(dec!(200.0), dec!(200.0), dec!(150.0), dec!(0.0)),
+            base_time,
+        );
+        let mut generator = TearSheetAssetGenerator::init_with_basis(&seed, BalanceBasis::NetAsset);
+
+        // 5 of interest accrues: net 200 - 150 - 5 = 45.
+        let accrued = Balance::new_margin(dec!(200.0), dec!(200.0), dec!(150.0), dec!(5.0));
+        generator.update_from_balance_parts(accrued, time_plus_days(base_time, 1));
+        assert_eq!(
+            generator.clone().generate().drawdown.unwrap().value,
+            dec!(0.1)
+        );
+
+        // All 155 repaid out of holdings: net is still 45, so the drawdown is unchanged.
+        let repaid = Balance::new_margin(dec!(45.0), dec!(45.0), dec!(0.0), dec!(0.0));
+        generator.update_from_balance_parts(repaid, time_plus_days(base_time, 2));
+        let tear_sheet = generator.generate();
+        assert_eq!(tear_sheet.drawdown.unwrap().value, dec!(0.1));
+        assert_eq!(tear_sheet.balance_end.unwrap().total, dec!(45.0));
     }
 
     /// Known limitation (documented on [`BalanceBasis::NetAsset`]): when the net-asset peak is zero,

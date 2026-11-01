@@ -4,7 +4,9 @@
 //! nothing: it gets a margin listen key, opens the account stream, and listens long enough for
 //! the heartbeat to need a pong from a quiet connection (two checks, 30 s apart, the first of
 //! which is a grace). It then checks the stream is still open and never reported its end. It
-//! prints only the kinds of the events that arrive, never their contents.
+//! also checks the client read Binance's server time before its first signed request. It prints
+//! only the kinds of the events that arrive, never their contents, and how far this host's clock
+//! leads Binance's.
 //!
 //! Run it on an account that nothing else trades, so that a quiet stream is expected. To see
 //! frames arrive, move a small amount in or out of the margin account while it listens.
@@ -66,6 +68,12 @@ async fn stream_stays_open(config: BinanceMarginConfig, instruments: &[Instrumen
         .account_stream(&[], instruments)
         .await
         .expect("account_stream opens");
+    // Opening the stream signs a listen-token request, which waits for the client's first read of
+    // Binance's server time.
+    let lead = client
+        .host_clock_lead()
+        .expect("the server time was read before the first signed request");
+    println!("host clock lead: {} ms", lead.num_milliseconds());
 
     let deadline = tokio::time::Instant::now() + listen_for();
     let mut kinds = Vec::new();

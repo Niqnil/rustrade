@@ -61,7 +61,10 @@ mod stream;
 
 pub use records::MarginForcedLiquidation;
 
+use super::commission::{CommissionRates, fetch_commission_rates};
+use super::restatement::{SharedStreamClock, StreamClock, restatement_time};
 use super::rules::RulesLoader;
+use super::server_time::{ServerTime, SigningClock, default_server_time_sync, read_server_time};
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
     FILL_RECOVERY_TIMEOUT_SECS, MyTradesFrom, ORDER_EXECUTIONS_BUDGET, OpenOrderListing,
@@ -70,13 +73,15 @@ use super::shared::{
     classify_order_kind_tif, classify_rest_order_error, classify_rest_query_error,
     convert_ended_order, convert_open_order_listing, convert_open_order_owned_symbol,
     dedup_key_from_event, drop_after, gap_failed, gap_time, is_duplicate, is_unknown_order,
-    new_dedup_cache, placed_order_state, recovered_order_cids, recovered_order_totals,
-    response_decode_error, rest_call_with_retry, trailing_params, unreadable_answer,
+    new_dedup_cache, optional_decimal, placed_order_state, recovered_order_cids,
+    recovered_order_totals, response_decode_error, rest_call_with_retry, rest_read_with_retry,
+    trailing_params, unreadable_answer,
 };
 use crate::rules::{OrderRules, PreSendRules};
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
-    IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent, UnindexedAccountSnapshot,
+    InstrumentBalanceSnapshot, IsolatedInstrumentState, IsolatedMarginRisk, UnindexedAccountEvent,
+    UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance},
     borrow_capacity::BorrowCapacity,
     client::{
@@ -85,6 +90,7 @@ use crate::{
             KnownLiveOrders, MAX_KNOWN_LIVE_ORDERS, OpenListing, OrderLookup,
             SharedKnownLiveOrders, UncheckedOrders, fetch_ended_by_key, recover_ended_orders,
         },
+        venue_clock::HostMoment,
     },
     error::{ApiError, OrderError, UnindexedClientError},
     margin::{MarginBorrow, MarginEffect, MarginPlacement},
@@ -96,7 +102,7 @@ use crate::{
     },
     position::PositionReport,
     shortability::Shortability,
-    trade::{AssetFees, Trade, TradeId, TradesRead},
+    trade::{AssetFees, TimeSource, Trade, TradeId, TradesRead},
 };
 use binance_sdk::{
     common::{config::ConfigurationRestApi, constants::MARGIN_TRADING_REST_API_PROD_URL},
@@ -121,7 +127,7 @@ use binance_sdk::{
         },
     },
 };
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use fnv::FnvHashSet;
 use futures::stream::BoxStream;
 use rust_decimal::Decimal;
@@ -227,6 +233,10 @@ pub struct BinanceMarginConfig {
     /// a margin order obeys.
     #[serde(default)]
     pub pre_send_rules: PreSendRules,
+    /// Whether signed requests are stamped with Binance's clock, read from its server time,
+    /// rather than this host's. Defaults to `true`. See [`BinanceMargin::host_clock_lead`].
+    #[serde(default = "crate::client::binance::server_time::default_server_time_sync")]
+    pub server_time_sync: bool,
 }
 
 // custom Debug to avoid leaking credentials in logs
@@ -241,6 +251,7 @@ impl std::fmt::Debug for BinanceMarginConfig {
             .field("margin_effect", &self.margin_effect)
             .field("auto_repay_at_cancel", &self.auto_repay_at_cancel)
             .field("pre_send_rules", &self.pre_send_rules)
+            .field("server_time_sync", &self.server_time_sync)
             .finish()
     }
 }
@@ -274,6 +285,7 @@ impl BinanceMarginConfig {
             margin_effect,
             auto_repay_at_cancel,
             pre_send_rules: PreSendRules::default(),
+            server_time_sync: default_server_time_sync(),
         }
     }
 
@@ -281,6 +293,14 @@ impl BinanceMarginConfig {
     #[must_use]
     pub fn with_pre_send_rules(mut self, pre_send_rules: PreSendRules) -> Self {
         self.pre_send_rules = pre_send_rules;
+        self
+    }
+
+    /// Set whether signed requests are stamped with Binance's clock, read from its server time
+    /// ([`server_time_sync`](Self::server_time_sync)).
+    #[must_use]
+    pub fn with_server_time_sync(mut self, server_time_sync: bool) -> Self {
+        self.server_time_sync = server_time_sync;
         self
     }
 
@@ -426,19 +446,19 @@ impl BinanceMarginConfig {
 ///
 /// # Margin balances & debt-freshness
 /// Balances carry per-asset margin debt: [`Balance::net_asset`](crate::balance::Balance::net_asset)
-/// returns `total - borrowed`, with `borrowed`/`interest` exposed via
-/// [`MarginDetails`](crate::balance::MarginDetails). Authoritative debt totals come from the REST
-/// [`account_snapshot`](Self::account_snapshot) (`BalanceSnapshot`). The WS stream keeps
-/// `free`/`locked` live via `BalanceStreamUpdate`, which **never** clobbers debt, and keeps debt
-/// live via [`AccountEventKind::MarginDebt`], one per asset a `liabilityChange` lists, on a cross
-/// account: Binance has not been seen to send that event for an isolated pair. A debt change sent
-/// while the stream is down is not recovered, so call `account_snapshot` at startup and after a
-/// reconnect (see [`account_stream`](Self::account_stream)'s cold-start note).
+/// returns `total - borrowed - interest`, as Binance's `netAsset` does, with `borrowed`/`interest`
+/// exposed via [`MarginDetails`](crate::balance::MarginDetails). Authoritative debt totals come
+/// from the REST [`account_snapshot`](Self::account_snapshot) (`BalanceSnapshot`). The WS stream
+/// keeps `free`/`locked` live via `BalanceStreamUpdate`, which **never** clobbers debt, and keeps
+/// debt live via [`AccountEventKind::MarginDebt`], one per asset a `liabilityChange` lists, on a
+/// cross account: Binance has not been seen to send that event for an isolated pair. A debt change
+/// sent while the stream is down is not recovered, so call `account_snapshot` at startup and after
+/// a reconnect (see [`account_stream`](Self::account_stream)'s cold-start note).
 ///
 /// As Binance documents it, margin interest is charged hourly on what is borrowed and accrues as
 /// the asset's unpaid `interest`, which comes out of `total` only when it is repaid. `net_asset`
-/// deducts `borrowed` alone, so until then `interest` is the only figure that holds it, as fresh
-/// as the rest of the debt. Fills carry no interest, so PnL computed from them excludes it.
+/// deducts it as it accrues, as fresh as the rest of the debt. Fills carry no interest, so PnL
+/// computed from them excludes it.
 ///
 /// # Rate limits
 /// Once a `/sapi` response reports at least 90% of the documented per-IP weight limit (12000 per
@@ -493,6 +513,10 @@ pub struct BinanceMargin {
     // The pairs' tick, lot and notional rules, loaded on each pair's first order from the spot
     // `exchangeInfo`. Shared by every clone.
     rules: Arc<RulesLoader>,
+    // Spot REST client for the spot endpoints margin has no counterpart of (`exchangeInfo` for
+    // `rules`, the account's commission rates), with its own tracker for the spot weight pool.
+    spot_rest: Arc<binance_sdk::spot::rest_api::RestApi>,
+    spot_rate_limiter: Arc<RateLimitTracker>,
 }
 
 impl std::fmt::Debug for BinanceMargin {
@@ -557,6 +581,102 @@ impl BinanceMargin {
         instruments: &[InstrumentNameExchange],
     ) -> Result<HashMap<InstrumentNameExchange, OrderRules>, UnindexedClientError> {
         self.rules.load(instruments).await
+    }
+
+    /// The next hourly interest rate of each of `assets` on this client's cross or isolated
+    /// margin: `GET /sapi/v1/margin/next-hourly-interest-rate`.
+    ///
+    /// Each rate is a fraction of the amount borrowed, per hour, at this account's VIP level, for
+    /// the next hourly charge; Binance can change it before then. It is not annualised:
+    /// [`fetch_shortability`](ShortabilityClient::fetch_shortability) reports the base asset's
+    /// rate × 24 × 365.
+    ///
+    /// An asset Binance does not answer for is absent from the map. An asset named twice is asked
+    /// for once, and an empty `assets` sends nothing.
+    ///
+    /// # Cost
+    ///
+    /// Binance takes at most 20 assets a request, so the assets are read 20 at a time, one
+    /// request after another, each costing 100 of Binance's per-IP request weight.
+    ///
+    /// # Errors
+    ///
+    /// Whatever error any of the requests returns: a failed request fails the whole read, rather
+    /// than return a map that silently lacks its assets. [`UnindexedClientError::Internal`] for a
+    /// rate that does not read as a decimal.
+    pub async fn fetch_next_hourly_interest_rates(
+        &self,
+        assets: &[AssetNameExchange],
+    ) -> Result<HashMap<AssetNameExchange, Decimal>, UnindexedClientError> {
+        let mut seen = FnvHashSet::default();
+        let unique: Vec<&str> = assets
+            .iter()
+            .map(|asset| asset.name().as_str())
+            .filter(|name| seen.insert(*name))
+            .collect();
+        let is_isolated = self.config.is_isolated;
+        let mut rates = HashMap::with_capacity(unique.len());
+        for chunk in unique.chunks(HOURLY_RATE_ASSETS_PER_REQUEST) {
+            let requested = chunk.join(",");
+            let response =
+                rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+                    let requested = requested.clone();
+                    Box::pin(async move {
+                        let params = GetFutureHourlyInterestRateParams::builder(
+                            requested,
+                            IsolatedFlag::from_flag(is_isolated),
+                        )
+                        .build()?;
+                        rest.get_future_hourly_interest_rate(params).await
+                    })
+                })
+                .await
+                .map_err(|e| classify_rest_query_error(&e, None))?;
+            for listed in response.data().await.map_err(response_decode_error)? {
+                let Some(asset) = listed.asset.filter(|asset| chunk.contains(&asset.as_str()))
+                else {
+                    continue;
+                };
+                let rate = optional_decimal(
+                    "nextHourlyInterestRate",
+                    listed.next_hourly_interest_rate.as_deref(),
+                )?;
+                if let Some(rate) = rate {
+                    rates.insert(AssetNameExchange::new(asset), rate);
+                }
+            }
+        }
+        Ok(rates)
+    }
+
+    /// The account's commission rates on `instrument`, read from the spot
+    /// `GET /api/v3/account/commission` at 20 of Binance's per-IP spot request weight.
+    ///
+    /// Binance margin has no commission endpoint of its own. A margin trade has been seen to pay
+    /// the account's spot rates, which is what this reads; Binance does not document that, so
+    /// treat it as observed, not guaranteed. [`CommissionRates`] says how Binance combines them.
+    ///
+    /// # Errors
+    ///
+    /// - [`ApiError::InstrumentInvalid`] for a symbol Binance does not list.
+    /// - [`UnindexedClientError::Internal`] for an answer missing a rate, with a rate that does
+    ///   not read as a decimal, or for another symbol.
+    pub async fn fetch_commission_rates(
+        &self,
+        instrument: &InstrumentNameExchange,
+    ) -> Result<CommissionRates, UnindexedClientError> {
+        fetch_commission_rates(&self.spot_rest, &self.spot_rate_limiter, instrument).await
+    }
+
+    /// The most this host's clock leads Binance's, from the client's reads of Binance's server
+    /// time; negative when it trails. `None` when
+    /// [`server_time_sync`](BinanceMarginConfig::server_time_sync) is off, or before a read has
+    /// succeeded.
+    ///
+    /// An upper bound: the true lead, plus the time the kept read's answer took to arrive and the
+    /// drift allowed for since. A read logs at `warn` when it finds the clocks 1 s or more apart.
+    pub fn host_clock_lead(&self) -> Option<TimeDelta> {
+        self.rate_limiter.host_clock_lead()
     }
 
     /// Submit a margin order over the SAPI `POST /sapi/v1/margin/order` endpoint, and report
@@ -677,7 +797,7 @@ impl BinanceMargin {
 
         if let Err(refused) = self
             .rules
-            .check(instrument.name(), kind, price, quantity)
+            .check(instrument.name(), side, kind, price, quantity)
             .await
         {
             return inactive(OrderState::inactive(refused));
@@ -822,11 +942,18 @@ impl BinanceMargin {
     /// # Panics
     /// Panics if the binance-sdk configuration builder fails (invalid credentials format).
     #[allow(clippy::expect_used)] // Documented panic: invalid credentials detected at startup
-    fn build_rest_config(config: &BinanceMarginConfig) -> ConfigurationRestApi {
-        ConfigurationRestApi::builder()
+    fn build_rest_config(
+        config: &BinanceMarginConfig,
+        signing: Option<&SigningClock>,
+    ) -> ConfigurationRestApi {
+        let mut builder = ConfigurationRestApi::builder()
             .api_key(config.api_key.clone())
             .api_secret(config.secret_key.clone())
-            .base_path(MARGIN_TRADING_REST_API_PROD_URL)
+            .base_path(MARGIN_TRADING_REST_API_PROD_URL);
+        if let Some(signing) = signing {
+            builder = builder.timestamp_provider(signing.provider());
+        }
+        builder
             .build()
             .expect("failed to build Binance margin REST configuration")
     }
@@ -886,15 +1013,21 @@ impl BinanceMargin {
             ));
         }
 
-        // Per-pair isolated balances + risk (chunked ≤5 symbols/request), keyed by instrument.
-        let mut balances_by_symbol = convert_isolated_margin_assets(
-            fetch_isolated_margin_account_info(
-                self.rest.clone(),
-                self.rate_limiter.clone(),
-                effective.clone(),
-            )
-            .await?,
-        );
+        // Per-pair isolated balances + risk (chunked ≤5 symbols/request), keyed by instrument,
+        // each chunk's stamped by when its request was sent.
+        let mut balances_by_symbol = HashMap::with_capacity(effective.len());
+        let reads = fetch_isolated_margin_account_info(
+            self.rest.clone(),
+            self.rate_limiter.clone(),
+            effective.clone(),
+        )
+        .await?;
+        for read in reads {
+            balances_by_symbol.extend(convert_isolated_margin_assets(
+                read.assets,
+                self.rate_limiter.balance_read_time(read.sent),
+            ));
+        }
 
         // Open orders per instrument over the same effective set, concurrently (bounded to avoid
         // bursting request-weight limits).
@@ -986,26 +1119,40 @@ impl ExecutionClient for BinanceMargin {
         // for the new-order and cancel requests via `send_request`. `ConfigurationRestApi: Clone`
         // and is cheap to copy (its `reqwest::Client` is `Arc`-backed), avoiding redundant credential
         // clones from building it twice.
-        let rest_config = Self::build_rest_config(&config);
+        let signing = config.server_time_sync.then(SigningClock::default);
+        let rest_config = Self::build_rest_config(&config, signing.as_ref());
         let rest = Arc::new(MarginTradingRestApi::production(rest_config.clone()));
-        // The rules come from the spot `exchangeInfo`, a public endpoint on the spot weight pool.
-        // Its tracker is this client's own: a `BinanceSpot` in the same process keeps another for
-        // the same IP pool, which is cheap, as rules load once per pair an hour.
+        // The rules come from the spot `exchangeInfo`, a public endpoint on the spot weight pool,
+        // and the commission rates from the spot account. Their tracker is this client's own: a
+        // `BinanceSpot` in the same process keeps another for the same IP pool, which is cheap,
+        // as rules load once per pair an hour and rates are read on request.
+        let spot_rest = Arc::new(binance_sdk::spot::SpotRestApi::production(
+            rest_config.clone(),
+        ));
+        // Binance's server time is read from the spot API: margin has no endpoint of its own, and
+        // the read is unsigned. Both trackers hold it, so that a request on either waits for the
+        // first read.
+        let server_time =
+            signing.map(|signing| ServerTime::new(signing, read_server_time(spot_rest.clone())));
+        let spot_rate_limiter =
+            Arc::new(RateLimitTracker::new(WeightPool::Spot).with_server_time(server_time.clone()));
         let rules = Arc::new(RulesLoader::new(
             config.pre_send_rules,
-            Arc::new(binance_sdk::spot::SpotRestApi::production(
-                rest_config.clone(),
-            )),
-            Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+            spot_rest.clone(),
+            spot_rate_limiter.clone(),
         ));
         let rest_config = Arc::new(rest_config);
         Self {
             config: Arc::new(config),
             rest,
             rest_config,
-            rate_limiter: Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
+            rate_limiter: Arc::new(
+                RateLimitTracker::new(WeightPool::Sapi).with_server_time(server_time),
+            ),
             known_live: KnownLiveOrders::shared(ExchangeId::BinanceMargin),
             rules,
+            spot_rest,
+            spot_rate_limiter,
         }
     }
 
@@ -1169,6 +1316,11 @@ impl ExecutionClient for BinanceMargin {
     /// [`account_stream`](Self::account_stream)'s balance events, or read again after a short
     /// delay. The client adds no retry or delay of its own: when and how to reconcile is the
     /// caller's policy.
+    ///
+    /// So each balance is stamped 5 s before its request was sent: a stream balance or debt
+    /// event the read may not yet show is then still more recent than the read, and applies over
+    /// it. The send is timed on Binance's clock when this host's is ahead of it (see the
+    /// [module docs](super#signed-requests-are-stamped-on-binances-clock)).
     async fn account_snapshot(
         &self,
         assets: &[AssetNameExchange],
@@ -1177,8 +1329,8 @@ impl ExecutionClient for BinanceMargin {
         if self.config.is_isolated {
             return self.isolated_account_snapshot(instruments).await;
         }
-        let response =
-            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+        let (response, sent) =
+            rest_read_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
                 Box::pin(async move {
                     let params = QueryCrossMarginAccountDetailsParams::builder().build()?;
                     rest.query_cross_margin_account_details(params).await
@@ -1189,8 +1341,11 @@ impl ExecutionClient for BinanceMargin {
 
         let account = response.data().await.map_err(response_decode_error)?;
 
-        let balances =
-            filter_and_convert_margin_balances(account.user_assets.unwrap_or_default(), assets);
+        let balances = filter_and_convert_margin_balances(
+            account.user_assets.unwrap_or_default(),
+            assets,
+            self.rate_limiter.balance_read_time(sent),
+        );
 
         // Fetch open orders for all instruments concurrently (with retry), limiting concurrency
         // to avoid bursting Binance's request weight limits. account_snapshot wraps Open orders
@@ -1256,8 +1411,8 @@ impl ExecutionClient for BinanceMargin {
         if self.config.is_isolated {
             return Ok(Vec::new());
         }
-        let response =
-            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+        let (response, sent) =
+            rest_read_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
                 Box::pin(async move {
                     let params = QueryCrossMarginAccountDetailsParams::builder().build()?;
                     rest.query_cross_margin_account_details(params).await
@@ -1271,6 +1426,7 @@ impl ExecutionClient for BinanceMargin {
         Ok(filter_and_convert_margin_balances(
             account.user_assets.unwrap_or_default(),
             assets,
+            self.rate_limiter.balance_read_time(sent),
         ))
     }
 
@@ -1468,6 +1624,8 @@ impl ExecutionClient for BinanceMargin {
     /// a new one. The key is not closed when the stream ends: it lapses 60 minutes after its last
     /// keepalive. The stream ends once 10 reconnects in a row have failed or a rate-limit cooldown
     /// outlasts what it waits through: see the [module docs](super#account-stream-reconnection).
+    /// After each reconnect it restates the account's balances, debt included: see
+    /// [there](super#balance-restatement-after-a-reconnect).
     ///
     /// Binance sends on this stream only when the account changes, so the client pings it at each
     /// heartbeat check, and the pong is what proves a quiet connection alive.
@@ -1597,7 +1755,10 @@ impl ExecutionClient for BinanceMargin {
     ///
     /// Debt totals (`borrowed`/`interest`) are not known to be streamed for an isolated pair (see
     /// "Margin debt" above), so they come from
-    /// [`account_snapshot`](ExecutionClient::account_snapshot).
+    /// [`account_snapshot`](ExecutionClient::account_snapshot), and from the
+    /// [`InstrumentBalanceSnapshot`](AccountEventKind::InstrumentBalanceSnapshot)s the stream
+    /// restates after each reconnect (see the
+    /// [module docs](super#balance-restatement-after-a-reconnect)).
     ///
     /// **Consumption contract (important):** the engine deliberately does **not** store
     /// `InstrumentBalanceUpdate` — it falls through `update_from_account`'s `_ => None` wildcard,
@@ -1611,9 +1772,10 @@ impl ExecutionClient for BinanceMargin {
     /// engine-queryable per-instrument balances uses the `InstrumentData` extension point instead.
     async fn account_stream(
         &self,
-        // _assets is intentionally ignored — Binance pushes outboundAccountPosition for all account
-        // assets regardless of any filter (mirrors spot). See account_snapshot for filtering.
-        _assets: &[AssetNameExchange],
+        // Only a reconnect's balance restatement uses `assets`: Binance pushes
+        // outboundAccountPosition for every asset of the account, whatever is asked for (mirrors
+        // spot).
+        assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
     ) -> Result<Self::AccountStream, UnindexedClientError> {
         let (tx, rx) = mpsc::unbounded_channel::<UnindexedAccountEvent>();
@@ -1622,12 +1784,15 @@ impl ExecutionClient for BinanceMargin {
             let symbols = self.config.isolated_symbols.clone();
             // Each pair's base and quote, which route its balance frames: a pair's never change,
             // so they are read once. A REST failure here fails the call before anything spawns.
-            let assets = fetch_isolated_margin_account_info(
+            let assets: Vec<_> = fetch_isolated_margin_account_info(
                 self.rest.clone(),
                 self.rate_limiter.clone(),
                 symbols.clone(),
             )
-            .await?;
+            .await?
+            .into_iter()
+            .flat_map(|read| read.assets)
+            .collect();
             let mut base_quote = build_base_quote_map(&assets);
             let pairs = symbols
                 .iter()
@@ -1660,6 +1825,8 @@ impl ExecutionClient for BinanceMargin {
             known: self.known_live.clone(),
             account,
             instruments,
+            assets: assets.to_vec(),
+            clock: StreamClock::shared(self.rate_limiter.signing_clock()),
             tx,
             dedup: new_dedup_cache(),
         };
@@ -1716,6 +1883,9 @@ impl OrderStatusClient for BinanceMargin {
 
 /// Hours in the 365-day year a Binance hourly interest rate is annualised over.
 const HOURS_PER_YEAR: u32 = 24 * 365;
+
+/// The most assets Binance takes in one `GET /sapi/v1/margin/next-hourly-interest-rate`.
+const HOURLY_RATE_ASSETS_PER_REQUEST: usize = 20;
 
 impl ShortabilityClient for BinanceMargin {
     /// Reads the pair, its base asset, the base asset's next hourly interest rate and Binance's
@@ -2018,54 +2188,16 @@ impl BinanceMargin {
     }
 
     /// `asset`'s next hourly interest rate on this client's cross or isolated margin, a fraction
-    /// per hour: `/sapi/v1/margin/next-hourly-interest-rate` (weight 100). Unknown if Binance does
-    /// not answer for it.
+    /// per hour (weight 100). Unknown if Binance does not answer for it.
     async fn fetch_next_hourly_interest_rate(
         &self,
         asset: &AssetNameExchange,
     ) -> Result<Option<Decimal>, UnindexedClientError> {
-        let name = asset.name().to_string();
-        let is_isolated = self.config.is_isolated;
-        let response =
-            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
-                let name = name.clone();
-                Box::pin(async move {
-                    let params = GetFutureHourlyInterestRateParams::builder(
-                        name,
-                        IsolatedFlag::from_flag(is_isolated),
-                    )
-                    .build()?;
-                    rest.get_future_hourly_interest_rate(params).await
-                })
-            })
-            .await
-            .map_err(|e| classify_rest_query_error(&e, None))?;
-        let rate = response
-            .data()
-            .await
-            .map_err(response_decode_error)?
-            .into_iter()
-            .find(|listed| listed.asset.as_deref() == Some(name.as_str()))
-            .and_then(|listed| listed.next_hourly_interest_rate);
-        optional_decimal("nextHourlyInterestRate", rate.as_deref())
+        let mut rates = self
+            .fetch_next_hourly_interest_rates(std::slice::from_ref(asset))
+            .await?;
+        Ok(rates.remove(asset))
     }
-}
-
-/// A decimal Binance may leave out: absent is `None`, but present and unreadable is an error, so a
-/// malformed amount is not mistaken for an unreported one.
-fn optional_decimal(
-    field: &str,
-    value: Option<&str>,
-) -> Result<Option<Decimal>, UnindexedClientError> {
-    value
-        .map(|value| {
-            Decimal::from_str(value).map_err(|error| {
-                UnindexedClientError::Internal(format!(
-                    "decoding Binance response: {field} {value:?}: {error}"
-                ))
-            })
-        })
-        .transpose()
 }
 
 // ---------------------------------------------------------------------------
@@ -2267,8 +2399,8 @@ async fn recover_margin_fills(
     }
 }
 
-/// Open what a reconnect after a disconnect at `disconnected` recovers: a fill gap on each of the
-/// stream's `instruments`, and a check of how the orders held as live ended on each of them that
+/// Open what a reconnect recovers for the gap from `start` to `end` a disconnect left (see
+/// [`Disconnect`](super::shared::Disconnect)): a fill gap on each of the stream's `instruments`, and a check of how the orders held as live ended on each of them that
 /// has one. Only the stream's instruments are checked, since only their fills are recovered, and
 /// an instrument is checked once its fills are.
 fn open_reconnect_recovery(
@@ -2276,11 +2408,73 @@ fn open_reconnect_recovery(
     unchecked: &mut UncheckedOrders,
     known: &SharedKnownLiveOrders,
     instruments: &[InstrumentNameExchange],
-    disconnected: DateTime<Utc>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
 ) {
-    unrecovered.open(instruments, disconnected, Utc::now());
+    unrecovered.open(instruments, start, end);
     let held = known.lock().instruments_among(instruments);
     unchecked.open(held);
+}
+
+/// Read the margin account's balances to restate after a reconnect, debt included, stamped by
+/// [`restatement_time`] for a read started with `floor` (see
+/// [`restate`](super::restatement::restate)).
+///
+/// A cross account's are each of `assets` (all of them when empty), as a
+/// [`BalanceSnapshot`](AccountEventKind::BalanceSnapshot). An isolated account's are the base and
+/// quote of each pair in `pairs`, in that order, as an
+/// [`InstrumentBalanceSnapshot`](AccountEventKind::InstrumentBalanceSnapshot); the pairs come in
+/// no particular order.
+async fn read_margin_restatement(
+    rest: &Arc<RestApi>,
+    rate_limiter: &Arc<RateLimitTracker>,
+    is_isolated: bool,
+    pairs: &[InstrumentNameExchange],
+    assets: &[AssetNameExchange],
+    clock: &SharedStreamClock,
+    floor: Option<DateTime<Utc>>,
+) -> Result<Vec<UnindexedAccountEvent>, UnindexedClientError> {
+    let event = |kind| UnindexedAccountEvent::new(ExchangeId::BinanceMargin, kind);
+    if is_isolated {
+        let reads =
+            fetch_isolated_margin_account_info(rest.clone(), rate_limiter.clone(), pairs.to_vec())
+                .await?;
+        let clock = clock.lock();
+        return Ok(reads
+            .into_iter()
+            .flat_map(|read| {
+                let time = restatement_time(&clock, read.sent, floor);
+                convert_isolated_margin_assets(read.assets, time)
+            })
+            .flat_map(|(pair, state)| {
+                [state.base, state.quote].map(|balance| {
+                    event(AccountEventKind::InstrumentBalanceSnapshot(
+                        InstrumentBalanceSnapshot::new(pair.clone(), balance),
+                    ))
+                })
+            })
+            .collect());
+    }
+    let (response, sent) = rest_read_with_retry(rest, rate_limiter, RequestKind::Query, |rest| {
+        Box::pin(async move {
+            let params = QueryCrossMarginAccountDetailsParams::builder().build()?;
+            rest.query_cross_margin_account_details(params).await
+        })
+    })
+    .await
+    .map_err(|e| classify_rest_query_error(&e, None))?;
+    let account = response.data().await.map_err(response_decode_error)?;
+    let time = restatement_time(&clock.lock(), sent, floor);
+    Ok(
+        filter_and_convert_margin_balances(account.user_assets.unwrap_or_default(), assets, time)
+            .into_iter()
+            .map(|balance| {
+                event(AccountEventKind::BalanceSnapshot(
+                    rustrade_integration::collection::snapshot::Snapshot(balance),
+                ))
+            })
+            .collect(),
+    )
 }
 
 /// Extract the invariant `instrument → (base_asset, quote_asset)` map from an isolated
@@ -2578,7 +2772,8 @@ enum MarginTradesQuery {
 impl MarginTradesQuery {
     /// The first request of a walk from `from`, or `None` when a walk by time starts after
     /// `now_ms` and so has nothing to read. `now_ms` is where a walk by time stops stepping by
-    /// window: the call's start, or a span's end if earlier.
+    /// window: a span's end, cut to one window past the call's start (see
+    /// [`paginate_margin_my_trades`]).
     fn first(from: MyTradesFrom, now_ms: i64) -> Option<Self> {
         match from {
             MyTradesFrom::Span { start, .. } => {
@@ -2632,7 +2827,9 @@ impl MarginTradesQuery {
 ///   bare `startTime` — without `fromId` it returns only 24 hours of trades, and it rejects a
 ///   `startTime`..`endTime` span of 24 hours or more. So the walk first steps forward in windows
 ///   of [`MARGIN_MY_TRADES_WINDOW_MS`], each bounded by `startTime` and `endTime`, from the span's
-///   start to its end or the call's start by the local clock, whichever is earlier. At the first
+///   start to its end. An end past the local clock is kept, because the venue's clock can be
+///   ahead of it, but cut to one window past the call's start, so an empty walk does not step
+///   on through windows no fill can be stamped in. At the first
 ///   window holding a trade it switches to `from_id = last_id + 1` and reads on until a short
 ///   page, unless that window was the last and read a short page, and stops at the first page
 ///   reaching past the span's end, without the executions after it.
@@ -2664,7 +2861,11 @@ async fn paginate_margin_my_trades(
     // A walk by time reads up to here. A trade after it is left to the caller's next read (or, on
     // reconnect, to the stream), unless the walk is already paging by id.
     let now_ms = match from {
-        MyTradesFrom::Span { end, .. } => end.min(Utc::now().timestamp_millis()),
+        MyTradesFrom::Span { end, .. } => end.min(
+            Utc::now()
+                .timestamp_millis()
+                .saturating_add(MARGIN_MY_TRADES_WINDOW_MS),
+        ),
         MyTradesFrom::Order(_) => Utc::now().timestamp_millis(),
     };
     let mut all_pages = Vec::new();
@@ -2736,7 +2937,7 @@ async fn paginate_margin_my_trades(
 /// [`Balance::new`]. Returns `None` (with a warning) if a required field is missing/unparseable.
 fn convert_margin_balance_entry(
     b: QueryCrossMarginAccountDetailsResponseUserAssetsInner,
-    now: DateTime<Utc>,
+    time: DateTime<Utc>,
 ) -> Option<AssetBalance<AssetNameExchange>> {
     let asset_name = AssetNameExchange::new(b.asset.as_deref()?);
     let free = match b.free.as_deref().and_then(|s| Decimal::from_str(s).ok()) {
@@ -2770,22 +2971,23 @@ fn convert_margin_balance_entry(
     Some(AssetBalance::new(
         asset_name,
         Balance::new_margin(free + locked, free, borrowed, interest),
-        now,
+        time,
     ))
 }
 
-/// Filter cross-margin `userAssets` to the requested assets and convert to [`AssetBalance`]s.
-/// An empty `assets` slice returns all. Mirrors spot's `filter_and_convert_balances`.
+/// Filter cross-margin `userAssets` to the requested assets and convert to [`AssetBalance`]s,
+/// each stamped `time`. An empty `assets` slice returns all. Mirrors spot's
+/// `filter_and_convert_balances`.
 fn filter_and_convert_margin_balances(
     user_assets: Vec<QueryCrossMarginAccountDetailsResponseUserAssetsInner>,
     assets: &[AssetNameExchange],
+    time: DateTime<Utc>,
 ) -> Vec<AssetBalance<AssetNameExchange>> {
-    let now = Utc::now();
     // Empty assets slice means "return all" — skip building the set entirely.
     if assets.is_empty() {
         return user_assets
             .into_iter()
-            .filter_map(|b| convert_margin_balance_entry(b, now))
+            .filter_map(|b| convert_margin_balance_entry(b, time))
             .collect();
     }
     // For small slices (≤16 assets), linear scan avoids allocation and hashing overhead.
@@ -2797,7 +2999,7 @@ fn filter_and_convert_margin_balances(
                 if !assets.iter().any(|a| a.name().as_str() == asset_name_str) {
                     return None;
                 }
-                convert_margin_balance_entry(b, now)
+                convert_margin_balance_entry(b, time)
             })
             .collect();
     }
@@ -2810,7 +3012,7 @@ fn filter_and_convert_margin_balances(
             if !asset_set.contains(asset_name_str) {
                 return None;
             }
-            convert_margin_balance_entry(b, now)
+            convert_margin_balance_entry(b, time)
         })
         .collect()
 }
@@ -2851,7 +3053,7 @@ fn convert_isolated_asset_balance(
     locked: Option<&str>,
     borrowed: Option<&str>,
     interest: Option<&str>,
-    now: DateTime<Utc>,
+    time: DateTime<Utc>,
 ) -> Option<AssetBalance<AssetNameExchange>> {
     let asset_name = AssetNameExchange::new(asset?);
     let free = match free.and_then(|s| Decimal::from_str(s).ok()) {
@@ -2877,7 +3079,7 @@ fn convert_isolated_asset_balance(
     Some(AssetBalance::new(
         asset_name,
         Balance::new_margin(free + locked, free, borrowed, interest),
-        now,
+        time,
     ))
 }
 
@@ -2887,13 +3089,12 @@ fn convert_isolated_asset_balance(
 /// An entry must carry a `symbol` plus a `baseAsset` and `quoteAsset` with parseable `free`/`locked`;
 /// an entry missing any of these is dropped with a `warn!` (observable, never silently mis-mapped).
 /// Per-pair risk metrics (`marginLevel`/`marginRatio`/`liquidatePrice`) are best-effort `Option`s — a
-/// missing/unparseable risk field becomes `None` and does NOT drop the entry.
+/// missing/unparseable risk field becomes `None` and does NOT drop the entry. Every balance is
+/// stamped `time`: the entries came from one REST response.
 fn convert_isolated_margin_assets(
     assets: Vec<QueryIsolatedMarginAccountInfoResponseAssetsInner>,
+    time: DateTime<Utc>,
 ) -> HashMap<InstrumentNameExchange, IsolatedInstrumentState<AssetNameExchange>> {
-    // Single timestamp for the whole batch: every entry came from the same REST response, so this
-    // is the response's freshness (mirrors the cross-margin `convert_margin_balance_entry` `now`).
-    let now = Utc::now();
     let mut map = HashMap::with_capacity(assets.len());
     for entry in assets {
         let Some(symbol) = entry.symbol.as_deref() else {
@@ -2917,7 +3118,7 @@ fn convert_isolated_margin_assets(
             base_raw.locked.as_deref(),
             base_raw.borrowed.as_deref(),
             base_raw.interest.as_deref(),
-            now,
+            time,
         ) else {
             warn!(%instrument, "BinanceMargin isolated baseAsset missing required field — skipping");
             continue;
@@ -2928,7 +3129,7 @@ fn convert_isolated_margin_assets(
             quote_raw.locked.as_deref(),
             quote_raw.borrowed.as_deref(),
             quote_raw.interest.as_deref(),
-            now,
+            time,
         ) else {
             warn!(%instrument, "BinanceMargin isolated quoteAsset missing required field — skipping");
             continue;
@@ -2969,8 +3170,15 @@ fn chunk_symbols(symbols: &[InstrumentNameExchange]) -> Vec<String> {
         .collect()
 }
 
+/// One request's `assets[]` entries from `query_isolated_margin_account_info`, with when the
+/// request was sent ([`rest_read_with_retry`]).
+struct IsolatedAccountRead {
+    assets: Vec<QueryIsolatedMarginAccountInfoResponseAssetsInner>,
+    sent: HostMoment,
+}
+
 /// Fetch isolated-margin account info for `symbols`, chunked at the venue's max-5-symbols/request
-/// cap and flattened to the `assets[]` entries across all chunks.
+/// cap, one [`IsolatedAccountRead`] per chunk.
 ///
 /// `symbols` must be non-empty (a no-symbol isolated call is invalid). Chunks are fetched
 /// concurrently (bounded to 8) through the shared rate-limit/backoff machinery.
@@ -2978,42 +3186,37 @@ async fn fetch_isolated_margin_account_info(
     rest: Arc<RestApi>,
     rate_limiter: Arc<RateLimitTracker>,
     symbols: Vec<InstrumentNameExchange>,
-) -> Result<Vec<QueryIsolatedMarginAccountInfoResponseAssetsInner>, UnindexedClientError> {
+) -> Result<Vec<IsolatedAccountRead>, UnindexedClientError> {
     use futures::{StreamExt as _, TryStreamExt as _};
 
     let chunks = chunk_symbols(&symbols);
 
-    // One `assets[]` entry per requested symbol, so pre-size the flat accumulator to `symbols.len()`
-    // and `try_fold` the per-chunk results straight into it — avoiding the intermediate
-    // `Vec<Vec<_>>` + re-copying `flatten().collect()` (mirrors the `try_fold` in `fetch_open_orders`).
     futures::stream::iter(chunks.into_iter().map(|symbols_param| {
         let rest = rest.clone();
         let rate_limiter = rate_limiter.clone();
         async move {
-            let response = rest_call_with_retry(&rest, &rate_limiter, RequestKind::Query, |rest| {
-                let symbols_param = symbols_param.clone();
-                Box::pin(async move {
-                    let params = QueryIsolatedMarginAccountInfoParams::builder()
-                        .symbols(symbols_param)
-                        .build()?;
-                    rest.query_isolated_margin_account_info(params).await
+            let (response, sent) =
+                rest_read_with_retry(&rest, &rate_limiter, RequestKind::Query, |rest| {
+                    let symbols_param = symbols_param.clone();
+                    Box::pin(async move {
+                        let params = QueryIsolatedMarginAccountInfoParams::builder()
+                            .symbols(symbols_param)
+                            .build()?;
+                        rest.query_isolated_margin_account_info(params).await
+                    })
                 })
-            })
-            .await
-            .map_err(|e| classify_rest_query_error(&e, None))?;
+                .await
+                .map_err(|e| classify_rest_query_error(&e, None))?;
 
             let info = response.data().await.map_err(response_decode_error)?;
-            Ok::<_, UnindexedClientError>(info.assets.unwrap_or_default())
+            Ok::<_, UnindexedClientError>(IsolatedAccountRead {
+                assets: info.assets.unwrap_or_default(),
+                sent,
+            })
         }
     }))
     .buffer_unordered(8)
-    .try_fold(
-        Vec::with_capacity(symbols.len()),
-        |mut acc, assets| async move {
-            acc.extend(assets);
-            Ok(acc)
-        },
-    )
+    .try_collect()
     .await
 }
 
@@ -3069,11 +3272,16 @@ fn convert_margin_trade(
         .as_deref()
         .and_then(|s| Decimal::from_str(s).ok())
         .unwrap_or(Decimal::ZERO);
-    let time_exchange = match t.time.and_then(|ms| Utc.timestamp_millis_opt(ms).single()) {
-        Some(ts) => ts,
+    // The trade carries no other time, so without `time` it is kept, stamped with this host's
+    // clock and marked so.
+    let (time_exchange, time_source) = match t
+        .time
+        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+    {
+        Some(ts) => (ts, TimeSource::Venue),
         None => {
             warn!(%instrument, trade_id = %trade_id_raw, "BinanceMargin trade missing/unparseable time, using now");
-            Utc::now()
+            (Utc::now(), TimeSource::Host)
         }
     };
 
@@ -3087,19 +3295,22 @@ fn convert_margin_trade(
         .map(AssetNameExchange::from)
         .unwrap_or_else(|| AssetNameExchange::from("UNKNOWN"));
 
-    Some(Trade::new(
-        trade_id,
-        order_id,
-        instrument.clone(),
-        StrategyId::unknown(), // Binance doesn't carry strategy IDs
-        time_exchange,
-        side,
-        price,
-        quantity,
-        // `myTrades` reports executions only -- no cumulative, no order status.
-        None,
-        AssetFees::new(fee_asset, commission, None),
-    ))
+    Some(
+        Trade::new(
+            trade_id,
+            order_id,
+            instrument.clone(),
+            StrategyId::unknown(), // Binance doesn't carry strategy IDs
+            time_exchange,
+            side,
+            price,
+            quantity,
+            // `myTrades` reports executions only -- no cumulative, no order status.
+            None,
+            AssetFees::new(fee_asset, commission, None),
+        )
+        .with_time_source(time_source),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -4097,10 +4308,10 @@ mod tests {
     fn recalled_order_kinds_are_known_and_those_past_the_limit_warned_of() {
         use crate::client::order_recovery::tests::logged_with_lock_free;
 
-        let client = BinanceMargin::new(BinanceMarginConfig::cross_margin(
-            "k".to_string(),
-            "s".to_string(),
-        ));
+        let client = BinanceMargin::new(
+            BinanceMarginConfig::cross_margin("k".to_string(), "s".to_string())
+                .with_server_time_sync(false),
+        );
         let trailing = OrderKind::TrailingStopFixedLimit {
             offset: Decimal::from(100),
             offset_type: TrailingOffsetType::BasisPoints,
@@ -4168,7 +4379,8 @@ mod tests {
 
     #[test]
     fn margin_balance_entry_maps_debt() {
-        // free=10, locked=2 → total=12; borrowed=3, interest=0.5 → net_asset = total - borrowed = 9.
+        // free=10, locked=2 → total=12; borrowed=3, interest=0.5 → net_asset = 8.5, which is
+        // Binance's own `netAsset` for the same row.
         let ab =
             convert_margin_balance_entry(user_asset("USDT", "10", "2", "3", "0.5"), Utc::now())
                 .expect("convert");
@@ -4179,8 +4391,7 @@ mod tests {
             ab.balance.margin.is_some(),
             "REST snapshot must populate margin"
         );
-        // net_asset deducts borrowed principal (interest is tracked separately, not deducted here).
-        assert_eq!(ab.balance.net_asset(), Decimal::from(9));
+        assert_eq!(ab.balance.net_asset(), Decimal::new(85, 1));
     }
 
     #[test]
@@ -4222,13 +4433,14 @@ mod tests {
         ];
         // Empty filter → all assets.
         assert_eq!(
-            filter_and_convert_margin_balances(assets.clone(), &[]).len(),
+            filter_and_convert_margin_balances(assets.clone(), &[], Utc::now()).len(),
             3
         );
         // Subset filter → only requested assets.
         let filtered = filter_and_convert_margin_balances(
             assets,
             &[AssetNameExchange::new("BTC"), AssetNameExchange::new("ETH")],
+            Utc::now(),
         );
         assert_eq!(filtered.len(), 2);
         assert!(filtered.iter().all(|b| b.asset.name().as_str() != "USDT"));
@@ -4253,7 +4465,7 @@ mod tests {
             "must exceed the linear-scan threshold"
         );
 
-        let filtered = filter_and_convert_margin_balances(assets, &requested);
+        let filtered = filter_and_convert_margin_balances(assets, &requested, Utc::now());
         assert_eq!(filtered.len(), 2);
         assert!(filtered.iter().all(|b| b.asset.name().as_str() != "DOGE"));
     }
@@ -4324,7 +4536,7 @@ mod tests {
                 .map(|s| InstrumentNameExchange::new(*s))
                 .collect(),
         );
-        BinanceMargin::new(config)
+        BinanceMargin::new(config.with_server_time_sync(false))
     }
 
     #[test]
@@ -4338,8 +4550,8 @@ mod tests {
 
     #[test]
     fn isolated_assets_map_base_quote_and_risk() {
-        // base: free 0.5 + locked 0.1 = total 0.6, borrowed 0.2 → net 0.4.
-        // quote: free 1000 + locked 50 = total 1050, borrowed 300 → net 750.
+        // base: free 0.5 + locked 0.1 = total 0.6, borrowed 0.2, interest 0.001 → net 0.399.
+        // quote: free 1000 + locked 50 = total 1050, borrowed 300, interest 1.5 → net 748.5.
         let entry = iso_entry(
             "BTCUSDT",
             iso_base("BTC", "0.5", "0.1", "0.2", "0.001"),
@@ -4348,7 +4560,7 @@ mod tests {
             Some("0.12"),
             Some("48000"),
         );
-        let map = convert_isolated_margin_assets(vec![entry]);
+        let map = convert_isolated_margin_assets(vec![entry], Utc::now());
         let state = map
             .get(&InstrumentNameExchange::new("BTCUSDT"))
             .expect("entry present");
@@ -4356,11 +4568,11 @@ mod tests {
         assert_eq!(state.base.asset.name().as_str(), "BTC");
         assert_eq!(state.base.balance.total, d("0.6"));
         assert_eq!(state.base.balance.free, d("0.5"));
-        assert_eq!(state.base.balance.net_asset(), d("0.4"));
+        assert_eq!(state.base.balance.net_asset(), d("0.399"));
 
         assert_eq!(state.quote.asset.name().as_str(), "USDT");
         assert_eq!(state.quote.balance.total, d("1050"));
-        assert_eq!(state.quote.balance.net_asset(), d("750"));
+        assert_eq!(state.quote.balance.net_asset(), d("748.5"));
 
         assert_eq!(state.risk.margin_level, Some(d("3.5")));
         assert_eq!(state.risk.margin_ratio, Some(d("0.12")));
@@ -4369,7 +4581,7 @@ mod tests {
 
     #[test]
     fn isolated_base_short_is_negative_net() {
-        // A short on the base side: total 0, borrowed 1.5 → net_asset = -1.5.
+        // A short on the base side: total 0, borrowed 1.5, interest 0.001 → net_asset = -1.501.
         let entry = iso_entry(
             "BTCUSDT",
             iso_base("BTC", "0", "0", "1.5", "0.001"),
@@ -4378,9 +4590,9 @@ mod tests {
             None,
             None,
         );
-        let map = convert_isolated_margin_assets(vec![entry]);
+        let map = convert_isolated_margin_assets(vec![entry], Utc::now());
         let state = map.get(&InstrumentNameExchange::new("BTCUSDT")).unwrap();
-        assert_eq!(state.base.balance.net_asset(), d("-1.5"));
+        assert_eq!(state.base.balance.net_asset(), d("-1.501"));
     }
 
     #[test]
@@ -4396,9 +4608,10 @@ mod tests {
         quote.free = Some("100".to_string());
         quote.locked = Some("0".to_string());
 
-        let map = convert_isolated_margin_assets(vec![iso_entry(
-            "BTCUSDT", base, quote, None, None, None,
-        )]);
+        let map = convert_isolated_margin_assets(
+            vec![iso_entry("BTCUSDT", base, quote, None, None, None)],
+            Utc::now(),
+        );
         let state = map.get(&InstrumentNameExchange::new("BTCUSDT")).unwrap();
         assert!(state.base.balance.margin.is_some());
         assert_eq!(state.base.balance.net_asset(), d("0.5"));
@@ -4416,7 +4629,7 @@ mod tests {
             None,
             None,
         );
-        let map = convert_isolated_margin_assets(vec![entry]);
+        let map = convert_isolated_margin_assets(vec![entry], Utc::now());
         let state = map.get(&InstrumentNameExchange::new("BTCUSDT")).unwrap();
         assert_eq!(state.risk.margin_level, None);
     }
@@ -4435,7 +4648,7 @@ mod tests {
             None,
             None,
         );
-        assert!(convert_isolated_margin_assets(vec![entry]).is_empty());
+        assert!(convert_isolated_margin_assets(vec![entry], Utc::now()).is_empty());
     }
 
     #[test]
@@ -4444,7 +4657,7 @@ mod tests {
         e.base_asset = Some(Box::new(iso_base("BTC", "1", "0", "0", "0")));
         e.quote_asset = Some(Box::new(iso_quote("USDT", "1", "0", "0", "0")));
         // no symbol set
-        assert!(convert_isolated_margin_assets(vec![e]).is_empty());
+        assert!(convert_isolated_margin_assets(vec![e], Utc::now()).is_empty());
     }
 
     #[test]
@@ -4670,6 +4883,27 @@ mod tests {
         assert_eq!(tr.fees.fees, Decimal::new(1, 3));
     }
 
+    /// A trade is at its `time`, the venue's; without one it is kept, at this host's time, and
+    /// says so.
+    #[test]
+    fn a_margin_trade_without_a_time_is_at_this_hosts_time() {
+        let inst = InstrumentNameExchange::new("BTCUSDT");
+        let tr = convert_margin_trade(&trade(Some(11), Some(false)), &inst).unwrap();
+        assert_eq!(
+            (tr.time_exchange, tr.time_source),
+            (
+                Utc.timestamp_millis_opt(1_700_000_000_000).unwrap(),
+                TimeSource::Venue
+            )
+        );
+        let before = Utc::now();
+        let mut untimed = trade(Some(11), Some(false));
+        untimed.time = None;
+        let tr = convert_margin_trade(&untimed, &inst).unwrap();
+        assert_eq!(tr.time_source, TimeSource::Host);
+        assert!((before..=Utc::now()).contains(&tr.time_exchange));
+    }
+
     #[test]
     fn margin_trade_missing_fields_are_dropped() {
         let inst = InstrumentNameExchange::new("BTCUSDT");
@@ -4778,11 +5012,11 @@ mod tests {
         }
     }
 
-    /// A walk by time from `start` with no end: every trade from `start` on.
+    /// A walk by time from `start` to the local clock's present.
     fn since(start: i64) -> MyTradesFrom {
         MyTradesFrom::Span {
             start,
-            end: i64::MAX,
+            end: Utc::now().timestamp_millis(),
         }
     }
 
@@ -5036,6 +5270,44 @@ mod tests {
 
         assert_eq!(ids, vec![9]);
         assert_eq!(requests.len(), 1);
+    }
+
+    /// A span ending past the local clock, as a read placed on a venue clock ahead of it ends,
+    /// reads a fill the venue stamped after the local clock's present.
+    #[tokio::test]
+    async fn margin_trades_read_past_the_local_clock_to_the_spans_end() {
+        let now = Utc::now().timestamp_millis();
+        let span = MyTradesFrom::Span {
+            start: now - HOUR_MS,
+            end: now + HOUR_MS,
+        };
+        let (ids, requests) = read_margin_trades(venue(vec![(4, now + HOUR_MS / 2)]), span).await;
+
+        assert_eq!(ids, vec![4]);
+        assert_eq!(requests.len(), 1);
+    }
+
+    /// An end far past the local clock is cut to one window past it: an empty walk steps through
+    /// the windows up to there and stops, rather than on toward the end.
+    #[tokio::test]
+    async fn margin_trades_to_a_far_end_stop_one_window_past_the_local_clock() {
+        let now = Utc::now().timestamp_millis();
+        let span = MyTradesFrom::Span {
+            start: now - HOUR_MS,
+            end: i64::MAX,
+        };
+        let (ids, requests) = read_margin_trades(venue(Vec::new()), span).await;
+
+        assert!(ids.is_empty());
+        // Windows from 1 hour before the local clock to 22 hours after it, then to 23 hours.
+        assert_eq!(requests.len(), 2);
+        let last_end = requests[1]["endTime"].parse::<i64>().unwrap();
+        let cut = now + MARGIN_MY_TRADES_WINDOW_MS;
+        // The cut is taken from the clock when the walk starts, a moment after `now`.
+        assert!(
+            (cut..cut + 60_000).contains(&last_end),
+            "the last window ends at {last_end}, not one window past {now}"
+        );
     }
 
     /// A walk from a time after the call's start has nothing to read and sends nothing.
@@ -5549,6 +5821,40 @@ mod tests {
         assert_eq!(filled.avg_price, None, "no negative average price");
     }
 
+    /// `new` keeps the client's signing clock read from Binance's server time on both of its
+    /// trackers, unless `server_time_sync` is off; `host_clock_lead` reports the reads.
+    #[tokio::test(start_paused = true)]
+    async fn the_host_clock_lead_is_the_clients_server_time_reads() {
+        let config = BinanceMarginConfig::cross_margin("k".to_string(), "s".to_string());
+        assert!(config.server_time_sync);
+        let synced = BinanceMargin::new(config.clone());
+        assert!(synced.rate_limiter.signing_clock().is_some());
+        assert!(synced.spot_rate_limiter.signing_clock().is_some());
+        let mut client = BinanceMargin::new(config.with_server_time_sync(false));
+        assert!(client.rate_limiter.signing_clock().is_none());
+        assert!(client.spot_rate_limiter.signing_clock().is_none());
+        assert_eq!(client.host_clock_lead(), None);
+
+        let host_ms = Utc::now().timestamp_millis();
+        let read: crate::client::binance::server_time::ReadServerTime =
+            Arc::new(move || Box::pin(async move { Ok(host_ms - 2_000) }));
+        client.rate_limiter = Arc::new(
+            RateLimitTracker::new(WeightPool::Sapi)
+                .with_server_time(Some(ServerTime::new(SigningClock::default(), read))),
+        );
+        client
+            .rate_limiter
+            .wait_if_blocked(RequestKind::Query)
+            .await
+            .unwrap();
+
+        let lead = client.host_clock_lead().unwrap();
+        assert!(
+            lead >= TimeDelta::seconds(2) && lead < TimeDelta::seconds(3),
+            "{lead}"
+        );
+    }
+
     /// A REST config whose requests go to `server`.
     fn margin_rest_config_at(server: &wiremock::MockServer) -> ConfigurationRestApi {
         ConfigurationRestApi::builder()
@@ -5580,26 +5886,23 @@ mod tests {
             BinanceMarginConfig::cross_margin("key".into(), "secret".into())
         };
         let mode = config.pre_send_rules;
-        let mut client = <BinanceMargin as ExecutionClient>::new(config);
+        let mut client =
+            <BinanceMargin as ExecutionClient>::new(config.with_server_time_sync(false));
         client.rest = margin_rest_at(server);
         client.rest_config = Arc::new(margin_rest_config_at(server));
-        client.rules = rules_at(server, mode);
+        client.spot_rest = Arc::new(binance_sdk::spot::SpotRestApi::from_config(
+            margin_rest_config_at(server),
+        ));
+        client.rules = rules_over(&client, mode);
         client
     }
 
-    /// Rules loaded from the spot `exchangeInfo` that `server` answers.
-    fn rules_at(server: &wiremock::MockServer, mode: PreSendRules) -> Arc<RulesLoader> {
+    /// Rules loaded from the spot `exchangeInfo` that `client`'s spot REST client reads.
+    fn rules_over(client: &BinanceMargin, mode: PreSendRules) -> Arc<RulesLoader> {
         Arc::new(RulesLoader::new(
             mode,
-            Arc::new(binance_sdk::spot::SpotRestApi::from_config(
-                ConfigurationRestApi::builder()
-                    .api_key("key")
-                    .api_secret("secret")
-                    .base_path(server.uri())
-                    .build()
-                    .unwrap(),
-            )),
-            Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+            client.spot_rest.clone(),
+            client.spot_rate_limiter.clone(),
         ))
     }
 
@@ -5642,6 +5945,197 @@ mod tests {
                 (request.url.path().to_owned(), isolated)
             })
             .collect()
+    }
+
+    /// Each balance a margin read returns is stamped [`REST_BALANCE_LAG`] before its request was
+    /// sent, never when the answer arrives: the cross account's REST view has trailed its
+    /// stream, and a stream balance or debt event the read does not yet show must stay more
+    /// recent than it.
+    #[tokio::test]
+    async fn a_cross_balance_read_is_stamped_the_rest_lag_before_its_request_was_sent() {
+        margin_balance_reads_are_stamped_the_rest_lag_before_their_requests(false, None).await;
+    }
+
+    /// As for the cross account, for an isolated pair's balances, which come only on its
+    /// instrument snapshot.
+    #[tokio::test]
+    async fn an_isolated_balance_read_is_stamped_the_rest_lag_before_its_request_was_sent() {
+        margin_balance_reads_are_stamped_the_rest_lag_before_their_requests(true, None).await;
+    }
+
+    /// With this host's clock ahead of Binance's, a cross balance read is stamped the REST lag
+    /// before Binance's time when its request was sent, as the client's server-time reads bound
+    /// it, not before this host's time: a stamp ahead of Binance's would have the engine drop the
+    /// stream's balance and debt events until Binance's clock caught up with it.
+    #[tokio::test]
+    async fn a_cross_balance_read_is_stamped_on_binances_clock_when_the_host_clock_leads() {
+        margin_balance_reads_are_stamped_the_rest_lag_before_their_requests(
+            false,
+            Some(TimeDelta::seconds(60)),
+        )
+        .await;
+    }
+
+    /// As for the cross account, for an isolated pair's balances.
+    #[tokio::test]
+    async fn an_isolated_balance_read_is_stamped_on_binances_clock_when_the_host_clock_leads() {
+        margin_balance_reads_are_stamped_the_rest_lag_before_their_requests(
+            true,
+            Some(TimeDelta::seconds(60)),
+        )
+        .await;
+    }
+
+    /// Read the account's balances with both `fetch_balances` and `account_snapshot`, each answer
+    /// delayed, and check every balance's time: on this host's clock, or with a `lead`, signed on
+    /// a server time read that far behind it.
+    async fn margin_balance_reads_are_stamped_the_rest_lag_before_their_requests(
+        is_isolated: bool,
+        lead: Option<TimeDelta>,
+    ) {
+        use crate::client::binance::shared::REST_BALANCE_LAG;
+        const ANSWER_DELAY: Duration = Duration::from_millis(200);
+        let asset = |name: &str| {
+            serde_json::json!({
+                "asset": name, "free": "1", "locked": "0", "borrowed": "0.5", "interest": "0",
+                "netAsset": "0.5",
+            })
+        };
+        let (account_path, body) = if is_isolated {
+            (
+                "/sapi/v1/margin/isolated/account",
+                serde_json::json!({ "assets": [{
+                    "symbol": "BTCUSDT", "baseAsset": asset("BTC"), "quoteAsset": asset("USDT"),
+                }] }),
+            )
+        } else {
+            (
+                "/sapi/v1/margin/account",
+                serde_json::json!({ "userAssets": [asset("BTC")] }),
+            )
+        };
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(account_path))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(body)
+                    .set_delay(ANSWER_DELAY),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/openOrders"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        let mut client = margin_client_at(&server, is_isolated);
+        if let Some(lead) = lead {
+            client.rate_limiter = Arc::new(
+                RateLimitTracker::new(WeightPool::Sapi)
+                    .with_server_time(Some(ServerTime::trailing_host(lead))),
+            );
+        }
+        // Signed on a server time read, a request can be stamped up to `TRAILING_HOST_BEHIND`
+        // before it was sent. On this host's clock, only 1 ms is allowed.
+        let behind = match lead {
+            Some(_) => ServerTime::TRAILING_HOST_BEHIND,
+            None => TimeDelta::milliseconds(1),
+        };
+        let lead = lead.unwrap_or_default();
+
+        let before = Utc::now();
+        let fetched = client.fetch_balances(&[]).await.unwrap();
+        let between = Utc::now();
+        let snapshot = client
+            .account_snapshot(&[], &[InstrumentNameExchange::new("BTCUSDT")])
+            .await
+            .unwrap();
+        let after = Utc::now();
+
+        // Each read's balances, and the span of host time its request was sent in.
+        let reads: Vec<(Vec<DateTime<Utc>>, _, _)> = if is_isolated {
+            // Isolated balances are the pair's, on its instrument snapshot.
+            assert!(fetched.is_empty());
+            let pair = snapshot.instruments[0].isolated.as_ref().unwrap();
+            vec![(
+                vec![pair.base.time_exchange, pair.quote.time_exchange],
+                between,
+                after,
+            )]
+        } else {
+            let times = |balances: &[AssetBalance<AssetNameExchange>]| {
+                balances
+                    .iter()
+                    .map(|balance| balance.time_exchange)
+                    .collect()
+            };
+            vec![
+                (times(&fetched), before, between),
+                (times(&snapshot.balances), between, after),
+            ]
+        };
+        for (times, from, to) in reads {
+            assert!(!times.is_empty());
+            for time in times {
+                // When the request was sent, by this host's clock, up to `behind` before `from`.
+                let sent = time + REST_BALANCE_LAG + lead;
+                assert!(
+                    from - behind <= sent && sent + ANSWER_DELAY <= to,
+                    "{time} + the lag and {lead} not within {from} ..= {to} - {ANSWER_DELAY:?}"
+                );
+            }
+        }
+    }
+
+    /// A cross restatement read the venue fails is an error; the next returns each balance, debt
+    /// included, as a balance snapshot.
+    #[tokio::test]
+    async fn a_cross_restatement_read_returns_the_balances_as_snapshots() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/account"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/sapi/v1/margin/account"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "userAssets": [{
+                    "asset": "BTC", "free": "1", "locked": "0", "borrowed": "0.5", "interest": "0",
+                    "netAsset": "0.5",
+                }] }),
+            ))
+            .mount(&server)
+            .await;
+        let (rest, limiter) = (
+            margin_rest_at(&server),
+            Arc::new(RateLimitTracker::new(WeightPool::Sapi)),
+        );
+        let clock = SharedStreamClock::default();
+        // The cross account's balances, all of them.
+        let read = || read_margin_restatement(&rest, &limiter, false, &[], &[], &clock, None);
+
+        let failed = read().await;
+        assert!(failed.is_err(), "{failed:?}");
+
+        let restated = read().await.unwrap();
+        let [event] = restated.as_slice() else {
+            panic!("one balance: {restated:?}");
+        };
+        assert_eq!(event.exchange, ExchangeId::BinanceMargin);
+        let AccountEventKind::BalanceSnapshot(balance) = &event.kind else {
+            panic!("a balance snapshot: {event:?}");
+        };
+        assert_eq!(balance.0.asset, AssetNameExchange::new("BTC"));
+        assert_eq!(
+            balance.0.balance.margin,
+            Some(crate::balance::MarginDetails::new(
+                Decimal::new(5, 1),
+                Decimal::ZERO
+            ))
+        );
     }
 
     #[tokio::test]
@@ -6186,6 +6680,63 @@ mod tests {
         );
     }
 
+    /// A trailing stop's offset is held to `TRAILING_DELTA`'s range for its side, the range above
+    /// for a buy and below for a sell, and refused unsent.
+    #[tokio::test]
+    async fn a_trailing_offset_outside_its_sides_range_is_refused_unsent() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/exchangeInfo"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"symbols": [{
+                    "symbol": "BTCUSDT", "status": "TRADING",
+                    "filters": [
+                        {"filterType": "TRAILING_DELTA", "minTrailingAboveDelta": 10,
+                         "maxTrailingAboveDelta": 2000, "minTrailingBelowDelta": 10,
+                         "maxTrailingBelowDelta": 1000},
+                    ],
+                }]}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_order_accepted(&server, 0).await;
+        let client = margin_client_at(&server, false);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+        let order = |cid: &str, side: Side, offset: Decimal| {
+            let mut request = margin_open_request(&btcusdt, cid);
+            request.state.side = side;
+            request.state.price = None;
+            request.state.kind = OrderKind::TrailingStop {
+                offset,
+                offset_type: crate::order::TrailingOffsetType::BasisPoints,
+                activation_price: None,
+            };
+            request
+        };
+
+        let buy = client.open_order(order("a", Side::Buy, dec!(2500))).await;
+        assert_eq!(
+            buy.state,
+            OrderState::inactive(OrderError::OutOfBounds(BoundsViolation::new(
+                OrderField::TrailingOffset,
+                Bound::Max,
+                dec!(2000),
+                dec!(2500)
+            )))
+        );
+        let sell = client.open_order(order("b", Side::Sell, dec!(1500))).await;
+        assert_eq!(
+            sell.state,
+            OrderState::inactive(OrderError::OutOfBounds(BoundsViolation::new(
+                OrderField::TrailingOffset,
+                Bound::Max,
+                dec!(1000),
+                dec!(1500)
+            )))
+        );
+    }
+
     /// With the rules off, nothing is read and every order is sent.
     #[tokio::test]
     async fn with_the_rules_off_every_order_is_sent_and_no_rules_are_read() {
@@ -6197,7 +6748,7 @@ mod tests {
             .await;
         mount_order_accepted(&server, 1).await;
         let mut client = margin_client_at(&server, false);
-        client.rules = rules_at(&server, PreSendRules::Off);
+        client.rules = rules_over(&client, PreSendRules::Off);
         let btcusdt = InstrumentNameExchange::new("BTCUSDT");
         let mut request = margin_open_request(&btcusdt, "x");
         request.state.price = Some(dec!(100.001));
@@ -6935,6 +7486,7 @@ mod tests {
             &known,
             &[btc.clone(), eth.clone()],
             Utc::now() - chrono::Duration::minutes(1),
+            Utc::now(),
         );
 
         assert!(unrecovered.covers(&btc) && unrecovered.covers(&eth));
@@ -7495,5 +8047,222 @@ mod tests {
             "API: request rejected: BTCUSDT: -11001 Isolated margin account does not exist."
         );
         assert!(!err.is_transient());
+    }
+
+    const HOURLY_RATE_ROUTE: &str = "/sapi/v1/margin/next-hourly-interest-rate";
+
+    fn assets(names: &[&str]) -> Vec<AssetNameExchange> {
+        names
+            .iter()
+            .map(|name| AssetNameExchange::new(*name))
+            .collect()
+    }
+
+    /// The `assets` of each next-hourly-rate request `server` received, in order.
+    async fn hourly_rate_requests(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.path() == HOURLY_RATE_ROUTE)
+            .filter_map(|request| {
+                request
+                    .url
+                    .query_pairs()
+                    .find(|(key, _)| key == "assets")
+                    .map(|(_, value)| value.into_owned())
+            })
+            .collect()
+    }
+
+    /// Answer each next-hourly-rate request with a rate of 0.0001 for every asset it names, or
+    /// with Binance's `-1102` when it names `refused`.
+    async fn mount_echoed_hourly_rates(
+        server: &wiremock::MockServer,
+        refused: Option<&'static str>,
+    ) {
+        wiremock::Mock::given(wiremock::matchers::path(HOURLY_RATE_ROUTE))
+            .respond_with(move |request: &wiremock::Request| {
+                let requested = request
+                    .url
+                    .query_pairs()
+                    .find(|(key, _)| key == "assets")
+                    .map(|(_, value)| value.into_owned())
+                    .unwrap_or_default();
+                if refused.is_some_and(|refused| requested.split(',').any(|a| a == refused)) {
+                    return margin_venue_error(-1102);
+                }
+                let answer: Vec<_> = requested
+                    .split(',')
+                    .map(|asset| {
+                        serde_json::json!({"asset": asset, "nextHourlyInterestRate": "0.0001"})
+                    })
+                    .collect();
+                wiremock::ResponseTemplate::new(200).set_body_json(answer)
+            })
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn margin_hourly_rates_are_read_once_per_asset_for_the_clients_margin() {
+        use rust_decimal_macros::dec;
+        for (is_isolated, flag) in [(false, "FALSE"), (true, "TRUE")] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("GET"))
+                .and(wiremock::matchers::path(HOURLY_RATE_ROUTE))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!([
+                        {"asset": "BTC", "nextHourlyInterestRate": "0.00000571"},
+                        {"asset": "ETH", "nextHourlyInterestRate": "0.0001"},
+                        {"asset": "USDT", "nextHourlyInterestRate": null},
+                        {"asset": "XRP", "nextHourlyInterestRate": "0.5"},
+                        {"nextHourlyInterestRate": "0.5"},
+                    ]),
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = margin_client_at(&server, is_isolated);
+
+            let rates = client
+                .fetch_next_hourly_interest_rates(&assets(&["BTC", "ETH", "BTC", "USDT", "SOL"]))
+                .await
+                .unwrap();
+            assert_eq!(
+                rates,
+                HashMap::from([
+                    (AssetNameExchange::new("BTC"), dec!(0.00000571)),
+                    (AssetNameExchange::new("ETH"), dec!(0.0001)),
+                ]),
+                "no rate, no answer, or an asset not asked for is absent"
+            );
+            assert_eq!(hourly_rate_requests(&server).await, ["BTC,ETH,USDT,SOL"]);
+            assert_eq!(
+                query_value(&server, HOURLY_RATE_ROUTE, "isIsolated")
+                    .await
+                    .as_deref(),
+                Some(flag)
+            );
+            assert!(
+                query_value(&server, HOURLY_RATE_ROUTE, "signature")
+                    .await
+                    .is_some(),
+                "signed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn margin_hourly_rates_past_twenty_assets_are_read_twenty_at_a_time() {
+        let server = wiremock::MockServer::start().await;
+        mount_echoed_hourly_rates(&server, None).await;
+        let client = margin_client_at(&server, false);
+        let names: Vec<String> = (0..45).map(|i| format!("A{i}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        let rates = client
+            .fetch_next_hourly_interest_rates(&assets(&names))
+            .await
+            .unwrap();
+        assert_eq!(rates.len(), 45);
+        assert_eq!(
+            hourly_rate_requests(&server).await,
+            [
+                names[..20].join(","),
+                names[20..40].join(","),
+                names[40..].join(",")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn margin_hourly_rates_fail_whole_when_one_request_fails() {
+        let server = wiremock::MockServer::start().await;
+        mount_echoed_hourly_rates(&server, Some("A20")).await;
+        let client = margin_client_at(&server, false);
+        let names: Vec<String> = (0..25).map(|i| format!("A{i}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+
+        let read = client
+            .fetch_next_hourly_interest_rates(&assets(&names))
+            .await;
+        assert!(
+            matches!(
+                read,
+                Err(UnindexedClientError::Api(ApiError::RequestRejected(_)))
+            ),
+            "{read:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn margin_hourly_rates_refuse_an_unreadable_rate_and_send_nothing_for_no_assets() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path(HOURLY_RATE_ROUTE))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!([{"asset": "BTC", "nextHourlyInterestRate": "0.0.1"}]),
+            ))
+            .mount(&server)
+            .await;
+        let client = margin_client_at(&server, false);
+
+        let none = client.fetch_next_hourly_interest_rates(&[]).await.unwrap();
+        assert!(none.is_empty());
+        assert!(
+            hourly_rate_requests(&server).await.is_empty(),
+            "nothing sent"
+        );
+
+        match client
+            .fetch_next_hourly_interest_rates(&assets(&["BTC"]))
+            .await
+        {
+            Err(UnindexedClientError::Internal(message)) => {
+                assert!(
+                    message.contains("nextHourlyInterestRate \"0.0.1\""),
+                    "{message}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn margin_commission_rates_are_the_spot_accounts() {
+        use crate::client::binance::CommissionPart;
+        use rust_decimal_macros::dec;
+        let part = |rate: &str| serde_json::json!({"maker": rate, "taker": rate, "buyer": "0", "seller": "0"});
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/account/commission"))
+            .and(wiremock::matchers::query_param("symbol", "BTCUSDT"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "symbol": "BTCUSDT",
+                    "standardCommission": part("0.001"),
+                    "specialCommission": part("0"),
+                    "taxCommission": part("0"),
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = margin_client_at(&server, true);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+
+        let rates = client.fetch_commission_rates(&btcusdt).await.unwrap();
+        assert_eq!(
+            rates.standard,
+            CommissionPart::new(dec!(0.001), dec!(0.001), dec!(0), dec!(0))
+        );
+        assert_eq!(rates.discount, None);
+        assert!(
+            query_value(&server, "/api/v3/account/commission", "signature")
+                .await
+                .is_some(),
+            "signed"
+        );
     }
 }

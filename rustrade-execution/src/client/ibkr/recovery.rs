@@ -9,7 +9,10 @@
 //! A watcher thread next to the stream worker closes that gap for fills:
 //!
 //! 1. It samples [`Client::is_connected`] and drains the globally routed notice stream every
-//!    [`POLL_INTERVAL`], estimating when a gap started ([`GapTracker`]).
+//!    [`POLL_INTERVAL`], estimating when a gap started ([`GapTracker`]). The gap is placed on IB's
+//!    clock, as a [`VenueClock`] estimates it from the times IB stamped on the executions the
+//!    stream delivered, so a host clock ahead of IB's does not start it after the fills IB
+//!    stamped during the outage.
 //! 2. When the gap closes, meaning `ibapi`'s [`TRANSPORT_RECONNECT_CODE`] notice or TWS's
 //!    1101/1102, it asks TWS for the last seven days of executions and keeps those from the start of the
 //!    gap on ([`RecoveredFills`]).
@@ -48,6 +51,7 @@ use crate::{
             EventSender, KnownLiveOrders, NoPendingFills, OpenListing, OrderLookup,
             SharedKnownLiveOrders, UncheckedOrders, recover_ended_orders,
         },
+        venue_clock::{HostMoment, VenueClock},
     },
     emit_stream_terminated,
     error::{StreamTerminationReason, UnindexedClientError},
@@ -59,8 +63,8 @@ use chrono::{DateTime, Utc};
 use fnv::FnvHashSet;
 use ibapi::{
     TRANSPORT_RECONNECT_CODE,
-    client::blocking::{Client, NoticeStream},
-    orders::{ExecutionData, Executions},
+    client::blocking::{Client, NoticeStream, Subscription},
+    orders::{ExecutionData, ExecutionFilter, Executions},
     subscriptions::SubscriptionItem,
 };
 use lru::LruCache;
@@ -154,9 +158,9 @@ pub(super) fn is_replayed_execution(execution: &ExecutionData) -> bool {
 #[derive(Debug)]
 pub(super) struct GapTracker {
     /// The last sample that saw the transport connected.
-    last_connected: DateTime<Utc>,
-    /// The estimated start of the earliest gap not yet recovered.
-    gap_start: Option<DateTime<Utc>>,
+    last_connected: HostMoment,
+    /// The estimated start of the earliest gap not yet recovered, on this host.
+    gap_start: Option<HostMoment>,
     /// A sample saw the transport disconnected, and no connected sample has followed yet.
     transport_down: bool,
     /// Delivery was restored after `gap_start`, so recovery can run.
@@ -166,7 +170,7 @@ pub(super) struct GapTracker {
 }
 
 impl GapTracker {
-    pub(super) fn new(now: DateTime<Utc>) -> Self {
+    pub(super) fn new(now: HostMoment) -> Self {
         Self {
             last_connected: now,
             gap_start: None,
@@ -182,7 +186,7 @@ impl GapTracker {
     /// somewhere between the two. A gap already open keeps its earlier start. The first connected
     /// sample after a disconnected one makes recovery due, so recovery does not hinge on the
     /// reconnect notice alone.
-    pub(super) fn observe_connection(&mut self, connected: bool, now: DateTime<Utc>) {
+    pub(super) fn observe_connection(&mut self, connected: bool, now: HostMoment) {
         if connected {
             if std::mem::take(&mut self.transport_down) {
                 self.recovery_due = true;
@@ -198,19 +202,40 @@ impl GapTracker {
     ///
     /// A restoration with no gap on record still makes recovery due, starting at `now`: a drop
     /// and reconnect that both fall between two samples leave no disconnected sample behind.
-    pub(super) fn observe_notice(&mut self, notice: ConnectivityNotice, now: DateTime<Utc>) {
+    pub(super) fn observe_notice(&mut self, notice: ConnectivityNotice, now: HostMoment) {
         self.gap_start.get_or_insert(now);
         if notice == ConnectivityNotice::Restored {
             self.recovery_due = true;
         }
     }
 
-    /// The instant to recover executions from, if recovery is due and the transport is up.
-    pub(super) fn recovery_floor(&self, connected: bool) -> Option<DateTime<Utc>> {
+    /// The instant to recover executions from, if recovery is due and the transport is up:
+    /// [`RECOVERY_LOOKBACK`] before IB's time at the gap's start, as the clock `venue` returns
+    /// estimates it, or this host's time then if that is earlier ([`VenueClock::span_start`]).
+    /// Before the stream has delivered an execution IB stamped, from this host's time. `venue` is
+    /// called only when recovery is due, as it reads a clock another thread shares.
+    pub(super) fn recovery_floor(
+        &self,
+        connected: bool,
+        venue: impl FnOnce() -> VenueClock,
+    ) -> Option<DateTime<Utc>> {
         if !(self.recovery_due && connected) {
             return None;
         }
-        self.gap_start.map(|start| start - RECOVERY_LOOKBACK)
+        self.gap_start.map(|start| {
+            venue()
+                .span_start(start)
+                .unwrap_or(start.time)
+                .checked_sub_signed(RECOVERY_LOOKBACK)
+                .unwrap_or(DateTime::<Utc>::MIN_UTC)
+        })
+    }
+
+    /// Where the gap open at `now` ends: the later of this host's and IB's time at `now`, as
+    /// `venue` estimates it, or the gap's start counted on to `now` on tokio's clock
+    /// ([`VenueClock::span_end`]). `None` without a gap open.
+    pub(super) fn gap_end(&self, venue: &VenueClock, now: HostMoment) -> Option<DateTime<Utc>> {
+        self.gap_start.map(|start| venue.span_end(start, now))
     }
 
     /// The gap was recovered.
@@ -247,14 +272,17 @@ pub(super) struct EventSink {
     /// The latest revision delivered of each execution, by [`ExecutionRevision::execution`].
     /// Bounded like the dedup cache, so it forgets the oldest execution rather than grow.
     ///
-    /// Lock order: `revisions`, then `known`, then `tx`; `dedup` is taken and released on its
-    /// own. Nothing takes `revisions` while holding another, nor `known` while holding `tx`.
+    /// Lock order: `revisions`, then `known`, then `tx`; `dedup` and `venue` are each taken and
+    /// released on their own. Nothing takes `revisions` while holding another, nor `known` while holding `tx`.
     revisions: Arc<Mutex<LruCache<SmolStr, DeliveredRevision>>>,
     /// The orders the client holds as live. Held across each send of an event it learns from,
     /// as the order check holds it across its own, so an order this stream reports ending and
     /// the check reach the consumer in the order they were decided, and the order is reported
     /// once.
     known: SharedKnownLiveOrders,
+    /// IB's clock, from the times IB stamped on the executions the stream delivered. Taken and
+    /// released on its own.
+    venue: Arc<Mutex<VenueClock>>,
 }
 
 /// The latest revision of an execution an [`EventSink`] delivered.
@@ -277,7 +305,20 @@ impl EventSink {
             dedup,
             revisions: Arc::new(Mutex::new(LruCache::new(REVISIONS_REMEMBERED))),
             known,
+            venue: Arc::new(Mutex::new(VenueClock::new())),
         }
+    }
+
+    /// Record `time`, which IB stamped on an execution the stream received just now, in the
+    /// stream's clock. Only a time IB stamped: one this host filled in would read as an IB clock
+    /// as far off as this host's.
+    pub(super) fn observe_stamp(&self, time: DateTime<Utc>) {
+        self.venue.lock().observe(time, tokio::time::Instant::now());
+    }
+
+    /// IB's clock, as the executions the stream delivered show it.
+    pub(super) fn venue_clock(&self) -> VenueClock {
+        *self.venue.lock()
     }
 
     /// Send `event`, having learnt from it what [`KnownLiveOrders`] learns. Returns `false` once
@@ -414,8 +455,9 @@ impl EventSender for EventSink {
 pub(super) enum RecoveryError {
     #[error("executions request failed: {0}")]
     Ibapi(#[source] ibapi::Error),
-    #[error("executions request did not complete within {}s", RECOVERY_TIMEOUT.as_secs())]
-    TimedOut,
+    /// The executions did not all arrive within the read's timeout, which this holds.
+    #[error("executions request did not complete within {}s", .0.as_secs())]
+    TimedOut(Duration),
     /// The stream ended, or its consumer went, while recovery was reading.
     #[error("account stream ended during recovery")]
     StreamClosed,
@@ -429,8 +471,8 @@ impl RecoveryError {
     /// How [`AccountEventKind::FillRecoveryGaveUp`] states this failure.
     fn failure(&self) -> FillRecoveryFailure {
         match self {
-            Self::TimedOut => FillRecoveryFailure::TimedOut {
-                timeout_secs: RECOVERY_TIMEOUT.as_secs(),
+            Self::TimedOut(timeout) => FillRecoveryFailure::TimedOut {
+                timeout_secs: timeout.as_secs(),
             },
             Self::Ibapi(_) | Self::StreamClosed => FillRecoveryFailure::Request(self.to_string()),
         }
@@ -445,6 +487,8 @@ pub(super) struct RecoveredFills<'a> {
     floor: DateTime<Utc>,
     scope: ExecutionScope,
     contracts: &'a ContractRegistry,
+    /// The gateway's zone, for an execution time that names none.
+    session_zone: Option<chrono_tz::Tz>,
     awaiting_commission: ExecutionBuffer,
     trades: Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
     /// Executions kept although their timestamp did not parse.
@@ -456,11 +500,13 @@ impl<'a> RecoveredFills<'a> {
         floor: DateTime<Utc>,
         scope: ExecutionScope,
         contracts: &'a ContractRegistry,
+        session_zone: Option<chrono_tz::Tz>,
     ) -> Self {
         Self {
             floor,
             scope,
             contracts,
+            session_zone,
             awaiting_commission: ExecutionBuffer::new(),
             trades: Vec::new(),
             unparseable: 0,
@@ -470,10 +516,15 @@ impl<'a> RecoveredFills<'a> {
     pub(super) fn push(&mut self, item: Executions) {
         match item {
             Executions::ExecutionData(execution) => {
-                // An execution whose time does not parse (a DST-ambiguous local time, or a
-                // format change) is kept: dropping it could lose a fill from the gap, while
-                // keeping one the stream already delivered costs nothing past the dedup cache.
-                match super::execution::parse_ib_timestamp(&execution.execution.time) {
+                // An execution whose time does not read (an unknown zone, a local time in a
+                // skipped hour, or a format change) is kept: dropping it could lose a fill from
+                // the gap, while keeping one the stream already delivered costs nothing past the
+                // dedup cache.
+                let time = super::execution::parse_ib_timestamp(
+                    &execution.execution.time,
+                    self.session_zone,
+                );
+                match time {
                     Some(time) if time < self.floor => return,
                     Some(_) => {}
                     None => {
@@ -485,7 +536,9 @@ impl<'a> RecoveredFills<'a> {
                         self.unparseable += 1;
                     }
                 }
-                if let Some(resolved) = resolve_execution(&execution, self.scope, self.contracts) {
+                if let Some(resolved) =
+                    resolve_execution(&execution, self.scope, self.contracts, time)
+                {
                     self.awaiting_commission.add_execution(execution, resolved);
                 }
             }
@@ -564,26 +617,58 @@ fn report_retention_gap(sink: &EventSink, floor: DateTime<Utc>, now: DateTime<Ut
     })
 }
 
-/// Ask TWS for the last [`EXECUTION_DAYS`](super::execution::EXECUTION_DAYS) days of executions
-/// and return the fills from `floor` on.
+/// Where [`recover_fills`] reads executions from: TWS, through `ibapi`'s client, or a scripted
+/// source in tests.
+trait ExecutionSource {
+    /// Request the executions `filter` selects.
+    fn executions(&self, filter: ExecutionFilter) -> Result<impl ExecutionReplies, ibapi::Error>;
+}
+
+/// The replies to one executions request.
+trait ExecutionReplies {
+    /// The next reply, waiting at most `timeout`. As with `ibapi`'s
+    /// [`Subscription::next_timeout`], `None` means either the end marker or that the time ran
+    /// out.
+    fn next_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Option<Result<SubscriptionItem<Executions>, ibapi::Error>>;
+}
+
+impl ExecutionSource for Client {
+    fn executions(&self, filter: ExecutionFilter) -> Result<impl ExecutionReplies, ibapi::Error> {
+        Client::executions(self, filter)
+    }
+}
+
+impl ExecutionReplies for Subscription<Executions> {
+    fn next_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Option<Result<SubscriptionItem<Executions>, ibapi::Error>> {
+        Subscription::next_timeout(self, timeout)
+    }
+}
+
+/// Ask `source` for the last [`EXECUTION_DAYS`](super::execution::EXECUTION_DAYS) days of
+/// executions and return the fills `fills` keeps, within `timeout` (the watcher's is
+/// [`RECOVERY_TIMEOUT`]).
 fn recover_fills(
-    client: &Client,
-    floor: DateTime<Utc>,
-    scope: ExecutionScope,
-    contracts: &ContractRegistry,
+    source: &impl ExecutionSource,
+    mut fills: RecoveredFills<'_>,
     pending: &ExecutionBuffer,
     sink: &EventSink,
+    timeout: Duration,
 ) -> Result<Vec<Trade<AssetNameExchange, InstrumentNameExchange>>, RecoveryError> {
     // A day count and nothing else, since with none TWS lists only the current day's executions
     // and a gap across its midnight would lose the fills before it. Not on time: TWS reads
     // `ExecutionFilter::time` in a zone of its own choosing, so `RecoveredFills` applies the
     // window. Not on the client either: `scope` reports a liquidation of another client's order whatever it is set
     // to, so which executions are reported is decided by `ExecutionScope::classify`.
-    let subscription = client
+    let subscription = source
         .executions(executions_filter())
         .map_err(RecoveryError::Ibapi)?;
-    let deadline = Instant::now() + RECOVERY_TIMEOUT;
-    let mut fills = RecoveredFills::new(floor, scope, contracts);
+    let deadline = Instant::now() + timeout;
 
     loop {
         if !sink.is_open() {
@@ -600,7 +685,7 @@ fn recover_fills(
             }
             Some(Err(e)) => return Err(RecoveryError::Ibapi(e)),
             // `next_timeout` answers `None` both at the end marker and when the slice runs out.
-            None if Instant::now() >= deadline => return Err(RecoveryError::TimedOut),
+            None if Instant::now() >= deadline => return Err(RecoveryError::TimedOut(timeout)),
             None if returned_early(waited.elapsed(), slice) => break,
             None => {}
         }
@@ -629,6 +714,8 @@ pub(super) struct RecoveryWatcher {
     pub(super) known: SharedKnownLiveOrders,
     pub(super) listings: ListingLock,
     pub(super) earlier_completions: EarlierCompletions,
+    /// The gateway's zone, in which an order's time that names none is read.
+    pub(super) session_zone: Option<chrono_tz::Tz>,
     pub(super) sink: EventSink,
     /// The runtime the order check, which is shared with the other venues, runs its timers on.
     pub(super) runtime: tokio::runtime::Handle,
@@ -656,18 +743,18 @@ impl RecoveryWatcher {
     /// down for good, the watcher stops: the order-update reader ends the stream then, on the
     /// `Error::Shutdown` `ibapi` sends it.
     pub(super) fn run(self) {
-        let mut tracker = GapTracker::new(Utc::now());
+        let mut tracker = GapTracker::new(HostMoment::now());
         let mut unchecked = UncheckedOrders::default();
 
         while self.sink.is_open() {
             let connected = self.client.is_connected();
-            tracker.observe_connection(connected, Utc::now());
+            tracker.observe_connection(connected, HostMoment::now());
 
             while let Some(notice) = self.notices.try_next() {
                 observe_notice(&mut tracker, &notice);
             }
 
-            if let Some(floor) = tracker.recovery_floor(connected) {
+            if let Some(floor) = tracker.recovery_floor(connected, || self.sink.venue_clock()) {
                 match self.recover(&mut tracker, floor) {
                     // Every order held as live may have ended during the gap. Checked after the
                     // fills, so an order's fills reach the stream before how it ended.
@@ -702,12 +789,11 @@ impl RecoveryWatcher {
         // Taken before the read: IB's retention applied when it was requested.
         let requested_at = Utc::now();
         match recover_fills(
-            &self.client,
-            floor,
-            self.scope,
-            &self.contracts,
+            &*self.client,
+            RecoveredFills::new(floor, self.scope, &self.contracts, self.session_zone),
             &self.pending,
             &self.sink,
+            RECOVERY_TIMEOUT,
         ) {
             Ok(trades) => {
                 info!(
@@ -742,7 +828,11 @@ impl RecoveryWatcher {
                     AccountEventKind::FillRecoveryGaveUp(FillRecoveryGap::new(
                         FillRecoveryScope::AllInstruments,
                         floor,
-                        Utc::now().max(floor),
+                        // A floor comes only from a gap open, so the end is there: the gap is
+                        // cleared below, once reported.
+                        tracker
+                            .gap_end(&self.sink.venue_clock(), HostMoment::now())
+                            .map_or(floor, |end| end.max(floor)),
                         MAX_RECOVERY_FAILURES,
                         e.failure(),
                     )),
@@ -774,6 +864,7 @@ impl RecoveryWatcher {
             &self.order_ids,
             &self.pending_cancels,
             &self.earlier_completions,
+            self.session_zone,
         );
         let list_open = |_instruments: Vec<_>| std::future::ready(self.listed_cids());
         let lookup = |key| {
@@ -816,7 +907,7 @@ fn order_check_due(unchecked: &UncheckedOrders) -> bool {
 fn observe_notice(tracker: &mut GapTracker, notice: &ibapi::Notice) {
     if let Some(kind) = classify_notice(notice.code) {
         info!(code = notice.code, message = %notice.message, "IBKR connectivity notice");
-        tracker.observe_notice(kind, Utc::now());
+        tracker.observe_notice(kind, HostMoment::now());
     }
 }
 
@@ -835,6 +926,16 @@ mod tests {
 
     fn at(s: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// The moment this host's clock read `s`, with tokio's clock as far on from a fixed instant as
+    /// `s` is from the first time these tests use, so the two clocks agree.
+    fn host(s: &str) -> HostMoment {
+        static BASE: std::sync::LazyLock<tokio::time::Instant> =
+            std::sync::LazyLock::new(tokio::time::Instant::now);
+        let time = at(s);
+        let since = time - at("2026-09-29T00:00:00Z");
+        HostMoment::new(time, *BASE + since.to_std().unwrap())
     }
 
     #[test]
@@ -877,67 +978,156 @@ mod tests {
 
     #[test]
     fn tracker_is_quiet_without_a_gap() {
-        let mut tracker = GapTracker::new(at("2026-09-29T14:00:00Z"));
-        tracker.observe_connection(true, at("2026-09-29T14:00:01Z"));
-        assert_eq!(tracker.recovery_floor(true), None);
+        let mut tracker = GapTracker::new(host("2026-09-29T14:00:00Z"));
+        tracker.observe_connection(true, host("2026-09-29T14:00:01Z"));
+        assert_eq!(tracker.recovery_floor(true, VenueClock::new), None);
     }
 
     #[test]
     fn observed_drop_recovers_from_last_connected_sample() {
-        let mut tracker = GapTracker::new(at("2026-09-29T14:00:00Z"));
-        tracker.observe_connection(true, at("2026-09-29T14:00:10Z"));
-        tracker.observe_connection(false, at("2026-09-29T14:00:11Z"));
-        tracker.observe_connection(false, at("2026-09-29T14:05:00Z"));
+        let mut tracker = GapTracker::new(host("2026-09-29T14:00:00Z"));
+        tracker.observe_connection(true, host("2026-09-29T14:00:10Z"));
+        tracker.observe_connection(false, host("2026-09-29T14:00:11Z"));
+        tracker.observe_connection(false, host("2026-09-29T14:05:00Z"));
         // Still down: nothing is due until delivery is restored.
-        assert_eq!(tracker.recovery_floor(false), None);
+        assert_eq!(tracker.recovery_floor(false, VenueClock::new), None);
 
-        tracker.observe_connection(true, at("2026-09-29T14:05:01Z"));
-        tracker.observe_notice(ConnectivityNotice::Restored, at("2026-09-29T14:05:01Z"));
+        tracker.observe_connection(true, host("2026-09-29T14:05:01Z"));
+        tracker.observe_notice(ConnectivityNotice::Restored, host("2026-09-29T14:05:01Z"));
 
         assert_eq!(
-            tracker.recovery_floor(true),
+            tracker.recovery_floor(true, VenueClock::new),
             Some(at("2026-09-29T14:00:10Z") - RECOVERY_LOOKBACK)
         );
     }
 
+    /// The gap is placed on IB's clock once the stream has delivered an execution IB stamped, so
+    /// a host clock ahead of IB's beyond the lookback still recovers the fills IB stamped during
+    /// the outage.
     #[test]
-    fn observed_reconnect_makes_recovery_due_without_a_notice() {
-        let mut tracker = GapTracker::new(at("2026-09-29T14:00:00Z"));
-        tracker.observe_connection(true, at("2026-09-29T14:00:10Z"));
-        tracker.observe_connection(false, at("2026-09-29T14:00:11Z"));
-        tracker.observe_connection(true, at("2026-09-29T14:00:40Z"));
+    fn a_host_clock_ahead_of_ibs_recovers_from_ibs_time() {
+        let mut venue = VenueClock::new();
+        // An execution IB stamped 13:58:10 arrived as the host read 14:00:00: two minutes ahead.
+        venue.observe(
+            at("2026-09-29T13:58:10Z"),
+            host("2026-09-29T14:00:00Z").instant,
+        );
+        let mut tracker = GapTracker::new(host("2026-09-29T14:00:00Z"));
+        tracker.observe_connection(true, host("2026-09-29T14:00:10Z"));
+        tracker.observe_connection(false, host("2026-09-29T14:00:11Z"));
+        tracker.observe_connection(true, host("2026-09-29T14:05:00Z"));
+
+        let floor = tracker.recovery_floor(true, || venue).unwrap();
+
+        // IB's 13:58:20, less the drift allowed for over 10 s, less the lookback.
+        assert!(
+            floor <= at("2026-09-29T13:58:20Z") - RECOVERY_LOOKBACK,
+            "{floor}"
+        );
+        assert!(
+            floor > at("2026-09-29T13:58:19Z") - RECOVERY_LOOKBACK,
+            "{floor}"
+        );
+    }
+
+    /// A host clock stepped back before the reconnect does not end a reported gap before the
+    /// outage does: the gap's start counts on on tokio's clock.
+    #[test]
+    fn a_host_clock_stepped_back_still_ends_the_gap_past_the_outage() {
+        let mut tracker = GapTracker::new(host("2026-09-29T14:00:00Z"));
+        assert_eq!(
+            tracker.gap_end(&VenueClock::new(), host("2026-09-29T14:00:00Z")),
+            None
+        );
+        tracker.observe_connection(false, host("2026-09-29T14:00:01Z"));
+        // Five minutes on by tokio's clock, with the host clock an hour back.
+        let now = HostMoment::new(
+            at("2026-09-29T13:05:00Z"),
+            host("2026-09-29T14:05:00Z").instant,
+        );
 
         assert_eq!(
-            tracker.recovery_floor(true),
+            tracker.gap_end(&VenueClock::new(), now),
+            Some(at("2026-09-29T14:05:00Z"))
+        );
+    }
+
+    /// A connectivity notice reaches the tracker: a restoration makes recovery due, and a notice
+    /// that says nothing about delivery does not.
+    #[test]
+    fn a_connectivity_notice_reaches_the_tracker() {
+        let notice = |code| ibapi::Notice {
+            request_id: None,
+            code,
+            message: String::new(),
+            error_time: None,
+            advanced_order_reject_json: String::new(),
+        };
+        let mut tracker = GapTracker::new(HostMoment::now());
+        observe_notice(&mut tracker, &notice(2104));
+        assert_eq!(tracker.recovery_floor(true, VenueClock::new), None);
+
+        observe_notice(&mut tracker, &notice(CODE_LINK_RESTORED_DATA_KEPT));
+        assert!(tracker.recovery_floor(true, VenueClock::new).is_some());
+    }
+
+    /// The stream's clock is the one the sink samples, and starts with no sample.
+    #[test]
+    fn the_sinks_clock_holds_what_it_observed() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let sink = EventSink::new(
+            tx,
+            crate::client::dedup::new_dedup_cache(),
+            KnownLiveOrders::shared(ExchangeId::Ibkr),
+        );
+        assert_eq!(sink.venue_clock(), VenueClock::new());
+
+        let before = tokio::time::Instant::now();
+        sink.observe_stamp(at("2026-09-29T14:00:00Z"));
+
+        let earliest = sink.venue_clock().earliest_at(before).unwrap();
+        assert!(earliest <= at("2026-09-29T14:00:00Z"), "{earliest}");
+        assert!(earliest > at("2026-09-29T13:59:59Z"), "{earliest}");
+    }
+
+    #[test]
+    fn observed_reconnect_makes_recovery_due_without_a_notice() {
+        let mut tracker = GapTracker::new(host("2026-09-29T14:00:00Z"));
+        tracker.observe_connection(true, host("2026-09-29T14:00:10Z"));
+        tracker.observe_connection(false, host("2026-09-29T14:00:11Z"));
+        tracker.observe_connection(true, host("2026-09-29T14:00:40Z"));
+
+        assert_eq!(
+            tracker.recovery_floor(true, VenueClock::new),
             Some(at("2026-09-29T14:00:10Z") - RECOVERY_LOOKBACK)
         );
     }
 
     #[test]
     fn restoration_without_an_observed_drop_recovers_from_the_notice() {
-        let mut tracker = GapTracker::new(at("2026-09-29T14:00:00Z"));
-        tracker.observe_connection(true, at("2026-09-29T14:00:10Z"));
+        let mut tracker = GapTracker::new(host("2026-09-29T14:00:00Z"));
+        tracker.observe_connection(true, host("2026-09-29T14:00:10Z"));
         // Drop and reconnect both fell between two samples.
-        tracker.observe_connection(true, at("2026-09-29T14:00:11Z"));
-        tracker.observe_notice(ConnectivityNotice::Restored, at("2026-09-29T14:00:11Z"));
+        tracker.observe_connection(true, host("2026-09-29T14:00:11Z"));
+        tracker.observe_notice(ConnectivityNotice::Restored, host("2026-09-29T14:00:11Z"));
 
         assert_eq!(
-            tracker.recovery_floor(true),
+            tracker.recovery_floor(true, VenueClock::new),
             Some(at("2026-09-29T14:00:11Z") - RECOVERY_LOOKBACK)
         );
     }
 
     #[test]
     fn link_loss_notice_opens_gap_that_restoration_closes() {
-        let mut tracker = GapTracker::new(at("2026-09-29T14:00:00Z"));
-        tracker.observe_notice(ConnectivityNotice::Lost, at("2026-09-29T14:01:00Z"));
+        let mut tracker = GapTracker::new(host("2026-09-29T14:00:00Z"));
+        tracker.observe_notice(ConnectivityNotice::Lost, host("2026-09-29T14:01:00Z"));
         // TWS's link to IB is down but the socket is up: nothing to recover yet.
-        tracker.observe_connection(true, at("2026-09-29T14:02:00Z"));
-        assert_eq!(tracker.recovery_floor(true), None);
+        tracker.observe_connection(true, host("2026-09-29T14:02:00Z"));
+        assert_eq!(tracker.recovery_floor(true, VenueClock::new), None);
 
-        tracker.observe_notice(ConnectivityNotice::Restored, at("2026-09-29T14:03:00Z"));
+        tracker.observe_notice(ConnectivityNotice::Restored, host("2026-09-29T14:03:00Z"));
         assert_eq!(
-            tracker.recovery_floor(true),
+            tracker.recovery_floor(true, VenueClock::new),
             Some(at("2026-09-29T14:01:00Z") - RECOVERY_LOOKBACK)
         );
     }
@@ -1005,48 +1195,48 @@ mod tests {
 
     #[test]
     fn recovery_waits_for_the_transport() {
-        let mut tracker = GapTracker::new(at("2026-09-29T14:00:00Z"));
-        tracker.observe_notice(ConnectivityNotice::Restored, at("2026-09-29T14:00:05Z"));
-        assert_eq!(tracker.recovery_floor(false), None);
-        assert!(tracker.recovery_floor(true).is_some());
+        let mut tracker = GapTracker::new(host("2026-09-29T14:00:00Z"));
+        tracker.observe_notice(ConnectivityNotice::Restored, host("2026-09-29T14:00:05Z"));
+        assert_eq!(tracker.recovery_floor(false, VenueClock::new), None);
+        assert!(tracker.recovery_floor(true, VenueClock::new).is_some());
     }
 
     #[test]
     fn recovered_gap_is_cleared() {
-        let mut tracker = GapTracker::new(at("2026-09-29T14:00:00Z"));
-        tracker.observe_notice(ConnectivityNotice::Restored, at("2026-09-29T14:00:05Z"));
+        let mut tracker = GapTracker::new(host("2026-09-29T14:00:00Z"));
+        tracker.observe_notice(ConnectivityNotice::Restored, host("2026-09-29T14:00:05Z"));
         tracker.recovered();
-        assert_eq!(tracker.recovery_floor(true), None);
+        assert_eq!(tracker.recovery_floor(true, VenueClock::new), None);
 
         // A later gap starts afresh rather than from the recovered one.
-        tracker.observe_connection(true, at("2026-09-29T15:00:00Z"));
-        tracker.observe_connection(false, at("2026-09-29T15:00:01Z"));
-        tracker.observe_notice(ConnectivityNotice::Restored, at("2026-09-29T15:00:30Z"));
+        tracker.observe_connection(true, host("2026-09-29T15:00:00Z"));
+        tracker.observe_connection(false, host("2026-09-29T15:00:01Z"));
+        tracker.observe_notice(ConnectivityNotice::Restored, host("2026-09-29T15:00:30Z"));
         assert_eq!(
-            tracker.recovery_floor(true),
+            tracker.recovery_floor(true, VenueClock::new),
             Some(at("2026-09-29T15:00:00Z") - RECOVERY_LOOKBACK)
         );
     }
 
     #[test]
     fn transport_loss_during_recovery_keeps_the_gap_and_is_not_counted() {
-        let mut tracker = GapTracker::new(at("2026-09-29T14:00:00Z"));
-        tracker.observe_connection(false, at("2026-09-29T14:00:01Z"));
-        tracker.observe_notice(ConnectivityNotice::Restored, at("2026-09-29T14:01:00Z"));
-        let floor = tracker.recovery_floor(true);
+        let mut tracker = GapTracker::new(host("2026-09-29T14:00:00Z"));
+        tracker.observe_connection(false, host("2026-09-29T14:00:01Z"));
+        tracker.observe_notice(ConnectivityNotice::Restored, host("2026-09-29T14:01:00Z"));
+        let floor = tracker.recovery_floor(true, VenueClock::new);
 
         for _ in 0..MAX_RECOVERY_FAILURES * 2 {
             assert!(!tracker.recovery_failed(true));
         }
         // The second drop is later than the first; the gap still starts at the first.
-        tracker.observe_connection(false, at("2026-09-29T14:01:01Z"));
-        assert_eq!(tracker.recovery_floor(true), floor);
+        tracker.observe_connection(false, host("2026-09-29T14:01:01Z"));
+        assert_eq!(tracker.recovery_floor(true, VenueClock::new), floor);
     }
 
     #[test]
     fn repeated_other_failures_abandon_recovery() {
-        let mut tracker = GapTracker::new(at("2026-09-29T14:00:00Z"));
-        tracker.observe_notice(ConnectivityNotice::Restored, at("2026-09-29T14:00:05Z"));
+        let mut tracker = GapTracker::new(host("2026-09-29T14:00:00Z"));
+        tracker.observe_notice(ConnectivityNotice::Restored, host("2026-09-29T14:00:05Z"));
         for _ in 1..MAX_RECOVERY_FAILURES {
             assert!(!tracker.recovery_failed(false));
         }
@@ -1055,8 +1245,8 @@ mod tests {
 
     #[test]
     fn success_resets_the_failure_count() {
-        let mut tracker = GapTracker::new(at("2026-09-29T14:00:00Z"));
-        tracker.observe_notice(ConnectivityNotice::Restored, at("2026-09-29T14:00:05Z"));
+        let mut tracker = GapTracker::new(host("2026-09-29T14:00:00Z"));
+        tracker.observe_notice(ConnectivityNotice::Restored, host("2026-09-29T14:00:05Z"));
         for _ in 1..MAX_RECOVERY_FAILURES {
             assert!(!tracker.recovery_failed(false));
         }
@@ -1083,6 +1273,7 @@ mod tests {
             origin: TradeOrigin::Order,
             position_side: None,
             client_order_id: None,
+            time_source: crate::trade::TimeSource::Venue,
         }
     }
 
@@ -1156,11 +1347,15 @@ mod tests {
     /// A gap given up is reported with why its last read failed.
     #[test]
     fn a_failed_recovery_states_why() {
+        // Not `RECOVERY_TIMEOUT`: the timeout the read ran out is stated, whatever it was.
+        let timed_out = RecoveryError::TimedOut(Duration::from_secs(7));
         assert_eq!(
-            RecoveryError::TimedOut.failure(),
-            FillRecoveryFailure::TimedOut {
-                timeout_secs: RECOVERY_TIMEOUT.as_secs()
-            }
+            timed_out.failure(),
+            FillRecoveryFailure::TimedOut { timeout_secs: 7 }
+        );
+        assert_eq!(
+            timed_out.to_string(),
+            "executions request did not complete within 7s"
         );
         assert!(matches!(
             RecoveryError::Ibapi(ibapi::Error::Simple("refused".into())).failure(),
@@ -1406,7 +1601,7 @@ mod tests {
     fn recovered_fills_keep_the_window_and_this_clients_orders() {
         let contracts = registered();
         let pending = ExecutionBuffer::new();
-        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts);
+        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts, None);
 
         for item in [
             // Before the window: the stream delivered it, or it predates the stream.
@@ -1465,7 +1660,8 @@ mod tests {
         let read = |scope: ExecutionScope| {
             let contracts = registered();
             let pending = ExecutionBuffer::new();
-            let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), scope, &contracts);
+            let mut fills =
+                RecoveredFills::new(at("2026-09-29T14:00:00Z"), scope, &contracts, None);
             for item in [
                 other("external", 4242, 0),
                 commission("external"),
@@ -1528,7 +1724,7 @@ mod tests {
     fn recovered_execution_with_unparseable_time_is_kept() {
         let contracts = registered();
         let pending = ExecutionBuffer::new();
-        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts);
+        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts, None);
         fills.push(execution("garbled", IB_ORDER_ID, "not a time"));
         fills.push(commission("garbled"));
 
@@ -1544,7 +1740,7 @@ mod tests {
     fn recovered_fills_put_an_execution_ahead_of_its_corrections() {
         let contracts = registered();
         let pending = ExecutionBuffer::new();
-        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts);
+        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts, None);
         for item in [
             execution("x.01.02", IB_ORDER_ID, "20260929 14:00:00 UTC"),
             commission("x.01.02"),
@@ -1570,7 +1766,7 @@ mod tests {
     fn recovered_execution_without_commission_moves_to_the_stream_buffer() {
         let contracts = registered();
         let pending = ExecutionBuffer::new();
-        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts);
+        let mut fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts, None);
         fills.push(execution("late", IB_ORDER_ID, "20260929 14:00:30 UTC"));
 
         assert!(fills.finish(&pending).is_empty());
@@ -1582,5 +1778,155 @@ mod tests {
         };
         let trade = pending.complete_with_commission(&report).unwrap();
         assert_eq!(trade.id.0.as_str(), "late");
+    }
+
+    type Reply = Result<SubscriptionItem<Executions>, ibapi::Error>;
+
+    /// An executions request answered from a script, read as TWS answers one.
+    struct Script {
+        /// Why the request itself fails, if it does.
+        refusal: Mutex<Option<ibapi::Error>>,
+        replies: Mutex<std::collections::VecDeque<Reply>>,
+        /// Whether the replies end with TWS's end marker, rather than going silent.
+        ends: bool,
+    }
+
+    impl Script {
+        fn new(replies: impl IntoIterator<Item = Reply>, ends: bool) -> Self {
+            Self {
+                refusal: Mutex::new(None),
+                replies: Mutex::new(replies.into_iter().collect()),
+                ends,
+            }
+        }
+
+        fn refused(refusal: ibapi::Error) -> Self {
+            Self {
+                refusal: Mutex::new(Some(refusal)),
+                ..Self::new([], true)
+            }
+        }
+    }
+
+    impl ExecutionSource for Script {
+        fn executions(&self, _: ExecutionFilter) -> Result<impl ExecutionReplies, ibapi::Error> {
+            match self.refusal.lock().take() {
+                Some(refusal) => Err(refusal),
+                None => Ok(self),
+            }
+        }
+    }
+
+    impl ExecutionReplies for &Script {
+        fn next_timeout(&self, timeout: Duration) -> Option<Reply> {
+            if let Some(reply) = self.replies.lock().pop_front() {
+                return Some(reply);
+            }
+            // Past the end marker `ibapi` answers at once; a silent TWS lets the time run out.
+            if !self.ends {
+                std::thread::sleep(timeout);
+            }
+            None
+        }
+    }
+
+    fn data(item: Executions) -> Reply {
+        Ok(SubscriptionItem::Data(item))
+    }
+
+    const SINGAPORE: Option<chrono_tz::Tz> = Some(chrono_tz::Asia::Singapore);
+
+    fn recover(
+        script: &Script,
+        sink: &EventSink,
+        timeout: Duration,
+    ) -> Result<Vec<String>, RecoveryError> {
+        let contracts = registered();
+        let fills = RecoveredFills::new(at("2026-09-29T14:00:00Z"), OWN, &contracts, SINGAPORE);
+        let trades = recover_fills(script, fills, &ExecutionBuffer::new(), sink, timeout)?;
+        Ok(trades
+            .into_iter()
+            .map(|trade| format!("{} at {}", trade.id.0, trade.time_exchange.to_rfc3339()))
+            .collect())
+    }
+
+    #[test]
+    fn recovery_reads_the_replies_to_the_end_marker() {
+        let (sink, _rx) = sink();
+        let script = Script::new(
+            [
+                Ok(SubscriptionItem::Notice(ibapi::Notice {
+                    request_id: Some(9001),
+                    code: 2176,
+                    message: "a warning bound to the request".to_string(),
+                    error_time: None,
+                    advanced_order_reject_json: String::new(),
+                })),
+                // Times that name no zone, read in the session's: one second before the floor,
+                // and at it.
+                data(execution("before", IB_ORDER_ID, "20260929 21:59:59")),
+                data(commission("before")),
+                data(execution("gap", IB_ORDER_ID, "20260929 22:00:00")),
+                data(commission("gap")),
+            ],
+            true,
+        );
+
+        let recovered = recover(&script, &sink, RECOVERY_TIMEOUT).unwrap();
+        assert_eq!(recovered, ["gap at 2026-09-29T14:00:00+00:00"]);
+    }
+
+    #[test]
+    fn recovery_fails_when_the_request_is_refused() {
+        let (sink, _rx) = sink();
+        let script = Script::refused(ibapi::Error::ConnectionFailed);
+        assert!(matches!(
+            recover(&script, &sink, RECOVERY_TIMEOUT),
+            Err(RecoveryError::Ibapi(ibapi::Error::ConnectionFailed))
+        ));
+    }
+
+    #[test]
+    fn recovery_fails_on_an_error_reply() {
+        let (sink, _rx) = sink();
+        let script = Script::new(
+            [
+                data(execution("gap", IB_ORDER_ID, "20260929 22:00:00")),
+                Err(ibapi::Error::ConnectionReset),
+                data(commission("gap")),
+            ],
+            true,
+        );
+        assert!(matches!(
+            recover(&script, &sink, RECOVERY_TIMEOUT),
+            Err(RecoveryError::Ibapi(ibapi::Error::ConnectionReset))
+        ));
+    }
+
+    #[test]
+    fn recovery_times_out_when_tws_goes_silent() {
+        let (sink, _rx) = sink();
+        let script = Script::new(
+            [data(execution("gap", IB_ORDER_ID, "20260929 22:00:00"))],
+            false,
+        );
+        assert!(matches!(
+            recover(&script, &sink, Duration::from_millis(50)),
+            Err(RecoveryError::TimedOut(timeout)) if timeout == Duration::from_millis(50)
+        ));
+    }
+
+    #[test]
+    fn recovery_stops_when_the_consumer_goes() {
+        let (sink, rx) = sink();
+        drop(rx);
+        let script = Script::new(
+            [data(execution("gap", IB_ORDER_ID, "20260929 22:00:00"))],
+            true,
+        );
+        assert!(matches!(
+            recover(&script, &sink, RECOVERY_TIMEOUT),
+            Err(RecoveryError::StreamClosed)
+        ));
     }
 }

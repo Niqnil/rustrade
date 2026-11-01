@@ -580,11 +580,13 @@ fn is_transport_loss(e: &ibapi::Error) -> bool {
 /// registered.
 ///
 /// An execution of this client's own order is reported even if the client no longer tracks the
-/// order: after a restart, or once its id was reaped, it is still this client's fill.
+/// order: after a restart, or once its id was reaped, it is still this client's fill. `time` is
+/// its time as [`parse_ib_timestamp`] read it, carried to the trade.
 fn resolve_execution(
     execution: &ibapi::orders::ExecutionData,
     scope: ExecutionScope,
     contracts: &ContractRegistry,
+    time: Option<DateTime<Utc>>,
 ) -> Option<ResolvedExecution> {
     let ib_order_id = execution.execution.order_id;
     let con_id = execution.contract.contract_id;
@@ -626,6 +628,7 @@ fn resolve_execution(
         instrument,
         order_id,
         origin,
+        time,
     })
 }
 
@@ -958,6 +961,7 @@ fn forward_order_updates(
     sink: &recovery::EventSink,
     scope: ExecutionScope,
     contracts: &ContractRegistry,
+    session_zone: Option<chrono_tz::Tz>,
     order_ids: &OrderIdMap,
     pending_cancels: &PendingCancels,
     exec_buffer: &ExecutionBuffer,
@@ -1052,7 +1056,13 @@ fn forward_order_updates(
                     );
                     continue;
                 }
-                let Some(resolved) = resolve_execution(&exec, scope, contracts) else {
+                let time = execution::parse_ib_timestamp(&exec.execution.time, session_zone);
+                // IB stamped it, whoever the execution is for: it samples the stream's clock,
+                // which places fill recovery's span on IB's clock.
+                if let Some(time) = time {
+                    sink.observe_stamp(time);
+                }
+                let Some(resolved) = resolve_execution(&exec, scope, contracts, time) else {
                     continue;
                 };
                 // Logged on arrival, so the correction is seen even if no commission report
@@ -1320,6 +1330,9 @@ pub struct IbkrClient {
     /// The completions taken as an earlier order's under a reused client order id, each warned
     /// about once.
     earlier_completions: ended_orders::EarlierCompletions,
+    /// The gateway's time zone from the connection handshake: see
+    /// [`session_zone`](Self::session_zone).
+    session_zone: Option<chrono_tz::Tz>,
 }
 
 impl std::fmt::Debug for IbkrClient {
@@ -1398,6 +1411,7 @@ impl IbkrClient {
         })?;
 
         let next_id = client.next_order_id();
+        let session_zone = execution::session_zone(&client);
 
         let contracts = ContractRegistry::new();
         let skipped = connect::register_configured(&config.contracts, &contracts, |contract| {
@@ -1422,6 +1436,7 @@ impl IbkrClient {
             known_live: KnownLiveOrders::shared(ExchangeId::Ibkr),
             listings: ListingLock::default(),
             earlier_completions: ended_orders::EarlierCompletions::new(),
+            session_zone,
         };
         Ok(ConnectOutcome { client, skipped })
     }
@@ -1533,6 +1548,18 @@ impl IbkrClient {
     /// Get the contract registry.
     pub fn contract_registry(&self) -> &ContractRegistry {
         &self.contracts
+    }
+
+    /// The gateway's time zone, from the connection handshake, in which an execution's or a
+    /// completed order's time that names no zone is read (see [`parse_ib_timestamp`]), and a
+    /// listed order's good-till-date that names none.
+    ///
+    /// `None` when the gateway's zone name is not one `ibapi` recognises, which it warns of at
+    /// connect, or not a tz database name: such a time is then not read, and a fill with one is
+    /// stamped with this host's time ([`TimeSource::Host`](crate::trade::TimeSource::Host)). Such
+    /// a good-till-date is read as UTC, with a `warn!`, so that its order can still be listed.
+    pub fn session_zone(&self) -> Option<chrono_tz::Tz> {
+        self.session_zone
     }
 
     /// Get the number of pending executions awaiting commission reports.
@@ -2504,6 +2531,7 @@ impl ExecutionClient for IbkrClient {
         let contracts = self.contracts.clone();
         let order_ids = self.order_ids.clone();
         let listings = self.listings.clone();
+        let session_zone = self.session_zone;
         let orders_future = tokio::task::spawn_blocking(move || {
             let listing = listings.open_orders(&client)?;
             Ok::<_, UnindexedClientError>(open_orders_from_listing(
@@ -2511,6 +2539,7 @@ impl ExecutionClient for IbkrClient {
                 client.client_id(),
                 &contracts,
                 &order_ids,
+                session_zone,
             ))
         });
 
@@ -2721,6 +2750,7 @@ impl ExecutionClient for IbkrClient {
         .map_err(|e| UnindexedClientError::Internal(format!("order updates: {e}")))?;
 
         let scope = self.execution_scope();
+        let session_zone = self.session_zone;
         let contracts_clone = self.contracts.clone();
         let order_ids_clone = self.order_ids.clone();
         let pending_cancels_clone = self.pending_cancels.clone();
@@ -2741,6 +2771,7 @@ impl ExecutionClient for IbkrClient {
             known: self.known_live.clone(),
             listings: self.listings.clone(),
             earlier_completions: self.earlier_completions.clone(),
+            session_zone: self.session_zone,
             sink: sink.clone(),
             runtime: tokio::runtime::Handle::current(),
             scope,
@@ -2775,6 +2806,7 @@ impl ExecutionClient for IbkrClient {
                         &sink,
                         scope,
                         &contracts_clone,
+                        session_zone,
                         &order_ids_clone,
                         &pending_cancels_clone,
                         &exec_buffer_clone,
@@ -3160,9 +3192,9 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Limitations
     ///
-    /// The `time_exchange` field in returned balances uses `Utc::now()`, not
-    /// the actual IB server timestamp. IB's account summary endpoint does not
-    /// provide timestamps per balance update.
+    /// IB's account summary carries no time, so each balance's `time_exchange` is this host's
+    /// time when the request was sent, as the [`ExecutionClient::fetch_balances`] contract
+    /// describes.
     ///
     /// # Errors
     ///
@@ -3181,6 +3213,8 @@ impl ExecutionClient for IbkrClient {
         };
 
         tokio::task::spawn_blocking(move || {
+            // The balances' time: the summary describes the account no earlier than this.
+            let sent = Utc::now();
             // IB's reqAccountSummary expects a group name ("All" for all linked accounts),
             // not an account ID. Using account ID causes error 321 "Unified group name is invalid".
             // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
@@ -3193,7 +3227,7 @@ impl ExecutionClient for IbkrClient {
                 || client.is_connected(),
                 |timeout| sub.next_timeout(timeout),
             )?
-            .to_balances();
+            .to_balances(sent);
 
             if let Some(ref filter) = assets_filter {
                 balances.retain(|b| filter.contains(&b.asset));
@@ -3242,6 +3276,7 @@ impl ExecutionClient for IbkrClient {
         let contracts = self.contracts.clone();
         let order_ids = self.order_ids.clone();
         let listings = self.listings.clone();
+        let session_zone = self.session_zone;
         let instruments_filter: Option<HashSet<_>> = if instruments.is_empty() {
             None
         } else {
@@ -3250,8 +3285,13 @@ impl ExecutionClient for IbkrClient {
 
         let listed = tokio::task::spawn_blocking(move || {
             let listing = listings.open_orders(&client)?;
-            let mut listed =
-                open_orders_from_listing(listing, client.client_id(), &contracts, &order_ids);
+            let mut listed = open_orders_from_listing(
+                listing,
+                client.client_id(),
+                &contracts,
+                &order_ids,
+                session_zone,
+            );
             if let Some(filter) = &instruments_filter {
                 listed.retain(|listed| filter.contains(&listed.instrument));
             }
@@ -3316,6 +3356,7 @@ impl ExecutionClient for IbkrClient {
         let client = self.client.clone();
         let contracts = self.contracts.clone();
         let scope = self.execution_scope();
+        let session_zone = self.session_zone;
         let instruments_filter: Option<HashSet<_>> = if instruments.is_empty() {
             None
         } else {
@@ -3346,6 +3387,7 @@ impl ExecutionClient for IbkrClient {
                 listing,
                 scope,
                 &contracts,
+                session_zone,
                 start..=end,
                 instruments_filter.as_ref(),
             );
@@ -3369,6 +3411,7 @@ fn trades_from_executions(
     listing: impl IntoIterator<Item = ibapi::orders::Executions>,
     scope: ExecutionScope,
     contracts: &ContractRegistry,
+    session_zone: Option<chrono_tz::Tz>,
     span: std::ops::RangeInclusive<DateTime<Utc>>,
     instruments: Option<&HashSet<InstrumentNameExchange>>,
 ) -> Vec<Trade<AssetNameExchange, InstrumentNameExchange>> {
@@ -3398,7 +3441,7 @@ fn trades_from_executions(
                 if instruments.is_some_and(|filter| !filter.contains(&instrument)) {
                     continue;
                 }
-                match execution::parse_ib_timestamp(&exec.time) {
+                match execution::parse_ib_timestamp(&exec.time, session_zone) {
                     Some(time) if span.contains(&time) => {
                         awaiting_commission.add_execution(
                             data,
@@ -3406,6 +3449,7 @@ fn trades_from_executions(
                                 instrument,
                                 order_id,
                                 origin,
+                                time: Some(time),
                             },
                         );
                     }
@@ -3466,13 +3510,14 @@ impl ListedOpenOrder {
 }
 
 /// This API client's open orders from what one open-orders request listed, by IB order id, each
-/// read back as [`open_order_from_listing`] does. Orders in contracts not registered, and orders
-/// that have ended, are left out.
+/// read back as [`open_order_from_listing`] does, with a good-till-date that names no zone read in
+/// `session_zone`. Orders in contracts not registered, and orders that have ended, are left out.
 fn open_orders_from_listing(
     listing: impl IntoIterator<Item = ibapi::orders::Orders>,
     api_client_id: i32,
     contracts: &ContractRegistry,
     order_ids: &OrderIdMap,
+    session_zone: Option<chrono_tz::Tz>,
 ) -> Vec<ListedOpenOrder> {
     use ibapi::orders::Orders;
 
@@ -3493,7 +3538,13 @@ fn open_orders_from_listing(
     listed
         .into_values()
         .filter_map(|data| {
-            open_order_from_listing(&data, statuses.get(&data.order_id), contracts, order_ids)
+            open_order_from_listing(
+                &data,
+                statuses.get(&data.order_id),
+                contracts,
+                order_ids,
+                session_zone,
+            )
         })
         .collect()
 }
@@ -3504,7 +3555,8 @@ fn open_orders_from_listing(
 /// An order is named by the client order id it was placed with: the one this client tracks it
 /// under, or else its order reference, which carries the id ([`order::order_ref`]). Either way an
 /// order this client tracks keeps the shape it was placed with, and any other is read back by
-/// [`order::order_shape_from_ib`]. An order named by its reference that this client does not track,
+/// [`order::order_shape_from_ib`], with a good-till-date that names no zone read in `session_zone`.
+/// An order named by its reference that this client does not track,
 /// such as one placed before a restart, is adopted: tracked from then on under that id, so its
 /// fills and status reach the account stream and it can be cancelled.
 ///
@@ -3518,6 +3570,7 @@ fn open_order_from_listing(
     status: Option<&ibapi::orders::OrderStatus>,
     contracts: &ContractRegistry,
     order_ids: &OrderIdMap,
+    session_zone: Option<chrono_tz::Tz>,
 ) -> Option<ListedOpenOrder> {
     let ib_id = data.order_id;
     let instrument = contracts.get_name_by_con_id(data.contract.contract_id)?;
@@ -3549,7 +3602,7 @@ fn open_order_from_listing(
     let (cid, ctx, named_as_placed) = match tracked {
         Some((cid, ctx)) => (cid, ctx, true),
         None => {
-            let shape = match order::order_shape_from_ib(&data.order) {
+            let shape = match order::order_shape_from_ib(&data.order, session_zone) {
                 Ok(shape) => shape,
                 Err(reason) => {
                     warn!(
@@ -3790,6 +3843,11 @@ fn cancelled_at_expiry(user_cancel: bool, time_in_force: &TimeInForce, at: DateT
 /// [`GTD_EXPIRY_TOLERANCE`] of its expiry, it will be misclassified as `Expired`. This
 /// is rare and acceptable given the alternative (forking ibapi to preserve order_id in
 /// error callbacks).
+///
+/// # Time
+///
+/// The state is stamped with this host's time when the status is converted: IB's `OrderStatus`
+/// carries no time of its own.
 fn make_order_from_status(
     status: &ibapi::orders::OrderStatus,
     client_id: ClientOrderId,
@@ -3963,6 +4021,7 @@ impl OrderStatusClient for IbkrClient {
         let order_ids = self.order_ids.clone();
         let pending_cancels = self.pending_cancels.clone();
         let earlier_completions = self.earlier_completions.clone();
+        let session_zone = self.session_zone;
         tokio::task::spawn_blocking(move || {
             let reader = ended_orders::EndedOrderReader::new(
                 &client,
@@ -3971,6 +4030,7 @@ impl OrderStatusClient for IbkrClient {
                 &order_ids,
                 &pending_cancels,
                 &earlier_completions,
+                session_zone,
             );
             // Each lookup is answered from listings read on this thread, so the futures are
             // ready at once and nothing awaits the runtime.
@@ -4814,6 +4874,7 @@ mod order_reader_tests {
             sink,
             scope(0),
             &ContractRegistry::new(),
+            None,
             &OrderIdMap::new(),
             &PendingCancels::new(),
             &ExecutionBuffer::new(),
@@ -4892,6 +4953,7 @@ mod order_reader_tests {
                 &sink,
                 scope(0),
                 &ContractRegistry::new(),
+                None,
                 &order_ids,
                 &PendingCancels::new(),
                 &ExecutionBuffer::new(),
@@ -4946,6 +5008,7 @@ mod order_reader_tests {
             &sink,
             scope(903),
             &ContractRegistry::new(),
+            None,
             &order_ids,
             &PendingCancels::new(),
             &ExecutionBuffer::new(),
@@ -5007,6 +5070,7 @@ mod order_reader_tests {
             &sink,
             scope(0),
             &ContractRegistry::new(),
+            None,
             &order_ids,
             &PendingCancels::new(),
             &ExecutionBuffer::new(),
@@ -5118,6 +5182,7 @@ mod order_reader_tests {
             &sink,
             scope(0),
             &contracts,
+            None,
             &order_ids,
             &PendingCancels::new(),
             &ExecutionBuffer::new(),
@@ -5457,7 +5522,7 @@ mod order_reader_tests {
                 Ok(SubscriptionItem::Data(AccountSummaryResult::End)),
             ])
             .unwrap()
-            .to_balances();
+            .to_balances(Utc::now());
             assert_eq!(balances.len(), 1, "{balances:?}");
             let cut_short = read(vec![summary()]);
             assert!(
@@ -5547,6 +5612,7 @@ mod order_reader_tests {
                 API_CLIENT,
                 &contracts(),
                 &order_ids,
+                None,
             );
 
             assert_eq!(listed_orders.len(), 2, "{listed_orders:?}");
@@ -5620,6 +5686,7 @@ mod order_reader_tests {
                 API_CLIENT,
                 &contracts(),
                 &OrderIdMap::new(),
+                None,
             );
             assert_eq!(orders.len(), 1, "{orders:?}");
             assert!(orders[0].order.is_none());
@@ -5631,6 +5698,39 @@ mod order_reader_tests {
                 order_ref: order_ref.to_owned(),
                 ..stop_order()
             }
+        }
+
+        /// An order this client does not track, listed with a good-till-date that names no zone,
+        /// has it read in the session's zone, as IB reads it.
+        #[test]
+        fn a_listed_good_till_date_without_a_zone_is_read_in_the_sessions() {
+            use chrono::TimeZone as _;
+            let good_till_date = ibapi::orders::Order {
+                tif: ibapi::orders::TimeInForce::GoodTillDate,
+                good_till_date: "20261009 16:00:00".to_owned(),
+                ..referenced("gtd")
+            };
+
+            let orders = open_orders_from_listing(
+                [
+                    listed(API_CLIENT, 7, good_till_date),
+                    status(API_CLIENT, 7, OrderStatusKind::Submitted, 0.0),
+                ],
+                API_CLIENT,
+                &contracts(),
+                &OrderIdMap::new(),
+                Some(chrono_tz::Asia::Singapore),
+            );
+
+            let [listed] = orders.as_slice() else {
+                panic!("one order: {orders:?}");
+            };
+            assert_eq!(
+                listed.order.as_ref().unwrap().time_in_force,
+                crate::order::TimeInForce::GoodTillDate {
+                    expiry: chrono::Utc.with_ymd_and_hms(2026, 10, 9, 8, 0, 0).unwrap()
+                }
+            );
         }
 
         /// An order this client does not track, such as one placed before a restart, is named by
@@ -5646,6 +5746,7 @@ mod order_reader_tests {
                 API_CLIENT,
                 &contracts(),
                 &order_ids,
+                None,
             );
 
             assert_eq!(listed.len(), 1, "{listed:?}");
@@ -5691,6 +5792,7 @@ mod order_reader_tests {
                 API_CLIENT,
                 &contracts(),
                 &order_ids,
+                None,
             );
 
             let order = listed[0].order.as_ref().unwrap();
@@ -5783,6 +5885,7 @@ mod order_reader_tests {
                 API_CLIENT,
                 &contracts,
                 &OrderIdMap::new(),
+                None,
             );
 
             let mut orders = SnapshotOrders::new(Some(listed_orders));
@@ -5848,6 +5951,7 @@ mod order_reader_tests {
                 ],
                 scope(API_CLIENT),
                 &contracts(),
+                None,
                 at("2026-10-07T10:00:00Z")..=at("2026-10-07T11:00:00Z"),
                 None,
             );
@@ -5878,6 +5982,7 @@ mod order_reader_tests {
                 ],
                 scope(API_CLIENT),
                 &contracts(),
+                None,
                 at("2026-10-07T10:00:00Z")..=at("2026-10-07T11:00:00Z"),
                 Some(&HashSet::from([InstrumentNameExchange::new("MSFT")])),
             );
@@ -5897,6 +6002,7 @@ mod order_reader_tests {
                     other_clients: true,
                 },
                 &contracts(),
+                None,
                 at("2026-10-07T10:00:00Z")..=at("2026-10-07T11:00:00Z"),
                 None,
             );
@@ -5910,6 +6016,33 @@ mod order_reader_tests {
                     ("7", crate::trade::TradeOrigin::Order),
                     ("client:905:7", crate::trade::TradeOrigin::External)
                 ]
+            );
+
+            // A read selects by time, so an execution whose time does not read is skipped:
+            // in a zone that is not a tz database name, or naming none without a session zone.
+            // With the session's zone, one naming none is read in it.
+            let untimed = |session_zone| {
+                trades_from_executions(
+                    [
+                        executed(API_CLIENT, 7, "unknown-zone", "20261007 10:00:00 Nowhere"),
+                        commission("unknown-zone"),
+                        executed(API_CLIENT, 7, "no-zone", "20261007 18:00:00"),
+                        commission("no-zone"),
+                    ],
+                    scope(API_CLIENT),
+                    &contracts(),
+                    session_zone,
+                    at("2026-10-07T10:00:00Z")..=at("2026-10-07T11:00:00Z"),
+                    None,
+                )
+                .into_iter()
+                .map(|trade| (trade.id.0.to_string(), trade.time_exchange))
+                .collect::<Vec<_>>()
+            };
+            assert_eq!(untimed(None), []);
+            assert_eq!(
+                untimed(Some(chrono_tz::Asia::Singapore)),
+                [("no-zone".to_string(), at("2026-10-07T10:00:00Z"))]
             );
         }
     }

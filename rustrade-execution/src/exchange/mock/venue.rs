@@ -25,7 +25,7 @@ use crate::{
     position::{Position, PositionReport},
     shortability::ShortabilityProvider,
     slippage::Slippage,
-    trade::{AssetFees, Trade, TradeId, TradeOrigin},
+    trade::{AssetFees, TimeSource, Trade, TradeId, TradeOrigin},
 };
 use chrono::{DateTime, Utc};
 use fnv::{FnvHashMap, FnvHashSet};
@@ -41,6 +41,11 @@ use rustrade_integration::collection::snapshot::Snapshot;
 use smol_str::ToSmolStr;
 use std::{sync::Arc, time::Duration};
 use tracing::warn;
+
+mod liquidation;
+mod spot_pairs;
+
+use spot_pairs::{SpotPair, SpotPairs};
 
 /// Everything one request obliges a driver to deliver, in the order it must deliver it.
 ///
@@ -211,6 +216,12 @@ pub enum VenueRegime {
 /// carries [`InterestTiming::OnBorrow`] and one at a boundary [`InterestTiming::Periodic`]. A venue that books such
 /// interest at the start of its hour stamps it earlier than this venue does.
 ///
+/// It liquidates the account only when the configuration says so, with
+/// [`SpotMarginConfig::with_liquidation`]: then, after each input, an account whose margin level
+/// has fallen to the configured level has its open orders cancelled and every debt closed by
+/// forced trades, reported as [`TradeOrigin::Liquidation`] fills, and is charged a fee. See
+/// [`SpotMarginLiquidation`](crate::margin::SpotMarginLiquidation).
+///
 /// [`Balance::margin`]: crate::balance::Balance::margin
 ///
 /// # How a CFD is accounted
@@ -232,16 +243,17 @@ pub enum VenueRegime {
 /// The position is reported by [`account_snapshot`](Self::account_snapshot), and a position that
 /// a configured `initial_state` reports for a CFD is where this venue starts.
 ///
-/// Not modelled: liquidation. A short closed at more than twice its entry has lost more than its
-/// margin, and pays the shortfall as a debit. Carry is charged only when configured: see
+/// Not modelled: liquidation of a CFD position, even on a venue that liquidates its spot margin
+/// account. A short closed at more than twice its entry has lost more than its margin, and pays
+/// the shortfall as a debit. Carry is charged only when configured: see
 /// `# Holding costs`.
 ///
 /// [`Perpetual`](InstrumentKind::Perpetual), [`Future`](InstrumentKind::Future) and
 /// [`Option`](InstrumentKind::Option) need funding, margin and expiry settlement, none of which this
 /// venue models. They are **rejected at [`open_order`](Self::open_order)** with
 /// [`ApiError::InstrumentInvalid`] rather than filled. The check lives here, not only in the
-/// `rustrade` builder, because this type and its [`instruments`](Self::instruments) map are public:
-/// a consumer that constructs one directly bypasses every upstream gate, and the alternative to
+/// `rustrade` builder, because this type and its constructors are public: a consumer that
+/// constructs one directly bypasses every upstream gate, and the alternative to
 /// rejecting is filling a derivative as if it were deliverable stock.
 ///
 /// # Holding costs
@@ -252,8 +264,10 @@ pub enum VenueRegime {
 /// - **When.** At each model's boundaries, as the clock reaches them. This venue has no timer, so
 ///   a boundary is charged when a driver next moves the clock to or past it, through
 ///   [`advance_time`](Self::advance_time) or [`apply_market`](Self::apply_market). Several
-///   boundaries passed at once are each charged, in time order. A driver that moves the clock to
-///   [`next_deadline`](Self::next_deadline) charges each one when it falls, as `SimRunner` does.
+///   boundaries passed at once are each charged once, in time order, however far the clock
+///   jumped, and a clock moved back charges nothing (see [`advance_time`](Self::advance_time)). A
+///   driver that moves the clock to [`next_deadline`](Self::next_deadline) charges each one when
+///   it falls, as `SimRunner` does.
 ///   Charging starts at the instant the clock first moves, so a position a configured
 ///   `initial_state` seeds is charged from there, and never for the time before the run.
 /// - **What.** The position held across the boundary, valued at the mid of this venue's market,
@@ -267,7 +281,7 @@ pub enum VenueRegime {
 ///   with a [`CashFlowId`] from this venue's own sequence. The engine adds the flow to the
 ///   position's `carry`, as it does a live venue's. A charge the account cannot cover is still
 ///   made, and takes `free` below zero, with a WARN on the charge that does so, since this venue
-///   models no liquidation.
+///   liquidates no CFD position.
 ///
 /// # Locates and the short-sale restriction
 /// This venue lends no stock: a spot sell delivers base the account must hold, so a short sale of
@@ -522,7 +536,13 @@ pub struct SimulatedVenue {
     /// Moves each taker fill against the order, from its own seeded stream. Private: the stream's
     /// position is what makes a run reproducible from its seed, so nothing else may draw from it.
     slippage: Slippage,
-    pub instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
+    /// Every instrument this venue trades, as constructed. Private, and never changed after
+    /// construction: [`spot_pairs`](Self::spot_pairs) indexes it, and resting orders were accepted
+    /// against it. Read through [`instruments`](Self::instruments).
+    instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
+    /// The spot instruments of [`instruments`](Self::instruments), by the two assets each pairs.
+    /// What values an account and picks a liquidation's legs without scanning every instrument.
+    spot_pairs: SpotPairs,
     pub account: AccountState,
     /// This venue's own view of each instrument it trades, as of the last
     /// [`apply_market`](Self::apply_market).
@@ -557,8 +577,10 @@ pub struct SimulatedVenue {
     /// collide between the two. A real venue mints trade ids independently for the same reason;
     /// the link back to the order is [`Trade::order_id`], which is typed rather than parsed.
     trade_sequence: u64,
-    /// Read via [`time_exchange`](Self::time_exchange), advanced only by
-    /// [`advance_time`](Self::advance_time).
+    /// Read via [`time_exchange`](Self::time_exchange), and set only by
+    /// [`advance_time`](Self::advance_time), which never sets it below
+    /// [`accrued_through`](Self::accrued_through). An [`apply_market`](Self::apply_market) since
+    /// can have raised that mark past it, until the next `advance_time` catches up.
     time_exchange_latest: DateTime<Utc>,
     /// Which price source this venue has. Private: it is fixed at construction, and a consumer
     /// flipping it on a venue already holding resting orders would leave them unmatchable with no
@@ -575,6 +597,10 @@ pub struct SimulatedVenue {
     /// a charge idempotent however often the clock is moved to one instant. It starts unset
     /// rather than at the epoch, so a venue charges from the first instant it is driven to, not
     /// for every boundary since 1970.
+    ///
+    /// Both inputs raise it and nothing lowers it, so it is also the latest instant this venue's
+    /// clock has reached, which both inputs hold the instant they are given to — see
+    /// [`not_before_reached`](Self::not_before_reached).
     accrued_through: Option<DateTime<Utc>>,
     /// The earliest holding-cost boundary after [`accrued_through`](Self::accrued_through) of any
     /// position held, or `None` if there is none.
@@ -625,6 +651,10 @@ pub struct SimulatedVenue {
     /// restatement whose debt differs is followed by an [`AccountEventKind::MarginDebt`]. Seeded
     /// with the debt the account starts with.
     reported_debt: FnvHashMap<AssetNameExchange, MarginDetails>,
+    /// Where a spot margin account stands against its configured
+    /// [`SpotMarginLiquidation`](crate::margin::SpotMarginLiquidation): whether a liquidation is
+    /// under way, and whether a margin call is outstanding.
+    liquidation: liquidation::LiquidationState,
 }
 
 impl SimulatedVenue {
@@ -692,6 +722,7 @@ impl SimulatedVenue {
             spot_fee_asset: config.spot_fee_asset,
             fill_model: Arc::new(config.fill_model),
             slippage: Slippage::new(config.slippage),
+            spot_pairs: SpotPairs::new(&instruments),
             instruments,
             account,
             market: FnvHashMap::default(),
@@ -715,6 +746,7 @@ impl SimulatedVenue {
             next_interest: None,
             next_interest_loans: 0,
             reported_debt,
+            liquidation: Default::default(),
         }
     }
 
@@ -885,20 +917,56 @@ impl SimulatedVenue {
     /// the type's `# Holding costs` and `# Spot margin`. They precede the expiries, which are
     /// stamped at `time_exchange`.
     ///
+    /// # And the liquidation it caused
+    /// Last, a spot margin account configured with a
+    /// [`SpotMarginLiquidation`](crate::margin::SpotMarginLiquidation) is checked at
+    /// `time_exchange`, and the notices, cancels, forced trades and fee that check causes follow
+    /// everything else, stamped there too.
+    ///
+    /// # The clock never moves back
+    /// An instant earlier than the latest this venue has reached, through this call or through
+    /// [`apply_market`](Self::apply_market), is taken as that latest instant. It charges nothing
+    /// again, and the balances it restamps and whatever a request after it produces are stamped no
+    /// earlier than what this venue has already reported. A consumer keeping the latest stamp of
+    /// each balance would otherwise drop such a restatement as older than one it holds.
+    ///
+    /// The venue clamps the instant itself, so this holds whichever driver calls it, including one
+    /// stamping requests from a wall clock that stepped back. A request that arrives behind a later
+    /// market tick is therefore stamped at that tick. [`apply_market`](Self::apply_market) clamps
+    /// its tick the same way.
+    ///
+    /// # A forward jump charges every boundary it crosses
+    /// However far one call moves the clock, each boundary in between is charged once, at its own
+    /// stamp, on what was held and owed across it: a live paper venue whose host resumes after
+    /// hours asleep charges every hour it slept through. That is what a venue that kept running
+    /// would have charged, since funding and interest fall due at a boundary whether or not anyone
+    /// is watching. Each is valued at the market as it stood before the jump, since this venue saw
+    /// none in between.
+    ///
     /// # Panics
     /// If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract: a
     /// boundary not after the instant it was asked from, or a negative interest.
     #[must_use]
     pub fn advance_time(&mut self, time_exchange: DateTime<Utc>) -> Vec<UnindexedAccountEvent> {
+        let time_exchange = self.not_before_reached(time_exchange);
         // Charged before the balances are restamped, so each restatement it emits keeps its own
         // boundary's stamp and the ledger still ends stamped at `time_exchange`.
         let mut events = self.accrue(time_exchange);
         self.time_exchange_latest = time_exchange;
         self.account.update_time_exchange(time_exchange);
         events.append(&mut self.sweep_expired(time_exchange));
+        self.check_margin(time_exchange, &mut events);
         self.refresh_next_interest_if_loans_changed();
         self.report_debt_changes(&mut events);
         events
+    }
+
+    /// `time_exchange`, or the latest instant this venue has reached if that is later, which is
+    /// how both inputs keep the clock from moving back. See `advance_time`'s
+    /// `# The clock never moves back`.
+    fn not_before_reached(&self, time_exchange: DateTime<Utc>) -> DateTime<Utc> {
+        self.accrued_through
+            .map_or(time_exchange, |reached| reached.max(time_exchange))
     }
 
     /// Charges every holding-cost and interest boundary in `(accrued_through, now]`, the first
@@ -1094,7 +1162,7 @@ impl SimulatedVenue {
                 free = %balance.balance.free,
                 %boundary,
                 "SimulatedVenue charged a holding cost the account could not cover: free balance \
-                 is negative, and this venue models no liquidation"
+                 is negative, and this venue liquidates no CFD position"
             );
         }
 
@@ -1186,8 +1254,8 @@ impl SimulatedVenue {
     /// instrument with `terms`: see [`SpotMarginConfig`]'s `# How much it lends`.
     ///
     /// Zero unless spot margin lends, the order's `effect` is [`Borrow`](MarginEffect::Borrow),
-    /// the instrument is spot, and `free` falls short of the debit, so a venue that lends nothing,
-    /// or an order that needs no loan, values nothing.
+    /// the instrument is spot, no liquidation is under way, and `free` falls short of the debit,
+    /// so a venue that lends nothing, or an order that needs no loan, values nothing.
     /// `market` is the snapshot the order is priced from, used to value an asset on an instrument
     /// this venue holds no market for, as on a [`RequestPriced`](VenueRegime::RequestPriced)
     /// venue.
@@ -1203,6 +1271,7 @@ impl SimulatedVenue {
         };
         if effect != MarginEffect::Borrow
             || terms.cash_settled
+            || self.liquidation.under_way()
             || self.account.free(&debit.asset) >= debit.settled + debit.reserved
         {
             return Decimal::ZERO;
@@ -1213,29 +1282,39 @@ impl SimulatedVenue {
         let Some(asset_price) = self.price_in(&debit.asset, valuation, priced) else {
             return Decimal::ZERO;
         };
-
-        let mut equity = Decimal::ZERO;
-        let mut debt = Decimal::ZERO;
-        for balance in self.account.balances() {
-            let margin = balance.balance.margin.unwrap_or_default();
-            let owed = margin.borrowed + margin.interest;
-            let Some(price) = self.price_in(&balance.asset, valuation, priced) else {
-                // A debt this venue cannot value could be any size, so it lends nothing more.
-                if owed > Decimal::ZERO {
-                    return Decimal::ZERO;
-                }
-                continue;
-            };
-            equity += (balance.balance.total - owed) * price;
-            debt += owed * price;
-        }
+        // A debt this venue cannot value could be any size, so it lends nothing more.
+        let Some(Valued { equity, debt }) = self.valued(valuation, priced) else {
+            return Decimal::ZERO;
+        };
 
         let headroom = (config.max_leverage() - Decimal::ONE) * equity - debt;
         // `price_in` never values an asset at zero, so the division is safe.
-        match headroom > Decimal::ZERO {
-            true => headroom / asset_price,
-            false => Decimal::ZERO,
+        headroom.max(Decimal::ZERO) / asset_price
+    }
+
+    /// The account's equity and debt, valued in `valuation` as [`SpotMarginConfig`]'s
+    /// `# How much it lends` says, or `None` if it owes an asset this venue cannot value.
+    ///
+    /// `priced` is as for [`price_in`](Self::price_in). Shared by the leverage limit and the
+    /// liquidation check, so the two value an account alike.
+    fn valued(
+        &self,
+        valuation: &AssetNameExchange,
+        priced: Option<(&Underlying<AssetNameExchange>, &MarketSnapshot)>,
+    ) -> Option<Valued> {
+        let mut valued = Valued::default();
+        for balance in self.account.balances() {
+            let owed = owed(balance);
+            let Some(price) = self.price_in(&balance.asset, valuation, priced) else {
+                if owed > Decimal::ZERO {
+                    return None;
+                }
+                continue;
+            };
+            valued.equity += balance.balance.net_asset() * price;
+            valued.debt += owed * price;
         }
+        Some(valued)
     }
 
     /// What one unit of `asset` is worth in `valuation`: one for `valuation` itself, else the mid
@@ -1255,37 +1334,36 @@ impl SimulatedVenue {
             return Some(Decimal::ONE);
         }
 
-        let snapshot_of = |name: &InstrumentNameExchange, underlying| {
-            self.market(name).map(|market| market.snapshot).or_else(|| {
-                priced
-                    .filter(|(pair, _)| *pair == underlying)
-                    .map(|(_, s)| *s)
-            })
+        // `priced` applies to an instrument whose underlying it names: `asset`/`valuation`, or the
+        // reverse for an inverse pair.
+        let snapshot_of = |pair: &SpotPair| {
+            self.market(&pair.instrument)
+                .map(|market| market.snapshot)
+                .or_else(|| {
+                    let (underlying, snapshot) = priced?;
+                    let (base, quote) = match pair.inverse {
+                        true => (valuation, asset),
+                        false => (asset, valuation),
+                    };
+                    (underlying.base == *base && underlying.quote == *quote).then_some(*snapshot)
+                })
         };
 
-        self.instruments
+        // Ordered by name, so the first that prices is the one first by name.
+        self.spot_pairs
+            .between(asset, valuation)
             .iter()
-            .filter(|(_, instrument)| matches!(instrument.kind, InstrumentKind::Spot))
-            .filter_map(|(name, instrument)| {
-                let underlying = &instrument.underlying;
-                let inverse = match (&underlying.base, &underlying.quote) {
-                    (base, quote) if base == asset && quote == valuation => false,
-                    (base, quote) if base == valuation && quote == asset => true,
-                    _ => return None,
-                };
-                let price = mid_or_last(&snapshot_of(name, underlying)?)?;
+            .find_map(|pair| {
+                let price = mid_or_last(&snapshot_of(pair)?)?;
                 // A price of zero values nothing, and the inverse would divide by it.
                 if price <= Decimal::ZERO {
                     return None;
                 }
-                let value = match inverse {
+                Some(match pair.inverse {
                     true => Decimal::ONE / price,
                     false => price,
-                };
-                Some((name, value))
+                })
             })
-            .min_by(|(a, _), (b, _)| a.cmp(b))
-            .map(|(_, value)| value)
     }
 
     /// Retires every order whose deadline `time_exchange` has reached, releasing what it held.
@@ -1355,6 +1433,8 @@ impl SimulatedVenue {
         events
     }
 
+    /// The instant [`advance_time`](Self::advance_time) last set, which stamps what a request
+    /// produces. The Unix epoch until `advance_time` is first called.
     pub fn time_exchange(&self) -> DateTime<Utc> {
         self.time_exchange_latest
     }
@@ -1410,7 +1490,9 @@ impl SimulatedVenue {
     ///
     /// They are preceded by the holding costs of every boundary since the clock last moved and the
     /// expiries this tick reached, exactly as [`advance_time`](Self::advance_time) reports them.
-    /// The costs are valued at the market as it stood before this tick replaced it.
+    /// The costs are valued at the market as it stood before this tick replaced it. They are
+    /// followed by what the margin check at the end of the tick causes, as for `advance_time`,
+    /// valued at the market this tick set.
     ///
     /// # A bar releases the orders held for it
     /// Under [`MarketOrderTiming::NextBar`], an observation carrying a
@@ -1442,6 +1524,19 @@ impl SimulatedVenue {
     /// `#[must_use]` because a driver that applies the market and drops the result has silently
     /// eaten the fills, leaving its client holding an order the venue no longer has.
     ///
+    /// # The clock never moves back
+    /// A `time_exchange` earlier than the latest instant this venue has reached, through this call
+    /// or through [`advance_time`](Self::advance_time), is taken as that latest instant, as
+    /// `advance_time` takes one. It charges nothing again, and everything the tick stamps is
+    /// stamped no earlier than what this venue has already reported: the market it stores, the
+    /// instant it counts as [`fresh`](MarketObservation::fresh) from, the expiries it sweeps, and
+    /// the fills it causes with the balances they restate. A consumer keeping the latest stamp of
+    /// each balance would otherwise drop a fill's restatement as older than one it holds.
+    ///
+    /// The venue clamps the instant itself, so this holds whichever driver calls it. A driver that
+    /// feeds its ticks in order, never behind an instant it has already advanced to, sees no
+    /// difference.
+    ///
     /// # Panics
     /// If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract: a
     /// boundary not after the instant it was asked from, or a negative interest.
@@ -1452,6 +1547,7 @@ impl SimulatedVenue {
         observation: MarketObservation,
         time_exchange: DateTime<Utc>,
     ) -> Vec<UnindexedAccountEvent> {
+        let time_exchange = self.not_before_reached(time_exchange);
         // Charged before the snapshot is replaced, so a boundary this tick passed is valued at the
         // market as of that boundary rather than at a price observed after it.
         let mut events = self.accrue(time_exchange);
@@ -1510,6 +1606,7 @@ impl SimulatedVenue {
                 }
             }
         }
+        self.check_margin(time_exchange, &mut events);
         self.refresh_next_interest_if_loans_changed();
         self.report_debt_changes(&mut events);
         events
@@ -1611,9 +1708,9 @@ impl SimulatedVenue {
         // One lookup for the whole instrument: every crossing order is on it by construction.
         let terms = match self.instrument_terms(instrument) {
             Ok(terms) => terms,
-            // Unreachable: an order cannot rest on an instrument this venue rejected at open. A
-            // venue whose `instruments` map was mutated afterwards would reach it, and dropping the
-            // fills silently is the one thing this method must not do.
+            // Unreachable: an order cannot rest on an instrument this venue rejected at open, and
+            // the instruments never change after construction. Should that ever break, dropping
+            // the fills silently is the one thing this method must not do.
             Err(error) => panic!(
                 "SimulatedVenue holds resting orders on an instrument it cannot price: {error}"
             ),
@@ -2162,6 +2259,7 @@ impl SimulatedVenue {
             origin: TradeOrigin::Order,
             position_side: None,
             client_order_id: Some(order.key.cid.clone()),
+            time_source: TimeSource::Venue,
         };
 
         self.account.ack_trade(trade.clone());
@@ -2481,6 +2579,25 @@ impl SimulatedVenue {
         events.push(self.build_account_event(Snapshot(UnindexedOrder::from(cancelled))));
 
         events
+    }
+
+    /// Every instrument this venue trades, keyed by its exchange name, exactly as it was
+    /// constructed with.
+    ///
+    /// Read only: the set of instruments is fixed for the venue's life. To trade a different set,
+    /// construct a new venue.
+    pub fn instruments(
+        &self,
+    ) -> &FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>> {
+        &self.instruments
+    }
+
+    /// The instrument this venue trades under `name`, or `None` if it trades none by that name.
+    pub fn instrument(
+        &self,
+        name: &InstrumentNameExchange,
+    ) -> Option<&Instrument<ExchangeId, AssetNameExchange>> {
+        self.instruments.get(name)
     }
 
     /// This venue's view of `instrument`, or `None` if nothing has fed it one.
@@ -3744,6 +3861,7 @@ impl SimulatedVenue {
             origin: TradeOrigin::Order,
             position_side: None,
             client_order_id: Some(request.key.cid.clone()),
+            time_source: TimeSource::Venue,
         };
 
         // Booked here rather than by the caller, so that whatever this order became is decided in
@@ -4306,8 +4424,8 @@ impl SimulatedVenue {
     /// Returns whether `instrument` is cash-settled, rejecting kinds this venue cannot model.
     ///
     /// # Why this is enforced here and not only upstream
-    /// This type and its [`instruments`](Self::instruments) map are both public, so a consumer can
-    /// construct one directly and never pass through the `rustrade` builder that screens kinds
+    /// This type and its constructors are public, so a consumer can construct one directly with
+    /// any instruments and never pass through the `rustrade` builder that screens kinds
     /// today. Without this gate a [`InstrumentKind::Perpetual`], [`InstrumentKind::Future`] or
     /// [`InstrumentKind::Option`] falls to the physically-settled spot path and is filled as if it
     /// were deliverable stock — with its `contract_size` multiplier applied to a delivery that
@@ -4505,6 +4623,23 @@ fn insufficient_error(insufficient: BalanceInsufficient) -> UnindexedApiError {
         ),
     };
     ApiError::BalanceInsufficient(Some(asset), message)
+}
+
+/// What `balance` owes: its loan and the interest on it, zero on a cash account.
+fn owed(balance: &AssetBalance<AssetNameExchange>) -> Decimal {
+    balance
+        .balance
+        .margin
+        .map_or(Decimal::ZERO, |margin| margin.borrowed + margin.interest)
+}
+
+/// A margin account's equity and debt, in its valuation asset. See [`SimulatedVenue::valued`].
+#[derive(Debug, Clone, Copy, Default)]
+struct Valued {
+    /// The value of what the account holds, net of what it owes.
+    equity: Decimal,
+    /// The value of what it owes, loans plus interest.
+    debt: Decimal,
 }
 
 /// The mid of `snapshot`'s best bid and ask, else its last price.
@@ -5346,7 +5481,7 @@ mod tests {
         assert_eq!(trades[0].price, d("50000"));
     }
 
-    /// `advance_time` is the venue's only clock input, and it stamps everything produced after it.
+    /// `advance_time` sets the instant everything a request produces after it is stamped with.
     #[test]
     fn a_fill_is_stamped_with_the_instant_the_venue_was_last_advanced() {
         let mut venue = make_venue("100", "10000000");
@@ -5358,6 +5493,79 @@ mod tests {
         let outcome = venue.open_order(buy_request("0.01", market_prices("50000")));
         assert_eq!(filled_trade(&outcome).time_exchange, time_exchange);
         assert_eq!(filled_balance(&outcome).time_exchange, time_exchange);
+    }
+
+    /// A run may start before 1970: the first instant is taken as given, not held at the epoch
+    /// the clock reads before it first moves.
+    #[test]
+    fn the_first_instant_may_precede_the_epoch() {
+        let mut venue = make_venue("100", "10000000");
+        let start = "1965-03-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
+
+        advance(&mut venue, start);
+
+        assert_eq!(venue.time_exchange(), start);
+    }
+
+    /// A request arriving behind a market tick the venue has already applied is stamped at the
+    /// tick, so nothing it reports is older than what the tick could have reported.
+    #[test]
+    fn a_request_behind_a_later_market_tick_is_stamped_at_the_tick() {
+        let mut venue = make_cfd_venue_charging("200000", Vec::new());
+        let tick = time(10);
+        let fills = venue.apply_market(
+            &cfd_instrument_name(),
+            MarketObservation::new(MarketSnapshot {
+                best_bid: Some(d("5000")),
+                best_ask: Some(d("5000")),
+                last_price: Some(d("5000")),
+            }),
+            tick,
+        );
+        assert!(fills.is_empty());
+
+        assert!(venue.advance_time(time(5)).is_empty());
+        assert_eq!(venue.time_exchange(), tick, "the clock is held at the tick");
+
+        let outcome = venue.open_order(cfd_request(Side::Buy, "1", None));
+        assert_eq!(filled_trade(&outcome).time_exchange, tick);
+        assert_eq!(filled_balance(&outcome).time_exchange, tick);
+    }
+
+    /// A market tick behind an instant the venue has already reached is applied at that instant,
+    /// so the fill it causes, the balances it restates and the market it stores are stamped no
+    /// earlier than what the venue has already reported.
+    #[test]
+    fn a_market_tick_behind_the_clock_is_applied_at_the_clock() {
+        let (mut venue, _) = venue_resting_one_buy("48000");
+        let reached = time(10);
+        advance(&mut venue, reached);
+
+        let events = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("47800", "47900")),
+            time(5),
+        );
+
+        assert_eq!(
+            events.len(),
+            4,
+            "the tick still crosses the resting order: two balances, a trade, an order"
+        );
+        assert_eq!(balance_of(&events[0]).time_exchange, reached);
+        assert_eq!(balance_of(&events[1]).time_exchange, reached);
+        assert_eq!(trade_of(&events[2]).time_exchange, reached);
+        assert!(
+            venue
+                .account
+                .balances()
+                .all(|balance| balance.time_exchange == reached),
+            "no balance is restamped earlier than the venue has reported"
+        );
+        let market = venue.market(&instrument_name()).unwrap();
+        assert_eq!(market.time_exchange, reached);
+        assert_eq!(market.fresh_at, Some(reached));
+        assert_eq!(venue.time_exchange(), reached);
     }
 
     /// A resting order's arrival stamp survives the clock moving past it.
@@ -6151,9 +6359,9 @@ mod tests {
 
     /// A derivative must be rejected, not filled down the physically-settled spot path.
     ///
-    /// The fixture is mutated through the public `instruments` map on purpose: that is exactly the
-    /// route a consumer takes when it builds a venue itself rather than through the `rustrade`
-    /// builder, and it is the route that had no gate on it.
+    /// The venue is constructed directly with the derivative on purpose: that is exactly the route
+    /// a consumer takes when it builds a venue itself rather than through the `rustrade` builder,
+    /// and it is the route that had no gate on it.
     #[test]
     fn unsupported_instrument_kinds_are_rejected_rather_than_filled_as_spot() {
         use rustrade_instrument::instrument::kind::{
@@ -6187,8 +6395,10 @@ mod tests {
 
         for kind in unsupported {
             // Amply funded: the rejection must come from the kind, not from a balance shortfall.
-            let mut venue = make_venue("10", "10000000");
-            venue.instruments.get_mut(&instrument_name()).unwrap().kind = kind.clone();
+            let mut instruments = spot_instruments();
+            instruments.get_mut(&instrument_name()).unwrap().kind = kind.clone();
+            let config = spot_config("10", "10000000", FeeModelConfig::default());
+            let mut venue = SimulatedVenue::new(&config, instruments);
 
             let outcome = venue.open_order(buy_request("1.0", market_prices("50000")));
 
@@ -10189,6 +10399,39 @@ mod tests {
         assert_eq!(free_usd(&venue), d("75000") + d("37.5"));
     }
 
+    /// An earlier instant is held at the latest one: it charges nothing, the balances keep their
+    /// stamp, and the next boundary is charged once, as if the earlier instant had never come.
+    #[test]
+    fn an_earlier_instant_moves_neither_the_clock_nor_the_accrual_back() {
+        let mut venue = make_cfd_venue_charging("200000", vec![hourly_funding("0.0001")]);
+        assert!(cfd_market(&mut venue, "5000", "5000", "5000").is_empty());
+        cfd_market_fill(&mut venue, Side::Sell, "1");
+        let reached = boundary(1) + TimeDelta::seconds(1);
+        assert_eq!(charges(&venue.advance_time(reached)).len(), 2);
+        let free = free_usd(&venue);
+
+        assert!(
+            venue.advance_time(boundary(0)).is_empty(),
+            "nothing is charged again"
+        );
+        assert_eq!(venue.time_exchange(), reached);
+        assert!(
+            venue
+                .account
+                .balances()
+                .all(|balance| balance.time_exchange == reached),
+            "no balance is restamped earlier than the venue has reported"
+        );
+        assert_eq!(free_usd(&venue), free);
+
+        let events = venue.advance_time(boundary(2));
+        let stamps: Vec<_> = charges(&events)
+            .iter()
+            .map(|(_, flow)| flow.time_exchange)
+            .collect();
+        assert_eq!(stamps, vec![boundary(2)]);
+    }
+
     /// Charging starts where the clock first moves, not at the epoch the clock starts at. A venue
     /// with no market values the position at its entry price.
     #[test]
@@ -10274,39 +10517,12 @@ mod tests {
 
     /// Run `f`, returning its value and the message of every WARN it logged on this thread.
     fn warnings<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
-        use std::sync::Mutex;
-        use tracing_subscriber::layer::SubscriberExt;
-
-        struct Warnings(Arc<Mutex<Vec<String>>>);
-
-        struct Message<'a>(&'a mut String);
-
-        impl tracing::field::Visit for Message<'_> {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    *self.0 = format!("{value:?}");
-                }
-            }
-        }
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                if *event.metadata().level() == tracing::Level::WARN {
-                    let mut message = String::new();
-                    event.record(&mut Message(&mut message));
-                    self.0.lock().unwrap().push(message);
-                }
-            }
-        }
-
-        let warnings = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(Warnings(Arc::clone(&warnings)));
-        let value = tracing::subscriber::with_default(subscriber, f);
-        let warnings = warnings.lock().unwrap().clone();
+        let (value, events) = rustrade_instrument::test_utils::logs::capture(f);
+        let warnings = events
+            .iter()
+            .filter(|event| event.level == tracing::Level::WARN)
+            .map(|event| event.message().to_owned())
+            .collect();
         (value, warnings)
     }
 
@@ -12772,6 +12988,62 @@ mod tests {
             Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("25000"), Decimal::ZERO)
         );
         assert_eq!(balance_now(&venue, base()).total, d("1.5"));
+    }
+
+    #[test]
+    fn a_request_snapshot_values_only_the_pair_it_names() {
+        // Request-priced, so the venue holds no market and values from the request's snapshot.
+        let venue = SimulatedVenue::new(
+            &spot_config("1", "0", FeeModelConfig::default()),
+            spot_instruments(),
+        );
+        let snapshot = market_prices("50000").unwrap();
+        let eth = || AssetNameExchange::new("ETH");
+        let price_in = |asset: AssetNameExchange,
+                        valuation: AssetNameExchange,
+                        priced: Underlying<AssetNameExchange>| {
+            venue.price_in(&asset, &valuation, Some((&priced, &snapshot)))
+        };
+
+        assert_eq!(
+            price_in(base(), quote(), Underlying::new(base(), quote())),
+            Some(d("50000"))
+        );
+        assert_eq!(
+            price_in(quote(), base(), Underlying::new(base(), quote())),
+            Some(d("0.00002")),
+            "valued through the inverse of the pair the snapshot names"
+        );
+        assert_eq!(
+            price_in(base(), quote(), Underlying::new(base(), eth())),
+            None,
+            "a snapshot of another pair sharing the base prices nothing"
+        );
+        assert_eq!(
+            price_in(base(), quote(), Underlying::new(eth(), quote())),
+            None,
+            "a snapshot of another pair sharing the quote prices nothing"
+        );
+    }
+
+    #[test]
+    fn a_venue_reads_back_the_instruments_it_was_constructed_with() {
+        let instruments = fee_asset_instruments();
+        let venue = SimulatedVenue::new(
+            &spot_config("1", "0", FeeModelConfig::default()),
+            instruments.clone(),
+        );
+
+        assert_eq!(venue.instruments(), &instruments);
+        assert_eq!(
+            venue.instrument(&instrument_name()),
+            instruments.get(&instrument_name())
+        );
+        assert!(venue.instrument(&instrument_name()).is_some());
+        assert_eq!(
+            venue.instrument(&InstrumentNameExchange::new("ETHUSDT")),
+            None
+        );
     }
 
     #[test]
@@ -15326,4 +15598,6 @@ mod tests {
         assert_eq!(filled_trade(&outcome).fees.asset, usd());
         assert_eq!(balance_now(&venue, bnb()).total, d("10"));
     }
+
+    mod liquidation;
 }

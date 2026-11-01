@@ -40,7 +40,8 @@ pub trait ClosePositionsStrategy<
     /// State used by the `ClosePositionsStrategy` to determine what open and cancel requests
     /// to generate.
     ///
-    /// For Barter ecosystem strategies, this is the full `EngineState` of the trading system.
+    /// For a strategy run by the [`Engine`](crate::engine::Engine), this is the full `EngineState`
+    /// of the trading system.
     ///
     /// eg/ `EngineState<DefaultGlobalData, DefaultInstrumentMarketData>`
     type State;

@@ -7,6 +7,428 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-01
+
+### Changed
+
+- **Breaking: the strategy can attribute a cash flow on the account as a whole to a position**
+  (`rustrade`, #800). A new strategy trait, `CashFlowAttributionStrategy`, has one method,
+  `attribute_cash_flow`. `Engine::process` calls it for each account `CashFlow` whose
+  `instrument` is `None`, such as cross-margin interest, before the flow updates the state or is
+  recorded in the audit. It sees the engine state, the exchange and the flow:
+  - `Some(instrument)` sets the flow's `instrument`, and the flow goes to that instrument's open
+    position's carry, as a flow the venue attributed does. A state replica applies it the same way
+    from the audit.
+  - `None` leaves the flow on the account, as before.
+  - An instrument the state does not track on the flow's exchange is ignored with a `warn!`.
+
+  The engine asks in one place, so one rule serves live trading, `backtest` and `SimStepper`.
+  Before, a flow could be attributed only before the event reached the engine, which none of those
+  three let a caller do. The new `route_to_base` helper is one such rule, opt in: the only
+  instrument on the exchange whose base asset is the flow's asset and that holds an open position.
+  Every strategy used with the `Engine` must implement the trait; returning `None` keeps today's
+  behaviour, and `DefaultStrategy` does that.
+
+- **Breaking: a `SimStart` can open a simulated spot margin account already short, or owing a
+  loan** (`rustrade`, #794). On a venue whose `MockExecutionConfig::spot_margin` is set:
+  - A spot short seeds the venue with a loan of its base asset, holding none of it, and seeds the
+    `Engine` with the short at its entry price, as a long is seeded. Spot positions on one base
+    asset net, as a cross margin account nets them: a net long is held, a net short is borrowed.
+  - `StartBalance` carries a loan, borrowed principal and interest owed, set with the new
+    `StartBalance::with_loan`. That lets a start hold a long bought partly with borrowed quote,
+    interest already owed, or a base loan larger than the net short. A listed base asset must hold
+    its spot positions' net quantity net of its borrowed principal.
+    `SimStartError::BaseBalanceConflict` reports that figure as `listed`, where it had a
+    `balance` field. `StartBalance` is now `#[non_exhaustive]`: build it with
+    `StartBalance::new`.
+  - The short's proceeds are listed in `SimStart::balances`, as a long's leftover cash is.
+    Interest on what the start owes is charged from the interest model's first boundary after the
+    venue's clock first moves, with no charge for the borrow.
+  - The start's debt may not exceed what the venue lends, `(max_leverage − 1) × equity`, valued
+    at the start's own prices, since no market exists yet: the valuation asset at one, and an
+    asset a spot position pairs with it at that position's entry price. An asset with no such
+    price adds nothing to equity, and a debt in one is refused.
+
+  A venue that does not lend still refuses a spot short (`SimStartError::SpotShort`), and refuses
+  a loan with the new `SimStartError::LoanWithoutMargin`. Other new variants: `NegativeLoan`,
+  `UnpricedDebt` and `OverLeveraged`, which names the assets held but valued at zero.
+
+- **Breaking: `Balance::net_asset` deducts accrued interest** (`rustrade-execution`). It returns
+  `total - borrowed - interest` for a margin balance, as Binance defines its margin accounts'
+  `netAsset`, where it returned `total - borrowed`. The signature is unchanged, so a caller that
+  subtracted `MarginDetails::interest` itself now subtracts it twice. Interest is owed as the
+  principal is, so the figure falls as interest accrues, and a repayment out of the asset's
+  holdings no longer moves it. `BalanceBasis::NetAsset` follows (`rustrade`): net-asset drawdown
+  and end-of-session balance count interest as it accrues, rather than as a step when the loan is
+  repaid, which the simulated venue's margin account showed. A cash balance (`margin: None`) still
+  returns `total`, and `Balance::accrued` is not counted.
+
+- **`binance-sdk` 77.0.0 → 77.2.0** (`rustrade-execution`, `binance` feature, #773). It adds the
+  timestamp provider the clients now sign with (see Added). The three `binance_sdk::common`
+  internals the margin user-data stream couples to hold, and the margin module is unchanged. Two
+  changes reach the compiled code: a failed automatic reconnect of an SDK WebSocket connection is
+  now retried with a backoff from 1 s to 60 s, where 77.0.0 only logged it, and still stops once
+  the connection is closed; and spot symbol statuses gain `CANCEL_ONLY`, which these clients do
+  not read.
+
+- **Breaking: `OrderRules::check` takes the order's side, and checks a trailing order's offset**
+  (`rustrade-execution`, #787). New `OrderRules::trailing_offset_above` and
+  `trailing_offset_below` hold the range of a trailing offset, in basis points, for a trigger that
+  trails above the market (a buy trailing stop) and below it (a sell). The pre-send check refuses
+  an offset outside its side's range with `OrderError::OutOfBounds` on
+  `OrderField::TrailingOffset`, naming the limit in the offset's own unit (percent for a
+  `Percentage` offset); an `Absolute` offset is not checked. The Binance clients read them from
+  `TRAILING_DELTA`. `OrderRules::new` keeps its four arguments and leaves the new parts off.
+
+- **Breaking: IBKR times are read in the zone they name, or the gateway's, and never in a
+  guessed one** (`rustrade-execution`, #775). `parse_ib_timestamp` takes the gateway's session
+  zone as a second argument. A time that names a zone that is not a tz database name, or names
+  none on a connection whose zone is unknown, no longer reads as UTC, which could misstate a fill
+  by the zone's offset, hours ahead or behind: it does not read, and a fill with it is stamped with
+  this host's time and marked `TimeSource::Host`. A time that names no zone is read in the
+  gateway's zone from the connection handshake. A reading in a repeated daylight-saving hour is
+  its earlier instant, rather than not read, and IB's `YYYYMMDD-HH:MM:SS` form is read as UTC.
+  `IbkrClient::clear_stale_executions` ages an execution whose time does not read by when it was
+  buffered, rather than clearing it at once, before its commission report could arrive.
+
+- **Binance balance updates without a venue time are dropped** (`rustrade-execution`, #775). An
+  `outboundAccountPosition` with neither its update time `u` nor its event time `E` readable was
+  stamped with this host's time. The engine orders balances by time, so a host time ahead of
+  Binance's held back the next genuine updates. It is now dropped with a `warn!`; the account's
+  next update restates its balances.
+
+- **Breaking: a dataset summary's variance and standard deviation are computed when read**
+  (`rustrade`). `Dispersion` holds the range and the recurrence relation M only: its `variance`
+  and `std_dev` fields are gone, and `Dispersion::update` no longer takes the count. Read them
+  with `DataSetSummary::variance` and `DataSetSummary::std_dev`. A serialised summary no longer
+  carries the two fields, and one serialised with them still loads. Each closed position used to
+  take a `Decimal` square root, twice for a loss, though only `TearSheetGenerator::generate`
+  reads the result. That was about 30% of a simulated step that fills an order.
+
+- **Breaking: a `SimulatedVenue`'s instruments are fixed when it is constructed**
+  (`rustrade-execution`, #813). Its public `instruments` field is now private. Read it with the
+  new `SimulatedVenue::instruments` and `SimulatedVenue::instrument`; to trade a different set of
+  instruments, construct a new venue. The venue now indexes its spot instruments by the two assets
+  each one pairs, once, at construction. Valuing a spot margin account no longer scans every
+  instrument for each balance, and neither does choosing a liquidation's trades. The valuation is
+  what the leverage limit checks on each borrowing order, and what the liquidation check runs at
+  the end of every market input and clock move while the account owes anything. A map changed
+  after construction would leave the index stale, and the account valued wrongly with no sign of
+  it. Which instrument values an asset is unchanged: the first by name that has a positive price.
+  The new `sim_margin_valuation` benchmark measures one market input with the liquidation check
+  on and off. The check's cost per input now grows with the assets held, not with the
+  instruments traded. At 1,000 instruments and 100 assets held it fell from about 235 µs to
+  about 6.4 µs.
+
+- **`HistoricalClock` reads its instant without a lock** (`rustrade`, #768). Its instant is held
+  in a sequence lock over the seconds and nanoseconds instead of a `parking_lot::RwLock`. A read
+  that overlaps an advance retries rather than blocking it, and advances on clones serialise
+  among themselves. An advance to an instant no later than the clock's stores nothing. Every
+  `DateTime<Utc>` is still held exactly, from `MIN_UTC` to `MAX_UTC`, leap seconds included, and
+  the clock still never moves backwards. The shared state is aligned to 128 bytes, so clocks used
+  on different threads do not share a cache line. `process` now logs after storing rather than
+  while holding the clock, and the `Debug` output shows `time_exchange_last` directly, without the
+  lock around it.
+  - A read takes about 5.4 ns instead of 8.6 ns, and a `process` at the clock's instant about
+    7.1 ns instead of 9.4 ns.
+  - A `SimStepper` step is about 2% faster when it only shows a bar, and about 4% faster when it
+    also fills an order.
+  - Clocks used on many threads at once no longer slow each other down. The previous clocks were
+    allocated next to each other and could share a cache line, so their cost depended on where the
+    allocator placed them. On 16 threads, an advance and three reads now take about 60 ns per
+    thread, where the previous clock took up to 158 ns. Most of that gain is the alignment.
+
+- **Breaking: `RiskRefused` no longer implements `Unrecoverable`, and its reason is a `String`**
+  (`rustrade`). The type loses its `Reason` parameter: it is now `RiskRefused<T>`, with
+  `reason: String`. `RiskManager::check` could only ever return a `String` reason, which is never
+  unrecoverable, and the engine never asked. So the impl could not affect anything. A refusal
+  concerns only the request it refuses: the engine does not send it, reports it, and carries on.
+  To stop the strategy generating orders, send `TradingState::Disabled`, which still lets
+  cancels and position closes through. The serialized form is unchanged.
+
+### Added
+
+- **The simulated venue can liquidate its spot margin account** (`rustrade-execution`, #803). Off
+  by default. `SpotMarginConfig::with_liquidation(SpotMarginLiquidation)` sets a liquidation
+  level (a margin level, the value of what the account holds over what it owes, at least 1) and a
+  fee rate in `[0, 1)`.
+  - The venue checks the margin level after every market tick and clock move, valued as the
+    leverage limit values the account: mid, else last price, of a spot pair with the valuation
+    asset. There is no index price. A debt it cannot value is not checked, with a `warn!` once.
+  - At or below the level it sends an `AccountNotice` of `NoticeKind::Liquidation`, cancels every
+    open order, and closes every debt: from each asset's own free balance first, then by selling
+    the account's other assets for the valuation asset (in name order, as much as needed), then
+    by buying back each other asset owed. Each forced trade fills as a market order on arrival
+    would, as a taker, and is reported as a `Trade` with `TradeOrigin::Liquidation`, no client
+    order id and no order snapshot.
+  - The fee is the rate times the value of the debt repaid, charged in the valuation asset and
+    reported as a new `CashFlowKind::LiquidationFee { rate, repaid }`.
+  - A debt it cannot close at once (thin depth, no market, too little to sell) is left owed with a
+    `warn!`, and the liquidation continues on later inputs without another notice. Each pass
+    charges its fee on what it repaid, out of what the account holds after that pass's
+    repayments, so a debt it leaves owed has that much less to be repaid from. There is no
+    insurance fund: a fee the account cannot pay takes its free balance below zero.
+  - While a liquidation is under way the venue lends nothing, so an order that would need a loan
+    is rejected as unaffordable, and a held order whose fill would need one is cancelled. One the
+    account can pay for itself is accepted, and cancelled by the next input if it is still open.
+    A debt the venue cannot trade out of keeps lending off until the account repays it.
+  - `SpotMarginLiquidation::with_margin_call(level)` also sends `NoticeKind::MarginCall` when the
+    margin level falls to that level and `NoticeKind::MarginRestored` when it rises back above it,
+    once per crossing.
+  - `with_liquidation` refuses a level that an account borrowed to the leverage limit would
+    already be at (`SpotMarginConfigError::LiquidationWithinLeverage`). CFD positions are not
+    liquidated. Configurations without `liquidation` deserialise as before.
+
+- **Binance signed requests are stamped on Binance's clock** (`rustrade-execution`, #773). Both
+  clients read `GET /api/v3/time` and stamp each signed request with the earliest Binance's clock
+  can read, counted on from the read on a monotonic clock, instead of with this host's clock. A
+  host clock off Binance's by more than Binance accepts (1 s ahead, or `recvWindow`, 5 s, behind)
+  no longer fails every signed request with `-1021`, and a wall-clock step between reads does not
+  move the stamps.
+  - The first request waits for one read. A failed read is logged at `warn`, and requests are
+    stamped with this host's clock until one succeeds. A request that finds the last read 5
+    minutes old starts another in the background, and one that finds the wall clock gone more
+    than 1 s further than the monotonic clock since then, as after a suspend, waits for one.
+  - A `-1021` reads again before the error returns, and the answer replaces the reading, so the
+    caller's retry is stamped on the new one. The error itself is unchanged.
+  - `BinanceSpot::host_clock_lead` and `BinanceMargin::host_clock_lead` report how far this host's
+    clock leads Binance's. A read that finds them 1 s or more apart logs at `warn`.
+  - The account streams also take the reads as a bound on Binance's clock, so fill recovery and
+    balance restatement are placed on Binance's time before a stream's first event too.
+  - `server_time_sync` on `BinanceSpotConfig` and `BinanceMarginConfig` (`true` by default, also
+    `with_server_time_sync`) turns it off.
+
+- **A Binance account's commission rates** (`rustrade-execution`, #789).
+  `BinanceSpot::fetch_commission_rates` and `BinanceMargin::fetch_commission_rates` read
+  `GET /api/v3/account/commission` for a symbol into `CommissionRates`: the standard, special and
+  tax parts kept apart (`CommissionPart`, each with maker, taker, buyer and seller rates), and the
+  BNB discount (`CommissionDiscount`, whose `multiplier` is Binance's `discount`, the share of the
+  standard part charged). `CommissionRates::rate(side, liquidity)` sums the three parts' rates for
+  a trade not paid in BNB; paid in BNB, only the standard part is discounted, as the rustdoc
+  details. A missing or unreadable rate is an error, never zero. Margin has no commission endpoint
+  of its own; the margin method reads the spot rates, which margin trades have been seen to pay.
+
+- **The next hour's margin borrow rate for a list of assets** (`rustrade-execution`, #788).
+  `BinanceMargin::fetch_next_hourly_interest_rates(assets)` reads
+  `GET /sapi/v1/margin/next-hourly-interest-rate` on the client's cross or isolated margin, and
+  returns each asset's rate per hour. Binance takes 20 assets a request, so a longer list is read
+  20 at a time (100 request weight each), and one failed request fails the whole read. An asset
+  Binance does not answer for is absent from the map.
+
+- **Rounding onto an order rule's grid** (`rustrade-execution`, #786). `ValueRule::round_down`
+  and `round_up` return the nearest multiple of the rule's step at or below, or at or above, a
+  value, counted from zero as the pre-send check counts it; a value on the grid, or any value when
+  there is no step, comes back unchanged. `OrderRules::round_quantity_down` and
+  `round_quantity_up` take the order's kind: a market order's quantity rounds to the grid that
+  `quantity` and `market_quantity`'s steps share. None of them clamps to the rule's range, so the
+  result may still be refused, and each returns `None` only when a `Decimal` cannot hold the
+  result.
+
+- **The notional limits a venue applies to market orders** (`rustrade-execution`, #787).
+  `OrderRules::market_notional` holds the part of `notional` that also holds for a market order,
+  read on Binance from `NOTIONAL`'s `applyMinToMarket` / `applyMaxToMarket` or `MIN_NOTIONAL`'s
+  `applyToMarket`. The pre-send check does not apply it: the venue measures a market order's
+  notional at a price of its own, such as a reference or average price. Build rules with it with
+  `OrderRules::with_market_notional`, and with trailing offset ranges with
+  `OrderRules::with_trailing_offsets`.
+
+- **`VenueClock::span_start`, `VenueClock::span_end` and `HostMoment`** (`rustrade-execution`,
+  #774). Where a read of a span the venue stamped starts and ends, placed on the venue's clock as
+  estimated: the start is the earlier of the venue's and this host's time at a moment, and the
+  end the latest of both now and the start counted on on tokio's clock. A `HostMoment` pairs a
+  wall-clock time with its instant on tokio's clock, built with `HostMoment::new` or
+  `HostMoment::now`.
+
+- **`Trade::time_source` and `TimeSource`** (`rustrade-execution`, #775). Whether a fill's
+  `time_exchange` is the venue's, or this host's, filled in because the venue sent no readable
+  time. `Trade::with_time_source` sets it, and a trade serialised before the field existed loads
+  as `Venue`. `TimeSource` documents what each client does without a venue time.
+  `IbkrClient::session_zone` returns the gateway's zone.
+
+- **`EngineClock::instant` and `EngineInstant`** (`rustrade`, #771). A clock's monotonic reading,
+  for measuring durations, beside `time()`, which stamps. The method has a default that reads
+  `time()`, so existing implementations keep compiling. A custom clock that follows the host's
+  wall clock should override it with a monotonic source. `EngineInstant` adds a `Duration`
+  (`saturating_add`), measures the time since an earlier reading (`saturating_duration_since`),
+  and orders. Readings of different clocks do not compare.
+
+- **`VenueClock`** (`rustrade-execution`, `client::venue_clock`). It estimates the earliest a
+  venue's clock can read at a given moment, from the times the venue stamped on its events. Each
+  event's stamp is paired with the tokio `Instant` it arrived at, and the estimate counts on from
+  there on that monotonic clock, so a step of this host's wall clock does not move it. The sample
+  that bounds the venue's time tightest is kept, with an allowance of 100 ppm for drift between
+  the two clocks. An old event delivered late, such as a replayed fill, never displaces a better
+  sample. `host_lead` gives how far this host's clock can lead the venue's.
+
+- **`AccountEventKind::InstrumentBalanceSnapshot`** (`rustrade-execution`). One asset's full
+  balance in a pair's isolated sub-account, debt included, read over REST: the per-pair
+  counterpart of `BalanceSnapshot`. A Binance isolated margin stream emits it for each pair's base
+  and quote after it reconnects. The engine does not store it, as with `InstrumentBalanceUpdate`.
+
+### Fixed
+
+- **Binance spot fill recovery after a heartbeat timeout reaches back to the last frame**
+  (`rustrade-execution`). The account stream checks for activity once every 30 s window and
+  declares a timeout at the end of the first window without a frame, so the connection can have
+  died almost 60 s before. Recovery after a heartbeat timeout started its gap only 30 s (plus a
+  short margin) before the timeout, so fills from earlier in that span could be missed. It now
+  reaches back two windows. Fills read twice are dropped by the stream's dedup, as before.
+
+- **An IBKR good-till-date that names no zone is read in the gateway session's zone**
+  (`rustrade-execution`, #797). Listing open orders, or reading how an order ended, reads back the
+  good-till-date of an order this client did not place, or no longer tracks. A `yyyyMMdd HH:mm:ss`
+  with no zone was read as UTC, but IB reads such a time in the TWS/Gateway session's zone, so the
+  expiry came back off by that zone's offset (8 h on an `Asia/Singapore` session). It is now read
+  in `IbkrClient::session_zone`, as execution and completion times already are. The dash form
+  `yyyyMMdd-HH:mm:ss`, which this client sends, stays UTC, and a named zone stays that zone. A
+  good-till-date that cannot be read in its zone is still read as UTC, with a `warn!`, so its order
+  can be listed: an unknown zone, no session zone, or a time in the hour skipped as clocks go
+  forward, in the named zone or the session's. The rustdoc now names each of these causes.
+
+- **Binance REST balance reads are stamped no later than Binance's time when this host's clock
+  leads** (`rustrade-execution`, #796). `fetch_balances` and `account_snapshot`, on spot and on
+  cross and isolated margin, stamped each balance with this host's time before the request, less
+  the 5 s REST lag allowance. The engine orders balance and debt state by that stamp, so one ahead
+  of Binance's time had it drop the stream's balance and debt events until Binance's clock caught
+  up. A host clock more than a second ahead used to fail every signed read, which kept the stamp
+  within the allowance; since #773 such reads succeed. They now take the earlier of this host's
+  time and the signing clock's estimate of Binance's time when the request was sent, as the
+  balance restatement after a reconnect already did. That restatement now times its read at the
+  request's send, after any rate-limit wait, rather than before. With `server_time_sync` off,
+  balance reads are stamped from this host's time as before.
+
+- **The clients' own fill recovery after a reconnect reads its span on the venue's clock**
+  (`rustrade-execution`, #774). Alpaca, Binance Spot and Margin, and IBKR each recover the fills
+  missed while their account stream was down, and bounded that span by this host's clock. A host
+  clock ahead of the venue's by more than the client's lookback (1.5 s on Alpaca, 30 s on IBKR)
+  started the read after fills the venue stamped during the outage, and a host clock stepped back
+  before the reconnect ended a Binance gap early. Those fills were lost with no
+  `FillRecoveryGaveUp`. (On Binance a host clock more than about a second ahead fails every
+  signed request, so its recovery failed visibly.) Each stream now keeps a `VenueClock`, sampled from the times the venue
+  stamped on the events it delivered: every Binance event's `E`, every Alpaca `trade_updates`
+  event, and IBKR's executions. The span starts at the venue's or the host's time at the
+  disconnect, whichever is earlier, less the lookback, and ends past the latest of the host's
+  time, the venue's estimated time, and the disconnect counted on on a monotonic clock. A
+  `FillRecoveryGaveUp` reports the span on the same clock. Before an Alpaca stream has seen an
+  event, Alpaca's clock is unknown, and its read now starts 30 s further back.
+
+- **A fill stamped with this host's time no longer skews the venue-clock estimate**
+  (`rustrade`, `rustrade-execution`, #775). The `ExecutionManager`'s fill recovery, and the Binance
+  clients' balance restatement after a reconnect, estimate the venue's clock from the fills
+  delivered. A fill without a readable venue time was stamped with this host's time, unmarked, so
+  a host clock ahead of the venue's read as a venue clock ahead too, and the recovery read after a
+  reconnect started late. They now skip `TimeSource::Host` fills. Each client also falls back to
+  another time the venue stamped before this host's: a Binance `executionReport` to its event time
+  `E`, and an Alpaca `trade_updates` event to its order's `updated_at`. Every fill still stamped
+  with this host's time, such as a Binance or Alpaca REST trade without one, is marked so.
+
+- **The simulated venue's clock never moves back** (`rustrade-execution`, #772).
+  `SimulatedVenue::advance_time` took whatever instant it was given. An instant earlier than one
+  the venue had reached moved its clock back: it restamped every balance and stamped the fills
+  of later requests earlier than what it had already reported, and the engine drops a balance
+  older than the one it holds. That could happen when a request-priced `MockExchange` stamped
+  requests from a wall clock that stepped back, or when a consumer driving the venue directly
+  advanced it behind a later `apply_market` tick. Now:
+  - `advance_time` holds an earlier instant at the latest one either input, `advance_time` or
+    `apply_market`, has reached. It charges nothing again, and what follows is stamped at that
+    instant. The venue clamps it itself, whichever driver calls it.
+  - `apply_market` clamps its tick the same way. A tick behind that instant is applied at it, so
+    the fills it causes, the balances they restate, the expiries it sweeps and the market it
+    stores (`time_exchange`, `fresh_at`) are stamped no earlier than what the venue has already
+    reported. Drivers that feed their ticks in order, as `SimRunner` and a market-driven
+    `MockExchange` do, see no change.
+  - The jump policy is documented on `advance_time` and the type's `# Holding costs`: a forward
+    move, however large, charges every funding and interest boundary it crosses once each, at
+    its own stamp, on what was held across it. A live paper venue whose host slept through
+    several hours therefore charges each of them, as a running venue would have.
+
+- **In-flight deadlines run on a monotonic clock, not the host's wall clock** (`rustrade`, #771).
+  The engine measured an order's in-flight deadline from its `time_sent`, on `LiveClock`'s wall
+  time. A step of the host's clock back delayed every `InFlightOverdue` by the size of the step,
+  and one larger than a deadline lost the flag for orders sent after it. A jump forward of at
+  least a deadline flagged every order in flight at once. Now:
+  - The deadlines run on the new `EngineClock::instant` (see Added). `LiveClock` reads
+    `std::time::Instant`, and `TokioClock` reads tokio's clock, so paused time still controls
+    deadlines in a test. `HistoricalClock` and the default implementation read the clock's
+    `time()`, so a backtest's deadlines stay in simulated time and an existing `EngineClock`
+    implementation behaves as before.
+  - `time_sent` stays the wall-clock stamp. `InFlightOverdue::elapsed` is now measured on the
+    monotonic reading.
+  - An order the engine started from already in flight is measured from its wall-clock age when
+    first checked, as before, and on the monotonic reading after that.
+  - `LiveClock`'s rustdoc states that its time follows the host's wall clock and can step back
+    or jump forward.
+
+- **Missed-fill recovery reads its span on the venue's clock, not this host's** (`rustrade`,
+  #770). When the `ExecutionManager` reopened an account stream, the read of the fills it missed
+  started from the host time the last event arrived, less up to `max_clock_skew`, and ended at
+  the host's present. A host clock more than `max_clock_skew` + `overlap` ahead of the venue's,
+  or any amount ahead before the first fill, started the read after fills the venue stamped
+  during the outage. A host clock that stepped back before the reconnect ended it too early. In
+  both cases those fills were lost with no `FillRecoveryGaveUp`. Now:
+  - The read starts at the venue's time when the last event arrived, as a `VenueClock` estimates
+    it from the fills delivered, or at the local time if that is earlier, less `overlap`.
+  - It ends `max_clock_skew` past the latest of the local time, the venue's estimated time, and
+    the local time of the last event counted on on tokio's clock, so a clock stepped back since
+    then does not end it early, with or without a fill. A fill the read and the new stream both
+    deliver is still delivered once.
+  - A clock difference beyond `max_clock_skew` is logged as a warning at each reopening.
+  - Until a fill has been delivered the venue's clock is unknown, so the read starts
+    `max_clock_skew` before the local time instead of `overlap` before it.
+  - A fill stamped `max_span` or more before it arrived is an old fill replayed, not a sample of
+    the venue's clock. A younger replayed fill, such as one a venue replays on subscribing, is
+    taken for one until a fill delivered on time replaces it: the reads in between start as far
+    back as its stamp, and warn of the clock difference it implies.
+
+- **Binance margin `fetch_trades` reads to an end past the local clock** (`rustrade-execution`).
+  It used to cut the span's end to this host's clock, so a read placed on a venue clock ahead of
+  this host's missed the fills stamped in between. The end is now cut only at one 23-hour
+  window past the local clock. The `ExecutionClient::fetch_trades` rustdoc now states that `end`
+  can lie past the present and must not be cut to the host's clock.
+
+- **A balance read over REST is stamped no later than the state it describes**
+  (`rustrade-execution`, #777). Every client stamped the balances from `fetch_balances` and
+  `account_snapshot` with this host's time taken after the response arrived. The engine orders
+  balance and debt state by that time, so a snapshot stamped later than its state shut out
+  stream balance and debt events from between the two: they were judged stale and dropped, and
+  the engine kept the snapshot's holdings until the next event. Two ways this happened:
+  - **The REST view trailed the stream.** A Binance cross-margin account read straight after a
+    fill has returned the pre-trade balances, so the fill's own balance and debt events were
+    dropped.
+  - **This host's clock ran ahead of the venue's.** Such a snapshot blocked every stream event
+    for that long.
+
+  Now each balance is stamped with this host's time taken before the request that read it was
+  sent. On Binance that is the retry, for a request retried after a rate limit. On Binance spot
+  and margin, cross and isolated, the stamp is also 5 s earlier, to cover the REST view trailing
+  the stream. Alpaca, IBKR and Hyperliquid stream no balances, so they subtract nothing. The rule
+  is stated on `ExecutionClient::fetch_balances` and `AssetBalance::time_exchange`. Erring early
+  costs little: a stream event from between the stamp and the read that arrives after the
+  snapshot applies over it. A host clock ahead of the venue's still carries into the stamp, and
+  keeping the two within bounds is the caller's obligation.
+
+- **A Binance account stream restates its balances after it reconnects by itself**
+  (`rustrade-execution`, #778). The spot and margin streams recover the fills and order endings
+  they missed while disconnected, but no balances. A balance update or margin debt change sent in
+  the gap was lost, and the engine's balances and debt stayed wrong until the next REST snapshot,
+  which a long-running process may never take.
+  - **The read.** Once the gap's fills have been read, the stream now reads the account's balances
+    over REST and delivers each of the assets it was opened for (all of them when that list is
+    empty) as a `BalanceSnapshot`, debt included on margin. An isolated margin stream delivers
+    each pair's base and quote as an `InstrumentBalanceSnapshot`. A gap whose fill read failed does
+    not hold the read back, so the balances can include fills the stream delivers later.
+  - **The stamp.** Each is stamped with the earlier of this host's time and the venue's time at
+    the read's start, less 5 s. The venue's time comes from a `VenueClock` fed by the stream's own
+    events, so a host clock ahead of the venue's does not carry into it. The read waits until the
+    venue's clock is 5 s past the latest balance or debt event the stream delivered, and is never
+    stamped earlier than that event, which the engine would otherwise keep.
+  - **Failure.** A read that fails, or does not finish within 30 s (rate-limit waits included), is
+    logged at `warn` and retried while connected, after 5 s and then twice as long each time, up
+    to 2 minutes. It is never given up, and a later reconnect replaces it.
+  - **Cost.** One account read per reconnect.
+  - **Other clients.** Alpaca's, IBKR's and Hyperliquid's streams carry no balance events, so they
+    lose none in a gap.
+
 ## [0.17.0] - 2026-10-28
 
 ### Added

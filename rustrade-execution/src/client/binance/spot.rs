@@ -36,23 +36,28 @@
 //   report cannot resurrect a retired order as a resting one. That order's filled
 //   quantity is settled instead by the terminal report's own z, or by fetch_open_orders.
 
+use super::commission::{CommissionRates, fetch_commission_rates};
+use super::restatement::{
+    BalanceRestatement, SharedStreamClock, StreamClock, restate, restatement_time,
+};
 use super::rules::RulesLoader;
+use super::server_time::{ServerTime, SigningClock, default_server_time_sync, read_server_time};
 use super::shared::{
     AbortOnDropStream, BINANCE_MAX_TRADES, BinanceOrderType, BinanceTimeInForce,
-    CONNECT_TIMEOUT_SECS, DisconnectOnDrop, ExecutionReport, FILL_RECOVERY_TIMEOUT_SECS,
-    HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal, MyTradesFrom, ORDER_EXECUTIONS_BUDGET,
-    OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
-    SIGNAL_RECOVERY_LOOKBACK_MS, SharedDedupCache, UnhandledEvents, UnrecoveredFills,
-    UnsubscribeOnDrop, UserDataFrame, WeightPool, account_position_time, answer_time,
-    binance_filled_qty, classify_order_kind_tif, classify_rest_query_error,
-    classify_ws_order_error, convert_ended_order, convert_execution_report,
-    convert_open_order_listing, convert_open_order_owned_symbol, dedup_key_from_event,
-    disconnect_error, drop_after, frame_excerpt, gap_failed, gap_time, is_duplicate,
-    is_unknown_order, log_unhandled_event, log_unrecognised_frame, new_dedup_cache,
-    parse_user_data_frame, placed_order_state, recovered_order_cids, recovered_order_totals,
-    response_decode_error, rest_call_with_retry, retry_or_end, trailing_params, unix_ms,
-    unreadable_answer,
+    CONNECT_TIMEOUT_SECS, Disconnect, DisconnectOnDrop, ExecutionReport,
+    FILL_RECOVERY_TIMEOUT_SECS, HEARTBEAT_TIMEOUT_SECS, HandshakeRefusal, MyTradesFrom,
+    ORDER_EXECUTIONS_BUDGET, OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
+    SharedDedupCache, UnhandledEvents, UnrecoveredFills, UnsubscribeOnDrop, UserDataFrame,
+    WeightPool, account_position_time, answer_time, binance_filled_qty, classify_order_kind_tif,
+    classify_rest_query_error, classify_ws_order_error, convert_ended_order,
+    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
+    dedup_key_from_event, disconnect_error, disconnect_lookback, drop_after, frame_excerpt,
+    gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
+    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
+    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
+    rest_read_with_retry, retry_or_end, trailing_params, unix_ms, unreadable_answer,
 };
+use crate::client::venue_clock::HostMoment;
 use crate::rules::{OrderRules, PreSendRules};
 use crate::{
     AccountEventKind, AccountSnapshot, FillRecoveryFailure, InstrumentAccountSnapshot,
@@ -80,7 +85,7 @@ use crate::{
     },
     parse_env_bool,
     position::PositionReport,
-    trade::{AssetFees, Trade, TradeId, TradesRead},
+    trade::{AssetFees, TimeSource, Trade, TradeId, TradesRead},
 };
 use binance_sdk::{
     common::{
@@ -99,7 +104,7 @@ use binance_sdk::{
         },
     },
 };
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use fnv::FnvHashSet;
 use futures::stream::BoxStream;
 use rust_decimal::Decimal;
@@ -145,6 +150,12 @@ pub struct BinanceSpotConfig {
     /// [`BinanceSpot::open_order`](crate::client::ExecutionClient::open_order).
     #[serde(default)]
     pub pre_send_rules: PreSendRules,
+
+    /// Whether signed requests are stamped with Binance's clock, read from its server time,
+    /// rather than this host's. Defaults to `true`. See
+    /// [`BinanceSpot::host_clock_lead`](crate::client::binance::BinanceSpot::host_clock_lead).
+    #[serde(default = "crate::client::binance::server_time::default_server_time_sync")]
+    pub server_time_sync: bool,
 }
 
 /// Serde default for [`BinanceSpotConfig::testnet`]: an absent `testnet` field deserializes to the
@@ -164,6 +175,7 @@ impl std::fmt::Debug for BinanceSpotConfig {
             .field("secret_key", &"***")
             .field("testnet", &self.testnet)
             .field("pre_send_rules", &self.pre_send_rules)
+            .field("server_time_sync", &self.server_time_sync)
             .finish()
     }
 }
@@ -182,6 +194,7 @@ impl BinanceSpotConfig {
             secret_key,
             testnet: true,
             pre_send_rules: PreSendRules::default(),
+            server_time_sync: default_server_time_sync(),
         }
     }
 
@@ -189,6 +202,14 @@ impl BinanceSpotConfig {
     #[must_use]
     pub fn with_pre_send_rules(mut self, pre_send_rules: PreSendRules) -> Self {
         self.pre_send_rules = pre_send_rules;
+        self
+    }
+
+    /// Set whether signed requests are stamped with Binance's clock, read from its server time
+    /// ([`server_time_sync`](Self::server_time_sync)).
+    #[must_use]
+    pub fn with_server_time_sync(mut self, server_time_sync: bool) -> Self {
+        self.server_time_sync = server_time_sync;
         self
     }
 
@@ -202,6 +223,7 @@ impl BinanceSpotConfig {
             secret_key,
             testnet: false,
             pre_send_rules: PreSendRules::default(),
+            server_time_sync: default_server_time_sync(),
         }
     }
 
@@ -423,6 +445,35 @@ impl BinanceSpot {
         self.rules.load(instruments).await
     }
 
+    /// The account's commission rates on `instrument`: `GET /api/v3/account/commission`, at 20
+    /// of Binance's per-IP request weight. [`CommissionRates`] says how Binance combines them.
+    ///
+    /// Spot Testnet reports every rate as zero, and no discount asset, unless the account has
+    /// chosen to be charged commissions there.
+    ///
+    /// # Errors
+    ///
+    /// - [`ApiError::InstrumentInvalid`] for a symbol Binance does not list.
+    /// - [`UnindexedClientError::Internal`] for an answer missing a rate, with a rate that does
+    ///   not read as a decimal, or for another symbol.
+    pub async fn fetch_commission_rates(
+        &self,
+        instrument: &InstrumentNameExchange,
+    ) -> Result<CommissionRates, UnindexedClientError> {
+        fetch_commission_rates(&self.rest, &self.rate_limiter, instrument).await
+    }
+
+    /// The most this host's clock leads Binance's, from the client's reads of Binance's server
+    /// time; negative when it trails. `None` when
+    /// [`server_time_sync`](BinanceSpotConfig::server_time_sync) is off, or before a read has
+    /// succeeded.
+    ///
+    /// An upper bound: the true lead, plus the time the kept read's answer took to arrive and the
+    /// drift allowed for since. A read logs at `warn` when it finds the clocks 1 s or more apart.
+    pub fn host_clock_lead(&self) -> Option<TimeDelta> {
+        self.rate_limiter.host_clock_lead()
+    }
+
     /// Hold each of `orders` as live, for a reconnect to ask about if the stream misses its end.
     fn remember_live<'a>(
         &self,
@@ -437,10 +488,14 @@ impl BinanceSpot {
     /// # Panics
     /// Panics if the binance-sdk configuration builder fails (invalid credentials format).
     #[allow(clippy::expect_used)] // Documented panic: invalid credentials detected at startup
-    fn build_rest(config: &BinanceSpotConfig) -> Arc<RestApi> {
-        let rest_config = ConfigurationRestApi::builder()
+    fn build_rest(config: &BinanceSpotConfig, signing: Option<&SigningClock>) -> Arc<RestApi> {
+        let mut builder = ConfigurationRestApi::builder()
             .api_key(config.api_key.clone())
-            .api_secret(config.secret_key.clone())
+            .api_secret(config.secret_key.clone());
+        if let Some(signing) = signing {
+            builder = builder.timestamp_provider(signing.provider());
+        }
+        let rest_config = builder
             .build()
             .expect("failed to build Binance REST configuration");
 
@@ -454,10 +509,17 @@ impl BinanceSpot {
     /// # Panics
     /// Panics if the binance-sdk configuration builder fails (invalid credentials format).
     #[allow(clippy::expect_used)] // Documented panic: invalid credentials detected at startup
-    fn build_ws_handle(config: &BinanceSpotConfig) -> WebsocketApiHandle {
-        let ws_config = ConfigurationWebsocketApi::builder()
+    fn build_ws_handle(
+        config: &BinanceSpotConfig,
+        signing: Option<&SigningClock>,
+    ) -> WebsocketApiHandle {
+        let mut builder = ConfigurationWebsocketApi::builder()
             .api_key(config.api_key.clone())
-            .api_secret(config.secret_key.clone())
+            .api_secret(config.secret_key.clone());
+        if let Some(signing) = signing {
+            builder = builder.timestamp_provider(signing.provider());
+        }
+        let ws_config = builder
             .build()
             .expect("failed to build Binance WebSocket configuration");
 
@@ -856,9 +918,14 @@ impl ExecutionClient for BinanceSpot {
     /// Panics if the binance-sdk REST or WebSocket configuration builder fails
     /// (e.g. empty or malformed API key/secret).
     fn new(config: Self::Config) -> Self {
-        let rest = Self::build_rest(&config);
-        let ws_handle = Self::build_ws_handle(&config);
-        let rate_limiter = Arc::new(RateLimitTracker::new(WeightPool::Spot));
+        let signing = config.server_time_sync.then(SigningClock::default);
+        let rest = Self::build_rest(&config, signing.as_ref());
+        let ws_handle = Self::build_ws_handle(&config, signing.as_ref());
+        // `GET /api/v3/time` is unsigned, so the client that signs with the clock reads it.
+        let server_time =
+            signing.map(|signing| ServerTime::new(signing, read_server_time(Arc::clone(&rest))));
+        let rate_limiter =
+            Arc::new(RateLimitTracker::new(WeightPool::Spot).with_server_time(server_time));
         let rules = Arc::new(RulesLoader::new(
             config.pre_send_rules,
             Arc::clone(&rest),
@@ -881,8 +948,8 @@ impl ExecutionClient for BinanceSpot {
         instruments: &[InstrumentNameExchange],
     ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
         // Fetch account info via REST (with rate-limit retry)
-        let response =
-            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+        let (response, sent) =
+            rest_read_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
                 Box::pin(async move {
                     let params = GetAccountParams::builder().build()?;
                     rest.get_account(params).await
@@ -894,7 +961,11 @@ impl ExecutionClient for BinanceSpot {
         let account = response.data().await.map_err(response_decode_error)?;
 
         // Convert balances, filtering to requested assets
-        let balances = filter_and_convert_balances(account.balances.unwrap_or_default(), assets);
+        let balances = filter_and_convert_balances(
+            account.balances.unwrap_or_default(),
+            assets,
+            self.rate_limiter.balance_read_time(sent),
+        );
 
         // Fetch open orders for all instruments concurrently (with retry)
         // limit concurrency to avoid bursting Binance's request weight limits
@@ -952,7 +1023,8 @@ impl ExecutionClient for BinanceSpot {
     ///
     /// The stream reconnects by itself, and ends once 10 reconnects in a row have failed or a
     /// rate-limit cooldown outlasts what it waits through. See the
-    /// [module docs](super#account-stream-reconnection).
+    /// [module docs](super#account-stream-reconnection). After each reconnect it restates the
+    /// account's balances: see [there](super#balance-restatement-after-a-reconnect).
     ///
     /// # Startup Race Window
     ///
@@ -1027,10 +1099,10 @@ impl ExecutionClient for BinanceSpot {
     /// The same lookup is public as [`OrderStatusClient::fetch_ended_orders`].
     async fn account_stream(
         &self,
-        // _assets is intentionally ignored — Binance pushes outboundAccountPosition
-        // for all account assets regardless of any filter. Client-side filtering would hide
-        // balance updates for assets not in the initial list. See account_snapshot for filtering.
-        _assets: &[AssetNameExchange],
+        // Only a reconnect's balance restatement uses `assets`: Binance pushes
+        // outboundAccountPosition for every asset of the account, whatever is asked for, and
+        // filtering it would hide balance updates for assets not in the initial list.
+        assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
     ) -> Result<Self::AccountStream, UnindexedClientError> {
         // Resilient account stream with auto-reconnection, heartbeat monitoring,
@@ -1100,6 +1172,7 @@ impl ExecutionClient for BinanceSpot {
                     }
                     Ok(Ok(())) => {}
                 }
+                self.rate_limiter.after_failure(&e).await;
                 return Err(self
                     .rate_limiter
                     .stream_open_error(&e, |e| UnindexedClientError::Internal(e.to_string())));
@@ -1125,6 +1198,7 @@ impl ExecutionClient for BinanceSpot {
             rate_limiter,
             known_live,
             instruments,
+            assets.to_vec(),
             Some(initial_ws),
         ));
 
@@ -1251,6 +1325,8 @@ impl ExecutionClient for BinanceSpot {
                 // Check the venue response first (zero-alloc downcast) — order rejections are
                 // the common case; rate limits during placement are rare.
                 if let Some(order_err) = classify_ws_order_error(&e, &instrument) {
+                    // A refused timestamp reads Binance's time before the caller can retry.
+                    self.rate_limiter.after_failure(&e).await;
                     // Venue response — WS session is healthy, don't tear it down. A throttle
                     // (429, -1003, a WAF 403) backs off the shared limiter for the wait Binance
                     // sent, so REST calls and later orders back off too.
@@ -1314,7 +1390,7 @@ impl ExecutionClient for BinanceSpot {
 
         if let Err(refused) = self
             .rules
-            .check(instrument.name(), kind, price, quantity)
+            .check(instrument.name(), side, kind, price, quantity)
             .await
         {
             return Order {
@@ -1533,6 +1609,8 @@ impl ExecutionClient for BinanceSpot {
                 // Check the venue response first (zero-alloc downcast) — order rejections are
                 // the common case; rate limits during placement are rare.
                 if let Some(order_err) = classify_ws_order_error(&e, &instrument) {
+                    // A refused timestamp reads Binance's time before the caller can retry.
+                    self.rate_limiter.after_failure(&e).await;
                     // Venue response — WS session is healthy, don't tear it down. A throttle
                     // (429, -1003, a WAF 403) backs off the shared limiter for the wait Binance
                     // sent, so REST calls and later orders back off too.
@@ -1568,12 +1646,17 @@ impl ExecutionClient for BinanceSpot {
         }
     }
 
+    /// Each balance is stamped 5 s before its request was sent, as is each in
+    /// [`account_snapshot`](Self::account_snapshot): Binance's REST account view can trail its
+    /// account stream, and a stream balance event the read may not yet show must still be more
+    /// recent than the read. The send is timed on Binance's clock when this host's is ahead of it
+    /// (see the [module docs](super#signed-requests-are-stamped-on-binances-clock)).
     async fn fetch_balances(
         &self,
         assets: &[AssetNameExchange],
     ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
-        let response =
-            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
+        let (response, sent) =
+            rest_read_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
                 Box::pin(async move {
                     let params = GetAccountParams::builder().build()?;
                     rest.get_account(params).await
@@ -1587,6 +1670,7 @@ impl ExecutionClient for BinanceSpot {
         Ok(filter_and_convert_balances(
             account.balances.unwrap_or_default(),
             assets,
+            self.rate_limiter.balance_read_time(sent),
         ))
     }
 
@@ -1782,14 +1866,20 @@ async fn connection_manager(
     rate_limiter: Arc<RateLimitTracker>,
     known: SharedKnownLiveOrders,
     instruments: Vec<InstrumentNameExchange>,
+    // The assets whose balances a reconnect restates; empty for all of them.
+    assets: Vec<AssetNameExchange>,
     initial_ws: Option<DisconnectOnDrop<WebsocketApi>>,
 ) {
     let mut budget = ReconnectBudget::new("Binance", BackoffLimits::ACCOUNT_STREAM);
-    let mut disconnect_time: Option<DateTime<Utc>> = None;
+    let mut disconnect: Option<Disconnect> = None;
     // Gaps not yet recovered: read at reconnect, and retried on a timer while connected, once due.
     let mut unrecovered = UnrecoveredFills::default();
     // Instruments whose known-live orders a reconnect has yet to check, likewise.
     let mut unchecked = UncheckedOrders::default();
+    // The balances a reconnect has yet to restate, read once its fills have been recovered.
+    let mut restatement = BalanceRestatement::default();
+    // The venue's clock and the latest balance time, from the events the stream delivers.
+    let clock = StreamClock::shared(rate_limiter.signing_clock());
     let mut current_ws = initial_ws;
 
     loop {
@@ -1814,6 +1904,8 @@ async fn connection_manager(
                         error!(%e, "BinanceSpot WS connect/subscribe failed");
                         // A rate-limit refusal starts a cooldown, so REST and orders back off too.
                         rate_limiter.on_stream_refused(&e);
+                        // A refused subscribe timestamp reads Binance's time before the retry.
+                        rate_limiter.after_failure(&e).await;
                         if let Err(reason) =
                             retry_or_end(&mut budget, &rate_limiter, || e.to_string()).await
                         {
@@ -1842,6 +1934,7 @@ async fn connection_manager(
         let hb_callback = heartbeat_flag.clone();
         let dedup_callback = dedup.clone();
         let known_callback = known.clone();
+        let clock_callback = clock.clone();
         // tx: used directly by recover_fills and the heartbeat/consumer-drop monitor.
         // event_tx: cloned into the WS callback closure (taken on first send failure or
         // stream termination so the callback becomes a no-op after disconnect).
@@ -1856,7 +1949,7 @@ async fn connection_manager(
         // subscription; that task processes events sequentially from an internal channel,
         // so FnMut callbacks are never invoked concurrently per subscription. If the SDK
         // changes to concurrent callbacks, these `Option::take()` calls would need a Mutex.
-        // verified against binance-sdk =77.0.0. Re-verify on SDK upgrade.
+        // verified against binance-sdk =77.2.0. Re-verify on SDK upgrade.
         let subscription = ws.subscribe_on_ws_events(move |event| {
             let Some(ref sender) = event_tx else { return };
             match event {
@@ -1867,7 +1960,14 @@ async fn connection_manager(
                     // Borrowed discriminator + matched-variant parse (no full Value DOM).
                     // RPC responses (the subscribe ack) are ignored inside the converter, and
                     // unrecognised frames are logged there (throttled warn).
-                    let stream_terminated = convert_user_data_events(&json_str, &mut event_buf);
+                    let outcome = convert_user_data_events(&json_str, &mut event_buf);
+                    StreamClock::observe_frame(
+                        &clock_callback,
+                        outcome.event_time,
+                        &event_buf,
+                        tokio::time::Instant::now(),
+                    );
+                    let stream_terminated = outcome.terminated;
                     for ev in event_buf.drain(..) {
                         // Dedup check
                         if let Some(key) = dedup_key_from_event(&ev)
@@ -1937,11 +2037,13 @@ async fn connection_manager(
         // Fills first, then how the orders held as live ended: an order whose fills are not all
         // recovered is not checked yet. Each gap and check is opened before it is read, so one
         // that fails or times out is kept for a retry.
-        if let Some(dt) = disconnect_time.take() {
-            unrecovered.open(&instruments, dt, Utc::now());
+        if let Some(disconnect) = disconnect.take() {
+            let end = disconnect.end(&clock.lock().venue(), HostMoment::now());
+            unrecovered.open(&instruments, disconnect.start, end);
             // Only the instruments this stream recovers fills for, so fills-first holds for each.
             let held = known.lock().instruments_among(&instruments);
             unchecked.open(held);
+            restatement.open();
         }
         recover_fills(&rest, &rate_limiter, &mut unrecovered, &tx, &dedup, &known).await;
         recover_spot_ended_orders(
@@ -1953,6 +2055,9 @@ async fn connection_manager(
             &tx,
         )
         .await;
+        // The balances are restated beside the monitor below, which reads them at once: after the
+        // fills just recovered, without holding back the heartbeat. A gap whose read failed does
+        // not hold them back either.
 
         // --- Monitor: wait for disconnect, heartbeat timeout, or consumer drop ---
         enum DisconnectReason {
@@ -1962,15 +2067,26 @@ async fn connection_manager(
         }
         let reason = {
             let mut signal_rx = signal_rx;
-            // Gaps and order checks a recovery did not finish are retried as they fall due,
-            // alongside the monitor, so a disconnect is still seen at once. An order check waiting
-            // on a gap runs right after the gap's retry. It never completes; dropping it when the
-            // monitor ends loses nothing, since each gap, and each instrument's order check, is
-            // settled in one step as soon as its read ends.
+            // Gaps, order checks and a restatement a recovery did not finish are retried as they
+            // fall due, alongside the monitor, so a disconnect is still seen at once. An order
+            // check waiting on a gap runs right after the gap's retry. It never completes; dropping
+            // it when the monitor ends loses nothing, since each gap, each instrument's order
+            // check, and the restatement is settled in one step as soon as its read ends.
             let retry_gaps = async {
                 loop {
+                    // First, the restatement a reconnect has just opened, due at once.
+                    restate("BinanceSpot", &clock, &mut restatement, &tx, |floor| {
+                        read_spot_restatement(&rest, &rate_limiter, &assets, &clock, floor)
+                    })
+                    .await;
                     let next_check = unchecked.next_due(&unrecovered);
-                    match unrecovered.next_due().into_iter().chain(next_check).min() {
+                    match unrecovered
+                        .next_due()
+                        .into_iter()
+                        .chain(next_check)
+                        .chain(restatement.next_due())
+                        .min()
+                    {
                         Some(due) => tokio::time::sleep_until(due).await,
                         None => std::future::pending::<()>().await,
                     }
@@ -2032,28 +2148,26 @@ async fn connection_manager(
         };
         let should_reconnect = !matches!(reason, DisconnectReason::ConsumerDropped);
 
-        // record disconnect time BEFORE cleanup so fill recovery covers
-        // the full gap. For heartbeat timeouts the connection may have died up to
-        // HEARTBEAT_TIMEOUT_SECS ago, so subtract that as a safety margin.
-        // For signal-based disconnects (WS close/error/stream terminated), subtract a
+        // record the disconnect BEFORE cleanup so fill recovery covers
+        // the full gap. For heartbeat timeouts the connection may have died up to two
+        // heartbeat windows ago, so look back that far (see `disconnect_lookback`).
+        // For signal-based disconnects (WS close/error/stream terminated), look back a
         // small margin to cover Tokio scheduling jitter between the WS close event and
-        // the monitor task recording Utc::now(). Dedup cache handles any resulting duplicates.
+        // the monitor task seeing it. Dedup cache handles any resulting duplicates.
         if should_reconnect {
-            disconnect_time = Some(match reason {
-                DisconnectReason::HeartbeatTimeout => {
-                    Utc::now()
-                        - chrono::Duration::seconds(HEARTBEAT_TIMEOUT_SECS as i64)
-                        - chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS)
-                }
-                _ => Utc::now() - chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS),
-            });
+            let heartbeat_timed_out = matches!(reason, DisconnectReason::HeartbeatTimeout);
+            disconnect = Some(Disconnect::seen(
+                &clock.lock().venue(),
+                HostMoment::now(),
+                disconnect_lookback(heartbeat_timed_out),
+            ));
         }
 
         // --- Cleanup current connection ---
         // must explicitly unsubscribe — Subscription::drop only detaches the
         // internal JoinHandle, it doesn't abort it.
         // unsubscribe() aborts the callback task without waiting for it (verified against
-        // binance-sdk =77.0.0): a callback already running finishes, and none starts once the
+        // binance-sdk =77.2.0): a callback already running finishes, and none starts once the
         // task sees the abort. That is benign: the callback holds its own clone of the
         // `heartbeat_flag` Arc, so dropping ours here is safe, and an event it still forwards
         // reaches the consumer through the dedup cache like any other from this connection.
@@ -2080,6 +2194,41 @@ async fn connection_manager(
             break;
         }
     }
+}
+
+/// Read the spot account's balances to restate after a reconnect, as a
+/// [`BalanceSnapshot`](AccountEventKind::BalanceSnapshot) for each of `assets` (all of them when
+/// empty), stamped by [`restatement_time`] for a read started with `floor` (see [`restate`]).
+async fn read_spot_restatement(
+    rest: &Arc<RestApi>,
+    rate_limiter: &Arc<RateLimitTracker>,
+    assets: &[AssetNameExchange],
+    clock: &SharedStreamClock,
+    floor: Option<DateTime<Utc>>,
+) -> Result<Vec<UnindexedAccountEvent>, UnindexedClientError> {
+    let (response, sent) = rest_read_with_retry(rest, rate_limiter, RequestKind::Query, |rest| {
+        Box::pin(async move {
+            let params = GetAccountParams::builder().build()?;
+            rest.get_account(params).await
+        })
+    })
+    .await
+    .map_err(|e| classify_rest_query_error(&e, None))?;
+    let account = response.data().await.map_err(response_decode_error)?;
+    let time = restatement_time(&clock.lock(), sent, floor);
+    Ok(
+        filter_and_convert_balances(account.balances.unwrap_or_default(), assets, time)
+            .into_iter()
+            .map(|balance| {
+                UnindexedAccountEvent::new(
+                    ExchangeId::BinanceSpot,
+                    AccountEventKind::BalanceSnapshot(
+                        rustrade_integration::collection::snapshot::Snapshot(balance),
+                    ),
+                )
+            })
+            .collect(),
+    )
 }
 
 /// Recover the fills of every gap in `unrecovered` that is due: the fills missed while the stream
@@ -2312,16 +2461,18 @@ fn convert_balance_entry(
     ))
 }
 
+/// Filter `balances` to `assets` (all of them when `assets` is empty) and convert them, each
+/// stamped `time`.
 fn filter_and_convert_balances(
     balances: Vec<binance_sdk::spot::rest_api::GetAccountResponseBalancesInner>,
     assets: &[AssetNameExchange],
+    time: chrono::DateTime<Utc>,
 ) -> Vec<AssetBalance<AssetNameExchange>> {
-    let now = Utc::now();
     // Empty assets slice means "return all" — skip building the set entirely.
     if assets.is_empty() {
         return balances
             .into_iter()
-            .filter_map(|b| convert_balance_entry(b, now))
+            .filter_map(|b| convert_balance_entry(b, time))
             .collect();
     }
     // For small slices (≤16 assets), linear scan avoids allocation and hashing overhead.
@@ -2334,7 +2485,7 @@ fn filter_and_convert_balances(
                 if !assets.iter().any(|a| a.name().as_str() == asset_name_str) {
                     return None;
                 }
-                convert_balance_entry(b, now)
+                convert_balance_entry(b, time)
             })
             .collect();
     }
@@ -2347,7 +2498,7 @@ fn filter_and_convert_balances(
             if !asset_set.contains(asset_name_str) {
                 return None;
             }
-            convert_balance_entry(b, now)
+            convert_balance_entry(b, time)
         })
         .collect()
 }
@@ -2404,11 +2555,16 @@ fn convert_my_trade(
         .as_deref()
         .and_then(|s| Decimal::from_str(s).ok())
         .unwrap_or(Decimal::ZERO);
-    let time_exchange = match t.time.and_then(|ms| Utc.timestamp_millis_opt(ms).single()) {
-        Some(ts) => ts,
+    // The trade carries no other time, so without `time` it is kept, stamped with this host's
+    // clock and marked so.
+    let (time_exchange, time_source) = match t
+        .time
+        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+    {
+        Some(ts) => (ts, TimeSource::Venue),
         None => {
             warn!(%instrument, trade_id = %trade_id_raw, "BinanceSpot trade missing/unparseable time, using now");
-            Utc::now()
+            (Utc::now(), TimeSource::Host)
         }
     };
 
@@ -2423,19 +2579,22 @@ fn convert_my_trade(
         .map(AssetNameExchange::from)
         .unwrap_or_else(|| AssetNameExchange::from("UNKNOWN"));
 
-    Some(Trade::new(
-        trade_id,
-        order_id,
-        instrument.clone(),
-        StrategyId::unknown(), // Binance doesn't carry strategy IDs
-        time_exchange,
-        side,
-        price,
-        quantity,
-        // `myTrades` reports executions only -- no cumulative, no order status.
-        None,
-        AssetFees::new(fee_asset, commission, None),
-    ))
+    Some(
+        Trade::new(
+            trade_id,
+            order_id,
+            instrument.clone(),
+            StrategyId::unknown(), // Binance doesn't carry strategy IDs
+            time_exchange,
+            side,
+            price,
+            quantity,
+            // `myTrades` reports executions only -- no cumulative, no order status.
+            None,
+            AssetFees::new(fee_asset, commission, None),
+        )
+        .with_time_source(time_source),
+    )
 }
 
 /// Convert a raw BinanceSpot user-data WS frame to rustrade AccountEvents.
@@ -2444,7 +2603,8 @@ fn convert_my_trade(
 /// A single Binance event (e.g., outboundAccountPosition) may map to multiple
 /// rustrade events (one per asset balance).
 ///
-/// Returns `true` if the stream should be considered terminated (requires reconnect).
+/// Returns whether the stream should be considered terminated (requires reconnect), and the
+/// event's time `E`, when Binance sent it, to sample the stream's clock with.
 ///
 /// # Frame shape
 ///
@@ -2462,18 +2622,43 @@ fn convert_my_trade(
 /// the matched variant straight from the inner event slice — avoiding the full
 /// `serde_json::Value` DOM that `UserDataStreamEventsResponse`'s `#[serde(try_from = "Value")]`
 /// would build for every inbound frame.
-fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> bool {
-    let (event_type, event) = match parse_user_data_frame(frame) {
-        UserDataFrame::Response => return false,
+fn convert_user_data_events(frame: &str, buf: &mut Vec<UnindexedAccountEvent>) -> UserDataOutcome {
+    let (event_type, event, event_time) = match parse_user_data_frame(frame) {
+        UserDataFrame::Response => return UserDataOutcome::default(),
         UserDataFrame::Event {
-            event_type, event, ..
-        } => (event_type, event),
+            event_type,
+            event,
+            event_time,
+            ..
+        } => (event_type, event, event_time),
         UserDataFrame::Unrecognised => {
             static SEEN: AtomicU64 = AtomicU64::new(0);
             log_unrecognised_frame("BinanceSpot", &SEEN, frame);
-            return false;
+            return UserDataOutcome::default();
         }
     };
+    UserDataOutcome {
+        terminated: convert_user_data_event(event_type, event, buf),
+        event_time,
+    }
+}
+
+/// What [`convert_user_data_events`] found in a frame.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct UserDataOutcome {
+    /// The venue ended the stream: reconnect.
+    terminated: bool,
+    /// The event's time `E`, by Binance's clock.
+    event_time: Option<DateTime<Utc>>,
+}
+
+/// Convert one user-data event of type `event_type`, appending its events to `buf`. Returns `true`
+/// if the stream should be considered terminated.
+fn convert_user_data_event(
+    event_type: &str,
+    event: &str,
+    buf: &mut Vec<UnindexedAccountEvent>,
+) -> bool {
     // Tag values match `UserDataStreamEventsResponse`'s `try_from = "Value"` arms (binance-sdk).
     match event_type {
         "executionReport" => {
@@ -2541,8 +2726,11 @@ fn convert_account_position(
 ) {
     // `u` (last account update time) rather than `E` (event time), for more accurate balance
     // timestamps.
-    let time_exchange =
-        account_position_time(ExchangeId::BinanceSpot, position.u, position.e_uppercase);
+    let Some(time_exchange) =
+        account_position_time(ExchangeId::BinanceSpot, position.u, position.e_uppercase)
+    else {
+        return;
+    };
 
     for b in position.b_uppercase.unwrap_or_default() {
         let asset = match b.a {
@@ -2682,7 +2870,9 @@ mod tests {
             order::{request::RequestOpen, state::InactiveOrderState},
         };
 
-        let client = BinanceSpot::new(BinanceSpotConfig::testnet("key".into(), "secret".into()));
+        let client = BinanceSpot::new(
+            BinanceSpotConfig::testnet("key".into(), "secret".into()).with_server_time_sync(false),
+        );
         let instrument = InstrumentNameExchange::new("BTCUSDT");
 
         for effect in [MarginEffect::Borrow, MarginEffect::Repay] {
@@ -2732,8 +2922,9 @@ mod tests {
             ))
             .mount(&server)
             .await;
-        let mut client =
-            BinanceSpot::new(BinanceSpotConfig::testnet("key".into(), "secret".into()));
+        let mut client = BinanceSpot::new(
+            BinanceSpotConfig::testnet("key".into(), "secret".into()).with_server_time_sync(false),
+        );
         client.rules = Arc::new(RulesLoader::new(
             PreSendRules::Enforce,
             Arc::new(SpotRestApi::from_config(
@@ -2780,8 +2971,9 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let mut client =
-            BinanceSpot::new(BinanceSpotConfig::testnet("key".into(), "secret".into()));
+        let mut client = BinanceSpot::new(
+            BinanceSpotConfig::testnet("key".into(), "secret".into()).with_server_time_sync(false),
+        );
         client.rules = Arc::new(RulesLoader::new(
             PreSendRules::Enforce,
             Arc::new(SpotRestApi::from_config(
@@ -2827,6 +3019,100 @@ mod tests {
                 )
             ),
             "{order:?}"
+        );
+    }
+
+    /// A trailing stop's offset is held to `TRAILING_DELTA`'s range for its side, the range above
+    /// for a buy and below for a sell, and refused unsent.
+    #[tokio::test]
+    async fn open_order_refuses_a_trailing_offset_outside_its_sides_range_unsent() {
+        use crate::{
+            client::ExecutionClient,
+            error::{Bound, BoundsViolation, OrderField},
+            order::{TrailingOffsetType, request::RequestOpen, state::InactiveOrderState},
+        };
+
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/exchangeInfo"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"symbols": [{
+                    "symbol": "BTCUSDT", "status": "TRADING",
+                    "filters": [
+                        {"filterType": "TRAILING_DELTA", "minTrailingAboveDelta": 10,
+                         "maxTrailingAboveDelta": 2000, "minTrailingBelowDelta": 10,
+                         "maxTrailingBelowDelta": 1000},
+                    ],
+                }]}),
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client = BinanceSpot::new(
+            BinanceSpotConfig::testnet("key".into(), "secret".into()).with_server_time_sync(false),
+        );
+        client.rules = Arc::new(RulesLoader::new(
+            PreSendRules::Enforce,
+            Arc::new(SpotRestApi::from_config(
+                ConfigurationRestApi::builder()
+                    .api_key("key")
+                    .api_secret("secret")
+                    .base_path(server.uri())
+                    .build()
+                    .unwrap(),
+            )),
+            Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+        ));
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        let order = |cid: &str, side: Side, offset: Decimal| OrderRequestOpen {
+            key: OrderKey::new(
+                ExchangeId::BinanceSpot,
+                &instrument,
+                StrategyId::new("strategy"),
+                ClientOrderId::new(cid),
+            ),
+            state: RequestOpen::new(
+                side,
+                None,
+                Decimal::ONE,
+                OrderKind::TrailingStop {
+                    offset,
+                    offset_type: TrailingOffsetType::BasisPoints,
+                    activation_price: None,
+                },
+                TimeInForce::GoodUntilCancelled { post_only: false },
+            ),
+        };
+        let refused_at = |order: Order<_, _, _>| match order.state {
+            OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::OutOfBounds(
+                violation,
+            ))) => Some(violation),
+            _ => None,
+        };
+
+        let buy = client
+            .open_order(order("a", Side::Buy, Decimal::from(2500)))
+            .await;
+        assert_eq!(
+            refused_at(buy),
+            Some(BoundsViolation::new(
+                OrderField::TrailingOffset,
+                Bound::Max,
+                Decimal::from(2000),
+                Decimal::from(2500),
+            ))
+        );
+        let sell = client
+            .open_order(order("b", Side::Sell, Decimal::from(1500)))
+            .await;
+        assert_eq!(
+            refused_at(sell),
+            Some(BoundsViolation::new(
+                OrderField::TrailingOffset,
+                Bound::Max,
+                Decimal::from(1000),
+                Decimal::from(1500),
+            ))
         );
     }
 
@@ -2995,8 +3281,6 @@ mod tests {
 
     #[test]
     fn test_convert_order_kind_tif() {
-        use rust_decimal::Decimal;
-
         // binance-sdk enums don't derive PartialEq, so use matches!
         assert!(matches!(
             convert_order_kind_tif(OrderKind::Market, TimeInForce::ImmediateOrCancel),
@@ -3036,8 +3320,12 @@ mod tests {
         // GoodUntilEndOfDay is unsupported on Binance (no native EOD order) — surfaced as
         // unsupported rather than silently coerced to GTC, which would drop the EOD semantics.
         assert!(convert_order_kind_tif(OrderKind::Limit, TimeInForce::GoodUntilEndOfDay).is_none());
+    }
 
-        // Conditional orders
+    #[test]
+    fn test_convert_order_kind_tif_conditional() {
+        use rust_decimal::Decimal;
+
         assert!(matches!(
             convert_order_kind_tif(
                 OrderKind::Stop {
@@ -3080,6 +3368,11 @@ mod tests {
                 Some(OrderPlaceTimeInForceEnum::Fok)
             ))
         ));
+    }
+
+    #[test]
+    fn test_convert_order_kind_tif_trailing() {
+        use rust_decimal::Decimal;
 
         // TrailingStop with BasisPoints/Percentage → StopLoss (trailingDelta set separately)
         assert!(matches!(
@@ -3626,7 +3919,6 @@ mod tests {
                 u,
                 e_uppercase: e,
                 b_uppercase: Some(vec![make_balance_inner("ETH", "2.0", "0.0")]),
-                ..Default::default()
             };
             let mut buf = Vec::new();
             convert_account_position(position, &mut buf);
@@ -3708,6 +4000,26 @@ mod tests {
             buf.is_empty(),
             "empty balance list should produce no events"
         );
+    }
+
+    /// A frame with neither an update time `u` nor an event time `E` is dropped, rather than
+    /// stamped with this host's time; one with either is delivered.
+    #[test]
+    fn an_account_position_without_a_venue_time_is_dropped() {
+        let converted = |u, e_uppercase| {
+            let position = binance_sdk::spot::websocket_api::OutboundAccountPosition {
+                u,
+                e_uppercase,
+                b_uppercase: Some(vec![make_balance_inner("USDT", "100.0", "0.0")]),
+            };
+            let mut buf = Vec::new();
+            convert_account_position(position, &mut buf);
+            buf.len()
+        };
+        assert_eq!(converted(None, None), 0);
+        assert_eq!(converted(Some(i64::MAX), None), 0);
+        assert_eq!(converted(Some(1_700_000_000_000), None), 1);
+        assert_eq!(converted(None, Some(1_700_000_000_000)), 1);
     }
 
     #[test]
@@ -3888,6 +4200,47 @@ mod tests {
             }
             other => panic!("TRADE should yield Trade, got {other:?}"),
         }
+    }
+
+    /// A fill is at its transaction time `T`, else at its report's event time `E`, both the
+    /// venue's; with neither it is at this host's time, and says so.
+    #[test]
+    fn a_fills_time_is_its_transaction_time_then_its_event_time_then_this_hosts() {
+        let trade = |transaction_time, event_time| {
+            let report = ExecutionReport {
+                execution_type: Some("TRADE".to_string()),
+                side: Some("BUY".to_string()),
+                trade_id: Some(9999),
+                last_executed_price: Some("50000.00".to_string()),
+                last_executed_quantity: Some("0.01".to_string()),
+                transaction_time,
+                event_time,
+                ..make_base_report()
+            };
+            match sole_event(convert(report)).map(|event| event.kind) {
+                Some(AccountEventKind::Trade(trade)) => trade,
+                other => panic!("TRADE should yield Trade, got {other:?}"),
+            }
+        };
+        let at = |ms| Utc.timestamp_millis_opt(ms).unwrap();
+
+        let fill = trade(Some(1_700_000_000_000), Some(1_700_000_000_005));
+        assert_eq!(
+            (fill.time_exchange, fill.time_source),
+            (at(1_700_000_000_000), crate::trade::TimeSource::Venue)
+        );
+        for transaction_time in [None, Some(i64::MAX)] {
+            let fill = trade(transaction_time, Some(1_700_000_000_005));
+            assert_eq!(
+                (fill.time_exchange, fill.time_source),
+                (at(1_700_000_000_005), crate::trade::TimeSource::Venue),
+                "{transaction_time:?}"
+            );
+        }
+        let before = Utc::now();
+        let fill = trade(None, None);
+        assert_eq!(fill.time_source, crate::trade::TimeSource::Host);
+        assert!((before..=Utc::now()).contains(&fill.time_exchange));
     }
 
     /// The `(Trade, OrderSnapshot)` pair a fill report must produce, in that order.
@@ -4322,7 +4675,7 @@ mod tests {
             make_balance("BTC", "1.0", "0.0"),
             make_balance("USDT", "500.0", "50.0"),
         ];
-        let result = filter_and_convert_balances(balances, &[]);
+        let result = filter_and_convert_balances(balances, &[], Utc::now());
         assert_eq!(result.len(), 2, "empty filter should return all balances");
     }
 
@@ -4333,7 +4686,7 @@ mod tests {
             make_balance("ETH", "10.0", "0.0"),
         ];
         let assets = vec![AssetNameExchange::new("BTC")];
-        let result = filter_and_convert_balances(balances, &assets);
+        let result = filter_and_convert_balances(balances, &assets, Utc::now());
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].asset, AssetNameExchange::new("BTC"));
         // total = free + locked = 1.5 + 0.5
@@ -4348,7 +4701,7 @@ mod tests {
             make_balance("ETH", "2.0", "0.0"),
         ];
         let assets = vec![AssetNameExchange::new("USDT")];
-        let result = filter_and_convert_balances(balances, &assets);
+        let result = filter_and_convert_balances(balances, &assets, Utc::now());
         assert!(
             result.is_empty(),
             "non-matching asset should be filtered out"
@@ -4365,7 +4718,7 @@ mod tests {
             },
             make_balance("USDT", "100.0", "0.0"),
         ];
-        let result = filter_and_convert_balances(balances, &[]);
+        let result = filter_and_convert_balances(balances, &[], Utc::now());
         assert_eq!(
             result.len(),
             1,
@@ -4383,7 +4736,7 @@ mod tests {
                 locked: Some("0.0".to_string()),
             },
         ];
-        let result = filter_and_convert_balances(balances, &[]);
+        let result = filter_and_convert_balances(balances, &[], Utc::now());
         assert!(
             result.is_empty(),
             "unparseable free field should be skipped"
@@ -4398,7 +4751,7 @@ mod tests {
             make_balance("BTC", "0.00000000", "0.00000000"),
             make_balance("USDT", "100.0", "0.0"),
         ];
-        let result = filter_and_convert_balances(balances, &[]);
+        let result = filter_and_convert_balances(balances, &[], Utc::now());
         assert_eq!(result.len(), 2, "zero-balance entries must be included");
         let btc = result
             .iter()
@@ -4417,7 +4770,7 @@ mod tests {
             make_balance("BTC", "1.0", "0.0"),
             make_balance("BTC", "2.0", "0.0"),
         ];
-        let result = filter_and_convert_balances(balances, &[]);
+        let result = filter_and_convert_balances(balances, &[], Utc::now());
         assert_eq!(
             result.len(),
             2,
@@ -4451,6 +4804,29 @@ mod tests {
         assert_eq!(trade.side, Side::Buy);
         assert_eq!(trade.price, Decimal::from_str("50000.00").unwrap());
         assert_eq!(trade.quantity, Decimal::from_str("0.01").unwrap());
+    }
+
+    /// A trade is at its `time`, the venue's; without one it is kept, at this host's time, and
+    /// says so.
+    #[test]
+    fn a_rest_trade_without_a_time_is_at_this_hosts_time() {
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        let trade = convert_my_trade(&make_base_trade(), &instrument).unwrap();
+        assert_eq!(
+            (trade.time_exchange, trade.time_source),
+            (
+                Utc.timestamp_millis_opt(1_700_000_000_000).unwrap(),
+                TimeSource::Venue
+            )
+        );
+        let before = Utc::now();
+        let t = binance_sdk::spot::rest_api::MyTradesResponseInner {
+            time: None,
+            ..make_base_trade()
+        };
+        let trade = convert_my_trade(&t, &instrument).unwrap();
+        assert_eq!(trade.time_source, TimeSource::Host);
+        assert!((before..=Utc::now()).contains(&trade.time_exchange));
     }
 
     #[test]
@@ -4981,7 +5357,7 @@ mod tests {
         };
         let frame = user_data_frame("executionReport", &report);
         let mut buf = Vec::new();
-        let terminated = convert_user_data_events(&frame, &mut buf);
+        let terminated = convert_user_data_events(&frame, &mut buf).terminated;
         assert!(
             !terminated,
             "ExecutionReport should not signal stream termination"
@@ -4999,7 +5375,7 @@ mod tests {
         };
         let frame = user_data_frame("outboundAccountPosition", &position);
         let mut buf = Vec::new();
-        let terminated = convert_user_data_events(&frame, &mut buf);
+        let terminated = convert_user_data_events(&frame, &mut buf).terminated;
         assert!(
             !terminated,
             "OutboundAccountPosition should not signal stream termination"
@@ -5018,7 +5394,7 @@ mod tests {
         };
         let frame = user_data_frame("balanceUpdate", &update);
         let mut buf = Vec::new();
-        let terminated = convert_user_data_events(&frame, &mut buf);
+        let terminated = convert_user_data_events(&frame, &mut buf).terminated;
         assert!(
             !terminated,
             "BalanceUpdate should not signal stream termination"
@@ -5032,7 +5408,7 @@ mod tests {
         let frame =
             r#"{"subscriptionId":0,"event":{"e":"eventStreamTerminated","E":1700000000000}}"#;
         let mut buf = Vec::new();
-        let terminated = convert_user_data_events(frame, &mut buf);
+        let terminated = convert_user_data_events(frame, &mut buf).terminated;
         assert!(
             terminated,
             "eventStreamTerminated must signal stream termination"
@@ -5052,7 +5428,7 @@ mod tests {
                 r#"{{"subscriptionId":0,"event":{{"e":"{e}","E":1700000000000,"s":"BTCUSDT"}}}}"#
             );
             let mut buf = Vec::new();
-            let terminated = convert_user_data_events(&frame, &mut buf);
+            let terminated = convert_user_data_events(&frame, &mut buf).terminated;
             assert!(!terminated, "{e} must not signal termination");
             assert!(buf.is_empty(), "{e} should push no events");
         }
@@ -5069,7 +5445,7 @@ mod tests {
             "x":"TRADE","X":"FILLED","i":777,"l":"0.5","z":"0.5","L":"40000","n":"0.02",
             "N":"USDT","T":1700000001000,"t":888}}"#;
         let mut buf = Vec::new();
-        assert!(!convert_user_data_events(fill, &mut buf));
+        assert!(!convert_user_data_events(fill, &mut buf).terminated);
         assert!(
             buf.iter()
                 .any(|ev| matches!(ev.kind, AccountEventKind::Trade(_))),
@@ -5079,8 +5455,26 @@ mod tests {
         // The pre-fix fixture shape: a bare event with no envelope is not an event frame.
         let bare = r#"{"e":"executionReport","s":"BTCUSDT","i":777,"x":"NEW","X":"NEW"}"#;
         buf.clear();
-        assert!(!convert_user_data_events(bare, &mut buf));
+        assert!(!convert_user_data_events(bare, &mut buf).terminated);
         assert!(buf.is_empty());
+    }
+
+    /// Every pushed event's `E` is returned to sample the stream's clock, an order's as much as
+    /// a fill's, so the clock has a sample before the stream's first fill.
+    #[test]
+    fn test_convert_user_data_events_returns_the_events_time() {
+        let new_order = r#"{"subscriptionId":3,"event":{"e":"executionReport","E":1700000002000,
+            "s":"BTCUSDT","c":"client-1","S":"BUY","o":"LIMIT","f":"GTC","q":"0.5","p":"40000",
+            "x":"NEW","X":"NEW","i":777,"l":"0","z":"0","L":"0","n":"0","T":1700000001000}}"#;
+        let mut buf = Vec::new();
+        let outcome = convert_user_data_events(new_order, &mut buf);
+        assert_eq!(
+            outcome.event_time,
+            DateTime::<Utc>::from_timestamp_millis(1_700_000_002_000)
+        );
+
+        let ack = r#"{"id":"abc","status":200,"result":[]}"#;
+        assert_eq!(convert_user_data_events(ack, &mut buf).event_time, None);
     }
 
     #[test]
@@ -5088,7 +5482,7 @@ mod tests {
         // RPC responses such as the subscribe ack carry a top-level `id` — ignored, not mis-parsed.
         let frame = r#"{"id":"abc","status":200,"result":[]}"#;
         let mut buf = Vec::new();
-        let terminated = convert_user_data_events(frame, &mut buf);
+        let terminated = convert_user_data_events(frame, &mut buf).terminated;
         assert!(
             !terminated,
             "non-user-data frame must not signal termination"
@@ -5273,13 +5667,24 @@ mod tests {
         }
     }
 
-    /// A spot client whose WS-API order session connects to `ws_url`. Its pre-send rules are off,
-    /// so an open reads no `exchangeInfo` from the production REST API.
+    /// A spot client whose WS-API order session and account stream connect to `ws_url`, and which
+    /// reaches no Binance REST API: its pre-send rules are off, so an open reads no
+    /// `exchangeInfo`, and its REST calls go to a closed local port, so a stream's reconnect reads
+    /// its fills and balances from nowhere unless a test points `rest` at a mock.
     fn client_with_ws_api(ws_url: String) -> BinanceSpot {
         let mut client = <BinanceSpot as ExecutionClient>::new(
             BinanceSpotConfig::new("key".into(), "secret".into())
+                .with_server_time_sync(false)
                 .with_pre_send_rules(PreSendRules::Off),
         );
+        client.rest = Arc::new(SpotRestApi::from_config(
+            ConfigurationRestApi::builder()
+                .api_key("key")
+                .api_secret("secret")
+                .base_path("http://127.0.0.1:9")
+                .build()
+                .unwrap(),
+        ));
         client.ws_handle = SpotWsApi::from_config(
             ConfigurationWebsocketApi::builder()
                 .api_key("key")
@@ -5326,10 +5731,9 @@ mod tests {
     /// rate-limit rejection, without a handshake.
     #[tokio::test]
     async fn cancel_without_a_session_during_a_cooldown_is_rejected_unsent() {
-        let client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
-            "key".into(),
-            "secret".into(),
-        ));
+        let client = <BinanceSpot as ExecutionClient>::new(
+            BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+        );
         client
             .rate_limiter
             .on_rate_limited(Some(Duration::from_secs(60)));
@@ -5521,6 +5925,67 @@ mod tests {
         assert_rate_limited_for(&state, TWO_MINUTE_BAN);
         assert_cooldown_about(&client, TWO_MINUTE_BAN);
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    /// A WS-API answer refusing any request's timestamp (`-1021`).
+    fn refused_timestamp(request: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": request["id"],
+            "status": 400,
+            "error": {
+                "code": -1021,
+                "msg": "Timestamp for this request was 1000ms ahead of the server's time.",
+            },
+        })
+    }
+
+    /// An order or cancel the WS API refuses with `-1021` reads Binance's server time again before
+    /// its answer returns, so a retry is stamped on the new reading.
+    #[tokio::test]
+    async fn a_ws_api_refused_timestamp_reads_the_server_time_again() {
+        let (url, _) = ws_api_answering(refused_timestamp).await;
+        let mut client = client_with_ws_api(url);
+        let reads = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let read: crate::client::binance::server_time::ReadServerTime = {
+            let reads = Arc::clone(&reads);
+            Arc::new(move || {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(i64::try_from(unix_ms()).unwrap()) })
+            })
+        };
+        client.rate_limiter = Arc::new(
+            RateLimitTracker::new(WeightPool::Spot)
+                .with_server_time(Some(ServerTime::new(SigningClock::default(), read))),
+        );
+        let instrument = InstrumentNameExchange::new("BTCUSDT");
+        let open = crate::order::OrderEvent {
+            key: OrderKey {
+                exchange: ExchangeId::BinanceSpot,
+                instrument: &instrument,
+                strategy: StrategyId::new("strategy"),
+                cid: ClientOrderId::new("cid"),
+            },
+            state: crate::order::request::RequestOpen::new(
+                Side::Buy,
+                Some(Decimal::new(50_000, 0)),
+                Decimal::new(1, 3),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilCancelled { post_only: false },
+            ),
+        };
+
+        let order = client.open_order(open).await;
+        assert!(
+            matches!(order.state, OrderState::Inactive(_)),
+            "{:?}",
+            order.state
+        );
+        // The first request's read, and the read after the refusal.
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+
+        let cancel = client.cancel_order(cancel_request(&instrument)).await;
+        assert!(cancel.state.is_err(), "{:?}", cancel.state);
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
     }
 
     /// A WS-API success whose result has no `orderId`.
@@ -5829,6 +6294,123 @@ mod tests {
         }
 
         tokio::join!(run(true), run(false));
+    }
+
+    /// After its connection drops and the stream reconnects by itself, it reads the account's
+    /// balances and delivers each one it was opened for as a balance snapshot.
+    #[tokio::test]
+    async fn a_reconnect_restates_the_balances() {
+        fn dropped_once(n: usize) -> test_ws_api::Lifetime {
+            match n {
+                0 => test_ws_api::Lifetime::Silent(Duration::from_millis(100)),
+                _ => test_ws_api::Lifetime::Open,
+            }
+        }
+        let venue = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/account"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "balances": [
+                    { "asset": "BTC", "free": "1", "locked": "0" },
+                    { "asset": "ETH", "free": "2", "locked": "0" },
+                ] }),
+            ))
+            .mount(&venue)
+            .await;
+        let (url, _) = test_ws_api::serve(subscribed, dropped_once).await;
+        let mut client = client_with_ws_api(url);
+        client.rest = rest_at(&venue);
+        let btc = AssetNameExchange::new("BTC");
+        let mut stream = client
+            .account_stream(std::slice::from_ref(&btc), &[])
+            .await
+            .unwrap();
+
+        let restated = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = futures::StreamExt::next(&mut stream).await.unwrap();
+                if let AccountEventKind::BalanceSnapshot(balance) = event.kind {
+                    break balance.0;
+                }
+            }
+        })
+        .await
+        .expect("the balances are restated after the reconnect");
+        assert_eq!(restated.asset, btc);
+        assert_eq!(restated.balance, Balance::new(Decimal::ONE, Decimal::ONE));
+    }
+
+    /// The latest balance event the stream delivered sets the floor of the restatement after the
+    /// next reconnect. Here the venue's clock reads 60 s ahead of this host's: the read waits until
+    /// the venue's clock is the REST lag past that event, and is stamped at its time, not this
+    /// host's time less the lag, which the engine would judge older than the event and drop.
+    #[tokio::test]
+    async fn a_restatement_is_stamped_no_earlier_than_the_last_balance_delivered() {
+        use crate::client::binance::shared::REST_BALANCE_LAG;
+        fn ahead_ms() -> i64 {
+            (Utc::now() + chrono::Duration::seconds(60)).timestamp_millis()
+        }
+        fn position() -> String {
+            let time = ahead_ms();
+            serde_json::json!({
+                "subscriptionId": 0,
+                "event": {
+                    "e": "outboundAccountPosition", "E": time, "u": time,
+                    "B": [{ "a": "BTC", "f": "1", "l": "0" }],
+                },
+            })
+            .to_string()
+        }
+        fn pushed_then_open(n: usize) -> test_ws_api::Lifetime {
+            match n {
+                0 => test_ws_api::Lifetime::Pushing(position, Duration::from_millis(300)),
+                _ => test_ws_api::Lifetime::Open,
+            }
+        }
+        let venue = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/account"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "balances": [{ "asset": "BTC", "free": "1", "locked": "0" }] }),
+            ))
+            .mount(&venue)
+            .await;
+        let (url, _) = test_ws_api::serve(subscribed, pushed_then_open).await;
+        let mut client = client_with_ws_api(url);
+        client.rest = rest_at(&venue);
+        let mut stream = client.account_stream(&[], &[]).await.unwrap();
+
+        let (pushed, restated) = tokio::time::timeout(Duration::from_secs(15), async {
+            let mut pushed = None;
+            loop {
+                let event = futures::StreamExt::next(&mut stream).await.unwrap();
+                match event.kind {
+                    AccountEventKind::BalanceStreamUpdate(update) => {
+                        pushed = Some((update.0.time_exchange, tokio::time::Instant::now()));
+                    }
+                    AccountEventKind::BalanceSnapshot(balance) => {
+                        break (
+                            pushed.expect("the pushed balance comes first"),
+                            (balance.0.time_exchange, tokio::time::Instant::now()),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("the balances are restated after the reconnect");
+
+        assert_eq!(restated.0, pushed.0);
+        // This test receives the balance event a little after the stream does, which is when the
+        // wait starts. A second's allowance for that still tells the 5 s wait from none: without
+        // it, the read would follow the reconnect, 300 ms after the event, at once.
+        let allowance = Duration::from_secs(1);
+        assert!(
+            restated.1 + allowance >= pushed.1 + REST_BALANCE_LAG.to_std().unwrap(),
+            "restated {:?} after the balance event, before the REST lag",
+            restated.1 - pushed.1
+        );
     }
 
     /// A cancel that waited on another's handshake, which Binance refused, is not sent and opens
@@ -6692,10 +7274,9 @@ mod tests {
             ]))
             .mount(&server)
             .await;
-        let mut client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
-            "key".into(),
-            "secret".into(),
-        ));
+        let mut client = <BinanceSpot as ExecutionClient>::new(
+            BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+        );
         client.rest = Arc::new(SpotRestApi::from_config(
             ConfigurationRestApi::builder()
                 .api_key("key")
@@ -7015,6 +7596,42 @@ mod tests {
         assert!(!is_unknown_order(&anyhow::anyhow!("-2013 in text only")));
     }
 
+    /// `new` keeps the client's signing clock read from Binance's server time, unless
+    /// `server_time_sync` is off; `host_clock_lead` reports the reads.
+    #[tokio::test(start_paused = true)]
+    async fn the_host_clock_lead_is_the_clients_server_time_reads() {
+        let config = BinanceSpotConfig::testnet("key".into(), "secret".into());
+        assert!(config.server_time_sync);
+        assert!(
+            BinanceSpot::new(config.clone())
+                .rate_limiter
+                .signing_clock()
+                .is_some()
+        );
+        let mut client = BinanceSpot::new(config.with_server_time_sync(false));
+        assert!(client.rate_limiter.signing_clock().is_none());
+        assert_eq!(client.host_clock_lead(), None);
+
+        let host_ms = Utc::now().timestamp_millis();
+        let read: crate::client::binance::server_time::ReadServerTime =
+            Arc::new(move || Box::pin(async move { Ok(host_ms - 2_000) }));
+        client.rate_limiter = Arc::new(
+            RateLimitTracker::new(WeightPool::Spot)
+                .with_server_time(Some(ServerTime::new(SigningClock::default(), read))),
+        );
+        client
+            .rate_limiter
+            .wait_if_blocked(RequestKind::Query)
+            .await
+            .unwrap();
+
+        let lead = client.host_clock_lead().unwrap();
+        assert!(
+            lead >= TimeDelta::seconds(2) && lead < TimeDelta::seconds(3),
+            "{lead}"
+        );
+    }
+
     fn rest_at(server: &wiremock::MockServer) -> Arc<RestApi> {
         Arc::new(SpotRestApi::from_config(
             ConfigurationRestApi::builder()
@@ -7067,6 +7684,176 @@ mod tests {
             .collect()
     }
 
+    /// A balance read is stamped [`REST_BALANCE_LAG`] before the request that read it was sent,
+    /// never when the answer arrives: Binance's REST view can trail its stream, and a stream
+    /// event the read does not yet show must stay more recent than it. A read refused for a rate
+    /// limit and retried is stamped by the retry, the request that read the balances.
+    #[tokio::test]
+    async fn a_balance_read_is_stamped_the_rest_lag_before_its_request_was_sent() {
+        use crate::client::binance::shared::REST_BALANCE_LAG;
+        const ANSWER_DELAY: Duration = Duration::from_millis(200);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/account"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(429)
+                    .insert_header("retry-after", "1")
+                    .set_body_json(serde_json::json!({ "code": -1003, "msg": "Too much weight." })),
+            )
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/account"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "balances": [{ "asset": "BTC", "free": "1", "locked": "0" }],
+                    }))
+                    .set_delay(ANSWER_DELAY),
+            )
+            .mount(&server)
+            .await;
+        let mut client = <BinanceSpot as ExecutionClient>::new(
+            BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+        );
+        client.rest = rest_at(&server);
+
+        let before = Utc::now();
+        let fetched = client.fetch_balances(&[]).await.unwrap();
+        let retried = Utc::now();
+        let snapshot = client.account_snapshot(&[], &[]).await.unwrap();
+        let after = Utc::now();
+
+        let within = |time, from, to| {
+            assert!(
+                from <= time + REST_BALANCE_LAG && time + REST_BALANCE_LAG + ANSWER_DELAY <= to,
+                "{time} + the lag not within {from} ..= {to} - {ANSWER_DELAY:?}"
+            );
+        };
+        assert_eq!((fetched.len(), snapshot.balances.len()), (1, 1));
+        // Sent no sooner than the second after the refusal.
+        within(
+            fetched[0].time_exchange,
+            before + Duration::from_secs(1),
+            retried,
+        );
+        within(snapshot.balances[0].time_exchange, retried, after);
+    }
+
+    /// With this host's clock ahead of Binance's, a balance read is stamped the REST lag before
+    /// Binance's time when its request was sent, as the client's server-time reads bound it, not
+    /// before this host's time: a stamp ahead of Binance's would have the engine drop the stream's
+    /// balance events until Binance's clock caught up with it. So is a restatement read.
+    #[tokio::test]
+    async fn a_balance_read_is_stamped_on_binances_clock_when_the_host_clock_leads() {
+        use crate::client::binance::shared::REST_BALANCE_LAG;
+        const LEAD: TimeDelta = TimeDelta::seconds(60);
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/account"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "balances": [{ "asset": "BTC", "free": "1", "locked": "0" }] }),
+            ))
+            .mount(&server)
+            .await;
+        let mut client = <BinanceSpot as ExecutionClient>::new(
+            BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+        );
+        client.rest = rest_at(&server);
+        client.rate_limiter = Arc::new(
+            RateLimitTracker::new(WeightPool::Spot)
+                .with_server_time(Some(ServerTime::trailing_host(LEAD))),
+        );
+        let clock = StreamClock::shared(client.rate_limiter.signing_clock());
+
+        let before = Utc::now();
+        let fetched = client.fetch_balances(&[]).await.unwrap();
+        let snapshot = client.account_snapshot(&[], &[]).await.unwrap();
+        let restated = read_spot_restatement(&client.rest, &client.rate_limiter, &[], &clock, None)
+            .await
+            .unwrap();
+        let after = Utc::now();
+
+        let [restated] = restated.as_slice() else {
+            panic!("one balance: {restated:?}");
+        };
+        let AccountEventKind::BalanceSnapshot(restated) = &restated.kind else {
+            panic!("a balance snapshot: {restated:?}");
+        };
+        assert_eq!((fetched.len(), snapshot.balances.len()), (1, 1));
+        for time in [
+            fetched[0].time_exchange,
+            snapshot.balances[0].time_exchange,
+            restated.0.time_exchange,
+        ] {
+            // Binance's time when the request was sent, by this host's clock. Signed on a server
+            // time read, it can be up to `TRAILING_HOST_BEHIND` before `before`.
+            let sent = time + REST_BALANCE_LAG + LEAD;
+            assert!(
+                before - ServerTime::TRAILING_HOST_BEHIND <= sent && sent <= after,
+                "{time} + the lag and the lead not within {before} ..= {after}"
+            );
+        }
+    }
+
+    /// A restatement read gets the account and returns each requested balance as a balance
+    /// snapshot, stamped the REST lag before the read was sent; a read the venue fails is an error.
+    #[tokio::test]
+    async fn a_restatement_read_returns_the_requested_balances_as_snapshots() {
+        use crate::client::binance::shared::REST_BALANCE_LAG;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/account"))
+            .respond_with(wiremock::ResponseTemplate::new(500))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/account"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({ "balances": [
+                    { "asset": "BTC", "free": "1", "locked": "0.5" },
+                    { "asset": "ETH", "free": "2", "locked": "0" },
+                ] }),
+            ))
+            .mount(&server)
+            .await;
+        let (rest, limiter) = (
+            rest_at(&server),
+            Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+        );
+        let clock = SharedStreamClock::default();
+        let btc = [AssetNameExchange::new("BTC")];
+
+        let failed = read_spot_restatement(&rest, &limiter, &btc, &clock, None).await;
+        assert!(failed.is_err(), "{failed:?}");
+
+        let before = Utc::now();
+        let sent = read_spot_restatement(&rest, &limiter, &btc, &clock, None)
+            .await
+            .unwrap();
+        let after = Utc::now();
+
+        let [event] = sent.as_slice() else {
+            panic!("one balance: {sent:?}");
+        };
+        assert_eq!(event.exchange, ExchangeId::BinanceSpot);
+        let AccountEventKind::BalanceSnapshot(balance) = &event.kind else {
+            panic!("a balance snapshot: {event:?}");
+        };
+        assert_eq!(balance.0.asset, btc[0]);
+        assert_eq!(
+            balance.0.balance,
+            Balance::new(Decimal::new(15, 1), Decimal::ONE)
+        );
+        let read = balance.0.time_exchange + REST_BALANCE_LAG;
+        assert!(
+            before <= read && read <= after,
+            "{read} not within {before} ..= {after}"
+        );
+    }
+
     #[tokio::test]
     async fn fetch_ended_orders_reports_each_ended_order_under_its_key_and_omits_the_rest() {
         let server = wiremock::MockServer::start().await;
@@ -7075,10 +7862,9 @@ mod tests {
         mount_order(&server, "live", row_response("live", "PARTIALLY_FILLED")).await;
         mount_order(&server, "unknown", venue_error(-2013)).await;
         mount_order(&server, "no-symbol", venue_error(-1121)).await;
-        let mut client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
-            "key".into(),
-            "secret".into(),
-        ));
+        let mut client = <BinanceSpot as ExecutionClient>::new(
+            BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+        );
         client.rest = rest_at(&server);
         let keys = ["filled", "cancelled", "live", "unknown"].map(|cid| spot_key("BTCUSDT", cid));
 
@@ -7110,10 +7896,9 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         mount_order(&server, "cancelled", row_response("cancelled", "CANCELED")).await;
         mount_order(&server, "refused", venue_error(-1100)).await;
-        let mut client = <BinanceSpot as ExecutionClient>::new(BinanceSpotConfig::new(
-            "key".into(),
-            "secret".into(),
-        ));
+        let mut client = <BinanceSpot as ExecutionClient>::new(
+            BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+        );
         client.rest = rest_at(&server);
 
         let result = client
@@ -7431,5 +8216,93 @@ mod tests {
                 .is_some_and(|due| due <= tokio::time::Instant::now()),
             "still due, not charged a failure"
         );
+    }
+
+    /// Binance's documented `account/commission` answer for `symbol`, with distinct rates.
+    fn commission_answer(symbol: &str) -> serde_json::Value {
+        let part = |maker: &str, taker: &str, buyer: &str, seller: &str| serde_json::json!({"maker": maker, "taker": taker, "buyer": buyer, "seller": seller});
+        serde_json::json!({
+            "symbol": symbol,
+            "standardCommission": part("0.00000010", "0.00000020", "0.00000030", "0.00000040"),
+            "specialCommission": part("0.01000000", "0.02000000", "0.03000000", "0.04000000"),
+            "taxCommission": part("0.00000112", "0.00000114", "0.00000118", "0.00000116"),
+            "discount": {
+                "enabledForAccount": true,
+                "enabledForSymbol": true,
+                "discountAsset": "BNB",
+                "discount": "0.75000000"
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn spot_commission_rates_are_read_signed_for_the_symbol() {
+        use crate::client::binance::{CommissionDiscount, CommissionPart};
+        use rust_decimal_macros::dec;
+        use rustrade_instrument::asset::name::AssetNameExchange;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api/v3/account/commission"))
+            .and(wiremock::matchers::query_param("symbol", "BTCUSDT"))
+            .and(wiremock::matchers::header("X-MBX-APIKEY", "key"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(commission_answer("BTCUSDT")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut client = <BinanceSpot as ExecutionClient>::new(
+            BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+        );
+        client.rest = rest_at(&server);
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+
+        let rates = client.fetch_commission_rates(&btcusdt).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests[0]
+                .url
+                .query_pairs()
+                .any(|(key, _)| key == "signature"),
+            "signed: {}",
+            requests[0].url
+        );
+        assert_eq!(rates.instrument, btcusdt);
+        assert_eq!(
+            rates.special,
+            CommissionPart::new(dec!(0.01), dec!(0.02), dec!(0.03), dec!(0.04))
+        );
+        assert_eq!(
+            rates.discount,
+            Some(CommissionDiscount::new(
+                true,
+                true,
+                Some(AssetNameExchange::new("BNB")),
+                dec!(0.75)
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn spot_commission_rates_of_an_unlisted_symbol_name_it() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::path("/api/v3/account/commission"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"code": -1121, "msg": "Invalid symbol."})),
+            )
+            .mount(&server)
+            .await;
+        let mut client = <BinanceSpot as ExecutionClient>::new(
+            BinanceSpotConfig::new("key".into(), "secret".into()).with_server_time_sync(false),
+        );
+        client.rest = rest_at(&server);
+        let nope = InstrumentNameExchange::new("NOPEUSDT");
+        match client.fetch_commission_rates(&nope).await {
+            Err(UnindexedClientError::Api(ApiError::InstrumentInvalid(instrument, _))) => {
+                assert_eq!(instrument, nope);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

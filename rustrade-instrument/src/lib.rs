@@ -190,4 +190,7 @@ pub mod test_utils {
             None,
         )
     }
+
+    #[cfg(feature = "test-utils")]
+    pub mod logs;
 }

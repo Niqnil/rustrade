@@ -75,7 +75,8 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
             let time_sent = self.clock.time();
             self.state
                 .record_in_flight_opens(output.sent_iter(), time_sent);
-            self.in_flight.on_sent(time_sent);
+            let clock = &self.clock;
+            self.in_flight.on_sent(time_sent, || clock.instant());
         }
         output
     }
@@ -99,7 +100,8 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
             let time_sent = self.clock.time();
             self.state
                 .record_in_flight_cancels(output.sent_iter(), time_sent);
-            self.in_flight.on_sent(time_sent);
+            let clock = &self.clock;
+            self.in_flight.on_sent(time_sent, || clock.instant());
         }
         output
     }

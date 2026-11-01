@@ -22,7 +22,8 @@
 //   backoff (1 s → 30 s, max 10 attempts)
 // - Heartbeat monitoring: reconnects if no WS message for HEARTBEAT_TIMEOUT_SECS
 // - Fill recovery: after reconnect, fetches missed fills via GET /v2/account/activities
-//   since disconnect_time; sent through the dedup cache to filter duplicates. A read that fails,
+//   since the last message, placed on Alpaca's clock as the times it stamped on the stream's
+//   events show it (see fill_recovery_start); sent through the dedup cache to filter duplicates. A read that fails,
 //   times out or truncates is reported as AccountEventKind::FillRecoveryGaveUp
 // - Dedup cache: LRU keyed on each fill's execution id (with "{order_id}:{cumulative_filled_qty}"
 //   for a fill without one) prevents duplicate fills arising from the overlap between WS events
@@ -54,6 +55,7 @@ use crate::{
             UncheckedOrders, fetch_ended_by_key, recover_ended_orders,
         },
         reconnect_budget::{BackoffLimits, ReconnectBudget},
+        venue_clock::{HostMoment, VenueClock},
     },
     emit_stream_terminated,
     error::{
@@ -77,7 +79,7 @@ use crate::{
     parse_env_bool,
     position::{Position, PositionReport},
     shortability::Shortability,
-    trade::{AssetFees, Trade, TradeAmendmentKind, TradeId, TradeOrigin, TradesRead},
+    trade::{AssetFees, TimeSource, Trade, TradeAmendmentKind, TradeId, TradeOrigin, TradesRead},
 };
 use chrono::{DateTime, NaiveDate, NaiveTime, SecondsFormat, TimeDelta, Utc};
 use fnv::{FnvHashMap, FnvHashSet};
@@ -107,9 +109,13 @@ use tracing::{debug, error, info, trace, warn};
 const HEARTBEAT_TIMEOUT_SECS: u64 = 35;
 /// Timeout for fill recovery REST queries after reconnect.
 const FILL_RECOVERY_TIMEOUT_SECS: u64 = 30;
-/// Extra lookback from disconnect timestamp to cover Tokio scheduling jitter and
-/// client/server clock drift on cloud VMs. The dedup cache absorbs resulting duplicates.
+/// Extra lookback from the disconnect to cover the delay between a fill and its delivery, and
+/// Tokio scheduling jitter. The dedup cache absorbs resulting duplicates.
 const SIGNAL_RECOVERY_LOOKBACK_MS: i64 = 1_500;
+/// How much further back fill recovery starts before the stream has seen a time Alpaca stamped,
+/// when Alpaca's clock is unknown: the difference between this host's clock and Alpaca's that is
+/// allowed for then. Alpaca's requests are not signed with a timestamp, so nothing else bounds it.
+const UNSAMPLED_CLOCK_SKEW: TimeDelta = TimeDelta::seconds(30);
 /// Alpaca's activity page size limit.
 const ALPACA_MAX_ACTIVITIES: usize = 100;
 /// Cooldown when rate-limited without a readable wait, and the longest wait read from Alpaca's
@@ -338,7 +344,7 @@ fn new_dedup_cache() -> SharedDedupCache {
 /// So after a bust, a new fill can still be taken for an earlier one at the same cumulative when
 /// either lacks an execution id: a fill without one matches any earlier fill's cumulative key,
 /// and a fill with one matches an earlier id-less fill's. An id-less WS fill is logged at `warn!`
-/// by [`convert_trade_update`].
+/// by [`convert_trade_update_at`].
 fn is_duplicate_fill(
     cache: &SharedDedupCache,
     execution_id: Option<&str>,
@@ -1038,6 +1044,10 @@ struct AlpacaOrderWs<'a> {
     #[serde(borrow)]
     trail_price: Option<&'a str>,
     status: SmolStr,
+    /// When the order last changed, as of this event. Read only for an event without a readable
+    /// `timestamp`, as the nearest time the venue stamped.
+    #[serde(borrow, default)]
+    updated_at: Option<&'a str>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1534,6 +1544,8 @@ impl ExecutionClient for AlpacaClient {
         // URLs are extracted before the closures to avoid re-allocating on each retry attempt.
         let account_url = format!("{base}/v2/account");
         let positions_url = format!("{base}/v2/positions");
+        // The balances' time: the reads describe the account no earlier than this.
+        let sent = Utc::now();
         let (account, positions): (Option<AlpacaAccount>, Vec<AlpacaPosition>) = tokio::try_join!(
             async {
                 if wants_usd {
@@ -1548,10 +1560,10 @@ impl ExecutionClient for AlpacaClient {
         )?;
 
         let mut balances = account
-            .map(|account| convert_account_to_balances(&account, assets))
+            .map(|account| convert_account_to_balances(&account, assets, sent))
             .unwrap_or_default();
         if wants_non_usd {
-            balances.extend(convert_positions_to_balances(&positions, assets));
+            balances.extend(convert_positions_to_balances(&positions, assets, sent));
         }
 
         // Converted before the open orders are fetched, so a position that cannot be converted
@@ -1615,9 +1627,15 @@ impl ExecutionClient for AlpacaClient {
     /// This gap also applies on every **reconnect**: during the auth+subscribe handshake
     /// (`connect_and_subscribe`), any `trade_updates` messages that arrive are consumed
     /// by the handshake loop and not forwarded. Fill events in this window are recovered
-    /// via the REST activities endpoint (anchored to `disconnect_time`). How an order held as live
-    /// ended in this window is recovered too (see below); a lifecycle event of any other order,
-    /// such as `new` for one placed elsewhere, is not.
+    /// via the REST activities endpoint, from the last message before the disconnect. How an
+    /// order held as live ended in this window is recovered too (see below); a lifecycle event of
+    /// any other order, such as `new` for one placed elsewhere, is not.
+    ///
+    /// The read is placed on Alpaca's clock, as the times Alpaca stamped on the stream's
+    /// `trade_updates` events show it, counted on from their arrival on a monotonic clock, so a
+    /// host clock ahead of Alpaca's does not start it after fills Alpaca stamped during the
+    /// outage. Before the stream's first such event, Alpaca's clock is unknown, and the read
+    /// starts 30 s further back to allow for a difference between the clocks.
     ///
     /// # Fill recovery ordering
     ///
@@ -1884,9 +1902,10 @@ impl ExecutionClient for AlpacaClient {
         if wants_usd {
             // Pre-allocate URL to avoid re-allocation on each retry attempt.
             let account_url = format!("{base}/v2/account");
+            let sent = Utc::now();
             let account: AlpacaAccount =
                 rest_with_retry(&self.rate_limiter, || http.get(&account_url)).await?;
-            result.extend(convert_account_to_balances(&account, assets));
+            result.extend(convert_account_to_balances(&account, assets, sent));
         }
 
         // Fetch positions for non-USD asset balances (e.g., BTC, ETH from crypto holdings).
@@ -1894,9 +1913,10 @@ impl ExecutionClient for AlpacaClient {
         if wants_non_usd {
             // Pre-allocate URL to avoid re-allocation on each retry attempt.
             let positions_url = format!("{base}/v2/positions");
+            let sent = Utc::now();
             let positions: Vec<AlpacaPosition> =
                 rest_with_retry(&self.rate_limiter, || http.get(&positions_url)).await?;
-            result.extend(convert_positions_to_balances(&positions, assets));
+            result.extend(convert_positions_to_balances(&positions, assets, sent));
         }
 
         Ok(result)
@@ -2917,7 +2937,10 @@ async fn connection_manager(
     initial_ws: Option<WebSocket>,
 ) {
     let mut budget = ReconnectBudget::new("Alpaca", BackoffLimits::ACCOUNT_STREAM);
-    let mut disconnect_time: Option<DateTime<Utc>> = None;
+    // The last message before the stream dropped, which fill recovery reads on from.
+    let mut disconnected: Option<HostMoment> = None;
+    // Alpaca's clock, from the times it stamped on the events the stream received.
+    let mut clock = VenueClock::new();
     // Instruments whose known-live orders a reconnect has yet to check: checked after the fills,
     // and retried on a timer while connected, once due.
     let mut unchecked = UncheckedOrders::default();
@@ -2958,13 +2981,17 @@ async fn connection_manager(
         // Runs before the event loop so live events arriving during recovery are
         // captured by the already-connected WS session. The dedup cache prevents
         // duplicates between recovered REST fills and live WS events.
-        if let Some(dt) = disconnect_time.take() {
+        if let Some(last) = disconnected.take() {
+            // The live stream is already subscribed, so every fill Alpaca stamps after `end`
+            // arrives live.
+            let end = clock.span_end(last, HostMoment::now());
             recover_fills_or_report(
                 &http,
                 &rate_limiter,
                 &instruments,
                 config.rest_base_url(),
-                dt,
+                fill_recovery_start(&clock, last),
+                end,
                 Duration::from_secs(FILL_RECOVERY_TIMEOUT_SECS),
                 &tx,
                 &dedup,
@@ -2990,12 +3017,12 @@ async fn connection_manager(
         //
         // The timer is pinned once and reset in-place via Sleep::reset(), avoiding
         // a new Sleep allocation and Tokio timer-wheel registration per loop iteration.
-        // Track the wall-clock time of the last received message. Used to anchor
-        // fill recovery after a heartbeat timeout: Utc::now() at reconnect time
+        // Track the moment of the last received message. Used to anchor
+        // fill recovery after a heartbeat timeout: the time at reconnect
         // would be ~HEARTBEAT_TIMEOUT_SECS after the last real message, causing
         // the recovery window to miss fills in that silent period.
 
-        let mut last_message_time = Utc::now();
+        let mut last_message = HostMoment::now();
         let heartbeat = tokio::time::sleep(Duration::from_secs(HEARTBEAT_TIMEOUT_SECS));
         tokio::pin!(heartbeat);
         // A connection still receiving a heartbeat window after the stream loop starts is proven
@@ -3010,7 +3037,7 @@ async fn connection_manager(
             run_order_checks(&http, &rate_limiter, &config, &known, &mut unchecked, &tx);
         tokio::pin!(order_checks);
 
-        // Resets the rolling heartbeat deadline, records the wall-clock receive time, and clears
+        // Resets the rolling heartbeat deadline, records the receive moment, and clears
         // the backoff once the connection is proven stable.
         // Pin<&mut Sleep> cannot be passed to a regular function, so a macro avoids
         // repeating the same block across every message-bearing select! arm.
@@ -3021,7 +3048,7 @@ async fn connection_manager(
                 heartbeat
                     .as_mut()
                     .reset(now + Duration::from_secs(HEARTBEAT_TIMEOUT_SECS));
-                last_message_time = Utc::now();
+                last_message = HostMoment::new(Utc::now(), now);
                 if now >= stable_from {
                     budget.reset();
                 }
@@ -3045,14 +3072,14 @@ async fn connection_manager(
                             reset_heartbeat!();
                         }
                         Some(Ok(WsMessage::Text(text))) => {
-                            process_ws_text(text.as_str(), &tx, &dedup, &known);
+                            process_ws_text(text.as_str(), &tx, &dedup, &known, &mut clock);
                             reset_heartbeat!();
                         }
                         Some(Ok(WsMessage::Binary(bytes))) => {
                             // Alpaca paper trading sends binary-framed JSON.
                             match std::str::from_utf8(&bytes) {
                                 Ok(text) => {
-                                    process_ws_text(text, &tx, &dedup, &known);
+                                    process_ws_text(text, &tx, &dedup, &known, &mut clock);
                                     // Only reset heartbeat for valid UTF-8 frames that may carry
                                     // real events. A corrupt binary frame (e.g. from a proxy)
                                     // must not keep the watchdog from firing.
@@ -3098,12 +3125,11 @@ async fn connection_manager(
             }
         };
 
-        // --- Record disconnect time for fill recovery ---
-        // Anchor to last_message_time, not Utc::now(). For heartbeat-triggered
-        // disconnects, Utc::now() would be ~HEARTBEAT_TIMEOUT_SECS after the last
+        // --- Record the disconnect for fill recovery ---
+        // Anchor to the last message, not now. For heartbeat-triggered
+        // disconnects, now would be ~HEARTBEAT_TIMEOUT_SECS after the last
         // real message, causing the recovery window to miss fills in that gap.
-        disconnect_time =
-            Some(last_message_time - chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS));
+        disconnected = Some(last_message);
 
         // --- Close stale WS ---
         let _ =
@@ -3368,11 +3394,16 @@ fn check_listen_ack(text: &str) -> bool {
 /// Each event is applied to `known` before it is sent, under the lock, so an order this reports
 /// ending and a reconnect's check of it reach the consumer in the order they were decided, and the
 /// check reports only an order not already reported.
+///
+/// The time Alpaca stamped on a `trade_updates` event, of any kind, samples `clock` (see
+/// [`trade_update_time`]), duplicates included: each was stamped by Alpaca's clock before it
+/// arrived. A time this host filled in does not.
 fn process_ws_text(
     text: &str,
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: &SharedDedupCache,
     known: &SharedKnownLiveOrders,
+    clock: &mut VenueClock,
 ) {
     let msg: AlpacaStreamMessage<'_> = match serde_json::from_str(text) {
         Ok(m) => m,
@@ -3404,6 +3435,14 @@ fn process_ws_text(
                 }
             };
 
+            // Read once: it samples the clock here, and stamps the events built below. Read before
+            // the duplicate gate, so a frame without Alpaca's time warns even when it is then
+            // dropped as a duplicate or an event type this client ignores.
+            let time = trade_update_time(&update);
+            if time.1 == TimeSource::Venue {
+                clock.observe(time.0, tokio::time::Instant::now());
+            }
+
             // PERF: Check dedup BEFORE constructing the full event for fill events.
             // This avoids heap allocations (Trade, InstrumentNameExchange, TradeId) on
             // duplicate fills, which occur on every reconnect during recovery overlap.
@@ -3424,7 +3463,7 @@ fn process_ws_text(
                 );
             }
 
-            for event in convert_trade_update(update).into_iter().flatten() {
+            for event in convert_trade_update_at(update, time).into_iter().flatten() {
                 // A resolved correction delivers its execution as the replacement trade. Should
                 // Alpaca also list it as a FILL activity, recovery must not deliver it again. An
                 // unresolved one delivered no trade, so recovery may.
@@ -3489,7 +3528,7 @@ fn ws_execution_id<'a>(update: &AlpacaTradeUpdate<'a>) -> Option<&'a str> {
 
 /// The [`fill_dedup_key`] of a WS fill, from its raw fields, before the full event is built.
 ///
-/// An unparseable `filled_qty` reads as zero, as `convert_trade_update` reports it.
+/// An unparseable `filled_qty` reads as zero, as `convert_trade_update_at` reports it.
 fn early_dedup_key(update: &AlpacaTradeUpdate<'_>) -> SmolStr {
     let filled_qty = update.order.filled_qty.unwrap_or("0");
     let qty = Decimal::from_str(filled_qty).unwrap_or(Decimal::ZERO);
@@ -3524,22 +3563,42 @@ struct UnreadFills {
     reason: FillRecoveryFailure,
 }
 
-/// Recover the fills missed since `disconnect` ([`recover_fills`]) within `timeout`, and send an
+/// Where the read of the fills missed after `last`, the last message the stream received, starts:
+/// Alpaca's or this host's time then, whichever is earlier ([`VenueClock::span_start`]), less
+/// [`SIGNAL_RECOVERY_LOOKBACK_MS`]. Before the stream has seen a time Alpaca stamped, from this
+/// host's time less [`UNSAMPLED_CLOCK_SKEW`] too.
+///
+/// So a host clock ahead of Alpaca's does not start the read after fills Alpaca stamped during the
+/// outage, once the stream has seen an event.
+fn fill_recovery_start(clock: &VenueClock, last: HostMoment) -> DateTime<Utc> {
+    let earlier = |time: DateTime<Utc>, by: TimeDelta| {
+        time.checked_sub_signed(by)
+            .unwrap_or(DateTime::<Utc>::MIN_UTC)
+    };
+    let at = clock
+        .span_start(last)
+        .unwrap_or_else(|| earlier(last.time, UNSAMPLED_CLOCK_SKEW));
+    earlier(at, TimeDelta::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS))
+}
+
+/// Recover the fills missed from `start` to `end` ([`recover_fills`]) within `timeout`, and send an
 /// [`AccountEventKind::FillRecoveryGaveUp`] for those the read did not deliver, after the fills
 /// it did.
+///
+/// The read runs from `start` to now. `end` is where the live stream takes over, by Alpaca's
+/// clock as estimated (see [`VenueClock::span_end`]): it only ends a gap reported.
 async fn recover_fills_or_report(
     http: &reqwest::Client,
     rate_limiter: &RateLimitTracker,
     instruments: &[InstrumentNameExchange],
     base: &str,
-    disconnect: DateTime<Utc>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
     timeout: Duration,
     tx: &mpsc::UnboundedSender<UnindexedAccountEvent>,
     dedup: &SharedDedupCache,
     known: &SharedKnownLiveOrders,
 ) {
-    // The live stream is already subscribed, so every fill after this arrives live.
-    let recovery_start = Utc::now();
     let outcome = match tokio::time::timeout(
         timeout,
         recover_fills(
@@ -3547,7 +3606,7 @@ async fn recover_fills_or_report(
             rate_limiter,
             instruments,
             base,
-            disconnect,
+            start,
             tx,
             dedup,
             known,
@@ -3570,7 +3629,7 @@ async fn recover_fills_or_report(
                  any of the instruments (every instrument when the list is empty)"
             );
             Err(UnreadFills {
-                start: disconnect,
+                start,
                 reason: FillRecoveryFailure::TimedOut {
                     timeout_secs: timeout.as_secs(),
                 },
@@ -3579,19 +3638,19 @@ async fn recover_fills_or_report(
     };
     if let Err(unread) = outcome
         && tx
-            .send(fill_recovery_gave_up(instruments, unread, recovery_start))
+            .send(fill_recovery_gave_up(instruments, unread, end))
             .is_err()
     {
         debug!("Alpaca fill recovery: consumer dropped before the give-up was sent");
     }
 }
 
-/// The [`AccountEventKind::FillRecoveryGaveUp`] for `unread`, whose recovery began at `end`,
-/// on a stream opened with `instruments`, every instrument when empty. Alpaca does not retry the
-/// read, so it was read once.
+/// The [`AccountEventKind::FillRecoveryGaveUp`] for `unread`, a recovery whose span ended at
+/// `end`, on a stream opened with `instruments`, every instrument when empty. Alpaca does not
+/// retry the read, so it was read once.
 ///
 /// A truncated read can return fills stamped after `end`, by Alpaca's clock, which may run ahead
-/// of this host's. The span then ends at its start rather than before it: the event is still
+/// of its estimate. The span then ends at its start rather than before it: the event is still
 /// sent, since a report with nothing left to read costs the consumer one read, while a report
 /// withheld on a clock comparison would be a silent loss.
 fn fill_recovery_gave_up(
@@ -4084,10 +4143,11 @@ fn is_usd(asset: &AssetNameExchange) -> bool {
 ///
 /// The balance is named [`USD`], however the caller spelled it. If `assets` is non-empty, it is
 /// returned only when USD is among them, matched ignoring case. An empty `assets` slice returns it
-/// unconditionally.
+/// unconditionally. It is stamped `time`.
 fn convert_account_to_balances(
     account: &AlpacaAccount,
     assets: &[AssetNameExchange],
+    time: DateTime<Utc>,
 ) -> Vec<AssetBalance<AssetNameExchange>> {
     if !assets.is_empty() && !assets.iter().any(is_usd) {
         return Vec::new();
@@ -4099,7 +4159,7 @@ fn convert_account_to_balances(
             account.cash,
             account.cash.min(account.non_marginable_buying_power),
         ),
-        Utc::now(),
+        time,
     )]
 }
 
@@ -4113,12 +4173,12 @@ fn convert_account_to_balances(
 /// - `free`  = qty_available (base currency units not locked in open orders)
 ///
 /// If `assets` is non-empty, only positions whose base asset name matches an
-/// entry in the slice (case-insensitive) are returned.
+/// entry in the slice (case-insensitive) are returned. Each is stamped `time`.
 fn convert_positions_to_balances(
     positions: &[AlpacaPosition],
     assets: &[AssetNameExchange],
+    time: DateTime<Utc>,
 ) -> Vec<AssetBalance<AssetNameExchange>> {
-    let now = Utc::now();
     positions
         .iter()
         .filter(|p| is_crypto_position(p))
@@ -4140,7 +4200,7 @@ fn convert_positions_to_balances(
             Some(AssetBalance::new(
                 asset_name,
                 Balance::new(p.qty, p.qty_available),
-                now,
+                time,
             ))
         })
         .collect()
@@ -4444,36 +4504,44 @@ fn convert_activity_to_trade(
     // `None` when Alpaca omitted the field or sent something unparseable, which is the honest
     // report: the venue did not tell us where the order stands, rather than "nothing is filled".
     let order_filled_quantity = a.cum_qty.as_deref().and_then(|s| Decimal::from_str(s).ok());
-    let time_exchange = parse_timestamp(&a.transaction_time).unwrap_or_else(|| {
-        warn!(id = %a.id, "Alpaca activity: unparseable transaction_time, using now");
-        Utc::now()
-    });
+    // The activity carries no other time, so without `transaction_time` the fill is kept, stamped
+    // with this host's clock and marked so.
+    let (time_exchange, time_source) = match parse_timestamp(&a.transaction_time) {
+        Some(time) => (time, TimeSource::Venue),
+        None => {
+            warn!(id = %a.id, "Alpaca activity: unparseable transaction_time, using now");
+            (Utc::now(), TimeSource::Host)
+        }
+    };
 
     // Alpaca equities and options are commission-free. Crypto trades incur
     // maker/taker fees (currently 0.15–0.25%) charged in the credited asset,
     // but fee info is not available in trade responses — use Activities API
     // for end-of-day fee reconciliation.
-    Some(Trade::new(
-        trade_id,
-        order_id,
-        instrument,
-        StrategyId::unknown(),
-        time_exchange,
-        side,
-        price,
-        quantity,
-        order_filled_quantity,
-        AssetFees::new(
-            AssetNameExchange::from(USD),
-            Decimal::ZERO,
-            Some(Decimal::ZERO),
-        ),
-    ))
+    Some(
+        Trade::new(
+            trade_id,
+            order_id,
+            instrument,
+            StrategyId::unknown(),
+            time_exchange,
+            side,
+            price,
+            quantity,
+            order_filled_quantity,
+            AssetFees::new(
+                AssetNameExchange::from(USD),
+                Decimal::ZERO,
+                Some(Decimal::ZERO),
+            ),
+        )
+        .with_time_source(time_source),
+    )
 }
 
 /// Build an `OrderSnapshot` event from the order payload embedded in a `trade_updates` frame.
 ///
-/// Shared by the acknowledgement arm and the fill arms of [`convert_trade_update`], so that a
+/// Shared by the acknowledgement arm and the fill arms of [`convert_trade_update_at`], so that a
 /// fill reports the order's new cumulative `filled_quantity` the same way an acknowledgement
 /// reports its initial one.
 ///
@@ -4562,12 +4630,9 @@ fn trade_amendment_event(
     update: &AlpacaTradeUpdate<'_>,
     instrument: InstrumentNameExchange,
     order_id: OrderId,
+    (time_exchange, time_source): (DateTime<Utc>, TimeSource),
 ) -> UnindexedAccountEvent {
     let order = &update.order;
-    let time_exchange = update
-        .timestamp
-        .and_then(parse_timestamp)
-        .unwrap_or_else(Utc::now);
     let original = update
         .previous_execution_id
         .filter(|id| !id.is_empty())
@@ -4603,7 +4668,8 @@ fn trade_amendment_event(
                                 Decimal::ZERO,
                                 Some(Decimal::ZERO),
                             ),
-                        ),
+                        )
+                        .with_time_source(time_source),
                         order.client_order_id.as_ref(),
                     ),
                 }
@@ -4628,6 +4694,33 @@ fn trade_amendment_event(
     )
 }
 
+/// When a `trade_updates` event happened, and whose clock says so: its `timestamp`, else its
+/// order's `updated_at`, else this host's clock, as [`TimeSource::Host`].
+///
+/// Alpaca stamps every event, so either falling back is logged with a `warn!`, once per frame,
+/// whether or not the frame then delivers an event. `updated_at` is
+/// when the order last changed as of the event, which for a fill is the fill. Either is a time on
+/// Alpaca's clock no later than when it sent the event, as [`VenueClock::observe`] needs.
+fn trade_update_time(update: &AlpacaTradeUpdate<'_>) -> (DateTime<Utc>, TimeSource) {
+    if let Some(time) = update.timestamp.and_then(parse_timestamp) {
+        return (time, TimeSource::Venue);
+    }
+    let order = &update.order;
+    if let Some(time) = order.updated_at.and_then(parse_timestamp) {
+        warn!(order_id = %order.id, event = %update.event, timestamp = ?update.timestamp, "Alpaca WS: event missing/unparseable timestamp, using its order's updated_at");
+        return (time, TimeSource::Venue);
+    }
+    warn!(order_id = %order.id, event = %update.event, timestamp = ?update.timestamp, updated_at = ?order.updated_at, "Alpaca WS: event missing/unparseable timestamp and order updated_at, using now");
+    (Utc::now(), TimeSource::Host)
+}
+
+/// [`convert_trade_update_at`], reading the event's time itself.
+#[cfg(test)]
+fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccountEvent>; 2] {
+    let time = trade_update_time(&update);
+    convert_trade_update_at(update, time)
+}
+
 /// Convert a WebSocket trade_update event into rustrade AccountEvents.
 ///
 /// Returns up to two events, in the order they must be applied. A fill frame genuinely carries
@@ -4637,7 +4730,12 @@ fn trade_amendment_event(
 /// The `Trade` is always first. A fully-filled snapshot retires its order, and routing a fill
 /// against an order that has already been retired is a strictly harder problem than routing it
 /// against a live one; emitting the execution first keeps the easy ordering.
-fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccountEvent>; 2] {
+///
+/// The events are stamped with the event's time and its source, read by [`trade_update_time`].
+fn convert_trade_update_at(
+    update: AlpacaTradeUpdate<'_>,
+    (time_exchange, time_source): (DateTime<Utc>, TimeSource),
+) -> [Option<UnindexedAccountEvent>; 2] {
     // Early exit for unrecognised event types before incurring allocations for
     // instrument/order_id/cid — those are wasted for unknown events.
     let event_str = update.event.as_str();
@@ -4675,10 +4773,6 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
             ) else {
                 return [None, None];
             };
-            let time_exchange = update
-                .timestamp
-                .and_then(parse_timestamp)
-                .unwrap_or_else(Utc::now);
 
             // If filled_qty is unparseable (API regression), cum_qty falls back to zero: the
             // trade reports a cumulative of 0, and a fill without an execution id is deduplicated
@@ -4730,7 +4824,8 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
                     Decimal::ZERO,
                     Some(Decimal::ZERO),
                 ),
-            );
+            )
+            .with_time_source(time_source);
             let trade = with_reported_cid(trade, order.client_order_id.as_ref());
             let trade_event = UnindexedAccountEvent::new(
                 ExchangeId::AlpacaBroker,
@@ -4759,10 +4854,6 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
             // Order acknowledged by Alpaca, or done for the day: Alpaca stops working a
             // `done_for_day` order until the next trading day but has not ended it, so it is
             // reported open with what it has filled, never retired.
-            let time_exchange = update
-                .timestamp
-                .and_then(parse_timestamp)
-                .unwrap_or_else(Utc::now);
 
             [
                 ws_order_snapshot(order, instrument, cid, order_id, time_exchange),
@@ -4778,10 +4869,6 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
             // the original as cancelled, but callers must call `fetch_open_orders` to
             // discover the replacement order (which has a new ID and won't appear in OMS
             // state automatically).
-            let time_exchange = update
-                .timestamp
-                .and_then(parse_timestamp)
-                .unwrap_or_else(Utc::now);
             let filled_qty = alpaca_filled_qty(&order.id, order.filled_qty);
             let cancelled = Cancelled::new(order_id, time_exchange, filled_qty);
             let response = crate::order::request::OrderResponseCancel {
@@ -4803,7 +4890,12 @@ fn convert_trade_update(update: AlpacaTradeUpdate<'_>) -> [Option<UnindexedAccou
         }
 
         "trade_bust" | "trade_correct" => [
-            Some(trade_amendment_event(&update, instrument, order_id)),
+            Some(trade_amendment_event(
+                &update,
+                instrument,
+                order_id,
+                (time_exchange, time_source),
+            )),
             None,
         ],
 
@@ -6313,7 +6405,7 @@ mod tests {
             "non_marginable_buying_power": "8500.25",
         }))
         .unwrap();
-        let balances = convert_account_to_balances(&account, &[]);
+        let balances = convert_account_to_balances(&account, &[], Utc::now());
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].asset, AssetNameExchange::new("USD"));
         assert_eq!(balances[0].balance.total, dec!(9000.50), "total is cash");
@@ -6336,7 +6428,7 @@ mod tests {
             "non_marginable_buying_power": "75000",
         }))
         .unwrap();
-        let balances = convert_account_to_balances(&account, &[]);
+        let balances = convert_account_to_balances(&account, &[], Utc::now());
         assert_eq!(balances[0].balance.total, dec!(50000));
         assert_eq!(balances[0].balance.free, dec!(50000));
     }
@@ -6352,7 +6444,7 @@ mod tests {
             "non_marginable_buying_power": "9900",
         }))
         .unwrap();
-        let balances = convert_account_to_balances(&account, &[]);
+        let balances = convert_account_to_balances(&account, &[], Utc::now());
         assert_eq!(balances[0].balance.total, dec!(10200));
         assert_eq!(balances[0].balance.free, dec!(9900));
     }
@@ -6366,7 +6458,7 @@ mod tests {
             "non_marginable_buying_power": "1250.00",
         }))
         .unwrap();
-        let balances = convert_account_to_balances(&account, &[]);
+        let balances = convert_account_to_balances(&account, &[], Utc::now());
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].balance.total, dec!(-2500.75));
         assert_eq!(
@@ -6392,12 +6484,12 @@ mod tests {
             non_marginable_buying_power: dec!(10000.00),
         };
         let usd = vec![AssetNameExchange::new("USD")];
-        let balances = convert_account_to_balances(&account, &usd);
+        let balances = convert_account_to_balances(&account, &usd, Utc::now());
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].asset, AssetNameExchange::new("USD"));
 
         let non_usd = vec![AssetNameExchange::new("BTC")];
-        let balances = convert_account_to_balances(&account, &non_usd);
+        let balances = convert_account_to_balances(&account, &non_usd, Utc::now());
         assert!(balances.is_empty());
     }
 
@@ -6409,7 +6501,8 @@ mod tests {
             cash: dec!(12000.00),
             non_marginable_buying_power: dec!(10000.00),
         };
-        let balances = convert_account_to_balances(&account, &[AssetNameExchange::new("usd")]);
+        let balances =
+            convert_account_to_balances(&account, &[AssetNameExchange::new("usd")], Utc::now());
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].asset, AssetNameExchange::new("USD"));
     }
@@ -6479,6 +6572,7 @@ mod tests {
             trail_percent: None,
             trail_price: None,
             status: SmolStr::new("partially_filled"),
+            updated_at: None,
         }
     }
 
@@ -6541,6 +6635,49 @@ mod tests {
         };
         let (trade, _order) = fill_events(convert_trade_update(update));
         assert_eq!(trade.client_order_id, Some(ClientOrderId::new("outside-1")));
+    }
+
+    /// A fill is at its frame's `timestamp`, else at its order's `updated_at`, both the venue's;
+    /// with neither it is at this host's time, and says so. An order snapshot takes the same time.
+    #[test]
+    fn a_fills_time_is_its_timestamp_then_its_orders_update_time_then_this_hosts() {
+        let fill = |timestamp, updated_at| {
+            let mut order = make_order_ws("ord-1", "SPY", "buy", "1");
+            order.updated_at = updated_at;
+            let update = AlpacaTradeUpdate {
+                event: SmolStr::new("fill"),
+                execution_id: Some("exec-1"),
+                previous_execution_id: None,
+                order,
+                price: Some("150.00"),
+                qty: Some("1"),
+                timestamp,
+            };
+            let (trade, order) = fill_events(convert_trade_update(update));
+            let OrderState::Active(crate::order::state::ActiveOrderState::Open(open)) = order.state
+            else {
+                panic!("expected an Open snapshot, got {:?}", order.state);
+            };
+            assert_eq!(open.time_exchange, trade.time_exchange);
+            (trade.time_exchange, trade.time_source)
+        };
+        let at = |time| parse_timestamp(time).unwrap();
+
+        assert_eq!(
+            fill(Some("2025-04-18T14:30:00Z"), Some("2025-04-18T14:30:01Z")),
+            (at("2025-04-18T14:30:00Z"), TimeSource::Venue)
+        );
+        for timestamp in [None, Some("not a time")] {
+            assert_eq!(
+                fill(timestamp, Some("2025-04-18T14:30:01Z")),
+                (at("2025-04-18T14:30:01Z"), TimeSource::Venue),
+                "{timestamp:?}"
+            );
+        }
+        let before = Utc::now();
+        let (time, source) = fill(None, None);
+        assert_eq!(source, TimeSource::Host);
+        assert!((before..=Utc::now()).contains(&time));
     }
 
     #[test]
@@ -6613,6 +6750,7 @@ mod tests {
             // make_order_ws reports qty=2; a cumulative filled of 2 completes it.
             order: AlpacaOrderWs {
                 status: SmolStr::new("filled"),
+                updated_at: None,
                 ..make_order_ws("ord-full", "SPY", "buy", "2")
             },
             price: Some("150.00"),
@@ -6649,6 +6787,7 @@ mod tests {
                 previous_execution_id: None,
                 order: AlpacaOrderWs {
                     status: SmolStr::new(status),
+                    updated_at: None,
                     ..make_order_ws("ord-late", "SPY", "buy", "1")
                 },
                 price: Some("150.00"),
@@ -6714,6 +6853,7 @@ mod tests {
                 trail_percent: None,
                 trail_price: None,
                 status: SmolStr::new("new"),
+                updated_at: None,
             },
             price: None,
             qty: None,
@@ -6857,6 +6997,35 @@ mod tests {
         assert!(convert_open_order(&order).is_none());
     }
 
+    /// A FILL activity is at its `transaction_time`, the venue's; without one it is kept, at this
+    /// host's time, and says so.
+    #[test]
+    fn an_activity_without_a_transaction_time_is_at_this_hosts_time() {
+        let activity = |transaction_time: &str| AlpacaActivity {
+            id: "act-1".to_string(),
+            order_id: "ord-1".to_string(),
+            symbol: "SPY".to_string(),
+            side: "buy".to_string(),
+            price: "150.00".to_string(),
+            qty: "1".to_string(),
+            transaction_time: transaction_time.to_string(),
+            cum_qty: Some("1".to_string()),
+        };
+
+        let trade = convert_activity_to_trade(&activity("2025-04-18T14:30:00Z")).unwrap();
+        assert_eq!(
+            (trade.time_exchange, trade.time_source),
+            (
+                parse_timestamp("2025-04-18T14:30:00Z").unwrap(),
+                TimeSource::Venue
+            )
+        );
+        let before = Utc::now();
+        let trade = convert_activity_to_trade(&activity("not a time")).unwrap();
+        assert_eq!(trade.time_source, TimeSource::Host);
+        assert!((before..=Utc::now()).contains(&trade.time_exchange));
+    }
+
     #[test]
     fn test_convert_activity_to_trade_bad_price_returns_none() {
         // When price is unparseable, convert_activity_to_trade must return None.
@@ -6890,7 +7059,7 @@ mod tests {
         ];
 
         // All crypto assets
-        let balances = convert_positions_to_balances(&positions, &[]);
+        let balances = convert_positions_to_balances(&positions, &[], Utc::now());
         assert_eq!(balances.len(), 2, "only crypto positions returned");
         assert_eq!(balances[0].asset.name().as_str(), "BTC");
         assert_eq!(balances[1].asset.name().as_str(), "ETH");
@@ -6900,7 +7069,7 @@ mod tests {
 
         // Filter to BTC only: matches the `BTCUSD` position
         let btc_only = vec![AssetNameExchange::new("btc")];
-        let balances = convert_positions_to_balances(&positions, &btc_only);
+        let balances = convert_positions_to_balances(&positions, &btc_only, Utc::now());
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].asset.name().as_str(), "BTC");
     }
@@ -7073,7 +7242,7 @@ mod tests {
         assert_eq!(positions[0].side, AlpacaPositionSide::Unknown);
         assert_eq!(positions[1].side, AlpacaPositionSide::Unknown);
 
-        let balances = convert_positions_to_balances(&positions, &[]);
+        let balances = convert_positions_to_balances(&positions, &[], Utc::now());
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].balance.total, dec!(0.5));
 
@@ -7356,6 +7525,81 @@ mod tests {
         assert!(!snapshots[3].orders_complete);
     }
 
+    fn epoch(secs: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap()
+    }
+
+    /// Fill recovery is placed on Alpaca's clock once the stream has seen a time it stamped, so a
+    /// host clock ahead of Alpaca's beyond the lookback still reads the fills Alpaca stamped
+    /// during the outage.
+    #[test]
+    fn fill_recovery_from_a_host_clock_ahead_starts_at_alpacas_time() {
+        let base = tokio::time::Instant::now();
+        let mut clock = VenueClock::new();
+        clock.observe(epoch(0), base);
+        // The last message arrived as Alpaca's clock read 0 s; the host reads 60 s ahead.
+        let last = HostMoment::new(epoch(60), base);
+
+        assert_eq!(
+            fill_recovery_start(&clock, last),
+            epoch(0) - TimeDelta::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS)
+        );
+    }
+
+    /// Before the stream has seen a time Alpaca stamped, the read starts further back by the skew
+    /// allowed for.
+    #[test]
+    fn fill_recovery_with_no_sample_allows_for_the_unsampled_skew() {
+        let last = HostMoment::new(epoch(60), tokio::time::Instant::now());
+
+        assert_eq!(
+            fill_recovery_start(&VenueClock::new(), last),
+            epoch(30) - TimeDelta::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS)
+        );
+        assert_eq!(UNSAMPLED_CLOCK_SKEW, TimeDelta::seconds(30));
+    }
+
+    /// Any `trade_updates` event samples the stream's clock with the time Alpaca stamped on it:
+    /// its `timestamp`, else its order's `updated_at`. An order's event counts as a fill's does.
+    #[test]
+    fn a_trade_update_samples_the_streams_clock() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
+        let frame = |stamps: &str| {
+            format!(
+                r#"{{"stream":"trade_updates","data":{{"event":"new",{stamps}"order":{{"id":"id-a","client_order_id":"a","symbol":"SPY","qty":"2","filled_qty":"0","side":"buy","type":"limit","time_in_force":"gtc","limit_price":"100","status":"new"{order_stamp}}}}}}}"#,
+                order_stamp = if stamps.is_empty() {
+                    r#","updated_at":"2027-01-15T08:00:05Z""#
+                } else {
+                    ""
+                },
+            )
+        };
+        let stamped = |frame: &str| {
+            let mut clock = VenueClock::new();
+            let before = tokio::time::Instant::now();
+            process_ws_text(frame, &tx, &new_dedup_cache(), &known, &mut clock);
+            clock.earliest_at(before)
+        };
+        let utc = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+
+        let by_timestamp = stamped(&frame(r#""timestamp":"2027-01-15T08:00:00Z","#)).unwrap();
+        assert!(
+            by_timestamp <= utc("2027-01-15T08:00:00Z"),
+            "{by_timestamp}"
+        );
+        assert!(by_timestamp > utc("2027-01-15T07:59:59Z"), "{by_timestamp}");
+        let by_updated_at = stamped(&frame("")).unwrap();
+        assert!(
+            by_updated_at <= utc("2027-01-15T08:00:05Z"),
+            "{by_updated_at}"
+        );
+        assert!(
+            by_updated_at > utc("2027-01-15T08:00:04Z"),
+            "{by_updated_at}"
+        );
+    }
+
     /// Verifies that the dedup key synthesised by `recover_fills` (REST path) matches
     /// the key produced by `convert_trade_update` (WS path) for the same partial fills.
     ///
@@ -7463,6 +7707,7 @@ mod tests {
                 trail_percent: None,
                 trail_price: None,
                 status: SmolStr::new("filled"),
+                updated_at: None,
             },
             price: Some("100.00"),
             qty: Some("10"),
@@ -7489,6 +7734,7 @@ mod tests {
                 trail_percent: None,
                 trail_price: None,
                 status: SmolStr::new("filled"),
+                updated_at: None,
             },
             price: Some("100.00"),
             qty: Some("10"),
@@ -7515,6 +7761,7 @@ mod tests {
                 trail_percent: None,
                 trail_price: None,
                 status: SmolStr::new("filled"),
+                updated_at: None,
             },
             price: Some("100.00"),
             qty: Some("10"),
@@ -7536,7 +7783,7 @@ mod tests {
         let json = r#"{"stream":"trade_updates","data":{"event":"rejected","order":{"id":"test-rej-id","client_order_id":"test-cid","symbol":"AAPL","qty":"10","side":"buy","type":"limit","time_in_force":"day","limit_price":"100.00","status":"rejected"}}}"#;
 
         let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
-        process_ws_text(json, &tx, &dedup, &known);
+        process_ws_text(json, &tx, &dedup, &known, &mut VenueClock::new());
 
         // The event must NOT be silently dropped — an OrderCancelled must be emitted.
         let event = rx.try_recv()
@@ -7569,7 +7816,13 @@ mod tests {
         for (field, expected) in cases {
             let (tx, mut rx) = mpsc::unbounded_channel();
             let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
-            process_ws_text(&frame(field), &tx, &new_dedup_cache(), &known);
+            process_ws_text(
+                &frame(field),
+                &tx,
+                &new_dedup_cache(),
+                &known,
+                &mut VenueClock::new(),
+            );
             let Ok(UnindexedAccountEvent {
                 kind: AccountEventKind::Trade(trade),
                 ..
@@ -7595,7 +7848,7 @@ mod tests {
         let dedup = new_dedup_cache();
         let known = KnownLiveOrders::shared(ExchangeId::AlpacaBroker);
         for frame in frames {
-            process_ws_text(frame, &tx, &dedup, &known);
+            process_ws_text(frame, &tx, &dedup, &known, &mut VenueClock::new());
         }
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
     }
@@ -8364,59 +8617,73 @@ mod tests {
         /// Mounts `/v2/account`, `/v2/positions` and an empty `/v2/orders` on `server`.
         /// Synthetic values only; no provider data.
         async fn mount_account_and_positions(server: &MockServer) {
+            mount_account_and_positions_answering_after(server, Duration::ZERO).await;
+        }
+
+        /// [`mount_account_and_positions`], answering the account and positions reads `delay`
+        /// after each arrives.
+        async fn mount_account_and_positions_answering_after(server: &MockServer, delay: Duration) {
             Mock::given(method("GET"))
                 .and(path("/v2/account"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "status": "ACTIVE",
-                    "currency": "USD",
-                    "cash": "-1500.50",
-                    "equity": "4000.00",
-                    "buying_power": "5000.00",
-                    "options_buying_power": "2000.00",
-                    "non_marginable_buying_power": "1000.00",
-                })))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({
+                            "status": "ACTIVE",
+                            "currency": "USD",
+                            "cash": "-1500.50",
+                            "equity": "4000.00",
+                            "buying_power": "5000.00",
+                            "options_buying_power": "2000.00",
+                            "non_marginable_buying_power": "1000.00",
+                        }))
+                        .set_delay(delay),
+                )
                 .mount(server)
                 .await;
             Mock::given(method("GET"))
                 .and(path("/v2/positions"))
-                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                    {
-                        "symbol": "XYZ",
-                        "asset_class": "us_equity",
-                        "side": "short",
-                        "qty": "-10",
-                        "qty_available": "-10",
-                        "avg_entry_price": "20.00",
-                        "unrealized_pl": "15.50",
-                    },
-                    {
-                        "symbol": "XYZ271217C00025000",
-                        "asset_class": "us_option",
-                        "side": "long",
-                        "qty": "3",
-                        "qty_available": "3",
-                        "avg_entry_price": "0.85",
-                        "unrealized_pl": "-45",
-                    },
-                    {
-                        "symbol": "ABC",
-                        "asset_class": "us_equity",
-                        "side": "long",
-                        "qty": "2.5",
-                        "qty_available": "2.5",
-                        "avg_entry_price": "40.00",
-                        "unrealized_pl": "1.25",
-                    },
-                    {
-                        "symbol": "BTCUSD",
-                        "asset_class": "crypto",
-                        "side": "long",
-                        "qty": "0.75",
-                        "qty_available": "0.5",
-                        "avg_entry_price": "50000",
-                        "unrealized_pl": "0",
-                    },
-                ])))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!([
+                            {
+                                "symbol": "XYZ",
+                                "asset_class": "us_equity",
+                                "side": "short",
+                                "qty": "-10",
+                                "qty_available": "-10",
+                                "avg_entry_price": "20.00",
+                                "unrealized_pl": "15.50",
+                            },
+                            {
+                                "symbol": "XYZ271217C00025000",
+                                "asset_class": "us_option",
+                                "side": "long",
+                                "qty": "3",
+                                "qty_available": "3",
+                                "avg_entry_price": "0.85",
+                                "unrealized_pl": "-45",
+                            },
+                            {
+                                "symbol": "ABC",
+                                "asset_class": "us_equity",
+                                "side": "long",
+                                "qty": "2.5",
+                                "qty_available": "2.5",
+                                "avg_entry_price": "40.00",
+                                "unrealized_pl": "1.25",
+                            },
+                            {
+                                "symbol": "BTCUSD",
+                                "asset_class": "crypto",
+                                "side": "long",
+                                "qty": "0.75",
+                                "qty_available": "0.5",
+                                "avg_entry_price": "50000",
+                                "unrealized_pl": "0",
+                            },
+                        ]))
+                        .set_delay(delay),
+                )
                 .mount(server)
                 .await;
             Mock::given(method("GET"))
@@ -8489,6 +8756,43 @@ mod tests {
                 ],
                 "short equity, option and fractional positions; no crypto position"
             );
+        }
+
+        /// Balances are stamped no later than the requests that read them were sent, never when
+        /// the answers arrive: the engine orders balance state by that time, so a later one would
+        /// shut out events from between the two.
+        #[tokio::test]
+        async fn balances_are_stamped_before_their_reads_were_sent() {
+            use crate::client::ExecutionClient;
+
+            const ANSWER_DELAY: Duration = Duration::from_millis(200);
+            let server = MockServer::start().await;
+            mount_account_and_positions_answering_after(&server, ANSWER_DELAY).await;
+            let client = client_for(&server);
+
+            let before = Utc::now();
+            let fetched = client.fetch_balances(&[]).await.unwrap();
+            let between = Utc::now();
+            let snapshot = client.account_snapshot(&[], &[]).await.unwrap();
+            let after = Utc::now();
+
+            assert_eq!((fetched.len(), snapshot.balances.len()), (2, 2));
+            // `fetch_balances` reads the account, then the positions: the account's balance was
+            // sent for before both answers.
+            assert_eq!(fetched[0].asset.name().as_str(), USD);
+            assert!(fetched[0].time_exchange + 2 * ANSWER_DELAY <= between);
+            // Each read's balances against the span its requests were sent in.
+            for (balances, from, to) in [
+                (&fetched, before, between),
+                (&snapshot.balances, between, after),
+            ] {
+                for balance in balances {
+                    assert!(
+                        from <= balance.time_exchange && balance.time_exchange + ANSWER_DELAY <= to,
+                        "{balance:?} not within {from} ..= {to} - {ANSWER_DELAY:?}"
+                    );
+                }
+            }
         }
 
         /// A USD-only request still fetches positions, since they back the instrument
@@ -9317,6 +9621,114 @@ mod tests {
             assert!(rx.try_recv().is_err(), "nothing follows the termination");
         }
 
+        /// A reconnect reads the missed fills from Alpaca's time at the last message, as the
+        /// stream's events showed it: with this host's clock two minutes ahead of Alpaca's, the
+        /// read starts at Alpaca's time, not this host's, so the fills Alpaca stamped during the
+        /// outage are read.
+        #[tokio::test]
+        async fn a_reconnect_reads_missed_fills_from_alpacas_time_when_the_host_is_ahead() {
+            use futures::{SinkExt as _, StreamExt as _};
+            use tokio_tungstenite::tungstenite::Message;
+
+            // Alpaca's clock reads two minutes behind this host's.
+            let stamped = Utc::now() - TimeDelta::seconds(120);
+            let update = format!(
+                r#"{{"stream":"trade_updates","data":{{"event":"new","timestamp":"{}","order":{{"id":"id-a","client_order_id":"a","symbol":"SPY","qty":"2","filled_qty":"0","side":"buy","type":"limit","time_in_force":"gtc","limit_price":"100","status":"new"}}}}}}"#,
+                stamped.to_rfc3339_opts(SecondsFormat::Millis, true)
+            );
+
+            // A WS server that authorises and acknowledges the listen, sends the first
+            // connection the update and closes it, and keeps the second open.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let ws_url = format!("ws://{}", listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                let mut connections = 0..;
+                while let Ok((stream, _)) = listener.accept().await {
+                    let first = connections.next() == Some(0);
+                    let update = update.clone();
+                    tokio::spawn(async move {
+                        let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                            return;
+                        };
+                        for answer in [
+                            r#"{"stream":"authorization","data":{"status":"authorized","action":"authenticate"}}"#,
+                            r#"{"stream":"listening","data":{"streams":["trade_updates"]}}"#,
+                        ] {
+                            let Some(Ok(_)) = ws.next().await else {
+                                return;
+                            };
+                            if ws.send(Message::text(answer)).await.is_err() {
+                                return;
+                            }
+                        }
+                        if first {
+                            let _ = ws.send(Message::text(update)).await;
+                            let _ = ws.close(None).await;
+                        }
+                        while let Some(Ok(_)) = ws.next().await {}
+                    });
+                }
+            });
+            let rest = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/account/activities"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+                .mount(&rest)
+                .await;
+            let mut config = AlpacaConfig::with_base_url("key".into(), "secret".into(), rest.uri());
+            config.ws_url_override = Some(ws_url);
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let task = tokio::spawn(connection_manager(
+                tx,
+                new_dedup_cache(),
+                Arc::new(config),
+                reqwest::Client::new(),
+                Arc::new(RateLimitTracker::new()),
+                KnownLiveOrders::shared(ExchangeId::AlpacaBroker),
+                Vec::new(),
+                None,
+            ));
+
+            // Activities are read only on a reconnect, so the first read is the reconnect's.
+            let after = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let requests = rest.received_requests().await.unwrap_or_default();
+                    if let Some(after) = requests
+                        .iter()
+                        .filter(|request| request.url.path() == "/v2/account/activities")
+                        .find_map(|request| {
+                            request
+                                .url
+                                .query_pairs()
+                                .find(|(key, _)| key == "after")
+                                .map(|(_, after)| after.into_owned())
+                        })
+                    {
+                        break after;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the reconnect reads the missed fills");
+            let after = DateTime::parse_from_rfc3339(&after)
+                .unwrap()
+                .with_timezone(&Utc);
+
+            // Alpaca's time at the last message, less the lookback, and not this host's.
+            let lookback = TimeDelta::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS);
+            assert!(
+                after <= stamped + TimeDelta::seconds(1) - lookback,
+                "{after}"
+            );
+            assert!(
+                after >= stamped - TimeDelta::seconds(1) - lookback,
+                "{after}"
+            );
+
+            task.abort();
+        }
+
         /// Serve `activities` from a mock and run `recover_fills` against it, returning every
         /// event it forwarded.
         async fn drive_recover_fills_with(
@@ -9535,6 +9947,7 @@ mod tests {
                 instruments,
                 &server.uri(),
                 recovery_after(),
+                Utc::now(),
                 timeout,
                 &tx,
                 &new_dedup_cache(),
@@ -10730,6 +11143,7 @@ mod tests {
                 &tx,
                 &dedup,
                 &known,
+                &mut VenueClock::new(),
             );
 
             drive_recover_fills_with(
@@ -11415,13 +11829,31 @@ mod tests {
             };
             let cid = ClientOrderId::new("a");
 
-            process_ws_text(&frame("new", "0"), &tx, &dedup, &known);
+            process_ws_text(
+                &frame("new", "0"),
+                &tx,
+                &dedup,
+                &known,
+                &mut VenueClock::new(),
+            );
             assert!(known.lock().contains(&cid), "acknowledged");
 
-            process_ws_text(&frame("done_for_day", "1"), &tx, &dedup, &known);
+            process_ws_text(
+                &frame("done_for_day", "1"),
+                &tx,
+                &dedup,
+                &known,
+                &mut VenueClock::new(),
+            );
             assert!(known.lock().contains(&cid), "done for the day is not ended");
 
-            process_ws_text(&frame("canceled", "1"), &tx, &dedup, &known);
+            process_ws_text(
+                &frame("canceled", "1"),
+                &tx,
+                &dedup,
+                &known,
+                &mut VenueClock::new(),
+            );
             assert!(!known.lock().contains(&cid), "cancelled");
 
             let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();

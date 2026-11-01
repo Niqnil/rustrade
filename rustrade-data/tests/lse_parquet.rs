@@ -51,8 +51,6 @@ use rustrade_instrument::instrument::InstrumentIndex;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use tracing_subscriber::layer::SubscriberExt;
 
 /// A column of values to write: `None` entries become SQL nulls (OPTIONAL columns only).
 enum Col {
@@ -173,30 +171,12 @@ fn idx() -> InstrumentIndex {
 /// construction, so a test that asserts only on output cannot tell a working report from a deleted
 /// one.
 fn count_warnings<T>(decode: impl FnOnce() -> T) -> (T, usize) {
-    #[derive(Default)]
-    struct CountWarnings(Arc<AtomicUsize>);
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountWarnings {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            if *event.metadata().level() == tracing::Level::WARN {
-                self.0.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-
-    let layer = CountWarnings::default();
-    let count = Arc::clone(&layer.0);
-
-    // Thread-local rather than global: the default subscriber can only be set once per process, and
-    // every other test in this binary must stay unaffected.
-    let value =
-        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), decode);
-
-    (value, count.load(Ordering::Relaxed))
+    let (value, events) = rustrade_instrument::test_utils::logs::capture(decode);
+    let warnings = events
+        .iter()
+        .filter(|event| event.level == tracing::Level::WARN)
+        .count();
+    (value, warnings)
 }
 
 // ── the three measured tick layouts ──────────────────────────────────────────

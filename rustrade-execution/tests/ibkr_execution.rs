@@ -64,10 +64,12 @@
 //! | `test_place_and_cancel_bracket_order` | Bracket order with OCA |
 //! | `test_bracket_order_oca_group_linkage` | Verify OCA group linkage |
 //! | `test_place_and_cancel_gtd_order` | Good-Till-Date order |
+//! | `test_gtd_expiry_reads_back_after_a_restart` | A GTD expiry parsed from IB's open and completed orders by clients that never saw the order |
 //! | `test_place_moo_order_premarket` | Market-on-Open (timing-sensitive) |
 //! | `test_place_loo_order_premarket` | Limit-on-Open (timing-sensitive) |
 //! | `test_orders_found_by_client_order_id_across_a_restart` | Snapshot orders, adoption after a restart, ended-order lookup |
 //! | `test_account_values_raw` | Print every account summary tag and account update value, and the positions. Asserts nothing |
+//! | `test_event_time_formats_raw` | Print the session's time zone and the raw time text of the last 7 days' executions and of completed orders. Read only; asserts nothing |
 //! | `test_open_paper_short` | Sell `IBKR_SHORT_QTY` (default 100) of `IBKR_SHORT_SYMBOL` (default AAPL) at market. Regular trading hours only |
 //! | `test_close_paper_short` | Buy the same back at market. Regular trading hours only |
 //!
@@ -363,13 +365,22 @@ async fn test_fetch_balances() {
     let client = connect_client(config).await.expect("connection failed");
 
     let assets: Vec<AssetNameExchange> = vec![];
+    let before = chrono::Utc::now();
     let result = client.fetch_balances(&assets).await;
+    let after = chrono::Utc::now();
 
     assert!(result.is_ok(), "fetch_balances failed: {:?}", result.err());
 
     let balances = result.unwrap();
     println!("Fetched {} balance(s)", balances.len());
+    // A paper account always holds cash.
+    assert!(!balances.is_empty(), "no balance returned");
     for balance in &balances {
+        // Stamped when the summary was asked for: within the call, never after it.
+        assert!(
+            before <= balance.time_exchange && balance.time_exchange <= after,
+            "{balance:?} not stamped within {before} ..= {after}"
+        );
         println!(
             "  {}: total={}, free={}, accrued={:?}",
             balance.asset, balance.balance.total, balance.balance.free, balance.balance.accrued
@@ -1579,6 +1590,147 @@ async fn test_place_and_cancel_gtd_order() {
     }
 }
 
+/// A new client under `resolved_aapl_config(client_id_offset)`, once IB has released the API
+/// client id of the one just disconnected, which takes it a moment.
+async fn reconnect(client_id_offset: i32) -> IbkrClient {
+    let mut restarted = Err(String::new());
+    for _ in 0..15 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        restarted = connect_client(resolved_aapl_config(client_id_offset)).await;
+        if restarted.is_ok() {
+            break;
+        }
+    }
+    restarted.expect("reconnection failed")
+}
+
+/// A good-till-date order's expiry, parsed from what IB lists, reads back as the instant it was
+/// placed with: from IB's open orders, by a new client under the same API client id after a
+/// restart, and from IB's completed orders once it is cancelled, by another new client.
+///
+/// Each read is a client's first read of an order it has never seen, which is the read that parses
+/// IB's good-till-date. Once a client has placed or adopted an order, it answers from what it
+/// tracks.
+///
+/// The expiry is five days out: IB rejects a good-till-date that falls before the next market
+/// open (error 201, "Order will be expired before market opens"), which two days out from a Friday
+/// evening does. Run in the days before a daylight saving change in the session's zone, five days
+/// is also long enough to cross it, which reads the expiry across the change of offset. That
+/// happens only when the test is run in such a window; the test does not control it.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_gtd_expiry_reads_back_after_a_restart() {
+    init_logging();
+
+    let aapl = aapl_instrument();
+    let strategy = StrategyId::new("test-gtd-read-back");
+    let client = connect_client(resolved_aapl_config(30))
+        .await
+        .expect("connection failed");
+
+    // Whole seconds: IB's good-till-date carries no finer precision.
+    let expiry = chrono::DateTime::from_timestamp(
+        (chrono::Utc::now() + chrono::Duration::days(5)).timestamp(),
+        0,
+    )
+    .unwrap();
+    let time_in_force = TimeInForce::GoodTillDate { expiry };
+    let cid = ClientOrderId::new(format!(
+        "gtd-read-back-{}",
+        chrono::Utc::now().timestamp_millis()
+    ));
+    let key = OrderKey {
+        exchange: ExchangeId::Ibkr,
+        instrument: &aapl,
+        strategy: strategy.clone(),
+        cid: cid.clone(),
+    };
+    println!("Placing GTD limit order: BUY 1 AAPL @ $1.00, expires {expiry}");
+    let placed = client
+        .open_order(rustrade_execution::order::OrderEvent {
+            key: key.clone(),
+            state: RequestOpen::new(
+                Side::Buy,
+                Some(dec!(1.00)),
+                dec!(1),
+                OrderKind::Limit,
+                time_in_force,
+            ),
+        })
+        .await;
+    assert!(
+        matches!(placed.state, OrderState::Active(ActiveOrderState::Open(_))),
+        "{placed:?}"
+    );
+
+    // A restart: a new client under the same API client id, which has never seen the order.
+    client.disconnect();
+    let restarted = reconnect(30).await;
+
+    let open = restarted
+        .fetch_open_orders(std::slice::from_ref(&aapl))
+        .await
+        .expect("fetch_open_orders failed");
+    let listed = open
+        .iter()
+        .find(|order| order.key.cid == cid)
+        .expect("the order is listed under its client order id");
+    println!("Listed after the restart: {:?}", listed.time_in_force);
+
+    // Orders an earlier, failed run left open.
+    for leftover in open
+        .iter()
+        .filter(|order| order.key.cid != cid && order.key.cid.0.starts_with("gtd-read-back-"))
+    {
+        let _ = restarted
+            .cancel_order(rustrade_execution::order::OrderEvent {
+                key: OrderKey {
+                    cid: leftover.key.cid.clone(),
+                    ..key.clone()
+                },
+                state: rustrade_execution::order::request::RequestCancel { id: None },
+            })
+            .await;
+    }
+
+    let cancelled = restarted
+        .cancel_order(rustrade_execution::order::OrderEvent {
+            key: key.clone(),
+            state: rustrade_execution::order::request::RequestCancel { id: None },
+        })
+        .await;
+    assert!(cancelled.state.is_ok(), "{cancelled:?}");
+    // Asserted after the cancel, so a wrong read does not leave the order working.
+    assert_eq!(
+        listed.time_in_force, time_in_force,
+        "read from IB's open orders"
+    );
+
+    // Another restart, since the client that adopted the order answers from what it tracks.
+    restarted.disconnect();
+    let restarted = reconnect(30).await;
+    let ended = ended_eventually(
+        &restarted,
+        OrderKey {
+            exchange: ExchangeId::Ibkr,
+            instrument: aapl.clone(),
+            strategy,
+            cid,
+        },
+    )
+    .await;
+    assert!(
+        matches!(ended.state, InactiveOrderState::Cancelled(_)),
+        "{:?}",
+        ended.state
+    );
+    assert_eq!(
+        ended.time_in_force, time_in_force,
+        "read from IB's completed orders"
+    );
+}
+
 /// Test placing a Market-on-Open (MOO) order during pre-market.
 ///
 /// Note: This test is timing-sensitive - it should be run during pre-market hours
@@ -1919,15 +2071,7 @@ async fn test_orders_found_by_client_order_id_across_a_restart() {
     // A restart: a new client under the same API client id, which has never seen the order.
     // `disconnect` closes the socket, and IB then takes a moment to release the id.
     client.disconnect();
-    let mut restarted = Err(String::new());
-    for _ in 0..15 {
-        tokio::time::sleep(Duration::from_secs(1)).await;
-        restarted = connect_client(resolved_aapl_config(21)).await;
-        if restarted.is_ok() {
-            break;
-        }
-    }
-    let restarted = restarted.expect("reconnection failed");
+    let restarted = reconnect(21).await;
 
     let open = restarted
         .fetch_open_orders(std::slice::from_ref(&aapl))
@@ -2059,6 +2203,91 @@ fn test_account_values_raw() {
         |item| matches!(item, AccountUpdate::End),
     );
     updates.cancel();
+}
+
+/// Prints the time zone IB Gateway gave in the connection handshake, then the time text, exactly
+/// as sent, of each execution of the last 7 days and of each completed order, so the formats the
+/// time parsing must read can be seen. Read only: it places nothing, and prints no account id or
+/// amount. Asserts nothing.
+#[test]
+#[ignore]
+#[serial]
+fn test_event_time_formats_raw() {
+    init_logging();
+
+    let config = test_config(28);
+    let client = ibapi::client::blocking::Client::connect(
+        &format!("{}:{}", config.host, config.port),
+        config.client_id,
+    )
+    .expect("connection failed");
+    println!(
+        "session: time_zone {:?}, connection_time {:?}",
+        client.time_zone(),
+        client.connection_time()
+    );
+
+    let executions = client
+        .executions(ibapi::orders::ExecutionFilter {
+            last_n_days: 7,
+            ..Default::default()
+        })
+        .expect("executions failed");
+    let mut count = 0;
+    while let Some(item) = executions.next_timeout(Duration::from_secs(10)) {
+        match item {
+            Ok(SubscriptionItem::Data(ibapi::orders::Executions::ExecutionData(data))) => {
+                count += 1;
+                println!(
+                    "execution: {:?} {} {} time {:?}",
+                    data.contract.security_type,
+                    data.contract.symbol,
+                    data.execution.exchange,
+                    data.execution.time
+                );
+            }
+            Ok(SubscriptionItem::Data(_)) => {}
+            Ok(item) => {
+                println!("executions: {item:?}");
+                break;
+            }
+            Err(e) => {
+                println!("executions: error {e}");
+                break;
+            }
+        }
+    }
+    println!("executions: {count} listed");
+    executions.cancel();
+
+    let completed = client
+        .completed_orders(false)
+        .expect("completed_orders failed");
+    let mut count = 0;
+    while let Some(item) = completed.next_timeout(Duration::from_secs(10)) {
+        match item {
+            Ok(SubscriptionItem::Data(ibapi::orders::Orders::OrderData(data))) => {
+                count += 1;
+                println!(
+                    "completed: {:?} {} status {:?} completed_time {:?}",
+                    data.contract.security_type,
+                    data.contract.symbol,
+                    data.order_state.completed_status,
+                    data.order_state.completed_time
+                );
+            }
+            Ok(SubscriptionItem::Data(_)) => {}
+            Ok(item) => {
+                println!("completed: {item:?}");
+                break;
+            }
+            Err(e) => {
+                println!("completed: error {e}");
+                break;
+            }
+        }
+    }
+    println!("completed: {count} listed");
 }
 
 /// The stock and quantity [`test_open_paper_short`] and [`test_close_paper_short`] trade.

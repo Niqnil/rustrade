@@ -18,6 +18,7 @@
 //! Event deduplication lives in [`crate::client::dedup`], shared with the other clients that
 //! need it, and is re-exported here so Binance call sites keep a single import site.
 
+use super::server_time::{ServerTime, SigningClock};
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
     error::{
@@ -35,7 +36,7 @@ use crate::{
             Cancelled, Expired, Filled, InactiveOrderState, Open, OrderState, UnindexedOrderState,
         },
     },
-    trade::{AssetFees, Trade, TradeId},
+    trade::{AssetFees, TimeSource, Trade, TradeId},
 };
 
 // Deduplication moved to `client::dedup` when Hyperliquid needed the same machinery; re-exported
@@ -47,12 +48,13 @@ use crate::client::order_recovery::{
     GAP_RETRY_BASE_SECS, GapFailure, MAX_GAP_RETRIES, PendingFills,
 };
 use crate::client::reconnect_budget::ReconnectBudget;
+use crate::client::venue_clock::{HostMoment, VenueClock};
 use binance_sdk::common::{
     errors::{ConnectorError, WebsocketError},
     models::{Interval, ParamBuildError, RateLimitType, RestApiResponse, WebsocketApiRateLimit},
     websocket::Subscription,
 };
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, exchange::ExchangeId,
@@ -273,11 +275,11 @@ impl Drop for UnsubscribeOnDrop {
 
 /// If no WS activity (messages, ping, pong) for this duration, force reconnect.
 pub(crate) const HEARTBEAT_TIMEOUT_SECS: u64 = 30;
-// Compile-time guard: reconnect sites cast this to i64 (`chrono::Duration::seconds`); ensure it
-// never overflows.
+// Compile-time guard: reconnect sites cast this to i64 (`chrono::Duration::seconds`), and spot's
+// disconnect lookback doubles it; ensure neither overflows.
 const _: () = assert!(
-    HEARTBEAT_TIMEOUT_SECS <= i64::MAX as u64,
-    "HEARTBEAT_TIMEOUT_SECS overflows i64"
+    HEARTBEAT_TIMEOUT_SECS <= (i64::MAX / 2) as u64,
+    "2 * HEARTBEAT_TIMEOUT_SECS overflows i64"
 );
 /// Timeout for fill recovery REST queries after reconnect.
 pub(crate) const FILL_RECOVERY_TIMEOUT_SECS: u64 = 30;
@@ -285,17 +287,16 @@ pub(crate) const FILL_RECOVERY_TIMEOUT_SECS: u64 = 30;
 /// How far past the start of the recovery that opens it a [`FillGap`] reaches.
 ///
 /// Recovery starts after the live stream is subscribed, so a fill after that moment arrives live.
-/// Binance stamps fills by its own clock, which may run ahead of this host's. Binance rejects a
-/// signed request stamped more than `recvWindow` (5 s by default) from its clock, so a skew past
-/// this margin would already fail every REST call. The overlap with live delivery it leaves is
-/// seconds long, and the dedup cache absorbs it, as long as those fills have not left it by the
-/// time the gap is read.
+/// The end is placed no earlier than Binance's time as estimated ([`Disconnect::end`]), which is a
+/// lower bound: this margin covers the delay it trails by. The overlap with live delivery it
+/// leaves is seconds long, and the dedup cache absorbs it, as long as those fills have not left it
+/// by the time the gap is read.
 pub(crate) const GAP_END_SLACK_SECS: i64 = 10;
 
 /// A span of one instrument's fills that a reconnect's recovery has not yet forwarded.
 ///
 /// It runs from the disconnect to just after the recovery that opened it began
-/// ([`GAP_END_SLACK_SECS`]). The live stream delivers every fill after that, so reading the gap
+/// ([`GAP_END_SLACK_SECS`]), both on Binance's clock as estimated (see [`Disconnect`]). The live stream delivers every fill after that, so reading the gap
 /// never re-reads a fill the stream already delivered, however long the gap waits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FillGap {
@@ -334,22 +335,32 @@ impl PendingFills for UnrecoveredFills {
 }
 
 impl UnrecoveredFills {
-    /// Open a gap for each of `instruments`, from `disconnect_time` to just after `now`, the start
-    /// of the recovery that will read it, due at once.
+    /// Open a gap for each of `instruments`, from `start` to just after `end`, due at once.
+    ///
+    /// `end` is where the recovery that will read the gap, which starts now, has to read to: a
+    /// [`Disconnect`]'s [`end`](Disconnect::end). The live stream delivers what Binance stamps
+    /// after it.
     ///
     /// Where the new gap overlaps one the instrument already has, it starts after it instead: the
     /// kept gap covers that part and keeps its retry schedule, so no span is read twice and a
     /// reconnect never brings a retry forward. Disconnects come in time order, so an earlier part
     /// of the new gap that no kept gap covers is from before the previous disconnect, when the
-    /// stream was live.
+    /// stream was live. That holds as long as both gaps were placed on the same clock: a gap
+    /// opened before the stream saw any event starts at this host's time, and a later one placed
+    /// on Binance's clock can start before it when this host's clock is ahead. Binance fails every
+    /// signed request from a host clock more than about a second ahead, so that part is small.
     pub(crate) fn open(
         &mut self,
         instruments: &[InstrumentNameExchange],
-        disconnect_time: DateTime<Utc>,
-        now: DateTime<Utc>,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
     ) {
-        let start_ms = disconnect_time.timestamp_millis();
-        let end_ms = (now + chrono::Duration::seconds(GAP_END_SLACK_SECS)).timestamp_millis();
+        let start_ms = start.timestamp_millis();
+        // Saturating: `end` follows the venue's stamps, which this host does not bound.
+        let end_ms = end
+            .checked_add_signed(chrono::Duration::seconds(GAP_END_SLACK_SECS))
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+            .timestamp_millis();
         let due = tokio::time::Instant::now();
         for instrument in instruments {
             let kept = self.0.get(instrument).map_or(&[][..], Vec::as_slice);
@@ -449,6 +460,46 @@ impl UnrecoveredFills {
     }
 }
 
+/// Where an account stream's disconnect leaves the fills it missed to start, and the moment it was
+/// seen, from which the recovery after the reconnect counts on to where it ends.
+///
+/// Both are placed on Binance's clock as the stream's [`VenueClock`] estimates it, from the times
+/// Binance stamped on the events the stream delivered. So a host clock ahead of Binance's does not
+/// start the gap after fills Binance stamped during the outage, and one stepped back before the
+/// reconnect does not end it before the outage's end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Disconnect {
+    /// The first moment of the gap.
+    pub(crate) start: DateTime<Utc>,
+    /// When the disconnect was seen.
+    seen: HostMoment,
+}
+
+impl Disconnect {
+    /// A disconnect seen at `seen`, whose gap starts `lookback` before Binance's time then, or
+    /// this host's if that is earlier ([`VenueClock::span_start`]). Before Binance's time is
+    /// known, from the stream's events or the client's server-time reads, from this host's time.
+    /// Signed requests are then stamped with this host's clock too, and one more than about a
+    /// second ahead of Binance's fails every signed request, the gap's reads included, so that is
+    /// seen too.
+    pub(crate) fn seen(venue: &VenueClock, seen: HostMoment, lookback: TimeDelta) -> Self {
+        let at = venue.span_start(seen).unwrap_or(seen.time);
+        Self {
+            start: at
+                .checked_sub_signed(lookback)
+                .unwrap_or(DateTime::<Utc>::MIN_UTC),
+            seen,
+        }
+    }
+
+    /// Where a recovery of the gap that starts at `now` has to read to: the later of this host's
+    /// and Binance's time at `now`, or the moment it was seen counted on to `now` on tokio's clock
+    /// ([`VenueClock::span_end`]). [`UnrecoveredFills::open`] adds [`GAP_END_SLACK_SECS`].
+    pub(crate) fn end(&self, venue: &VenueClock, now: HostMoment) -> DateTime<Utc> {
+        venue.span_end(self.seen, now)
+    }
+}
+
 /// A gap boundary in epoch milliseconds, as a time for a log line.
 pub(crate) fn gap_time(ms: i64) -> DateTime<Utc> {
     Utc.timestamp_millis_opt(ms).single().unwrap_or_default()
@@ -529,7 +580,7 @@ const _: () = assert!(
     "CONNECT_TIMEOUT_SECS overflows i64"
 );
 /// Extra lookback subtracted from Signal disconnect timestamps to cover Tokio scheduling
-/// jitter between the actual WS close and when the monitor task records Utc::now().
+/// jitter between the actual WS close and when the monitor task sees it.
 /// The dedup cache absorbs any resulting duplicate fills.
 pub(crate) const SIGNAL_RECOVERY_LOOKBACK_MS: i64 = 500;
 /// Maximum trades per Binance REST query.
@@ -573,6 +624,8 @@ pub(crate) enum UserDataFrame<'a> {
         event_type: &'a str,
         /// The inner event, unparsed, for the matched branch's one typed pass.
         event: &'a str,
+        /// The inner event's time `E`: when Binance sent it, by Binance's clock.
+        event_time: Option<DateTime<Utc>>,
     },
     /// A frame shape this client does not know: neither of the above, or an event whose `e` tag
     /// is missing or not a plain string. Its caller logs it through [`log_unrecognised_frame`],
@@ -604,6 +657,8 @@ pub(crate) fn parse_user_data_frame(frame: &str) -> UserDataFrame<'_> {
     struct EventTag<'a> {
         #[serde(borrow, default)]
         e: Option<&'a str>,
+        #[serde(rename = "E", default, deserialize_with = "lenient_millis")]
+        event_time: Option<i64>,
     }
 
     let Ok(envelope) = serde_json::from_str::<Envelope<'_>>(frame) else {
@@ -618,9 +673,9 @@ pub(crate) fn parse_user_data_frame(frame: &str) -> UserDataFrame<'_> {
     let event = event.get();
     // A missing tag, or one that cannot be borrowed (escaped, or not a string), is unrecognised
     // rather than an empty type: an unknown type is ignored quietly, and this must not be.
-    let Some(event_type) = serde_json::from_str::<EventTag<'_>>(event)
+    let Some((event_type, event_time)) = serde_json::from_str::<EventTag<'_>>(event)
         .ok()
-        .and_then(|tag| tag.e)
+        .and_then(|tag| Some((tag.e?, tag.event_time)))
     else {
         return UserDataFrame::Unrecognised;
     };
@@ -628,7 +683,33 @@ pub(crate) fn parse_user_data_frame(frame: &str) -> UserDataFrame<'_> {
         subscription_id: envelope.subscription_id,
         event_type,
         event,
+        event_time: event_time.and_then(event_time_from_ms),
     }
+}
+
+/// An event's time `E`, in epoch milliseconds, or `None` when it is not an integer: it only
+/// samples the stream's clock, so a malformed one must not cost the event itself.
+pub(crate) fn lenient_millis<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Millis {
+        Integer(i64),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(
+        match <Option<Millis> as serde::Deserialize>::deserialize(deserializer)? {
+            Some(Millis::Integer(ms)) => Some(ms),
+            Some(Millis::Other(_)) | None => None,
+        },
+    )
+}
+
+/// A user-data event's time `E`, in epoch milliseconds, as a time, or `None` out of range.
+pub(crate) fn event_time_from_ms(ms: i64) -> Option<DateTime<Utc>> {
+    Utc.timestamp_millis_opt(ms).single()
 }
 
 /// Log an [`UserDataFrame::Unrecognised`] frame: at `warn` for the first, and for every 1000th
@@ -815,12 +896,18 @@ struct Deadlines {
 ///   from successful responses ([`observe_rest`](Self::observe_rest),
 ///   [`observe_ws_api`](Self::observe_ws_api)); a rejected request's response is not observed,
 ///   so usage can only be under-counted.
+///
+/// Every request passes [`wait_if_blocked`](Self::wait_if_blocked) before it is sent, so the
+/// tracker also holds the client's [`ServerTime`], when it keeps one: the wait then includes the
+/// client's first server-time read, and starts a refresh when the last read is old.
 pub(crate) struct RateLimitTracker {
     // parking_lot::Mutex — never poisons, consistent with SharedDedupCache
     deadlines: parking_lot::Mutex<Deadlines>,
     pool: WeightPool,
     /// The pool's per-minute weight limit.
     weight_limit: AtomicU32,
+    /// The clock signed requests are stamped with, kept read from Binance's server time.
+    server_time: Option<ServerTime>,
 }
 
 impl RateLimitTracker {
@@ -829,6 +916,59 @@ impl RateLimitTracker {
             deadlines: parking_lot::Mutex::new(Deadlines::default()),
             pool,
             weight_limit: AtomicU32::new(pool.default_limit()),
+            server_time: None,
+        }
+    }
+
+    /// The tracker, keeping `server_time` read before the requests it lets through.
+    #[must_use]
+    pub(crate) fn with_server_time(mut self, server_time: Option<ServerTime>) -> Self {
+        self.server_time = server_time;
+        self
+    }
+
+    /// The clock signed requests are stamped with, when the client keeps one read from
+    /// Binance's server time.
+    pub(crate) fn signing_clock(&self) -> Option<SigningClock> {
+        self.server_time
+            .as_ref()
+            .map(|server| server.clock().clone())
+    }
+
+    /// The time a REST balance read whose request was sent at `sent` is stamped with:
+    /// [`balance_read_time`] on [`venue_clock`](Self::venue_clock).
+    pub(crate) fn balance_read_time(&self, sent: HostMoment) -> DateTime<Utc> {
+        balance_read_time(sent, &self.venue_clock())
+    }
+
+    /// Binance's clock as the client's server-time reads bound it. Without a sample when the
+    /// client keeps no signing clock, or no read has succeeded.
+    ///
+    /// Taken after a read, it still bounds Binance's time at the read's send: the bound counts
+    /// back from a later sample ([`VenueClock::earliest_at`]).
+    pub(crate) fn venue_clock(&self) -> VenueClock {
+        self.server_time
+            .as_ref()
+            .map(|server| server.clock().venue())
+            .unwrap_or_default()
+    }
+
+    /// The most this host's clock leads Binance's, from the server-time reads so far; negative
+    /// when it trails. `None` without server-time sync, or before a read has succeeded.
+    pub(crate) fn host_clock_lead(&self) -> Option<TimeDelta> {
+        self.server_time.as_ref().and_then(ServerTime::host_lead)
+    }
+
+    /// After a request failed with `e`: when Binance refused its timestamp (`-1021`), wait for a
+    /// fresh server-time read to replace the signing clock's estimate, so that a retry is stamped
+    /// on the clock as read again. Nothing for any other failure, during a rate-limit cooldown,
+    /// when the read would be refused too, or without server-time sync.
+    pub(crate) async fn after_failure(&self, e: &anyhow::Error) {
+        if let Some(server_time) = &self.server_time
+            && is_timestamp_rejection(e)
+            && self.cooldown_remaining().is_none()
+        {
+            server_time.after_rejection().await;
         }
     }
 
@@ -841,7 +981,19 @@ impl RateLimitTracker {
     ///
     /// Loops after waking to re-check the deadline: another task may have extended it while this
     /// task was sleeping.
+    ///
+    /// Then, with server-time sync, waits for the client's first server-time read, or starts a
+    /// refresh when the last read is old ([`ServerTime::ready`]).
     pub(crate) async fn wait_if_blocked(&self, kind: RequestKind) -> Result<(), CooldownActive> {
+        self.wait_for_deadlines(kind).await?;
+        if let Some(server_time) = &self.server_time {
+            server_time.ready().await;
+        }
+        Ok(())
+    }
+
+    /// The rate-limit waits of [`wait_if_blocked`](Self::wait_if_blocked).
+    async fn wait_for_deadlines(&self, kind: RequestKind) -> Result<(), CooldownActive> {
         loop {
             let (blocked_until, deadline) = {
                 let deadlines = self.deadlines.lock();
@@ -1293,6 +1445,23 @@ pub(crate) async fn retry_or_end(
         attempts: budget.attempts(),
         last_error: last_error(),
     })
+}
+
+/// How far before the moment an account stream's disconnect is seen the gap it leaves begins, for
+/// fill recovery (see [`Disconnect::seen`]): a short lookback, [`SIGNAL_RECOVERY_LOOKBACK_MS`], for
+/// scheduling jitter and timer lateness, and after a heartbeat timeout two heartbeat windows more.
+///
+/// A stream reads its proof of life once every [`HEARTBEAT_TIMEOUT_SECS`] window and declares a
+/// timeout at the end of the first window without one. A read that finds proof of life says only
+/// that the connection was alive at some point in the window before it, so a connection that died
+/// just after one read is declared dead almost two windows later.
+pub(crate) fn disconnect_lookback(heartbeat_timed_out: bool) -> chrono::Duration {
+    let signal = chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS);
+    if heartbeat_timed_out {
+        chrono::Duration::seconds(2 * HEARTBEAT_TIMEOUT_SECS as i64) + signal
+    } else {
+        signal
+    }
 }
 
 /// What a reconnect budget spent on dropped connections reports as its last error: a heartbeat
@@ -1882,28 +2051,32 @@ pub(crate) fn answer_time(
 }
 
 /// When an `outboundAccountPosition` says its balances were last updated: its `u`, else its event
-/// time `E`, else the local clock.
+/// time `E`, else `None`, and the frame is dropped.
 ///
-/// Binance stamps every such frame with both, so either falling back is logged with a `warn!`. The
-/// balances are still delivered, because they state what the account holds whatever their time.
+/// Binance stamps every such frame with both, so either falling back is logged with a `warn!`.
 /// `E` is when the frame was sent, so it can be a little later than the change it reports; a
 /// consumer that orders balances by time may then take the next frame, if its `u` falls in between,
 /// as the older one.
+///
+/// A frame with neither is not stamped with this host's clock: the engine orders balances by their
+/// time, so a host time ahead of the venue's would hold back the venue's next updates, and the
+/// stream's estimate of the venue's clock would read it as the venue's. The balances it stated
+/// are restated by the account's next update.
 pub(crate) fn account_position_time(
     exchange: ExchangeId,
     last_update: Option<i64>,
     event_time: Option<i64>,
-) -> DateTime<Utc> {
+) -> Option<DateTime<Utc>> {
     let read = |ms: Option<i64>| ms.and_then(|ms| Utc.timestamp_millis_opt(ms).single());
     if let Some(time) = read(last_update) {
-        return time;
+        return Some(time);
     }
     if let Some(time) = read(event_time) {
         warn!(%exchange, ?last_update, "Binance outboundAccountPosition missing/unparseable update time (u), using its event time (E)");
-        return time;
+        return Some(time);
     }
-    warn!(%exchange, ?last_update, ?event_time, "Binance outboundAccountPosition missing/unparseable update time (u) and event time (E), using now");
-    Utc::now()
+    warn!(%exchange, ?last_update, ?event_time, "Binance outboundAccountPosition missing/unparseable update time (u) and event time (E), dropping");
+    None
 }
 
 /// The fields of Binance's response to placing an order that say what became of it.
@@ -2503,9 +2676,9 @@ pub(crate) fn order_running_totals<T: BinanceExecutionFields>(
 /// Every field is optional: which keys a report carries depends on its execution type, and each
 /// use below says what it does without one.
 ///
-/// Unlike `d`, the keys read as integers, `i`, `T` and `t`, are integers in Binance's docs and in
-/// both SDK models, so they are read strictly. A report carrying one of them in another shape
-/// still fails to decode whole; the stream handlers log it with an excerpt of the frame.
+/// Unlike `d`, the keys read as integers, `i`, `E`, `T` and `t`, are integers in Binance's docs
+/// and in both SDK models, so they are read strictly. A report carrying one of them in another
+/// shape still fails to decode whole; the stream handlers log it with an excerpt of the frame.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 // Tests build stream frames from reports.
 #[cfg_attr(test, derive(serde::Serialize))]
@@ -2540,6 +2713,10 @@ pub(crate) struct ExecutionReport {
     /// `T`: transaction time, in milliseconds.
     #[serde(rename = "T")]
     pub(crate) transaction_time: Option<i64>,
+    /// `E`: when Binance sent the report, in milliseconds. Read only for a report without a
+    /// readable `T`, as the nearest time the venue stamped.
+    #[serde(rename = "E")]
+    pub(crate) event_time: Option<i64>,
     /// `t`: the execution's own id, present only on a `TRADE`.
     #[serde(rename = "t")]
     pub(crate) trade_id: Option<i64>,
@@ -2700,6 +2877,28 @@ fn trade_order_is_live(status: &str) -> bool {
     matches!(status, "PARTIALLY_FILLED" | "FILLED")
 }
 
+/// When an `executionReport`'s execution happened, and whose clock says so: its transaction time
+/// `T`, else its event time `E`, else this host's clock, as [`TimeSource::Host`].
+///
+/// Binance stamps every report with both, so either falling back is logged with a `warn!`. `E` is
+/// when the report was sent, so it can be a little later than the execution.
+fn execution_report_time(
+    report: &ExecutionReport,
+    exchange: ExchangeId,
+    symbol: &InstrumentNameExchange,
+) -> (DateTime<Utc>, TimeSource) {
+    let read = |ms: Option<i64>| ms.and_then(|ms| Utc.timestamp_millis_opt(ms).single());
+    if let Some(time) = read(report.transaction_time) {
+        return (time, TimeSource::Venue);
+    }
+    if let Some(time) = read(report.event_time) {
+        warn!(%exchange, %symbol, transaction_time = ?report.transaction_time, "Binance executionReport missing/unparseable transaction time (T), using its event time (E)");
+        return (time, TimeSource::Venue);
+    }
+    warn!(%exchange, %symbol, transaction_time = ?report.transaction_time, event_time = ?report.event_time, "Binance executionReport missing/unparseable transaction time (T) and event time (E), using now");
+    (Utc::now(), TimeSource::Host)
+}
+
 /// Convert a Binance `executionReport` into rustrade account events, appended to `buf`.
 ///
 /// A `TRADE` report genuinely carries two facts -- the execution print (`l`/`L`) and the order's
@@ -2739,16 +2938,7 @@ pub(crate) fn convert_execution_report(
         None => ClientOrderId::new(order_id.0.as_str()),
     };
 
-    let time_exchange = match report
-        .transaction_time
-        .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
-    {
-        Some(t) => t,
-        None => {
-            warn!(%exchange, %symbol, "Binance executionReport missing/unparseable transaction time (T), using now");
-            Utc::now()
-        }
-    };
+    let (time_exchange, time_source) = execution_report_time(report, exchange, &symbol);
 
     match exec_type {
         "NEW" => {
@@ -2836,7 +3026,8 @@ pub(crate) fn convert_execution_report(
                 last_qty,
                 order_filled_quantity,
                 AssetFees::new(fee_asset, commission, None),
-            );
+            )
+            .with_time_source(time_source);
             // Only the order's own id: `cid` falls back to the exchange id without one.
             let trade = match report.order_client_id() {
                 Some(c) if !c.is_empty() => trade.with_client_order_id(cid.clone()),
@@ -3322,8 +3513,10 @@ pub(crate) fn parse_binance_order_rejection(
 /// - a venue failure ([`has_venue_failure_code`]) → [`ConnectivityError::Socket`]: the venue
 ///   failed the request, not the other way round, and Binance says to retry.
 /// - `-1021` (timestamp outside `recvWindow`) → [`ConnectivityError::Socket`]: the request took
-///   too long to arrive, or the local clock drifted. The SDK stamps each attempt afresh, so a
-///   retry can succeed; a clock that stays wrong keeps failing, so callers should bound retries.
+///   too long to arrive, or its stamp was off Binance's clock. The SDK stamps each attempt
+///   afresh, and with server-time sync the client reads Binance's time again before returning
+///   ([`RateLimitTracker::after_failure`]), so a retry can succeed. A clock that stays wrong
+///   keeps failing, so callers should bound retries.
 /// - `-1121` → [`ApiError::InstrumentInvalid`] when the request named one instrument; otherwise
 ///   there is no instrument to attach, so it falls through.
 /// - anything else → [`ApiError::RequestRejected`], prefixed with the symbol when the request
@@ -3436,6 +3629,23 @@ pub(crate) fn response_decode_error(e: ConnectorError) -> UnindexedClientError {
     UnindexedClientError::Internal(format!("decoding Binance response: {e}"))
 }
 
+/// A decimal Binance may leave out: absent is `None`, but present and unreadable is an error, so a
+/// malformed amount is not mistaken for an unreported one.
+pub(crate) fn optional_decimal(
+    field: &str,
+    value: Option<&str>,
+) -> Result<Option<Decimal>, UnindexedClientError> {
+    value
+        .map(|value| {
+            Decimal::from_str(value).map_err(|error| {
+                UnindexedClientError::Internal(format!(
+                    "decoding Binance response: {field} {value:?}: {error}"
+                ))
+            })
+        })
+        .transpose()
+}
+
 // ---------------------------------------------------------------------------
 // REST call retry wrapper
 // ---------------------------------------------------------------------------
@@ -3467,12 +3677,51 @@ pub(crate) async fn rest_call_with_retry<R, D>(
     rest: &Arc<R>,
     rate_limiter: &RateLimitTracker,
     kind: RequestKind,
-    mut make_call: impl FnMut(
+    make_call: impl FnMut(
         Arc<R>,
     ) -> Pin<
         Box<dyn std::future::Future<Output = anyhow::Result<RestApiResponse<D>>> + Send>,
     >,
 ) -> anyhow::Result<RestApiResponse<D>>
+where
+    R: Send + Sync,
+{
+    rest_read_with_retry(rest, rate_limiter, kind, make_call)
+        .await
+        .map(|(response, _)| response)
+}
+
+/// How far Binance's REST account view can trail its account stream, as the allowance a balance
+/// read is stamped back by ([`balance_read_time`]).
+///
+/// A cross-margin account read straight after a fill has returned the pre-trade balances, and
+/// was current about 2 s later.
+pub(crate) const REST_BALANCE_LAG: TimeDelta = TimeDelta::seconds(5);
+
+/// The time a REST balance read whose request was sent at `sent` is stamped with: the earlier of
+/// this host's time then and the earliest `venue`, an estimate of Binance's clock, can read then
+/// ([`VenueClock::span_start`]), less [`REST_BALANCE_LAG`]. From this host's time alone before
+/// `venue` has a sample.
+///
+/// So the stamp is no later than the state the read can return, even one that trails the
+/// account stream, and a host clock ahead of Binance's does not carry into it. A later stream
+/// event then still applies over it.
+pub(crate) fn balance_read_time(sent: HostMoment, venue: &VenueClock) -> DateTime<Utc> {
+    venue.span_start(sent).unwrap_or(sent.time) - REST_BALANCE_LAG
+}
+
+/// [`rest_call_with_retry`], also returning when the request that succeeded was sent, on this
+/// host's wall and monotonic clocks: a read describes the venue's state no earlier than that.
+pub(crate) async fn rest_read_with_retry<R, D>(
+    rest: &Arc<R>,
+    rate_limiter: &RateLimitTracker,
+    kind: RequestKind,
+    mut make_call: impl FnMut(
+        Arc<R>,
+    ) -> Pin<
+        Box<dyn std::future::Future<Output = anyhow::Result<RestApiResponse<D>>> + Send>,
+    >,
+) -> anyhow::Result<(RestApiResponse<D>, HostMoment)>
 where
     // `Arc<R>` is moved into the `+ Send` future, which requires `R: Send + Sync`. Both SDK
     // RestApi types satisfy this; stating it here surfaces the constraint at the definition
@@ -3484,11 +3733,13 @@ where
     // net — the loop body always returns before exhaustion.
     for attempt in 0..=MAX_RATE_LIMIT_RETRIES {
         rate_limiter.wait_if_blocked(kind).await?;
-        let sent_ms = unix_ms();
+        // One reading: the weight tracker's send time and the read's time are the same instant.
+        let sent = HostMoment::now();
+        let sent_ms = u128::try_from(sent.time.timestamp_millis()).unwrap_or_default();
         match make_call(Arc::clone(rest)).await {
             Ok(response) => {
                 rate_limiter.observe_rest(&response, sent_ms);
-                return Ok(response);
+                return Ok((response, sent));
             }
             Err(e) if is_rate_limit_error(&e) => {
                 let refusal = e.downcast_ref::<ConnectorError>();
@@ -3518,7 +3769,10 @@ where
                     return Err(e);
                 }
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                rate_limiter.after_failure(&e).await;
+                return Err(e);
+            }
         }
     }
     unreachable!("Binance REST retries exhausted: loop invariant violated")
@@ -3986,6 +4240,27 @@ pub(crate) fn classify_rest_order_error(
     order_error_from(classify_connector_error(ce), instrument)
 }
 
+/// Whether `e` is Binance refusing a request's timestamp (`-1021`): one `recvWindow` or more
+/// behind its clock, or 1 s or more ahead of it. Read from the code of a REST
+/// [`ConnectorError`] or a WS-API [`WebsocketError::ResponseError`], which context layers do not
+/// hide.
+pub(crate) fn is_timestamp_rejection(e: &anyhow::Error) -> bool {
+    const INVALID_TIMESTAMP: i64 = -1021;
+    if let Some(WebsocketError::ResponseError { code, .. }) = e.downcast_ref::<WebsocketError>() {
+        return *code == INVALID_TIMESTAMP;
+    }
+    matches!(
+        e.downcast_ref::<ConnectorError>(),
+        Some(
+            ConnectorError::BadRequestError { code, .. }
+                | ConnectorError::UnauthorizedError { code, .. }
+                | ConnectorError::ForbiddenError { code, .. }
+                | ConnectorError::NotFoundError { code, .. }
+                | ConnectorError::ConnectorClientError { code, .. }
+        ) if *code == Some(INVALID_TIMESTAMP)
+    )
+}
+
 /// Classify an `anyhow::Error` from a WS-API order/cancel request.
 ///
 /// binance-sdk returns both transport failures and venue responses with status >= 400 through
@@ -4047,6 +4322,39 @@ mod tests {
     use crate::client::reconnect_budget::BackoffLimits;
     use futures::FutureExt as _;
 
+    /// Both clients' rustdoc state the REST balance lag allowance as a number, since public docs
+    /// cannot link the crate-private constant. Change it only together with those docs.
+    #[test]
+    fn the_rest_balance_lag_is_as_documented() {
+        assert_eq!(REST_BALANCE_LAG, TimeDelta::seconds(5));
+    }
+
+    /// A balance read is stamped the REST lag before the earlier of this host's time at the send
+    /// and the earliest Binance's clock can read then, or before this host's time without an
+    /// estimate of Binance's clock.
+    #[test]
+    fn a_balance_read_is_stamped_the_lag_before_the_earlier_of_the_two_clocks() {
+        let at = |secs: i64| DateTime::<Utc>::from_timestamp(1_800_000_000 + secs, 0).unwrap();
+        let sampled = tokio::time::Instant::now();
+        let mut venue = VenueClock::new();
+        let sent = |secs| HostMoment::new(at(secs), sampled);
+
+        assert_eq!(
+            balance_read_time(sent(100), &venue),
+            at(100) - REST_BALANCE_LAG
+        );
+        venue.observe(at(100), sampled);
+        // This host reads 60 s ahead of Binance, then 60 s behind it.
+        assert_eq!(
+            balance_read_time(sent(160), &venue),
+            at(100) - REST_BALANCE_LAG
+        );
+        assert_eq!(
+            balance_read_time(sent(40), &venue),
+            at(40) - REST_BALANCE_LAG
+        );
+    }
+
     /// The module docs and both clients' rustdoc state the heartbeat window and the longest
     /// cooldown waited through as numbers. Change these only together with those docs. The
     /// reconnect budget's own numbers are pinned in `client::reconnect_budget`.
@@ -4054,6 +4362,38 @@ mod tests {
     fn the_heartbeat_and_cooldown_are_as_documented() {
         assert_eq!(HEARTBEAT_TIMEOUT_SECS, 30);
         assert_eq!(MAX_COOLDOWN_SLEEP, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_timestamp_rejection_is_read_from_the_code_of_either_api() {
+        let rest = |code| {
+            anyhow::Error::new(ConnectorError::BadRequestError {
+                msg: "Timestamp for this request is outside of the recvWindow.".to_owned(),
+                code,
+            })
+        };
+        let ws = |code| {
+            anyhow::Error::new(WebsocketError::ResponseError {
+                code,
+                message: "Timestamp for this request was 1000ms ahead of the server's time."
+                    .to_owned(),
+                retry_after: None,
+            })
+        };
+
+        assert!(is_timestamp_rejection(&rest(Some(-1021))));
+        assert!(is_timestamp_rejection(&ws(-1021)));
+        // Context layers do not hide it.
+        assert!(is_timestamp_rejection(&ws(-1021).context("order.place")));
+        assert!(is_timestamp_rejection(
+            &rest(Some(-1021)).context("get_account")
+        ));
+        assert!(!is_timestamp_rejection(&rest(Some(-1022))));
+        assert!(!is_timestamp_rejection(&rest(None)));
+        assert!(!is_timestamp_rejection(&ws(-1022)));
+        assert!(!is_timestamp_rejection(&anyhow::Error::new(
+            ConnectorError::NetworkError("-1021".to_owned())
+        )));
     }
 
     #[test]
@@ -4089,22 +4429,17 @@ mod tests {
         }
     }
 
-    /// An account position is at its update time `u`, else its event time `E`, else now.
+    /// An account position is at its update time `u`, else its event time `E`, else it has none.
     #[test]
-    fn an_account_positions_time_is_its_update_time_then_its_event_time_then_now() {
-        let at = |ms| Utc.timestamp_millis_opt(ms).unwrap();
+    fn an_account_positions_time_is_its_update_time_then_its_event_time_then_none() {
+        let at = |ms| Some(Utc.timestamp_millis_opt(ms).unwrap());
         let time = |u, e| account_position_time(ExchangeId::BinanceSpot, u, e);
 
         assert_eq!(time(Some(2_000), Some(3_000)), at(2_000));
         assert_eq!(time(None, Some(3_000)), at(3_000));
         assert_eq!(time(Some(i64::MAX), Some(3_000)), at(3_000));
         for event_time in [None, Some(i64::MAX)] {
-            let before = Utc::now();
-            let now = time(None, event_time);
-            assert!(
-                (before..=Utc::now()).contains(&now),
-                "{event_time:?} gave {now}"
-            );
+            assert_eq!(time(None, event_time), None, "{event_time:?}");
         }
     }
 
@@ -5141,6 +5476,49 @@ mod tests {
         assert!(unrecovered.is_empty(), "and no longer kept");
     }
 
+    /// A disconnect's gap is placed on Binance's clock as the stream's events show it, so a host
+    /// clock ahead of Binance's beyond the lookback still starts the gap before the fills Binance
+    /// stamped during the outage.
+    #[test]
+    fn a_disconnect_seen_by_a_host_clock_ahead_starts_its_gap_at_binances_time() {
+        let at = |secs: i64| Utc.timestamp_millis_opt(secs * 1_000).unwrap();
+        let base = tokio::time::Instant::now();
+        let mut venue = VenueClock::new();
+        // Binance stamped an event at 1 000 s as it arrived; the host reads 60 s ahead.
+        venue.observe(at(1_000), base);
+        let seen = HostMoment::new(at(1_060), base);
+
+        let disconnect = Disconnect::seen(&venue, seen, TimeDelta::seconds(1));
+
+        assert_eq!(disconnect.start, at(999));
+    }
+
+    /// Before the stream has seen a time Binance stamped, the gap starts from this host's time.
+    #[test]
+    fn a_disconnect_with_no_sample_starts_its_gap_from_the_hosts_time() {
+        let at = |secs: i64| Utc.timestamp_millis_opt(secs * 1_000).unwrap();
+        let seen = HostMoment::new(at(1_060), tokio::time::Instant::now());
+
+        let disconnect = Disconnect::seen(&VenueClock::new(), seen, TimeDelta::seconds(1));
+
+        assert_eq!(disconnect.start, at(1_059));
+    }
+
+    /// A host clock stepped back between the disconnect and the reconnect does not end the gap
+    /// before the outage does: the moment the disconnect was seen counts on on tokio's clock.
+    #[test]
+    fn a_host_clock_stepped_back_before_the_reconnect_still_ends_the_gap_past_the_outage() {
+        let at = |secs: i64| Utc.timestamp_millis_opt(secs * 1_000).unwrap();
+        let base = tokio::time::Instant::now();
+        let seen = HostMoment::new(at(1_000), base);
+        let disconnect = Disconnect::seen(&VenueClock::new(), seen, TimeDelta::zero());
+
+        // 120 s later by tokio's clock, but the host clock reads an hour back.
+        let now = HostMoment::new(at(1_120 - 3_600), base + Duration::from_secs(120));
+
+        assert_eq!(disconnect.end(&VenueClock::new(), now), at(1_120));
+    }
+
     /// A new gap that overlaps a kept one starts after it, so the kept one keeps its retry
     /// schedule and no span is read twice; a gap wholly covered is not opened.
     #[tokio::test]
@@ -5204,6 +5582,19 @@ mod tests {
                 subscription_id: Some(4),
                 event_type: "outboundAccountPosition",
                 event: r#"{"e":"outboundAccountPosition","E":1}"#,
+                event_time: Some(DateTime::<Utc>::from_timestamp_millis(1).unwrap()),
+            }
+        );
+        // A malformed `E` costs only the event's time, not the event.
+        assert_eq!(
+            parse_user_data_frame(
+                r#"{"subscriptionId":4,"event":{"e":"outboundAccountPosition","E":"soon"}}"#
+            ),
+            UserDataFrame::Event {
+                subscription_id: Some(4),
+                event_type: "outboundAccountPosition",
+                event: r#"{"e":"outboundAccountPosition","E":"soon"}"#,
+                event_time: None,
             }
         );
         // A frame with both `id` and `event` is a response.
@@ -6166,6 +6557,20 @@ mod tests {
         );
     }
 
+    /// A disconnect's gap begins a short lookback before it was seen, and after a heartbeat
+    /// timeout two 30 s windows earlier still: the last proof of life can come that long before
+    /// the timeout is declared.
+    #[test]
+    fn a_disconnect_looks_back_further_after_a_heartbeat_timeout() {
+        let signal = chrono::Duration::milliseconds(SIGNAL_RECOVERY_LOOKBACK_MS);
+        assert!(signal > chrono::Duration::zero());
+        assert_eq!(disconnect_lookback(false), signal);
+        assert_eq!(
+            disconnect_lookback(true),
+            chrono::Duration::seconds(60) + signal
+        );
+    }
+
     /// A reconnect facing a cooldown longer than a request sleeps through ends the stream at once,
     /// spending no attempt and no time, and so does a connect that finds it.
     #[tokio::test(start_paused = true)]
@@ -7045,6 +7450,10 @@ pub(super) mod test_ws_api {
         Silent(Duration),
         /// Closes after this long, pinging every second meanwhile.
         Pinging(Duration),
+        /// Closes after this long, sending the frame `push` builds every 100 ms meanwhile. The
+        /// first may arrive before the client has registered for it, and be dropped; a later one
+        /// is delivered.
+        Pushing(fn() -> String, Duration),
     }
 
     /// Starts a WS API answering every request with `answer`, whose `n`th connection (from 0)
@@ -7083,19 +7492,28 @@ pub(super) mod test_ws_api {
                         {
                             return;
                         }
-                        let (after, pinging) = match lifetime {
+                        let (after, pinging, push) = match lifetime {
                             Lifetime::Open => continue,
-                            Lifetime::Silent(after) => (after, false),
-                            Lifetime::Pinging(after) => (after, true),
+                            Lifetime::Silent(after) => (after, false, None),
+                            Lifetime::Pinging(after) => (after, true, None),
+                            Lifetime::Pushing(push, after) => (after, false, Some(push)),
                         };
                         let closes = tokio::time::sleep(after);
                         tokio::pin!(closes);
                         let mut pings = tokio::time::interval(Duration::from_secs(1));
+                        let mut pushes = tokio::time::interval(Duration::from_millis(100));
                         loop {
                             tokio::select! {
                                 () = &mut closes => break,
                                 _ = pings.tick(), if pinging => {
                                     if ws.send(Message::Ping(Default::default())).await.is_err() {
+                                        return;
+                                    }
+                                }
+                                _ = pushes.tick(), if push.is_some() => {
+                                    if let Some(push) = push
+                                        && ws.send(Message::text(push())).await.is_err()
+                                    {
                                         return;
                                     }
                                 }

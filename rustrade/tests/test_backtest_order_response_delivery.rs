@@ -69,8 +69,9 @@ use rustrade::{
     risk::DefaultRiskManager,
     statistic::time::Daily,
     strategy::{
-        DefaultStrategy, algo::AlgoStrategy, close_positions::ClosePositionsStrategy,
-        on_disconnect::OnDisconnectStrategy, on_trading_disabled::OnTradingDisabled,
+        DefaultStrategy, algo::AlgoStrategy, cash_flow_attribution::CashFlowAttributionStrategy,
+        close_positions::ClosePositionsStrategy, on_disconnect::OnDisconnectStrategy,
+        on_trading_disabled::OnTradingDisabled,
     },
     system::config::ExecutionConfig,
 };
@@ -82,6 +83,7 @@ use rustrade_data::{
 use rustrade_execution::{
     AccountSnapshot,
     balance::{AssetBalance, Balance},
+    cash_flow::CashFlow,
     client::mock::MockExecutionConfig,
     order::{
         OrderKey, OrderKind, TimeInForce,
@@ -238,6 +240,19 @@ impl ClosePositionsStrategy for OneShotStrategy {
         InstrumentIndex: 'a,
     {
         (std::iter::empty(), std::iter::empty())
+    }
+}
+
+impl CashFlowAttributionStrategy for OneShotStrategy {
+    type State = ProbeState;
+
+    fn attribute_cash_flow(
+        &mut self,
+        _: &Self::State,
+        _: ExchangeIndex,
+        _: &CashFlow<AssetIndex, InstrumentIndex>,
+    ) -> Option<InstrumentIndex> {
+        None
     }
 }
 

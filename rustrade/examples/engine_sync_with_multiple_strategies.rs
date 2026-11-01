@@ -26,6 +26,7 @@ use rustrade::{
     statistic::{summary::instrument::TearSheetGenerator, time::Daily},
     strategy::{
         algo::AlgoStrategy,
+        cash_flow_attribution::CashFlowAttributionStrategy,
         close_positions::{ClosePositionsStrategy, build_ioc_market_order_to_close_position},
         on_disconnect::OnDisconnectStrategy,
         on_trading_disabled::OnTradingDisabled,
@@ -42,6 +43,7 @@ use rustrade_data::{
 };
 use rustrade_execution::{
     AccountEvent, AccountEventKind,
+    cash_flow::CashFlow,
     order::{
         id::{ClientOrderId, StrategyId},
         request::{OrderRequestCancel, OrderRequestOpen},
@@ -206,6 +208,19 @@ impl ClosePositionsStrategy for MultiStrategy {
             });
 
         (std::iter::empty(), open_requests)
+    }
+}
+
+impl CashFlowAttributionStrategy for MultiStrategy {
+    type State = EngineState<DefaultGlobalData, MultiStrategyCustomInstrumentData>;
+
+    fn attribute_cash_flow(
+        &mut self,
+        _: &Self::State,
+        _: ExchangeIndex,
+        _: &CashFlow<AssetIndex, InstrumentIndex>,
+    ) -> Option<InstrumentIndex> {
+        None
     }
 }
 

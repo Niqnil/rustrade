@@ -283,11 +283,11 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     /// left of its balance once its debt and the positions are taken out, capped at what is free
     /// to trade. `None` while this state holds no balance for `asset`.
     ///
-    /// It is the balance's `total`, less [`MarginDetails`](rustrade_execution::balance::MarginDetails)
-    /// `borrowed` and `interest` where the venue reports debt, less the signed net quantity
-    /// ([`PositionManager::quantity_net`](position::PositionManager::quantity_net)) of every
-    /// [`InstrumentKind::Spot`] instrument whose base is `asset`, then capped at the balance's
-    /// `free`. An [`AssetIndex`] names an asset on one exchange, so only that exchange's
+    /// It is the balance's [`net_asset`](rustrade_execution::balance::Balance::net_asset) (its
+    /// `total`, less `borrowed` and `interest` where the venue reports debt), less the signed net
+    /// quantity ([`PositionManager::quantity_net`](position::PositionManager::quantity_net)) of
+    /// every [`InstrumentKind::Spot`] instrument whose base is `asset`, then capped at the
+    /// balance's `free`. An [`AssetIndex`] names an asset on one exchange, so only that exchange's
     /// instruments count. A derivative's position is counted in contracts, not held in the base,
     /// so it is not taken out.
     ///
@@ -361,9 +361,6 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     /// Panics if this state does not track `asset`, as [`AssetStates::asset_index`] does.
     pub fn free_base(&self, asset: &AssetIndex) -> Option<Decimal> {
         let balance = self.assets.asset_index(asset).balance.as_ref()?.value;
-        let interest = balance
-            .margin
-            .map_or(Decimal::ZERO, |margin| margin.interest);
         let positions: Decimal = self
             .instruments
             .0
@@ -374,7 +371,7 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
             })
             .map(|state| state.position.quantity_net())
             .sum();
-        Some((balance.net_asset() - interest - positions).min(balance.free))
+        Some((balance.net_asset() - positions).min(balance.free))
     }
 
     /// Each instrument whose position `snapshot` reports and differs from this state's.
@@ -473,33 +470,12 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     ///   borrowing that no open position caused.
     /// - Interest on a quote asset is shared by every pair quoted in it.
     ///
-    /// A consumer whose account rules out these cases can route a flow itself, before the event
-    /// reaches the engine. For example, it can give the flow to the only instrument on the
-    /// exchange whose base asset is the flow's asset and that has an open position, and leave the
-    /// flow on the account otherwise:
-    /// ```rust
-    /// use rustrade::engine::state::{EngineState, instrument::filter::InstrumentFilter};
-    /// use rustrade_execution::{AccountEvent, AccountEventKind};
-    ///
-    /// fn route_to_base<GlobalData, InstrumentData>(
-    ///     state: &EngineState<GlobalData, InstrumentData>,
-    ///     event: &mut AccountEvent,
-    /// ) {
-    ///     let filter = InstrumentFilter::exchanges([event.exchange]);
-    ///     let AccountEventKind::CashFlow(flow) = &mut event.kind else { return };
-    ///     if flow.instrument.is_some() {
-    ///         return;
-    ///     }
-    ///     let asset = flow.asset;
-    ///     let mut held = state.instruments.instruments(&filter).filter(|instrument| {
-    ///         instrument.instrument.underlying.base == asset
-    ///             && !instrument.position.positions.is_empty()
-    ///     });
-    ///     if let (Some(only), None) = (held.next(), held.next()) {
-    ///         flow.instrument = Some(only.key);
-    ///     }
-    /// }
-    /// ```
+    /// The [`Engine`](crate::engine::Engine) asks its strategy's
+    /// [`CashFlowAttributionStrategy`](crate::strategy::cash_flow_attribution::CashFlowAttributionStrategy)
+    /// for an instrument before such a flow reaches this method, so a strategy whose account rules
+    /// out these cases supplies its own rule there, in live trading, a backtest and a stepped
+    /// simulation alike. [`route_to_base`](crate::strategy::cash_flow_attribution::route_to_base)
+    /// is one such rule. Called directly, this method asks no strategy.
     ///
     /// This method:
     /// - Sets the account [`ConnectivityState`](connectivity::ConnectivityState) to

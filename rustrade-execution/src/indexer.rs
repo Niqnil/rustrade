@@ -1,7 +1,7 @@
 use crate::{
     AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
-    InstrumentBalanceUpdate, IsolatedInstrumentState, UnindexedAccountEvent,
-    UnindexedAccountSnapshot,
+    InstrumentBalanceSnapshot, InstrumentBalanceUpdate, IsolatedInstrumentState,
+    UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, AssetBalanceUpdate},
     cash_flow::CashFlow,
     error::{
@@ -109,6 +109,11 @@ impl AccountEventIndexer {
             }
             AccountEventKind::InstrumentBalanceUpdate(update) => {
                 AccountEventKind::InstrumentBalanceUpdate(self.instrument_balance_update(update)?)
+            }
+            AccountEventKind::InstrumentBalanceSnapshot(snapshot) => {
+                AccountEventKind::InstrumentBalanceSnapshot(
+                    self.instrument_balance_snapshot(snapshot)?,
+                )
             }
             AccountEventKind::OrderSnapshot(snapshot) => {
                 AccountEventKind::OrderSnapshot(self.order_snapshot(snapshot.0).map(Snapshot)?)
@@ -476,6 +481,21 @@ impl AccountEventIndexer {
         })
     }
 
+    pub fn instrument_balance_snapshot(
+        &self,
+        snapshot: InstrumentBalanceSnapshot<AssetNameExchange, InstrumentNameExchange>,
+    ) -> Result<InstrumentBalanceSnapshot, IndexError> {
+        let InstrumentBalanceSnapshot {
+            instrument,
+            balance,
+        } = snapshot;
+
+        Ok(InstrumentBalanceSnapshot {
+            instrument: self.map.find_instrument_index(&instrument)?,
+            balance: self.asset_balance(balance)?,
+        })
+    }
+
     pub fn order_snapshot(
         &self,
         order: UnindexedOrderSnapshot,
@@ -837,6 +857,7 @@ impl AccountEventIndexer {
             origin,
             position_side,
             client_order_id,
+            time_source,
         } = trade;
 
         let instrument_index = self.map.find_instrument_index(&instrument)?;
@@ -896,6 +917,7 @@ impl AccountEventIndexer {
             origin,
             position_side,
             client_order_id,
+            time_source,
         })
     }
 }
@@ -1107,6 +1129,57 @@ mod tests {
         assert!(matches!(
             indexer.index_account_event(wrong_exchange),
             Err(AccountIndexError::Rejected(IndexError::ExchangeIndex(_)))
+        ));
+    }
+
+    /// An isolated pair's balance snapshot indexes both its instrument and its asset; either one
+    /// unknown rejects it, an unknown asset included, since the balance is the pair's.
+    #[test]
+    fn an_instrument_balance_snapshot_indexes_its_instrument_and_asset() {
+        let indexer = binance_indexer();
+        let snapshot = |instrument: &str, asset: &str| {
+            UnindexedAccountEvent::new(
+                ExchangeId::BinanceSpot,
+                AccountEventKind::InstrumentBalanceSnapshot(InstrumentBalanceSnapshot::new(
+                    InstrumentNameExchange::new(instrument),
+                    AssetBalance::new(
+                        AssetNameExchange::new(asset),
+                        crate::balance::Balance::new(Decimal::ONE, Decimal::ONE),
+                        DateTime::<Utc>::MIN_UTC,
+                    ),
+                )),
+            )
+        };
+
+        let indexed = indexer
+            .index_account_event(snapshot("BTC_USDT", "usdt"))
+            .unwrap();
+        let AccountEventKind::InstrumentBalanceSnapshot(indexed) = indexed.kind else {
+            panic!("{indexed:?}");
+        };
+        let map = &indexer.map;
+        assert_eq!(
+            indexed.instrument,
+            map.find_instrument_index(&InstrumentNameExchange::new("BTC_USDT"))
+                .unwrap()
+        );
+        assert_eq!(
+            indexed.balance.asset,
+            map.find_asset_index(&AssetNameExchange::new("usdt"))
+                .unwrap()
+        );
+        assert_eq!(
+            indexed.balance.balance,
+            crate::balance::Balance::new(Decimal::ONE, Decimal::ONE)
+        );
+
+        assert!(matches!(
+            indexer.index_account_event(snapshot("ETH_USDT", "usdt")),
+            Err(AccountIndexError::Rejected(IndexError::InstrumentIndex(_)))
+        ));
+        assert!(matches!(
+            indexer.index_account_event(snapshot("BTC_USDT", "bnb")),
+            Err(AccountIndexError::Rejected(IndexError::AssetIndex(_)))
         ));
     }
 
@@ -1429,30 +1502,12 @@ mod tests {
     /// thread. A degrade is reported only by its log line, so asserting on the value alone could
     /// not tell a logged degrade from a silent one.
     fn count_warnings<T>(index: impl FnOnce() -> T) -> (T, usize) {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use tracing_subscriber::layer::SubscriberExt;
-
-        #[derive(Default)]
-        struct CountWarnings(Arc<AtomicUsize>);
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountWarnings {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                if *event.metadata().level() == tracing::Level::WARN {
-                    self.0.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-
-        let layer = CountWarnings::default();
-        let count = Arc::clone(&layer.0);
-        // Thread-local, so other tests running in parallel are not counted.
-        let value =
-            tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), index);
-        (value, count.load(Ordering::Relaxed))
+        let (value, events) = rustrade_instrument::test_utils::logs::capture(index);
+        let warnings = events
+            .iter()
+            .filter(|event| event.level == tracing::Level::WARN)
+            .count();
+        (value, warnings)
     }
 
     fn btc_usdt() -> InstrumentNameExchange {

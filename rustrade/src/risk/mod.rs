@@ -1,7 +1,6 @@
 use derive_more::{Constructor, Display, From};
 use rustrade_execution::order::request::{OrderRequestCancel, OrderRequestOpen};
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
-use rustrade_integration::Unrecoverable;
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, hash::Hash, marker::PhantomData};
 
@@ -22,8 +21,39 @@ pub mod check;
 /// * `ExchangeKey` - Type used to identify an exchange (defaults to [`ExchangeIndex`]).
 /// * `InstrumentKey` - Type used to identify an instrument (defaults to [`InstrumentIndex`]).
 pub trait RiskManager<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> {
+    /// State used by the `RiskManager` to check the open and cancel requests.
+    ///
+    /// For a risk manager run by the [`Engine`](crate::engine::Engine), this is the full
+    /// `EngineState` of the trading system.
+    ///
+    /// eg/ `EngineState<DefaultGlobalData, DefaultInstrumentMarketData>`
     type State;
 
+    /// Reviews one batch of the order requests an
+    /// [`AlgoStrategy`](super::strategy::algo::AlgoStrategy) generated, returning each as approved
+    /// or refused: approved cancels, approved opens, refused cancels, refused opens.
+    ///
+    /// The [`Engine`](crate::engine::Engine) calls it after each event it processes, except a
+    /// contract expiry or a corporate action, while trading is enabled and no drain is in
+    /// progress, with the batch its strategy generated from `state`.
+    /// It sends only the approved requests, cancels first, and reports the refused ones, with
+    /// their reasons, in [`GenerateAlgoOrdersOutput`]. Commands to close positions or cancel
+    /// orders do not pass through it.
+    ///
+    /// # Caller obligations
+    /// - **Return each request once, approved or refused.** The engine does not check this: a
+    ///   request in neither output is neither sent nor reported, and one in both is sent and
+    ///   reported as refused.
+    /// - **An approved request is sent as returned**, so a check that adjusts one, such as
+    ///   reducing its quantity, returns the adjusted request.
+    /// - **A refusal is final for this batch.** A refused request is not retried, and no refusal
+    ///   stops the engine or disables trading. To stop the strategy generating orders, send
+    ///   [`TradingState::Disabled`](crate::engine::state::trading::TradingState::Disabled), for
+    ///   example with [`System::trading_state`](crate::system::System::trading_state).
+    ///
+    /// The engine collects all four outputs before it sends anything, so they may borrow `state`.
+    ///
+    /// [`GenerateAlgoOrdersOutput`]: crate::engine::action::generate_algo_orders::GenerateAlgoOrdersOutput
     fn check(
         &self,
         state: &Self::State,
@@ -60,12 +90,16 @@ impl<T> RiskApproved<T> {
     }
 }
 
-/// Type that wraps order requests that have failed [`RiskManager`] checks, including the
-/// failure reason.
+/// An order request a [`RiskManager`] refused, and why.
+///
+/// A refusal concerns that one request only: the engine does not send it, reports it, and carries
+/// on. See [`RiskManager::check`].
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
-pub struct RiskRefused<T, Reason = String> {
+pub struct RiskRefused<T> {
+    /// The refused request.
     pub item: T,
-    pub reason: Reason,
+    /// Why it was refused.
+    pub reason: String,
 }
 
 impl<T> RiskRefused<T> {
@@ -75,20 +109,9 @@ impl<T> RiskRefused<T> {
             reason: reason.into(),
         }
     }
-}
 
-impl<T, Reason> RiskRefused<T, Reason> {
     pub fn into_item(self) -> T {
         self.item
-    }
-}
-
-impl<T, Reason> Unrecoverable for RiskRefused<T, Reason>
-where
-    Reason: Unrecoverable,
-{
-    fn is_unrecoverable(&self) -> bool {
-        self.reason.is_unrecoverable()
     }
 }
 

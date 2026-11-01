@@ -28,7 +28,7 @@ use rustrade::engine::state::{
 };
 use rustrade_execution::{
     AccountEventKind, AccountSnapshot, MarginEffect, PeriodicMarginInterest, SpotFeeAsset,
-    SpotMarginConfig,
+    SpotMarginConfig, SpotMarginLiquidation,
     balance::{AssetBalance, Balance, MarginDetails},
     client::mock::MockExecutionConfig,
     exchange::mock::SimulatedVenue,
@@ -37,7 +37,7 @@ use rustrade_execution::{
     holding_cost::{DayCount, RateSeries},
     indexer::AccountEventIndexer,
     map::generate_execution_instrument_map,
-    market::MarketSnapshot,
+    market::{MarketObservation, MarketSnapshot},
     order::{
         OrderEvent, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, StrategyId},
@@ -396,4 +396,99 @@ fn with_margin_interest_a_margin_account_and_the_engine_differ_by_exactly_the_in
             assert!(interest > Decimal::ZERO);
         }
     }
+}
+
+/// A venue that liquidates its account, fed a market, which has sold 1 BTC it borrowed at 10,000,
+/// and the engine fed every event it has reported.
+#[test]
+fn a_liquidation_flattens_the_engine_position_and_leaves_its_balances_the_venues() {
+    let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
+    let indexer = AccountEventIndexer::new(Arc::new(
+        generate_execution_instrument_map(&instruments, EXCHANGE).unwrap(),
+    ));
+    let mut engine: EngineState<DefaultGlobalData, DefaultInstrumentMarketData> =
+        EngineState::builder(&instruments, DefaultGlobalData, |_| {
+            DefaultInstrumentMarketData::default()
+        })
+        .time_engine_start(TIME)
+        .build();
+    let instrument_state = engine.instruments.instrument_index(&InstrumentIndex(0));
+    let (base_index, quote_index) = (
+        instrument_state.instrument.underlying.base,
+        instrument_state.instrument.underlying.quote,
+    );
+
+    let template = venue(SpotFeeAsset::Received);
+    let config = MockExecutionConfig {
+        mocked_exchange: EXCHANGE,
+        initial_state: AccountSnapshot {
+            exchange: EXCHANGE,
+            balances: vec![funded(base(), Decimal::ZERO), funded(quote(), dec!(10000))],
+            instruments: vec![],
+        },
+        latency_ms: 0,
+        fee_model: template.fee_model,
+        fill_model: SimFillConfig::default(),
+        spot_fee_asset: SpotFeeAsset::Received,
+        slippage: Default::default(),
+        market_order_timing: Default::default(),
+        stale_market: Default::default(),
+        spot_margin: Some(
+            SpotMarginConfig::new(quote(), dec!(3), MarginEffect::Borrow)
+                .unwrap()
+                .with_liquidation(SpotMarginLiquidation::new(dec!(1.1), dec!(0.02)).unwrap())
+                .unwrap(),
+        ),
+        fee_asset: None,
+    };
+    let mut venue = SimulatedVenue::new_market_driven(&config, template.instruments().clone());
+    let traded = |price| {
+        MarketObservation::new(MarketSnapshot {
+            best_bid: None,
+            best_ask: None,
+            last_price: Some(price),
+        })
+    };
+
+    let mut events = venue.advance_time(TIME);
+    events.extend(venue.apply_market(&instrument_name(), traded(dec!(10000)), TIME));
+    events.extend(
+        venue
+            .open_order(market_order(Side::Sell, dec!(1), dec!(10000)))
+            .events,
+    );
+    // 19,990 left of the sale against 18,200 owed: a margin level of 1.098.
+    let liquidated = venue.apply_market(&instrument_name(), traded(dec!(18200)), TIME + STEP);
+    assert!(
+        liquidated
+            .iter()
+            .any(|event| matches!(event.kind, AccountEventKind::Trade(_))),
+        "{liquidated:?}"
+    );
+    events.extend(liquidated);
+    for event in events {
+        engine.update_from_account(&indexer.account_event(event).unwrap());
+    }
+
+    assert!(
+        engine
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .position
+            .positions
+            .get(&PositionId::NETTING)
+            .is_none(),
+        "the forced buy closes the short"
+    );
+    for (index, asset) in [(base_index, base()), (quote_index, quote())] {
+        assert_eq!(
+            engine.assets.asset_index(&index).balance.unwrap().value,
+            balance_now(&venue, asset.clone()),
+            "the engine's {asset} balance"
+        );
+    }
+    assert_eq!(
+        balance_now(&venue, base()).margin.unwrap(),
+        MarginDetails::default()
+    );
 }

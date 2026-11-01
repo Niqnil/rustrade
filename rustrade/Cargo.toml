@@ -1,6 +1,6 @@
 [package]
 name = "rustrade"
-version = "0.17.0"
+version = "0.18.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -39,6 +39,21 @@ name = "market_event"
 path = "benches/market_event/mod.rs"
 harness = false
 
+[[bench]]
+name = "sim_stepper"
+path = "benches/sim_stepper/mod.rs"
+harness = false
+
+[[bench]]
+name = "clock"
+path = "benches/clock/mod.rs"
+harness = false
+
+[[bench]]
+name = "sim_margin_valuation"
+path = "benches/sim_margin_valuation/mod.rs"
+harness = false
+
 [dev-dependencies]
 rustrade-instrument = { workspace = true, features = ["test-utils"] }
 rust_decimal_macros = { workspace = true }
@@ -46,6 +61,7 @@ serde_json = { workspace = true }
 spin_sleep = { workspace = true }
 tokio = { workspace = true, features = ["fs", "test-util"]} # test-util gives the fill-recovery tests a paused clock
 criterion = { workspace = true }
+loom = { workspace = true } # Model-checks the clock's seqlock: tests/test_clock_seqlock_loom.rs
 
 [dependencies]
 # Rustrade Ecosystem

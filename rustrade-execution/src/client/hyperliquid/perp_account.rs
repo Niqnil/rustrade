@@ -127,14 +127,14 @@ pub(super) async fn fetch_balances(
     address: H160,
     dexes: &PerpDexes,
 ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
+    // The balances' time: the reads describe the account no earlier than this.
+    let sent = Utc::now();
     Ok(match account_mode(info_client, address).await? {
-        AccountMode::PerDex => per_dex_balances(
-            &dex_states(info_client, address, dexes).await?,
-            dexes,
-            Utc::now(),
-        ),
+        AccountMode::PerDex => {
+            per_dex_balances(&dex_states(info_client, address, dexes).await?, dexes, sent)
+        }
         AccountMode::Unified => {
-            unified_balances(&spot_state(info_client, address).await?, dexes, Utc::now())
+            unified_balances(&spot_state(info_client, address).await?, dexes, sent)
         }
     })
 }
@@ -202,7 +202,7 @@ pub(super) fn unified_balances(
 #[cfg(test)]
 // Test code: panics on bad input are acceptable
 #[allow(clippy::unwrap_used)]
-mod tests {
+pub(super) mod tests {
     use super::super::perp_dexes::tests::xyz_and_flx;
     use super::*;
     use rust_decimal_macros::dec;
@@ -330,16 +330,35 @@ mod tests {
     }
 
     /// A server answering `userAbstraction` with `mode`, `spotClearinghouseState` with 998.99
-    /// USDC (5.31 on hold), and each DEX's `clearinghouseState` with a distinct account value.
+    /// USDC (5.31 on hold), each DEX's `clearinghouseState` with a distinct account value, and
+    /// `openOrders` with none.
     async fn balance_server(mode: &str) -> wiremock::MockServer {
+        balance_server_answering_after(mode, std::time::Duration::ZERO).await
+    }
+
+    /// [`balance_server`], answering each request `delay` after it arrives.
+    pub(in super::super) async fn balance_server_answering_after(
+        mode: &str,
+        delay: std::time::Duration,
+    ) -> wiremock::MockServer {
         use wiremock::matchers::{body_partial_json, method, path};
         let server = wiremock::MockServer::start().await;
         let mount = |request: serde_json::Value, answer: serde_json::Value| {
             wiremock::Mock::given(method("POST"))
                 .and(path("/info"))
                 .and(body_partial_json(request))
-                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(answer))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(200)
+                        .set_body_json(answer)
+                        .set_delay(delay),
+                )
         };
+        mount(
+            serde_json::json!({"type": "openOrders"}),
+            serde_json::json!([]),
+        )
+        .mount(&server)
+        .await;
         mount(serde_json::json!({"type": "userAbstraction"}), mode.into())
             .mount(&server)
             .await;
@@ -377,6 +396,32 @@ mod tests {
         .mount(&server)
         .await;
         server
+    }
+
+    /// Balances are stamped no later than the first request that read them was sent, never when
+    /// the answers arrive, in either account mode.
+    #[tokio::test]
+    async fn balances_are_stamped_before_their_reads_were_sent() {
+        use super::super::common::info_tests::info_client_against;
+        const ANSWER_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+        let dexes = xyz_and_flx().await;
+        for mode in ["unifiedAccount", "default"] {
+            let server = balance_server_answering_after(mode, ANSWER_DELAY).await;
+            let info_client = info_client_against(server.uri()).await;
+            let before = Utc::now();
+            let balances = fetch_balances(&info_client, H160::zero(), &dexes)
+                .await
+                .unwrap();
+            let after = Utc::now();
+            assert!(!balances.is_empty(), "{mode}");
+            for balance in balances {
+                assert!(
+                    before <= balance.time_exchange
+                        && balance.time_exchange + ANSWER_DELAY <= after,
+                    "{mode}: {balance:?} not within {before} ..= {after} - {ANSWER_DELAY:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

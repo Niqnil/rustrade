@@ -259,9 +259,9 @@ checksum = "d86b93f97252c47b41663388e6d155714a9d0c398b99f1005cbc5f978b29f445"
 
 [[package]]
 name = "binance-sdk"
-version = "77.0.0"
+version = "77.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07615c59a122db3f1edd66e63b5e5639cffaee0abd79c0ec70188dace1e07fcc"
+checksum = "b193f2f00dabd41539ba21afde0da32f28fc123fca016d74a9e7557b98b25c6d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2091,6 +2091,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "generator"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1be81b31c9ce4caf7f3178eeb90662bb1864d3ad363ec6bdada3201adff19c37"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "libc",
+ "log",
+ "rustversion",
+ "windows-link",
+ "windows-result",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3059,6 +3074,19 @@ name = "log"
 version = "0.4.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+
+[[package]]
+name = "loom"
+version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "419e0dc8046cb947daa77eb95ae174acfbddb7673b4151f56d1eed8e93fbfaca"
+dependencies = [
+ "cfg-if",
+ "generator",
+ "scoped-tls",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "lru"
@@ -4447,7 +4475,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -4456,6 +4484,7 @@ dependencies = [
  "futures",
  "indexmap 2.14.2",
  "itertools 0.15.0",
+ "loom",
  "parking_lot",
  "pin-project",
  "prettytable-rs",
@@ -4477,7 +4506,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-data"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "async-stream",
  "chrono",
@@ -4522,7 +4551,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-execution"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "anyhow",
  "binance-sdk",
@@ -4550,6 +4579,7 @@ dependencies = [
  "smol_str",
  "temp-env",
  "thiserror 2.0.21",
+ "time-tz",
  "tokio",
  "tokio-stream",
  "tokio-tungstenite 0.30.0",
@@ -4562,7 +4592,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-instrument"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "chrono",
  "derive_more 2.1.1",
@@ -4575,11 +4605,13 @@ dependencies = [
  "serde_json",
  "smol_str",
  "thiserror 2.0.21",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "rustrade-integration"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -4613,7 +4645,7 @@ dependencies = [
 
 [[package]]
 name = "rustrade-macro"
-version = "0.17.0"
+version = "0.18.0"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",
@@ -4707,6 +4739,12 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "scoped-tls"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
 
 [[package]]
 name = "scopeguard"

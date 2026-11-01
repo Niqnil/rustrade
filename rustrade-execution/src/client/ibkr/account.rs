@@ -94,9 +94,9 @@ impl BalanceAggregator {
         }
     }
 
-    /// Convert aggregated data to rustrade AssetBalance list, ordered by currency.
-    pub fn to_balances(&self) -> Vec<AssetBalance<AssetNameExchange>> {
-        let now = Utc::now();
+    /// Convert aggregated data to rustrade AssetBalance list, ordered by currency, each stamped
+    /// `time`.
+    pub fn to_balances(&self, time: DateTime<Utc>) -> Vec<AssetBalance<AssetNameExchange>> {
         let mut balances = BTreeMap::<&str, Balance>::new();
         // Currencies whose `free` is left uncapped though their account reported `AvailableFunds`.
         let mut unconverted = BTreeSet::<&str>::new();
@@ -143,7 +143,7 @@ impl BalanceAggregator {
             .map(|(currency, balance)| AssetBalance {
                 asset: AssetNameExchange::from(currency),
                 balance,
-                time_exchange: now,
+                time_exchange: time,
             })
             .collect()
     }
@@ -447,7 +447,7 @@ mod tests {
             ],
         );
 
-        let balances = agg.to_balances();
+        let balances = agg.to_balances(Utc::now());
         let currencies = balances
             .iter()
             .map(|b| b.asset.as_ref())
@@ -473,7 +473,7 @@ mod tests {
             &[("SGD", "5000", "0", "1"), ("USD", "4000", "-2.5", "1.28")],
         );
 
-        let balances = agg.to_balances();
+        let balances = agg.to_balances(Utc::now());
         assert_eq!(balance_of(&balances, "SGD").free, dec!(1280));
         let usd = balance_of(&balances, "USD");
         assert_eq!(usd.free, dec!(1000), "1280 SGD at 1.28 SGD per USD");
@@ -498,7 +498,7 @@ mod tests {
             &[("USD", "500", "0.5", "1"), ("BASE", "500", "0.5", "1")],
         );
 
-        let balances = agg.to_balances();
+        let balances = agg.to_balances(Utc::now());
         assert_eq!(balances.len(), 2, "{balances:?}");
         let sgd = balance_of(&balances, "SGD");
         assert_eq!((sgd.total, sgd.free), (dec!(5000), dec!(1280)));
@@ -517,7 +517,7 @@ mod tests {
         agg.process(&account_summary("DU2", "AccruedCash", "-1", "EUR"));
         agg.process(&account_summary("DU1", "CashBalance", "5", "JPY"));
 
-        let balances = agg.to_balances();
+        let balances = agg.to_balances(Utc::now());
         let eur = balance_of(&balances, "EUR");
         assert_eq!((eur.total, eur.accrued), (dec!(30), Some(dec!(-1))));
         assert_eq!(balance_of(&balances, "JPY").accrued, None);
@@ -529,12 +529,15 @@ mod tests {
     fn test_balance_aggregator_free_is_total_without_funds_or_rate() {
         let mut agg = BalanceAggregator::new();
         ledger(&mut agg, None, &[("USD", "-50", "-0.1", "1")]);
-        let usd = *balance_of(&agg.to_balances(), "USD");
+        let usd = *balance_of(&agg.to_balances(Utc::now()), "USD");
         assert_eq!((usd.total, usd.free), (dec!(-50), dec!(-50)));
 
         let mut agg = BalanceAggregator::new();
         ledger(&mut agg, Some(("SGD", "10")), &[("USD", "500", "0", "n/a")]);
-        assert_eq!(balance_of(&agg.to_balances(), "USD").free, dec!(500));
+        assert_eq!(
+            balance_of(&agg.to_balances(Utc::now()), "USD").free,
+            dec!(500)
+        );
     }
 
     /// `CashBalance` stands in when `TotalCashBalance` is missing, and a currency with neither, or
@@ -545,7 +548,7 @@ mod tests {
         agg.process(&mock_account_summary("CashBalance", "75", "EUR"));
         agg.process(&mock_account_summary("AccruedCash", "1", "JPY"));
 
-        let balances = agg.to_balances();
+        let balances = agg.to_balances(Utc::now());
         assert_eq!(balances.len(), 1, "JPY has no cash: {balances:?}");
         let eur = balance_of(&balances, "EUR");
         assert_eq!(
@@ -791,10 +794,10 @@ mod tests {
     fn test_balance_aggregator_clear() {
         let mut agg = BalanceAggregator::new();
         ledger(&mut agg, Some(("USD", "900")), &[("USD", "1000", "0", "1")]);
-        assert_eq!(agg.to_balances().len(), 1);
+        assert_eq!(agg.to_balances(Utc::now()).len(), 1);
 
         agg.clear();
-        assert!(agg.to_balances().is_empty());
+        assert!(agg.to_balances(Utc::now()).is_empty());
     }
 
     #[test]

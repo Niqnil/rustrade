@@ -41,7 +41,8 @@
 //! At a high-level, it provides a few major components:
 //! * `Engine` with plug and play `Strategy` and `RiskManager` components.
 //! * Centralised cache friendly `EngineState` management with O(1) constant lookups using indexed data structures.
-//! * `Strategy` interfaces for customising Engine behavior (AlgoStrategy, ClosePositionsStrategy, OnDisconnectStrategy, etc.).
+//! * `Strategy` interfaces for customising Engine behavior (AlgoStrategy, ClosePositionsStrategy,
+//!   OnDisconnectStrategy, CashFlowAttributionStrategy, etc.).
 //! * `RiskManager` interface for defining custom risk logic which checking generated algorithmic orders.
 //! * Event-driven system that allows for Commands to be issued from external processes (eg/ CloseAllPositions, OpenOrders, CancelOrders, etc.),
 //!   as well as turning algorithmic trading on/off.
@@ -53,6 +54,8 @@
 // Silence unused_crate_dependencies for dev-dependencies used only in tests
 #[cfg(test)]
 use criterion as _;
+#[cfg(test)]
+use loom as _;
 #[cfg(test)]
 use serde_json as _;
 

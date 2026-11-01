@@ -93,6 +93,10 @@ pub mod dedup;
 ))]
 pub(crate) mod order_recovery;
 
+// An estimate of a venue's clock from the times it stamps on its events. Always compiled: the
+// execution manager's fill recovery uses it whatever the client.
+pub mod venue_clock;
+
 // The account streams' reconnect budget. Gated on the clients that use it.
 #[cfg(any(feature = "alpaca", feature = "binance"))]
 pub(crate) mod reconnect_budget;
@@ -455,6 +459,8 @@ where
     /// lets you ask, which saves bandwidth. A balance for another asset is not an error: the
     /// `ExecutionManager` drops it and logs the asset names once per snapshot.
     ///
+    /// Balances are stamped as [`fetch_balances`](Self::fetch_balances) describes.
+    ///
     /// # Order completeness
     ///
     /// Each [`InstrumentAccountSnapshot`](crate::InstrumentAccountSnapshot) states through
@@ -587,6 +593,21 @@ where
     ///
     /// An empty `assets` slice is the "return all" sentinel: implementations must return
     /// balances for every asset held. When non-empty, only the listed assets are returned.
+    ///
+    /// # Balance time
+    ///
+    /// Each balance's `time_exchange` must be no later than the state it describes, because the
+    /// engine orders balance and debt state by it: a balance stamped later than its state would
+    /// block the stream's balance and debt events from between the two (see
+    /// [`AssetBalance::time_exchange`]). Stamp a balance with this host's time taken before the
+    /// request that returned it was sent, less how far the venue's REST view can trail its
+    /// account stream where the stream carries balances, never with a time taken after the
+    /// response. A time the venue states for the account's state can be used instead.
+    ///
+    /// A host clock ahead of the venue's carries into a stamp taken from this host's time. An
+    /// implementation that keeps an estimate of the venue's clock that is never ahead of it takes
+    /// the earlier of the two times instead, and says so in its docs. Otherwise keeping the two
+    /// clocks within bounds is the caller's obligation.
     fn fetch_balances(
         &self,
         assets: &[AssetNameExchange],
@@ -622,6 +643,11 @@ where
     ///
     /// The caller owns the loop, and with it how many calls, and how long, it spends on a span.
     /// A `start` after `end` is an empty span, read as no trades and `resume: None`.
+    ///
+    /// `end` can lie past this host's present. A read placed on the venue's clock, as the
+    /// execution manager's missed-fill recovery is, ends past it to cover a venue clock ahead of
+    /// this host's. Implementations read to `end` or the venue's present, whichever is earlier,
+    /// and must not cut `end` to this host's clock.
     ///
     /// # Venue limits
     ///

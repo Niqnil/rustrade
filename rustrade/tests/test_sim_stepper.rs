@@ -9,9 +9,9 @@
 //! positions holds them on both sides; and stepping books exactly what a backtest over the same
 //! data books.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, TimeDelta, Utc};
 use fnv::FnvHashMap;
 use futures::{StreamExt, stream};
 use rust_decimal::Decimal;
@@ -49,8 +49,12 @@ use rustrade::{
     risk::DefaultRiskManager,
     shutdown::{Shutdown, SyncShutdown},
     strategy::{
-        DefaultStrategy, algo::AlgoStrategy, close_positions::ClosePositionsStrategy,
-        on_disconnect::OnDisconnectStrategy, on_trading_disabled::OnTradingDisabled,
+        DefaultStrategy,
+        algo::AlgoStrategy,
+        cash_flow_attribution::{CashFlowAttributionStrategy, route_to_base},
+        close_positions::ClosePositionsStrategy,
+        on_disconnect::OnDisconnectStrategy,
+        on_trading_disabled::OnTradingDisabled,
     },
 };
 use rustrade_data::{
@@ -59,10 +63,13 @@ use rustrade_data::{
     subscription::candle::Candle,
 };
 use rustrade_execution::{
-    AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot,
-    balance::{AssetBalance, Balance},
+    AccountEvent, AccountEventKind, AccountSnapshot, InstrumentAccountSnapshot, MarginEffect,
+    PeriodicMarginInterest, SpotMarginConfig,
+    balance::{AssetBalance, Balance, MarginDetails},
+    cash_flow::{CashFlow, CashFlowKind},
     client::mock::MockExecutionConfig,
     fill::{MarketOrderTiming, NextBarPrice, StaleMarketPolicy},
+    holding_cost::{DayCount, RateSeries},
     order::{
         OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, StrategyId},
@@ -239,9 +246,26 @@ fn session_configured<Strategy>(
     engine_positions: Option<Vec<PositionSeed>>,
     strategy: Strategy,
 ) -> Session<Strategy> {
+    session_modelling(
+        config,
+        SimVenueOptions::default(),
+        start,
+        engine_positions,
+        strategy,
+    )
+}
+
+/// [`session_configured`], for a venue also modelling what `options` add.
+fn session_modelling<Strategy>(
+    config: MockExecutionConfig,
+    options: SimVenueOptions,
+    start: SimStart,
+    engine_positions: Option<Vec<PositionSeed>>,
+    strategy: Strategy,
+) -> Session<Strategy> {
     let instruments = instruments();
     let build = SimExecutionBuilder::new(&instruments)
-        .add_venue_with_start(config, SimVenueOptions::default(), start)
+        .add_venue_with_start(config, options, start)
         .unwrap()
         .build();
     let seeds = engine_positions.unwrap_or_else(|| build.position_seeds());
@@ -342,6 +366,35 @@ fn balance<Strategy>(engine: &TestEngine<Strategy>, asset: &str) -> Decimal {
         .unwrap_or_default()
 }
 
+/// What the `Engine` holds `asset`'s balance owing, if it reports a loan.
+fn loan<Strategy>(engine: &TestEngine<Strategy>, asset: &str) -> Option<MarginDetails> {
+    engine
+        .state
+        .assets
+        .assets()
+        .find(|state| state.asset.name_internal.as_ref() == asset)
+        .and_then(|state| state.balance.as_ref())
+        .and_then(|balance| balance.value.margin)
+}
+
+/// `(amount, time)` of each margin interest charge among `events`.
+fn interest_charged<'a>(
+    events: impl IntoIterator<Item = &'a EngineEvent<DataKind>>,
+) -> Vec<(Decimal, DateTime<Utc>)> {
+    events
+        .into_iter()
+        .filter_map(|event| match event {
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                kind: AccountEventKind::CashFlow(flow),
+                ..
+            })) if matches!(flow.kind, CashFlowKind::MarginInterest { .. }) => {
+                Some((flow.amount, flow.time_exchange))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// `(side, quantity, entry price)` of the `Engine`'s position in `instrument`, if it holds one.
 fn position<Strategy>(
     engine: &TestEngine<Strategy>,
@@ -360,6 +413,17 @@ fn position<Strategy>(
                 position.price_entry_average,
             )
         })
+}
+
+/// The base asset carry of the `Engine`'s position in `instrument`, if it holds one.
+fn carry_base<Strategy>(engine: &TestEngine<Strategy>, instrument: usize) -> Option<Decimal> {
+    engine
+        .state
+        .instruments
+        .instruments(&InstrumentFilter::None)
+        .nth(instrument)
+        .and_then(|state| state.position.positions.values().next())
+        .map(|position| position.carry_assets.base)
 }
 
 fn price<Strategy>(engine: &TestEngine<Strategy>, instrument: usize) -> Option<Decimal> {
@@ -1117,6 +1181,161 @@ fn a_start_holding_a_cfd_closes_against_its_entry_and_pays_back_its_margin() {
     assert_eq!(balance(&s.engine, "usdt"), dec!(5100));
 }
 
+/// A venue lending spot margin up to `max_leverage`, valued in USDT.
+fn lending(max_leverage: Decimal) -> MockExecutionConfig {
+    MockExecutionConfig {
+        spot_margin: Some(
+            SpotMarginConfig::new(
+                AssetNameExchange::new("usdt"),
+                max_leverage,
+                MarginEffect::Borrow,
+            )
+            .unwrap(),
+        ),
+        ..config(0)
+    }
+}
+
+/// Short 1 BTC at 30000, with 40000 USDT: 10000 of equity owing 30000.
+fn short_one_btc() -> SimStart {
+    SimStart::new(
+        vec![StartBalance::new(
+            AssetNameExchange::new("usdt"),
+            dec!(40000),
+        )],
+        vec![PositionSeed::new(
+            "binance_spot-btc_usdt",
+            Side::Sell,
+            dec!(1),
+            dec!(30000),
+            at(0),
+        )],
+    )
+}
+
+#[test]
+fn a_start_short_on_a_venue_that_lends_owes_its_base_and_pays_interest_from_the_next_boundary() {
+    // 87.6% a year on BTC loans, exactly 0.01% an hour.
+    let interest = PeriodicMarginInterest::new(TimeDelta::hours(1), DayCount::Act365).with_rates(
+        AssetNameExchange::new("btc"),
+        RateSeries::constant(dec!(0.876)),
+    );
+    let mut s = session_modelling(
+        lending(dec!(4)),
+        SimVenueOptions::default().with_margin_interest(Arc::new(interest)),
+        short_one_btc(),
+        None,
+        DefaultStrategy::default(),
+    );
+
+    let opening = s
+        .stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(30000))])
+        .unwrap();
+    assert_eq!(
+        position(&s.engine, BTC),
+        Some((Side::Sell, dec!(1), dec!(30000)))
+    );
+    assert_eq!(balance(&s.engine, "btc"), Decimal::ZERO);
+    assert_eq!(
+        loan(&s.engine, "btc"),
+        Some(MarginDetails::new(dec!(1), dec!(0)))
+    );
+    assert_eq!(
+        interest_charged(events(&opening)),
+        vec![],
+        "the loan was taken before the start"
+    );
+
+    let boundary = s
+        .stepper
+        .step(&mut s.engine, at(3600), [bar(BTC, 3600, dec!(30000))])
+        .unwrap();
+    assert_eq!(
+        interest_charged(events(&boundary)),
+        vec![(dec!(-0.0001), at(3600))]
+    );
+    assert_eq!(
+        loan(&s.engine, "btc"),
+        Some(MarginDetails::new(dec!(1), dec!(0.0001)))
+    );
+    assert_eq!(
+        carry_base(&s.engine, BTC),
+        Some(Decimal::ZERO),
+        "the default strategy leaves account-level interest on the account"
+    );
+}
+
+#[test]
+fn a_strategy_routing_interest_to_its_base_puts_the_venues_interest_on_the_shorts_carry() {
+    let interest = PeriodicMarginInterest::new(TimeDelta::hours(1), DayCount::Act365).with_rates(
+        AssetNameExchange::new("btc"),
+        RateSeries::constant(dec!(0.876)),
+    );
+    let mut s = session_modelling(
+        lending(dec!(4)),
+        SimVenueOptions::default().with_margin_interest(Arc::new(interest)),
+        short_one_btc(),
+        None,
+        RoutesToBase,
+    );
+    s.stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(30000))])
+        .unwrap();
+
+    let boundary = s
+        .stepper
+        .step(&mut s.engine, at(3600), [bar(BTC, 3600, dec!(30000))])
+        .unwrap();
+
+    let attributed = events(&boundary)
+        .into_iter()
+        .filter_map(|event| match event {
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                kind: AccountEventKind::CashFlow(flow),
+                ..
+            })) => Some((flow.amount, flow.instrument)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attributed,
+        vec![(dec!(-0.0001), Some(InstrumentIndex(BTC)))],
+        "the audit records the flow as attributed"
+    );
+    assert_eq!(carry_base(&s.engine, BTC), Some(dec!(-0.0001)));
+}
+
+#[test]
+fn a_start_at_the_venues_lending_limit_is_lent_nothing_more() {
+    let loan_after_selling_more = |max_leverage| {
+        let mut s = session_modelling(
+            lending(max_leverage),
+            SimVenueOptions::default(),
+            short_one_btc(),
+            None,
+            DefaultStrategy::default(),
+        );
+        s.stepper
+            .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(30000))])
+            .unwrap();
+        s.engine.action(&order(BTC, Side::Sell, dec!(0.1), "more"));
+        s.stepper.settle(&mut s.engine).unwrap();
+        loan(&s.engine, "btc")
+    };
+
+    // At leverage 4 the start's 30000 of debt is exactly 3 × its 10000 of equity, the most the
+    // start accepts and the most the venue lends.
+    assert_eq!(
+        loan_after_selling_more(dec!(4)),
+        Some(MarginDetails::new(dec!(1), dec!(0)))
+    );
+    assert_eq!(
+        loan_after_selling_more(dec!(5)),
+        Some(MarginDetails::new(dec!(1.1), dec!(0)))
+    );
+}
+
 #[test]
 fn an_engine_not_seeded_with_the_venues_start_is_refused() {
     let mut s = session_with(0, holding_btc(), Some(vec![]), DefaultStrategy::default());
@@ -1313,6 +1532,19 @@ impl ClosePositionsStrategy for ShutsDownWhenDisabled {
     }
 }
 
+impl CashFlowAttributionStrategy for ShutsDownWhenDisabled {
+    type State = State;
+
+    fn attribute_cash_flow(
+        &mut self,
+        _: &Self::State,
+        _: ExchangeIndex,
+        _: &CashFlow<AssetIndex, InstrumentIndex>,
+    ) -> Option<InstrumentIndex> {
+        None
+    }
+}
+
 impl OnDisconnectStrategy<HistoricalClock, State, MultiExchangeTxMap, DefaultRiskManager<State>>
     for ShutsDownWhenDisabled
 {
@@ -1329,6 +1561,73 @@ impl OnTradingDisabled<HistoricalClock, State, MultiExchangeTxMap, DefaultRiskMa
     fn on_trading_disabled(engine: &mut TestEngine<Self>) -> Self::OnTradingDisabled {
         engine.shutdown();
     }
+}
+
+/// Trades nothing, and gives each account-level cash flow to [`route_to_base`]'s answer.
+#[derive(Debug, Default)]
+struct RoutesToBase;
+
+impl AlgoStrategy for RoutesToBase {
+    type State = State;
+
+    fn generate_algo_orders(
+        &self,
+        _state: &Self::State,
+    ) -> (
+        impl IntoIterator<Item = OrderRequestCancel<ExchangeIndex, InstrumentIndex>>,
+        impl IntoIterator<Item = OrderRequestOpen<ExchangeIndex, InstrumentIndex>>,
+    ) {
+        (std::iter::empty(), std::iter::empty())
+    }
+}
+
+impl ClosePositionsStrategy for RoutesToBase {
+    type State = State;
+
+    fn close_positions_requests<'a>(
+        &'a self,
+        _state: &'a Self::State,
+        _filter: &'a InstrumentFilter,
+    ) -> (
+        impl IntoIterator<Item = OrderRequestCancel<ExchangeIndex, InstrumentIndex>> + 'a,
+        impl IntoIterator<Item = OrderRequestOpen<ExchangeIndex, InstrumentIndex>> + 'a,
+    )
+    where
+        ExchangeIndex: 'a,
+        AssetIndex: 'a,
+        InstrumentIndex: 'a,
+    {
+        (std::iter::empty(), std::iter::empty())
+    }
+}
+
+impl CashFlowAttributionStrategy for RoutesToBase {
+    type State = State;
+
+    fn attribute_cash_flow(
+        &mut self,
+        state: &Self::State,
+        exchange: ExchangeIndex,
+        flow: &CashFlow<AssetIndex, InstrumentIndex>,
+    ) -> Option<InstrumentIndex> {
+        route_to_base(state, exchange, flow)
+    }
+}
+
+impl OnDisconnectStrategy<HistoricalClock, State, MultiExchangeTxMap, DefaultRiskManager<State>>
+    for RoutesToBase
+{
+    type OnDisconnect = ();
+
+    fn on_disconnect(_: &mut TestEngine<Self>, _: ExchangeId) -> Self::OnDisconnect {}
+}
+
+impl OnTradingDisabled<HistoricalClock, State, MultiExchangeTxMap, DefaultRiskManager<State>>
+    for RoutesToBase
+{
+    type OnTradingDisabled = ();
+
+    fn on_trading_disabled(_: &mut TestEngine<Self>) -> Self::OnTradingDisabled {}
 }
 
 #[test]
@@ -1563,6 +1862,19 @@ impl ClosePositionsStrategy for EveryBar {
         InstrumentIndex: 'a,
     {
         (std::iter::empty(), std::iter::empty())
+    }
+}
+
+impl CashFlowAttributionStrategy for EveryBar {
+    type State = State;
+
+    fn attribute_cash_flow(
+        &mut self,
+        _: &Self::State,
+        _: ExchangeIndex,
+        _: &CashFlow<AssetIndex, InstrumentIndex>,
+    ) -> Option<InstrumentIndex> {
+        None
     }
 }
 
