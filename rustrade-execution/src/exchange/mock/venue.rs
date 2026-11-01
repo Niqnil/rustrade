@@ -43,6 +43,9 @@ use std::{sync::Arc, time::Duration};
 use tracing::warn;
 
 mod liquidation;
+mod spot_pairs;
+
+use spot_pairs::{SpotPair, SpotPairs};
 
 /// Everything one request obliges a driver to deliver, in the order it must deliver it.
 ///
@@ -249,8 +252,8 @@ pub enum VenueRegime {
 /// [`Option`](InstrumentKind::Option) need funding, margin and expiry settlement, none of which this
 /// venue models. They are **rejected at [`open_order`](Self::open_order)** with
 /// [`ApiError::InstrumentInvalid`] rather than filled. The check lives here, not only in the
-/// `rustrade` builder, because this type and its [`instruments`](Self::instruments) map are public:
-/// a consumer that constructs one directly bypasses every upstream gate, and the alternative to
+/// `rustrade` builder, because this type and its constructors are public: a consumer that
+/// constructs one directly bypasses every upstream gate, and the alternative to
 /// rejecting is filling a derivative as if it were deliverable stock.
 ///
 /// # Holding costs
@@ -533,7 +536,13 @@ pub struct SimulatedVenue {
     /// Moves each taker fill against the order, from its own seeded stream. Private: the stream's
     /// position is what makes a run reproducible from its seed, so nothing else may draw from it.
     slippage: Slippage,
-    pub instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
+    /// Every instrument this venue trades, as constructed. Private, and never changed after
+    /// construction: [`spot_pairs`](Self::spot_pairs) indexes it, and resting orders were accepted
+    /// against it. Read through [`instruments`](Self::instruments).
+    instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
+    /// The spot instruments of [`instruments`](Self::instruments), by the two assets each pairs.
+    /// What values an account and picks a liquidation's legs without scanning every instrument.
+    spot_pairs: SpotPairs,
     pub account: AccountState,
     /// This venue's own view of each instrument it trades, as of the last
     /// [`apply_market`](Self::apply_market).
@@ -713,6 +722,7 @@ impl SimulatedVenue {
             spot_fee_asset: config.spot_fee_asset,
             fill_model: Arc::new(config.fill_model),
             slippage: Slippage::new(config.slippage),
+            spot_pairs: SpotPairs::new(&instruments),
             instruments,
             account,
             market: FnvHashMap::default(),
@@ -1324,37 +1334,36 @@ impl SimulatedVenue {
             return Some(Decimal::ONE);
         }
 
-        let snapshot_of = |name: &InstrumentNameExchange, underlying| {
-            self.market(name).map(|market| market.snapshot).or_else(|| {
-                priced
-                    .filter(|(pair, _)| *pair == underlying)
-                    .map(|(_, s)| *s)
-            })
+        // `priced` applies to an instrument whose underlying it names: `asset`/`valuation`, or the
+        // reverse for an inverse pair.
+        let snapshot_of = |pair: &SpotPair| {
+            self.market(&pair.instrument)
+                .map(|market| market.snapshot)
+                .or_else(|| {
+                    let (underlying, snapshot) = priced?;
+                    let (base, quote) = match pair.inverse {
+                        true => (valuation, asset),
+                        false => (asset, valuation),
+                    };
+                    (underlying.base == *base && underlying.quote == *quote).then_some(*snapshot)
+                })
         };
 
-        self.instruments
+        // Ordered by name, so the first that prices is the one first by name.
+        self.spot_pairs
+            .between(asset, valuation)
             .iter()
-            .filter(|(_, instrument)| matches!(instrument.kind, InstrumentKind::Spot))
-            .filter_map(|(name, instrument)| {
-                let underlying = &instrument.underlying;
-                let inverse = match (&underlying.base, &underlying.quote) {
-                    (base, quote) if base == asset && quote == valuation => false,
-                    (base, quote) if base == valuation && quote == asset => true,
-                    _ => return None,
-                };
-                let price = mid_or_last(&snapshot_of(name, underlying)?)?;
+            .find_map(|pair| {
+                let price = mid_or_last(&snapshot_of(pair)?)?;
                 // A price of zero values nothing, and the inverse would divide by it.
                 if price <= Decimal::ZERO {
                     return None;
                 }
-                let value = match inverse {
+                Some(match pair.inverse {
                     true => Decimal::ONE / price,
                     false => price,
-                };
-                Some((name, value))
+                })
             })
-            .min_by(|(a, _), (b, _)| a.cmp(b))
-            .map(|(_, value)| value)
     }
 
     /// Retires every order whose deadline `time_exchange` has reached, releasing what it held.
@@ -1699,9 +1708,9 @@ impl SimulatedVenue {
         // One lookup for the whole instrument: every crossing order is on it by construction.
         let terms = match self.instrument_terms(instrument) {
             Ok(terms) => terms,
-            // Unreachable: an order cannot rest on an instrument this venue rejected at open. A
-            // venue whose `instruments` map was mutated afterwards would reach it, and dropping the
-            // fills silently is the one thing this method must not do.
+            // Unreachable: an order cannot rest on an instrument this venue rejected at open, and
+            // the instruments never change after construction. Should that ever break, dropping
+            // the fills silently is the one thing this method must not do.
             Err(error) => panic!(
                 "SimulatedVenue holds resting orders on an instrument it cannot price: {error}"
             ),
@@ -2570,6 +2579,25 @@ impl SimulatedVenue {
         events.push(self.build_account_event(Snapshot(UnindexedOrder::from(cancelled))));
 
         events
+    }
+
+    /// Every instrument this venue trades, keyed by its exchange name, exactly as it was
+    /// constructed with.
+    ///
+    /// Read only: the set of instruments is fixed for the venue's life. To trade a different set,
+    /// construct a new venue.
+    pub fn instruments(
+        &self,
+    ) -> &FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>> {
+        &self.instruments
+    }
+
+    /// The instrument this venue trades under `name`, or `None` if it trades none by that name.
+    pub fn instrument(
+        &self,
+        name: &InstrumentNameExchange,
+    ) -> Option<&Instrument<ExchangeId, AssetNameExchange>> {
+        self.instruments.get(name)
     }
 
     /// This venue's view of `instrument`, or `None` if nothing has fed it one.
@@ -4396,8 +4424,8 @@ impl SimulatedVenue {
     /// Returns whether `instrument` is cash-settled, rejecting kinds this venue cannot model.
     ///
     /// # Why this is enforced here and not only upstream
-    /// This type and its [`instruments`](Self::instruments) map are both public, so a consumer can
-    /// construct one directly and never pass through the `rustrade` builder that screens kinds
+    /// This type and its constructors are public, so a consumer can construct one directly with
+    /// any instruments and never pass through the `rustrade` builder that screens kinds
     /// today. Without this gate a [`InstrumentKind::Perpetual`], [`InstrumentKind::Future`] or
     /// [`InstrumentKind::Option`] falls to the physically-settled spot path and is filled as if it
     /// were deliverable stock — with its `contract_size` multiplier applied to a delivery that
@@ -6331,9 +6359,9 @@ mod tests {
 
     /// A derivative must be rejected, not filled down the physically-settled spot path.
     ///
-    /// The fixture is mutated through the public `instruments` map on purpose: that is exactly the
-    /// route a consumer takes when it builds a venue itself rather than through the `rustrade`
-    /// builder, and it is the route that had no gate on it.
+    /// The venue is constructed directly with the derivative on purpose: that is exactly the route
+    /// a consumer takes when it builds a venue itself rather than through the `rustrade` builder,
+    /// and it is the route that had no gate on it.
     #[test]
     fn unsupported_instrument_kinds_are_rejected_rather_than_filled_as_spot() {
         use rustrade_instrument::instrument::kind::{
@@ -6367,8 +6395,10 @@ mod tests {
 
         for kind in unsupported {
             // Amply funded: the rejection must come from the kind, not from a balance shortfall.
-            let mut venue = make_venue("10", "10000000");
-            venue.instruments.get_mut(&instrument_name()).unwrap().kind = kind.clone();
+            let mut instruments = spot_instruments();
+            instruments.get_mut(&instrument_name()).unwrap().kind = kind.clone();
+            let config = spot_config("10", "10000000", FeeModelConfig::default());
+            let mut venue = SimulatedVenue::new(&config, instruments);
 
             let outcome = venue.open_order(buy_request("1.0", market_prices("50000")));
 

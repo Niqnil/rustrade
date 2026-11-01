@@ -441,7 +441,7 @@ fn a_liquidation_flattens_the_engine_position_and_leaves_its_balances_the_venues
         ),
         fee_asset: None,
     };
-    let mut venue = SimulatedVenue::new_market_driven(&config, template.instruments);
+    let mut venue = SimulatedVenue::new_market_driven(&config, template.instruments().clone());
     let traded = |price| {
         MarketObservation::new(MarketSnapshot {
             best_bid: None,

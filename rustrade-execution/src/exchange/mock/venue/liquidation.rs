@@ -16,9 +16,7 @@ use crate::{
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
-    Side,
-    asset::name::AssetNameExchange,
-    instrument::{kind::InstrumentKind, name::InstrumentNameExchange},
+    Side, asset::name::AssetNameExchange, instrument::name::InstrumentNameExchange,
 };
 use rustrade_integration::collection::snapshot::Snapshot;
 use smol_str::ToSmolStr;
@@ -341,23 +339,20 @@ impl SimulatedVenue {
         receive: &AssetNameExchange,
         want: Decimal,
     ) -> Option<Leg> {
+        // Ordered by name. Seen from `pay`, a direct pair sells it as base, an inverse one buys
+        // `receive` with it as quote.
         let (instrument, side) = self
-            .instruments
+            .spot_pairs
+            .between(pay, receive)
             .iter()
-            .filter(|(name, instrument)| {
-                matches!(instrument.kind, InstrumentKind::Spot) && self.market.contains_key(*name)
-            })
-            .filter_map(|(name, instrument)| {
-                let underlying = &instrument.underlying;
-                let side = match (&underlying.base, &underlying.quote) {
-                    (base, quote) if base == receive && quote == pay => Side::Buy,
-                    (base, quote) if base == pay && quote == receive => Side::Sell,
-                    _ => return None,
+            .find(|pair| self.market.contains_key(&pair.instrument))
+            .map(|pair| {
+                let side = match pair.inverse {
+                    true => Side::Buy,
+                    false => Side::Sell,
                 };
-                Some((name, side))
-            })
-            .min_by(|(a, _), (b, _)| a.cmp(b))
-            .map(|(name, side)| (name.clone(), side))?;
+                (pair.instrument.clone(), side)
+            })?;
         let snapshot = self.market(&instrument)?.snapshot;
         // `instrument_terms` refuses only an instrument it cannot settle, and this one is spot.
         let terms = self.instrument_terms(&instrument).ok()?;
