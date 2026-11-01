@@ -12991,6 +12991,62 @@ mod tests {
     }
 
     #[test]
+    fn a_request_snapshot_values_only_the_pair_it_names() {
+        // Request-priced, so the venue holds no market and values from the request's snapshot.
+        let venue = SimulatedVenue::new(
+            &spot_config("1", "0", FeeModelConfig::default()),
+            spot_instruments(),
+        );
+        let snapshot = market_prices("50000").unwrap();
+        let eth = || AssetNameExchange::new("ETH");
+        let price_in = |asset: AssetNameExchange,
+                        valuation: AssetNameExchange,
+                        priced: Underlying<AssetNameExchange>| {
+            venue.price_in(&asset, &valuation, Some((&priced, &snapshot)))
+        };
+
+        assert_eq!(
+            price_in(base(), quote(), Underlying::new(base(), quote())),
+            Some(d("50000"))
+        );
+        assert_eq!(
+            price_in(quote(), base(), Underlying::new(base(), quote())),
+            Some(d("0.00002")),
+            "valued through the inverse of the pair the snapshot names"
+        );
+        assert_eq!(
+            price_in(base(), quote(), Underlying::new(base(), eth())),
+            None,
+            "a snapshot of another pair sharing the base prices nothing"
+        );
+        assert_eq!(
+            price_in(base(), quote(), Underlying::new(eth(), quote())),
+            None,
+            "a snapshot of another pair sharing the quote prices nothing"
+        );
+    }
+
+    #[test]
+    fn a_venue_reads_back_the_instruments_it_was_constructed_with() {
+        let instruments = fee_asset_instruments();
+        let venue = SimulatedVenue::new(
+            &spot_config("1", "0", FeeModelConfig::default()),
+            instruments.clone(),
+        );
+
+        assert_eq!(venue.instruments(), &instruments);
+        assert_eq!(
+            venue.instrument(&instrument_name()),
+            instruments.get(&instrument_name())
+        );
+        assert!(venue.instrument(&instrument_name()).is_some());
+        assert_eq!(
+            venue.instrument(&InstrumentNameExchange::new("ETHUSDT")),
+            None
+        );
+    }
+
+    #[test]
     fn a_margin_buy_repays_interest_then_principal_and_frees_the_rest() {
         let config = MockExecutionConfig {
             spot_margin: Some(
