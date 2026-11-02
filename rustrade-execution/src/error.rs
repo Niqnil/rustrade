@@ -446,9 +446,10 @@ pub struct BorrowReject {
     pub venue_code: Option<String>,
     /// The venue's message. It may itself carry the code, as Binance's does.
     pub message: String,
-    /// How much the venue could still have lent, in the units the order was sized in, where
-    /// known: the most a smaller order could have sold short, or, for a spot margin sell, could
-    /// have borrowed. Set by the simulated venue; no live client reports it yet.
+    /// How much more the venue could still have lent, in the units the order was sized in, where
+    /// known: for a short sale, the most a smaller order could have sold short; for a spot margin
+    /// sell, the most it could have borrowed, on top of whatever free base the account holds. Set
+    /// by the simulated venue; no live client reports it yet.
     pub available: Option<Decimal>,
 }
 

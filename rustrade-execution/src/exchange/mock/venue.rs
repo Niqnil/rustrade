@@ -14798,6 +14798,19 @@ mod tests {
             Some(MarginDetails::new(d("0.3"), d("0.00003"))),
             "lent the whole 0.3 the cap leaves, its first charge taking the debt past the cap"
         );
+
+        let outcome = venue.open_order(sell_request("0.01", market_prices("50000")));
+        let reject = borrow_rejection(&outcome);
+        assert_eq!(
+            reject.available,
+            Some(Decimal::ZERO),
+            "a debt past the cap leaves nothing, not less than nothing"
+        );
+        assert!(
+            reject.message.ends_with("Borrowable: 0"),
+            "{}",
+            reject.message
+        );
     }
 
     #[test]
@@ -14885,6 +14898,72 @@ mod tests {
         let reject = borrow_rejection(&outcome);
         assert_eq!(reject.reason, BorrowRejectReason::BorrowLimitExceeded);
         assert_eq!(reject.available, Some(d("0.3")));
+    }
+
+    #[test]
+    fn a_held_sell_past_the_cap_is_rejected_on_arrival_as_over_the_limit() {
+        // 100 USDT at leverage 2 lends up to 1 BTC at the close of 100; the cap allows 0.5.
+        let mut venue = margin_venue_holding_with(
+            |config| config.with_max_borrow(base(), d("0.5")).unwrap(),
+            MarginEffect::Borrow,
+        );
+
+        let outcome = venue.open_order(market_order("held", Side::Sell, "0.6", gtc()));
+
+        let reject = borrow_rejection(&outcome);
+        assert_eq!(reject.reason, BorrowRejectReason::BorrowLimitExceeded);
+        assert_eq!(reject.available, Some(d("0.5")));
+    }
+
+    #[test]
+    fn a_held_sell_lent_the_whole_cap_fills_at_its_bar_though_interest_took_the_debt_past_it() {
+        let mut venue = margin_venue_holding_with(
+            |config| config.with_max_borrow(base(), d("0.5")).unwrap(),
+            MarginEffect::Borrow,
+        )
+        .with_margin_interest(Arc::new(hourly_interest(base())));
+        let outcome = venue.open_order(market_order("held", Side::Sell, "0.5", gtc()));
+        assert_eq!(
+            balance_of(sans_debt(&outcome.events)[0]).balance.margin,
+            Some(MarginDetails::new(d("0.5"), d("0.00005"))),
+            "the loan's first charge takes what is owed past the 0.5 cap"
+        );
+
+        // The loan is already held against the order, so its fill borrows nothing more.
+        let events = feed_bar(&mut venue, 2, ohlc("98", "99", "97", "98"));
+
+        let trade = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                AccountEventKind::Trade(trade) => Some(trade),
+                _ => None,
+            })
+            .expect("the held sell fills at its bar");
+        assert_eq!(trade.quantity, d("0.5"));
+    }
+
+    #[test]
+    fn a_held_buy_whose_bar_needs_a_loan_past_the_cap_is_cancelled() {
+        // 150 at the close of 100 borrows 50 USDT, all the cap allows.
+        let mut venue = margin_venue_holding_with(
+            |config| config.with_max_borrow(quote(), d("50")).unwrap(),
+            MarginEffect::Borrow,
+        );
+        venue.open_order(market_order("held", Side::Buy, "1.5", gtc()));
+
+        // 180 at an open of 120 would borrow 30 more, which the leverage limit allows and the cap
+        // does not.
+        let events = feed_bar(&mut venue, 2, ohlc("120", "121", "119", "120"));
+
+        assert_eq!(
+            balance_of(sans_debt(&events)[0]).balance,
+            Balance::new_margin(d("100"), d("100"), Decimal::ZERO, Decimal::ZERO),
+            "the cancel repays the 50 the order borrowed when it was accepted"
+        );
+        assert!(matches!(
+            order_of(sans_debt(&events)[1]).state,
+            OrderState::Inactive(InactiveOrderState::Cancelled(_))
+        ));
     }
 
     // ---------------------------------------------------------------------------------------
