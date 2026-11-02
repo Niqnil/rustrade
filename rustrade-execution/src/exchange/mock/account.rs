@@ -1350,6 +1350,80 @@ mod tests {
         account
     }
 
+    /// Lending of up to 1,000 by the leverage limit, under a cap of 40, which leaves 9 to an
+    /// account already owing 31 (30 principal and 1 interest).
+    fn capped_at_40() -> Lending {
+        Lending {
+            borrowable: dec!(1000),
+            min_borrow: Decimal::ZERO,
+            max_borrow: Some(dec!(40)),
+        }
+    }
+
+    fn usd_debit(settled: Decimal) -> Debit {
+        Debit {
+            asset: usd(),
+            settled,
+            reserved: Decimal::ZERO,
+        }
+    }
+
+    #[test]
+    fn the_cap_counts_the_principal_and_interest_already_owed() {
+        let mut account = account_owing_usd();
+        let at = DateTime::<Utc>::MIN_UTC;
+
+        let Err(insufficient) = account.commit(
+            &usd_debit(dec!(110)),
+            None,
+            MarginEffect::Borrow,
+            capped_at_40(),
+            at,
+        ) else {
+            panic!("a shortfall of 10 is more than the 9 the cap leaves");
+        };
+        assert_eq!(
+            insufficient,
+            BalanceInsufficient {
+                asset: usd(),
+                free: dec!(100),
+                required: dec!(110),
+                borrowable: Some(dec!(9)),
+                min_borrow: None,
+                max_borrow: Some(dec!(40)),
+            }
+        );
+
+        let Ok(committed) = account.commit(
+            &usd_debit(dec!(109)),
+            None,
+            MarginEffect::Borrow,
+            capped_at_40(),
+            at,
+        ) else {
+            panic!("a shortfall of 9 is what the cap leaves");
+        };
+        assert_eq!(committed.borrowed, dec!(9));
+        assert_eq!(account.owed(&usd()), dec!(40));
+    }
+
+    #[test]
+    fn an_order_that_does_not_borrow_is_refused_naming_neither_lending_nor_cap() {
+        let mut account = account_owing_usd();
+
+        let Err(insufficient) = account.commit(
+            &usd_debit(dec!(110)),
+            None,
+            MarginEffect::NoSideEffect,
+            capped_at_40(),
+            DateTime::<Utc>::MIN_UTC,
+        ) else {
+            panic!("an order that does not borrow pays with the 100 free alone");
+        };
+        assert_eq!(insufficient.borrowable, None);
+        assert_eq!(insufficient.max_borrow, None);
+    }
+
     #[test]
     fn the_loan_count_changes_only_when_a_principal_is_repaid_to_zero() {
         let mut account = account_owing_usd();
