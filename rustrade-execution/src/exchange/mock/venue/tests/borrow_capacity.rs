@@ -203,6 +203,10 @@ fn a_venue_without_markets_answers_only_what_it_can_value() {
     // where the leverage limit would leave it out of the equity and understate it.
     let venue = margin_venue("1", "10000", "3");
     assert_eq!(capacity(&venue, Side::Buy), BorrowCapacity::new(quote()));
+
+    // A BTC debt the venue cannot value could be any size, so the capacity is unknown too.
+    let venue = SimulatedVenue::new(&owing_btc_config("1", "0"), spot_instruments());
+    assert_eq!(capacity(&venue, Side::Buy), BorrowCapacity::new(quote()));
 }
 
 #[test]
@@ -226,6 +230,14 @@ fn a_cap_that_rules_a_loan_out_is_known_without_a_market() {
         capacity(&venue, Side::Sell).borrowable_now,
         Some(Decimal::ZERO),
         "what the cap leaves is below the minimum borrow"
+    );
+
+    // Nor does a holding the venue cannot value hide a cap that leaves nothing.
+    let config = with_max_borrow(margin_config("1", "10000", "3"), base(), "0");
+    let venue = SimulatedVenue::new(&config, spot_instruments());
+    assert_eq!(
+        capacity(&venue, Side::Sell).borrowable_now,
+        Some(Decimal::ZERO)
     );
 
     // A cap with room left says nothing of the leverage limit, so the capacity stays unknown.
