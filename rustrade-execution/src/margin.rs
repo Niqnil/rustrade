@@ -448,7 +448,8 @@ impl SpotMarginConfig {
     /// # Errors
     /// [`SpotMarginConfigError::CollateralRatioOutOfRange`] if `ratio` is outside `[0, 1]`, and
     /// [`SpotMarginConfigError::LiquidationRatioBelowBorrowRatio`] if it is below `asset`'s
-    /// [`borrow_collateral_ratio`](Self::borrow_collateral_ratio). Lower the borrow ratio first.
+    /// [`borrow_collateral_ratio`](Self::borrow_collateral_ratio). To set a liquidation ratio
+    /// below the asset's current borrow ratio, lower the borrow ratio first.
     pub fn with_liquidation_collateral_ratio(
         mut self,
         asset: AssetNameExchange,
