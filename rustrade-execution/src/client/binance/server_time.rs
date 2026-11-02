@@ -475,9 +475,11 @@ mod tests {
 
         assert_eq!(reads.load(Ordering::SeqCst), 1);
         assert_eq!(server_time.host_lead(), None);
-        // Still this host's clock.
-        let now = Utc::now().timestamp_millis();
-        assert!(i64::try_from(clock.stamp_ms()).unwrap() <= now);
+        // Still this host's clock: read the bounds either side of the stamp, so a millisecond
+        // passing between the reads cannot fail the check.
+        let before = Utc::now().timestamp_millis();
+        let stamp = i64::try_from(clock.stamp_ms()).unwrap();
+        assert!(stamp >= before && stamp <= Utc::now().timestamp_millis());
     }
 
     #[tokio::test(start_paused = true)]
