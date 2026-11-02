@@ -1309,9 +1309,8 @@ impl SimulatedVenue {
         asset: &AssetNameExchange,
         priced: Option<(&Underlying<AssetNameExchange>, &MarketSnapshot)>,
     ) -> Option<Decimal> {
-        let valuation = config.valuation_asset();
-        let asset_price = self.price_in(asset, valuation, priced)?;
-        let Valued { equity, debt } = self.valued(valuation, priced)?;
+        let asset_price = self.price_in(asset, config.valuation_asset(), priced)?;
+        let Valued { equity, debt } = self.valued(config, MarginCheck::Borrow, priced)?;
 
         let headroom = (config.max_leverage() - Decimal::ONE) * equity - debt;
         // `price_in` never values an asset at zero, so the division is safe.
@@ -1368,26 +1367,36 @@ impl SimulatedVenue {
         ApiError::BorrowRejected(reject)
     }
 
-    /// The account's equity and debt, valued in `valuation` as [`SpotMarginConfig`]'s
-    /// `# How much it lends` says, or `None` if it owes an asset this venue cannot value.
+    /// The account's equity and debt, valued in `config`'s valuation asset as
+    /// [`SpotMarginConfig`]'s `# How much it lends` says, with each asset's positive net weighted
+    /// by its collateral ratio for `check`, or `None` if it owes an asset this venue cannot value.
     ///
     /// `priced` is as for [`price_in`](Self::price_in). Shared by the leverage limit and the
-    /// liquidation check, so the two value an account alike.
+    /// liquidation check, so the two value an account alike but for the ratios.
     fn valued(
         &self,
-        valuation: &AssetNameExchange,
+        config: &SpotMarginConfig,
+        check: MarginCheck,
         priced: Option<(&Underlying<AssetNameExchange>, &MarketSnapshot)>,
     ) -> Option<Valued> {
         let mut valued = Valued::default();
         for balance in self.account.balances() {
             let owed = owed(balance);
-            let Some(price) = self.price_in(&balance.asset, valuation, priced) else {
+            let Some(price) = self.price_in(&balance.asset, config.valuation_asset(), priced)
+            else {
                 if owed > Decimal::ZERO {
                     return None;
                 }
                 continue;
             };
-            valued.equity += balance.balance.net_asset() * price;
+            let net = balance.balance.net_asset();
+            // Only what the account holds beyond what it owes is weighted: the rest counts in
+            // full, as does the net of an asset it owes more of than it holds.
+            let ratio = match net > Decimal::ZERO {
+                true => check.collateral_ratio(config, &balance.asset),
+                false => Decimal::ONE,
+            };
+            valued.equity += net * ratio * price;
             valued.debt += owed * price;
         }
         Some(valued)
@@ -4884,10 +4893,31 @@ fn owed(balance: &AssetBalance<AssetNameExchange>) -> Decimal {
         .map_or(Decimal::ZERO, |margin| margin.owed())
 }
 
+/// Which check a [`SimulatedVenue::valued`] call values the account for, and so which of
+/// [`SpotMarginConfig`]'s collateral ratios weights its equity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarginCheck {
+    /// The leverage limit: how much the venue lends.
+    Borrow,
+    /// The margin level a liquidation checks.
+    Liquidation,
+}
+
+impl MarginCheck {
+    /// The fraction of `asset`'s positive net that counts as equity for this check.
+    fn collateral_ratio(self, config: &SpotMarginConfig, asset: &AssetNameExchange) -> Decimal {
+        match self {
+            Self::Borrow => config.borrow_collateral_ratio(asset),
+            Self::Liquidation => config.liquidation_collateral_ratio(asset),
+        }
+    }
+}
+
 /// A margin account's equity and debt, in its valuation asset. See [`SimulatedVenue::valued`].
 #[derive(Debug, Clone, Copy, Default)]
 struct Valued {
-    /// The value of what the account holds, net of what it owes.
+    /// The value of what the account holds, net of what it owes, each asset's positive net
+    /// weighted by its collateral ratio.
     equity: Decimal,
     /// The value of what it owes, loans plus interest.
     debt: Decimal,
@@ -16445,6 +16475,38 @@ mod tests {
         assert_eq!(balance_now(&venue, bnb()).total, d("10"));
     }
 
+    fn eth() -> AssetNameExchange {
+        AssetNameExchange::new("ETH")
+    }
+
+    fn eth_instrument_name() -> InstrumentNameExchange {
+        InstrumentNameExchange::new("ETHUSDT")
+    }
+
+    /// BTCUSDT and ETHUSDT.
+    fn btc_and_eth_instruments()
+    -> FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>> {
+        let mut instruments = spot_instruments();
+        instruments.insert(
+            eth_instrument_name(),
+            Instrument {
+                exchange: EXCHANGE,
+                name_internal: InstrumentNameInternal::new("ethusdt"),
+                name_exchange: eth_instrument_name(),
+                underlying: Underlying {
+                    base: eth(),
+                    quote: quote(),
+                },
+                quote: InstrumentQuoteAsset::UnderlyingQuote,
+                kind: InstrumentKind::Spot,
+                spec: None,
+                data_venue: None,
+            },
+        );
+        instruments
+    }
+
     mod borrow_capacity;
+    mod collateral_ratio;
     mod liquidation;
 }

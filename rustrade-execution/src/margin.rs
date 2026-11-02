@@ -152,9 +152,11 @@ pub struct MarginPlacement {
 ///   valuation asset, else that market's last price, in either direction (`BTC/USDT`, or the
 ///   inverse of `USDT/BTC`). The valuation asset is worth one. A market priced at zero values
 ///   nothing.
-/// - **Equity** is the sum over assets of `total − borrowed − interest`, valued that way. An asset
-///   the venue cannot value counts as no equity, which understates what the account can borrow
-///   rather than overstating it.
+/// - **Equity** is the sum over assets of `total − borrowed − interest`, valued that way, where an
+///   asset whose net is positive counts at its
+///   [`borrow_collateral_ratio`](Self::borrow_collateral_ratio): see `# Collateral ratios`. An
+///   asset the venue cannot value counts as no equity, which understates what the account can
+///   borrow rather than overstating it.
 /// - **Debt** is the sum over assets of `borrowed + interest`, valued the same way. The venue
 ///   lends nothing while it cannot value a debt, and never lends an asset it cannot value.
 ///
@@ -173,6 +175,29 @@ pub struct MarginPlacement {
 ///
 /// It lends nothing while a liquidation is under way: see [`SpotMarginLiquidation`].
 ///
+/// # Collateral ratios
+/// An asset can count for less than its full value as collateral, as Binance's cross margin
+/// weights each asset by a collateral ratio. Each asset has two, both one by default:
+/// - a [`borrow_collateral_ratio`](Self::borrow_collateral_ratio), which the leverage limit above
+///   uses, and so what the venue lends;
+/// - a [`liquidation_collateral_ratio`](Self::liquidation_collateral_ratio), which the margin level
+///   a [`SpotMarginLiquidation`] checks uses.
+///
+/// A ratio applies only to the part of an asset the account holds beyond what it owes of it,
+/// its positive net: `ratio × (total − borrowed − interest)`. What it holds up to what it owes
+/// counts in full, and so do the holdings of an asset it owes more of than it holds. So an
+/// account that holds 2 BTC and owes 1, at a ratio of 0.95, counts the first BTC in full and the
+/// second at 0.95. Debt is never weighted. A ratio of zero counts the asset for nothing beyond
+/// its debt.
+///
+/// In margin-level terms, the account's collateral is its debt plus its weighted equity, and the
+/// margin level is collateral over debt, as Binance defines it: a borrow is allowed while that
+/// level, with borrow ratios, stays at or above `max_leverage / (max_leverage − 1)`.
+///
+/// An asset's liquidation ratio may not be below its borrow ratio, so that the borrow ratios are
+/// the stricter ones, as on Binance. That keeps a borrow the leverage limit allows from leaving
+/// the account at its liquidation level.
+///
 /// # What it repays
 /// Under [`MarginEffect::Repay`], whatever a fill delivers into an asset the account owes repays
 /// that asset's loan, interest first, then principal, and only the rest becomes free balance. What
@@ -189,19 +214,25 @@ pub struct MarginPlacement {
 ///
 /// # What it does not model
 /// - **Isolated margin.** One pool of balances backs every instrument.
+/// - **Tiered collateral ratios.** An asset has one ratio per check, whatever the size of its
+///   holding. Binance publishes each ratio in tiers by the holding's value in USD.
+/// - **Conservative borrow prices.** The leverage limit values each asset at the same price as the
+///   liquidation check. Binance's borrow check values an asset the account owes at the highest
+///   index price over a recent window, and every other asset at the lowest.
 /// - **The venue's lending pool.** The venue has whatever it lends: no shared pool runs short, as
 ///   one can on a real venue whatever the account's own limits allow.
 /// - **Interest**, by this configuration alone. A venue given a [`MarginInterestModel`] charges
 ///   it; see that trait.
 ///
 /// [`new`](Self::new) refuses a `max_leverage` below one, [`with_min_borrow`](Self::with_min_borrow)
-/// a negative minimum, [`with_max_borrow`](Self::with_max_borrow) a negative cap,
+/// a negative minimum, [`with_max_borrow`](Self::with_max_borrow) a negative cap, the collateral
+/// ratio builders a ratio outside `[0, 1]` or a liquidation ratio below the borrow ratio,
 /// [`with_liquidation`](Self::with_liquidation) a liquidation the leverage limit could reach, and
 /// so does deserialising any of them, so a configuration that exists is one the venue can apply.
-/// Serialised, `max_leverage`, each minimum borrow and each cap are decimal strings (`"3"`), as the
-/// crate writes decimals elsewhere, so no precision is lost to a float. `min_borrow` and
-/// `max_borrow` are maps from asset to amount, each left out when empty, and `liquidation` is left
-/// out when off.
+/// Serialised, `max_leverage`, each minimum borrow, each cap and each ratio are decimal strings
+/// (`"3"`), as the crate writes decimals elsewhere, so no precision is lost to a float.
+/// `min_borrow`, `max_borrow`, `borrow_collateral_ratio` and `liquidation_collateral_ratio` are
+/// maps from asset to amount, each left out when empty, and `liquidation` is left out when off.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(try_from = "SpotMarginRepr", into = "SpotMarginRepr")]
 pub struct SpotMarginConfig(SpotMarginRepr);
@@ -219,6 +250,10 @@ struct SpotMarginRepr {
     min_borrow: BTreeMap<AssetNameExchange, Decimal>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     max_borrow: BTreeMap<AssetNameExchange, Decimal>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    borrow_collateral_ratio: BTreeMap<AssetNameExchange, Decimal>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    liquidation_collateral_ratio: BTreeMap<AssetNameExchange, Decimal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     liquidation: Option<SpotMarginLiquidation>,
 }
@@ -251,6 +286,8 @@ impl SpotMarginConfig {
             auto_repay_at_cancel: default_auto_repay_at_cancel(),
             min_borrow: BTreeMap::new(),
             max_borrow: BTreeMap::new(),
+            borrow_collateral_ratio: BTreeMap::new(),
+            liquidation_collateral_ratio: BTreeMap::new(),
             liquidation: None,
         })
     }
@@ -369,6 +406,69 @@ impl SpotMarginConfig {
         self.0.max_borrow.get(asset).copied()
     }
 
+    /// This configuration, counting `ratio` of what the account holds of `asset` beyond what it
+    /// owes of it as equity when the venue decides how much it lends: the asset's borrow
+    /// collateral ratio, as Binance's Margin Data page lists one per asset. Replaces any borrow
+    /// ratio `asset` had. See [`SpotMarginConfig`]'s `# Collateral ratios`.
+    ///
+    /// Every asset's is one by default. A ratio of one removes it.
+    ///
+    /// # Errors
+    /// [`SpotMarginConfigError::CollateralRatioOutOfRange`] if `ratio` is outside `[0, 1]`, and
+    /// [`SpotMarginConfigError::LiquidationRatioBelowBorrowRatio`] if it is above `asset`'s
+    /// [`liquidation_collateral_ratio`](Self::liquidation_collateral_ratio).
+    pub fn with_borrow_collateral_ratio(
+        mut self,
+        asset: AssetNameExchange,
+        ratio: Decimal,
+    ) -> Result<Self, SpotMarginConfigError> {
+        self.0.borrow_collateral_ratio.insert(asset, ratio);
+        Self::try_from(self.0)
+    }
+
+    /// The fraction of what the account holds of `asset` beyond what it owes of it that counts
+    /// as equity when the venue decides how much it lends, one if it has none. See
+    /// [`with_borrow_collateral_ratio`](Self::with_borrow_collateral_ratio).
+    pub fn borrow_collateral_ratio(&self, asset: &AssetNameExchange) -> Decimal {
+        self.0
+            .borrow_collateral_ratio
+            .get(asset)
+            .copied()
+            .unwrap_or(Decimal::ONE)
+    }
+
+    /// This configuration, counting `ratio` of what the account holds of `asset` beyond what it
+    /// owes of it as equity in the margin level a [`SpotMarginLiquidation`] checks: the asset's
+    /// liquidation collateral ratio, as Binance's Margin Data page lists one per asset. Replaces
+    /// any liquidation ratio `asset` had. See [`SpotMarginConfig`]'s `# Collateral ratios`.
+    ///
+    /// Every asset's is one by default. A ratio of one removes it. It has no effect without a
+    /// [`liquidation`](Self::with_liquidation).
+    ///
+    /// # Errors
+    /// [`SpotMarginConfigError::CollateralRatioOutOfRange`] if `ratio` is outside `[0, 1]`, and
+    /// [`SpotMarginConfigError::LiquidationRatioBelowBorrowRatio`] if it is below `asset`'s
+    /// [`borrow_collateral_ratio`](Self::borrow_collateral_ratio). Lower the borrow ratio first.
+    pub fn with_liquidation_collateral_ratio(
+        mut self,
+        asset: AssetNameExchange,
+        ratio: Decimal,
+    ) -> Result<Self, SpotMarginConfigError> {
+        self.0.liquidation_collateral_ratio.insert(asset, ratio);
+        Self::try_from(self.0)
+    }
+
+    /// The fraction of what the account holds of `asset` beyond what it owes of it that counts
+    /// as equity in the margin level a liquidation checks, one if it has none. See
+    /// [`with_liquidation_collateral_ratio`](Self::with_liquidation_collateral_ratio).
+    pub fn liquidation_collateral_ratio(&self, asset: &AssetNameExchange) -> Decimal {
+        self.0
+            .liquidation_collateral_ratio
+            .get(asset)
+            .copied()
+            .unwrap_or(Decimal::ONE)
+    }
+
     /// This configuration, liquidating the account as `liquidation` says. Replaces any
     /// liquidation it had.
     ///
@@ -419,6 +519,35 @@ impl TryFrom<SpotMarginRepr> for SpotMarginConfig {
                 max_borrow: *max_borrow,
             });
         }
+        if let Some((asset, ratio)) = repr
+            .borrow_collateral_ratio
+            .iter()
+            .chain(&repr.liquidation_collateral_ratio)
+            .find(|(_, ratio)| !(Decimal::ZERO..=Decimal::ONE).contains(*ratio))
+        {
+            return Err(SpotMarginConfigError::CollateralRatioOutOfRange {
+                asset: asset.clone(),
+                ratio: *ratio,
+            });
+        }
+        let ratio_of = |ratios: &BTreeMap<AssetNameExchange, Decimal>, asset| {
+            ratios.get(asset).copied().unwrap_or(Decimal::ONE)
+        };
+        if let Some(asset) = repr
+            .borrow_collateral_ratio
+            .keys()
+            .chain(repr.liquidation_collateral_ratio.keys())
+            .find(|asset| {
+                ratio_of(&repr.liquidation_collateral_ratio, *asset)
+                    < ratio_of(&repr.borrow_collateral_ratio, *asset)
+            })
+        {
+            return Err(SpotMarginConfigError::LiquidationRatioBelowBorrowRatio {
+                asset: asset.clone(),
+                borrow: ratio_of(&repr.borrow_collateral_ratio, asset),
+                liquidation: ratio_of(&repr.liquidation_collateral_ratio, asset),
+            });
+        }
         if let Some(liquidation) = &repr.liquidation {
             // An account borrowed to the limit has `debt = (max_leverage − 1) × equity`, so a
             // margin level of `max_leverage / (max_leverage − 1)`. One lending nothing, at a
@@ -434,6 +563,11 @@ impl TryFrom<SpotMarginRepr> for SpotMarginConfig {
         // compare equal.
         repr.min_borrow
             .retain(|_, min_borrow| !min_borrow.is_zero());
+        // Likewise a ratio of one, which counts the asset in full.
+        repr.borrow_collateral_ratio
+            .retain(|_, ratio| *ratio != Decimal::ONE);
+        repr.liquidation_collateral_ratio
+            .retain(|_, ratio| *ratio != Decimal::ONE);
         Ok(Self(repr))
     }
 }
@@ -468,6 +602,30 @@ pub enum SpotMarginConfigError {
         asset: AssetNameExchange,
         /// The cap given, below zero.
         max_borrow: Decimal,
+    },
+    /// A collateral ratio for `asset` outside `[0, 1]`.
+    #[error("spot margin collateral ratio {ratio} of {asset} is outside [0, 1]")]
+    #[non_exhaustive]
+    CollateralRatioOutOfRange {
+        /// The asset given the ratio.
+        asset: AssetNameExchange,
+        /// The ratio given.
+        ratio: Decimal,
+    },
+    /// A liquidation collateral ratio for `asset` below its borrow collateral ratio, which would
+    /// count the asset for less when liquidating than when lending.
+    #[error(
+        "spot margin liquidation collateral ratio {liquidation} of {asset} is below its borrow \
+         collateral ratio {borrow}"
+    )]
+    #[non_exhaustive]
+    LiquidationRatioBelowBorrowRatio {
+        /// The asset whose ratios disagree.
+        asset: AssetNameExchange,
+        /// Its borrow collateral ratio.
+        borrow: Decimal,
+        /// Its liquidation collateral ratio, below `borrow`.
+        liquidation: Decimal,
     },
     /// A liquidation level below one, at which an account would already owe more than it holds.
     #[error("spot margin liquidation level {0} is below 1")]
@@ -509,8 +667,10 @@ pub enum SpotMarginConfigError {
 /// level is the value of everything the account holds over the value of what it owes, loans plus
 /// interest, both valued as the leverage limit values them (see [`SpotMarginConfig`]'s
 /// `# How much it lends`): at the mid of a spot instrument pairing each asset with the valuation
-/// asset, else its last price. There is no index price, so a market's own mid stands in for the
-/// one a venue liquidates on. An asset the venue cannot value counts for nothing, which can bring
+/// asset, else its last price. What it holds of an asset beyond what it owes of it counts at the
+/// asset's [`liquidation_collateral_ratio`](SpotMarginConfig::liquidation_collateral_ratio), one
+/// by default (see [`SpotMarginConfig`]'s `# Collateral ratios`). There is no index price, so a
+/// market's own mid stands in for the one a venue liquidates on. An asset the venue cannot value counts for nothing, which can bring
 /// a liquidation forward but never put one off. While it cannot value a debt it does not check,
 /// and warns once.
 ///
@@ -1097,6 +1257,125 @@ mod tests {
                 .unwrap()
                 .contains("max_borrow")
         );
+    }
+
+    #[test]
+    fn collateral_ratios_are_per_asset_and_one_where_none_is_set() {
+        let config = usdt_margin()
+            .with_borrow_collateral_ratio(btc(), dec!(0.95))
+            .unwrap()
+            .with_liquidation_collateral_ratio(btc(), dec!(0.97))
+            .unwrap();
+
+        assert_eq!(config.borrow_collateral_ratio(&btc()), dec!(0.95));
+        assert_eq!(config.liquidation_collateral_ratio(&btc()), dec!(0.97));
+        let usdt = AssetNameExchange::new("usdt");
+        assert_eq!(config.borrow_collateral_ratio(&usdt), Decimal::ONE);
+        assert_eq!(config.liquidation_collateral_ratio(&usdt), Decimal::ONE);
+    }
+
+    #[test]
+    fn a_ratio_of_one_is_no_ratio_and_zero_is_kept() {
+        let config = usdt_margin()
+            .with_borrow_collateral_ratio(btc(), dec!(0.5))
+            .unwrap()
+            .with_borrow_collateral_ratio(btc(), dec!(1.0))
+            .unwrap();
+        assert_eq!(
+            config,
+            usdt_margin(),
+            "a ratio of one counts the asset in full"
+        );
+
+        let zero = usdt_margin()
+            .with_borrow_collateral_ratio(btc(), Decimal::ZERO)
+            .unwrap()
+            .with_liquidation_collateral_ratio(btc(), Decimal::ZERO)
+            .unwrap();
+        assert_eq!(zero.borrow_collateral_ratio(&btc()), Decimal::ZERO);
+        assert_eq!(zero.liquidation_collateral_ratio(&btc()), Decimal::ZERO);
+    }
+
+    #[test]
+    fn a_ratio_outside_zero_to_one_is_refused_by_the_builders_and_by_deserialising() {
+        for ratio in [dec!(-0.01), dec!(1.01)] {
+            let refused = SpotMarginConfigError::CollateralRatioOutOfRange {
+                asset: btc(),
+                ratio,
+            };
+            assert_eq!(
+                usdt_margin().with_borrow_collateral_ratio(btc(), ratio),
+                Err(refused.clone())
+            );
+            assert_eq!(
+                usdt_margin().with_liquidation_collateral_ratio(btc(), ratio),
+                Err(refused)
+            );
+        }
+
+        for key in ["borrow_collateral_ratio", "liquidation_collateral_ratio"] {
+            let json = format!(
+                r#"{{"valuation_asset":"usdt","max_leverage":"3","margin_effect":"borrow","{key}":{{"btc":"1.5"}}}}"#
+            );
+            assert!(
+                serde_json::from_str::<SpotMarginConfig>(&json).is_err(),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_liquidation_ratio_below_the_borrow_ratio_is_refused_whichever_is_set_last() {
+        let below = SpotMarginConfigError::LiquidationRatioBelowBorrowRatio {
+            asset: btc(),
+            borrow: Decimal::ONE,
+            liquidation: dec!(0.9),
+        };
+        assert_eq!(
+            usdt_margin().with_liquidation_collateral_ratio(btc(), dec!(0.9)),
+            Err(below),
+            "the borrow ratio is one until set"
+        );
+
+        let config = usdt_margin()
+            .with_borrow_collateral_ratio(btc(), dec!(0.9))
+            .unwrap()
+            .with_liquidation_collateral_ratio(btc(), dec!(0.9))
+            .unwrap();
+        assert_eq!(
+            config.with_borrow_collateral_ratio(btc(), dec!(0.95)),
+            Err(SpotMarginConfigError::LiquidationRatioBelowBorrowRatio {
+                asset: btc(),
+                borrow: dec!(0.95),
+                liquidation: dec!(0.9),
+            })
+        );
+
+        let json = r#"{"valuation_asset":"usdt","max_leverage":"3","margin_effect":"borrow","liquidation_collateral_ratio":{"btc":"0.9"}}"#;
+        assert!(serde_json::from_str::<SpotMarginConfig>(json).is_err());
+    }
+
+    #[test]
+    fn collateral_ratios_round_trip_as_maps_of_decimal_strings_left_out_when_empty() {
+        let config = usdt_margin()
+            .with_borrow_collateral_ratio(btc(), dec!(0.95))
+            .unwrap()
+            .with_borrow_collateral_ratio(AssetNameExchange::new("eth"), dec!(0.8))
+            .unwrap()
+            .with_liquidation_collateral_ratio(btc(), dec!(0.99))
+            .unwrap();
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(
+            json,
+            r#"{"valuation_asset":"usdt","max_leverage":"3","margin_effect":"borrow","auto_repay_at_cancel":true,"borrow_collateral_ratio":{"btc":"0.95","eth":"0.8"},"liquidation_collateral_ratio":{"btc":"0.99"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SpotMarginConfig>(&json).unwrap(),
+            config
+        );
+        let plain = serde_json::to_string(&usdt_margin()).unwrap();
+        assert!(!plain.contains("collateral_ratio"), "{plain}");
     }
 
     #[test]
