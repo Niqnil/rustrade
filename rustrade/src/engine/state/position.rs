@@ -266,7 +266,8 @@ pub enum CarryUpdate {
     /// period the position entered within, so it may be the position's. But the period began
     /// before [`PositionManager::time_history_start`] or the session start, so an earlier position
     /// on the instrument may have taken the loan, or the charge may be in carry seeded with this
-    /// one.
+    /// one. A position a flip opened is in this case for its entry period, unless the flip fell
+    /// exactly at the period's start: the position the flip closed was open in it too.
     BeforeHistory,
     /// Several positions are open on the instrument ([`OmsMode::Hedging`]) and the venue does not
     /// say which one the flow belongs to.
@@ -3630,6 +3631,24 @@ mod tests {
                 tc.name
             );
         }
+    }
+
+    #[test]
+    fn a_position_manager_serialised_without_a_history_start_loads_with_none() {
+        let mut manager = PositionManager::<AssetIndex, InstrumentIndex>::new(OmsMode::Netting);
+        manager.record_position_end(DateTime::<Utc>::MIN_UTC);
+        let mut value = serde_json::to_value(&manager).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("time_history_start")
+            .expect("the field serialises under its name");
+
+        let loaded: PositionManager<AssetIndex, InstrumentIndex> =
+            serde_json::from_value(value).unwrap();
+
+        assert_eq!(loaded.time_history_start(), None);
+        assert_eq!(loaded, PositionManager::new(OmsMode::Netting));
     }
 
     #[test]

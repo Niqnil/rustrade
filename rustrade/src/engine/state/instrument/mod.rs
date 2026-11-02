@@ -1590,15 +1590,21 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ///   the instrument, not a slot, so which position a flow belongs to is unknown. WARN.
     /// - A flow stamped before the position's `time_enter`:
     ///   - When it is the charge on a new loan ([`InterestTiming::OnBorrow`]) with a
-    ///     [`period`](CashFlow::period), and the position entered before that period's end, the
+    ///     [`period`](CashFlow::period), and the position entered within that period, the
     ///     position may have taken the loan: a venue can stamp the charge at the start of the
     ///     period the loan was taken in, as Binance does. It is applied, as below, when no other
     ///     position can have been held on the instrument in the period: the period starts at or
     ///     after both the session start ([`TearSheetGenerator::time_engine_start`]) and the
     ///     instrument's [`PositionManager::time_history_start`](super::position::PositionManager::time_history_start),
     ///     its last close or seed. Otherwise it is
-    ///     [`BeforeHistory`](CarryUpdate::BeforeHistory), WARN: which position took the loan is
-    ///     unknown, or the charge may already be in carry seeded with this position.
+    ///     [`BeforeHistory`](CarryUpdate::BeforeHistory): which position took the loan is
+    ///     unknown, or the charge may already be in carry seeded with this position. Logged at
+    ///     WARN when the position entered in the session, and at DEBUG when it entered before,
+    ///     as a seed placed before the session start does, whose carry the charge belongs to.
+    ///
+    ///     A position a flip opened is not given such a charge, unless the flip fell exactly at
+    ///     the period's start: the fill that opened it closed the opposite position, which was
+    ///     open in the same period, and either side may have taken the loan.
     ///   - Any other is [`BeforeEntry`](CarryUpdate::BeforeEntry): it belongs to an earlier
     ///     position, or to carry seeded with this one (see
     ///     [`PositionSeed::with_carry`](super::position::PositionSeed::with_carry)). Logged at WARN
@@ -1670,11 +1676,24 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
 
         if flow.time_exchange < position.time_enter {
             match on_borrow_period(flow) {
-                Some(period) if position.time_enter < period.end() => {
+                Some(period) if period.contains(position.time_enter) => {
                     let session_start = self.tear_sheet.time_engine_start;
                     let known_from =
                         history_start.map_or(session_start, |time| time.max(session_start));
                     if period.start() < known_from {
+                        if position.time_enter < session_start {
+                            debug!(
+                                instrument = ?self.key,
+                                amount = %flow.amount,
+                                asset = ?flow.asset,
+                                time_exchange = %flow.time_exchange,
+                                period_start = %period.start(),
+                                time_enter = %position.time_enter,
+                                "charge on a new loan, in the period a position from before the \
+                                 session entered in — not applied to carry",
+                            );
+                            return CarryUpdate::BeforeHistory;
+                        }
                         warn!(
                             instrument = ?self.key,
                             amount = %flow.amount,
@@ -4639,6 +4658,10 @@ mod tests {
                 "a period that ends at the entry",
                 interest(quote, InterestTiming::OnBorrow, after(0), hour_from(0)),
             ),
+            (
+                "a period that starts after the entry",
+                interest(quote, InterestTiming::OnBorrow, after(0), hour_from(3601)),
+            ),
         ] {
             let (update, warnings) = count_warnings(|| state.update_from_cash_flow(&flow));
             assert_eq!(update, CarryUpdate::BeforeEntry, "{case}");
@@ -4720,6 +4743,105 @@ mod tests {
             "it may be in the seeded carry"
         );
         assert_eq!(warnings, 1);
+        assert_eq!(netting_carry(&state), Decimal::ZERO);
+    }
+
+    #[test]
+    fn a_charge_on_borrow_in_the_hour_of_a_flip_is_left_out_with_a_warning() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        assert!(fill_after(&mut state, "long", Side::Buy, dec!(1), 60).is_none());
+        // One fill closes the long and opens a short of 1.
+        assert!(fill_after(&mut state, "flip", Side::Sell, dec!(2), 1800).is_some());
+        assert_eq!(state.position.time_history_start(), Some(after(1800)));
+
+        let (update, warnings) = count_warnings(|| {
+            state.update_from_cash_flow(&interest(
+                quote,
+                InterestTiming::OnBorrow,
+                after(0),
+                hour_from(0),
+            ))
+        });
+        assert_eq!(
+            update,
+            CarryUpdate::BeforeHistory,
+            "either side may have borrowed"
+        );
+        assert_eq!(warnings, 1);
+    }
+
+    #[test]
+    fn a_hedging_survivor_is_not_given_a_charge_on_borrow_from_a_period_a_sibling_closed_in() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let quote = state.instrument.underlying.quote;
+        assert!(fill_after(&mut state, "a", Side::Sell, dec!(1), 1800).is_none());
+        assert!(fill_after(&mut state, "b", Side::Sell, dec!(1), 1900).is_none());
+        let flow = interest(quote, InterestTiming::OnBorrow, after(0), hour_from(0));
+
+        let (update, warnings) = count_warnings(|| state.update_from_cash_flow(&flow));
+        assert_eq!(
+            update,
+            CarryUpdate::SeveralOpen,
+            "two open: the period rule is not reached"
+        );
+        assert_eq!(warnings, 1);
+
+        // `b` closes; `a` is the only one left, but `b` was open in the period too.
+        let mut close_b = fill(OrderId::new("b"), Side::Buy, dec!(1));
+        close_b.time_exchange = after(2000);
+        assert!(state.update_from_trade(&close_b).exited.is_some());
+        assert_eq!(state.position.positions.len(), 1);
+
+        let (update, warnings) = count_warnings(|| state.update_from_cash_flow(&flow));
+        assert_eq!(update, CarryUpdate::BeforeHistory);
+        assert_eq!(warnings, 1);
+    }
+
+    #[test]
+    fn a_charge_on_borrow_whose_period_starts_at_the_session_start_is_applied() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        state.tear_sheet.time_engine_start = after(100);
+        assert!(fill_after(&mut state, "open", Side::Sell, dec!(1), 1800).is_none());
+
+        let update = state.update_from_cash_flow(&interest(
+            quote,
+            InterestTiming::OnBorrow,
+            after(100),
+            hour_from(100),
+        ));
+
+        assert_eq!(update, CarryUpdate::Applied);
+        assert_eq!(netting_carry(&state), dec!(-0.25));
+    }
+
+    #[test]
+    fn a_charge_on_borrow_in_the_period_a_seed_from_before_the_session_entered_in_is_quiet() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        crate::engine::state::position::PositionSeed::new(
+            "btc_usdt",
+            Side::Sell,
+            dec!(1),
+            dec!(100),
+            after(1800),
+        )
+        .seed_into(&mut state.position, InstrumentIndex(0), quote, Decimal::ONE)
+        .unwrap();
+        state.tear_sheet.time_engine_start = after(1900);
+
+        let (update, warnings) = count_warnings(|| {
+            state.update_from_cash_flow(&interest(
+                quote,
+                InterestTiming::OnBorrow,
+                after(0),
+                hour_from(0),
+            ))
+        });
+
+        assert_eq!(update, CarryUpdate::BeforeHistory);
+        assert_eq!(warnings, 0, "the charge belongs to the seeded carry");
         assert_eq!(netting_carry(&state), Decimal::ZERO);
     }
 

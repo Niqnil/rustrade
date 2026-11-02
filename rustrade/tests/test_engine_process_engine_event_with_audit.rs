@@ -2067,7 +2067,9 @@ fn test_contract_expiry_replica_parity_price_bail_then_settle_then_duplicate() {
         .instruments
         .instrument_index(&option);
     assert!(live.position.positions.is_empty());
-    assert_eq!(mirrored.position.positions, live.position.positions);
+    // The whole manager, so the replica also records where the instrument's history restarts.
+    assert_eq!(mirrored.position, live.position);
+    assert!(live.position.time_history_start().is_some());
     assert!(live.expiration_processed && mirrored.expiration_processed);
     // The settlement's exit reaches the tear sheet on both sides.
     assert_ne!(live.tear_sheet, pre_settle_tear_sheet);

@@ -46,7 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     on the instrument in that period. That holds when the period starts at or after the session
     start and the instrument's last close or seed (the new
     `PositionManager::time_history_start`). Otherwise the flow is left out and returns the new
-    `CarryUpdate::BeforeHistory`, logged at WARN.
+    `CarryUpdate::BeforeHistory`, logged at WARN, or at DEBUG for a position from before the
+    session. A position a flip opened is left out this way too, since the position the flip
+    closed was open in the same period.
   - Any other flow left out for predating its position (`CarryUpdate::BeforeEntry`) now logs at
     WARN when it is no older than the session start. It logged at DEBUG only.
 

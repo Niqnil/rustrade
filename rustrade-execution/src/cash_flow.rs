@@ -62,13 +62,14 @@ pub struct CashFlow<AssetKey, InstrumentKey> {
     pub time_exchange: DateTime<Utc>,
     /// The venue's identifier for the flow, when it gives one. See [`CashFlowId`].
     pub id: Option<CashFlowId>,
-    /// The period the flow is for, when its producer knows it: the charging period a margin
-    /// interest charge was made in, or the span a fee covers. `None` when the producer does not
-    /// say. Set with [`with_period`](Self::with_period).
+    /// The period the flow is for, when its producer knows it, such as the charging period a
+    /// margin interest charge was made in. `None` when the producer does not say. Set with
+    /// [`with_period`](Self::with_period).
     ///
-    /// [`time_exchange`](Self::time_exchange) stays the venue's own stamp. The `rustrade` engine
-    /// reads the period of an [`InterestTiming::OnBorrow`] charge only: a venue that stamps the
-    /// charge on a new loan at the start of its period stamps it before the position the loan
+    /// [`time_exchange`](Self::time_exchange) stays the venue's own stamp, which a producer
+    /// setting a period puts in the period or at its start. Nothing checks that. The `rustrade`
+    /// engine reads the period of an [`InterestTiming::OnBorrow`] charge only: a venue that stamps
+    /// the charge on a new loan at the start of its period stamps it before the position the loan
     /// funds opened, and the period tells the engine the position may still own it. See
     /// `InstrumentState::update_from_cash_flow` in `rustrade`.
     ///

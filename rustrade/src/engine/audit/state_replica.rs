@@ -290,10 +290,11 @@ where
                             // cross-instrument settlement logic), we would call
                             // shift_remove on the wrong instrument's position map.
                             if exit.instrument == key {
-                                instrument_state
+                                // `remove_ended` also moves the history start, as the live
+                                // settlement fill does.
+                                let _ = instrument_state
                                     .position
-                                    .positions
-                                    .shift_remove(&exit.position_id);
+                                    .remove_ended(&exit.position_id, exit.time_exit);
                                 // Fold the live exit into the tear sheet, as the live handler does.
                                 instrument_state.tear_sheet.update_from_position(exit);
                             }
