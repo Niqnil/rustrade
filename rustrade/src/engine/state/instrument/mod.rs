@@ -21,7 +21,7 @@ use rust_decimal::Decimal;
 use rustrade_data::event::MarketEvent;
 use rustrade_execution::{
     FeeModel, FeeModelConfig, InstrumentAccountSnapshot, Liquidity,
-    cash_flow::CashFlow,
+    cash_flow::{CashFlow, CashFlowKind, CashFlowPeriod, InterestTiming},
     order::{
         Order, OrderKey,
         id::{ClientOrderId, OrderId, PositionId, VenueOrderId},
@@ -1588,9 +1588,28 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ///   default; a run over historical flows should set it, or its flows all log at DEBUG.
     /// - [`SeveralOpen`](CarryUpdate::SeveralOpen) under [`OmsMode::Hedging`]: the venue charges
     ///   the instrument, not a slot, so which position a flow belongs to is unknown. WARN.
-    /// - [`BeforeEntry`](CarryUpdate::BeforeEntry): the flow predates the position's
-    ///   `time_enter`, so it belongs to an earlier position, or to carry seeded with this one
-    ///   (see [`PositionSeed::with_carry`](super::position::PositionSeed::with_carry)). DEBUG.
+    /// - A flow stamped before the position's `time_enter`:
+    ///   - When it is the charge on a new loan ([`InterestTiming::OnBorrow`]) with a
+    ///     [`period`](CashFlow::period), and the position entered within that period, the
+    ///     position may have taken the loan: a venue can stamp the charge at the start of the
+    ///     period the loan was taken in, as Binance does. It is applied, as below, when no other
+    ///     position can have been held on the instrument in the period: the period starts at or
+    ///     after both the session start ([`TearSheetGenerator::time_engine_start`]) and the
+    ///     instrument's [`PositionManager::time_history_start`](super::position::PositionManager::time_history_start),
+    ///     its last close or seed. Otherwise it is
+    ///     [`BeforeHistory`](CarryUpdate::BeforeHistory): which position took the loan is
+    ///     unknown, or the charge may already be in carry seeded with this position. Logged at
+    ///     WARN when the position entered in the session, and at DEBUG when it entered before,
+    ///     as a seed placed before the session start does, whose carry the charge belongs to.
+    ///
+    ///     A position a flip opened is not given such a charge, unless the flip fell exactly at
+    ///     the period's start: the fill that opened it closed the opposite position, which was
+    ///     open in the same period, and either side may have taken the loan.
+    ///   - Any other is [`BeforeEntry`](CarryUpdate::BeforeEntry): it belongs to an earlier
+    ///     position, or to carry seeded with this one (see
+    ///     [`PositionSeed::with_carry`](super::position::PositionSeed::with_carry)). Logged at WARN
+    ///     when the flow is no older than the session start, and at DEBUG when it is older, as for
+    ///     [`NoOpenPosition`](CarryUpdate::NoOpenPosition).
     /// - Otherwise the flow is added to the carry for its asset: the quote asset's
     ///   [`Position::carry`](super::position::Position::carry), the base asset's
     ///   [`AssetCarry::base`](super::position::AssetCarry::base), or any other asset's entry in
@@ -1618,6 +1637,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         AssetKey: Debug + PartialEq + Clone,
         InstrumentKey: Debug,
     {
+        let history_start = self.position.time_history_start();
         let mut open = self.position.positions.values_mut();
         let (Some(position), None) = (open.next(), open.next()) else {
             let open = self.position.positions.len();
@@ -1655,15 +1675,66 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         };
 
         if flow.time_exchange < position.time_enter {
-            debug!(
-                instrument = ?self.key,
-                kind = ?flow.kind,
-                amount = %flow.amount,
-                time_exchange = %flow.time_exchange,
-                time_enter = %position.time_enter,
-                "cash flow predates the open position — not applied to carry",
-            );
-            return CarryUpdate::BeforeEntry;
+            match on_borrow_period(flow) {
+                Some(period) if period.contains(position.time_enter) => {
+                    let session_start = self.tear_sheet.time_engine_start;
+                    let known_from =
+                        history_start.map_or(session_start, |time| time.max(session_start));
+                    if period.start() < known_from {
+                        if position.time_enter < session_start {
+                            debug!(
+                                instrument = ?self.key,
+                                amount = %flow.amount,
+                                asset = ?flow.asset,
+                                time_exchange = %flow.time_exchange,
+                                period_start = %period.start(),
+                                time_enter = %position.time_enter,
+                                "charge on a new loan, in the period a position from before the \
+                                 session entered in — not applied to carry",
+                            );
+                            return CarryUpdate::BeforeHistory;
+                        }
+                        warn!(
+                            instrument = ?self.key,
+                            amount = %flow.amount,
+                            asset = ?flow.asset,
+                            time_exchange = %flow.time_exchange,
+                            period_start = %period.start(),
+                            period_end = %period.end(),
+                            time_enter = %position.time_enter,
+                            %known_from,
+                            "charge on a new loan, in a period the open position entered in, \
+                             began before the engine knows every position on the instrument — \
+                             an earlier position may have taken the loan, so it is not applied \
+                             to carry",
+                        );
+                        return CarryUpdate::BeforeHistory;
+                    }
+                }
+                _ => {
+                    if flow.time_exchange >= self.tear_sheet.time_engine_start {
+                        warn!(
+                            instrument = ?self.key,
+                            kind = ?flow.kind,
+                            amount = %flow.amount,
+                            time_exchange = %flow.time_exchange,
+                            time_enter = %position.time_enter,
+                            "cash flow predates the open position — not applied to carry",
+                        );
+                    } else {
+                        debug!(
+                            instrument = ?self.key,
+                            kind = ?flow.kind,
+                            amount = %flow.amount,
+                            time_exchange = %flow.time_exchange,
+                            time_enter = %position.time_enter,
+                            "cash flow from before the session predates the open position — not \
+                             applied to carry",
+                        );
+                    }
+                    return CarryUpdate::BeforeEntry;
+                }
+            }
         }
 
         let slot = if flow.asset == self.instrument.underlying.quote {
@@ -2764,6 +2835,19 @@ where
     capped.fees.fees *= share;
     capped.fees.fees_quote = capped.fees.fees_quote.map(|fees| fees * share);
     capped
+}
+
+/// The period of `flow` when it is the charge on a new loan and its producer gave one.
+fn on_borrow_period<AssetKey, InstrumentKey>(
+    flow: &CashFlow<AssetKey, InstrumentKey>,
+) -> Option<CashFlowPeriod> {
+    match flow.kind {
+        CashFlowKind::MarginInterest {
+            timing: Some(InterestTiming::OnBorrow),
+            ..
+        } => flow.period,
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -4460,7 +4544,7 @@ mod tests {
     }
 
     #[test]
-    fn a_flow_from_before_the_positions_entry_is_left_out_quietly() {
+    fn a_flow_from_before_the_positions_entry_is_left_out_with_a_warning_only_in_the_session() {
         let mut state = instrument_state(OmsMode::Netting);
         let quote = state.instrument.underlying.quote;
         let _ = state.update_from_trade(&fill(OrderId::new("open"), Side::Sell, dec!(1)));
@@ -4470,15 +4554,320 @@ mod tests {
             .get_mut(&PositionId::NETTING)
             .unwrap();
         position.time_enter = after(10);
+        state.tear_sheet.time_engine_start = after(5);
 
         let (update, warnings) =
             count_warnings(|| state.update_from_cash_flow(&funding(quote, dec!(-2), after(5))));
         assert_eq!(update, CarryUpdate::BeforeEntry);
-        assert_eq!(warnings, 0);
+        assert_eq!(warnings, 1, "a flow from the session is a WARN");
+
+        let (update, warnings) =
+            count_warnings(|| state.update_from_cash_flow(&funding(quote, dec!(-2), after(4))));
+        assert_eq!(update, CarryUpdate::BeforeEntry);
+        assert_eq!(warnings, 0, "a flow from before the session is a DEBUG");
         assert_eq!(
             state.position.positions[&PositionId::NETTING].carry,
             Decimal::ZERO
         );
+    }
+
+    /// The hour from `start` seconds after [`TIME`].
+    fn hour_from(start: i64) -> Option<CashFlowPeriod> {
+        CashFlowPeriod::new(after(start), after(start + 3600))
+    }
+
+    /// A margin interest charge for the harness instrument, in `asset`, with `timing`, stamped
+    /// at `time` and for `period`.
+    fn interest(
+        asset: AssetIndex,
+        timing: InterestTiming,
+        time: DateTime<Utc>,
+        period: Option<CashFlowPeriod>,
+    ) -> CashFlow<AssetIndex, InstrumentIndex> {
+        CashFlow::new(
+            CashFlowKind::MarginInterest {
+                rate: None,
+                principal: None,
+                timing: Some(timing),
+            },
+            asset,
+            dec!(-0.25),
+            Some(InstrumentIndex(0)),
+            time,
+            None,
+        )
+        .with_period(period)
+    }
+
+    /// Fill `side` for `quantity` on order `order_id`, `seconds` after [`TIME`].
+    fn fill_after(
+        state: &mut InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex>,
+        order_id: &str,
+        side: Side,
+        quantity: Decimal,
+        seconds: i64,
+    ) -> Option<PositionExited<AssetIndex, InstrumentIndex>> {
+        let mut trade = fill(OrderId::new(order_id), side, quantity);
+        trade.time_exchange = after(seconds);
+        state.update_from_trade(&trade).exited
+    }
+
+    fn netting_carry(
+        state: &InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex>,
+    ) -> Decimal {
+        state.position.positions[&PositionId::NETTING].carry
+    }
+
+    #[test]
+    fn a_charge_on_borrow_stamped_at_its_periods_start_reaches_a_position_opened_in_that_period() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        assert!(fill_after(&mut state, "open", Side::Sell, dec!(1), 1800).is_none());
+
+        let (update, warnings) = count_warnings(|| {
+            state.update_from_cash_flow(&interest(
+                quote,
+                InterestTiming::OnBorrow,
+                after(0),
+                hour_from(0),
+            ))
+        });
+
+        assert_eq!(update, CarryUpdate::Applied);
+        assert_eq!(warnings, 0);
+        assert_eq!(netting_carry(&state), dec!(-0.25));
+    }
+
+    #[test]
+    fn a_charge_before_entry_without_a_period_or_not_on_borrow_or_for_an_earlier_period_is_left_out()
+     {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        assert!(fill_after(&mut state, "open", Side::Sell, dec!(1), 3600).is_none());
+
+        for (case, flow) in [
+            (
+                "no period",
+                interest(quote, InterestTiming::OnBorrow, after(0), None),
+            ),
+            (
+                "periodic",
+                interest(quote, InterestTiming::Periodic, after(0), hour_from(0)),
+            ),
+            (
+                "a period that ends at the entry",
+                interest(quote, InterestTiming::OnBorrow, after(0), hour_from(0)),
+            ),
+            (
+                "a period that starts after the entry",
+                interest(quote, InterestTiming::OnBorrow, after(0), hour_from(3601)),
+            ),
+        ] {
+            let (update, warnings) = count_warnings(|| state.update_from_cash_flow(&flow));
+            assert_eq!(update, CarryUpdate::BeforeEntry, "{case}");
+            assert_eq!(warnings, 1, "{case}");
+        }
+        assert_eq!(netting_carry(&state), Decimal::ZERO);
+    }
+
+    #[test]
+    fn a_charge_on_borrow_whose_period_an_earlier_position_was_open_in_is_left_out_with_a_warning()
+    {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        assert!(fill_after(&mut state, "open a", Side::Sell, dec!(1), 60).is_none());
+        assert!(fill_after(&mut state, "close a", Side::Buy, dec!(1), 600).is_some());
+        assert!(fill_after(&mut state, "open b", Side::Sell, dec!(1), 1800).is_none());
+        assert_eq!(state.position.time_history_start(), Some(after(600)));
+
+        let (update, warnings) = count_warnings(|| {
+            state.update_from_cash_flow(&interest(
+                quote,
+                InterestTiming::OnBorrow,
+                after(0),
+                hour_from(0),
+            ))
+        });
+
+        assert_eq!(update, CarryUpdate::BeforeHistory);
+        assert_eq!(warnings, 1);
+        assert_eq!(netting_carry(&state), Decimal::ZERO);
+    }
+
+    #[test]
+    fn a_charge_on_borrow_whose_period_starts_when_the_earlier_position_closed_is_applied() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        assert!(fill_after(&mut state, "open a", Side::Sell, dec!(1), 60).is_none());
+        assert!(fill_after(&mut state, "close a", Side::Buy, dec!(1), 3600).is_some());
+        assert!(fill_after(&mut state, "open b", Side::Sell, dec!(1), 4000).is_none());
+
+        let update = state.update_from_cash_flow(&interest(
+            quote,
+            InterestTiming::OnBorrow,
+            after(3600),
+            hour_from(3600),
+        ));
+
+        assert_eq!(update, CarryUpdate::Applied);
+        assert_eq!(netting_carry(&state), dec!(-0.25));
+    }
+
+    #[test]
+    fn a_charge_on_borrow_in_the_period_a_position_was_seeded_in_is_left_out_with_a_warning() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        crate::engine::state::position::PositionSeed::new(
+            "btc_usdt",
+            Side::Sell,
+            dec!(1),
+            dec!(100),
+            after(1800),
+        )
+        .seed_into(&mut state.position, InstrumentIndex(0), quote, Decimal::ONE)
+        .unwrap();
+        assert_eq!(state.position.time_history_start(), Some(after(1800)));
+
+        let (update, warnings) = count_warnings(|| {
+            state.update_from_cash_flow(&interest(
+                quote,
+                InterestTiming::OnBorrow,
+                after(0),
+                hour_from(0),
+            ))
+        });
+
+        assert_eq!(
+            update,
+            CarryUpdate::BeforeHistory,
+            "it may be in the seeded carry"
+        );
+        assert_eq!(warnings, 1);
+        assert_eq!(netting_carry(&state), Decimal::ZERO);
+    }
+
+    #[test]
+    fn a_charge_on_borrow_in_the_hour_of_a_flip_is_left_out_with_a_warning() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        assert!(fill_after(&mut state, "long", Side::Buy, dec!(1), 60).is_none());
+        // One fill closes the long and opens a short of 1.
+        assert!(fill_after(&mut state, "flip", Side::Sell, dec!(2), 1800).is_some());
+        assert_eq!(state.position.time_history_start(), Some(after(1800)));
+
+        let (update, warnings) = count_warnings(|| {
+            state.update_from_cash_flow(&interest(
+                quote,
+                InterestTiming::OnBorrow,
+                after(0),
+                hour_from(0),
+            ))
+        });
+        assert_eq!(
+            update,
+            CarryUpdate::BeforeHistory,
+            "either side may have borrowed"
+        );
+        assert_eq!(warnings, 1);
+    }
+
+    #[test]
+    fn a_hedging_survivor_is_not_given_a_charge_on_borrow_from_a_period_a_sibling_closed_in() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let quote = state.instrument.underlying.quote;
+        assert!(fill_after(&mut state, "a", Side::Sell, dec!(1), 1800).is_none());
+        assert!(fill_after(&mut state, "b", Side::Sell, dec!(1), 1900).is_none());
+        let flow = interest(quote, InterestTiming::OnBorrow, after(0), hour_from(0));
+
+        let (update, warnings) = count_warnings(|| state.update_from_cash_flow(&flow));
+        assert_eq!(
+            update,
+            CarryUpdate::SeveralOpen,
+            "two open: the period rule is not reached"
+        );
+        assert_eq!(warnings, 1);
+
+        // `b` closes; `a` is the only one left, but `b` was open in the period too.
+        let mut close_b = fill(OrderId::new("b"), Side::Buy, dec!(1));
+        close_b.time_exchange = after(2000);
+        assert!(state.update_from_trade(&close_b).exited.is_some());
+        assert_eq!(state.position.positions.len(), 1);
+
+        let (update, warnings) = count_warnings(|| state.update_from_cash_flow(&flow));
+        assert_eq!(update, CarryUpdate::BeforeHistory);
+        assert_eq!(warnings, 1);
+    }
+
+    #[test]
+    fn a_charge_on_borrow_whose_period_starts_at_the_session_start_is_applied() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        state.tear_sheet.time_engine_start = after(100);
+        assert!(fill_after(&mut state, "open", Side::Sell, dec!(1), 1800).is_none());
+
+        let update = state.update_from_cash_flow(&interest(
+            quote,
+            InterestTiming::OnBorrow,
+            after(100),
+            hour_from(100),
+        ));
+
+        assert_eq!(update, CarryUpdate::Applied);
+        assert_eq!(netting_carry(&state), dec!(-0.25));
+    }
+
+    #[test]
+    fn a_charge_on_borrow_in_the_period_a_seed_from_before_the_session_entered_in_is_quiet() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        crate::engine::state::position::PositionSeed::new(
+            "btc_usdt",
+            Side::Sell,
+            dec!(1),
+            dec!(100),
+            after(1800),
+        )
+        .seed_into(&mut state.position, InstrumentIndex(0), quote, Decimal::ONE)
+        .unwrap();
+        state.tear_sheet.time_engine_start = after(1900);
+
+        let (update, warnings) = count_warnings(|| {
+            state.update_from_cash_flow(&interest(
+                quote,
+                InterestTiming::OnBorrow,
+                after(0),
+                hour_from(0),
+            ))
+        });
+
+        assert_eq!(update, CarryUpdate::BeforeHistory);
+        assert_eq!(warnings, 0, "the charge belongs to the seeded carry");
+        assert_eq!(netting_carry(&state), Decimal::ZERO);
+    }
+
+    #[test]
+    fn a_charge_on_borrow_whose_period_began_before_the_session_is_left_out_with_a_warning() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        // The last close is before the period, so only the session start rules the flow out. The
+        // position enters at the session start, which is in the session, so the drop warns.
+        assert!(fill_after(&mut state, "open a", Side::Sell, dec!(1), 10).is_none());
+        assert!(fill_after(&mut state, "close a", Side::Buy, dec!(1), 50).is_some());
+        state.tear_sheet.time_engine_start = after(1800);
+        assert!(fill_after(&mut state, "open b", Side::Sell, dec!(1), 1800).is_none());
+
+        let (update, warnings) = count_warnings(|| {
+            state.update_from_cash_flow(&interest(
+                quote,
+                InterestTiming::OnBorrow,
+                after(100),
+                hour_from(100),
+            ))
+        });
+
+        assert_eq!(update, CarryUpdate::BeforeHistory);
+        assert_eq!(warnings, 1);
+        assert_eq!(netting_carry(&state), Decimal::ZERO);
     }
 
     #[test]

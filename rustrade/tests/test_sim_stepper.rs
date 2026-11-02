@@ -1306,6 +1306,97 @@ fn a_strategy_routing_interest_to_its_base_puts_the_venues_interest_on_the_short
     assert_eq!(carry_base(&s.engine, BTC), Some(dec!(-0.0001)));
 }
 
+/// 87.6% a year on BTC loans, exactly 0.01% an hour.
+fn btc_loans_hourly() -> Arc<PeriodicMarginInterest> {
+    Arc::new(
+        PeriodicMarginInterest::new(TimeDelta::hours(1), DayCount::Act365).with_rates(
+            AssetNameExchange::new("btc"),
+            RateSeries::constant(dec!(0.876)),
+        ),
+    )
+}
+
+#[test]
+fn a_strategy_routing_interest_to_its_base_puts_a_new_shorts_borrow_charge_on_its_carry() {
+    let mut s = session_modelling(
+        lending(dec!(4)),
+        SimVenueOptions::default().with_margin_interest(btc_loans_hourly()),
+        usdt(dec!(40000)),
+        None,
+        RoutesToBase,
+    );
+    s.stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(30000))])
+        .unwrap();
+
+    // Sells 1 BTC the account does not hold, so the venue lends it and charges an hour at once.
+    s.engine.action(&order(BTC, Side::Sell, dec!(1), "short"));
+    let settled = s.stepper.settle(&mut s.engine).unwrap();
+
+    assert_eq!(
+        position(&s.engine, BTC).map(|(side, quantity, _)| (side, quantity)),
+        Some((Side::Sell, dec!(1)))
+    );
+    assert_eq!(
+        interest_charged(events(&settled)),
+        vec![(dec!(-0.0001), at(3))]
+    );
+    assert_eq!(
+        carry_base(&s.engine, BTC),
+        Some(dec!(-0.0001)),
+        "the charge arrives after the fill that opened the short, so the strategy finds it"
+    );
+}
+
+#[test]
+fn under_next_bar_a_routed_borrow_charge_reaches_the_short_its_held_order_opens() {
+    let config = MockExecutionConfig {
+        market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),
+        ..lending(dec!(4))
+    };
+    let mut s = session_modelling(
+        config,
+        SimVenueOptions::default().with_margin_interest(btc_loans_hourly()),
+        usdt(dec!(40000)),
+        None,
+        RoutesToBase,
+    );
+    s.stepper
+        .step(&mut s.engine, at(3), [bar(BTC, 3, dec!(30000))])
+        .unwrap();
+
+    // Held for the next bar: lent and charged now, with no position for the charge yet.
+    s.engine.action(&order_working(
+        BTC,
+        Side::Sell,
+        dec!(1),
+        "short",
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    ));
+    let held = s.stepper.settle(&mut s.engine).unwrap();
+    assert_eq!(position(&s.engine, BTC), None);
+    assert_eq!(
+        interest_charged(events(&held)),
+        vec![],
+        "reported once a position exists for it"
+    );
+
+    let released = s
+        .stepper
+        .step(&mut s.engine, at(4), [bar(BTC, 4, dec!(30000))])
+        .unwrap();
+    assert_eq!(
+        position(&s.engine, BTC).map(|(side, quantity, _)| (side, quantity)),
+        Some((Side::Sell, dec!(1)))
+    );
+    assert_eq!(
+        interest_charged(events(&released)),
+        vec![(dec!(-0.0001), at(4))],
+        "the hold's charge, after the fill and stamped at it"
+    );
+    assert_eq!(carry_base(&s.engine, BTC), Some(dec!(-0.0001)));
+}
+
 #[test]
 fn a_start_at_the_venues_lending_limit_is_lent_nothing_more() {
     let loan_after_selling_more = |max_leverage| {

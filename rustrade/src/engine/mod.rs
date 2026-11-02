@@ -1220,7 +1220,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             // pnl_realised (which would later leak into a fresh post-split buy via VWAP-from-zero).
             if quantity_abs_after.is_zero() {
                 let instrument_state = self.state.instruments.instrument_index_mut(key);
-                if let Some(closed) = instrument_state.position.positions.shift_remove(&pos_id) {
+                if let Some(closed) = instrument_state.position.remove_ended(&pos_id, engine_time) {
                     // No trade closed it, so there is no exit price to value its base-asset carry at.
                     let mut exit = closed.into_exited(None);
                     exit.position_id = pos_id.clone();

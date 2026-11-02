@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-02
+
+### Fixed
+
+- **Breaking: the simulated venue reports a new loan's interest after the fill it pays for**
+  (`rustrade-execution`, #821). A margin order that borrows is charged interest at once
+  (`InterestTiming::OnBorrow`). The venue reported that `CashFlow` before the trade that opened the
+  position. So a `CashFlowAttributionStrategy` found no position to attribute it to, and
+  `route_to_base` returned `None` for the first charge of every short. The order is now
+  `[balance.., trade, cash flow]`. The balances still come before the fill, and they already
+  include the interest.
+
+  An order that borrows when it rests on the book, or when it is held for a later bar
+  (`MarketOrderTiming::NextBar`) or a fresh market (`StaleMarketPolicy::Wait`), has not traded
+  yet. Its cash flow now waits:
+  - It is reported after the order's first fill, or with the order's end if it never fills (a
+    cancel, an expiry, or a release it cannot afford).
+  - It is stamped at that instant, not when the charge was made, because the engine applies no
+    flow stamped before the position it belongs to.
+
+  The order's balance still shows the charge from the moment it rests. An order still open when
+  a run stops has not reported it: cancel open orders at the end of a run to report it.
+
+  Breaking: `exchange::mock::orders::Reservation` gains a public `unreported_interest` field,
+  which holds that cash flow. Code that builds a `Reservation` must set it (`Vec::new()` for none).
+
+- **A live venue's charge on a new loan, stamped at the start of its hour, now reaches the
+  position the loan funds** (`rustrade`, `rustrade-execution`, #822). The engine applies no flow
+  stamped before its position's `time_enter`. Binance stamps margin interest at the start of the
+  hour it is for, so a short opened at 10:23 had its `ON_BORROW` charge stamped 10:00. Even when
+  attributed, the charge never reached the short's carry.
+  - `CashFlow` gains `period: Option<CashFlowPeriod>`, the period a flow is for, set with
+    `CashFlow::with_period`. `time_exchange` keeps the venue's own stamp. `CashFlow::new` is
+    unchanged and gives no period.
+  - `BinanceMargin::fetch_margin_interest` gives each hourly charge (`PERIODIC`, `ON_BORROW` and
+    their `_CONVERTED` forms) the hour from its stamp as its period.
+  - The engine applies an `InterestTiming::OnBorrow` flow stamped before the open position's entry
+    when the position entered within the flow's period, and no other position can have been held
+    on the instrument in that period. That holds when the period starts at or after the session
+    start and the instrument's last close or seed (the new
+    `PositionManager::time_history_start`). Otherwise the flow is left out and returns the new
+    `CarryUpdate::BeforeHistory`, logged at WARN, or at DEBUG for a position from before the
+    session. A position a flip opened is left out this way too, since the position the flip
+    closed was open in the same period.
+  - Any other flow left out for predating its position (`CarryUpdate::BeforeEntry`) now logs at
+    WARN when it is no older than the session start. It logged at DEBUG only.
+
+  Breaking: `PositionManager` gains a private field, so it can no longer be built as a struct
+  literal; use `PositionManager::new`.
+
 ## [0.18.0] - 2026-11-01
 
 ### Changed

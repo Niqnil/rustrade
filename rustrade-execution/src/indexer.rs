@@ -371,6 +371,7 @@ impl AccountEventIndexer {
             instrument,
             time_exchange,
             id,
+            period,
         } = flow;
 
         Ok(CashFlow {
@@ -382,6 +383,7 @@ impl AccountEventIndexer {
                 .transpose()?,
             time_exchange,
             id,
+            period,
         })
     }
 
@@ -1116,6 +1118,7 @@ mod tests {
                 instrument: None,
                 time_exchange: DateTime::<Utc>::MIN_UTC,
                 id: None,
+                period: None,
             }),
         );
         assert!(matches!(
@@ -1621,15 +1624,16 @@ mod tests {
         assert_eq!(cancel.state, Err(indexed));
     }
 
-    /// A cash flow indexes its asset and, when it names one, its instrument, and fails when
-    /// either is not in the map.
+    /// A cash flow indexes its asset and, when it names one, its instrument, keeps its period,
+    /// and fails when either key is not in the map.
     #[test]
     fn account_event_indexes_a_cash_flow() {
-        use crate::cash_flow::{CashFlowId, CashFlowKind};
+        use crate::cash_flow::{CashFlowId, CashFlowKind, CashFlowPeriod};
         use rust_decimal_macros::dec;
 
         let indexer = binance_indexer();
         let time = DateTime::<Utc>::MIN_UTC;
+        let period = CashFlowPeriod::new(time, time + chrono::Duration::hours(1));
         let kind = CashFlowKind::Funding {
             rate: Some(dec!(0.0001)),
             position_quantity: Some(dec!(-2)),
@@ -1637,14 +1641,17 @@ mod tests {
         let flow = |asset: &str, instrument: Option<&str>| {
             UnindexedAccountEvent::new(
                 ExchangeId::BinanceSpot,
-                AccountEventKind::CashFlow(CashFlow::new(
-                    kind.clone(),
-                    AssetNameExchange::new(asset),
-                    dec!(1.5),
-                    instrument.map(InstrumentNameExchange::new),
-                    time,
-                    Some(CashFlowId::new("cf-1")),
-                )),
+                AccountEventKind::CashFlow(
+                    CashFlow::new(
+                        kind.clone(),
+                        AssetNameExchange::new(asset),
+                        dec!(1.5),
+                        instrument.map(InstrumentNameExchange::new),
+                        time,
+                        Some(CashFlowId::new("cf-1")),
+                    )
+                    .with_period(period),
+                ),
             )
         };
         let index_of = |event| match indexer.account_event(event) {
@@ -1675,7 +1682,8 @@ mod tests {
                 Some(btc_usdt),
                 time,
                 Some(CashFlowId::new("cf-1")),
-            ))
+            )
+            .with_period(period))
         );
         assert_eq!(
             index_of(flow("USDT", None)).map(|flow| flow.instrument),
