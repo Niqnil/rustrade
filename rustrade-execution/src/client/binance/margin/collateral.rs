@@ -48,9 +48,10 @@ impl BinanceMargin {
     /// The collateral ratio tiers of every asset on Binance cross margin:
     /// `GET /sapi/v1/margin/crossMarginCollateralRatio`.
     ///
-    /// Each asset maps to its tiers in ascending [`min_usd_value`](CollateralRatioTier::min_usd_value).
-    /// Binance groups assets that share a tier list; each asset of a group gets the group's tiers.
-    /// An asset Binance does not list is absent.
+    /// Each asset maps to its tiers in ascending
+    /// [`min_usd_value`](CollateralRatioTier::min_usd_value). Binance groups assets that share a
+    /// tier list; each asset of a group gets the group's tiers. An asset Binance does not list is
+    /// absent.
     ///
     /// The ratios are Binance's for cross margin, read whichever margin this client is
     /// configured for. They are market data, not this account's: the request carries the API key
@@ -70,6 +71,17 @@ impl BinanceMargin {
     ///
     /// Read the answer as observed, not guaranteed. Binance's API documents no endpoint for the
     /// borrow ratios, which govern how much the account may borrow.
+    ///
+    /// To model these ratios on the simulated venue, a single-tier ratio as observed above maps to
+    /// [`SpotMarginConfig::with_liquidation_collateral_ratio`]. Take the borrow ratios
+    /// ([`SpotMarginConfig::with_borrow_collateral_ratio`]) from Binance's Margin Data page, not
+    /// from this answer: they can be far lower, and using this answer for them would let a backtest
+    /// borrow more than Binance lends.
+    ///
+    /// [`SpotMarginConfig::with_liquidation_collateral_ratio`]:
+    ///     crate::margin::SpotMarginConfig::with_liquidation_collateral_ratio
+    /// [`SpotMarginConfig::with_borrow_collateral_ratio`]:
+    ///     crate::margin::SpotMarginConfig::with_borrow_collateral_ratio
     ///
     /// # Cost
     ///
