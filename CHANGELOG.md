@@ -40,8 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The query carries no market, so only the markets the venue holds value the account. When they
     cannot value the asset, or any balance the account holds or owes, `borrowable_now` is `None`
     (unknown). The exception is a cap with no room left, or less than the minimum borrow: that is
-    still zero. `account_limit` is the cap either way. A venue without its own markets (`SimulatedVenue::new`) can answer only for the
-    valuation asset, on an account that holds nothing else.
+    still zero. `account_limit` is the cap either way. A venue without its own markets
+    (`SimulatedVenue::new`) can answer only for the valuation asset, on an account that holds
+    nothing else.
   - `ApiError::InstrumentInvalid` for an instrument the venue does not trade, a cash-settled one,
     and every instrument on a venue without a `SpotMarginConfig`, which lends nothing.
   - New `SimulatedVenue::borrow_capacity`, `AccountState::cap_room`, and a
