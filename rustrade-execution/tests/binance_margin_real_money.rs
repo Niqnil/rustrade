@@ -24,7 +24,13 @@
 //!    `trailingDelta`, and a limit price below the market, so that once triggered it would buy no
 //!    higher than that. It reads the order raw from `GET /sapi/v1/margin/order`.
 //!
-//! Each checks the account stream reports the order as the trailing stop placed. On an isolated
+//! A fifth pair repeats step 2's borrow and cancel, then reads the account's interest history
+//! (`fetch_margin_interest`) until Binance posts the `ON_BORROW` charge on that loan, and checks
+//! that its `principal` equals the amount the order's answer reported lending
+//! (`marginBuyBorrowAmount`). It prints both figures. This is what matching a charge to its loan
+//! relies on.
+//!
+//! Each trailing test checks the account stream reports the order as the trailing stop placed. On an isolated
 //! account Binance's `executionReport` sends an empty `d` even for a trailing order, so only the
 //! kind the client recorded when it placed the order can say so. Each prints only field names and
 //! the trailing fields' values. The raw rows, which hold account data, go to
@@ -72,11 +78,13 @@ use binance_sdk::{
         },
     },
 };
+use chrono::{DurationRound, TimeDelta, Utc};
 use futures::{FutureExt, SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use rustrade_execution::{
     AccountEventKind, MarginDebtKind, UnindexedAccountEvent,
+    cash_flow::{CashFlowKind, InterestTiming},
     client::{
         ExecutionClient,
         binance::{BinanceMargin, BinanceMarginConfig},
@@ -768,6 +776,106 @@ async fn steps(client: &BinanceMargin, rest: &RestApi, account: Account, events:
     }
 }
 
+/// How long [`on_borrow_principal`] waits for Binance to post the `ON_BORROW` charge.
+const ON_BORROW_WAIT: Duration = Duration::from_secs(120);
+
+/// Step 2 of [`steps`] alone (a resting order that borrows the shortfall, then its cancel), then
+/// the account's interest history, read until the `ON_BORROW` charge on that loan appears: its
+/// `principal` must be the amount the order's answer reported lending.
+async fn on_borrow_principal(
+    client: &BinanceMargin,
+    rest: &RestApi,
+    account: Account,
+    events: &Events,
+) {
+    let symbol = symbol();
+    let instrument = InstrumentNameExchange::new(symbol.clone());
+    let market = market(&symbol).await;
+    let price = market.resting_price();
+    let free = free_quote(rest, account, &symbol, &market.quote).await;
+    let quantity = market.quantity(free + BORROW, price);
+    // Binance stamps the charge at the start of the hour the loan is made in, on its clock: a
+    // minute's margin covers the two clocks differing.
+    let since = Utc::now().duration_trunc(TimeDelta::hours(1)).unwrap() - TimeDelta::minutes(1);
+    let (cid, id, borrowed) = place(
+        client,
+        &instrument,
+        "on-borrow",
+        OrderKind::Limit,
+        price,
+        quantity,
+        MarginEffect::Borrow,
+    )
+    .await;
+    let loan = borrowed.expect("Binance reports the loan in its answer");
+    assert_eq!(loan.asset.as_ref(), market.quote, "the quote asset is lent");
+    let cancelled = |event: &UnindexedAccountEvent| matches!(&event.kind, AccountEventKind::OrderCancelled(cancel) if cancel.key.cid == cid);
+    // Cancelled before anything is judged, so that its auto-repay settles the loan.
+    cancel(client, &instrument, &cid, id).await;
+    assert!(
+        wait_for(events, cancelled).await,
+        "the stream did not deliver {cid}'s cancel"
+    );
+
+    let wanted_instrument = match account {
+        Account::Cross => None,
+        Account::Isolated => Some(&instrument),
+    };
+    let deadline = tokio::time::Instant::now() + ON_BORROW_WAIT;
+    let charges = loop {
+        let read = client
+            .fetch_margin_interest(since, Utc::now())
+            .await
+            .expect("the interest history reads");
+        let charges: Vec<_> = read
+            .flows
+            .into_iter()
+            .filter(|flow| {
+                flow.asset == loan.asset
+                    && flow.instrument.as_ref() == wanted_instrument
+                    && matches!(
+                        flow.kind,
+                        CashFlowKind::MarginInterest {
+                            timing: Some(InterestTiming::OnBorrow),
+                            ..
+                        }
+                    )
+            })
+            .collect();
+        if !charges.is_empty() || tokio::time::Instant::now() >= deadline {
+            break charges;
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    };
+    let principals: Vec<_> = charges
+        .iter()
+        .map(|flow| match flow.kind {
+            CashFlowKind::MarginInterest { principal, .. } => principal,
+            _ => unreachable!("filtered to margin interest"),
+        })
+        .collect();
+    println!(
+        "{account:?}: borrowed {} {}; ON_BORROW charges since {since}: principals {principals:?}, \
+         stamped {:?}",
+        loan.amount,
+        loan.asset,
+        charges
+            .iter()
+            .map(|flow| flow.time_exchange)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !charges.is_empty(),
+        "no ON_BORROW charge on {} posted within {ON_BORROW_WAIT:?}",
+        loan.asset
+    );
+    assert!(
+        principals.contains(&Some(loan.amount)),
+        "no ON_BORROW charge has the loan's principal {}: {principals:?}",
+        loan.amount
+    );
+}
+
 /// Reads `path` raw, signed, with `query` and the account's `isIsolated`, so that fields the SDK's
 /// response types leave out are kept.
 async fn raw_get(
@@ -1017,6 +1125,9 @@ enum Scenario {
     /// [`trailing_without_activation`]: whether a trailing stop with no activation price is
     /// accepted.
     TrailingWithoutActivation,
+    /// [`on_borrow_principal`]: whether the `ON_BORROW` charge's principal is the loan the
+    /// order's answer reported.
+    OnBorrowPrincipal,
 }
 
 /// Runs `scenario` on one account, then flattens the subaccount whatever happened, and reports.
@@ -1079,6 +1190,11 @@ async fn real_money_run(account: Account, scenario: Scenario) {
             ))
             .catch_unwind()
             .await
+        }
+        Scenario::OnBorrowPrincipal => {
+            AssertUnwindSafe(on_borrow_principal(&client, &rest, account, &events))
+                .catch_unwind()
+                .await
         }
     };
     // Let late frames (a repay, a notice) arrive before the summary.
@@ -1148,6 +1264,20 @@ async fn real_money_cross_trailing_stop_without_activation() {
 #[serial]
 async fn real_money_isolated_trailing_stop_without_activation() {
     real_money_run(Account::Isolated, Scenario::TrailingWithoutActivation).await;
+}
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn real_money_cross_on_borrow_principal_is_the_loan() {
+    real_money_run(Account::Cross, Scenario::OnBorrowPrincipal).await;
+}
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn real_money_isolated_on_borrow_principal_is_the_loan() {
+    real_money_run(Account::Isolated, Scenario::OnBorrowPrincipal).await;
 }
 
 /// The cleanup alone, for a subaccount a killed run left with open orders or debt.
