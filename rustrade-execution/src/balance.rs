@@ -56,6 +56,13 @@ pub struct MarginDetails {
     pub interest: Decimal,
 }
 
+impl MarginDetails {
+    /// What is owed of the asset: [`borrowed`](Self::borrowed) plus [`interest`](Self::interest).
+    pub fn owed(&self) -> Decimal {
+        self.borrowed + self.interest
+    }
+}
+
 /// Per-asset balance: gross holdings, the freely-tradable portion, optional margin debt and
 /// optional accrued carry.
 ///
@@ -187,7 +194,7 @@ impl Balance {
     /// Each venue client says whether it streams debt changes.
     pub fn net_asset(&self) -> Decimal {
         match self.margin {
-            Some(margin) => self.total - margin.borrowed - margin.interest,
+            Some(margin) => self.total - margin.owed(),
             None => self.total,
         }
     }

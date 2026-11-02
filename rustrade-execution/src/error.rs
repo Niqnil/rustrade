@@ -392,9 +392,11 @@ pub enum ApiError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// Reported by the Binance margin client, by Binance's code, by the Alpaca client, by the
     /// text of a 403 or 422, and by the
     /// [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue), for a CFD short its
-    /// [`ShortabilityProvider`](crate::shortability::ShortabilityProvider) does not allow. Other
-    /// clients report such refusals as [`OrderRejected`](Self::OrderRejected) until their venue's
-    /// wording is confirmed.
+    /// [`ShortabilityProvider`](crate::shortability::ShortabilityProvider) does not allow, and for
+    /// a spot margin borrow past an asset's cap
+    /// ([`SpotMarginConfig::with_max_borrow`](crate::margin::SpotMarginConfig::with_max_borrow)).
+    /// Other clients report such refusals as [`OrderRejected`](Self::OrderRejected) until their
+    /// venue's wording is confirmed.
     ///
     /// Not transient — the same request fails identically until the venue's lending changes.
     #[error("borrow rejected: {0}")]
@@ -445,8 +447,8 @@ pub struct BorrowReject {
     /// The venue's message. It may itself carry the code, as Binance's does.
     pub message: String,
     /// How much the venue could still have lent, in the units the order was sized in, where
-    /// known: the most a smaller order could have sold short. Set by the simulated venue; no live
-    /// client reports it yet.
+    /// known: the most a smaller order could have sold short, or, for a spot margin sell, could
+    /// have borrowed. Set by the simulated venue; no live client reports it yet.
     pub available: Option<Decimal>,
 }
 
