@@ -104,6 +104,12 @@ impl AccountState {
             .map_or(Decimal::ZERO, |margin| margin.owed())
     }
 
+    /// What a borrow cap of `cap` leaves to lend of `asset`, once what this account already owes
+    /// of it, principal plus interest, is counted. Never negative: a debt past the cap leaves zero.
+    pub fn cap_room(&self, asset: &AssetNameExchange, cap: Decimal) -> Decimal {
+        (cap - self.owed(asset)).max(Decimal::ZERO)
+    }
+
     /// Each asset this account owes principal in, with the principal owed.
     pub fn loans(&self) -> impl Iterator<Item = (&AssetNameExchange, Decimal)> + '_ {
         self.balances.iter().filter_map(|(asset, balance)| {
@@ -693,7 +699,7 @@ impl AccountState {
         // What the cap leaves, when it leaves less than the leverage limit does: the cap is then
         // the limit that decides, and a refusal names it. A tie leaves the leverage limit deciding.
         let capped = max_borrow
-            .map(|cap| (cap - self.owed(&debit.asset)).max(Decimal::ZERO))
+            .map(|cap| self.cap_room(&debit.asset, cap))
             .filter(|room| *room < borrowable);
         let lendable = capped.unwrap_or(borrowable);
         let shortfall = required - (free + funding);

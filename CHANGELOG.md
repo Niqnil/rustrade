@@ -30,6 +30,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     limit's `borrowable`, `min_borrow` and `max_borrow`) in place of its `borrowable` and
     `min_borrow` arguments, and `BalanceInsufficient` has a new `max_borrow` field: the cap, when
     it is the limit that refused.
+- **`MockExecution` implements `BorrowCapacityClient`** (`rustrade-execution`, #816).
+  `fetch_borrow_capacity(&instrument, side)` asks the simulated venue how much more the account
+  can borrow now: base for a sell, quote for a buy, as from a live margin client. The answer
+  follows the venue's own lending rules, so a strategy can size its orders against it in a backtest.
+  - `borrowable_now` is the lesser of what the leverage limit and the asset's borrow cap leave. It
+    is zero when that is below the asset's minimum borrow, and while a liquidation is under way.
+    The account's free balance is not added. `account_limit` is the asset's cap, when it has one.
+  - The query carries no market, so only the markets the venue holds value the account. When they
+    cannot value the asset, or any balance the account holds or owes, `borrowable_now` is `None`
+    (unknown). The exception is a cap with no room left, or less than the minimum borrow: that is
+    still zero. A venue without its own markets (`SimulatedVenue::new`) can answer only for the
+    valuation asset, on an account that holds nothing else.
+  - `ApiError::InstrumentInvalid` for an instrument the venue does not trade, a cash-settled one,
+    and every instrument on a venue without a `SpotMarginConfig`, which lends nothing.
+  - New `SimulatedVenue::borrow_capacity`, `AccountState::cap_room`, and a
+    `MockExchangeRequestKind::FetchBorrowCapacity` request (the enum is non-exhaustive).
 
 ## [0.19.0] - 2026-11-02
 

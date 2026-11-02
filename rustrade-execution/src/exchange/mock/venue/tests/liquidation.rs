@@ -418,6 +418,15 @@ fn a_debt_the_book_is_too_thin_to_close_is_closed_by_later_inputs() {
         d("0.4")
     );
 
+    assert_eq!(
+        venue
+            .borrow_capacity(&instrument_name(), Side::Sell)
+            .unwrap()
+            .borrowable_now,
+        Some(Decimal::ZERO),
+        "a liquidation under way lends nothing"
+    );
+
     let placed = venue.open_order(gtc_limit("later", Side::Buy, "0.1", "9000"));
     rested_open(&placed);
 
