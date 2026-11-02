@@ -86,9 +86,9 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustrade = "0.18"
-rustrade-data = { version = "0.18", features = ["hyperliquid"] }
-rustrade-execution = { version = "0.18", features = ["binance"] }
+rustrade = "0.19"
+rustrade-data = { version = "0.19", features = ["hyperliquid"] }
+rustrade-execution = { version = "0.19", features = ["binance"] }
 ```
 
 See the [examples](https://github.com/Niqnil/rustrade/tree/main/rustrade/examples) for complete working code.
