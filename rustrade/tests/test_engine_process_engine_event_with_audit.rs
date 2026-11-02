@@ -2067,7 +2067,9 @@ fn test_contract_expiry_replica_parity_price_bail_then_settle_then_duplicate() {
         .instruments
         .instrument_index(&option);
     assert!(live.position.positions.is_empty());
-    assert_eq!(mirrored.position.positions, live.position.positions);
+    // The whole manager, so the replica also records where the instrument's history restarts.
+    assert_eq!(mirrored.position, live.position);
+    assert!(live.position.time_history_start().is_some());
     assert!(live.expiration_processed && mirrored.expiration_processed);
     // The settlement's exit reaches the tear sheet on both sides.
     assert_ne!(live.tear_sheet, pre_settle_tear_sheet);
@@ -6417,6 +6419,18 @@ fn test_corporate_action_floor_to_zero_prunes_hedging_routing() {
     assert!(
         !instr.position_ids.values().any(|v| *v == pos_id),
         "the floored position's routing entry must be pruned by value"
+    );
+    let time_exit = outputs
+        .iter()
+        .find_map(|o| match o {
+            EngineOutput::PositionExit(p) if p.position_id == pos_id => Some(p.time_exit),
+            _ => None,
+        })
+        .expect("asserted above");
+    assert_eq!(
+        instr.position.time_history_start(),
+        Some(time_exit),
+        "the removal is where the instrument's position history starts again"
     );
     // ... while the resting order itself is left in place (the split price-adjusts, never cancels).
     assert!(
