@@ -70,6 +70,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     decimal string, each left out when empty.
   - Not modelled: Binance's tiers by holding size (one tier per asset today), and its borrow
     check's prices, the highest and lowest index price over a recent window.
+- **`BinanceMargin::fetch_collateral_ratios`** (`rustrade-execution`, `binance`, #829) reads
+  `GET /sapi/v1/margin/crossMarginCollateralRatio`: each asset's cross-margin collateral ratio
+  tiers, as a map from asset to the new `CollateralRatioTier`s (`min_usd_value`, `max_usd_value`,
+  `ratio`) in ascending minimum USD value. One unsigned request, 100 of Binance's per-IP weight.
+  - Binance publishes three collateral ratios per asset (borrow, transfer-out and liquidation),
+    and does not document which one the endpoint returns. On 2026-11-02 it returned a single
+    open tier with a ratio of 1 for every asset, which matches the liquidation ratios and not the
+    borrow ratios. The rustdoc records this as observed, not guaranteed.
+  - An answer that cannot be read whole (a group without assets or tiers, a tier without its
+    minimum or ratio, an unreadable decimal, an asset listed twice) is an
+    `UnindexedClientError::Internal`, not a map missing entries.
 
 ## [0.19.0] - 2026-11-02
 
