@@ -50,7 +50,8 @@ implementation's rustdoc states what a query costs: IBKR's holds a market data l
 
 The `new` constructors are `ExecutionClient::new`. Each connector is behind a Cargo feature, and
 none is enabled by default: `alpaca`, `binance` (Spot and Margin), `hyperliquid` (perpetuals and
-spot), and `ibkr`. The mock client is always available.
+spot), and `ibkr`. The mock client is always available. It implements `OrderStatusClient` and
+`BorrowCapacityClient`, which answers only when its venue lends (`MockExecutionConfig::spot_margin`).
 
 - **Hyperliquid** perpetuals are named `{coin}-{collateral}-PERP` (`BTC-USDC-PERP`,
   `xyz:TSLA-USDC-PERP`). `HyperliquidClient::connect` reads the default DEX, plus each

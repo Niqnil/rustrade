@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-02
+
+### Added
+
+- **An optional per-asset borrow cap on the simulated venue's spot margin** (`rustrade-execution`,
+  #816). `SpotMarginConfig::with_max_borrow(asset, amount)` caps what the account may owe of
+  `asset`, principal plus interest, counting the new loan. A borrow must fit both the leverage
+  limit and the cap. A real venue caps each asset too (Binance's `maxBorrowable` `borrowLimit`),
+  so a strategy sized to the leverage limit alone could be lent more in a backtest than live.
+  - An order that would borrow past a cap tighter than the leverage limit is rejected, never
+    clipped, with `ApiError::BorrowRejected` and `BorrowRejectReason::BorrowLimitExceeded`, as the
+    Binance margin client reports Binance's `-3006`. Its message names the cap. For a sell,
+    `BorrowReject::available` is how much more base the venue would lend. Where the leverage limit
+    is the tighter, the rejection stays `BalanceInsufficient`.
+  - The interest a new loan is charged when it is made is not counted, as the leverage limit does
+    not count it. Binance does not document whether its limit counts interest; counting it is
+    the simulated venue's own rule.
+  - Serialised as a `max_borrow` map from asset to decimal string, left out when empty. A negative
+    cap is refused with the new `SpotMarginConfigError::NegativeMaxBorrow`. A cap of zero lends
+    none of the asset.
+  - New `MarginDetails::owed` (principal plus interest) and `AccountState::owed`.
+  - Breaking: `exchange::mock::account::AccountState::commit` takes a new `Lending` (the leverage
+    limit's `borrowable`, `min_borrow` and `max_borrow`) in place of its `borrowable` and
+    `min_borrow` arguments, and `BalanceInsufficient` has a new `max_borrow` field: the cap, when
+    it is the limit that refused.
+- **`MockExecution` implements `BorrowCapacityClient`** (`rustrade-execution`, #816).
+  `fetch_borrow_capacity(&instrument, side)` asks the simulated venue how much more the account
+  can borrow now: base for a sell, quote for a buy, as from a live margin client. The answer
+  follows the venue's own lending rules, so a strategy can size its orders against it in a backtest.
+  - `borrowable_now` is the lesser of what the leverage limit and the asset's borrow cap leave. It
+    is zero when that is below the asset's minimum borrow, and while a liquidation is under way.
+    The account's free balance is not added. `account_limit` is the asset's cap, when it has one.
+  - The query carries no market, so only the markets the venue holds value the account. When they
+    cannot value the asset, or any balance the account holds or owes, `borrowable_now` is `None`
+    (unknown). The exception is a cap with no room left, or less than the minimum borrow: that is
+    still zero. `account_limit` is the cap either way. A venue without its own markets
+    (`SimulatedVenue::new`) can answer only for the valuation asset, on an account that holds
+    nothing else.
+  - `ApiError::InstrumentInvalid` for an instrument the venue does not trade, a cash-settled one,
+    and every instrument on a venue without a `SpotMarginConfig`, which lends nothing.
+  - New `SimulatedVenue::borrow_capacity`, `AccountState::cap_room`, and a
+    `MockExchangeRequestKind::FetchBorrowCapacity` request (the enum is non-exhaustive).
+- **Per-asset collateral ratios on the simulated venue's spot margin** (`rustrade-execution`,
+  #829). An asset can now count for less than its full value as collateral, as Binance's Cross
+  Margin Classic has weighted each asset by a collateral ratio since 2026-06-15 (BTC at 95 %, many
+  smaller assets at 10 % to 80 %). Without them a backtest could lend far more against such
+  assets than Binance does.
+  - `SpotMarginConfig::with_borrow_collateral_ratio(asset, ratio)` weights `asset` in the
+    leverage limit, and so in what the venue lends and in `fetch_borrow_capacity`.
+    `with_liquidation_collateral_ratio(asset, ratio)` weights it in the margin level a
+    `SpotMarginLiquidation` checks. Binance lists both per asset; its liquidation ratios are 100 %
+    today, so only lending changes. Getters `borrow_collateral_ratio` and
+    `liquidation_collateral_ratio` return one for an asset without one.
+  - A ratio weights only what the account holds of an asset beyond what it owes of it. Holdings
+    up to the debt count in full, and so do the holdings of an asset owed beyond them. Debt is
+    never weighted.
+  - Every ratio is one by default, so existing configurations lend and liquidate as before.
+  - A ratio outside `[0, 1]` is refused with the new
+    `SpotMarginConfigError::CollateralRatioOutOfRange`. A liquidation ratio below the asset's
+    borrow ratio is refused with `LiquidationRatioBelowBorrowRatio`, which keeps a borrow the
+    leverage limit allows from reaching the liquidation level.
+  - Serialised as `borrow_collateral_ratio` and `liquidation_collateral_ratio` maps from asset to
+    decimal string, each left out when empty.
+  - Not modelled: Binance's tiers by holding size (one tier per asset today), and its borrow
+    check's prices, the highest and lowest index price over a recent window.
+- **`BinanceMargin::fetch_collateral_ratios`** (`rustrade-execution`, `binance`, #829) reads
+  `GET /sapi/v1/margin/crossMarginCollateralRatio`: each asset's cross-margin collateral ratio
+  tiers, as a map from asset to the new `CollateralRatioTier`s (`min_usd_value`, `max_usd_value`,
+  `ratio`) in ascending minimum USD value. One unsigned request, 100 of Binance's per-IP weight.
+  - Binance publishes three collateral ratios per asset (borrow, transfer-out and liquidation),
+    and does not document which one the endpoint returns. On 2026-11-02 it returned a single
+    open tier with a ratio of 1 for every asset, which matches the liquidation ratios and not the
+    borrow ratios. The rustdoc records this as observed, not guaranteed.
+  - An answer that cannot be read whole (a group without assets or tiers, a tier without its
+    minimum or ratio, an unreadable decimal, an asset listed twice) is an
+    `UnindexedClientError::Internal`, not a map missing entries.
+
 ## [0.19.0] - 2026-11-02
 
 ### Fixed

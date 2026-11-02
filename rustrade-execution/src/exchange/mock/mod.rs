@@ -381,6 +381,17 @@ impl MockExchange {
             } => {
                 emit.respond(Vec::new(), response_tx, self.venue.orders_ended(&orders));
             }
+            MockExchangeRequestKind::FetchBorrowCapacity {
+                response_tx,
+                instrument,
+                side,
+            } => {
+                emit.respond(
+                    Vec::new(),
+                    response_tx,
+                    self.venue.borrow_capacity(&instrument, side),
+                );
+            }
             MockExchangeRequestKind::FetchTrades {
                 response_tx,
                 start,
@@ -1252,6 +1263,76 @@ mod tests {
         drop(client);
         drop(request_tx);
         driver.await.unwrap();
+    }
+
+    /// What the mock client's borrow capacity query gets back from a running driver, for an order
+    /// on BTCUSDT on `side`, from a venue configured as `config`.
+    async fn borrow_capacity_from(
+        config: crate::client::mock::MockExecutionConfig,
+        side: Side,
+    ) -> Result<crate::BorrowCapacity, crate::error::UnindexedClientError> {
+        use crate::client::{BorrowCapacityClient, mock::MockExecution};
+
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = broadcast::channel(16);
+        let exchange = MockExchange::new(config, request_rx, event_tx, spot_instruments());
+        let driver = tokio::spawn(exchange.run());
+
+        let client = MockExecution {
+            mocked_exchange: EXCHANGE,
+            clock: Utc::now,
+            request_tx,
+            event_rx,
+        };
+        let capacity = client.fetch_borrow_capacity(&instrument_name(), side).await;
+
+        drop(client);
+        driver.await.unwrap();
+        capacity
+    }
+
+    /// The mock client's borrow capacity query reaches the venue and back.
+    #[tokio::test]
+    async fn a_borrow_capacity_query_is_answered_by_the_venue() {
+        use crate::margin::{MarginEffect, SpotMarginConfig};
+
+        let config = crate::client::mock::MockExecutionConfig {
+            spot_margin: Some(
+                SpotMarginConfig::new(quote(), Decimal::from(3), MarginEffect::Borrow).unwrap(),
+            ),
+            ..spot_config("0", "10000", FeeModelConfig::default())
+        };
+
+        let capacity = borrow_capacity_from(config, Side::Buy)
+            .await
+            .expect("a margin venue lends against BTCUSDT");
+
+        assert_eq!(
+            capacity,
+            crate::BorrowCapacity::new(quote()).with_borrowable_now(Decimal::from(20_000))
+        );
+    }
+
+    /// A venue's refusal to report a capacity reaches the client as the venue's API error.
+    #[tokio::test]
+    async fn a_borrow_capacity_the_venue_refuses_is_an_api_error() {
+        let error = borrow_capacity_from(
+            spot_config("0", "10000", FeeModelConfig::default()),
+            Side::Sell,
+        )
+        .await
+        .expect_err("a cash venue lends against nothing");
+
+        assert!(
+            matches!(
+                &error,
+                crate::error::ClientError::Api(crate::error::ApiError::InstrumentInvalid(
+                    instrument,
+                    _,
+                )) if *instrument == instrument_name()
+            ),
+            "{error:?}"
+        );
     }
 
     /// A request-priced driver answers a fetch after the output booked before it, so a balance

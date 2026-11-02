@@ -38,7 +38,9 @@ ignore = [
     { id = "RUSTSEC-2026-0235", reason = "rkyv is an unenabled optional dep of rust_decimal; never compiled in this workspace" },
 
     # zip 0.6.6 archive-extraction advisories of 2026-10-09/10 (SUID/SGID bits kept, symlink
-    # targets and permissions not confined to the destination). Same class as rkyv above: an
+    # targets and permissions not confined to the destination), and RUSTSEC-2026-0429 of
+    # 2026-10-22 (`ZipArchive::extract` aborts the process on a symlink entry with a large declared
+    # size). Same class as rkyv above: an
     # *unenabled optional* dependency, two levels deep. The lockfile path is ethers 2.0.14 ->
     # ethers-solc (optional, behind ethers' `solc` feature) -> svm-rs 0.3.5 (optional, behind
     # ethers-solc's `svm-solc` feature) -> zip. Neither feature is enabled by us or by
@@ -50,6 +52,7 @@ ignore = [
     { id = "RUSTSEC-2026-0367", reason = "zip is an unenabled optional dep (ethers -> ethers-solc -> svm-rs); never compiled in this workspace" },
     { id = "RUSTSEC-2026-0368", reason = "zip is an unenabled optional dep (ethers -> ethers-solc -> svm-rs); never compiled in this workspace" },
     { id = "RUSTSEC-2026-0369", reason = "zip is an unenabled optional dep (ethers -> ethers-solc -> svm-rs); never compiled in this workspace" },
+    { id = "RUSTSEC-2026-0429", reason = "zip is an unenabled optional dep (ethers -> ethers-solc -> svm-rs); never compiled in this workspace" },
 
     # zstd-safe legacy-frame decompression advisory of 2026-10-16. Two copies are in Cargo.lock. The
     # compiled one (8.x, via zstd 0.14 <- async-compression, databento, parquet) is bumped past the

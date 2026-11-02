@@ -418,6 +418,15 @@ fn a_debt_the_book_is_too_thin_to_close_is_closed_by_later_inputs() {
         d("0.4")
     );
 
+    assert_eq!(
+        venue
+            .borrow_capacity(&instrument_name(), Side::Sell)
+            .unwrap()
+            .borrowable_now,
+        Some(Decimal::ZERO),
+        "a liquidation under way lends nothing"
+    );
+
     let placed = venue.open_order(gtc_limit("later", Side::Buy, "0.1", "9000"));
     rested_open(&placed);
 
@@ -607,37 +616,6 @@ fn a_debt_in_a_pairs_quote_is_bought_back_by_selling_the_valuation_asset_as_its_
     );
     // 1 BTC less the 0.95 sold and the 0.019 fee, on the 0.95 BTC the debt was worth.
     assert_eq!(balance_now(&venue, base()).total, d("0.031"));
-}
-
-fn eth() -> AssetNameExchange {
-    AssetNameExchange::new("ETH")
-}
-
-fn eth_instrument_name() -> InstrumentNameExchange {
-    InstrumentNameExchange::new("ETHUSDT")
-}
-
-/// BTCUSDT and ETHUSDT.
-fn btc_and_eth_instruments()
--> FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>> {
-    let mut instruments = spot_instruments();
-    instruments.insert(
-        eth_instrument_name(),
-        Instrument {
-            exchange: EXCHANGE,
-            name_internal: InstrumentNameInternal::new("ethusdt"),
-            name_exchange: eth_instrument_name(),
-            underlying: Underlying {
-                base: eth(),
-                quote: quote(),
-            },
-            quote: InstrumentQuoteAsset::UnderlyingQuote,
-            kind: InstrumentKind::Spot,
-            spec: None,
-            data_venue: None,
-        },
-    );
-    instruments
 }
 
 #[test]

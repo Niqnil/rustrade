@@ -3,11 +3,12 @@
 use crate::{
     AccountEventKind, InstrumentAccountSnapshot, UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, MarginDetails},
+    borrow_capacity::BorrowCapacity,
     cash_flow::{CashFlow, CashFlowId, CashFlowKind, InterestTiming},
     client::mock::MockExecutionConfig,
     error::{ApiError, BorrowReject, BorrowRejectReason, UnindexedApiError, UnindexedOrderError},
     exchange::mock::{
-        account::{AccountState, BalanceInsufficient, Committed, Credit, Debit, Delivery},
+        account::{AccountState, BalanceInsufficient, Committed, Credit, Debit, Delivery, Lending},
         orders::{AlreadyResting, OpenOrder, Reservation, RestingOrder},
     },
     fee::{FeeAssetConfig, FeeModel, FeeModelConfig, Liquidity, SpotFeeAsset},
@@ -1290,40 +1291,112 @@ impl SimulatedVenue {
         }
 
         let priced = market.map(|market| (&terms.underlying, market));
-        let valuation = config.valuation_asset();
-        let Some(asset_price) = self.price_in(&debit.asset, valuation, priced) else {
-            return Decimal::ZERO;
-        };
         // A debt this venue cannot value could be any size, so it lends nothing more.
-        let Some(Valued { equity, debt }) = self.valued(valuation, priced) else {
-            return Decimal::ZERO;
-        };
+        self.leverage_room(config, &debit.asset, priced)
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    /// How much more of `asset` the leverage limit of `config` lets this account borrow, whatever
+    /// order would borrow it: `(max_leverage − 1) · equity − debt`, never negative, in units of
+    /// `asset`. See [`SpotMarginConfig`]'s `# How much it lends`.
+    ///
+    /// `None` if this venue cannot value `asset`, or a debt the account owes. `priced` is as for
+    /// [`price_in`](Self::price_in). Shared by an order's [`borrowable`](Self::borrowable) and the
+    /// [`borrow_capacity`](Self::borrow_capacity) query, so the two agree.
+    fn leverage_room(
+        &self,
+        config: &SpotMarginConfig,
+        asset: &AssetNameExchange,
+        priced: Option<(&Underlying<AssetNameExchange>, &MarketSnapshot)>,
+    ) -> Option<Decimal> {
+        let asset_price = self.price_in(asset, config.valuation_asset(), priced)?;
+        let Valued { equity, debt } = self.valued(config, MarginCheck::Borrow, priced)?;
 
         let headroom = (config.max_leverage() - Decimal::ONE) * equity - debt;
         // `price_in` never values an asset at zero, so the division is safe.
-        headroom.max(Decimal::ZERO) / asset_price
+        Some(headroom.max(Decimal::ZERO) / asset_price)
     }
 
-    /// The account's equity and debt, valued in `valuation` as [`SpotMarginConfig`]'s
-    /// `# How much it lends` says, or `None` if it owes an asset this venue cannot value.
+    /// The rejection for an arrival the account refused, an order on `side`.
+    ///
+    /// [`ApiError::BorrowRejected`] with [`BorrowRejectReason::BorrowLimitExceeded`] when the
+    /// asset's borrow cap is the limit that refused ([`BalanceInsufficient::max_borrow`]), as a
+    /// live Binance margin client reports Binance's `-3006`; [`ApiError::BalanceInsufficient`]
+    /// otherwise. Both messages say how much the venue would lend, and name the minimum borrow and
+    /// the cap when they are why. A sell borrows the base asset, the units its order is sized in,
+    /// so its [`BorrowReject::available`] is what the cap left, or zero when that is below the
+    /// asset's minimum borrow, which no loan may be under. A buy borrows the quote asset, and
+    /// leaves it unset.
+    fn insufficient_error(
+        &self,
+        insufficient: BalanceInsufficient,
+        side: Side,
+    ) -> UnindexedApiError {
+        let BalanceInsufficient {
+            asset,
+            free,
+            required,
+            borrowable,
+            min_borrow,
+            max_borrow,
+        } = insufficient;
+        let mut message =
+            format!("Available Balance: {free}, Required Balance inc. fees: {required}");
+        if let Some(borrowable) = borrowable {
+            message.push_str(&format!(", Borrowable: {borrowable}"));
+        }
+        if let Some(min_borrow) = min_borrow {
+            message.push_str(&format!(", Minimum Borrow: {min_borrow}"));
+        }
+        let Some(max_borrow) = max_borrow else {
+            return ApiError::BalanceInsufficient(Some(asset), message);
+        };
+
+        let message = format!("{asset} borrow exceeds Max Borrow: {max_borrow}; {message}");
+        let reject = BorrowReject::new(BorrowRejectReason::BorrowLimitExceeded, None, message);
+        let reject = match (side, borrowable) {
+            (Side::Sell, Some(left)) => {
+                let least = self
+                    .spot_margin
+                    .as_ref()
+                    .map_or(Decimal::ZERO, |config| config.min_borrow(&asset));
+                reject.with_available(if left < least { Decimal::ZERO } else { left })
+            }
+            _ => reject,
+        };
+        ApiError::BorrowRejected(reject)
+    }
+
+    /// The account's equity and debt, valued in `config`'s valuation asset as
+    /// [`SpotMarginConfig`]'s `# How much it lends` says, with each asset's positive net weighted
+    /// by its collateral ratio for `check`, or `None` if it owes an asset this venue cannot value.
     ///
     /// `priced` is as for [`price_in`](Self::price_in). Shared by the leverage limit and the
-    /// liquidation check, so the two value an account alike.
+    /// liquidation check, so the two value an account alike but for the ratios.
     fn valued(
         &self,
-        valuation: &AssetNameExchange,
+        config: &SpotMarginConfig,
+        check: MarginCheck,
         priced: Option<(&Underlying<AssetNameExchange>, &MarketSnapshot)>,
     ) -> Option<Valued> {
         let mut valued = Valued::default();
         for balance in self.account.balances() {
             let owed = owed(balance);
-            let Some(price) = self.price_in(&balance.asset, valuation, priced) else {
+            let Some(price) = self.price_in(&balance.asset, config.valuation_asset(), priced)
+            else {
                 if owed > Decimal::ZERO {
                     return None;
                 }
                 continue;
             };
-            valued.equity += balance.balance.net_asset() * price;
+            let net = balance.balance.net_asset();
+            // Only what the account holds beyond what it owes is weighted: the rest counts in
+            // full, as does the net of an asset it owes more of than it holds.
+            let ratio = match net > Decimal::ZERO {
+                true => check.collateral_ratio(config, &balance.asset),
+                false => Decimal::ONE,
+            };
+            valued.equity += net * ratio * price;
             valued.debt += owed * price;
         }
         Some(valued)
@@ -2585,8 +2658,9 @@ impl SimulatedVenue {
     }
 
     /// Commits one arrival's whole ledger effect through [`AccountState::commit`], lending what
-    /// [`borrowable`](Self::borrowable) allows, and at least the asset's minimum borrow, to an
-    /// order whose `effect` borrows, then charges interest on whatever it lent.
+    /// [`borrowable`](Self::borrowable) and the asset's borrow cap allow, and at least the asset's
+    /// minimum borrow, to an order whose `effect` borrows, then charges interest on whatever it
+    /// lent.
     ///
     /// The interest is charged at `time_exchange` on the amount lent, so the restated
     /// [`Committed::paid`] includes it, and [`Commitment::interest`] reports it.
@@ -2602,14 +2676,20 @@ impl SimulatedVenue {
         market: Option<&MarketSnapshot>,
         time_exchange: DateTime<Utc>,
     ) -> Result<Commitment, BalanceInsufficient> {
-        let borrowable = self.borrowable(debit, effect, terms, market);
-        let min_borrow = self
-            .spot_margin
-            .as_ref()
-            .map_or(Decimal::ZERO, |config| config.min_borrow(&debit.asset));
-        let mut committed =
-            self.account
-                .commit(debit, credit, effect, borrowable, min_borrow, time_exchange)?;
+        let lending = Lending {
+            borrowable: self.borrowable(debit, effect, terms, market),
+            min_borrow: self
+                .spot_margin
+                .as_ref()
+                .map_or(Decimal::ZERO, |config| config.min_borrow(&debit.asset)),
+            max_borrow: self
+                .spot_margin
+                .as_ref()
+                .and_then(|config| config.max_borrow(&debit.asset)),
+        };
+        let mut committed = self
+            .account
+            .commit(debit, credit, effect, lending, time_exchange)?;
 
         let interest = match committed.borrowed > Decimal::ZERO {
             true => self
@@ -2716,6 +2796,105 @@ impl SimulatedVenue {
             .filter(|balance| assets.is_empty() || assets.contains(&balance.asset))
             .cloned()
             .collect()
+    }
+
+    /// How much more this account can borrow now for an order on `instrument` on `side`: what
+    /// [`BorrowCapacityClient::fetch_borrow_capacity`] asks a simulated venue.
+    ///
+    /// A sell borrows `instrument`'s base asset, a buy its quote asset, which the result names.
+    /// [`borrowable_now`](BorrowCapacity::borrowable_now) is the lesser of what the leverage limit
+    /// and the asset's borrow cap leave, as [`SpotMarginConfig`]'s `# How much it lends` says.
+    /// It is zero when that is below the asset's minimum borrow, which no loan may be under, and
+    /// while a liquidation is under way, when this venue lends nothing.
+    /// [`account_limit`](BorrowCapacity::account_limit) is the asset's cap, unset when it has none.
+    ///
+    /// It is the room to borrow alone. The account's free balance of the asset is not added,
+    /// though an order spends that before it borrows. Resting orders need no adjustment: what they
+    /// borrowed when placed is in the debt, and what they hold is still in the equity.
+    ///
+    /// # Valued without an order's market
+    /// The query carries no market snapshot, so only the markets this venue holds value the
+    /// account. When they cannot value the asset, or any balance the account holds or owes,
+    /// `borrowable_now` is `None`, unknown, where an order, which brings its own market, may still
+    /// be lent. A cap that leaves nothing, or less than the minimum borrow, still makes it zero.
+    /// A [`RequestPriced`](VenueRegime::RequestPriced) venue holds no market, so it can answer
+    /// only for an account holding nothing but its valuation asset, asked about that asset.
+    ///
+    /// # Errors
+    /// [`ApiError::InstrumentInvalid`] for an instrument this venue does not trade, and for one it
+    /// never lends against: every instrument on a cash account (no spot margin configuration),
+    /// and a cash-settled one on a margin account.
+    ///
+    /// [`BorrowCapacityClient::fetch_borrow_capacity`]: crate::client::BorrowCapacityClient::fetch_borrow_capacity
+    pub fn borrow_capacity(
+        &self,
+        instrument: &InstrumentNameExchange,
+        side: Side,
+    ) -> Result<BorrowCapacity, UnindexedApiError> {
+        let terms = self.instrument_terms(instrument)?;
+        let config = match &self.spot_margin {
+            Some(config) if !terms.cash_settled => config,
+            Some(_) => {
+                return Err(ApiError::InstrumentInvalid(
+                    instrument.clone(),
+                    format!(
+                        "SimulatedVenue lends nothing against {instrument}: it is cash-settled"
+                    ),
+                ));
+            }
+            None => {
+                return Err(ApiError::InstrumentInvalid(
+                    instrument.clone(),
+                    format!(
+                        "SimulatedVenue lends nothing against {instrument}: it has no spot margin \
+                         configuration"
+                    ),
+                ));
+            }
+        };
+        let asset = match side {
+            Side::Buy => &terms.underlying.quote,
+            Side::Sell => &terms.underlying.base,
+        };
+
+        let mut capacity = BorrowCapacity::new(asset.clone());
+        let cap = config.max_borrow(asset);
+        if let Some(cap) = cap {
+            capacity = capacity.with_account_limit(cap);
+        }
+        let cap_room = cap.map(|cap| self.account.cap_room(asset, cap));
+        let min_borrow = config.min_borrow(asset);
+
+        // The cap alone rules a loan out when it leaves none, or less than the least that may be
+        // lent, whatever the leverage limit would leave.
+        let ruled_out = self.liquidation.under_way()
+            || cap_room.is_some_and(|room| room.is_zero() || room < min_borrow);
+        let room = match ruled_out {
+            true => Some(Decimal::ZERO),
+            false => self
+                .values_every_holding(config.valuation_asset())
+                .then(|| self.leverage_room(config, asset, None))
+                .flatten()
+                .map(|room| cap_room.map_or(room, |cap_room| cap_room.min(room))),
+        };
+        if let Some(room) = room {
+            capacity = capacity.with_borrowable_now(match room < min_borrow {
+                true => Decimal::ZERO,
+                false => room,
+            });
+        }
+        Ok(capacity)
+    }
+
+    /// Whether the markets this venue holds value, in `valuation`, every asset the account holds
+    /// any of. The leverage limit leaves a holding it cannot value out of the equity, which
+    /// understates what an order may borrow, but a query that cannot value one does not know.
+    /// A debt it cannot value already stops [`leverage_room`](Self::leverage_room).
+    fn values_every_holding(&self, valuation: &AssetNameExchange) -> bool {
+        self.account.balances().all(|balance| {
+            balance.balance.total.is_zero()
+                || self.price_in(&balance.asset, valuation, None).is_some()
+        })
     }
 
     pub fn orders_open(
@@ -3488,7 +3667,10 @@ impl SimulatedVenue {
                 }) => (committed, interest),
                 Err(insufficient) => {
                     return (
-                        build_open_order_err_response(request, insufficient_error(insufficient)),
+                        build_open_order_err_response(
+                            request,
+                            self.insufficient_error(insufficient, side),
+                        ),
                         None,
                     );
                 }
@@ -3921,7 +4103,10 @@ impl SimulatedVenue {
                 // this order never been sent.
                 self.slippage = slippage_before;
                 return (
-                    build_open_order_err_response(request, insufficient_error(insufficient)),
+                    build_open_order_err_response(
+                        request,
+                        self.insufficient_error(insufficient, side),
+                    ),
                     None,
                 );
             }
@@ -4182,10 +4367,8 @@ impl SimulatedVenue {
                     ..
                 }) => (committed, interest),
                 Err(insufficient) => {
-                    return (
-                        build_open_order_err_response(request, insufficient_error(insufficient)),
-                        None,
-                    );
+                    let error = self.insufficient_error(insufficient, request.state.side);
+                    return (build_open_order_err_response(request, error), None);
                 }
             };
 
@@ -4702,43 +4885,39 @@ fn seeded_positions(
         .collect()
 }
 
-/// The rejection for an order the account cannot pay for, naming what it has, what it needs, and,
-/// on a margin account, what the venue would have lent, and the asset's minimum borrow when that
-/// is what it would not lend.
-fn insufficient_error(insufficient: BalanceInsufficient) -> UnindexedApiError {
-    let BalanceInsufficient {
-        asset,
-        free,
-        required,
-        borrowable,
-        min_borrow,
-    } = insufficient;
-    let message = match (borrowable, min_borrow) {
-        (None, _) => format!("Available Balance: {free}, Required Balance inc. fees: {required}"),
-        (Some(borrowable), None) => format!(
-            "Available Balance: {free}, Required Balance inc. fees: {required}, Borrowable: \
-             {borrowable}"
-        ),
-        (Some(borrowable), Some(min_borrow)) => format!(
-            "Available Balance: {free}, Required Balance inc. fees: {required}, Borrowable: \
-             {borrowable}, Minimum Borrow: {min_borrow}"
-        ),
-    };
-    ApiError::BalanceInsufficient(Some(asset), message)
-}
-
 /// What `balance` owes: its loan and the interest on it, zero on a cash account.
 fn owed(balance: &AssetBalance<AssetNameExchange>) -> Decimal {
     balance
         .balance
         .margin
-        .map_or(Decimal::ZERO, |margin| margin.borrowed + margin.interest)
+        .map_or(Decimal::ZERO, |margin| margin.owed())
+}
+
+/// Which check a [`SimulatedVenue::valued`] call values the account for, and so which of
+/// [`SpotMarginConfig`]'s collateral ratios weights its equity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarginCheck {
+    /// The leverage limit: how much the venue lends.
+    Borrow,
+    /// The margin level a liquidation checks.
+    Liquidation,
+}
+
+impl MarginCheck {
+    /// The fraction of `asset`'s positive net that counts as equity for this check.
+    fn collateral_ratio(self, config: &SpotMarginConfig, asset: &AssetNameExchange) -> Decimal {
+        match self {
+            Self::Borrow => config.borrow_collateral_ratio(asset),
+            Self::Liquidation => config.liquidation_collateral_ratio(asset),
+        }
+    }
 }
 
 /// A margin account's equity and debt, in its valuation asset. See [`SimulatedVenue::valued`].
 #[derive(Debug, Clone, Copy, Default)]
 struct Valued {
-    /// The value of what the account holds, net of what it owes.
+    /// The value of what the account holds, net of what it owes, each asset's positive net
+    /// weighted by its collateral ratio.
     equity: Decimal,
     /// The value of what it owes, loans plus interest.
     debt: Decimal,
@@ -14613,6 +14792,324 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------------------
+    // Spot margin: an asset's borrow cap.
+    // ---------------------------------------------------------------------------------------
+
+    /// `config`, its spot margin letting the account owe no more than `max_borrow` of `asset`.
+    fn with_max_borrow(
+        mut config: MockExecutionConfig,
+        asset: AssetNameExchange,
+        max_borrow: &str,
+    ) -> MockExecutionConfig {
+        config.spot_margin = config
+            .spot_margin
+            .map(|margin| margin.with_max_borrow(asset, d(max_borrow)).unwrap());
+        config
+    }
+
+    /// A venue holding 10,000 USDT and no BTC, at leverage 3: the leverage limit lends up to 0.4
+    /// BTC at 50,000, and `cap` caps BTC below that.
+    fn capped_venue(cap: &str) -> SimulatedVenue {
+        let config = with_max_borrow(margin_config("0", "10000", "3"), base(), cap);
+        SimulatedVenue::new(&config, spot_instruments())
+    }
+
+    #[test]
+    fn a_borrow_of_exactly_what_the_cap_leaves_is_lent() {
+        let mut venue = capped_venue("0.3");
+
+        let outcome = venue.open_order(sell_request("0.3", market_prices("50000")));
+
+        assert_eq!(
+            filled_balance(&outcome).balance,
+            Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("0.3"), Decimal::ZERO)
+        );
+    }
+
+    #[test]
+    fn a_borrow_past_a_cap_tighter_than_the_leverage_limit_is_rejected_as_over_the_limit() {
+        let mut venue = capped_venue("0.3");
+
+        let outcome = venue.open_order(sell_request("0.31", market_prices("50000")));
+
+        let reject = borrow_rejection(&outcome);
+        assert_eq!(reject.reason, BorrowRejectReason::BorrowLimitExceeded);
+        assert_eq!(reject.venue_code, None);
+        assert_eq!(
+            reject.available,
+            Some(d("0.3")),
+            "a smaller sell could still borrow what the cap leaves"
+        );
+        assert!(
+            reject
+                .message
+                .starts_with("BTC borrow exceeds Max Borrow: 0.3;")
+                && reject.message.ends_with("Borrowable: 0.3"),
+            "the reason names the cap and what it leaves: {}",
+            reject.message
+        );
+        assert_eq!(
+            balance_now(&venue, base()),
+            Balance::new_margin(Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO),
+            "a refused order borrows nothing"
+        );
+    }
+
+    #[test]
+    fn a_leverage_limit_tighter_than_the_cap_rejects_as_unaffordable_naming_no_cap() {
+        let mut venue = capped_venue("1");
+
+        let outcome = venue.open_order(sell_request("0.5", market_prices("50000")));
+
+        assert!(
+            insufficient_reason(&outcome).contains("Borrowable: 0.4")
+                && !insufficient_reason(&outcome).contains("Max Borrow"),
+            "{}",
+            insufficient_reason(&outcome)
+        );
+    }
+
+    #[test]
+    fn a_cap_leaving_exactly_what_the_leverage_limit_does_leaves_the_leverage_limit_deciding() {
+        let mut venue = capped_venue("0.4");
+
+        let outcome = venue.open_order(sell_request("0.5", market_prices("50000")));
+
+        assert!(
+            insufficient_reason(&outcome).contains("Borrowable: 0.4")
+                && !insufficient_reason(&outcome).contains("Max Borrow"),
+            "{}",
+            insufficient_reason(&outcome)
+        );
+    }
+
+    #[test]
+    fn a_cap_on_another_asset_does_not_limit_this_one() {
+        let config = with_max_borrow(margin_config("0", "10000", "3"), quote(), "0");
+        let mut venue = SimulatedVenue::new(&config, spot_instruments());
+
+        let outcome = venue.open_order(sell_request("0.3", market_prices("50000")));
+
+        assert_eq!(
+            filled_balance(&outcome).balance,
+            Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("0.3"), Decimal::ZERO)
+        );
+    }
+
+    #[test]
+    fn a_cap_of_zero_lends_none_of_the_asset() {
+        let mut venue = capped_venue("0");
+
+        let outcome = venue.open_order(sell_request("0.01", market_prices("50000")));
+
+        let reject = borrow_rejection(&outcome);
+        assert_eq!(reject.reason, BorrowRejectReason::BorrowLimitExceeded);
+        assert_eq!(reject.available, Some(Decimal::ZERO));
+    }
+
+    #[test]
+    fn the_cap_counts_what_is_already_owed_interest_included() {
+        let config = with_max_borrow(margin_config("0", "10000", "3"), base(), "0.3");
+        let mut venue = SimulatedVenue::new(&config, spot_instruments())
+            .with_margin_interest(Arc::new(hourly_interest(base())));
+        advance(&mut venue, time(1));
+        // Owes 0.2 lent plus 0.00002 interest charged on it, leaving 0.09998 under the cap.
+        venue.open_order(sell_request("0.2", market_prices("50000")));
+
+        let outcome = venue.open_order(sell_request("0.1", market_prices("50000")));
+        assert_eq!(borrow_rejection(&outcome).available, Some(d("0.09998")));
+
+        let outcome = venue.open_order(sell_request("0.09998", market_prices("50000")));
+        assert_eq!(
+            filled_balance(&outcome).balance.margin,
+            Some(MarginDetails::new(d("0.29998"), d("0.00003"))),
+            "0.00002 on the first loan, and 0.000009998 on the second, rounded up to 0.00001"
+        );
+    }
+
+    #[test]
+    fn the_interest_a_new_loan_is_charged_when_made_is_not_counted_against_the_cap() {
+        let config = with_max_borrow(margin_config("0", "10000", "3"), base(), "0.3");
+        let mut venue = SimulatedVenue::new(&config, spot_instruments())
+            .with_margin_interest(Arc::new(hourly_interest(base())));
+        advance(&mut venue, time(1));
+
+        let outcome = venue.open_order(sell_request("0.3", market_prices("50000")));
+
+        assert_eq!(
+            filled_balance(&outcome).balance.margin,
+            Some(MarginDetails::new(d("0.3"), d("0.00003"))),
+            "lent the whole 0.3 the cap leaves, its first charge taking the debt past the cap"
+        );
+
+        let outcome = venue.open_order(sell_request("0.01", market_prices("50000")));
+        let reject = borrow_rejection(&outcome);
+        assert_eq!(
+            reject.available,
+            Some(Decimal::ZERO),
+            "a debt past the cap leaves nothing to lend"
+        );
+        assert!(
+            reject.message.ends_with("Borrowable: 0"),
+            "{}",
+            reject.message
+        );
+    }
+
+    #[test]
+    fn a_minimum_borrow_past_what_the_cap_leaves_is_refused_with_nothing_available() {
+        let config = with_min_borrow(
+            with_max_borrow(margin_config("0", "10000", "3"), base(), "0.3"),
+            base(),
+            "0.5",
+        );
+        let mut venue = SimulatedVenue::new(&config, spot_instruments());
+
+        // The 0.1 shortfall fits under the cap, but the loan is raised to the 0.5 minimum.
+        let outcome = venue.open_order(sell_request("0.1", market_prices("50000")));
+        let reject = borrow_rejection(&outcome);
+        assert_eq!(reject.reason, BorrowRejectReason::BorrowLimitExceeded);
+        assert_eq!(
+            reject.available,
+            Some(Decimal::ZERO),
+            "no loan can both reach the minimum and stay under the cap"
+        );
+        assert!(
+            reject
+                .message
+                .ends_with("Borrowable: 0.3, Minimum Borrow: 0.5"),
+            "{}",
+            reject.message
+        );
+
+        // A 0.35 shortfall is past the cap by itself, so the minimum is not named, but still
+        // leaves nothing a smaller sell could borrow.
+        let outcome = venue.open_order(sell_request("0.35", market_prices("50000")));
+        let reject = borrow_rejection(&outcome);
+        assert_eq!(reject.available, Some(Decimal::ZERO));
+        assert!(
+            !reject.message.contains("Minimum Borrow"),
+            "{}",
+            reject.message
+        );
+    }
+
+    #[test]
+    fn a_minimum_borrow_within_what_the_cap_leaves_keeps_what_it_leaves_available() {
+        let config = with_min_borrow(
+            with_max_borrow(margin_config("0", "10000", "3"), base(), "0.3"),
+            base(),
+            "0.3",
+        );
+        let mut venue = SimulatedVenue::new(&config, spot_instruments());
+
+        let outcome = venue.open_order(sell_request("0.35", market_prices("50000")));
+
+        assert_eq!(borrow_rejection(&outcome).available, Some(d("0.3")));
+    }
+
+    #[test]
+    fn a_buy_past_the_cap_on_its_quote_is_rejected_with_no_available_in_base() {
+        // 1 BTC at 50,000 at leverage 3 lends up to 100,000 USDT; the cap allows 5,000.
+        let config = with_max_borrow(margin_config("1", "0", "3"), quote(), "5000");
+        let mut venue = SimulatedVenue::new(&config, spot_instruments());
+
+        let outcome = venue.open_order(buy_request("0.2", market_prices("50000")));
+
+        let reject = borrow_rejection(&outcome);
+        assert_eq!(reject.reason, BorrowRejectReason::BorrowLimitExceeded);
+        assert_eq!(
+            reject.available, None,
+            "the loan is in USDT, and the order is sized in BTC"
+        );
+        assert!(
+            reject
+                .message
+                .starts_with("USDT borrow exceeds Max Borrow: 5000;"),
+            "{}",
+            reject.message
+        );
+    }
+
+    #[test]
+    fn a_resting_sell_past_the_cap_is_rejected_as_over_the_limit() {
+        let config = with_max_borrow(margin_config("0", "100000", "3"), base(), "0.3");
+        let mut venue = market_venue_for(&config);
+
+        let outcome = venue.open_order(limit_request("rest", Side::Sell, "0.4", "50000", gtc()));
+
+        let reject = borrow_rejection(&outcome);
+        assert_eq!(reject.reason, BorrowRejectReason::BorrowLimitExceeded);
+        assert_eq!(reject.available, Some(d("0.3")));
+    }
+
+    #[test]
+    fn a_held_sell_past_the_cap_is_rejected_on_arrival_as_over_the_limit() {
+        // 100 USDT at leverage 2 lends up to 1 BTC at the close of 100; the cap allows 0.5.
+        let mut venue = margin_venue_holding_with(
+            |config| config.with_max_borrow(base(), d("0.5")).unwrap(),
+            MarginEffect::Borrow,
+        );
+
+        let outcome = venue.open_order(market_order("held", Side::Sell, "0.6", gtc()));
+
+        let reject = borrow_rejection(&outcome);
+        assert_eq!(reject.reason, BorrowRejectReason::BorrowLimitExceeded);
+        assert_eq!(reject.available, Some(d("0.5")));
+    }
+
+    #[test]
+    fn a_held_sell_lent_the_whole_cap_fills_at_its_bar_though_interest_took_the_debt_past_it() {
+        let mut venue = margin_venue_holding_with(
+            |config| config.with_max_borrow(base(), d("0.5")).unwrap(),
+            MarginEffect::Borrow,
+        )
+        .with_margin_interest(Arc::new(hourly_interest(base())));
+        let outcome = venue.open_order(market_order("held", Side::Sell, "0.5", gtc()));
+        assert_eq!(
+            balance_of(sans_debt(&outcome.events)[0]).balance.margin,
+            Some(MarginDetails::new(d("0.5"), d("0.00005"))),
+            "the loan's first charge takes what is owed past the 0.5 cap"
+        );
+
+        // The loan is already held against the order, so its fill borrows nothing more.
+        let events = feed_bar(&mut venue, 2, ohlc("98", "99", "97", "98"));
+
+        let trade = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                AccountEventKind::Trade(trade) => Some(trade),
+                _ => None,
+            })
+            .expect("the held sell fills at its bar");
+        assert_eq!(trade.quantity, d("0.5"));
+    }
+
+    #[test]
+    fn a_held_buy_whose_bar_needs_a_loan_past_the_cap_is_cancelled() {
+        // 150 at the close of 100 borrows 50 USDT, all the cap allows.
+        let mut venue = margin_venue_holding_with(
+            |config| config.with_max_borrow(quote(), d("50")).unwrap(),
+            MarginEffect::Borrow,
+        );
+        venue.open_order(market_order("held", Side::Buy, "1.5", gtc()));
+
+        // 180 at an open of 120 would borrow 30 more, which the leverage limit allows and the cap
+        // does not.
+        let events = feed_bar(&mut venue, 2, ohlc("120", "121", "119", "120"));
+
+        assert_eq!(
+            balance_of(sans_debt(&events)[0]).balance,
+            Balance::new_margin(d("100"), d("100"), Decimal::ZERO, Decimal::ZERO),
+            "the cancel repays the 50 the order borrowed when it was accepted"
+        );
+        assert!(matches!(
+            order_of(sans_debt(&events)[1]).state,
+            OrderState::Inactive(InactiveOrderState::Cancelled(_))
+        ));
+    }
+
+    // ---------------------------------------------------------------------------------------
     // Margin interest: charged when a loan is taken, then at each boundary while it is open.
     // ---------------------------------------------------------------------------------------
 
@@ -15978,5 +16475,38 @@ mod tests {
         assert_eq!(balance_now(&venue, bnb()).total, d("10"));
     }
 
+    fn eth() -> AssetNameExchange {
+        AssetNameExchange::new("ETH")
+    }
+
+    fn eth_instrument_name() -> InstrumentNameExchange {
+        InstrumentNameExchange::new("ETHUSDT")
+    }
+
+    /// BTCUSDT and ETHUSDT.
+    fn btc_and_eth_instruments()
+    -> FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>> {
+        let mut instruments = spot_instruments();
+        instruments.insert(
+            eth_instrument_name(),
+            Instrument {
+                exchange: EXCHANGE,
+                name_internal: InstrumentNameInternal::new("ethusdt"),
+                name_exchange: eth_instrument_name(),
+                underlying: Underlying {
+                    base: eth(),
+                    quote: quote(),
+                },
+                quote: InstrumentQuoteAsset::UnderlyingQuote,
+                kind: InstrumentKind::Spot,
+                spec: None,
+                data_venue: None,
+            },
+        );
+        instruments
+    }
+
+    mod borrow_capacity;
+    mod collateral_ratio;
     mod liquidation;
 }

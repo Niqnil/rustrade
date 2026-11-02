@@ -949,7 +949,9 @@ pub trait ShortabilityClient: ExecutionClient {
 /// # Type-Level Capability
 ///
 /// A supertrait of [`ExecutionClient`], for the reason [`BracketOrderClient`] is one. Only a venue
-/// that lends against an account's collateral and reports what is left of it implements it.
+/// that lends against an account's collateral and reports what is left of it implements it. The
+/// mock client implements it whether or not its simulated venue lends, and answers
+/// [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid) when it does not.
 pub trait BorrowCapacityClient: ExecutionClient {
     /// How much this account can borrow now for an order on `instrument` on `side`.
     ///

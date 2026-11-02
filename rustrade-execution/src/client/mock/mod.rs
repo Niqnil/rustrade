@@ -1,9 +1,10 @@
 use crate::{
     AccountEventKind, UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::AssetBalance,
-    client::{ExecutionClient, OrderStatusClient},
+    borrow_capacity::BorrowCapacity,
+    client::{BorrowCapacityClient, ExecutionClient, OrderStatusClient},
     error::{
-        ConnectivityError, NotPlacedReason, OrderError, StreamTerminationReason,
+        ClientError, ConnectivityError, NotPlacedReason, OrderError, StreamTerminationReason,
         UnindexedClientError, UnindexedOrderError,
     },
     exchange::mock::request::MockExchangeRequest,
@@ -22,6 +23,7 @@ use chrono::{DateTime, Utc};
 use derive_more::Constructor;
 use futures::{StreamExt, stream::BoxStream};
 use rustrade_instrument::{
+    Side,
     asset::name::AssetNameExchange,
     exchange::ExchangeId,
     instrument::{kind::InstrumentKindDiscriminant, name::InstrumentNameExchange},
@@ -449,6 +451,46 @@ where
                 self.mocked_exchange,
             ))
         })
+    }
+}
+
+/// Answered by the simulated venue from its own ledger and the markets it holds: see
+/// [`SimulatedVenue::borrow_capacity`](crate::exchange::mock::venue::SimulatedVenue::borrow_capacity)
+/// for how it values the account, and when it answers `None` or an error. A venue without a
+/// [`SpotMarginConfig`] lends against no instrument, so answers
+/// [`ApiError::InstrumentInvalid`](crate::error::ApiError::InstrumentInvalid) for every one.
+impl<FnTime> BorrowCapacityClient for MockExecution<FnTime>
+where
+    FnTime: Fn() -> DateTime<Utc> + Clone + Send + Sync,
+{
+    async fn fetch_borrow_capacity(
+        &self,
+        instrument: &InstrumentNameExchange,
+        side: Side,
+    ) -> Result<BorrowCapacity, UnindexedClientError> {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        self.request_tx
+            .send(MockExchangeRequest::fetch_borrow_capacity(
+                self.time_request(),
+                instrument.clone(),
+                side,
+                response_tx,
+            ))
+            .map_err(|_| {
+                UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(
+                    self.mocked_exchange,
+                ))
+            })?;
+
+        response_rx
+            .await
+            .map_err(|_| {
+                UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(
+                    self.mocked_exchange,
+                ))
+            })?
+            .map_err(ClientError::Api)
     }
 }
 
