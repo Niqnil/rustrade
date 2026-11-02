@@ -17,7 +17,8 @@
 //! borrow terms ([`ShortabilityClient`]) and how much this account can borrow for it
 //! ([`BorrowCapacityClient`]). Two reads beyond the traits cover what the account stream does not
 //! carry: the interest charged ([`BinanceMargin::fetch_margin_interest`]) and forced liquidations
-//! ([`BinanceMargin::fetch_forced_liquidations`]).
+//! ([`BinanceMargin::fetch_forced_liquidations`]). [`BinanceMargin::fetch_collateral_ratios`]
+//! reads cross margin's per-asset collateral ratios.
 //!
 //! The client supports both **cross** (`isIsolated = "FALSE"`, account-wide collateral) and
 //! **isolated** (`isIsolated = "TRUE"`, per-pair sub-accounts) margin, selected by
@@ -56,9 +57,11 @@
 //!   instead by the terminal report's own `z`, or by
 //!   [`ExecutionClient::fetch_open_orders`].
 
+mod collateral;
 mod records;
 mod stream;
 
+pub use collateral::CollateralRatioTier;
 pub use records::MarginForcedLiquidation;
 
 use super::commission::{CommissionRates, fetch_commission_rates};
