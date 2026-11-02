@@ -328,6 +328,28 @@ async fn free_quote(rest: &RestApi, account: Account, symbol: &str, quote: &str)
     }
 }
 
+/// The isolated pair's free base asset.
+async fn free_isolated_base(rest: &RestApi, symbol: &str) -> Decimal {
+    let info = rest
+        .query_isolated_margin_account_info(
+            QueryIsolatedMarginAccountInfoParams::builder()
+                .symbols(symbol.to_owned())
+                .build()
+                .unwrap(),
+        )
+        .await
+        .expect("isolated margin account")
+        .data()
+        .await
+        .expect("isolated margin account decode");
+    info.assets
+        .unwrap_or_default()
+        .into_iter()
+        .find(|pair| pair.symbol.as_deref() == Some(symbol))
+        .and_then(|pair| pair.base_asset)
+        .map_or(Decimal::ZERO, |asset| decimal(asset.free.as_ref()))
+}
+
 /// Cancels the account's open orders on the pair and repays what it owes, then reads it again,
 /// up to six times three seconds apart, since account reads can trail a cancel or repay.
 async fn flatten(rest: &RestApi, account: Account, symbol: &str) -> Leftovers {
@@ -804,8 +826,10 @@ async fn on_borrow_principal(
     let market = market(&symbol).await;
     // Cross borrows the quote asset with a buy below the market, larger than the free quote. On
     // the isolated pair Binance has refused to lend the quote asset (`-3012`), so it borrows the
-    // base asset instead, with a sell above the market: the pair holds none, so the whole sale is
-    // lent, at least the asset's minimum borrow.
+    // base asset instead, with a sell above the market of more than the pair holds, so Binance
+    // lends the rest, at least the asset's minimum borrow. Keep a little of the base asset in the
+    // pair: the hour's interest is owed in it after the cancel's auto-repay, and the cleanup can
+    // repay it only from what the pair holds.
     let (side, price, quantity, lent) = match account {
         Account::Cross => {
             let price = market.resting_price();
@@ -819,7 +843,10 @@ async fn on_borrow_principal(
                 .strip_suffix(market.quote.as_str())
                 .expect("the pair's name ends with its quote asset")
                 .to_owned();
-            (Side::Sell, price, market.quantity(BORROW, price), base)
+            // What the pair holds of the base asset is sold first, so the loan is the rest.
+            let free = free_isolated_base(rest, &symbol).await;
+            let quantity = (free + market.quantity(BORROW, price)).normalize();
+            (Side::Sell, price, quantity, base)
         }
     };
     // Binance stamps the charge at the start of the hour the loan is made in, on its clock: a
@@ -1309,6 +1336,77 @@ async fn real_money_cross_on_borrow_principal_is_the_loan() {
 #[serial]
 async fn real_money_isolated_on_borrow_principal_is_the_loan() {
     real_money_run(Account::Isolated, Scenario::OnBorrowPrincipal).await;
+}
+
+/// The most of its base asset the isolated pair may owe for
+/// [`real_money_isolated_buy_base_to_repay_dust`] to act: a few satoshi of leftover interest.
+const DUST_DEBT: Decimal = dec!(0.000001);
+
+/// One-off cleanup for an isolated pair that owes a few satoshi of its base asset, the interest
+/// left after a base-asset loan's auto-repay, and holds none to repay it with. **This one
+/// fills**: a `MARKET` buy of the base asset with the pair's quote asset, about 1.1 times
+/// Binance's minimum notional, then the usual cleanup repays the debt from it. It costs the
+/// trading fee and the spread, and leaves the rest of the bought base asset in the pair.
+///
+/// It acts only when the cross account is flat and the isolated pair has no open orders and owes
+/// nothing but its base asset, less than [`DUST_DEBT`] of it.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn real_money_isolated_buy_base_to_repay_dust() {
+    if !opted_in() {
+        return;
+    }
+    let symbol = symbol();
+    let rest = rest();
+    let market = market(&symbol).await;
+    let base = symbol
+        .strip_suffix(market.quote.as_str())
+        .expect("the pair's name ends with its quote asset")
+        .to_owned();
+    let cross = leftovers(&rest, Account::Cross, &symbol).await;
+    assert!(
+        cross.is_flat(),
+        "refusing: the cross account is not flat ({cross:?})"
+    );
+    let left = leftovers(&rest, Account::Isolated, &symbol).await;
+    let dust_only = left.open_orders == 0
+        && matches!(left.debt.as_slice(), [(asset, amount)] if *asset == base && *amount < DUST_DEBT);
+    assert!(
+        dust_only,
+        "refusing: the isolated pair holds more than a dust debt in {base} ({left:?})"
+    );
+
+    let (api_key, secret_key) = keys();
+    let instrument = InstrumentNameExchange::new(symbol.clone());
+    let client = BinanceMargin::new(BinanceMarginConfig::isolated(
+        api_key,
+        secret_key,
+        vec![instrument.clone()],
+    ));
+    let quantity = market.quantity(market.min_notional * dec!(1.1), market.last);
+    let (cid, placement) = submit(
+        &client,
+        &instrument,
+        "dust-buy",
+        Side::Buy,
+        OrderKind::Market,
+        market.last,
+        quantity,
+        MarginEffect::NoSideEffect,
+    )
+    .await;
+    println!(
+        "dust-buy: {cid} for {quantity} {base}: {:?}",
+        placement.order.state
+    );
+    assert!(
+        placement.borrowed.is_none(),
+        "the buy borrowed {:?}",
+        placement.borrowed
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    flatten_all(&rest, &symbol).await;
 }
 
 /// The cleanup alone, for a subaccount a killed run left with open orders or debt.
