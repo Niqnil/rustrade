@@ -4849,10 +4849,11 @@ mod tests {
     fn a_charge_on_borrow_whose_period_began_before_the_session_is_left_out_with_a_warning() {
         let mut state = instrument_state(OmsMode::Netting);
         let quote = state.instrument.underlying.quote;
-        // The last close is before the period, so only the session start rules the flow out.
+        // The last close is before the period, so only the session start rules the flow out. The
+        // position enters at the session start, which is in the session, so the drop warns.
         assert!(fill_after(&mut state, "open a", Side::Sell, dec!(1), 10).is_none());
         assert!(fill_after(&mut state, "close a", Side::Buy, dec!(1), 50).is_some());
-        state.tear_sheet.time_engine_start = after(200);
+        state.tear_sheet.time_engine_start = after(1800);
         assert!(fill_after(&mut state, "open b", Side::Sell, dec!(1), 1800).is_none());
 
         let (update, warnings) = count_warnings(|| {
