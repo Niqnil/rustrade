@@ -196,9 +196,10 @@ impl SimulatedVenue {
         }
     }
 
-    /// Cancels every open order, resting or held, releasing what each held, as `[balance, order]`
-    /// per order, or `[order]` for one that held nothing. By client order id, so every run cancels
-    /// in the same order.
+    /// Cancels every open order, resting or held, releasing what each held, as `[balance, cash
+    /// flow.., order]` per order, or `[order]` for one that held nothing. The cash flows report the
+    /// interest an order's loan was charged when it was placed, if it borrowed. By client order id,
+    /// so every run cancels in the same order.
     fn cancel_every_order(
         &mut self,
         time_exchange: DateTime<Utc>,
@@ -217,7 +218,7 @@ impl SimulatedVenue {
             if let Some(resting) = self.account.remove_order(&cid) {
                 let released = resting
                     .reservation
-                    .map(|reservation| self.release_reservation(&reservation, time_exchange));
+                    .map(|reservation| self.release_reservation(reservation, time_exchange));
                 events.extend(self.cancel_unfilled(resting.order, released, time_exchange));
             }
         }
@@ -484,8 +485,7 @@ impl SimulatedVenue {
         };
         self.account.ack_trade(trade.clone());
 
-        self.push_committed(events, commitment);
-        events.push(self.build_account_event(AccountEventKind::Trade(trade)));
+        self.push_committed(events, commitment, Some(trade));
         delivered(&settlement.credit)
     }
 
