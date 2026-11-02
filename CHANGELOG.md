@@ -47,6 +47,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and every instrument on a venue without a `SpotMarginConfig`, which lends nothing.
   - New `SimulatedVenue::borrow_capacity`, `AccountState::cap_room`, and a
     `MockExchangeRequestKind::FetchBorrowCapacity` request (the enum is non-exhaustive).
+- **Per-asset collateral ratios on the simulated venue's spot margin** (`rustrade-execution`,
+  #829). An asset can now count for less than its full value as collateral, as Binance's Cross
+  Margin Classic has weighted each asset by a collateral ratio since 2026-06-15 (BTC at 95 %, many
+  smaller assets at 10 % to 80 %). Without them a backtest could lend far more against such
+  assets than Binance does.
+  - `SpotMarginConfig::with_borrow_collateral_ratio(asset, ratio)` weights `asset` in the
+    leverage limit, and so in what the venue lends and in `fetch_borrow_capacity`.
+    `with_liquidation_collateral_ratio(asset, ratio)` weights it in the margin level a
+    `SpotMarginLiquidation` checks. Binance lists both per asset; its liquidation ratios are 100 %
+    today, so only lending changes. Getters `borrow_collateral_ratio` and
+    `liquidation_collateral_ratio` return one for an asset without one.
+  - A ratio weights only what the account holds of an asset beyond what it owes of it. Holdings
+    up to the debt count in full, and so do the holdings of an asset owed beyond them. Debt is
+    never weighted.
+  - Every ratio is one by default, so existing configurations lend and liquidate as before.
+  - A ratio outside `[0, 1]` is refused with the new
+    `SpotMarginConfigError::CollateralRatioOutOfRange`. A liquidation ratio below the asset's
+    borrow ratio is refused with `LiquidationRatioBelowBorrowRatio`, which keeps a borrow the
+    leverage limit allows from reaching the liquidation level.
+  - Serialised as `borrow_collateral_ratio` and `liquidation_collateral_ratio` maps from asset to
+    decimal string, each left out when empty.
+  - Not modelled: Binance's tiers by holding size (one tier per asset today), and its borrow
+    check's prices, the highest and lowest index price over a recent window.
 - **`BinanceMargin::fetch_collateral_ratios`** (`rustrade-execution`, `binance`, #829) reads
   `GET /sapi/v1/margin/crossMarginCollateralRatio`: each asset's cross-margin collateral ratio
   tiers, as a map from asset to the new `CollateralRatioTier`s (`min_usd_value`, `max_usd_value`,

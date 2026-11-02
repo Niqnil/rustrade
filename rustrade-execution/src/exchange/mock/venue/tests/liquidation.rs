@@ -618,37 +618,6 @@ fn a_debt_in_a_pairs_quote_is_bought_back_by_selling_the_valuation_asset_as_its_
     assert_eq!(balance_now(&venue, base()).total, d("0.031"));
 }
 
-fn eth() -> AssetNameExchange {
-    AssetNameExchange::new("ETH")
-}
-
-fn eth_instrument_name() -> InstrumentNameExchange {
-    InstrumentNameExchange::new("ETHUSDT")
-}
-
-/// BTCUSDT and ETHUSDT.
-fn btc_and_eth_instruments()
--> FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>> {
-    let mut instruments = spot_instruments();
-    instruments.insert(
-        eth_instrument_name(),
-        Instrument {
-            exchange: EXCHANGE,
-            name_internal: InstrumentNameInternal::new("ethusdt"),
-            name_exchange: eth_instrument_name(),
-            underlying: Underlying {
-                base: eth(),
-                quote: quote(),
-            },
-            quote: InstrumentQuoteAsset::UnderlyingQuote,
-            kind: InstrumentKind::Spot,
-            spec: None,
-            data_venue: None,
-        },
-    );
-    instruments
-}
-
 #[test]
 fn collateral_is_sold_in_name_order_and_only_as_much_as_the_debt_and_fee_need() {
     let config = liquidating_config(

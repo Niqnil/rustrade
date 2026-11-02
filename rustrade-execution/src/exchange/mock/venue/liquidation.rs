@@ -1,7 +1,7 @@
 //! Liquidating the simulated venue's spot margin account, and the margin-call notices before it.
 //! See [`SpotMarginLiquidation`] for what the venue does, and when.
 
-use super::{InstrumentTerms, NetPosition, SimulatedVenue, Valued, mid_or_last, owed};
+use super::{InstrumentTerms, MarginCheck, NetPosition, SimulatedVenue, Valued, mid_or_last, owed};
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
     cash_flow::{CashFlow, CashFlowId, CashFlowKind},
@@ -88,7 +88,8 @@ impl SimulatedVenue {
             return;
         }
 
-        let Some(Valued { equity, debt }) = self.valued(&valuation, None) else {
+        let Some(Valued { equity, debt }) = self.valued(config, MarginCheck::Liquidation, None)
+        else {
             if !self.liquidation.warned_unvalued {
                 self.liquidation.warned_unvalued = true;
                 warn!(
@@ -146,7 +147,7 @@ impl SimulatedVenue {
         self.cancel_every_order(time_exchange, events);
         // Valued after the cancels, so the fee is charged on what the liquidation repaid, not on
         // the loans the cancelled orders gave back.
-        let debt_before = self.debt_in(valuation);
+        let debt_before = self.debt_in();
 
         for asset in self.owed_assets() {
             if self.account.free(&asset) > Decimal::ZERO {
@@ -167,7 +168,7 @@ impl SimulatedVenue {
 
         // The prices have not moved since `debt_before`, and nothing here borrows, so every debt
         // is still valued and the difference is what this pass repaid.
-        let repaid = (debt_before - self.debt_in(valuation)).max(Decimal::ZERO);
+        let repaid = (debt_before - self.debt_in()).max(Decimal::ZERO);
         let fee = liquidation.fee_rate() * repaid;
         if fee > Decimal::ZERO {
             self.charge_liquidation_fee(
@@ -509,9 +510,13 @@ impl SimulatedVenue {
             .map_or(Decimal::ZERO, owed)
     }
 
-    /// The account's debt valued in `valuation`, zero if a debt cannot be valued.
-    fn debt_in(&self, valuation: &AssetNameExchange) -> Decimal {
-        self.valued(valuation, None)
+    /// The account's debt valued in its spot margin configuration's valuation asset, zero if a
+    /// debt cannot be valued or the venue has no spot margin.
+    fn debt_in(&self) -> Decimal {
+        self.spot_margin
+            .as_ref()
+            // The ratios weight only equity, so either check values the debt alike.
+            .and_then(|config| self.valued(config, MarginCheck::Liquidation, None))
             .map_or(Decimal::ZERO, |valued| valued.debt)
     }
 
