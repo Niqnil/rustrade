@@ -337,6 +337,10 @@ impl SpotMarginConfig {
     /// borrow its limit allows because it has too little of the asset to lend, which this venue
     /// does not model.
     ///
+    /// The mock client reports the cap as
+    /// [`BorrowCapacity::account_limit`](crate::BorrowCapacity::account_limit), from
+    /// [`BorrowCapacityClient::fetch_borrow_capacity`](crate::client::BorrowCapacityClient::fetch_borrow_capacity).
+    ///
     /// # Rejection
     /// An order that would borrow past the cap is rejected, never lent less than it needs. Where
     /// the cap allows less than the leverage limit, the rejection is

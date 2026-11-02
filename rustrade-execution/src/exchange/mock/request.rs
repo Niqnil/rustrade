@@ -1,6 +1,8 @@
 use crate::{
     UnindexedAccountSnapshot,
     balance::AssetBalance,
+    borrow_capacity::BorrowCapacity,
+    error::UnindexedApiError,
     order::{
         Order, UnindexedInactiveOrder, UnindexedOrderKey,
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
@@ -10,7 +12,8 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use rustrade_instrument::{
-    asset::name::AssetNameExchange, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
+    Side, asset::name::AssetNameExchange, exchange::ExchangeId,
+    instrument::name::InstrumentNameExchange,
 };
 use tokio::sync::oneshot;
 
@@ -59,6 +62,22 @@ impl MockExchangeRequest {
             MockExchangeRequestKind::FetchOrdersOpen {
                 response_tx,
                 instruments,
+            },
+        )
+    }
+
+    pub fn fetch_borrow_capacity(
+        time_request: DateTime<Utc>,
+        instrument: InstrumentNameExchange,
+        side: Side,
+        response_tx: oneshot::Sender<Result<BorrowCapacity, UnindexedApiError>>,
+    ) -> Self {
+        Self::new(
+            time_request,
+            MockExchangeRequestKind::FetchBorrowCapacity {
+                response_tx,
+                instrument,
+                side,
             },
         )
     }
@@ -145,6 +164,12 @@ pub enum MockExchangeRequestKind {
     FetchOrdersEnded {
         orders: Vec<UnindexedOrderKey>,
         response_tx: oneshot::Sender<Vec<UnindexedInactiveOrder>>,
+    },
+    /// How much more the account can borrow for an order on `instrument` on `side`.
+    FetchBorrowCapacity {
+        instrument: InstrumentNameExchange,
+        side: Side,
+        response_tx: oneshot::Sender<Result<BorrowCapacity, UnindexedApiError>>,
     },
     /// Every trade from `start` to `end`, both inclusive.
     FetchTrades {

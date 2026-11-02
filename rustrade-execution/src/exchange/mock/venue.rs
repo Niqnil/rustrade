@@ -3,6 +3,7 @@
 use crate::{
     AccountEventKind, InstrumentAccountSnapshot, UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, MarginDetails},
+    borrow_capacity::BorrowCapacity,
     cash_flow::{CashFlow, CashFlowId, CashFlowKind, InterestTiming},
     client::mock::MockExecutionConfig,
     error::{ApiError, BorrowReject, BorrowRejectReason, UnindexedApiError, UnindexedOrderError},
@@ -1290,18 +1291,31 @@ impl SimulatedVenue {
         }
 
         let priced = market.map(|market| (&terms.underlying, market));
-        let valuation = config.valuation_asset();
-        let Some(asset_price) = self.price_in(&debit.asset, valuation, priced) else {
-            return Decimal::ZERO;
-        };
         // A debt this venue cannot value could be any size, so it lends nothing more.
-        let Some(Valued { equity, debt }) = self.valued(valuation, priced) else {
-            return Decimal::ZERO;
-        };
+        self.leverage_room(config, &debit.asset, priced)
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    /// How much more of `asset` the leverage limit of `config` lets this account borrow, whatever
+    /// order would borrow it: `(max_leverage − 1) · equity − debt`, never negative, in units of
+    /// `asset`. See [`SpotMarginConfig`]'s `# How much it lends`.
+    ///
+    /// `None` if this venue cannot value `asset`, or a debt the account owes. `priced` is as for
+    /// [`price_in`](Self::price_in). Shared by an order's [`borrowable`](Self::borrowable) and the
+    /// [`borrow_capacity`](Self::borrow_capacity) query, so the two agree.
+    fn leverage_room(
+        &self,
+        config: &SpotMarginConfig,
+        asset: &AssetNameExchange,
+        priced: Option<(&Underlying<AssetNameExchange>, &MarketSnapshot)>,
+    ) -> Option<Decimal> {
+        let valuation = config.valuation_asset();
+        let asset_price = self.price_in(asset, valuation, priced)?;
+        let Valued { equity, debt } = self.valued(valuation, priced)?;
 
         let headroom = (config.max_leverage() - Decimal::ONE) * equity - debt;
         // `price_in` never values an asset at zero, so the division is safe.
-        headroom.max(Decimal::ZERO) / asset_price
+        Some(headroom.max(Decimal::ZERO) / asset_price)
     }
 
     /// The rejection for an arrival the account refused, an order on `side`.
@@ -2773,6 +2787,105 @@ impl SimulatedVenue {
             .filter(|balance| assets.is_empty() || assets.contains(&balance.asset))
             .cloned()
             .collect()
+    }
+
+    /// How much more this account can borrow now for an order on `instrument` on `side`: what
+    /// [`BorrowCapacityClient::fetch_borrow_capacity`] asks a simulated venue.
+    ///
+    /// A sell borrows `instrument`'s base asset, a buy its quote asset, which the result names.
+    /// [`borrowable_now`](BorrowCapacity::borrowable_now) is the lesser of what the leverage limit
+    /// and the asset's borrow cap leave, as [`SpotMarginConfig`]'s `# How much it lends` says.
+    /// It is zero when that is below the asset's minimum borrow, which no loan may be under, and
+    /// while a liquidation is under way, when this venue lends nothing.
+    /// [`account_limit`](BorrowCapacity::account_limit) is the asset's cap, unset when it has none.
+    ///
+    /// It is the room to borrow alone. The account's free balance of the asset is not added,
+    /// though an order spends that before it borrows. Resting orders need no adjustment: what they
+    /// borrowed when placed is in the debt, and what they hold is still in the equity.
+    ///
+    /// # Valued without an order's market
+    /// The query carries no market snapshot, so only the markets this venue holds value the
+    /// account. When they cannot value the asset, or any balance the account holds or owes,
+    /// `borrowable_now` is `None`, unknown, where an order, which brings its own market, may still
+    /// be lent. A cap that leaves nothing, or less than the minimum borrow, still makes it zero.
+    /// A [`RequestPriced`](VenueRegime::RequestPriced) venue holds no market, so it can answer
+    /// only for an account holding nothing but its valuation asset, asked about that asset.
+    ///
+    /// # Errors
+    /// [`ApiError::InstrumentInvalid`] for an instrument this venue does not trade, and for one it
+    /// never lends against: every instrument on a cash account (no spot margin configuration),
+    /// and a cash-settled one on a margin account.
+    ///
+    /// [`BorrowCapacityClient::fetch_borrow_capacity`]: crate::client::BorrowCapacityClient::fetch_borrow_capacity
+    pub fn borrow_capacity(
+        &self,
+        instrument: &InstrumentNameExchange,
+        side: Side,
+    ) -> Result<BorrowCapacity, UnindexedApiError> {
+        let terms = self.instrument_terms(instrument)?;
+        let config = match &self.spot_margin {
+            Some(config) if !terms.cash_settled => config,
+            Some(_) => {
+                return Err(ApiError::InstrumentInvalid(
+                    instrument.clone(),
+                    format!(
+                        "SimulatedVenue lends nothing against {instrument}: it is cash-settled"
+                    ),
+                ));
+            }
+            None => {
+                return Err(ApiError::InstrumentInvalid(
+                    instrument.clone(),
+                    format!(
+                        "SimulatedVenue lends nothing against {instrument}: it has no spot margin \
+                         configuration"
+                    ),
+                ));
+            }
+        };
+        let asset = match side {
+            Side::Buy => &terms.underlying.quote,
+            Side::Sell => &terms.underlying.base,
+        };
+
+        let mut capacity = BorrowCapacity::new(asset.clone());
+        let cap = config.max_borrow(asset);
+        if let Some(cap) = cap {
+            capacity = capacity.with_account_limit(cap);
+        }
+        let cap_room = cap.map(|cap| self.account.cap_room(asset, cap));
+        let min_borrow = config.min_borrow(asset);
+
+        // The cap alone rules a loan out when it leaves none, or less than the least that may be
+        // lent, whatever the leverage limit would leave.
+        let ruled_out = self.liquidation.under_way()
+            || cap_room.is_some_and(|room| room.is_zero() || room < min_borrow);
+        let room = match ruled_out {
+            true => Some(Decimal::ZERO),
+            false => self
+                .values_every_holding(config.valuation_asset())
+                .then(|| self.leverage_room(config, asset, None))
+                .flatten()
+                .map(|room| cap_room.map_or(room, |cap_room| cap_room.min(room))),
+        };
+        if let Some(room) = room {
+            capacity = capacity.with_borrowable_now(match room < min_borrow {
+                true => Decimal::ZERO,
+                false => room,
+            });
+        }
+        Ok(capacity)
+    }
+
+    /// Whether the markets this venue holds value, in `valuation`, every asset the account holds
+    /// any of. The leverage limit leaves a holding it cannot value out of the equity, which
+    /// understates what an order may borrow, but a query that cannot value one does not know.
+    /// A debt it cannot value already stops [`leverage_room`](Self::leverage_room).
+    fn values_every_holding(&self, valuation: &AssetNameExchange) -> bool {
+        self.account.balances().all(|balance| {
+            balance.balance.total.is_zero()
+                || self.price_in(&balance.asset, valuation, None).is_some()
+        })
     }
 
     pub fn orders_open(
@@ -16332,5 +16445,6 @@ mod tests {
         assert_eq!(balance_now(&venue, bnb()).total, d("10"));
     }
 
+    mod borrow_capacity;
     mod liquidation;
 }
