@@ -262,6 +262,12 @@ pub enum CarryUpdate {
     /// The flow predates the open position's `time_enter`, so it belongs to an earlier position on
     /// the instrument, or to the carry seeded with this one.
     BeforeEntry,
+    /// The flow is the charge on a new loan, stamped before the open position's `time_enter` in a
+    /// period the position entered within, so it may be the position's. But the period began
+    /// before [`PositionManager::time_history_start`] or the session start, so an earlier position
+    /// on the instrument may have taken the loan, or the charge may be in carry seeded with this
+    /// one.
+    BeforeHistory,
     /// Several positions are open on the instrument ([`OmsMode::Hedging`]) and the venue does not
     /// say which one the flow belongs to.
     SeveralOpen,
@@ -333,6 +339,11 @@ pub struct PositionManager<AssetKey = AssetIndex, InstrumentKey = InstrumentInde
     pub mode: OmsMode,
     /// All currently open positions keyed by `PositionId`.
     pub positions: FnvIndexMap<PositionId, Position<AssetKey, InstrumentKey>>,
+    /// See [`Self::time_history_start`].
+    ///
+    /// `#[serde(default)]` so a manager serialised before this field existed still loads.
+    #[serde(default)]
+    time_history_start: Option<DateTime<Utc>>,
 }
 
 impl<AssetKey, InstrumentKey> Default for PositionManager<AssetKey, InstrumentKey> {
@@ -350,7 +361,41 @@ impl<AssetKey, InstrumentKey> PositionManager<AssetKey, InstrumentKey> {
         Self {
             mode,
             positions: FnvIndexMap::with_capacity_and_hasher(1, Default::default()),
+            time_history_start: None,
         }
+    }
+
+    /// The latest time a position on the instrument ended in this manager's view: when a fill
+    /// closed one, a split removed one, or a [`PositionSeed`] placed one (the engine does not
+    /// know what was held before a seed's `time_enter`). `None` until any of these happens.
+    ///
+    /// From it on, the manager has seen every position on the instrument. Before it, a position
+    /// other than the open one may have been held, so a charge for a period that began before it
+    /// cannot be given to the open position without guessing. See
+    /// [`InstrumentState::update_from_cash_flow`](super::instrument::InstrumentState::update_from_cash_flow).
+    ///
+    /// A position inserted into [`Self::positions`] directly, rather than by a fill or a seed, does
+    /// not move it.
+    pub fn time_history_start(&self) -> Option<DateTime<Utc>> {
+        self.time_history_start
+    }
+
+    /// Move [`Self::time_history_start`] to `time` when that is later.
+    pub(crate) fn record_position_end(&mut self, time: DateTime<Utc>) {
+        self.time_history_start = Some(self.time_history_start.map_or(time, |t| t.max(time)));
+    }
+
+    /// Remove the position `position_id`, which ended at `time` other than by a fill, as a split
+    /// that floors its quantity to zero ends it, and move [`Self::time_history_start`] to `time`.
+    /// `None`, and nothing moved, when no such position is open.
+    pub(crate) fn remove_ended(
+        &mut self,
+        position_id: &PositionId,
+        time: DateTime<Utc>,
+    ) -> Option<Position<AssetKey, InstrumentKey>> {
+        let removed = self.positions.shift_remove(position_id)?;
+        self.record_position_end(time);
+        Some(removed)
     }
 }
 
@@ -482,6 +527,9 @@ impl<AssetKey: Debug + Clone, InstrumentKey> PositionManager<AssetKey, Instrumen
             e.position_id = position_id.clone();
             e
         });
+        if let Some(exited) = &closed {
+            self.record_position_end(exited.time_exit);
+        }
 
         if let Some(pos) = updated {
             self.positions.insert(position_id.clone(), pos);
@@ -696,6 +744,7 @@ impl PositionSeed {
             contract_size,
         };
         manager.positions.insert(position_id, position);
+        manager.record_position_end(self.time_enter);
         Ok(())
     }
 }

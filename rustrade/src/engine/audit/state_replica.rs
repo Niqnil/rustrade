@@ -436,10 +436,9 @@ where
                             .replica_engine_state_mut()
                             .instruments
                             .instrument_index_mut(&instrument);
-                        instrument_state
+                        let _ = instrument_state
                             .position
-                            .positions
-                            .shift_remove(&exit.position_id);
+                            .remove_ended(&exit.position_id, exit.time_exit);
                         instrument_state.tear_sheet.update_from_position(exit);
                         // Mirror the live handler's Hedging fill-routing prune on floor-to-zero
                         // (engine/mod.rs): drop the now-dangling `cid → removed_pos_id` mapping by

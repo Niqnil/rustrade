@@ -5,7 +5,9 @@
 
 use super::BinanceMargin;
 use crate::{
-    cash_flow::{CashFlow, CashFlowId, CashFlowKind, CashFlowsRead, InterestTiming},
+    cash_flow::{
+        CashFlow, CashFlowId, CashFlowKind, CashFlowPeriod, CashFlowsRead, InterestTiming,
+    },
     client::binance::shared::{
         RequestKind, classify_rest_query_error, parse_side, response_decode_error,
         rest_call_with_retry,
@@ -131,6 +133,12 @@ impl BinanceMargin {
     ///   the charge is for, not when Binance posted it (see [Delivery](#delivery)): for an hourly
     ///   charge, the start of its hour. An `ON_BORROW` charge is stamped at the start of the hour
     ///   the loan was taken in, so it can precede the opening of the position it belongs to.
+    /// - [`period`](CashFlow::period) is that hour, from `interestAccuredTime` to an hour after
+    ///   it, for an hourly charge: `PERIODIC`, `ON_BORROW` and their `_CONVERTED` forms. The engine
+    ///   reads it to give an `ON_BORROW` charge to a position opened later in its hour (see
+    ///   `InstrumentState::update_from_cash_flow` in `rustrade`). `None` for any other `type`,
+    ///   whose period Binance does not document, `PORTFOLIO` included, and, logged at WARN, for an
+    ///   hourly charge not stamped on the hour.
     /// - [`id`](CashFlow::id) is Binance's transaction id for the charge.
     ///
     /// The engine adds a flow attributed to an instrument to the carry of its open position, in
@@ -483,6 +491,41 @@ fn interest_timing(r#type: &str) -> InterestTiming {
     }
 }
 
+/// The length of an hourly charge's period.
+const INTEREST_HOUR: TimeDelta = TimeDelta::hours(1);
+
+/// The period of an `interestHistory` row of `type` `r#type` stamped at `time`: the hour from
+/// `time` for an hourly charge, which Binance stamps at the start of its hour. `None` for another
+/// type, whose period Binance does not document, and, logged at WARN, for an hourly charge whose
+/// stamp is not on the hour, since then the stamp is not what this assumes.
+fn interest_period(
+    r#type: Option<&str>,
+    time: DateTime<Utc>,
+    tx_id: Option<i64>,
+) -> Option<CashFlowPeriod> {
+    let hourly = matches!(
+        r#type,
+        Some("PERIODIC" | "PERIODIC_CONVERTED" | "ON_BORROW" | "ON_BORROW_CONVERTED")
+    );
+    if !hourly {
+        return None;
+    }
+    if time
+        .timestamp_millis()
+        .rem_euclid(INTEREST_HOUR.num_milliseconds())
+        != 0
+    {
+        warn!(
+            ?tx_id,
+            r#type,
+            %time,
+            "BinanceMargin hourly interest record not stamped on the hour — no period given"
+        );
+        return None;
+    }
+    CashFlowPeriod::new(time, time + INTEREST_HOUR)
+}
+
 /// One `interestHistory` row as a [`CashFlow`], or `None`, with a warning, if it lacks what a flow
 /// needs. `pair` is the isolated pair the row was read for, if any.
 fn convert_interest(
@@ -526,18 +569,22 @@ fn convert_interest(
         .as_deref()
         .map(InstrumentNameExchange::new)
         .or_else(|| pair.cloned());
-    Some(CashFlow::new(
-        CashFlowKind::MarginInterest {
-            rate: optional_decimal("interest", "interestRate", row.interest_rate.as_deref()),
-            principal: optional_decimal("interest", "principal", row.principal.as_deref()),
-            timing: row.r#type.as_deref().map(interest_timing),
-        },
-        AssetNameExchange::new(asset),
-        -interest,
-        instrument,
-        time_exchange,
-        tx_id.map(|id| CashFlowId(format_smolstr!("{id}"))),
-    ))
+    let period = interest_period(row.r#type.as_deref(), time_exchange, tx_id);
+    Some(
+        CashFlow::new(
+            CashFlowKind::MarginInterest {
+                rate: optional_decimal("interest", "interestRate", row.interest_rate.as_deref()),
+                principal: optional_decimal("interest", "principal", row.principal.as_deref()),
+                timing: row.r#type.as_deref().map(interest_timing),
+            },
+            AssetNameExchange::new(asset),
+            -interest,
+            instrument,
+            time_exchange,
+            tx_id.map(|id| CashFlowId(format_smolstr!("{id}"))),
+        )
+        .with_period(period),
+    )
 }
 
 /// One `forceLiquidationRec` row as a [`MarginForcedLiquidation`], or `None`, with a warning, if
@@ -617,6 +664,7 @@ fn convert_forced_liquidation(
 mod tests {
     use super::{super::tests::margin_client_at, *};
     use crate::error::ApiError;
+    use chrono::DurationRound;
     use rust_decimal_macros::dec;
     use serde_json::{Value, json};
     use std::collections::HashMap;
@@ -783,6 +831,63 @@ mod tests {
         ] {
             assert_eq!(interest_timing(r#type), expected, "{type}");
         }
+    }
+
+    #[test]
+    fn an_hourly_charge_has_the_hour_from_its_stamp_as_its_period() {
+        let hour = Utc.with_ymd_and_hms(2026, 10, 22, 9, 0, 0).unwrap();
+        for r#type in [
+            "PERIODIC",
+            "PERIODIC_CONVERTED",
+            "ON_BORROW",
+            "ON_BORROW_CONVERTED",
+        ] {
+            assert_eq!(
+                interest_period(Some(r#type), hour, Some(1)),
+                CashFlowPeriod::new(hour, hour + TimeDelta::hours(1)),
+                "{type}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_charge_of_another_type_or_off_the_hour_has_no_period() {
+        let hour = Utc.with_ymd_and_hms(2026, 10, 22, 9, 0, 0).unwrap();
+        for r#type in [Some("PORTFOLIO"), Some("ON_LIQUIDATION"), None] {
+            assert_eq!(interest_period(r#type, hour, Some(1)), None, "{type:?}");
+        }
+        for off in [TimeDelta::milliseconds(1), TimeDelta::minutes(31)] {
+            assert_eq!(
+                interest_period(Some("ON_BORROW"), hour + off, Some(1)),
+                None,
+                "{off}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_charge_on_borrow_read_from_binance_has_its_hour_as_its_period() {
+        let server = MockServer::start().await;
+        let now = Utc::now();
+        // An hour divides a day, so truncating to one cannot fail.
+        let hour = now.duration_trunc(TimeDelta::hours(1)).unwrap() - TimeDelta::hours(2);
+        let mut row = interest_row(1, hour, None);
+        row["type"] = json!("ON_BORROW");
+        mount(&server, INTEREST_PATH, page(vec![row])).await;
+        let client = margin_client_at(&server, false);
+
+        let flows = client
+            .fetch_margin_interest(now - TimeDelta::days(1), now)
+            .await
+            .unwrap()
+            .flows;
+
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].time_exchange, hour);
+        assert_eq!(
+            flows[0].period,
+            CashFlowPeriod::new(hour, hour + TimeDelta::hours(1))
+        );
     }
 
     #[tokio::test]

@@ -80,7 +80,9 @@ pub mod balance;
 pub mod borrow_capacity;
 pub use borrow_capacity::BorrowCapacity;
 pub mod cash_flow;
-pub use cash_flow::{CashFlow, CashFlowId, CashFlowKind, CashFlowsRead, InterestTiming};
+pub use cash_flow::{
+    CashFlow, CashFlowId, CashFlowKind, CashFlowPeriod, CashFlowsRead, InterestTiming,
+};
 pub mod client;
 pub mod error;
 pub mod exchange;

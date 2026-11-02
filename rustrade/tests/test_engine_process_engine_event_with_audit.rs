@@ -6418,6 +6418,18 @@ fn test_corporate_action_floor_to_zero_prunes_hedging_routing() {
         !instr.position_ids.values().any(|v| *v == pos_id),
         "the floored position's routing entry must be pruned by value"
     );
+    let time_exit = outputs
+        .iter()
+        .find_map(|o| match o {
+            EngineOutput::PositionExit(p) if p.position_id == pos_id => Some(p.time_exit),
+            _ => None,
+        })
+        .expect("asserted above");
+    assert_eq!(
+        instr.position.time_history_start(),
+        Some(time_exit),
+        "the removal is where the instrument's position history starts again"
+    );
     // ... while the resting order itself is left in place (the split price-adjusts, never cancels).
     assert!(
         instr.orders.0.contains_key(&cid),

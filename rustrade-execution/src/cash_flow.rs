@@ -7,7 +7,7 @@
 //! the consumer's.
 
 use chrono::{DateTime, Utc};
-use derive_more::{Constructor, From};
+use derive_more::From;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
@@ -41,7 +41,7 @@ use std::fmt::{Display, Formatter};
 ///   [`SpotMarginLiquidation`](crate::margin::SpotMarginLiquidation), each flow once, with an id
 ///   from its own sequence.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, Constructor)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct CashFlow<AssetKey, InstrumentKey> {
     /// What the flow is for.
     pub kind: CashFlowKind,
@@ -56,10 +56,106 @@ pub struct CashFlow<AssetKey, InstrumentKey> {
     /// strategy's `CashFlowAttributionStrategy`, and applies the flow to no position when that
     /// names none. See `EngineState::update_from_account` in `rustrade` for why.
     pub instrument: Option<InstrumentKey>,
-    /// When the venue posted the flow.
+    /// The time the venue stamps the flow with: when it posted the flow, unless its producer
+    /// documents otherwise. A venue may stamp a charge at the start of the period it is for, as
+    /// Binance stamps its margin interest; such a producer also sets [`period`](Self::period).
     pub time_exchange: DateTime<Utc>,
     /// The venue's identifier for the flow, when it gives one. See [`CashFlowId`].
     pub id: Option<CashFlowId>,
+    /// The period the flow is for, when its producer knows it: the charging period a margin
+    /// interest charge was made in, or the span a fee covers. `None` when the producer does not
+    /// say. Set with [`with_period`](Self::with_period).
+    ///
+    /// [`time_exchange`](Self::time_exchange) stays the venue's own stamp. The `rustrade` engine
+    /// reads the period of an [`InterestTiming::OnBorrow`] charge only: a venue that stamps the
+    /// charge on a new loan at the start of its period stamps it before the position the loan
+    /// funds opened, and the period tells the engine the position may still own it. See
+    /// `InstrumentState::update_from_cash_flow` in `rustrade`.
+    ///
+    /// `#[serde(default)]` so a flow serialised before this field existed still loads.
+    #[serde(default)]
+    pub period: Option<CashFlowPeriod>,
+}
+
+impl<AssetKey, InstrumentKey> CashFlow<AssetKey, InstrumentKey> {
+    /// A flow with no [`period`](Self::period). Add one with [`with_period`](Self::with_period).
+    pub fn new(
+        kind: CashFlowKind,
+        asset: AssetKey,
+        amount: Decimal,
+        instrument: Option<InstrumentKey>,
+        time_exchange: DateTime<Utc>,
+        id: Option<CashFlowId>,
+    ) -> Self {
+        Self {
+            kind,
+            asset,
+            amount,
+            instrument,
+            time_exchange,
+            id,
+            period: None,
+        }
+    }
+
+    /// Sets [`period`](Self::period).
+    pub fn with_period(mut self, period: Option<CashFlowPeriod>) -> Self {
+        self.period = period;
+        self
+    }
+}
+
+/// The period a [`CashFlow`] is for: from [`start`](Self::start), inclusive, to
+/// [`end`](Self::end), exclusive. `end` is after `start`.
+///
+/// Deserialising checks the order too, so a period read back is as valid as one built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "CashFlowPeriodFields")]
+pub struct CashFlowPeriod {
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+}
+
+impl CashFlowPeriod {
+    /// The period from `start` to `end`, or `None` when `end` is not after `start`.
+    pub fn new(start: DateTime<Utc>, end: DateTime<Utc>) -> Option<Self> {
+        (start < end).then_some(Self { start, end })
+    }
+
+    /// When the period starts: the first instant in it.
+    pub fn start(&self) -> DateTime<Utc> {
+        self.start
+    }
+
+    /// When the period ends: the first instant after it.
+    pub fn end(&self) -> DateTime<Utc> {
+        self.end
+    }
+
+    /// Whether `time` is in the period.
+    pub fn contains(&self, time: DateTime<Utc>) -> bool {
+        (self.start..self.end).contains(&time)
+    }
+}
+
+/// The serialised form of a [`CashFlowPeriod`], before its order is checked.
+#[derive(Deserialize)]
+struct CashFlowPeriodFields {
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+}
+
+impl TryFrom<CashFlowPeriodFields> for CashFlowPeriod {
+    type Error = String;
+
+    fn try_from(fields: CashFlowPeriodFields) -> Result<Self, Self::Error> {
+        Self::new(fields.start, fields.end).ok_or_else(|| {
+            format!(
+                "CashFlowPeriod end {} is not after its start {}",
+                fields.end, fields.start
+            )
+        })
+    }
 }
 
 /// What a [`CashFlow`] is for.
@@ -129,7 +225,9 @@ pub enum CashFlowKind {
 ///
 /// A venue charges the interest on a new loan when it is taken and again at each of its charging
 /// boundaries. A charge on a new loan can carry a time before the position it belongs to opened,
-/// since a venue may stamp it at the start of the period the loan was taken in.
+/// since a venue may stamp it at the start of the period the loan was taken in. Such a producer
+/// gives the flow that period as its [`CashFlow::period`], which lets the `rustrade` engine still
+/// give the charge to that position.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum InterestTiming {
@@ -218,5 +316,62 @@ impl<AssetKey, InstrumentKey> CashFlowsRead<AssetKey, InstrumentKey> {
     pub fn with_held_since(mut self, held_since: Option<DateTime<Utc>>) -> Self {
         self.held_since = held_since;
         self
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // test code: panics acceptable
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn at(hour: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 2, hour, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn a_period_must_end_after_it_starts() {
+        assert!(CashFlowPeriod::new(at(10), at(10)).is_none());
+        assert!(CashFlowPeriod::new(at(11), at(10)).is_none());
+        let period = CashFlowPeriod::new(at(10), at(11)).unwrap();
+        assert_eq!((period.start(), period.end()), (at(10), at(11)));
+    }
+
+    #[test]
+    fn a_period_holds_its_start_and_not_its_end() {
+        let period = CashFlowPeriod::new(at(10), at(11)).unwrap();
+        assert!(period.contains(at(10)));
+        assert!(period.contains(at(10) + chrono::Duration::minutes(59)));
+        assert!(!period.contains(at(11)));
+        assert!(!period.contains(at(9)));
+    }
+
+    #[test]
+    fn a_period_round_trips_and_a_reversed_one_does_not_deserialise() {
+        let period = CashFlowPeriod::new(at(10), at(11)).unwrap();
+        let json = serde_json::to_string(&period).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CashFlowPeriod>(&json).unwrap(),
+            period
+        );
+
+        let reversed = json.replace("10:00:00Z", "12:00:00Z");
+        assert!(serde_json::from_str::<CashFlowPeriod>(&reversed).is_err());
+    }
+
+    #[test]
+    fn a_flow_serialised_without_a_period_loads_with_none() {
+        let flow: CashFlow<String, String> = CashFlow::new(
+            CashFlowKind::Rebate,
+            "USD".to_owned(),
+            Decimal::ONE,
+            None,
+            at(10),
+            None,
+        );
+        let mut value = serde_json::to_value(&flow).unwrap();
+        value.as_object_mut().unwrap().remove("period");
+        let loaded: CashFlow<String, String> = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded, flow);
     }
 }
