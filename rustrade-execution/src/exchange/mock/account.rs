@@ -95,6 +95,15 @@ impl AccountState {
             .map_or(Decimal::ZERO, |balance| balance.balance.free)
     }
 
+    /// What this account owes of `asset`, principal plus interest, zero for an asset it has never
+    /// held or owes nothing in.
+    pub fn owed(&self, asset: &AssetNameExchange) -> Decimal {
+        self.balances
+            .get(asset)
+            .and_then(|balance| balance.balance.margin)
+            .map_or(Decimal::ZERO, |margin| margin.owed())
+    }
+
     /// Each asset this account owes principal in, with the principal owed.
     pub fn loans(&self) -> impl Iterator<Item = (&AssetNameExchange, Decimal)> + '_ {
         self.balances.iter().filter_map(|(asset, balance)| {
@@ -364,6 +373,7 @@ impl AccountState {
                 required: amount,
                 borrowable: None,
                 min_borrow: None,
+                max_borrow: None,
             });
         }
 
@@ -621,13 +631,14 @@ impl AccountState {
     /// # What a margin account lends and repays
     /// On a margin account, for an order whose `effect` is [`Borrow`](MarginEffect::Borrow), a
     /// requirement `free` and the credit do not cover borrows the shortfall of the paying asset,
-    /// raised to `min_borrow` if it is less, if that loan is at most `borrowable`, the most the
-    /// venue will lend of it now. The loan is taken with the rest of the arrival, or not at all.
-    /// [`Committed::borrowed`] says how much was lent, and [`Committed::excess_borrowed`] how much
-    /// of it the minimum added, which stays free. A paying asset the account has never held has
-    /// nothing free, and is opened when the loan is taken. A cash account, and an order with
-    /// another effect, ignore `borrowable` and `min_borrow`, and a negative `borrowable` lends
-    /// nothing.
+    /// raised to [`lending.min_borrow`](Lending::min_borrow) if it is less, if that loan is within
+    /// both of `lending`'s limits: [`borrowable`](Lending::borrowable), and what
+    /// [`max_borrow`](Lending::max_borrow) leaves once what the account already owes of the asset,
+    /// principal plus interest, is counted. The loan is taken with the rest of the arrival, or not
+    /// at all. [`Committed::borrowed`] says how much was lent, and [`Committed::excess_borrowed`]
+    /// how much of it the minimum added, which stays free. A paying asset the account has never
+    /// held has nothing free, and is opened when the loan is taken. A cash account, and an order
+    /// with another effect, ignore `lending`, and a negative `borrowable` lends nothing.
     ///
     /// For an order whose `effect` is [`Repay`](MarginEffect::Repay), what the credit delivers
     /// repays the loan of the asset it is delivered into, as [`deliver`](Self::deliver) does.
@@ -647,8 +658,7 @@ impl AccountState {
         debit: &Debit,
         credit: Option<&Credit>,
         effect: MarginEffect,
-        borrowable: Decimal,
-        min_borrow: Decimal,
+        lending: Lending,
         time_exchange: DateTime<Utc>,
     ) -> Result<Committed, BalanceInsufficient> {
         let (funding, delivery) = match credit {
@@ -669,26 +679,38 @@ impl AccountState {
         // within what the venue allows. It never lends less than the minimum, so a minimum the
         // venue cannot lend refuses the arrival.
         // A margin account borrows even an asset it has never held, which it opens on lending.
+        let Lending {
+            borrowable,
+            min_borrow,
+            max_borrow,
+        } = lending;
         let required = debit.settled + debit.reserved;
         let lends = self.margin && effect == MarginEffect::Borrow;
         let free = match self.margin {
             true => self.free(&debit.asset),
             false => self.balance_expect(&debit.asset).balance.free,
         };
+        // What the cap leaves, when it leaves less than the leverage limit does: the cap is then
+        // the limit that decides, and a refusal names it. A tie leaves the leverage limit deciding.
+        let capped = max_borrow
+            .map(|cap| (cap - self.owed(&debit.asset)).max(Decimal::ZERO))
+            .filter(|room| *room < borrowable);
+        let lendable = capped.unwrap_or(borrowable);
         let shortfall = required - (free + funding);
         let loan = shortfall.max(min_borrow);
         let (borrowed, excess_borrowed) = match shortfall > Decimal::ZERO {
             false => (Decimal::ZERO, Decimal::ZERO),
-            true if lends && loan <= borrowable => (loan, loan - shortfall),
+            true if lends && loan <= lendable => (loan, loan - shortfall),
             true => {
                 return Err(BalanceInsufficient {
                     asset: debit.asset.clone(),
                     free: free + funding,
                     required,
-                    borrowable: lends.then_some(borrowable.max(Decimal::ZERO)),
+                    borrowable: lends.then_some(lendable.max(Decimal::ZERO)),
                     // Named only when it is what was refused: the shortfall alone was lendable, so
                     // the loan refused is the minimum it was raised to.
-                    min_borrow: (lends && shortfall <= borrowable).then_some(min_borrow),
+                    min_borrow: (lends && shortfall <= lendable).then_some(min_borrow),
+                    max_borrow: max_borrow.filter(|_| lends && capped.is_some()),
                 });
             }
         };
@@ -707,6 +729,7 @@ impl AccountState {
                     required: -delivery.amount,
                     borrowable: None,
                     min_borrow: None,
+                    max_borrow: None,
                 });
             }
         }
@@ -861,6 +884,26 @@ pub struct BalanceInsufficient {
     /// The asset's minimum borrow, when it is why a margin account refused: the venue would have
     /// lent the shortfall, but not the minimum the loan was raised to. `None` otherwise.
     pub min_borrow: Option<Decimal>,
+    /// The asset's borrow cap, when it is the limit that refused: it left less to lend than the
+    /// leverage limit, and less than the loan. [`borrowable`](Self::borrowable) is then what the
+    /// cap left. `None` otherwise.
+    pub max_borrow: Option<Decimal>,
+}
+
+/// What a margin account may lend one arrival of the asset it pays with, as its venue judged it.
+/// Passed to [`AccountState::commit`], which a cash account, or an order that does not borrow,
+/// leaves unread.
+///
+/// The default lends nothing, has no minimum and no cap.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Lending {
+    /// The most the leverage limit lets the account borrow of the asset now.
+    pub borrowable: Decimal,
+    /// The least one loan of the asset may be: a smaller loan is raised to it.
+    pub min_borrow: Decimal,
+    /// The most the account may owe of the asset, principal plus interest, counting the new loan,
+    /// or `None` when the asset has no cap. The account counts what it already owes against it.
+    pub max_borrow: Option<Decimal>,
 }
 
 /// An account snapshot lists one [`ClientOrderId`] more than once among the orders it seeds.
@@ -1002,8 +1045,7 @@ mod tests {
             &debit,
             Some(&credit),
             MarginEffect::NoSideEffect,
-            Decimal::ZERO,
-            Decimal::ZERO,
+            Lending::default(),
             DateTime::<Utc>::MIN_UTC,
         ) else {
             panic!("100 free plus a 200 credit covers 290");
@@ -1033,8 +1075,7 @@ mod tests {
             &debit,
             Some(&credit),
             MarginEffect::NoSideEffect,
-            Decimal::ZERO,
-            Decimal::ZERO,
+            Lending::default(),
             DateTime::<Utc>::MIN_UTC,
         ) else {
             panic!("100 free plus a 200 credit does not cover 310");
@@ -1048,6 +1089,7 @@ mod tests {
                 required: dec!(310),
                 borrowable: None,
                 min_borrow: None,
+                max_borrow: None,
             }
         );
         assert_eq!(usd_balance(&account), Balance::new(dec!(100), dec!(100)));
@@ -1083,8 +1125,7 @@ mod tests {
             &debit,
             Some(&credit),
             MarginEffect::NoSideEffect,
-            Decimal::ZERO,
-            Decimal::ZERO,
+            Lending::default(),
             DateTime::<Utc>::MIN_UTC,
         ) else {
             panic!("100 free covers 100");
@@ -1120,8 +1161,7 @@ mod tests {
             &debit,
             Some(&credit),
             MarginEffect::NoSideEffect,
-            Decimal::ZERO,
-            Decimal::ZERO,
+            Lending::default(),
             DateTime::<Utc>::MIN_UTC,
         ) else {
             panic!("100 free does not cover 101, whatever another asset is credited");
@@ -1135,6 +1175,7 @@ mod tests {
                 required: dec!(101),
                 borrowable: None,
                 min_borrow: None,
+                max_borrow: None,
             }
         );
         assert_eq!(usd_balance(&account), Balance::new(dec!(100), dec!(100)));
@@ -1172,8 +1213,7 @@ mod tests {
             &debit,
             Some(&short),
             MarginEffect::NoSideEffect,
-            Decimal::ZERO,
-            Decimal::ZERO,
+            Lending::default(),
             DateTime::<Utc>::MIN_UTC,
         ) else {
             panic!("3 usd free does not cover a 4 usd excess fee");
@@ -1186,6 +1226,7 @@ mod tests {
                 required: dec!(4),
                 borrowable: None,
                 min_borrow: None,
+                max_borrow: None,
             }
         );
         assert_eq!(
@@ -1202,8 +1243,7 @@ mod tests {
             &debit,
             Some(&covered),
             MarginEffect::NoSideEffect,
-            Decimal::ZERO,
-            Decimal::ZERO,
+            Lending::default(),
             DateTime::<Utc>::MIN_UTC,
         ) else {
             panic!("3 usd free covers a 2 usd excess fee");
@@ -1308,6 +1348,103 @@ mod tests {
         );
         account.enable_margin();
         account
+    }
+
+    /// Lending of up to 1,000 by the leverage limit, under a cap of 40, which leaves 9 to an
+    /// account already owing 31 (30 principal and 1 interest).
+    fn capped_at_40() -> Lending {
+        Lending {
+            borrowable: dec!(1000),
+            min_borrow: Decimal::ZERO,
+            max_borrow: Some(dec!(40)),
+        }
+    }
+
+    fn usd_debit(settled: Decimal) -> Debit {
+        Debit {
+            asset: usd(),
+            settled,
+            reserved: Decimal::ZERO,
+        }
+    }
+
+    #[test]
+    fn the_cap_counts_the_principal_and_interest_already_owed() {
+        let mut account = account_owing_usd();
+        let at = DateTime::<Utc>::MIN_UTC;
+
+        let Err(insufficient) = account.commit(
+            &usd_debit(dec!(110)),
+            None,
+            MarginEffect::Borrow,
+            capped_at_40(),
+            at,
+        ) else {
+            panic!("a shortfall of 10 is more than the 9 the cap leaves");
+        };
+        assert_eq!(
+            insufficient,
+            BalanceInsufficient {
+                asset: usd(),
+                free: dec!(100),
+                required: dec!(110),
+                borrowable: Some(dec!(9)),
+                min_borrow: None,
+                max_borrow: Some(dec!(40)),
+            }
+        );
+
+        let Ok(committed) = account.commit(
+            &usd_debit(dec!(109)),
+            None,
+            MarginEffect::Borrow,
+            capped_at_40(),
+            at,
+        ) else {
+            panic!("a shortfall of 9 is what the cap leaves");
+        };
+        assert_eq!(committed.borrowed, dec!(9));
+        assert_eq!(account.owed(&usd()), dec!(40));
+    }
+
+    #[test]
+    fn a_debt_past_the_cap_does_not_name_it_when_the_leverage_limit_lends_nothing_either() {
+        let mut account = account_owing_usd();
+
+        // Owing 31 under a cap of 20 leaves nothing, the same as the leverage limit, so the cap
+        // is not the tighter limit, however far past it the debt is.
+        let Err(insufficient) = account.commit(
+            &usd_debit(dec!(110)),
+            None,
+            MarginEffect::Borrow,
+            Lending {
+                borrowable: Decimal::ZERO,
+                min_borrow: Decimal::ZERO,
+                max_borrow: Some(dec!(20)),
+            },
+            DateTime::<Utc>::MIN_UTC,
+        ) else {
+            panic!("nothing may be lent");
+        };
+        assert_eq!(insufficient.borrowable, Some(Decimal::ZERO));
+        assert_eq!(insufficient.max_borrow, None);
+    }
+
+    #[test]
+    fn an_order_that_does_not_borrow_is_refused_naming_neither_lending_nor_cap() {
+        let mut account = account_owing_usd();
+
+        let Err(insufficient) = account.commit(
+            &usd_debit(dec!(110)),
+            None,
+            MarginEffect::NoSideEffect,
+            capped_at_40(),
+            DateTime::<Utc>::MIN_UTC,
+        ) else {
+            panic!("an order that does not borrow pays with the 100 free alone");
+        };
+        assert_eq!(insufficient.borrowable, None);
+        assert_eq!(insufficient.max_borrow, None);
     }
 
     #[test]

@@ -158,10 +158,18 @@ pub struct MarginPlacement {
 /// - **Debt** is the sum over assets of `borrowed + interest`, valued the same way. The venue
 ///   lends nothing while it cannot value a debt, and never lends an asset it cannot value.
 ///
-/// An order that needs more than that is rejected as unaffordable, with a reason that says how
-/// much the venue would lend. So is one whose asset's [`min_borrow`](Self::min_borrow) is more
-/// than that, since the venue never lends less than the minimum, and its reason names the minimum
-/// too. A `max_leverage` of one lends nothing, but still reports each balance's loan.
+/// An asset given a [`max_borrow`](Self::max_borrow) is lent no more than that cap allows as
+/// well: what the account already owes of it, principal plus interest, plus the new loan, is at
+/// most the cap. Both limits apply, and the tighter one decides.
+///
+/// An order that needs more than the leverage limit allows is rejected as unaffordable, with a
+/// reason that says how much the venue would lend. So is one whose asset's
+/// [`min_borrow`](Self::min_borrow) is more than that, since the venue never lends less than the
+/// minimum, and its reason names the minimum too. One that needs more than an asset's cap allows,
+/// where the cap is the tighter limit, is rejected with
+/// [`ApiError::BorrowRejected`](crate::error::ApiError::BorrowRejected) instead: see
+/// [`with_max_borrow`](Self::with_max_borrow). A `max_leverage` of one lends nothing, but still
+/// reports each balance's loan.
 ///
 /// It lends nothing while a liquidation is under way: see [`SpotMarginLiquidation`].
 ///
@@ -181,18 +189,19 @@ pub struct MarginPlacement {
 ///
 /// # What it does not model
 /// - **Isolated margin.** One pool of balances backs every instrument.
-/// - **Per-asset borrow limits and the venue's lending pool.** Only the leverage limit, and each
-///   asset's minimum borrow, apply.
+/// - **The venue's lending pool.** The venue has whatever it lends: no shared pool runs short, as
+///   one can on a real venue whatever the account's own limits allow.
 /// - **Interest**, by this configuration alone. A venue given a [`MarginInterestModel`] charges
 ///   it; see that trait.
 ///
 /// [`new`](Self::new) refuses a `max_leverage` below one, [`with_min_borrow`](Self::with_min_borrow)
-/// a negative minimum, [`with_liquidation`](Self::with_liquidation) a liquidation the leverage
-/// limit could reach, and so does deserialising any of them, so a configuration that exists is
-/// one the venue can apply. Serialised, `max_leverage` and each minimum borrow are decimal strings
-/// (`"3"`), as the crate writes decimals elsewhere, so no precision is lost to a float.
-/// `min_borrow` is a map from asset to minimum, left out when empty, and `liquidation` is left out
-/// when off.
+/// a negative minimum, [`with_max_borrow`](Self::with_max_borrow) a negative cap,
+/// [`with_liquidation`](Self::with_liquidation) a liquidation the leverage limit could reach, and
+/// so does deserialising any of them, so a configuration that exists is one the venue can apply.
+/// Serialised, `max_leverage`, each minimum borrow and each cap are decimal strings (`"3"`), as the
+/// crate writes decimals elsewhere, so no precision is lost to a float. `min_borrow` and
+/// `max_borrow` are maps from asset to amount, each left out when empty, and `liquidation` is left
+/// out when off.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(try_from = "SpotMarginRepr", into = "SpotMarginRepr")]
 pub struct SpotMarginConfig(SpotMarginRepr);
@@ -208,6 +217,8 @@ struct SpotMarginRepr {
     auto_repay_at_cancel: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     min_borrow: BTreeMap<AssetNameExchange, Decimal>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    max_borrow: BTreeMap<AssetNameExchange, Decimal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     liquidation: Option<SpotMarginLiquidation>,
 }
@@ -239,6 +250,7 @@ impl SpotMarginConfig {
             margin_effect,
             auto_repay_at_cancel: default_auto_repay_at_cancel(),
             min_borrow: BTreeMap::new(),
+            max_borrow: BTreeMap::new(),
             liquidation: None,
         })
     }
@@ -305,6 +317,54 @@ impl SpotMarginConfig {
             .unwrap_or(Decimal::ZERO)
     }
 
+    /// This configuration, lending `asset` only while what the account owes of it, principal plus
+    /// interest, and the new loan come to at most `max_borrow`: a fixed cap on the account's debt
+    /// in `asset`, as Binance caps what a margin account may borrow of each asset
+    /// (`maxBorrowable`'s `borrowLimit`). Replaces any cap `asset` had.
+    ///
+    /// No asset has one by default, so only the leverage limit bounds a loan. A cap of zero lends
+    /// none of `asset`. Nor is `asset` lent once what the cap leaves is below its
+    /// [`min_borrow`](Self::min_borrow), since the venue never lends less than the minimum.
+    ///
+    /// # How the cap counts
+    /// A borrow is allowed while what the account already owes of `asset`, loan plus interest,
+    /// plus the new loan is at most the cap. Interest the new loan is charged when it is made is
+    /// not counted, as the leverage limit does not count it, so it can take the debt just past the
+    /// cap. Counting interest is this venue's rule: Binance does not document whether its limit
+    /// counts it.
+    ///
+    /// The cap is the account's own limit, not the venue's supply: Binance can also refuse a
+    /// borrow its limit allows because it has too little of the asset to lend, which this venue
+    /// does not model.
+    ///
+    /// # Rejection
+    /// An order that would borrow past the cap is rejected, never lent less than it needs. Where
+    /// the cap allows less than the leverage limit, the rejection is
+    /// [`ApiError::BorrowRejected`](crate::error::ApiError::BorrowRejected) with
+    /// reason [`BorrowLimitExceeded`](crate::error::BorrowRejectReason::BorrowLimitExceeded),
+    /// as a live Binance margin client reports Binance's `-3006`. Its message names the cap, and
+    /// for a sell its [`available`](crate::error::BorrowReject::available) is how much more of the
+    /// base asset the venue would lend: zero when that is below the minimum borrow. A buy borrows
+    /// the quote asset, in units other than the order's, so it leaves `available` unset. Where
+    /// the leverage limit is the tighter, the order is rejected as unaffordable, as without a cap.
+    ///
+    /// # Errors
+    /// Returns [`SpotMarginConfigError::NegativeMaxBorrow`] if `max_borrow` is negative.
+    pub fn with_max_borrow(
+        mut self,
+        asset: AssetNameExchange,
+        max_borrow: Decimal,
+    ) -> Result<Self, SpotMarginConfigError> {
+        self.0.max_borrow.insert(asset, max_borrow);
+        Self::try_from(self.0)
+    }
+
+    /// The most the account may owe of `asset`, principal plus interest, or `None` if it has no
+    /// cap. See [`with_max_borrow`](Self::with_max_borrow).
+    pub fn max_borrow(&self, asset: &AssetNameExchange) -> Option<Decimal> {
+        self.0.max_borrow.get(asset).copied()
+    }
+
     /// This configuration, liquidating the account as `liquidation` says. Replaces any
     /// liquidation it had.
     ///
@@ -343,6 +403,16 @@ impl TryFrom<SpotMarginRepr> for SpotMarginConfig {
             return Err(SpotMarginConfigError::NegativeMinBorrow {
                 asset: asset.clone(),
                 min_borrow: *min_borrow,
+            });
+        }
+        if let Some((asset, max_borrow)) = repr
+            .max_borrow
+            .iter()
+            .find(|(_, max_borrow)| **max_borrow < Decimal::ZERO)
+        {
+            return Err(SpotMarginConfigError::NegativeMaxBorrow {
+                asset: asset.clone(),
+                max_borrow: *max_borrow,
             });
         }
         if let Some(liquidation) = &repr.liquidation {
@@ -385,6 +455,15 @@ pub enum SpotMarginConfigError {
         asset: AssetNameExchange,
         /// The minimum given, below zero.
         min_borrow: Decimal,
+    },
+    /// A negative borrow cap for `asset`.
+    #[error("spot margin max_borrow {max_borrow} of {asset} is negative")]
+    #[non_exhaustive]
+    NegativeMaxBorrow {
+        /// The asset given the cap.
+        asset: AssetNameExchange,
+        /// The cap given, below zero.
+        max_borrow: Decimal,
     },
     /// A liquidation level below one, at which an account would already owe more than it holds.
     #[error("spot margin liquidation level {0} is below 1")]
@@ -939,6 +1018,80 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<SpotMarginConfig>(&json).unwrap(),
             config
+        );
+    }
+
+    fn usdt_margin() -> SpotMarginConfig {
+        SpotMarginConfig::new(
+            AssetNameExchange::new("usdt"),
+            dec!(3),
+            MarginEffect::Borrow,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_borrow_cap_is_per_asset_and_none_where_none_is_set() {
+        let config = usdt_margin()
+            .with_max_borrow(AssetNameExchange::new("btc"), dec!(100))
+            .unwrap();
+
+        assert_eq!(
+            config.max_borrow(&AssetNameExchange::new("btc")),
+            Some(dec!(100))
+        );
+        assert_eq!(config.max_borrow(&AssetNameExchange::new("usdt")), None);
+    }
+
+    #[test]
+    fn a_borrow_cap_replaces_the_asset_s_last_and_a_zero_cap_is_kept() {
+        let config = usdt_margin()
+            .with_max_borrow(AssetNameExchange::new("btc"), dec!(100))
+            .unwrap()
+            .with_max_borrow(AssetNameExchange::new("btc"), Decimal::ZERO)
+            .unwrap();
+
+        assert_eq!(
+            config.max_borrow(&AssetNameExchange::new("btc")),
+            Some(Decimal::ZERO),
+            "a cap of zero lends none of the asset, which no cap would not say"
+        );
+        assert_ne!(config, usdt_margin());
+    }
+
+    #[test]
+    fn a_negative_borrow_cap_is_refused_by_the_builder_and_by_deserialising() {
+        assert_eq!(
+            usdt_margin().with_max_borrow(AssetNameExchange::new("btc"), dec!(-0.1)),
+            Err(SpotMarginConfigError::NegativeMaxBorrow {
+                asset: AssetNameExchange::new("btc"),
+                max_borrow: dec!(-0.1),
+            })
+        );
+
+        let json = r#"{"valuation_asset":"usdt","max_leverage":"3","margin_effect":"borrow","max_borrow":{"btc":"-0.1"}}"#;
+        assert!(serde_json::from_str::<SpotMarginConfig>(json).is_err());
+    }
+
+    #[test]
+    fn a_borrow_cap_round_trips_as_a_map_of_decimal_strings_left_out_when_empty() {
+        let config = usdt_margin()
+            .with_max_borrow(AssetNameExchange::new("btc"), dec!(150.5))
+            .unwrap();
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(
+            json,
+            r#"{"valuation_asset":"usdt","max_leverage":"3","margin_effect":"borrow","auto_repay_at_cancel":true,"max_borrow":{"btc":"150.5"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SpotMarginConfig>(&json).unwrap(),
+            config
+        );
+        assert!(
+            !serde_json::to_string(&usdt_margin())
+                .unwrap()
+                .contains("max_borrow")
         );
     }
 

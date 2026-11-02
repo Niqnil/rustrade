@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **An optional per-asset borrow cap on the simulated venue's spot margin** (`rustrade-execution`,
+  #816). `SpotMarginConfig::with_max_borrow(asset, amount)` caps what the account may owe of
+  `asset`, principal plus interest, counting the new loan. A borrow must fit both the leverage
+  limit and the cap. A real venue caps each asset too (Binance's `maxBorrowable` `borrowLimit`),
+  so a strategy sized to the leverage limit alone could be lent more in a backtest than live.
+  - An order that would borrow past a cap tighter than the leverage limit is rejected, never
+    clipped, with `ApiError::BorrowRejected` and `BorrowRejectReason::BorrowLimitExceeded`, as the
+    Binance margin client reports Binance's `-3006`. Its message names the cap. For a sell,
+    `BorrowReject::available` is how much more base the venue would lend. Where the leverage limit
+    is the tighter, the rejection stays `BalanceInsufficient`.
+  - The interest a new loan is charged when it is made is not counted, as the leverage limit does
+    not count it. Binance does not document whether its limit counts interest; counting it is
+    the simulated venue's own rule.
+  - Serialised as a `max_borrow` map from asset to decimal string, left out when empty. A negative
+    cap is refused with the new `SpotMarginConfigError::NegativeMaxBorrow`. A cap of zero lends
+    none of the asset.
+  - New `MarginDetails::owed` (principal plus interest) and `AccountState::owed`.
+  - Breaking: `exchange::mock::account::AccountState::commit` takes a new `Lending` (the leverage
+    limit's `borrowable`, `min_borrow` and `max_borrow`) in place of its `borrowable` and
+    `min_borrow` arguments, and `BalanceInsufficient` has a new `max_borrow` field: the cap, when
+    it is the limit that refused.
+
 ## [0.19.0] - 2026-11-02
 
 ### Fixed
