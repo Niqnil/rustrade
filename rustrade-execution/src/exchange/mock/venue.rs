@@ -14804,7 +14804,7 @@ mod tests {
         assert_eq!(
             reject.available,
             Some(Decimal::ZERO),
-            "a debt past the cap leaves nothing, not less than nothing"
+            "a debt past the cap leaves nothing to lend"
         );
         assert!(
             reject.message.ends_with("Borrowable: 0"),

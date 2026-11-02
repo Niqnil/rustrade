@@ -1408,6 +1408,29 @@ mod tests {
     }
 
     #[test]
+    fn a_debt_past_the_cap_does_not_name_it_when_the_leverage_limit_lends_nothing_either() {
+        let mut account = account_owing_usd();
+
+        // Owing 31 under a cap of 20 leaves nothing, the same as the leverage limit, so the cap
+        // is not the tighter limit, however far past it the debt is.
+        let Err(insufficient) = account.commit(
+            &usd_debit(dec!(110)),
+            None,
+            MarginEffect::Borrow,
+            Lending {
+                borrowable: Decimal::ZERO,
+                min_borrow: Decimal::ZERO,
+                max_borrow: Some(dec!(20)),
+            },
+            DateTime::<Utc>::MIN_UTC,
+        ) else {
+            panic!("nothing may be lent");
+        };
+        assert_eq!(insufficient.borrowable, Some(Decimal::ZERO));
+        assert_eq!(insufficient.max_borrow, None);
+    }
+
+    #[test]
     fn an_order_that_does_not_borrow_is_refused_naming_neither_lending_nor_cap() {
         let mut account = account_owing_usd();
 
