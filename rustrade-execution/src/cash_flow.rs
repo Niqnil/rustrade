@@ -134,6 +134,7 @@ impl<AssetKey, InstrumentKey> CashFlow<AssetKey, InstrumentKey> {
 /// and charge interest on the new loan at once. The order identifies the position the loan funds:
 /// the one the order's trades open or add to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct CashFlowLoan {
     /// When the venue lent: its time for accepting the order that borrowed.
     pub time: DateTime<Utc>,

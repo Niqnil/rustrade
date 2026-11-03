@@ -158,6 +158,7 @@ impl MarginPlacement {
 /// by [`MarginPlacement::loan`], and handed back to a client after a restart by, for example,
 /// `BinanceMargin::recall_loans`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, Constructor)]
+#[non_exhaustive]
 pub struct OrderLoan {
     /// The instrument the order traded.
     pub instrument: InstrumentNameExchange,

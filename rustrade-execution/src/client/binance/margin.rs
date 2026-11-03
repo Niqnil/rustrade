@@ -591,7 +591,9 @@ impl BinanceMargin {
     /// Each loan must be one this client's account took, as [`MarginPlacement::loan`] reports it:
     /// a loan is linked as given, unchecked against Binance's records. A loan of an order already
     /// held replaces it. At most 4096 loans are held: past that the oldest by loan time is
-    /// dropped, and a recalled loan older than every held one is not held, with a warning.
+    /// dropped. That is silent when a newer loan takes its place, as it routinely does once a
+    /// long-running client has placed that many, and logged at WARN when the loan dropped is a
+    /// recalled one older than every held loan, which is then not held.
     pub fn recall_loans(&self, loans: impl IntoIterator<Item = OrderLoan>) {
         // Collected before the loans are locked, so `loans` may call this client.
         let loans: Vec<_> = loans.into_iter().collect();

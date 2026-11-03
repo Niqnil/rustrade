@@ -277,6 +277,10 @@ pub enum CarryUpdate {
     /// the loan neither opened nor added to the open position (it is not in
     /// [`Position::orders_enter`]): it has not traded yet, as an order resting on the book, or
     /// traded only into an earlier position, or only reduced this one.
+    ///
+    /// The engine keeps no flow it leaves out. A caller that reads a venue's charge before the
+    /// order that took the loan has traded, as for an order still resting on the book, can offer
+    /// the flow again once that order's fill has opened or added to the position.
     LoanOfOtherOrder,
     /// Several positions are open on the instrument ([`OmsMode::Hedging`]) and the venue does not
     /// say which one the flow belongs to.
