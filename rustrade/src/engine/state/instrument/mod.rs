@@ -1588,7 +1588,8 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ///   default; a run over historical flows should set it, or its flows all log at DEBUG.
     /// - A flow that names the loan it is the charge on ([`CashFlow::loan`]), whenever it is
     ///   stamped: applied, as below, to the open position that the order that took the loan opened
-    ///   or added to (it is in [`Position::orders_enter`](super::position::Position::orders_enter)).
+    ///   or added to (it is in
+    ///   [`Position::orders_enter`](super::position::Position::orders_enter)).
     ///   The order picks the position, so under [`OmsMode::Hedging`] the flow is applied with
     ///   several open; in the unexpected case that the order is in more than one, it is
     ///   [`SeveralOpen`](CarryUpdate::SeveralOpen), logged at WARN.
