@@ -197,7 +197,9 @@ impl<'a> ClientInstrument<'a> {
 ///   see each fill once. `account_stream` and `fetch_trades` overlap on purpose, around a
 ///   reconnect, so a fill can pass through both; `process_account_events` sees it once, after the
 ///   engine's `ExecutionManager` drops the copy, with the recovered fills and the snapshot in
-///   order. A rule that only withholds fills can stay on the two paths above.
+///   order. The method takes `&self` and returns a `'static` stream, so hold that state in an
+///   `Arc` and move a clone into the stream. A rule that only withholds fills can stay on the two
+///   paths above.
 /// - **One inner client per engine.** A wrapper that owns one client counts as that one client.
 ///   Two clients on one account whose account streams both reach one engine deliver every fill
 ///   twice.
@@ -535,7 +537,7 @@ where
     ///   `buffered`, not `buffer_unordered`.
     /// - **End only when `events` ends.** When the returned stream ends, the manager opens the
     ///   account stream again. Each fill `events` yielded is recorded as seen by then, so one this
-    ///   stage took and did not pass on is not read again.
+    ///   stage took and did not pass on is not read again: it is lost.
     /// - **Retry a step that fails here, with backoff**, such as a REST call to attribute a fill.
     ///   To give up on a fill, report it as an [`AccountEventKind::FillRecoveryGaveUp`] whose scope
     ///   is its instrument, whose span is its time, and whose reason is
@@ -545,8 +547,10 @@ where
     ///
     /// # What the manager does around it
     /// - Every fill the returned stream yields is recorded as seen, and none is dropped. A fill
-    ///   this stage adds that the venue sends later is then delivered once; one it adds that was
-    ///   delivered before is delivered again.
+    ///   this stage adds is recorded as it leaves the stage, so a copy the venue sends after that
+    ///   is dropped before it reaches the stage; one it adds that was delivered before is
+    ///   delivered again. A copy the stage has already taken from `events` is not caught: a stage
+    ///   that adds fills while it reads ahead, as `buffered` does, drops the venue's copy itself.
     /// - Where the next read of a missed span starts is measured on `events`, so a fill this stage
     ///   drops or holds does not widen it, and the stage's own delay does not skew it.
     /// - The returned events are indexed. A snapshot this stage changes so that it no longer

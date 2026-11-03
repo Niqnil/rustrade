@@ -592,14 +592,12 @@ where
     ) -> impl Stream<Item = AccountEvent> {
         let mut warned = FnvHashSet::<AssetNameExchange>::default();
         stream.filter_map(move |event| {
-            let indexed = match event.kind {
-                AccountEventKind::Snapshot(snapshot) => {
-                    Self::index_snapshot(&indexer, snapshot).map_err(AccountIndexError::Rejected)
-                }
-                kind => indexer.index_account_event(UnindexedAccountEvent {
-                    exchange: event.exchange,
-                    kind,
-                }),
+            let indexed = match event {
+                UnindexedAccountEvent {
+                    kind: AccountEventKind::Snapshot(snapshot),
+                    ..
+                } => Self::index_snapshot(&indexer, snapshot).map_err(AccountIndexError::Rejected),
+                event => indexer.index_account_event(event),
             };
             std::future::ready(match indexed {
                 Ok(indexed_event) => Some(indexed_event),
@@ -1161,7 +1159,8 @@ mod tests {
     use chrono::{DateTime, Utc};
     use rust_decimal_macros::dec;
     use rustrade_execution::{
-        AccountSnapshot, UnindexedAccountEvent, UnindexedAccountSnapshot,
+        AccountSnapshot, FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope,
+        UnindexedAccountEvent, UnindexedAccountSnapshot,
         balance::AssetBalance,
         error::{ApiError, ClientError, UnindexedClientError, UnindexedOrderError},
         map::generate_execution_instrument_map,
@@ -1978,6 +1977,105 @@ mod tests {
         );
     }
 
+    /// A stage that ends its stream early makes the manager reopen, and a fill the stage took
+    /// and did not pass on is not offered to it again: the read and the new stream both send it,
+    /// and both copies are dropped as seen.
+    #[tokio::test]
+    async fn a_fill_a_stage_took_before_ending_early_is_not_offered_again_on_the_reopen() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let client = FlakyAccountClient {
+            live: vec![live_trade("x", 10)],
+            reads: Arc::new(std::sync::Mutex::new(
+                [Ok(TradesRead::complete(vec![missed_trade("x", 10)]))].into(),
+            )),
+            // Takes the snapshot and the fill, passes on the snapshot only, then ends.
+            stage: Some(Stage(Arc::new({
+                let seen = Arc::clone(&seen);
+                move |events| {
+                    let open = {
+                        let mut seen = seen.lock().unwrap();
+                        seen.push(Vec::new());
+                        seen.len() - 1
+                    };
+                    let seen = Arc::clone(&seen);
+                    events
+                        .inspect(move |event| {
+                            seen.lock().unwrap()[open].push(describe_unindexed(event));
+                        })
+                        .take(2)
+                        .filter(|event| {
+                            std::future::ready(!matches!(event.kind, AccountEventKind::Trade(_)))
+                        })
+                        .boxed()
+                }
+            }))),
+            ..FlakyAccountClient::default()
+        };
+        let fetched = Arc::clone(&client.fetched);
+        let Ok(manager) = init_flaky_recovering(client, at_clock(100)).await else {
+            panic!("the first attempt succeeds, so init should too");
+        };
+
+        let events = manager.account_stream.take(3).collect::<Vec<_>>().await;
+
+        assert_eq!(
+            events.iter().map(describe).collect::<Vec<_>>(),
+            ["snapshot", "reconnecting", "snapshot"]
+        );
+        assert_eq!(fetched.lock().unwrap().len(), 1, "the reopen reads the gap");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [vec!["snapshot", "trade x"], vec!["snapshot"]]
+        );
+    }
+
+    /// A fill the stage gives up on, reported as the contract asks, reaches the consumer as a
+    /// gap indexed like any other: scoped to the fill's instrument, at its time.
+    #[tokio::test]
+    async fn a_fill_the_stage_gives_up_on_reaches_the_consumer_as_an_indexed_gap() {
+        let client = FlakyAccountClient {
+            live: vec![live_trade("x", 10)],
+            stage: Some(Stage(Arc::new(|events| {
+                events
+                    .map(|event| match event.kind {
+                        AccountEventKind::Trade(trade) => UnindexedAccountEvent {
+                            exchange: event.exchange,
+                            kind: AccountEventKind::FillRecoveryGaveUp(FillRecoveryGap::new(
+                                FillRecoveryScope::Instruments(vec![trade.instrument]),
+                                trade.time_exchange,
+                                trade.time_exchange,
+                                3,
+                                FillRecoveryFailure::Processing("no order".to_owned()),
+                            )),
+                        },
+                        _ => event,
+                    })
+                    .boxed()
+            }))),
+            ..FlakyAccountClient::default()
+        };
+        let Ok(manager) = init_flaky(client).await else {
+            panic!("the first attempt succeeds, so init should too");
+        };
+
+        let events = manager.account_stream.take(2).collect::<Vec<_>>().await;
+
+        let [_, AccountStreamEvent::Item(event)] = &events[..] else {
+            panic!("expected the snapshot then an event, got {events:?}");
+        };
+        let time = DateTime::<Utc>::from_timestamp(1_800_000_010, 0).unwrap();
+        assert_eq!(
+            event.kind,
+            AccountEventKind::FillRecoveryGaveUp(FillRecoveryGap::new(
+                FillRecoveryScope::Instruments(vec![InstrumentIndex(0)]),
+                time,
+                time,
+                3,
+                FillRecoveryFailure::Processing("no order".to_owned()),
+            ))
+        );
+    }
+
     /// A host clock 190 s ahead of the venue's, far beyond the 30 s allowance, still reads the
     /// fill the venue stamped while the stream was down: the read is placed on the venue's clock,
     /// from the time it stamped on the last fill delivered.
@@ -2461,6 +2559,27 @@ mod tests {
         assert_eq!(snapshot_balances_kept(&["usdt", "btc"]), (2, 0, 0, 0));
         // An account holding nothing is not a mismatch.
         assert_eq!(snapshot_balances_kept(&[]), (0, 0, 0, 0));
+    }
+
+    /// A snapshot a client's stage changed so that it no longer indexes is dropped with an error,
+    /// as any other rejected event is.
+    #[test]
+    fn a_snapshot_that_no_longer_indexes_after_the_stage_is_dropped_with_an_error() {
+        let instruments = IndexedInstruments::new(vec![instrument(EXCHANGE, "btc", "usdt")]);
+        let map = generate_execution_instrument_map(&instruments, EXCHANGE).unwrap();
+        let snapshot = UnindexedAccountEvent {
+            exchange: EXCHANGE,
+            kind: AccountEventKind::Snapshot(UnindexedAccountSnapshot::new(
+                ExchangeId::Kraken,
+                vec![],
+                vec![],
+            )),
+        };
+
+        assert_eq!(
+            index_and_count_logs(AccountEventIndexer::new(Arc::new(map)), vec![snapshot]),
+            (0, 0, 0, 1)
+        );
     }
 
     #[test]
