@@ -435,7 +435,6 @@ pub struct SystemBuild<Engine, Event, MarketStream> {
 
     /// A handle to each paper venue, by exchange: see
     /// [`ExecutionBuild::paper_venues`](crate::execution::builder::ExecutionBuild::paper_venues).
-    /// Empty from [`new`](Self::new); set with [`with_paper_venues`](Self::with_paper_venues).
     pub paper_venues: FnvHashMap<ExchangeId, PaperVenue>,
 
     phantom_event: PhantomData<Event>,
@@ -453,6 +452,11 @@ where
     MarketStream: Stream + Send + 'static,
 {
     /// Construct a new `SystemBuild` from the provided components.
+    ///
+    /// `account_channel`, `execution_build_futures` and `paper_venues` are the parts of one
+    /// [`ExecutionBuild`](crate::execution::builder::ExecutionBuild): its `account_channel`,
+    /// `futures` and `paper_venues`. [`init`](Self::init) carries `paper_venues` on to the
+    /// [`System`].
     pub fn new(
         engine: Engine,
         engine_feed_mode: EngineFeedMode,
@@ -460,6 +464,7 @@ where
         market_stream: MarketStream,
         account_channel: Channel<AccountStreamEvent>,
         execution_build_futures: ExecutionBuildFutures,
+        paper_venues: FnvHashMap<ExchangeId, PaperVenue>,
     ) -> Self {
         Self {
             engine,
@@ -468,17 +473,8 @@ where
             market_stream,
             account_channel,
             execution_build_futures,
-            paper_venues: FnvHashMap::default(),
-            phantom_event: Default::default(),
-        }
-    }
-
-    /// This build, holding `paper_venues`, the handles of the paper venues its execution
-    /// components run, which [`init`](Self::init) carries on to the [`System`].
-    pub fn with_paper_venues(self, paper_venues: FnvHashMap<ExchangeId, PaperVenue>) -> Self {
-        Self {
             paper_venues,
-            ..self
+            phantom_event: Default::default(),
         }
     }
 
@@ -931,7 +927,7 @@ mod tests {
         );
     }
 
-    /// [`SystemBuild::with_paper_venues`] sets the handles a build carries to its system.
+    /// [`SystemBuild::new`] keeps the handles it is given, which the build carries to its system.
     #[test]
     fn a_build_holds_the_paper_venues_it_is_given() {
         let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
@@ -949,7 +945,15 @@ mod tests {
         let paper_venues = std::mem::take(&mut system.paper_venues);
         assert_eq!(paper_venues.len(), 1);
 
-        let system = system.with_paper_venues(paper_venues);
+        let system = SystemBuild::<_, EngineEvent, _>::new(
+            system.engine,
+            system.engine_feed_mode,
+            system.audit_mode,
+            system.market_stream,
+            system.account_channel,
+            system.execution_build_futures,
+            paper_venues,
+        );
 
         assert_eq!(system.paper_venues.keys().collect::<Vec<_>>(), [&EXECUTION]);
     }

@@ -15,8 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   question from its own lending rules, but `ExecutionBuilder::add_paper` kept no handle to it, so a
   paper run could not ask.
   - `ExecutionBuild::paper_venues` holds a cloneable `PaperVenue` for each venue `add_paper`
-    added, by exchange. `Execution`, `SystemBuild` (set with `SystemBuild::with_paper_venues`) and
-    `System` carry them on.
+    added, by exchange. `Execution`, `SystemBuild` and `System` carry them on.
   - `PaperVenue::fetch_borrow_capacity` answers with what the venue's
     `SimulatedVenue::borrow_capacity` would, with the trait method's signature and errors. It is
     advisory, as on a live venue.
@@ -30,7 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Breaking: `ExecutionBuild`, `Execution`, `SystemBuild` and `System` have a new public field,
   `paper_venues`** (`rustrade`, #844). Code that builds one of them as a literal, or destructures
-  one without `..`, must name it.
+  one without `..`, must name it. `SystemBuild::new` takes the `ExecutionBuild`'s `paper_venues`
+  after `execution_build_futures`.
 
 ## [0.20.0] - 2026-11-02
 
