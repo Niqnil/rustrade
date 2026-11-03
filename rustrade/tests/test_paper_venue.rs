@@ -396,18 +396,17 @@ fn margin_config() -> MockExecutionConfig {
     }
 }
 
+/// Feeds a paper venue's market.
+type MarketTx = futures::channel::mpsc::UnboundedSender<
+    reconnect::Event<ExchangeId, MarketEvent<InstrumentIndex, DataKind>>,
+>;
+
 /// A paper venue of `config`, built on tokio's paused clock and fed by the returned sender, with
 /// its handle, before it is started.
 fn paper_build(
     instruments: &IndexedInstruments,
     config: MockExecutionConfig,
-) -> (
-    ExecutionBuild,
-    PaperVenue,
-    futures::channel::mpsc::UnboundedSender<
-        reconnect::Event<ExchangeId, MarketEvent<InstrumentIndex, DataKind>>,
-    >,
-) {
+) -> (ExecutionBuild, PaperVenue, MarketTx) {
     let (market_tx, market_rx) = futures::channel::mpsc::unbounded();
     let (tap, feed) = PaperMarketFeed::tap(market_rx);
     // Stands in for the `Engine`'s market feed, which is what polls the tap in a live system.
