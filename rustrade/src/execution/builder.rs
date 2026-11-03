@@ -5,7 +5,7 @@ use crate::{
         AccountStreamEvent, Execution,
         error::ExecutionError,
         manager::{AccountStreamOptions, Clock as ManagerClock, ExecutionManager},
-        paper::{PaperMarketFeed, PaperMarketUpdate, PaperOptions},
+        paper::{PaperMarketFeed, PaperMarketUpdate, PaperOptions, PaperVenue},
         request::ExecutionRequest,
         sim::builder::market_driven_venue,
     },
@@ -75,6 +75,7 @@ pub struct ExecutionBuilder<'a> {
     mock_exchange_futures: Vec<RunFuture>,
     execution_init_futures: Vec<ExecutionInitFuture>,
     in_flight_deadlines: InFlightDeadlines,
+    paper_venues: FnvHashMap<ExchangeId, PaperVenue>,
 }
 
 impl<'a> ExecutionBuilder<'a> {
@@ -87,6 +88,7 @@ impl<'a> ExecutionBuilder<'a> {
             mock_exchange_futures: Vec::default(),
             execution_init_futures: Vec::default(),
             in_flight_deadlines: InFlightDeadlines::default(),
+            paper_venues: FnvHashMap::default(),
         }
     }
 
@@ -202,6 +204,10 @@ impl<'a> ExecutionBuilder<'a> {
     ///
     /// The exchange gets no in-flight deadline, as for [`add_mock`](Self::add_mock).
     ///
+    /// [`build`](Self::build) returns a [`PaperVenue`] handle to the venue, in
+    /// [`ExecutionBuild::paper_venues`], for queries outside the `Engine`'s order flow, such as how
+    /// much the paper account can borrow.
+    ///
     /// # Errors
     /// Returns [`BarterError::ExecutionBuilder`] if:
     /// - `config.market_order_timing` is [`MarketOrderTiming::NextBar`]. A backtest delivers the
@@ -249,6 +255,7 @@ impl<'a> ExecutionBuilder<'a> {
             let clock = clock.clone();
             Arc::new(move || clock.time())
         };
+        let paper_venue = PaperVenue::new(exchange, &request_tx, Arc::clone(&venue_clock));
         let mock_execution_client_config = MockExecutionClientConfig {
             mocked_exchange: exchange,
             clock: move || clock.time(),
@@ -278,6 +285,7 @@ impl<'a> ExecutionBuilder<'a> {
         );
         this.mock_exchange_futures
             .push(Box::pin(mock_exchange.run()));
+        this.paper_venues.insert(exchange, paper_venue);
 
         Ok(this)
     }
@@ -429,6 +437,7 @@ impl<'a> ExecutionBuilder<'a> {
             execution_tx_map,
             in_flight_deadlines: self.in_flight_deadlines,
             account_channel: self.merged_channel,
+            paper_venues: self.paper_venues,
             futures: ExecutionBuildFutures {
                 mock_exchange_run_futures: self.mock_exchange_futures,
                 execution_init_futures: self.execution_init_futures,
@@ -450,6 +459,9 @@ pub struct ExecutionBuild {
     /// [`ExecutionBuilder::add_mock`].
     pub in_flight_deadlines: InFlightDeadlines,
     pub account_channel: Channel<AccountStreamEvent>,
+    /// A handle to each venue [`ExecutionBuilder::add_paper`] added, by exchange. A handle works
+    /// before [`init`](Self::init) too: a query sent then waits for the venue to start.
+    pub paper_venues: FnvHashMap<ExchangeId, PaperVenue>,
     pub futures: ExecutionBuildFutures,
 }
 
@@ -490,6 +502,7 @@ impl ExecutionBuild {
             execution_txs: self.execution_tx_map,
             in_flight_deadlines: self.in_flight_deadlines,
             account_channel: self.account_channel,
+            paper_venues: self.paper_venues,
             handles,
         })
     }

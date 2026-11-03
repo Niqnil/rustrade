@@ -468,30 +468,55 @@ where
         instrument: &InstrumentNameExchange,
         side: Side,
     ) -> Result<BorrowCapacity, UnindexedClientError> {
-        let (response_tx, response_rx) = oneshot::channel();
-
-        self.request_tx
-            .send(MockExchangeRequest::fetch_borrow_capacity(
-                self.time_request(),
-                instrument.clone(),
-                side,
-                response_tx,
-            ))
-            .map_err(|_| {
-                UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(
-                    self.mocked_exchange,
-                ))
-            })?;
-
-        response_rx
-            .await
-            .map_err(|_| {
-                UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(
-                    self.mocked_exchange,
-                ))
-            })?
-            .map_err(ClientError::Api)
+        request_borrow_capacity(
+            &self.request_tx,
+            self.mocked_exchange,
+            self.time_request(),
+            instrument,
+            side,
+        )
+        .await
     }
+}
+
+/// Asks the [`MockExchange`](crate::exchange::mock::MockExchange) that reads `request_tx` how much
+/// the account can borrow now for an order on `instrument` on `side`, with the request stamped
+/// `time_request`.
+///
+/// What [`MockExecution`]'s [`BorrowCapacityClient`] implementation sends, for a caller that holds
+/// the exchange's request channel without a client, such as a handle to a paper venue. The answer
+/// and its errors are the same.
+///
+/// # Errors
+/// - [`ConnectivityError::ExchangeOffline`] for `mocked_exchange` when the exchange is not running:
+///   it never started, or it has stopped.
+/// - [`ClientError::Api`] with the venue's own error, as
+///   [`SimulatedVenue::borrow_capacity`](crate::exchange::mock::venue::SimulatedVenue::borrow_capacity)
+///   says.
+pub async fn request_borrow_capacity(
+    request_tx: &mpsc::UnboundedSender<MockExchangeRequest>,
+    mocked_exchange: ExchangeId,
+    time_request: DateTime<Utc>,
+    instrument: &InstrumentNameExchange,
+    side: Side,
+) -> Result<BorrowCapacity, UnindexedClientError> {
+    let offline =
+        || UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(mocked_exchange));
+    let (response_tx, response_rx) = oneshot::channel();
+
+    request_tx
+        .send(MockExchangeRequest::fetch_borrow_capacity(
+            time_request,
+            instrument.clone(),
+            side,
+            response_tx,
+        ))
+        .map_err(|_| offline())?;
+
+    response_rx
+        .await
+        .map_err(|_| offline())?
+        .map_err(ClientError::Api)
 }
 
 #[cfg(test)]
