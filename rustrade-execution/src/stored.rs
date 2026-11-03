@@ -7,8 +7,10 @@ use thiserror::Error;
 /// A value that carries the version of the format it was written in.
 ///
 /// A field added within a version takes `#[serde(default)]`, so a value written before the field
-/// existed still loads. A change an older value cannot be read under bumps
-/// [`VERSION`](Self::VERSION).
+/// existed still loads in a self-describing format such as JSON. A change an older value cannot
+/// be read under bumps [`VERSION`](Self::VERSION). A value holding another versioned value bumps
+/// its own version whenever the inner one's rises, so that its version alone says whether it
+/// reads.
 pub trait FormatVersion {
     /// The format version this release writes, and the only one it reads.
     const VERSION: u32;
@@ -73,14 +75,22 @@ impl<T: FormatVersion> Stored<T> {
 pub enum StoredFormatError {
     /// The value was written in a format version this release does not read.
     #[error("saved in format version {found}; this release reads version {supported}")]
-    UnsupportedVersion { found: u32, supported: u32 },
+    UnsupportedVersion {
+        /// The version the value was written in.
+        found: u32,
+        /// The version this release reads.
+        supported: u32,
+    },
 
     /// The value claims the format version this release reads, but does not read in it.
     #[error(
         "saved in format version {version}, which this release reads, but it does not read in \
          that format"
     )]
-    Malformed { version: u32 },
+    Malformed {
+        /// The version the value claims, which is this release's.
+        version: u32,
+    },
 }
 
 #[cfg(test)]

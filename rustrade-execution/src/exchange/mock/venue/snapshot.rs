@@ -60,8 +60,8 @@ use thiserror::Error;
 ///   never observed, so the order did not fill.
 ///
 /// # Versions
-/// Carries a format [`version`](Self::version). Fields a later release adds are read with defaults
-/// from an older snapshot. A change an older snapshot cannot be read under raises the version, and
+/// Carries a format [`version`](Self::version). In a self-describing format such as JSON, fields a
+/// later release adds are read with defaults from an older snapshot. A change an older snapshot cannot be read under raises the version, and
 /// [`SimulatedVenue::from_snapshot`] refuses a version other than
 /// [`VERSION`](Self::VERSION).
 ///
@@ -207,6 +207,8 @@ pub enum VenueRestoreError {
 }
 
 impl FormatVersion for SimulatedVenueSnapshot {
+    // The inherent constant: an inherent item takes priority over the trait's, so this does not
+    // refer to itself.
     const VERSION: u32 = Self::VERSION;
 
     fn format_version(&self) -> u32 {

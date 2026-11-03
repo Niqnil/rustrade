@@ -740,12 +740,17 @@ async fn a_paper_venue_refuses_a_checkpoint_of_another_venue() {
     };
     assert!(error.to_string().contains("cannot be restored"), "{error}");
 
-    // A checkpoint written in another format version, whose shape still reads in this one.
-    let mut json = serde_json::to_value(&checkpoint_v1).unwrap();
-    json["version"] = serde_json::json!(EngineCheckpoint::VERSION + 1);
-    let other_version: EngineCheckpoint = serde_json::from_value(json).unwrap();
-    let refused = ExecutionBuilder::new(&instruments).add_paper(
-        margin_config(),
+    // A checkpoint written in another format version, whose shape still reads in this one. Its
+    // version is checked first, so it is refused for that even on another exchange.
+    let json = serde_json::to_value(&checkpoint_v1).unwrap();
+    let mut other_version = json.clone();
+    other_version["version"] = serde_json::json!(EngineCheckpoint::VERSION + 1);
+    let other_version: EngineCheckpoint = serde_json::from_value(other_version).unwrap();
+    let refused = ExecutionBuilder::new(&kraken).add_paper(
+        MockExecutionConfig {
+            mocked_exchange: ExchangeId::Kraken,
+            ..margin_config()
+        },
         PaperOptions::default().with_checkpoint(other_version),
         TokioClock::starting_at(start()),
         &feed,
@@ -754,4 +759,25 @@ async fn a_paper_venue_refuses_a_checkpoint_of_another_venue() {
         panic!("a checkpoint of another format version is refused");
     };
     assert!(error.to_string().contains("in format version 2"), "{error}");
+
+    // A venue snapshot of another format version inside a checkpoint of this one is refused by
+    // the venue's restore.
+    let mut other_snapshot = json;
+    other_snapshot["venue"]["snapshot"]["version"] = serde_json::json!(2);
+    let other_snapshot: EngineCheckpoint = serde_json::from_value(other_snapshot).unwrap();
+    let refused = ExecutionBuilder::new(&instruments).add_paper(
+        margin_config(),
+        PaperOptions::default().with_checkpoint(other_snapshot),
+        TokioClock::starting_at(start()),
+        &feed,
+    );
+    let Err(error) = refused else {
+        panic!("a venue snapshot of another format version is refused");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("venue snapshot is format version 2"),
+        "{error}"
+    );
 }

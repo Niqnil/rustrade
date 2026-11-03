@@ -41,10 +41,11 @@ use thiserror::Error;
 /// up as it does on any connect. Statistics and tear sheets start afresh from the restore.
 ///
 /// # Saving and reading it back
-/// Serialise it whole, in any serde format. It carries one format [`version`](Self::version) for
-/// both halves, which changes whenever either half's format does; `add_paper` refuses a
-/// checkpoint of another version. Fields a later release adds are read with defaults from an
-/// older checkpoint.
+/// Serialise it whole. It carries one format [`version`](Self::version) for both halves, which
+/// changes whenever either half's format does; `add_paper` refuses a checkpoint of another
+/// version. In a self-describing format such as JSON, fields a later release adds are read with
+/// defaults from an older checkpoint; a format such as bincode reads only the exact shape it
+/// wrote.
 ///
 /// A checkpoint whose shape a later format changed fails in the deserialiser, without saying why.
 /// In a self-describing format such as JSON, read it as a
@@ -66,6 +67,11 @@ pub struct EngineCheckpoint {
 
 impl EngineCheckpoint {
     /// The format version this release writes, and the only one it restores.
+    ///
+    /// It rises whenever
+    /// [`SimulatedVenueSnapshot::VERSION`](rustrade_execution::exchange::mock::venue::SimulatedVenueSnapshot::VERSION)
+    /// or the positions' format does, so a checkpoint in this version always holds a venue
+    /// snapshot this release reads.
     pub const VERSION: u32 = 1;
 
     /// A checkpoint of `venue` and the engine's `positions` at it, in this release's format
@@ -163,6 +169,8 @@ impl EngineCheckpoint {
 }
 
 impl FormatVersion for EngineCheckpoint {
+    // The inherent constant: an inherent item takes priority over the trait's, so this does not
+    // refer to itself.
     const VERSION: u32 = Self::VERSION;
 
     fn format_version(&self) -> u32 {
@@ -666,6 +674,16 @@ mod tests {
             AssetCarry::default()
         );
         assert_eq!(read.check_positions_agree(&instruments), Ok(()));
+
+        // This version in a shape it does not read in is malformed.
+        let mut malformed = json.clone();
+        malformed["positions"] = serde_json::json!("a later shape");
+        assert_eq!(
+            stored(malformed),
+            Err(StoredFormatError::Malformed {
+                version: EngineCheckpoint::VERSION
+            })
+        );
 
         // A later version is refused, whether it still reads in this shape or not.
         let unsupported = Err(StoredFormatError::UnsupportedVersion {

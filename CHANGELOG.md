@@ -50,8 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A restored position is checked like a seed, with the new `PositionSeedError::UnknownAsset`
     for an asset the engine does not have.
   - An `EngineCheckpoint` carries one format version for both halves (`EngineCheckpoint::VERSION`,
-    `version()`), and `add_paper` refuses another. Build one with `EngineCheckpoint::new`. Fields
-    a later release adds read with defaults from an older checkpoint.
+    `version()`), and `add_paper` refuses another. Build one with `EngineCheckpoint::new`. In a
+    self-describing format such as JSON, fields a later release adds read with defaults from an
+    older checkpoint.
   - New `rustrade_execution::stored`: read a saved checkpoint or venue snapshot as a
     `Stored<T>` and call `into_current()` to be told the version it was written in
     (`StoredFormatError::UnsupportedVersion`) even when a later format changed its shape, which
