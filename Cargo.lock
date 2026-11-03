@@ -2577,9 +2577,9 @@ dependencies = [
 
 [[package]]
 name = "ibapi"
-version = "5.2.0"
+version = "5.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73d090a47160fa89dabd7d328c75d4a282c843f9cf95ad6d944370b6c89c37c6"
+checksum = "dc3318263c678fe79d2bc43a2926374f0cf3dac5f9e723ff9a53be2955a82daf"
 dependencies = [
  "byteorder",
  "crossbeam",

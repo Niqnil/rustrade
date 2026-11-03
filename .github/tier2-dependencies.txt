@@ -16,7 +16,7 @@
 # cannot land while leaving this record behind. CI cannot verify that the re-verification a
 # pinned entry mandates was actually performed — only that this file was not left untouched.
 
-ibapi=5.2.0  # 2026-10-27 | Financial protocol, community-maintained, no official SDK. Latest re-verification: the =5.2.0 record below (git 37a7e9681472047b4d4558c275b1ffef3afcf7f7; standing properties 1-5 hold). The rest of this line is the 3.2.0->3.3.0 review: all four properties recorded at 3.2.0 re-verified and still hold: zero unsafe (also no transmute/from_raw/extern "C"/asm!; holds by inspection, not by lint — upstream has no #![forbid(unsafe_code)]), no build.rs, dependency tree byte-identical vs 3.2.0 (both Cargo.toml and Cargo.lock differ by the version line alone; 9 direct deps under our `default-features = false, features = ["sync"]` selection, unchanged), still only a caller-supplied TWS socket (reconnect reuses the caller's address — no fallback host, no telemetry) + the opt-in local recorder dir (IBAPI_RECORDING_DIR; recorder.rs byte-identical). Env set unchanged (IBAPI_RECORDING_DIR, IBAPI_TIMEZONE_ALIASES); no process spawn, no obfuscation; published from git b140b312d1136d240f3b5651a89f4778e01aa222.
+ibapi=5.5.0  # 2026-11-03 | Financial protocol, community-maintained, no official SDK. Latest re-verification: the =5.5.0 record below (git 91fd3077f0eb24ee8e5ff7fc3ad754584a246755; standing properties 1-5 hold). The rest of this line is the 3.2.0->3.3.0 review: all four properties recorded at 3.2.0 re-verified and still hold: zero unsafe (also no transmute/from_raw/extern "C"/asm!; holds by inspection, not by lint — upstream has no #![forbid(unsafe_code)]), no build.rs, dependency tree byte-identical vs 3.2.0 (both Cargo.toml and Cargo.lock differ by the version line alone; 9 direct deps under our `default-features = false, features = ["sync"]` selection, unchanged), still only a caller-supplied TWS socket (reconnect reuses the caller's address — no fallback host, no telemetry) + the opt-in local recorder dir (IBAPI_RECORDING_DIR; recorder.rs byte-identical). Env set unchanged (IBAPI_RECORDING_DIR, IBAPI_TIMEZONE_ALIASES); no process spawn, no obfuscation; published from git b140b312d1136d240f3b5651a89f4778e01aa222.
 #   New in 3.3.0, reviewed: `src/config` — despite the name it reads NO local files and NO env vars. It wraps two TWS wire messages (ReqConfig=108/UpdateConfig=109) over the already-open socket, whose protobuf types already existed in 3.2.0. Version-gated, #[must_use] builder, not reachable during connect/handshake.
 #   NOTE (capability, not vulnerability): `update_config()` can write the gateway's own safety settings — read_only_api, the bypass_* order precautions, trusted_ips, allow_localhost_only, socket_port, master_client_id. rustrade does not call it and does not re-export it; keep it out of the wrapper surface unless there is a deliberate reason.
 #   Upstream BREAKING in a minor release: the `fundamental` module was removed (IBKR retired reqFundamentalData in TWS API 10.47). rustrade never used it — verified no reference to fundamental_data / FundamentalData / FundamentalReportType / TickType::FundamentalRatios.
@@ -464,6 +464,79 @@ ibapi=5.2.0  # 2026-10-27 | Financial protocol, community-maintained, no officia
 # to disconnect; the same run order reproduces that on =5.1.0, so it is the paper account's permissions, not
 # this bump. Not exercised: a fill of this client's own order (outside regular hours), an automatic reconnect, a
 # liquidation.
+#
+# Re-verified against the =5.5.0 crates.io source on 2026-11-03 (5.2.0 -> 5.5.0, through 5.3.0 and 5.4.0).
+# Published 2026-10-30 by the same crates.io owner as every 5.x release, from git
+# 91fd3077f0eb24ee8e5ff7fc3ad754584a246755; crate sha256
+# dc3318263c678fe79d2bc43a2926374f0cf3dac5f9e723ff9a53be2955a82daf (= Cargo.lock). Authors and repository unchanged.
+#
+# Standing properties, all hold:
+#   1. ZERO unsafe -- no unsafe / transmute / extern "C" / asm! / #[no_mangle] / #[link] / dlopen in src/. The
+#      only `from_raw` is still the safe `RequestId::from_raw(i32)` (client/ids.rs:35). By inspection.
+#   2. NO build.rs (`build = false`), no proc macros, no include_bytes!/include_str!. `proto/mod.rs` `include!`s
+#      the checked-in prost output `proto/protobuf.rs`, a file in the package.
+#   3. DEPENDENCY TREE -- `[dependencies.` up to `[dev-dependencies` byte-identical to 5.2.0, `[features]`
+#      identical, rust-version stays 1.88. The manifest delta is the version, the description, one async example
+#      and a `[lints.clippy]` table. Cargo.lock: ibapi's version and checksum only, zero packages added or removed.
+#      (Dependabot's own lockfile also re-pointed tokio / hyper-util / quinn from socket2 0.5 to 0.6 and several
+#      windows-sys edges, all between versions already in the lock and none on ibapi's tree; that churn is
+#      cargo's re-resolution, not this bump, and was left out.)
+#   4. NETWORK SURFACE -- still only the caller's TWS socket (transport/sync.rs:1283, reconnect :1319 reuses the
+#      stored address). URLs in src/ are doc links or error text. No process spawn, no telemetry, no obfuscation.
+#      Thread spawns unchanged (transport/sync.rs:616 dispatcher, :854 cleanup). The new `Client::resubscribing`
+#      (subscriptions/resubscribe.rs) spawns nothing: it waits on a Mutex+Condvar connection signal. We do not
+#      call it.
+#   5. ENV SURFACE unchanged: IBAPI_RAW_CAPTURE_DIR (transport/raw_capture.rs:92), IBAPI_RECORDING_DIR
+#      (transport/recorder.rs:40), IBAPI_TIMEZONE_ALIASES (common/timezone.rs:175). The recorder's constructor
+#      was split (`disabled` / `recording_to`); same directory, same writes. Filesystem sites unchanged.
+#   `update_config()` is still reachable only through an explicit builder `.submit()`.
+#
+# ORDER WIRE FORMAT: unchanged for every order rustrade builds. The order encoders moved from
+# `proto/encoders.rs` into `orders/common/encoders.rs` with identical bodies, plus five fields that 5.2.0
+# hard-coded to `None`: `post_only`, `allow_pre_open`, `ignore_open_auction`, `seek_price_improvement` and
+# `what_if_type`. `Order::default()` leaves all five false/None, `some_bool(false)` omits the field, and their
+# server-version checks (orders/common/verify.rs) fire only when one is set. We build every order from
+# `..Order::default()`. The handshake still advertises max server version 226.
+#
+# NOTICE CLASSIFICATION: `WARNING_CODE_RANGE`, 202, 317, 399, 10089/10090/10091/10167 and the system codes
+# 1100/1101/1102/1300 unchanged, so our INFORMATIONAL_ORDER_CODES handling is unaffected. One addition: code 165
+# is a warning in its "HMDS server connection was successful" form only (messages/notice.rs). New constants
+# (162, 200, 321, 326) and `Error::ClientIdInUse` (a handshake 326; `Error` is #[non_exhaustive]).
+#
+# BEHAVIOUR CHANGES ON PATHS WE COMPILE:
+#   - SESSION STATE: sends are refused with ConnectionReset while reconnecting, ConnectionFailed once the
+#     reconnect gave up, Shutdown after a shutdown. An OPEN order update stream still ends with Error::Shutdown
+#     on a give-up, as in 5.2.0 (`order_taps.close` is unchanged), so the account stream's Shutdown arm still
+#     fires. Only a NEW `order_update_stream()` on a client that gave up now gets ConnectionFailed, which
+#     `account_stream` maps to `Internal` whatever the variant; `is_transport_loss` already lists both.
+#   - STRICTER DECODE: OrderStatus `filled`/`remaining` (orders/common/decoders.rs:65-66) and the `position` of
+#     Position, PositionMulti, PortfolioValue and PnLSingle (accounts/common/decoders.rs) are now required: a
+#     missing value is Error::Parse instead of 0. Reaches the account stream and `positions_multi`.
+#   - HISTORICAL: a 165 "HMDS server connection was successful" no longer fails a one-shot `fetch`; it is skipped
+#     and the bars that follow are returned. A bar with a missing or unparseable date is Error::Parse instead of
+#     an epoch bar.
+#   - CANCEL ON DROP is skipped for a subscription from an earlier session (a reconnect since) and for one TWS
+#     already ended with 162/200/321, so no stale-id cancel errors reach TWS. Reaches every market data
+#     `subscribe` in rustrade-data.
+#   - RECONNECT refreshes the server version along with the order-id floor (client/handshake_state.rs).
+#   - `ExecutionFilterSide`, `OptionRight` and `LegAction` are no longer #[non_exhaustive]; we match `OptionRight`
+#     on `Call`/`Put` only, with no wildcard.
+#   rustrade compiles unchanged: `cargo check --locked --workspace --all-targets --all-features` is warning-free.
+#
+# Exercised against a paper IB Gateway on 2026-11-03, outside US regular trading hours, the client advertising
+# server versions up to 226: in rustrade-execution/tests/ibkr_execution.rs, test_connection,
+# test_contract_registration, test_fetch_open_orders, test_place_and_cancel_limit_order, test_account_stream,
+# test_cancel_produces_cancelled_not_expired, test_place_and_cancel_bracket_order,
+# test_bracket_order_oca_group_linkage, test_orders_found_by_client_order_id_across_a_restart,
+# test_order_id_mapping_cleanup, test_fetch_shortability, test_shortability_raw_ticks, test_fetch_balances and
+# test_order_without_registered_contract (14 pass); in rustrade-data/tests/ibkr_integration.rs,
+# test_contract_resolution, test_historical_connection, test_historical_daily_bars, test_historical_minute_bars,
+# test_historical_ticks_trade, test_historical_midpoint_data and test_market_stream_disconnect_while_subscribing
+# pass. test_market_stream_disconnect_while_running fails as recorded at =5.2.0: IB ends both AAPL
+# subscriptions at once with 10168 / 10189 (no market data permissions on the paper account), leaving nothing
+# to disconnect. Order status and position frames decoded without a Parse error under the stricter decoders.
+# Not exercised: a fill of this client's own order (outside regular hours), an automatic reconnect or a
+# reconnect that gives up, a cold-HMDS historical fetch, a liquidation.
 binance-sdk=77.2.0  # 2026-10-30 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
 #   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
