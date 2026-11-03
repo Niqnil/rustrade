@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The simulated venue can value each asset over a recent window of its price when it lends**
+  (`rustrade-execution`, #829). Binance's cross margin borrow check values an asset the account
+  owes at the highest price over a recent window, and every other asset at the lowest. A price
+  that has just jumped lends no more at once, and one that has just fallen lends less at once.
+  - `SpotMarginConfig::with_borrow_price_window(TimeDelta)` sets the window, and
+    `borrow_price_window()` reads it. Off by default, when every asset is valued at its current
+    price as before. A window that is not a positive whole number of milliseconds is refused with
+    the new `SpotMarginConfigError::BorrowPriceWindowInvalid`. It serialises as
+    `borrow_price_window_ms`, an integer, left out when off.
+  - Each market observation the venue is fed adds to its instrument's window: the mid, else the
+    last price, and the high and low of a bar it carries. The current price always counts. The
+    venue keeps each price that could still be the window's lowest or highest, so in a market
+    that only rises or falls it holds every observation inside the window.
+  - An asset the account owes is valued at its highest for all the units it holds as well as
+    for its debt. So is the asset being borrowed. Every other asset is valued at its lowest.
+  - The venue lends the lesser of what the leverage limit allows at the window's prices and at
+    the current ones. So the window only ever lends less, and a borrow the leverage limit allows
+    still never leaves the account at its liquidation level.
+  - It applies to orders that borrow and to `borrow_capacity`. The liquidation check and
+    interest still use current prices. A venue no driver feeds the market has no window to look
+    back on, and lends at the request's own price.
 - **A charge on a new loan names the order that took the loan, and goes to the position that
   order opened or added to** (`rustrade-execution`, `rustrade`, #831). A margin venue charges
   interest when it lends to an order (`InterestTiming::OnBorrow`). Until now the engine placed

@@ -44,8 +44,10 @@ use std::{sync::Arc, time::Duration};
 use tracing::warn;
 
 mod liquidation;
+mod price_window;
 mod spot_pairs;
 
+use price_window::PriceWindow;
 use spot_pairs::{SpotPair, SpotPairs};
 
 /// Everything one request obliges a driver to deliver, in the order it must deliver it.
@@ -560,6 +562,10 @@ pub struct SimulatedVenue {
     /// Empty unless a driver feeds it — see [`apply_market`](Self::apply_market) for which drivers
     /// do. Read through [`market`](Self::market).
     market: FnvHashMap<InstrumentNameExchange, VenueInstrumentMarket>,
+    /// Each spot instrument's prices over the [`spot_margin`](Self::spot_margin)'s borrow price
+    /// window, as [`apply_market`](Self::apply_market) observed them. Empty without a window.
+    /// See [`SpotMarginConfig`]'s `# Borrow price window`.
+    borrow_prices: FnvHashMap<InstrumentNameExchange, PriceWindow>,
     /// The net position of each cash-settled instrument this account holds one in.
     ///
     /// What decides how much of a CFD fill closes a position, returning its margin and realising
@@ -736,6 +742,7 @@ impl SimulatedVenue {
             instruments,
             account,
             market: FnvHashMap::default(),
+            borrow_prices: FnvHashMap::default(),
             positions,
             order_sequence: 0,
             order_id_start,
@@ -1306,18 +1313,46 @@ impl SimulatedVenue {
     /// `None` if this venue cannot value `asset`, or a debt the account owes. `priced` is as for
     /// [`price_in`](Self::price_in). Shared by an order's [`borrowable`](Self::borrowable) and the
     /// [`borrow_capacity`](Self::borrow_capacity) query, so the two agree.
+    ///
+    /// With a borrow price window, the lesser of the room at the window's prices and at the
+    /// current ones. See [`SpotMarginConfig`]'s `# Borrow price window`.
     fn leverage_room(
         &self,
         config: &SpotMarginConfig,
         asset: &AssetNameExchange,
         priced: Option<(&Underlying<AssetNameExchange>, &MarketSnapshot)>,
     ) -> Option<Decimal> {
-        let asset_price = self.price_in(asset, config.valuation_asset(), priced)?;
-        let Valued { equity, debt } = self.valued(config, MarginCheck::Borrow, priced)?;
+        let room = |prices: Prices<'_>| {
+            // The asset being borrowed: owed, under the window, whatever the account owes now.
+            let asset_price =
+                self.price_of(asset, config.valuation_asset(), priced, prices, true)?;
+            let Valued { equity, debt } =
+                self.valued(config, MarginCheck::Borrow, priced, prices)?;
 
-        let headroom = (config.max_leverage() - Decimal::ONE) * equity - debt;
-        // `price_in` never values an asset at zero, so the division is safe.
-        Some(headroom.max(Decimal::ZERO) / asset_price)
+            let headroom = (config.max_leverage() - Decimal::ONE) * equity - debt;
+            // `price_of` never values an asset at zero, so the division is safe.
+            Some(headroom.max(Decimal::ZERO) / asset_price)
+        };
+
+        let current = room(Prices::Current)?;
+        // Only ever less: see `# Borrow price window` for why the window alone could lend more.
+        let Some(since) = self.borrow_window_since(config) else {
+            return Some(current);
+        };
+        Some(current.min(room(Prices::Window {
+            since,
+            borrowing: asset,
+        })?))
+    }
+
+    /// The earliest instant `config`'s borrow price window reaches back to from the latest instant
+    /// this venue's clock has reached, or `None` without a window, or before the clock first moved,
+    /// when nothing was observed to look back on.
+    fn borrow_window_since(&self, config: &SpotMarginConfig) -> Option<DateTime<Utc>> {
+        Some(window_start(
+            self.accrued_through?,
+            config.borrow_price_window()?,
+        ))
     }
 
     /// The rejection for an arrival the account refused, an order on `side`.
@@ -1374,19 +1409,27 @@ impl SimulatedVenue {
     /// [`SpotMarginConfig`]'s `# How much it lends` says, with each asset's positive net weighted
     /// by its collateral ratio for `check`, or `None` if it owes an asset this venue cannot value.
     ///
-    /// `priced` is as for [`price_in`](Self::price_in). Shared by the leverage limit and the
-    /// liquidation check, so the two value an account alike but for the ratios.
+    /// `priced` is as for [`price_in`](Self::price_in), and `prices` says which price of each
+    /// asset counts. Shared by the leverage limit and the liquidation check, so the two value an
+    /// account alike but for the ratios and the borrow price window.
     fn valued(
         &self,
         config: &SpotMarginConfig,
         check: MarginCheck,
         priced: Option<(&Underlying<AssetNameExchange>, &MarketSnapshot)>,
+        prices: Prices<'_>,
     ) -> Option<Valued> {
         let mut valued = Valued::default();
         for balance in self.account.balances() {
             let owed = owed(balance);
-            let Some(price) = self.price_in(&balance.asset, config.valuation_asset(), priced)
-            else {
+            let price = self.price_of(
+                &balance.asset,
+                config.valuation_asset(),
+                priced,
+                prices,
+                owed > Decimal::ZERO,
+            );
+            let Some(price) = price else {
                 if owed > Decimal::ZERO {
                     return None;
                 }
@@ -1418,9 +1461,26 @@ impl SimulatedVenue {
         valuation: &AssetNameExchange,
         priced: Option<(&Underlying<AssetNameExchange>, &MarketSnapshot)>,
     ) -> Option<Decimal> {
+        self.price_of(asset, valuation, priced, Prices::Current, false)
+    }
+
+    /// What one unit of `asset` is worth in `valuation` at `prices`: its
+    /// [`price_in`](Self::price_in), or under [`Prices::Window`] the highest or lowest of that and
+    /// the prices the same instrument was observed at in the window. The highest for an asset the
+    /// account `owes` any of, and for the asset being borrowed; the lowest for every other.
+    /// `None` exactly when [`price_in`](Self::price_in) is.
+    fn price_of(
+        &self,
+        asset: &AssetNameExchange,
+        valuation: &AssetNameExchange,
+        priced: Option<(&Underlying<AssetNameExchange>, &MarketSnapshot)>,
+        prices: Prices<'_>,
+        owes: bool,
+    ) -> Option<Decimal> {
         if asset == valuation {
             return Some(Decimal::ONE);
         }
+        let extreme = prices.extreme(asset, owes);
 
         // `priced` applies to an instrument whose underlying it names: `asset`/`valuation`, or the
         // reverse for an inverse pair.
@@ -1447,6 +1507,20 @@ impl SimulatedVenue {
                 if price <= Decimal::ZERO {
                     return None;
                 }
+                // The window holds the instrument's price, so the asset's lowest is the inverse of
+                // its highest. It holds only positive prices, so the inverse stays safe.
+                let window = self.borrow_prices.get(&pair.instrument);
+                let price = match (extreme, pair.inverse) {
+                    (None, _) => price,
+                    (Some((Extreme::Lowest, since)), false)
+                    | (Some((Extreme::Highest, since)), true) => window
+                        .and_then(|window| window.low(since))
+                        .map_or(price, |low| low.min(price)),
+                    (Some((Extreme::Highest, since)), false)
+                    | (Some((Extreme::Lowest, since)), true) => window
+                        .and_then(|window| window.high(since))
+                        .map_or(price, |high| high.max(price)),
+                };
                 Some(match pair.inverse {
                     true => Decimal::ONE / price,
                     false => price,
@@ -1663,6 +1737,8 @@ impl SimulatedVenue {
         if fresh {
             entry.fresh_at = Some(time_exchange);
         }
+        // Recorded before anything can borrow on this tick, so a loan it funds is valued with it.
+        self.record_borrow_price(instrument, &snapshot, bar.as_ref(), time_exchange);
 
         // Swept before matching, so an order whose deadline this tick has reached cannot trade on
         // the very tick that retires it -- see `advance_time`.
@@ -1705,6 +1781,57 @@ impl SimulatedVenue {
         self.refresh_next_interest_if_loans_changed();
         self.report_debt_changes(&mut events);
         events
+    }
+
+    /// Adds what `snapshot` and `bar` say `instrument` traded at, at `time_exchange`, to its
+    /// borrow price window, if the spot margin configuration has one and `instrument` is spot:
+    /// the mid, else the last price, at which the venue values it, and the bar's high and low.
+    /// See [`SpotMarginConfig`]'s `# Borrow price window`.
+    fn record_borrow_price(
+        &mut self,
+        instrument: &InstrumentNameExchange,
+        snapshot: &MarketSnapshot,
+        bar: Option<&MarketBar>,
+        time_exchange: DateTime<Utc>,
+    ) {
+        let Some(window) = self
+            .spot_margin
+            .as_ref()
+            .and_then(SpotMarginConfig::borrow_price_window)
+        else {
+            return;
+        };
+        // Only a spot instrument values an asset, so no other needs a window.
+        if !self
+            .instruments
+            .get(instrument)
+            .is_some_and(|traded| matches!(traded.kind, InstrumentKind::Spot))
+        {
+            return;
+        }
+        // A price of zero values nothing, as the venue values at the current price.
+        let Some((low, high)) = [
+            mid_or_last(snapshot),
+            bar.map(|bar| bar.low),
+            bar.map(|bar| bar.high),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|price| *price > Decimal::ZERO)
+        .minmax()
+        .into_option() else {
+            return;
+        };
+        let since = window_start(time_exchange, window);
+        // Looked up before it is entered, so the name is cloned only on the first observation.
+        match self.borrow_prices.get_mut(instrument) {
+            Some(prices) => prices.record(time_exchange, low, high, since),
+            None => self
+                .borrow_prices
+                .entry(instrument.clone())
+                .or_default()
+                .record(time_exchange, low, high, since),
+        }
     }
 
     /// Whether applying `observation` to `instrument` releases orders held for its bar,
@@ -4970,6 +5097,53 @@ impl MarginCheck {
             Self::Liquidation => config.liquidation_collateral_ratio(asset),
         }
     }
+}
+
+/// Which price of each asset a valuation takes. See [`SimulatedVenue::price_of`].
+#[derive(Debug, Clone, Copy)]
+enum Prices<'a> {
+    /// Each asset's current price.
+    Current,
+    /// Over the borrow price window from `since`: the highest for an asset the account owes and
+    /// for `borrowing`, the lowest for every other. See [`SpotMarginConfig`]'s
+    /// `# Borrow price window`.
+    Window {
+        /// The earliest instant the window reaches back to.
+        since: DateTime<Utc>,
+        /// The asset being borrowed, valued as one the account owes.
+        borrowing: &'a AssetNameExchange,
+    },
+}
+
+impl Prices<'_> {
+    /// Which extreme of `asset`'s window counts and from when, or `None` for its current price.
+    /// `owes` is whether the account owes any of `asset`.
+    fn extreme(self, asset: &AssetNameExchange, owes: bool) -> Option<(Extreme, DateTime<Utc>)> {
+        match self {
+            Self::Current => None,
+            Self::Window { since, borrowing } => Some((
+                match owes || asset == borrowing {
+                    true => Extreme::Highest,
+                    false => Extreme::Lowest,
+                },
+                since,
+            )),
+        }
+    }
+}
+
+/// Which end of a borrow price window an asset is valued at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Extreme {
+    Lowest,
+    Highest,
+}
+
+/// The earliest instant a `window` ending at `end` reaches back to, inclusive: the earliest
+/// instant there is, for a window longer than all of time before `end`.
+fn window_start(end: DateTime<Utc>, window: chrono::TimeDelta) -> DateTime<Utc> {
+    end.checked_sub_signed(window)
+        .unwrap_or(DateTime::<Utc>::MIN_UTC)
 }
 
 /// A margin account's equity and debt, in its valuation asset. See [`SimulatedVenue::valued`].
@@ -16733,6 +16907,7 @@ mod tests {
     }
 
     mod borrow_capacity;
+    mod borrow_price_window;
     mod collateral_ratio;
     mod liquidation;
 }

@@ -210,7 +210,8 @@ pub struct OrderLoan {
 /// - Each asset is valued at the mid of an instrument on the venue that pairs it with the
 ///   valuation asset, else that market's last price, in either direction (`BTC/USDT`, or the
 ///   inverse of `USDT/BTC`). The valuation asset is worth one. A market priced at zero values
-///   nothing.
+///   nothing. A [borrow price window](Self::with_borrow_price_window) values each asset over a
+///   recent window of that price instead: see `# Borrow price window`.
 /// - **Equity** is the sum over assets of `total − borrowed − interest`, valued that way, where an
 ///   asset whose net is positive counts at its
 ///   [`borrow_collateral_ratio`](Self::borrow_collateral_ratio): see `# Collateral ratios`. An
@@ -257,6 +258,39 @@ pub struct OrderLoan {
 /// the stricter ones, as on Binance. That keeps a borrow the leverage limit allows from leaving
 /// the account at its liquidation level.
 ///
+/// # Borrow price window
+/// Off by default: the leverage limit values each asset at its current price, as the liquidation
+/// check does. Binance's borrow check is stricter. It values each asset over a recent window of
+/// its price, at the highest for an asset the account owes and the lowest for every other, so a
+/// price that just jumped lends no more at once, and one that just fell lends less at once. Set
+/// with [`with_borrow_price_window`](Self::with_borrow_price_window), the leverage limit does the
+/// same over the window given:
+/// - Each market observation the venue is fed adds its price to the window of that instrument:
+///   the mid, else the last price, at which the venue values the instrument, and the high and low
+///   of a bar the observation carries. The current price always counts.
+/// - What counts is what was observed in the window up to the latest instant the venue's clock
+///   has reached, from that instant less the window, inclusive.
+/// - An asset the account owes is valued at its highest price in the window, for every unit it
+///   holds as well as for its debt. So is the asset being borrowed, since the loan makes it one
+///   the account owes: an order's or a [`borrow_capacity`] query's. Every other asset is valued
+///   at its lowest. The valuation asset is worth one.
+/// - The venue lends the lesser of what the leverage limit allows at those prices and at the
+///   current ones. The window can only make the venue lend less. Valuing an asset the account owes
+///   at its highest raises the value of its holdings as well as its debt, so on its own it could
+///   lend more than the current prices would, and leave the account at its liquidation level the
+///   moment it borrowed.
+///
+/// The venue keeps, per spot instrument, every observed price that could still be the window's
+/// lowest or highest: in a market that only rises or only falls, every observation inside the
+/// window, so a long window over a fast feed holds that many.
+///
+/// The window changes only how much the venue lends: the margin level a [`SpotMarginLiquidation`]
+/// checks, and any interest, are valued at current prices. A venue no driver feeds the market,
+/// one priced by each request's own snapshot, has no window to look back on, and lends as if
+/// there were none.
+///
+/// [`borrow_capacity`]: crate::exchange::mock::venue::SimulatedVenue::borrow_capacity
+///
 /// # What it repays
 /// Under [`MarginEffect::Repay`], whatever a fill delivers into an asset the account owes repays
 /// that asset's loan, interest first, then principal, and only the rest becomes free balance. What
@@ -275,9 +309,9 @@ pub struct OrderLoan {
 /// - **Isolated margin.** One pool of balances backs every instrument.
 /// - **Tiered collateral ratios.** An asset has one ratio per check, whatever the size of its
 ///   holding. Binance publishes each ratio in tiers by the holding's value in USD.
-/// - **Conservative borrow prices.** The leverage limit values each asset at the same price as the
-///   liquidation check. Binance's borrow check values an asset the account owes at the highest
-///   index price over a recent window, and every other asset at the lowest.
+/// - **Index prices.** Every check values an asset at a market's own mid or last price, where
+///   Binance values at an index over several venues. The borrow price window above stands in for
+///   the window Binance takes over that index.
 /// - **The venue's lending pool.** The venue has whatever it lends: no shared pool runs short, as
 ///   one can on a real venue whatever the account's own limits allow.
 /// - **Interest**, by this configuration alone. A venue given a [`MarginInterestModel`] charges
@@ -286,12 +320,15 @@ pub struct OrderLoan {
 /// [`new`](Self::new) refuses a `max_leverage` below one, [`with_min_borrow`](Self::with_min_borrow)
 /// a negative minimum, [`with_max_borrow`](Self::with_max_borrow) a negative cap, the collateral
 /// ratio builders a ratio outside `[0, 1]` or a liquidation ratio below the borrow ratio,
-/// [`with_liquidation`](Self::with_liquidation) a liquidation the leverage limit could reach, and
-/// so does deserialising any of them, so a configuration that exists is one the venue can apply.
+/// [`with_borrow_price_window`](Self::with_borrow_price_window) a window that is not a positive
+/// whole number of milliseconds, [`with_liquidation`](Self::with_liquidation) a liquidation the
+/// leverage limit could reach, and so does deserialising any of them, so a configuration that
+/// exists is one the venue can apply.
 /// Serialised, `max_leverage`, each minimum borrow, each cap and each ratio are decimal strings
 /// (`"3"`), as the crate writes decimals elsewhere, so no precision is lost to a float.
 /// `min_borrow`, `max_borrow`, `borrow_collateral_ratio` and `liquidation_collateral_ratio` are
-/// maps from asset to amount, each left out when empty, and `liquidation` is left out when off.
+/// maps from asset to amount, each left out when empty. `borrow_price_window_ms` is the window
+/// in whole milliseconds, an integer, and `liquidation` is left out when off, as is the window.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(try_from = "SpotMarginRepr", into = "SpotMarginRepr")]
 pub struct SpotMarginConfig(SpotMarginRepr);
@@ -313,6 +350,8 @@ struct SpotMarginRepr {
     borrow_collateral_ratio: BTreeMap<AssetNameExchange, Decimal>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     liquidation_collateral_ratio: BTreeMap<AssetNameExchange, Decimal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    borrow_price_window_ms: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     liquidation: Option<SpotMarginLiquidation>,
 }
@@ -347,6 +386,7 @@ impl SpotMarginConfig {
             max_borrow: BTreeMap::new(),
             borrow_collateral_ratio: BTreeMap::new(),
             liquidation_collateral_ratio: BTreeMap::new(),
+            borrow_price_window_ms: None,
             liquidation: None,
         })
     }
@@ -529,6 +569,35 @@ impl SpotMarginConfig {
             .unwrap_or(Decimal::ONE)
     }
 
+    /// This configuration, valuing each asset over the trailing `window` of its price when the
+    /// venue decides how much it lends. Replaces any window it had. See [`SpotMarginConfig`]'s
+    /// `# Borrow price window`.
+    ///
+    /// Off by default, when each asset is valued at its current price.
+    ///
+    /// # Errors
+    /// [`SpotMarginConfigError::BorrowPriceWindowInvalid`] if `window` is not a positive whole
+    /// number of milliseconds, the unit it is serialised in.
+    pub fn with_borrow_price_window(
+        mut self,
+        window: TimeDelta,
+    ) -> Result<Self, SpotMarginConfigError> {
+        let millis = window.num_milliseconds();
+        if window <= TimeDelta::zero() || TimeDelta::milliseconds(millis) != window {
+            return Err(SpotMarginConfigError::BorrowPriceWindowInvalid(window));
+        }
+        self.0.borrow_price_window_ms = Some(millis);
+        Self::try_from(self.0)
+    }
+
+    /// How far back the venue looks at each asset's price when it decides how much it lends, or
+    /// `None` if it values each at its current price. See
+    /// [`with_borrow_price_window`](Self::with_borrow_price_window).
+    pub fn borrow_price_window(&self) -> Option<TimeDelta> {
+        // Validated positive, so within what a `TimeDelta` holds.
+        self.0.borrow_price_window_ms.map(TimeDelta::milliseconds)
+    }
+
     /// This configuration, liquidating the account as `liquidation` says. Replaces any
     /// liquidation it had.
     ///
@@ -607,6 +676,12 @@ impl TryFrom<SpotMarginRepr> for SpotMarginConfig {
                 borrow: ratio_of(&repr.borrow_collateral_ratio, asset),
                 liquidation: ratio_of(&repr.liquidation_collateral_ratio, asset),
             });
+        }
+        if let Some(millis) = repr.borrow_price_window_ms.filter(|millis| *millis <= 0) {
+            // Only `i64::MIN` milliseconds is beyond a `TimeDelta`, whose range is symmetric; it
+            // is reported as the most negative one there is.
+            let window = TimeDelta::try_milliseconds(millis).unwrap_or(TimeDelta::MIN);
+            return Err(SpotMarginConfigError::BorrowPriceWindowInvalid(window));
         }
         if let Some(liquidation) = &repr.liquidation {
             // An account borrowed to the limit has `debt = (max_leverage − 1) × equity`, so a
@@ -687,6 +762,10 @@ pub enum SpotMarginConfigError {
         /// Its liquidation collateral ratio, below `borrow`.
         liquidation: Decimal,
     },
+    /// A borrow price window that is not a positive whole number of milliseconds, the unit it is
+    /// serialised in.
+    #[error("spot margin borrow price window {0} is not a positive whole number of milliseconds")]
+    BorrowPriceWindowInvalid(TimeDelta),
     /// A liquidation level below one, at which an account would already owe more than it holds.
     #[error("spot margin liquidation level {0} is below 1")]
     LiquidationLevelBelowOne(Decimal),
@@ -1534,6 +1613,81 @@ mod tests {
         );
         let plain = serde_json::to_string(&usdt_margin()).unwrap();
         assert!(!plain.contains("collateral_ratio"), "{plain}");
+    }
+
+    #[test]
+    fn a_borrow_price_window_is_off_by_default_and_replaced_by_the_builder() {
+        assert_eq!(usdt_margin().borrow_price_window(), None);
+
+        let config = usdt_margin()
+            .with_borrow_price_window(TimeDelta::hours(2))
+            .unwrap()
+            .with_borrow_price_window(TimeDelta::milliseconds(1))
+            .unwrap();
+
+        assert_eq!(
+            config.borrow_price_window(),
+            Some(TimeDelta::milliseconds(1))
+        );
+    }
+
+    #[test]
+    fn a_borrow_price_window_not_a_positive_whole_number_of_milliseconds_is_refused() {
+        for window in [
+            TimeDelta::zero(),
+            TimeDelta::milliseconds(-1),
+            TimeDelta::microseconds(1),
+            TimeDelta::microseconds(1_500),
+            TimeDelta::MIN,
+        ] {
+            assert_eq!(
+                usdt_margin().with_borrow_price_window(window),
+                Err(SpotMarginConfigError::BorrowPriceWindowInvalid(window)),
+                "{window}"
+            );
+        }
+        assert!(
+            usdt_margin()
+                .with_borrow_price_window(TimeDelta::MAX)
+                .is_ok()
+        );
+
+        let json = |millis: &str| {
+            format!(
+                r#"{{"valuation_asset":"usdt","max_leverage":"3","margin_effect":"borrow","borrow_price_window_ms":{millis}}}"#
+            )
+        };
+        for (millis, window) in [
+            ("0", TimeDelta::zero()),
+            ("-5", TimeDelta::milliseconds(-5)),
+            // One past the most negative `TimeDelta`, reported as that.
+            (&i64::MIN.to_string(), TimeDelta::MIN),
+        ] {
+            let refused = serde_json::from_str::<SpotMarginConfig>(&json(millis))
+                .unwrap_err()
+                .to_string();
+            let expected = SpotMarginConfigError::BorrowPriceWindowInvalid(window).to_string();
+            assert!(refused.contains(&expected), "{millis}: {refused}");
+        }
+    }
+
+    #[test]
+    fn a_borrow_price_window_round_trips_as_whole_milliseconds_left_out_when_off() {
+        let config = usdt_margin()
+            .with_borrow_price_window(TimeDelta::hours(1))
+            .unwrap();
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(
+            json,
+            r#"{"valuation_asset":"usdt","max_leverage":"3","margin_effect":"borrow","auto_repay_at_cancel":true,"borrow_price_window_ms":3600000}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SpotMarginConfig>(&json).unwrap(),
+            config
+        );
+        let plain = serde_json::to_string(&usdt_margin()).unwrap();
+        assert!(!plain.contains("borrow_price_window"), "{plain}");
     }
 
     #[test]
