@@ -58,6 +58,7 @@
 //!   [`ExecutionClient::fetch_open_orders`].
 
 mod collateral;
+mod loans;
 mod records;
 mod stream;
 
@@ -96,7 +97,7 @@ use crate::{
         venue_clock::HostMoment,
     },
     error::{ApiError, OrderError, UnindexedClientError},
-    margin::{MarginBorrow, MarginEffect, MarginPlacement},
+    margin::{MarginBorrow, MarginEffect, MarginPlacement, OrderLoan},
     order::{
         Order, OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
@@ -133,6 +134,7 @@ use binance_sdk::{
 use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use fnv::FnvHashSet;
 use futures::stream::BoxStream;
+use loans::{Loans, MAX_LOANS, SharedLoans};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     Side,
@@ -513,6 +515,9 @@ pub struct BinanceMargin {
     // The orders seen live and not yet seen end, which a reconnect asks about. Shared by every
     // clone and every account stream, since an order placed through one ends on any of them.
     known_live: SharedKnownLiveOrders,
+    // The loans this client's orders took, which `fetch_margin_interest` links Binance's charges
+    // on new loans to. Shared by every clone.
+    loans: SharedLoans,
     // The pairs' tick, lot and notional rules, loaded on each pair's first order from the spot
     // `exchangeInfo`. Shared by every clone.
     rules: Arc<RulesLoader>,
@@ -570,6 +575,27 @@ impl BinanceMargin {
                 "Binance margin: recalled order kinds past the limit are ignored"
             );
         }
+    }
+
+    /// Tell the client the loans its orders took before it was created, such as before a restart,
+    /// so that [`fetch_margin_interest`](Self::fetch_margin_interest) links Binance's charges on
+    /// them to their orders.
+    ///
+    /// The client holds the loan each order it places reports
+    /// ([`MarginPlacement::loan`]), and links an `ON_BORROW` charge to the one held loan of its
+    /// asset and principal taken in its hour (see [`fetch_margin_interest`](Self::fetch_margin_interest)).
+    /// It keeps nothing across restarts, so a charge read after one is linked to no loan unless the
+    /// caller persisted [`MarginPlacement::loan`] for each order that borrowed and hands the loans
+    /// back here. It can be called again at any time, and adds to what earlier calls supplied.
+    ///
+    /// Each loan must be one this client's account took, as [`MarginPlacement::loan`] reports it:
+    /// a loan is linked as given, unchecked against Binance's records. A loan of an order already
+    /// held replaces it. At most 4096 loans are held: past that the oldest by loan time is
+    /// dropped, and a recalled loan older than every held one is not held, with a warning.
+    pub fn recall_loans(&self, loans: impl IntoIterator<Item = OrderLoan>) {
+        // Collected before the loans are locked, so `loans` may call this client.
+        let loans: Vec<_> = loans.into_iter().collect();
+        self.hold_loans(loans);
     }
 
     /// Load the order rules of `instruments` from Binance now, and hold them for
@@ -922,7 +948,31 @@ impl BinanceMargin {
         if let Some(sending) = sending {
             sending.sent(&placement.order.state);
         }
+        if let Some(loan) = placement.loan() {
+            self.hold_loans([loan]);
+        }
         placement
+    }
+
+    /// Hold each of `loans` for [`fetch_margin_interest`](Self::fetch_margin_interest) to link
+    /// Binance's charges on them to, warning of any not held past [`MAX_LOANS`].
+    fn hold_loans(&self, loans: impl IntoIterator<Item = OrderLoan>) {
+        // The guard is dropped at the end of the statement, so the warning waits for no lock.
+        let dropped = {
+            let mut held = self.loans.lock();
+            loans
+                .into_iter()
+                .map(|loan| held.insert(loan))
+                .filter(|held| !held)
+                .count()
+        };
+        if dropped > 0 {
+            warn!(
+                dropped,
+                limit = MAX_LOANS,
+                "Binance margin: loans older than every held loan are not held past the limit"
+            );
+        }
     }
 
     /// Hold each of `orders` as live, for a reconnect to ask about if the stream misses its end.
@@ -1153,6 +1203,7 @@ impl ExecutionClient for BinanceMargin {
                 RateLimitTracker::new(WeightPool::Sapi).with_server_time(server_time),
             ),
             known_live: KnownLiveOrders::shared(ExchangeId::BinanceMargin),
+            loans: Loans::shared(),
             rules,
             spot_rest,
             spot_rate_limiter,
@@ -7172,6 +7223,99 @@ mod tests {
             );
             assert_eq!(placement.borrowed, expected, "{answer}");
         }
+    }
+
+    /// The loan an order reports borrowing is held, with the order's ids and the answer's time,
+    /// whether the order is placed through `open_margin_order` or `ExecutionClient::open_order`,
+    /// and an order that borrows nothing holds none.
+    #[tokio::test]
+    async fn a_placement_holds_the_loan_its_order_took() {
+        let btcusdt = InstrumentNameExchange::new("BTCUSDT");
+        let loan = OrderLoan::new(
+            btcusdt.clone(),
+            MarginBorrow::new(AssetNameExchange::new("BTC"), dec!(0.00004321)),
+            crate::cash_flow::CashFlowLoan::new(
+                Utc.timestamp_millis_opt(1_700_000_000_000).unwrap(),
+                OrderId::new("7"),
+                ClientOrderId::new("borrow"),
+            ),
+        );
+        for (answer, through_trait, expected) in [
+            (borrowing_answer(), false, Some(&loan)),
+            (borrowing_answer(), true, Some(&loan)),
+            (
+                borrowing_answer_without(&["marginBuyBorrowAmount", "marginBuyBorrowAsset"]),
+                false,
+                None,
+            ),
+        ] {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/sapi/v1/margin/order"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(&answer))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = margin_client_at(&server, false);
+
+            if through_trait {
+                client.open_order(borrowing_request(&btcusdt)).await;
+            } else {
+                let placement = client.open_margin_order(borrowing_request(&btcusdt)).await;
+                assert_eq!(placement.loan().as_ref(), expected, "{answer}");
+            }
+
+            let hour = crate::cash_flow::CashFlowPeriod::new(
+                loan.loan.time - TimeDelta::minutes(1),
+                loan.loan.time + TimeDelta::minutes(59),
+            )
+            .unwrap();
+            let held = client.loans.lock();
+            assert_eq!(held.len(), usize::from(expected.is_some()), "{answer}");
+            let linked = held.link(&loan.borrowed.asset, loan.borrowed.amount, hour, None);
+            match expected {
+                Some(expected) => assert_eq!(linked, loans::LoanLink::One(expected)),
+                None => assert_eq!(linked, loans::LoanLink::None),
+            }
+        }
+    }
+
+    /// Recalled loans are held as placed ones are, and a recalled loan of an order already held
+    /// replaces it.
+    #[test]
+    fn recalled_loans_are_held() {
+        let client = <BinanceMargin as ExecutionClient>::new(
+            BinanceMarginConfig::cross_margin("key".into(), "secret".into())
+                .with_server_time_sync(false),
+        );
+        let loan = |order: &str, amount: Decimal| {
+            OrderLoan::new(
+                InstrumentNameExchange::new("BTCUSDT"),
+                MarginBorrow::new(AssetNameExchange::new("USDT"), amount),
+                crate::cash_flow::CashFlowLoan::new(
+                    Utc.timestamp_millis_opt(1_700_000_000_000).unwrap(),
+                    OrderId::new(order),
+                    ClientOrderId::new(order),
+                ),
+            )
+        };
+
+        client.recall_loans([loan("1", dec!(6)), loan("2", dec!(7))]);
+        client.recall_loans([loan("1", dec!(8))]);
+
+        let held = client.loans.lock();
+        assert_eq!(held.len(), 2);
+        let hour = crate::cash_flow::CashFlowPeriod::new(
+            Utc.timestamp_millis_opt(1_700_000_000_000).unwrap(),
+            Utc.timestamp_millis_opt(1_700_003_600_000).unwrap(),
+        )
+        .unwrap();
+        let usdt = AssetNameExchange::new("USDT");
+        assert_eq!(held.link(&usdt, dec!(6), hour, None), loans::LoanLink::None);
+        assert_eq!(
+            held.link(&usdt, dec!(8), hour, None),
+            loans::LoanLink::One(&loan("1", dec!(8)))
+        );
     }
 
     /// An order that borrowed is answered with the borrowed amount as a decimal string, which

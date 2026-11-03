@@ -4,6 +4,7 @@
 //! Neither arrives on the account stream, so the caller reads them when it wants them.
 
 use super::BinanceMargin;
+use super::loans::{LoanLink, Loans};
 use crate::{
     cash_flow::{
         CashFlow, CashFlowId, CashFlowKind, CashFlowPeriod, CashFlowsRead, InterestTiming,
@@ -97,7 +98,8 @@ impl BinanceMargin {
     ///
     /// A cross-margin client reads the cross account. An isolated one reads each pair in its
     /// [`isolated_symbols`](super::BinanceMarginConfig::isolated_symbols), and attributes each
-    /// charge to its pair through [`CashFlow::instrument`]; a cross charge is attributed to none.
+    /// charge to its pair through [`CashFlow::instrument`]. A cross charge is attributed to none,
+    /// unless it is linked to the loan of one of this client's orders, as below.
     ///
     /// # What a charge is
     /// Binance charges interest hourly, and once when a loan is taken, by adding it to the loan
@@ -139,6 +141,9 @@ impl BinanceMargin {
     ///   `InstrumentState::update_from_cash_flow` in `rustrade`). `None` for any other `type`,
     ///   whose period Binance does not document, `PORTFOLIO` included, and, logged at WARN, for an
     ///   hourly charge not stamped on the hour.
+    /// - [`loan`](CashFlow::loan) is the loan an `ON_BORROW` charge is on, when it is the loan of
+    ///   an order this client placed (see [Linking a charge to its loan](#linking-a-charge-to-its-loan)),
+    ///   and `None` otherwise.
     /// - [`id`](CashFlow::id) is Binance's transaction id for the charge.
     ///
     /// The engine adds a flow attributed to an instrument to the carry of its open position, in
@@ -147,19 +152,42 @@ impl BinanceMargin {
     /// closes at, which is what buying the asset back costs. Interest in BNB, or any asset that is
     /// neither the instrument's base nor quote, is kept as charged and is in no PnL figure.
     ///
+    /// # Linking a charge to its loan
+    /// Binance's record of a charge names no order or loan. The client holds the loan each order
+    /// it places reports ([`MarginPlacement::loan`](crate::margin::MarginPlacement::loan)), up to
+    /// 4096, and links an `ON_BORROW` charge to the one held loan of the charge's asset whose
+    /// principal is exactly the charge's `principal` and that was taken in the charge's hour, on
+    /// the same pair for an isolated client. Binance's `principal` has been seen to equal the
+    /// amount the order's answer reported borrowing. A linked charge carries the loan in
+    /// [`loan`](CashFlow::loan) and the order's instrument in [`instrument`](CashFlow::instrument),
+    /// on a cross client too.
+    ///
+    /// - A charge that fits several held loans is linked to none, logged at WARN, and one that fits
+    ///   none, logged at DEBUG.
+    /// - Linking only reads the held loans, so a charge read again is linked again, to the same
+    ///   loan.
+    /// - `ON_BORROW_CONVERTED` charges, in BNB, are not linked: their asset is not the loan's.
+    /// - The held loans do not survive a restart: hand them back with
+    ///   [`recall_loans`](Self::recall_loans), or charges on loans taken before it are linked to
+    ///   none.
+    ///
     /// # Delivery
     /// Nothing is pushed: the caller decides when to read, and must drop the charges it has
     /// already counted, by [`id`](CashFlow::id), before applying a read's flows. Within one read
     /// each charge appears once: a charge read twice, as one stamped on a window's boundary is, is
-    /// kept the first time its id is seen in its asset and pair, or, without an id, once per
-    /// identical record.
+    /// kept the first time its id is seen in its asset and the account it was read from, or,
+    /// without an id, once per identical record before linking.
+    ///
+    /// A cross charge read once linked and once not, as across a restart, names an instrument
+    /// only the first time. Drop a cross client's charges by id within their asset, not their
+    /// [`instrument`](CashFlow::instrument).
     ///
     /// A charge is posted some time after the period it is for, by a delay Binance does not
     /// document and that may vary, and is then served stamped at that period. A read whose span
     /// ends near the present can therefore miss a charge that a later read returns at a time
     /// inside the earlier span. A caller that polls by time should start each read before the
     /// previous read's `end`, by at least the longest posting delay it is prepared to allow for,
-    /// and drop the charges it has already counted by id within their asset and pair. A charge
+    /// and drop the charges it has already counted by id within their asset and account. A charge
     /// with no id can be matched only by its whole record, which cannot tell it from an identical
     /// charge.
     ///
@@ -219,17 +247,27 @@ impl BinanceMargin {
             .await?;
 
         let mut seen = FnvHashSet::default();
-        let mut flows: Vec<_> = rows
-            .into_iter()
-            .flat_map(|(pair, rows)| {
-                rows.into_iter()
-                    .filter_map(move |row| convert_interest(row, pair.as_ref()))
-            })
-            .filter(|flow| (start..=end).contains(&flow.time_exchange))
-            // Consecutive windows share their boundary, and a page can repeat a row when a new
-            // charge lands mid-walk and shifts the pages after it.
-            .filter(|flow| seen.insert(ChargeKey::of(flow)))
-            .collect();
+        let mut flows: Vec<_> = {
+            let loans = self.loans.lock();
+            rows.into_iter()
+                .flat_map(|(pair, rows)| {
+                    rows.into_iter().filter_map(move |row| {
+                        let on_borrow = row.r#type.as_deref() == Some(ON_BORROW);
+                        let flow = convert_interest(row, pair.as_ref())?;
+                        Some((flow, on_borrow.then(|| pair.clone())))
+                    })
+                })
+                .filter(|(flow, _)| (start..=end).contains(&flow.time_exchange))
+                // Consecutive windows share their boundary, and a page can repeat a row when a
+                // new charge lands mid-walk and shifts the pages after it. Before linking, which
+                // can name a cross charge's instrument.
+                .filter(|(flow, _)| seen.insert(ChargeKey::of(flow)))
+                .map(|(flow, on_borrow)| match on_borrow {
+                    Some(pair) => link_loan(flow, &loans, pair.as_ref()),
+                    None => flow,
+                })
+                .collect()
+        };
         flows.sort_by_key(|flow| flow.time_exchange);
         Ok(CashFlowsRead::complete(flows).with_held_since(held_since))
     }
@@ -524,6 +562,55 @@ fn interest_period(
         return None;
     }
     CashFlowPeriod::new(time, time + INTEREST_HOUR)
+}
+
+/// The `interestHistory` `type` of the charge on a new loan, in the asset borrowed. Its
+/// `_CONVERTED` form is in BNB, so its asset is not the loan's.
+const ON_BORROW: &str = "ON_BORROW";
+
+/// `flow`, an `ON_BORROW` charge read from `pair`'s account (`None` for cross), linked to the held
+/// loan it is the charge on, if exactly one fits: with that loan in [`CashFlow::loan`] and its
+/// order's instrument in [`CashFlow::instrument`]. Unchanged when none fits, logged at DEBUG, or
+/// when several do, logged at WARN.
+fn link_loan(
+    mut flow: CashFlow<AssetNameExchange, InstrumentNameExchange>,
+    loans: &Loans,
+    pair: Option<&InstrumentNameExchange>,
+) -> CashFlow<AssetNameExchange, InstrumentNameExchange> {
+    let (
+        CashFlowKind::MarginInterest {
+            principal: Some(principal),
+            ..
+        },
+        Some(period),
+    ) = (&flow.kind, flow.period)
+    else {
+        return flow;
+    };
+    match loans.link(&flow.asset, *principal, period, pair) {
+        LoanLink::One(loan) => {
+            flow.instrument = Some(loan.instrument.clone());
+            flow.loan = Some(loan.loan.clone());
+        }
+        LoanLink::Ambiguous(fits) => warn!(
+            id = ?flow.id,
+            asset = %flow.asset,
+            %principal,
+            period_start = %period.start(),
+            ?pair,
+            fits,
+            "BinanceMargin ON_BORROW charge fits several held loans — linked to none"
+        ),
+        LoanLink::None => debug!(
+            id = ?flow.id,
+            asset = %flow.asset,
+            %principal,
+            period_start = %period.start(),
+            ?pair,
+            "BinanceMargin ON_BORROW charge fits no held loan — linked to none"
+        ),
+    }
+    flow
 }
 
 /// One `interestHistory` row as a [`CashFlow`], or `None`, with a warning, if it lacks what a flow
@@ -947,6 +1034,177 @@ mod tests {
         };
         assert_eq!(*principal, Some(Decimal::ZERO));
         assert_eq!(*timing, Some(InterestTiming::Periodic));
+    }
+
+    /// A loan the client holds: `amount` of `asset` on `pair`, taken at `time` by order `order`.
+    fn held_loan(
+        order: &str,
+        pair: &str,
+        asset: &str,
+        amount: Decimal,
+        time: DateTime<Utc>,
+    ) -> crate::margin::OrderLoan {
+        crate::margin::OrderLoan::new(
+            InstrumentNameExchange::new(pair),
+            crate::margin::MarginBorrow::new(AssetNameExchange::new(asset), amount),
+            crate::cash_flow::CashFlowLoan::new(
+                time,
+                OrderId::new(order),
+                crate::order::id::ClientOrderId::new(format!("cid-{order}")),
+            ),
+        )
+    }
+
+    /// `interest_row` of `type` `kind` on a loan of `principal` of `asset`.
+    fn charge_row(
+        tx_id: i64,
+        hour: DateTime<Utc>,
+        kind: &str,
+        asset: &str,
+        principal: &str,
+    ) -> Value {
+        let mut row = interest_row(tx_id, hour, None);
+        row["type"] = json!(kind);
+        row["asset"] = json!(asset);
+        row["principal"] = json!(principal);
+        row
+    }
+
+    /// An hour that ended at least an hour before now.
+    fn past_hour() -> (DateTime<Utc>, DateTime<Utc>) {
+        let now = Utc::now();
+        // An hour divides a day, so truncating to one cannot fail.
+        (
+            now.duration_trunc(TimeDelta::hours(1)).unwrap() - TimeDelta::hours(2),
+            now,
+        )
+    }
+
+    /// A cross `ON_BORROW` charge is linked to the held loan of its asset and principal taken in
+    /// its hour, and named by its order's instrument. Other charges are linked to nothing: a
+    /// `PERIODIC` one, a converted one, and one whose loan is not held. A second read links the
+    /// same charge again.
+    #[tokio::test]
+    async fn a_cross_charge_on_borrow_is_linked_to_the_held_loan_it_is_on() {
+        let server = MockServer::start().await;
+        let (hour, now) = past_hour();
+        mount(
+            &server,
+            INTEREST_PATH,
+            page(vec![
+                charge_row(1, hour, "ON_BORROW", "USDT", "6.23292076"),
+                charge_row(2, hour, "PERIODIC", "USDT", "6.23292076"),
+                charge_row(3, hour, "ON_BORROW_CONVERTED", "USDT", "6.23292076"),
+                charge_row(4, hour, "ON_BORROW", "USDT", "9"),
+            ]),
+        )
+        .await;
+        let client = margin_client_at(&server, false);
+        let loan = held_loan(
+            "11",
+            "BTCUSDT",
+            "USDT",
+            dec!(6.23292076),
+            hour + TimeDelta::minutes(5),
+        );
+        client.recall_loans([loan.clone()]);
+
+        for _ in 0..2 {
+            let flows = client
+                .fetch_margin_interest(now - TimeDelta::days(1), now)
+                .await
+                .unwrap()
+                .flows;
+
+            let by_id = |id: &str| {
+                flows
+                    .iter()
+                    .find(|flow| flow.id == Some(CashFlowId::new(id)))
+                    .unwrap()
+            };
+            let linked = by_id("1");
+            assert_eq!(linked.loan, Some(loan.loan.clone()));
+            assert_eq!(linked.instrument, Some(loan.instrument.clone()));
+            for id in ["2", "3", "4"] {
+                assert_eq!(by_id(id).loan, None, "{id}");
+                assert_eq!(by_id(id).instrument, None, "{id}");
+            }
+        }
+    }
+
+    /// A charge that fits two held loans is linked to neither, and one whose loan was taken in
+    /// another hour is linked to none.
+    #[tokio::test]
+    async fn a_charge_on_borrow_fitting_several_loans_or_none_is_linked_to_none() {
+        let server = MockServer::start().await;
+        let (hour, now) = past_hour();
+        mount(
+            &server,
+            INTEREST_PATH,
+            page(vec![
+                charge_row(1, hour, "ON_BORROW", "USDT", "6"),
+                charge_row(2, hour, "ON_BORROW", "USDT", "7"),
+            ]),
+        )
+        .await;
+        let client = margin_client_at(&server, false);
+        client.recall_loans([
+            held_loan(
+                "11",
+                "BTCUSDT",
+                "USDT",
+                dec!(6),
+                hour + TimeDelta::minutes(5),
+            ),
+            held_loan(
+                "12",
+                "ETHUSDT",
+                "USDT",
+                dec!(6),
+                hour + TimeDelta::minutes(6),
+            ),
+            held_loan("13", "BTCUSDT", "USDT", dec!(7), hour + TimeDelta::hours(1)),
+        ]);
+
+        let flows = client
+            .fetch_margin_interest(now - TimeDelta::days(1), now)
+            .await
+            .unwrap()
+            .flows;
+
+        assert_eq!(flows.len(), 2);
+        for flow in flows {
+            assert_eq!(flow.loan, None, "{flow:?}");
+            assert_eq!(flow.instrument, None, "{flow:?}");
+        }
+    }
+
+    /// An isolated pair's `ON_BORROW` charge is linked only to a held loan on that pair.
+    #[tokio::test]
+    async fn an_isolated_charge_on_borrow_is_linked_to_a_loan_on_its_pair() {
+        let server = MockServer::start().await;
+        let (hour, now) = past_hour();
+        let mut row = charge_row(1, hour, "ON_BORROW", "BTC", "0.00007");
+        row["isolatedSymbol"] = json!("BTCUSDT");
+        mount(&server, INTEREST_PATH, page(vec![row])).await;
+        let client = margin_client_at(&server, true);
+        let loan = held_loan("11", "BTCUSDT", "BTC", dec!(0.00007), hour);
+        client.recall_loans([
+            loan.clone(),
+            held_loan("12", "ETHBTC", "BTC", dec!(0.00007), hour),
+        ]);
+
+        let flows = client
+            .fetch_margin_interest(now - TimeDelta::days(1), now)
+            .await
+            .unwrap()
+            .flows;
+
+        let [flow] = flows.as_slice() else {
+            panic!("one flow: {flows:?}");
+        };
+        assert_eq!(flow.loan, Some(loan.loan));
+        assert_eq!(flow.instrument, Some(loan.instrument));
     }
 
     #[tokio::test]
