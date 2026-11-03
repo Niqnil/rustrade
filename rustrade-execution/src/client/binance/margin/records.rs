@@ -5,6 +5,7 @@
 
 use super::BinanceMargin;
 use super::loans::{LoanLink, Loans};
+use crate::margin::OrderLoan;
 use crate::{
     cash_flow::{
         CashFlow, CashFlowId, CashFlowKind, CashFlowPeriod, CashFlowsRead, InterestTiming,
@@ -247,27 +248,42 @@ impl BinanceMargin {
             .await?;
 
         let mut seen = FnvHashSet::default();
-        let mut flows: Vec<_> = {
-            let loans = self.loans.lock();
-            rows.into_iter()
-                .flat_map(|(pair, rows)| {
-                    rows.into_iter().filter_map(move |row| {
-                        let on_borrow = row.r#type.as_deref() == Some(ON_BORROW);
-                        let flow = convert_interest(row, pair.as_ref())?;
-                        Some((flow, on_borrow.then(|| pair.clone())))
-                    })
+        let charges: Vec<_> = rows
+            .into_iter()
+            .flat_map(|(pair, rows)| {
+                rows.into_iter().filter_map(move |row| {
+                    let on_borrow = row.r#type.as_deref() == Some(ON_BORROW);
+                    let flow = convert_interest(row, pair.as_ref())?;
+                    Some((flow, on_borrow.then(|| pair.clone())))
                 })
-                .filter(|(flow, _)| (start..=end).contains(&flow.time_exchange))
-                // Consecutive windows share their boundary, and a page can repeat a row when a
-                // new charge lands mid-walk and shifts the pages after it. Before linking, which
-                // can name a cross charge's instrument.
-                .filter(|(flow, _)| seen.insert(ChargeKey::of(flow)))
-                .map(|(flow, on_borrow)| match on_borrow {
-                    Some(pair) => link_loan(flow, &loans, pair.as_ref()),
-                    None => flow,
+            })
+            .filter(|(flow, _)| (start..=end).contains(&flow.time_exchange))
+            // Consecutive windows share their boundary, and a page can repeat a row when a new
+            // charge lands mid-walk and shifts the pages after it. Before linking, which can name
+            // a cross charge's instrument.
+            .filter(|(flow, _)| seen.insert(ChargeKey::of(flow)))
+            .collect();
+        // Fitted under the lock and linked, with any log, after it, so that a slow log holds up
+        // no order placement waiting to hold its loan.
+        let fits: Vec<_> = {
+            let loans = self.loans.lock();
+            charges
+                .iter()
+                .map(|(flow, on_borrow)| {
+                    on_borrow
+                        .as_ref()
+                        .and_then(|pair| LoanFit::of(flow, &loans, pair.as_ref()))
                 })
                 .collect()
         };
+        let mut flows: Vec<_> = charges
+            .into_iter()
+            .zip(fits)
+            .map(|((flow, on_borrow), fit)| match fit {
+                Some(fit) => fit.link(flow, on_borrow.flatten().as_ref()),
+                None => flow,
+            })
+            .collect();
         flows.sort_by_key(|flow| flow.time_exchange);
         Ok(CashFlowsRead::complete(flows).with_held_since(held_since))
     }
@@ -572,45 +588,86 @@ const ON_BORROW: &str = "ON_BORROW";
 /// loan it is the charge on, if exactly one fits: with that loan in [`CashFlow::loan`] and its
 /// order's instrument in [`CashFlow::instrument`]. Unchanged when none fits, logged at DEBUG, or
 /// when several do, logged at WARN.
-fn link_loan(
-    mut flow: CashFlow<AssetNameExchange, InstrumentNameExchange>,
-    loans: &Loans,
-    pair: Option<&InstrumentNameExchange>,
-) -> CashFlow<AssetNameExchange, InstrumentNameExchange> {
-    let (
-        CashFlowKind::MarginInterest {
-            principal: Some(principal),
-            ..
-        },
-        Some(period),
-    ) = (&flow.kind, flow.period)
-    else {
-        return flow;
-    };
-    match loans.link(&flow.asset, *principal, period, pair) {
-        LoanLink::One(loan) => {
-            flow.instrument = Some(loan.instrument.clone());
-            flow.loan = Some(loan.loan.clone());
-        }
-        LoanLink::Ambiguous(fits) => warn!(
-            id = ?flow.id,
-            asset = %flow.asset,
-            %principal,
-            period_start = %period.start(),
-            ?pair,
-            fits,
-            "BinanceMargin ON_BORROW charge fits several held loans — linked to none"
-        ),
-        LoanLink::None => debug!(
-            id = ?flow.id,
-            asset = %flow.asset,
-            %principal,
-            period_start = %period.start(),
-            ?pair,
-            "BinanceMargin ON_BORROW charge fits no held loan — linked to none"
-        ),
+/// What an `ON_BORROW` charge fits among the held loans, owned so that the charge is linked, and
+/// any log written, once the loans are unlocked.
+struct LoanFit {
+    principal: Decimal,
+    period: CashFlowPeriod,
+    fit: Fit,
+}
+
+enum Fit {
+    One(OrderLoan),
+    Several(usize),
+    None,
+}
+
+impl LoanFit {
+    /// What `flow` fits among `loans`, or `None` for a charge without the principal and period
+    /// it is fitted by. `pair` is the isolated pair the charge was read for, if any.
+    fn of(
+        flow: &CashFlow<AssetNameExchange, InstrumentNameExchange>,
+        loans: &Loans,
+        pair: Option<&InstrumentNameExchange>,
+    ) -> Option<Self> {
+        let (
+            CashFlowKind::MarginInterest {
+                principal: Some(principal),
+                ..
+            },
+            Some(period),
+        ) = (&flow.kind, flow.period)
+        else {
+            return None;
+        };
+        let fit = match loans.link(&flow.asset, *principal, period, pair) {
+            LoanLink::One(loan) => Fit::One(loan.clone()),
+            LoanLink::Ambiguous(fits) => Fit::Several(fits),
+            LoanLink::None => Fit::None,
+        };
+        Some(Self {
+            principal: *principal,
+            period,
+            fit,
+        })
     }
-    flow
+
+    /// `flow`, linked to the loan it fits, or as it is, logged, when it fits several or none.
+    fn link(
+        self,
+        mut flow: CashFlow<AssetNameExchange, InstrumentNameExchange>,
+        pair: Option<&InstrumentNameExchange>,
+    ) -> CashFlow<AssetNameExchange, InstrumentNameExchange> {
+        let Self {
+            principal,
+            period,
+            fit,
+        } = self;
+        match fit {
+            Fit::One(loan) => {
+                flow.instrument = Some(loan.instrument);
+                flow.loan = Some(loan.loan);
+            }
+            Fit::Several(fits) => warn!(
+                id = ?flow.id,
+                asset = %flow.asset,
+                %principal,
+                period_start = %period.start(),
+                ?pair,
+                fits,
+                "BinanceMargin ON_BORROW charge fits several held loans — linked to none"
+            ),
+            Fit::None => debug!(
+                id = ?flow.id,
+                asset = %flow.asset,
+                %principal,
+                period_start = %period.start(),
+                ?pair,
+                "BinanceMargin ON_BORROW charge fits no held loan — linked to none"
+            ),
+        }
+        flow
+    }
 }
 
 /// One `interestHistory` row as a [`CashFlow`], or `None`, with a warning, if it lacks what a flow
