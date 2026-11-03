@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A charge on a new loan names the order that took the loan, and goes to the position that
+  order opened or added to** (`rustrade-execution`, `rustrade`, #831). A margin venue charges
+  interest when it lends to an order (`InterestTiming::OnBorrow`). Until now the engine placed
+  such a charge by its time alone, which could give it to the wrong position: a resting order
+  that borrowed at 10:05, while a different order opened the position at 10:10, had its charge
+  applied to that position, and a borrowing order that filled in a later hour had its charge left
+  out.
+  - `CashFlow` gains `loan: Option<CashFlowLoan>`, set with `CashFlow::with_loan`: when the venue
+    lent, and the order that borrowed (`order_id`, as its `Trade`s carry it, and `cid`).
+    `CashFlow::new` is unchanged and names no loan. `#[serde(default)]`, so a stored flow still
+    loads.
+  - `Position` gains `orders_enter: Vec<OrderId>`: each order whose fills opened or added to the
+    position, once. A flip's order opens the next position. A seeded position names none.
+  - The engine applies a flow that names a loan only to the open position whose `orders_enter`
+    holds the loan's order, whenever the flow is stamped. The order picks the position, so under
+    `OmsMode::Hedging` such a flow is applied with several positions open, where one naming no
+    loan returns `CarryUpdate::SeveralOpen`. Otherwise it returns the new
+    `CarryUpdate::LoanOfOtherOrder` and logs a WARN, or a DEBUG for a flow from before the
+    session. A flow that names no loan keeps the existing rules.
+  - `BinanceMargin` holds the loan each order it places reports, up to 4096, and
+    `fetch_margin_interest` links an `ON_BORROW` charge to the one held loan of the charge's
+    asset whose principal is exactly the charge's, taken in the charge's hour (on the same pair,
+    for an isolated client). A linked cross charge also names the order's instrument. A charge
+    that fits several loans is linked to none, with a WARN. Linking only reads the held loans, so
+    reading a charge again links it again. `ON_BORROW_CONVERTED` charges, in BNB, are not linked.
+  - The held loans do not survive a restart. Persist `MarginPlacement::loan` (new) for each
+    order that borrows, and hand the loans back with the new `BinanceMargin::recall_loans`.
+    `OrderLoan` (new) is what both carry.
+  - A cross charge read once linked and once not, as across a restart, names an instrument only
+    the first time, so drop a cross client's charges by id within their asset, not their
+    instrument.
 - **A handle to each paper venue, to ask how much the paper account can borrow** (`rustrade`,
   `rustrade-execution`, #844). A strategy that sizes its shorts against borrow capacity asks a live
   margin client (`BorrowCapacityClient::fetch_borrow_capacity`). A paper venue answers the same
@@ -27,6 +58,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The simulated venue's charge on a new loan names the order that took it, and that order's
+  instrument** (`rustrade-execution`, #831). Its `InterestTiming::OnBorrow` cash flows now carry
+  `CashFlow::loan`, lent at the charge, and `instrument: Some(..)`, where they had
+  `instrument: None`. The engine therefore routes them to the order's instrument directly instead
+  of through a `CashFlowAttributionStrategy`, and applies them by the rule above. Charges at a
+  boundary (`InterestTiming::Periodic`) are unchanged.
+- **Breaking: `Position` has a new public field, `orders_enter`** (`rustrade`, #831). Code that
+  builds a `Position` literal must set it (`Vec::new()` for none). Its `Constructor` takes it
+  after `trades`.
 - **Breaking: `ExecutionBuild`, `Execution`, `SystemBuild` and `System` have a new public field,
   `paper_venues`** (`rustrade`, #844). Code that builds one of them as a literal, or destructures
   one without `..`, must name it. `SystemBuild::new` takes the `ExecutionBuild`'s `paper_venues`
