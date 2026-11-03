@@ -489,6 +489,35 @@ async fn a_cash_paper_venue_s_handle_answers_that_it_lends_against_no_instrument
     );
 }
 
+/// A query sent through the handle before the venue starts waits for it, and is answered once it
+/// runs.
+#[tokio::test(start_paused = true)]
+async fn a_paper_venue_s_handle_queried_before_the_venue_starts_is_answered_once_it_runs() {
+    let instruments = instruments();
+    let (build, venue, _market_tx) = paper_build(&instruments, config());
+    let query = tokio::spawn(async move {
+        venue
+            .fetch_borrow_capacity(&InstrumentNameExchange::new("btc_usdt"), Side::Sell)
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert!(!query.is_finished(), "the venue has not started");
+
+    let _execution = build.init().await.unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(60), query)
+        .await
+        .expect("answered once the venue runs")
+        .unwrap();
+
+    assert!(
+        matches!(
+            answer,
+            Err(ClientError::Api(ApiError::InstrumentInvalid(..)))
+        ),
+        "{answer:?}"
+    );
+}
+
 /// The handle keeps no venue running: a system shuts down while one is held, and a query then
 /// finds the venue offline, as it does for a build dropped without being started.
 #[tokio::test(start_paused = true)]
