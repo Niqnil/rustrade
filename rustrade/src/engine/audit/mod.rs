@@ -277,6 +277,9 @@ impl<Event, OnTradingDisabled, OnDisconnect>
                 .fold(Self::with_event(event), |audit, drift| {
                     audit.add_output(EngineOutput::PositionDrift(drift))
                 }),
+            UpdateFromAccountOutput::Checkpoint(checkpoint) => {
+                Self::with_output(event, EngineOutput::Checkpoint(checkpoint))
+            }
         }
     }
 

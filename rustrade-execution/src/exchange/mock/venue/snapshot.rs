@@ -11,6 +11,7 @@ use crate::{
 use chrono::{DateTime, Utc};
 use fnv::FnvHashMap;
 use itertools::Itertools;
+use rust_decimal::Decimal;
 use rustrade_instrument::{
     asset::name::AssetNameExchange,
     exchange::ExchangeId,
@@ -60,7 +61,9 @@ use thiserror::Error;
 /// [`SimulatedVenue::from_snapshot`] refuses a version other than
 /// [`VERSION`](Self::VERSION). A snapshot whose shape this release cannot parse fails in the
 /// deserialiser instead, before it reaches the venue.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+/// `Ord` and `Hash` exist so it can sit in an engine output, which requires them, and are not a
+/// meaningful ranking.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct SimulatedVenueSnapshot {
     version: u32,
     exchange: ExchangeId,
@@ -83,6 +86,7 @@ pub struct SimulatedVenueSnapshot {
     /// Sorted by instrument.
     borrow_prices: Vec<(InstrumentNameExchange, PriceWindow)>,
     slippage_draws: u64,
+    checkpoint_sequence: u64,
 }
 
 impl SimulatedVenueSnapshot {
@@ -109,11 +113,34 @@ impl SimulatedVenueSnapshot {
         self.time_exchange
     }
 
+    /// The net position of each cash-settled instrument the venue held one in, in contracts:
+    /// positive long, negative short. A flat instrument is not listed, nor is a spot holding, which
+    /// the venue holds as an asset balance.
+    pub fn positions(&self) -> impl Iterator<Item = (&InstrumentNameExchange, Decimal)> + '_ {
+        self.positions
+            .iter()
+            .map(|(instrument, position)| (instrument, position.quantity))
+    }
+
     /// The instant up to which the venue had charged every interest and holding-cost boundary, or
     /// `None` if its clock had never moved.
     pub fn accrued_through(&self) -> Option<DateTime<Utc>> {
         self.accrued_through
     }
+}
+
+/// A [`SimulatedVenueSnapshot`] taken at one point in the venue's account stream, and sent on it as
+/// an [`AccountEventKind::VenueCheckpoint`](crate::AccountEventKind::VenueCheckpoint): every event
+/// the venue sent before it is in the snapshot, and none sent after it.
+///
+/// Made by [`SimulatedVenue::checkpoint`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+pub struct VenueCheckpoint {
+    /// Numbers the venue's checkpoints from one, counting across restores, so a caller can tell
+    /// the checkpoint it asked for from an earlier one.
+    pub id: u64,
+    /// The venue's state at this point in its stream.
+    pub snapshot: SimulatedVenueSnapshot,
 }
 
 /// Why [`SimulatedVenue::from_snapshot`] refused a [`SimulatedVenueSnapshot`].
@@ -197,6 +224,21 @@ impl SimulatedVenue {
                 .sorted_unstable_by(|(a, _), (b, _)| a.cmp(b))
                 .collect(),
             slippage_draws: self.slippage.draws(),
+            checkpoint_sequence: self.checkpoint_sequence,
+        }
+    }
+
+    /// This venue's state, numbered as its next checkpoint: see [`VenueCheckpoint`].
+    ///
+    /// A driver sends it as an
+    /// [`AccountEventKind::VenueCheckpoint`](crate::AccountEventKind::VenueCheckpoint) in order
+    /// with the venue's other output, so whoever applies the stream up to it holds what the
+    /// snapshot holds.
+    pub fn checkpoint(&mut self) -> VenueCheckpoint {
+        self.checkpoint_sequence += 1;
+        VenueCheckpoint {
+            id: self.checkpoint_sequence,
+            snapshot: self.snapshot(),
         }
     }
 
@@ -291,6 +333,7 @@ impl SimulatedVenue {
             margin_called,
             borrow_prices,
             slippage_draws,
+            checkpoint_sequence,
         } = snapshot;
 
         let mut venue = Self::assemble(
@@ -317,6 +360,7 @@ impl SimulatedVenue {
             venue.borrow_prices = borrow_prices.into_iter().collect();
         }
         venue.slippage = Slippage::resumed(config.slippage, slippage_draws);
+        venue.checkpoint_sequence = checkpoint_sequence;
         venue.refresh_next_charge();
         venue.refresh_next_interest();
         Ok(venue)

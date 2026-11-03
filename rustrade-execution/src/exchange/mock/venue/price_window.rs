@@ -23,7 +23,7 @@ use std::collections::VecDeque;
 ///
 /// Memory is the number of prices still a candidate extreme: at most every observation inside
 /// the window, in a market that only rises or only falls, and far fewer in one that turns.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub(super) struct PriceWindow {
     /// Strictly rising prices, each with the instant it was recorded.
     lows: VecDeque<(DateTime<Utc>, Decimal)>,

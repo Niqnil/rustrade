@@ -199,8 +199,12 @@ impl<'a> ExecutionBuilder<'a> {
     /// [`LiveClock`](crate::engine::clock::LiveClock); a test under tokio's paused time,
     /// [`TokioClock`](crate::engine::clock::TokioClock).
     ///
-    /// The venue holds its state in memory only: it starts from `config.initial_state` every time
-    /// it is built, so restarting the process loses the paper account.
+    /// The venue holds its state in memory. It starts from `config.initial_state`, unless
+    /// `options` carry a [`checkpoint`](PaperOptions::with_checkpoint) taken with
+    /// [`PaperVenue::checkpoint`], when it carries on from that checkpoint's venue half. Restore the
+    /// `Engine`'s positions from the same checkpoint. A venue added with
+    /// [`SystemBuilder::paper_venue`](crate::system::builder::SystemBuilder::paper_venue) has its
+    /// positions restored for it.
     ///
     /// The exchange gets no in-flight deadline, as for [`add_mock`](Self::add_mock).
     ///
@@ -214,6 +218,11 @@ impl<'a> ExecutionBuilder<'a> {
     ///   fill a bar releases ahead of the bar itself, which a live feed shared with a running
     ///   `Engine` cannot do, so the venue would not behave as its backtest does.
     /// - `options.account_stream_capacity` is zero.
+    /// - `options` carry a checkpoint of another exchange, one whose engine and venue halves hold
+    ///   different positions on a cash-settled instrument (see
+    ///   [`EngineCheckpoint::check_positions_agree`](crate::engine::state::position::EngineCheckpoint::check_positions_agree)),
+    ///   or one [`SimulatedVenue::from_snapshot`](rustrade_execution::exchange::mock::SimulatedVenue::from_snapshot)
+    ///   refuses.
     /// - Any of [`add_mock`](Self::add_mock)'s and
     ///   [`SimExecutionBuilder::add_venue_with_options`]'s errors apply.
     ///
@@ -240,7 +249,16 @@ impl<'a> ExecutionBuilder<'a> {
         let PaperOptions {
             venue: venue_options,
             account_stream_capacity,
+            checkpoint,
         } = options;
+        if let Some(checkpoint) = &checkpoint
+            && checkpoint.exchange() != exchange
+        {
+            return Err(BarterError::ExecutionBuilder(format!(
+                "paper venue {exchange} given a checkpoint of {}",
+                checkpoint.exchange()
+            )));
+        }
         if account_stream_capacity == 0 {
             return Err(BarterError::ExecutionBuilder(format!(
                 "paper venue {exchange} has an account_stream_capacity of zero"
@@ -273,7 +291,20 @@ impl<'a> ExecutionBuilder<'a> {
             options,
         )?;
 
-        let venue = market_driven_venue(&config, venue_options, this.instruments)?;
+        let restore = match checkpoint {
+            None => None,
+            Some(checkpoint) => {
+                checkpoint
+                    .check_positions_agree(this.instruments)
+                    .map_err(|error| {
+                        BarterError::ExecutionBuilder(format!(
+                            "paper venue {exchange} cannot be restored: {error}"
+                        ))
+                    })?;
+                Some(checkpoint.venue.snapshot)
+            }
+        };
+        let venue = market_driven_venue(&config, venue_options, this.instruments, restore)?;
         let market = paper_market(this.instruments, exchange, feed);
         let mock_exchange = MockExchange::new_market_driven(
             venue,

@@ -28,7 +28,7 @@ pub type OpenOrder = Order<ExchangeId, InstrumentNameExchange, Open>;
 /// could make disagree with the one the client was told about. A CFD fill is the exception: what
 /// it costs depends on the position it trades against, which can move while the order rests, so
 /// its hold is released and the fill costed afresh (see `SimulatedVenue`'s reserved balances).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct Reservation {
     /// The asset the order pays with: quote for a buy or a CFD, base for a spot sell.
     pub asset: AssetNameExchange,
@@ -79,7 +79,7 @@ impl Reservation {
 /// The two are one value rather than two collections because they have exactly one lifetime: an
 /// order that leaves the book takes its reservation with it, and a reservation that outlives its
 /// order is held against nothing.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct RestingOrder {
     pub order: OpenOrder,
     /// What the venue holds against [`order`](Self::order), or `None` if it holds nothing.
@@ -567,7 +567,7 @@ impl OpenOrders {
 }
 
 /// Where an open order stands in an [`OpenOrders`]: one part of an [`OpenOrderEntry`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OrderPlacement {
     /// On its instrument's price-time queue, where matching reaches it.
@@ -581,7 +581,7 @@ pub enum OrderPlacement {
 
 /// One open order, what is held against it, and where it stands: what [`OpenOrders::entries`]
 /// lists.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct OpenOrderEntry {
     pub resting: RestingOrder,
     pub placement: OrderPlacement,

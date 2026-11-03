@@ -931,7 +931,7 @@ pub struct DuplicateSeededOrder(pub ClientOrderId);
 ///
 /// Listed in a fixed order (balances by asset, ended orders by id, trades as booked), so two
 /// snapshots of one state are equal.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct AccountStateSnapshot {
     balances: Vec<AssetBalance<AssetNameExchange>>,
     orders_open: Vec<OpenOrderEntry>,

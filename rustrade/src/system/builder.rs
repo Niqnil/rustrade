@@ -204,6 +204,12 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
     /// For the same exchange, a second paper venue, or one beside an [`ExecutionConfig`] venue,
     /// fails the build.
     ///
+    /// # Restoring from a checkpoint
+    /// When `options` carry a [`checkpoint`](PaperOptions::with_checkpoint), the engine built here
+    /// starts with that checkpoint's positions, restored as
+    /// [`EngineStateBuilder::restored_positions`] restores them, so the venue and the engine
+    /// start from the same point. Seed nothing else for that venue's instruments.
+    ///
     /// # Errors
     /// [`build`](Self::build) returns the errors of [`ExecutionBuilder::add_paper`], such as
     /// `MarketOrderTiming::NextBar` or a zero `options.account_stream_capacity`.
@@ -321,6 +327,12 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
                 ExecutionConfig::Mock(mock_config) => builder.add_mock(mock_config, clock.clone()),
             },
         )?;
+        // A restored paper venue's engine half, taken before its options move into the builder.
+        let restored_positions = paper_venues
+            .iter()
+            .filter_map(|(_, options, _)| options.checkpoint.as_ref())
+            .flat_map(|checkpoint| checkpoint.positions.iter().cloned())
+            .collect::<Vec<_>>();
         let execution = paper_venues
             .into_iter()
             .try_fold(execution, |builder, (config, options, feed)| {
@@ -351,7 +363,8 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
                     .into_iter()
                     .map(|(key, value)| Keyed::new(key, value)),
             )
-            .positions(positions);
+            .positions(positions)
+            .restored_positions(restored_positions);
         let state = expiry_handling
             .into_iter()
             .fold(state, |state, (exchange, handling)| {

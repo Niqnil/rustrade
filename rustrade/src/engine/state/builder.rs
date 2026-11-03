@@ -5,7 +5,7 @@ use crate::{
         connectivity::generate_empty_indexed_connectivity_states,
         instrument::{ExpiryHandling, generate_indexed_instrument_states},
         order::Orders,
-        position::{OmsMode, PositionManager, PositionSeed, PositionSeedError},
+        position::{OmsMode, PositionCheckpoint, PositionManager, PositionSeed, PositionSeedError},
         trading::TradingState,
     },
     statistic::summary::asset::BalanceBasis,
@@ -48,6 +48,9 @@ pub struct EngineStateBuilder<'a, GlobalData, FnInstrumentData> {
     execution_venues: Option<FnvHashSet<ExchangeId>>,
     /// Open positions to place in the built state — see [`EngineStateBuilder::positions`].
     positions: Vec<PositionSeed>,
+    /// Positions to place in the built state exactly as a checkpoint saved them — see
+    /// [`EngineStateBuilder::restored_positions`].
+    restored_positions: Vec<PositionCheckpoint>,
     /// [`ExpiryHandling`] per exchange — see [`EngineStateBuilder::expiry_handling`]. An exchange
     /// not named keeps [`ExpiryHandling::Engine`].
     expiry_handling: FnvHashMap<ExchangeId, ExpiryHandling>,
@@ -77,6 +80,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             balance_basis: BalanceBasis::default(),
             execution_venues: None,
             positions: Vec::new(),
+            restored_positions: Vec::new(),
             expiry_handling: FnvHashMap::default(),
         }
     }
@@ -224,6 +228,26 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
         self
     }
 
+    /// Optionally provide open positions exactly as an
+    /// [`EngineCheckpoint`](crate::engine::state::position::EngineCheckpoint) saved them, to restore
+    /// an engine to that checkpoint.
+    ///
+    /// Each [`PositionCheckpoint`] is placed in its slot unchanged: its PnL, carry, fees, trades
+    /// and the orders that entered it are as they were, so a later fill, cash flow or close treats
+    /// it as the engine that saved it would have. Pass the same checkpoint's venue half to the venue
+    /// being restored, so the two agree.
+    ///
+    /// Validated by [`Self::try_build`] like a [`PositionSeed`]: an unknown instrument or asset, a
+    /// slot another restored position or seed already filled, or a non-netting slot under
+    /// [`OmsMode::Netting`], is refused. Repeated calls append.
+    pub fn restored_positions<Iter>(mut self, positions: Iter) -> Self
+    where
+        Iter: IntoIterator<Item = PositionCheckpoint>,
+    {
+        self.restored_positions.extend(positions);
+        self
+    }
+
     /// Use the builder data to generate the associated [`EngineState`].
     ///
     /// If optional data is not provided (eg/ Balances), default values are used (eg/ zero Balance).
@@ -268,6 +292,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             balance_basis,
             execution_venues,
             positions,
+            restored_positions,
             expiry_handling,
         } = self;
 
@@ -314,6 +339,9 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             )
             .collect();
 
+        // Kept for the restored positions below, which name their exchange by id.
+        let indexed_instruments = instruments;
+
         // Generate empty InstrumentStates using provided FnInstrumentData etc.
         let mut instruments = generate_indexed_instrument_states(
             instruments,
@@ -340,6 +368,21 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
             let contract_size = state.instrument.kind.contract_size();
             let quote = state.instrument.underlying.quote;
             seed.seed_into(&mut state.position, state.key, quote, contract_size)?;
+        }
+
+        // Place restored positions exactly as they were saved
+        for restored in restored_positions {
+            let Some(state) = instruments.0.get_mut(restored.instrument()) else {
+                return Err(PositionSeedError::UnknownInstrument {
+                    instrument: restored.instrument().clone(),
+                });
+            };
+            let exchange = indexed_instruments
+                .find_exchange(state.instrument.exchange)
+                .map_err(|_| PositionSeedError::UnknownInstrument {
+                    instrument: restored.instrument().clone(),
+                })?;
+            restored.restore_into(&mut state.position, state.key, exchange, &assets)?;
         }
 
         Ok(EngineState {

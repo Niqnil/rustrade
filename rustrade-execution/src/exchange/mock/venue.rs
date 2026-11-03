@@ -49,7 +49,7 @@ mod price_window;
 mod snapshot;
 mod spot_pairs;
 
-pub use snapshot::{SimulatedVenueSnapshot, VenueRestoreError};
+pub use snapshot::{SimulatedVenueSnapshot, VenueCheckpoint, VenueRestoreError};
 
 use price_window::PriceWindow;
 use spot_pairs::{SpotPair, SpotPairs};
@@ -123,7 +123,7 @@ pub struct VenueInstrumentMarket {
 /// limit order placed through a driver with no market feed would be accepted and then rest forever
 /// with nothing that could ever match it — accepted-and-silently-never-filled, which is worse than
 /// a flat rejection naming the reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub enum VenueRegime {
     /// No market feed: a market order is priced from the snapshot its own request carries, and
     /// nothing can rest, so [`OrderKind::Limit`] is rejected.
@@ -675,6 +675,9 @@ pub struct SimulatedVenue {
     /// [`SpotMarginLiquidation`](crate::margin::SpotMarginLiquidation): whether a liquidation is
     /// under way, and whether a margin call is outstanding.
     liquidation: liquidation::LiquidationState,
+    /// How many checkpoints this venue has taken, which numbers the next. Kept in its snapshot, so
+    /// a restored venue never repeats an id.
+    checkpoint_sequence: u64,
 }
 
 impl SimulatedVenue {
@@ -791,6 +794,7 @@ impl SimulatedVenue {
             next_interest_loans: 0,
             reported_debt,
             liquidation: Default::default(),
+            checkpoint_sequence: 0,
         }
     }
 
@@ -5723,7 +5727,9 @@ impl Settlement {
 /// Kept per instrument, in contracts, whatever position mode the client keeps its own book in. A
 /// CFD venue nets one account's trades in one instrument, which is what decides how much of a fill
 /// returns margin and realises PnL rather than posting new margin.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
+)]
 struct NetPosition {
     /// Signed quantity in contracts: positive long, negative short, zero flat.
     quantity: Decimal,
