@@ -460,6 +460,8 @@ impl SimulatedVenue {
             MarginEffect::Repay,
             &leg.terms,
             None,
+            // `Repay` borrows nothing, so there is no loan to link to the order.
+            None,
             time_exchange,
         ) else {
             return Decimal::ZERO;
