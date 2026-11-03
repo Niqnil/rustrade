@@ -134,7 +134,7 @@ use binance_sdk::{
 use chrono::{DateTime, TimeDelta, TimeZone, Utc};
 use fnv::FnvHashSet;
 use futures::stream::BoxStream;
-use loans::{Loans, MAX_LOANS, SharedLoans};
+use loans::{MAX_LOANS, SharedLoans};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     Side,
@@ -1203,7 +1203,7 @@ impl ExecutionClient for BinanceMargin {
                 RateLimitTracker::new(WeightPool::Sapi).with_server_time(server_time),
             ),
             known_live: KnownLiveOrders::shared(ExchangeId::BinanceMargin),
-            loans: Loans::shared(),
+            loans: SharedLoans::default(),
             rules,
             spot_rest,
             spot_rate_limiter,
@@ -7316,6 +7316,47 @@ mod tests {
             held.link(&usdt, dec!(8), hour, None),
             loans::LoanLink::One(&loan("1", dec!(8)))
         );
+    }
+
+    /// Past the limit, a recalled loan older than every held one is not held, and the client
+    /// warns once for the call; a call that drops nothing does not warn.
+    #[test]
+    fn a_recalled_loan_not_held_past_the_limit_is_warned_of() {
+        let client = <BinanceMargin as ExecutionClient>::new(
+            BinanceMarginConfig::cross_margin("key".into(), "secret".into())
+                .with_server_time_sync(false),
+        );
+        let start = Utc.timestamp_millis_opt(1_700_000_000_000).unwrap();
+        let loan = |order: usize, seconds: i64| {
+            OrderLoan::new(
+                InstrumentNameExchange::new("BTCUSDT"),
+                MarginBorrow::new(AssetNameExchange::new("USDT"), dec!(6)),
+                crate::cash_flow::CashFlowLoan::new(
+                    start + TimeDelta::seconds(seconds),
+                    OrderId::new(format_smolstr!("{order}")),
+                    ClientOrderId::new(format_smolstr!("{order}")),
+                ),
+            )
+        };
+        let warnings_of = |loans: Vec<OrderLoan>| {
+            let ((), events) =
+                rustrade_instrument::test_utils::logs::capture(|| client.recall_loans(loans));
+            events
+                .iter()
+                .filter(|event| event.level == tracing::Level::WARN)
+                .count()
+        };
+
+        let up_to_the_limit = (0..MAX_LOANS)
+            .map(|order| loan(order, i64::try_from(order).unwrap() + 1))
+            .collect();
+        assert_eq!(warnings_of(up_to_the_limit), 0);
+        assert_eq!(
+            warnings_of(vec![loan(MAX_LOANS, 0), loan(MAX_LOANS + 1, 0)]),
+            1,
+            "two older than every held loan, one warning"
+        );
+        assert_eq!(client.loans.lock().len(), MAX_LOANS);
     }
 
     /// An order that borrowed is answered with the borrowed amount as a decimal string, which

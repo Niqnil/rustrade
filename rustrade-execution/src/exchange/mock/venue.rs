@@ -15715,6 +15715,16 @@ mod tests {
             "then what the bar borrowed"
         );
         assert_eq!(cash_flow_of(events[4]).time_exchange, time(2));
+        assert_eq!(
+            cash_flow_of(events[4]).loan,
+            Some(CashFlowLoan::new(
+                time(2),
+                held_id.clone(),
+                ClientOrderId::new("held")
+            )),
+            "lent to the held order at its bar"
+        );
+        assert_eq!(cash_flow_of(events[4]).instrument, Some(instrument_name()));
         assert_eq!(events.len(), 6, "and the filled order last: {events:?}");
     }
 

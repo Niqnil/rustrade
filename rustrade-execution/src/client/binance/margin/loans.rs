@@ -42,10 +42,6 @@ pub(super) enum LoanLink<'a> {
 }
 
 impl Loans {
-    pub(super) fn shared() -> SharedLoans {
-        Arc::new(parking_lot::Mutex::new(Self::default()))
-    }
-
     /// Holds `loan`, in place of a held loan of the same order on the same instrument. Returns
     /// whether it is held: past [`MAX_LOANS`] the oldest loan by time is dropped, which is `loan`
     /// itself when it is the oldest.
@@ -300,6 +296,20 @@ mod tests {
         assert_eq!(
             loans.link(&usdt(), dec!(8), hour_from(10_000), None),
             LoanLink::One(&newest)
+        );
+
+        // As old as the oldest: held, in its place.
+        let tied = loan(9_002, "BTCUSDT", "USDT", dec!(9), at(2));
+        assert!(loans.insert(tied.clone()));
+        assert_eq!(loans.len(), MAX_LOANS);
+        let oldest_hour = CashFlowPeriod::new(at(2), at(3)).unwrap();
+        assert_eq!(
+            loans.link(&usdt(), dec!(6), oldest_hour, None),
+            LoanLink::None
+        );
+        assert_eq!(
+            loans.link(&usdt(), dec!(9), oldest_hour, None),
+            LoanLink::One(&tied)
         );
     }
 }
