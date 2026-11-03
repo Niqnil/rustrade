@@ -522,6 +522,21 @@ ibapi=5.5.0  # 2026-11-03 | Financial protocol, community-maintained, no officia
 #   - `ExecutionFilterSide`, `OptionRight` and `LegAction` are no longer #[non_exhaustive]; we match `OptionRight`
 #     on `Call`/`Put` only, with no wildcard.
 #   rustrade compiles unchanged: `cargo check --locked --workspace --all-targets --all-features` is warning-free.
+#
+# Exercised against a paper IB Gateway on 2026-11-03, outside US regular trading hours, the client advertising
+# server versions up to 226: in rustrade-execution/tests/ibkr_execution.rs, test_connection,
+# test_contract_registration, test_fetch_open_orders, test_place_and_cancel_limit_order, test_account_stream,
+# test_cancel_produces_cancelled_not_expired, test_place_and_cancel_bracket_order,
+# test_bracket_order_oca_group_linkage, test_orders_found_by_client_order_id_across_a_restart,
+# test_order_id_mapping_cleanup, test_fetch_shortability, test_shortability_raw_ticks, test_fetch_balances and
+# test_order_without_registered_contract (14 pass); in rustrade-data/tests/ibkr_integration.rs,
+# test_contract_resolution, test_historical_connection, test_historical_daily_bars, test_historical_minute_bars,
+# test_historical_ticks_trade, test_historical_midpoint_data and test_market_stream_disconnect_while_subscribing
+# pass. test_market_stream_disconnect_while_running fails as recorded at =5.2.0: IB ends both AAPL
+# subscriptions at once with 10168 / 10189 (no market data permissions on the paper account), leaving nothing
+# to disconnect. Order status and position frames decoded without a Parse error under the stricter decoders.
+# Not exercised: a fill of this client's own order (outside regular hours), an automatic reconnect or a
+# reconnect that gives up, a cold-HMDS historical fetch, a liquidation.
 binance-sdk=77.2.0  # 2026-10-30 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
 #   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
