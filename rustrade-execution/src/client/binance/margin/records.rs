@@ -584,10 +584,6 @@ fn interest_period(
 /// `_CONVERTED` form is in BNB, so its asset is not the loan's.
 const ON_BORROW: &str = "ON_BORROW";
 
-/// `flow`, an `ON_BORROW` charge read from `pair`'s account (`None` for cross), linked to the held
-/// loan it is the charge on, if exactly one fits: with that loan in [`CashFlow::loan`] and its
-/// order's instrument in [`CashFlow::instrument`]. Unchanged when none fits, logged at DEBUG, or
-/// when several do, logged at WARN.
 /// What an `ON_BORROW` charge fits among the held loans, owned so that the charge is linked, and
 /// any log written, once the loans are unlocked.
 struct LoanFit {
@@ -599,7 +595,7 @@ struct LoanFit {
 enum Fit {
     One(OrderLoan),
     Several(usize),
-    None,
+    Unheld,
 }
 
 impl LoanFit {
@@ -623,7 +619,7 @@ impl LoanFit {
         let fit = match loans.link(&flow.asset, *principal, period, pair) {
             LoanLink::One(loan) => Fit::One(loan.clone()),
             LoanLink::Ambiguous(fits) => Fit::Several(fits),
-            LoanLink::None => Fit::None,
+            LoanLink::None => Fit::Unheld,
         };
         Some(Self {
             principal: *principal,
@@ -632,7 +628,10 @@ impl LoanFit {
         })
     }
 
-    /// `flow`, linked to the loan it fits, or as it is, logged, when it fits several or none.
+    /// `flow`, an `ON_BORROW` charge read from `pair`'s account (`None` for cross), linked to the
+    /// held loan it is the charge on, if exactly one fits: with that loan in [`CashFlow::loan`]
+    /// and its order's instrument in [`CashFlow::instrument`]. Unchanged when none fits, logged at
+    /// DEBUG, or when several do, logged at WARN.
     fn link(
         self,
         mut flow: CashFlow<AssetNameExchange, InstrumentNameExchange>,
@@ -657,7 +656,7 @@ impl LoanFit {
                 fits,
                 "BinanceMargin ON_BORROW charge fits several held loans — linked to none"
             ),
-            Fit::None => debug!(
+            Fit::Unheld => debug!(
                 id = ?flow.id,
                 asset = %flow.asset,
                 %principal,
