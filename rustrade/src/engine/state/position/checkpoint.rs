@@ -556,6 +556,8 @@ mod tests {
             .positions(seeds)
             .build::<()>()
             .position_checkpoints(spot_exchange(instruments));
+        // The second, so a test reading the id cannot pass on the first's 1 by chance.
+        venue.checkpoint();
         EngineCheckpoint {
             venue: venue.checkpoint(),
             positions,
@@ -575,7 +577,7 @@ mod tests {
         let checkpoint = cfd_checkpoint(&instruments, vec![short_cfd(dec!(1)), spot_long]);
 
         assert_eq!(checkpoint.exchange(), ExchangeId::BinanceSpot);
-        assert_eq!(checkpoint.id(), 1);
+        assert_eq!(checkpoint.id(), 2);
         assert_eq!(checkpoint.check_positions_agree(&instruments), Ok(()));
     }
 

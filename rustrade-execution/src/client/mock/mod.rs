@@ -619,6 +619,35 @@ mod tests {
         assert_eq!(read, TradesRead::complete(vec![trade("eth_usdt")]));
     }
 
+    /// `request_checkpoint` asks the mock exchange for a checkpoint and answers with the id the
+    /// exchange gave it, or that the exchange is offline once it has stopped.
+    #[tokio::test]
+    async fn request_checkpoint_answers_with_the_exchange_s_id() {
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<MockExchangeRequest>();
+        let exchange = tokio::spawn(async move {
+            let request = request_rx.recv().await.expect("a request");
+            let crate::exchange::mock::request::MockExchangeRequestKind::Checkpoint { response_tx } =
+                request.kind
+            else {
+                panic!("expected Checkpoint, got {:?}", request.kind);
+            };
+            response_tx.send(7).expect("the caller awaits the answer");
+        });
+
+        let id = request_checkpoint(&request_tx, ExchangeId::Mock, Utc::now()).await;
+        // Checked before joining the exchange's task, which waits for a request until one comes.
+        assert_eq!(id.unwrap(), 7);
+        exchange.await.unwrap();
+
+        // The exchange's task has ended and dropped its receiver.
+        assert!(matches!(
+            request_checkpoint(&request_tx, ExchangeId::Mock, Utc::now()).await,
+            Err(UnindexedClientError::Connectivity(
+                ConnectivityError::ExchangeOffline(ExchangeId::Mock)
+            ))
+        ));
+    }
+
     /// Broadcast lag is a terminal stream death: the account stream must deliver an in-band
     /// `StreamTerminated(Error)` (not a silent EOF) and then end.
     #[tokio::test]

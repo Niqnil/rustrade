@@ -84,6 +84,20 @@ fn a_restored_venue_carries_on_exactly_as_the_original_would() {
     .unwrap()
     .with_margin_interest(Arc::new(hourly_interest(base())));
     assert_eq!(restored.snapshot(), snapshot, "restored as it was taken");
+    // Both sides of the equality above go through `snapshot`, so a field it lost would compare
+    // equal: the fields a caller can see are checked against the original directly.
+    assert_eq!(
+        snapshot.accrued_through(),
+        Some(time(1800)),
+        "interest is charged up to the venue's clock"
+    );
+    let sold = ClientOrderId::new("test-cid");
+    assert!(original.account.order_ended(&sold).is_some());
+    assert_eq!(
+        restored.account.order_ended(&sold),
+        original.account.order_ended(&sold),
+        "the filled sell is still known as filled"
+    );
     assert_eq!(restored.regime(), VenueRegime::MarketDriven);
     assert_eq!(restored.next_deadline(), original.next_deadline());
 
@@ -190,6 +204,10 @@ fn a_cfd_position_closes_against_its_restored_entry() {
     .unwrap();
     assert!(cfd_position(&restored).is_some());
     assert_eq!(cfd_position(&restored), cfd_position(&original));
+    assert_eq!(
+        original.snapshot().positions().collect::<Vec<_>>(),
+        [(&cfd_instrument_name(), d("2"))]
+    );
 
     let close = |venue: &mut SimulatedVenue| {
         let mut events = cfd_market(venue, "109", "111", "110");
@@ -304,6 +322,40 @@ fn a_snapshot_naming_an_instrument_it_does_not_list_is_refused() {
         refused.unwrap_err(),
         VenueRestoreError::UnknownInstrument(eth_instrument_name())
     );
+}
+
+#[test]
+fn a_snapshot_whose_account_names_an_instrument_it_does_not_list_is_refused() {
+    let mut json = serde_json::to_value(venue_mid_run().snapshot()).unwrap();
+    let trades = json["account"]["trades"].as_array_mut().unwrap();
+    assert!(!trades.is_empty(), "the sell traded");
+    trades[0]["instrument"] = serde_json::json!("ETHUSDT");
+    let snapshot = serde_json::from_value(json).unwrap();
+
+    let refused =
+        SimulatedVenue::from_snapshot(&margin_window_config(), spot_instruments(), snapshot);
+    assert_eq!(
+        refused.unwrap_err(),
+        VenueRestoreError::UnknownInstrument(eth_instrument_name())
+    );
+}
+
+/// A checkpoint's id counts from one, and a venue restored from one carries on counting.
+#[test]
+fn checkpoints_are_numbered_from_one_across_a_restore() {
+    let mut original = venue_mid_run();
+    assert_eq!(original.checkpoint().id, 1);
+    let second = original.checkpoint();
+    assert_eq!(second.id, 2);
+    assert_eq!(second.snapshot, original.snapshot(), "the venue as it is");
+
+    let mut restored = SimulatedVenue::from_snapshot(
+        &margin_window_config(),
+        spot_instruments(),
+        through_json(&second.snapshot),
+    )
+    .unwrap();
+    assert_eq!(restored.checkpoint().id, 3);
 }
 
 #[test]
