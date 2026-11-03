@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A handle to each paper venue, to ask how much the paper account can borrow** (`rustrade`,
+  `rustrade-execution`, #844). A strategy that sizes its shorts against borrow capacity asks a live
+  margin client (`BorrowCapacityClient::fetch_borrow_capacity`). A paper venue answers the same
+  question from its own lending rules, but `ExecutionBuilder::add_paper` kept no handle to it, so a
+  paper run could not ask.
+  - `ExecutionBuild::paper_venues` holds a cloneable `PaperVenue` for each venue `add_paper`
+    added, by exchange. `Execution`, `SystemBuild` (set with `SystemBuild::with_paper_venues`) and
+    `System` carry them on.
+  - `PaperVenue::fetch_borrow_capacity` answers with what the venue's
+    `SimulatedVenue::borrow_capacity` would, with the trait method's signature and errors. It is
+    advisory, as on a live venue.
+  - The handle places no orders and keeps no venue running. It holds the venue's request channel
+    weakly, so a system shuts down as before, and a query to a stopped venue fails with
+    `ConnectivityError::ExchangeOffline`.
+  - `rustrade_execution::client::mock::request_borrow_capacity` is the request `MockExecution`
+    sends, for a caller holding a mock exchange's request channel.
+
+### Changed
+
+- **Breaking: `ExecutionBuild`, `Execution`, `SystemBuild` and `System` have a new public field,
+  `paper_venues`** (`rustrade`, #844). Code that builds one of them as a literal, or destructures
+  one without `..`, must name it.
+
 ## [0.20.0] - 2026-11-02
 
 ### Added
