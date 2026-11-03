@@ -1588,7 +1588,16 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ///   default; a run over historical flows should set it, or its flows all log at DEBUG.
     /// - [`SeveralOpen`](CarryUpdate::SeveralOpen) under [`OmsMode::Hedging`]: the venue charges
     ///   the instrument, not a slot, so which position a flow belongs to is unknown. WARN.
-    /// - A flow stamped before the position's `time_enter`:
+    /// - A flow that names the loan it is the charge on ([`CashFlow::loan`]), whenever it is
+    ///   stamped: applied, as below, when the order that took the loan opened or added to the open
+    ///   position (it is in [`Position::orders_enter`](super::position::Position::orders_enter)).
+    ///   Otherwise it is [`LoanOfOtherOrder`](CarryUpdate::LoanOfOtherOrder): the order has not
+    ///   traded yet, as one resting on the book, or traded only into an earlier position, or only
+    ///   reduced this one. Logged at WARN when the flow is no older than the session start, and
+    ///   at DEBUG when it is older, as for [`NoOpenPosition`](CarryUpdate::NoOpenPosition). A
+    ///   position seeded with [`PositionSeed`](super::position::PositionSeed) names no order, so a
+    ///   charge on a loan taken before the seed is not applied to it.
+    /// - A flow stamped before the position's `time_enter`, naming no loan:
     ///   - When it is the charge on a new loan ([`InterestTiming::OnBorrow`]) with a
     ///     [`period`](CashFlow::period), and the position entered within that period, the
     ///     position may have taken the loan: a venue can stamp the charge at the start of the
@@ -1674,7 +1683,36 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
             return CarryUpdate::SeveralOpen;
         };
 
-        if flow.time_exchange < position.time_enter {
+        if let Some(loan) = &flow.loan {
+            if !position.orders_enter.contains(&loan.order_id) {
+                if flow.time_exchange >= self.tear_sheet.time_engine_start {
+                    warn!(
+                        instrument = ?self.key,
+                        kind = ?flow.kind,
+                        amount = %flow.amount,
+                        time_exchange = %flow.time_exchange,
+                        order_id = %loan.order_id,
+                        cid = %loan.cid,
+                        time_loan = %loan.time,
+                        "charge on a loan whose order neither opened nor added to the open \
+                         position — not applied to carry",
+                    );
+                } else {
+                    debug!(
+                        instrument = ?self.key,
+                        kind = ?flow.kind,
+                        amount = %flow.amount,
+                        time_exchange = %flow.time_exchange,
+                        order_id = %loan.order_id,
+                        cid = %loan.cid,
+                        time_loan = %loan.time,
+                        "charge from before the session on a loan whose order neither opened nor \
+                         added to the open position — not applied to carry",
+                    );
+                }
+                return CarryUpdate::LoanOfOtherOrder;
+            }
+        } else if flow.time_exchange < position.time_enter {
             match on_borrow_period(flow) {
                 Some(period) if period.contains(position.time_enter) => {
                     let session_start = self.tear_sheet.time_engine_start;
@@ -2857,6 +2895,7 @@ mod tests {
     use crate::engine::state::EngineState;
     use rust_decimal_macros::dec;
     use rustrade_execution::{
+        cash_flow::CashFlowLoan,
         order::{
             OrderKind, TimeInForce,
             id::{ClientOrderId, OrderId, PositionId, StrategyId, VenueOrderId},
@@ -4769,6 +4808,184 @@ mod tests {
             "either side may have borrowed"
         );
         assert_eq!(warnings, 1);
+    }
+
+    /// `flow`, naming the loan order `order_id` took `seconds` after [`TIME`].
+    fn lent_by(
+        flow: CashFlow<AssetIndex, InstrumentIndex>,
+        order_id: &str,
+        seconds: i64,
+    ) -> CashFlow<AssetIndex, InstrumentIndex> {
+        flow.with_loan(Some(CashFlowLoan::new(
+            after(seconds),
+            OrderId::new(order_id),
+            ClientOrderId::new(order_id),
+        )))
+    }
+
+    /// A charge on the loan of the order that opened the position is the position's, whenever it
+    /// is stamped: before the entry, outside the entry's period, or after it.
+    #[test]
+    fn a_charge_on_the_loan_of_the_order_that_opened_the_position_is_applied_whenever_stamped() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        // A resting order that borrowed at 60 fills two hours later.
+        assert!(fill_after(&mut state, "borrower", Side::Sell, dec!(1), 7200).is_none());
+
+        for (case, flow) in [
+            (
+                "stamped at the start of the loan's hour, before the entry's",
+                interest(quote, InterestTiming::OnBorrow, after(0), hour_from(0)),
+            ),
+            (
+                "stamped with no period",
+                interest(quote, InterestTiming::OnBorrow, after(60), None),
+            ),
+            (
+                "stamped after the entry",
+                interest(quote, InterestTiming::OnBorrow, after(7200), None),
+            ),
+        ] {
+            let (update, warnings) =
+                count_warnings(|| state.update_from_cash_flow(&lent_by(flow, "borrower", 60)));
+            assert_eq!(update, CarryUpdate::Applied, "{case}");
+            assert_eq!(warnings, 0, "{case}");
+        }
+        assert_eq!(netting_carry(&state), dec!(-0.75));
+    }
+
+    #[test]
+    fn a_charge_on_the_loan_of_an_order_that_added_to_the_position_is_applied() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        assert!(fill_after(&mut state, "open", Side::Sell, dec!(1), 60).is_none());
+        assert!(fill_after(&mut state, "add", Side::Sell, dec!(1), 5400).is_none());
+
+        let update = state.update_from_cash_flow(&lent_by(
+            interest(
+                quote,
+                InterestTiming::OnBorrow,
+                after(3600),
+                hour_from(3600),
+            ),
+            "add",
+            4000,
+        ));
+
+        assert_eq!(update, CarryUpdate::Applied);
+        assert_eq!(netting_carry(&state), dec!(-0.25));
+    }
+
+    /// A charge on the loan of an order that did not open or add to the position is left out,
+    /// even where a charge naming no loan would be applied: the order may still rest on the book
+    /// while another opened the position, or have traded into an earlier position, or only
+    /// reduced this one. WARN from the session start, DEBUG before it.
+    #[test]
+    fn a_charge_on_the_loan_of_another_order_is_left_out_with_a_warning_only_in_the_session() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        assert!(fill_after(&mut state, "earlier", Side::Sell, dec!(1), 10).is_none());
+        assert!(fill_after(&mut state, "close", Side::Buy, dec!(1), 20).is_some());
+        state.tear_sheet.time_engine_start = after(1000);
+        assert!(fill_after(&mut state, "open", Side::Sell, dec!(2), 1800).is_none());
+        assert!(fill_after(&mut state, "reduce", Side::Buy, dec!(1), 1900).is_none());
+
+        // Each in-session charge but the one stamped after the entry would be applied if it named
+        // no loan: it is stamped in the hour the position entered in, which starts after the last
+        // close and in the session.
+        let in_entry_hour = || {
+            interest(
+                quote,
+                InterestTiming::OnBorrow,
+                after(1500),
+                hour_from(1500),
+            )
+        };
+        for (case, order, flow, expected_warnings) in [
+            (
+                "a resting order, in the hour the position entered in",
+                "resting",
+                in_entry_hour(),
+                1,
+            ),
+            (
+                "a resting order, stamped after the entry",
+                "resting",
+                interest(
+                    quote,
+                    InterestTiming::OnBorrow,
+                    after(3600),
+                    hour_from(3600),
+                ),
+                1,
+            ),
+            ("an earlier position's order", "earlier", in_entry_hour(), 1),
+            (
+                "an order that only reduced the position",
+                "reduce",
+                in_entry_hour(),
+                1,
+            ),
+            (
+                "stamped before the session",
+                "resting",
+                interest(quote, InterestTiming::OnBorrow, after(0), hour_from(0)),
+                0,
+            ),
+        ] {
+            let (update, warnings) =
+                count_warnings(|| state.update_from_cash_flow(&lent_by(flow, order, 0)));
+            assert_eq!(update, CarryUpdate::LoanOfOtherOrder, "{case}");
+            assert_eq!(warnings, expected_warnings, "{case}");
+        }
+        assert_eq!(netting_carry(&state), Decimal::ZERO);
+    }
+
+    /// The order that flips a position borrowed for the position it opened, so the charge on its
+    /// loan is that position's, where a charge naming no loan is left out. The flipped position's
+    /// own order is not the new position's.
+    #[test]
+    fn a_charge_on_the_loan_of_a_flipping_order_is_the_position_it_opened() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        assert!(fill_after(&mut state, "long", Side::Buy, dec!(1), 60).is_none());
+        assert!(fill_after(&mut state, "flip", Side::Sell, dec!(2), 1800).is_some());
+
+        let charge = || interest(quote, InterestTiming::OnBorrow, after(0), hour_from(0));
+        assert_eq!(
+            state.update_from_cash_flow(&lent_by(charge(), "long", 60)),
+            CarryUpdate::LoanOfOtherOrder
+        );
+        assert_eq!(
+            state.update_from_cash_flow(&lent_by(charge(), "flip", 1800)),
+            CarryUpdate::Applied
+        );
+        assert_eq!(netting_carry(&state), dec!(-0.25));
+    }
+
+    /// A seeded position names no order, so a charge on a loan is not given to it.
+    #[test]
+    fn a_charge_on_a_loan_is_not_given_to_a_seeded_position() {
+        let mut state = instrument_state(OmsMode::Netting);
+        let quote = state.instrument.underlying.quote;
+        crate::engine::state::position::PositionSeed::new(
+            "btc_usdt",
+            Side::Sell,
+            dec!(1),
+            dec!(100),
+            after(1800),
+        )
+        .seed_into(&mut state.position, InstrumentIndex(0), quote, Decimal::ONE)
+        .unwrap();
+
+        let update = state.update_from_cash_flow(&lent_by(
+            interest(quote, InterestTiming::OnBorrow, after(3600), None),
+            "before the seed",
+            0,
+        ));
+
+        assert_eq!(update, CarryUpdate::LoanOfOtherOrder);
+        assert_eq!(netting_carry(&state), Decimal::ZERO);
     }
 
     #[test]
