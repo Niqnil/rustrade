@@ -1,5 +1,5 @@
 use crate::{
-    UnindexedAccountEvent,
+    AccountEventKind, UnindexedAccountEvent,
     client::mock::MockExecutionConfig,
     error::StreamTerminationReason,
     exchange::mock::{
@@ -400,6 +400,15 @@ impl MockExchange {
                 let mut trades = self.venue.trades(start);
                 trades.retain(|trade| trade.time_exchange <= end);
                 emit.respond(Vec::new(), response_tx, trades);
+            }
+            MockExchangeRequestKind::Checkpoint { response_tx } => {
+                let checkpoint = self.venue.checkpoint();
+                let id = checkpoint.id;
+                let event = UnindexedAccountEvent::new(
+                    self.venue.exchange,
+                    AccountEventKind::VenueCheckpoint(Box::new(checkpoint)),
+                );
+                emit.respond(vec![event], response_tx, id);
             }
             MockExchangeRequestKind::CancelOrder {
                 response_tx,

@@ -6,13 +6,16 @@
 //! crosses them, and spot margin, interest, fees and the stale-market policies behave as they do in
 //! a backtest of the same configuration.
 
-use crate::execution::sim::{SimVenueOptions, market::VenueMarketUpdate};
+use crate::{
+    engine::state::position::EngineCheckpoint,
+    execution::sim::{SimVenueOptions, market::VenueMarketUpdate},
+};
 use fnv::FnvHashMap;
 use futures::Stream;
 use rustrade_data::streams::{consumer::MarketStreamEvent, reconnect};
 use rustrade_execution::{
     borrow_capacity::BorrowCapacity,
-    client::mock::request_borrow_capacity,
+    client::mock::{request_borrow_capacity, request_checkpoint},
     error::{ConnectivityError, UnindexedClientError},
     exchange::mock::{MockExchangeClock, request::MockExchangeRequest},
     market::MarketObservation,
@@ -198,6 +201,9 @@ pub struct PaperOptions {
     /// ended stream is reopened and the fills it lost are read back, so this bounds memory, not
     /// correctness.
     pub account_stream_capacity: usize,
+    /// The checkpoint to restore the venue from, or `None` to start it from the configuration's
+    /// `initial_state`. See [`with_checkpoint`](Self::with_checkpoint).
+    pub checkpoint: Option<EngineCheckpoint>,
 }
 
 impl PaperOptions {
@@ -217,6 +223,22 @@ impl PaperOptions {
         self.account_stream_capacity = capacity;
         self
     }
+
+    /// These options, restoring the venue from `checkpoint`'s venue half, so it carries on where
+    /// the venue that took it stopped, rather than starting from the configuration's
+    /// `initial_state`.
+    ///
+    /// Restore the `Engine`'s positions from the same checkpoint, with
+    /// [`EngineStateBuilder::restored_positions`](crate::engine::state::builder::EngineStateBuilder::restored_positions),
+    /// so the two agree. The venue is given the same configuration and [`venue`](Self::venue)
+    /// models as before: the checkpoint holds state, not configuration. See
+    /// [`SimulatedVenueSnapshot`](rustrade_execution::exchange::mock::venue::SimulatedVenueSnapshot)
+    /// for what is restored and what happens to the time the process was down.
+    #[must_use]
+    pub fn with_checkpoint(mut self, checkpoint: EngineCheckpoint) -> Self {
+        self.checkpoint = Some(checkpoint);
+        self
+    }
 }
 
 impl Default for PaperOptions {
@@ -224,6 +246,7 @@ impl Default for PaperOptions {
         Self {
             venue: SimVenueOptions::default(),
             account_stream_capacity: Self::DEFAULT_ACCOUNT_STREAM_CAPACITY,
+            checkpoint: None,
         }
     }
 }
@@ -302,6 +325,43 @@ impl PaperVenue {
             ));
         };
         request_borrow_capacity(&request_tx, self.exchange, (self.clock)(), instrument, side).await
+    }
+}
+
+impl PaperVenue {
+    /// Asks the venue for a checkpoint: it sends its state on its account stream, after every
+    /// account event it sent before, and the `Engine` answers it with an
+    /// [`EngineOutput::Checkpoint`](crate::engine::EngineOutput::Checkpoint) holding that state
+    /// and the engine's positions at the same point. Keep that output to restore from, with
+    /// [`PaperOptions::with_checkpoint`].
+    ///
+    /// Returns the checkpoint's [`id`](EngineCheckpoint::id) once the venue has sent it, so the
+    /// output answering this call can be told from an earlier one. When the venue takes it is
+    /// ordered as a query is: see `# Ordering` on this type.
+    ///
+    /// Sent is not processed. If the venue's account stream ends or lags before the checkpoint
+    /// reaches the `Engine`, as it does when the manager reopens the stream, no output answers
+    /// it: ask again once the stream is back. The engine's audit shows the stream ending before
+    /// any checkpoint output, and a caller waiting for one keeps its own deadline too.
+    ///
+    /// The checkpoint is taken once the request reaches the venue, whether or not this call is
+    /// still awaited: a call dropped by a timeout or a `select!` can still be answered by an
+    /// output, with an id the caller never learned.
+    ///
+    /// A checkpoint copies the venue's whole account, including every trade and ended order of
+    /// the run, which grow with it, so it costs more the longer the venue has run. The venue
+    /// handles nothing else while it copies.
+    ///
+    /// # Errors
+    /// [`ConnectivityError::ExchangeOffline`] once the venue has stopped, as for
+    /// [`fetch_borrow_capacity`](Self::fetch_borrow_capacity).
+    pub async fn checkpoint(&self) -> Result<u64, UnindexedClientError> {
+        let Some(request_tx) = self.request_tx.upgrade() else {
+            return Err(UnindexedClientError::Connectivity(
+                ConnectivityError::ExchangeOffline(self.exchange),
+            ));
+        };
+        request_checkpoint(&request_tx, self.exchange, (self.clock)()).await
     }
 }
 

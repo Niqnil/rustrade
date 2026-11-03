@@ -126,6 +126,10 @@ impl AccountEventIndexer {
             AccountEventKind::StreamTerminated(reason) => {
                 AccountEventKind::StreamTerminated(reason)
             }
+            // Venue-native names throughout, read by whoever restores the venue, not indexed.
+            AccountEventKind::VenueCheckpoint(checkpoint) => {
+                AccountEventKind::VenueCheckpoint(checkpoint)
+            }
             AccountEventKind::FillRecoveryGaveUp(gap) => {
                 AccountEventKind::FillRecoveryGaveUp(self.fill_recovery_gap(gap)?)
             }

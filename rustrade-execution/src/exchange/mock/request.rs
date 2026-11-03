@@ -112,6 +112,13 @@ impl MockExchangeRequest {
         )
     }
 
+    pub fn checkpoint(time_request: DateTime<Utc>, response_tx: oneshot::Sender<u64>) -> Self {
+        Self::new(
+            time_request,
+            MockExchangeRequestKind::Checkpoint { response_tx },
+        )
+    }
+
     pub fn cancel_order(
         time_request: DateTime<Utc>,
         response_tx: oneshot::Sender<UnindexedOrderResponseCancel>,
@@ -177,6 +184,9 @@ pub enum MockExchangeRequestKind {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     },
+    /// Send a [`VenueCheckpoint`](crate::exchange::mock::venue::VenueCheckpoint) on the account
+    /// stream, after everything the venue produced before it, answering with its id once sent.
+    Checkpoint { response_tx: oneshot::Sender<u64> },
     CancelOrder {
         response_tx: oneshot::Sender<UnindexedOrderResponseCancel>,
         request: OrderRequestCancel<ExchangeId, InstrumentNameExchange>,

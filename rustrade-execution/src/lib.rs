@@ -126,6 +126,7 @@ pub mod shortability;
 pub mod slippage;
 pub use shortability::{Shortability, ShortabilityProvider, ShortabilityTable};
 pub use slippage::{SlippageConfig, SlippageConfigError};
+pub mod stored;
 pub mod trade;
 
 /// Convenient type alias for an [`AccountEvent`] keyed with [`ExchangeId`],
@@ -298,6 +299,18 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
     /// consumer-initiated drop closes the receiver, so there is no one left to deliver to (see
     /// [`StreamTerminationReason`] for the deliverable-only rationale).
     StreamTerminated(StreamTerminationReason),
+
+    /// A simulated venue's state at this point in its account stream: every event the venue sent
+    /// before this one is in it, and none sent after.
+    ///
+    /// Sent only by a simulated venue, when asked for a checkpoint (for a paper venue, through
+    /// the `rustrade` crate's `PaperVenue::checkpoint`). No live venue sends one. Its place in the
+    /// stream is what makes it useful: a consumer that has applied every event before it holds
+    /// state consistent with the snapshot it carries. The `rustrade` engine answers it with its
+    /// own positions at that point.
+    ///
+    /// Boxed, because a snapshot is large and a checkpoint rare.
+    VenueCheckpoint(Box<exchange::mock::venue::VenueCheckpoint>),
 
     /// Fill recovery gave up on a span of fills: fills in it may not have been delivered.
     ///

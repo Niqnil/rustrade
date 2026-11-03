@@ -8,7 +8,7 @@ use rustrade_execution::{
 };
 use rustrade_instrument::{
     Side,
-    asset::AssetIndex,
+    asset::{AssetIndex, name::AssetNameInternal},
     corporate_action::SplitRatio,
     instrument::{InstrumentIndex, name::InstrumentNameInternal},
 };
@@ -18,8 +18,10 @@ use std::fmt::Debug;
 use thiserror::Error;
 use tracing::{error, warn};
 
+mod checkpoint;
 mod drift;
 mod venue;
+pub use checkpoint::{CheckpointMismatch, EngineCheckpoint, PositionCheckpoint};
 pub use drift::PositionDrift;
 pub use venue::{SkippedVenuePosition, VenuePositionSeeds, VenuePositionSkipReason};
 
@@ -768,6 +770,10 @@ impl PositionSeed {
 /// Why a [`PositionSeed`] was rejected by
 /// [`EngineStateBuilder::try_build`](crate::engine::state::builder::EngineStateBuilder::try_build).
 ///
+/// A position restored from a checkpoint
+/// ([`EngineStateBuilder::restored_positions`](crate::engine::state::builder::EngineStateBuilder::restored_positions))
+/// is checked the same way and refused with the same variants, which then say "seed" of it.
+///
 /// `#[non_exhaustive]`: a further check can be added without breaking downstream exhaustive
 /// matches.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
@@ -806,6 +812,14 @@ pub enum PositionSeedError {
     /// A seed under [`OmsMode::Hedging`] has no slot, so no order could later close it.
     #[error("position seed for {instrument} has no position_id, which OmsMode::Hedging requires")]
     MissingPositionIdInHedging { instrument: InstrumentNameInternal },
+
+    /// A restored [`PositionCheckpoint`] names an asset its instrument's exchange does not have
+    /// in the engine.
+    #[error("restored position on {instrument} names unknown asset {asset}")]
+    UnknownAsset {
+        instrument: InstrumentNameInternal,
+        asset: AssetNameInternal,
+    },
 }
 
 /// Represents an open trading position for a specific instrument.
@@ -964,7 +978,13 @@ pub enum PositionSeedError {
 /// assert_eq!(new_position.price_entry_average, dec!(40_000.0));
 /// assert_eq!(new_position.pnl_realised, dec!(-5.0));
 /// ```
-#[derive(Debug, Clone, PartialEq, PartialOrd, Deserialize, Serialize, Constructor)]
+///
+/// `Ord` and `Hash` exist so a saved position can sit in an
+/// [`EngineOutput`](crate::engine::EngineOutput), which requires them, and are not a meaningful
+/// ranking: they compare field by field.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize, Constructor,
+)]
 pub struct Position<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// [`Position`] Instrument identifier (eg/ InstrumentIndex, InstrumentNameInternal, etc.).
     pub instrument: InstrumentKey,

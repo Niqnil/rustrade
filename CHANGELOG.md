@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A simulated venue can be snapshotted and restored, so it carries on where it stopped**
+  (`rustrade-execution`, #836). A run that stops and starts again, such as a paper venue across a
+  process restart, no longer loses its account.
+  - `SimulatedVenue::snapshot()` returns a `SimulatedVenueSnapshot`, a serde value holding what
+    the venue has accumulated: balances with their loans and unpaid interest, open and held orders
+    with what is held against them and their place in the queue, ended orders and trades, CFD
+    positions, the id sequences, the venue's clock and the instant it has charged interest
+    through, the debt it last reported, its liquidation and margin-call state, the borrow price
+    window, and how far its slippage stream has drawn.
+  - `SimulatedVenue::from_snapshot(config, instruments, snapshot)` builds the venue back. A
+    restored venue produces exactly the events the original would have from the same inputs. It
+    is given its models through the same builder methods as a fresh venue.
+  - It does not hold the configuration, the models, or the market. A restored venue holds no
+    market until it is fed one. Interest boundaries passed in between are charged once its clock
+    moves, and a resting order is matched against the first market it observes after the restore.
+  - The snapshot carries a format version. `from_snapshot` refuses another version, another
+    exchange, other instruments, a margin account restored without `spot_margin` or the other way
+    round, an order id listed twice, and an instrument or asset listed twice where the venue holds
+    one entry for each, each with a `VenueRestoreError` variant.
+- **A paper venue and the engine trading on it can be checkpointed together and restored after a
+  restart** (`rustrade-execution`, `rustrade`, #836). The venue sends its snapshot in band on its
+  account stream, and the engine answers it with its own positions at the same point, so the two
+  halves always agree: an order the venue filled before the checkpoint is in both, one filled
+  after it in neither.
+  - `PaperVenue::checkpoint()` asks the venue for one and returns its id. The venue sends a new
+    `AccountEventKind::VenueCheckpoint`, carrying a `VenueCheckpoint` (the id and the venue's
+    `SimulatedVenueSnapshot`), after every account event it sent before.
+    `SimulatedVenue::checkpoint()` makes one directly.
+  - The engine answers that event with the new `EngineOutput::Checkpoint(Box<EngineCheckpoint>)`,
+    in the audit `process` returns, so an engine driven by hand gets it too. An
+    `EngineCheckpoint` holds the venue's checkpoint and the engine's positions on that venue, each
+    a `PositionCheckpoint`: the engine's `Position` exactly, keyed by instrument and asset names,
+    with its slot. `EngineState::position_checkpoints` reads them.
+  - `PaperOptions::with_checkpoint(checkpoint)` restores the venue from the checkpoint's venue
+    half. `EngineStateBuilder::restored_positions` puts the engine's positions back unchanged,
+    PnL, fees, carry and entering orders included, and `SystemBuilder::paper_venue` does it for you.
+    `add_paper` refuses a checkpoint of another exchange, or one whose halves hold different
+    positions on a cash-settled instrument (`EngineCheckpoint::check_positions_agree`).
+  - A restored position is checked like a seed, with the new `PositionSeedError::UnknownAsset`
+    for an asset the engine does not have.
+  - An `EngineCheckpoint` carries one format version for both halves (`EngineCheckpoint::VERSION`,
+    `version()`), and `add_paper` refuses another. Build one with `EngineCheckpoint::new`. In a
+    self-describing format such as JSON, fields a later release adds read with defaults from an
+    older checkpoint.
+  - New `rustrade_execution::stored`: read a saved checkpoint or venue snapshot as a
+    `Stored<T>` and call `into_current()` to be told the version it was written in
+    (`StoredFormatError::UnsupportedVersion`) even when a later format changed its shape, which
+    reading `T` itself reports only as a parse error. It needs a self-describing format such as
+    JSON. Both types implement the new `FormatVersion` trait.
+  - `Position`, `CashFlow` and the types they hold now also derive `Eq`, `Ord` and `Hash` where
+    they did not, so a checkpoint can be an engine output.
 - **The simulated venue can value each asset over a recent window of its price when it lends**
   (`rustrade-execution`, #829). Binance's cross margin borrow check values an asset the account
   owes at the highest price over a recent window, and every other asset at the lowest. A price

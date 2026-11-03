@@ -192,6 +192,10 @@ pub const RATE_DECIMAL_PLACES: u32 = 12;
 pub(crate) struct Slippage {
     config: SlippageConfig,
     rng: Xoshiro256PlusPlus,
+    /// How many values [`rng`](Self::rng) has yielded since it was seeded: its position in the
+    /// stream, which [`resumed`](Self::resumed) restores. Counted rather than read from the
+    /// generator, whose state `rand` does not promise to keep stable across versions.
+    draws: u64,
 }
 
 impl Slippage {
@@ -201,7 +205,26 @@ impl Slippage {
             config,
             // A configuration without a seed never draws, so the stream it gets is never read.
             rng: Xoshiro256PlusPlus::seed_from_u64(config.seed().unwrap_or_default()),
+            draws: 0,
         }
+    }
+
+    /// The slippage `config` describes, its stream `draws` values past the start of its seed: where
+    /// a venue whose [`draws`](Self::draws) said so had reached.
+    ///
+    /// Costs one generator step per draw skipped, a few nanoseconds each.
+    pub(crate) fn resumed(config: SlippageConfig, draws: u64) -> Self {
+        let mut slippage = Self::new(config);
+        for _ in 0..draws {
+            slippage.rng.next_u64();
+        }
+        slippage.draws = draws;
+        slippage
+    }
+
+    /// How many values the stream has yielded since it was seeded.
+    pub(crate) fn draws(&self) -> u64 {
+        self.draws
     }
 
     /// `reference` moved against an order trading `side`, by a rate drawn for this one fill.
@@ -231,6 +254,7 @@ impl Slippage {
         // inclusive. Mapped here rather than by `rand`'s range sampling, whose algorithm the crate
         // does not promise to keep, so a seed's prices hold across `rand` versions. Both factors
         // of the product lie in `[0, 1]`, so it cannot overflow.
+        self.draws += 1;
         let unit = Decimal::from(self.rng.next_u64()) / Decimal::from(u64::MAX);
         // Rounded so a slipped price does not carry `Decimal`'s full 28 places, then clamped,
         // since rounding can step past a bound given with more places than this keeps.
@@ -314,6 +338,29 @@ mod tests {
         };
         assert_eq!(prices(42), prices(42));
         assert_ne!(prices(42), prices(43));
+    }
+
+    /// A stream resumed at the number of draws another had made continues exactly where that one
+    /// was, and a single fixed rate draws nothing.
+    #[test]
+    fn a_resumed_stream_continues_where_its_draws_left_off() {
+        let config = SlippageConfig::uniform(d("0.01"), d("0.025"), 7).unwrap();
+        let mut original = Slippage::new(config);
+        for _ in 0..5 {
+            original.apply(Side::Buy, d("100"));
+        }
+        assert_eq!(original.draws(), 5);
+
+        let mut resumed = Slippage::resumed(config, original.draws());
+        assert_eq!(resumed, original);
+        assert_eq!(
+            resumed.apply(Side::Sell, d("100")),
+            original.apply(Side::Sell, d("100"))
+        );
+
+        let mut fixed = Slippage::new(SlippageConfig::fixed(d("0.01")).unwrap());
+        fixed.apply(Side::Buy, d("100"));
+        assert_eq!(fixed.draws(), 0);
     }
 
     /// Pins the stream a seed gives, so a change of generator or of the mapping from its output

@@ -22,6 +22,7 @@ use rustrade::{
     engine::{
         clock::{EngineClock, TokioClock},
         execution_tx::ExecutionTxMap,
+        state::position::EngineCheckpoint,
     },
     execution::{
         Execution,
@@ -55,7 +56,10 @@ use rustrade_execution::{
 };
 use rustrade_instrument::{
     Side, Underlying,
-    asset::name::AssetNameExchange,
+    asset::{
+        AssetIndex,
+        name::{AssetNameExchange, AssetNameInternal},
+    },
     exchange::{ExchangeId, ExchangeIndex},
     index::IndexedInstruments,
     instrument::{
@@ -407,17 +411,22 @@ fn paper_build(
     instruments: &IndexedInstruments,
     config: MockExecutionConfig,
 ) -> (ExecutionBuild, PaperVenue, MarketTx) {
+    paper_build_with(instruments, config, PaperOptions::default(), start())
+}
+
+/// [`paper_build`], with `options`, its clock starting at `clock_start`.
+fn paper_build_with(
+    instruments: &IndexedInstruments,
+    config: MockExecutionConfig,
+    options: PaperOptions,
+    clock_start: DateTime<Utc>,
+) -> (ExecutionBuild, PaperVenue, MarketTx) {
     let (market_tx, market_rx) = futures::channel::mpsc::unbounded();
     let (tap, feed) = PaperMarketFeed::tap(market_rx);
     // Stands in for the `Engine`'s market feed, which is what polls the tap in a live system.
     tokio::spawn(tap.for_each(|_| std::future::ready(())));
     let build = ExecutionBuilder::new(instruments)
-        .add_paper(
-            config,
-            PaperOptions::default(),
-            TokioClock::starting_at(start()),
-            &feed,
-        )
+        .add_paper(config, options, TokioClock::starting_at(clock_start), &feed)
         .unwrap()
         .build();
     let venue = build.paper_venues.get(&EXCHANGE).unwrap().clone();
@@ -581,4 +590,194 @@ async fn a_paper_venue_books_what_a_backtest_of_the_same_venue_books() {
     );
 
     assert_eq!(paper_run().await, backtest);
+}
+
+/// Every account event the execution has delivered so far.
+fn delivered(execution: &mut Execution) -> Vec<rustrade_execution::AccountEvent> {
+    std::iter::from_fn(|| execution.account_channel.rx.rx.try_recv().ok())
+        .filter_map(|event| match event {
+            reconnect::Event::Item(event) => Some(event),
+            reconnect::Event::Reconnecting(_) => None,
+        })
+        .collect()
+}
+
+/// The btc balance an account event restates, if it does.
+fn btc_balance(event: &rustrade_execution::AccountEvent, btc: AssetIndex) -> Option<Balance> {
+    match &event.kind {
+        AccountEventKind::Snapshot(snapshot) => snapshot
+            .balances
+            .iter()
+            .find(|balance| balance.asset == btc)
+            .map(|balance| balance.balance),
+        AccountEventKind::BalanceSnapshot(balance) if balance.0.asset == btc => {
+            Some(balance.0.balance)
+        }
+        _ => None,
+    }
+}
+
+/// A paper venue's checkpoint follows every account event the venue sent before it, and a paper
+/// venue restored from it opens with the account it had, loan included, and numbers its next
+/// checkpoint on from it.
+#[tokio::test(start_paused = true)]
+async fn a_paper_venue_restored_from_its_checkpoint_carries_on_where_it_stopped() {
+    let instruments = instruments();
+    let btc = instruments
+        .find_asset_index(EXCHANGE, &AssetNameInternal::new("btc"))
+        .unwrap();
+    let anchor = tokio::time::Instant::now();
+    let (build, venue, market_tx) = paper_build(&instruments, margin_config());
+    let mut execution = build.init().await.unwrap();
+    let execution_tx = execution
+        .execution_txs
+        .find(&ExchangeIndex(0))
+        .unwrap()
+        .clone();
+
+    tokio::time::sleep_until(anchor + Duration::from_millis(1_000)).await;
+    market_tx
+        .unbounded_send(reconnect::Event::Item(trade_event(1_000, dec!(100))))
+        .unwrap();
+    tokio::time::sleep_until(anchor + Duration::from_millis(1_500)).await;
+    // Selling 15 btc holding 10 borrows the other 5.
+    execution_tx
+        .send(ExecutionRequest::Open(OrderEvent {
+            key: OrderKey {
+                exchange: ExchangeIndex(0),
+                instrument: InstrumentIndex(0),
+                strategy: StrategyId::new("paper"),
+                cid: ClientOrderId::new("short"),
+            },
+            state: market(Side::Sell, dec!(15)),
+        }))
+        .unwrap();
+    tokio::time::sleep_until(anchor + Duration::from_millis(1_520)).await;
+    // Asked while the short is still on its way to the venue: the checkpoint queues behind it.
+    assert_eq!(venue.checkpoint().await.unwrap(), 1);
+    tokio::time::sleep_until(anchor + Duration::from_millis(3_000)).await;
+
+    let events = delivered(&mut execution);
+    let traded = events
+        .iter()
+        .position(|event| matches!(event.kind, AccountEventKind::Trade(_)))
+        .expect("the short filled");
+    let Some(AccountEventKind::VenueCheckpoint(checkpoint)) = events.last().map(|e| &e.kind) else {
+        panic!("the checkpoint is the last event sent: {events:#?}");
+    };
+    assert!(traded < events.len() - 1);
+    assert_eq!(checkpoint.id, 1);
+    let btc_before = events
+        .iter()
+        .rev()
+        .find_map(|event| btc_balance(event, btc))
+        .unwrap();
+    assert_eq!(btc_before.margin.unwrap().borrowed, dec!(5));
+    let checkpoint = EngineCheckpoint::new((**checkpoint).clone(), vec![]);
+
+    // The process restarts later, on a fresh clock.
+    let (build, venue, _market_tx) = paper_build_with(
+        &instruments,
+        margin_config(),
+        PaperOptions::default().with_checkpoint(checkpoint),
+        at(3_000),
+    );
+    let mut restored = build.init().await.unwrap();
+    tokio::time::sleep_until(anchor + Duration::from_millis(3_500)).await;
+    let opened = delivered(&mut restored);
+    let btc_after = opened
+        .iter()
+        .find_map(|event| btc_balance(event, btc))
+        .expect("the restored venue's opening account");
+    assert_eq!(btc_after, btc_before);
+
+    assert_eq!(venue.checkpoint().await.unwrap(), 2);
+}
+
+/// A checkpoint of another exchange, or whose halves hold different positions, fails the build.
+#[tokio::test(start_paused = true)]
+async fn a_paper_venue_refuses_a_checkpoint_of_another_venue() {
+    let instruments = instruments();
+    let mut venue = backtest_venue(&margin_config()).1;
+    let checkpoint = EngineCheckpoint::new(venue.checkpoint(), vec![]);
+    let (_market_tx, market_rx) = futures::channel::mpsc::unbounded::<
+        reconnect::Event<ExchangeId, MarketEvent<InstrumentIndex, DataKind>>,
+    >();
+    let (_tap, feed) = PaperMarketFeed::tap(market_rx);
+
+    let other_exchange = MockExecutionConfig {
+        mocked_exchange: ExchangeId::Kraken,
+        ..margin_config()
+    };
+    let kraken = IndexedInstruments::new([instrument(ExchangeId::Kraken, "btc", "usdt")]);
+    let refused = ExecutionBuilder::new(&kraken).add_paper(
+        other_exchange,
+        PaperOptions::default().with_checkpoint(checkpoint.clone()),
+        TokioClock::starting_at(start()),
+        &feed,
+    );
+    let Err(error) = refused else {
+        panic!("a checkpoint of another exchange is refused");
+    };
+    assert!(
+        error.to_string().contains("given a checkpoint of"),
+        "{error}"
+    );
+
+    let cash = MockExecutionConfig {
+        spot_margin: None,
+        ..margin_config()
+    };
+    let checkpoint_v1 = checkpoint.clone();
+    let refused = ExecutionBuilder::new(&instruments).add_paper(
+        cash,
+        PaperOptions::default().with_checkpoint(checkpoint),
+        TokioClock::starting_at(start()),
+        &feed,
+    );
+    let Err(error) = refused else {
+        panic!("a margin checkpoint restored as a cash venue is refused");
+    };
+    assert!(error.to_string().contains("cannot be restored"), "{error}");
+
+    // A checkpoint written in another format version, whose shape still reads in this one. Its
+    // version is checked first, so it is refused for that even on another exchange.
+    let json = serde_json::to_value(&checkpoint_v1).unwrap();
+    let mut other_version = json.clone();
+    other_version["version"] = serde_json::json!(EngineCheckpoint::VERSION + 1);
+    let other_version: EngineCheckpoint = serde_json::from_value(other_version).unwrap();
+    let refused = ExecutionBuilder::new(&kraken).add_paper(
+        MockExecutionConfig {
+            mocked_exchange: ExchangeId::Kraken,
+            ..margin_config()
+        },
+        PaperOptions::default().with_checkpoint(other_version),
+        TokioClock::starting_at(start()),
+        &feed,
+    );
+    let Err(error) = refused else {
+        panic!("a checkpoint of another format version is refused");
+    };
+    assert!(error.to_string().contains("in format version 2"), "{error}");
+
+    // A venue snapshot of another format version inside a checkpoint of this one is refused by
+    // the venue's restore.
+    let mut other_snapshot = json;
+    other_snapshot["venue"]["snapshot"]["version"] = serde_json::json!(2);
+    let other_snapshot: EngineCheckpoint = serde_json::from_value(other_snapshot).unwrap();
+    let refused = ExecutionBuilder::new(&instruments).add_paper(
+        margin_config(),
+        PaperOptions::default().with_checkpoint(other_snapshot),
+        TokioClock::starting_at(start()),
+        &feed,
+    );
+    let Err(error) = refused else {
+        panic!("a venue snapshot of another format version is refused");
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("venue snapshot is format version 2"),
+        "{error}"
+    );
 }

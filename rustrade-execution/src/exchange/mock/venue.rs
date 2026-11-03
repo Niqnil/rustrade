@@ -39,13 +39,17 @@ use rustrade_instrument::{
     instrument::{Instrument, kind::InstrumentKind, name::InstrumentNameExchange},
 };
 use rustrade_integration::collection::snapshot::Snapshot;
+use serde::{Deserialize, Serialize};
 use smol_str::ToSmolStr;
 use std::{sync::Arc, time::Duration};
 use tracing::warn;
 
 mod liquidation;
 mod price_window;
+mod snapshot;
 mod spot_pairs;
+
+pub use snapshot::{SimulatedVenueSnapshot, VenueCheckpoint, VenueRestoreError};
 
 use price_window::PriceWindow;
 use spot_pairs::{SpotPair, SpotPairs};
@@ -119,7 +123,7 @@ pub struct VenueInstrumentMarket {
 /// limit order placed through a driver with no market feed would be accepted and then rest forever
 /// with nothing that could ever match it — accepted-and-silently-never-filled, which is worse than
 /// a flat rejection naming the reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub enum VenueRegime {
     /// No market feed: a market order is priced from the snapshot its own request carries, and
     /// nothing can rest, so [`OrderKind::Limit`] is rejected.
@@ -671,6 +675,9 @@ pub struct SimulatedVenue {
     /// [`SpotMarginLiquidation`](crate::margin::SpotMarginLiquidation): whether a liquidation is
     /// under way, and whether a margin call is outstanding.
     liquidation: liquidation::LiquidationState,
+    /// How many checkpoints this venue has taken, which numbers the next. Kept in its snapshot, so
+    /// a restored venue never repeats an id.
+    checkpoint_sequence: u64,
 }
 
 impl SimulatedVenue {
@@ -732,6 +739,29 @@ impl SimulatedVenue {
             .filter_map(|balance| Some((balance.asset.clone(), balance.balance.margin?)))
             .collect();
 
+        Self::assemble(
+            config,
+            instruments,
+            regime,
+            account,
+            positions,
+            order_id_start,
+            reported_debt,
+        )
+    }
+
+    /// A venue configured by `config`, holding `account`, `positions` and `reported_debt`, whose
+    /// clock has not yet moved and which has booked nothing. What both a fresh venue and a restored
+    /// one start from: [`from_snapshot`](Self::from_snapshot) then sets what the snapshot records.
+    fn assemble(
+        config: &MockExecutionConfig,
+        instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
+        regime: VenueRegime,
+        account: AccountState,
+        positions: FnvHashMap<InstrumentNameExchange, NetPosition>,
+        order_id_start: u128,
+        reported_debt: FnvHashMap<AssetNameExchange, MarginDetails>,
+    ) -> Self {
         Self {
             exchange: config.mocked_exchange,
             fee_model: config.fee_model,
@@ -764,6 +794,7 @@ impl SimulatedVenue {
             next_interest_loans: 0,
             reported_debt,
             liquidation: Default::default(),
+            checkpoint_sequence: 0,
         }
     }
 
@@ -5696,7 +5727,9 @@ impl Settlement {
 /// Kept per instrument, in contracts, whatever position mode the client keeps its own book in. A
 /// CFD venue nets one account's trades in one instrument, which is what decides how much of a fill
 /// returns margin and realises PnL rather than posting new margin.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
+)]
 struct NetPosition {
     /// Signed quantity in contracts: positive long, negative short, zero flat.
     quantity: Decimal,
@@ -16910,4 +16943,5 @@ mod tests {
     mod borrow_price_window;
     mod collateral_ratio;
     mod liquidation;
+    mod snapshot;
 }

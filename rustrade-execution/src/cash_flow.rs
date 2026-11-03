@@ -41,8 +41,11 @@ use std::fmt::{Display, Formatter};
 ///   [`LiquidationFee`](CashFlowKind::LiquidationFee) of a configured
 ///   [`SpotMarginLiquidation`](crate::margin::SpotMarginLiquidation), each flow once, with an id
 ///   from its own sequence.
+///
+/// `Ord` and `Hash` exist so a value holding one can sit in an engine output, which requires them,
+/// and are not a meaningful ranking: they compare field by field.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct CashFlow<AssetKey, InstrumentKey> {
     /// What the flow is for.
     pub kind: CashFlowKind,
@@ -133,7 +136,7 @@ impl<AssetKey, InstrumentKey> CashFlow<AssetKey, InstrumentKey> {
 /// A margin venue may lend when it accepts an order, as Binance does for an order that borrows,
 /// and charge interest on the new loan at once. The order identifies the position the loan funds:
 /// the one the order's trades open or add to.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct CashFlowLoan {
     /// When the venue lent: its time for accepting the order that borrowed.
@@ -160,7 +163,7 @@ impl CashFlowLoan {
 /// [`end`](Self::end), exclusive. `end` is after `start`.
 ///
 /// Deserialising checks the order too, so a period read back is as valid as one built.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "CashFlowPeriodFields")]
 pub struct CashFlowPeriod {
     start: DateTime<Utc>,
@@ -214,7 +217,7 @@ impl TryFrom<CashFlowPeriodFields> for CashFlowPeriod {
 /// Each variant carries the venue's own figures where it reports them, and `None` where it does
 /// not.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub enum CashFlowKind {
     /// A perpetual's funding payment, paid or received on a position held at a funding time.
     Funding {
@@ -280,7 +283,7 @@ pub enum CashFlowKind {
 /// gives the flow that period as its [`CashFlow::period`], which lets the `rustrade` engine still
 /// give the charge to that position.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub enum InterestTiming {
     /// The charge for holding the loan over a charging period, at one of the venue's boundaries.
     Periodic,

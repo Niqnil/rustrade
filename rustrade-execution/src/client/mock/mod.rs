@@ -519,6 +519,34 @@ pub async fn request_borrow_capacity(
         .map_err(ClientError::Api)
 }
 
+/// Asks the [`MockExchange`](crate::exchange::mock::MockExchange) that reads `request_tx` to send a
+/// [`VenueCheckpoint`](crate::exchange::mock::venue::VenueCheckpoint) on its account stream, with
+/// the request stamped `time_request`.
+///
+/// Answers with the checkpoint's id once the exchange has sent it, after every account event it
+/// produced before it. Sent is not received: a consumer whose account stream ended or lagged
+/// before the checkpoint reached it never sees it, and should ask again.
+///
+/// The exchange takes the checkpoint once the request reaches it, whether or not this call is
+/// still awaited, so a dropped call can still put a checkpoint on the account stream.
+///
+/// # Errors
+/// [`ConnectivityError::ExchangeOffline`] for `mocked_exchange` when the exchange is not running:
+/// it never started, or it has stopped.
+pub async fn request_checkpoint(
+    request_tx: &mpsc::UnboundedSender<MockExchangeRequest>,
+    mocked_exchange: ExchangeId,
+    time_request: DateTime<Utc>,
+) -> Result<u64, UnindexedClientError> {
+    let offline =
+        || UnindexedClientError::Connectivity(ConnectivityError::ExchangeOffline(mocked_exchange));
+    let (response_tx, response_rx) = oneshot::channel();
+    request_tx
+        .send(MockExchangeRequest::checkpoint(time_request, response_tx))
+        .map_err(|_| offline())?;
+    response_rx.await.map_err(|_| offline())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
@@ -592,6 +620,35 @@ mod tests {
             .unwrap();
         exchange.await.unwrap();
         assert_eq!(read, TradesRead::complete(vec![trade("eth_usdt")]));
+    }
+
+    /// `request_checkpoint` asks the mock exchange for a checkpoint and answers with the id the
+    /// exchange gave it, or that the exchange is offline once it has stopped.
+    #[tokio::test]
+    async fn request_checkpoint_answers_with_the_exchange_s_id() {
+        let (request_tx, mut request_rx) = mpsc::unbounded_channel::<MockExchangeRequest>();
+        let exchange = tokio::spawn(async move {
+            let request = request_rx.recv().await.expect("a request");
+            let crate::exchange::mock::request::MockExchangeRequestKind::Checkpoint { response_tx } =
+                request.kind
+            else {
+                panic!("expected Checkpoint, got {:?}", request.kind);
+            };
+            response_tx.send(7).expect("the caller awaits the answer");
+        });
+
+        let id = request_checkpoint(&request_tx, ExchangeId::Mock, Utc::now()).await;
+        // Checked before joining the exchange's task, which waits for a request until one comes.
+        assert_eq!(id.unwrap(), 7);
+        exchange.await.unwrap();
+
+        // The exchange's task has ended and dropped its receiver.
+        assert!(matches!(
+            request_checkpoint(&request_tx, ExchangeId::Mock, Utc::now()).await,
+            Err(UnindexedClientError::Connectivity(
+                ConnectivityError::ExchangeOffline(ExchangeId::Mock)
+            ))
+        ));
     }
 
     /// Broadcast lag is a terminal stream death: the account stream must deliver an in-band
