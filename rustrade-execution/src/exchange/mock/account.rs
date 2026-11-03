@@ -949,6 +949,11 @@ impl AccountStateSnapshot {
         self.margin
     }
 
+    /// The asset of each balance, in order.
+    pub(crate) fn balance_assets(&self) -> impl Iterator<Item = &AssetNameExchange> + '_ {
+        self.balances.iter().map(|balance| &balance.asset)
+    }
+
     /// Every instrument an open, ended or traded order names, possibly more than once.
     pub(crate) fn instruments(&self) -> impl Iterator<Item = &InstrumentNameExchange> + '_ {
         self.orders_open

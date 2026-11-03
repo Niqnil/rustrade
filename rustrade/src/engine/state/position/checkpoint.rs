@@ -34,6 +34,10 @@ use thiserror::Error;
 /// For a paper venue, `PaperOptions::with_checkpoint` restores the venue and checks the two halves
 /// agree.
 ///
+/// Only positions are saved of the engine. Its order state comes back from the venue: a restored
+/// venue opens its account stream with a snapshot listing its open orders, which the engine takes
+/// up as it does on any connect. Statistics and tear sheets start afresh from the restore.
+///
 /// `Ord` and `Hash` exist so it can sit in an [`EngineOutput`](crate::engine::EngineOutput), which
 /// requires them, and are not a meaningful ranking.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
@@ -174,6 +178,10 @@ impl PositionCheckpoint {
 
     /// Inserts this position into `manager`, the position manager of instrument `key` on
     /// `exchange`, with its assets indexed by `assets`.
+    ///
+    /// The manager's [`time_history_start`](PositionManager::time_history_start) is not carried
+    /// over. It only matters as the later of it and the session start, and a restored engine's
+    /// session starts after everything the checkpoint saw.
     pub(crate) fn restore_into(
         self,
         manager: &mut PositionManager,
@@ -187,6 +195,13 @@ impl PositionCheckpoint {
         } = self;
         let instrument = position.instrument.clone();
 
+        // An open position holds a quantity: what a checkpoint holds otherwise was edited.
+        if position.quantity_abs <= Decimal::ZERO {
+            return Err(PositionSeedError::NonPositiveQuantity {
+                instrument,
+                quantity_abs: position.quantity_abs,
+            });
+        }
         if manager.mode == OmsMode::Netting && position_id != PositionId::NETTING {
             return Err(PositionSeedError::PositionIdInNetting {
                 instrument,
@@ -220,6 +235,10 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
     /// Every open position held on `exchange`'s instruments, as an [`EngineCheckpoint`] saves it.
     ///
     /// In instrument order, then slot order, so two calls on one state are equal.
+    ///
+    /// # Panics
+    /// If a position holds an asset index this state's assets do not contain, which no position
+    /// the engine built can, as for `AssetStates::asset_index`.
     pub fn position_checkpoints(&self, exchange: ExchangeIndex) -> Vec<PositionCheckpoint> {
         let asset_name =
             |index: AssetIndex| -> Result<AssetNameInternal, std::convert::Infallible> {
@@ -642,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn a_restored_position_on_an_unknown_instrument_or_asset_is_refused() {
+    fn a_restored_position_on_an_unknown_instrument_or_asset_or_without_quantity_is_refused() {
         let instruments = instruments();
         let saved = traded_state(&instruments).position_checkpoints(spot_exchange(&instruments));
         let build = |positions: Vec<PositionCheckpoint>| {
@@ -661,7 +680,7 @@ mod tests {
             })
         );
 
-        let mut unknown_asset = saved;
+        let mut unknown_asset = saved.clone();
         unknown_asset[0].position.fees_exit.asset = AssetNameInternal::new("bnb");
         assert_eq!(
             build(unknown_asset),
@@ -670,6 +689,18 @@ mod tests {
                 asset: AssetNameInternal::new("bnb")
             })
         );
+
+        for quantity_abs in [Decimal::ZERO, dec!(-1)] {
+            let mut empty = saved.clone();
+            empty[0].position.quantity_abs = quantity_abs;
+            assert_eq!(
+                build(empty),
+                Err(PositionSeedError::NonPositiveQuantity {
+                    instrument: spot(),
+                    quantity_abs
+                })
+            );
+        }
     }
 
     #[test]

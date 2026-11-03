@@ -26,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     moves, and a resting order is matched against the first market it observes after the restore.
   - The snapshot carries a format version. `from_snapshot` refuses another version, another
     exchange, other instruments, a margin account restored without `spot_margin` or the other way
-    round, and an order id listed twice, each with a `VenueRestoreError` variant.
+    round, an order id listed twice, and an instrument or asset listed twice where the venue holds
+    one entry for each, each with a `VenueRestoreError` variant.
 - **A paper venue and the engine trading on it can be checkpointed together and restored after a
   restart** (`rustrade-execution`, `rustrade`, #836). The venue sends its snapshot in band on its
   account stream, and the engine answers it with its own positions at the same point, so the two

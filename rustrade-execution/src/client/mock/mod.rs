@@ -527,6 +527,9 @@ pub async fn request_borrow_capacity(
 /// produced before it. Sent is not received: a consumer whose account stream ended or lagged
 /// before the checkpoint reached it never sees it, and should ask again.
 ///
+/// The exchange takes the checkpoint once the request reaches it, whether or not this call is
+/// still awaited, so a dropped call can still put a checkpoint on the account stream.
+///
 /// # Errors
 /// [`ConnectivityError::ExchangeOffline`] for `mocked_exchange` when the exchange is not running:
 /// it never started, or it has stopped.

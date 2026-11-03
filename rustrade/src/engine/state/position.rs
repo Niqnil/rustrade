@@ -974,6 +974,10 @@ pub enum PositionSeedError {
 /// assert_eq!(new_position.price_entry_average, dec!(40_000.0));
 /// assert_eq!(new_position.pnl_realised, dec!(-5.0));
 /// ```
+///
+/// `Ord` and `Hash` exist so a saved position can sit in an
+/// [`EngineOutput`](crate::engine::EngineOutput), which requires them, and are not a meaningful
+/// ranking: they compare field by field.
 #[derive(
     Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize, Constructor,
 )]

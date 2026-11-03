@@ -41,6 +41,9 @@ use std::fmt::{Display, Formatter};
 ///   [`LiquidationFee`](CashFlowKind::LiquidationFee) of a configured
 ///   [`SpotMarginLiquidation`](crate::margin::SpotMarginLiquidation), each flow once, with an id
 ///   from its own sequence.
+///
+/// `Ord` and `Hash` exist so a value holding one can sit in an engine output, which requires them,
+/// and are not a meaningful ranking: they compare field by field.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct CashFlow<AssetKey, InstrumentKey> {

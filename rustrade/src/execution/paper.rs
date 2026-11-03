@@ -341,7 +341,16 @@ impl PaperVenue {
     ///
     /// Sent is not processed. If the venue's account stream ends or lags before the checkpoint
     /// reaches the `Engine`, as it does when the manager reopens the stream, no output answers
-    /// it: ask again once the stream is back.
+    /// it: ask again once the stream is back. The engine's audit shows the stream ending before
+    /// any checkpoint output, and a caller waiting for one keeps its own deadline too.
+    ///
+    /// The checkpoint is taken once the request reaches the venue, whether or not this call is
+    /// still awaited: a call dropped by a timeout or a `select!` can still be answered by an
+    /// output, with an id the caller never learned.
+    ///
+    /// A checkpoint copies the venue's whole account, including every trade and ended order of
+    /// the run, which grow with it, so it costs more the longer the venue has run. The venue
+    /// handles nothing else while it copies.
     ///
     /// # Errors
     /// [`ConnectivityError::ExchangeOffline`] once the venue has stopped, as for

@@ -195,11 +195,12 @@ fn a_cfd_position_closes_against_its_restored_entry() {
     let mut original = make_cfd_market_venue("100000");
     assert!(cfd_market(&mut original, "99", "101", "100").is_empty());
     cfd_market_fill(&mut original, Side::Buy, "2");
+    let snapshot_open = original.snapshot();
 
     let mut restored = SimulatedVenue::from_snapshot(
         &config,
         instruments_of(cfd_instrument()),
-        through_json(&original.snapshot()),
+        through_json(&snapshot_open),
     )
     .unwrap();
     assert!(cfd_position(&restored).is_some());
@@ -216,6 +217,19 @@ fn a_cfd_position_closes_against_its_restored_entry() {
     };
     assert_eq!(close(&mut restored), close(&mut original));
     assert_eq!(cfd_position(&restored), None);
+
+    let mut json = serde_json::to_value(snapshot_open).unwrap();
+    let positions = json["positions"].as_array_mut().unwrap();
+    positions.push(positions[0].clone());
+    let refused = SimulatedVenue::from_snapshot(
+        &config,
+        instruments_of(cfd_instrument()),
+        serde_json::from_value(json).unwrap(),
+    );
+    assert_eq!(
+        refused.unwrap_err(),
+        VenueRestoreError::DuplicateInstrument(cfd_instrument_name())
+    );
 }
 
 #[test]
@@ -412,10 +426,53 @@ fn a_window_the_configuration_no_longer_sets_is_dropped() {
         spot_margin: Some(SpotMarginConfig::new(quote(), d("3"), MarginEffect::Borrow).unwrap()),
         ..margin_window_config()
     };
-    let restored =
+    let (restored, warned) = warnings(|| {
         SimulatedVenue::from_snapshot(&without_window, spot_instruments(), original.snapshot())
-            .unwrap();
+            .unwrap()
+    });
 
     assert!(!original.borrow_prices.is_empty());
     assert!(restored.borrow_prices.is_empty());
+    assert_eq!(
+        warned
+            .iter()
+            .filter(|message| message.contains("drops the borrow price windows"))
+            .count(),
+        1,
+        "{warned:?}"
+    );
+}
+
+/// A list the venue holds one entry per key in, listing a key twice, is refused rather than
+/// restored with one of the two entries.
+#[test]
+fn a_snapshot_listing_an_instrument_or_asset_twice_is_refused() {
+    let json = serde_json::to_value(venue_mid_run().snapshot()).unwrap();
+    let restore = |json: serde_json::Value| {
+        SimulatedVenue::from_snapshot(
+            &margin_window_config(),
+            spot_instruments(),
+            serde_json::from_value(json).unwrap(),
+        )
+    };
+    let doubled = |mut json: serde_json::Value, pointer: &str| {
+        let list = json.pointer_mut(pointer).unwrap().as_array_mut().unwrap();
+        assert!(!list.is_empty(), "{pointer} has an entry to repeat");
+        list.push(list[0].clone());
+        json
+    };
+
+    assert_eq!(
+        restore(doubled(json.clone(), "/borrow_prices")).unwrap_err(),
+        VenueRestoreError::DuplicateInstrument(instrument_name())
+    );
+    assert_eq!(
+        restore(doubled(json.clone(), "/account/balances")).unwrap_err(),
+        VenueRestoreError::DuplicateAsset(base())
+    );
+    assert_eq!(
+        restore(doubled(json.clone(), "/reported_debt")).unwrap_err(),
+        VenueRestoreError::DuplicateAsset(base())
+    );
+    assert!(restore(json).is_ok());
 }

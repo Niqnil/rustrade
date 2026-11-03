@@ -18,7 +18,10 @@ use rustrade_instrument::{
     instrument::{Instrument, name::InstrumentNameExchange},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::{
+    collections::{BTreeSet, HashSet},
+    hash::Hash,
+};
 use thiserror::Error;
 
 /// Everything a [`SimulatedVenue`] has accumulated since it was built, as a value serde can write,
@@ -184,6 +187,21 @@ pub enum VenueRestoreError {
     /// The snapshot lists one order id twice.
     #[error(transparent)]
     DuplicateOrder(#[from] DuplicateSeededOrder),
+
+    /// The snapshot lists one instrument twice among its positions, or among its borrow price
+    /// windows.
+    #[error("venue snapshot lists {0} twice")]
+    DuplicateInstrument(InstrumentNameExchange),
+
+    /// The snapshot lists one asset twice among its balances, or among the debt it last reported.
+    #[error("venue snapshot lists {0} twice")]
+    DuplicateAsset(AssetNameExchange),
+}
+
+/// The first item `items` yields that an earlier one equals.
+fn first_repeat<'a, T: Eq + Hash + 'a>(items: impl IntoIterator<Item = &'a T>) -> Option<&'a T> {
+    let mut seen = HashSet::new();
+    items.into_iter().find(|item| !seen.insert(*item))
 }
 
 impl SimulatedVenue {
@@ -263,6 +281,13 @@ impl SimulatedVenue {
     ///   sets no `spot_margin`, or the other way round.
     /// - [`VenueRestoreError::DuplicateOrder`] if the snapshot lists one order id twice among its
     ///   open orders, or among its cancelled, filled or expired ones.
+    /// - [`VenueRestoreError::DuplicateInstrument`] or [`VenueRestoreError::DuplicateAsset`] if it
+    ///   lists one instrument or asset twice in a list that holds each once.
+    ///
+    /// # Cost
+    /// The slippage stream is resumed by drawing again every value the snapshot's venue drew, one
+    /// per fill it slipped, so a restore takes time in proportion to the snapshot's fills. A
+    /// snapshot is trusted input: one edited to claim a vast number of draws restores as slowly.
     pub fn from_snapshot(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
@@ -308,6 +333,17 @@ impl SimulatedVenue {
             .find(|instrument| !instruments.contains_key(*instrument))
         {
             return Err(VenueRestoreError::UnknownInstrument(unknown.clone()));
+        }
+        // Each list below becomes a map, which would keep one of two entries and drop the other.
+        if let Some(repeat) = first_repeat(snapshot.positions.iter().map(|(name, _)| name))
+            .or_else(|| first_repeat(snapshot.borrow_prices.iter().map(|(name, _)| name)))
+        {
+            return Err(VenueRestoreError::DuplicateInstrument(repeat.clone()));
+        }
+        if let Some(repeat) = first_repeat(snapshot.account.balance_assets())
+            .or_else(|| first_repeat(snapshot.reported_debt.iter().map(|(asset, _)| asset)))
+        {
+            return Err(VenueRestoreError::DuplicateAsset(repeat.clone()));
         }
         if snapshot.account.margin() != config.spot_margin.is_some() {
             return Err(VenueRestoreError::MarginMismatch {
@@ -358,6 +394,13 @@ impl SimulatedVenue {
             .is_some_and(|margin| margin.borrow_price_window().is_some())
         {
             venue.borrow_prices = borrow_prices.into_iter().collect();
+        } else if !borrow_prices.is_empty() {
+            tracing::warn!(
+                exchange = %config.mocked_exchange,
+                windows = borrow_prices.len(),
+                "restored venue drops the borrow price windows of its snapshot: the configuration \
+                 sets no borrow price window"
+            );
         }
         venue.slippage = Slippage::resumed(config.slippage, slippage_draws);
         venue.checkpoint_sequence = checkpoint_sequence;
