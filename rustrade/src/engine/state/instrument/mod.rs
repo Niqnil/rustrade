@@ -1586,17 +1586,21 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ///   session. The session start is the `time_engine_start` given to the
     ///   [`EngineStateBuilder`](crate::engine::state::builder::EngineStateBuilder), `Utc::now` by
     ///   default; a run over historical flows should set it, or its flows all log at DEBUG.
-    /// - [`SeveralOpen`](CarryUpdate::SeveralOpen) under [`OmsMode::Hedging`]: the venue charges
-    ///   the instrument, not a slot, so which position a flow belongs to is unknown. WARN.
     /// - A flow that names the loan it is the charge on ([`CashFlow::loan`]), whenever it is
-    ///   stamped: applied, as below, when the order that took the loan opened or added to the open
-    ///   position (it is in [`Position::orders_enter`](super::position::Position::orders_enter)).
+    ///   stamped: applied, as below, to the open position that the order that took the loan opened
+    ///   or added to (it is in [`Position::orders_enter`](super::position::Position::orders_enter)).
+    ///   The order picks the position, so under [`OmsMode::Hedging`] the flow is applied with
+    ///   several open; in the unexpected case that the order is in more than one, it is
+    ///   [`SeveralOpen`](CarryUpdate::SeveralOpen), logged at WARN.
     ///   Otherwise it is [`LoanOfOtherOrder`](CarryUpdate::LoanOfOtherOrder): the order has not
     ///   traded yet, as one resting on the book, or traded only into an earlier position, or only
     ///   reduced this one. Logged at WARN when the flow is no older than the session start, and
     ///   at DEBUG when it is older, as for [`NoOpenPosition`](CarryUpdate::NoOpenPosition). A
     ///   position seeded with [`PositionSeed`](super::position::PositionSeed) names no order, so a
     ///   charge on a loan taken before the seed is not applied to it.
+    /// - [`SeveralOpen`](CarryUpdate::SeveralOpen) for a flow that names no loan under
+    ///   [`OmsMode::Hedging`]: the venue charges the instrument, not a slot, so which position the
+    ///   flow belongs to is unknown. WARN.
     /// - A flow stamped before the position's `time_enter`, naming no loan:
     ///   - When it is the charge on a new loan ([`InterestTiming::OnBorrow`]) with a
     ///     [`period`](CashFlow::period), and the position entered within that period, the
@@ -1647,72 +1651,100 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         InstrumentKey: Debug,
     {
         let history_start = self.position.time_history_start();
-        let mut open = self.position.positions.values_mut();
-        let (Some(position), None) = (open.next(), open.next()) else {
-            let open = self.position.positions.len();
-            if open == 0 {
-                if flow.time_exchange >= self.tear_sheet.time_engine_start {
+        let open = self.position.positions.len();
+        if open == 0 {
+            if flow.time_exchange >= self.tear_sheet.time_engine_start {
+                warn!(
+                    instrument = ?self.key,
+                    kind = ?flow.kind,
+                    amount = %flow.amount,
+                    time_exchange = %flow.time_exchange,
+                    "cash flow for an instrument with no open position — not applied to carry",
+                );
+            } else {
+                debug!(
+                    instrument = ?self.key,
+                    kind = ?flow.kind,
+                    amount = %flow.amount,
+                    time_exchange = %flow.time_exchange,
+                    "cash flow from before the session for an instrument with no open position \
+                     — not applied to carry",
+                );
+            }
+            return CarryUpdate::NoOpenPosition;
+        }
+
+        let position = if let Some(loan) = &flow.loan {
+            // The order that took the loan picks the position, so several open positions need no
+            // guess.
+            let mut entered = self
+                .position
+                .positions
+                .values_mut()
+                .filter(|position| position.orders_enter.contains(&loan.order_id));
+            match (entered.next(), entered.next()) {
+                (Some(position), None) => position,
+                (None, _) => {
+                    if flow.time_exchange >= self.tear_sheet.time_engine_start {
+                        warn!(
+                            instrument = ?self.key,
+                            kind = ?flow.kind,
+                            amount = %flow.amount,
+                            time_exchange = %flow.time_exchange,
+                            order_id = %loan.order_id,
+                            cid = %loan.cid,
+                            time_loan = %loan.time,
+                            "charge on a loan whose order neither opened nor added to an open \
+                             position — not applied to carry",
+                        );
+                    } else {
+                        debug!(
+                            instrument = ?self.key,
+                            kind = ?flow.kind,
+                            amount = %flow.amount,
+                            time_exchange = %flow.time_exchange,
+                            order_id = %loan.order_id,
+                            cid = %loan.cid,
+                            time_loan = %loan.time,
+                            "charge from before the session on a loan whose order neither opened \
+                             nor added to an open position — not applied to carry",
+                        );
+                    }
+                    return CarryUpdate::LoanOfOtherOrder;
+                }
+                (Some(_), Some(_)) => {
                     warn!(
                         instrument = ?self.key,
+                        open,
                         kind = ?flow.kind,
                         amount = %flow.amount,
                         time_exchange = %flow.time_exchange,
-                        "cash flow for an instrument with no open position — not applied to carry",
+                        order_id = %loan.order_id,
+                        cid = %loan.cid,
+                        "charge on a loan whose order opened or added to several open positions \
+                         — which one took the loan is unknown, so it is not applied to carry",
                     );
-                } else {
-                    debug!(
-                        instrument = ?self.key,
-                        kind = ?flow.kind,
-                        amount = %flow.amount,
-                        time_exchange = %flow.time_exchange,
-                        "cash flow from before the session for an instrument with no open position \
-                         — not applied to carry",
-                    );
+                    return CarryUpdate::SeveralOpen;
                 }
-                return CarryUpdate::NoOpenPosition;
             }
-            warn!(
-                instrument = ?self.key,
-                open,
-                kind = ?flow.kind,
-                amount = %flow.amount,
-                time_exchange = %flow.time_exchange,
-                "cash flow for an instrument with several open positions — the venue does not say \
-                 which it belongs to, so it is not applied to carry",
-            );
-            return CarryUpdate::SeveralOpen;
+        } else {
+            let mut positions = self.position.positions.values_mut();
+            let (Some(position), None) = (positions.next(), positions.next()) else {
+                warn!(
+                    instrument = ?self.key,
+                    open,
+                    kind = ?flow.kind,
+                    amount = %flow.amount,
+                    time_exchange = %flow.time_exchange,
+                    "cash flow for an instrument with several open positions — the venue does \
+                     not say which it belongs to, so it is not applied to carry",
+                );
+                return CarryUpdate::SeveralOpen;
+            };
+            position
         };
 
-        if let Some(loan) = &flow.loan {
-            if !position.orders_enter.contains(&loan.order_id) {
-                if flow.time_exchange >= self.tear_sheet.time_engine_start {
-                    warn!(
-                        instrument = ?self.key,
-                        kind = ?flow.kind,
-                        amount = %flow.amount,
-                        time_exchange = %flow.time_exchange,
-                        order_id = %loan.order_id,
-                        cid = %loan.cid,
-                        time_loan = %loan.time,
-                        "charge on a loan whose order neither opened nor added to the open \
-                         position — not applied to carry",
-                    );
-                } else {
-                    debug!(
-                        instrument = ?self.key,
-                        kind = ?flow.kind,
-                        amount = %flow.amount,
-                        time_exchange = %flow.time_exchange,
-                        order_id = %loan.order_id,
-                        cid = %loan.cid,
-                        time_loan = %loan.time,
-                        "charge from before the session on a loan whose order neither opened nor \
-                         added to the open position — not applied to carry",
-                    );
-                }
-                return CarryUpdate::LoanOfOtherOrder;
-            }
-        } else if flow.time_exchange < position.time_enter {
+        if flow.loan.is_none() && flow.time_exchange < position.time_enter {
             match on_borrow_period(flow) {
                 Some(period) if period.contains(position.time_enter) => {
                     let session_start = self.tear_sheet.time_engine_start;
@@ -5124,6 +5156,59 @@ mod tests {
         assert_eq!(warnings, 1);
         let carry: Vec<Decimal> = state.position.positions.values().map(|p| p.carry).collect();
         assert_eq!(carry, [dec!(-1), Decimal::ZERO]);
+    }
+
+    /// The order that took a loan picks the position the charge on it belongs to, so the charge
+    /// is applied with several hedging positions open, where a flow naming no loan is left out.
+    #[test]
+    fn a_charge_on_a_loan_reaches_the_hedging_position_its_order_opened() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let quote = state.instrument.underlying.quote;
+        assert!(fill_after(&mut state, "a", Side::Sell, dec!(1), 60).is_none());
+        assert!(fill_after(&mut state, "b", Side::Sell, dec!(1), 120).is_none());
+        let charge = || interest(quote, InterestTiming::OnBorrow, after(0), hour_from(0));
+
+        assert_eq!(
+            state.update_from_cash_flow(&lent_by(charge(), "b", 120)),
+            CarryUpdate::Applied
+        );
+        let (update, warnings) =
+            count_warnings(|| state.update_from_cash_flow(&lent_by(charge(), "resting", 0)));
+        assert_eq!(update, CarryUpdate::LoanOfOtherOrder);
+        assert_eq!(warnings, 1);
+
+        let carry = |id: &str| state.position.positions[&PositionId::new(id)].carry;
+        assert_eq!(carry("a"), Decimal::ZERO);
+        assert_eq!(carry("b"), dec!(-0.25));
+    }
+
+    /// An order is not expected in two positions' `orders_enter`, but if it is, which position took
+    /// its loan is unknown, so the charge is left out rather than given to either.
+    #[test]
+    fn a_charge_on_a_loan_whose_order_entered_several_hedging_positions_is_left_out() {
+        let mut state = instrument_state(OmsMode::Hedging);
+        let quote = state.instrument.underlying.quote;
+        assert!(fill_after(&mut state, "a", Side::Sell, dec!(1), 60).is_none());
+        assert!(fill_after(&mut state, "b", Side::Sell, dec!(1), 120).is_none());
+        state
+            .position
+            .positions
+            .get_mut(&PositionId::new("b"))
+            .unwrap()
+            .orders_enter
+            .push(OrderId::new("a"));
+
+        let (update, warnings) = count_warnings(|| {
+            state.update_from_cash_flow(&lent_by(
+                interest(quote, InterestTiming::OnBorrow, after(0), hour_from(0)),
+                "a",
+                60,
+            ))
+        });
+
+        assert_eq!(update, CarryUpdate::SeveralOpen);
+        assert_eq!(warnings, 1);
+        assert!(state.position.positions.values().all(|p| p.carry.is_zero()));
     }
 
     #[test]

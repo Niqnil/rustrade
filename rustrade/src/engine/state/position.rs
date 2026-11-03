@@ -274,16 +274,17 @@ pub enum CarryUpdate {
     BeforeHistory,
     /// The flow names the loan it is the charge on
     /// ([`CashFlow::loan`](rustrade_execution::cash_flow::CashFlow::loan)), and the order that took
-    /// the loan neither opened nor added to the open position (it is not in
+    /// the loan neither opened nor added to an open position (it is in no open position's
     /// [`Position::orders_enter`]): it has not traded yet, as an order resting on the book, or
-    /// traded only into an earlier position, or only reduced this one.
+    /// traded only into an earlier position, or only reduced an open one.
     ///
     /// The engine keeps no flow it leaves out. A caller that reads a venue's charge before the
     /// order that took the loan has traded, as for an order still resting on the book, can offer
     /// the flow again once that order's fill has opened or added to the position.
     LoanOfOtherOrder,
     /// Several positions are open on the instrument ([`OmsMode::Hedging`]) and the venue does not
-    /// say which one the flow belongs to.
+    /// say which one the flow belongs to: the flow names no loan, or, unexpectedly, the order that
+    /// took the loan it names opened or added to more than one of them.
     SeveralOpen,
 }
 

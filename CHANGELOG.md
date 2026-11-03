@@ -22,8 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     loads.
   - `Position` gains `orders_enter: Vec<OrderId>`: each order whose fills opened or added to the
     position, once. A flip's order opens the next position. A seeded position names none.
-  - The engine applies a flow that names a loan only when the loan's order is in the open
-    position's `orders_enter`, whenever the flow is stamped. Otherwise it returns the new
+  - The engine applies a flow that names a loan only to the open position whose `orders_enter`
+    holds the loan's order, whenever the flow is stamped. The order picks the position, so under
+    `OmsMode::Hedging` such a flow is applied with several positions open, where one naming no
+    loan returns `CarryUpdate::SeveralOpen`. Otherwise it returns the new
     `CarryUpdate::LoanOfOtherOrder` and logs a WARN, or a DEBUG for a flow from before the
     session. A flow that names no loan keeps the existing rules.
   - `BinanceMargin` holds the loan each order it places reports, up to 4096, and
