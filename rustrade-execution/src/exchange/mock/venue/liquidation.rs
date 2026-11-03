@@ -1,7 +1,9 @@
 //! Liquidating the simulated venue's spot margin account, and the margin-call notices before it.
 //! See [`SpotMarginLiquidation`] for what the venue does, and when.
 
-use super::{InstrumentTerms, MarginCheck, NetPosition, SimulatedVenue, Valued, mid_or_last, owed};
+use super::{
+    InstrumentTerms, MarginCheck, NetPosition, Prices, SimulatedVenue, Valued, mid_or_last, owed,
+};
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
     cash_flow::{CashFlow, CashFlowId, CashFlowKind},
@@ -88,7 +90,8 @@ impl SimulatedVenue {
             return;
         }
 
-        let Some(Valued { equity, debt }) = self.valued(config, MarginCheck::Liquidation, None)
+        let Some(Valued { equity, debt }) =
+            self.valued(config, MarginCheck::Liquidation, None, Prices::Current)
         else {
             if !self.liquidation.warned_unvalued {
                 self.liquidation.warned_unvalued = true;
@@ -518,7 +521,7 @@ impl SimulatedVenue {
         self.spot_margin
             .as_ref()
             // The ratios weight only equity, so either check values the debt alike.
-            .and_then(|config| self.valued(config, MarginCheck::Liquidation, None))
+            .and_then(|config| self.valued(config, MarginCheck::Liquidation, None, Prices::Current))
             .map_or(Decimal::ZERO, |valued| valued.debt)
     }
 
