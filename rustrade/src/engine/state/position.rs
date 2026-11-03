@@ -770,6 +770,10 @@ impl PositionSeed {
 /// Why a [`PositionSeed`] was rejected by
 /// [`EngineStateBuilder::try_build`](crate::engine::state::builder::EngineStateBuilder::try_build).
 ///
+/// A position restored from a checkpoint
+/// ([`EngineStateBuilder::restored_positions`](crate::engine::state::builder::EngineStateBuilder::restored_positions))
+/// is checked the same way and refused with the same variants, which then say "seed" of it.
+///
 /// `#[non_exhaustive]`: a further check can be added without breaking downstream exhaustive
 /// matches.
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]

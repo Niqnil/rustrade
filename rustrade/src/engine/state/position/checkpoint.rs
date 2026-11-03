@@ -181,7 +181,8 @@ impl PositionCheckpoint {
     ///
     /// The manager's [`time_history_start`](PositionManager::time_history_start) is not carried
     /// over. It only matters as the later of it and the session start, and a restored engine's
-    /// session starts after everything the checkpoint saw.
+    /// session starts after everything the checkpoint saw, as long as its clock does not start
+    /// earlier than the checkpoint.
     pub(crate) fn restore_into(
         self,
         manager: &mut PositionManager,
