@@ -70,7 +70,7 @@ use crate::{
     trade::TradesRead,
 };
 use chrono::{DateTime, Utc};
-use futures::Stream;
+use futures::{Stream, stream::BoxStream};
 use rustrade_instrument::{
     Side,
     asset::name::AssetNameExchange,
@@ -167,10 +167,12 @@ impl<'a> ClientInstrument<'a> {
 ///   `EXCHANGE` differs from its instrument map's exchange (only the `Mock` and `Simulated` ids
 ///   are exempt), so one generic wrapper then serves every venue client.
 /// - **Forward every method, the provided ones included.** That is
-///   [`open_orders`](Self::open_orders), [`cancel_orders`](Self::cancel_orders) and
-///   [`validate_config`](Self::validate_config): left to the trait's defaults, they would bypass
-///   any batching or config check the inner client has. Implement the extension traits the inner
-///   client implements as well, with impls bounded on it, forwarding their provided methods too:
+///   [`open_orders`](Self::open_orders), [`cancel_orders`](Self::cancel_orders),
+///   [`validate_config`](Self::validate_config) and
+///   [`process_account_events`](Self::process_account_events): left to the trait's defaults, they
+///   would bypass any batching, config check or processing the inner client has. Implement the
+///   extension traits the inner client implements as well, with impls bounded on it, forwarding
+///   their provided methods too:
 ///   - [`OrderStatusClient`], which the `ExecutionManager` requires of every client it runs;
 ///   - [`BracketOrderClient`]
 ///   - [`ShortabilityClient`]
@@ -190,6 +192,12 @@ impl<'a> ClientInstrument<'a> {
 ///     whoever placed the order.
 ///   - **Leave `resume` alone.** Filtering a [`TradesRead`] keeps its `resume` as it was: it marks
 ///     where the venue's read stopped, not which fills the wrapper kept.
+/// - **Keep state over the fills in [`process_account_events`](Self::process_account_events).**
+///   A wrapper that tracks what the engine holds, attributes fills, or acts on each one needs to
+///   see each fill once. `account_stream` and `fetch_trades` overlap on purpose, around a
+///   reconnect, so a fill can pass through both; `process_account_events` sees it once, after the
+///   engine's `ExecutionManager` drops the copy, with the recovered fills and the snapshot in
+///   order. A rule that only withholds fills can stay on the two paths above.
 /// - **One inner client per engine.** A wrapper that owns one client counts as that one client.
 ///   Two clients on one account whose account streams both reach one engine deliver every fill
 ///   twice.
@@ -301,6 +309,13 @@ impl<'a> ClientInstrument<'a> {
 ///     }
 ///
 ///     // Everything else is forwarded unchanged.
+///
+///     fn process_account_events(
+///         &self,
+///         events: BoxStream<'static, UnindexedAccountEvent>,
+///     ) -> BoxStream<'static, UnindexedAccountEvent> {
+///         self.inner.process_account_events(events)
+///     }
 ///
 ///     async fn account_snapshot(
 ///         &self,
@@ -497,6 +512,58 @@ where
         assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
     ) -> impl Future<Output = Result<Self::AccountStream, UnindexedClientError>> + Send;
+
+    /// Processes the account events of one open of the account stream, after the engine's
+    /// `ExecutionManager` has dropped the fills it delivered before, and before it indexes them for
+    /// the engine. The default passes them on unchanged.
+    ///
+    /// The manager calls it each time it opens the account stream, the first time and on every
+    /// re-initialisation, with that open's events in the order it delivers them: the fills it read
+    /// for the span the stream was down, an [`AccountEventKind::FillRecoveryGaveUp`] for any span
+    /// it could not read, the [`AccountEventKind::Snapshot`], and then the stream's updates,
+    /// [`AccountEventKind::StreamTerminated`] included. Its own reports of the reconnect
+    /// (`Reconnecting`, [`AccountEventKind::ReinitFailed`]) do not pass through it.
+    ///
+    /// A fill reaches it once, whichever path brought it. [`account_stream`](Self::account_stream)
+    /// does not have that property: the manager opens the stream before it reads the span the
+    /// stream was down, so a fill made during the read arrives both ways, and a venue can replay
+    /// fills when a stream opens. Processing that keeps state over the fills the engine receives
+    /// belongs here (see [Wrapping a client](Self#wrapping-a-client)).
+    ///
+    /// # Contract
+    /// - **Keep the order** of the events passed on: process them with `then`, `flat_map` or
+    ///   `buffered`, not `buffer_unordered`.
+    /// - **End only when `events` ends.** When the returned stream ends, the manager opens the
+    ///   account stream again. Each fill `events` yielded is recorded as seen by then, so one this
+    ///   stage took and did not pass on is not read again.
+    /// - **Retry a step that fails here, with backoff**, such as a REST call to attribute a fill.
+    ///   To give up on a fill, report it as an [`AccountEventKind::FillRecoveryGaveUp`] whose scope
+    ///   is its instrument, whose span is its time, and whose reason is
+    ///   [`FillRecoveryFailure::Processing`]. A fill dropped without a report is lost.
+    /// - **Pass on the events it does not process**, the snapshot included.
+    /// - The manager sets no time limit: a slow step delays every event behind it.
+    ///
+    /// # What the manager does around it
+    /// - Every fill the returned stream yields is recorded as seen, and none is dropped. A fill
+    ///   this stage adds that the venue sends later is then delivered once; one it adds that was
+    ///   delivered before is delivered again.
+    /// - Where the next read of a missed span starts is measured on `events`, so a fill this stage
+    ///   drops or holds does not widen it, and the stage's own delay does not skew it.
+    /// - The returned events are indexed. A snapshot this stage changes so that it no longer
+    ///   indexes is dropped and logged as an error, as is any other event the indexer rejects.
+    /// - Events this stage holds when the manager stops are not delivered.
+    ///
+    /// [`FillRecoveryFailure::Processing`]: crate::fill_recovery::FillRecoveryFailure::Processing
+    /// [`AccountEventKind::FillRecoveryGaveUp`]: crate::AccountEventKind::FillRecoveryGaveUp
+    /// [`AccountEventKind::Snapshot`]: crate::AccountEventKind::Snapshot
+    /// [`AccountEventKind::StreamTerminated`]: crate::AccountEventKind::StreamTerminated
+    /// [`AccountEventKind::ReinitFailed`]: crate::AccountEventKind::ReinitFailed
+    fn process_account_events(
+        &self,
+        events: BoxStream<'static, UnindexedAccountEvent>,
+    ) -> BoxStream<'static, UnindexedAccountEvent> {
+        events
+    }
 
     /// Cancel an order at the venue.
     ///
@@ -992,6 +1059,34 @@ pub trait BorrowCapacityClient: ExecutionClient {
 mod tests {
     use super::*;
     use crate::client::mock::MockExecution;
+    use futures::StreamExt;
+
+    /// The provided stage passes each event on unchanged, in order.
+    #[test]
+    fn the_provided_account_event_stage_passes_events_on_unchanged() {
+        use crate::{AccountEventKind, error::StreamTerminationReason};
+        use rustrade_instrument::exchange::ExchangeId;
+        use std::time::Duration;
+
+        let (_event_tx, event_rx) = tokio::sync::broadcast::channel(1);
+        let (request_tx, _request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = MockExecution::new(ExchangeId::Mock, Utc::now, request_tx, event_rx);
+        let terminated = |secs| UnindexedAccountEvent {
+            exchange: ExchangeId::Mock,
+            kind: AccountEventKind::StreamTerminated(StreamTerminationReason::RateLimited {
+                retry_after: Duration::from_secs(secs),
+            }),
+        };
+        let events = vec![terminated(1), terminated(2)];
+
+        let processed = futures::executor::block_on(
+            client
+                .process_account_events(futures::stream::iter(events.clone()).boxed())
+                .collect::<Vec<_>>(),
+        );
+
+        assert_eq!(processed, events);
+    }
 
     #[test]
     fn mock_supports_only_the_kinds_it_can_model() {

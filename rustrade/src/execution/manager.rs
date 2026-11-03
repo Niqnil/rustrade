@@ -20,7 +20,7 @@ use rustrade_data::streams::{
     },
 };
 use rustrade_execution::{
-    AccountEvent, AccountEventKind, UnindexedAccountEvent,
+    AccountEvent, AccountEventKind, UnindexedAccountEvent, UnindexedAccountSnapshot,
     client::{ExecutionClient, OrderStatusClient, dedup::AccountEventDeduper},
     error::{
         AccountReinitFailure, AccountStreamInitError, ConnectivityError, NotPlacedReason,
@@ -39,6 +39,7 @@ use rustrade_execution::{
 use rustrade_instrument::{
     asset::{AssetIndex, name::AssetNameExchange},
     exchange::{ExchangeId, ExchangeIndex},
+    index::error::IndexError,
     instrument::{InstrumentIndex, name::InstrumentNameExchange},
 };
 use rustrade_integration::{
@@ -282,6 +283,11 @@ where
     /// across re-initialisations, with the 10,000 most recent kept. An order that ended without a
     /// fill in the gap is the snapshot's to show, as before.
     ///
+    /// Each open's events then pass through `client`'s
+    /// [`ExecutionClient::process_account_events`], in order, before they are indexed: the read's
+    /// fills and gaps, the snapshot and the stream's updates. Its rustdoc says what the manager
+    /// does around it.
+    ///
     /// # Errors
     /// [`ExecutionError::Config`] if `client` and `indexer` are for different exchanges, and
     /// [`ExecutionError::AccountStreamInit`] if the first attempt to initialise the AccountStream
@@ -341,16 +347,11 @@ where
                 // opens, so the span runs from the last event delivered to the moment it reads.
                 let last = *watermark.lock();
 
-                // Initialise AccountStream & apply indexing. Opened before the read, so a fill
+                // Initialise the AccountStream, deduplicated. Opened before the read, so a fill
                 // made during it arrives on the stream.
-                let updates = Self::init_indexed_account_stream(
-                    &client,
-                    indexer.clone(),
-                    &deduper,
-                    &assets,
-                    &instruments,
-                )
-                .await?;
+                let updates =
+                    Self::init_account_stream(&client, &indexer, &deduper, &assets, &instruments)
+                        .await?;
 
                 // Fills missed while the stream was down, before the snapshot that follows them.
                 let missed = match last {
@@ -391,18 +392,14 @@ where
                 };
                 // Deduplicated as each is delivered, so a read dropped part-way marks none of
                 // the fills it did not deliver.
-                let missed = Self::index_account_stream(
-                    futures::stream::iter(missed).filter({
-                        let deduper = deduper.clone();
-                        move |event| std::future::ready(!deduper.is_duplicate(event))
-                    }),
-                    indexer.clone(),
-                );
+                let missed = futures::stream::iter(missed).filter({
+                    let deduper = deduper.clone();
+                    move |event| std::future::ready(!deduper.is_duplicate(event))
+                });
 
-                // Fetch AccountSnapshot & index
+                // Fetch the AccountSnapshot, checked to index, so one that cannot fails the open
                 let snapshot =
-                    Self::fetch_indexed_account_snapshot(&client, &indexer, &assets, &instruments)
-                        .await?;
+                    Self::fetch_account_snapshot(&client, &indexer, &assets, &instruments).await?;
 
                 // Nothing delivered counts until it is delivered: the watermark moves as events
                 // pass, so an attempt that fails above leaves it where it was.
@@ -410,9 +407,10 @@ where
                     .lock()
                     .get_or_insert(Watermark::opened(opened.0, opened.1));
 
-                // It's expected downstream consumers (eg/ EngineState will sync updates)
-                // Boxed: the chain is named by every layer above it, once per client type.
-                Ok(missed
+                // The watermark is sampled before the client's stage: what the venue sent, as
+                // it arrived. A fill the stage drops or holds does not widen the next read, and
+                // the stage's own delay does not skew the estimate of the venue's clock.
+                let received = missed
                     .chain(futures::stream::once(std::future::ready(snapshot)))
                     .chain(updates)
                     .inspect(move |event| {
@@ -421,7 +419,18 @@ where
                             watermark.delivered(now, instant, event, &fill_recovery);
                         }
                     })
-                    .boxed())
+                    .boxed();
+
+                // Every fill the stage passes on is recorded as seen, none dropped: one it added
+                // that the venue sends later is then delivered once.
+                let processed = client.process_account_events(received).inspect({
+                    let deduper = deduper.clone();
+                    move |event| deduper.record(event)
+                });
+
+                // It's expected downstream consumers (eg/ EngineState will sync updates)
+                // Boxed: the chain is named by every layer above it, once per client type.
+                Ok(Self::index_account_stream(processed, indexer).boxed())
             }
         })
         .await?;
@@ -490,55 +499,73 @@ where
         }
     }
 
-    async fn fetch_indexed_account_snapshot(
+    /// The account snapshot, unindexed for the client's stage, once it is known to index: one that
+    /// cannot fails the open, which is retried.
+    async fn fetch_account_snapshot(
         client: &Arc<Client>,
         indexer: &AccountEventIndexer,
         assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
-    ) -> Result<AccountEvent, AccountStreamInitError> {
+    ) -> Result<UnindexedAccountEvent, AccountStreamInitError> {
         match client.account_snapshot(assets, instruments).await {
             Ok(snapshot) => {
-                let partitioned = indexer.snapshot_partitioned(snapshot)?;
-                let (indexed_snapshot, untracked) = (partitioned.snapshot, partitioned.untracked);
-                let untracked: Vec<&str> = untracked
-                    .iter()
-                    .map(|asset| asset.name().as_str())
-                    .collect();
-                if !untracked.is_empty() {
-                    if indexed_snapshot.balances.is_empty() {
-                        // Every balance was dropped: more likely the asset names do not match
-                        // the venue's than an account holding only unregistered assets, though
-                        // that is possible too.
-                        error!(
-                            ?untracked,
-                            "Account snapshot kept no balance: none of its assets is registered \
-                             in the ExecutionInstrumentMap"
-                        );
-                    } else {
-                        warn!(
-                            ?untracked,
-                            "Account snapshot balances dropped for assets the \
-                             ExecutionInstrumentMap does not register"
-                        );
-                    }
-                }
-                Ok(AccountEvent {
-                    exchange: indexer.map.exchange.key,
-                    kind: AccountEventKind::Snapshot(indexed_snapshot),
+                // A copy, as the snapshot is indexed again after the stage: once per open.
+                indexer.snapshot_partitioned(snapshot.clone())?;
+                Ok(UnindexedAccountEvent {
+                    exchange: indexer.map.exchange.value,
+                    kind: AccountEventKind::Snapshot(snapshot),
                 })
             }
             Err(error) => Err(AccountStreamInitError::Client(indexer.client_error(error))),
         }
     }
 
-    async fn init_indexed_account_stream(
+    /// Indexes an account snapshot, dropping and logging the balances of assets the map does not
+    /// register.
+    fn index_snapshot(
+        indexer: &AccountEventIndexer,
+        snapshot: UnindexedAccountSnapshot,
+    ) -> Result<AccountEvent, IndexError> {
+        let partitioned = indexer.snapshot_partitioned(snapshot)?;
+        let (indexed_snapshot, untracked) = (partitioned.snapshot, partitioned.untracked);
+        let untracked: Vec<&str> = untracked
+            .iter()
+            .map(|asset| asset.name().as_str())
+            .collect();
+        if !untracked.is_empty() {
+            if indexed_snapshot.balances.is_empty() {
+                // Every balance was dropped: more likely the asset names do not match the
+                // venue's than an account holding only unregistered assets, though that is
+                // possible too.
+                error!(
+                    ?untracked,
+                    "Account snapshot kept no balance: none of its assets is registered in the \
+                     ExecutionInstrumentMap"
+                );
+            } else {
+                warn!(
+                    ?untracked,
+                    "Account snapshot balances dropped for assets the ExecutionInstrumentMap \
+                     does not register"
+                );
+            }
+        }
+        Ok(AccountEvent {
+            exchange: indexer.map.exchange.key,
+            kind: AccountEventKind::Snapshot(indexed_snapshot),
+        })
+    }
+
+    async fn init_account_stream(
         client: &Arc<Client>,
-        indexer: AccountEventIndexer,
+        indexer: &AccountEventIndexer,
         deduper: &AccountEventDeduper,
         assets: &[AssetNameExchange],
         instruments: &[InstrumentNameExchange],
-    ) -> Result<impl Stream<Item = AccountEvent> + use<RequestStream, Client>, AccountStreamInitError>
-    {
+    ) -> Result<
+        impl Stream<Item = UnindexedAccountEvent> + use<RequestStream, Client>,
+        AccountStreamInitError,
+    > {
         let stream = match client.account_stream(assets, instruments).await {
             Ok(stream) => stream,
             Err(error) => {
@@ -546,27 +573,35 @@ where
             }
         };
 
-        // Deduplicated before indexing: the deduper keys on the venue's own names, and a fill the
-        // stream repeats from the read, or from an earlier stream, is dropped here.
+        // Deduplicated before the client's stage and indexing: the deduper keys on the venue's
+        // own names, and a fill the stream repeats from the read, or from an earlier stream, is
+        // dropped here.
         let deduper = deduper.clone();
-        Ok(Self::index_account_stream(
-            stream.filter(move |event| std::future::ready(!deduper.is_duplicate(event))),
-            indexer,
-        ))
+        Ok(stream.filter(move |event| std::future::ready(!deduper.is_duplicate(event))))
     }
 
     /// Index an unindexed account stream, logging and dropping each event the indexer rejects.
     ///
     /// A balance for an asset the map does not register is not a rejection: the first one per
     /// asset is a `warn!`, naming the asset, and later ones are `debug!`. The set of warned assets
-    /// belongs to the stream, so a reconnected stream warns again.
+    /// belongs to the stream, so a reconnected stream warns again. In a snapshot, such balances
+    /// are dropped and the snapshot kept, as [`index_snapshot`](Self::index_snapshot) logs.
     fn index_account_stream(
         stream: impl Stream<Item = UnindexedAccountEvent>,
         indexer: AccountEventIndexer,
     ) -> impl Stream<Item = AccountEvent> {
         let mut warned = FnvHashSet::<AssetNameExchange>::default();
         stream.filter_map(move |event| {
-            std::future::ready(match indexer.index_account_event(event) {
+            let indexed = match event.kind {
+                AccountEventKind::Snapshot(snapshot) => {
+                    Self::index_snapshot(&indexer, snapshot).map_err(AccountIndexError::Rejected)
+                }
+                kind => indexer.index_account_event(UnindexedAccountEvent {
+                    exchange: event.exchange,
+                    kind,
+                }),
+            };
+            std::future::ready(match indexed {
                 Ok(indexed_event) => Some(indexed_event),
                 Err(AccountIndexError::UntrackedBalance(asset)) => {
                     if warned.contains(&asset) {
@@ -1414,6 +1449,23 @@ mod tests {
         >,
         /// The span of each `fetch_trades` call.
         fetched: Arc<std::sync::Mutex<Vec<(DateTime<Utc>, DateTime<Utc>)>>>,
+        /// What `process_account_events` does; the identity when unset.
+        stage: Option<Stage>,
+    }
+
+    type Events = BoxStream<'static, UnindexedAccountEvent>;
+
+    type StageFn = dyn Fn(Events) -> Events + Send + Sync;
+
+    /// A client's stage over each open's account events, as a test sets it.
+    #[derive(Clone)]
+    struct Stage(Arc<StageFn>);
+
+    /// Manual because a closure is not [`Debug`].
+    impl std::fmt::Debug for Stage {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("Stage")
+        }
     }
 
     impl ExecutionClient for FlakyAccountClient {
@@ -1519,6 +1571,16 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_else(|| Ok(TradesRead::complete(Vec::new())))
+        }
+
+        fn process_account_events(
+            &self,
+            events: BoxStream<'static, UnindexedAccountEvent>,
+        ) -> BoxStream<'static, UnindexedAccountEvent> {
+            match &self.stage {
+                Some(stage) => (stage.0)(events),
+                None => events,
+            }
         }
     }
 
@@ -1648,12 +1710,26 @@ mod tests {
     fn describe(event: &AccountStreamEvent) -> String {
         match event {
             AccountStreamEvent::Reconnecting(_) => "reconnecting".to_owned(),
-            AccountStreamEvent::Item(event) => match &event.kind {
-                AccountEventKind::Snapshot(_) => "snapshot".to_owned(),
-                AccountEventKind::Trade(trade) => format!("trade {}", trade.id.0),
-                AccountEventKind::FillRecoveryGaveUp(gap) => format!("gap {}", gap.reason),
-                other => format!("{other:?}"),
-            },
+            AccountStreamEvent::Item(event) => describe_kind(&event.kind),
+        }
+    }
+
+    /// As [`describe`], for an event before it is indexed: what a client's stage sees.
+    fn describe_unindexed(event: &UnindexedAccountEvent) -> String {
+        describe_kind(&event.kind)
+    }
+
+    fn describe_kind<ExchangeKey, AssetKey, InstrumentKey>(
+        kind: &AccountEventKind<ExchangeKey, AssetKey, InstrumentKey>,
+    ) -> String
+    where
+        AccountEventKind<ExchangeKey, AssetKey, InstrumentKey>: std::fmt::Debug,
+    {
+        match kind {
+            AccountEventKind::Snapshot(_) => "snapshot".to_owned(),
+            AccountEventKind::Trade(trade) => format!("trade {}", trade.id.0),
+            AccountEventKind::FillRecoveryGaveUp(gap) => format!("gap {}", gap.reason),
+            other => format!("{other:?}"),
         }
     }
 
@@ -1771,6 +1847,135 @@ mod tests {
             panic!("one read")
         };
         assert!(start > opened, "{start} is not after the open at {opened}");
+    }
+
+    /// A client's stage sees each open's events once, in order: the read's fills, the snapshot,
+    /// then the stream's updates, with the fill the stream repeats from the read already dropped.
+    /// The manager's own reports of the reconnect do not pass through it.
+    #[tokio::test]
+    async fn the_clients_stage_sees_each_opens_events_once_in_order() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let client = FlakyAccountClient {
+            open_from: 1,
+            live: vec![live_trade("b", 20), live_trade("c", 30)],
+            reads: Arc::new(std::sync::Mutex::new(
+                [Ok(TradesRead::complete(vec![
+                    missed_trade("b", 20),
+                    missed_trade("a", 10),
+                ]))]
+                .into(),
+            )),
+            stage: Some(Stage(Arc::new({
+                let seen = Arc::clone(&seen);
+                move |events| {
+                    let open = {
+                        let mut seen = seen.lock().unwrap();
+                        seen.push(Vec::new());
+                        seen.len() - 1
+                    };
+                    let seen = Arc::clone(&seen);
+                    events
+                        .inspect(move |event| {
+                            seen.lock().unwrap()[open].push(describe_unindexed(event));
+                        })
+                        .boxed()
+                }
+            }))),
+            ..FlakyAccountClient::default()
+        };
+        let Ok(manager) = init_flaky_recovering(client, at_clock(100)).await else {
+            panic!("the first attempt succeeds, so init should too");
+        };
+
+        let events = manager.account_stream.take(6).collect::<Vec<_>>().await;
+
+        assert_eq!(
+            events.iter().map(describe).collect::<Vec<_>>(),
+            [
+                "snapshot",
+                "reconnecting",
+                "trade a",
+                "trade b",
+                "snapshot",
+                "trade c",
+            ]
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                vec!["snapshot"],
+                vec!["trade a", "trade b", "snapshot", "trade c"],
+            ]
+        );
+    }
+
+    /// A fill the client's stage adds is recorded as seen, so when the venue sends it later the
+    /// consumer gets it once.
+    #[tokio::test]
+    async fn a_fill_the_clients_stage_adds_is_not_delivered_again_when_the_venue_sends_it() {
+        let client = FlakyAccountClient {
+            live: vec![live_trade("z", 5), live_trade("c", 30)],
+            stage: Some(Stage(Arc::new(|events| {
+                events
+                    .flat_map(|event| {
+                        let events = match event.kind {
+                            AccountEventKind::Snapshot(_) => vec![event, live_trade("z", 5)],
+                            _ => vec![event],
+                        };
+                        futures::stream::iter(events)
+                    })
+                    .boxed()
+            }))),
+            ..FlakyAccountClient::default()
+        };
+        let Ok(manager) = init_flaky(client).await else {
+            panic!("the first attempt succeeds, so init should too");
+        };
+
+        let events = manager.account_stream.take(3).collect::<Vec<_>>().await;
+
+        assert_eq!(
+            events.iter().map(describe).collect::<Vec<_>>(),
+            ["snapshot", "trade z", "trade c"]
+        );
+    }
+
+    /// The watermark is sampled before the client's stage: a fill the stage drops still sets the
+    /// venue's clock for the next read. The host's clock is 190 s ahead of the venue's, so a read
+    /// placed without the fill would start past it, 32 s before the host's time.
+    #[tokio::test]
+    async fn the_read_is_placed_by_a_fill_received_even_if_the_stage_drops_it() {
+        let client = FlakyAccountClient {
+            open_from: 1,
+            ending: vec![live_trade("x", 10)],
+            stage: Some(Stage(Arc::new(|events| {
+                events
+                    .filter(|event| {
+                        std::future::ready(!matches!(event.kind, AccountEventKind::Trade(_)))
+                    })
+                    .boxed()
+            }))),
+            ..FlakyAccountClient::default()
+        };
+        let fetched = Arc::clone(&client.fetched);
+        let Ok(manager) = init_flaky_recovering(client, at_clock(200)).await else {
+            panic!("the first attempt succeeds, so init should too");
+        };
+
+        let events = manager.account_stream.take(3).collect::<Vec<_>>().await;
+
+        assert_eq!(
+            events.iter().map(describe).collect::<Vec<_>>(),
+            ["snapshot", "reconnecting", "snapshot"]
+        );
+        let fill = DateTime::<Utc>::from_timestamp(1_800_000_010, 0).unwrap();
+        let [(start, _)] = fetched.lock().unwrap().clone()[..] else {
+            panic!("one read")
+        };
+        assert!(
+            start <= fill,
+            "the read starts at {start}, after the fill at {fill}"
+        );
     }
 
     /// A host clock 190 s ahead of the venue's, far beyond the 30 s allowance, still reads the
@@ -2211,9 +2416,14 @@ mod tests {
         })
     }
 
-    /// Fetch the indexed account snapshot of a client holding balances for `held`, with the map
-    /// registering `btc` and `usdt` only: `(kept, warn, debug, error)`, the balances kept and the logs.
+    /// Fetch the account snapshot of a client holding balances for `held`, and index it, with the
+    /// map registering `btc` and `usdt` only: `(kept, warn, debug, error)`, the balances kept and
+    /// the logs.
     fn snapshot_balances_kept(held: &[&str]) -> (usize, usize, usize, usize) {
+        type Manager = ExecutionManager<
+            futures::stream::Pending<ExecutionRequest<ExchangeIndex, InstrumentIndex>>,
+            FlakyAccountClient,
+        >;
         let instruments = IndexedInstruments::new(vec![instrument(EXCHANGE, "btc", "usdt")]);
         let map = generate_execution_instrument_map(&instruments, EXCHANGE).unwrap();
         let indexer = AccountEventIndexer::new(Arc::new(map));
@@ -2222,14 +2432,18 @@ mod tests {
             ..Default::default()
         });
         with_log_counts(|| {
-            let event = futures::executor::block_on(ExecutionManager::<
-                futures::stream::Pending<ExecutionRequest<ExchangeIndex, InstrumentIndex>>,
-                FlakyAccountClient,
-            >::fetch_indexed_account_snapshot(
-                &client, &indexer, &[], &[]
+            let event = futures::executor::block_on(Manager::fetch_account_snapshot(
+                &client,
+                &indexer,
+                &[],
+                &[],
             ))
             .unwrap();
             let AccountEventKind::Snapshot(snapshot) = event.kind else {
+                panic!("expected a snapshot");
+            };
+            let indexed = Manager::index_snapshot(&indexer, snapshot).unwrap();
+            let AccountEventKind::Snapshot(snapshot) = indexed.kind else {
                 panic!("expected a snapshot");
             };
             snapshot.balances.len()

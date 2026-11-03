@@ -128,6 +128,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `rustrade_execution::client::mock::request_borrow_capacity` is the request `MockExecution`
     sends, for a caller holding a mock exchange's request channel.
 
+- **A client can process the account events the engine receives, each fill once**
+  (`rustrade-execution`, `rustrade`, #835). A wrapper that keeps state over the fills, such as one
+  that attributes them or tracks what the engine holds, had only `account_stream` and
+  `fetch_trades` to work on. Those two paths overlap on purpose around a reconnect, so the wrapper
+  saw some fills twice, and had to deduplicate and order them itself.
+  - New provided method `ExecutionClient::process_account_events`, a stage over each open of the
+    account stream. The `ExecutionManager` calls it on every open with that open's events after it
+    has dropped repeated fills: the fills read for the span the stream was down, any gap, the
+    snapshot, then the stream's updates. The default passes them on unchanged. Its rustdoc states
+    the contract: keep the order, end only when the input ends, retry inside the stage, and report
+    a fill given up on as a gap scoped to it rather than drop it.
+  - New `FillRecoveryFailure::Processing`, the reason for such a gap.
+  - New `AccountEventDeduper::record`, which marks a fill as seen without asking whether it was.
+    The manager records every fill the stage passes on, so a fill the stage adds, which the venue
+    sends later, is delivered once.
+  - A wrapping client must forward `process_account_events` to its inner client, as it forwards
+    the other provided methods.
+
 ### Changed
 
 - **The simulated venue's charge on a new loan names the order that took it, and that order's
@@ -143,6 +161,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `paper_venues`** (`rustrade`, #844). Code that builds one of them as a literal, or destructures
   one without `..`, must name it. `SystemBuild::new` takes the `ExecutionBuild`'s `paper_venues`
   after `execution_build_futures`.
+
+- **The `ExecutionManager` places its next missed-fill read from the events it receives, before
+  the client's stage** (`rustrade`, #835). A fill the stage drops or holds still counts, and the
+  stage's own delay does not skew the estimate of the venue's clock. The account snapshot is
+  still checked to index when the stream opens, so one that cannot still fails the open, and it
+  is indexed after the stage.
 
 ## [0.20.0] - 2026-11-02
 
