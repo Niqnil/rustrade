@@ -1,5 +1,8 @@
 use crate::{
-    engine::{clock::EngineClock, execution_tx::MultiExchangeTxMap, in_flight::InFlightDeadlines},
+    engine::{
+        clock::EngineClock, execution_tx::MultiExchangeTxMap, in_flight::InFlightDeadlines,
+        state::position::EngineCheckpoint,
+    },
     error::BarterError,
     execution::{
         AccountStreamEvent, Execution,
@@ -218,7 +221,9 @@ impl<'a> ExecutionBuilder<'a> {
     ///   fill a bar releases ahead of the bar itself, which a live feed shared with a running
     ///   `Engine` cannot do, so the venue would not behave as its backtest does.
     /// - `options.account_stream_capacity` is zero.
-    /// - `options` carry a checkpoint of another exchange, one whose engine and venue halves hold
+    /// - `options` carry a checkpoint in another
+    ///   [format version](crate::engine::state::position::EngineCheckpoint::version), or of another
+    ///   exchange, or one whose engine and venue halves hold
     ///   different positions on a cash-settled instrument (see
     ///   [`EngineCheckpoint::check_positions_agree`](crate::engine::state::position::EngineCheckpoint::check_positions_agree)),
     ///   or one [`SimulatedVenue::from_snapshot`](rustrade_execution::exchange::mock::SimulatedVenue::from_snapshot)
@@ -251,13 +256,21 @@ impl<'a> ExecutionBuilder<'a> {
             account_stream_capacity,
             checkpoint,
         } = options;
-        if let Some(checkpoint) = &checkpoint
-            && checkpoint.exchange() != exchange
-        {
-            return Err(BarterError::ExecutionBuilder(format!(
-                "paper venue {exchange} given a checkpoint of {}",
-                checkpoint.exchange()
-            )));
+        if let Some(checkpoint) = &checkpoint {
+            if checkpoint.version() != EngineCheckpoint::VERSION {
+                return Err(BarterError::ExecutionBuilder(format!(
+                    "paper venue {exchange} given a checkpoint in format version {}; this release \
+                     restores version {}",
+                    checkpoint.version(),
+                    EngineCheckpoint::VERSION
+                )));
+            }
+            if checkpoint.exchange() != exchange {
+                return Err(BarterError::ExecutionBuilder(format!(
+                    "paper venue {exchange} given a checkpoint of {}",
+                    checkpoint.exchange()
+                )));
+            }
         }
         if account_stream_capacity == 0 {
             return Err(BarterError::ExecutionBuilder(format!(

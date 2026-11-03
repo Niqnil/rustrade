@@ -49,6 +49,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     positions on a cash-settled instrument (`EngineCheckpoint::check_positions_agree`).
   - A restored position is checked like a seed, with the new `PositionSeedError::UnknownAsset`
     for an asset the engine does not have.
+  - An `EngineCheckpoint` carries one format version for both halves (`EngineCheckpoint::VERSION`,
+    `version()`), and `add_paper` refuses another. Build one with `EngineCheckpoint::new`. Fields
+    a later release adds read with defaults from an older checkpoint.
+  - New `rustrade_execution::stored`: read a saved checkpoint or venue snapshot as a
+    `Stored<T>` and call `into_current()` to be told the version it was written in
+    (`StoredFormatError::UnsupportedVersion`) even when a later format changed its shape, which
+    reading `T` itself reports only as a parse error. It needs a self-describing format such as
+    JSON. Both types implement the new `FormatVersion` trait.
   - `Position`, `CashFlow` and the types they hold now also derive `Eq`, `Ord` and `Hash` where
     they did not, so a checkpoint can be an engine output.
 - **The simulated venue can value each asset over a recent window of its price when it lends**

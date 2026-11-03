@@ -126,6 +126,7 @@ pub mod shortability;
 pub mod slippage;
 pub use shortability::{Shortability, ShortabilityProvider, ShortabilityTable};
 pub use slippage::{SlippageConfig, SlippageConfigError};
+pub mod stored;
 pub mod trade;
 
 /// Convenient type alias for an [`AccountEvent`] keyed with [`ExchangeId`],

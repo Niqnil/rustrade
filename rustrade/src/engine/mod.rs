@@ -497,10 +497,10 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 if let AccountEventKind::VenueCheckpoint(venue) = &event.kind {
                     // Every account event the venue sent before this one is applied, so the
                     // engine's positions are those the venue's snapshot holds.
-                    return UpdateFromAccountOutput::Checkpoint(Box::new(EngineCheckpoint {
-                        venue: (**venue).clone(),
-                        positions: self.state.position_checkpoints(event.exchange),
-                    }));
+                    return UpdateFromAccountOutput::Checkpoint(Box::new(EngineCheckpoint::new(
+                        (**venue).clone(),
+                        self.state.position_checkpoints(event.exchange),
+                    )));
                 }
                 let AccountEventKind::Snapshot(snapshot) = &event.kind else {
                     return UpdateFromAccountOutput::None;

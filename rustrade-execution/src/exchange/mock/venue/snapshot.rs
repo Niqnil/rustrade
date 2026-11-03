@@ -7,6 +7,7 @@ use crate::{
     client::mock::MockExecutionConfig,
     exchange::mock::account::{AccountState, AccountStateSnapshot, DuplicateSeededOrder},
     slippage::Slippage,
+    stored::FormatVersion,
 };
 use chrono::{DateTime, Utc};
 use fnv::FnvHashMap;
@@ -62,8 +63,12 @@ use thiserror::Error;
 /// Carries a format [`version`](Self::version). Fields a later release adds are read with defaults
 /// from an older snapshot. A change an older snapshot cannot be read under raises the version, and
 /// [`SimulatedVenue::from_snapshot`] refuses a version other than
-/// [`VERSION`](Self::VERSION). A snapshot whose shape this release cannot parse fails in the
-/// deserialiser instead, before it reaches the venue.
+/// [`VERSION`](Self::VERSION).
+///
+/// A snapshot whose shape this release cannot parse fails in the deserialiser, before it reaches
+/// the venue. Read one as a [`Stored`](crate::stored::Stored) snapshot to be told the version it
+/// was written in instead.
+///
 /// `Ord` and `Hash` exist so it can sit in an engine output, which requires them, and are not a
 /// meaningful ranking.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
@@ -77,6 +82,9 @@ pub struct SimulatedVenueSnapshot {
     /// Sorted by instrument.
     positions: Vec<(InstrumentNameExchange, NetPosition)>,
     order_sequence: u64,
+    /// Written as a string: a number this wide does not survive every reader, such as a
+    /// [`Stored`](crate::stored::Stored) snapshot read from JSON.
+    #[serde(with = "u128_as_string")]
     order_id_start: u128,
     trade_sequence: u64,
     cash_flow_sequence: u64,
@@ -196,6 +204,30 @@ pub enum VenueRestoreError {
     /// The snapshot lists one asset twice among its balances, or among the debt it last reported.
     #[error("venue snapshot lists {0} twice")]
     DuplicateAsset(AssetNameExchange),
+}
+
+impl FormatVersion for SimulatedVenueSnapshot {
+    const VERSION: u32 = Self::VERSION;
+
+    fn format_version(&self) -> u32 {
+        self.version
+    }
+}
+
+/// A `u128` written as a decimal string.
+mod u128_as_string {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub(super) fn serialize<S: Serializer>(value: &u128, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(value)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<u128, D::Error> {
+        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
+        text.parse().map_err(D::Error::custom)
+    }
 }
 
 /// The first item `items` yields that an earlier one equals.

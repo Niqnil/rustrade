@@ -2,7 +2,11 @@
 //! would, and a snapshot that does not fit the venue being restored is refused.
 
 use super::*;
-use crate::{exchange::mock::account::DuplicateSeededOrder, slippage::SlippageConfig};
+use crate::{
+    exchange::mock::account::DuplicateSeededOrder,
+    slippage::SlippageConfig,
+    stored::{Stored, StoredFormatError},
+};
 
 /// A margin account lending up to 3x in USDT, with an hour's borrow price window and seeded
 /// slippage, holding 1 BTC and 100,000 USDT.
@@ -287,6 +291,82 @@ fn a_snapshot_of_another_version_is_refused() {
             found: SimulatedVenueSnapshot::VERSION + 1,
             supported: SimulatedVenueSnapshot::VERSION,
         }
+    );
+}
+
+/// `json` read as a stored snapshot.
+fn stored(json: serde_json::Value) -> Result<SimulatedVenueSnapshot, StoredFormatError> {
+    serde_json::from_value::<Stored<SimulatedVenueSnapshot>>(json)
+        .unwrap()
+        .into_current()
+}
+
+#[test]
+fn a_stored_snapshot_reads_back_and_one_of_another_version_is_refused_whatever_its_shape() {
+    let snapshot = venue_mid_run().snapshot();
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(stored(json.clone()), Ok(snapshot));
+
+    // The widest order id a venue can start from survives the stored read.
+    let mut wide = json.clone();
+    wide["order_id_start"] = serde_json::json!(u128::MAX.to_string());
+    assert_eq!(
+        stored(wide.clone()),
+        Ok(serde_json::from_value::<SimulatedVenueSnapshot>(wide).unwrap())
+    );
+
+    let unsupported = Err(StoredFormatError::UnsupportedVersion {
+        found: SimulatedVenueSnapshot::VERSION + 1,
+        supported: SimulatedVenueSnapshot::VERSION,
+    });
+    let mut later = json.clone();
+    later["version"] = serde_json::json!(SimulatedVenueSnapshot::VERSION + 1);
+    assert_eq!(stored(later.clone()), unsupported, "same shape");
+    later["account"] = serde_json::json!(["a later shape"]);
+    assert_eq!(stored(later), unsupported, "another shape");
+
+    let mut edited = json;
+    edited["account"] = serde_json::json!(["not this version's shape"]);
+    assert_eq!(
+        stored(edited),
+        Err(StoredFormatError::Malformed {
+            version: SimulatedVenueSnapshot::VERSION
+        })
+    );
+}
+
+/// A field a later release added reads with its default from a snapshot written before it: here
+/// a trade's `order_filled_quantity`, which older trades do not carry.
+#[test]
+fn an_older_snapshot_without_a_later_field_restores_with_its_default() {
+    let mut json = serde_json::to_value(venue_mid_run().snapshot()).unwrap();
+    let trades = json["account"]["trades"].as_array_mut().unwrap();
+    assert!(!trades.is_empty(), "the sell traded");
+    for trade in trades.iter_mut() {
+        assert!(
+            trade
+                .as_object_mut()
+                .unwrap()
+                .remove("order_filled_quantity")
+                .is_some()
+        );
+    }
+
+    let restored = SimulatedVenue::from_snapshot(
+        &margin_window_config(),
+        spot_instruments(),
+        stored(json).unwrap(),
+    )
+    .unwrap();
+    let trades = restored
+        .account
+        .trades(DateTime::<Utc>::MIN_UTC)
+        .collect::<Vec<_>>();
+    assert!(!trades.is_empty());
+    assert!(
+        trades
+            .iter()
+            .all(|trade| trade.order_filled_quantity.is_none())
     );
 }
 

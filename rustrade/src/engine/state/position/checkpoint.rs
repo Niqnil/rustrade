@@ -4,7 +4,9 @@
 use super::{AssetCarry, OmsMode, Position, PositionId, PositionManager, PositionSeedError};
 use crate::engine::state::{EngineState, asset::AssetStates};
 use rust_decimal::Decimal;
-use rustrade_execution::{exchange::mock::venue::VenueCheckpoint, trade::AssetFees};
+use rustrade_execution::{
+    exchange::mock::venue::VenueCheckpoint, stored::FormatVersion, trade::AssetFees,
+};
 use rustrade_instrument::{
     Side,
     asset::{AssetIndex, ExchangeAsset, name::AssetNameInternal},
@@ -38,10 +40,23 @@ use thiserror::Error;
 /// venue opens its account stream with a snapshot listing its open orders, which the engine takes
 /// up as it does on any connect. Statistics and tear sheets start afresh from the restore.
 ///
+/// # Saving and reading it back
+/// Serialise it whole, in any serde format. It carries one format [`version`](Self::version) for
+/// both halves, which changes whenever either half's format does; `add_paper` refuses a
+/// checkpoint of another version. Fields a later release adds are read with defaults from an
+/// older checkpoint.
+///
+/// A checkpoint whose shape a later format changed fails in the deserialiser, without saying why.
+/// In a self-describing format such as JSON, read it as a
+/// [`Stored`](rustrade_execution::stored::Stored) checkpoint and call
+/// [`into_current`](rustrade_execution::stored::Stored::into_current), which reports the version
+/// it was written in instead.
+///
 /// `Ord` and `Hash` exist so it can sit in an [`EngineOutput`](crate::engine::EngineOutput), which
 /// requires them, and are not a meaningful ranking.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct EngineCheckpoint {
+    version: u32,
     /// The venue's state at the checkpoint.
     pub venue: VenueCheckpoint,
     /// The engine's open positions on the venue's instruments at the checkpoint, in instrument
@@ -50,6 +65,24 @@ pub struct EngineCheckpoint {
 }
 
 impl EngineCheckpoint {
+    /// The format version this release writes, and the only one it restores.
+    pub const VERSION: u32 = 1;
+
+    /// A checkpoint of `venue` and the engine's `positions` at it, in this release's format
+    /// version.
+    pub fn new(venue: VenueCheckpoint, positions: Vec<PositionCheckpoint>) -> Self {
+        Self {
+            version: Self::VERSION,
+            venue,
+            positions,
+        }
+    }
+
+    /// The format version this checkpoint was written in.
+    pub fn version(&self) -> u32 {
+        self.version
+    }
+
     /// The exchange the venue simulates.
     pub fn exchange(&self) -> ExchangeId {
         self.venue.snapshot.exchange()
@@ -126,6 +159,14 @@ impl EngineCheckpoint {
             return Err(CheckpointMismatch::UnknownVenueInstrument((*name).clone()));
         }
         Ok(())
+    }
+}
+
+impl FormatVersion for EngineCheckpoint {
+    const VERSION: u32 = Self::VERSION;
+
+    fn format_version(&self) -> u32 {
+        self.version
     }
 }
 
@@ -578,10 +619,7 @@ mod tests {
             .position_checkpoints(spot_exchange(instruments));
         // The second, so a test reading the id cannot pass on the first's 1 by chance.
         venue.checkpoint();
-        EngineCheckpoint {
-            venue: venue.checkpoint(),
-            positions,
-        }
+        EngineCheckpoint::new(venue.checkpoint(), positions)
     }
 
     fn short_cfd(quantity: Decimal) -> PositionSeed {
@@ -599,6 +637,46 @@ mod tests {
         assert_eq!(checkpoint.exchange(), ExchangeId::BinanceSpot);
         assert_eq!(checkpoint.id(), 2);
         assert_eq!(checkpoint.check_positions_agree(&instruments), Ok(()));
+    }
+
+    /// A checkpoint reads back as a stored one, and one written before a later position field
+    /// existed reads with that field's default; one of another version is refused with it.
+    #[test]
+    fn a_stored_checkpoint_reads_back_and_an_older_one_takes_a_later_field_s_default() {
+        use rustrade_execution::stored::{Stored, StoredFormatError};
+
+        let instruments = cfd_instruments();
+        let checkpoint = cfd_checkpoint(&instruments, vec![short_cfd(dec!(1))]);
+        assert_eq!(checkpoint.version(), EngineCheckpoint::VERSION);
+        let stored = |json: serde_json::Value| {
+            serde_json::from_value::<Stored<EngineCheckpoint>>(json)
+                .unwrap()
+                .into_current()
+        };
+        let json = serde_json::to_value(&checkpoint).unwrap();
+        assert_eq!(stored(json.clone()), Ok(checkpoint.clone()));
+
+        // `carry_assets` is a later field of a position.
+        let mut older = json.clone();
+        let position = older["positions"][0]["position"].as_object_mut().unwrap();
+        assert!(position.remove("carry_assets").is_some());
+        let read = stored(older).unwrap();
+        assert_eq!(
+            read.positions[0].position.carry_assets,
+            AssetCarry::default()
+        );
+        assert_eq!(read.check_positions_agree(&instruments), Ok(()));
+
+        // A later version is refused, whether it still reads in this shape or not.
+        let unsupported = Err(StoredFormatError::UnsupportedVersion {
+            found: EngineCheckpoint::VERSION + 1,
+            supported: EngineCheckpoint::VERSION,
+        });
+        let mut later = json;
+        later["version"] = serde_json::json!(EngineCheckpoint::VERSION + 1);
+        assert_eq!(stored(later.clone()), unsupported);
+        later["positions"] = serde_json::json!("a later shape");
+        assert_eq!(stored(later), unsupported);
     }
 
     #[test]

@@ -7942,10 +7942,10 @@ fn test_venue_checkpoint_is_answered_with_the_engine_positions() {
     assert_eq!(positions.len(), 1, "the btc_usdt long");
     assert_eq!(
         outputs,
-        vec![EngineOutput::Checkpoint(Box::new(EngineCheckpoint {
-            venue: venue_checkpoint,
-            positions,
-        }))]
+        vec![EngineOutput::Checkpoint(Box::new(EngineCheckpoint::new(
+            venue_checkpoint,
+            positions
+        )))]
     );
     assert_eq!(engine.state, before);
 }

@@ -673,10 +673,7 @@ async fn a_paper_venue_restored_from_its_checkpoint_carries_on_where_it_stopped(
         .find_map(|event| btc_balance(event, btc))
         .unwrap();
     assert_eq!(btc_before.margin.unwrap().borrowed, dec!(5));
-    let checkpoint = EngineCheckpoint {
-        venue: (**checkpoint).clone(),
-        positions: vec![],
-    };
+    let checkpoint = EngineCheckpoint::new((**checkpoint).clone(), vec![]);
 
     // The process restarts later, on a fresh clock.
     let (build, venue, _market_tx) = paper_build_with(
@@ -702,10 +699,7 @@ async fn a_paper_venue_restored_from_its_checkpoint_carries_on_where_it_stopped(
 async fn a_paper_venue_refuses_a_checkpoint_of_another_venue() {
     let instruments = instruments();
     let mut venue = backtest_venue(&margin_config()).1;
-    let checkpoint = EngineCheckpoint {
-        venue: venue.checkpoint(),
-        positions: vec![],
-    };
+    let checkpoint = EngineCheckpoint::new(venue.checkpoint(), vec![]);
     let (_market_tx, market_rx) = futures::channel::mpsc::unbounded::<
         reconnect::Event<ExchangeId, MarketEvent<InstrumentIndex, DataKind>>,
     >();
@@ -734,6 +728,7 @@ async fn a_paper_venue_refuses_a_checkpoint_of_another_venue() {
         spot_margin: None,
         ..margin_config()
     };
+    let checkpoint_v1 = checkpoint.clone();
     let refused = ExecutionBuilder::new(&instruments).add_paper(
         cash,
         PaperOptions::default().with_checkpoint(checkpoint),
@@ -744,4 +739,19 @@ async fn a_paper_venue_refuses_a_checkpoint_of_another_venue() {
         panic!("a margin checkpoint restored as a cash venue is refused");
     };
     assert!(error.to_string().contains("cannot be restored"), "{error}");
+
+    // A checkpoint written in another format version, whose shape still reads in this one.
+    let mut json = serde_json::to_value(&checkpoint_v1).unwrap();
+    json["version"] = serde_json::json!(EngineCheckpoint::VERSION + 1);
+    let other_version: EngineCheckpoint = serde_json::from_value(json).unwrap();
+    let refused = ExecutionBuilder::new(&instruments).add_paper(
+        margin_config(),
+        PaperOptions::default().with_checkpoint(other_version),
+        TokioClock::starting_at(start()),
+        &feed,
+    );
+    let Err(error) = refused else {
+        panic!("a checkpoint of another format version is refused");
+    };
+    assert!(error.to_string().contains("in format version 2"), "{error}");
 }
