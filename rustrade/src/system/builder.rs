@@ -924,6 +924,34 @@ mod tests {
             VenueRole::Both
         );
         assert!(system.engine.in_flight_deadlines().get(paper).is_none());
+        assert_eq!(
+            system.paper_venues.keys().collect::<Vec<_>>(),
+            [&DATA],
+            "only the paper venue has a handle"
+        );
+    }
+
+    /// [`SystemBuild::with_paper_venues`] sets the handles a build carries to its system.
+    #[test]
+    fn a_build_holds_the_paper_venues_it_is_given() {
+        let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
+        let mut system = SystemBuilder::new(SystemArgs {
+            executions: vec![],
+            ..system_args(&instruments)
+        })
+        .paper_venue(
+            mock_execution_config(EXECUTION),
+            PaperOptions::default(),
+            &paper_feed(),
+        )
+        .build::<EngineEvent, _>()
+        .expect("a paper venue must build");
+        let paper_venues = std::mem::take(&mut system.paper_venues);
+        assert_eq!(paper_venues.len(), 1);
+
+        let system = system.with_paper_venues(paper_venues);
+
+        assert_eq!(system.paper_venues.keys().collect::<Vec<_>>(), [&EXECUTION]);
     }
 
     /// A paper venue on an exchange that already has a venue, paper or mock, fails the build

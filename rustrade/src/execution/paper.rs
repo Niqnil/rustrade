@@ -395,4 +395,18 @@ mod tests {
         assert_eq!(tap.size_hint(), (3, Some(3)));
         assert!(format!("{tap:?}").contains("PaperMarketTap"));
     }
+
+    /// A venue handle's `Debug` names its exchange, and leaves out the clock, which has none.
+    #[test]
+    fn a_paper_venue_debugs_as_its_exchange() {
+        let (request_tx, _request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let clock: MockExchangeClock =
+            std::sync::Arc::new(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap());
+        let venue = PaperVenue::new(ExchangeId::BinanceSpot, &request_tx, clock);
+
+        assert_eq!(
+            format!("{venue:?}"),
+            "PaperVenue { exchange: BinanceSpot, .. }"
+        );
+    }
 }
