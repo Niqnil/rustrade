@@ -204,8 +204,8 @@ impl<'a> ExecutionBuilder<'a> {
     ///
     /// The venue holds its state in memory. It starts from `config.initial_state`, unless
     /// `options` carry a [`checkpoint`](PaperOptions::with_checkpoint) taken with
-    /// [`PaperVenue::checkpoint`], when it carries on from that checkpoint's venue half. Restore the
-    /// `Engine`'s positions from the same checkpoint. A venue added with
+    /// [`PaperVenue::checkpoint`], when it carries on from that checkpoint's venue half. Restore
+    /// the `Engine`'s positions from the same checkpoint. A venue added with
     /// [`SystemBuilder::paper_venue`](crate::system::builder::SystemBuilder::paper_venue) has its
     /// positions restored for it.
     ///

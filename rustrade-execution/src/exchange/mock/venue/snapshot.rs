@@ -61,9 +61,9 @@ use thiserror::Error;
 ///
 /// # Versions
 /// Carries a format [`version`](Self::version). In a self-describing format such as JSON, fields a
-/// later release adds are read with defaults from an older snapshot. A change an older snapshot cannot be read under raises the version, and
-/// [`SimulatedVenue::from_snapshot`] refuses a version other than
-/// [`VERSION`](Self::VERSION).
+/// later release adds are read with defaults from an older snapshot. A change an older snapshot
+/// cannot be read under raises the version, and [`SimulatedVenue::from_snapshot`] refuses a
+/// version other than [`VERSION`](Self::VERSION).
 ///
 /// A snapshot whose shape this release cannot parse fails in the deserialiser, before it reaches
 /// the venue. Read one as a [`Stored`](crate::stored::Stored) snapshot to be told the version it

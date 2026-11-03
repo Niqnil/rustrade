@@ -1979,8 +1979,8 @@ pub enum EngineOutput<
     /// Emitted for the
     /// [`VenueCheckpoint`](rustrade_execution::AccountEventKind::VenueCheckpoint) account event,
     /// which only a simulated venue sends, when asked: for a paper venue, by
-    /// [`PaperVenue::checkpoint`](crate::execution::paper::PaperVenue::checkpoint). An engine driven
-    /// by hand reads it off the audit [`process`](Processor::process) returns.
+    /// [`PaperVenue::checkpoint`](crate::execution::paper::PaperVenue::checkpoint). An engine
+    /// driven by hand reads it off the audit [`process`](Processor::process) returns.
     ///
     /// **Boxed**, because a checkpoint holds a venue's whole state and is rare.
     Checkpoint(Box<EngineCheckpoint>),

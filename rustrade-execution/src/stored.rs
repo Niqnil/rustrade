@@ -8,9 +8,9 @@ use thiserror::Error;
 ///
 /// A field added within a version takes `#[serde(default)]`, so a value written before the field
 /// existed still loads in a self-describing format such as JSON. A change an older value cannot
-/// be read under bumps [`VERSION`](Self::VERSION). A value holding another versioned value bumps
-/// its own version whenever the inner one's rises, so that its version alone says whether it
-/// reads.
+/// be read under bumps [`VERSION`](Self::VERSION). An implementer whose value holds another
+/// versioned value must bump its own version whenever the inner one's rises, so that its version
+/// alone says whether it reads: nothing checks this for it.
 pub trait FormatVersion {
     /// The format version this release writes, and the only one it reads.
     const VERSION: u32;

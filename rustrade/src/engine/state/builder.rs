@@ -229,13 +229,13 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
     }
 
     /// Optionally provide open positions exactly as an
-    /// [`EngineCheckpoint`](crate::engine::state::position::EngineCheckpoint) saved them, to restore
-    /// an engine to that checkpoint.
+    /// [`EngineCheckpoint`](crate::engine::state::position::EngineCheckpoint) saved them, to
+    /// restore an engine to that checkpoint.
     ///
     /// Each [`PositionCheckpoint`] is placed in its slot unchanged: its PnL, carry, fees, trades
     /// and the orders that entered it are as they were, so a later fill, cash flow or close treats
-    /// it as the engine that saved it would have. Pass the same checkpoint's venue half to the venue
-    /// being restored, so the two agree.
+    /// it as the engine that saved it would have. Pass the same checkpoint's venue half to the
+    /// venue being restored, so the two agree.
     ///
     /// Validated by [`Self::try_build`] like a [`PositionSeed`]: an unknown instrument or asset, a
     /// slot another restored position or seed already filled, or a non-netting slot under

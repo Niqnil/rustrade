@@ -68,10 +68,11 @@ pub struct EngineCheckpoint {
 impl EngineCheckpoint {
     /// The format version this release writes, and the only one it restores.
     ///
-    /// It rises whenever
+    /// A release raises it whenever it raises
     /// [`SimulatedVenueSnapshot::VERSION`](rustrade_execution::exchange::mock::venue::SimulatedVenueSnapshot::VERSION)
-    /// or the positions' format does, so a checkpoint in this version always holds a venue
-    /// snapshot this release reads.
+    /// or changes the positions' format, so that the checkpoint's version says whether both
+    /// halves read. A checkpoint whose venue half is of another version anyway, such as one edited
+    /// by hand, is refused when the venue is restored.
     pub const VERSION: u32 = 1;
 
     /// A checkpoint of `venue` and the engine's `positions` at it, in this release's format
@@ -649,6 +650,20 @@ mod tests {
 
     /// A checkpoint reads back as a stored one, and one written before a later position field
     /// existed reads with that field's default; one of another version is refused with it.
+    /// A tripwire: a change to either version fails here, so whoever makes it checks the
+    /// checkpoint's version rose with the venue snapshot's.
+    #[test]
+    fn the_checkpoint_version_is_revisited_with_the_venue_snapshot_version() {
+        use rustrade_execution::exchange::mock::venue::SimulatedVenueSnapshot;
+
+        assert_eq!(
+            (EngineCheckpoint::VERSION, SimulatedVenueSnapshot::VERSION),
+            (1, 1),
+            "raise EngineCheckpoint::VERSION whenever SimulatedVenueSnapshot::VERSION rises, \
+             then update this pair"
+        );
+    }
+
     #[test]
     fn a_stored_checkpoint_reads_back_and_an_older_one_takes_a_later_field_s_default() {
         use rustrade_execution::stored::{Stored, StoredFormatError};
