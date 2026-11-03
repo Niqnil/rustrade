@@ -24,11 +24,13 @@ use rustrade::{
         execution_tx::ExecutionTxMap,
     },
     execution::{
-        builder::ExecutionBuilder,
-        paper::{PaperMarketFeed, PaperOptions},
+        Execution,
+        builder::{ExecutionBuild, ExecutionBuilder},
+        paper::{PaperMarketFeed, PaperOptions, PaperVenue},
         request::ExecutionRequest,
         sim::VenueMarketUpdate,
     },
+    shutdown::AsyncShutdown,
 };
 use rustrade_data::{
     event::{DataKind, MarketEvent},
@@ -39,8 +41,10 @@ use rustrade_execution::{
     AccountEventKind, AccountSnapshot,
     balance::{AssetBalance, Balance},
     client::mock::MockExecutionConfig,
+    error::{ApiError, ClientError, ConnectivityError, UnindexedClientError},
     exchange::mock::SimulatedVenue,
     fee::{FeeModelConfig, PercentageFeeModel},
+    margin::{MarginEffect, SpotMarginConfig},
     market::MarketObservation,
     order::{
         OrderEvent, OrderKey, OrderKind, TimeInForce,
@@ -278,22 +282,7 @@ async fn paper_run() -> Vec<Booked> {
 /// The reference run: the backtest's market-driven venue, stepped through the same script by
 /// hand, each request booked half the latency after it was sent.
 fn backtest_run() -> Vec<Booked> {
-    let spot = Instrument {
-        exchange: EXCHANGE,
-        name_internal: instrument(EXCHANGE, "btc", "usdt").name_internal,
-        name_exchange: InstrumentNameExchange::new("btc_usdt"),
-        underlying: Underlying::new(
-            AssetNameExchange::new("btc"),
-            AssetNameExchange::new("usdt"),
-        ),
-        quote: InstrumentQuoteAsset::UnderlyingQuote,
-        kind: InstrumentKind::Spot,
-        spec: None,
-        data_venue: None,
-    };
-    let name = spot.name_exchange.clone();
-    let mut venue =
-        SimulatedVenue::new_market_driven(&config(), [(name.clone(), spot)].into_iter().collect());
+    let (name, mut venue) = backtest_venue(&config());
 
     // What the venue owes, in the order it falls due.
     enum Input {
@@ -304,17 +293,10 @@ fn backtest_run() -> Vec<Booked> {
     let mut inputs = script()
         .into_iter()
         .map(|(offset_ms, step)| match step {
-            Step::Trade(price) => {
-                let event = trade_event(offset_ms, price);
-                let bar = DataKind::bar(&state, &event);
-                let fresh = DataKind::fresh(&state, &event);
-                DataKind::apply(&mut state, &event);
-                let observation = MarketObservation::new(DataKind::snapshot(&state))
-                    .with_depth(DataKind::depth(&state))
-                    .with_bar(bar)
-                    .with_fresh(fresh);
-                (offset_ms, Input::Market(observation))
-            }
+            Step::Trade(price) => (
+                offset_ms,
+                Input::Market(observe(&mut state, &trade_event(offset_ms, price))),
+            ),
             Step::Order(request, cid) => (
                 offset_ms + (LATENCY_MS / 2) as i64,
                 Input::Book(request, cid),
@@ -362,6 +344,214 @@ fn backtest_run() -> Vec<Booked> {
         .into_iter()
         .filter_map(|event| booked(event.kind))
         .collect()
+}
+
+/// The backtest's market-driven venue of `config`, trading the one spot instrument, and its name.
+fn backtest_venue(config: &MockExecutionConfig) -> (InstrumentNameExchange, SimulatedVenue) {
+    let spot = Instrument {
+        exchange: EXCHANGE,
+        name_internal: instrument(EXCHANGE, "btc", "usdt").name_internal,
+        name_exchange: InstrumentNameExchange::new("btc_usdt"),
+        underlying: Underlying::new(
+            AssetNameExchange::new("btc"),
+            AssetNameExchange::new("usdt"),
+        ),
+        quote: InstrumentQuoteAsset::UnderlyingQuote,
+        kind: InstrumentKind::Spot,
+        spec: None,
+        data_venue: None,
+    };
+    let name = spot.name_exchange.clone();
+    let venue =
+        SimulatedVenue::new_market_driven(config, [(name.clone(), spot)].into_iter().collect());
+    (name, venue)
+}
+
+/// What a venue observes of `event`, folded into `state` as a paper venue's feed folds it.
+fn observe(
+    state: &mut <DataKind as VenueMarketUpdate>::State,
+    event: &MarketEvent<InstrumentIndex, DataKind>,
+) -> MarketObservation {
+    let bar = DataKind::bar(state, event);
+    let fresh = DataKind::fresh(state, event);
+    DataKind::apply(state, event);
+    MarketObservation::new(DataKind::snapshot(state))
+        .with_depth(DataKind::depth(state))
+        .with_bar(bar)
+        .with_fresh(fresh)
+}
+
+/// `config()` on a margin account, lending up to three times its value in usdt.
+fn margin_config() -> MockExecutionConfig {
+    MockExecutionConfig {
+        spot_margin: Some(
+            SpotMarginConfig::new(
+                AssetNameExchange::new("usdt"),
+                dec!(3),
+                MarginEffect::Borrow,
+            )
+            .unwrap(),
+        ),
+        ..config()
+    }
+}
+
+/// Feeds a paper venue's market.
+type MarketTx = futures::channel::mpsc::UnboundedSender<
+    reconnect::Event<ExchangeId, MarketEvent<InstrumentIndex, DataKind>>,
+>;
+
+/// A paper venue of `config`, built on tokio's paused clock and fed by the returned sender, with
+/// its handle, before it is started.
+fn paper_build(
+    instruments: &IndexedInstruments,
+    config: MockExecutionConfig,
+) -> (ExecutionBuild, PaperVenue, MarketTx) {
+    let (market_tx, market_rx) = futures::channel::mpsc::unbounded();
+    let (tap, feed) = PaperMarketFeed::tap(market_rx);
+    // Stands in for the `Engine`'s market feed, which is what polls the tap in a live system.
+    tokio::spawn(tap.for_each(|_| std::future::ready(())));
+    let build = ExecutionBuilder::new(instruments)
+        .add_paper(
+            config,
+            PaperOptions::default(),
+            TokioClock::starting_at(start()),
+            &feed,
+        )
+        .unwrap()
+        .build();
+    let venue = build.paper_venues.get(&EXCHANGE).unwrap().clone();
+    (build, venue, market_tx)
+}
+
+/// A paper venue's handle answers how much the account can borrow as the backtest's venue does
+/// on the same market, on either side.
+#[tokio::test(start_paused = true)]
+async fn a_paper_venue_s_handle_answers_borrow_capacity_as_the_backtest_venue_does() {
+    let instruments = instruments();
+    let anchor = tokio::time::Instant::now();
+    let (build, venue, market_tx) = paper_build(&instruments, margin_config());
+    assert_eq!(venue.exchange(), EXCHANGE);
+    let execution = build.init().await.unwrap();
+    assert_eq!(
+        execution.paper_venues.keys().collect::<Vec<_>>(),
+        [&EXCHANGE],
+        "init carries the handles on"
+    );
+
+    tokio::time::sleep_until(anchor + Duration::from_millis(1_000)).await;
+    let trade = trade_event(1_000, dec!(100));
+    market_tx
+        .unbounded_send(reconnect::Event::Item(trade.clone()))
+        .unwrap();
+    tokio::time::sleep_until(anchor + Duration::from_millis(1_500)).await;
+
+    let (name, mut reference) = backtest_venue(&margin_config());
+    // What the reference venue reports is not compared: only what it then answers.
+    let _restated = reference.advance_time(start());
+    let _observed =
+        reference.apply_market(&name, observe(&mut Default::default(), &trade), at(1_000));
+    for side in [Side::Sell, Side::Buy] {
+        let paper = venue.fetch_borrow_capacity(&name, side).await.unwrap();
+        assert_eq!(
+            paper,
+            reference.borrow_capacity(&name, side).unwrap(),
+            "{side:?}"
+        );
+        assert!(
+            paper
+                .borrowable_now
+                .is_some_and(|amount| amount > Decimal::ZERO),
+            "the account can borrow on {side:?}: {paper:?}"
+        );
+    }
+}
+
+/// A paper venue without spot margin lends against nothing, so its handle answers that the
+/// instrument cannot be borrowed against, as a live venue's client does.
+#[tokio::test(start_paused = true)]
+async fn a_cash_paper_venue_s_handle_answers_that_it_lends_against_no_instrument() {
+    let instruments = instruments();
+    let (build, venue, _market_tx) = paper_build(&instruments, config());
+    let _execution = build.init().await.unwrap();
+
+    let answer = venue
+        .fetch_borrow_capacity(&InstrumentNameExchange::new("btc_usdt"), Side::Sell)
+        .await;
+
+    assert!(
+        matches!(
+            answer,
+            Err(ClientError::Api(ApiError::InstrumentInvalid(..)))
+        ),
+        "{answer:?}"
+    );
+}
+
+/// A query sent through the handle before the venue starts waits for it, and is answered once it
+/// runs.
+#[tokio::test(start_paused = true)]
+async fn a_paper_venue_s_handle_queried_before_the_venue_starts_is_answered_once_it_runs() {
+    let instruments = instruments();
+    let (build, venue, _market_tx) = paper_build(&instruments, config());
+    let query = tokio::spawn(async move {
+        venue
+            .fetch_borrow_capacity(&InstrumentNameExchange::new("btc_usdt"), Side::Sell)
+            .await
+    });
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    assert!(!query.is_finished(), "the venue has not started");
+
+    let _execution = build.init().await.unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(60), query)
+        .await
+        .expect("answered once the venue runs")
+        .unwrap();
+
+    assert!(
+        matches!(
+            answer,
+            Err(ClientError::Api(ApiError::InstrumentInvalid(..)))
+        ),
+        "{answer:?}"
+    );
+}
+
+/// The handle keeps no venue running: a system shuts down while one is held, and a query then
+/// finds the venue offline, as it does for a build dropped without being started.
+#[tokio::test(start_paused = true)]
+async fn a_paper_venue_s_handle_keeps_no_venue_running() {
+    let instruments = instruments();
+    let name = InstrumentNameExchange::new("btc_usdt");
+    let offline = |answer: Result<_, UnindexedClientError>| {
+        matches!(
+            answer,
+            Err(ClientError::Connectivity(
+                ConnectivityError::ExchangeOffline(EXCHANGE)
+            ))
+        )
+    };
+
+    let (build, venue, _market_tx) = paper_build(&instruments, margin_config());
+    drop(build);
+    assert!(offline(
+        venue.fetch_borrow_capacity(&name, Side::Sell).await
+    ));
+
+    let (build, venue, _market_tx) = paper_build(&instruments, margin_config());
+    let Execution {
+        execution_txs,
+        mut handles,
+        ..
+    } = build.init().await.unwrap();
+    drop(execution_txs);
+    tokio::time::timeout(Duration::from_secs(60), handles.shutdown())
+        .await
+        .expect("the venue stops with its manager, though a handle to it is held")
+        .unwrap();
+    assert!(offline(
+        venue.fetch_borrow_capacity(&name, Side::Sell).await
+    ));
 }
 
 #[tokio::test(start_paused = true)]

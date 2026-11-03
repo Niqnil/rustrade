@@ -15,7 +15,7 @@ use crate::{
     execution::{
         AccountStreamEvent,
         builder::{ExecutionBuildFutures, ExecutionBuilder},
-        paper::{PaperMarketFeed, PaperOptions},
+        paper::{PaperMarketFeed, PaperOptions, PaperVenue},
     },
     shutdown::SyncShutdown,
     system::{System, SystemAuxillaryHandles, config::ExecutionConfig},
@@ -376,6 +376,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             market_stream,
             account_channel: execution.account_channel,
             execution_build_futures: execution.futures,
+            paper_venues: execution.paper_venues,
             phantom_event: PhantomData,
         })
     }
@@ -432,6 +433,10 @@ pub struct SystemBuild<Engine, Event, MarketStream> {
     /// Futures for initialising `ExecutionBuild` components.
     pub execution_build_futures: ExecutionBuildFutures,
 
+    /// A handle to each paper venue, by exchange: see
+    /// [`ExecutionBuild::paper_venues`](crate::execution::builder::ExecutionBuild::paper_venues).
+    pub paper_venues: FnvHashMap<ExchangeId, PaperVenue>,
+
     phantom_event: PhantomData<Event>,
 }
 
@@ -447,6 +452,11 @@ where
     MarketStream: Stream + Send + 'static,
 {
     /// Construct a new `SystemBuild` from the provided components.
+    ///
+    /// `account_channel`, `execution_build_futures` and `paper_venues` are the parts of one
+    /// [`ExecutionBuild`](crate::execution::builder::ExecutionBuild): its `account_channel`,
+    /// `futures` and `paper_venues`. [`init`](Self::init) carries `paper_venues` on to the
+    /// [`System`].
     pub fn new(
         engine: Engine,
         engine_feed_mode: EngineFeedMode,
@@ -454,6 +464,7 @@ where
         market_stream: MarketStream,
         account_channel: Channel<AccountStreamEvent>,
         execution_build_futures: ExecutionBuildFutures,
+        paper_venues: FnvHashMap<ExchangeId, PaperVenue>,
     ) -> Self {
         Self {
             engine,
@@ -462,6 +473,7 @@ where
             market_stream,
             account_channel,
             execution_build_futures,
+            paper_venues,
             phantom_event: Default::default(),
         }
     }
@@ -494,6 +506,7 @@ where
             market_stream,
             account_channel,
             execution_build_futures,
+            paper_venues,
             phantom_event: _,
         } = self;
 
@@ -580,6 +593,7 @@ where
             },
             feed_tx,
             audit,
+            paper_venues,
         })
     }
 }
@@ -906,6 +920,42 @@ mod tests {
             VenueRole::Both
         );
         assert!(system.engine.in_flight_deadlines().get(paper).is_none());
+        assert_eq!(
+            system.paper_venues.keys().collect::<Vec<_>>(),
+            [&DATA],
+            "only the paper venue has a handle"
+        );
+    }
+
+    /// [`SystemBuild::new`] keeps the handles it is given, which the build carries to its system.
+    #[test]
+    fn a_build_holds_the_paper_venues_it_is_given() {
+        let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
+        let mut system = SystemBuilder::new(SystemArgs {
+            executions: vec![],
+            ..system_args(&instruments)
+        })
+        .paper_venue(
+            mock_execution_config(EXECUTION),
+            PaperOptions::default(),
+            &paper_feed(),
+        )
+        .build::<EngineEvent, _>()
+        .expect("a paper venue must build");
+        let paper_venues = std::mem::take(&mut system.paper_venues);
+        assert_eq!(paper_venues.len(), 1);
+
+        let system = SystemBuild::<_, EngineEvent, _>::new(
+            system.engine,
+            system.engine_feed_mode,
+            system.audit_mode,
+            system.market_stream,
+            system.account_channel,
+            system.execution_build_futures,
+            paper_venues,
+        );
+
+        assert_eq!(system.paper_venues.keys().collect::<Vec<_>>(), [&EXECUTION]);
     }
 
     /// A paper venue on an exchange that already has a venue, paper or mock, fails the build

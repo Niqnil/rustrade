@@ -2,6 +2,7 @@ use crate::{
     engine::{execution_tx::MultiExchangeTxMap, in_flight::InFlightDeadlines},
     execution::builder::ExecutionHandles,
 };
+use fnv::FnvHashMap;
 use rustrade_data::streams::reconnect;
 use rustrade_execution::AccountEvent;
 use rustrade_instrument::{
@@ -55,5 +56,7 @@ pub struct Execution {
     /// See [`ExecutionBuild::in_flight_deadlines`](builder::ExecutionBuild::in_flight_deadlines).
     pub in_flight_deadlines: InFlightDeadlines,
     pub account_channel: Channel<AccountStreamEvent>,
+    /// See [`ExecutionBuild::paper_venues`](builder::ExecutionBuild::paper_venues).
+    pub paper_venues: FnvHashMap<ExchangeId, paper::PaperVenue>,
     pub handles: ExecutionHandles,
 }
