@@ -19,7 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the new `SpotMarginConfigError::BorrowPriceWindowInvalid`. It serialises as
     `borrow_price_window_ms`, an integer, left out when off.
   - Each market observation the venue is fed adds to its instrument's window: the mid, else the
-    last price, and the high and low of a bar it carries. The current price always counts.
+    last price, and the high and low of a bar it carries. The current price always counts. The
+    venue keeps each price that could still be the window's lowest or highest, so in a market
+    that only rises or falls it holds every observation inside the window.
   - An asset the account owes is valued at its highest for all the units it holds as well as
     for its debt. So is the asset being borrowed. Every other asset is valued at its lowest.
   - The venue lends the lesser of what the leverage limit allows at the window's prices and at

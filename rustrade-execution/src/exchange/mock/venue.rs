@@ -1822,15 +1822,16 @@ impl SimulatedVenue {
         .into_option() else {
             return;
         };
-        self.borrow_prices
-            .entry(instrument.clone())
-            .or_default()
-            .record(
-                time_exchange,
-                low,
-                high,
-                window_start(time_exchange, window),
-            );
+        let since = window_start(time_exchange, window);
+        // Looked up before it is entered, so the name is cloned only on the first observation.
+        match self.borrow_prices.get_mut(instrument) {
+            Some(prices) => prices.record(time_exchange, low, high, since),
+            None => self
+                .borrow_prices
+                .entry(instrument.clone())
+                .or_default()
+                .record(time_exchange, low, high, since),
+        }
     }
 
     /// Whether applying `observation` to `instrument` releases orders held for its bar,

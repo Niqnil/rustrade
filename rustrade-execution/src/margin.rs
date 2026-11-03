@@ -280,6 +280,10 @@ pub struct OrderLoan {
 ///   lend more than the current prices would, and leave the account at its liquidation level the
 ///   moment it borrowed.
 ///
+/// The venue keeps, per spot instrument, every observed price that could still be the window's
+/// lowest or highest: in a market that only rises or only falls, every observation inside the
+/// window, so a long window over a fast feed holds that many.
+///
 /// The window changes only how much the venue lends: the margin level a [`SpotMarginLiquidation`]
 /// checks, and any interest, are valued at current prices. A venue no driver feeds the market,
 /// one priced by each request's own snapshot, has no window to look back on, and lends as if

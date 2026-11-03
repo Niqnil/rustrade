@@ -19,6 +19,9 @@ use std::collections::VecDeque;
 ///
 /// Instants must be recorded in non-decreasing order, as the venue's clock, which never moves
 /// back, records them.
+///
+/// Memory is the number of prices still a candidate extreme: at most every observation inside
+/// the window, in a market that only rises or only falls, and far fewer in one that turns.
 #[derive(Debug, Clone, Default)]
 pub(super) struct PriceWindow {
     /// Strictly rising prices, each with the instant it was recorded.
@@ -75,17 +78,16 @@ impl PriceWindow {
 
 /// The price of the first entry of `queue` recorded at or after `since`.
 ///
-/// A scan rather than a pop, since a valuation reads the venue without changing it: the entries
-/// it passes over are those recorded since the last [`record`](PriceWindow::record) fell out of
-/// the window, and the next record drops them.
+/// A binary search rather than a pop, since a valuation reads the venue without changing it. The
+/// entries it passes over have fallen out of the window since the instrument's last
+/// [`record`](PriceWindow::record), which may be long ago for an instrument no longer observed.
 fn first_since(
     queue: &VecDeque<(DateTime<Utc>, Decimal)>,
     since: DateTime<Utc>,
 ) -> Option<Decimal> {
-    queue
-        .iter()
-        .find(|(recorded, _)| *recorded >= since)
-        .map(|(_, price)| *price)
+    // Recorded in time order, so the entries before `since` are a prefix.
+    let first = queue.partition_point(|(recorded, _)| *recorded < since);
+    queue.get(first).map(|(_, price)| *price)
 }
 
 #[cfg(test)]

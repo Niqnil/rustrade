@@ -157,6 +157,14 @@ fn a_price_older_than_the_window_no_longer_counts() {
         d("18000"),
         "62 s: 1 s is out"
     );
+
+    // Nothing observed in the last minute: the window is empty, and the current price counts.
+    advance(&mut venue, time(100));
+    assert_eq!(
+        borrowable_now(&venue, Side::Buy),
+        d("18000"),
+        "100 s: only the current"
+    );
 }
 
 #[test]
@@ -377,4 +385,23 @@ fn a_price_of_zero_is_not_recorded() {
     assert!(events.is_empty(), "{events:?}");
 
     assert_eq!(borrowable_now(&venue, Side::Buy), d("18000"));
+}
+
+#[test]
+fn on_an_inverse_pair_an_owed_assets_highest_is_the_inverse_of_the_instruments_lowest() {
+    // USDTBTC between 0.0001 and 0.000125 BTC, now 0.000125: BTC between 8,000 and 10,000 USDT,
+    // now 8,000. 1 BTC owed against 30,000 USDT counts at 10,000: equity 20,000 against a debt of
+    // 10,000 lends 30,000 more USDT at 3x, where the current price would lend 36,000.
+    let config = window_config(
+        vec![holding(base(), "0", "1"), funded(quote(), d("30000"))],
+        "3",
+        hour(),
+        |config| config,
+    );
+    let mut venue = SimulatedVenue::new_market_driven(&config, usdt_btc_instruments());
+    let name = InstrumentNameExchange::new("USDTBTC");
+    feed(&mut venue, &name, &[(1, "0.0001"), (2, "0.000125")]);
+
+    let capacity = venue.borrow_capacity(&name, Side::Sell).unwrap();
+    assert_eq!(capacity.borrowable_now, Some(d("30000")));
 }
