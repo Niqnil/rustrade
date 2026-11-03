@@ -6,6 +6,7 @@
 //! library delivers the venue's own figures; rates, day counts and what to do with the flows stay
 //! the consumer's.
 
+use crate::order::id::{ClientOrderId, OrderId};
 use chrono::{DateTime, Utc};
 use derive_more::From;
 use rust_decimal::Decimal;
@@ -68,14 +69,28 @@ pub struct CashFlow<AssetKey, InstrumentKey> {
     ///
     /// [`time_exchange`](Self::time_exchange) stays the venue's own stamp, which a producer
     /// setting a period puts in the period or at its start. Nothing checks that. The `rustrade`
-    /// engine reads the period of an [`InterestTiming::OnBorrow`] charge only: a venue that stamps
-    /// the charge on a new loan at the start of its period stamps it before the position the loan
-    /// funds opened, and the period tells the engine the position may still own it. See
-    /// `InstrumentState::update_from_cash_flow` in `rustrade`.
+    /// engine reads the period only of an [`InterestTiming::OnBorrow`] charge that names no
+    /// [`loan`](Self::loan): a venue that stamps the charge on a new loan at the start of its
+    /// period stamps it before the position the loan funds opened, and the period tells the engine
+    /// the position may still own it. See `InstrumentState::update_from_cash_flow` in
+    /// `rustrade`.
     ///
     /// `#[serde(default)]` so a flow serialised before this field existed still loads.
     #[serde(default)]
     pub period: Option<CashFlowPeriod>,
+    /// The loan the flow is the charge on, when its producer knows which loan, as for an
+    /// [`InterestTiming::OnBorrow`] charge on a loan one of its own orders took. `None` when the
+    /// producer does not know, which is the case for every other flow. Set with
+    /// [`with_loan`](Self::with_loan).
+    ///
+    /// A producer that sets it also sets [`instrument`](Self::instrument) to the order's
+    /// instrument. The `rustrade` engine applies a flow with a loan to the open position only if
+    /// the loan's order opened or added to that position, whenever the flow is stamped. See
+    /// `InstrumentState::update_from_cash_flow` in `rustrade`.
+    ///
+    /// `#[serde(default)]` so a flow serialised before this field existed still loads.
+    #[serde(default)]
+    pub loan: Option<CashFlowLoan>,
 }
 
 impl<AssetKey, InstrumentKey> CashFlow<AssetKey, InstrumentKey> {
@@ -96,6 +111,7 @@ impl<AssetKey, InstrumentKey> CashFlow<AssetKey, InstrumentKey> {
             time_exchange,
             id,
             period: None,
+            loan: None,
         }
     }
 
@@ -103,6 +119,39 @@ impl<AssetKey, InstrumentKey> CashFlow<AssetKey, InstrumentKey> {
     pub fn with_period(mut self, period: Option<CashFlowPeriod>) -> Self {
         self.period = period;
         self
+    }
+
+    /// Sets [`loan`](Self::loan).
+    pub fn with_loan(mut self, loan: Option<CashFlowLoan>) -> Self {
+        self.loan = loan;
+        self
+    }
+}
+
+/// The loan a [`CashFlow`] is the charge on: when it was taken, and the order that took it.
+///
+/// A margin venue may lend when it accepts an order, as Binance does for an order that borrows,
+/// and charge interest on the new loan at once. The order identifies the position the loan funds:
+/// the one the order's trades open or add to.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub struct CashFlowLoan {
+    /// When the venue lent: its time for accepting the order that borrowed.
+    pub time: DateTime<Utc>,
+    /// The venue's id for the order that borrowed, as its [`Trade`](crate::trade::Trade)s carry
+    /// it in [`order_id`](crate::trade::Trade::order_id).
+    pub order_id: OrderId,
+    /// The client order id the order was placed with.
+    pub cid: ClientOrderId,
+}
+
+impl CashFlowLoan {
+    /// The loan taken at `time` by the order with venue id `order_id` and client id `cid`.
+    pub fn new(time: DateTime<Utc>, order_id: OrderId, cid: ClientOrderId) -> Self {
+        Self {
+            time,
+            order_id,
+            cid,
+        }
     }
 }
 
@@ -374,5 +423,32 @@ mod tests {
         value.as_object_mut().unwrap().remove("period");
         let loaded: CashFlow<String, String> = serde_json::from_value(value).unwrap();
         assert_eq!(loaded, flow);
+    }
+
+    #[test]
+    fn a_flow_serialised_without_a_loan_loads_with_none_and_one_with_a_loan_round_trips() {
+        let flow: CashFlow<String, String> = CashFlow::new(
+            CashFlowKind::Rebate,
+            "USD".to_owned(),
+            Decimal::ONE,
+            None,
+            at(10),
+            None,
+        );
+        let mut value = serde_json::to_value(&flow).unwrap();
+        value.as_object_mut().unwrap().remove("loan");
+        let loaded: CashFlow<String, String> = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded, flow);
+
+        let lent = flow.with_loan(Some(CashFlowLoan::new(
+            at(9),
+            OrderId::new("7"),
+            ClientOrderId::new("borrow"),
+        )));
+        let json = serde_json::to_string(&lent).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CashFlow<String, String>>(&json).unwrap(),
+            lent
+        );
     }
 }

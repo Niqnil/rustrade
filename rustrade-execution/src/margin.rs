@@ -8,8 +8,12 @@
 //! built-in one. A margin client that learns what an order borrowed reports it as a
 //! [`MarginBorrow`], in a [`MarginPlacement`].
 
+use crate::cash_flow::CashFlowLoan;
 use crate::holding_cost::{DayCount, RateSeries, next_whole_interval};
-use crate::order::{Order, state::UnindexedOrderState};
+use crate::order::{
+    Order,
+    state::{ActiveOrderState, InactiveOrderState, OrderState, UnindexedOrderState},
+};
 use chrono::{DateTime, TimeDelta, Utc};
 use derive_more::Constructor;
 use fnv::FnvHashMap;
@@ -107,6 +111,60 @@ pub struct MarginPlacement {
     ///   the venue may have placed the order and lent to it without the client learning how
     ///   much. `None` then says nothing about a loan: read the account's balances.
     pub borrowed: Option<MarginBorrow>,
+}
+
+impl MarginPlacement {
+    /// The loan the order took, with what identifies it, when the answer reports one: what
+    /// [`borrowed`](Self::borrowed) says, the order's instrument, its venue and client ids, and
+    /// the venue's time for the order's state, which for a new order is when the venue accepted
+    /// it and lent.
+    ///
+    /// `None` when [`borrowed`](Self::borrowed) is, or when the order's state has no venue order
+    /// id: one the venue acknowledged without assigning its own, or one still in flight or
+    /// refused.
+    pub fn loan(&self) -> Option<OrderLoan> {
+        let borrowed = self.borrowed.clone()?;
+        let (order_id, time) = match &self.order.state {
+            OrderState::Active(ActiveOrderState::Open(open)) => {
+                (open.id.assigned()?.clone(), open.time_exchange)
+            }
+            OrderState::Inactive(InactiveOrderState::FullyFilled(filled)) => {
+                (filled.id.clone(), filled.time_exchange)
+            }
+            OrderState::Inactive(InactiveOrderState::Cancelled(cancelled)) => {
+                (cancelled.id.clone(), cancelled.time_exchange)
+            }
+            OrderState::Inactive(InactiveOrderState::Expired(expired)) => {
+                (expired.id.clone(), expired.time_exchange)
+            }
+            OrderState::Active(
+                ActiveOrderState::OpenInFlight(_) | ActiveOrderState::CancelInFlight(_),
+            )
+            | OrderState::Inactive(InactiveOrderState::OpenFailed(_)) => return None,
+        };
+        Some(OrderLoan::new(
+            self.order.key.instrument.clone(),
+            borrowed,
+            CashFlowLoan::new(time, order_id, self.order.key.cid.clone()),
+        ))
+    }
+}
+
+/// A loan an order took when it was placed, and what identifies it: the order's instrument, what
+/// it borrowed, and the order and time it borrowed at.
+///
+/// A margin client that keeps the loans its orders took can link the venue's charge on a new loan
+/// to the order that took it, through [`CashFlow::loan`](crate::cash_flow::CashFlow::loan). Built
+/// by [`MarginPlacement::loan`], and handed back to a client after a restart by, for example,
+/// `BinanceMargin::recall_loans`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, Constructor)]
+pub struct OrderLoan {
+    /// The instrument the order traded.
+    pub instrument: InstrumentNameExchange,
+    /// What the order borrowed: the asset and the loan's principal.
+    pub borrowed: MarginBorrow,
+    /// When the venue lent, and the order that borrowed.
+    pub loan: CashFlowLoan,
 }
 
 /// Spot margin on the simulated venue: what it lends a spot order, how much, and what it repays.
@@ -1063,6 +1121,104 @@ impl MarginInterestModel for PeriodicMarginInterest {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    /// A placement's loan is its order's, at its state's time, when the answer reports a loan and
+    /// the state names a venue order id, and none otherwise.
+    #[test]
+    fn a_placement_s_loan_is_its_order_s_when_its_state_names_a_venue_id() {
+        use crate::{
+            error::{ApiError, OrderError},
+            order::{
+                OrderKey, OrderKind, TimeInForce,
+                id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
+                state::{Cancelled, Expired, Filled, Open, OpenInFlight},
+            },
+        };
+        use chrono::TimeZone;
+        use rustrade_instrument::Side;
+
+        let time = Utc.with_ymd_and_hms(2026, 11, 2, 10, 5, 0).unwrap();
+        let id = OrderId::new("7");
+        let borrowed = MarginBorrow::new(AssetNameExchange::new("USDT"), dec!(6.23292076));
+        let placement =
+            |state: UnindexedOrderState, borrowed: Option<MarginBorrow>| MarginPlacement {
+                order: Order {
+                    key: OrderKey {
+                        exchange: ExchangeId::BinanceMargin,
+                        instrument: InstrumentNameExchange::new("BTCUSDT"),
+                        strategy: StrategyId::new("strategy"),
+                        cid: ClientOrderId::new("borrow"),
+                    },
+                    side: Side::Buy,
+                    price: None,
+                    quantity: dec!(1),
+                    kind: OrderKind::Market,
+                    time_in_force: TimeInForce::ImmediateOrCancel,
+                    state,
+                },
+                borrowed,
+            };
+        let loan = Some(OrderLoan::new(
+            InstrumentNameExchange::new("BTCUSDT"),
+            borrowed.clone(),
+            CashFlowLoan::new(time, id.clone(), ClientOrderId::new("borrow")),
+        ));
+
+        for (case, state, expected) in [
+            (
+                "open",
+                OrderState::active(Open::new(
+                    VenueOrderId::Assigned(id.clone()),
+                    time,
+                    Decimal::ZERO,
+                )),
+                loan.clone(),
+            ),
+            (
+                "filled",
+                OrderState::fully_filled(Filled::new(id.clone(), time, dec!(1), None)),
+                loan.clone(),
+            ),
+            (
+                "cancelled",
+                OrderState::inactive(Cancelled::new(id.clone(), time, None)),
+                loan.clone(),
+            ),
+            (
+                "expired",
+                OrderState::expired(Expired::new(id.clone(), time, None)),
+                loan.clone(),
+            ),
+            (
+                "open without a venue id",
+                OrderState::active(Open::new(VenueOrderId::ClientAssigned, time, Decimal::ZERO)),
+                None,
+            ),
+            (
+                "in flight",
+                OrderState::active(OpenInFlight::new(time)),
+                None,
+            ),
+            (
+                "refused",
+                OrderState::inactive(OrderError::Rejected(ApiError::OrderRejected(
+                    "refused".to_owned(),
+                ))),
+                None,
+            ),
+        ] {
+            assert_eq!(
+                placement(state.clone(), Some(borrowed.clone())).loan(),
+                expected,
+                "{case}"
+            );
+            assert_eq!(
+                placement(state, None).loan(),
+                None,
+                "{case}, no loan reported"
+            );
+        }
+    }
 
     #[test]
     fn a_leverage_below_one_is_refused_by_the_constructor_and_by_deserialising() {

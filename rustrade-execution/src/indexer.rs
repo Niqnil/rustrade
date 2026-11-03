@@ -372,6 +372,7 @@ impl AccountEventIndexer {
             time_exchange,
             id,
             period,
+            loan,
         } = flow;
 
         Ok(CashFlow {
@@ -384,6 +385,7 @@ impl AccountEventIndexer {
             time_exchange,
             id,
             period,
+            loan,
         })
     }
 
@@ -1119,6 +1121,7 @@ mod tests {
                 time_exchange: DateTime::<Utc>::MIN_UTC,
                 id: None,
                 period: None,
+                loan: None,
             }),
         );
         assert!(matches!(
