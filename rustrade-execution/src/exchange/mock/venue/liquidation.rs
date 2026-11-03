@@ -43,6 +43,21 @@ impl LiquidationState {
     pub(super) fn under_way(&self) -> bool {
         self.under_way
     }
+
+    /// Whether a margin call has been sent and not yet restored.
+    pub(super) fn margin_called(&self) -> bool {
+        self.margin_called
+    }
+
+    /// The state a venue restored from a snapshot starts in: a liquidation `under_way` and a
+    /// `margin_called` as they were, and no warning yet given, so the restored process warns again.
+    pub(super) fn restored(under_way: bool, margin_called: bool) -> Self {
+        Self {
+            under_way,
+            margin_called,
+            ..Self::default()
+        }
+    }
 }
 
 /// One forced trade: paying [`pay`](Self::pay) for the other asset of

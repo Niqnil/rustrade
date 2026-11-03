@@ -14,6 +14,7 @@ use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, exchange::ExchangeId,
     instrument::name::InstrumentNameExchange,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, hash_map::Entry};
 use thiserror::Error;
 
@@ -27,7 +28,7 @@ pub type OpenOrder = Order<ExchangeId, InstrumentNameExchange, Open>;
 /// could make disagree with the one the client was told about. A CFD fill is the exception: what
 /// it costs depends on the position it trades against, which can move while the order rests, so
 /// its hold is released and the fill costed afresh (see `SimulatedVenue`'s reserved balances).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct Reservation {
     /// The asset the order pays with: quote for a buy or a CFD, base for a spot sell.
     pub asset: AssetNameExchange,
@@ -78,7 +79,7 @@ impl Reservation {
 /// The two are one value rather than two collections because they have exactly one lifetime: an
 /// order that leaves the book takes its reservation with it, and a reservation that outlives its
 /// order is held against nothing.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct RestingOrder {
     pub order: OpenOrder,
     /// What the venue holds against [`order`](Self::order), or `None` if it holds nothing.
@@ -481,6 +482,109 @@ impl OpenOrders {
             self.queues.remove(&key);
         }
     }
+
+    /// Every open order with what is held against it and where it stands, in an order that
+    /// [`from_entries`](Self::from_entries) rebuilds this book from exactly: the same price-time
+    /// priority, the same orders held in the same arrival order, and the same deadlines.
+    ///
+    /// Queued orders come first, in the order they were queued, then held orders as
+    /// [`held`](Self::held) lists them, then the orders that are neither, by id.
+    pub fn entries(&self) -> Vec<OpenOrderEntry> {
+        let mut queued = self
+            .queues
+            .values()
+            .flat_map(|queue| queue.iter().map(|(position, cid)| (position.seq, cid)))
+            .collect::<Vec<_>>();
+        queued.sort_unstable_by_key(|(seq, _)| *seq);
+        let queued = queued
+            .into_iter()
+            .map(|(_, cid)| (cid.clone(), OrderPlacement::Queued));
+
+        let held = self.held().into_iter();
+        // An order `take_held` handed out and its caller has not yet removed is between two steps
+        // of one input, so a snapshot taken between inputs never sees one. Should one be listed,
+        // it is listed as held, which releases it again on its instrument's next bar.
+        let mut taken = self
+            .unqueued
+            .iter()
+            .filter(|cid| {
+                self.by_id.get(*cid).is_some_and(|resting| {
+                    !self.held_on(&resting.order.key.instrument).contains(cid)
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        taken.sort_unstable();
+        let held = held.chain(taken).map(|cid| (cid, OrderPlacement::Held));
+
+        let mut unranked = self
+            .by_id
+            .iter()
+            .filter(|(cid, resting)| {
+                resting.order.price.is_none()
+                    && !self.held_on(&resting.order.key.instrument).contains(cid)
+            })
+            .map(|(cid, _)| cid.clone())
+            .collect::<Vec<_>>();
+        unranked.sort_unstable();
+        let unranked = unranked
+            .into_iter()
+            .map(|cid| (cid, OrderPlacement::Unranked));
+
+        queued
+            .chain(held)
+            .chain(unranked)
+            .filter_map(|(cid, placement)| {
+                self.by_id.get(&cid).map(|resting| OpenOrderEntry {
+                    resting: resting.clone(),
+                    placement,
+                })
+            })
+            .collect()
+    }
+
+    /// The book `entries` lists, as [`entries`](Self::entries) lists one.
+    ///
+    /// # Errors
+    /// [`AlreadyResting`] if two entries share a [`ClientOrderId`].
+    pub fn from_entries(
+        entries: impl IntoIterator<Item = OpenOrderEntry>,
+    ) -> Result<Self, AlreadyResting> {
+        let mut book = Self::default();
+        for OpenOrderEntry {
+            resting: RestingOrder { order, reservation },
+            placement,
+        } in entries
+        {
+            match placement {
+                OrderPlacement::Queued => book.insert(order, reservation)?,
+                OrderPlacement::Held => book.hold(order, reservation)?,
+                OrderPlacement::Unranked => book.index(order, reservation, false)?,
+            }
+        }
+        Ok(book)
+    }
+}
+
+/// Where an open order stands in an [`OpenOrders`]: one part of an [`OpenOrderEntry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderPlacement {
+    /// On its instrument's price-time queue, where matching reaches it.
+    Queued,
+    /// Held until its instrument's next bar or fresh observation: see [`OpenOrders::hold`].
+    Held,
+    /// Neither: an order with no price, seeded by a configured `initial_state`, which nothing
+    /// matches.
+    Unranked,
+}
+
+/// One open order, what is held against it, and where it stands: what [`OpenOrders::entries`]
+/// lists.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct OpenOrderEntry {
+    pub resting: RestingOrder,
+    pub placement: OrderPlacement,
 }
 
 /// Narrows an order's state to `Open`, or `None` if it is in any other state.
@@ -835,6 +939,70 @@ mod tests {
 
     fn ids(cids: Vec<ClientOrderId>) -> Vec<String> {
         cids.into_iter().map(|cid| cid.0.to_string()).collect()
+    }
+
+    /// A book rebuilt from its entries ranks, holds and retires its orders exactly as the original:
+    /// two bids at one price and instant keep the order they were queued in, held orders keep their
+    /// arrival order and stay off the queues, and an unpriced seeded order stays unranked.
+    #[test]
+    fn a_book_rebuilt_from_its_entries_is_the_same_book() {
+        let mut open = OpenOrders::default();
+        // Queued in this order at one price and instant, so only the insertion sequence ranks them.
+        open.insert(order("second_cid", Side::Buy, Some(dec!(100)), 1_000), None)
+            .unwrap();
+        open.insert(order("first_cid", Side::Buy, Some(dec!(100)), 1_000), None)
+            .unwrap();
+        open.insert(order("best", Side::Buy, Some(dec!(101)), 2_000), None)
+            .unwrap();
+        open.insert(gtd("deadline", 5_000), None).unwrap();
+        open.insert(order("ask", Side::Sell, Some(dec!(105)), 1_000), None)
+            .unwrap();
+        open.insert(order("unpriced", Side::Buy, None, 1_000), None)
+            .unwrap();
+        open.hold(market("held_2", "btc_usdt", 3_000), None)
+            .unwrap();
+        open.hold(market("held_1", "eth_usdt", 4_000), None)
+            .unwrap();
+        let mut held_limit = order("held_limit", Side::Sell, Some(dec!(104)), 4_500);
+        held_limit.key.instrument = instrument();
+        open.hold(held_limit, None).unwrap();
+
+        let entries = open.entries();
+        let rebuilt = OpenOrders::from_entries(entries.clone()).unwrap();
+
+        assert_eq!(rebuilt.entries(), entries);
+        for side in [Side::Buy, Side::Sell] {
+            assert_eq!(resting_cids(&rebuilt, side), resting_cids(&open, side));
+        }
+        assert_eq!(
+            resting_cids(&rebuilt, Side::Buy),
+            ["best", "second_cid", "first_cid", "deadline"]
+        );
+        assert_eq!(ids(rebuilt.held()), ids(open.held()));
+        assert_eq!(ids(rebuilt.held()), ["held_2", "held_limit", "held_1"]);
+        assert_eq!(rebuilt.next_expiry(), Some(at(5_000)));
+        assert_eq!(rebuilt.len(), open.len());
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.placement == OrderPlacement::Unranked)
+                .map(|entry| entry.resting.order.key.cid.0.as_str())
+                .collect::<Vec<_>>(),
+            ["unpriced"]
+        );
+    }
+
+    #[test]
+    fn a_book_whose_entries_repeat_an_id_is_refused() {
+        let entry = OpenOrderEntry {
+            resting: RestingOrder {
+                order: order("twice", Side::Buy, Some(dec!(100)), 1_000),
+                reservation: None,
+            },
+            placement: OrderPlacement::Queued,
+        };
+        let refused = OpenOrders::from_entries([entry.clone(), entry]).unwrap_err();
+        assert_eq!(refused.0.order.key.cid, ClientOrderId::new("twice"));
     }
 
     #[test]

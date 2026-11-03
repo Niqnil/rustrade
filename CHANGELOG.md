@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A simulated venue can be snapshotted and restored, so it carries on where it stopped**
+  (`rustrade-execution`, #836). A run that stops and starts again, such as a paper venue across a
+  process restart, no longer loses its account.
+  - `SimulatedVenue::snapshot()` returns a `SimulatedVenueSnapshot`, a serde value holding what
+    the venue has accumulated: balances with their loans and unpaid interest, open and held orders
+    with what is held against them and their place in the queue, ended orders and trades, CFD
+    positions, the id sequences, the venue's clock and the instant it has charged interest
+    through, the debt it last reported, its liquidation and margin-call state, the borrow price
+    window, and how far its slippage stream has drawn.
+  - `SimulatedVenue::from_snapshot(config, instruments, snapshot)` builds the venue back. A
+    restored venue produces exactly the events the original would have from the same inputs. It
+    is given its models through the same builder methods as a fresh venue.
+  - It does not hold the configuration, the models, or the market. A restored venue holds no
+    market until it is fed one. Interest boundaries passed in between are charged once its clock
+    moves, and a resting order is matched against the first market it observes after the restore.
+  - The snapshot carries a format version. `from_snapshot` refuses another version, another
+    exchange, other instruments, a margin account restored without `spot_margin` or the other way
+    round, and an order id listed twice, each with a `VenueRestoreError` variant.
 - **The simulated venue can value each asset over a recent window of its price when it lends**
   (`rustrade-execution`, #829). Binance's cross margin borrow check values an asset the account
   owes at the highest price over a recent window, and every other asset at the lowest. A price

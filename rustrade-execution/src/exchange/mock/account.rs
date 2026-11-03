@@ -2,7 +2,7 @@ use crate::{
     UnindexedAccountSnapshot,
     balance::{AssetBalance, Balance, MarginDetails},
     exchange::mock::orders::{
-        AlreadyResting, OpenOrder, OpenOrders, Reservation, RestingOrder, as_open,
+        AlreadyResting, OpenOrder, OpenOrderEntry, OpenOrders, Reservation, RestingOrder, as_open,
     },
     margin::MarginEffect,
     order::{
@@ -14,10 +14,12 @@ use crate::{
 };
 use chrono::{DateTime, Utc};
 use fnv::FnvHashMap;
+use itertools::Itertools;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     asset::name::AssetNameExchange, exchange::ExchangeId, instrument::name::InstrumentNameExchange,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 #[derive(Debug)]
@@ -917,9 +919,135 @@ pub struct Lending {
 /// A snapshot seeds open and cancelled orders, and a client order id names one order at a time,
 /// so it can be listed once among them. Two entries under one id would leave the venue to choose
 /// which order it holds, silently.
+///
+/// Also what restoring an [`AccountStateSnapshot`] that lists one id twice among its open orders,
+/// or twice among its cancelled, filled or expired ones, returns.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("account snapshot lists {0} more than once among its open and cancelled orders")]
 pub struct DuplicateSeededOrder(pub ClientOrderId);
+
+/// An [`AccountState`] as plain data, which [`AccountState::from_snapshot`] rebuilds exactly: one
+/// part of a [`SimulatedVenueSnapshot`](crate::exchange::mock::venue::SimulatedVenueSnapshot).
+///
+/// Listed in a fixed order (balances by asset, ended orders by id, trades as booked), so two
+/// snapshots of one state are equal.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct AccountStateSnapshot {
+    balances: Vec<AssetBalance<AssetNameExchange>>,
+    orders_open: Vec<OpenOrderEntry>,
+    orders_cancelled: Vec<Order<ExchangeId, InstrumentNameExchange, Cancelled>>,
+    orders_filled: Vec<Order<ExchangeId, InstrumentNameExchange, Filled>>,
+    orders_expired: Vec<Order<ExchangeId, InstrumentNameExchange, Expired>>,
+    trades: Vec<Trade<AssetNameExchange, InstrumentNameExchange>>,
+    margin: bool,
+    loans_changed: u64,
+}
+
+impl AccountStateSnapshot {
+    /// Whether the account was a margin account.
+    pub fn margin(&self) -> bool {
+        self.margin
+    }
+
+    /// Every instrument an open, ended or traded order names, possibly more than once.
+    pub(crate) fn instruments(&self) -> impl Iterator<Item = &InstrumentNameExchange> + '_ {
+        self.orders_open
+            .iter()
+            .map(|entry| &entry.resting.order.key.instrument)
+            .chain(
+                self.orders_cancelled
+                    .iter()
+                    .map(|order| &order.key.instrument),
+            )
+            .chain(self.orders_filled.iter().map(|order| &order.key.instrument))
+            .chain(
+                self.orders_expired
+                    .iter()
+                    .map(|order| &order.key.instrument),
+            )
+            .chain(self.trades.iter().map(|trade| &trade.instrument))
+    }
+}
+
+impl AccountState {
+    /// This account as plain data: see [`AccountStateSnapshot`].
+    pub fn snapshot(&self) -> AccountStateSnapshot {
+        fn by_id<State: Clone>(
+            orders: &FnvHashMap<ClientOrderId, Order<ExchangeId, InstrumentNameExchange, State>>,
+        ) -> Vec<Order<ExchangeId, InstrumentNameExchange, State>> {
+            orders
+                .iter()
+                .sorted_unstable_by(|(a, _), (b, _)| a.cmp(b))
+                .map(|(_, order)| order.clone())
+                .collect()
+        }
+
+        AccountStateSnapshot {
+            balances: self
+                .balances
+                .iter()
+                .sorted_unstable_by(|(a, _), (b, _)| a.cmp(b))
+                .map(|(_, balance)| balance.clone())
+                .collect(),
+            orders_open: self.orders_open.entries(),
+            orders_cancelled: by_id(&self.orders_cancelled),
+            orders_filled: by_id(&self.orders_filled),
+            orders_expired: by_id(&self.orders_expired),
+            trades: self.trades.clone(),
+            margin: self.margin,
+            loans_changed: self.loans_changed,
+        }
+    }
+
+    /// The account `snapshot` describes, exactly as it was when [`snapshot`](Self::snapshot) was
+    /// taken.
+    ///
+    /// # Errors
+    /// [`DuplicateSeededOrder`] if `snapshot` lists one [`ClientOrderId`] twice among its open
+    /// orders, or twice among its cancelled, its filled or its expired orders.
+    pub fn from_snapshot(snapshot: AccountStateSnapshot) -> Result<Self, DuplicateSeededOrder> {
+        fn by_id<State>(
+            orders: Vec<Order<ExchangeId, InstrumentNameExchange, State>>,
+        ) -> Result<
+            FnvHashMap<ClientOrderId, Order<ExchangeId, InstrumentNameExchange, State>>,
+            DuplicateSeededOrder,
+        > {
+            let mut map = FnvHashMap::default();
+            for order in orders {
+                let cid = order.key.cid.clone();
+                if map.insert(cid.clone(), order).is_some() {
+                    return Err(DuplicateSeededOrder(cid));
+                }
+            }
+            Ok(map)
+        }
+
+        let AccountStateSnapshot {
+            balances,
+            orders_open,
+            orders_cancelled,
+            orders_filled,
+            orders_expired,
+            trades,
+            margin,
+            loans_changed,
+        } = snapshot;
+        Ok(Self {
+            balances: balances
+                .into_iter()
+                .map(|balance| (balance.asset.clone(), balance))
+                .collect(),
+            orders_open: OpenOrders::from_entries(orders_open)
+                .map_err(|AlreadyResting(resting)| DuplicateSeededOrder(resting.order.key.cid))?,
+            orders_cancelled: by_id(orders_cancelled)?,
+            orders_filled: by_id(orders_filled)?,
+            orders_expired: by_id(orders_expired)?,
+            trades,
+            margin,
+            loans_changed,
+        })
+    }
+}
 
 /// Seeds an account from a snapshot, as a [`SimulatedVenue`] does from its `initial_state`.
 ///
