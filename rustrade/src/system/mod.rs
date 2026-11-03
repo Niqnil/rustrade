@@ -11,11 +11,13 @@ use crate::{
         command::Command,
         state::{instrument::filter::InstrumentFilter, trading::TradingState},
     },
-    execution::builder::ExecutionHandles,
+    execution::{builder::ExecutionHandles, paper::PaperVenue},
     shutdown::{AsyncShutdown, Shutdown},
 };
 use feed::{FeedDepth, FeedTx};
+use fnv::FnvHashMap;
 use rustrade_execution::order::request::{OrderRequestCancel, OrderRequestOpen};
+use rustrade_instrument::exchange::ExchangeId;
 use rustrade_integration::{
     channel::{Tx, UnboundedRx},
     collection::{one_or_many::OneOrMany, snapshot::SnapUpdates},
@@ -94,6 +96,10 @@ where
     /// Optional audit snapshot with updates (present when audit sending is enabled).
     pub audit:
         Option<SnapUpdates<AuditTick<Engine::Snapshot>, UnboundedRx<AuditTick<Engine::Audit>>>>,
+
+    /// A handle to each paper venue the system runs, by exchange: see
+    /// [`ExecutionBuild::paper_venues`](crate::execution::builder::ExecutionBuild::paper_venues).
+    pub paper_venues: FnvHashMap<ExchangeId, PaperVenue>,
 }
 
 impl<Engine, Event> System<Engine, Event>
@@ -178,6 +184,7 @@ where
                 },
             feed_tx,
             audit: _,
+            paper_venues: _,
         } = self;
 
         // Wait for the MarketStream to finish forwarding before initiating shutdown. Note that

@@ -10,13 +10,23 @@ use crate::execution::sim::{SimVenueOptions, market::VenueMarketUpdate};
 use fnv::FnvHashMap;
 use futures::Stream;
 use rustrade_data::streams::{consumer::MarketStreamEvent, reconnect};
-use rustrade_execution::market::MarketObservation;
-use rustrade_instrument::instrument::InstrumentIndex;
+use rustrade_execution::{
+    borrow_capacity::BorrowCapacity,
+    client::mock::request_borrow_capacity,
+    error::{ConnectivityError, UnindexedClientError},
+    exchange::mock::{MockExchangeClock, request::MockExchangeRequest},
+    market::MarketObservation,
+};
+use rustrade_instrument::{
+    Side,
+    exchange::ExchangeId,
+    instrument::{InstrumentIndex, name::InstrumentNameExchange},
+};
 use std::{
     pin::Pin,
     task::{Context, Poll, ready},
 };
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 /// The market of one instrument, as a [`PaperMarketTap`] has folded it from the events seen so
 /// far.
@@ -215,6 +225,92 @@ impl Default for PaperOptions {
             venue: SimVenueOptions::default(),
             account_stream_capacity: Self::DEFAULT_ACCOUNT_STREAM_CAPACITY,
         }
+    }
+}
+
+/// A handle to a paper venue, for asking it what an account query on a live venue asks, outside
+/// the `Engine`'s order flow.
+///
+/// [`ExecutionBuilder::build`](crate::execution::builder::ExecutionBuilder::build) returns one for
+/// each venue [`add_paper`](crate::execution::builder::ExecutionBuilder::add_paper) added, in
+/// [`ExecutionBuild::paper_venues`](crate::execution::builder::ExecutionBuild::paper_venues), which
+/// [`Execution`](crate::execution::Execution) carries on. Cheap to clone; every clone asks the same
+/// venue.
+///
+/// It places and cancels nothing: orders go through the `Engine`, which tracks them.
+///
+/// # Ordering
+/// A query travels on the same request channel as the orders the venue's `ExecutionManager` sends
+/// it, after the same latency, and is answered from the venue's state when it arrives. An order the
+/// `Engine` sent just before the query may not have reached the manager's channel yet, so the
+/// answer can predate it.
+///
+/// # Before and after the venue runs
+/// The handle never keeps a venue running: it holds the venue's request channel weakly, so a
+/// system shuts down as it would without it. A query sent before
+/// [`ExecutionBuild::init`](crate::execution::builder::ExecutionBuild::init) starts the venue
+/// waits for it. Once the venue's `ExecutionManager` and the venue have stopped, or if their build
+/// was dropped without being started, a query fails with [`ConnectivityError::ExchangeOffline`].
+#[derive(Clone)]
+pub struct PaperVenue {
+    exchange: ExchangeId,
+    request_tx: mpsc::WeakUnboundedSender<MockExchangeRequest>,
+    clock: MockExchangeClock,
+}
+
+impl PaperVenue {
+    pub(crate) fn new(
+        exchange: ExchangeId,
+        request_tx: &mpsc::UnboundedSender<MockExchangeRequest>,
+        clock: MockExchangeClock,
+    ) -> Self {
+        Self {
+            exchange,
+            request_tx: request_tx.downgrade(),
+            clock,
+        }
+    }
+
+    /// The exchange the venue is added for.
+    pub fn exchange(&self) -> ExchangeId {
+        self.exchange
+    }
+
+    /// How much the paper account can borrow now for an order on `instrument` on `side`, as
+    /// [`BorrowCapacityClient::fetch_borrow_capacity`](rustrade_execution::client::BorrowCapacityClient::fetch_borrow_capacity)
+    /// asks a live margin venue.
+    ///
+    /// Answered by the simulated venue from its own ledger, its lending rules and the market it has
+    /// observed, as
+    /// [`SimulatedVenue::borrow_capacity`](rustrade_execution::exchange::mock::SimulatedVenue::borrow_capacity)
+    /// is in a backtest; see there for when it answers `None` or an error. **Advisory**, as on a
+    /// live venue: nothing is reserved, so an order sized to it can still be refused.
+    ///
+    /// # Errors
+    /// As [`request_borrow_capacity`] says. A venue configured without spot margin lends against no
+    /// instrument, so answers
+    /// [`ApiError::InstrumentInvalid`](rustrade_execution::error::ApiError::InstrumentInvalid) for
+    /// every one.
+    pub async fn fetch_borrow_capacity(
+        &self,
+        instrument: &InstrumentNameExchange,
+        side: Side,
+    ) -> Result<BorrowCapacity, UnindexedClientError> {
+        let Some(request_tx) = self.request_tx.upgrade() else {
+            return Err(UnindexedClientError::Connectivity(
+                ConnectivityError::ExchangeOffline(self.exchange),
+            ));
+        };
+        request_borrow_capacity(&request_tx, self.exchange, (self.clock)(), instrument, side).await
+    }
+}
+
+impl std::fmt::Debug for PaperVenue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The clock is a closure, which has no `Debug`.
+        f.debug_struct("PaperVenue")
+            .field("exchange", &self.exchange)
+            .finish_non_exhaustive()
     }
 }
 

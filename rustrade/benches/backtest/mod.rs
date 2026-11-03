@@ -535,6 +535,7 @@ async fn backtest_market_only(
         in_flight_deadlines,
         account_channel,
         futures,
+        paper_venues: _,
     } = args_constant
         .executions
         .clone()

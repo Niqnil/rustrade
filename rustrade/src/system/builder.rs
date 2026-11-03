@@ -15,7 +15,7 @@ use crate::{
     execution::{
         AccountStreamEvent,
         builder::{ExecutionBuildFutures, ExecutionBuilder},
-        paper::{PaperMarketFeed, PaperOptions},
+        paper::{PaperMarketFeed, PaperOptions, PaperVenue},
     },
     shutdown::SyncShutdown,
     system::{System, SystemAuxillaryHandles, config::ExecutionConfig},
@@ -376,6 +376,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             market_stream,
             account_channel: execution.account_channel,
             execution_build_futures: execution.futures,
+            paper_venues: execution.paper_venues,
             phantom_event: PhantomData,
         })
     }
@@ -432,6 +433,11 @@ pub struct SystemBuild<Engine, Event, MarketStream> {
     /// Futures for initialising `ExecutionBuild` components.
     pub execution_build_futures: ExecutionBuildFutures,
 
+    /// A handle to each paper venue, by exchange: see
+    /// [`ExecutionBuild::paper_venues`](crate::execution::builder::ExecutionBuild::paper_venues).
+    /// Empty from [`new`](Self::new); set with [`with_paper_venues`](Self::with_paper_venues).
+    pub paper_venues: FnvHashMap<ExchangeId, PaperVenue>,
+
     phantom_event: PhantomData<Event>,
 }
 
@@ -462,7 +468,17 @@ where
             market_stream,
             account_channel,
             execution_build_futures,
+            paper_venues: FnvHashMap::default(),
             phantom_event: Default::default(),
+        }
+    }
+
+    /// This build, holding `paper_venues`, the handles of the paper venues its execution
+    /// components run, which [`init`](Self::init) carries on to the [`System`].
+    pub fn with_paper_venues(self, paper_venues: FnvHashMap<ExchangeId, PaperVenue>) -> Self {
+        Self {
+            paper_venues,
+            ..self
         }
     }
 
@@ -494,6 +510,7 @@ where
             market_stream,
             account_channel,
             execution_build_futures,
+            paper_venues,
             phantom_event: _,
         } = self;
 
@@ -580,6 +597,7 @@ where
             },
             feed_tx,
             audit,
+            paper_venues,
         })
     }
 }
