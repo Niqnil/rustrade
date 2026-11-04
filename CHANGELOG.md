@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Binance's fetched collateral ratios can be applied to a simulated venue's spot margin**
+  (`rustrade-execution`, `binance`, #852). `apply_collateral_ratios(config, &ratios, assets)`
+  sets each named asset's borrow and liquidation collateral ratios on a `SpotMarginConfig` from
+  what `BinanceMargin::fetch_collateral_ratios` returns, so a backtest weights collateral as
+  Binance cross margin does without copying each value by hand.
+  - It applies only the assets named, and refuses, with `ApplyCollateralRatiosError`, an asset
+    Binance does not list, or one whose borrow or liquidation ratio is not a single tier covering
+    every USD value. The simulated venue applies one ratio per asset, and Binance's tiers are
+    progressive, so such an asset has no exact single ratio. A ratio the configuration refuses is
+    passed on, not clamped.
+  - Transfer-out ratios are not applied: the simulated venue does not check transfers out.
+- **`SpotMarginConfig::with_collateral_ratios` sets an asset's borrow and liquidation collateral
+  ratios together** (`rustrade-execution`, #852), checking the pair once both are set. Setting
+  them one at a time checks each against the other's old value, and so could refuse a valid
+  pair in one order or the other.
 - **A simulated venue can be snapshotted and restored, so it carries on where it stopped**
   (`rustrade-execution`, #836). A run that stops and starts again, such as a paper venue across a
   process restart, no longer loses its account.
