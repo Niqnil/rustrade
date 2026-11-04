@@ -4502,8 +4502,8 @@ impl SimulatedVenue {
     ///
     /// # Panics
     /// If an order is already resting under its id. `open_order_inner` refuses such an open before
-    /// anything else, under the same `&mut self`, so the book is vacant under this id by
-    /// construction, and a refusal here would be a bug in this venue with no correct reply left
+    /// anything touches the ledger, under the same `&mut self`, so the book is vacant under this id
+    /// by construction, and a refusal here would be a bug in this venue with no correct reply left
     /// to give.
     fn book_rested(&mut self, order: OpenOrder, reservation: Reservation) {
         if let Err(AlreadyResting(refused)) = self.account.book(order, Some(reservation)) {
