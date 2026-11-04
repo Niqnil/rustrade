@@ -148,6 +148,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: `BinanceMargin::fetch_collateral_ratios` returns all three of each asset's collateral
+  ratios** (`rustrade-execution`, `binance`, #850). It now returns
+  `HashMap<AssetNameExchange, CollateralRatios>`, where it returned each asset's liquidation tiers
+  alone. The new `CollateralRatios` holds `liquidation`, `borrow` and `transfer_out`, each a
+  `Vec<CollateralRatioTier>` in ascending minimum USD value, read from the endpoint's
+  `collaterals`, `borrowCollaterals` and `withdrawCollaterals`. Still one request.
+  - The borrow ratios govern how much the account can borrow, so a caller modelling borrowing no
+    longer has to take them from Binance's Margin Data page.
+  - A group missing its borrow or transfer-out set, or with an empty one, is an
+    `UnindexedClientError::Internal`, as a missing liquidation set already was.
+  - Migrate by reading `.liquidation` where the old tiers were used.
 - **The simulated venue's charge on a new loan names the order that took it, and that order's
   instrument** (`rustrade-execution`, #831). Its `InterestTiming::OnBorrow` cash flows now carry
   `CashFlow::loan`, lent at the charge, and `instrument: Some(..)`, where they had
@@ -167,6 +178,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stage's own delay does not skew the estimate of the venue's clock. The account snapshot is
   still checked to index when the stream opens, so one that cannot still fails the open, and it
   is indexed after the stage.
+
+### Fixed
+
+- **`BinanceMargin::fetch_collateral_ratios`'s rustdoc** (`rustrade-execution`, `binance`, #850)
+  said that Binance documents no endpoint for the borrow ratios and that the endpoint's single
+  ratio was observed, not documented, to be the liquidation one. Binance has confirmed that the
+  endpoint returns all three sets, that tiers are progressive (each USD slice of a holding is
+  weighted at its own tier's ratio), and that an open top tier has no `maxUsdValue` because it has
+  no upper limit. The rustdoc now says so, as does `SpotMarginConfig`'s note on tiered ratios.
 
 ## [0.20.0] - 2026-11-02
 
