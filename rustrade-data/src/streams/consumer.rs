@@ -390,6 +390,18 @@ mod tests {
         .map(move |event| (started.elapsed(), event))
     }
 
+    /// The first `count` events of `events`, failing the test if they have not all arrived
+    /// within a day of tokio's (paused) clock, so a stream that is never ended fails rather than
+    /// hangs.
+    async fn first<St: Stream>(events: St, count: usize) -> Vec<St::Item> {
+        tokio::time::timeout(
+            Duration::from_secs(24 * 60 * 60),
+            events.take(count).collect::<Vec<_>>(),
+        )
+        .await
+        .expect("the stream yielded fewer events than expected")
+    }
+
     fn silence_options() -> MarketStreamOptions {
         MarketStreamOptions::default()
             .with_reconnect(POLICY)
@@ -402,10 +414,7 @@ mod tests {
         let exchange = ExchangeId::BinanceFuturesUsd;
         let attempts = stream::iter([silent(), silent()]);
 
-        let events = timed_events(attempts.boxed(), silence_options())
-            .take(4)
-            .collect::<Vec<_>>()
-            .await;
+        let events = first(timed_events(attempts.boxed(), silence_options()), 4).await;
 
         // A successful initialisation resets the backoff, so the second connection starts at once
         // and is silent for one more threshold
@@ -426,10 +435,7 @@ mod tests {
         let gap = Duration::from_secs(3);
         let attempts = stream::iter([spaced(gap, vec![Ok(1), Ok(2)])]);
 
-        let events = timed_events(attempts.boxed(), silence_options())
-            .take(4)
-            .collect::<Vec<_>>()
-            .await;
+        let events = first(timed_events(attempts.boxed(), silence_options()), 4).await;
 
         assert_eq!(
             events,
@@ -449,10 +455,7 @@ mod tests {
         let error = DataError::Socket("frame failed to parse".to_owned());
         let attempts = stream::iter([spaced(gap, vec![Err(error.clone())])]);
 
-        let events = timed_events(attempts.boxed(), silence_options())
-            .take(3)
-            .collect::<Vec<_>>()
-            .await;
+        let events = first(timed_events(attempts.boxed(), silence_options()), 3).await;
 
         assert_eq!(
             events,
@@ -473,10 +476,7 @@ mod tests {
             silent()
         });
 
-        let events = timed_events(attempts.boxed(), silence_options())
-            .take(2)
-            .collect::<Vec<_>>()
-            .await;
+        let events = first(timed_events(attempts.boxed(), silence_options()), 2).await;
 
         assert_eq!(
             events,
@@ -533,5 +533,9 @@ mod tests {
         let options = options.with_silence_timeout(SILENCE).unwrap();
         assert_eq!(options.silence_timeout(), Some(SILENCE));
         assert_eq!(options.reconnect, STREAM_RECONNECTION_POLICY);
+
+        let options = options.with_reconnect(POLICY);
+        assert_eq!(options.reconnect, POLICY);
+        assert_eq!(options.silence_timeout(), Some(SILENCE));
     }
 }
