@@ -270,6 +270,16 @@ impl AccountEventDeduper {
         matches!(event.kind, AccountEventKind::Trade(_))
             && dedup_key_from_event(event).is_some_and(|key| is_duplicate(&self.0, key))
     }
+
+    /// Records `event` as seen if it is a fill, without asking whether it was: for a fill
+    /// delivered by a path that is not itself deduplicated, so that a later copy of it is.
+    pub fn record(&self, event: &UnindexedAccountEvent) {
+        if matches!(event.kind, AccountEventKind::Trade(_))
+            && let Some(key) = dedup_key_from_event(event)
+        {
+            self.0.lock().put(key, ());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -313,6 +323,32 @@ mod tests {
         // The id is per instrument.
         assert!(!deduper.is_duplicate(&trade_event("eth_usdt", "1")));
         assert!(!deduper.is_duplicate(&trade_event("btc_usdt", "2")));
+    }
+
+    /// A recorded fill is a duplicate when it is seen next, and recording one already seen
+    /// changes nothing. An event that is not a fill is not recorded, even one with a key.
+    #[test]
+    fn a_recorded_fill_is_a_duplicate_and_nothing_else_is_recorded() {
+        let deduper = AccountEventDeduper::new();
+
+        deduper.record(&trade_event("btc_usdt", "1"));
+        deduper.record(&trade_event("btc_usdt", "1"));
+        assert!(deduper.is_duplicate(&trade_event("btc_usdt", "1")));
+        assert!(!deduper.is_duplicate(&trade_event("btc_usdt", "2")));
+
+        let notice = UnindexedAccountEvent {
+            exchange: ExchangeId::BinanceSpot,
+            kind: AccountEventKind::Notice(crate::notice::AccountNotice::new(
+                crate::notice::NoticeKind::Other,
+                None,
+                DateTime::UNIX_EPOCH,
+                None,
+                "STATUS".into(),
+            )),
+        };
+        assert!(dedup_key_from_event(&notice).is_some());
+        deduper.record(&notice);
+        assert_eq!(deduper.0.lock().len(), 2);
     }
 
     #[test]

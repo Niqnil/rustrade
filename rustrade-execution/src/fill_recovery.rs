@@ -47,7 +47,9 @@ pub struct FillRecoveryGap<InstrumentKey> {
     /// The last moment of the span, inclusive.
     pub end: DateTime<Utc>,
     /// How many times the span was read before it was given up: 1 when the venue does not retry
-    /// it. Retries within one read, such as after a rate limit, are not counted.
+    /// it. Retries within one read, such as after a rate limit, are not counted. For a
+    /// [`Processing`](FillRecoveryFailure::Processing) gap, how many times the client tried to
+    /// process the fill.
     pub attempts: u32,
     /// Why the last read failed.
     pub reason: FillRecoveryFailure,
@@ -125,4 +127,11 @@ pub enum FillRecoveryFailure {
         /// The maximum number of calls.
         max_pages: u32,
     },
+
+    /// A fill was delivered, but a client's
+    /// [`process_account_events`](crate::client::ExecutionClient::process_account_events) could not
+    /// process it and gave up on it, so it did not reach the consumer. The gap's scope is the
+    /// fill's instrument, its span the fill's time, and its `attempts` the client's tries.
+    #[error("the client could not process a fill: {0}")]
+    Processing(String),
 }
