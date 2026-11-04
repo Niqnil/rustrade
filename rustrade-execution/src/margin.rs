@@ -308,7 +308,9 @@ pub struct OrderLoan {
 /// # What it does not model
 /// - **Isolated margin.** One pool of balances backs every instrument.
 /// - **Tiered collateral ratios.** An asset has one ratio per check, whatever the size of its
-///   holding. Binance publishes each ratio in tiers by the holding's value in USD.
+///   holding. Binance publishes each ratio in progressive tiers by the holding's value in USD:
+///   each slice of the value is weighted at its own tier's ratio. An asset with a single tier, as
+///   every asset had on 2026-11-04, is modelled exactly.
 /// - **Index prices.** Every check values an asset at a market's own mid or last price, where
 ///   Binance values at an index over several venues. The borrow price window above stands in for
 ///   the window Binance takes over that index.
