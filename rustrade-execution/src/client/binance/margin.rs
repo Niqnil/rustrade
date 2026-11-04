@@ -19,7 +19,8 @@
 //! carry: the interest charged ([`BinanceMargin::fetch_margin_interest`]) and forced liquidations
 //! ([`BinanceMargin::fetch_forced_liquidations`]). [`BinanceMargin::fetch_collateral_ratios`]
 //! reads cross margin's per-asset collateral ratios, for liquidation, borrowing and transfers
-//! out.
+//! out, and [`apply_collateral_ratios`] gives the simulated venue's spot margin those of them it
+//! models.
 //!
 //! The client supports both **cross** (`isIsolated = "FALSE"`, account-wide collateral) and
 //! **isolated** (`isIsolated = "TRUE"`, per-pair sub-accounts) margin, selected by
@@ -63,7 +64,10 @@ mod loans;
 mod records;
 mod stream;
 
-pub use collateral::{CollateralRatioTier, CollateralRatios};
+pub use collateral::{
+    ApplyCollateralRatiosError, CollateralRatioSet, CollateralRatioTier, CollateralRatios,
+    apply_collateral_ratios,
+};
 pub use records::MarginForcedLiquidation;
 
 use super::commission::{CommissionRates, fetch_commission_rates};

@@ -550,7 +550,8 @@ impl SpotMarginConfig {
     /// [`SpotMarginConfigError::CollateralRatioOutOfRange`] if `ratio` is outside `[0, 1]`, and
     /// [`SpotMarginConfigError::LiquidationRatioBelowBorrowRatio`] if it is below `asset`'s
     /// [`borrow_collateral_ratio`](Self::borrow_collateral_ratio). To set a liquidation ratio
-    /// below the asset's current borrow ratio, lower the borrow ratio first.
+    /// below the asset's current borrow ratio, lower the borrow ratio first, or set both at once
+    /// with [`with_collateral_ratios`](Self::with_collateral_ratios).
     pub fn with_liquidation_collateral_ratio(
         mut self,
         asset: AssetNameExchange,
@@ -569,6 +570,35 @@ impl SpotMarginConfig {
             .get(asset)
             .copied()
             .unwrap_or(Decimal::ONE)
+    }
+
+    /// This configuration, with `asset`'s
+    /// [`borrow_collateral_ratio`](Self::with_borrow_collateral_ratio) and
+    /// [`liquidation_collateral_ratio`](Self::with_liquidation_collateral_ratio) both replaced,
+    /// checked together once both are set.
+    ///
+    /// Setting the two one after the other checks the pair after each step, against the other
+    /// ratio's old value, so it can refuse a pair that is valid as a whole: raising a 0.5 borrow
+    /// ratio and a 0.6 liquidation ratio to 0.8 and 0.9 fails if the borrow ratio goes first, and
+    /// lowering them back fails the other way round. This setter does not depend on the order.
+    ///
+    /// A ratio of one removes it, as either setter does.
+    ///
+    /// # Errors
+    /// [`SpotMarginConfigError::CollateralRatioOutOfRange`] if either ratio is outside `[0, 1]`,
+    /// and [`SpotMarginConfigError::LiquidationRatioBelowBorrowRatio`] if `liquidation` is below
+    /// `borrow`.
+    pub fn with_collateral_ratios(
+        mut self,
+        asset: AssetNameExchange,
+        borrow: Decimal,
+        liquidation: Decimal,
+    ) -> Result<Self, SpotMarginConfigError> {
+        self.0.borrow_collateral_ratio.insert(asset.clone(), borrow);
+        self.0
+            .liquidation_collateral_ratio
+            .insert(asset, liquidation);
+        Self::try_from(self.0)
     }
 
     /// This configuration, valuing each asset over the trailing `window` of its price when the
@@ -1592,6 +1622,68 @@ mod tests {
 
         let json = r#"{"valuation_asset":"usdt","max_leverage":"3","margin_effect":"borrow","liquidation_collateral_ratio":{"btc":"0.9"}}"#;
         assert!(serde_json::from_str::<SpotMarginConfig>(json).is_err());
+    }
+
+    #[test]
+    fn with_collateral_ratios_sets_both_where_setting_them_in_turn_fails_in_one_order() {
+        let low = usdt_margin()
+            .with_collateral_ratios(btc(), dec!(0.5), dec!(0.6))
+            .unwrap();
+        assert_eq!(low.borrow_collateral_ratio(&btc()), dec!(0.5));
+        assert_eq!(low.liquidation_collateral_ratio(&btc()), dec!(0.6));
+        assert!(
+            low.clone()
+                .with_borrow_collateral_ratio(btc(), dec!(0.8))
+                .is_err(),
+            "raising the borrow ratio first passes the old liquidation ratio"
+        );
+
+        let high = low
+            .with_collateral_ratios(btc(), dec!(0.8), dec!(0.9))
+            .unwrap();
+        assert_eq!(high.borrow_collateral_ratio(&btc()), dec!(0.8));
+        assert_eq!(high.liquidation_collateral_ratio(&btc()), dec!(0.9));
+        assert!(
+            high.clone()
+                .with_liquidation_collateral_ratio(btc(), dec!(0.6))
+                .is_err(),
+            "lowering the liquidation ratio first passes the old borrow ratio"
+        );
+
+        let back = high
+            .with_collateral_ratios(btc(), dec!(0.5), dec!(0.6))
+            .unwrap();
+        assert_eq!(back.borrow_collateral_ratio(&btc()), dec!(0.5));
+        assert_eq!(back.liquidation_collateral_ratio(&btc()), dec!(0.6));
+        assert_eq!(
+            back.with_collateral_ratios(btc(), Decimal::ONE, dec!(1.0)),
+            Ok(usdt_margin()),
+            "ratios of one count the asset in full"
+        );
+    }
+
+    #[test]
+    fn with_collateral_ratios_refuses_what_either_setter_refuses() {
+        for (borrow, liquidation, ratio) in [
+            (dec!(-0.01), dec!(0.5), dec!(-0.01)),
+            (dec!(0.5), dec!(1.01), dec!(1.01)),
+        ] {
+            assert_eq!(
+                usdt_margin().with_collateral_ratios(btc(), borrow, liquidation),
+                Err(SpotMarginConfigError::CollateralRatioOutOfRange {
+                    asset: btc(),
+                    ratio,
+                })
+            );
+        }
+        assert_eq!(
+            usdt_margin().with_collateral_ratios(btc(), dec!(0.9), dec!(0.8)),
+            Err(SpotMarginConfigError::LiquidationRatioBelowBorrowRatio {
+                asset: btc(),
+                borrow: dec!(0.9),
+                liquidation: dec!(0.8),
+            })
+        );
     }
 
     #[test]
