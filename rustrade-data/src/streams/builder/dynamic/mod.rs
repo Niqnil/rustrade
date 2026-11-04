@@ -9,7 +9,7 @@ use crate::exchange::massive::{MassiveSubscriber, market::MassiveInstrument};
 use crate::{
     error::DataError,
     instrument::InstrumentData,
-    streams::consumer::MarketStreamResult,
+    streams::consumer::{MarketStreamOptions, MarketStreamResult},
     subscription::{
         SubKind, Subscription,
         book::{OrderBookEvent, OrderBookL1},
@@ -337,6 +337,9 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
     /// exceeded` on Alpaca — until the socket has closed. Massive refuses nothing: it closes the
     /// older socket instead, ending every stream still on it.
     ///
+    /// Every connection uses [`MarketStreamOptions::default`]; use
+    /// [`init_with_options`](Self::init_with_options) to set them per batch.
+    ///
     /// ## Examples
     /// Please see rustrade-data-rs/examples/dynamic_multi_stream_multi_exchange.rs for a
     /// comprehensive example of how to use this market data stream initialiser.
@@ -351,13 +354,43 @@ impl<InstrumentKey> DynamicStreams<InstrumentKey> {
         Instrument: DynamicInstrument + InstrumentData<Key = InstrumentKey>,
         InstrumentKey: Debug + Clone + PartialEq + Send + Sync + 'static,
     {
+        Self::init_with_options(
+            subscribers,
+            subscription_batches
+                .into_iter()
+                .map(|batch| (batch, MarketStreamOptions::default())),
+        )
+        .await
+    }
+
+    /// As [`init_with`](Self::init_with), with the [`MarketStreamOptions`] for each batch's
+    /// connections: their reconnect backoff, and a silence timeout that ends one when it delivers
+    /// nothing.
+    ///
+    /// A batch is split into one connection per `(ExchangeId, SubKind)` group, as in
+    /// [`init_with`](Self::init_with), and each of its connections has the batch's options. To give
+    /// two kinds on one venue different options, such as a silence timeout for a candle stream
+    /// only, put them in separate batches.
+    pub async fn init_with_options<SubBatchIter, SubIter, Sub, Instrument>(
+        subscribers: &DynamicSubscribers,
+        subscription_batches: SubBatchIter,
+    ) -> Result<Self, DataError>
+    where
+        SubBatchIter: IntoIterator<Item = (SubIter, MarketStreamOptions)>,
+        SubIter: IntoIterator<Item = Sub>,
+        Sub: Into<Subscription<ExchangeId, Instrument, SubKind>>,
+        Instrument: DynamicInstrument + InstrumentData<Key = InstrumentKey>,
+        InstrumentKey: Debug + Clone + PartialEq + Send + Sync + 'static,
+    {
+        let (batches, options): (Vec<_>, Vec<_>) = subscription_batches.into_iter().unzip();
+
         // Validate & dedup Subscription batches
-        let batches = validate_batches(subscription_batches)?;
+        let batches = validate_batches(batches)?;
 
         // Generate required Channels from Subscription batches
         let Channels { txs, rxs } = Channels::try_from(&batches)?;
 
-        let groups = route_batches(batches, &txs, subscribers)?;
+        let groups = route_batches(batches.into_iter().zip(options), &txs, subscribers)?;
 
         settle(join_all(groups).await).await?;
 
@@ -588,12 +621,18 @@ where
     Ok(batch)
 }
 
-/// Split each batch into its `(ExchangeId, SubKind)` groups and route every one, connecting none.
+/// Split each batch into its `(ExchangeId, SubKind)` groups and route every one, with its batch's
+/// options, connecting none.
 ///
 /// Routing all of them first is what lets a group nothing can serve fail the call before any
 /// connection is opened.
 fn route_batches<Instrument>(
-    batches: Vec<Vec<Subscription<ExchangeId, Instrument, SubKind>>>,
+    batches: impl IntoIterator<
+        Item = (
+            Vec<Subscription<ExchangeId, Instrument, SubKind>>,
+            MarketStreamOptions,
+        ),
+    >,
     txs: &Txs<Instrument::Key>,
     subscribers: &DynamicSubscribers,
 ) -> Result<Vec<plan::GroupFuture>, DataError>
@@ -602,17 +641,17 @@ where
 {
     batches
         .into_iter()
-        .flat_map(|mut batch| {
+        .flat_map(|(mut batch, options)| {
             batch.sort_unstable_by_key(|sub| (sub.exchange, sub.kind));
             batch
                 .into_iter()
                 .chunk_by(|sub| (sub.exchange, sub.kind))
                 .into_iter()
-                .map(|(key, subs)| (key, subs.collect::<Vec<_>>()))
+                .map(|(key, subs)| (key, subs.collect::<Vec<_>>(), options.clone()))
                 .collect::<Vec<_>>()
         })
-        .map(|((exchange, sub_kind), subs)| {
-            Instrument::route(exchange, sub_kind, subs, txs, subscribers)
+        .map(|((exchange, sub_kind), subs, options)| {
+            Instrument::route(exchange, sub_kind, subs, txs, subscribers, options)
         })
         .collect()
 }
@@ -977,6 +1016,9 @@ mod tests {
         subscribers: &DynamicSubscribers,
     ) -> Result<Vec<plan::GroupFuture>, DataError> {
         let Channels { txs, rxs: _ } = Channels::try_from(&batches)?;
+        let batches = batches
+            .into_iter()
+            .map(|batch| (batch, MarketStreamOptions::default()));
         route_batches(batches, &txs, subscribers)
     }
 

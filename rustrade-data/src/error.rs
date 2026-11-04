@@ -7,6 +7,7 @@ use rustrade_integration::{
     subscription::{SubscriptionId, display_subscription_ids},
 };
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 use thiserror::Error;
 
 /// All errors generated in `rustrade-data`.
@@ -139,6 +140,19 @@ pub enum DataError {
     /// keeps retrying; giving up is the caller's decision.
     #[error("stream re-initialisation attempt {attempt} failed: {error}")]
     ReinitFailed { attempt: u32, error: Box<DataError> },
+
+    /// A started stream delivered no market event for `threshold`, so it was ended and will
+    /// re-initialise.
+    ///
+    /// Yielded only by a stream given a silence timeout through
+    /// [`MarketStreamOptions::with_silence_timeout`](crate::streams::consumer::MarketStreamOptions::with_silence_timeout),
+    /// once per timeout, immediately before that stream's
+    /// [`Reconnecting`](crate::streams::reconnect::Event::Reconnecting). It reports that the
+    /// connection was open but silent, as opposed to closed, so a caller counting transport
+    /// faults can count it separately. The stream re-initialises as after any other end; giving
+    /// up on a feed that stays silent is the caller's decision.
+    #[error("no market event received for {threshold:?}, so the stream is reconnecting")]
+    SilenceTimeout { threshold: Duration },
 }
 
 impl DataError {
@@ -231,6 +245,14 @@ mod tests {
                 input: DataError::UnsupportedInterval {
                     exchange: ExchangeId::HyperliquidPerp,
                     interval: CandleInterval::Sec1,
+                },
+                expected: false,
+            },
+            TestCase {
+                // TC3: not terminal w/ DataError::SilenceTimeout — the stream that yields it
+                // has already ended itself, and re-initialises without being terminated.
+                input: DataError::SilenceTimeout {
+                    threshold: Duration::from_secs(5),
                 },
                 expected: false,
             },

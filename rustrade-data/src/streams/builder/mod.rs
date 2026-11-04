@@ -5,7 +5,7 @@ use crate::{
     exchange::StreamSelector,
     instrument::InstrumentData,
     streams::{
-        consumer::{MarketStreamResult, STREAM_RECONNECTION_POLICY, init_market_stream},
+        consumer::{MarketStreamOptions, MarketStreamResult, init_market_stream},
         reconnect::stream::ReconnectingStream,
     },
     subscription::{Subscription, SubscriptionKind},
@@ -84,10 +84,35 @@ where
     ///
     /// Note that [`Subscription`]s are not actioned until the
     /// [`init()`](StreamBuilder::init()) method is invoked.
+    ///
+    /// The connection uses [`MarketStreamOptions::default`]; use
+    /// [`subscribe_with_options`](Self::subscribe_with_options) to set its own.
     pub fn subscribe<SubIter, Sub, Exchange, Instrument>(
+        self,
+        subscriber: Exchange::Subscriber,
+        subscriptions: SubIter,
+    ) -> Self
+    where
+        SubIter: IntoIterator<Item = Sub>,
+        Sub: Into<Subscription<Exchange, Instrument, Kind>>,
+        Exchange: StreamSelector<Instrument, Kind> + Ord + Send + Sync + 'static,
+        Instrument: InstrumentData<Key = InstrumentKey> + Ord + Display + 'static,
+        Instrument::Key: Debug + Clone + Send + 'static,
+        Kind: Ord + Display + Send + Sync + 'static,
+        Kind::Event: Clone + Send,
+        Subscription<Exchange, Instrument, Kind>:
+            Identifier<Exchange::Channel> + Identifier<Exchange::Market>,
+    {
+        self.subscribe_with_options(subscriber, subscriptions, MarketStreamOptions::default())
+    }
+
+    /// As [`subscribe`](Self::subscribe), with the [`MarketStreamOptions`] this call's connection
+    /// uses: its reconnect backoff, and a silence timeout that ends it when it delivers nothing.
+    pub fn subscribe_with_options<SubIter, Sub, Exchange, Instrument>(
         mut self,
         subscriber: Exchange::Subscriber,
         subscriptions: SubIter,
+        options: MarketStreamOptions,
     ) -> Self
     where
         SubIter: IntoIterator<Item = Sub>,
@@ -120,8 +145,7 @@ where
             subscriptions.dedup();
 
             // Initialise a MarketEvent `ReconnectingStream`
-            let stream =
-                init_market_stream(STREAM_RECONNECTION_POLICY, subscriber, subscriptions).await?;
+            let stream = init_market_stream(options, subscriber, subscriptions).await?;
 
             // Forward MarketEvents to ExchangeTx
             tokio::spawn(stream.forward_to(exchange_tx));

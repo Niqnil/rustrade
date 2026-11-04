@@ -47,23 +47,36 @@ pub const WEBSOCKET_BASE_URL_BINANCE_FUTURES_USD_MARKET: &str =
 
 /// [`Binance`] perpetual usd exchange (`/public` WS tier: trade/bookTicker/depth).
 ///
-/// # Caller obligation: detect a silently dead stream
+/// # A stream can go silent without ending
 ///
 /// Binance has *demonstrated* that it re-routes which WS stream is served on which path tier (the
 /// `/public` vs `/market` split — see [`BinanceFuturesUsdMarket`]), and futures `PublicTrades` here
 /// rides the **undocumented** `@trade` stream. A tier change does **not** surface as an error: the
 /// handshake still returns HTTP `101` and the socket then delivers **zero frames**, silently —
-/// there is no `Err`, no disconnect, no reconnect trigger. The library cannot distinguish "the
-/// market is quiet" from "this stream is dead" without policy that belongs in the consumer.
+/// there is no `Err` and no disconnect. A subscription can also go quiet on a socket that stays
+/// open and keeps answering pings.
 ///
-/// Per this library's separation-of-concerns contract, staleness detection is the **caller's**
-/// responsibility: consumers (especially trading systems acting on this data) **must** run a
-/// staleness watchdog — assert that an expected-dense stream (e.g. `btcusdt` `PublicTrades`)
-/// delivers at least one event within a sane window (seconds for a liquid symbol), and treat
-/// prolonged silence on a connected socket as a fault to alert/halt on. Do not assume a healthy
-/// socket implies live data. If `@trade` ever goes dark, the known fix on rustrade's side is
-/// migrating futures `PublicTrades` to `@aggTrade` on [`BinanceFuturesUsdMarket`] (`/market`); the
-/// `#[ignore]`d `binance_ws_tier_canary` integration test re-verifies the live tier map on demand.
+/// The library ends such a stream when given a silence timeout:
+/// [`MarketStreamOptions::with_silence_timeout`](crate::streams::consumer::MarketStreamOptions::with_silence_timeout),
+/// set per connection. The stream then yields
+/// [`DataError::SilenceTimeout`](crate::error::DataError::SilenceTimeout) and reconnects. Only the
+/// caller knows how long its streams can be quiet when healthy, so the threshold is the caller's
+/// and the timeout is off by default:
+/// - **Dense streams:** a liquid symbol's `PublicTrades` delivers within seconds.
+/// - **Candles:** only closed candles are delivered, so a 1-second candle stream delivers about
+///   once a second per instrument and a 1-minute one once a minute. Set the threshold above the
+///   interval.
+/// - **One connection, one timer:** every subscription on a connection resets the same timer, so
+///   a busy subscription keeps a silent one on the same connection from being noticed. Give a
+///   stream that must be watched its own connection (its own
+///   [`subscribe_with_options`](crate::streams::builder::StreamBuilder::subscribe_with_options)
+///   call).
+///
+/// A trading system acting on this data should still treat a stream that keeps timing out as a
+/// fault to alert or halt on: reconnecting does not bring back a stream Binance no longer serves on
+/// that tier. If `@trade` ever goes dark, the known fix on rustrade's side is migrating futures
+/// `PublicTrades` to `@aggTrade` on [`BinanceFuturesUsdMarket`] (`/market`); the `#[ignore]`d
+/// `binance_ws_tier_canary` integration test re-verifies the live tier map on demand.
 ///
 /// # WebSocket connection limits
 ///
@@ -85,6 +98,11 @@ pub type BinanceFuturesUsd = Binance<BinanceServerFuturesUsd>;
 /// connection-layer detail selecting the WS path. Streams that Binance routes to `/market`
 /// (klines, liquidations) are implemented only on this type so routing them to the `/public`
 /// tier is a compile error rather than a silent dead stream.
+///
+/// 1-second continuous klines (`<pair>_perpetual@continuousKline_1s`) are delivered here and
+/// nothing on the unrouted `/ws` path (observed November 2026). A stream that can go silent
+/// without ending is covered under [`BinanceFuturesUsd`]'s "A stream can go silent without
+/// ending".
 pub type BinanceFuturesUsdMarket = Binance<BinanceServerFuturesUsdMarket>;
 
 /// [`Binance`] perpetual usd [`ExchangeServer`] (`/public` WS tier).

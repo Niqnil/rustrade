@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A market stream can be ended and reconnected when it stays silent** (`rustrade-data`, #862).
+  A WebSocket can stay open, and keep answering pings, while its subscriptions deliver nothing.
+  Such a stream never ended, so it never reconnected.
+  - `MarketStreamOptions::with_silence_timeout(threshold)` sets a per-connection timeout, off by
+    default. When the connection delivers no market event for `threshold`, its stream yields the
+    new `DataError::SilenceTimeout { threshold }`, then `Reconnecting`, and re-initialises with
+    its backoff, as after any other end. A zero threshold is refused
+    (`MarketStreamOptionsError::SilenceTimeoutZero`).
+  - Only the market events the stream delivers restart the timer: pings, pongs, a venue's
+    heartbeat and acknowledgement messages, an update the integration does not deliver (such as
+    a candle that has not closed) and the stream's errors do not. The timer starts once the
+    stream has initialised, including the venue acknowledging its subscriptions.
+  - `SilenceTimeout` is not terminal, and is yielded as an error so a caller can count it apart
+    from the stream's transport errors.
+  - New `StreamBuilder::subscribe_with_options` and `DynamicStreams::init_with_options` take the
+    options per `subscribe` call and per subscription batch. `subscribe`, `init` and `init_with`
+    use `MarketStreamOptions::default()`.
+  - `MarketStreamOptions` also carries the reconnect backoff (`with_reconnect`), which the
+    builders used to fix at `STREAM_RECONNECTION_POLICY`.
+  - The Binance USD-M futures rustdoc replaces its "caller obligation" to detect a silently dead
+    stream with how to set the timeout. It also notes that 1-second continuous klines are
+    delivered on the `/market` path only, and that `BinanceHistoricalClient::futures` returns
+    1-second candles from only about four months back, without an error for an earlier start.
+
+### Changed
+
+- **Breaking: `init_market_stream` takes `MarketStreamOptions` in place of its
+  `ReconnectionBackoffPolicy`** (`rustrade-data`, #862). Pass
+  `MarketStreamOptions::default().with_reconnect(policy)` to keep the old behaviour.
 ## [0.21.0] - 2026-11-04
 
 ### Added

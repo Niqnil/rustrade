@@ -43,7 +43,7 @@ use crate::{
     },
     instrument::InstrumentData,
     streams::{
-        consumer::{MarketStreamResult, STREAM_RECONNECTION_POLICY, init_market_stream},
+        consumer::{MarketStreamOptions, MarketStreamResult, init_market_stream},
         reconnect::stream::ReconnectingStream,
     },
     subscriber::WebSocketSubscriber,
@@ -92,7 +92,8 @@ impl<InstrumentKey> Default for Txs<InstrumentKey> {
 /// the blanket one below, which states every connector's identifier bound in one place.
 pub trait Route: InstrumentData + Ord + Display + Send + Sync + Sized + 'static {
     /// Route one group — every subscription in it shares `exchange` and `sub_kind` — to the
-    /// connector serving it, returning the future that initialises its stream without polling it.
+    /// connector serving it, returning the future that initialises its stream, with `options`,
+    /// without polling it.
     ///
     /// The arms here and
     /// [`exchange_supports_instrument_kind_sub_kind`](crate::subscription::exchange_supports_instrument_kind_sub_kind)
@@ -111,6 +112,7 @@ pub trait Route: InstrumentData + Ord + Display + Send + Sync + Sized + 'static 
         subscriptions: Vec<Subscription<ExchangeId, Self, SubKind>>,
         txs: &Txs<Self::Key>,
         subscribers: &DynamicSubscribers,
+        options: MarketStreamOptions,
     ) -> Result<GroupFuture, DataError>;
 }
 
@@ -161,6 +163,7 @@ where
         subscriptions: Vec<Subscription<ExchangeId, Self, SubKind>>,
         txs: &Txs<Self::Key>,
         subscribers: &DynamicSubscribers,
+        options: MarketStreamOptions,
     ) -> Result<GroupFuture, DataError> {
         use SubKind::{OrderBooksL1 as L1, OrderBooksL2 as L2, PublicTrades as Trades};
 
@@ -178,6 +181,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             (ExchangeId::BinanceSpot, L1) => group(
                 ws,
@@ -185,6 +189,7 @@ where
                 OrderBooksL1,
                 subs,
                 tx(&txs.l1s, exchange),
+                options,
             ),
             (ExchangeId::BinanceSpot, L2) => group(
                 ws,
@@ -192,6 +197,7 @@ where
                 OrderBooksL2,
                 subs,
                 tx(&txs.l2s, exchange),
+                options,
             ),
             (ExchangeId::BinanceFuturesUsd, Trades) => group(
                 ws,
@@ -199,6 +205,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             (ExchangeId::BinanceFuturesUsd, L1) => group(
                 ws,
@@ -206,6 +213,7 @@ where
                 OrderBooksL1,
                 subs,
                 tx(&txs.l1s, exchange),
+                options,
             ),
             (ExchangeId::BinanceFuturesUsd, L2) => group(
                 ws,
@@ -213,6 +221,7 @@ where
                 OrderBooksL2,
                 subs,
                 tx(&txs.l2s, exchange),
+                options,
             ),
             // `@forceOrder` is a `/market`-tier stream, so the market-tier server type is used for
             // its `/market/ws` URL. Both server types share the `BinanceFuturesUsd` id, so the
@@ -223,6 +232,7 @@ where
                 Liquidations,
                 subs,
                 tx(&txs.liquidations, exchange),
+                options,
             ),
             // A group shares one `SubKind`, so its `interval` is every subscription's interval.
             (ExchangeId::BinanceSpot, SubKind::Candles { interval }) => group(
@@ -231,6 +241,7 @@ where
                 Candles { interval },
                 subs,
                 tx(&txs.candles, exchange),
+                options,
             ),
             // Futures klines are `/market`-tier too; see the liquidations arm.
             (ExchangeId::BinanceFuturesUsd, SubKind::Candles { interval }) => group(
@@ -239,19 +250,31 @@ where
                 Candles { interval },
                 subs,
                 tx(&txs.candles, exchange),
+                options,
             ),
-            (ExchangeId::Bitfinex, Trades) => {
-                group(ws, Bitfinex, PublicTrades, subs, tx(&txs.trades, exchange))
-            }
-            (ExchangeId::Bitmex, Trades) => {
-                group(ws, Bitmex, PublicTrades, subs, tx(&txs.trades, exchange))
-            }
+            (ExchangeId::Bitfinex, Trades) => group(
+                ws,
+                Bitfinex,
+                PublicTrades,
+                subs,
+                tx(&txs.trades, exchange),
+                options,
+            ),
+            (ExchangeId::Bitmex, Trades) => group(
+                ws,
+                Bitmex,
+                PublicTrades,
+                subs,
+                tx(&txs.trades, exchange),
+                options,
+            ),
             (ExchangeId::BybitSpot, Trades) => group(
                 ws,
                 BybitSpot::default(),
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             (ExchangeId::BybitSpot, L1) => group(
                 ws,
@@ -259,6 +282,7 @@ where
                 OrderBooksL1,
                 subs,
                 tx(&txs.l1s, exchange),
+                options,
             ),
             (ExchangeId::BybitSpot, L2) => group(
                 ws,
@@ -266,6 +290,7 @@ where
                 OrderBooksL2,
                 subs,
                 tx(&txs.l2s, exchange),
+                options,
             ),
             (ExchangeId::BybitPerpetualsUsd, Trades) => group(
                 ws,
@@ -273,6 +298,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             (ExchangeId::BybitPerpetualsUsd, L1) => group(
                 ws,
@@ -280,6 +306,7 @@ where
                 OrderBooksL1,
                 subs,
                 tx(&txs.l1s, exchange),
+                options,
             ),
             (ExchangeId::BybitPerpetualsUsd, L2) => group(
                 ws,
@@ -287,16 +314,23 @@ where
                 OrderBooksL2,
                 subs,
                 tx(&txs.l2s, exchange),
+                options,
             ),
-            (ExchangeId::Coinbase, Trades) => {
-                group(ws, Coinbase, PublicTrades, subs, tx(&txs.trades, exchange))
-            }
+            (ExchangeId::Coinbase, Trades) => group(
+                ws,
+                Coinbase,
+                PublicTrades,
+                subs,
+                tx(&txs.trades, exchange),
+                options,
+            ),
             (ExchangeId::GateioSpot, Trades) => group(
                 ws,
                 GateioSpot::default(),
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             (ExchangeId::GateioFuturesUsd, Trades) => group(
                 ws,
@@ -304,6 +338,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             (ExchangeId::GateioFuturesBtc, Trades) => group(
                 ws,
@@ -311,6 +346,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             (ExchangeId::GateioPerpetualsUsd, Trades) => group(
                 ws,
@@ -318,6 +354,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             (ExchangeId::GateioPerpetualsBtc, Trades) => group(
                 ws,
@@ -325,6 +362,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             (ExchangeId::GateioOptions, Trades) => group(
                 ws,
@@ -332,16 +370,32 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
-            (ExchangeId::Kraken, Trades) => {
-                group(ws, Kraken, PublicTrades, subs, tx(&txs.trades, exchange))
-            }
-            (ExchangeId::Kraken, L1) => {
-                group(ws, Kraken, OrderBooksL1, subs, tx(&txs.l1s, exchange))
-            }
-            (ExchangeId::Okx, Trades) => {
-                group(ws, Okx, PublicTrades, subs, tx(&txs.trades, exchange))
-            }
+            (ExchangeId::Kraken, Trades) => group(
+                ws,
+                Kraken,
+                PublicTrades,
+                subs,
+                tx(&txs.trades, exchange),
+                options,
+            ),
+            (ExchangeId::Kraken, L1) => group(
+                ws,
+                Kraken,
+                OrderBooksL1,
+                subs,
+                tx(&txs.l1s, exchange),
+                options,
+            ),
+            (ExchangeId::Okx, Trades) => group(
+                ws,
+                Okx,
+                PublicTrades,
+                subs,
+                tx(&txs.trades, exchange),
+                options,
+            ),
 
             #[cfg(feature = "hyperliquid")]
             (ExchangeId::HyperliquidPerp, Trades) => group(
@@ -350,11 +404,17 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             #[cfg(feature = "hyperliquid")]
-            (ExchangeId::HyperliquidPerp, L2) => {
-                group(ws, Hyperliquid, OrderBooksL2, subs, tx(&txs.l2s, exchange))
-            }
+            (ExchangeId::HyperliquidPerp, L2) => group(
+                ws,
+                Hyperliquid,
+                OrderBooksL2,
+                subs,
+                tx(&txs.l2s, exchange),
+                options,
+            ),
             #[cfg(feature = "hyperliquid")]
             (ExchangeId::HyperliquidSpot, Trades) => group(
                 ws,
@@ -362,6 +422,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             #[cfg(feature = "hyperliquid")]
             (ExchangeId::HyperliquidSpot, L2) => group(
@@ -370,6 +431,7 @@ where
                 OrderBooksL2,
                 subs,
                 tx(&txs.l2s, exchange),
+                options,
             ),
             #[cfg(not(feature = "hyperliquid"))]
             (ExchangeId::HyperliquidPerp | ExchangeId::HyperliquidSpot, Trades | L2) => {
@@ -385,6 +447,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             // Alpaca's top of book is its quote, read from the `quotes` channel.
             #[cfg(feature = "alpaca")]
@@ -394,6 +457,7 @@ where
                 OrderBooksL1,
                 subs,
                 tx(&txs.l1s, exchange),
+                options,
             ),
             #[cfg(feature = "alpaca")]
             (ExchangeId::AlpacaIex, Trades) => group(
@@ -402,6 +466,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             #[cfg(feature = "alpaca")]
             (ExchangeId::AlpacaIex, L1) => group(
@@ -410,6 +475,7 @@ where
                 OrderBooksL1,
                 subs,
                 tx(&txs.l1s, exchange),
+                options,
             ),
             #[cfg(feature = "alpaca")]
             (ExchangeId::AlpacaSip, Trades) => group(
@@ -418,6 +484,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             #[cfg(feature = "alpaca")]
             (ExchangeId::AlpacaSip, L1) => group(
@@ -426,6 +493,7 @@ where
                 OrderBooksL1,
                 subs,
                 tx(&txs.l1s, exchange),
+                options,
             ),
             #[cfg(not(feature = "alpaca"))]
             (
@@ -444,6 +512,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             #[cfg(feature = "lse")]
             (ExchangeId::LseFx, L1) => group(
@@ -452,6 +521,7 @@ where
                 OrderBooksL1,
                 subs,
                 tx(&txs.l1s, exchange),
+                options,
             ),
             #[cfg(feature = "lse")]
             (ExchangeId::LseCrypto, Trades) => group(
@@ -460,6 +530,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             #[cfg(feature = "lse")]
             (ExchangeId::LseCrypto, L1) => group(
@@ -468,6 +539,7 @@ where
                 OrderBooksL1,
                 subs,
                 tx(&txs.l1s, exchange),
+                options,
             ),
             #[cfg(feature = "lse")]
             (ExchangeId::LseEquities, Trades) => group(
@@ -476,6 +548,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             #[cfg(feature = "lse")]
             (ExchangeId::LseEquities, L1) => group(
@@ -484,6 +557,7 @@ where
                 OrderBooksL1,
                 subs,
                 tx(&txs.l1s, exchange),
+                options,
             ),
             #[cfg(feature = "lse")]
             (ExchangeId::LseFutures, Trades) => group(
@@ -492,6 +566,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             #[cfg(feature = "lse")]
             (ExchangeId::LseFutures, L1) => group(
@@ -500,6 +575,7 @@ where
                 OrderBooksL1,
                 subs,
                 tx(&txs.l1s, exchange),
+                options,
             ),
             #[cfg(feature = "lse")]
             (ExchangeId::LseCfd, Trades) => group(
@@ -508,6 +584,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             #[cfg(feature = "lse")]
             (ExchangeId::LseCfd, L1) => group(
@@ -516,6 +593,7 @@ where
                 OrderBooksL1,
                 subs,
                 tx(&txs.l1s, exchange),
+                options,
             ),
             // Options publish no quote, so there is no L1 arm; the support matrix refuses one.
             #[cfg(feature = "lse")]
@@ -525,6 +603,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             #[cfg(not(feature = "lse"))]
             (
@@ -550,6 +629,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             #[cfg(feature = "massive")]
             (ExchangeId::MassiveStocks, L1) => group(
@@ -558,6 +638,7 @@ where
                 OrderBooksL1,
                 subs,
                 tx(&txs.l1s, exchange),
+                options,
             ),
             #[cfg(feature = "massive")]
             (ExchangeId::MassiveStocks, SubKind::Candles { interval }) => group(
@@ -566,6 +647,7 @@ where
                 Candles { interval },
                 subs,
                 tx(&txs.candles, exchange),
+                options,
             ),
             #[cfg(feature = "massive")]
             (ExchangeId::MassiveCrypto, Trades) => group(
@@ -574,6 +656,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             #[cfg(feature = "massive")]
             (ExchangeId::MassiveCrypto, L1) => group(
@@ -582,6 +665,7 @@ where
                 OrderBooksL1,
                 subs,
                 tx(&txs.l1s, exchange),
+                options,
             ),
             #[cfg(feature = "massive")]
             (ExchangeId::MassiveCrypto, SubKind::Candles { interval }) => group(
@@ -590,6 +674,7 @@ where
                 Candles { interval },
                 subs,
                 tx(&txs.candles, exchange),
+                options,
             ),
             // Forex publishes no trades, so there is no trades arm; the support matrix refuses one.
             #[cfg(feature = "massive")]
@@ -599,6 +684,7 @@ where
                 OrderBooksL1,
                 subs,
                 tx(&txs.l1s, exchange),
+                options,
             ),
             #[cfg(feature = "massive")]
             (ExchangeId::MassiveForex, SubKind::Candles { interval }) => group(
@@ -607,6 +693,7 @@ where
                 Candles { interval },
                 subs,
                 tx(&txs.candles, exchange),
+                options,
             ),
             #[cfg(feature = "massive")]
             (ExchangeId::MassiveOptions, Trades) => group(
@@ -615,6 +702,7 @@ where
                 PublicTrades,
                 subs,
                 tx(&txs.trades, exchange),
+                options,
             ),
             #[cfg(feature = "massive")]
             (ExchangeId::MassiveOptions, L1) => group(
@@ -623,6 +711,7 @@ where
                 OrderBooksL1,
                 subs,
                 tx(&txs.l1s, exchange),
+                options,
             ),
             #[cfg(feature = "massive")]
             (ExchangeId::MassiveOptions, SubKind::Candles { interval }) => group(
@@ -631,6 +720,7 @@ where
                 Candles { interval },
                 subs,
                 tx(&txs.candles, exchange),
+                options,
             ),
             #[cfg(not(feature = "massive"))]
             (
@@ -646,13 +736,15 @@ where
     }
 }
 
-/// Build the future initialising one group's stream on `exchange` and forwarding it into `tx`.
+/// Build the future initialising one group's stream on `exchange`, with `options`, and forwarding
+/// it into `tx`.
 fn group<Exchange, Instrument, Kind>(
     subscriber: Exchange::Subscriber,
     exchange: Exchange,
     kind: Kind,
     subscriptions: Vec<Subscription<ExchangeId, Instrument, SubKind>>,
     tx: UnboundedTx<MarketStreamResult<Instrument::Key, Kind::Event>>,
+    options: MarketStreamOptions,
 ) -> GroupFuture
 where
     Exchange: StreamSelector<Instrument, Kind> + Clone + Send + Sync + 'static,
@@ -669,8 +761,7 @@ where
         .collect();
 
     Box::pin(async move {
-        let stream =
-            init_market_stream(STREAM_RECONNECTION_POLICY, subscriber, subscriptions).await?;
+        let stream = init_market_stream(options, subscriber, subscriptions).await?;
         Ok(tokio::spawn(stream.forward_to(tx)))
     })
 }

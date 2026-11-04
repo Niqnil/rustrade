@@ -164,6 +164,12 @@ impl BinanceHistoricalClient {
     ///
     /// This is the surface that unlocks [`Sec1`](CandleInterval::Sec1) on
     /// futures; `/fapi/v1/klines` rejects it with `400 Invalid interval`.
+    ///
+    /// **[`Sec1`](CandleInterval::Sec1) history is short.** Observed in November 2026, 1-second
+    /// candles reach back only about four months: a request starting years earlier returns
+    /// candles from about four months before the request onwards, with no error, while
+    /// 1-minute candles reach back years. A `Sec1` backfill should check where the returned
+    /// series starts rather than assume it covers the requested start.
     #[must_use]
     pub fn futures() -> Self {
         Self {
