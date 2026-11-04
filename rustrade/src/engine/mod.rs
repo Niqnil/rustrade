@@ -22,8 +22,8 @@ use crate::{
             },
             order::{Orders, in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
             position::{
-                Position, PositionDrift, PositionExited, PositionId, SplitRoundingPolicy,
-                TradeOutcome,
+                EngineCheckpoint, Position, PositionDrift, PositionExited, PositionId,
+                SplitRoundingPolicy, TradeOutcome,
             },
             trading::TradingState,
         },
@@ -493,6 +493,14 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 let applied = self.state.update_from_account(event);
                 if !applied.is_empty() {
                     return UpdateFromAccountOutput::FillsApplied(applied);
+                }
+                if let AccountEventKind::VenueCheckpoint(venue) = &event.kind {
+                    // Every account event the venue sent before this one is applied, so the
+                    // engine's positions are those the venue's snapshot holds.
+                    return UpdateFromAccountOutput::Checkpoint(Box::new(EngineCheckpoint::new(
+                        (**venue).clone(),
+                        self.state.position_checkpoints(event.exchange),
+                    )));
                 }
                 let AccountEventKind::Snapshot(snapshot) = &event.kind else {
                     return UpdateFromAccountOutput::None;
@@ -1964,6 +1972,19 @@ pub enum EngineOutput<
     /// between them, and what to do, is the caller's.
     PositionDrift(PositionDrift<InstrumentKey>),
 
+    /// A simulated venue's checkpoint reached the engine, and this is the engine's answer: the
+    /// venue's state and the engine's positions on that venue, at the same point in the account
+    /// stream. See [`EngineCheckpoint`] for how to restore both from it.
+    ///
+    /// Emitted for the
+    /// [`VenueCheckpoint`](rustrade_execution::AccountEventKind::VenueCheckpoint) account event,
+    /// which only a simulated venue sends, when asked: for a paper venue, by
+    /// [`PaperVenue::checkpoint`](crate::execution::paper::PaperVenue::checkpoint). An engine
+    /// driven by hand reads it off the audit [`process`](Processor::process) returns.
+    ///
+    /// **Boxed**, because a checkpoint holds a venue's whole state and is rare.
+    Checkpoint(Box<EngineCheckpoint>),
+
     /// A reduce-only order's fill the engine cut so it would not grow or flip the position it
     /// reduces, or applied none of. See the reduce-only section of
     /// [`InstrumentState::update_from_trade`](crate::engine::state::instrument::InstrumentState::update_from_trade).
@@ -2198,6 +2219,10 @@ pub enum UpdateFromAccountOutput<OnDisconnect, InstrumentKey = InstrumentIndex> 
     /// An account snapshot reported positions that differ from the engine's, one per instrument.
     /// See [`EngineOutput::PositionDrift`].
     PositionDrift(Vec<PositionDrift<InstrumentKey>>),
+
+    /// A simulated venue's checkpoint, answered with the engine's positions. See
+    /// [`EngineOutput::Checkpoint`].
+    Checkpoint(Box<EngineCheckpoint>),
 }
 
 /// Output produced by the [`Engine`] updating from an [`MarketStreamEvent`], used to construct

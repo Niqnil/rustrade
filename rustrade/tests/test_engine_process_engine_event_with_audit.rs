@@ -7892,6 +7892,64 @@ fn test_account_snapshot_position_drift() {
     );
 }
 
+/// A simulated venue's checkpoint is answered with one `EngineOutput::Checkpoint`: the venue's
+/// checkpoint as sent, and the engine's positions on that venue once every earlier event is
+/// applied. Nothing in the engine changes.
+#[test]
+fn test_venue_checkpoint_is_answered_with_the_engine_positions() {
+    use rustrade::engine::state::position::EngineCheckpoint;
+    use rustrade_execution::{client::mock::MockExecutionConfig, exchange::mock::SimulatedVenue};
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_engine(TradingState::Disabled, execution_tx);
+    process_with_audit(
+        &mut engine,
+        account_event_trade(0, 1, Side::Buy, 10_000.0, 1.0),
+    );
+
+    let config = MockExecutionConfig::new(
+        ExchangeId::BinanceSpot,
+        AccountSnapshot {
+            exchange: ExchangeId::BinanceSpot,
+            balances: vec![],
+            instruments: vec![],
+        },
+        0,
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        Default::default(),
+        None,
+        None,
+    );
+    let venue_checkpoint = SimulatedVenue::new(&config, FnvHashMap::default()).checkpoint();
+    let before = engine.state.clone();
+
+    let audit = process_with_audit(
+        &mut engine,
+        EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+            exchange: ExchangeIndex(0),
+            kind: AccountEventKind::VenueCheckpoint(Box::new(venue_checkpoint.clone())),
+        })),
+    );
+    let EngineAudit::Process(audit) = audit.event else {
+        panic!("expected a processed event");
+    };
+    let outputs = audit.outputs.into_iter().collect::<Vec<_>>();
+    let positions = engine.state.position_checkpoints(ExchangeIndex(0));
+    assert_eq!(positions.len(), 1, "the btc_usdt long");
+    assert_eq!(
+        outputs,
+        vec![EngineOutput::Checkpoint(Box::new(EngineCheckpoint::new(
+            venue_checkpoint,
+            positions
+        )))]
+    );
+    assert_eq!(engine.state, before);
+}
+
 /// The in-flight deadline outputs among `audit`'s outputs.
 fn in_flight_overdue(
     audit: AuditTick<

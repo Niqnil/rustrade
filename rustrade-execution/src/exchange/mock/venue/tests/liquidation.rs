@@ -360,6 +360,58 @@ fn a_margin_call_is_restored_when_the_account_repays_everything_it_owes() {
     assert_eq!(notice_of(&events[0]).margin_level, None);
 }
 
+/// `venue` restored from its snapshot, configured as `short_one_btc` was with `liquidation`.
+fn restore_short(venue: &SimulatedVenue, liquidation: SpotMarginLiquidation) -> SimulatedVenue {
+    let config = liquidating_config(
+        vec![funded(base(), Decimal::ZERO), funded(quote(), d("10000"))],
+        liquidation,
+    );
+    SimulatedVenue::from_snapshot(&config, spot_instruments(), venue.snapshot()).unwrap()
+}
+
+#[test]
+fn a_restored_venue_keeps_its_margin_call_outstanding_or_not() {
+    let liquidation = || {
+        liquidation("1.1", "0.02")
+            .with_margin_call(d("1.3"))
+            .unwrap()
+    };
+    let mut venue = short_one_btc(liquidation());
+
+    // Not called: a level well above the margin call sends nothing, as it would have.
+    let mut uncalled = restore_short(&venue, liquidation());
+    assert!(tick(&mut uncalled, "14000", 2).is_empty());
+
+    assert_eq!(
+        notices(&tick(&mut venue, "15500", 2)),
+        [NoticeKind::MarginCall]
+    );
+    let mut called = restore_short(&venue, liquidation());
+    assert!(
+        tick(&mut called, "15600", 3).is_empty(),
+        "still called: no second notice after the restore"
+    );
+    assert_eq!(
+        notices(&tick(&mut called, "15000", 4)),
+        [NoticeKind::MarginRestored]
+    );
+}
+
+#[test]
+fn a_restored_venue_carries_on_a_liquidation_under_way_without_a_second_notice() {
+    let mut venue = short_one_btc(liquidation("1.1", "0.02"));
+    // 20,000 buys back only 0.8 of the BTC owed at 25,000, so the liquidation stays under way.
+    let (events, _) = warnings(|| tick(&mut venue, "25000", 2));
+    assert_eq!(notices(&events), [NoticeKind::Liquidation]);
+
+    let mut restored = restore_short(&venue, liquidation("1.1", "0.02"));
+    let (events, _) = warnings(|| tick(&mut restored, "25000", 3));
+    assert!(
+        events.is_empty(),
+        "the liquidation under way sends no second notice: {events:#?}"
+    );
+}
+
 #[test]
 fn a_debt_the_account_cannot_cover_is_left_owed_and_the_liquidation_continues_without_a_notice() {
     let mut venue = short_one_btc(liquidation("1.1", "0.02"));
@@ -1158,7 +1210,7 @@ fn an_order_a_liquidation_cancels_reports_the_interest_its_loan_was_charged_when
         d("1")
     );
     // A sell resting above the market borrows the 0.1 BTC it would deliver, charged 0.00001.
-    rested_open(&venue.open_order(gtc_limit("resting", Side::Sell, "0.1", "20000")));
+    let resting_id = rested_id(&venue.open_order(gtc_limit("resting", Side::Sell, "0.1", "20000")));
 
     let events = tick(&mut venue, "18200", 2);
 
@@ -1177,15 +1229,20 @@ fn an_order_a_liquidation_cancels_reports_the_interest_its_loan_was_charged_when
     );
     assert_eq!(
         *liquidation_fee(&events[3]),
-        interest_flow(
-            base(),
-            "0.1",
-            "0.00001",
-            time(2),
-            InterestTiming::OnBorrow,
-            "1"
+        lent(
+            interest_flow(
+                base(),
+                "0.1",
+                "0.00001",
+                time(2),
+                InterestTiming::OnBorrow,
+                "1"
+            ),
+            time(1),
+            &resting_id,
+            "resting"
         ),
-        "stamped at the cancel; the short's own charge was the first"
+        "stamped at the cancel, lent when the order rested; the short's own charge was the first"
     );
     assert_cancelled(order_named(&events, "resting"));
 }

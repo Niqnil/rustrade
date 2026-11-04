@@ -2,10 +2,13 @@ use chrono::{DateTime, Utc};
 use derive_more::Constructor;
 use rust_decimal::Decimal;
 pub use rustrade_execution::order::id::PositionId;
-use rustrade_execution::trade::{AssetFees, Trade, TradeId};
+use rustrade_execution::{
+    order::id::OrderId,
+    trade::{AssetFees, Trade, TradeId},
+};
 use rustrade_instrument::{
     Side,
-    asset::AssetIndex,
+    asset::{AssetIndex, name::AssetNameInternal},
     corporate_action::SplitRatio,
     instrument::{InstrumentIndex, name::InstrumentNameInternal},
 };
@@ -15,8 +18,10 @@ use std::fmt::Debug;
 use thiserror::Error;
 use tracing::{error, warn};
 
+mod checkpoint;
 mod drift;
 mod venue;
+pub use checkpoint::{CheckpointMismatch, EngineCheckpoint, PositionCheckpoint};
 pub use drift::PositionDrift;
 pub use venue::{SkippedVenuePosition, VenuePositionSeeds, VenuePositionSkipReason};
 
@@ -269,8 +274,19 @@ pub enum CarryUpdate {
     /// one. A position a flip opened is in this case for its entry period, unless the flip fell
     /// exactly at the period's start: the position the flip closed was open in it too.
     BeforeHistory,
+    /// The flow names the loan it is the charge on
+    /// ([`CashFlow::loan`](rustrade_execution::cash_flow::CashFlow::loan)), and the order that took
+    /// the loan neither opened nor added to an open position (it is in no open position's
+    /// [`Position::orders_enter`]): it has not traded yet, as an order resting on the book, or
+    /// traded only into an earlier position, or only reduced an open one.
+    ///
+    /// The engine keeps no flow it leaves out. A caller that reads a venue's charge before the
+    /// order that took the loan has traded, as for an order still resting on the book, can offer
+    /// the flow again once that order's fill has opened or added to the position.
+    LoanOfOtherOrder,
     /// Several positions are open on the instrument ([`OmsMode::Hedging`]) and the venue does not
-    /// say which one the flow belongs to.
+    /// say which one the flow belongs to: the flow names no loan, or, unexpectedly, the order that
+    /// took the loan it names opened or added to more than one of them.
     SeveralOpen,
 }
 
@@ -742,6 +758,7 @@ impl PositionSeed {
             time_enter: self.time_enter,
             time_exchange_update: self.time_enter,
             trades: Vec::new(),
+            orders_enter: Vec::new(),
             contract_size,
         };
         manager.positions.insert(position_id, position);
@@ -752,6 +769,10 @@ impl PositionSeed {
 
 /// Why a [`PositionSeed`] was rejected by
 /// [`EngineStateBuilder::try_build`](crate::engine::state::builder::EngineStateBuilder::try_build).
+///
+/// A position restored from a checkpoint
+/// ([`EngineStateBuilder::restored_positions`](crate::engine::state::builder::EngineStateBuilder::restored_positions))
+/// is checked the same way and refused with the same variants, which then say "seed" of it.
 ///
 /// `#[non_exhaustive]`: a further check can be added without breaking downstream exhaustive
 /// matches.
@@ -791,6 +812,14 @@ pub enum PositionSeedError {
     /// A seed under [`OmsMode::Hedging`] has no slot, so no order could later close it.
     #[error("position seed for {instrument} has no position_id, which OmsMode::Hedging requires")]
     MissingPositionIdInHedging { instrument: InstrumentNameInternal },
+
+    /// A restored [`PositionCheckpoint`] names an asset its instrument's exchange does not have
+    /// in the engine.
+    #[error("restored position on {instrument} names unknown asset {asset}")]
+    UnknownAsset {
+        instrument: InstrumentNameInternal,
+        asset: AssetNameInternal,
+    },
 }
 
 /// Represents an open trading position for a specific instrument.
@@ -949,7 +978,13 @@ pub enum PositionSeedError {
 /// assert_eq!(new_position.price_entry_average, dec!(40_000.0));
 /// assert_eq!(new_position.pnl_realised, dec!(-5.0));
 /// ```
-#[derive(Debug, Clone, PartialEq, PartialOrd, Deserialize, Serialize, Constructor)]
+///
+/// `Ord` and `Hash` exist so a saved position can sit in an
+/// [`EngineOutput`](crate::engine::EngineOutput), which requires them, and are not a meaningful
+/// ranking: they compare field by field.
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize, Constructor,
+)]
 pub struct Position<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// [`Position`] Instrument identifier (eg/ InstrumentIndex, InstrumentNameInternal, etc.).
     pub instrument: InstrumentKey,
@@ -1026,6 +1061,21 @@ pub struct Position<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// implications for long-lived positions with high fill counts.
     pub trades: Vec<TradeId>,
 
+    /// The venue's [`OrderId`]s of the orders whose [`Trade`]s opened or added to this
+    /// [`Position`], each once, in the order their first such trade arrived. An order whose trades
+    /// only reduced it is not here, and neither is one behind a [`PositionSeed`].
+    ///
+    /// Read by `InstrumentState::update_from_cash_flow`: a charge on a new loan that names the
+    /// order which took the loan ([`CashFlow::loan`](rustrade_execution::cash_flow::CashFlow::loan))
+    /// belongs to this position only if that order is here.
+    ///
+    /// Grows with each order that adds to the position, as [`trades`](Self::trades) grows with
+    /// each fill.
+    ///
+    /// `#[serde(default)]` so a position serialised before this field existed still loads.
+    #[serde(default)]
+    pub orders_enter: Vec<OrderId>,
+
     /// Contract multiplier for derivatives (options, futures, perpetuals).
     ///
     /// For spot instruments this is always `1`. For standard equity options it's typically `100`
@@ -1086,6 +1136,9 @@ impl<AssetKey, InstrumentKey> Position<AssetKey, InstrumentKey> {
         match (self.side, trade.side) {
             // Increase LONG/SHORT Position
             (Buy, Buy) | (Sell, Sell) => {
+                if !self.orders_enter.contains(&trade.order_id) {
+                    self.orders_enter.push(trade.order_id.clone());
+                }
                 self.update_price_entry_average(trade);
                 self.quantity_abs += trade.quantity.abs();
                 if self.quantity_abs > self.quantity_abs_max {
@@ -1704,6 +1757,7 @@ where
             time_enter: trade.time_exchange,
             time_exchange_update: trade.time_exchange,
             trades,
+            orders_enter: vec![trade.order_id.clone()],
             // Default to 1; PositionManager::update_from_trade_with_id assigns the
             // correct value via direct field assignment after creation.
             contract_size: Decimal::ONE,
@@ -2021,6 +2075,39 @@ mod tests {
         }
     }
 
+    /// A position names each order that opened or added to it, once, in the order its first such
+    /// fill came; an order that only reduced it is not named. A flip's order opens the next
+    /// position, which names only it.
+    #[test]
+    fn a_position_names_the_orders_that_opened_or_added_to_it() {
+        let base_time = DateTime::<Utc>::MIN_UTC;
+        let fill = |order: &str, side: Side, quantity: f64, day: u64| {
+            let mut fill = trade(time_plus_days(base_time, day), side, 100.0, quantity, 0.0);
+            fill.order_id = OrderId::new(order);
+            fill
+        };
+        let position = Position::from(&fill("open", Side::Buy, 1.0, 0));
+        let mut position = Some(position);
+        for fill in [
+            fill("add", Side::Buy, 1.0, 1),
+            fill("open", Side::Buy, 1.0, 2),
+            fill("reduce", Side::Sell, 1.0, 3),
+        ] {
+            let (next, exited) = position.take().unwrap().update_from_trade(&fill);
+            assert!(exited.is_none());
+            position = next;
+        }
+        let position = position.unwrap();
+        assert_eq!(
+            position.orders_enter,
+            vec![OrderId::new("open"), OrderId::new("add")]
+        );
+
+        let (flipped, exited) = position.update_from_trade(&fill("flip", Side::Sell, 3.0, 4));
+        assert!(exited.is_some());
+        assert_eq!(flipped.unwrap().orders_enter, vec![OrderId::new("flip")]);
+    }
+
     #[test]
     fn test_position_update_from_trade() {
         struct TestCase {
@@ -2060,6 +2147,7 @@ mod tests {
                     time_enter: base_time,
                     time_exchange_update: time_plus_days(base_time, 1),
                     trades: vec![TradeId::new("trade_id"), TradeId::new("trade_id")],
+                    orders_enter: vec![OrderId::new("order_id")],
                     contract_size: Decimal::ONE,
                 }),
                 expected_position_exited: None,
@@ -2091,6 +2179,7 @@ mod tests {
                     time_enter: base_time,
                     time_exchange_update: time_plus_days(base_time, 1),
                     trades: vec![TradeId::new("trade_id"), TradeId::new("trade_id")],
+                    orders_enter: vec![OrderId::new("order_id")],
                     contract_size: Decimal::ONE,
                 }),
                 expected_position_exited: None,
@@ -2152,6 +2241,7 @@ mod tests {
                     time_enter: time_plus_days(base_time, 1),
                     time_exchange_update: time_plus_days(base_time, 1),
                     trades: vec![TradeId::new("trade_id")],
+                    orders_enter: vec![OrderId::new("order_id")],
                     contract_size: Decimal::ONE,
                 }),
                 expected_position_exited: Some(PositionExited {
@@ -2206,6 +2296,7 @@ mod tests {
                     time_enter: base_time,
                     time_exchange_update: base_time,
                     trades: vec![TradeId::new("trade_id"), TradeId::new("trade_id")],
+                    orders_enter: vec![OrderId::new("order_id")],
                     contract_size: Decimal::ONE,
                 }),
                 expected_position_exited: None,
@@ -2237,6 +2328,7 @@ mod tests {
                     time_enter: base_time,
                     time_exchange_update: base_time,
                     trades: vec![TradeId::new("trade_id"), TradeId::new("trade_id")],
+                    orders_enter: vec![OrderId::new("order_id")],
                     contract_size: Decimal::ONE,
                 }),
                 expected_position_exited: None,
@@ -2298,6 +2390,7 @@ mod tests {
                     time_enter: base_time,
                     time_exchange_update: base_time,
                     trades: vec![TradeId::new("trade_id")],
+                    orders_enter: vec![OrderId::new("order_id")],
                     contract_size: Decimal::ONE,
                 }),
                 expected_position_exited: Some(PositionExited {
@@ -2565,6 +2658,7 @@ mod tests {
             time_enter: DateTime::<Utc>::MIN_UTC,
             time_exchange_update: DateTime::<Utc>::MIN_UTC,
             trades: vec![TradeId::new("t")],
+            orders_enter: Vec::new(),
             contract_size: Decimal::ONE,
         };
 
@@ -2607,6 +2701,7 @@ mod tests {
             time_enter: DateTime::<Utc>::MIN_UTC,
             time_exchange_update: DateTime::<Utc>::MIN_UTC,
             trades: vec![TradeId::new("t")],
+            orders_enter: Vec::new(),
             contract_size: Decimal::ONE,
         };
 
@@ -2811,6 +2906,7 @@ mod tests {
             time_enter: DateTime::<Utc>::MIN_UTC,
             time_exchange_update: DateTime::<Utc>::MIN_UTC,
             trades: vec![TradeId::new("t")],
+            orders_enter: Vec::new(),
             contract_size: Decimal::ONE,
         };
 
@@ -3305,6 +3401,7 @@ mod tests {
             time_enter: DateTime::<Utc>::MIN_UTC,
             time_exchange_update: DateTime::<Utc>::MIN_UTC,
             trades: vec![TradeId::new("t")],
+            orders_enter: Vec::new(),
             contract_size: Decimal::ONE,
         };
 
@@ -3414,6 +3511,7 @@ mod tests {
             time_enter: DateTime::<Utc>::MIN_UTC,
             time_exchange_update: DateTime::<Utc>::MIN_UTC,
             trades: vec![TradeId::new("t")],
+            orders_enter: Vec::new(),
             contract_size: Decimal::ONE,
         }
     }

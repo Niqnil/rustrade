@@ -14,7 +14,10 @@ use rustrade_execution::{
         ExecutionClient,
         mock::{MockExecution, MockExecutionConfig},
     },
-    exchange::mock::SimulatedVenue,
+    exchange::mock::{
+        SimulatedVenue,
+        venue::{SimulatedVenueSnapshot, VenueRegime},
+    },
     fill::FillModel,
     holding_cost::HoldingCostModel,
     indexer::AccountEventIndexer,
@@ -95,15 +98,18 @@ impl SimVenueOptions {
     }
 }
 
-/// The market-driven [`SimulatedVenue`] `config` describes, modelling what `options` add to it.
+/// The market-driven [`SimulatedVenue`] `config` describes, modelling what `options` add to it,
+/// starting from `restore` if given, else from `config`'s initial state.
 ///
 /// Shared by every builder of a market-driven venue, the backtest's and paper trading's, so a
 /// configuration and its options build the same venue on both.
 ///
 /// # Errors
-/// [`BarterError::ExecutionBuilder`] if `options` carries a
-/// [`margin_interest`](SimVenueOptions::margin_interest) model while `config` has no
-/// [`spot_margin`](MockExecutionConfig::spot_margin).
+/// [`BarterError::ExecutionBuilder`] if:
+/// - `options` carries a [`margin_interest`](SimVenueOptions::margin_interest) model while
+///   `config` has no [`spot_margin`](MockExecutionConfig::spot_margin);
+/// - `restore` is refused by [`SimulatedVenue::from_snapshot`], or is of a venue that was not
+///   market-driven.
 ///
 /// # Panics
 /// If an instrument executed on the venue has a kind the venue cannot model: callers check
@@ -112,6 +118,7 @@ pub(crate) fn market_driven_venue(
     config: &MockExecutionConfig,
     options: SimVenueOptions,
     instruments: &IndexedInstruments,
+    restore: Option<SimulatedVenueSnapshot>,
 ) -> Result<SimulatedVenue, BarterError> {
     let SimVenueOptions {
         holding_costs,
@@ -129,11 +136,24 @@ pub(crate) fn market_driven_venue(
         )));
     }
 
-    let mut venue = SimulatedVenue::new_market_driven(
-        config,
-        generate_mock_exchange_instruments(instruments, exchange),
-    )
-    .with_holding_costs(holding_costs);
+    let venue_instruments = generate_mock_exchange_instruments(instruments, exchange);
+    let venue = match restore {
+        None => SimulatedVenue::new_market_driven(config, venue_instruments),
+        Some(snapshot) => {
+            if snapshot.regime() != VenueRegime::MarketDriven {
+                return Err(BarterError::ExecutionBuilder(format!(
+                    "simulated venue {exchange} cannot be restored from a snapshot of a \
+                     request-priced venue"
+                )));
+            }
+            SimulatedVenue::from_snapshot(config, venue_instruments, snapshot).map_err(|error| {
+                BarterError::ExecutionBuilder(format!(
+                    "simulated venue {exchange} cannot be restored: {error}"
+                ))
+            })?
+        }
+    };
+    let mut venue = venue.with_holding_costs(holding_costs);
     if let Some(provider) = shortability {
         venue = venue.with_shortability(provider);
     }
@@ -238,7 +258,7 @@ impl<'a> SimExecutionBuilder<'a> {
 
         // Market-driven: `SimRunner::poll_next` routes every source market event to this venue
         // before the `Engine` sees it, which is what lets it accept resting orders.
-        let venue = market_driven_venue(&config, options, self.instruments)?;
+        let venue = market_driven_venue(&config, options, self.instruments, None)?;
 
         let instrument_map = generate_execution_instrument_map(self.instruments, exchange)?;
         let index = instrument_map.exchange.key;

@@ -15,7 +15,7 @@ use crate::{
     execution::{
         AccountStreamEvent,
         builder::{ExecutionBuildFutures, ExecutionBuilder},
-        paper::{PaperMarketFeed, PaperOptions},
+        paper::{PaperMarketFeed, PaperOptions, PaperVenue},
     },
     shutdown::SyncShutdown,
     system::{System, SystemAuxillaryHandles, config::ExecutionConfig},
@@ -204,6 +204,12 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
     /// For the same exchange, a second paper venue, or one beside an [`ExecutionConfig`] venue,
     /// fails the build.
     ///
+    /// # Restoring from a checkpoint
+    /// When `options` carry a [`checkpoint`](PaperOptions::with_checkpoint), the engine built here
+    /// starts with that checkpoint's positions, restored as
+    /// [`EngineStateBuilder::restored_positions`] restores them, so the venue and the engine
+    /// start from the same point. Seed nothing else for that venue's instruments.
+    ///
     /// # Errors
     /// [`build`](Self::build) returns the errors of [`ExecutionBuilder::add_paper`], such as
     /// `MarketOrderTiming::NextBar` or a zero `options.account_stream_capacity`.
@@ -321,6 +327,12 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
                 ExecutionConfig::Mock(mock_config) => builder.add_mock(mock_config, clock.clone()),
             },
         )?;
+        // A restored paper venue's engine half, taken before its options move into the builder.
+        let restored_positions = paper_venues
+            .iter()
+            .filter_map(|(_, options, _)| options.checkpoint.as_ref())
+            .flat_map(|checkpoint| checkpoint.positions.iter().cloned())
+            .collect::<Vec<_>>();
         let execution = paper_venues
             .into_iter()
             .try_fold(execution, |builder, (config, options, feed)| {
@@ -351,7 +363,8 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
                     .into_iter()
                     .map(|(key, value)| Keyed::new(key, value)),
             )
-            .positions(positions);
+            .positions(positions)
+            .restored_positions(restored_positions);
         let state = expiry_handling
             .into_iter()
             .fold(state, |state, (exchange, handling)| {
@@ -376,6 +389,7 @@ impl<'a, Clock, Strategy, Risk, MarketStream, GlobalData, FnInstrumentData>
             market_stream,
             account_channel: execution.account_channel,
             execution_build_futures: execution.futures,
+            paper_venues: execution.paper_venues,
             phantom_event: PhantomData,
         })
     }
@@ -432,6 +446,10 @@ pub struct SystemBuild<Engine, Event, MarketStream> {
     /// Futures for initialising `ExecutionBuild` components.
     pub execution_build_futures: ExecutionBuildFutures,
 
+    /// A handle to each paper venue, by exchange: see
+    /// [`ExecutionBuild::paper_venues`](crate::execution::builder::ExecutionBuild::paper_venues).
+    pub paper_venues: FnvHashMap<ExchangeId, PaperVenue>,
+
     phantom_event: PhantomData<Event>,
 }
 
@@ -447,6 +465,11 @@ where
     MarketStream: Stream + Send + 'static,
 {
     /// Construct a new `SystemBuild` from the provided components.
+    ///
+    /// `account_channel`, `execution_build_futures` and `paper_venues` are the parts of one
+    /// [`ExecutionBuild`](crate::execution::builder::ExecutionBuild): its `account_channel`,
+    /// `futures` and `paper_venues`. [`init`](Self::init) carries `paper_venues` on to the
+    /// [`System`].
     pub fn new(
         engine: Engine,
         engine_feed_mode: EngineFeedMode,
@@ -454,6 +477,7 @@ where
         market_stream: MarketStream,
         account_channel: Channel<AccountStreamEvent>,
         execution_build_futures: ExecutionBuildFutures,
+        paper_venues: FnvHashMap<ExchangeId, PaperVenue>,
     ) -> Self {
         Self {
             engine,
@@ -462,6 +486,7 @@ where
             market_stream,
             account_channel,
             execution_build_futures,
+            paper_venues,
             phantom_event: Default::default(),
         }
     }
@@ -494,6 +519,7 @@ where
             market_stream,
             account_channel,
             execution_build_futures,
+            paper_venues,
             phantom_event: _,
         } = self;
 
@@ -580,6 +606,7 @@ where
             },
             feed_tx,
             audit,
+            paper_venues,
         })
     }
 }
@@ -906,6 +933,42 @@ mod tests {
             VenueRole::Both
         );
         assert!(system.engine.in_flight_deadlines().get(paper).is_none());
+        assert_eq!(
+            system.paper_venues.keys().collect::<Vec<_>>(),
+            [&DATA],
+            "only the paper venue has a handle"
+        );
+    }
+
+    /// [`SystemBuild::new`] keeps the handles it is given, which the build carries to its system.
+    #[test]
+    fn a_build_holds_the_paper_venues_it_is_given() {
+        let instruments = IndexedInstruments::new([instrument(EXECUTION, "btc", "usdt")]);
+        let mut system = SystemBuilder::new(SystemArgs {
+            executions: vec![],
+            ..system_args(&instruments)
+        })
+        .paper_venue(
+            mock_execution_config(EXECUTION),
+            PaperOptions::default(),
+            &paper_feed(),
+        )
+        .build::<EngineEvent, _>()
+        .expect("a paper venue must build");
+        let paper_venues = std::mem::take(&mut system.paper_venues);
+        assert_eq!(paper_venues.len(), 1);
+
+        let system = SystemBuild::<_, EngineEvent, _>::new(
+            system.engine,
+            system.engine_feed_mode,
+            system.audit_mode,
+            system.market_stream,
+            system.account_channel,
+            system.execution_build_futures,
+            paper_venues,
+        );
+
+        assert_eq!(system.paper_venues.keys().collect::<Vec<_>>(), [&EXECUTION]);
     }
 
     /// A paper venue on an exchange that already has a venue, paper or mock, fails the build

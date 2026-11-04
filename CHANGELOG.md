@@ -7,6 +7,254 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-04
+
+### Added
+
+- **Binance's fetched collateral ratios can be applied to a simulated venue's spot margin**
+  (`rustrade-execution`, `binance`, #852). `apply_collateral_ratios(config, &ratios, assets)`
+  sets each named asset's borrow and liquidation collateral ratios on a `SpotMarginConfig` from
+  what `BinanceMargin::fetch_collateral_ratios` returns, so a backtest weights collateral as
+  Binance cross margin does without copying each value by hand.
+  - It applies only the assets named, and refuses, with `ApplyCollateralRatiosError`, an asset
+    Binance does not list, or one whose borrow or liquidation ratio is not a single tier covering
+    every USD value. The simulated venue applies one ratio per asset, and Binance's tiers are
+    progressive, so such an asset has no exact single ratio. A ratio the configuration refuses is
+    passed on, not clamped.
+  - Transfer-out ratios are not applied: the simulated venue does not check transfers out.
+- **`SpotMarginConfig::with_collateral_ratios` sets an asset's borrow and liquidation collateral
+  ratios together** (`rustrade-execution`, #852), checking the pair once both are set. Setting
+  them one at a time checks each against the other's old value, and so could refuse a valid
+  pair in one order or the other.
+- **A simulated venue can be snapshotted and restored, so it carries on where it stopped**
+  (`rustrade-execution`, #836). A run that stops and starts again, such as a paper venue across a
+  process restart, no longer loses its account.
+  - `SimulatedVenue::snapshot()` returns a `SimulatedVenueSnapshot`, a serde value holding what
+    the venue has accumulated: balances with their loans and unpaid interest, open and held orders
+    with what is held against them and their place in the queue, ended orders and trades, CFD
+    positions, the id sequences, the venue's clock and the instant it has charged interest
+    through, the debt it last reported, its liquidation and margin-call state, the borrow price
+    window, and how far its slippage stream has drawn.
+  - `SimulatedVenue::from_snapshot(config, instruments, snapshot)` builds the venue back. A
+    restored venue produces exactly the events the original would have from the same inputs. It
+    is given its models through the same builder methods as a fresh venue.
+  - It does not hold the configuration, the models, or the market. A restored venue holds no
+    market until it is fed one. Interest boundaries passed in between are charged once its clock
+    moves, and a resting order is matched against the first market it observes after the restore.
+  - The snapshot carries a format version. `from_snapshot` refuses another version, another
+    exchange, other instruments, a margin account restored without `spot_margin` or the other way
+    round, an order id listed twice, and an instrument or asset listed twice where the venue holds
+    one entry for each, each with a `VenueRestoreError` variant.
+- **A paper venue and the engine trading on it can be checkpointed together and restored after a
+  restart** (`rustrade-execution`, `rustrade`, #836). The venue sends its snapshot in band on its
+  account stream, and the engine answers it with its own positions at the same point, so the two
+  halves always agree: an order the venue filled before the checkpoint is in both, one filled
+  after it in neither.
+  - `PaperVenue::checkpoint()` asks the venue for one and returns its id. The venue sends a new
+    `AccountEventKind::VenueCheckpoint`, carrying a `VenueCheckpoint` (the id and the venue's
+    `SimulatedVenueSnapshot`), after every account event it sent before.
+    `SimulatedVenue::checkpoint()` makes one directly.
+  - The engine answers that event with the new `EngineOutput::Checkpoint(Box<EngineCheckpoint>)`,
+    in the audit `process` returns, so an engine driven by hand gets it too. An
+    `EngineCheckpoint` holds the venue's checkpoint and the engine's positions on that venue, each
+    a `PositionCheckpoint`: the engine's `Position` exactly, keyed by instrument and asset names,
+    with its slot. `EngineState::position_checkpoints` reads them.
+  - `PaperOptions::with_checkpoint(checkpoint)` restores the venue from the checkpoint's venue
+    half. `EngineStateBuilder::restored_positions` puts the engine's positions back unchanged,
+    PnL, fees, carry and entering orders included, and `SystemBuilder::paper_venue` does it for you.
+    `add_paper` refuses a checkpoint of another exchange, or one whose halves hold different
+    positions on a cash-settled instrument (`EngineCheckpoint::check_positions_agree`).
+  - A restored position is checked like a seed, with the new `PositionSeedError::UnknownAsset`
+    for an asset the engine does not have.
+  - An `EngineCheckpoint` carries one format version for both halves (`EngineCheckpoint::VERSION`,
+    `version()`), and `add_paper` refuses another. Build one with `EngineCheckpoint::new`. In a
+    self-describing format such as JSON, fields a later release adds read with defaults from an
+    older checkpoint.
+  - New `rustrade_execution::stored`: read a saved checkpoint or venue snapshot as a
+    `Stored<T>` and call `into_current()` to be told the version it was written in
+    (`StoredFormatError::UnsupportedVersion`) even when a later format changed its shape, which
+    reading `T` itself reports only as a parse error. It needs a self-describing format such as
+    JSON. Both types implement the new `FormatVersion` trait.
+  - `Position`, `CashFlow` and the types they hold now also derive `Eq`, `Ord` and `Hash` where
+    they did not, so a checkpoint can be an engine output.
+- **The simulated venue can value each asset over a recent window of its price when it lends**
+  (`rustrade-execution`, #829). Binance's cross margin borrow check values an asset the account
+  owes at the highest price over a recent window, and every other asset at the lowest. A price
+  that has just jumped lends no more at once, and one that has just fallen lends less at once.
+  - `SpotMarginConfig::with_borrow_price_window(TimeDelta)` sets the window, and
+    `borrow_price_window()` reads it. Off by default, when every asset is valued at its current
+    price as before. A window that is not a positive whole number of milliseconds is refused with
+    the new `SpotMarginConfigError::BorrowPriceWindowInvalid`. It serialises as
+    `borrow_price_window_ms`, an integer, left out when off.
+  - Each market observation the venue is fed adds to its instrument's window: the mid, else the
+    last price, and the high and low of a bar it carries. The current price always counts. The
+    venue keeps each price that could still be the window's lowest or highest, so in a market
+    that only rises or falls it holds every observation inside the window.
+  - An asset the account owes is valued at its highest for all the units it holds as well as
+    for its debt. So is the asset being borrowed. Every other asset is valued at its lowest.
+  - The venue lends the lesser of what the leverage limit allows at the window's prices and at
+    the current ones. So the window only ever lends less, and a borrow the leverage limit allows
+    still never leaves the account at its liquidation level.
+  - It applies to orders that borrow and to `borrow_capacity`. The liquidation check and
+    interest still use current prices. A venue no driver feeds the market has no window to look
+    back on, and lends at the request's own price.
+- **A charge on a new loan names the order that took the loan, and goes to the position that
+  order opened or added to** (`rustrade-execution`, `rustrade`, #831). A margin venue charges
+  interest when it lends to an order (`InterestTiming::OnBorrow`). Until now the engine placed
+  such a charge by its time alone, which could give it to the wrong position: a resting order
+  that borrowed at 10:05, while a different order opened the position at 10:10, had its charge
+  applied to that position, and a borrowing order that filled in a later hour had its charge left
+  out.
+  - `CashFlow` gains `loan: Option<CashFlowLoan>`, set with `CashFlow::with_loan`: when the venue
+    lent, and the order that borrowed (`order_id`, as its `Trade`s carry it, and `cid`).
+    `CashFlow::new` is unchanged and names no loan. `#[serde(default)]`, so a stored flow still
+    loads.
+  - `Position` gains `orders_enter: Vec<OrderId>`: each order whose fills opened or added to the
+    position, once. A flip's order opens the next position. A seeded position names none.
+  - The engine applies a flow that names a loan only to the open position whose `orders_enter`
+    holds the loan's order, whenever the flow is stamped. The order picks the position, so under
+    `OmsMode::Hedging` such a flow is applied with several positions open, where one naming no
+    loan returns `CarryUpdate::SeveralOpen`. Otherwise it returns the new
+    `CarryUpdate::LoanOfOtherOrder` and logs a WARN, or a DEBUG for a flow from before the
+    session. A flow that names no loan keeps the existing rules.
+  - `BinanceMargin` holds the loan each order it places reports, up to 4096, and
+    `fetch_margin_interest` links an `ON_BORROW` charge to the one held loan of the charge's
+    asset whose principal is exactly the charge's, taken in the charge's hour (on the same pair,
+    for an isolated client). A linked cross charge also names the order's instrument. A charge
+    that fits several loans is linked to none, with a WARN. Linking only reads the held loans, so
+    reading a charge again links it again. `ON_BORROW_CONVERTED` charges, in BNB, are not linked.
+  - The held loans do not survive a restart. Persist `MarginPlacement::loan` (new) for each
+    order that borrows, and hand the loans back with the new `BinanceMargin::recall_loans`.
+    `OrderLoan` (new) is what both carry.
+  - A cross charge read once linked and once not, as across a restart, names an instrument only
+    the first time, so drop a cross client's charges by id within their asset, not their
+    instrument.
+- **A handle to each paper venue, to ask how much the paper account can borrow** (`rustrade`,
+  `rustrade-execution`, #844). A strategy that sizes its shorts against borrow capacity asks a live
+  margin client (`BorrowCapacityClient::fetch_borrow_capacity`). A paper venue answers the same
+  question from its own lending rules, but `ExecutionBuilder::add_paper` kept no handle to it, so a
+  paper run could not ask.
+  - `ExecutionBuild::paper_venues` holds a cloneable `PaperVenue` for each venue `add_paper`
+    added, by exchange. `Execution`, `SystemBuild` and `System` carry them on.
+  - `PaperVenue::fetch_borrow_capacity` answers with what the venue's
+    `SimulatedVenue::borrow_capacity` would, with the trait method's signature and errors. It is
+    advisory, as on a live venue.
+  - The handle places no orders and keeps no venue running. It holds the venue's request channel
+    weakly, so a system shuts down as before, and a query to a stopped venue fails with
+    `ConnectivityError::ExchangeOffline`.
+  - `rustrade_execution::client::mock::request_borrow_capacity` is the request `MockExecution`
+    sends, for a caller holding a mock exchange's request channel.
+
+- **A client can process the account events the engine receives, each fill once**
+  (`rustrade-execution`, `rustrade`, #835). A wrapper that keeps state over the fills, such as one
+  that attributes them or tracks what the engine holds, had only `account_stream` and
+  `fetch_trades` to work on. Those two paths overlap on purpose around a reconnect, so the wrapper
+  saw some fills twice, and had to deduplicate and order them itself.
+  - New provided method `ExecutionClient::process_account_events`, a stage over each open of the
+    account stream. The `ExecutionManager` calls it on every open with that open's events after it
+    has dropped repeated fills: the fills read for the span the stream was down, any gap, the
+    snapshot, then the stream's updates. The default passes them on unchanged. Its rustdoc states
+    the contract: keep the order, end only when the input ends, retry inside the stage, and report
+    a fill given up on as a gap scoped to it rather than drop it.
+  - New `FillRecoveryFailure::Processing`, the reason for such a gap.
+  - New `AccountEventDeduper::record`, which marks a fill as seen without asking whether it was.
+    The manager records every fill the stage passes on, so a fill the stage adds, which the venue
+    sends later, is delivered once.
+  - A wrapping client must forward `process_account_events` to its inner client, as it forwards
+    the other provided methods.
+
+### Changed
+
+- **Breaking: IBKR account reads report a dropped TWS/Gateway connection as a transient
+  `Connectivity` error** (`rustrade-execution`, `ibkr`, #855). The affected reads are
+  `account_snapshot`, `fetch_balances`, `fetch_open_orders`, `fetch_trades` and
+  `fetch_ended_orders`. They returned `UnindexedClientError::Internal`, which is never transient.
+  They now classify a failure as contract resolution already did:
+  - `ConnectivityError::Socket`: a connection reset or I/O error, a request refused while `ibapi`
+    reconnects, or a listing cut short by the drop;
+  - `ConnectivityError::Timeout`: a listing IB stops sending for 10 seconds, or a request for the
+    login's accounts IB does not answer;
+  - `Internal`, as before, for everything else. That includes a client that has given up
+    reconnecting or has shut down, which a retry cannot help.
+
+  `is_transient()` is therefore `true` for these failures. A caller matching `Internal` for them
+  must match `Connectivity` instead.
+  - `account_snapshot` fails at once too (#857). Until now it returned only once `ibapi`'s
+    reconnect ended, which can take minutes, holding a blocking thread all that time: `ibapi`
+    holds its request for the login's accounts until the connection is back. That request is now
+    sent only while the client is connected. A drop between that check and the request can still
+    wait.
+  - `account_stream` is unchanged in practice: opening it sends nothing to IB, so it succeeds while
+    `ibapi` reconnects.
+- **Breaking: `BinanceMargin::fetch_collateral_ratios` returns all three of each asset's collateral
+  ratios** (`rustrade-execution`, `binance`, #850). It now returns
+  `HashMap<AssetNameExchange, CollateralRatios>`, where it returned each asset's liquidation tiers
+  alone. The new `CollateralRatios` holds `liquidation`, `borrow` and `transfer_out`, each a
+  `Vec<CollateralRatioTier>` in ascending minimum USD value, read from the endpoint's
+  `collaterals`, `borrowCollaterals` and `withdrawCollaterals`. Still one request.
+  - The borrow ratios govern how much the account can borrow, so a caller modelling borrowing no
+    longer has to take them from Binance's Margin Data page.
+  - A group missing its borrow or transfer-out set, or with an empty one, is an
+    `UnindexedClientError::Internal`, as a missing liquidation set already was.
+  - Migrate by reading `.liquidation` where the old tiers were used.
+- **The engine logs a fill whose base-asset fee left the holding off the quantity step at DEBUG**
+  (`rustrade`), where it logged it at INFO. On a venue that charges spot fees in the base asset,
+  most fills do this, so INFO was noise. The fill is still counted on `TearSheet::fills_dust`.
+- **The simulated venue's charge on a new loan names the order that took it, and that order's
+  instrument** (`rustrade-execution`, #831). Its `InterestTiming::OnBorrow` cash flows now carry
+  `CashFlow::loan`, lent at the charge, and `instrument: Some(..)`, where they had
+  `instrument: None`. The engine therefore routes them to the order's instrument directly instead
+  of through a `CashFlowAttributionStrategy`, and applies them by the rule above. Charges at a
+  boundary (`InterestTiming::Periodic`) are unchanged.
+- **Breaking: `Position` has a new public field, `orders_enter`** (`rustrade`, #831). Code that
+  builds a `Position` literal must set it (`Vec::new()` for none). Its `Constructor` takes it
+  after `trades`.
+- **Breaking: `ExecutionBuild`, `Execution`, `SystemBuild` and `System` have a new public field,
+  `paper_venues`** (`rustrade`, #844). Code that builds one of them as a literal, or destructures
+  one without `..`, must name it. `SystemBuild::new` takes the `ExecutionBuild`'s `paper_venues`
+  after `execution_build_futures`.
+
+- **The `ExecutionManager` places its next missed-fill read from the events it receives, before
+  the client's stage** (`rustrade`, #835). A fill the stage drops or holds still counts, and the
+  stage's own delay does not skew the estimate of the venue's clock. The account snapshot is
+  still checked to index when the stream opens, so one that cannot still fails the open, and it
+  is indexed after the stage.
+
+- **`ibapi` 5.2.0 → 5.5.0** (`rustrade-execution`, `rustrade-data`, `rustrade-instrument`, feature
+  `ibkr`, #840). The bytes sent for every order this crate builds are unchanged. The changes that
+  reach the compiled code:
+  - While `ibapi` reconnects, a request is refused at once with a connection reset. Once the
+    reconnect has given up, it is refused as a failed connection, and after a shutdown as shut
+    down. The IBKR account reads classify these as described above (#855, #857).
+  - An order status's filled and remaining quantities, and a position's quantity, are now
+    required: a frame missing one is a parse error, where it read as zero before. This reaches
+    the account stream and the IBKR position reads.
+  - A one-shot historical fetch no longer fails on IB's notice that the historical data server
+    connected (165); the bars that follow are returned. A bar with a missing or unparseable date
+    is a parse error, where it read as the epoch before.
+  - Dropping a market data subscription from before a reconnect, or one IB already ended, sends
+    no cancel, so IB no longer answers with cancel errors for a stale id.
+  - A reconnect refreshes the negotiated server version along with the next order id.
+- **`databento` 0.63.0 → 0.64.0** (`rustrade-data`, `databento` feature, #839). It moves to DBN
+  0.73.0, which adds the DBN version 4 record layout, and its live client gains `unsubscribe`. No
+  change to this crate's API.
+- **`vecmap-rs` 0.2.5 → 0.3.1** (`rustrade-data`, #842). `DynamicStreams`'s public fields
+  (`trades`, `l1s`, `l2s`, `liquidations`, `candles`) are `vecmap::VecMap`s, so code that names
+  their type needs `vecmap-rs` 0.3. Each holds one stream per exchange, so 0.3's change to how a
+  duplicate key is resolved does not reach them.
+- **`parquet` 60.0.0 → 60.1.0** (`rustrade-data`, `lse-parquet` feature, #841). Its decoder is
+  stricter: a malformed LSE Parquet export that 60.0.0 read without complaint can now fail with an
+  error. A well-formed file reads as before.
+
+### Fixed
+
+- **`BinanceMargin::fetch_collateral_ratios`'s rustdoc** (`rustrade-execution`, `binance`, #850)
+  said that Binance documents no endpoint for the borrow ratios and that the endpoint's single
+  ratio was observed, not documented, to be the liquidation one. Binance has confirmed that the
+  endpoint returns all three sets, that tiers are progressive (each USD slice of a holding is
+  weighted at its own tier's ratio), and that an open top tier has no `maxUsdValue` because it has
+  no upper limit. The rustdoc now says so, as does `SpotMarginConfig`'s note on tiered ratios.
+
 ## [0.20.0] - 2026-11-02
 
 ### Added

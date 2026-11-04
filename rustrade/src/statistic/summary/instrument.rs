@@ -206,7 +206,7 @@ pub struct TearSheet<Interval> {
     /// The remainder stays in the account's balance, too small for the venue to sell alone, and
     /// is held, not charged to `pnl`: a long's is base the account holds, a short's base still
     /// owed on the loan. Its quantity is summed in [`Self::dust_quantity`] and its value in
-    /// [`Self::dust_value`]. Each is logged at INFO. See the base-asset fee section of
+    /// [`Self::dust_value`]. Each is logged at DEBUG. See the base-asset fee section of
     /// [`InstrumentState::update_from_trade`](crate::engine::state::instrument::InstrumentState::update_from_trade).
     #[serde(default)]
     pub fills_dust: usize,

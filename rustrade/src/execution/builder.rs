@@ -1,11 +1,14 @@
 use crate::{
-    engine::{clock::EngineClock, execution_tx::MultiExchangeTxMap, in_flight::InFlightDeadlines},
+    engine::{
+        clock::EngineClock, execution_tx::MultiExchangeTxMap, in_flight::InFlightDeadlines,
+        state::position::EngineCheckpoint,
+    },
     error::BarterError,
     execution::{
         AccountStreamEvent, Execution,
         error::ExecutionError,
         manager::{AccountStreamOptions, Clock as ManagerClock, ExecutionManager},
-        paper::{PaperMarketFeed, PaperMarketUpdate, PaperOptions},
+        paper::{PaperMarketFeed, PaperMarketUpdate, PaperOptions, PaperVenue},
         request::ExecutionRequest,
         sim::builder::market_driven_venue,
     },
@@ -75,6 +78,7 @@ pub struct ExecutionBuilder<'a> {
     mock_exchange_futures: Vec<RunFuture>,
     execution_init_futures: Vec<ExecutionInitFuture>,
     in_flight_deadlines: InFlightDeadlines,
+    paper_venues: FnvHashMap<ExchangeId, PaperVenue>,
 }
 
 impl<'a> ExecutionBuilder<'a> {
@@ -87,6 +91,7 @@ impl<'a> ExecutionBuilder<'a> {
             mock_exchange_futures: Vec::default(),
             execution_init_futures: Vec::default(),
             in_flight_deadlines: InFlightDeadlines::default(),
+            paper_venues: FnvHashMap::default(),
         }
     }
 
@@ -197,10 +202,18 @@ impl<'a> ExecutionBuilder<'a> {
     /// [`LiveClock`](crate::engine::clock::LiveClock); a test under tokio's paused time,
     /// [`TokioClock`](crate::engine::clock::TokioClock).
     ///
-    /// The venue holds its state in memory only: it starts from `config.initial_state` every time
-    /// it is built, so restarting the process loses the paper account.
+    /// The venue holds its state in memory. It starts from `config.initial_state`, unless
+    /// `options` carry a [`checkpoint`](PaperOptions::with_checkpoint) taken with
+    /// [`PaperVenue::checkpoint`], when it carries on from that checkpoint's venue half. Restore
+    /// the `Engine`'s positions from the same checkpoint. A venue added with
+    /// [`SystemBuilder::paper_venue`](crate::system::builder::SystemBuilder::paper_venue) has its
+    /// positions restored for it.
     ///
     /// The exchange gets no in-flight deadline, as for [`add_mock`](Self::add_mock).
+    ///
+    /// [`build`](Self::build) returns a [`PaperVenue`] handle to the venue, in
+    /// [`ExecutionBuild::paper_venues`], for queries outside the `Engine`'s order flow, such as how
+    /// much the paper account can borrow.
     ///
     /// # Errors
     /// Returns [`BarterError::ExecutionBuilder`] if:
@@ -208,6 +221,13 @@ impl<'a> ExecutionBuilder<'a> {
     ///   fill a bar releases ahead of the bar itself, which a live feed shared with a running
     ///   `Engine` cannot do, so the venue would not behave as its backtest does.
     /// - `options.account_stream_capacity` is zero.
+    /// - `options` carry a checkpoint in another
+    ///   [format version](crate::engine::state::position::EngineCheckpoint::version), or of another
+    ///   exchange, or one whose engine and venue halves hold
+    ///   different positions on a cash-settled instrument (see
+    ///   [`EngineCheckpoint::check_positions_agree`](crate::engine::state::position::EngineCheckpoint::check_positions_agree)),
+    ///   or one [`SimulatedVenue::from_snapshot`](rustrade_execution::exchange::mock::SimulatedVenue::from_snapshot)
+    ///   refuses.
     /// - Any of [`add_mock`](Self::add_mock)'s and
     ///   [`SimExecutionBuilder::add_venue_with_options`]'s errors apply.
     ///
@@ -234,7 +254,24 @@ impl<'a> ExecutionBuilder<'a> {
         let PaperOptions {
             venue: venue_options,
             account_stream_capacity,
+            checkpoint,
         } = options;
+        if let Some(checkpoint) = &checkpoint {
+            if checkpoint.version() != EngineCheckpoint::VERSION {
+                return Err(BarterError::ExecutionBuilder(format!(
+                    "paper venue {exchange} given a checkpoint in format version {}; this release \
+                     restores version {}",
+                    checkpoint.version(),
+                    EngineCheckpoint::VERSION
+                )));
+            }
+            if checkpoint.exchange() != exchange {
+                return Err(BarterError::ExecutionBuilder(format!(
+                    "paper venue {exchange} given a checkpoint of {}",
+                    checkpoint.exchange()
+                )));
+            }
+        }
         if account_stream_capacity == 0 {
             return Err(BarterError::ExecutionBuilder(format!(
                 "paper venue {exchange} has an account_stream_capacity of zero"
@@ -249,6 +286,7 @@ impl<'a> ExecutionBuilder<'a> {
             let clock = clock.clone();
             Arc::new(move || clock.time())
         };
+        let paper_venue = PaperVenue::new(exchange, &request_tx, Arc::clone(&venue_clock));
         let mock_execution_client_config = MockExecutionClientConfig {
             mocked_exchange: exchange,
             clock: move || clock.time(),
@@ -266,7 +304,20 @@ impl<'a> ExecutionBuilder<'a> {
             options,
         )?;
 
-        let venue = market_driven_venue(&config, venue_options, this.instruments)?;
+        let restore = match checkpoint {
+            None => None,
+            Some(checkpoint) => {
+                checkpoint
+                    .check_positions_agree(this.instruments)
+                    .map_err(|error| {
+                        BarterError::ExecutionBuilder(format!(
+                            "paper venue {exchange} cannot be restored: {error}"
+                        ))
+                    })?;
+                Some(checkpoint.venue.snapshot)
+            }
+        };
+        let venue = market_driven_venue(&config, venue_options, this.instruments, restore)?;
         let market = paper_market(this.instruments, exchange, feed);
         let mock_exchange = MockExchange::new_market_driven(
             venue,
@@ -278,6 +329,7 @@ impl<'a> ExecutionBuilder<'a> {
         );
         this.mock_exchange_futures
             .push(Box::pin(mock_exchange.run()));
+        this.paper_venues.insert(exchange, paper_venue);
 
         Ok(this)
     }
@@ -429,6 +481,7 @@ impl<'a> ExecutionBuilder<'a> {
             execution_tx_map,
             in_flight_deadlines: self.in_flight_deadlines,
             account_channel: self.merged_channel,
+            paper_venues: self.paper_venues,
             futures: ExecutionBuildFutures {
                 mock_exchange_run_futures: self.mock_exchange_futures,
                 execution_init_futures: self.execution_init_futures,
@@ -450,6 +503,9 @@ pub struct ExecutionBuild {
     /// [`ExecutionBuilder::add_mock`].
     pub in_flight_deadlines: InFlightDeadlines,
     pub account_channel: Channel<AccountStreamEvent>,
+    /// A handle to each venue [`ExecutionBuilder::add_paper`] added, by exchange. A handle works
+    /// before [`init`](Self::init) too: a query sent then waits for the venue to start.
+    pub paper_venues: FnvHashMap<ExchangeId, PaperVenue>,
     pub futures: ExecutionBuildFutures,
 }
 
@@ -490,6 +546,7 @@ impl ExecutionBuild {
             execution_txs: self.execution_tx_map,
             in_flight_deadlines: self.in_flight_deadlines,
             account_channel: self.account_channel,
+            paper_venues: self.paper_venues,
             handles,
         })
     }

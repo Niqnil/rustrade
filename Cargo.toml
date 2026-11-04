@@ -20,11 +20,11 @@ categories = ["finance", "simulation"]
 
 [workspace.dependencies]
 # Rustrade Ecosystem
-rustrade-integration = { path = "./rustrade-integration", version = "0.20.0" }
-rustrade-instrument = { path = "./rustrade-instrument", version = "0.20.0" }
-rustrade-data = { path = "./rustrade-data", version = "0.20.0" }
-rustrade-execution = { path = "./rustrade-execution", version = "0.20.0" }
-rustrade-macro = { path = "./rustrade-macro", version = "0.20.0" }
+rustrade-integration = { path = "./rustrade-integration", version = "0.21.0" }
+rustrade-instrument = { path = "./rustrade-instrument", version = "0.21.0" }
+rustrade-data = { path = "./rustrade-data", version = "0.21.0" }
+rustrade-execution = { path = "./rustrade-execution", version = "0.21.0" }
+rustrade-macro = { path = "./rustrade-macro", version = "0.21.0" }
 
 # Logging
 tracing = { version = "0.1.41" }
@@ -60,7 +60,7 @@ http = { version = "1" }
 tokio-tungstenite = { version = "0.30.0", features = ["url","rustls-tls-webpki-roots"] }
 
 # Data Structures
-vecmap-rs = { version = "0.2.2" }
+vecmap-rs = { version = "0.3.1" }
 parking_lot = { version = "0.12.3" }
 lru = { version = "0.19" }
 rust_decimal = { version = "1.36.0", features = ["maths", "serde-with-str"] }

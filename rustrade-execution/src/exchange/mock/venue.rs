@@ -4,7 +4,7 @@ use crate::{
     AccountEventKind, InstrumentAccountSnapshot, UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::{AssetBalance, MarginDetails},
     borrow_capacity::BorrowCapacity,
-    cash_flow::{CashFlow, CashFlowId, CashFlowKind, InterestTiming},
+    cash_flow::{CashFlow, CashFlowId, CashFlowKind, CashFlowLoan, InterestTiming},
     client::mock::MockExecutionConfig,
     error::{ApiError, BorrowReject, BorrowRejectReason, UnindexedApiError, UnindexedOrderError},
     exchange::mock::{
@@ -39,13 +39,19 @@ use rustrade_instrument::{
     instrument::{Instrument, kind::InstrumentKind, name::InstrumentNameExchange},
 };
 use rustrade_integration::collection::snapshot::Snapshot;
+use serde::{Deserialize, Serialize};
 use smol_str::ToSmolStr;
 use std::{sync::Arc, time::Duration};
 use tracing::warn;
 
 mod liquidation;
+mod price_window;
+mod snapshot;
 mod spot_pairs;
 
+pub use snapshot::{SimulatedVenueSnapshot, VenueCheckpoint, VenueRestoreError};
+
+use price_window::PriceWindow;
 use spot_pairs::{SpotPair, SpotPairs};
 
 /// Everything one request obliges a driver to deliver, in the order it must deliver it.
@@ -117,7 +123,7 @@ pub struct VenueInstrumentMarket {
 /// limit order placed through a driver with no market feed would be accepted and then rest forever
 /// with nothing that could ever match it — accepted-and-silently-never-filled, which is worse than
 /// a flat rejection naming the reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub enum VenueRegime {
     /// No market feed: a market order is priced from the snapshot its own request carries, and
     /// nothing can rest, so [`OrderKind::Limit`] is rejected.
@@ -203,14 +209,16 @@ pub enum VenueRegime {
 /// [`with_margin_interest`](Self::with_margin_interest). Then each loan is charged when it is
 /// taken, and at each of the model's boundaries while principal is owed in its asset:
 /// - **At borrow**, on the amount lent, when the order that borrows is accepted. The balance the
-///   order restates includes the interest. The [`AccountEventKind::CashFlow`] reporting it comes
-///   after the trade the loan pays for, once the position it funds exists, so that a consumer
-///   attributing the charge to that position (see `CashFlowAttributionStrategy` in the `rustrade`
-///   crate) finds it: `[balance.., trade, cash flow]`. An order that borrows when it rests on the
-///   book, or is held for a later bar or a fresh market, has traded nothing yet, so its cash flow
-///   waits: it is reported after the order's first fill, or with the order's end if it never fills
-///   (a cancel, an expiry, or a release it cannot afford). It is stamped at that instant, not at
-///   the charge, since a consumer applies no flow stamped before the position it belongs to.
+///   order restates includes the interest. The [`AccountEventKind::CashFlow`] reporting it is
+///   linked to the order: it carries the loan, lent at the charge, and the order, in
+///   [`CashFlow::loan`], and the order's instrument in [`CashFlow::instrument`]. It comes after
+///   the trade the loan pays for, once the position it funds exists, so that a consumer applying
+///   the charge to that position finds it: `[balance.., trade, cash flow]`. An order that borrows
+///   when it rests on the book, or is held for a later bar or a fresh market, has traded nothing
+///   yet, so its cash flow waits: it is reported after the order's first fill, or with the
+///   order's end if it never fills (a cancel, an expiry, or a release it cannot afford). It is
+///   stamped at that instant, not at the charge, since a consumer applies no flow stamped before
+///   the position it belongs to. Its loan keeps the charge's time.
 /// - **At a boundary**, on the principal owed when it falls, as `[balance, cash flow]` stamped at the
 ///   boundary, when a driver moves the clock to or past it, as for holding costs (see
 ///   `# Holding costs`). A loan taken at a boundary's instant is charged at borrow, not again at
@@ -218,10 +226,11 @@ pub enum VenueRegime {
 ///
 /// The interest is added to the loan, so `total` and `free` are unchanged and what a fill
 /// delivers repays it first. Each cash flow is a
-/// [`CashFlowKind::MarginInterest`], in the borrowed asset, negative, with no instrument, since a
-/// cross margin loan belongs to the account rather than to a position. A charge on a new loan
-/// carries [`InterestTiming::OnBorrow`] and one at a boundary [`InterestTiming::Periodic`]. A venue that books such
-/// interest at the start of its hour stamps it earlier than this venue does.
+/// [`CashFlowKind::MarginInterest`], in the borrowed asset, negative. A charge on a new loan
+/// carries [`InterestTiming::OnBorrow`], the loan and the order's instrument, as above. One at a
+/// boundary carries [`InterestTiming::Periodic`] and no instrument, since a cross margin loan
+/// belongs to the account rather than to a position. A venue that books such interest at the
+/// start of its hour stamps it earlier than this venue does.
 ///
 /// It liquidates the account only when the configuration says so, with
 /// [`SpotMarginConfig::with_liquidation`]: then, after each input, an account whose margin level
@@ -557,6 +566,10 @@ pub struct SimulatedVenue {
     /// Empty unless a driver feeds it — see [`apply_market`](Self::apply_market) for which drivers
     /// do. Read through [`market`](Self::market).
     market: FnvHashMap<InstrumentNameExchange, VenueInstrumentMarket>,
+    /// Each spot instrument's prices over the [`spot_margin`](Self::spot_margin)'s borrow price
+    /// window, as [`apply_market`](Self::apply_market) observed them. Empty without a window.
+    /// See [`SpotMarginConfig`]'s `# Borrow price window`.
+    borrow_prices: FnvHashMap<InstrumentNameExchange, PriceWindow>,
     /// The net position of each cash-settled instrument this account holds one in.
     ///
     /// What decides how much of a CFD fill closes a position, returning its margin and realising
@@ -662,6 +675,9 @@ pub struct SimulatedVenue {
     /// [`SpotMarginLiquidation`](crate::margin::SpotMarginLiquidation): whether a liquidation is
     /// under way, and whether a margin call is outstanding.
     liquidation: liquidation::LiquidationState,
+    /// How many checkpoints this venue has taken, which numbers the next. Kept in its snapshot, so
+    /// a restored venue never repeats an id.
+    checkpoint_sequence: u64,
 }
 
 impl SimulatedVenue {
@@ -723,6 +739,29 @@ impl SimulatedVenue {
             .filter_map(|balance| Some((balance.asset.clone(), balance.balance.margin?)))
             .collect();
 
+        Self::assemble(
+            config,
+            instruments,
+            regime,
+            account,
+            positions,
+            order_id_start,
+            reported_debt,
+        )
+    }
+
+    /// A venue configured by `config`, holding `account`, `positions` and `reported_debt`, whose
+    /// clock has not yet moved and which has booked nothing. What both a fresh venue and a restored
+    /// one start from: [`from_snapshot`](Self::from_snapshot) then sets what the snapshot records.
+    fn assemble(
+        config: &MockExecutionConfig,
+        instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
+        regime: VenueRegime,
+        account: AccountState,
+        positions: FnvHashMap<InstrumentNameExchange, NetPosition>,
+        order_id_start: u128,
+        reported_debt: FnvHashMap<AssetNameExchange, MarginDetails>,
+    ) -> Self {
         Self {
             exchange: config.mocked_exchange,
             fee_model: config.fee_model,
@@ -733,6 +772,7 @@ impl SimulatedVenue {
             instruments,
             account,
             market: FnvHashMap::default(),
+            borrow_prices: FnvHashMap::default(),
             positions,
             order_sequence: 0,
             order_id_start,
@@ -754,6 +794,7 @@ impl SimulatedVenue {
             next_interest_loans: 0,
             reported_debt,
             liquidation: Default::default(),
+            checkpoint_sequence: 0,
         }
     }
 
@@ -1303,18 +1344,46 @@ impl SimulatedVenue {
     /// `None` if this venue cannot value `asset`, or a debt the account owes. `priced` is as for
     /// [`price_in`](Self::price_in). Shared by an order's [`borrowable`](Self::borrowable) and the
     /// [`borrow_capacity`](Self::borrow_capacity) query, so the two agree.
+    ///
+    /// With a borrow price window, the lesser of the room at the window's prices and at the
+    /// current ones. See [`SpotMarginConfig`]'s `# Borrow price window`.
     fn leverage_room(
         &self,
         config: &SpotMarginConfig,
         asset: &AssetNameExchange,
         priced: Option<(&Underlying<AssetNameExchange>, &MarketSnapshot)>,
     ) -> Option<Decimal> {
-        let asset_price = self.price_in(asset, config.valuation_asset(), priced)?;
-        let Valued { equity, debt } = self.valued(config, MarginCheck::Borrow, priced)?;
+        let room = |prices: Prices<'_>| {
+            // The asset being borrowed: owed, under the window, whatever the account owes now.
+            let asset_price =
+                self.price_of(asset, config.valuation_asset(), priced, prices, true)?;
+            let Valued { equity, debt } =
+                self.valued(config, MarginCheck::Borrow, priced, prices)?;
 
-        let headroom = (config.max_leverage() - Decimal::ONE) * equity - debt;
-        // `price_in` never values an asset at zero, so the division is safe.
-        Some(headroom.max(Decimal::ZERO) / asset_price)
+            let headroom = (config.max_leverage() - Decimal::ONE) * equity - debt;
+            // `price_of` never values an asset at zero, so the division is safe.
+            Some(headroom.max(Decimal::ZERO) / asset_price)
+        };
+
+        let current = room(Prices::Current)?;
+        // Only ever less: see `# Borrow price window` for why the window alone could lend more.
+        let Some(since) = self.borrow_window_since(config) else {
+            return Some(current);
+        };
+        Some(current.min(room(Prices::Window {
+            since,
+            borrowing: asset,
+        })?))
+    }
+
+    /// The earliest instant `config`'s borrow price window reaches back to from the latest instant
+    /// this venue's clock has reached, or `None` without a window, or before the clock first moved,
+    /// when nothing was observed to look back on.
+    fn borrow_window_since(&self, config: &SpotMarginConfig) -> Option<DateTime<Utc>> {
+        Some(window_start(
+            self.accrued_through?,
+            config.borrow_price_window()?,
+        ))
     }
 
     /// The rejection for an arrival the account refused, an order on `side`.
@@ -1371,19 +1440,27 @@ impl SimulatedVenue {
     /// [`SpotMarginConfig`]'s `# How much it lends` says, with each asset's positive net weighted
     /// by its collateral ratio for `check`, or `None` if it owes an asset this venue cannot value.
     ///
-    /// `priced` is as for [`price_in`](Self::price_in). Shared by the leverage limit and the
-    /// liquidation check, so the two value an account alike but for the ratios.
+    /// `priced` is as for [`price_in`](Self::price_in), and `prices` says which price of each
+    /// asset counts. Shared by the leverage limit and the liquidation check, so the two value an
+    /// account alike but for the ratios and the borrow price window.
     fn valued(
         &self,
         config: &SpotMarginConfig,
         check: MarginCheck,
         priced: Option<(&Underlying<AssetNameExchange>, &MarketSnapshot)>,
+        prices: Prices<'_>,
     ) -> Option<Valued> {
         let mut valued = Valued::default();
         for balance in self.account.balances() {
             let owed = owed(balance);
-            let Some(price) = self.price_in(&balance.asset, config.valuation_asset(), priced)
-            else {
+            let price = self.price_of(
+                &balance.asset,
+                config.valuation_asset(),
+                priced,
+                prices,
+                owed > Decimal::ZERO,
+            );
+            let Some(price) = price else {
                 if owed > Decimal::ZERO {
                     return None;
                 }
@@ -1415,9 +1492,26 @@ impl SimulatedVenue {
         valuation: &AssetNameExchange,
         priced: Option<(&Underlying<AssetNameExchange>, &MarketSnapshot)>,
     ) -> Option<Decimal> {
+        self.price_of(asset, valuation, priced, Prices::Current, false)
+    }
+
+    /// What one unit of `asset` is worth in `valuation` at `prices`: its
+    /// [`price_in`](Self::price_in), or under [`Prices::Window`] the highest or lowest of that and
+    /// the prices the same instrument was observed at in the window. The highest for an asset the
+    /// account `owes` any of, and for the asset being borrowed; the lowest for every other.
+    /// `None` exactly when [`price_in`](Self::price_in) is.
+    fn price_of(
+        &self,
+        asset: &AssetNameExchange,
+        valuation: &AssetNameExchange,
+        priced: Option<(&Underlying<AssetNameExchange>, &MarketSnapshot)>,
+        prices: Prices<'_>,
+        owes: bool,
+    ) -> Option<Decimal> {
         if asset == valuation {
             return Some(Decimal::ONE);
         }
+        let extreme = prices.extreme(asset, owes);
 
         // `priced` applies to an instrument whose underlying it names: `asset`/`valuation`, or the
         // reverse for an inverse pair.
@@ -1444,6 +1538,20 @@ impl SimulatedVenue {
                 if price <= Decimal::ZERO {
                     return None;
                 }
+                // The window holds the instrument's price, so the asset's lowest is the inverse of
+                // its highest. It holds only positive prices, so the inverse stays safe.
+                let window = self.borrow_prices.get(&pair.instrument);
+                let price = match (extreme, pair.inverse) {
+                    (None, _) => price,
+                    (Some((Extreme::Lowest, since)), false)
+                    | (Some((Extreme::Highest, since)), true) => window
+                        .and_then(|window| window.low(since))
+                        .map_or(price, |low| low.min(price)),
+                    (Some((Extreme::Highest, since)), false)
+                    | (Some((Extreme::Lowest, since)), true) => window
+                        .and_then(|window| window.high(since))
+                        .map_or(price, |high| high.max(price)),
+                };
                 Some(match pair.inverse {
                     true => Decimal::ONE / price,
                     false => price,
@@ -1660,6 +1768,8 @@ impl SimulatedVenue {
         if fresh {
             entry.fresh_at = Some(time_exchange);
         }
+        // Recorded before anything can borrow on this tick, so a loan it funds is valued with it.
+        self.record_borrow_price(instrument, &snapshot, bar.as_ref(), time_exchange);
 
         // Swept before matching, so an order whose deadline this tick has reached cannot trade on
         // the very tick that retires it -- see `advance_time`.
@@ -1702,6 +1812,57 @@ impl SimulatedVenue {
         self.refresh_next_interest_if_loans_changed();
         self.report_debt_changes(&mut events);
         events
+    }
+
+    /// Adds what `snapshot` and `bar` say `instrument` traded at, at `time_exchange`, to its
+    /// borrow price window, if the spot margin configuration has one and `instrument` is spot:
+    /// the mid, else the last price, at which the venue values it, and the bar's high and low.
+    /// See [`SpotMarginConfig`]'s `# Borrow price window`.
+    fn record_borrow_price(
+        &mut self,
+        instrument: &InstrumentNameExchange,
+        snapshot: &MarketSnapshot,
+        bar: Option<&MarketBar>,
+        time_exchange: DateTime<Utc>,
+    ) {
+        let Some(window) = self
+            .spot_margin
+            .as_ref()
+            .and_then(SpotMarginConfig::borrow_price_window)
+        else {
+            return;
+        };
+        // Only a spot instrument values an asset, so no other needs a window.
+        if !self
+            .instruments
+            .get(instrument)
+            .is_some_and(|traded| matches!(traded.kind, InstrumentKind::Spot))
+        {
+            return;
+        }
+        // A price of zero values nothing, as the venue values at the current price.
+        let Some((low, high)) = [
+            mid_or_last(snapshot),
+            bar.map(|bar| bar.low),
+            bar.map(|bar| bar.high),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|price| *price > Decimal::ZERO)
+        .minmax()
+        .into_option() else {
+            return;
+        };
+        let since = window_start(time_exchange, window);
+        // Looked up before it is entered, so the name is cloned only on the first observation.
+        match self.borrow_prices.get_mut(instrument) {
+            Some(prices) => prices.record(time_exchange, low, high, since),
+            None => self
+                .borrow_prices
+                .entry(instrument.clone())
+                .or_default()
+                .record(time_exchange, low, high, since),
+        }
     }
 
     /// Whether applying `observation` to `instrument` releases orders held for its bar,
@@ -2067,14 +2228,19 @@ impl SimulatedVenue {
             Liquidity::Taker,
         );
 
-        let mut committed =
-            match self.settle_resting_afresh(terms, reservation, &settlement, time_exchange) {
-                RestingSettlement::Settled(committed) => committed,
-                RestingSettlement::Unaffordable { released } => {
-                    self.slippage = slippage_before;
-                    return self.cancel_unfilled(order, released, time_exchange);
-                }
-            };
+        let mut committed = match self.settle_resting_afresh(
+            &order,
+            terms,
+            reservation,
+            &settlement,
+            time_exchange,
+        ) {
+            RestingSettlement::Settled(committed) => committed,
+            RestingSettlement::Unaffordable { released } => {
+                self.slippage = slippage_before;
+                return self.cancel_unfilled(order, released, time_exchange);
+            }
+        };
         self.take_fee_apart(&settlement, &mut committed, time_exchange);
 
         self.consume_depth(&order.key.instrument, side, filled_quantity);
@@ -2240,7 +2406,7 @@ impl SimulatedVenue {
             |reservation| reservation.effect,
         );
         let (mut committed, loan, excess_borrowed) =
-            match self.commit_afresh(terms, reservation, &debit, credit, time_exchange) {
+            match self.commit_afresh(&order, terms, reservation, &debit, credit, time_exchange) {
                 Recommitted::Committed {
                     commitment,
                     loan,
@@ -2400,12 +2566,24 @@ impl SimulatedVenue {
             // A fill whose fee is taken apart costs less than its order holds, the cost of its
             // fee falling back, whenever that fee would have been on top of what it pays with.
             _ if settlement.fee_apart => {
-                return self.settle_resting_afresh(terms, reservation, settlement, time_exchange);
+                return self.settle_resting_afresh(
+                    order,
+                    terms,
+                    reservation,
+                    settlement,
+                    time_exchange,
+                );
             }
             Credit::Delivery(delivery) if !delivery.amount.is_sign_negative() => delivery,
             // A cash-settled fill, or a spot fill whose fee exceeds what it receives.
             Credit::PaidBack(_) | Credit::Delivery(_) => {
-                return self.settle_resting_afresh(terms, reservation, settlement, time_exchange);
+                return self.settle_resting_afresh(
+                    order,
+                    terms,
+                    reservation,
+                    settlement,
+                    time_exchange,
+                );
             }
         };
 
@@ -2433,6 +2611,7 @@ impl SimulatedVenue {
                     effect,
                     terms,
                     None,
+                    Borrower::of(order).as_ref(),
                     time_exchange,
                 )
                 .unwrap_or_else(|insufficient| {
@@ -2486,12 +2665,14 @@ impl SimulatedVenue {
     /// as a cancelled order does.
     fn settle_resting_afresh(
         &mut self,
+        order: &OpenOrder,
         terms: &InstrumentTerms,
         reservation: Option<Reservation>,
         settlement: &Settlement,
         time_exchange: DateTime<Utc>,
     ) -> RestingSettlement {
         match self.commit_afresh(
+            order,
             terms,
             reservation,
             &settlement.settled(),
@@ -2508,6 +2689,7 @@ impl SimulatedVenue {
     /// [`settle_resting_afresh`](Self::settle_resting_afresh) and [`Recommitted`].
     fn commit_afresh(
         &mut self,
+        order: &OpenOrder,
         terms: &InstrumentTerms,
         mut reservation: Option<Reservation>,
         debit: &Debit,
@@ -2532,7 +2714,16 @@ impl SimulatedVenue {
         });
 
         let repays_at_cancel = self.repays_at_cancel();
-        match self.commit(debit, credit, effect, terms, None, time_exchange) {
+        let borrower = Borrower::of(order);
+        match self.commit(
+            debit,
+            credit,
+            effect,
+            terms,
+            None,
+            borrower.as_ref(),
+            time_exchange,
+        ) {
             Ok(mut commitment) => {
                 let mut loan = commitment.committed.shortfall_borrowed();
                 let mut excess_borrowed = commitment.committed.excess_borrowed;
@@ -2674,6 +2865,7 @@ impl SimulatedVenue {
         effect: MarginEffect,
         terms: &InstrumentTerms,
         market: Option<&MarketSnapshot>,
+        borrower: Option<&Borrower<'_>>,
         time_exchange: DateTime<Utc>,
     ) -> Result<Commitment, BalanceInsufficient> {
         let lending = Lending {
@@ -2700,7 +2892,10 @@ impl SimulatedVenue {
                 )
                 .map(|(balance, flow)| {
                     committed.paid = balance;
-                    Box::new(flow)
+                    Box::new(match borrower {
+                        Some(borrower) => borrower.lent(flow),
+                        None => flow,
+                    })
                 }),
             false => None,
         };
@@ -3656,25 +3851,32 @@ impl SimulatedVenue {
 
         let debit = settlement.reserved();
         let effect = self.margin_effect(request.state.margin_effect);
-        let (committed, interest) =
-            match self.commit(&debit, None, effect, terms, market.as_ref(), time_exchange) {
-                // A fresh commitment holds no earlier order's interest, so `held_interest` is
-                // empty.
-                Ok(Commitment {
-                    committed,
-                    interest,
-                    ..
-                }) => (committed, interest),
-                Err(insufficient) => {
-                    return (
-                        build_open_order_err_response(
-                            request,
-                            self.insufficient_error(insufficient, side),
-                        ),
-                        None,
-                    );
-                }
-            };
+        let (committed, interest) = match self.commit(
+            &debit,
+            None,
+            effect,
+            terms,
+            market.as_ref(),
+            Some(&Borrower::arriving(&request, self.next_order_id())),
+            time_exchange,
+        ) {
+            // A fresh commitment holds no earlier order's interest, so `held_interest` is
+            // empty.
+            Ok(Commitment {
+                committed,
+                interest,
+                ..
+            }) => (committed, interest),
+            Err(insufficient) => {
+                return (
+                    build_open_order_err_response(
+                        request,
+                        self.insufficient_error(insufficient, side),
+                    ),
+                    None,
+                );
+            }
+        };
 
         let open = Open::new(
             VenueOrderId::Assigned(self.order_id_sequence_fetch_add()),
@@ -4095,6 +4297,7 @@ impl SimulatedVenue {
             effect,
             terms,
             Some(&market),
+            Some(&Borrower::arriving(&request, self.next_order_id())),
             time_exchange,
         ) {
             Ok(commitment) => commitment,
@@ -4299,8 +4502,8 @@ impl SimulatedVenue {
     ///
     /// # Panics
     /// If an order is already resting under its id. `open_order_inner` refuses such an open before
-    /// anything else, under the same `&mut self`, so the book is vacant under this id by
-    /// construction, and a refusal here would be a bug in this venue with no correct reply left
+    /// anything touches the ledger, under the same `&mut self`, so the book is vacant under this id
+    /// by construction, and a refusal here would be a bug in this venue with no correct reply left
     /// to give.
     fn book_rested(&mut self, order: OpenOrder, reservation: Reservation) {
         if let Err(AlreadyResting(refused)) = self.account.book(order, Some(reservation)) {
@@ -4357,20 +4560,27 @@ impl SimulatedVenue {
             .market(&request.key.instrument)
             .map(|market| market.snapshot);
         let effect = self.margin_effect(request.state.margin_effect);
-        let (committed, interest) =
-            match self.commit(&debit, None, effect, terms, market.as_ref(), time_exchange) {
-                // Nothing traded, so nothing is delivered: the one balance is the hold. A fresh
-                // commitment holds no earlier order's interest, so `held_interest` is empty.
-                Ok(Commitment {
-                    committed,
-                    interest,
-                    ..
-                }) => (committed, interest),
-                Err(insufficient) => {
-                    let error = self.insufficient_error(insufficient, request.state.side);
-                    return (build_open_order_err_response(request, error), None);
-                }
-            };
+        let (committed, interest) = match self.commit(
+            &debit,
+            None,
+            effect,
+            terms,
+            market.as_ref(),
+            Some(&Borrower::arriving(&request, self.next_order_id())),
+            time_exchange,
+        ) {
+            // Nothing traded, so nothing is delivered: the one balance is the hold. A fresh
+            // commitment holds no earlier order's interest, so `held_interest` is empty.
+            Ok(Commitment {
+                committed,
+                interest,
+                ..
+            }) => (committed, interest),
+            Err(insufficient) => {
+                let error = self.insufficient_error(insufficient, request.state.side);
+                return (build_open_order_err_response(request, error), None);
+            }
+        };
 
         // The order rests carrying whatever it has already done, so the book, the client and this
         // venue's own later arithmetic all read the same remainder off it.
@@ -4755,6 +4965,13 @@ impl SimulatedVenue {
         })
     }
 
+    /// The `OrderId` [`order_id_sequence_fetch_add`](Self::order_id_sequence_fetch_add) mints
+    /// next, without minting it: for an arriving order, whose id is minted only once the venue
+    /// commits to it, so a refused order consumes none.
+    fn next_order_id(&self) -> OrderId {
+        OrderId((self.order_id_start + u128::from(self.order_sequence)).to_smolstr())
+    }
+
     fn order_id_sequence_fetch_add(&mut self) -> OrderId {
         let sequence = self.order_sequence;
         self.order_sequence += 1;
@@ -4911,6 +5128,53 @@ impl MarginCheck {
             Self::Liquidation => config.liquidation_collateral_ratio(asset),
         }
     }
+}
+
+/// Which price of each asset a valuation takes. See [`SimulatedVenue::price_of`].
+#[derive(Debug, Clone, Copy)]
+enum Prices<'a> {
+    /// Each asset's current price.
+    Current,
+    /// Over the borrow price window from `since`: the highest for an asset the account owes and
+    /// for `borrowing`, the lowest for every other. See [`SpotMarginConfig`]'s
+    /// `# Borrow price window`.
+    Window {
+        /// The earliest instant the window reaches back to.
+        since: DateTime<Utc>,
+        /// The asset being borrowed, valued as one the account owes.
+        borrowing: &'a AssetNameExchange,
+    },
+}
+
+impl Prices<'_> {
+    /// Which extreme of `asset`'s window counts and from when, or `None` for its current price.
+    /// `owes` is whether the account owes any of `asset`.
+    fn extreme(self, asset: &AssetNameExchange, owes: bool) -> Option<(Extreme, DateTime<Utc>)> {
+        match self {
+            Self::Current => None,
+            Self::Window { since, borrowing } => Some((
+                match owes || asset == borrowing {
+                    true => Extreme::Highest,
+                    false => Extreme::Lowest,
+                },
+                since,
+            )),
+        }
+    }
+}
+
+/// Which end of a borrow price window an asset is valued at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Extreme {
+    Lowest,
+    Highest,
+}
+
+/// The earliest instant a `window` ending at `end` reaches back to, inclusive: the earliest
+/// instant there is, for a window longer than all of time before `end`.
+fn window_start(end: DateTime<Utc>, window: chrono::TimeDelta) -> DateTime<Utc> {
+    end.checked_sub_signed(window)
+        .unwrap_or(DateTime::<Utc>::MIN_UTC)
 }
 
 /// A margin account's equity and debt, in its valuation asset. See [`SimulatedVenue::valued`].
@@ -5227,6 +5491,53 @@ enum OpenOrderNotifications {
     },
 }
 
+/// The order a commitment is for, to which a loan it takes is lent.
+#[derive(Debug)]
+struct Borrower<'a> {
+    instrument: &'a InstrumentNameExchange,
+    order_id: OrderId,
+    cid: &'a ClientOrderId,
+}
+
+impl<'a> Borrower<'a> {
+    /// `order`, which the venue already holds. `None` for one without a venue id, which this
+    /// venue never holds.
+    fn of(order: &'a OpenOrder) -> Option<Self> {
+        Some(Self {
+            instrument: &order.key.instrument,
+            order_id: order.state.id.assigned()?.clone(),
+            cid: &order.key.cid,
+        })
+    }
+
+    /// The order `request` places, which the venue will give `order_id`.
+    fn arriving(
+        request: &'a OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
+        order_id: OrderId,
+    ) -> Self {
+        Self {
+            instrument: &request.key.instrument,
+            order_id,
+            cid: &request.key.cid,
+        }
+    }
+
+    /// `flow`, the interest charged on the loan this order took when it was lent, linked to the
+    /// order: the loan in [`CashFlow::loan`], lent at the flow's time, and the order's instrument
+    /// in [`CashFlow::instrument`].
+    fn lent(
+        &self,
+        flow: CashFlow<AssetNameExchange, InstrumentNameExchange>,
+    ) -> CashFlow<AssetNameExchange, InstrumentNameExchange> {
+        let loan = CashFlowLoan::new(flow.time_exchange, self.order_id.clone(), self.cid.clone());
+        CashFlow {
+            instrument: Some(self.instrument.clone()),
+            ..flow
+        }
+        .with_loan(Some(loan))
+    }
+}
+
 /// What one arrival committed on this venue: the balances the ledger restated, and the interest
 /// charged on what a margin account lent it, if any.
 #[derive(Debug)]
@@ -5416,7 +5727,9 @@ impl Settlement {
 /// Kept per instrument, in contracts, whatever position mode the client keeps its own book in. A
 /// CFD venue nets one account's trades in one instrument, which is what decides how much of a fill
 /// returns margin and realises PnL rather than posting new margin.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
+)]
 struct NetPosition {
     /// Signed quantity in contracts: positive long, negative short, zero flat.
     quantity: Decimal,
@@ -14104,13 +14417,18 @@ mod tests {
         );
         assert_eq!(
             *cash_flow_of(sans_debt(&outcome.events)[3]),
-            interest_flow(
-                base(),
-                "0.5",
-                "0.00005",
+            lent(
+                interest_flow(
+                    base(),
+                    "0.5",
+                    "0.00005",
+                    time(1),
+                    InterestTiming::OnBorrow,
+                    "0"
+                ),
                 time(1),
-                InterestTiming::OnBorrow,
-                "0"
+                &filled_trade(&outcome).order_id,
+                "test-cid"
             ),
         );
     }
@@ -14490,6 +14808,7 @@ mod tests {
         // 1.5 at the stale 100 lacks 50 of the 150, which is lent and charged 0.005.
         let outcome = venue.open_order(gtc_limit("waiting", Side::Buy, "1.5", "100"));
         assert_eq!(sans_debt(&outcome.events).len(), 1, "{:?}", outcome.events);
+        let waiting_id = rested_id(&outcome);
 
         // A fresh market it does not cross: it joins the book whole, having traded nothing.
         let events = venue.apply_market(
@@ -14511,15 +14830,21 @@ mod tests {
         });
         assert_eq!(
             *cash_flow_of(sans_debt(&cancelled.events)[1]),
-            interest_flow(
-                quote(),
-                "50",
-                "0.005",
-                time(30),
-                InterestTiming::OnBorrow,
-                "0"
+            lent(
+                interest_flow(
+                    quote(),
+                    "50",
+                    "0.005",
+                    time(30),
+                    InterestTiming::OnBorrow,
+                    "0"
+                ),
+                time(12),
+                &waiting_id,
+                "waiting"
             ),
-            "carried to the book, and reported at the order's end"
+            "carried to the book, and reported at the order's end, stamped then, though lent \
+             when the order was placed"
         );
     }
 
@@ -14537,6 +14862,7 @@ mod tests {
         // 1.5 at the stale 100 lacks 50 of the 150, which is lent and charged 0.005.
         let outcome = venue.open_order(gtc_limit("partial", Side::Buy, "1.5", "100"));
         assert_eq!(sans_debt(&outcome.events).len(), 1, "{:?}", outcome.events);
+        let partial_id = rested_id(&outcome);
 
         // A fresh market offering 0.5 under the limit: 0.5 trades and the other 1 joins the book.
         let events = venue.apply_market(
@@ -14550,17 +14876,24 @@ mod tests {
             .position(|event| matches!(event.kind, AccountEventKind::Trade(_)))
             .unwrap_or_else(|| panic!("a trade: {events:?}"));
         assert_eq!(trade_of(events[traded_at]).quantity, d("0.5"));
+        assert_eq!(trade_of(events[traded_at]).order_id, partial_id);
         assert_eq!(
             *cash_flow_of(events[traded_at + 1]),
-            interest_flow(
-                quote(),
-                "50",
-                "0.005",
-                time(20),
-                InterestTiming::OnBorrow,
-                "0"
+            lent(
+                interest_flow(
+                    quote(),
+                    "50",
+                    "0.005",
+                    time(20),
+                    InterestTiming::OnBorrow,
+                    "0"
+                ),
+                time(12),
+                &partial_id,
+                "partial"
             ),
-            "the hold's charge after the trade, stamped at it: {events:?}"
+            "the hold's charge after the trade, stamped at it, lent when the order was placed: \
+             {events:?}"
         );
         assert_eq!(
             events
@@ -14605,6 +14938,7 @@ mod tests {
             TimeInForce::ImmediateOrCancel,
         ));
         assert_eq!(sans_debt(&outcome.events).len(), 1, "{:?}", outcome.events);
+        let immediate_id = rested_id(&outcome);
 
         let bar = ohlc("100", "100", "100", "100");
         let events = venue.apply_market(
@@ -14619,15 +14953,21 @@ mod tests {
         assert_eq!(events.len(), 3, "{events:?}");
         assert_eq!(
             *cash_flow_of(events[1]),
-            interest_flow(
-                quote(),
-                "50",
-                "0.005",
-                time(2),
-                InterestTiming::OnBorrow,
-                "0"
+            lent(
+                interest_flow(
+                    quote(),
+                    "50",
+                    "0.005",
+                    time(2),
+                    InterestTiming::OnBorrow,
+                    "0"
+                ),
+                time(1),
+                &immediate_id,
+                "immediate"
             ),
-            "the order never traded, so its cancel reports the charge, stamped then"
+            "the order never traded, so its cancel reports the charge, stamped then, though lent \
+             when the order was held"
         );
         assert!(matches!(
             order_of(events[2]).state,
@@ -15145,6 +15485,35 @@ mod tests {
         )
     }
 
+    /// `flow`, the interest charged on a loan lent at `lent_at` to the order with venue id
+    /// `order_id` and client id `cid`, as the venue links it: to the order's instrument and to
+    /// the loan.
+    fn lent(
+        flow: CashFlow<AssetNameExchange, InstrumentNameExchange>,
+        lent_at: DateTime<Utc>,
+        order_id: &OrderId,
+        cid: &str,
+    ) -> CashFlow<AssetNameExchange, InstrumentNameExchange> {
+        CashFlow {
+            instrument: Some(instrument_name()),
+            ..flow
+        }
+        .with_loan(Some(CashFlowLoan::new(
+            lent_at,
+            order_id.clone(),
+            ClientOrderId::new(cid),
+        )))
+    }
+
+    /// The venue's id for the order `outcome` reports resting.
+    fn rested_id(outcome: &OpenOutcome) -> OrderId {
+        rested_open(outcome)
+            .id
+            .assigned()
+            .expect("a resting order has a venue id")
+            .clone()
+    }
+
     fn cash_flow_of(
         event: &UnindexedAccountEvent,
     ) -> &CashFlow<AssetNameExchange, InstrumentNameExchange> {
@@ -15177,19 +15546,26 @@ mod tests {
             Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("0.75"), d("0.000075")),
             "the interest is added to the loan, leaving total and free as they were"
         );
-        assert_eq!(trade_of(sans_debt(&outcome.events)[2]).quantity, d("1"));
+        let trade = trade_of(sans_debt(&outcome.events)[2]);
+        assert_eq!(trade.quantity, d("1"));
         assert_eq!(
             *cash_flow_of(sans_debt(&outcome.events)[3]),
-            interest_flow(
-                base(),
-                "0.75",
-                "0.000075",
+            lent(
+                interest_flow(
+                    base(),
+                    "0.75",
+                    "0.000075",
+                    time(1),
+                    InterestTiming::OnBorrow,
+                    "0"
+                ),
                 time(1),
-                InterestTiming::OnBorrow,
-                "0"
+                &trade.order_id,
+                "test-cid"
             ),
             "charged on the amount lent, stamped at the borrow, after the trade that opened the \
-             short, so the position it belongs to exists when it is read"
+             short, so the position it belongs to exists when it is read, and linked to the \
+             order of that trade and to its instrument"
         );
     }
 
@@ -15217,6 +15593,12 @@ mod tests {
                 InterestTiming::Periodic,
                 "1"
             )
+        );
+        assert!(
+            charged
+                .iter()
+                .all(|(_, flow)| flow.instrument.is_none() && flow.loan.is_none()),
+            "a charge at a boundary belongs to no order: {charged:?}"
         );
         assert_eq!(
             charged[1].0.balance,
@@ -15414,13 +15796,18 @@ mod tests {
         let outcome = venue.open_order(sell_request("1", market_prices("50000")));
         assert_eq!(
             *cash_flow_of(sans_debt(&outcome.events)[3]),
-            interest_flow(
-                base(),
-                "0.75",
-                "0.000075",
+            lent(
+                interest_flow(
+                    base(),
+                    "0.75",
+                    "0.000075",
+                    boundary(0),
+                    InterestTiming::OnBorrow,
+                    "0"
+                ),
                 boundary(0),
-                InterestTiming::OnBorrow,
-                "0"
+                &filled_trade(&outcome).order_id,
+                "test-cid"
             )
         );
 
@@ -15438,6 +15825,7 @@ mod tests {
             .with_margin_interest(Arc::new(hourly_interest(base())));
 
         let outcome = venue.open_order(limit_request("rest", Side::Sell, "1", "50000", gtc()));
+        let rest_id = rested_id(&outcome);
         assert_eq!(
             sans_debt(&outcome.events).len(),
             1,
@@ -15463,15 +15851,20 @@ mod tests {
         );
         assert_eq!(
             *cash_flow_of(sans_debt(&cancelled.events)[1]),
-            interest_flow(
-                base(),
-                "1",
-                "0.0001",
-                time(5),
-                InterestTiming::OnBorrow,
-                "0"
+            lent(
+                interest_flow(
+                    base(),
+                    "1",
+                    "0.0001",
+                    time(5),
+                    InterestTiming::OnBorrow,
+                    "0"
+                ),
+                time(1),
+                &rest_id,
+                "rest"
             ),
-            "reported with the cancel, the order's end, stamped then"
+            "reported with the cancel, the order's end, stamped then, though lent when placed"
         );
         assert_eq!(sans_debt(&cancelled.events).len(), 2);
         assert_eq!(venue.next_deadline(), Some(boundary(0)));
@@ -15484,6 +15877,7 @@ mod tests {
 
         // 150 at the close of 100: 50 borrowed, charged 0.005.
         let outcome = venue.open_order(market_order("held", Side::Buy, "1.5", gtc()));
+        let held_id = rested_id(&outcome);
         assert_eq!(
             sans_debt(&outcome.events).len(),
             1,
@@ -15503,18 +15897,24 @@ mod tests {
             Balance::new_margin(Decimal::ZERO, Decimal::ZERO, d("80"), d("0.008"))
         );
         assert_eq!(trade_of(events[2]).price, d("120"));
+        assert_eq!(trade_of(events[2]).order_id, held_id);
         assert_eq!(
             *cash_flow_of(events[3]),
-            interest_flow(
-                quote(),
-                "50",
-                "0.005",
-                time(2),
-                InterestTiming::OnBorrow,
-                "0"
+            lent(
+                interest_flow(
+                    quote(),
+                    "50",
+                    "0.005",
+                    time(2),
+                    InterestTiming::OnBorrow,
+                    "0"
+                ),
+                time(1),
+                &held_id,
+                "held"
             ),
             "the hold's charge after the fill, stamped at the fill, so a position entered then \
-             takes it"
+             takes it, though lent when the order was held"
         );
         assert_eq!(
             cash_flow_of(events[4]).amount,
@@ -15522,6 +15922,16 @@ mod tests {
             "then what the bar borrowed"
         );
         assert_eq!(cash_flow_of(events[4]).time_exchange, time(2));
+        assert_eq!(
+            cash_flow_of(events[4]).loan,
+            Some(CashFlowLoan::new(
+                time(2),
+                held_id.clone(),
+                ClientOrderId::new("held")
+            )),
+            "lent to the held order at its bar"
+        );
+        assert_eq!(cash_flow_of(events[4]).instrument, Some(instrument_name()));
         assert_eq!(events.len(), 6, "and the filled order last: {events:?}");
     }
 
@@ -15529,7 +15939,8 @@ mod tests {
     fn a_resting_sell_that_borrowed_reports_its_interest_after_its_fill() {
         let mut venue = margin_market_venue("0", "100000")
             .with_margin_interest(Arc::new(hourly_interest(base())));
-        venue.open_order(limit_request("rest", Side::Sell, "1", "50000", gtc()));
+        let rested = venue.open_order(limit_request("rest", Side::Sell, "1", "50000", gtc()));
+        let rest_id = rested_id(&rested);
 
         advance(&mut venue, time(7));
         let events = venue.apply_market(
@@ -15540,17 +15951,23 @@ mod tests {
         let events = sans_debt(&events);
 
         assert_eq!(trade_of(events[2]).quantity, d("1"));
+        assert_eq!(trade_of(events[2]).order_id, rest_id);
         assert_eq!(
             *cash_flow_of(events[3]),
-            interest_flow(
-                base(),
-                "1",
-                "0.0001",
-                time(7),
-                InterestTiming::OnBorrow,
-                "0"
+            lent(
+                interest_flow(
+                    base(),
+                    "1",
+                    "0.0001",
+                    time(7),
+                    InterestTiming::OnBorrow,
+                    "0"
+                ),
+                time(1),
+                &rest_id,
+                "rest"
             ),
-            "after the fill that opened the short, stamped at it"
+            "after the fill that opened the short, stamped at it, lent when the order was placed"
         );
         assert_eq!(events.len(), 5, "and the filled order last: {events:?}");
     }
@@ -15559,7 +15976,7 @@ mod tests {
     fn a_held_buy_unaffordable_at_its_bar_reports_its_interest_with_its_cancel() {
         let mut venue =
             margin_venue_holding().with_margin_interest(Arc::new(hourly_interest(quote())));
-        venue.open_order(market_order("held", Side::Buy, "1.5", gtc()));
+        let held_id = rested_id(&venue.open_order(market_order("held", Side::Buy, "1.5", gtc())));
 
         // 375 at an open of 250 is more than the venue lends.
         let events = feed_bar(&mut venue, 2, ohlc("250", "251", "249", "250"));
@@ -15567,13 +15984,18 @@ mod tests {
 
         assert_eq!(
             *cash_flow_of(events[1]),
-            interest_flow(
-                quote(),
-                "50",
-                "0.005",
-                time(2),
-                InterestTiming::OnBorrow,
-                "0"
+            lent(
+                interest_flow(
+                    quote(),
+                    "50",
+                    "0.005",
+                    time(2),
+                    InterestTiming::OnBorrow,
+                    "0"
+                ),
+                time(1),
+                &held_id,
+                "held"
             ),
             "the order never traded, so its end reports the charge, stamped then"
         );
@@ -15587,20 +16009,25 @@ mod tests {
     fn a_held_sell_that_expires_reports_its_interest_before_its_end() {
         let mut venue = margin_venue_holding_with(|config| config, MarginEffect::Borrow)
             .with_margin_interest(Arc::new(hourly_interest(base())));
-        venue.open_order(market_order("held", Side::Sell, "1", gtc()));
+        let held_id = rested_id(&venue.open_order(market_order("held", Side::Sell, "1", gtc())));
 
         let events = venue.expire_held(time(2));
         let events = sans_debt(&events);
 
         assert_eq!(
             *cash_flow_of(events[1]),
-            interest_flow(
-                base(),
-                "1",
-                "0.0001",
-                time(2),
-                InterestTiming::OnBorrow,
-                "0"
+            lent(
+                interest_flow(
+                    base(),
+                    "1",
+                    "0.0001",
+                    time(2),
+                    InterestTiming::OnBorrow,
+                    "0"
+                ),
+                time(1),
+                &held_id,
+                "held"
             )
         );
         assert!(matches!(
@@ -16357,17 +16784,23 @@ mod tests {
                 time(1)
             )
         );
-        assert_eq!(trade_of(sans_debt(&outcome.events)[3]).quantity, d("0.3"));
+        let trade = trade_of(sans_debt(&outcome.events)[3]);
+        assert_eq!(trade.quantity, d("0.3"));
         // 5,000 at 0.01% for the hour, after the trade the loan paid for.
         assert_eq!(
             *cash_flow_of(sans_debt(&outcome.events)[4]),
-            interest_flow(
-                quote(),
-                "5000",
-                "0.5",
+            lent(
+                interest_flow(
+                    quote(),
+                    "5000",
+                    "0.5",
+                    time(1),
+                    InterestTiming::OnBorrow,
+                    "0"
+                ),
                 time(1),
-                InterestTiming::OnBorrow,
-                "0"
+                &trade.order_id,
+                "test-cid"
             )
         );
     }
@@ -16507,6 +16940,8 @@ mod tests {
     }
 
     mod borrow_capacity;
+    mod borrow_price_window;
     mod collateral_ratio;
     mod liquidation;
+    mod snapshot;
 }

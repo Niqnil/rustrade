@@ -126,6 +126,10 @@ impl AccountEventIndexer {
             AccountEventKind::StreamTerminated(reason) => {
                 AccountEventKind::StreamTerminated(reason)
             }
+            // Venue-native names throughout, read by whoever restores the venue, not indexed.
+            AccountEventKind::VenueCheckpoint(checkpoint) => {
+                AccountEventKind::VenueCheckpoint(checkpoint)
+            }
             AccountEventKind::FillRecoveryGaveUp(gap) => {
                 AccountEventKind::FillRecoveryGaveUp(self.fill_recovery_gap(gap)?)
             }
@@ -372,6 +376,7 @@ impl AccountEventIndexer {
             time_exchange,
             id,
             period,
+            loan,
         } = flow;
 
         Ok(CashFlow {
@@ -384,6 +389,7 @@ impl AccountEventIndexer {
             time_exchange,
             id,
             period,
+            loan,
         })
     }
 
@@ -1119,6 +1125,7 @@ mod tests {
                 time_exchange: DateTime::<Utc>::MIN_UTC,
                 id: None,
                 period: None,
+                loan: None,
             }),
         );
         assert!(matches!(

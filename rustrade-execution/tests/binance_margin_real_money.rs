@@ -24,7 +24,15 @@
 //!    `trailingDelta`, and a limit price below the market, so that once triggered it would buy no
 //!    higher than that. It reads the order raw from `GET /sapi/v1/margin/order`.
 //!
-//! Each checks the account stream reports the order as the trailing stop placed. On an isolated
+//! A fifth pair repeats step 2's borrow and cancel (on the isolated pair a resting sell 15 % above
+//! the market that borrows the base asset, about 6 of the quote asset's worth, since Binance has
+//! refused to lend the quote asset there), then reads the account's interest history
+//! (`fetch_margin_interest`) until Binance posts the `ON_BORROW` charge on that loan, and checks
+//! that its `principal` equals the amount the order's answer reported lending
+//! (`marginBuyBorrowAmount`). It prints both figures. This is what matching a charge to its loan
+//! relies on.
+//!
+//! Each trailing test checks the account stream reports the order as the trailing stop placed. On an isolated
 //! account Binance's `executionReport` sends an empty `d` even for a trailing order, so only the
 //! kind the client recorded when it placed the order can say so. Each prints only field names and
 //! the trailing fields' values. The raw rows, which hold account data, go to
@@ -72,11 +80,13 @@ use binance_sdk::{
         },
     },
 };
+use chrono::{DurationRound, TimeDelta, Utc};
 use futures::{FutureExt, SinkExt, StreamExt};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use rustrade_execution::{
     AccountEventKind, MarginDebtKind, UnindexedAccountEvent,
+    cash_flow::{CashFlowKind, InterestTiming},
     client::{
         ExecutionClient,
         binance::{BinanceMargin, BinanceMarginConfig},
@@ -316,6 +326,28 @@ async fn free_quote(rest: &RestApi, account: Account, symbol: &str, quote: &str)
                 .map_or(Decimal::ZERO, |asset| decimal(asset.free.as_ref()))
         }
     }
+}
+
+/// The isolated pair's free base asset.
+async fn free_isolated_base(rest: &RestApi, symbol: &str) -> Decimal {
+    let info = rest
+        .query_isolated_margin_account_info(
+            QueryIsolatedMarginAccountInfoParams::builder()
+                .symbols(symbol.to_owned())
+                .build()
+                .unwrap(),
+        )
+        .await
+        .expect("isolated margin account")
+        .data()
+        .await
+        .expect("isolated margin account decode");
+    info.assets
+        .unwrap_or_default()
+        .into_iter()
+        .find(|pair| pair.symbol.as_deref() == Some(symbol))
+        .and_then(|pair| pair.base_asset)
+        .map_or(Decimal::ZERO, |asset| decimal(asset.free.as_ref()))
 }
 
 /// Cancels the account's open orders on the pair and repays what it owes, then reads it again,
@@ -583,11 +615,14 @@ fn print_frame_shapes(path: &str) {
 // The steps
 // ---------------------------------------------------------------------------
 
-/// Places a buy and returns its client order id and the client's answer, whatever it is.
+/// Places an order on `side` and returns its client order id and the client's answer, whatever
+/// it is.
+#[allow(clippy::too_many_arguments)] // A test helper: each argument is one field of the order.
 async fn submit(
     client: &BinanceMargin,
     instrument: &InstrumentNameExchange,
     tag: &str,
+    side: Side,
     kind: OrderKind,
     price: Decimal,
     quantity: Decimal,
@@ -606,7 +641,7 @@ async fn submit(
                 cid: cid.clone(),
             },
             state: RequestOpen::new(
-                Side::Buy,
+                side,
                 Some(price),
                 quantity,
                 kind,
@@ -618,11 +653,13 @@ async fn submit(
     (cid, placement)
 }
 
-/// Places a buy that must rest, and returns its ids and what it borrowed.
+/// Places an order on `side` that must rest, and returns its ids and what it borrowed.
+#[allow(clippy::too_many_arguments)] // A test helper: each argument is one field of the order.
 async fn place(
     client: &BinanceMargin,
     instrument: &InstrumentNameExchange,
     tag: &str,
+    side: Side,
     kind: OrderKind,
     price: Decimal,
     quantity: Decimal,
@@ -632,7 +669,8 @@ async fn place(
     VenueOrderId,
     Option<rustrade_execution::margin::MarginBorrow>,
 ) {
-    let (cid, placement) = submit(client, instrument, tag, kind, price, quantity, effect).await;
+    let (cid, placement) =
+        submit(client, instrument, tag, side, kind, price, quantity, effect).await;
     let OrderState::Active(ActiveOrderState::Open(open)) = &placement.order.state else {
         panic!(
             "{tag}: the order is not resting: {:?}",
@@ -686,6 +724,7 @@ async fn steps(client: &BinanceMargin, rest: &RestApi, account: Account, events:
         client,
         &instrument,
         "plain",
+        Side::Buy,
         OrderKind::Limit,
         price,
         quantity,
@@ -715,6 +754,7 @@ async fn steps(client: &BinanceMargin, rest: &RestApi, account: Account, events:
         client,
         &instrument,
         "borrow",
+        Side::Buy,
         OrderKind::Limit,
         price,
         quantity,
@@ -766,6 +806,130 @@ async fn steps(client: &BinanceMargin, rest: &RestApi, account: Account, events:
         }
         Account::Isolated => {}
     }
+}
+
+/// How long [`on_borrow_principal`] waits for Binance to post the `ON_BORROW` charge.
+const ON_BORROW_WAIT: Duration = Duration::from_secs(120);
+
+/// A resting order that borrows its shortfall, then its cancel (step 2 of [`steps`] on cross; a
+/// sell that borrows the base asset on the isolated pair), then the account's interest history,
+/// read until the `ON_BORROW` charge on that loan appears: its `principal` must be the amount
+/// the order's answer reported lending.
+async fn on_borrow_principal(
+    client: &BinanceMargin,
+    rest: &RestApi,
+    account: Account,
+    events: &Events,
+) {
+    let symbol = symbol();
+    let instrument = InstrumentNameExchange::new(symbol.clone());
+    let market = market(&symbol).await;
+    // Cross borrows the quote asset with a buy below the market, larger than the free quote. On
+    // the isolated pair Binance has refused to lend the quote asset (`-3012`), so it borrows the
+    // base asset instead, with a sell above the market of more than the pair holds, so Binance
+    // lends the rest, at least the asset's minimum borrow. Keep a little of the base asset in the
+    // pair: the hour's interest is owed in it after the cancel's auto-repay, and the cleanup can
+    // repay it only from what the pair holds.
+    let (side, price, quantity, lent) = match account {
+        Account::Cross => {
+            let price = market.resting_price();
+            let free = free_quote(rest, account, &symbol, &market.quote).await;
+            let quantity = market.quantity(free + BORROW, price);
+            (Side::Buy, price, quantity, market.quote.clone())
+        }
+        Account::Isolated => {
+            let price = market.activation_price();
+            let base = symbol
+                .strip_suffix(market.quote.as_str())
+                .expect("the pair's name ends with its quote asset")
+                .to_owned();
+            // What the pair holds of the base asset is sold first, so the loan is the rest.
+            let free = free_isolated_base(rest, &symbol).await;
+            let quantity = (free + market.quantity(BORROW, price)).normalize();
+            (Side::Sell, price, quantity, base)
+        }
+    };
+    // Binance stamps the charge at the start of the hour the loan is made in, on its clock: a
+    // minute's margin covers the two clocks differing.
+    let since = Utc::now().duration_trunc(TimeDelta::hours(1)).unwrap() - TimeDelta::minutes(1);
+    let (cid, id, borrowed) = place(
+        client,
+        &instrument,
+        "on-borrow",
+        side,
+        OrderKind::Limit,
+        price,
+        quantity,
+        MarginEffect::Borrow,
+    )
+    .await;
+    let loan = borrowed.expect("Binance reports the loan in its answer");
+    assert_eq!(loan.asset.as_ref(), lent, "{lent} is lent");
+    let cancelled = |event: &UnindexedAccountEvent| matches!(&event.kind, AccountEventKind::OrderCancelled(cancel) if cancel.key.cid == cid);
+    // Cancelled before anything is judged, so that its auto-repay settles the loan.
+    cancel(client, &instrument, &cid, id).await;
+    assert!(
+        wait_for(events, cancelled).await,
+        "the stream did not deliver {cid}'s cancel"
+    );
+
+    let wanted_instrument = match account {
+        Account::Cross => None,
+        Account::Isolated => Some(&instrument),
+    };
+    let deadline = tokio::time::Instant::now() + ON_BORROW_WAIT;
+    let charges = loop {
+        let read = client
+            .fetch_margin_interest(since, Utc::now())
+            .await
+            .expect("the interest history reads");
+        let charges: Vec<_> = read
+            .flows
+            .into_iter()
+            .filter(|flow| {
+                flow.asset == loan.asset
+                    && flow.instrument.as_ref() == wanted_instrument
+                    && matches!(
+                        flow.kind,
+                        CashFlowKind::MarginInterest {
+                            timing: Some(InterestTiming::OnBorrow),
+                            ..
+                        }
+                    )
+            })
+            .collect();
+        if !charges.is_empty() || tokio::time::Instant::now() >= deadline {
+            break charges;
+        }
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    };
+    let principals: Vec<_> = charges
+        .iter()
+        .map(|flow| match flow.kind {
+            CashFlowKind::MarginInterest { principal, .. } => principal,
+            _ => unreachable!("filtered to margin interest"),
+        })
+        .collect();
+    println!(
+        "{account:?}: borrowed {} {}; ON_BORROW charges since {since}: principals {principals:?}, \
+         stamped {:?}",
+        loan.amount,
+        loan.asset,
+        charges
+            .iter()
+            .map(|flow| flow.time_exchange)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !charges.is_empty(),
+        "no ON_BORROW charge on {} posted within {ON_BORROW_WAIT:?}",
+        loan.asset
+    );
+    assert!(
+        principals.contains(&Some(loan.amount)),
+        "no ON_BORROW charge has the loan's principal {}: {principals:?}",
+        loan.amount
+    );
 }
 
 /// Reads `path` raw, signed, with `query` and the account's `isIsolated`, so that fields the SDK's
@@ -857,6 +1021,7 @@ async fn trailing_read_back(
         client,
         &instrument,
         "trailing",
+        Side::Buy,
         kind,
         activation,
         quantity,
@@ -957,6 +1122,7 @@ async fn trailing_without_activation(
         client,
         &instrument,
         "trail-noact",
+        Side::Buy,
         kind,
         limit,
         quantity,
@@ -1017,6 +1183,9 @@ enum Scenario {
     /// [`trailing_without_activation`]: whether a trailing stop with no activation price is
     /// accepted.
     TrailingWithoutActivation,
+    /// [`on_borrow_principal`]: whether the `ON_BORROW` charge's principal is the loan the
+    /// order's answer reported.
+    OnBorrowPrincipal,
 }
 
 /// Runs `scenario` on one account, then flattens the subaccount whatever happened, and reports.
@@ -1079,6 +1248,11 @@ async fn real_money_run(account: Account, scenario: Scenario) {
             ))
             .catch_unwind()
             .await
+        }
+        Scenario::OnBorrowPrincipal => {
+            AssertUnwindSafe(on_borrow_principal(&client, &rest, account, &events))
+                .catch_unwind()
+                .await
         }
     };
     // Let late frames (a repay, a notice) arrive before the summary.
@@ -1148,6 +1322,91 @@ async fn real_money_cross_trailing_stop_without_activation() {
 #[serial]
 async fn real_money_isolated_trailing_stop_without_activation() {
     real_money_run(Account::Isolated, Scenario::TrailingWithoutActivation).await;
+}
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn real_money_cross_on_borrow_principal_is_the_loan() {
+    real_money_run(Account::Cross, Scenario::OnBorrowPrincipal).await;
+}
+
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn real_money_isolated_on_borrow_principal_is_the_loan() {
+    real_money_run(Account::Isolated, Scenario::OnBorrowPrincipal).await;
+}
+
+/// The most of its base asset the isolated pair may owe for
+/// [`real_money_isolated_buy_base_to_repay_dust`] to act: a few satoshi of leftover interest.
+const DUST_DEBT: Decimal = dec!(0.000001);
+
+/// One-off cleanup for an isolated pair that owes a few satoshi of its base asset, the interest
+/// left after a base-asset loan's auto-repay, and holds none to repay it with. **This one
+/// fills**: a `MARKET` buy of the base asset with the pair's quote asset, about 1.1 times
+/// Binance's minimum notional, then the usual cleanup repays the debt from it. It costs the
+/// trading fee and the spread, and leaves the rest of the bought base asset in the pair.
+///
+/// It acts only when the cross account is flat and the isolated pair has no open orders and owes
+/// nothing but its base asset, less than [`DUST_DEBT`] of it.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn real_money_isolated_buy_base_to_repay_dust() {
+    if !opted_in() {
+        return;
+    }
+    let symbol = symbol();
+    let rest = rest();
+    let market = market(&symbol).await;
+    let base = symbol
+        .strip_suffix(market.quote.as_str())
+        .expect("the pair's name ends with its quote asset")
+        .to_owned();
+    let cross = leftovers(&rest, Account::Cross, &symbol).await;
+    assert!(
+        cross.is_flat(),
+        "refusing: the cross account is not flat ({cross:?})"
+    );
+    let left = leftovers(&rest, Account::Isolated, &symbol).await;
+    let dust_only = left.open_orders == 0
+        && matches!(left.debt.as_slice(), [(asset, amount)] if *asset == base && *amount < DUST_DEBT);
+    assert!(
+        dust_only,
+        "refusing: the isolated pair holds more than a dust debt in {base} ({left:?})"
+    );
+
+    let (api_key, secret_key) = keys();
+    let instrument = InstrumentNameExchange::new(symbol.clone());
+    let client = BinanceMargin::new(BinanceMarginConfig::isolated(
+        api_key,
+        secret_key,
+        vec![instrument.clone()],
+    ));
+    let quantity = market.quantity(market.min_notional * dec!(1.1), market.last);
+    let (cid, placement) = submit(
+        &client,
+        &instrument,
+        "dust-buy",
+        Side::Buy,
+        OrderKind::Market,
+        market.last,
+        quantity,
+        MarginEffect::NoSideEffect,
+    )
+    .await;
+    println!(
+        "dust-buy: {cid} for {quantity} {base}: {:?}",
+        placement.order.state
+    );
+    assert!(
+        placement.borrowed.is_none(),
+        "the buy borrowed {:?}",
+        placement.borrowed
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    flatten_all(&rest, &symbol).await;
 }
 
 /// The cleanup alone, for a subaccount a killed run left with open orders or debt.

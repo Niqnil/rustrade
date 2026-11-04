@@ -1,7 +1,9 @@
 //! Liquidating the simulated venue's spot margin account, and the margin-call notices before it.
 //! See [`SpotMarginLiquidation`] for what the venue does, and when.
 
-use super::{InstrumentTerms, MarginCheck, NetPosition, SimulatedVenue, Valued, mid_or_last, owed};
+use super::{
+    InstrumentTerms, MarginCheck, NetPosition, Prices, SimulatedVenue, Valued, mid_or_last, owed,
+};
 use crate::{
     AccountEventKind, UnindexedAccountEvent,
     cash_flow::{CashFlow, CashFlowId, CashFlowKind},
@@ -40,6 +42,21 @@ impl LiquidationState {
     /// nothing.
     pub(super) fn under_way(&self) -> bool {
         self.under_way
+    }
+
+    /// Whether a margin call has been sent and not yet restored.
+    pub(super) fn margin_called(&self) -> bool {
+        self.margin_called
+    }
+
+    /// The state a venue restored from a snapshot starts in: a liquidation `under_way` and a
+    /// `margin_called` as they were, and no warning yet given, so the restored process warns again.
+    pub(super) fn restored(under_way: bool, margin_called: bool) -> Self {
+        Self {
+            under_way,
+            margin_called,
+            ..Self::default()
+        }
     }
 }
 
@@ -88,7 +105,8 @@ impl SimulatedVenue {
             return;
         }
 
-        let Some(Valued { equity, debt }) = self.valued(config, MarginCheck::Liquidation, None)
+        let Some(Valued { equity, debt }) =
+            self.valued(config, MarginCheck::Liquidation, None, Prices::Current)
         else {
             if !self.liquidation.warned_unvalued {
                 self.liquidation.warned_unvalued = true;
@@ -460,6 +478,8 @@ impl SimulatedVenue {
             MarginEffect::Repay,
             &leg.terms,
             None,
+            // `Repay` borrows nothing, so there is no loan to link to the order.
+            None,
             time_exchange,
         ) else {
             return Decimal::ZERO;
@@ -516,7 +536,7 @@ impl SimulatedVenue {
         self.spot_margin
             .as_ref()
             // The ratios weight only equity, so either check values the debt alike.
-            .and_then(|config| self.valued(config, MarginCheck::Liquidation, None))
+            .and_then(|config| self.valued(config, MarginCheck::Liquidation, None, Prices::Current))
             .map_or(Decimal::ZERO, |valued| valued.debt)
     }
 

@@ -535,6 +535,7 @@ async fn backtest_market_only(
         in_flight_deadlines,
         account_channel,
         futures,
+        paper_venues,
     } = args_constant
         .executions
         .clone()
@@ -564,6 +565,7 @@ async fn backtest_market_only(
         raw_market,
         account_channel,
         futures,
+        paper_venues,
     )
     .init()
     .await?;
