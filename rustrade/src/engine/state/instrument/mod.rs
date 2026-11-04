@@ -614,11 +614,9 @@ pub struct ReduceOnlyCapped<InstrumentKey = InstrumentIndex> {
     pub reduce_only: ReduceOnly,
     /// Whether the excess is free base the order was sized to trade: an order sent
     /// [`ReduceOnly::PositionAndFreeBase`] on a spot instrument, whose fill moved against the
-    /// position or found it flat. A fill that only grows the position trades none. Logged at
-    /// INFO and counted on
-    /// [`TearSheet::fills_free_base_traded`](crate::statistic::summary::instrument::TearSheet::fills_free_base_traded)
-    /// if so, and otherwise at WARN and on
-    /// [`TearSheet::fills_reduce_only_capped`](crate::statistic::summary::instrument::TearSheet::fills_reduce_only_capped).
+    /// position or found it flat. A fill that only grows the position trades none. Logged at INFO
+    /// and counted on [`TearSheet::fills_free_base_traded`] if so, and otherwise at WARN and on
+    /// [`TearSheet::fills_reduce_only_capped`].
     ///
     /// It follows from [`Self::reduce_only`], the instrument's kind, and the signs of
     /// [`Self::held`] and [`Self::excess`], and is carried because a consumer of the output has
@@ -626,6 +624,11 @@ pub struct ReduceOnlyCapped<InstrumentKey = InstrumentIndex> {
     ///
     /// `#[serde(default)]` so outputs serialised before this field existed still load, as
     /// `false`.
+    ///
+    /// [`TearSheet::fills_free_base_traded`]:
+    ///     crate::statistic::summary::instrument::TearSheet::fills_free_base_traded
+    /// [`TearSheet::fills_reduce_only_capped`]:
+    ///     crate::statistic::summary::instrument::TearSheet::fills_reduce_only_capped
     #[serde(default)]
     pub trades_free_base: bool,
 }
@@ -1873,10 +1876,10 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     /// `trade`, while the fill booked keeps everything else of `effective`, the fee this state's
     /// fee model added included.
     ///
-    /// When the move rounds the position to the quantity step, it logs the fill at INFO and
-    /// counts it and its remainder on the tear sheet. When it cuts a
-    /// reduce-only fill, it keeps on the fill the share of its fees that the move is of the
-    /// netted move, charges the rest to the tear sheet, logs the fill and counts it.
+    /// When the move rounds the position to the quantity step, it logs the fill at DEBUG and
+    /// counts it and its remainder on the tear sheet. When it cuts a reduce-only fill, it keeps
+    /// on the fill the share of its fees that the move is of the netted move, charges the rest to
+    /// the tear sheet, logs the fill and counts it.
     fn move_holding(
         &mut self,
         trade: &Trade<AssetKey, InstrumentKey>,
@@ -1924,7 +1927,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
         // neither the remainder nor the quote it cost, so its PnL agrees with the account at the
         // fill's price, and the remainder's value moves with the price outside it.
         let value = moved.dust * netted.price;
-        info!(
+        debug!(
             instrument = ?netted.instrument,
             order_id = %netted.order_id,
             %position_id,
@@ -2179,7 +2182,7 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
     ///   [`Instrument::quantity_step`] gives a step, the position the fill leaves is rounded toward
     ///   zero to it, and the remainder, less than one step, is left out of the position, in the
     ///   account's balance. A buy of 1 with a 0.1 % fee and a step of 0.01 holds 0.999, and the
-    ///   position books 0.99. The fill is logged at INFO and counted on
+    ///   position books 0.99. The fill is logged at DEBUG and counted on
     ///   [`TearSheet::fills_dust`](crate::statistic::summary::instrument::TearSheet::fills_dust).
     ///   - The remainder is held, not a cost. A long's is base the account holds, a short's base
     ///     still owed on the loan. The position books neither it nor the quote it cost, and PnL is
