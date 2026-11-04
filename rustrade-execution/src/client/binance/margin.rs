@@ -18,7 +18,8 @@
 //! ([`BorrowCapacityClient`]). Two reads beyond the traits cover what the account stream does not
 //! carry: the interest charged ([`BinanceMargin::fetch_margin_interest`]) and forced liquidations
 //! ([`BinanceMargin::fetch_forced_liquidations`]). [`BinanceMargin::fetch_collateral_ratios`]
-//! reads cross margin's per-asset collateral ratios.
+//! reads cross margin's per-asset collateral ratios, for liquidation, borrowing and transfers
+//! out.
 //!
 //! The client supports both **cross** (`isIsolated = "FALSE"`, account-wide collateral) and
 //! **isolated** (`isIsolated = "TRUE"`, per-pair sub-accounts) margin, selected by
@@ -62,7 +63,7 @@ mod loans;
 mod records;
 mod stream;
 
-pub use collateral::CollateralRatioTier;
+pub use collateral::{CollateralRatioTier, CollateralRatios};
 pub use records::MarginForcedLiquidation;
 
 use super::commission::{CommissionRates, fetch_commission_rates};
@@ -506,9 +507,9 @@ pub struct BinanceMargin {
     // REST client for cancels and queries (account snapshots, balances, trades).
     rest: Arc<RestApi>,
     // Production-configured REST config (credentials + base path) for the new-order and cancel
-    // requests, sent through the SDK's `common::utils::send_request` rather than the typed
-    // `RestApi` surface, since the SDK's response types cannot decode their answers (see
-    // `NewOrderAnswer` and `CancelOrderAnswer`).
+    // requests, and the collateral ratio read, sent through the SDK's `common::utils::send_request`
+    // rather than the typed `RestApi` surface, since the SDK's response types cannot decode their
+    // answers whole (see `NewOrderAnswer`, `CancelOrderAnswer` and `fetch_collateral_ratios`).
     rest_config: Arc<ConfigurationRestApi>,
     // shared rate-limit tracker across all REST calls
     rate_limiter: Arc<RateLimitTracker>,
@@ -992,7 +993,8 @@ impl BinanceMargin {
     ///
     /// The base path is pinned to production (`https://api.binance.com`): margin/SAPI has no
     /// testnet, and the config is reused both for the SDK `RestApi` and the requests sent through
-    /// `send_request` (the new-order and cancel requests, which join their paths onto this base).
+    /// `send_request` (the new-order, cancel and collateral ratio requests, which join their paths
+    /// onto this base).
     ///
     /// # Panics
     /// Panics if the binance-sdk configuration builder fails (invalid credentials format).
@@ -1171,9 +1173,9 @@ impl ExecutionClient for BinanceMargin {
             "BinanceMarginConfig: is_isolated = true requires a non-empty isolated_symbols"
         );
         // Built once and shared: one clone is consumed by the SDK `RestApi`, the original is retained
-        // for the new-order and cancel requests via `send_request`. `ConfigurationRestApi: Clone`
-        // and is cheap to copy (its `reqwest::Client` is `Arc`-backed), avoiding redundant credential
-        // clones from building it twice.
+        // for the new-order, cancel and collateral ratio requests via `send_request`.
+        // `ConfigurationRestApi: Clone` and is cheap to copy (its `reqwest::Client` is
+        // `Arc`-backed), avoiding redundant credential clones from building it twice.
         let signing = config.server_time_sync.then(SigningClock::default);
         let rest_config = Self::build_rest_config(&config, signing.as_ref());
         let rest = Arc::new(MarginTradingRestApi::production(rest_config.clone()));

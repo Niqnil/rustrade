@@ -9,26 +9,25 @@ use crate::{
     },
     error::UnindexedClientError,
 };
-use binance_sdk::margin_trading::rest_api::{
-    CrossMarginCollateralRatioResponseInner,
-    CrossMarginCollateralRatioResponseInnerCollateralsInner,
-};
 use rust_decimal::Decimal;
 use rustrade_instrument::asset::name::AssetNameExchange;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{BTreeMap, HashMap, hash_map::Entry};
 
-/// One tier of a Binance cross-margin collateral ratio: the ratio applied to an asset's value in
-/// a range of USD values.
+/// The collateral ratio endpoint, joined onto the REST config's base path.
+const COLLATERAL_RATIO_PATH: &str = "/sapi/v1/margin/crossMarginCollateralRatio";
+
+/// One tier of a Binance cross-margin collateral ratio: the ratio applied to the slice of an
+/// asset's value that falls in a range of USD values.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CollateralRatioTier {
     /// The lowest USD value the tier covers (Binance's `minUsdValue`).
     pub min_usd_value: Decimal,
-    /// The highest USD value the tier covers (Binance's `maxUsdValue`). `None` when Binance sends
-    /// none, as it does for the open top tier.
+    /// The highest USD value the tier covers (Binance's `maxUsdValue`). `None` for the open top
+    /// tier, which has no upper limit: Binance leaves its `maxUsdValue` out.
     pub max_usd_value: Option<Decimal>,
-    /// The fraction of the asset's value counted as collateral in this tier: 1 counts all of it,
+    /// The fraction of the slice's value counted as collateral in this tier: 1 counts all of it,
     /// 0.95 counts 95% (Binance's `discountRate`). Reported as Binance sends it, unchecked.
     pub ratio: Decimal,
 }
@@ -44,14 +43,47 @@ impl CollateralRatioTier {
     }
 }
 
+/// An asset's three Binance cross-margin collateral ratios, one per check, each as its tiers in
+/// ascending [`min_usd_value`](CollateralRatioTier::min_usd_value).
+///
+/// The tiers are progressive: each slice of the asset's USD value is weighted at the ratio of the
+/// tier that slice falls in, as income tax brackets are, not the whole value at the ratio of the
+/// tier its total reaches.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct CollateralRatios {
+    /// The ratio for the account's margin level, which decides margin calls and liquidation
+    /// (Binance's `collaterals`).
+    pub liquidation: Vec<CollateralRatioTier>,
+    /// The ratio for how much the account can borrow (Binance's `borrowCollaterals`).
+    pub borrow: Vec<CollateralRatioTier>,
+    /// The ratio for how much the account can transfer out of margin (Binance's
+    /// `withdrawCollaterals`).
+    pub transfer_out: Vec<CollateralRatioTier>,
+}
+
+impl CollateralRatios {
+    /// An asset's ratios with these tiers, each as given.
+    pub fn new(
+        liquidation: Vec<CollateralRatioTier>,
+        borrow: Vec<CollateralRatioTier>,
+        transfer_out: Vec<CollateralRatioTier>,
+    ) -> Self {
+        Self {
+            liquidation,
+            borrow,
+            transfer_out,
+        }
+    }
+}
+
 impl BinanceMargin {
-    /// The collateral ratio tiers of every asset on Binance cross margin:
+    /// The collateral ratios of every asset on Binance cross margin:
     /// `GET /sapi/v1/margin/crossMarginCollateralRatio`.
     ///
-    /// Each asset maps to its tiers in ascending
-    /// [`min_usd_value`](CollateralRatioTier::min_usd_value). Binance groups assets that share a
-    /// tier list; each asset of a group gets the group's tiers. An asset Binance does not list is
-    /// absent.
+    /// Each asset maps to its three ratios, one per check: liquidation, borrow and transfer-out
+    /// (see [`CollateralRatios`]). Binance groups assets that share their ratios; each asset of a
+    /// group gets the group's. An asset Binance does not list is absent.
     ///
     /// The ratios are Binance's for cross margin, read whichever margin this client is
     /// configured for. They are market data, not this account's: the request carries the API key
@@ -59,24 +91,22 @@ impl BinanceMargin {
     ///
     /// # What the answer holds
     ///
-    /// Binance publishes three collateral ratios per asset on its Margin Data page (borrow,
-    /// transfer-out and liquidation), and the endpoint returns one. Binance does not document
-    /// which, nor how an asset with several tiers is weighted across them. What was observed on
-    /// 2026-11-02:
+    /// Binance's API documentation listed only the liquidation set as of 2026-11-04; Binance has
+    /// confirmed that the endpoint returns all three. What was observed on 2026-11-04:
     ///
-    /// - every asset had one tier with a ratio of 1, matching the page's liquidation ratios
-    ///   (100% for every asset) and not its borrow ratios (as low as 10%);
-    /// - that tier had no `maxUsdValue`, so it is reported with
-    ///   [`max_usd_value`](CollateralRatioTier::max_usd_value) `None`.
+    /// - every asset had one open tier per check, so its ratio applies to the asset's whole value;
+    /// - the liquidation ratio was 1 for every asset;
+    /// - the borrow and transfer-out ratios were equal, and matched the Margin Data page: 0.9999
+    ///   for the main stablecoins, 0.95 for the largest assets, and as low as 0.1.
     ///
-    /// Read the answer as observed, not guaranteed. Binance's API documents no endpoint for the
-    /// borrow ratios, which govern how much the account may borrow.
+    /// To model these ratios on the simulated venue, an asset's single-tier ratios map to
+    /// [`SpotMarginConfig::with_liquidation_collateral_ratio`] and
+    /// [`SpotMarginConfig::with_borrow_collateral_ratio`]. The simulated venue checks no
+    /// transfer-out, so that ratio has no counterpart there, and it applies one ratio per asset,
+    /// so an asset with several tiers has no exact counterpart either.
     ///
-    /// To model these ratios on the simulated venue, a single-tier ratio as observed above maps to
-    /// [`SpotMarginConfig::with_liquidation_collateral_ratio`]. Take the borrow ratios
-    /// ([`SpotMarginConfig::with_borrow_collateral_ratio`]) from Binance's Margin Data page, not
-    /// from this answer: they can be far lower, and using this answer for them would let a backtest
-    /// borrow more than Binance lends.
+    /// The borrow check also values each asset at the lowest (held) or highest (owed) of its
+    /// recent prices. Binance publishes no API for those prices nor for the window they span.
     ///
     /// [`SpotMarginConfig::with_liquidation_collateral_ratio`]:
     ///     crate::margin::SpotMarginConfig::with_liquidation_collateral_ratio
@@ -91,46 +121,77 @@ impl BinanceMargin {
     ///
     /// - Whatever error the request returns.
     /// - [`UnindexedClientError::Internal`] for an answer that cannot be read whole, rather than
-    ///   return a map that silently lacks its assets or tiers: a group missing its assets or its
-    ///   tiers, a group with no tiers, a tier missing its `minUsdValue` or `discountRate`, a value
-    ///   that does not read as a decimal, or an asset listed twice.
+    ///   return a map that silently lacks its assets, ratios or tiers: a group missing its assets
+    ///   or any of its three tier sets, a set with no tiers, a tier missing its `minUsdValue` or
+    ///   `discountRate`, a value that does not read as a decimal, or an asset listed twice.
     pub async fn fetch_collateral_ratios(
         &self,
-    ) -> Result<HashMap<AssetNameExchange, Vec<CollateralRatioTier>>, UnindexedClientError> {
-        let response =
-            rest_call_with_retry(&self.rest, &self.rate_limiter, RequestKind::Query, |rest| {
-                Box::pin(async move { rest.cross_margin_collateral_ratio().await })
-            })
-            .await
-            .map_err(|e| classify_rest_query_error(&e, None))?;
+    ) -> Result<HashMap<AssetNameExchange, CollateralRatios>, UnindexedClientError> {
+        // Sent through `send_request` so that the answer decodes into `CollateralRatioGroup`: the
+        // SDK's response type has no borrow or transfer-out set, so the SDK's own call drops them.
+        let response = rest_call_with_retry(
+            &self.rest_config,
+            &self.rate_limiter,
+            RequestKind::Query,
+            |cfg| {
+                Box::pin(async move {
+                    binance_sdk::common::utils::send_request::<Vec<CollateralRatioGroup>>(
+                        &cfg,
+                        COLLATERAL_RATIO_PATH,
+                        reqwest::Method::GET,
+                        BTreeMap::new(),
+                        BTreeMap::new(),
+                        None,
+                        false,
+                    )
+                    .await
+                })
+            },
+        )
+        .await
+        .map_err(|e| classify_rest_query_error(&e, None))?;
         collateral_ratios(response.data().await.map_err(response_decode_error)?)
     }
 }
 
-/// Each asset of `groups` with its group's tiers, in ascending minimum USD value.
+/// One group of the collateral ratio answer: assets sharing their three tier sets. Every field is
+/// optional here so that a missing one is reported by name rather than as a bare decode error.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CollateralRatioGroup {
+    asset_names: Option<Vec<String>>,
+    collaterals: Option<Vec<CollateralRatioTierAnswer>>,
+    borrow_collaterals: Option<Vec<CollateralRatioTierAnswer>>,
+    withdraw_collaterals: Option<Vec<CollateralRatioTierAnswer>>,
+}
+
+/// One tier of the collateral ratio answer, its values as Binance's decimal strings.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CollateralRatioTierAnswer {
+    min_usd_value: Option<String>,
+    max_usd_value: Option<String>,
+    discount_rate: Option<String>,
+}
+
+/// Each asset of `groups` with its group's ratios.
 fn collateral_ratios(
-    groups: Vec<CrossMarginCollateralRatioResponseInner>,
-) -> Result<HashMap<AssetNameExchange, Vec<CollateralRatioTier>>, UnindexedClientError> {
+    groups: Vec<CollateralRatioGroup>,
+) -> Result<HashMap<AssetNameExchange, CollateralRatios>, UnindexedClientError> {
     let mut ratios = HashMap::new();
     for (index, group) in groups.into_iter().enumerate() {
         let assets = group
             .asset_names
             .ok_or_else(|| decode_error(format!("group {index}: assetNames missing")))?;
-        let tiers = group
-            .collaterals
-            .ok_or_else(|| decode_error(format!("group {index}: collaterals missing")))?;
-        if tiers.is_empty() {
-            return Err(decode_error(format!("group {index}: no collaterals")));
-        }
-        let mut tiers = tiers
-            .into_iter()
-            .map(|tier| collateral_ratio_tier(index, tier))
-            .collect::<Result<Vec<_>, _>>()?;
-        tiers.sort_by_key(|tier| tier.min_usd_value);
+        let group_ratios = CollateralRatios {
+            liquidation: tier_set(index, "collaterals", group.collaterals)?,
+            borrow: tier_set(index, "borrowCollaterals", group.borrow_collaterals)?,
+            transfer_out: tier_set(index, "withdrawCollaterals", group.withdraw_collaterals)?,
+        };
         for asset in assets {
             match ratios.entry(AssetNameExchange::new(asset)) {
                 Entry::Vacant(entry) => {
-                    entry.insert(tiers.clone());
+                    entry.insert(group_ratios.clone());
                 }
                 Entry::Occupied(entry) => {
                     return Err(decode_error(format!("{} listed twice", entry.key())));
@@ -141,22 +202,40 @@ fn collateral_ratios(
     Ok(ratios)
 }
 
-/// The tier `tier` of group `index`. Its minimum and ratio are required, its maximum is not.
+/// The tier set `set` of group `index`, in ascending minimum USD value. It must be present and
+/// hold at least one tier.
+fn tier_set(
+    index: usize,
+    set: &str,
+    tiers: Option<Vec<CollateralRatioTierAnswer>>,
+) -> Result<Vec<CollateralRatioTier>, UnindexedClientError> {
+    let tiers = tiers.ok_or_else(|| decode_error(format!("group {index}: {set} missing")))?;
+    if tiers.is_empty() {
+        return Err(decode_error(format!("group {index}: no {set}")));
+    }
+    let mut tiers = tiers
+        .into_iter()
+        .map(|tier| collateral_ratio_tier(index, set, tier))
+        .collect::<Result<Vec<_>, _>>()?;
+    tiers.sort_by_key(|tier| tier.min_usd_value);
+    Ok(tiers)
+}
+
+/// A tier of set `set` of group `index`. Its minimum and ratio are required, its maximum is not.
 fn collateral_ratio_tier(
     index: usize,
-    tier: CrossMarginCollateralRatioResponseInnerCollateralsInner,
+    set: &str,
+    tier: CollateralRatioTierAnswer,
 ) -> Result<CollateralRatioTier, UnindexedClientError> {
+    let field_name = |field: &str| format!("group {index} {set}: {field}");
     let required = |field: &str, value: Option<String>| {
-        let field = format!("group {index}: {field}");
+        let field = field_name(field);
         optional_decimal(&field, value.as_deref())?
             .ok_or_else(|| decode_error(format!("{field} missing")))
     };
     Ok(CollateralRatioTier {
         min_usd_value: required("minUsdValue", tier.min_usd_value)?,
-        max_usd_value: optional_decimal(
-            &format!("group {index}: maxUsdValue"),
-            tier.max_usd_value.as_deref(),
-        )?,
+        max_usd_value: optional_decimal(&field_name("maxUsdValue"), tier.max_usd_value.as_deref())?,
         ratio: required("discountRate", tier.discount_rate)?,
     })
 }
@@ -172,9 +251,9 @@ mod tests {
     use crate::error::ApiError;
     use rust_decimal_macros::dec;
 
-    const ROUTE: &str = "/sapi/v1/margin/crossMarginCollateralRatio";
+    const SETS: [&str; 3] = ["collaterals", "borrowCollaterals", "withdrawCollaterals"];
 
-    fn groups(body: serde_json::Value) -> Vec<CrossMarginCollateralRatioResponseInner> {
+    fn groups(body: serde_json::Value) -> Vec<CollateralRatioGroup> {
         serde_json::from_value(body).unwrap()
     }
 
@@ -182,12 +261,19 @@ mod tests {
         AssetNameExchange::new(name)
     }
 
-    /// Two groups: one with the single open tier Binance was seen to send, one with three tiers
-    /// listed out of order.
+    fn open(ratio: Decimal) -> Vec<CollateralRatioTier> {
+        vec![CollateralRatioTier::new(dec!(0), None, ratio)]
+    }
+
+    /// Two groups: one with the single open tier per set Binance was seen to send, each set's
+    /// ratio distinct so that a set read into the wrong field shows; and one with sets of several
+    /// tiers listed out of order.
     fn tiered() -> serde_json::Value {
         serde_json::json!([
             {
                 "collaterals": [{"minUsdValue": "0", "discountRate": "1"}],
+                "borrowCollaterals": [{"minUsdValue": "0", "discountRate": "0.95"}],
+                "withdrawCollaterals": [{"minUsdValue": "0", "discountRate": "0.9"}],
                 "assetNames": ["USDT", "BTC"]
             },
             {
@@ -196,27 +282,45 @@ mod tests {
                     {"minUsdValue": "10000", "discountRate": "0"},
                     {"minUsdValue": "0", "maxUsdValue": "5000", "discountRate": "0.9"}
                 ],
+                "borrowCollaterals": [
+                    {"minUsdValue": "2000", "discountRate": "0.05"},
+                    {"minUsdValue": "0", "maxUsdValue": "2000", "discountRate": "0.1"}
+                ],
+                "withdrawCollaterals": [
+                    {"minUsdValue": "3000", "discountRate": "0.02"},
+                    {"minUsdValue": "0", "maxUsdValue": "3000", "discountRate": "0.2"}
+                ],
                 "assetNames": ["SHIB"]
             }
         ])
     }
 
     #[test]
-    fn collateral_ratios_give_each_asset_its_groups_tiers_in_ascending_order() {
+    fn collateral_ratios_give_each_asset_its_groups_three_sets_in_ascending_order() {
         let ratios = collateral_ratios(groups(tiered())).unwrap();
-        let open = vec![CollateralRatioTier::new(dec!(0), None, dec!(1))];
+        let single = CollateralRatios::new(open(dec!(1)), open(dec!(0.95)), open(dec!(0.9)));
         assert_eq!(
             ratios,
             HashMap::from([
-                (asset("USDT"), open.clone()),
-                (asset("BTC"), open),
+                (asset("USDT"), single.clone()),
+                (asset("BTC"), single),
                 (
                     asset("SHIB"),
-                    vec![
-                        CollateralRatioTier::new(dec!(0), Some(dec!(5000)), dec!(0.9)),
-                        CollateralRatioTier::new(dec!(5000), Some(dec!(10000)), dec!(0.5)),
-                        CollateralRatioTier::new(dec!(10000), None, dec!(0)),
-                    ]
+                    CollateralRatios::new(
+                        vec![
+                            CollateralRatioTier::new(dec!(0), Some(dec!(5000)), dec!(0.9)),
+                            CollateralRatioTier::new(dec!(5000), Some(dec!(10000)), dec!(0.5)),
+                            CollateralRatioTier::new(dec!(10000), None, dec!(0)),
+                        ],
+                        vec![
+                            CollateralRatioTier::new(dec!(0), Some(dec!(2000)), dec!(0.1)),
+                            CollateralRatioTier::new(dec!(2000), None, dec!(0.05)),
+                        ],
+                        vec![
+                            CollateralRatioTier::new(dec!(0), Some(dec!(3000)), dec!(0.2)),
+                            CollateralRatioTier::new(dec!(3000), None, dec!(0.02)),
+                        ],
+                    )
                 ),
             ])
         );
@@ -225,36 +329,35 @@ mod tests {
     #[test]
     fn collateral_ratios_of_no_groups_or_a_group_of_no_assets_are_empty() {
         assert!(collateral_ratios(Vec::new()).unwrap().is_empty());
-        let body = serde_json::json!([{
-            "collaterals": [{"minUsdValue": "0", "discountRate": "1"}],
-            "assetNames": []
-        }]);
+        let mut body = tiered();
+        body[0]["assetNames"] = serde_json::json!([]);
+        body.as_array_mut().unwrap().truncate(1);
         assert!(collateral_ratios(groups(body)).unwrap().is_empty());
     }
 
     #[test]
     fn collateral_ratios_refuse_an_answer_they_cannot_read_whole() {
         let mut cases = Vec::new();
-        for field in ["assetNames", "collaterals"] {
-            let mut body = tiered();
-            body[1].as_object_mut().unwrap().remove(field);
-            cases.push((format!("group 1: {field} missing"), body));
-        }
         let mut body = tiered();
-        body[1]["collaterals"] = serde_json::json!([]);
-        cases.push(("group 1: no collaterals".to_string(), body));
-        for field in ["minUsdValue", "discountRate"] {
+        body[1].as_object_mut().unwrap().remove("assetNames");
+        cases.push(("group 1: assetNames missing".to_string(), body));
+        for set in SETS {
             let mut body = tiered();
-            body[1]["collaterals"][0]
-                .as_object_mut()
-                .unwrap()
-                .remove(field);
-            cases.push((format!("group 1: {field} missing"), body));
-        }
-        for field in ["minUsdValue", "maxUsdValue", "discountRate"] {
+            body[1].as_object_mut().unwrap().remove(set);
+            cases.push((format!("group 1: {set} missing"), body));
             let mut body = tiered();
-            body[1]["collaterals"][0][field] = serde_json::json!("0.5.0");
-            cases.push((format!("group 1: {field} \"0.5.0\""), body));
+            body[1][set] = serde_json::json!([]);
+            cases.push((format!("group 1: no {set}"), body));
+            for field in ["minUsdValue", "discountRate"] {
+                let mut body = tiered();
+                body[1][set][1].as_object_mut().unwrap().remove(field);
+                cases.push((format!("group 1 {set}: {field} missing"), body));
+            }
+            for field in ["minUsdValue", "maxUsdValue", "discountRate"] {
+                let mut body = tiered();
+                body[1][set][0][field] = serde_json::json!("0.5.0");
+                cases.push((format!("group 1 {set}: {field} \"0.5.0\""), body));
+            }
         }
         let mut body = tiered();
         body[1]["assetNames"] = serde_json::json!(["SHIB", "BTC"]);
@@ -278,7 +381,7 @@ mod tests {
         for is_isolated in [false, true] {
             let server = wiremock::MockServer::start().await;
             wiremock::Mock::given(wiremock::matchers::method("GET"))
-                .and(wiremock::matchers::path(ROUTE))
+                .and(wiremock::matchers::path(COLLATERAL_RATIO_PATH))
                 .and(wiremock::matchers::header("X-MBX-APIKEY", "key"))
                 .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(tiered()))
                 .expect(1)
@@ -292,9 +395,10 @@ mod tests {
             let [request] = requests.as_slice() else {
                 panic!("{requests:?}");
             };
-            assert!(
-                !request.url.query_pairs().any(|(key, _)| key == "signature"),
-                "unsigned: {}",
+            assert_eq!(
+                request.url.query_pairs().count(),
+                0,
+                "unsigned, no parameters: {}",
                 request.url
             );
         }
@@ -303,7 +407,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_collateral_ratios_reports_a_refusal_and_an_unreadable_answer() {
         let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::path(ROUTE))
+        wiremock::Mock::given(wiremock::matchers::path(COLLATERAL_RATIO_PATH))
             .respond_with(
                 wiremock::ResponseTemplate::new(400)
                     .set_body_json(serde_json::json!({"code": -1102, "msg": "refused"})),
@@ -311,13 +415,10 @@ mod tests {
             .up_to_n_times(1)
             .mount(&server)
             .await;
-        wiremock::Mock::given(wiremock::matchers::path(ROUTE))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([{
-                    "collaterals": [{"minUsdValue": "0", "discountRate": "one"}],
-                    "assetNames": ["BTC"]
-                }])),
-            )
+        let mut unreadable = tiered();
+        unreadable[0]["borrowCollaterals"][0]["discountRate"] = serde_json::json!("one");
+        wiremock::Mock::given(wiremock::matchers::path(COLLATERAL_RATIO_PATH))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(unreadable))
             .mount(&server)
             .await;
         let client = margin_client_at(&server, false);
@@ -332,7 +433,10 @@ mod tests {
         );
         match client.fetch_collateral_ratios().await {
             Err(UnindexedClientError::Internal(message)) => {
-                assert!(message.contains("discountRate \"one\""), "{message}");
+                assert!(
+                    message.contains("borrowCollaterals: discountRate \"one\""),
+                    "{message}"
+                );
             }
             other => panic!("{other:?}"),
         }

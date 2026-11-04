@@ -193,6 +193,7 @@ mod spot;
 
 pub use commission::{CommissionDiscount, CommissionPart, CommissionRates};
 pub use margin::{
-    BinanceMargin, BinanceMarginConfig, CollateralRatioTier, MarginForcedLiquidation,
+    BinanceMargin, BinanceMarginConfig, CollateralRatioTier, CollateralRatios,
+    MarginForcedLiquidation,
 };
 pub use spot::{BinanceSpot, BinanceSpotConfig, BinanceSpotConfigError};
