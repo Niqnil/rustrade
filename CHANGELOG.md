@@ -177,9 +177,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `is_transient()` is therefore `true` for these failures. A caller matching `Internal` for them
   must match `Connectivity` instead.
-  - `account_snapshot` returns no sooner than `ibapi`'s reconnect ends, since `ibapi` holds its
-    request for the login's accounts until then. It then fails with the `Socket` error of its
-    other reads.
+  - `account_snapshot` fails at once too (#857). Until now it returned only once `ibapi`'s
+    reconnect ended, which can take minutes, holding a blocking thread all that time: `ibapi`
+    holds its request for the login's accounts until the connection is back. That request is now
+    sent only while the client is connected. A drop between that check and the request can still
+    wait.
   - `account_stream` is unchanged in practice: opening it sends nothing to IB, so it succeeds while
     `ibapi` reconnects.
 - **Breaking: `BinanceMargin::fetch_collateral_ratios` returns all three of each asset's collateral

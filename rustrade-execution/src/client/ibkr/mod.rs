@@ -136,10 +136,10 @@
 //! A read that fails returns nothing of what it read: part of a listing is not mistaken for all
 //! of it.
 //!
-//! `account_snapshot` fails no sooner than `ibapi`'s reconnect ends: `ibapi` holds its request
-//! for the login's accounts until the connection is back, and retries it then. Its other reads
-//! fail at once, so during a drop it returns their [`ConnectivityError::Socket`] once the
-//! reconnect has succeeded or been given up.
+//! `account_snapshot` sends its request for the login's accounts only while the client is
+//! connected, since `ibapi` holds that request until a reconnect ends. A drop between that check
+//! and the request is the exception: the snapshot then returns only once `ibapi`'s reconnect has
+//! succeeded or been given up, which can take minutes.
 //!
 //! # Caller Responsibilities
 //!
@@ -2503,9 +2503,9 @@ impl ExecutionClient for IbkrClient {
     /// or if the request for the login's accounts yields none, as it does when the session ends
     /// during it.
     ///
-    /// During a dropped connection, this returns only once `ibapi`'s reconnect has succeeded or
-    /// been given up, which can take minutes: `ibapi` holds the request for the login's accounts
-    /// until then.
+    /// While the connection is down this fails at once, as the other account reads do. It may
+    /// wait for `ibapi`'s reconnect to end, which can take minutes, when the connection drops just
+    /// as the snapshot starts: see [Account read errors](crate::client::ibkr#account-read-errors).
     ///
     /// # Known Issue: ibapi Decode Errors
     ///
@@ -2543,6 +2543,17 @@ impl ExecutionClient for IbkrClient {
         let positions_filter = instruments_filter.clone();
         let positions_future = tokio::task::spawn_blocking(move || {
             let instruments_filter = positions_filter;
+            // `ibapi` holds a request for the login's accounts until a reconnect ends, so none is
+            // sent while the client is down. The balances read, refused at once when it runs after
+            // the drop, is checked first and then says why: transient while `ibapi` reconnects,
+            // `Internal` once it has given up. Had it finished just before the drop, this error is
+            // the snapshot's.
+            if !client.is_connected() {
+                return Err(ConnectivityError::Socket(
+                    "managed accounts: not connected to TWS/Gateway".to_string(),
+                )
+                .into());
+            }
             let accounts = client
                 .managed_accounts()
                 .map_err(|e| read_error("managed accounts", e))?;
