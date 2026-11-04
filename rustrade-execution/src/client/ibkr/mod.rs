@@ -2544,8 +2544,10 @@ impl ExecutionClient for IbkrClient {
         let positions_future = tokio::task::spawn_blocking(move || {
             let instruments_filter = positions_filter;
             // `ibapi` holds a request for the login's accounts until a reconnect ends, so none is
-            // sent while the client is down. The balances read, refused at once, is checked first
-            // and says why: transient while `ibapi` reconnects, `Internal` once it has given up.
+            // sent while the client is down. The balances read, refused at once when it runs after
+            // the drop, is checked first and then says why: transient while `ibapi` reconnects,
+            // `Internal` once it has given up. Had it finished just before the drop, this error is
+            // the snapshot's.
             if !client.is_connected() {
                 return Err(ConnectivityError::Socket(
                     "managed accounts: not connected to TWS/Gateway".to_string(),

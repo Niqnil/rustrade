@@ -2341,6 +2341,12 @@ async fn test_account_reads_while_the_connection_is_down() {
         "fetch_balances after disconnect: {shut_down:?}"
     );
     assert!(!shut_down.unwrap_err().is_transient());
+    let snapshot = client.account_snapshot(&[], instruments).await;
+    assert!(
+        matches!(&snapshot, Err(ClientError::Internal(_))),
+        "account_snapshot after disconnect: {:?}",
+        snapshot.as_ref().err()
+    );
     let stream = client.account_stream(&[], instruments).await;
     assert!(
         matches!(&stream, Err(ClientError::Internal(_))),
