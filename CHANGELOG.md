@@ -176,8 +176,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     reconnecting or has shut down, which a retry cannot help.
 
   `is_transient()` is therefore `true` for these failures. A caller matching `Internal` for them
-  must match `Connectivity` instead. `account_stream` is unchanged in practice: opening it sends
-  nothing to IB, so it succeeds while `ibapi` reconnects.
+  must match `Connectivity` instead.
+  - `account_snapshot` returns no sooner than `ibapi`'s reconnect ends, since `ibapi` holds its
+    request for the login's accounts until then. It then fails with the `Socket` error of its
+    other reads.
+  - `account_stream` is unchanged in practice: opening it sends nothing to IB, so it succeeds while
+    `ibapi` reconnects.
 - **Breaking: `BinanceMargin::fetch_collateral_ratios` returns all three of each asset's collateral
   ratios** (`rustrade-execution`, `binance`, #850). It now returns
   `HashMap<AssetNameExchange, CollateralRatios>`, where it returned each asset's liquidation tiers

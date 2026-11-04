@@ -136,6 +136,11 @@
 //! A read that fails returns nothing of what it read: part of a listing is not mistaken for all
 //! of it.
 //!
+//! `account_snapshot` fails no sooner than `ibapi`'s reconnect ends: `ibapi` holds its request
+//! for the login's accounts until the connection is back, and retries it then. Its other reads
+//! fail at once, so during a drop it returns their [`ConnectivityError::Socket`] once the
+//! reconnect has succeeded or been given up.
+//!
 //! # Caller Responsibilities
 //!
 //! 1. **Fill reconciliation**: when fill recovery fails repeatedly, the stream reports the
@@ -609,7 +614,11 @@ fn read_error(what: &str, e: ibapi::Error) -> UnindexedClientError {
         e if is_transient_transport_loss(&e) => {
             ConnectivityError::Socket(format!("{what}: {e}")).into()
         }
-        ibapi::Error::Timeout => ConnectivityError::Timeout.into(),
+        ibapi::Error::Timeout => {
+            // `Timeout` carries no context, so the request IB did not answer is named here.
+            warn!(what, "IB did not answer an IBKR account read in time");
+            ConnectivityError::Timeout.into()
+        }
         e => UnindexedClientError::Internal(format!("{what}: {e}")),
     }
 }
@@ -732,7 +741,15 @@ impl ListingError {
         match self {
             Self::Ibapi(e) => read_error(what, e),
             e @ Self::Dropped => ConnectivityError::Socket(format!("{what}: {e}")).into(),
-            Self::Stalled(_) => ConnectivityError::Timeout.into(),
+            Self::Stalled(stall_timeout) => {
+                // `Timeout` carries no context, so the listing that stalled is named here.
+                warn!(
+                    what,
+                    ?stall_timeout,
+                    "IB stopped sending an IBKR listing before its end"
+                );
+                ConnectivityError::Timeout.into()
+            }
         }
     }
 }
@@ -2485,6 +2502,10 @@ impl ExecutionClient for IbkrClient {
     /// [`UnindexedClientError::Internal`] if a position quantity does not convert to a `Decimal`,
     /// or if the request for the login's accounts yields none, as it does when the session ends
     /// during it.
+    ///
+    /// During a dropped connection, this returns only once `ibapi`'s reconnect has succeeded or
+    /// been given up, which can take minutes: `ibapi` holds the request for the login's accounts
+    /// until then.
     ///
     /// # Known Issue: ibapi Decode Errors
     ///

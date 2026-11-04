@@ -2173,6 +2173,8 @@ impl CuttableRelay {
         let (accept_refusing, accept_live) = (Arc::clone(&refusing), Arc::clone(&live));
         std::thread::spawn(move || {
             for inbound in listener.incoming().flatten() {
+                // Checked under the lock `cut` takes, so no connection is relayed past a cut.
+                let mut live = accept_live.lock().unwrap();
                 // Dropping the connection closes it, so the client's reconnect attempt fails.
                 if accept_refusing.load(Ordering::SeqCst) {
                     continue;
@@ -2180,7 +2182,6 @@ impl CuttableRelay {
                 let Ok(upstream) = TcpStream::connect(("127.0.0.1", upstream_port)) else {
                     continue;
                 };
-                let mut live = accept_live.lock().unwrap();
                 live.push(inbound.try_clone().unwrap());
                 live.push(upstream.try_clone().unwrap());
                 relay_one_way(inbound.try_clone().unwrap(), upstream.try_clone().unwrap());
@@ -2195,8 +2196,9 @@ impl CuttableRelay {
     }
 
     fn cut(&self) {
+        let mut live = self.live.lock().unwrap();
         self.refusing.store(true, Ordering::SeqCst);
-        for stream in self.live.lock().unwrap().drain(..) {
+        for stream in live.drain(..) {
             let _ = stream.shutdown(Shutdown::Both);
         }
     }
@@ -2226,9 +2228,10 @@ fn assert_dropped<T: std::fmt::Debug>(read: &str, result: Result<T, UnindexedCli
 }
 
 /// While `ibapi` reconnects after a dropped connection, every account read fails with a transient
-/// `Connectivity` error, and a read succeeds again once it has reconnected. Opening the account
-/// stream sends nothing, so it succeeds during the drop. On a client that has shut down, the
-/// reads fail with `Internal`, which a retry cannot clear.
+/// `Connectivity` error, and a read succeeds again once it has reconnected. `account_snapshot`
+/// returns only once the reconnect has ended, since `ibapi` holds its request for the login's
+/// accounts until then. Opening the account stream sends nothing, so it succeeds during the drop.
+/// On a client that has shut down, the reads fail with `Internal`, which a retry cannot clear.
 #[tokio::test]
 #[ignore]
 #[serial]
@@ -2264,10 +2267,11 @@ async fn test_account_reads_while_the_connection_is_down() {
         }
     };
     assert_dropped("fetch_balances", first);
-    assert_dropped(
-        "account_snapshot",
-        client.account_snapshot(&[], instruments).await,
-    );
+    let snapshot = tokio::spawn({
+        let client = client.clone();
+        let instruments = instruments.to_vec();
+        async move { client.account_snapshot(&[], &instruments).await }
+    });
     assert_dropped(
         "fetch_open_orders",
         client.fetch_open_orders(instruments).await,
@@ -2298,8 +2302,18 @@ async fn test_account_reads_while_the_connection_is_down() {
         stream.err()
     );
     drop(stream);
+    assert!(
+        !snapshot.is_finished(),
+        "account_snapshot returned before the reconnect: {:?}",
+        snapshot.await
+    );
 
     relay.restore();
+    let snapshot = tokio::time::timeout(Duration::from_secs(60), snapshot)
+        .await
+        .expect("account_snapshot did not return within 60 s of the restore")
+        .expect("account_snapshot task");
+    assert_dropped("account_snapshot", snapshot);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         match client.fetch_balances(&[]).await {
