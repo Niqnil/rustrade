@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-04
+
 ### Added
 
 - **Binance's fetched collateral ratios can be applied to a simulated venue's spot margin**
@@ -217,6 +219,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stage's own delay does not skew the estimate of the venue's clock. The account snapshot is
   still checked to index when the stream opens, so one that cannot still fails the open, and it
   is indexed after the stage.
+
+- **`ibapi` 5.2.0 → 5.5.0** (`rustrade-execution`, `rustrade-data`, `rustrade-instrument`, feature
+  `ibkr`, #840). The bytes sent for every order this crate builds are unchanged. The changes that
+  reach the compiled code:
+  - While `ibapi` reconnects, a request is refused at once with a connection reset. Once the
+    reconnect has given up, it is refused as a failed connection, and after a shutdown as shut
+    down. The IBKR account reads classify these as described above (#855, #857).
+  - An order status's filled and remaining quantities, and a position's quantity, are now
+    required: a frame missing one is a parse error, where it read as zero before. This reaches
+    the account stream and the IBKR position reads.
+  - A one-shot historical fetch no longer fails on IB's notice that the historical data server
+    connected (165); the bars that follow are returned. A bar with a missing or unparseable date
+    is a parse error, where it read as the epoch before.
+  - Dropping a market data subscription from before a reconnect, or one IB already ended, sends
+    no cancel, so IB no longer answers with cancel errors for a stale id.
+  - A reconnect refreshes the negotiated server version along with the next order id.
+- **`databento` 0.63.0 → 0.64.0** (`rustrade-data`, `databento` feature, #839). It moves to DBN
+  0.73.0, which adds the DBN version 4 record layout, and its live client gains `unsubscribe`. No
+  change to this crate's API.
+- **`vecmap-rs` 0.2.5 → 0.3.1** (`rustrade-data`, #842). `DynamicStreams`'s public fields
+  (`trades`, `l1s`, `l2s`, `liquidations`, `candles`) are `vecmap::VecMap`s, so code that names
+  their type needs `vecmap-rs` 0.3. Each holds one stream per exchange, so 0.3's change to how a
+  duplicate key is resolved does not reach them.
+- **`parquet` 60.0.0 → 60.1.0** (`rustrade-data`, `lse-parquet` feature, #841). Its decoder is
+  stricter: a malformed LSE Parquet export that 60.0.0 read without complaint can now fail with an
+  error. A well-formed file reads as before.
 
 ### Fixed
 
