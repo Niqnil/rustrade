@@ -90,7 +90,9 @@
 //! `ibapi` reconnects its socket to TWS/Gateway by itself, with the same client ID.
 //! In-flight requests fail with `ConnectionReset` at the drop, and new sends are refused
 //! until the reconnect completes. Order sends classify that as a transient
-//! [`OrderError::Connectivity`]. If the reconnect fails, `ibapi` shuts the client down.
+//! [`OrderError::Connectivity`], and the account reads as a transient
+//! [`ConnectivityError`] (see [Account read errors](#account-read-errors)). If the reconnect
+//! fails, `ibapi` shuts the client down.
 //!
 //! [`ExecutionClient::account_stream`] stays open across a successful reconnect. It
 //! detects the gap and, once delivery is restored, recovers the fills TWS sent while
@@ -115,6 +117,24 @@
 //! only when IB tags its execution with this client's ID: `ibapi` drops a live execution tagged
 //! with another client's, so such a fill reaches only fill recovery and `fetch_trades`. Which ID
 //! IB gives a liquidation's execution is not documented.
+//!
+//! # Account read errors
+//!
+//! The account reads ([`ExecutionClient::account_snapshot`], [`ExecutionClient::fetch_balances`],
+//! [`ExecutionClient::fetch_open_orders`], [`ExecutionClient::fetch_trades`] and
+//! [`OrderStatusClient::fetch_ended_orders`]) fail with:
+//!
+//! - [`ConnectivityError::Socket`] when the connection drops during the read, or `ibapi` refuses
+//!   the request while it reconnects. Transient: retry once `ibapi` has reconnected.
+//! - [`ConnectivityError::Timeout`] when IB sends nothing for 10 seconds before the end of a
+//!   listing, or does not answer the request for the login's accounts within 30 seconds.
+//!   Transient: retry.
+//! - [`UnindexedClientError::Internal`] for any other failure, among them a client `ibapi` has
+//!   given up reconnecting or one that has shut down. Retrying cannot help: replace the client
+//!   (see [Caller Responsibilities](#caller-responsibilities)). Each method names its other cases.
+//!
+//! A read that fails returns nothing of what it read: part of a listing is not mistaken for all
+//! of it.
 //!
 //! # Caller Responsibilities
 //!
@@ -575,6 +595,25 @@ fn is_transport_loss(e: &ibapi::Error) -> bool {
     )
 }
 
+/// What an `ibapi` error answering an account read means for its caller, naming the request
+/// `what`.
+///
+/// - [`ConnectivityError::Socket`] for a transport loss `ibapi` recovers from by reconnecting by
+///   itself (see [`is_transient_transport_loss`]): the same read may succeed once it has.
+/// - [`ConnectivityError::Timeout`] when IB does not answer a request `ibapi` gives a deadline of
+///   its own, such as the one for the login's accounts.
+/// - [`UnindexedClientError::Internal`] for any other error, among them a client that has given
+///   up reconnecting (`ConnectionFailed`) or has shut down (`Shutdown`): retrying cannot help.
+fn read_error(what: &str, e: ibapi::Error) -> UnindexedClientError {
+    match e {
+        e if is_transient_transport_loss(&e) => {
+            ConnectivityError::Socket(format!("{what}: {e}")).into()
+        }
+        ibapi::Error::Timeout => ConnectivityError::Timeout.into(),
+        e => UnindexedClientError::Internal(format!("{what}: {e}")),
+    }
+}
+
 /// What `execution`'s trade is reported with, or `None` when it is not reported: another API
 /// client's execution that `scope` leaves out, or one in a contract this client has not
 /// registered.
@@ -647,10 +686,13 @@ const LISTING_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// only while `connected` still says the client is connected.
 ///
 /// # Errors
-/// [`UnindexedClientError::Internal`], naming `what`, when IB answers with an error, sends
-/// nothing for `stall_timeout` ([`LISTING_STALL_TIMEOUT`] outside tests) before the end of the
-/// listing, or the connection is gone when the listing stops. Either way what was read is not the
-/// whole listing, and must not be mistaken for it.
+/// Whenever what was read is not the whole listing, so that it is not mistaken for it:
+/// - [`ConnectivityError::Socket`] when the connection is gone when the listing stops, or
+///   `ibapi` fails the read with a transport loss it recovers from (see [`read_error`]);
+/// - [`ConnectivityError::Timeout`] when IB sends nothing for `stall_timeout`
+///   ([`LISTING_STALL_TIMEOUT`] outside tests) before the end of the listing;
+/// - [`UnindexedClientError::Internal`], naming `what`, when IB or `ibapi` answers with any other
+///   error.
 ///
 /// # Known limitation
 /// A connection that drops and is restored between the last item and that check reads as the end
@@ -666,7 +708,7 @@ fn read_listing<T>(
     on_item: impl FnMut(T) -> ControlFlow<()>,
 ) -> Result<(), UnindexedClientError> {
     read_listing_items(what, stall_timeout, connected, next, on_item)
-        .map_err(|e| UnindexedClientError::Internal(format!("{what}: {e}")))
+        .map_err(|e| e.into_client_error(what))
 }
 
 /// Why a listing read ended short of IB's end-of-listing marker: see [`read_listing`].
@@ -681,6 +723,18 @@ enum ListingError {
     /// IB sent nothing for this long before the end of the listing.
     #[error("IB sent nothing for {0:?} before the end of the listing")]
     Stalled(std::time::Duration),
+}
+
+impl ListingError {
+    /// What this means for an account read's caller, naming the listing `what`: see
+    /// [`read_listing`].
+    fn into_client_error(self, what: &str) -> UnindexedClientError {
+        match self {
+            Self::Ibapi(e) => read_error(what, e),
+            e @ Self::Dropped => ConnectivityError::Socket(format!("{what}: {e}")).into(),
+            Self::Stalled(_) => ConnectivityError::Timeout.into(),
+        }
+    }
 }
 
 /// [`read_listing`], keeping why the read failed for a caller that tells IB's errors apart.
@@ -781,17 +835,6 @@ fn contract_details_error(e: ibapi::Error) -> ResolveContractError {
     }
 }
 
-/// What an `ibapi` error answering the request for the login's accounts means for the caller.
-///
-/// IB sending no answer is a stall a retry can clear. Any other error is `Internal`; see the call
-/// in `account_snapshot` for why.
-fn managed_accounts_error(e: ibapi::Error) -> UnindexedClientError {
-    match e {
-        ibapi::Error::Timeout => ConnectivityError::Timeout.into(),
-        e => UnindexedClientError::Internal(format!("managed accounts: {e}")),
-    }
-}
-
 /// Serializes the reads of IB's order listings.
 ///
 /// IB answers an open-orders or completed-orders request without naming the request, so `ibapi`
@@ -811,10 +854,9 @@ impl ListingLock {
         client: &Client,
     ) -> Result<Vec<ibapi::orders::Orders>, UnindexedClientError> {
         let _serial = self.0.lock();
-        // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
         let subscription = client
             .all_open_orders()
-            .map_err(|e| UnindexedClientError::Internal(format!("open_orders: {e}")))?;
+            .map_err(|e| read_error("open_orders", e))?;
         let mut listing = Vec::new();
         read_listing(
             "open_orders",
@@ -843,7 +885,7 @@ impl ListingLock {
         let _serial = self.0.lock();
         let subscription = client
             .completed_orders(false)
-            .map_err(|e| UnindexedClientError::Internal(format!("completed_orders: {e}")))?;
+            .map_err(|e| read_error("completed_orders", e))?;
         read_listing(
             "completed_orders",
             LISTING_STALL_TIMEOUT,
@@ -917,14 +959,13 @@ fn read_account_positions(
 
     let subscription = client
         .positions_multi(Some(&account), None)
-        .map_err(|e| UnindexedClientError::Internal(format!("positions of {account}: {e}")))?;
+        .map_err(|e| read_error(&format!("positions of {account}"), e))?;
 
     for update in subscription.timeout_iter_data(POSITION_STALL_TIMEOUT) {
         // Surface subscription errors rather than returning partial positions
         // (a truncated snapshot could be misread as positions having closed).
-        let update = update.map_err(|e| {
-            UnindexedClientError::Internal(format!("positions subscription of {account}: {e}"))
-        })?;
+        let update =
+            update.map_err(|e| read_error(&format!("positions subscription of {account}"), e))?;
         let position = match update {
             PositionUpdateMulti::Position(position) => Position {
                 account: position.account,
@@ -2439,12 +2480,11 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Errors
     ///
-    /// - [`ConnectivityError::Timeout`] if IB does not answer the request for the login's
-    ///   accounts within 30 seconds. Transient: retry.
-    /// - [`UnindexedClientError::Internal`] if a position quantity does not convert to a
-    ///   `Decimal`, if the request for the login's accounts fails otherwise or yields none (as it
-    ///   does when the session ends during it), if a positions subscription fails, or as
-    ///   [`fetch_balances`](ExecutionClient::fetch_balances).
+    /// As each [account read](crate::client::ibkr#account-read-errors), and as
+    /// [`fetch_balances`](ExecutionClient::fetch_balances). Also
+    /// [`UnindexedClientError::Internal`] if a position quantity does not convert to a `Decimal`,
+    /// or if the request for the login's accounts yields none, as it does when the session ends
+    /// during it.
     ///
     /// # Known Issue: ibapi Decode Errors
     ///
@@ -2482,11 +2522,9 @@ impl ExecutionClient for IbkrClient {
         let positions_filter = instruments_filter.clone();
         let positions_future = tokio::task::spawn_blocking(move || {
             let instruments_filter = positions_filter;
-            // ibapi::Error is unstructured — apart from a timeout, we cannot distinguish
-            // connection failures (transient, should retry) from API errors (e.g., invalid
-            // request). Mapped to Internal (non-transient) conservatively; a caller needing
-            // reconnect logic should drive it from connection state, not from the error type.
-            let accounts = client.managed_accounts().map_err(managed_accounts_error)?;
+            let accounts = client
+                .managed_accounts()
+                .map_err(|e| read_error("managed accounts", e))?;
             if accounts.is_empty() {
                 // `ibapi` also answers with no accounts when the session ends mid-request.
                 return Err(UnindexedClientError::Internal(
@@ -2730,6 +2768,15 @@ impl ExecutionClient for IbkrClient {
     /// `order_update_stream()` returns events for all orders on the account.
     /// Callers subscribing for a specific instrument will receive events for
     /// all instruments.
+    ///
+    /// # Errors
+    ///
+    /// [`UnindexedClientError::Internal`] when the client has given up reconnecting or has shut
+    /// down: replace it (see [Caller Responsibilities]). Opening the stream sends nothing to IB,
+    /// so it succeeds while `ibapi` reconnects, and the stream then recovers the gap as described
+    /// above.
+    ///
+    /// [Caller Responsibilities]: crate::client::ibkr#caller-responsibilities
     async fn account_stream(
         &self,
         _assets: &[AssetNameExchange],
@@ -2738,7 +2785,6 @@ impl ExecutionClient for IbkrClient {
         let client = self.client.clone();
 
         // M-8 fix: Wrap blocking subscription call in spawn_blocking
-        // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
         let (notices, order_sub) = tokio::task::spawn_blocking(move || {
             // Notices first, so a reconnect that lands while the order stream is being set up is
             // not missed.
@@ -2747,7 +2793,7 @@ impl ExecutionClient for IbkrClient {
         })
         .await
         .map_err(|e| UnindexedClientError::TaskFailed(format!("task join: {e}")))?
-        .map_err(|e| UnindexedClientError::Internal(format!("order updates: {e}")))?;
+        .map_err(|e| read_error("order updates", e))?;
 
         let scope = self.execution_scope();
         let session_zone = self.session_zone;
@@ -3198,9 +3244,9 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Errors
     ///
-    /// [`UnindexedClientError::Internal`] if the request fails, IB answers with an
-    /// error, IB sends nothing for 10 seconds before the end of the listing, or the
-    /// connection drops during it.
+    /// As each [account read](crate::client::ibkr#account-read-errors). Also
+    /// [`UnindexedClientError::Internal`] if IB's account summary ends, with the connection up,
+    /// before the end of its listing.
     async fn fetch_balances(
         &self,
         assets: &[AssetNameExchange],
@@ -3217,10 +3263,9 @@ impl ExecutionClient for IbkrClient {
             let sent = Utc::now();
             // IB's reqAccountSummary expects a group name ("All" for all linked accounts),
             // not an account ID. Using account ID causes error 321 "Unified group name is invalid".
-            // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
             let sub = client
                 .account_summary(&ACCOUNT_GROUP_ALL, account::BALANCE_SUMMARY_TAGS)
-                .map_err(|e| UnindexedClientError::Internal(format!("account_summary: {e}")))?;
+                .map_err(|e| read_error("account_summary", e))?;
 
             let mut balances = read_account_summary(
                 LISTING_STALL_TIMEOUT,
@@ -3265,9 +3310,7 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Errors
     ///
-    /// [`UnindexedClientError::Internal`] if the request fails, IB answers with an
-    /// error, IB sends nothing for 10 seconds before the end of the listing, or the
-    /// connection drops during it.
+    /// As each [account read](crate::client::ibkr#account-read-errors).
     async fn fetch_open_orders(
         &self,
         instruments: &[InstrumentNameExchange],
@@ -3333,9 +3376,7 @@ impl ExecutionClient for IbkrClient {
     ///
     /// # Errors
     ///
-    /// [`UnindexedClientError::Internal`] if the request fails, IB answers with an
-    /// error, IB sends nothing for 10 seconds before the end of the listing, or the
-    /// connection drops during it.
+    /// As each [account read](crate::client::ibkr#account-read-errors).
     ///
     /// # Corrections
     ///
@@ -3366,10 +3407,9 @@ impl ExecutionClient for IbkrClient {
         tokio::task::spawn_blocking(move || {
             // Every client's executions: `scope` decides which are reported (see
             // `ExecutionScope::classify`).
-            // Note: ibapi errors are unstructured — see comment in account_snapshot() re: Internal
             let sub = client
                 .executions(execution::executions_filter())
-                .map_err(|e| UnindexedClientError::Internal(format!("executions: {e}")))?;
+                .map_err(|e| read_error("executions", e))?;
 
             let mut listing = Vec::new();
             read_listing(
@@ -4004,8 +4044,7 @@ impl BracketOrderClient for IbkrClient {
 ///
 /// # Errors
 ///
-/// [`UnindexedClientError::Internal`] when a listing fails, IB sends nothing for 10 seconds
-/// before the end of one, or the connection drops during it.
+/// As each [account read](crate::client::ibkr#account-read-errors).
 impl OrderStatusClient for IbkrClient {
     async fn fetch_ended_orders(
         &self,
@@ -5344,35 +5383,45 @@ mod order_reader_tests {
         }
 
         /// What a stalled or failed read holds is not the whole listing, so it is not returned.
+        /// A stall, or a transport loss `ibapi` recovers from, is worth retrying; another error
+        /// is not.
         #[test]
         fn a_stalled_or_failed_listing_read_is_an_error() {
             let stalled = read(vec![Ok(SubscriptionItem::Data(1))], true, None);
-            assert!(
-                matches!(&stalled, Err(UnindexedClientError::Internal(m)) if m.contains("sent nothing")),
-                "{stalled:?}"
+            assert_eq!(
+                stalled,
+                Err(UnindexedClientError::Connectivity(
+                    ConnectivityError::Timeout
+                ))
             );
-            let failed = read(
-                vec![
-                    Ok(SubscriptionItem::Data(1)),
-                    Err(ibapi::Error::ConnectionReset),
-                ],
-                false,
-                None,
+
+            let failed = |e| read(vec![Ok(SubscriptionItem::Data(1)), Err(e)], false, None);
+            assert_eq!(
+                failed(ibapi::Error::ConnectionReset),
+                Err(UnindexedClientError::Connectivity(
+                    ConnectivityError::Socket("test: ConnectionReset".to_string())
+                ))
             );
-            assert!(
-                matches!(failed, Err(UnindexedClientError::Internal(_))),
-                "{failed:?}"
-            );
+            for permanent in [ibapi::Error::ConnectionFailed, ibapi::Error::Shutdown] {
+                let label = permanent.to_string();
+                assert_eq!(
+                    failed(permanent),
+                    Err(UnindexedClientError::Internal(format!("test: {label}")))
+                );
+            }
         }
 
         /// `ibapi` answers early when it drops a subscription's channel as well as at the end
-        /// marker, so a listing that stops while the client is disconnected is not its end.
+        /// marker, so a listing that stops while the client is disconnected is not its end, and
+        /// is worth retrying once `ibapi` has reconnected.
         #[test]
         fn a_listing_that_stops_while_disconnected_is_an_error() {
             let read = read_while(vec![Ok(SubscriptionItem::Data(1))], false, None, false);
-            assert!(
-                matches!(&read, Err(UnindexedClientError::Internal(m)) if m.contains("connection dropped")),
-                "{read:?}"
+            assert_eq!(
+                read,
+                Err(UnindexedClientError::Connectivity(
+                    ConnectivityError::Socket(format!("test: {}", ListingError::Dropped))
+                ))
             );
         }
 
@@ -5473,23 +5522,40 @@ mod order_reader_tests {
             assert!(!ResolveContractError::NoMatch.is_transient());
         }
 
-        /// IB not answering the request for the login's accounts is a stall a retry can clear;
-        /// any other failure is not.
+        /// An account read that `ibapi` fails with a transport loss it recovers from, or that IB
+        /// does not answer in time, is worth retrying. A client that has given up reconnecting
+        /// or shut down, or any other error, is not.
         #[test]
-        fn only_an_unanswered_accounts_request_is_worth_retrying() {
-            let timeout = managed_accounts_error(ibapi::Error::Timeout);
-            assert_eq!(
-                timeout,
-                UnindexedClientError::Connectivity(ConnectivityError::Timeout)
-            );
-            assert!(timeout.is_transient());
+        fn an_account_read_error_says_whether_a_retry_can_help() {
+            let transient = [
+                (
+                    ibapi::Error::ConnectionReset,
+                    ConnectivityError::Socket("reading: ConnectionReset".to_string()),
+                ),
+                (
+                    ibapi::Error::Io(std::io::Error::other("broken pipe")),
+                    ConnectivityError::Socket("reading: broken pipe".to_string()),
+                ),
+                (ibapi::Error::Timeout, ConnectivityError::Timeout),
+            ];
+            for (e, connectivity) in transient {
+                let classified = read_error("reading", e);
+                assert_eq!(classified, UnindexedClientError::Connectivity(connectivity));
+                assert!(classified.is_transient());
+            }
 
-            for e in [ibapi::Error::Shutdown, ibapi::Error::Simple("no".into())] {
+            for e in [
+                ibapi::Error::ConnectionFailed,
+                ibapi::Error::Shutdown,
+                ibapi::Error::Simple("no".into()),
+            ] {
                 let label = e.to_string();
+                let classified = read_error("reading", e);
                 assert_eq!(
-                    managed_accounts_error(e),
-                    UnindexedClientError::Internal(format!("managed accounts: {label}"))
+                    classified,
+                    UnindexedClientError::Internal(format!("reading: {label}"))
                 );
+                assert!(!classified.is_transient());
             }
         }
 
