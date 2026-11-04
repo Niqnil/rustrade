@@ -159,6 +159,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A group missing its borrow or transfer-out set, or with an empty one, is an
     `UnindexedClientError::Internal`, as a missing liquidation set already was.
   - Migrate by reading `.liquidation` where the old tiers were used.
+- **The engine logs a fill whose base-asset fee left the holding off the quantity step at DEBUG**
+  (`rustrade`), where it logged it at INFO. On a venue that charges spot fees in the base asset,
+  most fills do this, so INFO was noise. The fill is still counted on `TearSheet::fills_dust`.
 - **The simulated venue's charge on a new loan names the order that took it, and that order's
   instrument** (`rustrade-execution`, #831). Its `InterestTiming::OnBorrow` cash flows now carry
   `CashFlow::loan`, lent at the charge, and `instrument: Some(..)`, where they had
