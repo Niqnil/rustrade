@@ -163,6 +163,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: IBKR account reads report a dropped TWS/Gateway connection as a transient
+  `Connectivity` error** (`rustrade-execution`, `ibkr`, #855). The affected reads are
+  `account_snapshot`, `fetch_balances`, `fetch_open_orders`, `fetch_trades` and
+  `fetch_ended_orders`. They returned `UnindexedClientError::Internal`, which is never transient.
+  They now classify a failure as contract resolution already did:
+  - `ConnectivityError::Socket`: a connection reset or I/O error, a request refused while `ibapi`
+    reconnects, or a listing cut short by the drop;
+  - `ConnectivityError::Timeout`: a listing IB stops sending for 10 seconds, or a request for the
+    login's accounts IB does not answer;
+  - `Internal`, as before, for everything else. That includes a client that has given up
+    reconnecting or has shut down, which a retry cannot help.
+
+  `is_transient()` is therefore `true` for these failures. A caller matching `Internal` for them
+  must match `Connectivity` instead.
+  - `account_snapshot` returns no sooner than `ibapi`'s reconnect ends, since `ibapi` holds its
+    request for the login's accounts until then. It then fails with the `Socket` error of its
+    other reads.
+  - `account_stream` is unchanged in practice: opening it sends nothing to IB, so it succeeds while
+    `ibapi` reconnects.
 - **Breaking: `BinanceMargin::fetch_collateral_ratios` returns all three of each asset's collateral
   ratios** (`rustrade-execution`, `binance`, #850). It now returns
   `HashMap<AssetNameExchange, CollateralRatios>`, where it returned each asset's liquidation tiers

@@ -11,7 +11,7 @@ use super::{
     LISTING_STALL_TIMEOUT, ListingLock, cancelled_at_expiry,
     execution::{self, EXECUTIONS_COVER, ExecutionRevision, try_decimal_or_warn},
     order::{self, OrderContext, OrderIdMap, PendingCancels, Registration},
-    read_listing,
+    read_error, read_listing,
 };
 use crate::{
     client::order_recovery::OrderLookup,
@@ -475,7 +475,7 @@ impl<'a> EndedOrderReader<'a> {
         let subscription = self
             .client
             .executions(execution::executions_filter())
-            .map_err(|e| UnindexedClientError::Internal(format!("executions: {e}")))?;
+            .map_err(|e| read_error("executions", e))?;
         let api_client_id = self.client.client_id();
         let mut executed = ExecutedQuantities::default();
         read_listing(

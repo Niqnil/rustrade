@@ -51,6 +51,7 @@
 //! | `test_fetch_open_orders` | Fetch currently open orders |
 //! | `test_account_stream` | Stream account events |
 //! | `test_fetch_trades` | Fetch historical trades |
+//! | `test_account_reads_while_the_connection_is_down` | A dropped connection fails the account reads as transient `Connectivity` |
 //! | `test_order_id_mapping_cleanup` | Test stale order cleanup |
 //! | `test_place_and_cancel_limit_order` | Place and cancel limit order |
 //! | `test_order_without_registered_contract` | Verify rejection for unknown contract |
@@ -104,7 +105,7 @@ use rustrade_execution::{
             contract::{ContractConfigError, ResolveContractError, stock_contract},
         },
     },
-    error::{ApiError, ClientError},
+    error::{ApiError, ClientError, ConnectivityError, UnindexedClientError},
     order::{
         OrderKey, OrderKind, TimeInForce, TrailingOffsetType,
         id::{ClientOrderId, StrategyId},
@@ -117,7 +118,14 @@ use rustrade_instrument::{
     instrument::name::InstrumentNameExchange,
 };
 use serial_test::serial;
-use std::time::{Duration, Instant};
+use std::{
+    net::{Shutdown, TcpListener, TcpStream},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 use tokio_stream::StreamExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
@@ -2140,6 +2148,206 @@ async fn test_orders_found_by_client_order_id_across_a_restart() {
             .await
             .expect("fetch_ended_orders failed")
             .is_empty()
+    );
+}
+
+// ============================================================================
+// Connection Loss Tests — Tier 0: Paper Account Only (FREE)
+// ============================================================================
+
+/// A TCP relay between the client and IB Gateway that stands in for a dropped socket:
+/// [`cut`](Self::cut) closes every relayed connection and refuses new ones until
+/// [`restore`](Self::restore). The accepting thread lives until the test process ends.
+struct CuttableRelay {
+    port: u16,
+    refusing: Arc<AtomicBool>,
+    live: Arc<Mutex<Vec<TcpStream>>>,
+}
+
+impl CuttableRelay {
+    fn start(upstream_port: u16) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the relay");
+        let port = listener.local_addr().expect("relay address").port();
+        let refusing = Arc::new(AtomicBool::new(false));
+        let live = Arc::new(Mutex::new(Vec::new()));
+        let (accept_refusing, accept_live) = (Arc::clone(&refusing), Arc::clone(&live));
+        std::thread::spawn(move || {
+            for inbound in listener.incoming().flatten() {
+                // Checked under the lock `cut` takes, so no connection is relayed past a cut.
+                let mut live = accept_live.lock().unwrap();
+                // Dropping the connection closes it, so the client's reconnect attempt fails.
+                if accept_refusing.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let Ok(upstream) = TcpStream::connect(("127.0.0.1", upstream_port)) else {
+                    continue;
+                };
+                live.push(inbound.try_clone().unwrap());
+                live.push(upstream.try_clone().unwrap());
+                relay_one_way(inbound.try_clone().unwrap(), upstream.try_clone().unwrap());
+                relay_one_way(upstream, inbound);
+            }
+        });
+        Self {
+            port,
+            refusing,
+            live,
+        }
+    }
+
+    fn cut(&self) {
+        let mut live = self.live.lock().unwrap();
+        self.refusing.store(true, Ordering::SeqCst);
+        for stream in live.drain(..) {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    fn restore(&self) {
+        self.refusing.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Copy `from` to `to` on a thread of its own until either side closes, then close both.
+fn relay_one_way(mut from: TcpStream, mut to: TcpStream) {
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut from, &mut to);
+        let _ = to.shutdown(Shutdown::Both);
+        let _ = from.shutdown(Shutdown::Both);
+    });
+}
+
+/// Check `read` failed with a transient [`ConnectivityError::Socket`].
+fn assert_dropped<T: std::fmt::Debug>(read: &str, result: Result<T, UnindexedClientError>) {
+    match result {
+        Err(error @ ClientError::Connectivity(ConnectivityError::Socket(_))) => {
+            assert!(error.is_transient(), "{read}: {error:?}");
+        }
+        other => panic!("{read} while the connection is down: {other:?}"),
+    }
+}
+
+/// While `ibapi` reconnects after a dropped connection, every account read fails with a transient
+/// `Connectivity` error, and a read succeeds again once it has reconnected. `account_snapshot`
+/// returns only once the reconnect has ended, since `ibapi` holds its request for the login's
+/// accounts until then. Opening the account stream sends nothing, so it succeeds during the drop.
+/// On a client that has shut down, the reads fail with `Internal`, which a retry cannot clear.
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_account_reads_while_the_connection_is_down() {
+    init_logging();
+
+    let relay = CuttableRelay::start(test_port());
+    let mut config = resolved_aapl_config(31);
+    config.port = relay.port;
+    let client = connect_client(config)
+        .await
+        .expect("connect through the relay");
+    let aapl = aapl_instrument();
+    let instruments = std::slice::from_ref(&aapl);
+    client
+        .fetch_balances(&[])
+        .await
+        .expect("fetch_balances before the drop");
+
+    relay.cut();
+    // The client may not have seen the drop yet, so the first read that fails is checked.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let first = loop {
+        match client.fetch_balances(&[]).await {
+            Err(error) => break Err::<(), _>(error),
+            Ok(_) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "reads still succeed after the cut"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+    assert_dropped("fetch_balances", first);
+    let snapshot = tokio::spawn({
+        let client = client.clone();
+        let instruments = instruments.to_vec();
+        async move { client.account_snapshot(&[], &instruments).await }
+    });
+    assert_dropped(
+        "fetch_open_orders",
+        client.fetch_open_orders(instruments).await,
+    );
+    let now = chrono::Utc::now();
+    assert_dropped(
+        "fetch_trades",
+        client
+            .fetch_trades(now - chrono::Duration::hours(1), now, instruments)
+            .await,
+    );
+    let never_placed = OrderKey {
+        exchange: ExchangeId::Ibkr,
+        instrument: aapl.clone(),
+        strategy: StrategyId::new("test-strategy"),
+        cid: ClientOrderId::new("never-placed-drop"),
+    };
+    assert_dropped(
+        "fetch_ended_orders",
+        client
+            .fetch_ended_orders(std::slice::from_ref(&never_placed))
+            .await,
+    );
+    let stream = client.account_stream(&[], instruments).await;
+    assert!(
+        stream.is_ok(),
+        "account_stream during the drop: {:?}",
+        stream.err()
+    );
+    drop(stream);
+    assert!(
+        !snapshot.is_finished(),
+        "account_snapshot returned before the reconnect: {:?}",
+        snapshot.await
+    );
+
+    relay.restore();
+    let snapshot = tokio::time::timeout(Duration::from_secs(60), snapshot)
+        .await
+        .expect("account_snapshot did not return within 60 s of the restore")
+        .expect("account_snapshot task");
+    assert_dropped("account_snapshot", snapshot);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match client.fetch_balances(&[]).await {
+            Ok(_) => break,
+            Err(error) => {
+                assert!(
+                    error.is_transient(),
+                    "fetch_balances while reconnecting: {error:?}"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "no reconnect within 60 s: {error:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+    client
+        .fetch_open_orders(instruments)
+        .await
+        .expect("fetch_open_orders after the reconnect");
+
+    client.disconnect();
+    let shut_down = client.fetch_balances(&[]).await;
+    assert!(
+        matches!(&shut_down, Err(ClientError::Internal(_))),
+        "fetch_balances after disconnect: {shut_down:?}"
+    );
+    assert!(!shut_down.unwrap_err().is_transient());
+    let stream = client.account_stream(&[], instruments).await;
+    assert!(
+        matches!(&stream, Err(ClientError::Internal(_))),
+        "account_stream after disconnect: {:?}",
+        stream.as_ref().err()
     );
 }
 
