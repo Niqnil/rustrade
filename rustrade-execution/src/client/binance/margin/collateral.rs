@@ -620,6 +620,24 @@ mod tests {
     }
 
     #[test]
+    fn apply_collateral_ratios_errors_name_the_asset_and_the_set() {
+        let not_open = ApplyCollateralRatiosError::NotOneOpenTier {
+            asset: asset("SHIB"),
+            set: CollateralRatioSet::Liquidation,
+            tiers: Vec::new(),
+        };
+        assert_eq!(
+            not_open.to_string(),
+            "SHIB's liquidation collateral ratio is not one tier covering every USD value: []"
+        );
+        assert_eq!(CollateralRatioSet::Borrow.to_string(), "borrow");
+        assert_eq!(
+            ApplyCollateralRatiosError::AssetNotListed(asset("DOGE")).to_string(),
+            "Binance lists no collateral ratios for DOGE"
+        );
+    }
+
+    #[test]
     fn apply_collateral_ratios_passes_on_the_configs_refusal_unclamped() {
         for (borrow, liquidation, refused) in [
             (
