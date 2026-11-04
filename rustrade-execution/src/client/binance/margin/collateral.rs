@@ -91,8 +91,8 @@ impl BinanceMargin {
     ///
     /// # What the answer holds
     ///
-    /// Binance's API documentation lists only the liquidation set; Binance has confirmed that the
-    /// endpoint returns all three. What was observed on 2026-11-04:
+    /// Binance's API documentation listed only the liquidation set as of 2026-11-04; Binance has
+    /// confirmed that the endpoint returns all three. What was observed on 2026-11-04:
     ///
     /// - every asset had one open tier per check, so its ratio applies to the asset's whole value;
     /// - the liquidation ratio was 1 for every asset;
