@@ -242,9 +242,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`trades`, `l1s`, `l2s`, `liquidations`, `candles`) are `vecmap::VecMap`s, so code that names
   their type needs `vecmap-rs` 0.3. Each holds one stream per exchange, so 0.3's change to how a
   duplicate key is resolved does not reach them.
-- **`parquet` 60.0.0 → 60.1.0** (`rustrade-data`, `lse-parquet` feature, #841). Its decoder is stricter:
-  a malformed LSE Parquet export that 60.0.0 read without complaint can now fail with an error. A
-  well-formed file reads as before.
+- **`parquet` 60.0.0 → 60.1.0** (`rustrade-data`, `lse-parquet` feature, #841). Its decoder is
+  stricter: a malformed LSE Parquet export that 60.0.0 read without complaint can now fail with an
+  error. A well-formed file reads as before.
 
 ### Fixed
 
