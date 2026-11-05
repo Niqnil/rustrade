@@ -629,23 +629,25 @@ fn disconnect_test_stream(client_id_offset: i32) -> IbkrMarketStream<String> {
         client_id: test_client_id_base() + client_id_offset,
     };
 
+    // IDEALPRO forex quotes, because a paper account has them: it may lack the stock market data
+    // permissions, and then IB ends a stock subscription before the disconnect is tested. With no
+    // quotes flowing, outside forex hours, a subscription still stays open.
+    let pairs = [("EUR.USD", "EUR", "USD"), ("GBP.USD", "GBP", "USD")];
     let registry = ContractRegistry::new();
-    registry.register_by_name_only("AAPL".into(), aapl_contract());
+    for (name, base, quote) in pairs {
+        registry.register_by_name_only(name.into(), Contract::forex(base, quote).build());
+    }
     let registry = Arc::new(registry);
 
     // Two workers, so the stream ends only once both have exited.
-    let subscriptions = vec![
-        IbkrSubscription {
-            instrument: "AAPL".into(),
-            key: "AAPL".to_string(),
+    let subscriptions = pairs
+        .into_iter()
+        .map(|(name, _, _)| IbkrSubscription {
+            instrument: name.into(),
+            key: name.to_string(),
             kind: IbkrSubscriptionKind::Quotes,
-        },
-        IbkrSubscription {
-            instrument: "AAPL".into(),
-            key: "AAPL".to_string(),
-            kind: IbkrSubscriptionKind::Trades,
-        },
-    ];
+        })
+        .collect();
 
     IbkrMarketStream::init(config, registry, subscriptions).expect("stream init failed")
 }
