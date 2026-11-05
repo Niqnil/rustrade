@@ -41,6 +41,8 @@ pub const STREAM_RECONNECTION_POLICY: ReconnectionBackoffPolicy = ReconnectionBa
 pub struct MarketStreamOptions {
     /// The backoff between attempts to re-initialise a stream that ended.
     pub reconnect: ReconnectionBackoffPolicy,
+    // Private, unlike `reconnect`, so it can only be set through `with_silence_timeout`, which
+    // refuses zero.
     silence_timeout: Option<Duration>,
 }
 
@@ -84,8 +86,11 @@ impl MarketStreamOptions {
     ///   per `threshold` until the caller stops it.
     /// - **A shared connection:** for a subscriber whose streams share one connection (see
     ///   [`Subscriber::Transport`](crate::subscriber::Subscriber::Transport)), the stream is a view
-    ///   of that connection. Ending it releases this stream's share and subscribes again over the
-    ///   same connection, which closes and reopens only once no stream holds it.
+    ///   of that connection, and ending it does not close the socket while another stream is
+    ///   attached. Its re-initialisation attaches to the same socket, and sends its subscriptions
+    ///   to the venue again only if no other stream on the socket holds the same ones. So on a
+    ///   shared connection the timeout still reports the silence, but reconnects the socket only
+    ///   when no other stream is attached to it.
     ///
     /// Off by default.
     ///

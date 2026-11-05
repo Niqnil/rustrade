@@ -38,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking: `init_market_stream` takes `MarketStreamOptions` in place of its
   `ReconnectionBackoffPolicy`** (`rustrade-data`, #862). Pass
   `MarketStreamOptions::default().with_reconnect(policy)` to keep the old behaviour.
+
 ## [0.21.0] - 2026-11-04
 
 ### Added

@@ -621,8 +621,8 @@ where
     Ok(batch)
 }
 
-/// Split each batch into its `(ExchangeId, SubKind)` groups and route every one, with its batch's
-/// options, connecting none.
+/// Route every `(ExchangeId, SubKind)` group of every batch, with its batch's options, connecting
+/// none.
 ///
 /// Routing all of them first is what lets a group nothing can serve fail the call before any
 /// connection is opened.
@@ -639,6 +639,39 @@ fn route_batches<Instrument>(
 where
     Instrument: DynamicInstrument,
 {
+    group_batches(batches)
+        .into_iter()
+        .map(|group| {
+            Instrument::route(
+                group.exchange,
+                group.sub_kind,
+                group.subscriptions,
+                txs,
+                subscribers,
+                group.options,
+            )
+        })
+        .collect()
+}
+
+/// The subscriptions of one batch that share a venue and a kind, and so one connection.
+#[derive(Debug, PartialEq)]
+struct Group<Instrument> {
+    exchange: ExchangeId,
+    sub_kind: SubKind,
+    subscriptions: Vec<Subscription<ExchangeId, Instrument, SubKind>>,
+    options: MarketStreamOptions,
+}
+
+/// Split each batch into its `(ExchangeId, SubKind)` groups, each with its batch's options.
+fn group_batches<Instrument>(
+    batches: impl IntoIterator<
+        Item = (
+            Vec<Subscription<ExchangeId, Instrument, SubKind>>,
+            MarketStreamOptions,
+        ),
+    >,
+) -> Vec<Group<Instrument>> {
     batches
         .into_iter()
         .flat_map(|(mut batch, options)| {
@@ -647,11 +680,13 @@ where
                 .into_iter()
                 .chunk_by(|sub| (sub.exchange, sub.kind))
                 .into_iter()
-                .map(|(key, subs)| (key, subs.collect::<Vec<_>>(), options.clone()))
+                .map(|((exchange, sub_kind), subs)| Group {
+                    exchange,
+                    sub_kind,
+                    subscriptions: subs.collect(),
+                    options: options.clone(),
+                })
                 .collect::<Vec<_>>()
-        })
-        .map(|((exchange, sub_kind), subs, options)| {
-            Instrument::route(exchange, sub_kind, subs, txs, subscribers, options)
         })
         .collect()
 }
@@ -1072,6 +1107,50 @@ mod tests {
             "hyperliquid" => cfg!(feature = "hyperliquid"),
             other => panic!("no dynamic route is gated on the `{other}` feature"),
         }
+    }
+
+    #[test]
+    fn each_group_carries_its_own_batch_options() {
+        let spot = || MarketDataInstrumentKind::Spot;
+        let trades = subscription(ExchangeId::BinanceSpot, spot(), SubKind::PublicTrades);
+        let l1 = subscription(ExchangeId::BinanceSpot, spot(), SubKind::OrderBooksL1);
+        let silenced = MarketStreamOptions::default()
+            .with_silence_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        // The same venue and kind in two batches is two connections, each with its batch's options
+        let groups = group_batches([
+            (
+                vec![trades.clone(), l1.clone()],
+                MarketStreamOptions::default(),
+            ),
+            (vec![trades.clone()], silenced.clone()),
+        ]);
+
+        let summary = |options: &MarketStreamOptions| {
+            let mut kinds = groups
+                .iter()
+                .filter(|group| &group.options == options)
+                .map(|group| {
+                    assert_eq!(group.exchange, ExchangeId::BinanceSpot);
+                    (group.sub_kind, group.subscriptions.clone())
+                })
+                .collect::<Vec<_>>();
+            kinds.sort_by_key(|(sub_kind, _)| *sub_kind);
+            kinds
+        };
+        let mut expected_default = vec![
+            (SubKind::PublicTrades, vec![trades.clone()]),
+            (SubKind::OrderBooksL1, vec![l1]),
+        ];
+        expected_default.sort_by_key(|(sub_kind, _)| *sub_kind);
+
+        assert_eq!(groups.len(), 3);
+        assert_eq!(summary(&MarketStreamOptions::default()), expected_default);
+        assert_eq!(
+            summary(&silenced),
+            vec![(SubKind::PublicTrades, vec![trades])]
+        );
     }
 
     #[test]
