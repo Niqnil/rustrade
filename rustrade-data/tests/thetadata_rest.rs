@@ -574,6 +574,7 @@ async fn a_chain_snapshot_is_one_request() {
         .mount(&server)
         .await;
     Mock::given(path("/v3/option/snapshot/ohlc"))
+        .and(query_param("strike", "101.5"))
         .respond_with(ndjson(&[&format!(
             r#"{{"timestamp":"2024-03-04T12:00:00",{CONTRACT},"open":1,"high":2,"low":0.5,"close":1.5,"volume":10,"count":3}}"#
         )]))
