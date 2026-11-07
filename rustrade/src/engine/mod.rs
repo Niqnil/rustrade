@@ -327,10 +327,15 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     /// that names no instrument this state tracks on the flow's exchange is logged and ignored.
     /// See [`CashFlowAttributionStrategy::attribute_cash_flow`].
     ///
-    /// [`Engine::process`](Processor::process) calls this for every account event. A caller that
-    /// drives the `Engine` by hand, through [`Engine::update_from_account_stream`], calls it first:
-    /// before `update_from_account_stream`, and before recording the event in any audit it keeps,
-    /// so the recorded event carries the instrument the state applied.
+    /// [`Engine::process`](Processor::process) calls this on the event of each
+    /// [`AccountStreamEvent::Item`]. A caller that drives the `Engine` by hand, through
+    /// [`Engine::update_from_account_stream`], calls it first: before `update_from_account_stream`,
+    /// and before recording the event in any audit it keeps, so the recorded event carries the
+    /// instrument the state applied. It can pass every account event, since any other kind is left
+    /// alone.
+    ///
+    /// Call it once per event. A flow it attributed is not asked about again, but a flow left on
+    /// the account is asked about again on every call.
     pub fn attribute_cash_flow(&mut self, event: &mut AccountEvent)
     where
         Strategy: CashFlowAttributionStrategy<State = EngineState<GlobalData, InstrumentData>>,

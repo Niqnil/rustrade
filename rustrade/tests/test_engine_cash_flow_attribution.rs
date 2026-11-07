@@ -233,7 +233,8 @@ fn a_caller_driving_the_engine_by_hand_attributes_before_updating_from_the_accou
     let btc = base(&engine.state, BTC_USDT);
     let interest = flow(btc, dec!(-0.0001), None);
 
-    // Without asking: the flow stays on the account.
+    // Without asking: the flow stays on the account (it is applied to the account's balance only,
+    // so the carry checked below holds just the attributed flow).
     engine.update_from_account_stream(&AccountStreamEvent::Item(AccountEvent {
         exchange: BINANCE,
         kind: AccountEventKind::CashFlow(interest.clone()),
@@ -251,10 +252,31 @@ fn a_caller_driving_the_engine_by_hand_attributes_before_updating_from_the_accou
         panic!("not a cash flow: {event:?}");
     };
     assert_eq!(attributed.instrument, Some(BTC_USDT));
+    // An attributed flow is not asked about again.
+    engine.attribute_cash_flow(&mut event);
     engine.update_from_account_stream(&AccountStreamEvent::Item(event));
 
     assert_eq!(engine.strategy.asked, vec![(BINANCE, interest)]);
     assert_eq!(carry_base(&engine.state, BTC_USDT), dec!(-0.0001));
+}
+
+#[test]
+fn a_flow_left_on_the_account_is_asked_about_again_on_every_call() {
+    let mut engine = engine(&[BTC_USDT], None);
+    let btc = base(&engine.state, BTC_USDT);
+    let mut event = AccountEvent {
+        exchange: BINANCE,
+        kind: AccountEventKind::CashFlow(flow(btc, dec!(-0.0001), None)),
+    };
+
+    engine.attribute_cash_flow(&mut event);
+    engine.attribute_cash_flow(&mut event);
+
+    assert_eq!(engine.strategy.asked.len(), 2);
+    let AccountEventKind::CashFlow(left) = &event.kind else {
+        panic!("not a cash flow: {event:?}");
+    };
+    assert_eq!(left.instrument, None);
 }
 
 #[test]
