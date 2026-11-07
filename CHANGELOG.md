@@ -30,7 +30,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     flight, matching the account's concurrency limit.
   - **Errors:** `ThetaDataError` tells apart an unreachable Terminal, a request the plan does not
     include, a session taken over by another login, a full queue and other failures, and marks
-    the transient ones. A request with no data yields no rows.
+    the transient ones. A request with no data yields no rows. Dates before the plan's history
+    starts are refused as an invalid request (HTTP 400), not as a permission error.
+  - **Securing the Terminal:** its API has no authentication, and the Terminal may listen on every
+    network interface whatever its configured host. Keep its port behind a firewall, or in a
+    container that does not publish it beyond `127.0.0.1` or a private network.
 
   ⚠️ ThetaData's individual plans are for personal, non-commercial use, and its terms forbid
   redistributing the data. Do not commit or publish what this integration retrieves. See
