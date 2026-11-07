@@ -33,6 +33,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     delivered on the `/market` path only, and that `BinanceHistoricalClient::futures` returns
     1-second candles from only about four months back, without an error for an earlier start.
 
+- **`Engine::attribute_cash_flow` is public** (`rustrade`). `Engine::process` asks the strategy's
+  `CashFlowAttributionStrategy` which position an account-level cash flow belongs to.
+  `Engine::update_from_account_stream` does not, so a caller driving the engine by hand left every
+  such flow on the account. That caller now calls `attribute_cash_flow` on each account event
+  before `update_from_account_stream`, and before recording the event in any audit it keeps.
+
 ### Changed
 
 - **Breaking: `init_market_stream` takes `MarketStreamOptions` in place of its

@@ -29,7 +29,9 @@ pub trait CashFlowAttributionStrategy {
     ///
     /// The `Engine` calls this for every [`CashFlow`] account event whose
     /// [`instrument`](CashFlow::instrument) is `None`, before the event updates the state or is
-    /// recorded in the audit. A flow the venue already attributed never reaches it.
+    /// recorded in the audit. A flow the venue already attributed never reaches it. `Engine::process`
+    /// does so itself; a caller that drives the `Engine` by hand does so through
+    /// [`Engine::attribute_cash_flow`](crate::engine::Engine::attribute_cash_flow).
     ///
     /// On `Some(instrument)`, the `Engine` sets the flow's `instrument` and the flow goes to that
     /// instrument's open position's carry, exactly as a flow the venue attributed would. Since the
