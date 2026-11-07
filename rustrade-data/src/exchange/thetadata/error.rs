@@ -22,12 +22,16 @@ pub enum ThetaDataError {
     #[error("Theta Terminal unreachable at {base_url}: {message}")]
     TerminalUnreachable { base_url: String, message: String },
 
-    /// The account's subscription does not include this request (HTTP 403 or 471).
+    /// The account's subscription does not include this endpoint or interval (HTTP 403 or 471).
+    ///
+    /// A request for dates before the plan's history starts is answered differently, with HTTP
+    /// 400: it arrives as [`Self::InvalidRequest`], with ThetaData's message naming the plan.
     #[error("ThetaData subscription does not permit this request (HTTP {status}): {message}")]
     PermissionDenied { status: u16, message: String },
 
-    /// The Terminal rejected the request as malformed (HTTP 400, 404, 473 or 475). An outdated
-    /// Terminal can also answer this way to a request it does not know.
+    /// The Terminal rejected the request (HTTP 400, 404, 473 or 475): malformed, or, with HTTP
+    /// 400, for dates before the account's plan starts its history. An outdated Terminal can also
+    /// answer this way to a request it does not know.
     #[error("ThetaData rejected the request (HTTP {status}): {message}")]
     InvalidRequest { status: u16, message: String },
 

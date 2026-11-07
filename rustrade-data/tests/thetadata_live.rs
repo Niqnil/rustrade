@@ -13,10 +13,12 @@
 
 use chrono::{Datelike, NaiveDate, Utc};
 use futures_util::{Stream, StreamExt};
+use rust_decimal_macros::dec;
 use rustrade_data::exchange::thetadata::{
-    DEFAULT_BASE_URL, Expiration, InterestRateSeries, OptionSelection, ThetaDataClient,
+    DEFAULT_BASE_URL, Expiration, InterestRateSeries, OptionSelection, Strike, ThetaDataClient,
     ThetaDataError,
 };
+use rustrade_instrument::instrument::kind::option::OptionKind;
 
 fn client() -> ThetaDataClient {
     let base_url =
@@ -99,12 +101,44 @@ async fn end_of_day_history_covers_each_trading_day() {
 
 #[tokio::test]
 #[ignore = "needs a running Theta Terminal"]
+async fn end_of_day_history_longer_than_one_request_is_split() {
+    let client = client();
+    // Stock: more than a year, so more than one span of daily data.
+    let stock =
+        collect(client.stock_end_of_day_history("SPY", date(2024, 6, 3), date(2025, 10, 17))).await;
+    assert!(stock.len() > 340, "{} reports", stock.len());
+    assert!(
+        stock
+            .windows(2)
+            .all(|w| w[0].created.date_naive() < w[1].created.date_naive()),
+        "one report per day, in order"
+    );
+
+    // Option: one contract over more than 28 days, so more than one span of option daily data.
+    let contract = OptionSelection::new("SPY", Expiration::On(date(2025, 12, 19)))
+        .with_strike(Strike::At(dec!(600)))
+        .with_kind(OptionKind::Call);
+    let option =
+        collect(client.option_end_of_day_history(&contract, date(2025, 10, 1), date(2025, 11, 14)))
+            .await;
+    assert!(option.len() > 28, "{} reports", option.len());
+    assert!(
+        option.windows(2).all(|w| {
+            w[0].end_of_day.created.date_naive() < w[1].end_of_day.created.date_naive()
+        }),
+        "one report per day, in order"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a running Theta Terminal"]
 async fn interest_rates_span_more_than_one_request() {
-    // Two years: more than one span of daily data, so the split is exercised live.
+    // Two years: more than one span of daily data, so the split is exercised live. The free plan's
+    // rate history starts in 2024.
     let rates = collect(client().interest_rate_history(
         InterestRateSeries::Sofr,
-        date(2023, 10, 1),
-        date(2025, 9, 30),
+        date(2024, 1, 1),
+        date(2025, 12, 31),
     ))
     .await;
     assert!(rates.len() > 400, "{} rates", rates.len());
@@ -117,7 +151,27 @@ async fn interest_rates_span_more_than_one_request() {
             .iter()
             .all(|rate| rate.rate_percent.is_sign_positive() && rate.rate_percent < 20.into())
     );
-    assert_eq!(rates.first().unwrap().date.year(), 2023);
+    assert_eq!(rates.first().unwrap().date.year(), 2024);
+}
+
+#[tokio::test]
+#[ignore = "needs a running Theta Terminal"]
+async fn history_before_the_plan_starts_is_a_rejected_request() {
+    // The free plan's rate history starts in 2024; earlier dates are refused with HTTP 400, not
+    // with a permission status. On a plan that reaches back further they arrive.
+    let result: Vec<_> = client()
+        .interest_rate_history(
+            InterestRateSeries::Sofr,
+            date(2023, 12, 1),
+            date(2023, 12, 29),
+        )
+        .collect()
+        .await;
+    match result.first() {
+        Some(Err(ThetaDataError::InvalidRequest { status: 400, .. })) => {}
+        Some(Ok(_)) => assert!(result.iter().all(Result::is_ok)),
+        other => panic!("{other:?}"),
+    }
 }
 
 #[tokio::test]
