@@ -52,7 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Breaking: `ExpiryHandling::Engine` carries a `LongOptionExpiry`** (`rustrade`, #868). Write
   `ExpiryHandling::Engine(LongOptionExpiry::Exercise)`, or `ExpiryHandling::default()`, for the
-  old behaviour. A serialised bare `"Engine"` still deserialises, as that.
+  old behaviour. In a human-readable format such as JSON, a serialised bare `"Engine"` still
+  deserialises, as that. `ExpiryHandling` and `LongOptionExpiry` are `#[non_exhaustive]`, so a
+  `match` on either outside `rustrade` needs a wildcard arm.
 
 - **Breaking: `init_market_stream` takes `MarketStreamOptions` in place of its
   `ReconnectionBackoffPolicy`** (`rustrade-data`, #862). Pass
