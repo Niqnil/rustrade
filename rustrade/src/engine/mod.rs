@@ -326,7 +326,12 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     /// Does nothing for any other event, or for a flow that already names an instrument. An answer
     /// that names no instrument this state tracks on the flow's exchange is logged and ignored.
     /// See [`CashFlowAttributionStrategy::attribute_cash_flow`].
-    fn attribute_cash_flow(&mut self, event: &mut AccountEvent)
+    ///
+    /// [`Engine::process`](Processor::process) calls this for every account event. A caller that
+    /// drives the `Engine` by hand, through [`Engine::update_from_account_stream`], calls it first:
+    /// before `update_from_account_stream`, and before recording the event in any audit it keeps,
+    /// so the recorded event carries the instrument the state applied.
+    pub fn attribute_cash_flow(&mut self, event: &mut AccountEvent)
     where
         Strategy: CashFlowAttributionStrategy<State = EngineState<GlobalData, InstrumentData>>,
     {
@@ -464,8 +469,9 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     /// the `Engine` will call the configured [`OnDisconnectStrategy`] strategy logic.
     ///
     /// Asks no [`CashFlowAttributionStrategy`]: [`Engine::process`](Processor::process) does that
-    /// before calling this, so a cash flow on the account as a whole passed here directly stays on
-    /// the account unless its `instrument` is already set.
+    /// before calling this. A caller passing events here directly calls
+    /// [`Engine::attribute_cash_flow`] on each account event first, or a cash flow on the account as
+    /// a whole stays on the account unless its `instrument` is already set.
     pub fn update_from_account_stream(
         &mut self,
         event: &AccountStreamEvent,

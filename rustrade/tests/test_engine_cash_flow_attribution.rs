@@ -6,8 +6,10 @@
 //! Each test pins one part of that contract: an answer sends the flow to that position's carry and
 //! into the audit; `None` leaves it on the account; a flow the venue attributed, or any other
 //! event, is never asked about; an answer naming no instrument tracked on the flow's exchange is
-//! ignored; a replica fed the audit applies the flow as the `Engine` did; and `route_to_base`
-//! answers only when exactly one held instrument on the exchange has the flow's asset as its base.
+//! ignored; a replica fed the audit applies the flow as the `Engine` did; a caller driving the
+//! `Engine` by hand gets the same attribution by calling `attribute_cash_flow` before
+//! `update_from_account_stream`; and `route_to_base` answers only when exactly one held instrument
+//! on the exchange has the flow's asset as its base.
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -223,6 +225,36 @@ fn no_answer_leaves_the_flow_on_the_account() {
     assert_eq!(engine.strategy.asked.len(), 1);
     assert_eq!(audited_instrument(&audit), None);
     assert_eq!(carry_base(&engine.state, BTC_USDT), Decimal::ZERO);
+}
+
+#[test]
+fn a_caller_driving_the_engine_by_hand_attributes_before_updating_from_the_account_stream() {
+    let mut engine = engine(&[BTC_USDT], Some(BTC_USDT));
+    let btc = base(&engine.state, BTC_USDT);
+    let interest = flow(btc, dec!(-0.0001), None);
+
+    // Without asking: the flow stays on the account.
+    engine.update_from_account_stream(&AccountStreamEvent::Item(AccountEvent {
+        exchange: BINANCE,
+        kind: AccountEventKind::CashFlow(interest.clone()),
+    }));
+    assert_eq!(engine.strategy.asked, vec![]);
+    assert_eq!(carry_base(&engine.state, BTC_USDT), Decimal::ZERO);
+
+    // Asking first names the instrument on the event the caller then applies (and would record).
+    let mut event = AccountEvent {
+        exchange: BINANCE,
+        kind: AccountEventKind::CashFlow(interest.clone()),
+    };
+    engine.attribute_cash_flow(&mut event);
+    let AccountEventKind::CashFlow(attributed) = &event.kind else {
+        panic!("not a cash flow: {event:?}");
+    };
+    assert_eq!(attributed.instrument, Some(BTC_USDT));
+    engine.update_from_account_stream(&AccountStreamEvent::Item(event));
+
+    assert_eq!(engine.strategy.asked, vec![(BINANCE, interest)]);
+    assert_eq!(carry_base(&engine.state, BTC_USDT), dec!(-0.0001));
 }
 
 #[test]
