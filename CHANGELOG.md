@@ -39,9 +39,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ReconnectionBackoffPolicy`** (`rustrade-data`, #862). Pass
   `MarketStreamOptions::default().with_reconnect(policy)` to keep the old behaviour.
 - The IBKR execution module rustdoc now records how a paper account handled a short stock
-  position's charge: it accrued daily in that currency's `AccruedCash` and posted to cash early in
-  the next month, so `Balance::total + Balance::accrued` included it. IB still does not document
-  this, and a live account may differ (`rustrade-execution`).
+  position's charge: it accrued daily in that currency's `AccruedCash`, was booked several days
+  late (once after the position had closed), and posted to cash early in the next month, so
+  `Balance::total + Balance::accrued` included it. IB still does not document this, and a live
+  account may differ (`rustrade-execution`).
 
 ## [0.21.0] - 2026-11-04
 
