@@ -52,7 +52,8 @@ pub struct EngineStateBuilder<'a, GlobalData, FnInstrumentData> {
     /// [`EngineStateBuilder::restored_positions`].
     restored_positions: Vec<PositionCheckpoint>,
     /// [`ExpiryHandling`] per exchange — see [`EngineStateBuilder::expiry_handling`]. An exchange
-    /// not named keeps [`ExpiryHandling::Engine`].
+    /// not named keeps the default, [`ExpiryHandling::Engine`] with
+    /// [`LongOptionExpiry::Exercise`](crate::engine::state::instrument::LongOptionExpiry::Exercise).
     expiry_handling: FnvHashMap<ExchangeId, ExpiryHandling>,
 }
 
@@ -115,8 +116,11 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
     /// Optionally set who settles expiring contracts on `exchange`'s instruments — see
     /// [`ExpiryHandling`].
     ///
-    /// Every exchange not named here keeps [`ExpiryHandling::Engine`]: the engine closes each
-    /// position with a synthesised settlement trade. Choose [`ExpiryHandling::Venue`] for an
+    /// Every exchange not named here keeps the default, [`ExpiryHandling::Engine`] with
+    /// [`LongOptionExpiry::Exercise`](crate::engine::state::instrument::LongOptionExpiry::Exercise): the engine closes each position with a synthesised
+    /// settlement trade, a long option in the money at its intrinsic value. Choose
+    /// [`LongOptionExpiry::Lapse`](crate::engine::state::instrument::LongOptionExpiry::Lapse) to settle every long option at zero instead, as when the
+    /// caller instructs the venue not to exercise. Choose [`ExpiryHandling::Venue`] for an
     /// exchange whose execution client reports its own trades for an expiry, exercise or
     /// assignment, and whose trades the caller feeds to the engine. Otherwise each position is
     /// closed twice, once by the engine and once by the venue.
@@ -399,6 +403,7 @@ impl<'a, GlobalData, FnInstrumentData> EngineStateBuilder<'a, GlobalData, FnInst
 #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
+    use crate::engine::state::instrument::LongOptionExpiry;
     use crate::{
         engine::state::{
             EngineState,
@@ -527,7 +532,10 @@ mod tests {
                 .expiry_handling
         };
         assert_eq!(handling(PERP), ExpiryHandling::Venue);
-        assert_eq!(handling(SPOT), ExpiryHandling::Engine);
+        assert_eq!(
+            handling(SPOT),
+            ExpiryHandling::Engine(LongOptionExpiry::Exercise)
+        );
     }
 
     /// End-to-end seam for [`EngineStateBuilder::execution_venues`]: the declared set has to reach

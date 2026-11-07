@@ -17,7 +17,7 @@ use crate::{
             connectivity::UntrackedExchange,
             fee::FeeConversion,
             instrument::{
-                ExpiryHandling, FillsApplied, OptionSplitPlan, ReduceOnlyCapped,
+                ExpiryHandling, FillsApplied, LongOptionExpiry, OptionSplitPlan, ReduceOnlyCapped,
                 data::InstrumentDataState, filter::InstrumentFilter,
             },
             order::{Orders, in_flight_recorder::InFlightRequestRecorder, manager::OrderManager},
@@ -598,11 +598,14 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     ///    No order is cancelled, no position is closed, and `expiration_processed` stays unset.
     /// 2. Guards on `expiration_processed` (idempotent).
     /// 3. Cancels all open orders for the instrument by sending `ExecutionRequest::Cancel` for each.
-    /// 4. Derives the settlement price from instrument data and the contract specification:
+    /// 4. Derives each position's settlement price from instrument data and the contract
+    ///    specification:
     ///    - option, OTM: settlement price = 0
     ///    - option, ITM call: settlement = spot - strike (per-contract intrinsic value), where spot
     ///      is the last price of the underlying `Spot` instrument on the same exchange
     ///    - option, ITM put: settlement = strike - spot (per-contract intrinsic value)
+    ///    - long option under [`ExpiryHandling::Engine`] with [`LongOptionExpiry::Lapse`]: 0, in
+    ///      the money or not, with no underlying price needed. Short options settle as above.
     ///    - future: the contract's own last price
     /// 5. Synthesises a closing `Trade` at the settlement price for every open position, and emits
     ///    an [`EngineOutput::PositionExit`] for each.
@@ -616,23 +619,27 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
     /// of the [`ContractExpiryNotSettled`](EngineOutput::ContractExpiryNotSettled) cases below
     /// apply.
     ///
-    /// If the price settlement needs is unavailable, the method emits an
+    /// If the price any open position's settlement needs is unavailable, the method emits an
     /// [`EngineOutput::ContractExpiryNotSettled`] carrying
     /// [`ContractExpiryNotSettledReason::SettlementPriceUnavailable`] and synthesises no fill. The
     /// orders cancelled in step 3 stay cancelled, but positions are untouched and
     /// `expiration_processed` is **not** set, so the event is **retryable**: re-inject
     /// `ContractExpiry` once that price has arrived.
     ///
-    /// If a position is open and more than one `Spot` instrument matches the option's underlying,
-    /// the method emits an [`EngineOutput::ContractExpiryNotSettled`] carrying
+    /// If a position that needs the underlying's price is open and more than one `Spot` instrument
+    /// matches the option's underlying, the method emits an
+    /// [`EngineOutput::ContractExpiryNotSettled`] carrying
     /// [`ContractExpiryNotSettledReason::AmbiguousUnderlying`] and synthesises no fill, with the
     /// same effects as above. Re-injecting the event is rejected the same way. With no position
-    /// open, no price is needed, so the expiry completes as usual.
+    /// open, or only lapsing long options, no price is needed, so the expiry completes as usual.
+    ///
+    /// Nothing is settled in part: when one position lacks its price, none is closed.
     ///
     /// # Not modelled (deferred)
     ///
     /// - **Assignment for short writers:** short positions at expiry are closed at intrinsic
-    ///   value identical to long positions (OTM at 0, ITM at `|spot − strike|`). True
+    ///   value (OTM at 0, ITM at `|spot − strike|`), whatever [`LongOptionExpiry`] says. A short
+    ///   only a little out of the money, which a holder might still exercise, settles at 0. True
     ///   assignment — where the short writer is obligated to deliver the underlying — is not
     ///   modelled. A future enhancement would detect net-short positions and open a synthetic
     ///   underlying position instead of (or in addition to) closing the option position.
@@ -706,7 +713,11 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
 
         // Steps 4–5: Synthesise settlement fills only if positions are open and the engine, not
         // the venue, settles them.
-        let venue_settles = instrument_state.expiry_handling == ExpiryHandling::Venue;
+        let long_options = match instrument_state.expiry_handling {
+            ExpiryHandling::Engine(long_options) => Some(long_options),
+            ExpiryHandling::Venue => None,
+        };
+        let venue_settles = long_options.is_none();
         if venue_settles || instrument_state.position.positions.is_empty() {
             if venue_settles && !instrument_state.position.positions.is_empty() {
                 info!(
@@ -724,6 +735,15 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             return vec![];
         }
 
+        // A long option that lapses settles at zero whatever the underlying did, so it needs no
+        // reference price. Look the price up only when some position settles against it.
+        let lapses = |side: Side| settlement.lapses(long_options, side);
+        let needs_reference = instrument_state
+            .position
+            .positions
+            .values()
+            .any(|position| !lapses(position.side));
+
         // The reference price settlement is computed from (see `ExpirySettlement`).
         // For options, ITM/OTM determination requires the *underlying's* price, not the
         // option's own market price (which includes premium and would give wrong results).
@@ -732,6 +752,7 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         // multi-exchange setup (e.g. BTC/USD on both Binance and Alpaca) would
         // silently use the wrong exchange's price.
         let reference_price = match settlement {
+            _ if !needs_reference => None,
             ExpirySettlement::OptionIntrinsic {
                 base: base_key,
                 quote: quote_key,
@@ -791,7 +812,23 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         // Re-borrow mutably after the immutable scan above.
         let instrument_state = self.state.instruments.instrument_index_mut(key);
 
-        let Some(reference_price) = reference_price else {
+        // Each position's settlement price: zero for a lapsing long option, otherwise computed
+        // from the reference price. `None` when that price is unavailable.
+        let settlements: Option<Vec<(PositionId, Decimal)>> = instrument_state
+            .position
+            .positions
+            .iter()
+            .map(|(position_id, position)| {
+                let price = if lapses(position.side) {
+                    Some(Decimal::ZERO)
+                } else {
+                    reference_price.map(|reference| settlement.price(reference))
+                };
+                price.map(|price| (position_id.clone(), price))
+            })
+            .collect();
+
+        let Some(settlements) = settlements else {
             warn!(
                 instrument = ?key,
                 "ContractExpiry: settlement price unavailable — cannot compute settlement. \
@@ -806,17 +843,6 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
             }];
         };
 
-        let settlement_price = settlement.price(reference_price);
-
-        // Collect all position IDs before iterating so we can re-borrow instrument_state
-        // mutably inside the loop without conflicting with the keys() borrow.
-        let position_ids: Vec<PositionId> = instrument_state
-            .position
-            .positions
-            .keys()
-            .cloned()
-            .collect();
-
         // Advance the engine clock to the contract's expiry instant before stamping the synthetic
         // settlement trades below. The `ContractExpiry` event carries no timestamp on its payload
         // (unlike `CorporateAction`, whose `effective_time` advances the clock via `TimeExchange`),
@@ -829,9 +855,9 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
         // Using self.time() (not Utc::now()) keeps backtests deterministic.
         let engine_time = self.time();
 
-        let mut exited = Vec::with_capacity(position_ids.len());
+        let mut exited = Vec::with_capacity(settlements.len());
 
-        for pos_id in position_ids {
+        for (pos_id, settlement_price) in settlements {
             let instrument_state = self.state.instruments.instrument_index_mut(key);
 
             let Some(open_position) = instrument_state.position.positions.get(&pos_id) else {
@@ -2113,6 +2139,15 @@ impl ExpirySettlement {
             InstrumentKind::Future(contract) => Some((contract.expiry, Self::OwnLastPrice)),
             InstrumentKind::Spot | InstrumentKind::Perpetual(_) | InstrumentKind::Cfd(_) => None,
         }
+    }
+
+    /// Whether a position on `side` lapses, settling at zero with no reference price: a long
+    /// option when the engine settles with [`LongOptionExpiry::Lapse`]. `long_options` is `None`
+    /// when the venue settles.
+    fn lapses(self, long_options: Option<LongOptionExpiry>, side: Side) -> bool {
+        matches!(self, Self::OptionIntrinsic { .. })
+            && long_options == Some(LongOptionExpiry::Lapse)
+            && side == Side::Buy
     }
 
     /// The settlement price, given the reference price: the underlying's last price for

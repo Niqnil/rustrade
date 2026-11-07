@@ -550,18 +550,30 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
 pub const MAX_RETIRED_ROUTING: usize = 64;
 
 /// Who settles an expiring instrument's positions when the engine processes a
-/// [`ContractExpiry`](crate::EngineEvent::ContractExpiry).
+/// [`ContractExpiry`](crate::EngineEvent::ContractExpiry), and, when the engine does, how a long
+/// option settles.
 ///
 /// Set per instrument on [`InstrumentState::expiry_handling`], usually for every instrument of one
 /// exchange through
 /// [`EngineStateBuilder::expiry_handling`](crate::engine::state::builder::EngineStateBuilder::expiry_handling).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+///
+/// Defaults to `Engine(LongOptionExpiry::Exercise)`.
+///
+/// # Serialisation
+///
+/// `Engine` serialises with its [`LongOptionExpiry`], as `{"Engine": "Exercise"}` in JSON. The
+/// bare `"Engine"` written before `Engine` carried one still deserialises, as
+/// `Engine(LongOptionExpiry::Exercise)`, the behaviour it named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(from = "ExpiryHandlingRepr")]
 pub enum ExpiryHandling {
     /// The engine settles. It closes every open position with a trade it synthesises at the
-    /// settlement price, so expiry is cash-settled. The default, and the right choice for a
-    /// backtest, or for a venue that reports no trade at expiry.
-    #[default]
-    Engine,
+    /// settlement price, so expiry is cash-settled. The right choice for a backtest, or for a
+    /// venue that reports no trade at expiry.
+    ///
+    /// A future settles at its own last price. A short option settles at its intrinsic value,
+    /// standing in for assignment. A long option settles as the [`LongOptionExpiry`] says.
+    Engine(LongOptionExpiry),
     /// The venue settles. It reports its own trades for the expiry, exercise or assignment, and
     /// those trades move the positions. On `ContractExpiry` the engine cancels the instrument's
     /// orders and marks it processed, but synthesises no trade, so a position is not closed twice.
@@ -571,6 +583,66 @@ pub enum ExpiryHandling {
     /// The positions stay open until the venue's trades arrive. A caller that never feeds them to
     /// the engine is left holding positions on an expired instrument.
     Venue,
+}
+
+impl Default for ExpiryHandling {
+    fn default() -> Self {
+        Self::Engine(LongOptionExpiry::default())
+    }
+}
+
+/// How [`ExpiryHandling::Engine`] settles a long option position at expiry. Short options and
+/// futures are not affected.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+pub enum LongOptionExpiry {
+    /// An option in the money is exercised: the position settles at its intrinsic value, in
+    /// cash, against the underlying's last price. One out of the money settles at zero. The
+    /// default, matching an exchange that exercises in-the-money options automatically.
+    #[default]
+    Exercise,
+    /// Every long option lapses: the position settles at zero, in the money or not, and no
+    /// underlying price is needed for it. This matches a holder who instructs the broker not to
+    /// exercise any option still held at expiry.
+    Lapse,
+}
+
+/// What [`ExpiryHandling`] deserialises from: today's form, or the bare `Engine` written before
+/// `Engine` carried a [`LongOptionExpiry`].
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ExpiryHandlingRepr {
+    Current(ExpiryHandlingCurrent),
+    Legacy(ExpiryHandlingLegacy),
+}
+
+/// [`ExpiryHandling`]'s own serialised form.
+#[derive(Deserialize)]
+#[serde(rename = "ExpiryHandling")]
+enum ExpiryHandlingCurrent {
+    Engine(LongOptionExpiry),
+    Venue,
+}
+
+/// The unit `Engine` variant serialised before it carried a [`LongOptionExpiry`].
+#[derive(Deserialize)]
+#[serde(rename = "ExpiryHandling")]
+enum ExpiryHandlingLegacy {
+    Engine,
+}
+
+impl From<ExpiryHandlingRepr> for ExpiryHandling {
+    fn from(repr: ExpiryHandlingRepr) -> Self {
+        match repr {
+            ExpiryHandlingRepr::Current(ExpiryHandlingCurrent::Engine(long_options)) => {
+                Self::Engine(long_options)
+            }
+            ExpiryHandlingRepr::Current(ExpiryHandlingCurrent::Venue) => Self::Venue,
+            ExpiryHandlingRepr::Legacy(ExpiryHandlingLegacy::Engine) => {
+                Self::Engine(LongOptionExpiry::Exercise)
+            }
+        }
+    }
 }
 
 /// A reduce-only order's fill the engine cut so it would not grow or flip the position it
@@ -720,7 +792,7 @@ pub struct InstrumentState<
     pub fee_model: FeeModelConfig,
 
     /// Who settles this instrument's positions at expiry. See [`ExpiryHandling`]. Defaults to
-    /// [`ExpiryHandling::Engine`].
+    /// [`ExpiryHandling::Engine`] with [`LongOptionExpiry::Exercise`].
     #[serde(default)]
     pub expiry_handling: ExpiryHandling,
 
@@ -6766,5 +6838,44 @@ mod tests {
         state.clear_order_routing();
 
         assert!(state.reduce_only.is_empty());
+    }
+
+    /// `ExpiryHandling` round-trips in its own form, and the bare `"Engine"` written before
+    /// `Engine` carried a `LongOptionExpiry` still loads, as the exercise it named.
+    #[test]
+    fn expiry_handling_serde_round_trips_and_reads_the_bare_engine() {
+        for handling in [
+            ExpiryHandling::Engine(LongOptionExpiry::Exercise),
+            ExpiryHandling::Engine(LongOptionExpiry::Lapse),
+            ExpiryHandling::Venue,
+        ] {
+            let json = serde_json::to_string(&handling).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ExpiryHandling>(&json).unwrap(),
+                handling
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&ExpiryHandling::Engine(LongOptionExpiry::Lapse)).unwrap(),
+            r#"{"Engine":"Lapse"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ExpiryHandling>(r#""Engine""#).unwrap(),
+            ExpiryHandling::Engine(LongOptionExpiry::Exercise)
+        );
+        assert_eq!(
+            serde_json::from_str::<ExpiryHandling>(r#""Venue""#).unwrap(),
+            ExpiryHandling::Venue
+        );
+        assert!(serde_json::from_str::<ExpiryHandling>(r#""Lapse""#).is_err());
+        assert!(serde_json::from_str::<ExpiryHandling>(r#"{"Engine":"Never"}"#).is_err());
+    }
+
+    #[test]
+    fn expiry_handling_defaults_to_the_engine_exercising() {
+        assert_eq!(
+            ExpiryHandling::default(),
+            ExpiryHandling::Engine(LongOptionExpiry::Exercise)
+        );
     }
 }
