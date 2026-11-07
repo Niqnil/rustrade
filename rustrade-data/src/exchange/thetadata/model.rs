@@ -603,6 +603,29 @@ mod tests {
     const NBBO: &str = r#""bid_size":598,"bid_exchange":5,"bid":4.55,"bid_condition":50,"ask_size":424,"ask_exchange":9,"ask":4.70,"ask_condition":50"#;
 
     #[test]
+    fn a_line_that_is_not_an_object_is_a_decode_error_naming_what_was_expected() {
+        for line in ["[1,2]", "7", "\"text\""] {
+            let Err(ThetaDataError::Decode { message, row }) = Row::parse(line) else {
+                panic!("{line} parsed as a row");
+            };
+            assert!(message.contains("expected a JSON object"), "{message}");
+            assert_eq!(row, line);
+        }
+    }
+
+    #[test]
+    fn fields_are_found_by_name_whatever_their_order() {
+        let row = Row::parse(r#"{"b":2,"a":1,"c":null}"#).unwrap();
+        assert_eq!((row.u64("a").unwrap(), row.u64("b").unwrap()), (1, 2));
+        assert_eq!(row.decimal_opt("c").unwrap(), None);
+        assert_eq!(row.decimal_opt("missing").unwrap(), None);
+        assert!(matches!(
+            row.u64("missing"),
+            Err(ThetaDataError::Decode { .. })
+        ));
+    }
+
+    #[test]
     fn prices_keep_their_exact_decimal_text() {
         let row = Row::parse(
             r#"{"a":187.2984,"b":0.1,"c":1.5e-3,"d":"x","e":null,"f":7,"g":-1,"h":1.5}"#,
