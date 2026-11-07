@@ -327,17 +327,22 @@ impl From<&SymbolQuote> for OrderBookL1 {
 /// The day's OHLC, volume and trade count are a daily [`Candle`]. Its
 /// [`close_time`](Candle::close_time) is 00:00 UTC after `date`, the end of the UTC day, as for
 /// every daily candle (see [`Candle`]'s `close_time` contract). ThetaData generates the report at
-/// 17:15 New York time, 21:15 or 22:15 UTC, so before that, and a backtest stamping the candle at
-/// its `close_time` does not see the day's figures before they existed. A day without a trade is reported with zero prices, as ThetaData sends
-/// it, and kept as such.
+/// 17:15 New York time (21:15 or 22:15 UTC), before the candle's `close_time`, so a backtest that
+/// stamps the candle at its `close_time` never sees the day's figures before they existed.
+///
+/// A day without a trade is reported with zero prices, as ThetaData sends it, and kept as such.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct EndOfDay {
     /// The trading day reported: the New York date of `created`.
     pub date: NaiveDate,
+    /// When ThetaData generated the report.
     pub created: DateTime<Utc>,
+    /// The time of the day's last trade.
     pub last_trade: DateTime<Utc>,
-    /// The day's OHLC, volume and trade count, closing at 00:00 UTC after `date`.
+    /// The day's OHLC, volume and trade count, closing at 00:00 UTC after `date`. On a day without
+    /// a trade the prices are zero: skip such candles before feeding them to an engine, which
+    /// would otherwise price the instrument at zero.
     pub candle: Candle,
     /// The last NBBO of the day.
     pub closing_nbbo: Nbbo,

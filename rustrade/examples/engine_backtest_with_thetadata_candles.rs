@@ -64,6 +64,9 @@
 //! These are consolidated prices, and the engine fills against a mock exchange at the candle's
 //! close. That is sound for research, but a daily close is not a price anyone could trade at once
 //! the candle arrives: the next trade comes at the following session.
+//!
+//! The config charges no fees (`"Zero"`), as commission-free US stock brokers do. Before adding a
+//! strategy, set the fee model to your broker's schedule.
 
 use chrono::NaiveDate;
 use futures::{Stream, StreamExt};
