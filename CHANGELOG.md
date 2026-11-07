@@ -44,6 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking: `init_market_stream` takes `MarketStreamOptions` in place of its
   `ReconnectionBackoffPolicy`** (`rustrade-data`, #862). Pass
   `MarketStreamOptions::default().with_reconnect(policy)` to keep the old behaviour.
+- The IBKR execution module rustdoc now records how a paper account handled a short stock
+  position's charge: it accrued daily in that currency's `AccruedCash` and posted to cash early in
+  the next month, so `Balance::total + Balance::accrued` included it. IB still does not document
+  this, and a live account may differ (`rustrade-execution`).
 
 ## [0.21.0] - 2026-11-04
 
@@ -2740,8 +2744,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Each client now says what its balances include and how fresh they are. Hyperliquid's
     standard-mode balances include funding, but position PnL does not. Binance margin debt and
     accrued interest are only as fresh as the last REST read. IBKR's `TotalCashValue`, as IB
-    documents it, leaves out interest and borrow fees accrued during the month until they are
-    posted. Alpaca reads only fill activities, and its trades report zero fees.
+    documents it, leaves out interest accrued during the month until it is posted; IB does not
+    document how stock borrow fees are treated. Alpaca reads only fill activities, and its trades report zero fees.
   - `SimulatedVenue` charges no carry, lends no stock, and models no locate or short-sale
     restriction.
 
