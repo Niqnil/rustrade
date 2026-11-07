@@ -86,6 +86,8 @@ pub use cash_flow::{
 pub mod client;
 pub mod error;
 pub mod exchange;
+pub mod expiry;
+pub use expiry::LongOptionExpiry;
 pub mod fee;
 pub use fee::{
     FeeAssetConfig, FeeAssetConfigError, FeeModel, FeeModelConfig, Liquidity, PerContractFeeModel,
