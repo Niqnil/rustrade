@@ -11,8 +11,9 @@
 // Tests use unwrap/expect for concise failure messages; panics are the intended failure mode.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use chrono::{Datelike, NaiveDate, Utc};
+use chrono::{Datelike, NaiveDate, NaiveTime, Utc};
 use futures_util::{Stream, StreamExt};
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use rustrade_data::exchange::thetadata::{
     DEFAULT_BASE_URL, Expiration, InterestRateSeries, OptionSelection, Strike, ThetaDataClient,
@@ -74,11 +75,34 @@ async fn end_of_day_history_covers_each_trading_day() {
     let stock = collect(client.stock_end_of_day_history("SPY", start, end)).await;
     assert_eq!(stock.len(), 10, "one report per trading day");
     for eod in &stock {
-        assert!(eod.low <= eod.open && eod.open <= eod.high, "{eod:?}");
-        assert!(eod.low <= eod.close && eod.close <= eod.high, "{eod:?}");
-        assert!(eod.volume > 0 && eod.trade_count > 0);
+        let candle = &eod.candle;
+        assert!(
+            candle.low <= candle.open && candle.open <= candle.high,
+            "{eod:?}"
+        );
+        assert!(
+            candle.low <= candle.close && candle.close <= candle.high,
+            "{eod:?}"
+        );
+        assert!(candle.volume > Some(Decimal::ZERO) && candle.trade_count > Some(0));
         assert!(eod.last_trade <= eod.created);
+        // The trading day is the report's New York date, and the daily candle closes at the end
+        // of that UTC day, after the report was generated.
+        assert!((start..=end).contains(&eod.date), "{eod:?}");
+        assert_eq!(
+            candle.close_time,
+            eod.date
+                .succ_opt()
+                .unwrap()
+                .and_time(NaiveTime::MIN)
+                .and_utc()
+        );
+        assert!(eod.created < candle.close_time, "{eod:?}");
     }
+    assert!(
+        stock.windows(2).all(|w| w[0].date < w[1].date),
+        "one report per trading day, in order"
+    );
     let index = collect(client.index_end_of_day_history("SPX", start, end)).await;
     assert!(!index.is_empty());
 

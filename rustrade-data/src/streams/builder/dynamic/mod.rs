@@ -894,6 +894,9 @@ mod tests {
             MassiveCrypto,
             MassiveForex,
             MassiveOptions,
+            ThetaDataStocks,
+            ThetaDataOptions,
+            ThetaDataIndices,
         ];
 
         // Exhaustive, so a new variant fails to compile here. The compiler cannot see the list
@@ -965,7 +968,10 @@ mod tests {
                 | MassiveStocks
                 | MassiveCrypto
                 | MassiveForex
-                | MassiveOptions => {}
+                | MassiveOptions
+                | ThetaDataStocks
+                | ThetaDataOptions
+                | ThetaDataIndices => {}
             }
         }
 
