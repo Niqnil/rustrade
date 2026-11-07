@@ -24,6 +24,11 @@ pub fn new_york_to_utc(local: NaiveDateTime) -> Option<DateTime<Utc>> {
     }
 }
 
+/// The New York date of `instant`.
+pub(crate) fn new_york_date(instant: DateTime<Utc>) -> NaiveDate {
+    instant.with_timezone(&New_York).date_naive()
+}
+
 /// Parse a ThetaData timestamp (`YYYY-MM-DDTHH:MM:SS` with an optional fraction) as New York time
 /// and convert it to UTC.
 pub(crate) fn parse_timestamp(text: &str) -> Result<DateTime<Utc>, String> {

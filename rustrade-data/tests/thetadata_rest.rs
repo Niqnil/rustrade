@@ -530,8 +530,8 @@ async fn option_daily_history_decodes_open_interest_and_end_of_day() {
     let eod = &end_of_day[0].end_of_day;
     assert_eq!(end_of_day[0].contract, xyz_call());
     assert_eq!(
-        (eod.close, eod.volume, eod.trade_count),
-        (dec!(1.2), 300, 25)
+        (eod.candle.close, eod.candle.volume, eod.candle.trade_count),
+        (dec!(1.2), Some(dec!(300)), Some(25))
     );
     assert_eq!(eod.closing_nbbo.bid_size, 12);
     assert_eq!(
@@ -716,7 +716,10 @@ async fn stock_and_index_endpoints_decode_their_rows() {
     let day = date(2024, 3, 4);
 
     let eod = collect(client.index_end_of_day_history("IDX", day, day)).await;
-    assert_eq!((eod[0].close, eod[0].volume), (dec!(10.5), 1000));
+    assert_eq!(
+        (eod[0].candle.close, eod[0].candle.volume),
+        (dec!(10.5), Some(dec!(1000)))
+    );
 
     let bars = collect(client.stock_ohlc_history("XYZ", day, day, Interval::H1, None)).await;
     assert_eq!(

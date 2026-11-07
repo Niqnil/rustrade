@@ -21,8 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     reports and snapshots.
   - **Interest rates and calendar:** daily SOFR and Treasury yields, and the market's schedule for
     a day or a year's holidays.
-  - **Output types:** quotes and bars convert to `OrderBookL1` and `Candle`. Option contracts keep
-    ThetaData's root (such as `SPXW`) and convert to `MarketDataOptionContract`.
+  - **Output types:** quotes and bars convert to `OrderBookL1` and `Candle`. An end-of-day report
+    carries its trading date and the day's `Candle`, closing at 00:00 UTC after that date, after
+    ThetaData generates the report, so a free account can drive a daily backtest. Option contracts
+    keep ThetaData's root (such as `SPXW`) and convert to `MarketDataOptionContract`.
+  - **Exchange ids:** `ExchangeId::ThetaDataStocks`, `ThetaDataOptions` and `ThetaDataIndices`
+    (`rustrade-instrument`), one per asset class, so a backtest can give stocks and options their
+    own mock fee model and expiry handling.
+  - **Example:** `engine_backtest_with_thetadata_candles` (`rustrade`, `thetadata` feature) runs a
+    backtest on daily candles from end-of-day reports, or on one-minute bars with
+    `--minute-bars` (value plan).
   - **Prices are exact:** each is read from its decimal text. ThetaData's New York wall-clock
     times are converted to UTC, with the daylight-saving transitions documented.
   - **Ranges and concurrency:** date ranges are split into requests within ThetaData's per-request

@@ -3,7 +3,10 @@
 use super::{error::ThetaDataError, time};
 use crate::{
     books::Level,
-    subscription::{book::OrderBookL1, candle::Candle},
+    subscription::{
+        book::OrderBookL1,
+        candle::{Candle, CandleInterval, close_time_from_open},
+    },
 };
 use chrono::{DateTime, NaiveDate, NaiveTime, TimeDelta, Utc};
 use rust_decimal::Decimal;
@@ -320,17 +323,22 @@ impl From<&SymbolQuote> for OrderBookL1 {
 /// ThetaData generates it at 17:15 New York time from the day's trades and the last NBBO, since
 /// the feeds publish no national end-of-day report of their own. `created` is when the report was
 /// generated and `last_trade` the time of the day's last trade.
+///
+/// The day's OHLC, volume and trade count are a daily [`Candle`]. Its
+/// [`close_time`](Candle::close_time) is 00:00 UTC after `date`, the end of the UTC day, as for
+/// every daily candle (see [`Candle`]'s `close_time` contract). ThetaData generates the report at
+/// 17:15 New York time, 21:15 or 22:15 UTC, so before that, and a backtest stamping the candle at
+/// its `close_time` does not see the day's figures before they existed. A day without a trade is reported with zero prices, as ThetaData sends
+/// it, and kept as such.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct EndOfDay {
+    /// The trading day reported: the New York date of `created`.
+    pub date: NaiveDate,
     pub created: DateTime<Utc>,
     pub last_trade: DateTime<Utc>,
-    pub open: Decimal,
-    pub high: Decimal,
-    pub low: Decimal,
-    pub close: Decimal,
-    pub volume: u64,
-    pub trade_count: u64,
+    /// The day's OHLC, volume and trade count, closing at 00:00 UTC after `date`.
+    pub candle: Candle,
     /// The last NBBO of the day.
     pub closing_nbbo: Nbbo,
 }
@@ -537,15 +545,24 @@ impl<'a> Row<'a> {
     }
 
     pub(crate) fn end_of_day(&self) -> Result<EndOfDay, ThetaDataError> {
+        let created = self.timestamp("created")?;
+        let date = time::new_york_date(created);
+        let open_time = date.and_time(NaiveTime::MIN).and_utc();
+        let close_time = close_time_from_open(open_time, CandleInterval::Day1.to_step())
+            .ok_or_else(|| self.error("end-of-day candle close time out of range"))?;
         Ok(EndOfDay {
-            created: self.timestamp("created")?,
+            date,
+            created,
             last_trade: self.timestamp("last_trade")?,
-            open: self.decimal("open")?,
-            high: self.decimal("high")?,
-            low: self.decimal("low")?,
-            close: self.decimal("close")?,
-            volume: self.u64("volume")?,
-            trade_count: self.u64("count")?,
+            candle: Candle {
+                close_time,
+                open: self.decimal("open")?,
+                high: self.decimal("high")?,
+                low: self.decimal("low")?,
+                close: self.decimal("close")?,
+                volume: Some(Decimal::from(self.u64("volume")?)),
+                trade_count: Some(self.u64("count")?),
+            },
             closing_nbbo: self.nbbo()?,
         })
     }
@@ -786,5 +803,48 @@ mod tests {
         assert!(Interval::S30.is_single_day());
         assert!(!Interval::M1.is_single_day());
         assert!(!Interval::H1.is_single_day());
+    }
+
+    /// An end-of-day report's trading day is the New York date of `created`, even when the report
+    /// lands after midnight UTC, and its candle closes at 00:00 UTC after that day.
+    #[test]
+    fn an_end_of_day_row_is_a_daily_candle_on_its_new_york_date() {
+        let row = |created: &str| {
+            format!(
+                r#"{{{NBBO},"created":"{created}","last_trade":"2024-03-04T15:59:58","open":1.0,"high":1.5,"low":0.9,"close":1.2,"volume":300,"count":25}}"#
+            )
+        };
+        // 17:15 New York is 22:15 UTC on the same date (EST).
+        let eod = Row::parse(&row("2024-03-04T17:15:01.5"))
+            .unwrap()
+            .end_of_day()
+            .unwrap();
+        assert_eq!(eod.date, NaiveDate::from_ymd_opt(2024, 3, 4).unwrap());
+        assert_eq!(eod.created.to_rfc3339(), "2024-03-04T22:15:01.500+00:00");
+        assert_eq!(
+            eod.candle,
+            Candle {
+                close_time: "2024-03-05T00:00:00Z".parse().unwrap(),
+                open: dec!(1.0),
+                high: dec!(1.5),
+                low: dec!(0.9),
+                close: dec!(1.2),
+                volume: Some(dec!(300)),
+                trade_count: Some(25),
+            }
+        );
+        assert_eq!(eod.closing_nbbo.bid, dec!(4.55));
+
+        // A report created at 20:30 New York is already 01:30 UTC the next day. It still reports
+        // the New York date, not the UTC one, so the candle keeps the trading day's boundary.
+        let late = Row::parse(&row("2024-03-04T20:30:00"))
+            .unwrap()
+            .end_of_day()
+            .unwrap();
+        assert_eq!(late.date, NaiveDate::from_ymd_opt(2024, 3, 4).unwrap());
+        assert_eq!(
+            late.candle.close_time,
+            "2024-03-05T00:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
     }
 }

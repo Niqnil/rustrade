@@ -20,6 +20,7 @@ alpaca = ["rustrade-data/alpaca"]
 # Forwarded so the streaming-backtest example can build a market data factory from a real provider.
 # The engine itself is provider-agnostic; nothing under `src/` is gated on this.
 lse = ["rustrade-data/lse"]
+thetadata = ["rustrade-data/thetadata"]
 
 [[example]]
 name = "engine_backtest_with_lse_candles"
@@ -28,6 +29,10 @@ required-features = ["lse"]
 [[example]]
 name = "engine_sync_with_lse_market_data_and_mock_execution"
 required-features = ["lse"]
+
+[[example]]
+name = "engine_backtest_with_thetadata_candles"
+required-features = ["thetadata"]
 
 [[bench]]
 name = "backtest"
