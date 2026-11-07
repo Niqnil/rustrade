@@ -333,21 +333,99 @@ jobs:
   # only when the run itself does, for example when the tests already fail without any mutation.
   # See CONTRIBUTING.md, "Mutation testing".
   #
-  # The mutants are split across parallel shards, each a job of its own. A job tests one mutant at
-  # a time, at roughly 30 s each (more on a slow runner), after about 5 minutes of setup, so on a
-  # slow runner a single job ran out of time at about 60. Three shards fit about 180 even there.
-  # Each shard repeats the setup, so add one only when diffs outgrow that.
+  # The mutants are split across parallel shards, each a job of its own, and `mutants-plan` sizes
+  # the matrix to the PR: see there.
+  mutants-plan:
+    name: cargo mutants (plan)
+    needs: changes
+    # Fails closed like the other jobs: it skips only when `changes` succeeded and found no code.
+    if: ${{ github.event_name == 'pull_request' && !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # A shard tests one mutant at a time, after about 4 minutes of setup, and its run is cut off at
+    # 40 minutes. A mutant takes from about 30 s to about 2 minutes, depending on how long the
+    # mutated crate's tests run, so 15 per shard finishes in time even at the slow end. A fixed
+    # matrix could not suit both ends: three shards started two idle jobs for a one-mutant PR, and
+    # stopped a 192-mutant PR after about a third. The cap keeps a huge diff from occupying every
+    # runner the repository may use at once. Beyond it the shards stop early, and their summaries
+    # say so.
+    env:
+      MUTANTS_PER_SHARD: 15
+      MAX_SHARDS: 16
+    outputs:
+      count: ${{ steps.plan.outputs.count }}
+      shards: ${{ steps.plan.outputs.shards }}
+    steps:
+      # Depth 2 fetches the base branch tip, the test merge commit's first parent; see `changes`.
+      - name: Checkout sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 2
+
+      # The same diff as each shard's, from the same commit: see the shard's step for the pathspec.
+      - name: Extract the PR's diff
+        id: diff
+        run: |
+          git rev-parse --verify --quiet HEAD^2 > /dev/null
+          git diff --no-renames HEAD^1 HEAD -- '*/src/*.rs' > "$RUNNER_TEMP/pr.diff"
+          if [ -s "$RUNNER_TEMP/pr.diff" ]; then
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install stable toolchain
+        if: steps.diff.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
+
+      - name: Install cargo-mutants
+        if: steps.diff.outputs.rust == 'true'
+        run: cargo install --locked cargo-mutants@27.1.0
+
+      # Listing parses the sources and builds nothing, so it takes about a second. It reads the same
+      # `.cargo/mutants.toml` as the shards' run, so it lists the mutants they share out. A shard
+      # count of at most the mutant count gives every shard at least one.
+      - name: Plan the shards
+        id: plan
+        env:
+          RUST_CHANGED: ${{ steps.diff.outputs.rust }}
+        run: |
+          count=0
+          if [ "$RUST_CHANGED" = true ]; then
+            cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" --list > "$RUNNER_TEMP/mutants.list"
+            count=$(wc -l < "$RUNNER_TEMP/mutants.list")
+          fi
+          shards=$(( (count + MUTANTS_PER_SHARD - 1) / MUTANTS_PER_SHARD ))
+          if [ "$shards" -gt "$MAX_SHARDS" ]; then shards=$MAX_SHARDS; fi
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          echo "shards=$(jq -cn --argjson n "$shards" '[range($n)]')" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Mutation testing plan"
+            if [ "$RUST_CHANGED" != true ]; then
+              echo "No crate source changed: nothing to mutate."
+            elif [ "$count" = 0 ]; then
+              echo "No mutants: the diff touches no code cargo-mutants can mutate."
+            else
+              echo "$count mutants over $shards shards."
+              if [ "$count" -gt $(( shards * MUTANTS_PER_SHARD )) ]; then
+                echo "That is more than $MUTANTS_PER_SHARD per shard, so the shards may stop before testing them all."
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   mutants:
     name: cargo mutants (shard ${{ matrix.shard }}/${{ strategy.job-total }})
-    needs: [fmt, check]
-    # Only a PR has a diff to scope the run to. The rest is `test`'s gate.
-    if: ${{ github.event_name == 'pull_request' && !cancelled() && needs.fmt.result == 'success' && needs.check.result == 'success' }}
+    needs: [fmt, check, mutants-plan]
+    # Only a PR has a diff to scope the run to, and the plan skips one with no mutants. The rest is
+    # `test`'s gate.
+    if: ${{ github.event_name == 'pull_request' && !cancelled() && needs.fmt.result == 'success' && needs.check.result == 'success' && needs.mutants-plan.result == 'success' && needs.mutants-plan.outputs.count != '0' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        shard: [0, 1, 2]  # cargo-mutants numbers shards from 0
+        # cargo-mutants numbers shards from 0, and `--shard` below takes the count from the matrix.
+        shard: ${{ fromJSON(needs.mutants-plan.outputs.shards) }}
     # Must match `test`'s `env` exactly. The cache restored below is `test`'s, and rust-cache hashes
     # `CARGO_*` variables into its key, so any difference here misses it.
     env:
@@ -360,36 +438,26 @@ jobs:
           fetch-depth: 2
 
       # cargo-mutants mutates only the sources of library and binary targets, never `tests/`,
-      # `examples/` or `benches/`, so a PR that changes no `src/` has nothing to mutate and every
-      # step below skips. The diff is cut to the same files: a binary file, a mode change or a rename
-      # elsewhere could otherwise make it unparseable. In a pathspec `*` also matches `/`, so this
-      # covers nested modules. The `HEAD^2` check is the same guard as in `changes`.
+      # `examples/` or `benches/`, so the diff is cut to `src/`: a binary file, a mode change or a
+      # rename elsewhere could otherwise make it unparseable. In a pathspec `*` also matches `/`,
+      # so this covers nested modules. The `HEAD^2` check is the same guard as in `changes`. This
+      # job runs only when `mutants-plan` found mutants in the same diff.
       - name: Extract the PR's diff
-        id: diff
         run: |
           git rev-parse --verify --quiet HEAD^2 > /dev/null
           git diff --no-renames HEAD^1 HEAD -- '*/src/*.rs' > "$RUNNER_TEMP/pr.diff"
-          if [ -s "$RUNNER_TEMP/pr.diff" ]; then
-            echo "rust=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "rust=false" >> "$GITHUB_OUTPUT"
-            echo "No crate source changed: nothing to mutate" >> "$GITHUB_STEP_SUMMARY"
-          fi
 
       - name: Free disk space  # As in `test`, which builds the same targets
-        if: steps.diff.outputs.rust == 'true'
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
           df -h /
 
       - name: Install mold linker
-        if: steps.diff.outputs.rust == 'true'
         uses: rui314/setup-mold@da13e0b42e392e3a45d1215033a2270b849d7d36  # v1
         with:
           mold-version: ${{ env.MOLD_VERSION }}
 
       - name: Install stable toolchain
-        if: steps.diff.outputs.rust == 'true'
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable
 
       # `test`'s cache, restored read-only. This job runs only on PRs, and a PR run can save a cache
@@ -402,14 +470,12 @@ jobs:
       # `--test-workspace` would hit the cache in full, but then every mutant rebuilds and tests
       # every crate that depends on its own.
       - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31  # v2
-        if: steps.diff.outputs.rust == 'true'
         with:
           shared-key: "rustrade-ci-test"
           save-if: false
 
       # Compiled on every run, since the cache above is never saved.
       - name: Install cargo-mutants
-        if: steps.diff.outputs.rust == 'true'
         run: cargo install --locked cargo-mutants@27.1.0
 
       # - `--in-place` mutates this checkout rather than a copy, so the build reuses the restored
@@ -426,7 +492,6 @@ jobs:
       #   of the mutants tested so far. cargo-mutants records each outcome as it lands.
       - name: Run cargo mutants
         id: mutants
-        if: steps.diff.outputs.rust == 'true'
         run: |
           status=0
           timeout --signal=INT --kill-after=2m 40m \
@@ -447,7 +512,7 @@ jobs:
           esac
 
       - name: Summary
-        if: ${{ !cancelled() && steps.diff.outputs.rust == 'true' }}
+        if: ${{ !cancelled() }}
         env:
           OUTCOME: ${{ steps.mutants.outcome }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
@@ -459,15 +524,9 @@ jobs:
             if [ "$OUTCOME" != success ]; then
               echo "The run failed, so any counts below are partial: see the \`Run cargo mutants\` log."
             fi
+            # Only a run that failed before it started leaves no output. `mutants-plan` gives every
+            # shard at least one mutant, so an empty shard is not a case here.
             if [ ! -d "$out" ]; then
-              if [ "$OUTCOME" = success ]; then
-                echo "No mutants: the diff touches no code cargo-mutants can mutate."
-              fi
-              exit 0
-            fi
-            # A shard dealt no mutants still writes its (empty) list and exits 0.
-            if [ -f "$out/mutants.json" ] && [ "$(jq length "$out/mutants.json")" = 0 ]; then
-              echo "No mutants in this shard: the diff has too few to give every shard one."
               exit 0
             fi
             echo "| Caught | Missed | Timed out | Unviable |"
