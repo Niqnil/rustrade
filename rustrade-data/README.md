@@ -6,8 +6,8 @@ Integration library for streaming public market data from exchanges and data pro
 
 Binance, Bitfinex, Bitmex, Bybit, Coinbase, Gate.io, Kraken and OKX are always available. The other
 exchanges and the data providers are each behind a Cargo feature, none enabled by default:
-`alpaca`, `databento`, `hyperliquid`, `ibkr`, `lse` (`lse-parquet` adds Parquet export decoding)
-and `massive`.
+`alpaca`, `databento`, `hyperliquid`, `ibkr`, `lse` (`lse-parquet` adds Parquet export decoding),
+`massive` and `thetadata`.
 
 | Exchange | Constructor | InstrumentKinds | SubscriptionKinds |
 |:--------:|:-----------:|:---------------:|:-----------------:|
@@ -70,6 +70,7 @@ and `massive`.
 | **LseCfd** | `LseCfd::default()`, with `LseSubscriber` | Cfd (indices, commodities, rates, volatility) | PublicTrades, OrderBooksL1 |
 | **LseOptions** | `LseOptions::default()`, with `LseSubscriber` | Option (US equity and ETF contracts) | PublicTrades |
 | **LSE historical** | `LseVaultClient::from_env()` | — | Candles (REST, not a subscription) |
+| **ThetaData** (REST, via a running Theta Terminal) | `ThetaDataClient::new()` | Option, Spot (Equities), indices | Quotes, Candles, open interest, end-of-day, snapshots (historical; not a subscription) |
 
 > **⚠️ London Strategic Edge data is NOT redistributable.** This integration's *code* is MIT
 > like the rest of the repository; the *data* it retrieves is not. LSE permits use for your own
@@ -82,5 +83,10 @@ and `massive`.
 > BID candles, candle volume is unreliable, non-trading days are emitted as flat bars, the live
 > tick is a quote rather than a print (except on options), and live volume is fabricated on
 > `LseFx` and `LseCfd`. See the `exchange::lse` module documentation before relying on any of it.
+
+> **⚠️ ThetaData data is NOT redistributable.** ThetaData's individual plans license the data for
+> personal, non-commercial use only, and its terms forbid reproducing, distributing or publishing
+> it. Do not commit retrieved data, publish it as fixtures or example datasets, or re-serve it.
+> Terms: <https://www.thetadata.net/terms-and-conditions>
 
 See the [workspace README](../README.md) for documentation, examples, and contributing guidelines.
