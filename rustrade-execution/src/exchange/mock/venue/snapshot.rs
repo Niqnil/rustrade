@@ -440,6 +440,16 @@ impl SimulatedVenue {
         venue.checkpoint_sequence = checkpoint_sequence;
         venue.refresh_next_charge();
         venue.refresh_next_interest();
+        venue.refresh_next_option_expiry();
+        // An option the snapshot still holds past its expiry was waiting for a price to settle at,
+        // so it waits again. Rebuilt rather than stored: it is exactly those positions.
+        venue.expiry_pending = venue
+            .option_expiries
+            .iter()
+            .take_while(|(expiry, _)| accrued_through.is_some_and(|reached| *expiry <= reached))
+            .filter(|(_, name)| venue.positions.contains_key(name))
+            .map(|(_, name)| name.clone())
+            .collect();
         Ok(venue)
     }
 }

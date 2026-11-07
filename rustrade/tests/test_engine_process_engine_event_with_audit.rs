@@ -7932,6 +7932,7 @@ fn test_venue_checkpoint_is_answered_with_the_engine_positions() {
         Default::default(),
         None,
         None,
+        Default::default(),
     );
     let venue_checkpoint = SimulatedVenue::new(&config, FnvHashMap::default()).checkpoint();
     let before = engine.state.clone();

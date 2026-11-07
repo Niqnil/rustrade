@@ -185,6 +185,7 @@ fn config() -> MockExecutionConfig {
         stale_market: Default::default(),
         spot_margin: None,
         fee_asset: None,
+        long_option_expiry: Default::default(),
     }
 }
 

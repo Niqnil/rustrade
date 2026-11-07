@@ -740,6 +740,7 @@ pub(crate) mod fixtures {
             crate::fill::StaleMarketPolicy::default(),
             None,
             None,
+            Default::default(),
         )
     }
 
@@ -776,6 +777,7 @@ pub(crate) mod fixtures {
             crate::fill::StaleMarketPolicy::default(),
             None,
             None,
+            Default::default(),
         )
     }
 

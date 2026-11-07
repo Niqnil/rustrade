@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 /// expiry itself, or the [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue). Short options
 /// and futures are not affected.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
+)]
 pub enum LongOptionExpiry {
     /// An option in the money is exercised, against the underlying's last price. One out of the
     /// money settles at zero. The default, matching an exchange that exercises in-the-money

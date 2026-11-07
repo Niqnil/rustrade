@@ -137,6 +137,7 @@ fn venue(spot_fee_asset: SpotFeeAsset) -> SimulatedVenue {
         stale_market: Default::default(),
         spot_margin: Some(SpotMarginConfig::new(quote(), dec!(3), MarginEffect::Borrow).unwrap()),
         fee_asset: None,
+        long_option_expiry: Default::default(),
     };
     let spot = Instrument {
         exchange: EXCHANGE,
@@ -440,6 +441,7 @@ fn a_liquidation_flattens_the_engine_position_and_leaves_its_balances_the_venues
                 .unwrap(),
         ),
         fee_asset: None,
+        long_option_expiry: Default::default(),
     };
     let mut venue = SimulatedVenue::new_market_driven(&config, template.instruments().clone());
     let traded = |price| {

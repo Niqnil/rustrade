@@ -112,6 +112,7 @@ fn venue() -> SimulatedVenue {
         stale_market: Default::default(),
         spot_margin: None,
         fee_asset: Some(FeeAssetConfig::new(asset("bnb"), dec!(0.25)).unwrap()),
+        long_option_expiry: Default::default(),
     };
     let mut venue = SimulatedVenue::new_market_driven(
         &config,

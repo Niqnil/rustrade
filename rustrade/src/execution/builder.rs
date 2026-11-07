@@ -37,7 +37,9 @@ use rustrade_instrument::{
     index::IndexedInstruments,
     instrument::{
         Instrument, InstrumentIndex,
-        kind::{InstrumentKind, InstrumentKindDiscriminant, cfd::CfdContract},
+        kind::{
+            InstrumentKind, InstrumentKindDiscriminant, cfd::CfdContract, option::OptionContract,
+        },
         name::InstrumentNameExchange,
         spec::{InstrumentSpec, InstrumentSpecQuantity, OrderQuantityUnits},
     },
@@ -729,6 +731,22 @@ pub(crate) fn generate_mock_exchange_instruments(
                             .name_exchange
                             .clone(),
                     }),
+                    // An option's settlement asset is re-resolved to its exchange name, as a
+                    // CFD's is; its other terms carry over unchanged.
+                    InstrumentKind::Option(contract) => InstrumentKind::Option(OptionContract {
+                        contract_size: contract.contract_size,
+                        settlement_asset: instruments
+                            .find_asset(contract.settlement_asset)
+                            .unwrap()
+                            .asset
+                            .name_exchange
+                            .clone(),
+                        kind: contract.kind,
+                        exercise: contract.exercise,
+                        settlement: contract.settlement,
+                        expiry: contract.expiry,
+                        strike: contract.strike,
+                    }),
                     // Unreachable through `ExecutionBuilder`: `add_execution` rejects a kind
                     // outside `MockExecution::SUPPORTED_KINDS` before this projection runs. Kept as
                     // an assertion rather than a silent skip so that a `SUPPORTED_KINDS` widened
@@ -1028,6 +1046,7 @@ mod tests {
             stale_market: Default::default(),
             spot_margin: None,
             fee_asset: None,
+            long_option_expiry: Default::default(),
         }
     }
 

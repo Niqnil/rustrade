@@ -262,7 +262,7 @@ fn an_instrument_the_venue_does_not_trade_is_invalid() {
 }
 
 #[test]
-fn a_cash_settled_instrument_is_invalid_on_a_margin_venue() {
+fn a_cfd_is_invalid_on_a_margin_venue() {
     let config = MockExecutionConfig {
         spot_margin: Some(SpotMarginConfig::new(usd(), d("3"), MarginEffect::Borrow).unwrap()),
         ..config_from_balances(vec![funded(usd(), d("10000"))], FeeModelConfig::default())
@@ -270,5 +270,8 @@ fn a_cash_settled_instrument_is_invalid_on_a_margin_venue() {
     let venue = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
 
     let reason = invalid_reason(&venue, &cfd_instrument_name());
-    assert!(reason.contains("cash-settled"), "{reason}");
+    assert!(
+        reason.contains("only a spot instrument borrows"),
+        "{reason}"
+    );
 }

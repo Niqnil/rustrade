@@ -89,8 +89,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A lapsing long needs no underlying price. When any position that needs the price is open and
     the price is missing, nothing is settled and the expiry stays retryable, as before.
 
+- **The simulated venue holds long options, and settles them at expiry itself** (`rustrade-execution`,
+  #872). `SimulatedVenue` used to refuse every option order. Now:
+  - **Premium is paid in cash.** A buy pays `price × quantity × contract_size` and the fee in the
+    quote asset, and a sale receives it. The venue keeps a net position per option and reports it
+    in its account snapshot.
+  - **Longs only, for now.** A buy needs its premium and fee in free cash. A sale may close only what
+    is held, less the sales already resting. Orders at or after expiry are refused. A price that is
+    not positive is no price, so a zero candle never fills an option.
+  - **Expiry is settled by the venue.** When the clock passes a contract's expiry, the venue retires
+    the orders still working on it and settles the position against its own last price for the
+    underlying, at zero fee: out of the money at zero (`TradeOrigin::Expiry`); in the money,
+    exercised, by delivering the underlying at the strike or paying the intrinsic value, as the
+    contract's `settlement` says (`TradeOrigin::Exercise`). A delivery the account cannot cover is
+    still made, with a WARN. Without an underlying price, settlement waits for one.
+    `MockExecutionConfig::long_option_expiry` makes every long lapse instead.
+  - **Leave expiry to the venue:** configure the engine with `ExpiryHandling::Venue` for that
+    exchange, or the position is closed twice.
+  - The `rustrade` execution builder now accepts option instruments for a mock exchange.
+  - A `SimStart` may hold a long option position, seeded into the venue and the engine at its
+    entry price with its premium already paid. A short one is refused with
+    `SimStartError::OptionShort`.
+- **`OptionContract::settlement`: whether an exercised option delivers the underlying or pays cash**
+  (`rustrade-instrument`, #872). `OptionSettlement::{Physical, Cash}`, a contract term beside
+  `exercise`. A serialised contract without it loads as `Physical`.
+
 ### Changed
 
+- **Breaking: `OptionContract` has a `settlement` field** (`rustrade-instrument`, #872). Struct
+  literals must set it; `OptionSettlement::Physical` is what every contract was taken to be before.
+- **Breaking: `MockExecutionConfig` has a `long_option_expiry` field** (`rustrade-execution`, #872).
+  Struct literals and `MockExecutionConfig::new` must set it; `LongOptionExpiry::default()` keeps
+  exercising in-the-money options. A serialised config without it loads with the default.
+- **`LongOptionExpiry` moved to `rustrade_execution::expiry`** (#872), so the simulated venue settles
+  by the same choice as the engine. `rustrade::engine::state::instrument::LongOptionExpiry` still
+  names it.
 - **Breaking: `ExpiryHandling::Engine` carries a `LongOptionExpiry`** (`rustrade`, #868). Write
   `ExpiryHandling::Engine(LongOptionExpiry::Exercise)`, or `ExpiryHandling::default()`, for the
   old behaviour. In a human-readable format such as JSON, a serialised bare `"Engine"` still
