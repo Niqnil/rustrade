@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A ThetaData provider: US options, stocks, indices, interest rates and the market calendar**
+  (`rustrade-data`, new `thetadata` feature, #865). `ThetaDataClient` talks to the REST API (v3)
+  of a Theta Terminal, ThetaData's local application, which the caller runs logged in to their
+  account.
+  - **Options:** roots, expirations, strikes, and the contracts listed on a date with expired ones
+    included. History: NBBO quotes (every quote or one per interval), OHLC bars, open interest and
+    end-of-day reports. Snapshots: quotes, where one request covers a whole chain, plus OHLC and
+    open interest.
+  - **Stocks and indices:** symbols, dates, OHLC bars, NBBO quotes, index prices, end-of-day
+    reports and snapshots.
+  - **Interest rates and calendar:** daily SOFR and Treasury yields, and the market's schedule for
+    a day or a year's holidays.
+  - **Output types:** quotes and bars convert to `OrderBookL1` and `Candle`. Option contracts keep
+    ThetaData's root (such as `SPXW`) and convert to `MarketDataOptionContract`.
+  - **Prices are exact:** each is read from its decimal text. ThetaData's New York wall-clock
+    times are converted to UTC, with the daylight-saving transitions documented.
+  - **Ranges and concurrency:** date ranges are split into requests within ThetaData's per-request
+    caps and streamed back in order. The client keeps at most a caller-set number of requests in
+    flight, matching the account's concurrency limit.
+  - **Errors:** `ThetaDataError` tells apart an unreachable Terminal, a request the plan does not
+    include, a session taken over by another login, a full queue and other failures, and marks
+    the transient ones. A request with no data yields no rows.
+
+  ⚠️ ThetaData's individual plans are for personal, non-commercial use, and its terms forbid
+  redistributing the data. Do not commit or publish what this integration retrieves. See
+  <https://www.thetadata.net/terms-and-conditions>.
+
 - **A market stream can be ended and reconnected when it stays silent** (`rustrade-data`, #862).
   A WebSocket can stay open, and keep answering pings, while its subscriptions deliver nothing.
   Such a stream never ended, so it never reconnected.
