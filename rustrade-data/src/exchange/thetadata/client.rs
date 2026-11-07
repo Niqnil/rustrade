@@ -344,19 +344,21 @@ pub(crate) fn day_spans(
             "start date {start} is after end date {end}"
         )));
     }
-    let step = TimeDelta::days(i64::from(max_days.max(1)) - 1);
-    let mut spans = Vec::new();
-    let mut span_start = start;
-    loop {
-        let span_end = span_start
-            .checked_add_signed(step)
-            .map_or(end, |span_end| span_end.min(end));
-        spans.push((span_start, span_end));
-        match span_end.succ_opt() {
-            Some(next) if span_end < end => span_start = next,
-            _ => return Ok(spans),
-        }
-    }
+    let span_days = i64::from(max_days.max(1));
+    let total_days = end.signed_duration_since(start).num_days() + 1;
+    // Iterating over a span count fixed up front, not until a date condition holds, keeps the loop
+    // bounded: the span list cannot grow without end, whatever the dates.
+    let span_count = (total_days + span_days - 1) / span_days;
+    Ok((0..span_count)
+        .map(|index| {
+            // Every span starts on or before `end`, so this cannot overflow.
+            let span_start = start + TimeDelta::days(index * span_days);
+            let span_end = span_start
+                .checked_add_signed(TimeDelta::days(span_days - 1))
+                .map_or(end, |span_end| span_end.min(end));
+            (span_start, span_end)
+        })
+        .collect())
 }
 
 /// The parameters of an intraday request's interval and time window.
