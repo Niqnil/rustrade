@@ -339,6 +339,8 @@ jobs:
     name: cargo mutants (plan)
     needs: changes
     # Fails closed like the other jobs: it skips only when `changes` succeeded and found no code.
+    # A plan that fails (cargo-mutants will not install, or cannot list the diff) is a failed run,
+    # red like a shard whose run fails, and the shards then skip.
     if: ${{ github.event_name == 'pull_request' && !cancelled() && !(needs.changes.result == 'success' && needs.changes.outputs.code == 'false') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
