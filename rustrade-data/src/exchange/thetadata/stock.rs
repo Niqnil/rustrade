@@ -17,6 +17,7 @@ use smol_str::SmolStr;
 /// ThetaData omits a report whose price did not change. At an interval, `price` is the price at
 /// that exact time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct IndexPrice {
     pub time: DateTime<Utc>,
     pub price: Decimal,
@@ -24,6 +25,7 @@ pub struct IndexPrice {
 
 /// An index's latest price.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct IndexPriceSnapshot {
     pub symbol: SmolStr,
     pub time: DateTime<Utc>,

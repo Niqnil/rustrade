@@ -16,6 +16,7 @@ use smol_str::SmolStr;
 ///
 /// Quotes are the wider listing: a contract can be quoted on a day it never trades.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Listing {
     Trade,
     Quote,
@@ -32,6 +33,7 @@ impl Listing {
 
 /// An option's NBBO quote at a time.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct OptionQuote {
     pub contract: OptionContract,
     pub time: DateTime<Utc>,
@@ -46,6 +48,7 @@ impl From<&OptionQuote> for OrderBookL1 {
 
 /// One OHLC bar of an option.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct OptionBar {
     pub contract: OptionContract,
     pub bar: Bar,
@@ -56,6 +59,7 @@ pub struct OptionBar {
 /// OPRA reports open interest once a day, around 06:30 New York time; `time` is that report's, and
 /// the figure is the open interest at the end of the **previous** trading day.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct OptionOpenInterest {
     pub contract: OptionContract,
     pub time: DateTime<Utc>,
@@ -64,6 +68,7 @@ pub struct OptionOpenInterest {
 
 /// An option's end-of-day report.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct OptionEndOfDay {
     pub contract: OptionContract,
     pub end_of_day: EndOfDay,
@@ -71,6 +76,7 @@ pub struct OptionEndOfDay {
 
 /// The current day's OHLC of an option, as of `time`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct OptionOhlcSnapshot {
     pub contract: OptionContract,
     pub time: DateTime<Utc>,
@@ -206,7 +212,8 @@ impl ThetaDataClient {
     /// or the last one at each interval (value plan; ticks need standard).
     ///
     /// Each day's rows cover `window`, by default the regular session. A selection of every
-    /// expiration is fetched one day per request, the most ThetaData serves for it.
+    /// expiration is fetched one day per request: ThetaData serves several days of quotes in one
+    /// request only for a single expiration.
     pub fn option_quote_history(
         &self,
         selection: &OptionSelection,

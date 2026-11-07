@@ -27,10 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     times are converted to UTC, with the daylight-saving transitions documented.
   - **Ranges and concurrency:** date ranges are split into requests within ThetaData's per-request
     caps and streamed back in order. The client keeps at most a caller-set number of requests in
-    flight, matching the account's concurrency limit.
+    flight, matching the account's concurrency limit. A stream holds its slot until it ends or is
+    dropped, so at a limit of 1, drain or drop one stream before polling the next.
   - **Errors:** `ThetaDataError` tells apart an unreachable Terminal, a request the plan does not
     include, a session taken over by another login, a full queue and other failures, and marks
-    the transient ones. A request with no data yields no rows. Dates before the plan's history
+    the transient ones. A request with no data yields no rows, or `None` from the calendar's
+    single-day methods. Dates before the plan's history
     starts are refused as an invalid request (HTTP 400), not as a permission error.
   - **Securing the Terminal:** its API has no authentication, and the Terminal may listen on every
     network interface whatever its configured host. Keep its port behind a firewall, or in a

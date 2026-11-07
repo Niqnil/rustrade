@@ -361,6 +361,55 @@ async fn requests_beyond_the_limit_wait_for_a_free_slot() {
 }
 
 #[tokio::test]
+async fn a_stream_holds_its_slot_until_it_ends_or_is_dropped() {
+    let server = MockServer::start().await;
+    Mock::given(path("/v3/stock/list/symbols"))
+        .respond_with(ndjson(&[r#"{"symbol":"XYZ"}"#, r#"{"symbol":"ABC"}"#]))
+        .mount(&server)
+        .await;
+    let client = client(&server).await;
+
+    // The first stream is between rows: it still holds the only slot.
+    let mut first = Box::pin(client.stock_symbols());
+    assert_eq!(first.next().await.unwrap().unwrap(), "XYZ");
+    let mut second = Box::pin(client.stock_symbols());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), second.next())
+            .await
+            .is_err(),
+        "a second request started while the first stream was unfinished"
+    );
+
+    // Dropping the unfinished stream frees the slot.
+    drop(first);
+    let rows = tokio::time::timeout(Duration::from_secs(5), async {
+        let mut rows = Vec::new();
+        while let Some(row) = second.next().await {
+            rows.push(row.unwrap());
+        }
+        rows
+    })
+    .await
+    .expect("the dropped stream released its slot");
+    assert_eq!(rows, ["XYZ", "ABC"]);
+}
+
+#[tokio::test]
+async fn a_body_without_newlines_is_refused_not_buffered_without_bound() {
+    let server = MockServer::start().await;
+    Mock::given(path("/v3/stock/list/symbols"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(2 << 20)))
+        .mount(&server)
+        .await;
+    let client = client(&server).await;
+    let error = first_error(client.stock_symbols()).await;
+    assert!(
+        matches!(&error, ThetaDataError::Decode { message, .. } if message.contains("longer than")),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
 async fn option_bars_carry_their_close_time_and_vwap() {
     let server = MockServer::start().await;
     Mock::given(path("/v3/option/history/ohlc"))
@@ -439,15 +488,24 @@ async fn option_daily_history_decodes_open_interest_and_end_of_day() {
     Mock::given(path("/v3/option/history/open_interest"))
         .and(query_param("expiration", "*"))
         .and(query_param("max_dte", "30"))
+        // A whole chain's daily history goes in one request over several days; only quote history
+        // needs an expiration for that.
+        .and(query_param("start_date", "20240304"))
+        .and(query_param("end_date", "20240315"))
         .respond_with(ndjson(&[&format!(
             r#"{{{CONTRACT},"timestamp":"2024-03-04T06:30:02","open_interest":1234}}"#
         )]))
+        .expect(1)
         .mount(&server)
         .await;
     Mock::given(path("/v3/option/history/eod"))
+        .and(query_param("expiration", "*"))
+        .and(query_param("start_date", "20240304"))
+        .and(query_param("end_date", "20240315"))
         .respond_with(ndjson(&[&format!(
             r#"{{{CONTRACT},"created":"2024-03-04T17:15:01.5","last_trade":"2024-03-04T15:59:58","open":1.0,"high":1.5,"low":0.9,"close":1.2,"volume":300,"count":25,{NBBO}}}"#
         )]))
+        .expect(1)
         .mount(&server)
         .await;
     let client = client(&server).await;
@@ -456,7 +514,7 @@ async fn option_daily_history_decodes_open_interest_and_end_of_day() {
     let open_interest = collect(client.option_open_interest_history(
         &selection,
         date(2024, 3, 4),
-        date(2024, 3, 4),
+        date(2024, 3, 15),
     ))
     .await;
     assert_eq!(open_interest[0].contract, xyz_call());
@@ -467,7 +525,7 @@ async fn option_daily_history_decodes_open_interest_and_end_of_day() {
     );
 
     let end_of_day =
-        collect(client.option_end_of_day_history(&selection, date(2024, 3, 4), date(2024, 3, 4)))
+        collect(client.option_end_of_day_history(&selection, date(2024, 3, 4), date(2024, 3, 15)))
             .await;
     let eod = &end_of_day[0].end_of_day;
     assert_eq!(end_of_day[0].contract, xyz_call());
@@ -721,10 +779,14 @@ async fn the_calendar_decodes_days_and_holidays() {
         .await;
     let client = client(&server).await;
 
-    let today = client.market_day_today().await.unwrap();
+    let today = client.market_day_today().await.unwrap().unwrap();
     assert_eq!(today.kind, MarketDayKind::Open);
     assert_eq!(today.close, NaiveTime::from_hms_opt(16, 0, 0));
-    let christmas = client.market_day(date(2024, 12, 25)).await.unwrap();
+    let christmas = client
+        .market_day(date(2024, 12, 25))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         (christmas.kind, christmas.open),
         (MarketDayKind::FullClose, None)
@@ -740,5 +802,5 @@ async fn the_calendar_decodes_days_and_holidays() {
         .respond_with(ResponseTemplate::new(472))
         .mount(&server)
         .await;
-    assert!(client.market_day(date(2030, 1, 2)).await.is_err());
+    assert_eq!(client.market_day(date(2030, 1, 2)).await, Ok(None));
 }

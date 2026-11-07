@@ -51,6 +51,7 @@ impl InterestRateSeries {
 
 /// One day's published rate of a series.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct InterestRate {
     pub date: NaiveDate,
     /// The rate in percent, as published: `3.91` is 3.91%.
@@ -84,6 +85,7 @@ pub enum MarketDayKind {
 /// `open` and `close` are the regular session's; `None` where ThetaData publishes none (a closed
 /// day, and sometimes an early-close day, whose times it does not always fill in).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct MarketDay {
     pub kind: MarketDayKind,
     pub open: Option<NaiveTime>,
@@ -92,6 +94,7 @@ pub struct MarketDay {
 
 /// A day the market is closed or closes early.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct MarketHoliday {
     pub date: NaiveDate,
     pub day: MarketDay,
@@ -135,14 +138,15 @@ impl ThetaDataClient {
         )
     }
 
-    /// Today's market schedule (free plan).
-    pub async fn market_day_today(&self) -> Result<MarketDay, ThetaDataError> {
+    /// Today's market schedule (free plan), or `None` if ThetaData has none.
+    pub async fn market_day_today(&self) -> Result<Option<MarketDay>, ThetaDataError> {
         self.single_row("calendar/today", Vec::new(), decode_market_day)
             .await
     }
 
-    /// The market schedule on `date`, from 2012 through the end of next year (value plan).
-    pub async fn market_day(&self, date: NaiveDate) -> Result<MarketDay, ThetaDataError> {
+    /// The market schedule on `date`, from 2012 through the end of next year (value plan), or
+    /// `None` for a date ThetaData has no schedule for.
+    pub async fn market_day(&self, date: NaiveDate) -> Result<Option<MarketDay>, ThetaDataError> {
         self.single_row(
             "calendar/on_date",
             vec![("date", super::time::format_date(date))],
@@ -169,21 +173,16 @@ impl ThetaDataClient {
         )
     }
 
+    /// The first row of a request that answers with one, or `None` when there is no data.
     async fn single_row<T: Send + 'static>(
         &self,
         path: &'static str,
         params: Vec<(&'static str, String)>,
         decode: fn(&Row<'_>) -> Result<T, ThetaDataError>,
-    ) -> Result<T, ThetaDataError> {
+    ) -> Result<Option<T>, ThetaDataError> {
         let rows = self.rows(path.into(), params, decode);
         futures::pin_mut!(rows);
-        match rows.next().await {
-            Some(row) => row,
-            None => Err(ThetaDataError::Api {
-                status: 200,
-                message: format!("{path} returned no row"),
-            }),
-        }
+        rows.next().await.transpose()
     }
 }
 

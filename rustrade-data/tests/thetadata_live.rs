@@ -132,6 +132,28 @@ async fn end_of_day_history_longer_than_one_request_is_split() {
 
 #[tokio::test]
 #[ignore = "needs a running Theta Terminal"]
+async fn whole_chain_end_of_day_history_takes_several_days_per_request() {
+    // Every expiration within a week, over a trading week: ThetaData serves several days of a
+    // whole chain's end-of-day reports in one request.
+    let chain = OptionSelection::new("SPY", Expiration::All).with_max_dte(7);
+    let rows =
+        collect(client().option_end_of_day_history(&chain, date(2025, 10, 13), date(2025, 10, 17)))
+            .await;
+    let mut days: Vec<_> = rows
+        .iter()
+        .map(|row| row.end_of_day.created.date_naive())
+        .collect();
+    days.sort_unstable();
+    days.dedup();
+    assert_eq!(days.len(), 5, "one report day per trading day");
+    let mut expirations: Vec<_> = rows.iter().map(|row| row.contract.expiration).collect();
+    expirations.sort_unstable();
+    expirations.dedup();
+    assert!(expirations.len() > 1, "{} expirations", expirations.len());
+}
+
+#[tokio::test]
+#[ignore = "needs a running Theta Terminal"]
 async fn interest_rates_span_more_than_one_request() {
     // Two years: more than one span of daily data, so the split is exercised live. The free plan's
     // rate history starts in 2024.
@@ -178,7 +200,11 @@ async fn history_before_the_plan_starts_is_a_rejected_request() {
 #[ignore = "needs a running Theta Terminal"]
 async fn the_calendar_answers_today() {
     let client = client();
-    let today = client.market_day_today().await.unwrap();
+    let today = client
+        .market_day_today()
+        .await
+        .unwrap()
+        .expect("today has a schedule");
     if today.open.is_some() {
         assert!(today.open < today.close, "{today:?}");
     }

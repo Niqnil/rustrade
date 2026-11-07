@@ -13,7 +13,7 @@ use rustrade_instrument::instrument::{
 };
 use serde_json::value::RawValue;
 use smol_str::SmolStr;
-use std::{borrow::Cow, collections::HashMap, str::FromStr};
+use std::{borrow::Cow, str::FromStr};
 
 /// The sampling of a history request: every event (`Tick`) or one row per interval.
 ///
@@ -94,6 +94,7 @@ impl Interval {
 
 /// Which expirations an option request covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Expiration {
     /// Every expiration (`*`).
     All,
@@ -112,6 +113,7 @@ impl Expiration {
 
 /// Which strikes an option request covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Strike {
     /// Every strike (`*`).
     All,
@@ -254,6 +256,7 @@ impl OptionContract {
 /// quoted on it is reported as a zero price and size, and kept here as such; [`Self::top_of_book`]
 /// maps it to an absent level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct Nbbo {
     pub bid: Decimal,
     pub bid_size: u64,
@@ -285,6 +288,7 @@ impl Nbbo {
 
 /// An NBBO quote at a time: one row of a stock quote history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct Quote {
     pub time: DateTime<Utc>,
     pub nbbo: Nbbo,
@@ -298,6 +302,7 @@ impl From<&Quote> for OrderBookL1 {
 
 /// An NBBO quote for one symbol: one row of a stock quote snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct SymbolQuote {
     pub symbol: SmolStr,
     pub time: DateTime<Utc>,
@@ -316,6 +321,7 @@ impl From<&SymbolQuote> for OrderBookL1 {
 /// the feeds publish no national end-of-day report of their own. `created` is when the report was
 /// generated and `last_trade` the time of the day's last trade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct EndOfDay {
     pub created: DateTime<Utc>,
     pub last_trade: DateTime<Utc>,
@@ -331,6 +337,7 @@ pub struct EndOfDay {
 
 /// An OHLC report for one symbol: one row of a snapshot of the current day's OHLC.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct OhlcSnapshot {
     pub symbol: SmolStr,
     pub time: DateTime<Utc>,
@@ -349,6 +356,7 @@ pub struct OhlcSnapshot {
 /// [`Candle::close_time`] is `open_time + interval`. An interval with no trades is reported as a
 /// bar of zero prices and kept as such.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct Bar {
     pub open_time: DateTime<Utc>,
     pub candle: Candle,
@@ -369,7 +377,38 @@ pub struct Bar {
 /// for all of them.
 pub(crate) struct Row<'a> {
     line: &'a str,
-    fields: HashMap<&'a str, &'a RawValue>,
+    fields: Fields<'a>,
+}
+
+/// A row's fields in their order on the line. A row has a dozen or so short keys, which a linear
+/// scan finds faster than hashing them, with one allocation per row.
+struct Fields<'a>(Vec<(&'a str, &'a RawValue)>);
+
+impl<'de> serde::Deserialize<'de> for Fields<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Fields<'de>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut fields = Vec::with_capacity(map.size_hint().unwrap_or(16));
+                while let Some(field) = map.next_entry()? {
+                    fields.push(field);
+                }
+                Ok(Fields(fields))
+            }
+        }
+
+        deserializer.deserialize_map(Visitor)
+    }
 }
 
 impl<'a> Row<'a> {
@@ -382,20 +421,37 @@ impl<'a> Row<'a> {
         ThetaDataError::decode(message, self.line)
     }
 
-    fn raw(&self, name: &str) -> Result<&'a RawValue, ThetaDataError> {
+    /// The field's raw text, or `None` when it is missing.
+    fn field(&self, name: &str) -> Option<&'a RawValue> {
         self.fields
-            .get(name)
-            .copied()
+            .0
+            .iter()
+            .find_map(|(key, raw)| (*key == name).then_some(*raw))
+    }
+
+    fn raw(&self, name: &str) -> Result<&'a RawValue, ThetaDataError> {
+        self.field(name)
             .ok_or_else(|| self.error(format_args!("missing field `{name}`")))
     }
 
-    fn is_null(&self, name: &str) -> bool {
-        self.fields.get(name).is_none_or(|raw| raw.get() == "null")
+    /// The field's raw text, or `None` when it is missing or null.
+    fn raw_opt(&self, name: &str) -> Option<&'a RawValue> {
+        self.field(name).filter(|raw| raw.get() != "null")
+    }
+
+    fn str_of(&self, name: &str, raw: &'a RawValue) -> Result<Cow<'a, str>, ThetaDataError> {
+        serde_json::from_str(raw.get()).map_err(|e| self.error(format_args!("field `{name}`: {e}")))
+    }
+
+    fn decimal_of(&self, name: &str, raw: &RawValue) -> Result<Decimal, ThetaDataError> {
+        let text = raw.get();
+        Decimal::from_str(text)
+            .or_else(|_| Decimal::from_scientific(text))
+            .map_err(|e| self.error(format_args!("field `{name}` = {text}: {e}")))
     }
 
     pub(crate) fn str(&self, name: &str) -> Result<Cow<'a, str>, ThetaDataError> {
-        serde_json::from_str(self.raw(name)?.get())
-            .map_err(|e| self.error(format_args!("field `{name}`: {e}")))
+        self.str_of(name, self.raw(name)?)
     }
 
     pub(crate) fn symbol(&self, name: &str) -> Result<SmolStr, ThetaDataError> {
@@ -403,18 +459,13 @@ impl<'a> Row<'a> {
     }
 
     pub(crate) fn decimal(&self, name: &str) -> Result<Decimal, ThetaDataError> {
-        let text = self.raw(name)?.get();
-        Decimal::from_str(text)
-            .or_else(|_| Decimal::from_scientific(text))
-            .map_err(|e| self.error(format_args!("field `{name}` = {text}: {e}")))
+        self.decimal_of(name, self.raw(name)?)
     }
 
     pub(crate) fn decimal_opt(&self, name: &str) -> Result<Option<Decimal>, ThetaDataError> {
-        if self.is_null(name) {
-            Ok(None)
-        } else {
-            self.decimal(name).map(Some)
-        }
+        self.raw_opt(name)
+            .map(|raw| self.decimal_of(name, raw))
+            .transpose()
     }
 
     pub(crate) fn u64(&self, name: &str) -> Result<u64, ThetaDataError> {
@@ -438,10 +489,10 @@ impl<'a> Row<'a> {
     }
 
     pub(crate) fn time_of_day_opt(&self, name: &str) -> Result<Option<NaiveTime>, ThetaDataError> {
-        if self.is_null(name) {
+        let Some(raw) = self.raw_opt(name) else {
             return Ok(None);
-        }
-        let text = self.str(name)?;
+        };
+        let text = self.str_of(name, raw)?;
         if text.is_empty() {
             return Ok(None);
         }

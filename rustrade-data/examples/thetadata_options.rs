@@ -64,7 +64,10 @@ async fn main() {
         .market_day_today()
         .await
         .expect("Theta Terminal reachable");
-    println!("market today: {today:?}");
+    match today {
+        Some(today) => println!("market today: {today:?}"),
+        None => println!("market today: no schedule"),
+    }
 
     let expirations: Vec<_> = client
         .option_expirations(UNDERLYING)

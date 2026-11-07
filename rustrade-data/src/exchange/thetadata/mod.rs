@@ -22,7 +22,9 @@
 //!   account, invalidates this Terminal's session: requests then fail with
 //!   [`ThetaDataError::SessionInvalid`] until the Terminal is restarted alone on the account.
 //! - **Concurrency is per account**, by the highest subscription tier: free 1, value 2, standard
-//!   4, pro 8 requests in flight. See [`ThetaDataClient`] for how the client keeps within it.
+//!   4, pro 8 requests in flight. See [`ThetaDataClient`] for how the client keeps within it. A
+//!   stream holds its request's slot until it ends or is dropped, so at a limit of 1, drain or drop
+//!   one stream before polling the next.
 //! - **The REST API has no authentication of its own**: anything that reaches the Terminal's port
 //!   uses the account, and the same port can serve endpoints beyond the REST API. The Terminal may
 //!   listen on every network interface whatever the `host` in its `config.toml` says, so restrict

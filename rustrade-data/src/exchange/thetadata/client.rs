@@ -23,6 +23,10 @@ pub(crate) const MAX_DAYS_INTRADAY: u32 = 28;
 /// interest rates).
 pub(crate) const MAX_DAYS_DAILY: u32 = 365;
 
+/// The longest partial line the client buffers. A row is a few hundred bytes; a body that runs
+/// past this without a newline is not NDJSON, and is refused rather than buffered without bound.
+const MAX_LINE_BYTES: usize = 1 << 20;
+
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -47,8 +51,14 @@ pub struct TimeWindow {
 /// account. The Terminal queues requests beyond the limit, up to its queue size, then answers 429
 /// ([`ThetaDataError::Throttled`]). This client keeps at most
 /// [`with_max_concurrent_requests`](Self::with_max_concurrent_requests) requests in flight
-/// (default 1), counting a request until its response has been read to the end. Clones share the
-/// limit.
+/// (default 1). Clones share the limit.
+///
+/// A stream holds its request's slot from its first poll until it ends or is dropped, including
+/// while the caller is between rows. So at a limit of 1, polling a second stream of the same client
+/// before the first has ended waits until the first ends or is dropped, and never returns if the
+/// caller awaits the second inside the first's loop (or zips or selects the two). Drain or drop one
+/// stream before polling the next, or set the limit to at least the number of streams polled
+/// together.
 ///
 /// # Ranges
 /// History requests are capped by ThetaData: a month of data at one-minute intervals and above, a
@@ -72,15 +82,20 @@ pub struct ThetaDataClient {
 impl ThetaDataClient {
     /// A client for a Terminal at [`DEFAULT_BASE_URL`], one request in flight at a time.
     pub fn new() -> Result<Self, ThetaDataError> {
+        let limit = NonZeroUsize::MIN;
         Self::build(
             DEFAULT_BASE_URL.to_owned(),
-            NonZeroUsize::MIN,
+            Arc::new(Semaphore::new(limit.get())),
+            limit,
             DEFAULT_READ_TIMEOUT,
         )
     }
 
+    /// A client over `permits`: the setters that rebuild the HTTP client pass the existing
+    /// semaphore, so clones keep sharing one limit.
     fn build(
         base_url: String,
+        permits: Arc<Semaphore>,
         max_concurrent_requests: NonZeroUsize,
         read_timeout: Duration,
     ) -> Result<Self, ThetaDataError> {
@@ -97,7 +112,7 @@ impl ThetaDataClient {
         Ok(Self {
             http,
             base_url,
-            permits: Arc::new(Semaphore::new(max_concurrent_requests.get())),
+            permits,
             max_concurrent_requests,
             read_timeout,
         })
@@ -107,7 +122,8 @@ impl ThetaDataClient {
     ///
     /// The URL must be `http` or `https`; a trailing `/` is ignored. ThetaData treats requests from
     /// different addresses as different clients (HTTP 476), so `localhost` and `127.0.0.1` are not
-    /// interchangeable: use one spelling for the Terminal's whole run.
+    /// interchangeable: use one spelling for the Terminal's whole run. Clones keep sharing the
+    /// request limit.
     pub fn with_base_url(self, base_url: impl Into<String>) -> Result<Self, ThetaDataError> {
         let base_url = base_url.into();
         let parsed = url::Url::parse(&base_url)
@@ -118,7 +134,12 @@ impl ThetaDataClient {
             )));
         }
         let base_url = base_url.trim_end_matches('/').to_owned();
-        Self::build(base_url, self.max_concurrent_requests, self.read_timeout)
+        Self::build(
+            base_url,
+            self.permits,
+            self.max_concurrent_requests,
+            self.read_timeout,
+        )
     }
 
     /// The same client keeping at most `limit` requests in flight, normally the account's
@@ -134,9 +155,14 @@ impl ThetaDataClient {
     /// The same client waiting at most `timeout` for each read of a response (default 120 s).
     ///
     /// A large history request can take the Terminal several seconds before its first row; the
-    /// timeout bounds a stall, not a whole response.
+    /// timeout bounds a stall, not a whole response. Clones keep sharing the request limit.
     pub fn with_read_timeout(self, timeout: Duration) -> Result<Self, ThetaDataError> {
-        Self::build(self.base_url, self.max_concurrent_requests, timeout)
+        Self::build(
+            self.base_url,
+            self.permits,
+            self.max_concurrent_requests,
+            timeout,
+        )
     }
 
     /// The Terminal's base URL.
@@ -199,14 +225,23 @@ impl ThetaDataClient {
                 let chunk = chunk.map_err(|e| ThetaDataError::Http {
                     message: format!("reading the response: {e}"),
                 })?;
+                // The bytes already in the buffer hold no newline: only the new chunk is scanned.
+                let scanned = buffer.len();
                 buffer.extend_from_slice(&chunk);
-                let (lines, consumed) = complete_lines(&buffer);
+                let (lines, consumed) = complete_lines(&buffer, scanned);
                 for line in lines {
                     if let Some(row) = decode_line(&buffer[line], &decode)? {
                         yield row;
                     }
                 }
                 buffer.drain(..consumed);
+                if buffer.len() > MAX_LINE_BYTES {
+                    let error = ThetaDataError::decode(
+                        format!("a line longer than {MAX_LINE_BYTES} bytes"),
+                        &String::from_utf8_lossy(&buffer),
+                    );
+                    Err(error)?;
+                }
             }
             if let Some(row) = decode_line(&buffer, &decode)? {
                 yield row;
@@ -258,13 +293,15 @@ impl ThetaDataClient {
 }
 
 /// The complete lines in `buffer` (without their `\n`), and how many bytes they take: what follows
-/// is a partial line, kept until the next chunk completes it.
-fn complete_lines(buffer: &[u8]) -> (Vec<std::ops::Range<usize>>, usize) {
+/// is a partial line, kept until the next chunk completes it. The first `scanned` bytes are known
+/// to hold no newline and are not searched again.
+fn complete_lines(buffer: &[u8], scanned: usize) -> (Vec<std::ops::Range<usize>>, usize) {
     let mut lines = Vec::new();
     let mut start = 0;
     for (index, _) in buffer
         .iter()
         .enumerate()
+        .skip(scanned)
         .filter(|(_, byte)| **byte == b'\n')
     {
         lines.push(start..index);
@@ -349,8 +386,9 @@ mod tests {
         let mut buffer = Vec::new();
         let mut lines = Vec::new();
         for chunk in body.chunks(size) {
+            let scanned = buffer.len();
             buffer.extend_from_slice(chunk);
-            let (complete, consumed) = complete_lines(&buffer);
+            let (complete, consumed) = complete_lines(&buffer, scanned);
             lines.extend(
                 complete
                     .into_iter()
@@ -369,12 +407,31 @@ mod tests {
         for size in 1..=body.len() {
             assert_eq!(lines_in_chunks(body, size), expected, "chunk size {size}");
         }
-        assert_eq!(complete_lines(b"no newline"), (vec![], 0));
-        let (lines, consumed) = complete_lines(b"x\n");
+        assert_eq!(complete_lines(b"no newline", 0), (vec![], 0));
+        let (lines, consumed) = complete_lines(b"x\n", 0);
         assert_eq!(
             (lines.len(), lines.first().cloned(), consumed),
             (1, Some(0..1), 2)
         );
+        // Bytes before `scanned` are not searched again, but a line still starts at 0.
+        let (lines, consumed) = complete_lines(b"ab\ncd\n", 3);
+        assert_eq!(
+            (lines.len(), lines.first().cloned(), consumed),
+            (1, Some(0..5), 6)
+        );
+    }
+
+    #[test]
+    fn a_character_split_across_chunks_is_reassembled() {
+        // "é" and "€" are two and three bytes: every chunk size splits one of them somewhere.
+        let body = "{\"s\":\"é\"}\n{\"s\":\"€\"}".as_bytes();
+        for size in 1..=body.len() {
+            assert_eq!(
+                lines_in_chunks(body, size),
+                vec!["{\"s\":\"é\"}", "{\"s\":\"€\"}"],
+                "chunk size {size}"
+            );
+        }
     }
 
     #[test]

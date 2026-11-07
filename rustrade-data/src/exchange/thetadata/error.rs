@@ -56,6 +56,7 @@ pub enum ThetaDataError {
 
     /// Any other error status, including 470 (general), 476 (requests from a different address
     /// than the first one; `localhost` and `127.0.0.1` count as different) and 572 (uncaught).
+    /// Only the gateway statuses 502, 503 and 504 are transient.
     #[error("ThetaData API error (HTTP {status}): {message}")]
     Api { status: u16, message: String },
 
@@ -75,10 +76,16 @@ pub enum ThetaDataError {
 
 impl ThetaDataError {
     /// Whether retrying the same request later may succeed: the Terminal unreachable,
-    /// disconnected from ThetaData, throttled, the server restarting, or a transport failure.
+    /// disconnected from ThetaData, throttled, the server restarting, a transport failure, or a
+    /// gateway status (HTTP 502, 503 or 504) from a proxy in front of the Terminal.
     ///
-    /// A permission denial, an invalid request, an invalid session, a decode failure and invalid
-    /// input are not: the same request fails the same way until something else changes.
+    /// A permission denial, an invalid request, an invalid session, any other status, a decode
+    /// failure and invalid input are not: the same request fails the same way until something else
+    /// changes.
+    ///
+    /// An error can end a stream after it has yielded rows (a transport failure midway through a
+    /// response, or a later request of a split range failing). Retrying the same call then yields
+    /// those rows again.
     pub fn is_transient(&self) -> bool {
         match self {
             Self::TerminalUnreachable { .. }
@@ -86,10 +93,10 @@ impl ThetaDataError {
             | Self::Throttled { .. }
             | Self::ServerRestarting { .. }
             | Self::Http { .. } => true,
+            Self::Api { status, .. } => matches!(status, 502..=504),
             Self::PermissionDenied { .. }
             | Self::InvalidRequest { .. }
             | Self::SessionInvalid { .. }
-            | Self::Api { .. }
             | Self::Decode { .. }
             | Self::InvalidInput { .. } => false,
         }
@@ -188,6 +195,9 @@ mod tests {
             ThetaDataError::from_status(474, ""),
             ThetaDataError::from_status(429, ""),
             ThetaDataError::from_status(571, ""),
+            ThetaDataError::from_status(502, ""),
+            ThetaDataError::from_status(503, ""),
+            ThetaDataError::from_status(504, ""),
             ThetaDataError::Http {
                 message: String::new(),
             },
@@ -200,6 +210,9 @@ mod tests {
             ThetaDataError::from_status(473, ""),
             ThetaDataError::from_status(478, ""),
             ThetaDataError::from_status(470, ""),
+            ThetaDataError::from_status(501, ""),
+            ThetaDataError::from_status(505, ""),
+            ThetaDataError::from_status(572, ""),
             ThetaDataError::decode("bad", "{}"),
             ThetaDataError::invalid_input("bad"),
         ];
