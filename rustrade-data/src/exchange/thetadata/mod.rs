@@ -24,7 +24,10 @@
 //! - **Concurrency is per account**, by the highest subscription tier: free 1, value 2, standard
 //!   4, pro 8 requests in flight. See [`ThetaDataClient`] for how the client keeps within it.
 //! - **The REST API has no authentication of its own**: anything that reaches the Terminal's port
-//!   uses the account. Keep the port on the host or a private network.
+//!   uses the account. The Terminal may listen on every network interface by default, and the
+//!   same port can serve endpoints beyond the REST API. Set the `host` in the Terminal's
+//!   `config.toml` deliberately: `127.0.0.1` when the client runs on the same host, or an address
+//!   reachable only from a private network.
 //!
 //! # Plans
 //! Each method's documentation names the cheapest plan that serves it. A request the account's
