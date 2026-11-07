@@ -72,7 +72,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   such flow on the account. That caller now calls `attribute_cash_flow` on each account event
   before `update_from_account_stream`, and before recording the event in any audit it keeps.
 
+- **The engine can let long options lapse at expiry** (`rustrade`, #868).
+  `ExpiryHandling::Engine(LongOptionExpiry::Lapse)` settles every long option at zero, in the money
+  or not, matching a holder who instructs the venue not to exercise. Set it per exchange with
+  `expiry_handling`.
+  - Short options still settle at their intrinsic value, standing in for assignment, and futures at
+    their own last price.
+  - A lapsing long needs no underlying price. When any position that needs the price is open and
+    the price is missing, nothing is settled and the expiry stays retryable, as before.
+
 ### Changed
+
+- **Breaking: `ExpiryHandling::Engine` carries a `LongOptionExpiry`** (`rustrade`, #868). Write
+  `ExpiryHandling::Engine(LongOptionExpiry::Exercise)`, or `ExpiryHandling::default()`, for the
+  old behaviour. In a human-readable format such as JSON, a serialised bare `"Engine"` still
+  deserialises, as that. `ExpiryHandling` and `LongOptionExpiry` are `#[non_exhaustive]`, so a
+  `match` on either outside `rustrade` needs a wildcard arm.
 
 - **Breaking: `init_market_stream` takes `MarketStreamOptions` in place of its
   `ReconnectionBackoffPolicy`** (`rustrade-data`, #862). Pass

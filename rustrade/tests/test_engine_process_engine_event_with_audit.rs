@@ -27,7 +27,7 @@ use rustrade::{
             connectivity::{ConnectivityDimension, Health, UntrackedExchange},
             global::DefaultGlobalData,
             instrument::{
-                ExpiryHandling,
+                ExpiryHandling, LongOptionExpiry,
                 data::{DefaultInstrumentMarketData, InstrumentDataState},
                 filter::InstrumentFilter,
             },
@@ -2210,7 +2210,10 @@ fn test_contract_expiry_engine_handling_is_the_default() {
         .instruments
         .instruments(&InstrumentFilter::None)
     {
-        assert_eq!(state.expiry_handling, ExpiryHandling::Engine);
+        assert_eq!(
+            state.expiry_handling,
+            ExpiryHandling::Engine(LongOptionExpiry::Exercise)
+        );
     }
 }
 
@@ -8651,4 +8654,274 @@ fn test_hedging_pending_fill_keeps_the_fee_value_it_arrived_with() {
         .position
         .positions[&position_id];
     assert_eq!(position.fees_enter.fees_quote, Some(dec!(0.0002)));
+}
+
+// ---------------------------------------------------------------------------
+// ExpiryHandling::Engine(LongOptionExpiry::Lapse)
+// ---------------------------------------------------------------------------
+
+/// Make the engine settle instrument index 0 with long options lapsing.
+fn lapse_long_options<Strategy>(engine: &mut TestEngine<Strategy>) {
+    engine
+        .state
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(0))
+        .expiry_handling = ExpiryHandling::Engine(LongOptionExpiry::Lapse);
+}
+
+/// Open a position with its own `position_id` in a Hedging engine, filled at `price`.
+fn open_hedged_option_position(engine: &mut TestEngine, leg: &str, side: Side, price: Decimal) {
+    let cid = ClientOrderId::new(format!("cid-{leg}"));
+    let exchange_order_id = OrderId::new(format!("exch-{leg}"));
+    send_open_order_with_position_id(
+        engine,
+        cid.clone(),
+        PositionId::new(leg),
+        side,
+        price,
+        ReduceOnly::No,
+    );
+    send_order_ack(engine, cid, exchange_order_id.clone(), side);
+    send_fill(engine, exchange_order_id, side, price);
+}
+
+/// A long call in the money lapses: it settles at zero, not at its intrinsic value, losing the
+/// premium paid.
+#[test]
+fn test_contract_expiry_lapse_long_itm_call_settles_at_zero() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    lapse_long_options(&mut engine);
+    // Intrinsic would be 55_000 - 50_000 = 5_000.
+    send_spot_price(&mut engine, 1, dec!(55_000));
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
+
+    assert_eq!(exited.len(), 1);
+    assert_eq!(exited[0].side, Side::Buy);
+    assert_eq!(exited[0].price_exit, Some(Decimal::ZERO));
+    assert_eq!(exited[0].pnl_realised, dec!(-2_000));
+    let state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert!(state.position.positions.is_empty());
+    assert!(state.expiration_processed);
+}
+
+/// A lapsing long needs no underlying price, so it settles even when none has arrived.
+#[test]
+fn test_contract_expiry_lapse_long_needs_no_underlying_price() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    lapse_long_options(&mut engine);
+    // No spot price is sent.
+    open_option_position(&mut engine, dec!(1), dec!(1_000));
+
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
+
+    assert_eq!(exited.len(), 1);
+    assert_eq!(exited[0].price_exit, Some(Decimal::ZERO));
+    assert_eq!(exited[0].pnl_realised, dec!(-1_000));
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .expiration_processed
+    );
+}
+
+/// A short call in the money still settles at its intrinsic value when longs lapse: the short
+/// stands in for assignment.
+#[test]
+fn test_contract_expiry_lapse_short_itm_call_settles_at_intrinsic() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    lapse_long_options(&mut engine);
+    send_spot_price(&mut engine, 1, dec!(55_000));
+    open_option_position_side(&mut engine, Side::Sell, dec!(1), dec!(2_000));
+
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
+
+    assert_eq!(exited.len(), 1);
+    assert_eq!(exited[0].side, Side::Sell);
+    assert_eq!(exited[0].price_exit, Some(dec!(5_000)));
+    // Sold at 2_000, bought back at the 5_000 intrinsic.
+    assert_eq!(exited[0].pnl_realised, dec!(-3_000));
+}
+
+/// A short still needs the underlying price when longs lapse. Without it nothing settles, and the
+/// expiry stays retryable.
+#[test]
+fn test_contract_expiry_lapse_short_without_price_is_not_settled() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    lapse_long_options(&mut engine);
+    open_option_position_side(&mut engine, Side::Sell, dec!(1), dec!(2_000));
+
+    let outputs: Vec<EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>> =
+        engine.process_contract_expiry(&InstrumentIndex(0));
+
+    assert_eq!(
+        outputs,
+        vec![EngineOutput::ContractExpiryNotSettled {
+            instrument: InstrumentIndex(0),
+            reason: ContractExpiryNotSettledReason::SettlementPriceUnavailable,
+        }]
+    );
+    let state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert_eq!(state.position.positions.len(), 1);
+    assert!(!state.expiration_processed);
+}
+
+/// In Hedging mode each position settles by its own side: the long lapses at zero and the short
+/// settles at intrinsic.
+#[test]
+fn test_contract_expiry_lapse_hedging_long_and_short() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_hedging_option_engine(TradingState::Disabled, execution_tx);
+    lapse_long_options(&mut engine);
+    send_spot_price(&mut engine, 1, dec!(55_000));
+    open_hedged_option_position(&mut engine, "long-leg", Side::Buy, dec!(2_000));
+    open_hedged_option_position(&mut engine, "short-leg", Side::Sell, dec!(3_000));
+
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
+
+    assert_eq!(exited.len(), 2);
+    let exit = |leg: &str| {
+        exited
+            .iter()
+            .find(|exit| exit.position_id == PositionId::new(leg))
+            .unwrap()
+    };
+    assert_eq!(exit("long-leg").price_exit, Some(Decimal::ZERO));
+    assert_eq!(exit("long-leg").pnl_realised, dec!(-2_000));
+    assert_eq!(exit("short-leg").price_exit, Some(dec!(5_000)));
+    assert_eq!(exit("short-leg").pnl_realised, dec!(-2_000));
+    let state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert!(state.position.positions.is_empty());
+    assert!(state.expiration_processed);
+}
+
+/// With a long and a short open and no underlying price, neither settles: the expiry is not
+/// settled in part.
+#[test]
+fn test_contract_expiry_lapse_hedging_without_price_settles_nothing() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_hedging_option_engine(TradingState::Disabled, execution_tx);
+    lapse_long_options(&mut engine);
+    open_hedged_option_position(&mut engine, "long-leg", Side::Buy, dec!(2_000));
+    open_hedged_option_position(&mut engine, "short-leg", Side::Sell, dec!(3_000));
+
+    let outputs: Vec<EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>> =
+        engine.process_contract_expiry(&InstrumentIndex(0));
+
+    assert_eq!(
+        outputs,
+        vec![EngineOutput::ContractExpiryNotSettled {
+            instrument: InstrumentIndex(0),
+            reason: ContractExpiryNotSettledReason::SettlementPriceUnavailable,
+        }]
+    );
+    let state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert_eq!(state.position.positions.len(), 2);
+    assert!(!state.expiration_processed);
+}
+
+/// `Lapse` concerns options only: a long future still settles at its own last price.
+#[test]
+fn test_contract_expiry_lapse_leaves_a_future_at_its_last_price() {
+    let expiry = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_single_kind_engine(
+        InstrumentKind::Future(FutureContract {
+            contract_size: dec!(1),
+            settlement_asset: Asset::from("usd"),
+            expiry,
+        }),
+        execution_tx,
+    );
+    lapse_long_options(&mut engine);
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+    send_spot_price(&mut engine, 0, dec!(1_100));
+
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
+
+    assert_eq!(exited.len(), 1);
+    assert_eq!(exited[0].price_exit, Some(dec!(1_100)));
+    assert_eq!(exited[0].pnl_realised, dec!(200));
+}
+
+/// The audit replica follows a lapse settled with no underlying price: the position is removed
+/// and the instrument marked processed on both sides.
+#[test]
+fn test_contract_expiry_replica_parity_lapse_without_price() {
+    use rustrade::engine::audit::{context::EngineContext, state_replica::StateReplicaManager};
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    lapse_long_options(&mut engine);
+    open_option_position(&mut engine, dec!(1), dec!(1_000));
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: engine.state.clone(),
+        context: EngineContext {
+            time: STARTING_TIMESTAMP,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica = StateReplicaManager::new(seed_tick, dummy_updates);
+    let option = InstrumentIndex(0);
+
+    process_live_and_replica!(&mut engine, replica, EngineEvent::ContractExpiry(option));
+
+    let live = engine.state.instruments.instrument_index(&option);
+    assert!(live.position.positions.is_empty());
+    assert!(live.expiration_processed);
+    assert_eq!(
+        replica
+            .replica_engine_state()
+            .instruments
+            .instrument_index(&option),
+        live
+    );
+}
+
+/// Lapsing longs need no underlying price, so an ambiguous underlying does not stop them settling.
+/// A short on the same underlying would still be refused as `AmbiguousUnderlying`.
+#[test]
+fn test_contract_expiry_lapse_long_ignores_an_ambiguous_underlying() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_ambiguous_underlying_engine(TradingState::Disabled, execution_tx);
+    lapse_long_options(&mut engine);
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    engine.process(market_event_trade(1, 2, dec!(55_000)));
+    open_position_on(&mut engine, 0, Side::Buy, dec!(1_000), dec!(2), "opt-open");
+
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
+
+    assert_eq!(exited.len(), 1);
+    assert_eq!(exited[0].price_exit, Some(Decimal::ZERO));
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .expiration_processed
+    );
 }
