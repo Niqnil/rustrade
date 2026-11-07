@@ -304,6 +304,7 @@ impl<ExchangeKey, AssetKey> Instrument<ExchangeKey, AssetKey> {
                 settlement_asset: find_asset(&contract.settlement_asset)?,
                 kind: contract.kind,
                 exercise: contract.exercise,
+                settlement: contract.settlement,
                 expiry: contract.expiry,
                 strike: contract.strike,
             }),

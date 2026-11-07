@@ -3763,13 +3763,14 @@ mod tests {
         mut state: InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex>,
     ) -> InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex> {
         use rustrade_instrument::instrument::kind::option::{
-            OptionContract, OptionExercise, OptionKind,
+            OptionContract, OptionExercise, OptionKind, OptionSettlement,
         };
         state.instrument.kind = InstrumentKind::Option(OptionContract {
             contract_size: Decimal::ONE,
             settlement_asset: state.instrument.underlying.quote,
             kind: OptionKind::Call,
             exercise: OptionExercise::American,
+            settlement: OptionSettlement::Physical,
             expiry: TIME,
             strike: dec!(100),
         });

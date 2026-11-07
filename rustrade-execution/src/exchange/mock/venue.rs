@@ -6970,7 +6970,7 @@ mod tests {
     fn unsupported_instrument_kinds_are_rejected_rather_than_filled_as_spot() {
         use rustrade_instrument::instrument::kind::{
             future::FutureContract,
-            option::{OptionContract, OptionExercise, OptionKind},
+            option::{OptionContract, OptionExercise, OptionKind, OptionSettlement},
             perpetual::PerpetualContract,
         };
 
@@ -6992,6 +6992,7 @@ mod tests {
                 settlement_asset: settlement.clone(),
                 kind: OptionKind::Call,
                 exercise: OptionExercise::European,
+                settlement: OptionSettlement::Physical,
                 expiry,
                 strike: d("50000"),
             }),
