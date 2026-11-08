@@ -1,5 +1,7 @@
 //! What a simulated venue holds against a short option.
 
+use rust_decimal::Decimal;
+use rustrade_instrument::asset::name::AssetNameExchange;
 use serde::{Deserialize, Serialize};
 
 /// How much quote a short put holds on the
@@ -26,4 +28,17 @@ pub enum ShortPutCollateral {
     /// cash-secured put this way. A limit sale resting on the book holds the strike less the
     /// premium at its limit price, and gives back what a better fill does not need.
     StrikeLessPremium,
+}
+
+/// What a short option position holds as collateral on the
+/// [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue): `amount` of `asset`, kept out of that
+/// asset's `free` balance and still in its `total`. A put holds quote, the strike it would pay; a
+/// call holds base, the underlying it would deliver.
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Collateral {
+    /// The asset held.
+    pub asset: AssetNameExchange,
+    /// How much of it is held.
+    pub amount: Decimal,
 }

@@ -25,7 +25,7 @@ use crate::{
         state::{Cancelled, Expired, Filled, Open, OrderState, UnindexedOrderState},
     },
     position::{Position, PositionReport},
-    short_option::ShortPutCollateral,
+    short_option::{Collateral, ShortPutCollateral},
     shortability::ShortabilityProvider,
     slippage::Slippage,
     trade::{AssetFees, TimeSource, Trade, TradeId, TradeOrigin},
@@ -323,9 +323,10 @@ pub enum VenueRegime {
 /// - **A buy that buys a short back** releases its share of the collateral as it fills. A put's
 ///   released cash helps pay for the buy, so a resting buy-back holds only what that cash does not
 ///   cover; a call's released base is restated beside the quote the buy pays.
-/// - **What an order opens is measured** as if every order already resting on the same side
-///   filled first. One order may close a long and open a short, and the short part holds
-///   collateral as above.
+/// - **What an order opens is measured**, and what it holds while it rests, as if every order
+///   already resting on the same side filled first. One order may close a long and open a short,
+///   and the short part holds collateral as above. A resting order is costed afresh at its fill,
+///   against the position as it then stands, and cancelled if the account can no longer cover it.
 /// - **Refused shorts:** a short cash-settled call, which nothing in a cash account secures, and
 ///   any short sale on a [`RequestPriced`](VenueRegime::RequestPriced) venue, which could never
 ///   price the underlying to assign it. Both with [`ApiError::OrderRejected`]. A short seeded
@@ -842,6 +843,9 @@ impl SimulatedVenue {
     ///   obligations on [`SimulatedVenue`].
     /// - If `initial_state` lists one client order id more than once among its open and cancelled
     ///   orders: see [`DuplicateSeededOrder`](super::account::DuplicateSeededOrder).
+    /// - If `initial_state` holds a short option position that its seeded free balances do not
+    ///   cover, whose collateral asset it holds no balance of, or that is a cash-settled call: see
+    ///   `# How an option is accounted` on [`SimulatedVenue`].
     pub fn new(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
@@ -863,6 +867,9 @@ impl SimulatedVenue {
     ///   obligations on [`SimulatedVenue`].
     /// - If `initial_state` lists one client order id more than once among its open and cancelled
     ///   orders: see [`DuplicateSeededOrder`](super::account::DuplicateSeededOrder).
+    /// - If `initial_state` holds a short option position that its seeded free balances do not
+    ///   cover, whose collateral asset it holds no balance of, or that is a cash-settled call: see
+    ///   `# How an option is accounted` on [`SimulatedVenue`].
     pub fn new_market_driven(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
@@ -1311,27 +1318,22 @@ impl SimulatedVenue {
         });
     }
 
-    /// The collateral the account's short position in the option `instrument` holds, and the
-    /// asset it is held in: `strike × contracts × contract_size` of quote for a put, `contracts ×
-    /// contract_size` of base for a call. `None` when the account is not short that option, or
-    /// this venue does not list it.
+    /// The collateral the account's short position in the option `instrument` holds:
+    /// `strike × contracts × contract_size` of quote for a put, `contracts × contract_size` of base
+    /// for a call. `None` both when the account is not short that option and when this venue does
+    /// not list it.
     ///
     /// The amount is part of that asset's balance `total − free`, beside what open orders hold, and
     /// is derived from the position, so it changes only as the short does. See the type's
     /// `# How an option is accounted`.
-    pub fn collateral_held(
-        &self,
-        instrument: &InstrumentNameExchange,
-    ) -> Option<(AssetNameExchange, Decimal)> {
+    pub fn collateral_held(&self, instrument: &InstrumentNameExchange) -> Option<Collateral> {
         let position = self.positions.get(instrument)?;
         if !position.quantity.is_sign_negative() {
             return None;
         }
-        let terms = self.instrument_terms(instrument).ok()?;
-        let Settles::Option { strike, kind, .. } = terms.settles else {
-            return None;
-        };
-        Some(option_collateral(&terms, strike, kind, position.quantity))
+        self.instrument_terms(instrument)
+            .ok()?
+            .short_collateral(position.quantity)
     }
 
     /// Whether the account holds a position in the option `instrument`, or has an order on it.
@@ -1467,15 +1469,19 @@ impl SimulatedVenue {
         let Some(position) = self.positions.get(instrument).copied() else {
             return true;
         };
-        let Some(Instrument {
-            underlying,
-            kind: InstrumentKind::Option(contract),
-            ..
-        }) = self.instruments.get(instrument)
+        let Some((terms, contract)) =
+            self.instruments
+                .get(instrument)
+                .and_then(|listed| match &listed.kind {
+                    InstrumentKind::Option(contract) => {
+                        Some((InstrumentTerms::of(listed).ok()?, contract.clone()))
+                    }
+                    _ => None,
+                })
         else {
             return true;
         };
-        let (underlying, contract) = (underlying.clone(), contract.clone());
+        let underlying = terms.underlying.clone();
         let short = position.quantity.is_sign_negative();
         let contracts = position.quantity.abs();
 
@@ -1493,16 +1499,6 @@ impl SimulatedVenue {
             }
         };
 
-        let terms = InstrumentTerms {
-            underlying: underlying.clone(),
-            contract_size: contract.contract_size,
-            settles: Settles::Option {
-                expiry: contract.expiry,
-                strike: contract.strike,
-                kind: contract.kind,
-                settlement: contract.settlement,
-            },
-        };
         let zero_fee =
             || AssetFees::new(underlying.quote.clone(), Decimal::ZERO, Some(Decimal::ZERO));
         // The side that closes the position, and how an exercise in the money is reported: the
@@ -1512,8 +1508,7 @@ impl SimulatedVenue {
             true => (Side::Buy, TradeOrigin::Assignment),
         };
         // What a short holds, released or spent below. Derived from the position, as it was held.
-        let collateral =
-            short.then(|| option_collateral(&terms, contract.strike, contract.kind, contracts));
+        let collateral = short.then(|| terms.short_collateral(contracts)).flatten();
 
         let Some((spot, intrinsic)) = in_the_money else {
             // Out of the money, or a long lapsed: the option closes at nothing, and a short's
@@ -1527,7 +1522,7 @@ impl SimulatedVenue {
                     price: Decimal::ZERO,
                 },
             );
-            if let Some((asset, amount)) = collateral {
+            if let Some(Collateral { asset, amount }) = collateral {
                 let balance = self.account.release(&asset, amount, at);
                 events.push(self.build_account_event(Snapshot(balance)));
             }
@@ -1570,7 +1565,10 @@ impl SimulatedVenue {
                     ),
                     // A put's intrinsic value never exceeds its strike, so the cash it holds pays
                     // it, and the rest is released.
-                    Some((asset, held)) => {
+                    Some(Collateral {
+                        asset,
+                        amount: held,
+                    }) => {
                         debug_assert!(asset == underlying.quote && amount <= held);
                         self.account.settle(&asset, amount, at);
                         self.account.release(&asset, held - amount, at)
@@ -1624,7 +1622,10 @@ impl SimulatedVenue {
                 let (quote, base) = match collateral {
                     // A short spends exactly what it holds: a put the strike in quote, a call the
                     // base it delivers. What it receives is delivered.
-                    Some((asset, held)) => {
+                    Some(Collateral {
+                        asset,
+                        amount: held,
+                    }) => {
                         let spent = self.account.settle(&asset, held, at);
                         match contract.kind {
                             OptionKind::Put => {
@@ -3096,6 +3097,7 @@ impl SimulatedVenue {
                 Some((price, _)) => position.after(side, filled_quantity, *price),
                 None => position,
             };
+            let position = self.behind_resting(terms, &order.key.instrument, side, position);
             self.settlement(terms, position, side, unfilled, limit, Liquidity::Maker)
         });
         // One order pays with one asset, which a call sale whose fill only closes a long, while its
@@ -3423,7 +3425,7 @@ impl SimulatedVenue {
         mut reservation: Option<Reservation>,
         debit: &Debit,
         credit: Option<&Credit>,
-        release: Option<&CollateralRelease>,
+        release: Option<&Collateral>,
         time_exchange: DateTime<Utc>,
     ) -> Recommitted {
         // Reported after the fill this commits, or with the cancel if the account cannot cover
@@ -3591,7 +3593,7 @@ impl SimulatedVenue {
     /// [`Committed::paid`].
     fn releasing_collateral(
         &mut self,
-        release: Option<&CollateralRelease>,
+        release: Option<&Collateral>,
         time_exchange: DateTime<Utc>,
         commit: impl FnOnce(&mut Self) -> Result<Commitment, BalanceInsufficient>,
     ) -> Result<Commitment, BalanceInsufficient> {
@@ -3609,8 +3611,8 @@ impl SimulatedVenue {
                 Ok(commitment)
             }
             Err(insufficient) => {
-                // A refused commit moves nothing, so what was just released is still free.
-                #[allow(clippy::expect_used)] // Unreachable: see the comment above.
+                #[allow(clippy::expect_used)]
+                // Unreachable: a refused commit moves nothing, so what was just released is still free.
                 self.account
                     .reserve(&release.asset, release.amount, time_exchange)
                     .expect("a refused commit leaves the collateral it was offered free");
@@ -4668,7 +4670,7 @@ impl SimulatedVenue {
         let time_exchange = self.time_exchange();
         let settlement = self.settlement(
             terms,
-            self.net_position(terms, &request.key.instrument),
+            self.position_behind_resting(terms, &request.key.instrument, side),
             side,
             request.state.quantity,
             estimate,
@@ -4777,9 +4779,9 @@ impl SimulatedVenue {
     ) -> Result<(), UnindexedOrderError> {
         let Settles::Option {
             expiry,
-            strike,
             kind,
             settlement,
+            ..
         } = terms.settles
         else {
             return Ok(());
@@ -4804,23 +4806,14 @@ impl SimulatedVenue {
             )));
         }
 
-        // The position left if every order already resting on this side filled, and what of this
-        // order would then open or increase a position on its side rather than close one.
+        // What of this order would open or increase a position on its side rather than close one,
+        // once every order already resting on that side filled.
         let side = request.state.side;
-        let resting: Decimal = self
-            .account
-            .orders_open()
-            .filter(|order| order.key.instrument == *instrument && order.side == side)
-            .map(|order| order.state.quantity_remaining(order.quantity))
-            .sum();
-        let position = self.net_position(terms, instrument).quantity;
-        let closable = match side {
-            Side::Buy => -(position + resting),
-            Side::Sell => position - resting,
-        }
-        .max(Decimal::ZERO);
         let quantity = request.state.quantity;
-        let opening = quantity - quantity.min(closable);
+        let opening = quantity
+            - self
+                .position_behind_resting(terms, instrument, side)
+                .closing(side, quantity);
         if opening.is_zero() {
             return Ok(());
         }
@@ -4860,7 +4853,13 @@ impl SimulatedVenue {
                     OptionKind::Call => true,
                     OptionKind::Put => self.short_put_collateral == ShortPutCollateral::Strike,
                 };
-                let (asset, required) = option_collateral(terms, strike, kind, opening);
+                let Some(Collateral {
+                    asset,
+                    amount: required,
+                }) = terms.short_collateral(opening)
+                else {
+                    return Ok(());
+                };
                 let free = self.account.free(&asset);
                 if checked && free < required {
                     return Err(UnindexedOrderError::Rejected(
@@ -5234,7 +5233,12 @@ impl SimulatedVenue {
         let held = match remainder {
             Remainder::Rest { limit } if unfilled > Decimal::ZERO => Some(self.settlement(
                 terms,
-                position.after(side, filled_quantity, fill_price),
+                self.behind_resting(
+                    terms,
+                    &request.key.instrument,
+                    side,
+                    position.after(side, filled_quantity, fill_price),
+                ),
                 side,
                 unfilled,
                 limit,
@@ -5518,10 +5522,11 @@ impl SimulatedVenue {
         let time_exchange = self.time_exchange();
 
         // Priced and charged exactly as the fill will be: the unfilled remainder, at the order's
-        // own limit, as the maker, against the position as it stands now.
+        // own limit, as the maker, against the position as it stands now, or for an option once
+        // the orders already resting on its side have filled.
         let settlement = self.settlement(
             terms,
-            self.net_position(terms, &request.key.instrument),
+            self.position_behind_resting(terms, &request.key.instrument, request.state.side),
             request.state.side,
             request.state.quantity - filled_quantity,
             limit,
@@ -5607,14 +5612,7 @@ impl SimulatedVenue {
         &self,
         instrument: &InstrumentNameExchange,
     ) -> Result<InstrumentTerms, UnindexedApiError> {
-        let instrument = self.find_instrument_data(instrument)?;
-        let settles = Self::settlement_of_supported_kind(instrument)?;
-
-        Ok(InstrumentTerms {
-            underlying: instrument.underlying.clone(),
-            contract_size: instrument.kind.contract_size(),
-            settles,
-        })
+        InstrumentTerms::of(self.find_instrument_data(instrument)?)
     }
 
     /// The net position an order on `instrument` trades against. Flat for a cash-settled
@@ -5629,6 +5627,48 @@ impl SimulatedVenue {
             return NetPosition::default();
         }
         self.positions.get(instrument).copied().unwrap_or_default()
+    }
+
+    /// The net position a new order on `side` of `instrument` is measured and held against: for
+    /// an option, the position as it would stand once every order already resting on that side
+    /// filled, so two resting orders cannot both count on closing the same contracts, and one
+    /// that would open a short holds its collateral from the moment it rests. Any other
+    /// instrument's position as it stands, which [`net_position`](Self::net_position) gives.
+    fn position_behind_resting(
+        &self,
+        terms: &InstrumentTerms,
+        instrument: &InstrumentNameExchange,
+        side: Side,
+    ) -> NetPosition {
+        self.behind_resting(
+            terms,
+            instrument,
+            side,
+            self.net_position(terms, instrument),
+        )
+    }
+
+    /// `position` moved by every order resting on `side` of the option `instrument`, as
+    /// [`position_behind_resting`](Self::position_behind_resting) explains. Only a position that
+    /// opposes `side` moves: resting orders that only add to it change nothing an order closes.
+    fn behind_resting(
+        &self,
+        terms: &InstrumentTerms,
+        instrument: &InstrumentNameExchange,
+        side: Side,
+        position: NetPosition,
+    ) -> NetPosition {
+        if !matches!(terms.settles, Settles::Option { .. }) || !position.opposes(side) {
+            return position;
+        }
+        let resting: Decimal = self
+            .account
+            .orders_open()
+            .filter(|order| order.key.instrument == *instrument && order.side == side)
+            .map(|order| order.state.quantity_remaining(order.quantity))
+            .sum();
+        // The entry price is no part of what an option settlement reads.
+        position.after(side, resting, position.entry)
     }
 
     /// Moves `instrument`'s net position by a fill, if it is cash-settled. A spot fill moves the
@@ -5773,9 +5813,8 @@ impl SimulatedVenue {
         let quantity = quantity.abs();
         let fees = AssetFees::new(terms.underlying.quote.clone(), fees_quote, Some(fees_quote));
 
-        if let Settles::Option { strike, kind, .. } = terms.settles {
-            return self
-                .option_settlement(terms, position, side, quantity, price, fees, strike, kind);
+        if matches!(terms.settles, Settles::Option { .. }) {
+            return self.option_settlement(terms, position, side, quantity, price, fees);
         }
 
         if terms.holds_position() {
@@ -5883,7 +5922,15 @@ impl SimulatedVenue {
     ///   collateral. A call pays with base: it holds the base it would deliver and delivers its
     ///   premium, net of the fee, into quote.
     /// - **A sale that only closes a long** pays its fee out of the premium, in quote.
-    #[allow(clippy::too_many_arguments)] // Each is one fact of the fill; a struct would only rename them.
+    ///
+    /// A call sale opening a short whose fee exceeds its premium delivers the difference out of
+    /// quote, which a resting order does not hold: its reservation is the base alone, and the
+    /// fill takes the difference from free quote, or the order is cancelled at its fill if the
+    /// account no longer has it, as any resting order the ledger cannot cover is.
+    ///
+    /// # Panics
+    /// If `terms` are not an option's: [`settlement`](Self::settlement) hands only an option's
+    /// fill here.
     fn option_settlement(
         &self,
         terms: &InstrumentTerms,
@@ -5892,22 +5939,23 @@ impl SimulatedVenue {
         quantity: Decimal,
         price: Decimal,
         fees: AssetFees<AssetNameExchange>,
-        strike: Decimal,
-        kind: OptionKind,
     ) -> Settlement {
+        let Settles::Option { kind, .. } = terms.settles else {
+            unreachable!(
+                "SimulatedVenue::settlement hands only an option's fill to option_settlement"
+            )
+        };
         let quote = &terms.underlying.quote;
         let fees_quote = fees.fees_quote.unwrap_or(Decimal::ZERO);
         let premium = price * quantity * terms.contract_size;
         let closing = position.closing(side, quantity);
         let opening = quantity - closing;
-        let collateral = |contracts: Decimal| option_collateral(terms, strike, kind, contracts);
 
         match side {
             Side::Buy => {
-                let released = (!closing.is_zero()).then(|| {
-                    let (asset, amount) = collateral(closing);
-                    CollateralRelease { asset, amount }
-                });
+                let released = (!closing.is_zero())
+                    .then(|| terms.short_collateral(closing))
+                    .flatten();
                 Settlement {
                     asset: quote.clone(),
                     amount: premium + fees_quote,
@@ -5929,7 +5977,13 @@ impl SimulatedVenue {
                 collateral: CollateralMove::default(),
             },
             Side::Sell => {
-                let (asset, held) = collateral(opening);
+                let Some(Collateral {
+                    asset,
+                    amount: held,
+                }) = terms.short_collateral(opening)
+                else {
+                    unreachable!("an option's terms always secure a short")
+                };
                 match kind {
                     OptionKind::Put => Settlement {
                         asset,
@@ -6214,29 +6268,24 @@ fn hold_seeded_collateral(
     let shorts = positions
         .iter()
         .filter(|(_, position)| position.quantity.is_sign_negative())
-        .filter_map(|(name, position)| match &instruments.get(name)?.kind {
-            InstrumentKind::Option(contract) => Some((name, position.quantity, contract)),
-            _ => None,
+        .filter_map(|(name, position)| {
+            let instrument = instruments.get(name)?;
+            let InstrumentKind::Option(contract) = &instrument.kind else {
+                return None;
+            };
+            let terms = InstrumentTerms::of(instrument).ok()?;
+            Some((name, position.quantity, contract, terms))
         })
         .sorted_by(|a, b| a.0.cmp(b.0));
-    for (name, quantity, contract) in shorts {
+    for (name, quantity, contract, terms) in shorts {
         assert!(
             !(contract.kind == OptionKind::Call && contract.settlement == OptionSettlement::Cash),
             "SimulatedVenue's initial_state reports a short position in the cash-settled call \
              {name}, which nothing in a cash account secures"
         );
-        let instrument = &instruments[name];
-        let terms = InstrumentTerms {
-            underlying: instrument.underlying.clone(),
-            contract_size: contract.contract_size,
-            settles: Settles::Option {
-                expiry: contract.expiry,
-                strike: contract.strike,
-                kind: contract.kind,
-                settlement: contract.settlement,
-            },
+        let Some(Collateral { asset, amount }) = terms.short_collateral(quantity) else {
+            continue;
         };
-        let (asset, amount) = option_collateral(&terms, contract.strike, contract.kind, quantity);
         let Some(time) = account
             .balances()
             .find(|balance| balance.asset == asset)
@@ -6854,10 +6903,42 @@ struct InstrumentTerms {
 }
 
 impl InstrumentTerms {
+    /// The terms of `instrument`, or why this venue does not support its kind.
+    fn of(
+        instrument: &Instrument<ExchangeId, AssetNameExchange>,
+    ) -> Result<Self, UnindexedApiError> {
+        Ok(Self {
+            underlying: instrument.underlying.clone(),
+            contract_size: instrument.kind.contract_size(),
+            settles: SimulatedVenue::settlement_of_supported_kind(instrument)?,
+        })
+    }
+
     /// Whether a fill moves a net position this venue keeps for the instrument, rather than only
     /// the balances: true for a CFD and an option, false for spot.
     fn holds_position(&self) -> bool {
         !matches!(self.settles, Settles::Spot)
+    }
+
+    /// The collateral `contracts` (either sign) of a short in this option hold:
+    /// `strike × contracts × contract_size` of quote for a put, the cash it would pay for the
+    /// underlying if assigned; `contracts × contract_size` of base for a call, the underlying it
+    /// would deliver. `None` for any instrument but an option.
+    fn short_collateral(&self, contracts: Decimal) -> Option<Collateral> {
+        let Settles::Option { strike, kind, .. } = self.settles else {
+            return None;
+        };
+        let units = contracts.abs() * self.contract_size;
+        Some(match kind {
+            OptionKind::Put => Collateral {
+                asset: self.underlying.quote.clone(),
+                amount: strike * units,
+            },
+            OptionKind::Call => Collateral {
+                asset: self.underlying.base.clone(),
+                amount: units,
+            },
+        })
     }
 }
 
@@ -6958,18 +7039,11 @@ struct CollateralMove {
     held: Decimal,
     /// The collateral the part of the fill that buys a short back releases, in the asset it was
     /// held in: quote for a put, base for a call. `None` when it buys nothing back.
-    released: Option<CollateralRelease>,
+    released: Option<Collateral>,
     /// The least [`Settlement::requirement`] may be, whatever the fill credits:
     /// under [`ShortPutCollateral::Strike`], the collateral of a put sale, which the premium it
     /// receives must not pay for.
     floor: Decimal,
-}
-
-/// Collateral a short option held that a fill gives back to `free`.
-#[derive(Debug, Clone)]
-struct CollateralRelease {
-    asset: AssetNameExchange,
-    amount: Decimal,
 }
 
 impl Settlement {
@@ -7014,8 +7088,9 @@ impl Settlement {
     /// pays nothing in base and delivers its premium, net of the fee, into quote.
     ///
     /// # Panics
-    /// Debug-asserts that this is such a fill: it pays only its fee, in the asset its premium is
-    /// paid back into, and holds no collateral.
+    /// Always, if this settlement pays with another asset than `asset` and is not paid back in
+    /// the asset it pays with: only such a call sale pays with an asset other than its
+    /// remainder's. Debug-asserts, too, that it moves no collateral.
     fn paying_with(self, asset: &AssetNameExchange) -> Self {
         if self.asset == *asset {
             return self;
@@ -7078,23 +7153,6 @@ impl Settlement {
     }
 }
 
-/// The collateral `contracts` of a short in the option `terms` describes hold, and the asset it is
-/// held in: `strike × contracts × contract_size` of quote for a put, the cash it would pay for the
-/// underlying if assigned; `contracts × contract_size` of base for a call, the underlying it would
-/// deliver.
-fn option_collateral(
-    terms: &InstrumentTerms,
-    strike: Decimal,
-    kind: OptionKind,
-    contracts: Decimal,
-) -> (AssetNameExchange, Decimal) {
-    let units = contracts.abs() * terms.contract_size;
-    match kind {
-        OptionKind::Put => (terms.underlying.quote.clone(), strike * units),
-        OptionKind::Call => (terms.underlying.base.clone(), units),
-    }
-}
-
 /// A cash-settled instrument's net position on this venue: what a CFD fill closes before it
 /// opens anything.
 ///
@@ -7119,13 +7177,17 @@ impl NetPosition {
         self.quantity.is_sign_positive() && !self.quantity.is_zero()
     }
 
-    /// How much of a fill of `quantity` on `side` closes this position. The rest of it opens one.
-    fn closing(&self, side: Side, quantity: Decimal) -> Decimal {
-        let opposes = match side {
+    /// Whether a fill on `side` would close some of this position.
+    fn opposes(&self, side: Side) -> bool {
+        match side {
             Side::Buy => self.quantity.is_sign_negative() && !self.quantity.is_zero(),
             Side::Sell => self.is_long(),
-        };
-        match opposes {
+        }
+    }
+
+    /// How much of a fill of `quantity` on `side` closes this position. The rest of it opens one.
+    fn closing(&self, side: Side, quantity: Decimal) -> Decimal {
+        match self.opposes(side) {
             true => quantity.min(self.quantity.abs()),
             false => Decimal::ZERO,
         }
@@ -8165,6 +8227,27 @@ mod tests {
         assert_eq!(balance_of(&events[0]).balance.free, d("130000"));
         assert_eq!(filled_price(order_of(&events[2])), d("5200"));
         assert_eq!(cfd_position(&venue), None);
+    }
+
+    /// Unlike an option's, a CFD order is held against the position as it stands, whatever else
+    /// rests on its side: each closing order holds nothing, and one that turns out to open a
+    /// position is costed when it fills.
+    #[test]
+    fn a_second_resting_order_that_only_reduces_a_cfd_position_holds_nothing_either() {
+        let mut venue = make_cfd_market_venue("125000");
+        assert!(cfd_market(&mut venue, "4990", "5000", "5000").is_empty());
+        cfd_market_fill(&mut venue, Side::Buy, "1");
+        let first = venue.open_order(cfd_limit("close", Side::Sell, "1", "5200"));
+        assert!(rested_open(&first).filled_quantity.is_zero());
+
+        let second = venue.open_order(cfd_limit("close2", Side::Sell, "1", "5300"));
+
+        assert!(rested_open(&second).filled_quantity.is_zero());
+        assert_eq!(
+            total_usd(&venue) - free_usd(&venue),
+            Decimal::ZERO,
+            "nothing is held"
+        );
     }
 
     #[test]

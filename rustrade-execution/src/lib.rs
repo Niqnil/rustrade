@@ -125,7 +125,7 @@ pub mod reduce_only;
 pub mod rules;
 pub use rules::{OrderRules, PreSendRules, ValueRule};
 pub mod short_option;
-pub use short_option::ShortPutCollateral;
+pub use short_option::{Collateral, ShortPutCollateral};
 pub mod shortability;
 pub mod slippage;
 pub use shortability::{Shortability, ShortabilityProvider, ShortabilityTable};

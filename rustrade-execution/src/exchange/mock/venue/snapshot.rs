@@ -6,6 +6,7 @@ use crate::{
     balance::MarginDetails,
     client::mock::MockExecutionConfig,
     exchange::mock::account::{AccountState, AccountStateSnapshot, DuplicateSeededOrder},
+    short_option::Collateral,
     slippage::Slippage,
     stored::FormatVersion,
 };
@@ -325,9 +326,13 @@ impl SimulatedVenue {
     /// beyond what its open orders reserve. A balance holds `total − free`; the collateral itself
     /// is derived from the positions, so it is not stored, and a snapshot whose balances do not
     /// hold it would let an assignment spend balance the account never set aside.
+    ///
+    /// A lower bound: anything else a hand-edited snapshot holds out of `free` counts towards the
+    /// collateral too. A snapshot this venue wrote holds exactly its orders' reservations and
+    /// the collateral.
     fn check_collateral_held(&self) -> Result<(), VenueRestoreError> {
         let mut required: FnvHashMap<AssetNameExchange, Decimal> = FnvHashMap::default();
-        for (asset, amount) in self
+        for Collateral { asset, amount } in self
             .positions
             .keys()
             .filter_map(|name| self.collateral_held(name))

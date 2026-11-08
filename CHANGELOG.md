@@ -104,8 +104,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     cash to buy the underlying at the strike, `strike × quantity × contract_size` of quote; a call
     the shares it would deliver, `quantity × contract_size` of base. Covering shares cannot be
     sold or used by another order, and collateral is never borrowed. A limit sale holds it while
-    it rests; a buy-back releases its share as it fills. `SimulatedVenue::collateral_held` reports
-    it. A short whose collateral is not free is refused (`ApiError::BalanceInsufficient`), and a
+    it rests, measured, like every order, as if the orders already resting on its side filled
+    first; a buy-back releases its share as it fills. `SimulatedVenue::collateral_held` reports
+    it as a `Collateral`. A short whose collateral is not free is refused (`ApiError::BalanceInsufficient`), and a
     short cash-settled call always is.
   - **`MockExecutionConfig::short_put_collateral`** (`ShortPutCollateral`) decides whether a put's
     premium counts towards its collateral: `Strike`, the default, holds the full strike before the

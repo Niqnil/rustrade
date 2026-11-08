@@ -6,7 +6,7 @@ use crate::{
     expiry::LongOptionExpiry,
     fee::PerContractFeeModel,
     order::request::{RequestCancel, RequestOpen},
-    short_option::ShortPutCollateral,
+    short_option::{Collateral, ShortPutCollateral},
 };
 use rustrade_instrument::instrument::{
     kind::option::{OptionContract, OptionExercise, OptionKind, OptionSettlement},
@@ -1107,6 +1107,14 @@ fn sell(venue: &mut SimulatedVenue, quantity: &str) -> Vec<UnindexedAccountEvent
     outcome.events
 }
 
+/// What [`SimulatedVenue::collateral_held`] reports for a short holding `amount` of `asset`.
+fn collateral(asset: AssetNameExchange, amount: &str) -> Option<Collateral> {
+    Some(Collateral {
+        asset,
+        amount: d(amount),
+    })
+}
+
 fn totals(venue: &SimulatedVenue, asset: AssetNameExchange) -> (Decimal, Decimal) {
     let balance = balance(venue, asset);
     (balance.total, balance.free)
@@ -1139,7 +1147,7 @@ fn a_short_put_receives_its_premium_and_holds_its_strike() {
     );
     assert_eq!(
         venue.collateral_held(&option_name()),
-        Some((usd(), d("10000")))
+        collateral(usd(), "10000")
     );
 }
 
@@ -1200,7 +1208,7 @@ fn under_strike_less_premium_the_premium_counts_towards_the_strike() {
     assert_eq!(totals(&venue, usd()), (d("10000"), Decimal::ZERO));
     assert_eq!(
         venue.collateral_held(&option_name()),
-        Some((usd(), d("10000")))
+        collateral(usd(), "10000")
     );
 
     let short = driven_venue(OptionKind::Put, OptionSettlement::Physical, |config| {
@@ -1231,7 +1239,7 @@ fn a_covered_call_holds_the_shares_it_would_deliver() {
     assert_eq!(totals(&venue, usd()), (d("150"), d("150")));
     assert_eq!(
         venue.collateral_held(&option_name()),
-        Some((spy(), d("100")))
+        collateral(spy(), "100")
     );
     assert_eq!(snapshots_of(&events, &spy()), 1, "{events:?}");
     assert_eq!(snapshots_of(&events, &usd()), 1, "{events:?}");
@@ -1338,7 +1346,7 @@ fn buying_part_of_a_short_back_releases_its_share() {
     assert_eq!(option_position(&venue), Some(d("-1")));
     assert_eq!(
         venue.collateral_held(&option_name()),
-        Some((usd(), d("10000")))
+        collateral(usd(), "10000")
     );
     assert_eq!(totals(&venue, usd()), (d("20200"), d("10200")));
 }
@@ -1600,6 +1608,125 @@ fn a_put_sale_filled_in_part_holds_the_strike_for_both_the_fill_and_the_remainde
         (d("30150"), d("10150")),
         "150 received; 10000 held by the short, 10000 by the resting sale"
     );
+}
+
+#[test]
+fn a_resting_sale_behind_one_that_closes_the_long_holds_the_shares_of_the_short_it_opens() {
+    let mut venue = driven_venue(
+        OptionKind::Call,
+        OptionSettlement::Physical,
+        funds("1000", "100"),
+    );
+    feed(&mut venue, "100", "1.5", time(2));
+    buy(&mut venue, "1");
+
+    let closing = venue.open_order(limit(option_name(), Side::Sell, "2", "1", "ask"));
+    assert!(
+        closing.response.state.is_accepted(),
+        "{:?}",
+        closing.response.state
+    );
+    assert_eq!(
+        totals(&venue, spy()),
+        (d("100"), d("100")),
+        "it only closes the long"
+    );
+
+    let opening = venue.open_order(limit(option_name(), Side::Sell, "2", "1", "ask2"));
+    assert!(
+        opening.response.state.is_accepted(),
+        "{:?}",
+        opening.response.state
+    );
+    assert_eq!(
+        totals(&venue, spy()),
+        (d("100"), Decimal::ZERO),
+        "once the first fills, this one opens a short, so it holds the shares from now"
+    );
+
+    let _ = venue.apply_market(
+        &option_name(),
+        MarketObservation::new(traded("2.1")),
+        time(3),
+    );
+
+    assert_eq!(option_position(&venue), Some(d("-1")));
+    assert_eq!(totals(&venue, spy()), (d("100"), Decimal::ZERO));
+    assert_eq!(
+        venue.collateral_held(&option_name()),
+        collateral(spy(), "100")
+    );
+}
+
+#[test]
+fn a_resting_buy_behind_one_that_buys_the_short_back_holds_the_premium_of_the_long_it_opens() {
+    let mut venue = driven_venue(
+        OptionKind::Put,
+        OptionSettlement::Physical,
+        funds("10200", "0"),
+    );
+    feed(&mut venue, "100", "1.5", time(2));
+    sell(&mut venue, "1");
+    assert_eq!(totals(&venue, usd()), (d("10350"), d("350")));
+
+    let buyback = venue.open_order(limit(option_name(), Side::Buy, "1", "1", "bid"));
+    assert!(
+        buyback.response.state.is_accepted(),
+        "{:?}",
+        buyback.response.state
+    );
+    assert_eq!(
+        totals(&venue, usd()),
+        (d("10350"), d("350")),
+        "the strike it releases pays for it"
+    );
+
+    let opening = venue.open_order(limit(option_name(), Side::Buy, "1", "1", "bid2"));
+    assert!(
+        opening.response.state.is_accepted(),
+        "{:?}",
+        opening.response.state
+    );
+    assert_eq!(
+        totals(&venue, usd()),
+        (d("10350"), d("250")),
+        "once the first fills, this one opens a long, so it holds its 100 premium"
+    );
+}
+
+#[test]
+fn a_resting_covered_call_whose_fee_exceeds_its_premium_is_cancelled_at_its_fill_without_the_quote()
+{
+    let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |config| {
+        funds("0", "100")(config);
+        config.fee_model = FeeModelConfig::PerContract(PerContractFeeModel {
+            commission_per_contract: d("2"),
+        });
+    });
+    feed(&mut venue, "100", "0.005", time(2));
+
+    let rested = venue.open_order(limit(option_name(), Side::Sell, "0.01", "1", "ask"));
+    assert!(
+        rested.response.state.is_accepted(),
+        "{:?}",
+        rested.response.state
+    );
+    assert_eq!(
+        totals(&venue, spy()),
+        (d("100"), Decimal::ZERO),
+        "it holds the shares, and not the 1 of quote its fee exceeds its premium by"
+    );
+
+    let _ = venue.apply_market(
+        &option_name(),
+        MarketObservation::new(traded("0.02")),
+        time(3),
+    );
+
+    assert!(venue.orders_open(&[]).is_empty());
+    assert_eq!(option_position(&venue), None);
+    assert_eq!(totals(&venue, spy()), (d("100"), d("100")));
+    assert_eq!(totals(&venue, usd()), (Decimal::ZERO, Decimal::ZERO));
 }
 
 #[test]
