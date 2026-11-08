@@ -970,6 +970,25 @@ fn a_snapshot_holding_an_option_short_is_refused() {
     );
 }
 
+/// The short check refuses only a negative quantity: a flat option position is not a short.
+#[test]
+fn a_snapshot_holding_a_flat_option_position_is_not_refused_as_a_short() {
+    let (kind, settlement) = (OptionKind::Call, OptionSettlement::Cash);
+    let mut venue = driven_venue(kind, settlement, |_| {});
+    feed(&mut venue, "100", "1.5", time(2));
+    buy(&mut venue, "1");
+
+    let mut json = serde_json::to_value(venue.snapshot()).unwrap();
+    json["positions"][0][1]["quantity"] = serde_json::json!("0");
+    let restored = SimulatedVenue::from_snapshot(
+        &config("10000", FeeModelConfig::default()),
+        driven_instruments(kind, settlement),
+        serde_json::from_value(json).unwrap(),
+    );
+
+    assert!(restored.is_ok(), "{:?}", restored.err());
+}
+
 /// A market input can carry the clock past an expiry before the driver's next `advance_time`, and
 /// an order placed then is refused all the same.
 #[test]
