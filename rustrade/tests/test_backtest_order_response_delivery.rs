@@ -358,6 +358,7 @@ fn args_constant()
             spot_margin: None,
             fee_asset: None,
             long_option_expiry: Default::default(),
+            short_put_collateral: Default::default(),
         })],
         market_data: MarketDataInMemory::new(Arc::new(market_events)),
         summary_interval: Daily,
