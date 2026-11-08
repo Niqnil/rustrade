@@ -139,6 +139,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking: `init_market_stream` takes `MarketStreamOptions` in place of its
   `ReconnectionBackoffPolicy`** (`rustrade-data`, #862). Pass
   `MarketStreamOptions::default().with_reconnect(policy)` to keep the old behaviour.
+- **`ibapi` 5.5.0 → 5.7.0** (`rustrade-execution`, `rustrade-data`, `rustrade-instrument`, feature
+  `ibkr`, #859). The bytes sent for every order this crate builds are unchanged. The changes that
+  reach the compiled code:
+  - A one-shot request with a deadline no longer waits past it for a reconnect, and fails with a
+    timeout instead. So `IbkrClient::account_snapshot`, when the connection drops just as it
+    starts, now waits at most 30 seconds for the reconnect and then fails with the transient
+    `ConnectivityError::Timeout`. It used to return only once the reconnect ended, which can take
+    minutes. While the connection is down it still fails at once.
+  - A request sent while `ibapi` reconnects is either written on the old connection or refused with
+    a connection reset. It can no longer reach the new connection before its handshake has
+    finished. A write stuck on a gateway that stopped reading now fails with a connection reset,
+    and the reconnect goes ahead.
+  - The handshake offers server version 227. It changes only combo implied bid/ask ticks, which
+    this crate does not request.
 
 ### Fixed
 
