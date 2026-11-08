@@ -418,7 +418,10 @@ impl SimulatedVenue {
         venue.order_sequence = order_sequence;
         venue.trade_sequence = trade_sequence;
         venue.cash_flow_sequence = cash_flow_sequence;
-        venue.time_exchange_latest = time_exchange;
+        // A snapshot written before a market tick moved the request clock can hold it behind the
+        // instant reached; restored at that instant, as the next input would set it.
+        venue.time_exchange_latest =
+            accrued_through.map_or(time_exchange, |reached| reached.max(time_exchange));
         venue.accrued_through = accrued_through;
         venue.liquidation = LiquidationState::restored(liquidation_under_way, margin_called);
         // A window the configuration no longer sets would never be read or trimmed.

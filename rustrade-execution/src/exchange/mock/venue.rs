@@ -597,10 +597,11 @@ pub struct SimulatedVenue {
     /// collide between the two. A real venue mints trade ids independently for the same reason;
     /// the link back to the order is [`Trade::order_id`], which is typed rather than parsed.
     trade_sequence: u64,
-    /// Read via [`time_exchange`](Self::time_exchange), and set only by
-    /// [`advance_time`](Self::advance_time), which never sets it below
-    /// [`accrued_through`](Self::accrued_through). An [`apply_market`](Self::apply_market) since
-    /// can have raised that mark past it, until the next `advance_time` catches up.
+    /// Read via [`time_exchange`](Self::time_exchange). Set by both inputs,
+    /// [`advance_time`](Self::advance_time) and [`apply_market`](Self::apply_market), to the
+    /// instant each reached, so after either it equals
+    /// [`accrued_through`](Self::accrued_through) and a request never reads an instant behind one
+    /// the venue has already reported.
     time_exchange_latest: DateTime<Utc>,
     /// Which price source this venue has. Private: it is fixed at construction, and a consumer
     /// flipping it on a venue already holding resting orders would leave them unmatchable with no
@@ -1633,8 +1634,13 @@ impl SimulatedVenue {
         events
     }
 
-    /// The instant [`advance_time`](Self::advance_time) last set, which stamps what a request
-    /// produces. The Unix epoch until `advance_time` is first called.
+    /// The latest instant this venue has reached, through [`advance_time`](Self::advance_time) or
+    /// [`apply_market`](Self::apply_market), which stamps what a request produces and is the
+    /// instant its deadlines are judged at. The Unix epoch until either is first called.
+    ///
+    /// A request placed after a market tick, without an `advance_time` in between, is therefore
+    /// stamped at that tick, and an order whose [`GoodTillDate`](TimeInForce::GoodTillDate)
+    /// deadline the tick reached expires on arrival rather than resting.
     pub fn time_exchange(&self) -> DateTime<Utc> {
         self.time_exchange_latest
     }
@@ -1737,6 +1743,12 @@ impl SimulatedVenue {
     /// feeds its ticks in order, never behind an instant it has already advanced to, sees no
     /// difference.
     ///
+    /// # The tick moves the request clock too
+    /// The instant this tick reached becomes [`time_exchange`](Self::time_exchange), as an
+    /// [`advance_time`](Self::advance_time) to it would set, so a request that follows the tick is
+    /// stamped no earlier than it and its deadlines are judged at it. Unlike `advance_time`, the
+    /// tick does not restamp the balances it leaves untouched.
+    ///
     /// # Panics
     /// If a configured [`HoldingCostModel`] or [`MarginInterestModel`] breaks its contract: a
     /// boundary not after the instant it was asked from, or a negative interest.
@@ -1751,6 +1763,8 @@ impl SimulatedVenue {
         // Charged before the snapshot is replaced, so a boundary this tick passed is valued at the
         // market as of that boundary rather than at a price observed after it.
         let mut events = self.accrue(time_exchange);
+        // One clock: a request after this tick is stamped, and its deadlines judged, at the tick.
+        self.time_exchange_latest = time_exchange;
 
         let MarketObservation {
             snapshot,
@@ -9802,6 +9816,75 @@ mod tests {
             }
             ref other => panic!("a stale deadline must expire, not {other:?}"),
         }
+    }
+
+    /// A market tick moves the clock a request reads, as an `advance_time` would: an order that
+    /// follows a tick past its deadline, with no `advance_time` in between, expires on arrival,
+    /// stamped at the tick, instead of resting until the next input sweeps it.
+    #[test]
+    fn a_good_till_date_order_after_a_tick_past_its_deadline_is_never_rested() {
+        let mut venue = make_market_venue("10", "1000000");
+        advance(&mut venue, time(1));
+        let _ = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("47800", "47900")),
+            time(9),
+        );
+        assert_eq!(venue.time_exchange(), time(9));
+
+        let outcome = venue.open_order(limit_request(
+            "after-tick",
+            Side::Buy,
+            "1",
+            "47000",
+            TimeInForce::GoodTillDate { expiry: time(5) },
+        ));
+
+        assert!(venue.orders_open(&[]).is_empty(), "it must not rest");
+        match outcome.response.state {
+            OrderState::Inactive(InactiveOrderState::Expired(ref expired)) => {
+                assert_eq!(expired.time_exchange, time(9), "stamped at the tick");
+            }
+            ref other => panic!("a deadline the tick reached must expire, not {other:?}"),
+        }
+    }
+
+    /// A market tick that is the venue's first input sets the request clock too.
+    #[test]
+    fn a_first_input_tick_sets_the_request_clock() {
+        let mut venue = make_market_venue("10", "1000000");
+        assert_eq!(venue.time_exchange(), DateTime::<Utc>::default());
+
+        let _ = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("47800", "47900")),
+            time(9),
+        );
+
+        assert_eq!(venue.time_exchange(), time(9));
+    }
+
+    /// A request that follows a market tick is stamped at the tick, not at the last
+    /// `advance_time`, so nothing it reports is older than what the tick already reported.
+    #[test]
+    fn a_fill_after_a_tick_is_stamped_at_the_tick() {
+        let mut venue = make_market_venue("10", "1000000");
+        advance(&mut venue, time(1));
+        let _ = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("47800", "47900")),
+            time(9),
+        );
+
+        let outcome = venue.open_order(buy_request("0.01", None));
+
+        assert!(
+            outcome.response.state.is_accepted(),
+            "{:?}",
+            outcome.response.state
+        );
+        assert_eq!(filled_trade(&outcome).time_exchange, time(9));
+        assert_eq!(filled_balance(&outcome).time_exchange, time(9));
     }
 
     /// A stale deadline retires the order even when the book would have filled it.
