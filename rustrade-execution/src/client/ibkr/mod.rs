@@ -2551,10 +2551,10 @@ impl ExecutionClient for IbkrClient {
             let instruments_filter = positions_filter;
             // While the client is down, `ibapi` would hold a request for the login's accounts
             // until the reconnect ends or the request's 30 s deadline passes. So none is sent, and
-            // the snapshot fails at once rather than after a wait. The balances read, refused at once when it
-            // runs after the drop, is checked first and then says why: transient while `ibapi`
-            // reconnects, `Internal` once it has given up. Had it finished just before the drop,
-            // this error is the snapshot's.
+            // the snapshot fails at once rather than after a wait. The balances read, refused at
+            // once when it runs after the drop, is checked first and then says why: transient
+            // while `ibapi` reconnects, `Internal` once it has given up. Had it finished just
+            // before the drop, this error is the snapshot's.
             if !client.is_connected() {
                 return Err(ConnectivityError::Socket(
                     "managed accounts: not connected to TWS/Gateway".to_string(),
