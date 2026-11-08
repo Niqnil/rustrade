@@ -286,6 +286,12 @@ pub enum VenueRegime {
 /// It holds an option **only long**:
 /// - **A buy** must find its premium and fee in free quote balance, or it is refused, as a spot
 ///   buy is.
+/// - **A buy on a [`RequestPriced`](VenueRegime::RequestPriced) venue under
+///   [`LongOptionExpiry::Exercise`]** is refused with [`ApiError::OrderRejected`]. That venue has
+///   no market feed, so it could never price the underlying to settle the long at its expiry. Use
+///   [`new_market_driven`](Self::new_market_driven) and feed the underlying, or
+///   [`LongOptionExpiry::Lapse`]. A long seeded through `initial_state` there can still be sold,
+///   but it does not settle at expiry, as below.
 /// - **A sale** may close what is held long, less what the account's resting sales would close if
 ///   they all filled. One that would leave the account short is refused with
 ///   [`ApiError::OrderRejected`].
@@ -323,15 +329,19 @@ pub enum VenueRegime {
 ///     [`TradeOrigin::Exercise`] trades, the second on the spot instrument, reported as
 ///     `[option trade, quote balance, base balance, spot trade]`. The account takes the delivery
 ///     whether or not it can cover it, with a WARN when a free balance goes below zero, as an
-///     assigned account does.
+///     assigned account does. **Not modelled:** on a venue configured with
+///     [`SpotMarginConfig`], that shortfall is not borrowed. The balance goes below zero with no
+///     loan, so it accrues no interest and is not counted as debt by the leverage limit or a
+///     liquidation.
 ///   - [`Cash`](OptionSettlement::Cash): the option closes at its intrinsic value, credited in
 ///     quote, as `[balance, trade]`, a [`TradeOrigin::Exercise`] trade.
 /// - **Every settlement trade** carries zero fee, under an order id of the venue's own.
 /// - **Without a price** to settle against, the venue warns and leaves the position open. An
 ///   underlying with no price yet settles the position on the first later input that brings one,
-///   stamped at that input. An underlying no single spot instrument on this venue trades is never
-///   priced, so the position stays open; only [`LongOptionExpiry::Lapse`] settles it, since a
-///   lapse needs no price.
+///   stamped at that input. An underlying no single spot instrument on this venue trades, or any
+///   underlying on a [`RequestPriced`](VenueRegime::RequestPriced) venue, is never priced, so the
+///   position stays open; only [`LongOptionExpiry::Lapse`] settles it, since a lapse needs no
+///   price.
 ///
 /// [`Perpetual`](InstrumentKind::Perpetual) and [`Future`](InstrumentKind::Future) need funding and
 /// futures margin, which this venue does not model. They are **rejected at
@@ -4419,14 +4429,20 @@ impl SimulatedVenue {
     }
 
     /// Refuses an option order this venue cannot take: one placed at or after the contract's
-    /// expiry, or a sale that would leave the account short, which this venue does not hold.
+    /// expiry, a buy this venue could never exercise, or a sale that would leave the account
+    /// short, which this venue does not hold.
+    ///
+    /// A [`RequestPriced`](VenueRegime::RequestPriced) venue has no market feed, so it never holds
+    /// the underlying's price, and under [`LongOptionExpiry::Exercise`] a long it bought could
+    /// never settle. It refuses the buy rather than hold a position that stays open past its
+    /// expiry. A sale still closes a long held since `initial_state`.
     ///
     /// A sale may close what the account holds long, less what its sales already resting would
     /// close if they all filled, so two resting sales cannot together sell more than is held.
     ///
     /// # Errors
     /// [`ApiError::InstrumentInvalid`] for an expired contract, and [`ApiError::OrderRejected`]
-    /// for a sale beyond the long held.
+    /// for a buy on a request-priced venue that exercises, or a sale beyond the long held.
     fn check_option_order(
         &self,
         request: &OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
@@ -4450,7 +4466,20 @@ impl SimulatedVenue {
             )));
         }
 
-        if request.state.side != Side::Sell {
+        if request.state.side == Side::Buy {
+            if self.regime == VenueRegime::RequestPriced
+                && self.long_option_expiry == LongOptionExpiry::Exercise
+            {
+                return Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+                    format!(
+                        "cannot buy the option {instrument}: SimulatedVenue in \
+                     VenueRegime::RequestPriced has no market feed, so under \
+                     LongOptionExpiry::Exercise it could never price the underlying to settle \
+                     the long at its expiry. Construct it with SimulatedVenue::new_market_driven \
+                     and feed the underlying, or configure LongOptionExpiry::Lapse"
+                    ),
+                )));
+            }
             return Ok(());
         }
         let resting_sells: Decimal = self

@@ -83,10 +83,13 @@ fn config(usd_balance: &str, fee_model: FeeModelConfig) -> MockExecutionConfig {
     )
 }
 
-/// A request-priced venue listing the call alone.
+/// A request-priced venue listing the call alone. It lapses its longs: one that exercised could
+/// never price the underlying, so it takes no option buy.
 fn priced_venue(usd_balance: &str, fee_model: FeeModelConfig) -> SimulatedVenue {
+    let mut config = config(usd_balance, fee_model);
+    config.long_option_expiry = LongOptionExpiry::Lapse;
     let mut venue = SimulatedVenue::new(
-        &config(usd_balance, fee_model),
+        &config,
         instruments_of(option_instrument(
             OptionKind::Call,
             OptionSettlement::Physical,
@@ -448,6 +451,30 @@ fn an_exercised_put_without_the_shares_takes_the_underlying_below_zero() {
     );
     let shares = balance(&venue, spy());
     assert_eq!((shares.total, shares.free), (d("-100"), d("-100")));
+}
+
+/// On a venue that lends, the shortfall of a put exercised without the shares is not borrowed:
+/// the base goes below zero with no loan, so no interest accrues on it and it is not counted as
+/// debt. Pinned until a later change models the delivery shortfall as a loan.
+#[test]
+fn an_exercised_put_without_the_shares_on_a_margin_venue_records_no_loan() {
+    let mut venue = driven_venue(OptionKind::Put, OptionSettlement::Physical, |config| {
+        config.spot_margin =
+            Some(SpotMarginConfig::new(usd(), d("3"), MarginEffect::Borrow).unwrap());
+    });
+    feed(&mut venue, "100", "1.5", time(2));
+    buy(&mut venue, "1");
+    feed(&mut venue, "80", "20", time(50));
+
+    let events = venue.advance_time(expiry());
+
+    assert_eq!(trades(&events).len(), 2, "{events:?}");
+    let shares = balance(&venue, spy());
+    assert_eq!((shares.total, shares.free), (d("-100"), d("-100")));
+    assert_eq!(
+        shares.margin.map_or(Decimal::ZERO, |margin| margin.owed()),
+        Decimal::ZERO
+    );
 }
 
 #[test]
@@ -869,22 +896,26 @@ fn an_option_observation_keeps_only_the_prices_it_can_trade_at() {
 
 #[test]
 fn an_option_without_a_spot_instrument_for_its_underlying_settles_only_by_lapsing() {
-    // `priced_venue` lists the call alone, so nothing prices its underlying.
-    let mut exercising = priced_venue("1000", FeeModelConfig::default());
-    let _ = exercising.open_order(option_request(Side::Buy, "1", market_prices("1.5")));
-    assert!(trades(&exercising.advance_time(time(200))).is_empty());
-    assert_eq!(option_position(&exercising), Some(d("1")));
-
-    let mut config = config("1000", FeeModelConfig::default());
-    config.long_option_expiry = LongOptionExpiry::Lapse;
-    let mut lapsing = SimulatedVenue::new(
-        &config,
+    // A market-driven venue listing the call alone, so nothing prices its underlying.
+    let mut exercising = SimulatedVenue::new_market_driven(
+        &config("1000", FeeModelConfig::default()),
         instruments_of(option_instrument(
             OptionKind::Call,
             OptionSettlement::Physical,
         )),
     );
-    advance(&mut lapsing, time(1));
+    advance(&mut exercising, time(1));
+    let _ = exercising.apply_market(
+        &option_name(),
+        MarketObservation::new(traded("1.5")),
+        time(2),
+    );
+    buy(&mut exercising, "1");
+    assert!(trades(&exercising.advance_time(time(200))).is_empty());
+    assert_eq!(option_position(&exercising), Some(d("1")));
+
+    // `priced_venue` lists the call alone too, and lapses.
+    let mut lapsing = priced_venue("1000", FeeModelConfig::default());
     let _ = lapsing.open_order(option_request(Side::Buy, "1", market_prices("1.5")));
     let events = lapsing.advance_time(time(200));
     let trades = trades(&events);
@@ -968,4 +999,40 @@ fn an_order_after_a_market_input_crossed_the_expiry_is_refused() {
         "{:?}",
         outcome.response.state
     );
+}
+
+/// A request-priced venue has no market feed, so under `Exercise` it refuses an option buy it could
+/// never settle, but still sells a long it was seeded with.
+#[test]
+fn a_request_priced_venue_that_exercises_refuses_an_option_buy() {
+    let mut config = config("1000", FeeModelConfig::default());
+    config.initial_state.instruments.push(held_option());
+    let mut venue = SimulatedVenue::new(
+        &config,
+        instruments_of(option_instrument(
+            OptionKind::Call,
+            OptionSettlement::Physical,
+        )),
+    );
+    advance(&mut venue, time(1));
+
+    let bought = venue.open_order(option_request(Side::Buy, "1", market_prices("1.5")));
+    match &bought.response.state {
+        OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+            ApiError::OrderRejected(reason),
+        ))) => {
+            assert!(reason.contains("LongOptionExpiry::Lapse"), "{reason}");
+        }
+        other => panic!("the buy must be refused: {other:?}"),
+    }
+    assert_eq!(option_position(&venue), Some(d("1")));
+    assert_eq!(balance(&venue, usd()).total, d("1000"));
+
+    let sold = venue.open_order(option_request(Side::Sell, "1", market_prices("2")));
+    assert!(
+        sold.response.state.is_accepted(),
+        "{:?}",
+        sold.response.state
+    );
+    assert_eq!(option_position(&venue), None);
 }

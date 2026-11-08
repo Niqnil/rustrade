@@ -96,14 +96,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     in its account snapshot.
   - **Longs only, for now.** A buy needs its premium and fee in free cash. A sale may close only what
     is held, less the sales already resting. Orders at or after expiry are refused. A price that is
-    not positive is no price, so a zero candle never fills an option.
+    not positive is no price, so a zero candle never fills an option. A request-priced venue
+    (`SimulatedVenue::new`) has no market feed to exercise against, so it refuses an option buy
+    unless `long_option_expiry` is `Lapse`.
   - **Expiry is settled by the venue.** When the clock passes a contract's expiry, the venue retires
     the orders still working on it and settles the position against its own last price for the
     underlying, at zero fee: out of the money at zero (`TradeOrigin::Expiry`); in the money,
     exercised, by delivering the underlying at the strike or paying the intrinsic value, as the
     contract's `settlement` says (`TradeOrigin::Exercise`). A delivery the account cannot cover is
-    still made, with a WARN. Without an underlying price, settlement waits for one; an option
-    whose underlying no single spot instrument on the venue trades settles only by lapsing.
+    still made, with a WARN. On a venue that lends, that shortfall is not yet borrowed: the
+    balance goes negative with no loan, so it accrues no interest and is not counted as debt.
+    Without an underlying price, settlement waits for one; an option whose underlying no single
+    spot instrument on the venue trades settles only by lapsing.
     `MockExecutionConfig::long_option_expiry` makes every long lapse instead.
   - A snapshot holding an option short is refused on restore (`VenueRestoreError::OptionShort`).
   - **Leave expiry to the venue:** configure the engine with `ExpiryHandling::Venue` for that
