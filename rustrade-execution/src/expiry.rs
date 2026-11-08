@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
 )]
 pub enum LongOptionExpiry {
-    /// An option in the money is exercised, against the underlying's last price. One out of the
-    /// money settles at zero. The default, matching an exchange that exercises in-the-money
+    /// An option in the money is exercised, against the underlying's price as whoever settles it
+    /// takes it (see their documentation). One out of the money settles at zero. The default, matching an exchange that exercises in-the-money
     /// options automatically. What exercise does to the account is up to whoever settles it: an
     /// engine settles in cash at the intrinsic value, and the simulated venue settles as the
     /// contract's [`OptionSettlement`](rustrade_instrument::instrument::kind::option::OptionSettlement)

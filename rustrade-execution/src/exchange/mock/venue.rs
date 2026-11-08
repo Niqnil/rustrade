@@ -327,9 +327,11 @@ pub enum VenueRegime {
 ///   - [`Cash`](OptionSettlement::Cash): the option closes at its intrinsic value, credited in
 ///     quote, as `[balance, trade]`, a [`TradeOrigin::Exercise`] trade.
 /// - **Every settlement trade** carries zero fee, under an order id of the venue's own.
-/// - **Without a price** to settle against, because the underlying has none or no single spot
-///   instrument trades it, the venue warns and leaves the position open. It settles on the first
-///   later input that brings a price, stamped at that input. A lapse needs no price.
+/// - **Without a price** to settle against, the venue warns and leaves the position open. An
+///   underlying with no price yet settles the position on the first later input that brings one,
+///   stamped at that input. An underlying no single spot instrument on this venue trades is never
+///   priced, so the position stays open; only [`LongOptionExpiry::Lapse`] settles it, since a
+///   lapse needs no price.
 ///
 /// [`Perpetual`](InstrumentKind::Perpetual) and [`Future`](InstrumentKind::Future) need funding and
 /// futures margin, which this venue does not model. They are **rejected at
@@ -753,9 +755,13 @@ pub struct SimulatedVenue {
     /// The first of [`option_expiries`](Self::option_expiries) after `accrued_through`, cached
     /// like [`next_charge`](Self::next_charge).
     next_option_expiry: Option<DateTime<Utc>>,
+    /// The spot instrument each option's underlying trades as: the one spot instrument this venue
+    /// lists on the option's base and quote. An option whose pair no spot instrument trades, or
+    /// more than one, is absent, and can settle only by lapsing. Fixed at construction.
+    option_spots: FnvHashMap<InstrumentNameExchange, InstrumentNameExchange>,
     /// Options whose expiry has passed with a position still held, because the underlying had no
-    /// price to settle it against. Retried on every input until one arrives. Ordered, so a run
-    /// settles them in the same order every time.
+    /// price to settle it against. Each input checks whether it can settle them now, a lookup
+    /// each, until it can. Ordered, so a run settles them in the same order every time.
     expiry_pending: BTreeSet<InstrumentNameExchange>,
 }
 
@@ -842,6 +848,7 @@ impl SimulatedVenue {
         reported_debt: FnvHashMap<AssetNameExchange, MarginDetails>,
     ) -> Self {
         let option_expiries = option_expiries(&instruments);
+        let option_spots = option_spots(&instruments);
         Self {
             exchange: config.mocked_exchange,
             fee_model: config.fee_model,
@@ -878,6 +885,7 @@ impl SimulatedVenue {
             long_option_expiry: config.long_option_expiry,
             option_expiries,
             next_option_expiry: None,
+            option_spots,
             expiry_pending: BTreeSet::new(),
         }
     }
@@ -1135,7 +1143,8 @@ impl SimulatedVenue {
                 self.refresh_next_interest();
                 self.refresh_next_option_expiry();
                 // An option already expired when the clock first moves, held or with orders since
-                // `initial_state`, settles on the first input that can price it, as a late one does.
+                // `initial_state`, has its orders retired now, and its position settles on the
+                // first input that can price it, as a late one does.
                 let expired: Vec<_> = self
                     .option_expiries
                     .iter()
@@ -1143,8 +1152,14 @@ impl SimulatedVenue {
                     .filter(|(_, name)| self.has_option_exposure(name))
                     .map(|(_, name)| name.clone())
                     .collect();
-                self.expiry_pending.extend(expired);
-                return Vec::new();
+                let mut events = Vec::new();
+                for name in expired {
+                    self.retire_option_orders(&name, now, &mut events);
+                    if self.positions.contains_key(&name) {
+                        self.expiry_pending.insert(name);
+                    }
+                }
+                return events;
             }
             Some(after) if now <= after => return Vec::new(),
             Some(after) => after,
@@ -1246,6 +1261,35 @@ impl SimulatedVenue {
         instrument: &InstrumentNameExchange,
         events: &mut Vec<UnindexedAccountEvent>,
     ) {
+        self.retire_option_orders(instrument, expiry, events);
+        if self.settle_option(instrument, expiry, events) {
+            return;
+        }
+        match self.option_spots.contains_key(instrument) {
+            true => warn!(
+                instrument = %instrument,
+                %expiry,
+                "SimulatedVenue cannot settle an expired option yet: its underlying has no price. \
+                 The position stays open until a price arrives"
+            ),
+            false => warn!(
+                instrument = %instrument,
+                %expiry,
+                "SimulatedVenue cannot exercise an expired option: no single spot instrument on \
+                 this venue trades its underlying, so it has no price to settle against. The \
+                 position stays open; only LongOptionExpiry::Lapse settles it"
+            ),
+        }
+        self.expiry_pending.insert(instrument.clone());
+    }
+
+    /// Retires every order still working on the option `instrument`, as expired at `at`.
+    fn retire_option_orders(
+        &mut self,
+        instrument: &InstrumentNameExchange,
+        at: DateTime<Utc>,
+        events: &mut Vec<UnindexedAccountEvent>,
+    ) {
         let working: Vec<ClientOrderId> = self
             .account
             .orders_open()
@@ -1254,23 +1298,15 @@ impl SimulatedVenue {
             .collect();
         for cid in working {
             if let Some(resting) = self.account.remove_order(&cid) {
-                events.extend(self.retire_expired(resting, expiry));
+                events.extend(self.retire_expired(resting, at));
             }
-        }
-
-        if !self.settle_option(instrument, expiry, events) {
-            warn!(
-                instrument = %instrument,
-                %expiry,
-                "SimulatedVenue cannot settle an expired option: its underlying has no price, or \
-                 no single spot instrument on this venue trades it. The position stays open until \
-                 a price arrives"
-            );
-            self.expiry_pending.insert(instrument.clone());
         }
     }
 
     /// Settles each option left pending at its expiry that can now be priced, stamped `now`.
+    ///
+    /// Its orders were retired when it expired, and an expired option takes no new ones, so only
+    /// its position is left to settle.
     fn settle_pending_expiries(
         &mut self,
         now: DateTime<Utc>,
@@ -1279,48 +1315,43 @@ impl SimulatedVenue {
         if self.expiry_pending.is_empty() {
             return;
         }
-        let pending = std::mem::take(&mut self.expiry_pending);
-        for instrument in pending {
-            // Orders placed before the first clock move on a contract already expired by then.
-            let working: Vec<ClientOrderId> = self
-                .account
-                .orders_open()
-                .filter(|order| order.key.instrument == instrument)
-                .map(|order| order.key.cid.clone())
-                .collect();
-            for cid in working {
-                if let Some(resting) = self.account.remove_order(&cid) {
-                    events.extend(self.retire_expired(resting, now));
-                }
-            }
-            if !self.settle_option(&instrument, now, events) {
-                self.expiry_pending.insert(instrument);
-            }
+        // Most inputs price nothing a pending option waits for, so only those that settle now are
+        // taken out, and an input that settles none allocates nothing.
+        let ready: Vec<InstrumentNameExchange> = self
+            .expiry_pending
+            .iter()
+            .filter(|instrument| self.can_settle(instrument))
+            .cloned()
+            .collect();
+        for instrument in ready {
+            self.expiry_pending.remove(&instrument);
+            let settled = self.settle_option(&instrument, now, events);
+            debug_assert!(settled, "{instrument} could settle, so it settled");
         }
     }
 
-    /// The single spot instrument on this venue trading `underlying`, and its price: the mid of
-    /// its market, else the last price. `None` if no spot instrument, or more than one, trades
-    /// the pair, or the one that does has no positive price.
+    /// Whether [`settle_option`](Self::settle_option) can settle the option `instrument` now:
+    /// nothing is held, a long lapses without a price, or its underlying has one.
+    fn can_settle(&self, instrument: &InstrumentNameExchange) -> bool {
+        !self.positions.contains_key(instrument)
+            || self.long_option_expiry == LongOptionExpiry::Lapse
+            || self.underlying_price(instrument).is_some()
+    }
+
+    /// The spot instrument the option `instrument` settles against (see
+    /// [`option_spots`](Self::option_spots)), and its price: the mid of its market, else the last
+    /// price. `None` if the option has no such instrument, or it has no positive price.
     fn underlying_price(
         &self,
-        underlying: &Underlying<AssetNameExchange>,
+        instrument: &InstrumentNameExchange,
     ) -> Option<(InstrumentNameExchange, Decimal)> {
-        let (name,) = self
-            .instruments
-            .iter()
-            .filter(|(_, instrument)| {
-                matches!(instrument.kind, InstrumentKind::Spot)
-                    && instrument.underlying == *underlying
-            })
-            .map(|(name, _)| name)
-            .collect_tuple()?;
+        let spot = self.option_spots.get(instrument)?;
         let price = self
             .market
-            .get(name)
+            .get(spot)
             .and_then(|market| mid_or_last(&market.snapshot))
             .filter(|price| *price > Decimal::ZERO)?;
-        Some((name.clone(), price))
+        Some((spot.clone(), price))
     }
 
     /// Settles the position held in the option `instrument`, stamped `at`, pushing what it moved
@@ -1355,7 +1386,7 @@ impl SimulatedVenue {
         let exercised = match self.long_option_expiry {
             LongOptionExpiry::Lapse => None,
             LongOptionExpiry::Exercise => {
-                let Some((spot, price)) = self.underlying_price(&underlying) else {
+                let Some((spot, price)) = self.underlying_price(instrument) else {
                     return false;
                 };
                 let intrinsic = match contract.kind {
@@ -1412,7 +1443,16 @@ impl SimulatedVenue {
                         price: intrinsic,
                     },
                 );
-                let balance = self.account.charge(&underlying.quote, proceeds, at);
+                // Delivered rather than charged: a long seeded from `initial_state` may have no
+                // quote balance, and `deliver` opens one at zero.
+                let balance = self.account.deliver(
+                    &Delivery {
+                        asset: underlying.quote.clone(),
+                        amount: proceeds,
+                    },
+                    MarginEffect::NoSideEffect,
+                    at,
+                );
                 events.push(self.build_account_event(Snapshot(balance)));
                 let trade = self.settlement_trade(
                     instrument,
@@ -1454,7 +1494,14 @@ impl SimulatedVenue {
                     OptionKind::Call => (Side::Buy, -cost, units),
                     OptionKind::Put => (Side::Sell, cost, -units),
                 };
-                let quote = self.account.charge(&underlying.quote, paid, at);
+                let quote = self.account.deliver(
+                    &Delivery {
+                        asset: underlying.quote.clone(),
+                        amount: paid,
+                    },
+                    MarginEffect::NoSideEffect,
+                    at,
+                );
                 let base = self.account.deliver(
                     &Delivery {
                         asset: underlying.base.clone(),
@@ -4371,15 +4418,6 @@ impl SimulatedVenue {
         )
     }
 
-    /// Refuses an order that would open or increase a CFD short which the configured
-    /// [`ShortabilityProvider`] does not allow; see the type's
-    /// `# Locates and the short-sale restriction`.
-    ///
-    /// The short an order opens is measured as if every resting sell on the instrument filled
-    /// first, so that a short this venue has already accepted on the book counts against what is
-    /// left to lend, and an order whose short part is nothing — a buy, or a sell that only reduces
-    /// a long — passes untouched. `market` is the snapshot the order will be priced from, so
-    /// whether it is marketable is judged against the book it would fill on.
     /// Refuses an option order this venue cannot take: one placed at or after the contract's
     /// expiry, or a sale that would leave the account short, which this venue does not hold.
     ///
@@ -4434,6 +4472,15 @@ impl SimulatedVenue {
         Ok(())
     }
 
+    /// Refuses an order that would open or increase a CFD short which the configured
+    /// [`ShortabilityProvider`] does not allow; see the type's
+    /// `# Locates and the short-sale restriction`.
+    ///
+    /// The short an order opens is measured as if every resting sell on the instrument filled
+    /// first, so that a short this venue has already accepted on the book counts against what is
+    /// left to lend, and an order whose short part is nothing — a buy, or a sell that only reduces
+    /// a long — passes untouched. `market` is the snapshot the order will be priced from, so
+    /// whether it is marketable is judged against the book it would fill on.
     fn check_shortability(
         &self,
         request: &OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
@@ -5602,6 +5649,31 @@ fn option_expiries(
         .collect()
 }
 
+/// The spot instrument each option in `instruments` settles against: the only spot instrument
+/// trading its underlying pair. An option whose pair has none, or several, is left out.
+fn option_spots(
+    instruments: &FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
+) -> FnvHashMap<InstrumentNameExchange, InstrumentNameExchange> {
+    // `None` marks a pair more than one spot instrument trades.
+    let mut spots = FnvHashMap::<_, Option<&InstrumentNameExchange>>::default();
+    for (name, instrument) in instruments {
+        if matches!(instrument.kind, InstrumentKind::Spot) {
+            spots
+                .entry(&instrument.underlying)
+                .and_modify(|spot| *spot = None)
+                .or_insert(Some(name));
+        }
+    }
+    instruments
+        .iter()
+        .filter(|(_, instrument)| matches!(instrument.kind, InstrumentKind::Option(_)))
+        .filter_map(|(name, instrument)| {
+            let spot = spots.get(&instrument.underlying).copied().flatten()?;
+            Some((name.clone(), spot.clone()))
+        })
+        .collect()
+}
+
 /// The net positions an `initial_state` opens a venue with: one for each CFD and option the
 /// snapshot reports an open position in.
 ///
@@ -5745,7 +5817,6 @@ struct Valued {
     debt: Decimal,
 }
 
-/// The mid of `snapshot`'s best bid and ask, else its last price.
 /// `snapshot` with every price that is not positive dropped.
 ///
 /// For an option, whose price is never below zero: a zero is how some providers report an interval
@@ -5781,6 +5852,7 @@ fn priced_only(observation: MarketObservation) -> MarketObservation {
     }
 }
 
+/// The mid of `snapshot`'s best bid and ask, else its last price.
 fn mid_or_last(snapshot: &MarketSnapshot) -> Option<Decimal> {
     match (snapshot.best_bid, snapshot.best_ask) {
         (Some(bid), Some(ask)) => Some((bid + ask) / Decimal::TWO),

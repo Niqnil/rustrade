@@ -112,9 +112,9 @@ impl<'a> ExecutionBuilder<'a> {
     ///
     /// # Errors
     /// Returns [`BarterError::ExecutionBuilder`] if any indexed instrument executed on
-    /// `mocked_exchange` has an [`InstrumentKind`] other than `Spot` or `Cfd`, per
-    /// [`MockExecution::SUPPORTED_KINDS`]. `MockExchange` models no expiry, funding or contract
-    /// chain, so a `Perpetual`, `Future` or `Option` has no faithful projection. This is rejected
+    /// `mocked_exchange` has an [`InstrumentKind`] other than `Spot`, `Cfd` or `Option`, per
+    /// [`MockExecution::SUPPORTED_KINDS`]. `MockExchange` models no funding or futures contract
+    /// chain, so a `Perpetual` or `Future` has no faithful projection. This is rejected
     /// here, at build time, rather than at first order — an unbacktestable instrument set is a
     /// configuration error, and deferring it would surface as a rejected order mid-run.
     ///
@@ -667,9 +667,9 @@ impl IntoIterator for ExecutionHandles {
 /// Project indexed instruments onto the `MockExchange`'s own instrument representation.
 ///
 /// # Supported [`InstrumentKind`]s
-/// `MockExchange` models `Spot` and `Cfd`, and **panics** on any other kind. This is a capability
-/// limit of the mock — it fills at price × quantity with no expiry, settlement or contract chain —
-/// not a statement about which kinds are executable in general.
+/// `MockExchange` models `Spot`, `Cfd` and `Option`, and **panics** on any other kind. This is a
+/// capability limit of the mock — it models no funding or futures contract chain — not a statement
+/// about which kinds are executable in general.
 ///
 /// The same limit is declared as `MockExecution::SUPPORTED_KINDS`, which
 /// [`ExecutionBuilder::add_mock`] checks first, so through the builder an unsupported kind is a
@@ -679,6 +679,9 @@ impl IntoIterator for ExecutionHandles {
 /// `Cfd` is supported because the mock accounts for a cash-settled position directly: it applies
 /// `contract_size` to the notional and the fee, and debits the **quote** asset in both directions.
 /// Without it every CFD-quoted dataset would panic at execution-build time and be unbacktestable.
+///
+/// `Option` is supported because the mock pays a long option's premium in the quote asset and
+/// settles the position itself at expiry; see its `# How an option is accounted`.
 ///
 /// `settlement_asset` is re-resolved to its exchange name so the projected instrument describes
 /// itself faithfully, but the mock does not settle in it — see [`MockExchange`]'s limitations for

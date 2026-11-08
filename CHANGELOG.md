@@ -102,8 +102,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     underlying, at zero fee: out of the money at zero (`TradeOrigin::Expiry`); in the money,
     exercised, by delivering the underlying at the strike or paying the intrinsic value, as the
     contract's `settlement` says (`TradeOrigin::Exercise`). A delivery the account cannot cover is
-    still made, with a WARN. Without an underlying price, settlement waits for one.
+    still made, with a WARN. Without an underlying price, settlement waits for one; an option
+    whose underlying no single spot instrument on the venue trades settles only by lapsing.
     `MockExecutionConfig::long_option_expiry` makes every long lapse instead.
+  - A snapshot holding an option short is refused on restore (`VenueRestoreError::OptionShort`).
   - **Leave expiry to the venue:** configure the engine with `ExpiryHandling::Venue` for that
     exchange, or the position is closed twice.
   - The `rustrade` execution builder now accepts option instruments for a mock exchange.

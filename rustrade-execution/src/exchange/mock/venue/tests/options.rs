@@ -661,6 +661,27 @@ fn a_restored_venue_still_waits_to_settle_an_expiry_it_had_no_price_for() {
     assert_eq!(option_position(&restored), None);
 }
 
+/// One option contract held long since `initial_state`, bought at 1.50.
+fn held_option() -> InstrumentAccountSnapshot<ExchangeId, AssetNameExchange, InstrumentNameExchange>
+{
+    InstrumentAccountSnapshot {
+        instrument: option_name(),
+        orders: Vec::new(),
+        orders_complete: false,
+        position: PositionReport::Open(Position::new(
+            d("1"),
+            Some(d("1.5")),
+            None,
+            None,
+            None,
+            None,
+            None,
+            time(0),
+        )),
+        isolated: None,
+    }
+}
+
 /// A good-till-cancelled limit order on `instrument`, identified by `cid`.
 fn limit(
     instrument: InstrumentNameExchange,
@@ -760,25 +781,7 @@ fn a_zero_underlying_price_is_no_price_to_settle_at() {
 #[test]
 fn an_option_expired_before_the_clock_first_moves_settles_at_the_first_price() {
     let mut config = config("10000", FeeModelConfig::default());
-    config
-        .initial_state
-        .instruments
-        .push(InstrumentAccountSnapshot {
-            instrument: option_name(),
-            orders: Vec::new(),
-            orders_complete: false,
-            position: PositionReport::Open(Position::new(
-                d("1"),
-                Some(d("1.5")),
-                None,
-                None,
-                None,
-                None,
-                None,
-                time(0),
-            )),
-            isolated: None,
-        });
+    config.initial_state.instruments.push(held_option());
     let mut venue = SimulatedVenue::new_market_driven(
         &config,
         driven_instruments(OptionKind::Call, OptionSettlement::Cash),
@@ -861,5 +864,73 @@ fn an_option_observation_keeps_only_the_prices_it_can_trade_at() {
     assert!(
         !observed(quoted(Some("1"), Some("1"), Some("1")), bar("1"), false).fresh,
         "a stale observation stays stale"
+    );
+}
+
+#[test]
+fn an_option_without_a_spot_instrument_for_its_underlying_settles_only_by_lapsing() {
+    // `priced_venue` lists the call alone, so nothing prices its underlying.
+    let mut exercising = priced_venue("1000", FeeModelConfig::default());
+    let _ = exercising.open_order(option_request(Side::Buy, "1", market_prices("1.5")));
+    assert!(trades(&exercising.advance_time(time(200))).is_empty());
+    assert_eq!(option_position(&exercising), Some(d("1")));
+
+    let mut config = config("1000", FeeModelConfig::default());
+    config.long_option_expiry = LongOptionExpiry::Lapse;
+    let mut lapsing = SimulatedVenue::new(
+        &config,
+        instruments_of(option_instrument(
+            OptionKind::Call,
+            OptionSettlement::Physical,
+        )),
+    );
+    advance(&mut lapsing, time(1));
+    let _ = lapsing.open_order(option_request(Side::Buy, "1", market_prices("1.5")));
+    let events = lapsing.advance_time(time(200));
+    let trades = trades(&events);
+    assert_eq!(trades.len(), 1, "{events:?}");
+    assert_eq!(
+        (trades[0].origin, trades[0].price, trades[0].time_exchange),
+        (TradeOrigin::Expiry, Decimal::ZERO, expiry())
+    );
+}
+
+/// A long held since `initial_state` on an account listing no quote balance is paid its
+/// settlement into a quote balance opened at zero.
+#[test]
+fn a_seeded_long_without_a_quote_balance_is_paid_into_a_new_one() {
+    let mut config = config_from_balances(vec![], FeeModelConfig::default());
+    config.initial_state.instruments.push(held_option());
+    let mut venue = SimulatedVenue::new_market_driven(
+        &config,
+        driven_instruments(OptionKind::Call, OptionSettlement::Cash),
+    );
+    advance(&mut venue, time(1));
+    let _ = venue.apply_market(&spy_name(), MarketObservation::new(traded("110")), time(50));
+
+    let events = venue.advance_time(expiry());
+
+    assert_eq!(trades(&events).len(), 1, "{events:?}");
+    assert_eq!(balance(&venue, usd()).total, d("1000"), "10 × 1 × 100");
+}
+
+#[test]
+fn a_snapshot_holding_an_option_short_is_refused() {
+    let (kind, settlement) = (OptionKind::Call, OptionSettlement::Cash);
+    let mut venue = driven_venue(kind, settlement, |_| {});
+    feed(&mut venue, "100", "1.5", time(2));
+    buy(&mut venue, "1");
+
+    let mut json = serde_json::to_value(venue.snapshot()).unwrap();
+    json["positions"][0][1]["quantity"] = serde_json::json!("-1");
+    let refused = SimulatedVenue::from_snapshot(
+        &config("10000", FeeModelConfig::default()),
+        driven_instruments(kind, settlement),
+        serde_json::from_value(json).unwrap(),
+    );
+
+    assert_eq!(
+        refused.unwrap_err(),
+        VenueRestoreError::OptionShort(option_name())
     );
 }

@@ -16,7 +16,7 @@ use rust_decimal::Decimal;
 use rustrade_instrument::{
     asset::name::AssetNameExchange,
     exchange::ExchangeId,
-    instrument::{Instrument, name::InstrumentNameExchange},
+    instrument::{Instrument, kind::InstrumentKind, name::InstrumentNameExchange},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -204,6 +204,10 @@ pub enum VenueRestoreError {
     /// The snapshot lists one asset twice among its balances, or among the debt it last reported.
     #[error("venue snapshot lists {0} twice")]
     DuplicateAsset(AssetNameExchange),
+
+    /// The snapshot holds a short position in an option, which the venue cannot hold.
+    #[error("venue snapshot holds {0} short, and SimulatedVenue holds options only long")]
+    OptionShort(InstrumentNameExchange),
 }
 
 impl FormatVersion for SimulatedVenueSnapshot {
@@ -317,6 +321,7 @@ impl SimulatedVenue {
     ///   open orders, or among its cancelled, filled or expired ones.
     /// - [`VenueRestoreError::DuplicateInstrument`] or [`VenueRestoreError::DuplicateAsset`] if it
     ///   lists one instrument or asset twice in a list that holds each once.
+    /// - [`VenueRestoreError::OptionShort`] if it holds a short option position.
     ///
     /// # Cost
     /// The slippage stream is resumed by drawing again every value the snapshot's venue drew, one
@@ -378,6 +383,12 @@ impl SimulatedVenue {
             .or_else(|| first_repeat(snapshot.reported_debt.iter().map(|(asset, _)| asset)))
         {
             return Err(VenueRestoreError::DuplicateAsset(repeat.clone()));
+        }
+        if let Some((short, _)) = snapshot.positions.iter().find(|(name, position)| {
+            matches!(instruments[name].kind, InstrumentKind::Option(_))
+                && position.quantity < Decimal::ZERO
+        }) {
+            return Err(VenueRestoreError::OptionShort(short.clone()));
         }
         if snapshot.account.margin() != config.spot_margin.is_some() {
             return Err(VenueRestoreError::MarginMismatch {
