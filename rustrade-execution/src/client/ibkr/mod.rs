@@ -616,8 +616,12 @@ fn read_error(what: &str, e: ibapi::Error) -> UnindexedClientError {
             ConnectivityError::Socket(format!("{what}: {e}")).into()
         }
         ibapi::Error::Timeout => {
-            // `Timeout` carries no context, so the request IB did not answer is named here.
-            warn!(what, "IB did not answer an IBKR account read in time");
+            // `Timeout` carries no context, so the request that timed out is named here.
+            warn!(
+                what,
+                "IBKR account read timed out: IB did not answer, or ibapi's reconnect outlasted \
+                 the request's deadline"
+            );
             ConnectivityError::Timeout.into()
         }
         e => UnindexedClientError::Internal(format!("{what}: {e}")),
@@ -2505,8 +2509,9 @@ impl ExecutionClient for IbkrClient {
     /// during it.
     ///
     /// While the connection is down this fails at once, as the other account reads do. When the
-    /// connection drops just as the snapshot starts, it may wait up to 30 seconds for `ibapi`'s
-    /// reconnect: see [Account read errors](crate::client::ibkr#account-read-errors).
+    /// connection drops just as the snapshot starts, it may wait for `ibapi`'s reconnect, up to
+    /// 30 seconds for the reconnect and IB's answer together: see
+    /// [Account read errors](crate::client::ibkr#account-read-errors).
     ///
     /// # Known Issue: ibapi Decode Errors
     ///
@@ -2544,9 +2549,9 @@ impl ExecutionClient for IbkrClient {
         let positions_filter = instruments_filter.clone();
         let positions_future = tokio::task::spawn_blocking(move || {
             let instruments_filter = positions_filter;
-            // While the client is down, a request for the login's accounts can only fail, and
-            // `ibapi` would hold it until the reconnect ends or its 30 s deadline passes. So none
-            // is sent, and the snapshot fails at once. The balances read, refused at once when it
+            // While the client is down, `ibapi` would hold a request for the login's accounts
+            // until the reconnect ends or the request's 30 s deadline passes. So none is sent, and
+            // the snapshot fails at once rather than after a wait. The balances read, refused at once when it
             // runs after the drop, is checked first and then says why: transient while `ibapi`
             // reconnects, `Internal` once it has given up. Had it finished just before the drop,
             // this error is the snapshot's.
