@@ -116,6 +116,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A `SimStart` may hold a long option position, seeded into the venue and the engine at its
     entry price with its premium already paid. A short one is refused with
     `SimStartError::OptionShort`.
+- **A simulated venue learns when its market feed goes down** (`rustrade-execution`, `rustrade`,
+  #876). Under `StaleMarketPolicy::Wait`, a venue could tell a dead feed from a quiet market only
+  by its age, so a `max_age` short enough to catch an outage also refused orders on a quiet book.
+  - `SimulatedVenue::mark_market_stale(instrument, time)` records that an instrument's feed is
+    down, in the new `VenueInstrumentMarket::stale_since`. Under `Wait`, a marked market is stale
+    however recently it was observed fresh, so an order waits for its next fresh observation, and
+    an immediate-or-cancel or fill-or-kill order is rejected with a reason naming the feed. The
+    next fresh observation clears the mark. Under `StaleMarketPolicy::Off` nothing changes.
+  - **Paper venues:** `PaperMarketFeed::tap` now passes a `Reconnecting` event on to the venues,
+    which mark every instrument they trade whose market data comes from that exchange
+    (`Instrument::data_exchange`). The end of the stream marks all of them. A reconnection names
+    only its exchange, so it also marks that exchange's instruments on connections still
+    delivering, until each one's next fresh observation.
+  - **Backtests:** `SimRunner` and `SimStepper` mark the same instruments on a `Reconnecting` event
+    in their source, as a paper venue does.
+  - **Custom drivers:** `MarketFeedEvent::Stale { instruments }` marks instruments on a
+    market-driven `MockExchange`, and the driver marks every instrument when its feed ends.
+  - `ExecutionInstrumentMap::own_instruments_priced_from(exchange)` lists an exchange's
+    instruments priced from another, or its own, exchange.
+  - A connection that stays open but delivers nothing reconnects only with
+    `MarketStreamOptions::with_silence_timeout` (#862); without it, such a feed is still noticed
+    only by its age.
 - **`OptionContract::settlement`: whether an exercised option delivers the underlying or pays cash**
   (`rustrade-instrument`, #872). `OptionSettlement::{Physical, Cash}`, a contract term beside
   `exercise`. A serialised contract without it loads as `Physical`.
@@ -135,6 +157,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   old behaviour. In a human-readable format such as JSON, a serialised bare `"Engine"` still
   deserialises, as that. `ExpiryHandling` and `LongOptionExpiry` are `#[non_exhaustive]`, so a
   `match` on either outside `rustrade` needs a wildcard arm.
+
+- **Breaking: `VenueInstrumentMarket` is `#[non_exhaustive]` and has a `stale_since` field**
+  (`rustrade-execution`, #876). Outside the crate it can no longer be built with a struct literal;
+  start from `VenueInstrumentMarket::default()`.
 
 - **Breaking: `init_market_stream` takes `MarketStreamOptions` in place of its
   `ReconnectionBackoffPolicy`** (`rustrade-data`, #862). Pass

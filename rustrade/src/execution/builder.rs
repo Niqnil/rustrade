@@ -320,7 +320,7 @@ impl<'a> ExecutionBuilder<'a> {
             }
         };
         let venue = market_driven_venue(&config, venue_options, this.instruments, restore)?;
-        let market = paper_market(this.instruments, exchange, feed);
+        let market = paper_market(this.instruments, exchange, feed)?;
         let mock_exchange = MockExchange::new_market_driven(
             venue,
             config.latency_ms,
@@ -909,47 +909,60 @@ fn join_kinds(kinds: impl Iterator<Item = InstrumentKindDiscriminant>) -> String
 }
 
 /// The market a paper venue for `exchange` trades on: what `feed` observes of `exchange`'s
-/// instruments, by their names on it, and a [`MarketFeedEvent::Lagged`] wherever the venue fell
-/// behind.
+/// instruments, by their names on it, a [`MarketFeedEvent::Stale`] naming the instruments a
+/// reconnection or the end of the stream stopped, and a [`MarketFeedEvent::Lagged`] wherever the
+/// venue fell behind.
+///
+/// # Errors
+/// If `instruments` does not index `exchange`.
 fn paper_market(
     instruments: &IndexedInstruments,
     exchange: ExchangeId,
     feed: &PaperMarketFeed,
-) -> BoxStream<'static, MarketFeedEvent> {
-    let names = instruments
-        .instruments()
-        .iter()
-        .filter(|instrument| instrument.value.exchange.value == exchange)
-        .map(|instrument| (instrument.key, instrument.value.name_exchange.clone()))
-        .collect::<FnvHashMap<_, _>>();
+) -> Result<BoxStream<'static, MarketFeedEvent>, BarterError> {
+    let map = generate_execution_instrument_map(instruments, exchange)?;
 
-    futures::stream::unfold(
-        (feed.subscribe(), names),
-        |(mut updates, names)| async move {
+    let stream =
+        futures::stream::unfold((feed.subscribe(), map), |(mut updates, map)| async move {
             loop {
-                match updates.recv().await {
-                    Ok(PaperMarketUpdate {
+                let event = match updates.recv().await {
+                    Ok(PaperMarketUpdate::Observation {
                         instrument,
                         observation,
                     }) => {
                         // Absent for another exchange's instrument, which this venue does not trade.
-                        if let Some(name) = names.get(&instrument) {
-                            let event = MarketFeedEvent::Observation {
-                                instrument: name.clone(),
-                                observation,
-                            };
-                            return Some((event, (updates, names)));
+                        let Some(name) = map.find_own_instrument_name_exchange(instrument) else {
+                            continue;
+                        };
+                        MarketFeedEvent::Observation {
+                            instrument: name.clone(),
+                            observation,
                         }
                     }
+                    Ok(PaperMarketUpdate::Reconnecting(data_exchange)) => {
+                        let instruments = map
+                            .own_instruments_priced_from(data_exchange)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        // Empty for an exchange none of this venue's instruments is priced from.
+                        if instruments.is_empty() {
+                            continue;
+                        }
+                        MarketFeedEvent::Stale { instruments }
+                    }
+                    Ok(PaperMarketUpdate::Ended) => MarketFeedEvent::Stale {
+                        instruments: map.exchange_instruments().cloned().collect(),
+                    },
                     Err(broadcast::error::RecvError::Lagged(missed)) => {
-                        return Some((MarketFeedEvent::Lagged { missed }, (updates, names)));
+                        MarketFeedEvent::Lagged { missed }
                     }
                     Err(broadcast::error::RecvError::Closed) => return None,
-                }
+                };
+                return Some((event, (updates, map)));
             }
-        },
-    )
-    .boxed()
+        });
+
+    Ok(stream.boxed())
 }
 
 /// The [`AccountStreamOptions`] of a mock venue's manager: the defaults, measured on `clock`, the
@@ -1479,7 +1492,7 @@ mod tests {
             ]),
             2,
         );
-        let market = paper_market(&instruments, EXCHANGE, &feed);
+        let market = paper_market(&instruments, EXCHANGE, &feed).unwrap();
         assert_eq!(
             tap.count().await,
             4,
@@ -1491,7 +1504,7 @@ mod tests {
         assert_eq!(
             market.collect::<Vec<_>>().await,
             vec![
-                MarketFeedEvent::Lagged { missed: 2 },
+                MarketFeedEvent::Lagged { missed: 3 },
                 MarketFeedEvent::Observation {
                     instrument: InstrumentNameExchange::from("spx500_usd"),
                     observation: MarketObservation::new(MarketSnapshot {
@@ -1500,8 +1513,82 @@ mod tests {
                         last_price: Some(dec!(4)),
                     }),
                 },
+                MarketFeedEvent::Stale {
+                    instruments: vec![InstrumentNameExchange::from("spx500_usd")],
+                },
             ],
-            "the two oldest are reported missed, and the other exchange's update is skipped"
+            "the three oldest are reported missed, the other exchange's update is skipped, and \
+             the end of the stream marks only this venue's instruments stale"
+        );
+    }
+
+    /// A reconnection marks stale the venue's instruments whose market data comes from the
+    /// exchange it names, wherever they trade, and nothing for an exchange none of them is priced
+    /// from. The end of the stream marks all of them.
+    #[tokio::test]
+    async fn a_paper_venue_hears_which_of_its_instruments_a_reconnection_stopped() {
+        use rustrade_data::{
+            event::DataKind,
+            streams::{consumer::MarketStreamEvent, reconnect},
+        };
+        use rustrade_instrument::instrument::data_venue::DataVenue;
+
+        let instrument_on = |exchange, base: &str, quote: &str| {
+            let name = format!("{base}_{quote}");
+            Instrument::new(
+                exchange,
+                name.as_str(),
+                name.as_str(),
+                Underlying::new(asset(base), asset(quote)),
+                InstrumentQuoteAsset::UnderlyingQuote,
+                InstrumentKind::Spot,
+                None,
+            )
+        };
+        let instruments = IndexedInstrumentsBuilder::default()
+            .add_instrument(instrument_on(EXCHANGE, "spx500", "usd"))
+            .add_instrument(
+                instrument_on(EXCHANGE, "btc", "usd")
+                    .with_data_venue(DataVenue::new(ExchangeId::BinanceSpot, None)),
+            )
+            .add_instrument(instrument_on(ExchangeId::BinanceSpot, "eth", "usdt"))
+            .build();
+
+        let events: [MarketStreamEvent<InstrumentIndex, DataKind>; 3] = [
+            reconnect::Event::Reconnecting(ExchangeId::BinanceSpot),
+            reconnect::Event::Reconnecting(ExchangeId::Kraken),
+            reconnect::Event::Reconnecting(EXCHANGE),
+        ];
+        let (tap, feed) = PaperMarketFeed::tap(futures::stream::iter(events));
+        let market = paper_market(&instruments, EXCHANGE, &feed).unwrap();
+        assert_eq!(
+            tap.count().await,
+            3,
+            "the tap yields every event it is given"
+        );
+        drop(feed);
+
+        // Which instruments, not in what order: the end of the stream lists them unordered.
+        let names = |event: MarketFeedEvent| match event {
+            MarketFeedEvent::Stale { instruments } => {
+                let mut names = instruments
+                    .iter()
+                    .map(|name| name.name().to_string())
+                    .collect::<Vec<_>>();
+                names.sort();
+                names
+            }
+            other => panic!("expected a stale mark, got {other:?}"),
+        };
+        assert_eq!(
+            market.map(names).collect::<Vec<_>>().await,
+            vec![
+                vec!["btc_usd"],
+                vec!["spx500_usd"],
+                vec!["btc_usd", "spx500_usd"],
+            ],
+            "BinanceSpot prices btc_usd, which this venue trades, Kraken prices none of them, and \
+             the end of the stream stops both"
         );
     }
 }

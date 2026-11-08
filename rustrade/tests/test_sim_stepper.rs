@@ -812,6 +812,54 @@ fn stale_btc_session() -> Session<DefaultStrategy<State>> {
     s
 }
 
+/// A reconnection of the exchange a market comes from makes it stale however recently it was
+/// observed fresh: an order waits for the next fresh bar instead of filling at the last one.
+#[test]
+fn under_stale_wait_a_reconnection_holds_an_order_until_the_next_fresh_bar() {
+    let mut s = stale_wait_session(usdt(dec!(10_000)));
+    s.stepper
+        .step(
+            &mut s.engine,
+            at(3),
+            [
+                bar(BTC, 3, dec!(100)),
+                EngineEvent::Market(MarketStreamEvent::Reconnecting(EXCHANGE)),
+            ],
+        )
+        .unwrap();
+
+    // At 3s, the bar is well within the one-second `max_age`.
+    s.engine.action(&order_working(
+        BTC,
+        Side::Buy,
+        dec!(2),
+        "waiting",
+        TimeInForce::GoodUntilCancelled { post_only: false },
+    ));
+    let settled = s.stepper.settle(&mut s.engine).unwrap();
+    assert!(
+        fills(events(&settled)).is_empty(),
+        "the feed is down, so nothing fills at the 3s close"
+    );
+    assert!(refused(events(&settled)).is_empty());
+
+    let stepped = s
+        .stepper
+        .step(&mut s.engine, at(4), [bar(BTC, 4, dec!(104))])
+        .unwrap();
+    assert_eq!(
+        fills(events(&stepped)),
+        vec![(
+            InstrumentIndex::new(BTC),
+            Side::Buy,
+            dec!(104),
+            dec!(2),
+            at(4)
+        )],
+        "the next fresh bar clears the mark and fills the order at its close"
+    );
+}
+
 #[test]
 fn under_stale_wait_an_order_on_a_stale_market_fills_after_the_next_fresh_bar() {
     let mut s = stale_btc_session();
