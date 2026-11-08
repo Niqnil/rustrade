@@ -4186,20 +4186,19 @@ impl SimulatedVenue {
                         None,
                     );
                 }
-                MarketAge::Stale {
-                    fresh_at,
-                    stale_since,
-                } => {
+                MarketAge::Stale(cause) => {
                     if matches!(
                         request.state.time_in_force,
                         TimeInForce::ImmediateOrCancel | TimeInForce::FillOrKill
                     ) {
-                        let last = match (stale_since, fresh_at) {
-                            (Some(stale_since), _) => {
-                                format!("its feed was reported down at {stale_since}")
+                        let last = match cause {
+                            StaleCause::FeedDown { since } => {
+                                format!("its feed was reported down at {since}")
                             }
-                            (None, Some(fresh_at)) => format!("last observed fresh at {fresh_at}"),
-                            (None, None) => "never observed fresh".to_owned(),
+                            StaleCause::Aged { fresh_at } => {
+                                format!("last observed fresh at {fresh_at}")
+                            }
+                            StaleCause::NeverFresh => "never observed fresh".to_owned(),
                         };
                         let reason = format!(
                             "cannot fill {} on {}: {}'s market is stale under \
@@ -4306,26 +4305,17 @@ impl SimulatedVenue {
         else {
             return MarketAge::Unpriced;
         };
-        if let Some(stale_since) = market.stale_since {
-            return MarketAge::Stale {
-                fresh_at: market.fresh_at,
-                stale_since: Some(stale_since),
-            };
+        if let Some(since) = market.stale_since {
+            return MarketAge::Stale(StaleCause::FeedDown { since });
         }
         let Some(fresh_at) = market.fresh_at else {
-            return MarketAge::Stale {
-                fresh_at: None,
-                stale_since: None,
-            };
+            return MarketAge::Stale(StaleCause::NeverFresh);
         };
         // A `max_age` too long for a `TimeDelta` is longer than any run, so nothing is stale.
         let stale = chrono::TimeDelta::from_std(max_age)
             .is_ok_and(|max_age| now.signed_duration_since(fresh_at) > max_age);
         if stale {
-            MarketAge::Stale {
-                fresh_at: Some(fresh_at),
-                stale_since: None,
-            }
+            MarketAge::Stale(StaleCause::Aged { fresh_at })
         } else {
             MarketAge::Fresh
         }
@@ -6165,12 +6155,22 @@ enum MarketAge {
     Unpriced,
     /// Observed fresh within the policy's `max_age`.
     Fresh,
-    /// Priced, but its feed was reported down at `stale_since`, or it was last observed fresh at
-    /// `fresh_at`, longer ago than the policy's `max_age`, or never.
-    Stale {
-        fresh_at: Option<DateTime<Utc>>,
-        stale_since: Option<DateTime<Utc>>,
-    },
+    /// Priced, but stale, for the reason given.
+    Stale(StaleCause),
+}
+
+/// Why [`market_age`](SimulatedVenue::market_age) found a priced market stale: one reason at a
+/// time, the first that applies in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleCause {
+    /// Its feed was reported down at `since`, by
+    /// [`mark_market_stale`](SimulatedVenue::mark_market_stale), and nothing fresh has arrived
+    /// since.
+    FeedDown { since: DateTime<Utc> },
+    /// It was last observed fresh at `fresh_at`, longer ago than the policy's `max_age`.
+    Aged { fresh_at: DateTime<Utc> },
+    /// It was never observed fresh.
+    NeverFresh,
 }
 
 /// What a held order is priced from when it is released.
