@@ -12,14 +12,19 @@
 //! - whether a margin trades read accepts an `endTime` past Binance's clock, as a fill-recovery
 //!   read placed on the venue's clock sends one.
 //!
+//! The record checks mean something only on an account that has borrowed or been liquidated. On
+//! one with no such history they pass over no records, and only the `endTime` and span checks
+//! tell anything.
+//!
 //! The reads cost about 20 of Binance's per-IP request weight, of the 12000 a minute allows, plus
 //! one per page of records.
 //!
 //! The key is named apart from `BINANCE_API_KEY`, which the other Binance tests read as a testnet
 //! key:
 //!
-//! - `BINANCE_SUBACCOUNT_READONLY_API_KEY`, `BINANCE_SUBACCOUNT_READONLY_API_SECRET`: a production
-//!   key that may read margin data. It needs no trading permission.
+//! - `BINANCE_SUBACCOUNT_READONLY_API_KEY`, `BINANCE_SUBACCOUNT_READONLY_API_SECRET`: the
+//!   read-only production key `.env.template` describes. It needs no trading permission, and its
+//!   account must have cross margin activated.
 //!
 //! ```bash
 //! cargo test -p rustrade-execution --features binance --test binance_margin_records -- --ignored --nocapture

@@ -8,8 +8,9 @@
 //! The key is named apart from `BINANCE_API_KEY`, which the other Binance tests read as a testnet
 //! key:
 //!
-//! - `BINANCE_SUBACCOUNT_READONLY_API_KEY`, `BINANCE_SUBACCOUNT_READONLY_API_SECRET`: a production
-//!   key that may read margin data. It needs no trading permission.
+//! - `BINANCE_SUBACCOUNT_READONLY_API_KEY`, `BINANCE_SUBACCOUNT_READONLY_API_SECRET`: the
+//!   read-only production key `.env.template` describes. It needs no trading permission, and its
+//!   account must have cross margin activated.
 //! - `BINANCE_MARGIN_SYMBOL`: the pair, such as `BTCUSDT`.
 //! - `BINANCE_MARGIN_ISOLATED`: `true` to ask the pair's isolated margin account, which must exist;
 //!   otherwise cross margin.
