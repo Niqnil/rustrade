@@ -1013,6 +1013,7 @@ where
             &mut self.pending,
             &mut self.seq,
             &mut self.wakeups,
+            time,
             &event,
         )?;
 
@@ -1092,10 +1093,16 @@ where
 /// Folds one source event into per-instrument market state, hands it to every venue trading it,
 /// and schedules whatever resting orders it filled.
 ///
-/// Anything that is not a market data item is ignored: an account event, a command or a reconnect
-/// carries no price. A reconnect in particular is deliberately *not* treated as clearing the
-/// market — a gap in a feed does not mean the instrument stopped having a price, and a venue that
-/// forgot its market on every reconnect would refuse to match orders it should have matched.
+/// Anything that is not a market data item is ignored, an account event or a command, except a
+/// reconnect. A reconnect carries no price, and is deliberately *not* treated as clearing the
+/// market: a gap in a feed does not mean the instrument stopped having a price, and a venue that
+/// forgot its market on every reconnect would refuse to match orders it should have matched. It
+/// does say that nothing more is arriving from its exchange, so each venue marks the instruments
+/// it trades whose market data comes from that exchange with
+/// [`SimulatedVenue::mark_market_stale`] at `time`, the instant the source carried it at. Only
+/// [`StaleMarketPolicy::Wait`](rustrade_execution::fill::StaleMarketPolicy::Wait) reads the mark.
+/// The end of the data needs no mark: nothing arrives after it, and
+/// [`expire_held`](SimCore::expire_held) retires what is still held.
 ///
 /// A venue whose exchange does not list the instrument is skipped, so a runner driving several
 /// venues never leaks one exchange's prices into another's view, even when both list the same
@@ -1121,13 +1128,23 @@ fn route_market<MarketKind>(
     pending: &mut BinaryHeap<Reverse<ScheduledEvent>>,
     seq: &mut u64,
     wakeups: &mut Wakeups,
+    time: DateTime<Utc>,
     event: &EngineEvent<MarketKind>,
 ) -> Result<Routed, SimFault>
 where
     MarketKind: VenueMarketUpdate,
 {
-    let EngineEvent::Market(MarketStreamEvent::Item(event)) = event else {
-        return Ok(Routed::Now);
+    let event = match event {
+        EngineEvent::Market(MarketStreamEvent::Item(event)) => event,
+        EngineEvent::Market(MarketStreamEvent::Reconnecting(data_exchange)) => {
+            for slot in venues.values_mut() {
+                for name in slot.indexer.map.own_instruments_priced_from(*data_exchange) {
+                    slot.venue.mark_market_stale(name, time);
+                }
+            }
+            return Ok(Routed::Now);
+        }
+        _ => return Ok(Routed::Now),
     };
 
     let state = market.entry(event.instrument).or_default();

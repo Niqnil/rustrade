@@ -31,12 +31,19 @@ use std::{
 };
 use tokio::sync::{broadcast, mpsc};
 
-/// The market of one instrument, as a [`PaperMarketTap`] has folded it from the events seen so
-/// far.
+/// What a [`PaperMarketTap`] tells the venues subscribed to its feed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PaperMarketUpdate {
-    pub instrument: InstrumentIndex,
-    pub observation: MarketObservation,
+pub(crate) enum PaperMarketUpdate {
+    /// The market of one instrument, as the tap has folded it from the events seen so far.
+    Observation {
+        instrument: InstrumentIndex,
+        observation: MarketObservation,
+    },
+    /// The stream is reconnecting to `0`, the exchange the market data comes from, so nothing more
+    /// arrives from it until it is back.
+    Reconnecting(ExchangeId),
+    /// The stream has ended, so nothing more arrives from any exchange.
+    Ended,
 }
 
 /// The market a [`PaperMarketTap`] observes, for paper venues to subscribe to.
@@ -46,7 +53,8 @@ pub(crate) struct PaperMarketUpdate {
 /// subscribes a venue to it. A venue sees only what the tap observes after it subscribed.
 ///
 /// The feed ends only when the tap and every clone of this handle are dropped. A venue then keeps
-/// serving requests on the last market it saw.
+/// serving requests on the last market it saw, marked stale as when the stream ends: see
+/// [`tap`](Self::tap).
 ///
 /// # A venue that falls behind
 /// The feed holds a bounded number of updates for its subscribers. A venue that falls further
@@ -74,8 +82,31 @@ impl PaperMarketFeed {
     ///
     /// The fold runs inline in the task that polls the returned stream, ahead of the `Engine`.
     ///
-    /// A [`Reconnecting`](reconnect::Event::Reconnecting) event is passed on and sends nothing. A
-    /// venue sees no market while the stream reconnects, so a price that crossed a resting order
+    /// # A feed that goes down
+    /// A [`Reconnecting`](reconnect::Event::Reconnecting) event is passed on, and tells each venue
+    /// that the exchange it names has stopped delivering. The venue marks every instrument it
+    /// trades whose market data comes from that exchange (see
+    /// [`Instrument::data_exchange`](rustrade_instrument::instrument::Instrument::data_exchange))
+    /// with
+    /// [`SimulatedVenue::mark_market_stale`](rustrade_execution::exchange::mock::SimulatedVenue::mark_market_stale).
+    /// The end of the stream marks every instrument a venue trades, once.
+    ///
+    /// - **What the mark does:** under
+    ///   [`StaleMarketPolicy::Wait`](rustrade_execution::fill::StaleMarketPolicy::Wait), a marked
+    ///   instrument's market is stale however recently it was observed fresh, so an order waits
+    ///   for its next fresh observation, or is rejected if its time in force will not wait. Under
+    ///   [`StaleMarketPolicy::Off`](rustrade_execution::fill::StaleMarketPolicy::Off) nothing
+    ///   changes.
+    /// - **What clears it:** the instrument's next fresh observation.
+    /// - **Per exchange, not per connection:** a reconnection names only its exchange, and one
+    ///   exchange's subscriptions can be spread over several connections. So it marks the
+    ///   exchange's instruments on the connections still delivering too, until each one's next
+    ///   fresh observation.
+    /// - **A connection that stays open but goes silent** reconnects only under
+    ///   [`MarketStreamOptions::with_silence_timeout`](rustrade_data::streams::consumer::MarketStreamOptions::with_silence_timeout).
+    ///   Without it, such a feed is noticed only by its age.
+    ///
+    /// A venue sees no market while the stream reconnects, so a price that crossed a resting order
     /// during the gap fills nothing.
     ///
     /// Holds [`DEFAULT_CAPACITY`](Self::DEFAULT_CAPACITY) updates per subscriber; see
@@ -107,6 +138,7 @@ impl PaperMarketFeed {
             stream,
             market: FnvHashMap::default(),
             tx: tx.clone(),
+            ended: false,
         };
         (tap, Self { tx })
     }
@@ -129,6 +161,9 @@ where
     stream: MarketStream,
     market: FnvHashMap<InstrumentIndex, Kind::State>,
     tx: broadcast::Sender<PaperMarketUpdate>,
+    /// Whether the wrapped stream has ended, so that its end is sent once however often the tap is
+    /// polled after it.
+    ended: bool,
 }
 
 /// Manual because the wrapped stream need not be `Debug`, and the fold state says nothing a reader
@@ -156,23 +191,33 @@ where
         let this = self.project();
         let item = ready!(this.stream.poll_next(cx));
 
-        if let Some(reconnect::Event::Item(event)) = &item {
-            let state = this.market.entry(event.instrument).or_default();
-            // Asked before the fold, which is the only point at which the state can say whether
-            // the bar is new, or whether it takes the event at all: as `SimRunner` routes it.
-            let bar = Kind::bar(state, event);
-            let fresh = Kind::fresh(state, event);
-            Kind::apply(state, event);
-            let observation = MarketObservation::new(Kind::snapshot(state))
-                .with_depth(Kind::depth(state))
-                .with_bar(bar)
-                .with_fresh(fresh);
+        let update = match &item {
+            Some(reconnect::Event::Item(event)) => {
+                let state = this.market.entry(event.instrument).or_default();
+                // Asked before the fold, which is the only point at which the state can say
+                // whether the bar is new, or whether it takes the event at all: as `SimRunner`
+                // routes it.
+                let bar = Kind::bar(state, event);
+                let fresh = Kind::fresh(state, event);
+                Kind::apply(state, event);
+                let observation = MarketObservation::new(Kind::snapshot(state))
+                    .with_depth(Kind::depth(state))
+                    .with_bar(bar)
+                    .with_fresh(fresh);
+                Some(PaperMarketUpdate::Observation {
+                    instrument: event.instrument,
+                    observation,
+                })
+            }
+            Some(reconnect::Event::Reconnecting(exchange)) => {
+                Some(PaperMarketUpdate::Reconnecting(*exchange))
+            }
+            None => (!std::mem::replace(this.ended, true)).then_some(PaperMarketUpdate::Ended),
+        };
 
+        if let Some(update) = update {
             // An error means no venue is subscribed, which leaves nobody to tell.
-            let _ = this.tx.send(PaperMarketUpdate {
-                instrument: event.instrument,
-                observation,
-            });
+            let _ = this.tx.send(update);
         }
 
         Poll::Ready(item)
@@ -407,8 +452,8 @@ mod tests {
         })
     }
 
-    /// The tap yields what it wraps unchanged, sends each instrument's folded market, and sends
-    /// nothing for a reconnection.
+    /// The tap yields what it wraps unchanged, sends each instrument's folded market, passes a
+    /// reconnection on with its exchange, and says when the stream ends.
     #[tokio::test]
     async fn the_tap_passes_events_through_and_sends_each_instruments_market() {
         let events = vec![
@@ -421,28 +466,45 @@ mod tests {
 
         assert_eq!(tap.collect::<Vec<_>>().await, events);
 
-        let traded = |price| {
-            MarketObservation::new(MarketSnapshot {
+        let traded = |instrument, price| PaperMarketUpdate::Observation {
+            instrument: InstrumentIndex(instrument),
+            observation: MarketObservation::new(MarketSnapshot {
                 best_bid: None,
                 best_ask: None,
                 last_price: Some(price),
-            })
+            }),
         };
+        let mut sent = Vec::new();
+        while let Ok(update) = updates.try_recv() {
+            sent.push(update);
+        }
         assert_eq!(
-            updates.try_recv().unwrap(),
-            PaperMarketUpdate {
-                instrument: InstrumentIndex(0),
-                observation: traded(dec!(100)),
-            }
+            sent,
+            [
+                traded(0, dec!(100)),
+                PaperMarketUpdate::Reconnecting(ExchangeId::BinanceSpot),
+                traded(1, dec!(7)),
+                PaperMarketUpdate::Ended,
+            ]
         );
-        assert_eq!(
-            updates.try_recv().unwrap(),
-            PaperMarketUpdate {
-                instrument: InstrumentIndex(1),
-                observation: traded(dec!(7)),
-            }
-        );
-        assert!(updates.try_recv().is_err(), "a reconnection sends nothing");
+    }
+
+    /// The end of the stream is sent once, however often the tap is polled after it.
+    #[tokio::test]
+    async fn the_tap_sends_the_end_of_its_stream_once() {
+        let (mut tap, feed) = PaperMarketFeed::tap(futures::stream::iter(vec![trade(0, dec!(1))]));
+        let mut updates = feed.subscribe();
+
+        assert!(tap.next().await.is_some());
+        assert!(tap.next().await.is_none());
+        assert!(tap.next().await.is_none());
+
+        assert!(matches!(
+            updates.try_recv(),
+            Ok(PaperMarketUpdate::Observation { .. })
+        ));
+        assert_eq!(updates.try_recv(), Ok(PaperMarketUpdate::Ended));
+        assert!(updates.try_recv().is_err(), "the end is sent once");
     }
 
     #[test]

@@ -325,6 +325,18 @@ pub enum StaleMarketPolicy {
     /// An instrument whose venue has no price at all is not stale but unpriced: its market orders
     /// are rejected and its limit orders rest, as they do without this policy.
     ///
+    /// # A feed reported down
+    /// Age alone cannot tell a quiet market from a dead feed. A driver that learns its feed has
+    /// stopped delivering an instrument, because the stream is reconnecting or has ended, says so
+    /// with
+    /// [`SimulatedVenue::mark_market_stale`](crate::exchange::mock::SimulatedVenue::mark_market_stale).
+    /// The market then counts as stale, however recently it was observed fresh, until its next
+    /// fresh observation. The `rustrade` crate's paper venues and `SimRunner` do this for every
+    /// instrument priced from an exchange whose stream reconnects, and paper venues also for every
+    /// instrument when the stream ends. `SimRunner` marks nothing when its data ends, since nothing
+    /// arrives after it. A driver that never calls it leaves this policy judging by age alone,
+    /// which is all it can do for a connection that stays open but goes silent.
+    ///
     /// # What waits
     /// Every order arriving on a stale market, market and limit alike: whether the old market
     /// crosses a limit order says nothing about whether the market it will trade in does. The

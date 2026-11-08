@@ -91,6 +91,10 @@ pub type CancelOutcome = VenueOutcome<UnindexedOrderResponseCancel>;
 /// needs both: an order resting since `T` may only be matched against a market at or after `T`.
 /// The remaining depth is here for the same reason and one more: it is not even a property of the
 /// market, but of what this account has already taken out of it.
+///
+/// `#[non_exhaustive]`: what a venue tracks about a market grows, and each addition arrives as a
+/// new field rather than as a break for code that builds one. Start from [`Default`].
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct VenueInstrumentMarket {
     /// Prices as of [`time_exchange`](Self::time_exchange).
@@ -123,6 +127,14 @@ pub struct VenueInstrumentMarket {
     /// it standing while it replaces [`snapshot`](Self::snapshot). What
     /// [`StaleMarketPolicy::Wait`] measures a market's age from.
     pub fresh_at: Option<DateTime<Utc>>,
+
+    /// When this instrument's feed was reported down, or `None` while it is not.
+    ///
+    /// Set by [`mark_market_stale`](SimulatedVenue::mark_market_stale), and cleared by the next
+    /// [`fresh`](MarketObservation::fresh) observation. While it is set,
+    /// [`StaleMarketPolicy::Wait`] treats the market as stale however recent
+    /// [`fresh_at`](Self::fresh_at) is.
+    pub stale_since: Option<DateTime<Utc>>,
 }
 
 /// Which price source a [`SimulatedVenue`] has, and therefore which orders it can accept.
@@ -2271,6 +2283,7 @@ impl SimulatedVenue {
         }
         if fresh {
             entry.fresh_at = Some(time_exchange);
+            entry.stale_since = None;
         }
         // Recorded before anything can borrow on this tick, so a loan it funds is valued with it.
         self.record_borrow_price(instrument, &snapshot, bar.as_ref(), time_exchange);
@@ -3477,6 +3490,39 @@ impl SimulatedVenue {
         self.market.get(instrument)
     }
 
+    /// Records that `instrument`'s feed is down as of `time_exchange`, so that under
+    /// [`StaleMarketPolicy::Wait`] its market counts as stale, however recently it was observed
+    /// fresh, until its next [`fresh`](MarketObservation::fresh) observation.
+    ///
+    /// A driver calls this when its feed reports that it stopped delivering `instrument`: a stream
+    /// reconnecting, or ending. Age alone cannot tell a quiet market from a dead feed, so without
+    /// this call [`StaleMarketPolicy::Wait`] judges a market by its age alone.
+    ///
+    /// - **Only [`StaleMarketPolicy::Wait`] reads the mark.** Under [`StaleMarketPolicy::Off`] the
+    ///   venue records it and nothing else changes.
+    /// - **The market is kept.** The prices the venue holds still value positions and margin. A
+    ///   feed going down says nothing new about the price, only that nothing more is arriving.
+    /// - **What clears it:** the next fresh observation of `instrument`, and nothing else. An
+    ///   observation that is not fresh, such as a bar reported with zero volume, moves the price
+    ///   but leaves the mark. So does an observation of another instrument.
+    /// - **An instrument the venue holds no market for** is left alone: it is unpriced, not stale,
+    ///   and its first observation prices it.
+    /// - **Marking an instrument already marked** keeps the earlier instant.
+    /// - **It moves no clock and fills nothing.** `time_exchange` is only recorded, taken as the
+    ///   latest instant the venue has reached if it is earlier, as
+    ///   [`apply_market`](Self::apply_market) takes one. Orders already held keep waiting, and
+    ///   their deadlines still retire them.
+    pub fn mark_market_stale(
+        &mut self,
+        instrument: &InstrumentNameExchange,
+        time_exchange: DateTime<Utc>,
+    ) {
+        let time_exchange = self.not_before_reached(time_exchange);
+        if let Some(market) = self.market.get_mut(instrument) {
+            market.stale_since.get_or_insert(time_exchange);
+        }
+    }
+
     /// Number of orders this venue has booked.
     ///
     /// Also how far the next `OrderId` is past the first one this venue minted, which is `0` unless
@@ -4140,15 +4186,20 @@ impl SimulatedVenue {
                         None,
                     );
                 }
-                MarketAge::Stale { fresh_at } => {
+                MarketAge::Stale(cause) => {
                     if matches!(
                         request.state.time_in_force,
                         TimeInForce::ImmediateOrCancel | TimeInForce::FillOrKill
                     ) {
-                        let last = fresh_at.map_or_else(
-                            || "never observed fresh".to_owned(),
-                            |fresh_at| format!("last observed fresh at {fresh_at}"),
-                        );
+                        let last = match cause {
+                            StaleCause::FeedDown { since } => {
+                                format!("its feed was reported down at {since}")
+                            }
+                            StaleCause::Aged { fresh_at } => {
+                                format!("last observed fresh at {fresh_at}")
+                            }
+                            StaleCause::NeverFresh => "never observed fresh".to_owned(),
+                        };
                         let reason = format!(
                             "cannot fill {} on {}: {}'s market is stale under \
                              StaleMarketPolicy::Wait (max_age {max_age:?}; {last}), and \
@@ -4254,16 +4305,17 @@ impl SimulatedVenue {
         else {
             return MarketAge::Unpriced;
         };
+        if let Some(since) = market.stale_since {
+            return MarketAge::Stale(StaleCause::FeedDown { since });
+        }
         let Some(fresh_at) = market.fresh_at else {
-            return MarketAge::Stale { fresh_at: None };
+            return MarketAge::Stale(StaleCause::NeverFresh);
         };
         // A `max_age` too long for a `TimeDelta` is longer than any run, so nothing is stale.
         let stale = chrono::TimeDelta::from_std(max_age)
             .is_ok_and(|max_age| now.signed_duration_since(fresh_at) > max_age);
         if stale {
-            MarketAge::Stale {
-                fresh_at: Some(fresh_at),
-            }
+            MarketAge::Stale(StaleCause::Aged { fresh_at })
         } else {
             MarketAge::Fresh
         }
@@ -6103,9 +6155,22 @@ enum MarketAge {
     Unpriced,
     /// Observed fresh within the policy's `max_age`.
     Fresh,
-    /// Priced, but last observed fresh at `fresh_at`, longer ago than the policy's `max_age`, or
-    /// never.
-    Stale { fresh_at: Option<DateTime<Utc>> },
+    /// Priced, but stale, for the reason given.
+    Stale(StaleCause),
+}
+
+/// Why [`market_age`](SimulatedVenue::market_age) found a priced market stale: one reason at a
+/// time, the first that applies in this order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleCause {
+    /// Its feed was reported down at `since`, by
+    /// [`mark_market_stale`](SimulatedVenue::mark_market_stale), and nothing fresh has arrived
+    /// since.
+    FeedDown { since: DateTime<Utc> },
+    /// It was last observed fresh at `fresh_at`, longer ago than the policy's `max_age`.
+    Aged { fresh_at: DateTime<Utc> },
+    /// It was never observed fresh.
+    NeverFresh,
 }
 
 /// What a held order is priced from when it is released.
@@ -13258,6 +13323,111 @@ mod tests {
 
         let outcome = venue.open_order(gtc_buy("waiting", "1"));
         assert_eq!(rested_open(&outcome).filled_quantity, Decimal::ZERO);
+    }
+
+    #[test]
+    fn a_market_marked_stale_waits_however_recently_it_was_observed_fresh() {
+        let mut venue = venue_waiting();
+        venue.mark_market_stale(&instrument_name(), time(2));
+        // Well within `MAX_AGE` of the fresh observation at `time(1)`.
+        advance(&mut venue, time(3));
+
+        let outcome = venue.open_order(ioc_buy("immediate", "1"));
+        let reason = rejection_reason(&outcome);
+        assert!(
+            reason.contains("StaleMarketPolicy::Wait")
+                && reason.contains("feed was reported down")
+                && reason.contains(&time(2).to_string()),
+            "{reason}"
+        );
+
+        let outcome = venue.open_order(gtc_buy("waiting", "1"));
+        assert_eq!(rested_open(&outcome).filled_quantity, Decimal::ZERO);
+        assert!(venue.account.orders().holds(&instrument_name()));
+
+        let events = observe(&mut venue, 4, traded("105"));
+        assert_eq!(
+            trade_of(&events[2]).price,
+            d("105"),
+            "the next fresh observation releases it"
+        );
+        assert_eq!(venue.market(&instrument_name()).unwrap().stale_since, None);
+
+        let outcome = venue.open_order(gtc_buy("after", "1"));
+        assert_eq!(
+            filled_trade(&outcome).price,
+            d("105"),
+            "the mark is cleared, so an order fills on arrival again"
+        );
+    }
+
+    #[test]
+    fn an_observation_that_is_not_fresh_leaves_the_mark() {
+        let mut venue = venue_waiting();
+        venue.mark_market_stale(&instrument_name(), time(2));
+
+        assert!(observe_idle(&mut venue, 3, traded("101")).is_empty());
+
+        let market = venue.market(&instrument_name()).unwrap();
+        assert_eq!(
+            (market.snapshot.last_price, market.stale_since),
+            (Some(d("101")), Some(time(2))),
+            "the price moves, the mark stays"
+        );
+        let outcome = venue.open_order(ioc_buy("immediate", "1"));
+        assert!(rejection_reason(&outcome).contains("feed was reported down"));
+    }
+
+    #[test]
+    fn a_mark_keeps_its_first_instant_never_before_the_venues_clock() {
+        let mut venue = venue_waiting();
+        advance(&mut venue, time(5));
+
+        venue.mark_market_stale(&instrument_name(), time(2));
+        assert_eq!(
+            venue.market(&instrument_name()).unwrap().stale_since,
+            Some(time(5)),
+            "taken as the latest instant reached"
+        );
+
+        venue.mark_market_stale(&instrument_name(), time(8));
+        assert_eq!(
+            venue.market(&instrument_name()).unwrap().stale_since,
+            Some(time(5)),
+            "a second mark keeps the first instant"
+        );
+        assert_eq!(venue.time_exchange(), time(5), "a mark moves no clock");
+    }
+
+    #[test]
+    fn a_mark_leaves_an_instrument_with_no_market_unpriced() {
+        let mut venue =
+            SimulatedVenue::new_market_driven(&stale_config(MAX_AGE), spot_instruments());
+        advance(&mut venue, time(1));
+
+        venue.mark_market_stale(&instrument_name(), time(1));
+
+        assert!(venue.market(&instrument_name()).is_none());
+    }
+
+    #[test]
+    fn a_mark_changes_nothing_without_the_wait_policy() {
+        let mut venue = SimulatedVenue::new_market_driven(
+            &spot_config("10", "10000", FeeModelConfig::default()),
+            spot_instruments(),
+        );
+        advance(&mut venue, time(1));
+        assert!(observe(&mut venue, 1, traded("100")).is_empty());
+
+        venue.mark_market_stale(&instrument_name(), time(2));
+
+        assert_eq!(
+            venue.market(&instrument_name()).unwrap().stale_since,
+            Some(time(2)),
+            "recorded"
+        );
+        let outcome = venue.open_order(ioc_buy("immediate", "1"));
+        assert_eq!(filled_trade(&outcome).price, d("100"), "and not read");
     }
 
     #[test]

@@ -207,6 +207,27 @@ impl ExecutionInstrumentMap {
             .map(|listed| &listed.name_exchange)
     }
 
+    /// The names this exchange knows its instruments by, for those whose market data comes from
+    /// `data_exchange`: see [`Instrument::data_exchange`].
+    ///
+    /// An instrument with no [`DataVenue`](rustrade_instrument::instrument::data_venue::DataVenue)
+    /// is priced from the exchange it is listed on, so for `data_exchange` equal to this exchange
+    /// this yields every such instrument, and for another exchange only those a `DataVenue` sources
+    /// from it. Use it to decide which of a venue's instruments a market stream event that names
+    /// only its exchange, such as a reconnection, is about.
+    pub fn own_instruments_priced_from(
+        &self,
+        data_exchange: ExchangeId,
+    ) -> impl Iterator<Item = &InstrumentNameExchange> {
+        self.instruments
+            .iter()
+            .filter(move |listed| {
+                listed.exchange.key == self.exchange.key
+                    && listed.data_exchange().value == data_exchange
+            })
+            .map(|listed| &listed.name_exchange)
+    }
+
     /// Find the [`InstrumentIndex`] of the instrument this exchange reports as `instrument`.
     ///
     /// Matches the registered spelling first, and failing that ignores ASCII case, logging the
@@ -305,6 +326,31 @@ mod tests {
         ];
 
         IndexedInstruments::new(instruments)
+    }
+
+    /// Only this exchange's instruments, and of those only the ones priced from the exchange asked
+    /// about: their own by default, another through a `DataVenue`.
+    #[test]
+    fn own_instruments_priced_from_follows_each_instruments_data_exchange() {
+        use rustrade_instrument::instrument::data_venue::DataVenue;
+
+        let instruments = IndexedInstruments::new(vec![
+            test_utils::instrument(ExchangeId::Kraken, "BTC", "USD"),
+            test_utils::instrument(ExchangeId::Kraken, "ETH", "USD")
+                .with_data_venue(DataVenue::new(ExchangeId::BinanceSpot, None)),
+            test_utils::instrument(ExchangeId::BinanceSpot, "SOL", "USDT"),
+        ]);
+        let kraken = generate_execution_instrument_map(&instruments, ExchangeId::Kraken).unwrap();
+        let priced_from = |exchange| {
+            kraken
+                .own_instruments_priced_from(exchange)
+                .map(|name| name.name().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(priced_from(ExchangeId::Kraken), ["BTC_USD"]);
+        assert_eq!(priced_from(ExchangeId::BinanceSpot), ["ETH_USD"]);
+        assert!(priced_from(ExchangeId::Coinbase).is_empty());
     }
 
     #[test]
