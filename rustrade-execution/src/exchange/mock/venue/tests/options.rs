@@ -1040,3 +1040,26 @@ fn a_request_priced_venue_that_exercises_refuses_an_option_buy() {
     );
     assert_eq!(option_position(&venue), None);
 }
+
+/// A lapsing long already expired when the clock first moves needs no price: it lapses at zero
+/// in that very move, though nothing ever prices its underlying.
+#[test]
+fn a_lapsing_option_expired_before_the_clock_first_moves_lapses_without_a_price() {
+    let mut config = config("10000", FeeModelConfig::default());
+    config.long_option_expiry = LongOptionExpiry::Lapse;
+    config.initial_state.instruments.push(held_option());
+    let mut venue = SimulatedVenue::new_market_driven(
+        &config,
+        driven_instruments(OptionKind::Call, OptionSettlement::Cash),
+    );
+
+    let events = venue.advance_time(time(150));
+
+    let trades = trades(&events);
+    assert_eq!(trades.len(), 1, "{events:?}");
+    assert_eq!(
+        (trades[0].origin, trades[0].price, trades[0].time_exchange),
+        (TradeOrigin::Expiry, Decimal::ZERO, time(150))
+    );
+    assert_eq!(option_position(&venue), None);
+}
