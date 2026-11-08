@@ -15,11 +15,11 @@
 //! The reads cost about 20 of Binance's per-IP request weight, of the 12000 a minute allows, plus
 //! one per page of records.
 //!
-//! The variables are named apart from `BINANCE_API_KEY`, which the other Binance tests read as a
-//! testnet key:
+//! The key is named apart from `BINANCE_API_KEY`, which the other Binance tests read as a testnet
+//! key:
 //!
-//! - `BINANCE_MARGIN_API_KEY`, `BINANCE_MARGIN_SECRET_KEY`: a production key that may read margin
-//!   data. It needs no trading permission.
+//! - `BINANCE_SUBACCOUNT_READONLY_API_KEY`, `BINANCE_SUBACCOUNT_READONLY_API_SECRET`: a production
+//!   key that may read margin data. It needs no trading permission.
 //!
 //! ```bash
 //! cargo test -p rustrade-execution --features binance --test binance_margin_records -- --ignored --nocapture
@@ -50,8 +50,8 @@ fn env(name: &str) -> String {
 
 fn credentials() -> (String, String) {
     (
-        env("BINANCE_MARGIN_API_KEY"),
-        env("BINANCE_MARGIN_SECRET_KEY"),
+        env("BINANCE_SUBACCOUNT_READONLY_API_KEY"),
+        env("BINANCE_SUBACCOUNT_READONLY_API_SECRET"),
     )
 }
 

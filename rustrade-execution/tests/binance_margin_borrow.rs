@@ -5,11 +5,11 @@
 //! rate and the account's max borrowable amounts. The reads cost about 250 of Binance's per-IP
 //! request weight in all, of the 12000 a minute allows.
 //!
-//! The variables are named apart from `BINANCE_API_KEY`, which the other Binance tests read as a
-//! testnet key:
+//! The key is named apart from `BINANCE_API_KEY`, which the other Binance tests read as a testnet
+//! key:
 //!
-//! - `BINANCE_MARGIN_API_KEY`, `BINANCE_MARGIN_SECRET_KEY`: a production key that may read margin
-//!   data. It needs no trading permission.
+//! - `BINANCE_SUBACCOUNT_READONLY_API_KEY`, `BINANCE_SUBACCOUNT_READONLY_API_SECRET`: a production
+//!   key that may read margin data. It needs no trading permission.
 //! - `BINANCE_MARGIN_SYMBOL`: the pair, such as `BTCUSDT`.
 //! - `BINANCE_MARGIN_ISOLATED`: `true` to ask the pair's isolated margin account, which must exist;
 //!   otherwise cross margin.
@@ -39,8 +39,8 @@ async fn margin_borrow_terms_and_capacity_read_back() {
     let instrument = InstrumentNameExchange::new(env("BINANCE_MARGIN_SYMBOL"));
     let is_isolated = std::env::var("BINANCE_MARGIN_ISOLATED").is_ok_and(|value| value == "true");
     let (api_key, secret_key) = (
-        env("BINANCE_MARGIN_API_KEY"),
-        env("BINANCE_MARGIN_SECRET_KEY"),
+        env("BINANCE_SUBACCOUNT_READONLY_API_KEY"),
+        env("BINANCE_SUBACCOUNT_READONLY_API_SECRET"),
     );
     let config = if is_isolated {
         BinanceMarginConfig::isolated(api_key, secret_key, vec![instrument.clone()])
