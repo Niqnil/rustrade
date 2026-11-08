@@ -471,9 +471,13 @@ fn an_exercised_put_without_the_shares_on_a_margin_venue_records_no_loan() {
     assert_eq!(trades(&events).len(), 2, "{events:?}");
     let shares = balance(&venue, spy());
     assert_eq!((shares.total, shares.free), (d("-100"), d("-100")));
+    // No principal opened in either asset, and nothing owed in the shares: the margin valuation
+    // counts debt only from what is owed, so the shortfall is not debt either.
+    assert_eq!(venue.account.loans().count(), 0);
+    assert_eq!(venue.account.owed(&spy()), Decimal::ZERO);
     assert_eq!(
-        shares.margin.map_or(Decimal::ZERO, |margin| margin.owed()),
-        Decimal::ZERO
+        balance(&venue, usd()).total,
+        d("10000") - d("150") + d("10000")
     );
 }
 

@@ -97,8 +97,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Longs only, for now.** A buy needs its premium and fee in free cash. A sale may close only what
     is held, less the sales already resting. Orders at or after expiry are refused. A price that is
     not positive is no price, so a zero candle never fills an option. A request-priced venue
-    (`SimulatedVenue::new`) has no market feed to exercise against, so it refuses an option buy
-    unless `long_option_expiry` is `Lapse`.
+    (`SimulatedVenue::new`, and so `MockExchange::new`) has no market feed to exercise against, so
+    it refuses an option buy unless `long_option_expiry` is `Lapse`.
   - **Expiry is settled by the venue.** When the clock passes a contract's expiry, the venue retires
     the orders still working on it and settles the position against its own last price for the
     underlying, at zero fee: out of the money at zero (`TradeOrigin::Expiry`); in the money,

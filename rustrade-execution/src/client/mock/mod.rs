@@ -104,6 +104,11 @@ pub struct MockExecutionConfig {
     /// How the venue settles a long option it holds at expiry: exercised when in the money, the
     /// default, or lapsed. See [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue)'s
     /// `# How an option is accounted`.
+    ///
+    /// A request-priced venue ([`SimulatedVenue::new`](crate::exchange::mock::SimulatedVenue::new),
+    /// and so [`MockExchange::new`](crate::exchange::mock::MockExchange::new)) has no market feed
+    /// to price an underlying at expiry, so it takes an option buy only under
+    /// [`LongOptionExpiry::Lapse`].
     #[serde(default)]
     pub long_option_expiry: LongOptionExpiry,
 }
