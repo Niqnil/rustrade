@@ -109,8 +109,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   earlier than the tick had already reported, and a `GoodTillDate` order whose deadline the tick
   had reached was accepted and rested until the next input swept it. Now `time_exchange()` is the
   latest instant either input reached, so such a request is stamped at the tick and such an order
-  expires on arrival. Drivers that call `advance_time` before each request, as `MockExchange` does,
-  see no change.
+  expires on arrival. A snapshot written with the lagging clock restores it at the instant
+  reached. Drivers that call `advance_time` before each request, as `MockExchange` does, see no
+  change.
 
 ## [0.21.0] - 2026-11-04
 

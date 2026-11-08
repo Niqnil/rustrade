@@ -9849,6 +9849,21 @@ mod tests {
         }
     }
 
+    /// A market tick that is the venue's first input sets the request clock too.
+    #[test]
+    fn a_first_input_tick_sets_the_request_clock() {
+        let mut venue = make_market_venue("10", "1000000");
+        assert_eq!(venue.time_exchange(), DateTime::<Utc>::default());
+
+        let _ = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("47800", "47900")),
+            time(9),
+        );
+
+        assert_eq!(venue.time_exchange(), time(9));
+    }
+
     /// A request that follows a market tick is stamped at the tick, not at the last
     /// `advance_time`, so nothing it reports is older than what the tick already reported.
     #[test]
