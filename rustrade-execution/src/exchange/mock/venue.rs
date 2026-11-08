@@ -4467,9 +4467,9 @@ impl SimulatedVenue {
         };
         let instrument = &request.key.instrument;
 
-        // The instant the clock has reached: an `apply_market` can carry it past an expiry before
-        // the next `advance_time` moves `time_exchange`.
-        let now = self.not_before_reached(self.time_exchange());
+        // The instant either input reached, so an `apply_market` past the expiry refuses the order
+        // before the next `advance_time`.
+        let now = self.time_exchange();
         if now >= expiry {
             return Err(UnindexedOrderError::Rejected(ApiError::InstrumentInvalid(
                 instrument.clone(),

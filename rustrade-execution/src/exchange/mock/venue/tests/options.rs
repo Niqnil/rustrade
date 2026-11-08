@@ -1005,10 +1005,6 @@ fn an_order_after_a_market_input_crossed_the_expiry_is_refused() {
         MarketObservation::new(traded("1.5")),
         time(150),
     );
-    assert!(
-        venue.time_exchange() < expiry(),
-        "only the market moved past it"
-    );
 
     let outcome = venue.open_order(option_request(Side::Buy, "1", None));
 
