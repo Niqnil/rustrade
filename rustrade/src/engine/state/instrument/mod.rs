@@ -595,21 +595,10 @@ impl Default for ExpiryHandling {
     }
 }
 
-/// How [`ExpiryHandling::Engine`] settles a long option position at expiry. Short options and
-/// futures are not affected.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
-pub enum LongOptionExpiry {
-    /// An option in the money is exercised: the position settles at its intrinsic value, in
-    /// cash, against the underlying's last price. One out of the money settles at zero. The
-    /// default, matching an exchange that exercises in-the-money options automatically.
-    #[default]
-    Exercise,
-    /// Every long option lapses: the position settles at zero, in the money or not, and no
-    /// underlying price is needed for it. This matches a holder who instructs the broker not to
-    /// exercise any option still held at expiry.
-    Lapse,
-}
+/// How [`ExpiryHandling::Engine`] settles a long option position at expiry: in cash, at the
+/// intrinsic value when exercised. Defined in `rustrade-execution`, so that the simulated venue
+/// settles by the same choice.
+pub use rustrade_execution::expiry::LongOptionExpiry;
 
 /// [`ExpiryHandling`]'s own serialised form, read as derived by a binary format.
 #[derive(Deserialize)]
@@ -3763,13 +3752,14 @@ mod tests {
         mut state: InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex>,
     ) -> InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex> {
         use rustrade_instrument::instrument::kind::option::{
-            OptionContract, OptionExercise, OptionKind,
+            OptionContract, OptionExercise, OptionKind, OptionSettlement,
         };
         state.instrument.kind = InstrumentKind::Option(OptionContract {
             contract_size: Decimal::ONE,
             settlement_asset: state.instrument.underlying.quote,
             kind: OptionKind::Call,
             exercise: OptionExercise::American,
+            settlement: OptionSettlement::Physical,
             expiry: TIME,
             strike: dec!(100),
         });

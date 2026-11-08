@@ -8,6 +8,7 @@ use crate::{
         UnindexedClientError, UnindexedOrderError,
     },
     exchange::mock::request::MockExchangeRequest,
+    expiry::LongOptionExpiry,
     fee::{FeeAssetConfig, FeeModelConfig, SpotFeeAsset},
     fill::{MarketOrderTiming, SimFillConfig, StaleMarketPolicy},
     margin::SpotMarginConfig,
@@ -100,6 +101,16 @@ pub struct MockExecutionConfig {
     /// See [`FeeAssetConfig`] for what a fill pays and when it falls back to that rule.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fee_asset: Option<FeeAssetConfig>,
+    /// How the venue settles a long option it holds at expiry: exercised when in the money, the
+    /// default, or lapsed. See [`SimulatedVenue`](crate::exchange::mock::SimulatedVenue)'s
+    /// `# How an option is accounted`.
+    ///
+    /// A request-priced venue ([`SimulatedVenue::new`](crate::exchange::mock::SimulatedVenue::new),
+    /// and so [`MockExchange::new`](crate::exchange::mock::MockExchange::new)) has no market feed
+    /// to price an underlying at expiry, so it takes an option buy only under
+    /// [`LongOptionExpiry::Lapse`].
+    #[serde(default)]
+    pub long_option_expiry: LongOptionExpiry,
 }
 
 #[derive(Debug, Constructor)]
@@ -161,13 +172,14 @@ where
 {
     const EXCHANGE: ExchangeId = ExchangeId::Mock;
 
-    // `MockExchange` models no expiry, funding schedule or contract chain, so `Perpetual`, `Future`
-    // and `Option` have no faithful projection onto it. `Spot` and `Cfd` need none: both are
-    // positions in an instrument that the mock can open, close and mark without simulating a
-    // lifecycle. Kept in step with the projection in `generate_mock_exchange_instruments`.
+    // `MockExchange` models no funding schedule or margin for a future, so `Perpetual` and `Future`
+    // have no faithful projection onto it. `Spot` and `Cfd` are positions the mock can open, close
+    // and mark without simulating a lifecycle, and an `Option` is one it settles itself at expiry.
+    // Kept in step with the projection in `generate_mock_exchange_instruments`.
     const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] = &[
         InstrumentKindDiscriminant::Spot,
         InstrumentKindDiscriminant::Cfd,
+        InstrumentKindDiscriminant::Option,
     ];
     type Config = MockExecutionClientConfig<FnTime>;
     type AccountStream = BoxStream<'static, UnindexedAccountEvent>;

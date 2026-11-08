@@ -136,6 +136,7 @@ fn venue(fee_model: FeeModelConfig, spot_fee_asset: SpotFeeAsset) -> SimulatedVe
         stale_market: Default::default(),
         spot_margin: None,
         fee_asset: None,
+        long_option_expiry: Default::default(),
     };
     let spot = Instrument {
         exchange: EXCHANGE,

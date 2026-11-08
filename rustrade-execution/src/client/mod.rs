@@ -1094,14 +1094,15 @@ mod tests {
 
     #[test]
     fn mock_supports_only_the_kinds_it_can_model() {
-        // No expiry, funding schedule or contract chain in `MockExchange`, so `Perpetual`, `Future`
-        // and `Option` have no faithful projection onto it. Kept in step with the projection in
+        // No funding schedule or futures margin in `MockExchange`, so `Perpetual` and `Future` have
+        // no faithful projection onto it. Kept in step with the projection in
         // `generate_mock_exchange_instruments`, which panics on a kind it cannot project.
         assert_eq!(
             <MockExecution<fn() -> DateTime<Utc>> as ExecutionClient>::SUPPORTED_KINDS,
             &[
                 InstrumentKindDiscriminant::Spot,
-                InstrumentKindDiscriminant::Cfd
+                InstrumentKindDiscriminant::Cfd,
+                InstrumentKindDiscriminant::Option,
             ]
         );
     }
