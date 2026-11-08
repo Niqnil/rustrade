@@ -13,8 +13,9 @@
 //!   read placed on the venue's clock sends one.
 //!
 //! The record checks mean something only on an account that has borrowed or been liquidated. On
-//! one with no such history they pass over no records, and only the `endTime` and span checks
-//! tell anything.
+//! one with no such history they pass over no records, and only the checks that need none tell
+//! anything: that the reads succeed and report a retention limit, the `endTime` read and the
+//! two-year span.
 //!
 //! The reads cost about 20 of Binance's per-IP request weight, of the 12000 a minute allows, plus
 //! one per page of records.
