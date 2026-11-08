@@ -934,3 +934,38 @@ fn a_snapshot_holding_an_option_short_is_refused() {
         VenueRestoreError::OptionShort(option_name())
     );
 }
+
+/// A market input can carry the clock past an expiry before the driver's next `advance_time`, and
+/// an order placed then is refused all the same.
+#[test]
+fn an_order_after_a_market_input_crossed_the_expiry_is_refused() {
+    let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |_| {});
+    let _ = venue.apply_market(
+        &option_name(),
+        MarketObservation::new(traded("1.5")),
+        time(2),
+    );
+    buy(&mut venue, "1");
+    let _ = venue.apply_market(
+        &option_name(),
+        MarketObservation::new(traded("1.5")),
+        time(150),
+    );
+    assert!(
+        venue.time_exchange() < expiry(),
+        "only the market moved past it"
+    );
+
+    let outcome = venue.open_order(option_request(Side::Buy, "1", None));
+
+    assert!(
+        matches!(
+            outcome.response.state,
+            OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                ApiError::InstrumentInvalid(..)
+            )))
+        ),
+        "{:?}",
+        outcome.response.state
+    );
+}

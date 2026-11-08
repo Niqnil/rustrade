@@ -1324,9 +1324,9 @@ impl SimulatedVenue {
             .cloned()
             .collect();
         for instrument in ready {
-            self.expiry_pending.remove(&instrument);
-            let settled = self.settle_option(&instrument, now, events);
-            debug_assert!(settled, "{instrument} could settle, so it settled");
+            if self.settle_option(&instrument, now, events) {
+                self.expiry_pending.remove(&instrument);
+            }
         }
     }
 
@@ -4437,7 +4437,9 @@ impl SimulatedVenue {
         };
         let instrument = &request.key.instrument;
 
-        let now = self.time_exchange();
+        // The instant the clock has reached: an `apply_market` can carry it past an expiry before
+        // the next `advance_time` moves `time_exchange`.
+        let now = self.not_before_reached(self.time_exchange());
         if now >= expiry {
             return Err(UnindexedOrderError::Rejected(ApiError::InstrumentInvalid(
                 instrument.clone(),
