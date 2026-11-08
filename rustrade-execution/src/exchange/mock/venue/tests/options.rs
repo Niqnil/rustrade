@@ -660,3 +660,206 @@ fn a_restored_venue_still_waits_to_settle_an_expiry_it_had_no_price_for() {
     assert_eq!(price(&mut restored), settled);
     assert_eq!(option_position(&restored), None);
 }
+
+/// A good-till-cancelled limit order on `instrument`, identified by `cid`.
+fn limit(
+    instrument: InstrumentNameExchange,
+    side: Side,
+    price: &str,
+    quantity: &str,
+    cid: &str,
+) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
+    OrderRequestOpen {
+        key: OrderKey {
+            cid: ClientOrderId::new(cid),
+            ..request(instrument, side, quantity, None).key
+        },
+        state: RequestOpen::new(side, Some(d(price)), d(quantity), OrderKind::Limit, gtc()),
+    }
+}
+
+#[test]
+fn a_resting_buy_does_not_count_against_what_may_be_sold() {
+    let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |_| {});
+    feed(&mut venue, "100", "1.5", time(2));
+    buy(&mut venue, "1");
+    let rested = venue.open_order(limit(option_name(), Side::Buy, "0.5", "1", "bid"));
+    assert!(
+        rested.response.state.is_accepted(),
+        "{:?}",
+        rested.response.state
+    );
+
+    let sale = venue.open_order(limit(option_name(), Side::Sell, "5", "1", "ask"));
+
+    assert!(
+        sale.response.state.is_accepted(),
+        "a resting buy closes nothing: {:?}",
+        sale.response.state
+    );
+}
+
+#[test]
+fn a_cash_settled_put_pays_its_intrinsic_value_on_every_contract() {
+    let mut venue = driven_venue(OptionKind::Put, OptionSettlement::Cash, |_| {});
+    feed(&mut venue, "100", "1.5", time(2));
+    buy(&mut venue, "2");
+    feed(&mut venue, "90", "10", time(50));
+
+    let events = venue.advance_time(expiry());
+
+    let trades = trades(&events);
+    assert_eq!(trades.len(), 1, "{events:?}");
+    assert_eq!(
+        (trades[0].origin, trades[0].price, trades[0].quantity),
+        (TradeOrigin::Exercise, d("10"), d("2"))
+    );
+    // 10,000 less 2 × 1.50 × 100 of premium, plus 10 × 2 × 100 of intrinsic value.
+    assert_eq!(
+        balance(&venue, usd()).total,
+        d("10000") - d("300") + d("2000")
+    );
+}
+
+#[test]
+fn an_option_exactly_at_the_money_expires_at_zero() {
+    let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Physical, |_| {});
+    feed(&mut venue, "100", "1.5", time(2));
+    buy(&mut venue, "1");
+
+    let events = venue.advance_time(expiry());
+
+    let trades = trades(&events);
+    assert_eq!(trades.len(), 1, "{events:?}");
+    assert_eq!(
+        (trades[0].origin, trades[0].price),
+        (TradeOrigin::Expiry, Decimal::ZERO)
+    );
+    assert_eq!(
+        balance(&venue, spy()).total,
+        Decimal::ZERO,
+        "nothing delivered"
+    );
+}
+
+#[test]
+fn a_zero_underlying_price_is_no_price_to_settle_at() {
+    let mut venue = driven_venue(OptionKind::Call, OptionSettlement::Cash, |_| {});
+    feed(&mut venue, "0", "1.5", time(2));
+    buy(&mut venue, "1");
+
+    let events = venue.advance_time(expiry());
+
+    assert!(trades(&events).is_empty(), "{events:?}");
+    assert_eq!(option_position(&venue), Some(d("1")));
+}
+
+/// An option held from `initial_state` that has already expired when the clock first moves
+/// settles at the first price for its underlying, and only its own orders are retired: an order
+/// resting on the underlying is left working.
+#[test]
+fn an_option_expired_before_the_clock_first_moves_settles_at_the_first_price() {
+    let mut config = config("10000", FeeModelConfig::default());
+    config
+        .initial_state
+        .instruments
+        .push(InstrumentAccountSnapshot {
+            instrument: option_name(),
+            orders: Vec::new(),
+            orders_complete: false,
+            position: PositionReport::Open(Position::new(
+                d("1"),
+                Some(d("1.5")),
+                None,
+                None,
+                None,
+                None,
+                None,
+                time(0),
+            )),
+            isolated: None,
+        });
+    let mut venue = SimulatedVenue::new_market_driven(
+        &config,
+        driven_instruments(OptionKind::Call, OptionSettlement::Cash),
+    );
+
+    assert!(trades(&venue.advance_time(time(150))).is_empty());
+    let rested = venue.open_order(limit(spy_name(), Side::Buy, "1", "1", "spy-bid"));
+    assert!(
+        rested.response.state.is_accepted(),
+        "{:?}",
+        rested.response.state
+    );
+
+    let priced = venue.apply_market(
+        &spy_name(),
+        MarketObservation::new(traded("110")),
+        time(160),
+    );
+
+    let trades = trades(&priced);
+    assert_eq!(trades.len(), 1, "{priced:?}");
+    assert_eq!(
+        (trades[0].price, trades[0].time_exchange),
+        (d("10"), time(160))
+    );
+    assert_eq!(option_position(&venue), None);
+    assert_eq!(
+        venue
+            .account
+            .orders_open()
+            .map(|order| order.key.cid.clone())
+            .collect::<Vec<_>>(),
+        [ClientOrderId::new("spy-bid")],
+        "the order on the underlying is still working"
+    );
+}
+
+#[test]
+fn an_option_observation_keeps_only_the_prices_it_can_trade_at() {
+    let bar = |low: &str| Some(MarketBar::new(d("2"), d("3"), d(low), d("2.5")));
+    let observed = |snapshot: MarketSnapshot, bar: Option<MarketBar>, fresh: bool| {
+        let mut observation = MarketObservation::new(snapshot).with_bar(bar);
+        observation.fresh = fresh;
+        priced_only(observation)
+    };
+    let none = MarketSnapshot::default();
+
+    assert_eq!(
+        observed(none, bar("1"), true).bar,
+        bar("1"),
+        "a positive bar is kept"
+    );
+    assert_eq!(
+        observed(none, bar("0"), true).bar,
+        None,
+        "a bar touching zero is dropped"
+    );
+    assert_eq!(observed(none, bar("-1"), true).bar, None);
+
+    // Each price source alone keeps an observation fresh; none at all does not.
+    let quoted = |bid: Option<&str>, ask: Option<&str>, last: Option<&str>| MarketSnapshot {
+        best_bid: bid.map(d),
+        best_ask: ask.map(d),
+        last_price: last.map(d),
+    };
+    assert!(observed(none, bar("1"), true).fresh, "a bar alone");
+    assert!(
+        observed(quoted(Some("1"), None, None), None, true).fresh,
+        "a bid alone"
+    );
+    assert!(
+        observed(quoted(None, Some("1"), None), None, true).fresh,
+        "an ask alone"
+    );
+    assert!(
+        observed(quoted(None, None, Some("1")), None, true).fresh,
+        "a last price alone"
+    );
+    assert!(!observed(quoted(Some("0"), Some("0"), Some("0")), bar("0"), true).fresh);
+    assert!(
+        !observed(quoted(Some("1"), Some("1"), Some("1")), bar("1"), false).fresh,
+        "a stale observation stays stale"
+    );
+}
