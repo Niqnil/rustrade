@@ -383,10 +383,10 @@ mod tests {
         assert_eq!(state.time_sent(), Some(sent));
         assert_eq!(state.open_meta(), Some(&order));
 
-        state
-            .open_meta_mut()
-            .expect("an amend in flight has a working order")
-            .filled_quantity = dec!(2);
+        let Some(working) = state.open_meta_mut() else {
+            panic!("an amend in flight has a working order");
+        };
+        working.filled_quantity = dec!(2);
         assert_eq!(
             state.open_meta().map(|open| open.filled_quantity),
             Some(dec!(2))
