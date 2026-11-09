@@ -397,6 +397,9 @@ pub struct RequestCancel {
 ///   rests: a stop being moved leaves its position unprotected for one round trip to the venue.
 /// - **Only within the group.** Requests outside it, including other groups, are not ordered
 ///   against it.
+/// - **A held open is in flight.** It has not left yet, so a cancel sent for it while it is held
+///   reaches the venue first and finds no order, as for any open whose request is still in
+///   flight.
 /// - **One answer per leg.** Each cancel is answered as a cancel sent alone would be. Each open is
 ///   answered as an open sent alone would be, or, when it is dropped, with an inactive order whose
 ///   error is [`NotPlacedReason::CancelFailed`](crate::error::NotPlacedReason::CancelFailed).
@@ -478,6 +481,9 @@ impl<ExchangeKey, InstrumentKey> CancelThenOpen<ExchangeKey, InstrumentKey> {
 /// expired, not found, a rejection, or a timeout. The likeliest failure is that the order has
 /// already filled, which is exactly when sending an exit or a replacement is wrong, hence the
 /// default.
+///
+/// Deliberately exhaustive: a new policy is a breaking change, so no code that sequences a group
+/// falls back to one it was not written for.
 #[derive(
     Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Default, Deserialize, Serialize,
 )]

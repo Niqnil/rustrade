@@ -786,7 +786,7 @@ where
                     // The cancel's answer goes first, so the opens it released, or the reports of
                     // the opens it dropped, follow it.
                     let Some(group) = group else { continue };
-                    let Ok(opens) = self.release(held_opens.answer(group, cid, failed)) else {
+                    let Some(opens) = self.release(held_opens.answer(group, cid, failed)) else {
                         break;
                     };
                     in_flight_opens.extend(opens.into_iter().map(|open| {
@@ -949,19 +949,17 @@ where
     /// The opens to send now that a group's cancel has been answered: those `release` sends, and
     /// none before the group's last answer. Each open it drops is answered as dropped first.
     ///
-    /// # Errors
-    /// If the channel to the Engine has closed while answering a dropped open.
+    /// `None` if the channel to the Engine closed while answering a dropped open.
     fn release(
         &self,
         release: Option<Release>,
-    ) -> Result<Vec<OrderRequestOpen<ExchangeIndex, InstrumentIndex>>, ()> {
+    ) -> Option<Vec<OrderRequestOpen<ExchangeIndex, InstrumentIndex>>> {
         match release {
-            None => Ok(Vec::new()),
-            Some(Release::Send(opens)) => Ok(opens),
-            Some(Release::Drop { opens, cancel }) => self
-                .forward_dropped(opens, &cancel)
-                .then(Vec::new)
-                .ok_or(()),
+            None => Some(Vec::new()),
+            Some(Release::Send(opens)) => Some(opens),
+            Some(Release::Drop { opens, cancel }) => {
+                self.forward_dropped(opens, &cancel).then(Vec::new)
+            }
         }
     }
 
@@ -3770,6 +3768,43 @@ mod tests {
             );
             assert_eq!(events.len(), 2, "{events:?}");
             assert_eq!(events[1], "snapshot exit active");
+        }
+
+        /// A group with no cancel has nothing to wait on: its opens go out at once. The Engine
+        /// refuses such a group, so this is a caller sending its own requests.
+        #[tokio::test(start_paused = true)]
+        async fn a_group_without_cancels_sends_its_opens_at_once() {
+            let client = ScriptedClient::new(vec![]);
+            let events = run(
+                &client,
+                vec![ExecutionRequest::CancelThenOpen(group(&[], &["exit"]))],
+            )
+            .await;
+
+            assert_eq!(client.logged(), ["open exit"]);
+            assert_eq!(events, ["snapshot exit active"]);
+        }
+
+        /// `Shutdown` abandons a held open with everything else in flight: it is never sent, and
+        /// nothing more is forwarded.
+        #[tokio::test(start_paused = true)]
+        async fn shutdown_abandons_held_opens() {
+            let client = ScriptedClient::new(vec![("stop", 1, Answer::Cancelled)]);
+            let events = run(
+                &client,
+                vec![
+                    ExecutionRequest::CancelThenOpen(group(&["stop"], &["exit"])),
+                    ExecutionRequest::Shutdown,
+                ],
+            )
+            .await;
+
+            assert!(
+                !client.logged().iter().any(|call| call.starts_with("open")),
+                "{:?}",
+                client.logged()
+            );
+            assert!(events.is_empty(), "{events:?}");
         }
 
         /// Two groups are sequenced apart: one's failure drops only its own opens.

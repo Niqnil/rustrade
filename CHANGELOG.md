@@ -223,7 +223,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for `CancelThenOpen`** (`rustrade`, #887). New variants `ExecutionRequest::CancelThenOpen`,
   `Command::SendCancelThenOpenRequests` and `ActionOutput::CancelThenOpens`, so an exhaustive
   `match` needs an arm for each. A struct literal of `GenerateAlgoOrdersOutput` must set its new
-  field `cancel_then_opens` (`None` for no groups); `GenerateAlgoOrdersOutput::new` sets it.
+  field `cancel_then_opens` (`None` for no groups); `GenerateAlgoOrdersOutput::new` sets it. The
+  engine's `GenerateAlgoOrders` implementation also requires `ExchangeKey: PartialEq`, which every
+  key type in the library is.
 - **`InFlightDeadlines::deadline_for` adds one more `request_timeout`** (`rustrade`, #887): an open
   held behind a cancel waits up to that long before it is sent. Deadlines derived by the
   `ExecutionBuilder` grow by the same amount, so an order stranded in flight is flagged that much

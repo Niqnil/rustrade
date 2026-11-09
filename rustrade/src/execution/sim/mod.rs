@@ -3277,6 +3277,95 @@ mod tests {
         );
     }
 
+    /// `SendOpens` sends a group's opens after a failed cancel, one round trip after the cancel
+    /// acted, as after a cancel that succeeded.
+    #[tokio::test]
+    async fn send_opens_sends_a_groups_opens_after_a_failed_cancel() {
+        let mut harness = Harness::new(
+            200,
+            vec![
+                market(10, dec!(200)),
+                market(205, dec!(200)),
+                market(305, dec!(200)),
+                market(405, dec!(200)),
+                market(415, dec!(200)),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        let (unknown, open) = (ClientOrderId::random(), ClientOrderId::random());
+        let ExecutionRequest::CancelThenOpen(group) =
+            cancel_then_open(harness.exchange, &[&unknown], &[&open])
+        else {
+            unreachable!("the helper builds a group");
+        };
+        harness.send(ExecutionRequest::CancelThenOpen(
+            group.with_on_cancel_failure(OnCancelFailure::SendOpens),
+        ));
+
+        let events = harness.rest_events().await;
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec![
+                "market",    // 205
+                "cancelled", // 210: no such order
+                "market",    // 305
+                "market",    // 405
+                "balance",   // 410: the open, acted at 310
+                "order",     // 410
+                "market",    // 415
+                "after_drain"
+            ]
+        );
+        assert!(cancel_outcomes(&events)[0].is_err(), "{events:?}");
+        assert!(
+            matches!(last_order_state(&events), OrderState::Active(_)),
+            "{:?}",
+            last_order_state(&events)
+        );
+    }
+
+    /// With several cancels, a dropped open names the first that failed, even after one that
+    /// succeeded.
+    #[tokio::test]
+    async fn a_dropped_open_names_the_groups_first_failed_cancel() {
+        let mut harness = Harness::new(0, vec![market(10, dec!(200)), market(20, dec!(200))]);
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        let resting = harness.send_limit(dec!(1));
+        assert_eq!(harness.next().await, Some("balance"));
+        assert_eq!(harness.next().await, Some("order"));
+
+        let (first_unknown, second_unknown, open) = (
+            ClientOrderId::random(),
+            ClientOrderId::random(),
+            ClientOrderId::random(),
+        );
+        harness.send(cancel_then_open(
+            harness.exchange,
+            &[&resting, &first_unknown, &second_unknown],
+            &[&open],
+        ));
+
+        let events = harness.rest_events().await;
+        let outcomes: Vec<_> = cancel_outcomes(&events).iter().map(Result::is_ok).collect();
+        assert_eq!(outcomes, vec![true, false, false]);
+        assert_eq!(
+            last_order_state(&events),
+            &OrderState::inactive(rustrade_execution::error::OrderError::NotPlaced(
+                rustrade_execution::error::NotPlacedReason::CancelFailed {
+                    cancel: first_unknown,
+                },
+            ))
+        );
+    }
+
     /// A deadline that passed before a cancel arrives is delivered ahead of the cancel's response,
     /// and the cancel is told the order expired.
     ///
