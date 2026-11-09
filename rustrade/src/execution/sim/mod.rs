@@ -188,14 +188,14 @@ impl Wakeups {
         }
         self.queued.insert(exchange, deadline);
 
-        pending.push(Reverse(ScheduledEvent {
-            time: deadline,
-            class: CLASS_ACTION,
-            seq: *seq,
+        push(
+            pending,
+            seq,
+            deadline,
+            CLASS_ACTION,
             exchange,
-            payload: Payload::Act(Action::Wake),
-        }));
-        *seq += 1;
+            Payload::Act(Action::Wake),
+        );
     }
 
     /// Whether a wake-up for `exchange` popped at `time` is the earliest one queued for it,
@@ -1344,14 +1344,14 @@ fn drain_requests(
                 }
             };
 
-            pending.push(Reverse(ScheduledEvent {
-                time: arrives,
-                class: CLASS_ACTION,
-                seq: *seq,
-                exchange: *exchange,
-                payload: Payload::Act(action),
-            }));
-            *seq += 1;
+            push(
+                pending,
+                seq,
+                arrives,
+                CLASS_ACTION,
+                *exchange,
+                Payload::Act(action),
+            );
         }
     }
 
@@ -1482,17 +1482,17 @@ fn act(
             match (failed, on_cancel_failure) {
                 (Some(cancel), OnCancelFailure::DropOpens) => {
                     for open in opens {
-                        pending.push(Reverse(ScheduledEvent {
-                            time: delivers,
-                            class: CLASS_ACCOUNT,
-                            seq: *seq,
+                        push(
+                            pending,
+                            seq,
+                            delivers,
+                            CLASS_ACCOUNT,
                             exchange,
-                            payload: Payload::Deliver(Deliverable::OpenResponse(dropped_open(
+                            Payload::Deliver(Deliverable::OpenResponse(dropped_open(
                                 open,
                                 cancel.clone(),
                             ))),
-                        }));
-                        *seq += 1;
+                        );
                     }
                 }
                 (None, _) | (Some(_), OnCancelFailure::SendOpens) => {
@@ -1504,14 +1504,14 @@ fn act(
                         "an open held behind a cancel arriving at the venue",
                     )?;
                     for open in opens {
-                        pending.push(Reverse(ScheduledEvent {
-                            time: arrives,
-                            class: CLASS_ACTION,
-                            seq: *seq,
+                        push(
+                            pending,
+                            seq,
+                            arrives,
+                            CLASS_ACTION,
                             exchange,
-                            payload: Payload::Act(Action::Open(open)),
-                        }));
-                        *seq += 1;
+                            Payload::Act(Action::Open(open)),
+                        );
                     }
                 }
             }
@@ -1522,6 +1522,28 @@ fn act(
 
     wakeups.arm(pending, seq, exchange, &slot.venue);
     Ok(woken)
+}
+
+/// Queue `payload`, owed to or by `exchange`, at `time` in `class`, under the next `seq`.
+///
+/// Every entry goes through here, so no two share a `seq` and entries at one instant and class pop
+/// in the order they were queued.
+fn push(
+    pending: &mut BinaryHeap<Reverse<ScheduledEvent>>,
+    seq: &mut u64,
+    time: DateTime<Utc>,
+    class: u8,
+    exchange: ExchangeIndex,
+    payload: Payload,
+) {
+    pending.push(Reverse(ScheduledEvent {
+        time,
+        class,
+        seq: *seq,
+        exchange,
+        payload,
+    }));
+    *seq += 1;
 }
 
 /// Apply a simulated latency offset, refusing to schedule an event before its own cause.
@@ -1561,14 +1583,14 @@ fn schedule<Response>(
 
     schedule_events(pending, seq, exchange, time, events);
 
-    pending.push(Reverse(ScheduledEvent {
+    push(
+        pending,
+        seq,
         time,
-        class: CLASS_ACCOUNT,
-        seq: *seq,
+        CLASS_ACCOUNT,
         exchange,
-        payload: Payload::Deliver(wrap(response)),
-    }));
-    *seq += 1;
+        Payload::Deliver(wrap(response)),
+    );
 }
 
 /// Push account events onto the queue, in the order the venue gave them.
@@ -1584,14 +1606,14 @@ fn schedule_events(
     events: Vec<UnindexedAccountEvent>,
 ) {
     for event in events {
-        pending.push(Reverse(ScheduledEvent {
+        push(
+            pending,
+            seq,
             time,
-            class: CLASS_ACCOUNT,
-            seq: *seq,
+            CLASS_ACCOUNT,
             exchange,
-            payload: Payload::Deliver(Deliverable::Account(event)),
-        }));
-        *seq += 1;
+            Payload::Deliver(Deliverable::Account(event)),
+        );
     }
 }
 
