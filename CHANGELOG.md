@@ -208,10 +208,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     answered as dropped, as when sequenced. A timeout fails the cancel and leaves the open's
     outcome unknown, so the open is looked up like any other.
   - **A request the venue refuses whole changes nothing,** unlike a sequenced group. The venue
-    checks it before acting on either leg, for a filter, a limit, or a malformed request. The
-    order to cancel then still rests: the cancel is answered as failed with the venue's reason,
-    and the open as dropped under `DropOpens` or refused under `SendOpens`. Sequenced, the cancel
-    could have gone through with only the open refused, leaving nothing resting.
+    refuses it before acting on either leg, for example on a filter, an order limit, or a
+    malformed or unauthorised request. The order to cancel then still rests: the cancel is
+    answered as failed with the venue's reason, and the open as dropped under `DropOpens` or
+    refused under `SendOpens`. Sequenced, the cancel could have gone through with only the open
+    refused, leaving nothing resting.
   - **Binance Spot** sends such a group as `POST /api/v3/order/cancelReplace`:
     - The mode is `STOP_ON_FAILURE` for `DropOpens` and `ALLOW_FAILURE` for `SendOpens`.
     - The venue answers each leg separately. A cancel that went through beside a refused new

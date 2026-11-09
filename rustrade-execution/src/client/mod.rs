@@ -694,7 +694,7 @@ where
     /// - **Keep the group's order.** The venue must finish the cancel before it places the open.
     ///   Under [`OnCancelFailure::DropOpens`] it must not place the open when the cancel fails.
     ///   Under [`OnCancelFailure::SendOpens`] it must attempt the open whatever the cancel's
-    ///   answer.
+    ///   answer, unless the venue refuses the whole request (below).
     /// - **Answer what the venue did with each leg,** in the form a leg sent alone is answered:
     ///   [`CancelReplaceAnswer::cancel`] as [`cancel_order`](Self::cancel_order) answers, and
     ///   [`CancelReplaceAnswer::open`] as [`open_order`](Self::open_order) answers. `open` is
@@ -705,8 +705,8 @@ where
     ///   unauthorised request. The order to cancel then still rests, so the cancel is answered as
     ///   failed with that refusal, and the open as not attempted under `DropOpens` or as refused
     ///   with the same reason under `SendOpens`. Sent apart, the cancel might have gone through
-    ///   and only the open been refused. Under `DropOpens` that would leave nothing resting,
-    ///   where the refused request leaves the order to cancel in place.
+    ///   and only the open been refused, leaving nothing resting, where the refused request
+    ///   leaves the order to cancel in place.
     /// - **Unknown stays unknown.** When the venue's answer is lost, the cancel is an error, and
     ///   the open is `Some`, with an outcome that is unknown (see
     ///   [`OrderState::is_outcome_unknown`](crate::order::state::OrderState::is_outcome_unknown)).
