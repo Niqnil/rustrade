@@ -874,6 +874,57 @@ mod tests {
         );
     }
 
+    /// The weight an answer reports as used reaches the rate limiter, as a plain REST answer's
+    /// does: from its parsed `x-mbx-*` limits for the spot pool, and from its headers for the
+    /// SAPI pool.
+    #[tokio::test(start_paused = true)]
+    async fn an_answers_used_weight_reaches_the_rate_limiter() {
+        use super::super::shared::{RateLimitTracker, RequestKind, WeightPool, unix_ms};
+
+        let near_limit = |name: &str| {
+            let headers = HashMap::from([(name.to_string(), "1000000".to_string())]);
+            RawAnswer {
+                rate_limits: parse_rate_limit_headers(&headers),
+                headers,
+                ..answer(200, json!({}))
+            }
+        };
+        let pauses = |pool, answer: &RawAnswer| {
+            let tracker = RateLimitTracker::new(pool);
+            tracker.observe_rest(answer, unix_ms());
+            async move {
+                tokio::time::timeout(
+                    Duration::from_millis(1),
+                    tracker.wait_if_blocked(RequestKind::Query),
+                )
+                .await
+                .is_err()
+            }
+        };
+
+        let spot = near_limit("x-mbx-used-weight-1m");
+        assert!(!spot.rate_limits.is_empty(), "the header parses as a limit");
+        assert!(pauses(WeightPool::Spot, &spot).await);
+        assert!(pauses(WeightPool::Sapi, &near_limit("x-sapi-used-ip-weight-1m")).await);
+        assert!(!pauses(WeightPool::Sapi, &answer(200, json!({}))).await);
+    }
+
+    /// The client's `Debug` names its endpoint, and leaves out its key and secret.
+    #[test]
+    fn signed_rest_debug_hides_the_credentials() {
+        let rest = SignedRest::new(
+            "https://api.example".to_string(),
+            "the-key".to_string(),
+            "the-secret".to_string(),
+            None,
+            Duration::from_secs(5),
+        );
+        let shown = format!("{rest:?}");
+        assert!(shown.contains("https://api.example"), "{shown}");
+        assert!(!shown.contains("the-key"), "{shown}");
+        assert!(!shown.contains("the-secret"), "{shown}");
+    }
+
     /// A cancel-replace failure whose leg results are missing or garbled still reports legs, and
     /// leaves both outcomes unknown: the venue got as far as the legs, so neither is refused.
     #[test]
