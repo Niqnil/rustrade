@@ -2954,11 +2954,12 @@ fn convert_order_kind_tif(
     kind: OrderKind,
     tif: TimeInForce,
 ) -> Option<(OrderPlaceTypeEnum, Option<OrderPlaceTimeInForceEnum>)> {
-    // The decision logic (which kind/TIF combinations Binance supports, GTD coercion,
-    // trailing-offset handling) lives in the shared classifier so spot and margin share it;
-    // this adapter only maps the venue-neutral result onto spot's WS-API enum types.
-    let (binance_type, binance_tif) = classify_order_kind_tif(kind, tif)?;
-    Some(place_enums(binance_type, binance_tif))
+    // Through the same functions as `open_order`, so these tests read what it sends. The
+    // decision logic (which kind/TIF combinations Binance supports, GTD coercion,
+    // trailing-offset handling) lives in the shared classifier so spot and margin share it.
+    let price = Some(Decimal::ONE);
+    let fields = SpotOrderFields::new(kind, tif, price).ok()?;
+    Some(place_enums(fields.order_type, fields.time_in_force))
 }
 
 /// A new spot order's type, time in force and price fields, as every request that places one

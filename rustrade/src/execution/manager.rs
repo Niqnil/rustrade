@@ -828,8 +828,10 @@ where
                     let (cancel_event, open_answer) =
                         self.process_cancel_replace_answer(cancel, open, answer);
                     let (open_event, lookup) = match open_answer {
-                        Ok((open, response)) => self.process_open_answer(open, sent, response),
-                        Err(dropped) => (dropped, None),
+                        NativeOpen::Answered(open, response) => {
+                            self.process_open_answer(open, sent, response)
+                        }
+                        NativeOpen::Dropped(dropped) => (dropped, None),
                     };
                     // The cancel's answer goes first, as when the group is sequenced here.
                     let mut events = [cancel_event, open_event].into_iter();
@@ -1092,25 +1094,12 @@ where
     /// event that answers it as dropped when the venue did not attempt it.
     ///
     /// A timeout fails the cancel and leaves the open's outcome unknown.
-    #[allow(clippy::type_complexity)] // Names the open's answer as `process_open_answer` takes it.
     fn process_cancel_replace_answer(
         &self,
         cancel: OrderRequestCancel<ExchangeIndex, InstrumentIndex>,
         open: OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
         answer: Result<CancelReplaceAnswer, tokio::time::error::Elapsed>,
-    ) -> (
-        AccountStreamEvent,
-        Result<
-            (
-                OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
-                Result<
-                    Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
-                    tokio::time::error::Elapsed,
-                >,
-            ),
-            AccountStreamEvent,
-        >,
-    ) {
+    ) -> (AccountStreamEvent, NativeOpen) {
         match answer {
             Ok(CancelReplaceAnswer {
                 cancel: response,
@@ -1129,18 +1118,18 @@ where
                         "ExecutionManager received a cancel-replace that did not attempt its open although its cancel succeeded - answering the open as dropped"
                     );
                 }
-                (cancel_event, Err(self.dropped(open, &cid)))
+                (cancel_event, NativeOpen::Dropped(self.dropped(open, &cid)))
             }
             Ok(CancelReplaceAnswer {
                 cancel: response,
                 open: Some(opened),
             }) => (
                 self.process_cancel_response(cancel, response),
-                Ok((open, Ok(opened))),
+                NativeOpen::Answered(open, Ok(opened)),
             ),
             Err(elapsed) => (
                 Self::process_cancel_timeout(cancel),
-                Ok((open, Err(elapsed))),
+                NativeOpen::Answered(open, Err(elapsed)),
             ),
         }
     }
@@ -1489,6 +1478,23 @@ enum Release {
         opens: Vec<OrderRequestOpen<ExchangeIndex, InstrumentIndex>>,
         cancel: ClientOrderId,
     },
+}
+
+/// The open of a group sent as one venue request, as the request's answer leaves it.
+// Returned and matched at once, never stored, so the variants' size difference costs nothing,
+// where boxing would allocate on every answer.
+#[allow(clippy::large_enum_variant)]
+enum NativeOpen {
+    /// Answered, or timed out with its group: processed as an open sent alone.
+    Answered(
+        OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
+        Result<
+            Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
+            tokio::time::error::Elapsed,
+        >,
+    ),
+    /// Not attempted by the venue: the event that answers it as dropped.
+    Dropped(AccountStreamEvent),
 }
 
 impl HeldGroups {
