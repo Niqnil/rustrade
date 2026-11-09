@@ -3,9 +3,9 @@ use crate::{
     margin::MarginEffect,
     market::MarketSnapshot,
     order::{
-        OrderEvent, OrderKind, TimeInForce,
+        Order, OrderEvent, OrderKind, TimeInForce,
         id::{PositionId, VenueOrderId},
-        state::Cancelled,
+        state::{Cancelled, UnindexedOrderState},
     },
 };
 use derive_more::Constructor;
@@ -395,6 +395,10 @@ pub struct RequestCancel {
 ///   out together, and so do the opens.
 /// - **Not atomic.** Between the cancels' answers and the opens' arrival, nothing in the group
 ///   rests: a stop being moved leaves its position unprotected for one round trip to the venue.
+///   A group of one cancel and one open that the client can send as one venue request (see
+///   [`ExecutionClient::cancel_replace`](crate::client::ExecutionClient::cancel_replace)) is sent
+///   that way, which takes that round trip out. The venue still cancels before it places, so even
+///   then the two never rest together and the open is not placed atomically with the cancel.
 /// - **Only within the group.** Requests outside it, including other groups, are not ordered
 ///   against it.
 /// - **A held open is in flight.** It has not left yet, so a cancel sent for it while it is held
@@ -523,6 +527,24 @@ pub enum CancelThenOpenError {
     /// link, which cannot order requests sent through another.
     #[error("every leg of a CancelThenOpen group must be on one exchange")]
     MixedExchanges,
+}
+
+/// The answer to a cancel and an open that a venue carried out as one request: see
+/// [`ExecutionClient::cancel_replace`](crate::client::ExecutionClient::cancel_replace).
+///
+/// One answer per leg, each as the leg sent alone would have been answered.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CancelReplaceAnswer {
+    /// The cancel's answer, as [`cancel_order`](crate::client::ExecutionClient::cancel_order)
+    /// would have given it.
+    pub cancel: UnindexedOrderResponseCancel,
+    /// The open's answer, as [`open_order`](crate::client::ExecutionClient::open_order) would
+    /// have given it.
+    ///
+    /// `None` only when the cancel failed under [`OnCancelFailure::DropOpens`] and the venue did
+    /// not attempt the open. The open was not placed, and is answered as a dropped open of a
+    /// [`CancelThenOpen`] group is.
+    pub open: Option<Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>>,
 }
 
 #[cfg(test)]
