@@ -134,7 +134,14 @@ impl SignedRest {
             .header(reqwest::header::USER_AGENT, &self.user_agent)
             .send()
             .await
-            .map_err(|e| transport(format!("HTTP request failed: {:#}", anyhow::Error::new(e))))?;
+            // `without_url`: the URL carries the order and its signature, and this text reaches
+            // events and logs.
+            .map_err(|e| {
+                transport(format!(
+                    "HTTP request failed: {:#}",
+                    anyhow::Error::new(e.without_url())
+                ))
+            })?;
 
         let status = response.status().as_u16();
         let headers: HashMap<String, String> = response
@@ -151,7 +158,7 @@ impl SignedRest {
         let body = response
             .text()
             .await
-            .map_err(|e| transport(format!("Failed to get response bytes: {e}")))?;
+            .map_err(|e| transport(format!("Failed to get response bytes: {}", e.without_url())))?;
         Ok(RawAnswer {
             status,
             headers,
@@ -182,10 +189,23 @@ impl RestAnswer for RawAnswer {
 }
 
 impl RawAnswer {
-    /// Whether the venue answered the cancel-replace leg by leg: a success, or an error whose
-    /// `data` reports each leg. Any other answer refused the whole request.
+    /// Whether the venue got as far as the cancel-replace's legs: a success, a partial failure
+    /// (409), or an error that is coded as a cancel-replace failure (`-2021`, `-2022`) or carries
+    /// `data`. Such an answer is read leg by leg, and a leg it does not report readably is
+    /// answered as unknown. Any other answer refused the whole request.
     pub(super) fn reports_legs(&self) -> bool {
-        (200..300).contains(&self.status) || refusal(&self.body).is_some_and(|r| r.data.is_some())
+        /// Only the code, so that a `data` of an unexpected shape cannot hide it.
+        #[derive(Deserialize)]
+        struct Coded {
+            code: Option<i64>,
+            data: Option<serde::de::IgnoredAny>,
+        }
+
+        (200..300).contains(&self.status)
+            || self.status == 409
+            || serde_json::from_str::<Coded>(&self.body).is_ok_and(|coded| {
+                coded.data.is_some() || matches!(coded.code, Some(-2021 | -2022))
+            })
     }
 
     /// The error `binance-sdk` would have returned for this answer, so that the client's
@@ -832,12 +852,15 @@ mod tests {
         );
     }
 
-    /// Only a success, or an error carrying leg results, reports legs.
+    /// Only a success, a partial failure, or an error coded as a cancel-replace failure or
+    /// carrying leg results, reports legs.
     #[test]
     fn only_a_success_or_an_error_with_leg_results_reports_legs() {
         assert!(answer(200, json!({})).reports_legs());
         assert!(answer(409, json!({"code": -2021, "data": {}})).reports_legs());
+        assert!(answer(400, json!({"code": -1013, "data": {}})).reports_legs());
         assert!(!answer(400, json!({"code": -1013, "msg": "Filter failure"})).reports_legs());
+        assert!(!answer(400, json!({"code": -2011, "msg": "Unknown order sent."})).reports_legs());
         assert!(
             !RawAnswer {
                 body: "<html>".to_string(),
@@ -845,6 +868,37 @@ mod tests {
             }
             .reports_legs()
         );
+    }
+
+    /// A cancel-replace failure whose leg results are missing or garbled still reports legs, and
+    /// leaves both outcomes unknown: the venue got as far as the legs, so neither is refused.
+    #[test]
+    fn a_failure_without_readable_leg_results_leaves_both_legs_unknown() {
+        for unreadable in [
+            answer(
+                409,
+                json!({"code": -2021, "msg": "Order cancel-replace partially failed."}),
+            ),
+            answer(409, json!({"msg": "no code"})),
+            answer(
+                400,
+                json!({"code": -2022, "msg": "Order cancel-replace failed."}),
+            ),
+            answer(400, json!({"code": -2022, "data": "garbled"})),
+            answer(400, json!({"code": -2021, "data": {"cancelResult": 7}})),
+        ] {
+            assert!(unreadable.reports_legs(), "{unreadable:?}");
+            let (cancel, open) = read_legs(&unreadable, &btcusdt(), dec!(1));
+            assert_unknown(cancel.as_ref().expect_err("the cancel is unknown"));
+            match open {
+                Some(OrderState::Inactive(
+                    crate::order::state::InactiveOrderState::OpenFailed(error),
+                )) => {
+                    assert_unknown(&error);
+                }
+                other => panic!("expected the new order unknown, got {other:?}"),
+            }
+        }
     }
 
     /// An answer refusing the whole request reads as the error `binance-sdk` would return for
@@ -872,7 +926,7 @@ mod tests {
             ConnectorError::NotFoundError { code: c, .. } if c == code
         ));
         assert!(matches!(
-            refusal(409).into_connector_error(),
+            refusal(422).into_connector_error(),
             ConnectorError::ConnectorClientError { code: c, .. } if c == code
         ));
         assert!(matches!(
