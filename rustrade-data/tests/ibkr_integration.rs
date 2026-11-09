@@ -630,8 +630,8 @@ fn disconnect_test_stream(client_id_offset: i32) -> IbkrMarketStream<String> {
     };
 
     // IDEALPRO forex quotes, because a paper account has them: it may lack the stock market data
-    // permissions, and then IB ends a stock subscription before the disconnect is tested. With no
-    // quotes flowing, outside forex hours, a subscription still stays open.
+    // permissions, and then IB ends a stock subscription before the disconnect is tested. Outside
+    // forex hours no quotes flow, but the subscription still stays open.
     let pairs = [("EUR.USD", "EUR", "USD"), ("GBP.USD", "GBP", "USD")];
     let registry = ContractRegistry::new();
     for (name, base, quote) in pairs {

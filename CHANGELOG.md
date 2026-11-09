@@ -41,7 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The IBKR execution module rustdoc now records how a paper account handled a short stock
   position's borrow fee: it accrued daily in that currency's `AccruedCash`, was booked several
   days late (once after the position had closed), and posted to cash on the third business day of
-  the next month as interest, so `Balance::total + Balance::accrued` included it. IB still does not document this, and a live
+  the next month as interest, so until it posted `Balance::total` left it out and
+  `Balance::total + Balance::accrued` included it. IB still does not document this, and a live
   account may differ (`rustrade-execution`).
 
 ## [0.21.0] - 2026-11-04
@@ -2740,7 +2741,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     standard-mode balances include funding, but position PnL does not. Binance margin debt and
     accrued interest are only as fresh as the last REST read. IBKR's `TotalCashValue`, as IB
     documents it, leaves out interest accrued during the month until it is posted; IB does not
-    document how stock borrow fees are treated. Alpaca reads only fill activities, and its trades report zero fees.
+    document how stock borrow fees are treated. Alpaca reads only fill activities, and its
+    trades report zero fees.
   - `SimulatedVenue` charges no carry, lends no stock, and models no locate or short-sale
     restriction.
 

@@ -56,9 +56,9 @@
 //! does not document whether they accrue in `AccruedCash` or when they post. On a paper account,
 //! a short stock position's borrow fee, charged for every calendar day from settlement, accrued in
 //! the `AccruedCash` of the stock's currency, was booked several days late, and posted to that
-//! currency's cash early in the next month as the month's "Net Short Stock Interest". So there
-//! `total + accrued` included it; a live account may differ. For a short held from 12 October to
-//! 6 November 2026, in US Eastern dates:
+//! currency's cash early in the next month as the month's "Net Short Stock Interest". So there,
+//! until it posted, `total` left it out and `total + accrued` included it; a live account may
+//! differ. For a short held from 12 October to 6 November 2026, in US Eastern dates:
 //!
 //! - The fees for 13–15 October first appeared on 16 October.
 //! - October's total posted to cash on 4 November, the third business day, as IB support had
