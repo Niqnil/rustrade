@@ -4858,7 +4858,7 @@ impl SimulatedVenue {
                     amount: required,
                 }) = terms.short_collateral(opening)
                 else {
-                    return Ok(());
+                    unreachable!("an option's terms always secure a short")
                 };
                 let free = self.account.free(&asset);
                 if checked && free < required {
@@ -6284,7 +6284,7 @@ fn hold_seeded_collateral(
              {name}, which nothing in a cash account secures"
         );
         let Some(Collateral { asset, amount }) = terms.short_collateral(quantity) else {
-            continue;
+            unreachable!("an option's terms always secure a short")
         };
         let Some(time) = account
             .balances()
@@ -7088,9 +7088,9 @@ impl Settlement {
     /// pays nothing in base and delivers its premium, net of the fee, into quote.
     ///
     /// # Panics
-    /// Always, if this settlement pays with another asset than `asset` and is not paid back in
-    /// the asset it pays with: only such a call sale pays with an asset other than its
-    /// remainder's. Debug-asserts, too, that it moves no collateral.
+    /// Always, if this settlement pays with another asset than `asset` and its credit is not
+    /// `Credit::PaidBack`: only such a call sale pays with an asset other than its remainder's,
+    /// and it is paid back its premium. Debug-asserts, too, that it moves no collateral.
     fn paying_with(self, asset: &AssetNameExchange) -> Self {
         if self.asset == *asset {
             return self;
