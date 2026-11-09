@@ -53,6 +53,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `MockExecution` and the backtest runner, declares `AmendSupport::NONE`, so an amend is
     answered as refused there, never silently dropped.
 
+### Changed
+
+- **Breaking: amend in place grows the engine's enums, output and order-tracking traits**
+  (`rustrade-execution`, `rustrade`, #892).
+  - **New variants:** `ActiveOrderState::AmendInFlight`, `ExecutionRequest::Amend`,
+    `InFlightRequest::Amend`, `Command::SendAmendRequests` and `ActionOutput::Amends`. An
+    exhaustive `match` on any of them needs an arm for each.
+  - **`GenerateAlgoOrdersOutput` has an `amends` field.** A struct literal must set it (`None`
+    for no amends); `GenerateAlgoOrdersOutput::new` sets it.
+  - **New required trait methods:** `InFlightRequestRecorder::record_in_flight_amend` and
+    `OrderManager::update_from_amend_response`. A custom `InstrumentDataState` implements
+    `record_in_flight_amend`; one that tracks no orders can leave its body empty.
+  - **The engine's `GenerateAlgoOrders` implementation requires `State: PreparesAmend`.**
+    `EngineState` implements it; a custom engine state must implement it too.
+
 ## [0.22.0] - 2026-11-09
 
 ### Added
