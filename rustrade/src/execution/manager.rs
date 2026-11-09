@@ -3664,15 +3664,14 @@ mod tests {
             )
             .await;
 
-            assert_eq!(
-                client.logged(),
-                [
-                    "cancel stop",
-                    "open other",
-                    "cancel stop answered",
-                    "open exit"
-                ]
-            );
+            // Which of the first two calls starts first is up to the manager's `select!`, which
+            // polls its branches in a random order. Both start before the cancel answers.
+            let logged = client.logged();
+            let (first_two, rest) = logged.split_at(2);
+            let mut first_two = first_two.to_vec();
+            first_two.sort();
+            assert_eq!(first_two, ["cancel stop", "open other"], "{logged:?}");
+            assert_eq!(rest, ["cancel stop answered", "open exit"], "{logged:?}");
             assert_eq!(
                 events,
                 [
