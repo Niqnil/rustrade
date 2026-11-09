@@ -3103,8 +3103,8 @@ mod tests {
         ))
     }
 
-    /// A group's cancel acts one trip after it is sent, and its open one round trip after that:
-    /// the cancel's answer back to the sender, and the open out to the venue.
+    /// A group's cancel acts one trip after it is sent, and its opens one round trip after that, in
+    /// the group's order: the cancel's answer back to the sender, and the opens out to the venue.
     ///
     /// Each leg is 100 ms. Sent at 210, the cancel acts at 310 and is answered at 410; the open
     /// then acts at 510 and is answered at 610, between the ticks at 605 and 705. An open acting
@@ -3131,11 +3131,11 @@ mod tests {
         assert_eq!(harness.next().await, Some("order"));
 
         harness.clock.advance_to(at(210));
-        let replacement = ClientOrderId::random();
+        let replacements: Vec<_> = (0..3).map(|_| ClientOrderId::random()).collect();
         harness.send(cancel_then_open(
             harness.exchange,
             &[&resting],
-            &[&replacement],
+            &replacements.iter().collect::<Vec<_>>(),
         ));
 
         let events = harness.rest_events().await;
@@ -3147,17 +3147,37 @@ mod tests {
                 "cancelled", // 410
                 "market",    // 505
                 "market",    // 605
-                "balance",   // 610: the open, acted at 510
+                "balance",   // 610: each open, acted at 510
+                "order",     // 610
+                "balance",   // 610
+                "order",     // 610
+                "balance",   // 610
                 "order",     // 610
                 "market",    // 705
                 "after_drain"
             ]
         );
         assert_eq!(cancel_outcomes(&events), vec![Ok(())]);
-        assert!(
-            matches!(last_order_state(&events), OrderState::Active(_)),
-            "{:?}",
-            last_order_state(&events)
+        let opened: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                    kind: AccountEventKind::OrderSnapshot(Snapshot(order)),
+                    ..
+                })) => Some((
+                    order.key.cid.clone(),
+                    matches!(order.state, OrderState::Active(_)),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            opened,
+            replacements
+                .into_iter()
+                .map(|cid| (cid, true))
+                .collect::<Vec<_>>(),
+            "each open rests, acted on in the group's order"
         );
     }
 
