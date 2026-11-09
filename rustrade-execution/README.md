@@ -6,7 +6,7 @@ Execution client library for streaming private account data and executing orders
 
 | Exchange | Constructor | InstrumentKinds | Features |
 |:--------:|:-----------:|:---------------:|:--------:|
-| **BinanceSpot** | `BinanceSpot::new(BinanceSpotConfig)` | Spot | Orders, Balances, OrderRecovery |
+| **BinanceSpot** | `BinanceSpot::new(BinanceSpotConfig)` | Spot | Orders, Balances, OrderRecovery, CancelReplace |
 | **BinanceMargin** | `BinanceMargin::new(BinanceMarginConfig)` | Spot (cross/isolated margin) | Orders, Balances, OrderRecovery, Shortability, BorrowCapacity |
 | **Alpaca** | `AlpacaClient::new(AlpacaConfig)` | Spot (Equities, Crypto), Option | Orders, Balances, Positions, BracketOrders, OrderRecovery, Shortability |
 | **Hyperliquid** | `HyperliquidClient::connect(HyperliquidConfig)` | Perpetual | Orders, Balances, Positions, OrderRecovery |
@@ -48,10 +48,17 @@ the asset an order on a given side would borrow this account can borrow now, and
 implementation's rustdoc states what a query costs: IBKR's holds a market data line for up to
 `IbkrConfig::shortability_timeout` (10 s by default), and Binance's use request weight.
 
+**CancelReplace** means the client overrides `ExecutionClient::cancel_replace`, so the
+`ExecutionManager` sends a `CancelThenOpen` group of one cancel and one open as one venue request
+(Binance Spot: `POST /api/v3/order/cancelReplace`, for the pairs its rustdoc lists). Otherwise,
+and on other clients, the group is sequenced: the open is sent once the cancel has been answered,
+leaving nothing resting for one round trip.
+
 The `new` constructors are `ExecutionClient::new`. Each connector is behind a Cargo feature, and
 none is enabled by default: `alpaca`, `binance` (Spot and Margin), `hyperliquid` (perpetuals and
 spot), and `ibkr`. The mock client is always available. It implements `OrderStatusClient` and
 `BorrowCapacityClient`, which answers only when its venue lends (`MockExecutionConfig::spot_margin`).
+Its simulated venue also holds options, long or fully secured short, and settles them at expiry.
 
 - **Hyperliquid** perpetuals are named `{coin}-{collateral}-PERP` (`BTC-USDC-PERP`,
   `xyz:TSLA-USDC-PERP`). `HyperliquidClient::connect` reads the default DEX, plus each
