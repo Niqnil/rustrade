@@ -49,8 +49,11 @@ use tracing::error;
 /// # Choosing a deadline
 /// A deadline must exceed the exchange's `ExecutionManager` `request_timeout`, by which the manager
 /// answers every request, plus the longest its lookups of an open whose outcome is unknown can
-/// take, plus the time an answer takes to reach the engine. Otherwise orders awaiting an ordinary
-/// answer, or still being looked up, are flagged.
+/// take, plus the time an answer takes to reach the engine. An open of a
+/// [`CancelThenOpen`](rustrade_execution::order::request::CancelThenOpen) group is recorded as in
+/// flight when the group is sent but leaves only once its cancels are answered, so it needs one
+/// more `request_timeout`. Otherwise orders awaiting an ordinary answer, held behind a cancel, or
+/// still being looked up, are flagged.
 /// [`ExecutionBuilder`](crate::execution::builder::ExecutionBuilder)
 /// derives one per live exchange with [`Self::deadline_for`], and exposes them on
 /// [`ExecutionBuild`](crate::execution::builder::ExecutionBuild) and
@@ -74,15 +77,21 @@ impl InFlightDeadlines {
     pub const REQUEST_TIMEOUT_MARGIN: Duration = Duration::from_secs(5);
 
     /// The deadline for an exchange whose `ExecutionManager` has this `request_timeout` and
-    /// looks up an open whose outcome is unknown as `unknown_outcome` says: `request_timeout`,
-    /// plus the longest those lookups can take
+    /// looks up an open whose outcome is unknown as `unknown_outcome` says: twice
+    /// `request_timeout`, plus the longest those lookups can take
     /// ([`UnknownOutcomeLookup::longest`] of `request_timeout`, the manager's timeout for each
     /// lookup), plus [`Self::REQUEST_TIMEOUT_MARGIN`].
+    ///
+    /// Twice, because an open of a
+    /// [`CancelThenOpen`](rustrade_execution::order::request::CancelThenOpen) group waits up to one
+    /// `request_timeout` for its cancels' answers before it is sent, and then up to another for its
+    /// own.
     pub fn deadline_for(
         request_timeout: Duration,
         unknown_outcome: &UnknownOutcomeLookup,
     ) -> Duration {
         request_timeout
+            .saturating_mul(2)
             .saturating_add(unknown_outcome.longest(request_timeout))
             .saturating_add(Self::REQUEST_TIMEOUT_MARGIN)
     }
@@ -585,14 +594,15 @@ mod tests {
     }
 
     #[test]
-    fn deadline_for_adds_the_lookups_and_the_margin() {
+    fn deadline_for_adds_a_held_wait_the_lookups_and_the_margin() {
         let lookups = UnknownOutcomeLookup::default()
             .with_attempts(2)
             .with_first_delay(Duration::from_secs(1));
-        // Waits of 1 s and 2 s, each lookup given the 10 s request timeout.
+        // The 10 s request timeout twice (a held open waits on its cancels' answers first), then
+        // waits of 1 s and 2 s, each lookup given the request timeout.
         assert_eq!(
             InFlightDeadlines::deadline_for(Duration::from_secs(10), &lookups),
-            Duration::from_secs(10 + (1 + 10) + (2 + 10))
+            Duration::from_secs(10 + 10 + (1 + 10) + (2 + 10))
                 + InFlightDeadlines::REQUEST_TIMEOUT_MARGIN
         );
         assert_eq!(
@@ -600,7 +610,7 @@ mod tests {
                 Duration::from_secs(10),
                 &UnknownOutcomeLookup::default().with_attempts(0)
             ),
-            Duration::from_secs(10) + InFlightDeadlines::REQUEST_TIMEOUT_MARGIN,
+            Duration::from_secs(10 + 10) + InFlightDeadlines::REQUEST_TIMEOUT_MARGIN,
             "no lookups add nothing"
         );
         assert_eq!(
