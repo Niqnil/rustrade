@@ -36,6 +36,10 @@
 //   report cannot resurrect a retired order as a resting one. That order's filled
 //   quantity is settled instead by the terminal report's own z, or by fetch_open_orders.
 
+use super::cancel_replace::{
+    CANCEL_REPLACE_PATH, CancelReplaceRequest, CancelTarget, SignedRest, cancel_replace_query,
+    open_refused_legs, read_legs, refused_legs,
+};
 use super::commission::{CommissionRates, fetch_commission_rates};
 use super::restatement::{
     BalanceRestatement, SharedStreamClock, StreamClock, restate, restatement_time,
@@ -49,13 +53,14 @@ use super::shared::{
     ORDER_EXECUTIONS_BUDGET, OpenOrderListing, PlacementResponse, RateLimitTracker, RequestKind,
     SharedDedupCache, UnhandledEvents, UnrecoveredFills, UnsubscribeOnDrop, UserDataFrame,
     WeightPool, account_position_time, answer_time, binance_filled_qty, classify_order_kind_tif,
-    classify_rest_query_error, classify_ws_order_error, convert_ended_order,
-    convert_execution_report, convert_open_order_listing, convert_open_order_owned_symbol,
-    dedup_key_from_event, disconnect_error, disconnect_lookback, drop_after, frame_excerpt,
-    gap_failed, gap_time, is_duplicate, is_unknown_order, log_unhandled_event,
-    log_unrecognised_frame, new_dedup_cache, parse_user_data_frame, placed_order_state,
-    recovered_order_cids, recovered_order_totals, response_decode_error, rest_call_with_retry,
-    rest_read_with_retry, retry_or_end, trailing_params, unix_ms, unreadable_answer,
+    classify_rest_order_error, classify_rest_query_error, classify_ws_order_error,
+    convert_ended_order, convert_execution_report, convert_open_order_listing,
+    convert_open_order_owned_symbol, dedup_key_from_event, disconnect_error, disconnect_lookback,
+    drop_after, frame_excerpt, gap_failed, gap_time, is_duplicate, is_unknown_order,
+    log_unhandled_event, log_unrecognised_frame, new_dedup_cache, parse_user_data_frame,
+    placed_order_state, recovered_order_cids, recovered_order_totals, response_decode_error,
+    rest_call_with_retry, rest_read_with_retry, retry_or_end, trailing_params, unix_ms,
+    unreadable_answer,
 };
 use crate::client::venue_clock::HostMoment;
 use crate::rules::{OrderRules, PreSendRules};
@@ -80,7 +85,10 @@ use crate::{
     order::{
         Order, OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrderKey,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
-        request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
+        request::{
+            CancelReplaceAnswer, OnCancelFailure, OrderRequestCancel, OrderRequestOpen,
+            UnindexedOrderResponseCancel,
+        },
         state::{Cancelled, Open, OrderState, UnindexedOrderState},
     },
     parse_env_bool,
@@ -90,6 +98,7 @@ use crate::{
 use binance_sdk::{
     common::{
         config::{ConfigurationRestApi, ConfigurationWebsocketApi},
+        constants::{SPOT_REST_API_PROD_URL, SPOT_REST_API_TESTNET_URL},
         models::WebsocketEvent,
     },
     spot::{
@@ -419,6 +428,8 @@ pub struct BinanceSpot {
     // The symbols' tick, lot and notional rules, loaded on each symbol's first order. Shared by
     // every clone.
     rules: Arc<RulesLoader>,
+    // Signed REST requests sent past the SDK, for the cancel-replace answers it would cut short.
+    signed_rest: Arc<SignedRest>,
 }
 
 impl std::fmt::Debug for BinanceSpot {
@@ -504,6 +515,145 @@ impl BinanceSpot {
         } else {
             SpotRestApi::production(rest_config)
         })
+    }
+
+    /// The signed REST requests the client sends past the SDK, to the same API as
+    /// [`build_rest`](Self::build_rest)'s and stamped on the same clock.
+    ///
+    /// Each is bounded by 5 s, the WS-API session's wait for an order's answer: a cancel-replace
+    /// stands in for two such requests.
+    fn build_signed_rest(
+        config: &BinanceSpotConfig,
+        signing: Option<&SigningClock>,
+    ) -> Arc<SignedRest> {
+        let base_url = if config.testnet {
+            SPOT_REST_API_TESTNET_URL
+        } else {
+            SPOT_REST_API_PROD_URL
+        };
+        Arc::new(SignedRest::new(
+            base_url.to_string(),
+            config.api_key.clone(),
+            config.secret_key.clone(),
+            signing.map(SigningClock::provider),
+            Duration::from_secs(5),
+        ))
+    }
+
+    /// Send `cancel` and `open` as one cancel-replace, which
+    /// [`cancel_replace`](ExecutionClient::cancel_replace) has chosen, and answer each leg.
+    async fn send_cancel_replace(
+        &self,
+        cancel: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
+        open: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
+        target: CancelTarget,
+        fields: SpotOrderFields,
+        on_cancel_failure: OnCancelFailure,
+    ) -> CancelReplaceAnswer {
+        let instrument = open.key.instrument.clone();
+        let cancel_key = OrderKey::new(
+            ExchangeId::BinanceSpot,
+            instrument.clone(),
+            cancel.key.strategy.clone(),
+            cancel.key.cid.clone(),
+        );
+        let order_key = OrderKey::new(
+            ExchangeId::BinanceSpot,
+            instrument.clone(),
+            open.key.strategy.clone(),
+            open.key.cid.clone(),
+        );
+        let (side, price, quantity, kind, time_in_force) = (
+            open.state.side,
+            open.state.price,
+            open.state.quantity,
+            open.state.kind,
+            open.state.time_in_force,
+        );
+
+        let (cancelled, opened) = 'legs: {
+            // The check the plain open makes before sending. A refusal sends the cancel alone.
+            if let Err(refused) = self
+                .rules
+                .check(instrument.name(), side, kind, price, quantity)
+                .await
+            {
+                let cancelled = self.cancel_order(cancel).await.state;
+                break 'legs open_refused_legs(cancelled, refused, on_cancel_failure);
+            }
+
+            let request = CancelReplaceRequest {
+                symbol: instrument.name(),
+                cancel: target,
+                cid: order_key.cid.clone(),
+                side,
+                quantity,
+                fields,
+                on_cancel_failure,
+            };
+            let query = match request.params() {
+                Ok(params) => cancel_replace_query(params),
+                Err(e) => {
+                    error!(%e, "BinanceSpot failed to build cancel-replace params");
+                    let cancelled = self.cancel_order(cancel).await.state;
+                    let refused = OrderError::Rejected(ApiError::OrderRejected(e.to_string()));
+                    break 'legs open_refused_legs(cancelled, refused, on_cancel_failure);
+                }
+            };
+
+            let answer = rest_call_with_retry(
+                &self.signed_rest,
+                &self.rate_limiter,
+                RequestKind::Order,
+                |rest| {
+                    let query = query.clone();
+                    Box::pin(async move {
+                        let answer = rest
+                            .send(reqwest::Method::POST, CANCEL_REPLACE_PATH, query)
+                            .await?;
+                        if answer.reports_legs() {
+                            Ok(answer)
+                        } else {
+                            Err(answer.into_connector_error().into())
+                        }
+                    })
+                },
+            )
+            .await;
+            match answer {
+                Ok(answer) => read_legs(&answer, &instrument, quantity),
+                Err(e) => refused_legs(
+                    classify_rest_order_error(&e, &instrument),
+                    on_cancel_failure,
+                ),
+            }
+        };
+
+        {
+            let mut known_live = self.known_live.lock();
+            if cancelled.is_ok() {
+                known_live.ended(&cancel_key.cid);
+            }
+            if let Some(state) = &opened {
+                known_live.placed(&order_key, quantity, kind, state);
+            }
+        }
+
+        CancelReplaceAnswer {
+            cancel: UnindexedOrderResponseCancel {
+                key: cancel_key,
+                state: cancelled,
+            },
+            open: opened.map(|state| Order {
+                key: order_key,
+                side,
+                price,
+                quantity,
+                kind,
+                time_in_force,
+                state,
+            }),
+        }
     }
 
     /// # Panics
@@ -921,6 +1071,7 @@ impl ExecutionClient for BinanceSpot {
         let signing = config.server_time_sync.then(SigningClock::default);
         let rest = Self::build_rest(&config, signing.as_ref());
         let ws_handle = Self::build_ws_handle(&config, signing.as_ref());
+        let signed_rest = Self::build_signed_rest(&config, signing.as_ref());
         // `GET /api/v3/time` is unsigned, so the client that signs with the clock reads it.
         let server_time =
             signing.map(|signing| ServerTime::new(signing, read_server_time(Arc::clone(&rest))));
@@ -939,6 +1090,7 @@ impl ExecutionClient for BinanceSpot {
             rate_limiter,
             known_live: KnownLiveOrders::shared(ExchangeId::BinanceSpot),
             rules,
+            signed_rest,
         }
     }
 
@@ -1424,9 +1576,9 @@ impl ExecutionClient for BinanceSpot {
             Side::Sell => OrderPlaceSideEnum::Sell,
         };
 
-        let (binance_type, binance_tif) = match convert_order_kind_tif(kind, time_in_force) {
-            Some(converted) => converted,
-            None => {
+        let fields = match SpotOrderFields::new(kind, time_in_force, price) {
+            Ok(fields) => fields,
+            Err(refused) => {
                 return Order {
                     key: order_key,
                     side,
@@ -1434,12 +1586,11 @@ impl ExecutionClient for BinanceSpot {
                     quantity,
                     kind,
                     time_in_force,
-                    state: OrderState::inactive(OrderError::UnsupportedOrderType(format!(
-                        "Binance Spot does not yet support OrderKind::{kind:?}"
-                    ))),
+                    state: OrderState::inactive(refused),
                 };
             }
         };
+        let (binance_type, binance_tif) = place_enums(fields.order_type, fields.time_in_force);
 
         // market BUY sends base quantity, not quoteOrderQty. Callers must
         // specify how much of the base asset they want, not how much quote to spend.
@@ -1451,55 +1602,15 @@ impl ExecutionClient for BinanceSpot {
             OrderPlaceParams::builder(instrument.name().to_string(), binance_side, binance_type)
                 .quantity(quantity)
                 .new_client_order_id(cid.0.to_string());
-
-        // A trailing order's trailingDelta, fixed limit and activation price.
-        match trailing_params(&kind, price) {
-            Ok(Some(trailing)) => {
-                params_builder = params_builder.trailing_delta(trailing.trailing_delta);
-                if let Some(limit) = trailing.price {
-                    params_builder = params_builder.price(limit);
-                }
-                if let Some(activation_price) = trailing.stop_price {
-                    // Binance's activation price for a trailing order is its stopPrice.
-                    params_builder = params_builder.stop_price(activation_price);
-                }
-            }
-            Err(refused) => {
-                return Order {
-                    key: order_key,
-                    side,
-                    price,
-                    quantity,
-                    kind,
-                    time_in_force,
-                    state: OrderState::inactive(refused.into_order_error()),
-                };
-            }
-            Ok(None) => {}
+        if let Some(price) = fields.price {
+            params_builder = params_builder.price(price);
         }
-
-        // The other kinds' price and stopPrice, in a match with no wildcard, so that a new
-        // OrderKind fails to compile until it is handled here.
-        match kind {
-            OrderKind::Limit => {
-                params_builder = params_builder.price(price);
-            }
-            OrderKind::Stop { trigger_price } | OrderKind::TakeProfit { trigger_price } => {
-                params_builder = params_builder.stop_price(trigger_price);
-            }
-            OrderKind::StopLimit { trigger_price }
-            | OrderKind::TakeProfitLimit { trigger_price } => {
-                params_builder = params_builder.price(price).stop_price(trigger_price);
-            }
-            // Trailing orders are set above. Market sends no price, and TrailingStopLimit and
-            // ConditionalUnresolved are rejected by convert_order_kind_tif before this.
-            OrderKind::TrailingStop { .. }
-            | OrderKind::TrailingStopFixedLimit { .. }
-            | OrderKind::Market
-            | OrderKind::TrailingStopLimit { .. }
-            | OrderKind::ConditionalUnresolved { .. } => {}
+        if let Some(stop_price) = fields.stop_price {
+            params_builder = params_builder.stop_price(stop_price);
         }
-
+        if let Some(trailing_delta) = fields.trailing_delta {
+            params_builder = params_builder.trailing_delta(trailing_delta);
+        }
         if let Some(tif) = binance_tif {
             params_builder = params_builder.time_in_force(tif);
         }
@@ -1644,6 +1755,45 @@ impl ExecutionClient for BinanceSpot {
                 }
             }
         }
+    }
+
+    /// Sends a group of one cancel and one open on one symbol as one
+    /// `POST /api/v3/order/cancelReplace` (weight 1), and answers each leg from it: see
+    /// [`ExecutionClient::cancel_replace`].
+    ///
+    /// The mode follows the group's policy: `STOP_ON_FAILURE` for
+    /// [`OnCancelFailure::DropOpens`], so a failed cancel places nothing, and `ALLOW_FAILURE` for
+    /// [`OnCancelFailure::SendOpens`]. Binance cancels before it places, so the two never rest
+    /// together, and the new order gets an order id of its own.
+    ///
+    /// Declines, leaving the group to be sequenced, a pair on two symbols, an open the plain
+    /// [`open_order`](Self::open_order) would refuse unsent for its kind, time in force or margin
+    /// effect, and a cancel whose venue id does not read as Binance's numeric id. An open the
+    /// symbol's rules refuse is caught after the cancel-replace is chosen: the cancel is then sent
+    /// alone, and the open answered with the rules' refusal, as when sequenced.
+    ///
+    /// Sent over REST rather than the WS-API session the plain requests use, because only REST
+    /// is read whole here: the answer to a cancel-replace that partly failed carries each leg's
+    /// result in an error body.
+    fn cancel_replace(
+        &self,
+        cancel: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
+        open: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
+        on_cancel_failure: OnCancelFailure,
+    ) -> Option<impl Future<Output = CancelReplaceAnswer> + Send> {
+        if cancel.key.instrument != open.key.instrument
+            || open
+                .state
+                .margin_effect
+                .is_some_and(|effect| effect != MarginEffect::NoSideEffect)
+        {
+            return None;
+        }
+        let fields =
+            SpotOrderFields::new(open.state.kind, open.state.time_in_force, open.state.price)
+                .ok()?;
+        let target = CancelTarget::new(cancel.state.id.as_ref(), &cancel.key.cid)?;
+        Some(self.send_cancel_replace(cancel, open, target, fields, on_cancel_failure))
     }
 
     /// Each balance is stamped 5 s before its request was sent, as is each in
@@ -2799,6 +2949,7 @@ fn convert_account_position(
 ///   the stop trails, where `TrailingStopLimit`'s limit follows the stop. That order is
 ///   `TrailingStopFixedLimit`, which converts to `STOP_LOSS_LIMIT`.
 ///
+#[cfg(test)]
 fn convert_order_kind_tif(
     kind: OrderKind,
     tif: TimeInForce,
@@ -2807,6 +2958,83 @@ fn convert_order_kind_tif(
     // trailing-offset handling) lives in the shared classifier so spot and margin share it;
     // this adapter only maps the venue-neutral result onto spot's WS-API enum types.
     let (binance_type, binance_tif) = classify_order_kind_tif(kind, tif)?;
+    Some(place_enums(binance_type, binance_tif))
+}
+
+/// A new spot order's type, time in force and price fields, as every request that places one
+/// sends them: the WS-API `order.place` and the REST `order/cancelReplace`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SpotOrderFields {
+    pub(super) order_type: BinanceOrderType,
+    pub(super) time_in_force: Option<BinanceTimeInForce>,
+    pub(super) price: Option<Decimal>,
+    pub(super) stop_price: Option<Decimal>,
+    pub(super) trailing_delta: Option<i32>,
+}
+
+impl SpotOrderFields {
+    /// The fields of an order of `kind`, `time_in_force` and limit `price`.
+    ///
+    /// # Errors
+    /// [`OrderError::UnsupportedOrderType`] for a kind and time in force Binance Spot does not
+    /// take, and the error of a trailing order that cannot be sent as asked.
+    pub(super) fn new(
+        kind: OrderKind,
+        time_in_force: TimeInForce,
+        price: Option<Decimal>,
+    ) -> Result<Self, UnindexedOrderError> {
+        let Some((order_type, time_in_force)) = classify_order_kind_tif(kind, time_in_force) else {
+            return Err(OrderError::UnsupportedOrderType(format!(
+                "Binance Spot does not yet support OrderKind::{kind:?}"
+            )));
+        };
+        let mut fields = Self {
+            order_type,
+            time_in_force,
+            price: None,
+            stop_price: None,
+            trailing_delta: None,
+        };
+
+        // A trailing order's trailingDelta, fixed limit and activation price.
+        if let Some(trailing) =
+            trailing_params(&kind, price).map_err(|refused| refused.into_order_error())?
+        {
+            fields.trailing_delta = Some(trailing.trailing_delta);
+            fields.price = trailing.price;
+            // Binance's activation price for a trailing order is its stopPrice.
+            fields.stop_price = trailing.stop_price;
+        }
+
+        // The other kinds' price and stopPrice, in a match with no wildcard, so that a new
+        // OrderKind fails to compile until it is handled here.
+        match kind {
+            OrderKind::Limit => fields.price = price,
+            OrderKind::Stop { trigger_price } | OrderKind::TakeProfit { trigger_price } => {
+                fields.stop_price = Some(trigger_price);
+            }
+            OrderKind::StopLimit { trigger_price }
+            | OrderKind::TakeProfitLimit { trigger_price } => {
+                fields.price = price;
+                fields.stop_price = Some(trigger_price);
+            }
+            // Trailing orders are set above. Market sends no price, and TrailingStopLimit and
+            // ConditionalUnresolved are refused by classify_order_kind_tif before this.
+            OrderKind::TrailingStop { .. }
+            | OrderKind::TrailingStopFixedLimit { .. }
+            | OrderKind::Market
+            | OrderKind::TrailingStopLimit { .. }
+            | OrderKind::ConditionalUnresolved { .. } => {}
+        }
+        Ok(fields)
+    }
+}
+
+/// Spot's WS-API enums for a venue-neutral order type and time in force.
+fn place_enums(
+    binance_type: BinanceOrderType,
+    binance_tif: Option<BinanceTimeInForce>,
+) -> (OrderPlaceTypeEnum, Option<OrderPlaceTimeInForceEnum>) {
     let type_enum = match binance_type {
         BinanceOrderType::Market => OrderPlaceTypeEnum::Market,
         BinanceOrderType::Limit => OrderPlaceTypeEnum::Limit,
@@ -2821,7 +3049,7 @@ fn convert_order_kind_tif(
         BinanceTimeInForce::Ioc => OrderPlaceTimeInForceEnum::Ioc,
         BinanceTimeInForce::Fok => OrderPlaceTimeInForceEnum::Fok,
     });
-    Some((type_enum, tif_enum))
+    (type_enum, tif_enum)
 }
 
 #[cfg(test)]
@@ -8303,6 +8531,299 @@ mod tests {
                 assert_eq!(instrument, nope);
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// `cancel_replace` end to end, against a REST mock.
+    mod cancel_replace {
+        use super::*;
+        use crate::{
+            client::ExecutionClient,
+            order::{
+                request::{OnCancelFailure, RequestCancel, RequestOpen},
+                state::InactiveOrderState,
+            },
+        };
+        use rust_decimal_macros::dec;
+        use wiremock::matchers::{header, method, path, query_param};
+
+        /// A client whose cancel-replace goes to `server`, whose rules are off, and whose WS-API
+        /// session goes nowhere, so a cancel sent alone fails at once.
+        fn client(server: &wiremock::MockServer) -> BinanceSpot {
+            let mut client = client_with_ws_api("ws://127.0.0.1:9".to_string());
+            client.signed_rest = Arc::new(SignedRest::new(
+                server.uri(),
+                "key".to_string(),
+                "secret".to_string(),
+                None,
+                Duration::from_secs(5),
+            ));
+            client
+        }
+
+        fn btcusdt() -> InstrumentNameExchange {
+            InstrumentNameExchange::new("BTCUSDT")
+        }
+
+        fn cancel<'a>(
+            instrument: &'a InstrumentNameExchange,
+            id: Option<&str>,
+        ) -> OrderRequestCancel<ExchangeId, &'a InstrumentNameExchange> {
+            OrderRequestCancel {
+                key: OrderKey::new(
+                    ExchangeId::BinanceSpot,
+                    instrument,
+                    StrategyId::new("test"),
+                    ClientOrderId::new("stop"),
+                ),
+                state: RequestCancel {
+                    id: id.map(|id| VenueOrderId::Assigned(OrderId::new(id))),
+                },
+            }
+        }
+
+        fn open(
+            instrument: &InstrumentNameExchange,
+            request: RequestOpen,
+        ) -> OrderRequestOpen<ExchangeId, &InstrumentNameExchange> {
+            OrderRequestOpen {
+                key: OrderKey::new(
+                    ExchangeId::BinanceSpot,
+                    instrument,
+                    StrategyId::new("test"),
+                    ClientOrderId::new("exit"),
+                ),
+                state: request,
+            }
+        }
+
+        fn limit() -> RequestOpen {
+            RequestOpen::new(
+                Side::Sell,
+                Some(dec!(101.5)),
+                dec!(0.5),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilCancelled { post_only: false },
+            )
+        }
+
+        /// One signed POST carries both legs and the policy's mode, and each leg is answered
+        /// from the venue's per-leg result: here the cancel done and the new order refused.
+        #[tokio::test]
+        async fn one_signed_request_answers_each_leg() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(method("POST"))
+                .and(path("/api/v3/order/cancelReplace"))
+                .and(header("X-MBX-APIKEY", "key"))
+                .and(query_param("symbol", "BTCUSDT"))
+                .and(query_param("cancelReplaceMode", "STOP_ON_FAILURE"))
+                .and(query_param("cancelOrderId", "11"))
+                .and(query_param("newClientOrderId", "exit"))
+                .and(query_param("side", "SELL"))
+                .and(query_param("type", "LIMIT"))
+                .and(query_param("price", "101.5"))
+                .and(query_param("quantity", "0.5"))
+                .respond_with(wiremock::ResponseTemplate::new(409).set_body_json(
+                    serde_json::json!({
+                        "code": -2021, "msg": "Order cancel-replace partially failed.",
+                        "data": {
+                            "cancelResult": "SUCCESS", "newOrderResult": "FAILURE",
+                            "cancelResponse": {
+                                "symbol": "BTCUSDT", "orderId": 11, "status": "CANCELED",
+                                "transactTime": 1_700_000_000_000_i64, "executedQty": "0",
+                            },
+                            "newOrderResponse": {
+                                "code": -2010,
+                                "msg": "Account has insufficient balance for requested action.",
+                            },
+                        },
+                    }),
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = client(&server);
+            let instrument = btcusdt();
+
+            let answer = client
+                .cancel_replace(
+                    cancel(&instrument, Some("11")),
+                    open(&instrument, limit()),
+                    OnCancelFailure::DropOpens,
+                )
+                .expect("a same-symbol limit order goes as one request")
+                .await;
+
+            let requests = server.received_requests().await.unwrap();
+            let query = requests[0].url.query().unwrap_or_default();
+            assert!(query.contains("timestamp="), "{query}");
+            assert!(query.contains("signature="), "{query}");
+
+            assert_eq!(answer.cancel.key.cid, ClientOrderId::new("stop"));
+            assert_eq!(
+                answer.cancel.state.map(|cancelled| cancelled.id),
+                Ok(OrderId::new("11"))
+            );
+            let opened = answer.open.expect("the new order was attempted");
+            assert_eq!(opened.key.cid, ClientOrderId::new("exit"));
+            assert_eq!(opened.price, Some(dec!(101.5)));
+            assert!(
+                matches!(
+                    opened.state,
+                    OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(_)))
+                ),
+                "{:?}",
+                opened.state
+            );
+        }
+
+        /// A request refused whole, here throttled, placed nothing: the cancel fails with the
+        /// refusal, and under `DropOpens` the new order is answered as not attempted.
+        #[tokio::test]
+        async fn a_throttled_request_fails_the_cancel_and_attempts_nothing() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(method("POST"))
+                .and(path("/api/v3/order/cancelReplace"))
+                .respond_with(
+                    wiremock::ResponseTemplate::new(418)
+                        .insert_header("retry-after", "600")
+                        .set_body_json(
+                            serde_json::json!({ "code": -1003, "msg": "Way too much request weight used." }),
+                        ),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let client = client(&server);
+            let instrument = btcusdt();
+
+            let answer = client
+                .cancel_replace(
+                    cancel(&instrument, None),
+                    open(&instrument, limit()),
+                    OnCancelFailure::DropOpens,
+                )
+                .expect("offered")
+                .await;
+
+            assert!(
+                matches!(
+                    answer.cancel.state,
+                    Err(OrderError::Rejected(ApiError::RateLimit { .. }))
+                ),
+                "{:?}",
+                answer.cancel.state
+            );
+            assert_eq!(answer.open, None);
+        }
+
+        /// A pair the request cannot carry exactly is declined unsent, for the sequential path:
+        /// two symbols, a kind Binance Spot does not take, a borrow, a non-numeric venue id.
+        #[tokio::test]
+        async fn a_pair_the_request_cannot_carry_is_declined() {
+            let server = wiremock::MockServer::start().await;
+            let client = client(&server);
+            let instrument = btcusdt();
+            let other = InstrumentNameExchange::new("ETHUSDT");
+            let unsupported = RequestOpen::new(
+                Side::Sell,
+                Some(dec!(101.5)),
+                dec!(0.5),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilEndOfDay,
+            );
+            let borrowing = limit().with_margin_effect(MarginEffect::Borrow);
+
+            let declined = [
+                (cancel(&instrument, Some("11")), open(&other, limit())),
+                (
+                    cancel(&instrument, Some("11")),
+                    open(&instrument, unsupported),
+                ),
+                (
+                    cancel(&instrument, Some("11")),
+                    open(&instrument, borrowing),
+                ),
+                (cancel(&instrument, Some("x11")), open(&instrument, limit())),
+            ];
+            for (cancel, open) in declined {
+                assert!(
+                    client
+                        .cancel_replace(cancel, open, OnCancelFailure::DropOpens)
+                        .is_none()
+                );
+            }
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+
+        /// An open the symbol's rules refuse sends no cancel-replace: the cancel goes alone, and
+        /// the open is answered as when sequenced.
+        #[tokio::test]
+        async fn an_open_the_rules_refuse_sends_the_cancel_alone() {
+            let server = wiremock::MockServer::start().await;
+            wiremock::Mock::given(method("GET"))
+                .and(path("/api/v3/exchangeInfo"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"symbols": [{
+                        "symbol": "BTCUSDT", "status": "TRADING",
+                        "filters": [
+                            {"filterType": "LOT_SIZE", "minQty": "1", "maxQty": "100", "stepSize": "1"},
+                        ],
+                    }]}),
+                ))
+                .mount(&server)
+                .await;
+            let mut client = client(&server);
+            client.rules = Arc::new(RulesLoader::new(
+                PreSendRules::Enforce,
+                Arc::new(SpotRestApi::from_config(
+                    ConfigurationRestApi::builder()
+                        .api_key("key")
+                        .api_secret("secret")
+                        .base_path(server.uri())
+                        .build()
+                        .unwrap(),
+                )),
+                Arc::new(RateLimitTracker::new(WeightPool::Spot)),
+            ));
+            let instrument = btcusdt();
+
+            for (policy, open_answered) in [
+                (OnCancelFailure::DropOpens, false),
+                (OnCancelFailure::SendOpens, true),
+            ] {
+                let answer = client
+                    .cancel_replace(
+                        cancel(&instrument, Some("11")),
+                        open(&instrument, limit()),
+                        policy,
+                    )
+                    .expect("offered")
+                    .await;
+
+                // The WS-API session goes nowhere, so the cancel sent alone fails.
+                assert!(answer.cancel.state.is_err());
+                assert_eq!(answer.open.is_some(), open_answered, "{policy:?}");
+                if let Some(opened) = answer.open {
+                    assert!(
+                        matches!(
+                            opened.state,
+                            OrderState::Inactive(InactiveOrderState::OpenFailed(
+                                OrderError::InvalidPrecision(_)
+                            ))
+                        ),
+                        "{:?}",
+                        opened.state
+                    );
+                }
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.url.path() != "/api/v3/order/cancelReplace"),
+                "{requests:?}"
+            );
         }
     }
 }

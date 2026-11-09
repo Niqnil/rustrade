@@ -183,6 +183,7 @@
 //! `EnvFilter::from_default_env().add_directive(..)`, gets this backwards: it silently overrides
 //! an explicit request.
 
+mod cancel_replace;
 mod commission;
 mod margin;
 mod restatement;
