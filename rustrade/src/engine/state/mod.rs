@@ -242,10 +242,7 @@ impl<GlobalData, InstrumentData> PreparesAmend<ExchangeIndex, InstrumentIndex>
             quantity: order.quantity,
             kind: order.kind,
             time_in_force: order.time_in_force,
-            reduce_only: instrument
-                .reduce_only
-                .sent_as(&amend.key.cid)
-                .unwrap_or_default(),
+            reduce_only: instrument.reduce_only.sent_as(&amend.key.cid),
         };
         let request =
             RequestAmend::new(open.id.clone(), amend.state, current, open.filled_quantity);

@@ -414,7 +414,7 @@ mod tests {
                     quantity: open.state.quantity,
                     kind: OrderKind::Limit,
                     time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                    reduce_only: ReduceOnly::No,
+                    reduce_only: Some(ReduceOnly::No),
                 },
                 rust_decimal::Decimal::ZERO,
             ),

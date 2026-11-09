@@ -2981,7 +2981,7 @@ mod tests {
                         quantity: order.quantity,
                         kind: order.kind,
                         time_in_force: order.time_in_force,
-                        reduce_only: ReduceOnly::No,
+                        reduce_only: Some(ReduceOnly::No),
                     },
                     Decimal::ZERO,
                 ),

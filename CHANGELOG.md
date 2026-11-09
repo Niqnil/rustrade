@@ -16,8 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     in `rustrade_execution::order::amend`), built from `AmendPatch::default()` and its `with_*`
     methods. `quantity` is the new total, filled part included, and must stay above the quantity
     filled. The engine builds the `RequestAmend` the client receives from the order it tracks:
-    the venue id, the order as it stands (`AmendTarget`, reduce-only flag included) and the
-    quantity filled.
+    the venue id, the order as it stands (`AmendTarget`) and the quantity filled.
+    `AmendTarget::reduce_only` is `None` when the engine did not send the order, such as one
+    adopted from the venue's listing of open orders. A client that sends the whole order again
+    reads it with `AmendTarget::known_reduce_only`, which refuses the amend
+    (`AmendRefusal::ReduceOnlyUnknown`) rather than guess the flag.
   - **What a client can amend:** `ExecutionClient::amend_support` returns an `AmendSupport`: per
     field, `AmendAllowed::{Unsupported, Any, DecreaseOnly}`, plus whether several fields can
     change at once, whether the order keeps its venue id, and the queue priority after an amend
@@ -44,7 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     with defaults, so existing implementations are unaffected. The default check approves an
     amend that only lowers the quantity. It passes any other amend through `RiskManager::check`
     as the open the amended order would leave resting, and refuses it if `check` refuses or
-    adjusts that open. The amends appear in `GenerateAlgoOrdersOutput::amends`.
+    adjusts that open. An order whose reduce-only flag is not known is checked as one that may
+    add exposure. The amends appear in `GenerateAlgoOrdersOutput::amends`.
   - **From a command:** `Command::SendAmendRequests`, reported in `ActionOutput::Amends`. Like the
     other commands, it skips the risk manager.
   - **The engine** refuses an amend unsent, as `RecoverableEngineError::AmendRefused`, when it

@@ -3649,7 +3649,7 @@ mod tests {
             quantity: dec!(1),
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-            reduce_only: rustrade_execution::order::request::ReduceOnly::No,
+            reduce_only: Some(rustrade_execution::order::request::ReduceOnly::No),
         }
     }
 

@@ -659,6 +659,11 @@ pub enum AmendRefusal {
     #[error("the quantity must be above the {filled} already filled")]
     QuantityNotAboveFilled { filled: Decimal },
 
+    /// The client sends the whole order again to amend it, and the order's reduce-only flag is
+    /// not known: see [`AmendTarget::reduce_only`](crate::order::amend::AmendTarget::reduce_only).
+    #[error("the order's reduce-only flag is not known, and the amend would have to send it")]
+    ReduceOnlyUnknown,
+
     /// The order is not tracked as working: unknown, or ended.
     #[error("the order is not tracked")]
     Untracked,

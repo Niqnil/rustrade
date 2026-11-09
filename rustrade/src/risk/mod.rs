@@ -1,6 +1,7 @@
 use derive_more::{Constructor, Display, From};
 use rustrade_execution::order::request::{
-    CancelThenOpen, OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, RequestOpen,
+    CancelThenOpen, OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, ReduceOnly,
+    RequestOpen,
 };
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
 use serde::{Deserialize, Serialize};
@@ -153,6 +154,11 @@ pub trait RiskManager<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentInd
     /// `check` sees the projected open on top of the state, which still holds the order before
     /// the amend. A check that sums the exposure of resting orders therefore counts the order
     /// twice. Override this to net it out.
+    ///
+    /// An order whose reduce-only flag is not known
+    /// ([`AmendTarget::reduce_only`](rustrade_execution::order::amend::AmendTarget::reduce_only)
+    /// is `None`) is projected as [`ReduceOnly::No`]: an open that may add exposure, the cautious
+    /// reading.
     fn check_amends(
         &self,
         state: &Self::State,
@@ -195,7 +201,7 @@ pub trait RiskManager<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentInd
                 amended.kind,
                 amended.time_in_force,
             )
-            .with_reduce_only(amended.reduce_only);
+            .with_reduce_only(amended.reduce_only.unwrap_or(ReduceOnly::No));
             let open = OrderRequestOpen {
                 key: amend.key.clone(),
                 state: projected.clone(),
@@ -434,7 +440,7 @@ mod tests {
                     quantity,
                     kind: OrderKind::Limit,
                     time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-                    reduce_only: ReduceOnly::No,
+                    reduce_only: Some(ReduceOnly::No),
                 },
                 filled,
             ),
@@ -507,5 +513,56 @@ mod tests {
         assert_eq!(approved.into_iter().count(), 0);
         let refused: Vec<_> = refusals.into_iter().map(|refusal| refusal.item).collect();
         assert_eq!(refused, vec![raised, lowered_and_repriced]);
+    }
+
+    /// Approves every open unchanged, recording what each was sent as.
+    #[derive(Default)]
+    struct ReduceOnlyRecorder(std::cell::RefCell<Vec<ReduceOnly>>);
+
+    impl RiskManager for ReduceOnlyRecorder {
+        type State = ();
+
+        fn check(
+            &self,
+            _: &Self::State,
+            cancels: impl IntoIterator<Item = OrderRequestCancel>,
+            opens: impl IntoIterator<Item = OrderRequestOpen>,
+        ) -> (
+            impl IntoIterator<Item = RiskApproved<OrderRequestCancel>>,
+            impl IntoIterator<Item = RiskApproved<OrderRequestOpen>>,
+            impl IntoIterator<Item = RiskRefused<OrderRequestCancel>>,
+            impl IntoIterator<Item = RiskRefused<OrderRequestOpen>>,
+        ) {
+            let opens: Vec<_> = opens.into_iter().collect();
+            self.0
+                .borrow_mut()
+                .extend(opens.iter().map(|open| open.state.reduce_only));
+            (
+                cancels.into_iter().map(RiskApproved::new),
+                opens.into_iter().map(RiskApproved::new).collect::<Vec<_>>(),
+                std::iter::empty(),
+                std::iter::empty(),
+            )
+        }
+    }
+
+    /// The open an amend leaves keeps the order's reduce-only flag, and one not known is checked
+    /// as an open that may add exposure.
+    #[test]
+    fn the_default_amend_check_projects_an_unknown_reduce_only_as_no() {
+        let reprice = AmendPatch::default().with_price(dec!(99));
+        let mut known = amend("known", dec!(1), dec!(0), reprice);
+        known.state.current.reduce_only = Some(ReduceOnly::Position);
+        let mut unknown = amend("unknown", dec!(1), dec!(0), reprice);
+        unknown.state.current.reduce_only = None;
+
+        let recorder = ReduceOnlyRecorder::default();
+        let (approved, refusals) = recorder.check_amends(&(), [known, unknown]);
+        assert_eq!(approved.into_iter().count(), 2);
+        assert_eq!(refusals.into_iter().count(), 0);
+        assert_eq!(
+            recorder.0.into_inner(),
+            vec![ReduceOnly::Position, ReduceOnly::No]
+        );
     }
 }

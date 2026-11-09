@@ -2711,7 +2711,7 @@ fn test_command_send_amend_requests_builds_each_from_the_tracked_order() {
             quantity: dec!(1),
             kind: OrderKind::Limit,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-            reduce_only: ReduceOnly::No,
+            reduce_only: Some(ReduceOnly::No),
         }
     );
     assert_eq!(request.state.filled, dec!(0.25));
@@ -2756,6 +2756,50 @@ fn test_command_send_amend_requests_builds_each_from_the_tracked_order() {
     let order = order(&engine);
     assert_eq!(order.price, Some(dec!(44_000)));
     assert_eq!(order.state, ActiveOrderState::Open(amended));
+}
+
+/// An order the engine did not send, adopted from the venue's listing, is amended with its
+/// reduce-only flag reported as not known, rather than guessed.
+#[test]
+fn test_an_adopted_order_is_amended_with_its_reduce_only_unknown() {
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    send_spot_price(&mut engine, 1, dec!(45_000));
+    let adopted = open_request(InstrumentIndex(1), "adopted");
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+            exchange: ExchangeIndex(0),
+            kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+                key: adopted.key.clone(),
+                side: adopted.state.side,
+                price: adopted.state.price,
+                quantity: adopted.state.quantity,
+                kind: adopted.state.kind,
+                time_in_force: adopted.state.time_in_force,
+                state: OrderState::active(Open {
+                    id: VenueOrderId::Assigned(OrderId::new("venue-adopted")),
+                    time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
+                    filled_quantity: dec!(0),
+                }),
+            })),
+        })),
+    );
+
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendAmendRequests(OneOrMany::One(OrderAmend {
+            key: adopted.key.clone(),
+            state: AmendPatch::default().with_price(dec!(44_000)),
+        }))),
+    );
+    match execution_rx.rx.try_recv() {
+        Ok(ExecutionRequest::Amend(sent)) => {
+            assert_eq!(sent.key, adopted.key);
+            assert_eq!(sent.state.current.reduce_only, None);
+        }
+        other => panic!("expected the amend to be sent, got {other:?}"),
+    }
 }
 
 /// A `CancelThenOpen` group is sent whole, as one request, or refused whole, unsent and

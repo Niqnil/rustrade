@@ -140,7 +140,24 @@ pub struct AmendTarget {
     pub kind: OrderKind,
     pub time_in_force: TimeInForce,
     /// As the order was opened with: see [`RequestOpen::reduce_only`](super::request::RequestOpen::reduce_only).
-    pub reduce_only: ReduceOnly,
+    ///
+    /// `None` when the flag is not known: the engine knows it only for an order it sent itself,
+    /// not for one it adopted from a venue's listing of open orders (at start-up or after a
+    /// reconnect) or one placed outside it. A client that sends the whole order again must not
+    /// guess it: read it with [`AmendTarget::known_reduce_only`], which refuses the amend when
+    /// it is `None`.
+    pub reduce_only: Option<ReduceOnly>,
+}
+
+impl AmendTarget {
+    /// The order's reduce-only flag, for a client that must send it again with the amend.
+    ///
+    /// # Errors
+    /// [`AmendRefusal::ReduceOnlyUnknown`] when the flag is not known, since sending the order
+    /// again without it could turn a reduce-only order into one that opens a position.
+    pub fn known_reduce_only(&self) -> Result<ReduceOnly, AmendRefusal> {
+        self.reduce_only.ok_or(AmendRefusal::ReduceOnlyUnknown)
+    }
 }
 
 /// An amend of a working order, as sent to a client.
@@ -418,7 +435,7 @@ mod tests {
             quantity: dec!(10),
             kind,
             time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
-            reduce_only: ReduceOnly::No,
+            reduce_only: Some(ReduceOnly::No),
         }
     }
 
@@ -677,6 +694,20 @@ mod tests {
             !AmendSupport::NONE
                 .with_trigger_price(AmendAllowed::Any)
                 .is_none()
+        );
+    }
+
+    /// A client that sends the whole order again reads the reduce-only flag when it is known,
+    /// and refuses the amend when it is not.
+    #[test]
+    fn known_reduce_only_refuses_an_unknown_flag() {
+        let mut current = limit();
+        current.reduce_only = Some(ReduceOnly::Position);
+        assert_eq!(current.known_reduce_only(), Ok(ReduceOnly::Position));
+        current.reduce_only = None;
+        assert_eq!(
+            current.known_reduce_only(),
+            Err(AmendRefusal::ReduceOnlyUnknown)
         );
     }
 }
