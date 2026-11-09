@@ -60,8 +60,8 @@ use rustrade_execution::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, PositionId, StrategyId, VenueOrderId},
         request::{
-            OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, ReduceOnly, RequestCancel,
-            RequestOpen,
+            CancelThenOpen, CancelThenOpenError, OrderRequestCancel, OrderRequestOpen,
+            OrderResponseCancel, ReduceOnly, RequestCancel, RequestOpen,
         },
         state::{ActiveOrderState, Cancelled, Filled, Open, OrderState},
     },
@@ -2603,6 +2603,230 @@ fn test_command_send_open_requests_duplicate_cid_rejected_before_send() {
             .contains_key(&ClientOrderId::new("dup")),
         "the refused request's position routing is not recorded"
     );
+}
+
+/// A `CancelThenOpen` group is sent whole, as one request, or refused whole, unsent and
+/// unrecorded: when it is not valid, when a leg names an unknown instrument, or when an open's
+/// client order id is tracked already, claimed by an earlier group in the call, or repeated in the
+/// group. A sent group's opens are stamped, and every leg is recorded in flight.
+#[test]
+fn test_command_send_cancel_then_open_requests_sends_each_group_whole_or_not_at_all() {
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    send_spot_price(&mut engine, 1, dec!(45_000));
+    // The fixture has three instruments (indices 0..=2), so index 3 is unknown.
+    let (known, unknown) = (InstrumentIndex(1), InstrumentIndex(3));
+
+    // The resting order the groups cancel, tracked by an earlier action.
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(open_request(
+            known, "stop",
+        )))),
+    );
+    assert!(matches!(
+        execution_rx.rx.try_recv(),
+        Ok(ExecutionRequest::Open(_))
+    ));
+
+    let group = |opens: &[(InstrumentIndex, &str)]| {
+        CancelThenOpen::new(
+            vec![cancel_request(known, "stop")],
+            opens
+                .iter()
+                .map(|(instrument, cid)| open_request(*instrument, cid))
+                .collect(),
+        )
+    };
+    let valid = group(&[(known, "exit")]);
+    let no_cancels = CancelThenOpen::new(vec![], vec![open_request(known, "no-cancels")]);
+    let untracked = group(&[(known, "sibling"), (unknown, "untracked")]);
+    let tracked_id = group(&[(known, "stop")]);
+    let claimed = group(&[(known, "exit")]);
+    let repeated = group(&[(known, "twice"), (known, "twice")]);
+
+    let audit = process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendCancelThenOpenRequests(OneOrMany::Many(vec![
+            valid.clone(),
+            no_cancels.clone(),
+            untracked.clone(),
+            tracked_id.clone(),
+            claimed.clone(),
+            repeated.clone(),
+        ]))),
+    );
+    let EngineAudit::Process(audit) = audit.event else {
+        panic!("expected EngineAudit::Process");
+    };
+    assert!(
+        audit.errors.is_empty(),
+        "a refused group must not stop the engine"
+    );
+    let NoneOneOrMany::One(EngineOutput::Commanded(ActionOutput::CancelThenOpens(output))) =
+        audit.outputs
+    else {
+        panic!(
+            "expected one CancelThenOpens output, got {:?}",
+            audit.outputs
+        );
+    };
+
+    let sent: Vec<_> = output.sent_iter().cloned().collect();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].cancels, valid.cancels);
+    assert_eq!(sent[0].opens[0].key, valid.opens[0].key);
+    assert!(
+        sent[0].opens[0].state.market.is_some(),
+        "a sent open is stamped with the market"
+    );
+    let errors: Vec<_> = output
+        .errors
+        .iter()
+        .map(|error| (**error).clone())
+        .collect();
+    assert_eq!(
+        errors,
+        vec![
+            (
+                no_cancels,
+                EngineError::Recoverable(RecoverableEngineError::InvalidCancelThenOpen(
+                    CancelThenOpenError::NoCancels
+                ))
+            ),
+            (untracked, unknown_instrument_error(unknown)),
+            (tracked_id, duplicate_cid_error("stop")),
+            (claimed, duplicate_cid_error("exit")),
+            (repeated, duplicate_cid_error("twice")),
+        ]
+    );
+
+    match execution_rx.rx.try_recv() {
+        Ok(ExecutionRequest::CancelThenOpen(request)) => assert_eq!(request, sent[0]),
+        other => panic!("expected the valid group to be sent as one request, got {other:?}"),
+    }
+    assert!(
+        execution_rx.rx.try_recv().is_err(),
+        "no refused group may be sent"
+    );
+
+    let orders = &engine.state.instruments.instrument_index(&known).orders.0;
+    assert!(matches!(
+        orders[&ClientOrderId::new("stop")].state,
+        ActiveOrderState::CancelInFlight(_)
+    ));
+    assert!(matches!(
+        orders[&ClientOrderId::new("exit")].state,
+        ActiveOrderState::OpenInFlight(_)
+    ));
+    for refused in ["no-cancels", "sibling", "twice"] {
+        assert!(
+            !orders.contains_key(&ClientOrderId::new(refused)),
+            "{refused} must not be recorded"
+        );
+    }
+}
+
+/// Emits one plain open, and two groups from the strategy's `CancelThenOpen` hook: one valid, one
+/// reusing the plain open's client order id.
+struct CancelThenOpenStrategy;
+
+impl AlgoStrategy for CancelThenOpenStrategy {
+    type State = EngineState<DefaultGlobalData, DefaultInstrumentMarketData>;
+
+    fn generate_algo_orders(
+        &self,
+        _: &Self::State,
+    ) -> (
+        impl IntoIterator<Item = OrderRequestCancel<ExchangeIndex, InstrumentIndex>>,
+        impl IntoIterator<Item = OrderRequestOpen<ExchangeIndex, InstrumentIndex>>,
+    ) {
+        (
+            std::iter::empty(),
+            [open_request(InstrumentIndex(1), "plain")],
+        )
+    }
+
+    fn generate_cancel_then_opens(
+        &self,
+        _: &Self::State,
+    ) -> impl IntoIterator<Item = CancelThenOpen<ExchangeIndex, InstrumentIndex>> {
+        let known = InstrumentIndex(1);
+        [
+            CancelThenOpen::new(
+                vec![cancel_request(known, "stop")],
+                vec![open_request(known, "exit")],
+            ),
+            CancelThenOpen::new(
+                vec![cancel_request(known, "stop")],
+                vec![open_request(known, "plain")],
+            ),
+        ]
+    }
+}
+
+/// A strategy's groups pass the risk manager and are sent after its plain requests, so a group
+/// reusing a plain open's id is refused as a duplicate. They are reported in the algo output's
+/// `cancel_then_opens`, which an output without a group leaves `None`.
+#[test]
+fn test_strategy_cancel_then_open_groups_are_sent_after_plain_requests() {
+    use rustrade::engine::action::generate_algo_orders::GenerateAlgoOrders;
+
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine_with_strategy(
+        TradingState::Enabled,
+        execution_tx,
+        OmsMode::Netting,
+        CancelThenOpenStrategy,
+    );
+
+    let output = engine.generate_algo_orders();
+    let groups = output
+        .cancel_then_opens
+        .as_deref()
+        .expect("the strategy generated groups");
+    assert!(
+        groups.refused.is_none(),
+        "the default risk manager approves"
+    );
+    let sent: Vec<_> = groups
+        .sent
+        .sent_iter()
+        .map(|group| group.opens[0].key.cid.clone())
+        .collect();
+    assert_eq!(sent, [ClientOrderId::new("exit")]);
+    let errors: Vec<_> = groups
+        .sent
+        .errors
+        .iter()
+        .map(|error| (error.0.opens[0].key.cid.clone(), error.1.clone()))
+        .collect();
+    assert_eq!(
+        errors,
+        [(ClientOrderId::new("plain"), duplicate_cid_error("plain"))]
+    );
+
+    assert!(matches!(
+        execution_rx.rx.try_recv(),
+        Ok(ExecutionRequest::Open(open)) if open.key.cid == ClientOrderId::new("plain")
+    ));
+    assert!(matches!(
+        execution_rx.rx.try_recv(),
+        Ok(ExecutionRequest::CancelThenOpen(group)) if group.opens[0].key.cid == ClientOrderId::new("exit")
+    ));
+    assert!(execution_rx.rx.try_recv().is_err());
+
+    // A strategy without groups leaves the field `None`.
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine_with_strategy(
+        TradingState::Enabled,
+        execution_tx,
+        OmsMode::Netting,
+        FixedInstrumentStrategy {
+            instrument: InstrumentIndex(1),
+        },
+    );
+    assert!(engine.generate_algo_orders().cancel_then_opens.is_none());
 }
 
 /// Emits one cancel and one open for a fixed instrument, from both the algo and the

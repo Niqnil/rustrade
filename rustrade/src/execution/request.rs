@@ -1,5 +1,13 @@
 use derive_more::From;
-use rustrade_execution::order::request::{OrderRequestCancel, OrderRequestOpen};
+use rustrade_execution::{
+    error::{NotPlacedReason, OrderError},
+    order::{
+        Order,
+        id::ClientOrderId,
+        request::{CancelThenOpen, OrderRequestCancel, OrderRequestOpen},
+        state::OrderState,
+    },
+};
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -40,6 +48,38 @@ pub enum ExecutionRequest<ExchangeKey = ExchangeIndex, InstrumentKey = Instrumen
 
     /// Request to open an new `Order`.
     Open(OrderRequestOpen<ExchangeKey, InstrumentKey>),
+
+    /// Cancel orders, then open orders once every cancel has been answered: see
+    /// [`CancelThenOpen`].
+    ///
+    /// The execution side sends the cancels as it would [`Cancel`](Self::Cancel)s and holds the
+    /// opens. It answers each cancel as it arrives. Once the last has been answered, it sends the
+    /// opens as it would [`Open`](Self::Open)s, or, when a cancel failed and the group says
+    /// [`DropOpens`](rustrade_execution::order::request::OnCancelFailure::DropOpens), answers each
+    /// open instead with the order as requested, inactive with
+    /// [`NotPlacedReason::CancelFailed`].
+    CancelThenOpen(CancelThenOpen<ExchangeKey, InstrumentKey>),
+}
+
+/// The answer to an open of a [`CancelThenOpen`] group that is dropped because the cancel `cancel`
+/// failed: the order as requested, inactive with
+/// [`NotPlacedReason::CancelFailed`].
+pub(crate) fn dropped_open<ExchangeKey, AssetKey, InstrumentKey>(
+    request: OrderRequestOpen<ExchangeKey, InstrumentKey>,
+    cancel: ClientOrderId,
+) -> Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>> {
+    let OrderRequestOpen { key, state } = request;
+    Order {
+        key,
+        side: state.side,
+        price: state.price,
+        quantity: state.quantity,
+        kind: state.kind,
+        time_in_force: state.time_in_force,
+        state: OrderState::inactive(OrderError::NotPlaced(NotPlacedReason::CancelFailed {
+            cancel,
+        })),
+    }
 }
 
 /// An in-flight request to an [`ExecutionClient`](rustrade_execution::client::ExecutionClient),

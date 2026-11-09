@@ -167,6 +167,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`OptionContract::settlement`: whether an exercised option delivers the underlying or pays cash**
   (`rustrade-instrument`, #872). `OptionSettlement::{Physical, Cash}`, a contract term beside
   `exercise`. A serialised contract without it loads as `Physical`.
+- **Cancel, then open: an open sent only once the cancels it depends on have been answered**
+  (`rustrade-execution`, `rustrade`, #887). Requests are otherwise sent concurrently and reach the
+  venue in no guaranteed order, so an exit could race the cancel of a resting stop that would block
+  or flip it, and a stop could not be moved without two resting at once.
+  - **`CancelThenOpen { cancels, opens, on_cancel_failure }`** (`rustrade_execution::order::request`):
+    cancels and opens on one exchange. The opens are sent once every cancel has been answered.
+    Requests outside the group, other groups included, stay concurrent.
+  - **When a cancel fails** (any error: already filled, cancelled or expired, not found, rejected,
+    or timed out), `OnCancelFailure::DropOpens`, the default, sends none of the opens and answers
+    each with an inactive order whose error is the new
+    `NotPlacedReason::CancelFailed { cancel }`, naming the first cancel that failed.
+    `OnCancelFailure::SendOpens` sends them anyway. Each cancel is answered as a cancel sent alone
+    would be.
+  - **Not atomic:** between the cancels' answers and the opens' arrival nothing in the group rests,
+    so a stop being moved leaves its position unprotected for one round trip to the venue.
+  - **From a strategy:** `AlgoStrategy::generate_cancel_then_opens` and
+    `RiskManager::check_cancel_then_opens`, both with defaults, so existing implementations are
+    unaffected. The default check passes each group's legs, alone, through `RiskManager::check`
+    and approves the group only if no leg is refused, otherwise refusing it whole. The groups
+    appear in `GenerateAlgoOrdersOutput::cancel_then_opens`.
+  - **From a command:** `Command::SendCancelThenOpenRequests`, reported in
+    `ActionOutput::CancelThenOpens`. Like the other commands, it skips the risk manager.
+  - **The engine** sends a group whole or not at all, refusing it when it is not valid (no cancel,
+    no open, or more than one exchange: `RecoverableEngineError::InvalidCancelThenOpen`), when a
+    leg names an untracked instrument, or when an open reuses a client order id. Every leg is
+    recorded in flight when the group is sent.
+  - **Sequenced by the `ExecutionManager`, and by the backtest runner**, where the opens act one
+    simulated round trip after the cancels: `2 × to_venue + from_venue` after the group is sent.
+    A drain waits for held opens.
 
 ### Changed
 
@@ -189,6 +218,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Breaking: `VenueInstrumentMarket` is `#[non_exhaustive]` and has a `stale_since` field**
   (`rustrade-execution`, #876). Outside the crate it can no longer be built with a struct literal;
   start from `VenueInstrumentMarket::default()`.
+
+- **Breaking: `ExecutionRequest`, `Command`, `ActionOutput` and `GenerateAlgoOrdersOutput` grow
+  for `CancelThenOpen`** (`rustrade`, #887). New variants `ExecutionRequest::CancelThenOpen`,
+  `Command::SendCancelThenOpenRequests` and `ActionOutput::CancelThenOpens`, so an exhaustive
+  `match` needs an arm for each. A struct literal of `GenerateAlgoOrdersOutput` must set its new
+  field `cancel_then_opens` (`None` for no groups); `GenerateAlgoOrdersOutput::new` sets it.
+- **`InFlightDeadlines::deadline_for` adds one more `request_timeout`** (`rustrade`, #887): an open
+  held behind a cancel waits up to that long before it is sent. Deadlines derived by the
+  `ExecutionBuilder` grow by the same amount, so an order stranded in flight is flagged that much
+  later.
 
 - **Breaking: `init_market_stream` takes `MarketStreamOptions` in place of its
   `ReconnectionBackoffPolicy`** (`rustrade-data`, #862). Pass

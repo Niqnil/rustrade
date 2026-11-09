@@ -43,6 +43,11 @@ pub enum RecoverableEngineError {
     /// [`ClientOrderId`]: rustrade_execution::order::id::ClientOrderId
     #[error("open request under a client order id the Engine already tracks an order under: {0}")]
     DuplicateClientOrderId(String),
+
+    /// A [`CancelThenOpen`](rustrade_execution::order::request::CancelThenOpen) group was not
+    /// valid, so none of it was sent.
+    #[error("invalid CancelThenOpen group: {0}")]
+    InvalidCancelThenOpen(rustrade_execution::order::request::CancelThenOpenError),
 }
 
 /// Represents fatal error conditions that the [`Engine`](super::Engine) cannot recover from.

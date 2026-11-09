@@ -438,6 +438,14 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 // just the same. See `MarketSnapshotSource`.
                 ActionOutput::OpenOrders(self.send_open_requests(requests.clone()))
             }
+            Command::SendCancelThenOpenRequests(groups) => {
+                info!(
+                    ?groups,
+                    "Engine actioning user Command::SendCancelThenOpenRequests"
+                );
+                // Opens stamped like those of `SendOpenRequests`, for the same reason.
+                ActionOutput::CancelThenOpens(self.send_cancel_then_open_requests(groups.clone()))
+            }
             Command::ClosePositions(filter) => {
                 info!(?filter, "Engine actioning user Command::ClosePositions");
                 ActionOutput::ClosePositions(self.close_positions(filter))
@@ -1749,7 +1757,7 @@ pub enum EngineOutput<
     /// Output of an actioned [`Command`].
     ///
     /// **Inline.** [`ActionOutput`]'s inner order payloads are boxed at the root (#195), so
-    /// `ActionOutput` is only ~96 B — well under the ~144 B `AlgoOrders` variant that floors
+    /// `ActionOutput` is only ~96 B — well under the ~152 B `AlgoOrders` variant that floors
     /// this enum's size. Carrying it inline therefore costs `EngineOutput`
     /// nothing in stack size (and thus in the per-tick [`ProcessAudit`] copy), while avoiding a
     /// heap allocation and pointer indirection on the command path that an outer `Box` would add.
@@ -1771,7 +1779,7 @@ pub enum EngineOutput<
     /// path).
     ///
     /// **Inline.** `GenerateAlgoOrdersOutput`'s inner order payloads are boxed at the root (#195),
-    /// so it is only ~144 B, the variant that floors this enum's size now that
+    /// so it is only ~152 B, the variant that floors this enum's size now that
     /// [`PositionExit`](Self::PositionExit) is boxed. Carrying it inline therefore costs
     /// `EngineOutput` nothing beyond that floor in stack size (and thus in the per-tick [`ProcessAudit`] copy). The only allocation is the root
     /// boxing of the orders themselves, paid solely when the strategy actually emits some — the
@@ -2318,14 +2326,14 @@ mod size_guard {
     use super::*;
 
     /// Regression guard: `EngineOutput` stays small so the per-tick `ProcessAudit` copy is cheap. Its
-    /// floor is the largest inline variant, `AlgoOrders` (`GenerateAlgoOrdersOutput`, ~144 B). The
+    /// floor is the largest inline variant, `AlgoOrders` (`GenerateAlgoOrdersOutput`, ~152 B). The
     /// order payloads of `AlgoOrders`/`Commanded` are boxed at the root (#195), and `PositionExit`
     /// is boxed because a `PositionExited` is large and a close is rare. This bound (<= 192 B)
     /// catches a large regression — a new big inline variant, a re-inlined payload, or an unboxed
     /// `PositionExited` — while leaving headroom for unrelated growth.
     #[test]
     fn engine_output_stays_small() {
-        // Measured 168 B, floored by the AlgoOrders variant.
+        // Measured 176 B, floored by the AlgoOrders variant.
         let size = std::mem::size_of::<EngineOutput<(), (), ExchangeIndex, InstrumentIndex>>();
         assert!(
             size <= 192,

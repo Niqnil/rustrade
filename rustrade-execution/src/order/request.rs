@@ -383,9 +383,149 @@ pub struct RequestCancel {
     pub id: Option<VenueOrderId>,
 }
 
+/// Cancels on one exchange, and the opens to send only once every one of them has been answered.
+///
+/// For a pair of requests that must not race: an exit that a resting stop would block or flip, or a
+/// stop moved to a new trigger without two ever resting at once. Requests sent separately reach the
+/// venue in no guaranteed order. A group's opens are held back until each of its cancels has its
+/// answer, and are then sent, or dropped, as [`on_cancel_failure`](Self::on_cancel_failure) says.
+///
+/// # What is and is not guaranteed
+/// - **Order.** No open leaves before every cancel in its group has been answered. The cancels go
+///   out together, and so do the opens.
+/// - **Not atomic.** Between the cancels' answers and the opens' arrival, nothing in the group
+///   rests: a stop being moved leaves its position unprotected for one round trip to the venue.
+/// - **Only within the group.** Requests outside it, including other groups, are not ordered
+///   against it.
+/// - **One answer per leg.** Each cancel is answered as a cancel sent alone would be. Each open is
+///   answered as an open sent alone would be, or, when it is dropped, with an inactive order whose
+///   error is [`NotPlacedReason::CancelFailed`](crate::error::NotPlacedReason::CancelFailed).
+///
+/// # Valid groups
+/// At least one cancel, at least one open, and every leg on one exchange: see
+/// [`exchange`](Self::exchange).
+///
+/// `#[non_exhaustive]`, so a field can be added without breaking a caller. Outside this crate,
+/// build one with [`CancelThenOpen::new`] and [`with_on_cancel_failure`](Self::with_on_cancel_failure).
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub struct CancelThenOpen<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> {
+    /// The cancels to send first, together.
+    pub cancels: Vec<OrderRequestCancel<ExchangeKey, InstrumentKey>>,
+    /// The opens to send once every cancel has been answered.
+    pub opens: Vec<OrderRequestOpen<ExchangeKey, InstrumentKey>>,
+    /// What to do with the opens when a cancel fails.
+    ///
+    /// `#[serde(default)]`, so a group serialised without it loads with the safe default.
+    #[serde(default)]
+    pub on_cancel_failure: OnCancelFailure,
+}
+
+impl<ExchangeKey, InstrumentKey> CancelThenOpen<ExchangeKey, InstrumentKey> {
+    /// Send `cancels`, then `opens` once every cancel has been answered, dropping the opens if a
+    /// cancel fails ([`OnCancelFailure::DropOpens`]).
+    pub fn new(
+        cancels: Vec<OrderRequestCancel<ExchangeKey, InstrumentKey>>,
+        opens: Vec<OrderRequestOpen<ExchangeKey, InstrumentKey>>,
+    ) -> Self {
+        Self {
+            cancels,
+            opens,
+            on_cancel_failure: OnCancelFailure::default(),
+        }
+    }
+
+    /// Set what to do with the opens when a cancel fails.
+    #[must_use]
+    pub fn with_on_cancel_failure(self, on_cancel_failure: OnCancelFailure) -> Self {
+        Self {
+            on_cancel_failure,
+            ..self
+        }
+    }
+
+    /// The exchange every leg is on.
+    ///
+    /// # Errors
+    /// A [`CancelThenOpenError`] if the group has no cancel, has no open, or names more than one
+    /// exchange.
+    pub fn exchange(&self) -> Result<&ExchangeKey, CancelThenOpenError>
+    where
+        ExchangeKey: PartialEq,
+    {
+        let first = self.cancels.first().ok_or(CancelThenOpenError::NoCancels)?;
+        if self.opens.is_empty() {
+            return Err(CancelThenOpenError::NoOpens);
+        }
+        let exchange = &first.key.exchange;
+        let one_exchange = self
+            .cancels
+            .iter()
+            .map(|cancel| &cancel.key.exchange)
+            .chain(self.opens.iter().map(|open| &open.key.exchange))
+            .all(|leg| leg == exchange);
+        if one_exchange {
+            Ok(exchange)
+        } else {
+            Err(CancelThenOpenError::MixedExchanges)
+        }
+    }
+}
+
+/// What a [`CancelThenOpen`] group does with its opens when one of its cancels fails.
+///
+/// A cancel fails when its answer is any error: the order already filled, already cancelled or
+/// expired, not found, a rejection, or a timeout. The likeliest failure is that the order has
+/// already filled, which is exactly when sending an exit or a replacement is wrong, hence the
+/// default.
+#[derive(
+    Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Default, Deserialize, Serialize,
+)]
+pub enum OnCancelFailure {
+    /// Send none of the opens. Each is answered with an inactive order whose error is
+    /// [`NotPlacedReason::CancelFailed`](crate::error::NotPlacedReason::CancelFailed), naming the
+    /// cancel that failed.
+    #[default]
+    DropOpens,
+    /// Send the opens anyway, once every cancel has been answered.
+    SendOpens,
+}
+
+/// Why a [`CancelThenOpen`] group is not valid.
+#[non_exhaustive]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    Deserialize,
+    Serialize,
+    thiserror::Error,
+)]
+pub enum CancelThenOpenError {
+    /// The group has no cancel, so there is nothing for its opens to wait on.
+    #[error("a CancelThenOpen group needs at least one cancel")]
+    NoCancels,
+    /// The group has no open.
+    #[error("a CancelThenOpen group needs at least one open")]
+    NoOpens,
+    /// The legs name more than one exchange. A group is sequenced by one exchange's execution
+    /// link, which cannot order requests sent through another.
+    #[error("every leg of a CancelThenOpen group must be on one exchange")]
+    MixedExchanges,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::order::{
+        OrderKey,
+        id::{ClientOrderId, StrategyId},
+    };
     use rust_decimal_macros::dec;
 
     fn limit() -> RequestOpen {
@@ -605,5 +745,88 @@ mod tests {
                 .margin_effect,
             Some(MarginEffect::Repay)
         );
+    }
+
+    fn cancel_on(exchange: ExchangeId) -> OrderRequestCancel<ExchangeId, InstrumentNameExchange> {
+        OrderRequestCancel {
+            key: OrderKey {
+                exchange,
+                instrument: InstrumentNameExchange::new("btc_usdt"),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new("stop"),
+            },
+            state: RequestCancel { id: None },
+        }
+    }
+
+    fn open_on(exchange: ExchangeId) -> OrderRequestOpen<ExchangeId, InstrumentNameExchange> {
+        OrderRequestOpen {
+            key: OrderKey {
+                exchange,
+                instrument: InstrumentNameExchange::new("btc_usdt"),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new("exit"),
+            },
+            state: limit(),
+        }
+    }
+
+    /// A group is valid with at least one cancel and one open, all on one exchange, whichever leg
+    /// names another.
+    #[test]
+    fn cancel_then_open_exchange_validates_the_group() {
+        use ExchangeId::{BinanceSpot as A, Kraken as B};
+
+        let group = |cancels: Vec<ExchangeId>, opens: Vec<ExchangeId>| {
+            CancelThenOpen::new(
+                cancels.into_iter().map(cancel_on).collect(),
+                opens.into_iter().map(open_on).collect(),
+            )
+        };
+        assert_eq!(group(vec![A, A], vec![A, A]).exchange(), Ok(&A));
+        assert_eq!(
+            group(vec![], vec![A]).exchange(),
+            Err(CancelThenOpenError::NoCancels)
+        );
+        assert_eq!(
+            group(vec![A], vec![]).exchange(),
+            Err(CancelThenOpenError::NoOpens)
+        );
+        for (cancels, opens) in [
+            (vec![A, B], vec![A]),
+            (vec![A], vec![A, B]),
+            (vec![A], vec![B]),
+        ] {
+            assert_eq!(
+                group(cancels.clone(), opens.clone()).exchange(),
+                Err(CancelThenOpenError::MixedExchanges),
+                "{cancels:?} then {opens:?}"
+            );
+        }
+    }
+
+    /// A group drops its opens on a failed cancel unless told otherwise, including one
+    /// deserialised without the field.
+    #[test]
+    #[allow(clippy::unwrap_used)] // Test code: panics are the correct failure mode
+    fn cancel_then_open_drops_opens_by_default() {
+        let group = CancelThenOpen::new(
+            vec![cancel_on(ExchangeId::BinanceSpot)],
+            vec![open_on(ExchangeId::BinanceSpot)],
+        );
+        assert_eq!(group.on_cancel_failure, OnCancelFailure::DropOpens);
+        assert_eq!(
+            group
+                .clone()
+                .with_on_cancel_failure(OnCancelFailure::SendOpens)
+                .on_cancel_failure,
+            OnCancelFailure::SendOpens
+        );
+
+        let mut json = serde_json::to_value(&group).unwrap();
+        json.as_object_mut().unwrap().remove("on_cancel_failure");
+        let loaded: CancelThenOpen<ExchangeId, InstrumentNameExchange> =
+            serde_json::from_value(json).unwrap();
+        assert_eq!(loaded, group);
     }
 }
