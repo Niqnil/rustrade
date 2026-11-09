@@ -6,6 +6,7 @@ use crate::{
     balance::MarginDetails,
     client::mock::MockExecutionConfig,
     exchange::mock::account::{AccountState, AccountStateSnapshot, DuplicateSeededOrder},
+    short_option::Collateral,
     slippage::Slippage,
     stored::FormatVersion,
 };
@@ -16,7 +17,14 @@ use rust_decimal::Decimal;
 use rustrade_instrument::{
     asset::name::AssetNameExchange,
     exchange::ExchangeId,
-    instrument::{Instrument, kind::InstrumentKind, name::InstrumentNameExchange},
+    instrument::{
+        Instrument,
+        kind::{
+            InstrumentKind,
+            option::{OptionKind, OptionSettlement},
+        },
+        name::InstrumentNameExchange,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -205,9 +213,25 @@ pub enum VenueRestoreError {
     #[error("venue snapshot lists {0} twice")]
     DuplicateAsset(AssetNameExchange),
 
-    /// The snapshot holds a short position in an option, which the venue cannot hold.
-    #[error("venue snapshot holds {0} short, and SimulatedVenue holds options only long")]
-    OptionShort(InstrumentNameExchange),
+    /// The snapshot holds a short position in a cash-settled call, which nothing in a cash account
+    /// secures, so the venue never holds one.
+    #[error(
+        "venue snapshot holds the cash-settled call {0} short, which SimulatedVenue never holds"
+    )]
+    OptionShortUnsecurable(InstrumentNameExchange),
+
+    /// The snapshot's balances do not hold the collateral its short options secure: what an
+    /// asset's balance holds, net of what its open orders reserve, is less than that collateral.
+    /// A snapshot the venue wrote always holds it.
+    #[error(
+        "venue snapshot's short options secure {required} {asset}, but its balance holds only \
+         {held} beyond what its open orders reserve"
+    )]
+    OptionCollateralNotHeld {
+        asset: AssetNameExchange,
+        required: Decimal,
+        held: Decimal,
+    },
 }
 
 impl FormatVersion for SimulatedVenueSnapshot {
@@ -298,6 +322,49 @@ impl SimulatedVenue {
         }
     }
 
+    /// Checks that each asset's balance holds the collateral this venue's short options secure,
+    /// beyond what its open orders reserve. A balance holds `total − free`; the collateral itself
+    /// is derived from the positions, so it is not stored, and a snapshot whose balances do not
+    /// hold it would let an assignment spend balance the account never set aside.
+    ///
+    /// A lower bound: anything else a hand-edited snapshot holds out of `free` counts towards the
+    /// collateral too. A snapshot this venue wrote holds exactly its orders' reservations and
+    /// the collateral.
+    fn check_collateral_held(&self) -> Result<(), VenueRestoreError> {
+        let mut required: FnvHashMap<AssetNameExchange, Decimal> = FnvHashMap::default();
+        for Collateral { asset, amount } in self
+            .positions
+            .keys()
+            .filter_map(|name| self.collateral_held(name))
+        {
+            *required.entry(asset).or_default() += amount;
+        }
+        let mut reserved: FnvHashMap<AssetNameExchange, Decimal> = FnvHashMap::default();
+        for entry in self.account.orders().entries() {
+            if let Some(reservation) = entry.resting.reservation {
+                *reserved.entry(reservation.asset).or_default() += reservation.amount;
+            }
+        }
+        for (asset, required) in required.into_iter().sorted() {
+            let held = self
+                .account
+                .balances()
+                .find(|balance| balance.asset == asset)
+                .map_or(Decimal::ZERO, |balance| {
+                    balance.balance.total - balance.balance.free
+                })
+                - reserved.get(&asset).copied().unwrap_or_default();
+            if held < required {
+                return Err(VenueRestoreError::OptionCollateralNotHeld {
+                    asset,
+                    required,
+                    held,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// The venue `snapshot` was taken of, configured by `config` and trading `instruments`, which
     /// carries on exactly as that venue would have: see [`SimulatedVenueSnapshot`] for what it
     /// restores and what happens to the time in between.
@@ -321,7 +388,9 @@ impl SimulatedVenue {
     ///   open orders, or among its cancelled, filled or expired ones.
     /// - [`VenueRestoreError::DuplicateInstrument`] or [`VenueRestoreError::DuplicateAsset`] if it
     ///   lists one instrument or asset twice in a list that holds each once.
-    /// - [`VenueRestoreError::OptionShort`] if it holds a short option position.
+    /// - [`VenueRestoreError::OptionShortUnsecurable`] if it holds a short cash-settled call.
+    /// - [`VenueRestoreError::OptionCollateralNotHeld`] if its balances do not hold the collateral
+    ///   its short options secure.
     ///
     /// # Cost
     /// The slippage stream is resumed by drawing again every value the snapshot's venue drew, one
@@ -385,10 +454,14 @@ impl SimulatedVenue {
             return Err(VenueRestoreError::DuplicateAsset(repeat.clone()));
         }
         if let Some((short, _)) = snapshot.positions.iter().find(|(name, position)| {
-            matches!(instruments[name].kind, InstrumentKind::Option(_))
-                && position.quantity < Decimal::ZERO
+            matches!(
+                &instruments[name].kind,
+                InstrumentKind::Option(contract)
+                    if contract.kind == OptionKind::Call
+                        && contract.settlement == OptionSettlement::Cash
+            ) && position.quantity < Decimal::ZERO
         }) {
-            return Err(VenueRestoreError::OptionShort(short.clone()));
+            return Err(VenueRestoreError::OptionShortUnsecurable(short.clone()));
         }
         if snapshot.account.margin() != config.spot_margin.is_some() {
             return Err(VenueRestoreError::MarginMismatch {
@@ -450,6 +523,7 @@ impl SimulatedVenue {
                  sets no borrow price window"
             );
         }
+        venue.check_collateral_held()?;
         venue.slippage = Slippage::resumed(config.slippage, slippage_draws);
         venue.checkpoint_sequence = checkpoint_sequence;
         venue.refresh_next_charge();

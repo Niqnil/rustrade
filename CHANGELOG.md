@@ -89,33 +89,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A lapsing long needs no underlying price. When any position that needs the price is open and
     the price is missing, nothing is settled and the expiry stays retryable, as before.
 
-- **The simulated venue holds long options, and settles them at expiry itself** (`rustrade-execution`,
-  #872). `SimulatedVenue` used to refuse every option order. Now:
+- **The simulated venue holds options, long or fully secured short, and settles them at expiry
+  itself** (`rustrade-execution`, #872). `SimulatedVenue` used to refuse every option order. Now:
   - **Premium is paid in cash.** A buy pays `price × quantity × contract_size` and the fee in the
-    quote asset, and a sale receives it. The venue keeps a net position per option and reports it
-    in its account snapshot.
-  - **Longs only, for now.** A buy needs its premium and fee in free cash. A sale may close only what
-    is held, less the sales already resting. Orders at or after expiry are refused. A price that is
-    not positive is no price, so a zero candle never fills an option. A request-priced venue
-    (`SimulatedVenue::new`, and so `MockExchange::new`) has no market feed to exercise against, so
-    it refuses an option buy unless `long_option_expiry` is `Lapse`.
+    quote asset, and a sale receives it, less the fee, whether it opens or closes a position. The
+    venue keeps a net position per option and reports it in its account snapshot.
+  - **Orders.** A buy needs its premium and fee in free cash. Orders at or after expiry are
+    refused. A price that is not positive is no price, so a zero candle never fills an option. A
+    request-priced venue (`SimulatedVenue::new`, and so `MockExchange::new`) has no market feed to
+    price the underlying, so it refuses a buy opening a long unless `long_option_expiry` is
+    `Lapse`, and every sale opening a short.
+  - **Shorts are fully secured, as a cash account writes them.** A sale that opens or increases a
+    short holds collateral while the short is open, out of `free` and still in `total`: a put the
+    cash to buy the underlying at the strike, `strike × quantity × contract_size` of quote; a call
+    the shares it would deliver, `quantity × contract_size` of base. Covering shares cannot be
+    sold or used by another order, and collateral is never borrowed. A limit sale holds it while
+    it rests, measured, like every order, as if the orders already resting on its side filled
+    first; a buy-back releases its share as it fills. `SimulatedVenue::collateral_held` reports
+    it as a `Collateral`. A short whose collateral is not free is refused (`ApiError::BalanceInsufficient`), and a
+    short cash-settled call always is.
+  - **`MockExecutionConfig::short_put_collateral`** (`ShortPutCollateral`) decides whether a put's
+    premium counts towards its collateral: `Strike`, the default, holds the full strike before the
+    premium arrives, as Interactive Brokers does in a cash account; `StrikeLessPremium` lets the
+    premium count, as Alpaca does.
+  - **Not modelled:** naked shorts, margin against the underlying's price, credit for a long
+    option covering a short (spreads), and early assignment.
   - **Expiry is settled by the venue.** When the clock passes a contract's expiry, the venue retires
     the orders still working on it and settles the position against its own last price for the
     underlying, at zero fee: out of the money at zero (`TradeOrigin::Expiry`); in the money,
     exercised, by delivering the underlying at the strike or paying the intrinsic value, as the
-    contract's `settlement` says (`TradeOrigin::Exercise`). A delivery the account cannot cover is
-    still made, with a WARN. On a venue that lends, that shortfall is not yet borrowed: the
-    balance goes negative with no loan, so it accrues no interest and is not counted as debt.
-    Without an underlying price, settlement waits for one; an option whose underlying no single
-    spot instrument on the venue trades settles only by lapsing.
-    `MockExecutionConfig::long_option_expiry` makes every long lapse instead.
-  - A snapshot holding an option short is refused on restore (`VenueRestoreError::OptionShort`).
+    contract's `settlement` says (`TradeOrigin::Exercise`). A short in the money is always
+    assigned (`TradeOrigin::Assignment`), whole, and pays out of the collateral it held: a put buys
+    the shares with its cash, a call delivers its shares for the strike, a cash-settled put pays its
+    intrinsic value and releases the rest. Out of the money, a short's collateral is released.
+    A long's delivery the account cannot cover is still made: on a cash account with a WARN, the
+    balance going negative; on a venue that lends, the shortfall is lent as a margin loan, past the
+    borrow cap if need be (with a WARN), owed, counted as debt, and charged interest.
+    `AccountState::lend` takes such a loan. Without an underlying price, settlement waits for one;
+    an option whose underlying no single spot instrument on the venue trades settles only by a long
+    lapsing. `MockExecutionConfig::long_option_expiry` makes every long lapse instead; it does not
+    apply to shorts.
+  - **Restore** refuses a snapshot holding a short cash-settled call
+    (`VenueRestoreError::OptionShortUnsecurable`), or whose balances do not hold its shorts'
+    collateral (`VenueRestoreError::OptionCollateralNotHeld`). The snapshot format is unchanged:
+    collateral is derived from the positions.
   - **Leave expiry to the venue:** configure the engine with `ExpiryHandling::Venue` for that
     exchange, or the position is closed twice.
   - The `rustrade` execution builder now accepts option instruments for a mock exchange.
-  - A `SimStart` may hold a long option position, seeded into the venue and the engine at its
-    entry price with its premium already paid. A short one is refused with
-    `SimStartError::OptionShort`.
+  - A `SimStart` may hold an option position, seeded into the venue and the engine at its entry
+    price with its premium already paid or received. A short holds its collateral out of the listed
+    balances, which a spot position may supply for a covered call; one they do not cover is refused
+    (`SimStartError::OptionShortUncovered`), as is a short cash-settled call
+    (`SimStartError::OptionShortUnsecurable`). A venue's `initial_state` seeding a short holds its
+    collateral the same way, and panics if the seeded balances do not cover it.
 - **A simulated venue learns when its market feed goes down** (`rustrade-execution`, `rustrade`,
   #876). Under `StaleMarketPolicy::Wait`, a venue could tell a dead feed from a quiet market only
   by its age, so a `max_age` short enough to catch an outage also refused orders on a quiet book.
@@ -146,9 +172,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Breaking: `OptionContract` has a `settlement` field** (`rustrade-instrument`, #872). Struct
   literals must set it; `OptionSettlement::Physical` is what every contract was taken to be before.
-- **Breaking: `MockExecutionConfig` has a `long_option_expiry` field** (`rustrade-execution`, #872).
-  Struct literals and `MockExecutionConfig::new` must set it; `LongOptionExpiry::default()` keeps
-  exercising in-the-money options. A serialised config without it loads with the default.
+- **Breaking: `MockExecutionConfig` has `long_option_expiry` and `short_put_collateral` fields**
+  (`rustrade-execution`, #872). Struct literals and `MockExecutionConfig::new` must set them;
+  `LongOptionExpiry::default()` keeps exercising in-the-money options, and
+  `ShortPutCollateral::default()` holds a short put's full strike. A serialised config without
+  them loads with the defaults.
 - **`LongOptionExpiry` moved to `rustrade_execution::expiry`** (#872), so the simulated venue settles
   by the same choice as the engine. `rustrade::engine::state::instrument::LongOptionExpiry` still
   names it.
