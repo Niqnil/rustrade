@@ -3,11 +3,12 @@
 //!
 //! An amend changes a working order's price, total quantity or trigger price, and nothing else.
 //! A change of side, kind or time in force is a different order: send a
-//! [`CancelThenOpen`](super::request::CancelThenOpen) instead.
+//! [`CancelThenOpen`](crate::order::request::CancelThenOpen) instead.
 //!
-//! A client declares what it can amend in [`AmendSupport`]. An amend it cannot carry is refused
-//! with [`OrderError::AmendRefused`](crate::error::OrderError::AmendRefused), never served some
-//! other way, such as by cancelling and placing a new order.
+//! A client declares what it can amend in [`AmendSupport`](crate::order::amend::AmendSupport).
+//! An amend it cannot carry is refused with
+//! [`OrderError::AmendRefused`](crate::error::OrderError::AmendRefused), never served some other
+//! way, such as by cancelling and placing a new order.
 
 use crate::{
     error::{AmendField, AmendRefusal},

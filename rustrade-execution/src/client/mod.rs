@@ -223,9 +223,10 @@ impl<'a> ClientInstrument<'a> {
 ///     error::UnindexedClientError,
 ///     order::{
 ///         Order, UnindexedInactiveOrder, UnindexedOrderKey,
+///         amend::AmendSupport,
 ///         request::{
-///             CancelReplaceAnswer, OnCancelFailure, OrderRequestCancel, OrderRequestOpen,
-///             UnindexedOrderResponseCancel,
+///             CancelReplaceAnswer, OnCancelFailure, OrderRequestAmend, OrderRequestCancel,
+///             OrderRequestOpen, UnindexedOrderResponseAmend, UnindexedOrderResponseCancel,
 ///         },
 ///         state::{Open, UnindexedOrderState},
 ///     },
@@ -372,6 +373,20 @@ impl<'a> ClientInstrument<'a> {
 ///         on_cancel_failure: OnCancelFailure,
 ///     ) -> Option<impl Future<Output = CancelReplaceAnswer> + Send> {
 ///         self.inner.cancel_replace(cancel, open, on_cancel_failure)
+///     }
+///
+///     // Forwarded together, so the wrapper amends what the inner client amends. Left out, every
+///     // amend is refused; forwarding only `amend_support` would declare amends that the default
+///     // `amend_order` then refuses.
+///     fn amend_support(&self) -> AmendSupport {
+///         self.inner.amend_support()
+///     }
+///
+///     fn amend_order(
+///         &self,
+///         request: OrderRequestAmend<ExchangeId, &InstrumentNameExchange>,
+///     ) -> impl Future<Output = UnindexedOrderResponseAmend> + Send {
+///         self.inner.amend_order(request)
 ///     }
 ///
 ///     async fn fetch_balances(
