@@ -1,7 +1,7 @@
 use rustrade_execution::{
     client::{OrderStatusClient, VenueOrderStatus},
     error::{ConnectivityError, UnindexedClientError},
-    order::{Order, UnindexedInactiveOrder, UnindexedOrderKey, state::Open},
+    order::{Order, UnindexedInactiveOrder, UnindexedOrderKey, amend::AmendTarget, state::Open},
 };
 use rustrade_instrument::{exchange::ExchangeId, instrument::name::InstrumentNameExchange};
 use serde::{Deserialize, Serialize};
@@ -172,6 +172,123 @@ pub(crate) async fn look_up_unknown_outcome<Client>(
 where
     Client: OrderStatusClient + Sync,
 {
+    let found = look_up(
+        client,
+        key,
+        sent,
+        policy,
+        lookup_timeout,
+        "open",
+        |status| match status {
+            VenueOrderStatus::Live(order) => Step::Found(LookupOutcome::Live(order)),
+            VenueOrderStatus::Ended(order) => Step::Found(LookupOutcome::Ended(order)),
+            VenueOrderStatus::Unknown => Step::Unknown,
+        },
+    )
+    .await;
+    match found {
+        Lookup::Found(outcome) => outcome,
+        Lookup::Concluded => LookupOutcome::NeverPlaced,
+        Lookup::Exhausted => LookupOutcome::Exhausted,
+    }
+}
+
+/// What the lookups of an order whose amend's outcome is unknown found.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) enum AmendLookupOutcome {
+    /// The order is live at the venue, no longer as it was before the amend: the venue's state
+    /// and terms, to adopt.
+    Live(Box<Order<ExchangeId, InstrumentNameExchange, Open>>),
+    /// The order has ended, as this says.
+    Ended(Box<UnindexedInactiveOrder>),
+    /// The venue listed the order as it was before the amend as many times in a row as the policy
+    /// asks.
+    NotApplied,
+    /// The lookups ran out without a conclusion.
+    Exhausted,
+}
+
+/// Look up at the venue the order under `key` whose amend, handed to the client at `sent`, has an
+/// unknown outcome, as [`look_up_unknown_outcome`] does an open.
+///
+/// The order listed with `before`'s price, quantity and kind counts as `Unknown` does for an
+/// open: the venue may not have applied the amend yet, so only `unknowns_to_conclude` such
+/// listings in a row after the grace period conclude it was not. Listed any other way, the order
+/// is found, and its terms are the venue's. A venue that does not know the order at all is
+/// asked again, and never concludes anything.
+pub(crate) async fn look_up_unknown_amend<Client>(
+    client: &Client,
+    key: &UnindexedOrderKey,
+    before: &AmendTarget,
+    sent: Instant,
+    policy: UnknownOutcomeLookup,
+    lookup_timeout: Duration,
+) -> AmendLookupOutcome
+where
+    Client: OrderStatusClient + Sync,
+{
+    let found = look_up(
+        client,
+        key,
+        sent,
+        policy,
+        lookup_timeout,
+        "amend",
+        |status| match status {
+            VenueOrderStatus::Live(order)
+                if order.price == before.price
+                    && order.quantity == before.quantity
+                    && order.kind == before.kind =>
+            {
+                Step::Unknown
+            }
+            VenueOrderStatus::Live(order) => Step::Found(AmendLookupOutcome::Live(order)),
+            VenueOrderStatus::Ended(order) => Step::Found(AmendLookupOutcome::Ended(order)),
+            VenueOrderStatus::Unknown => Step::Retry,
+        },
+    )
+    .await;
+    match found {
+        Lookup::Found(outcome) => outcome,
+        Lookup::Concluded => AmendLookupOutcome::NotApplied,
+        Lookup::Exhausted => AmendLookupOutcome::Exhausted,
+    }
+}
+
+/// What one lookup's answer means to [`look_up`].
+enum Step<T> {
+    /// Settled.
+    Found(T),
+    /// Counts towards the conclusion, once past the grace period.
+    Unknown,
+    /// Says nothing: neither counts nor breaks the run of `Unknown`s.
+    Retry,
+}
+
+/// What [`look_up`] found.
+enum Lookup<T> {
+    Found(T),
+    /// As many `Unknown` steps in a row after the grace period as the policy asks.
+    Concluded,
+    /// The lookups ran out.
+    Exhausted,
+}
+
+/// Look the order under `key` up at the venue as `policy` says, reading each answer with `step`,
+/// until one is found, or as many `Unknown` steps in a row after the grace period as the policy
+/// asks conclude it, or the lookups run out. A failed lookup breaks the run of `Unknown`s.
+async fn look_up<Client, T>(
+    client: &Client,
+    key: &UnindexedOrderKey,
+    sent: Instant,
+    policy: UnknownOutcomeLookup,
+    lookup_timeout: Duration,
+    request: &'static str,
+    step: impl Fn(VenueOrderStatus) -> Step<T>,
+) -> Lookup<T>
+where
+    Client: OrderStatusClient + Sync,
+{
     let unknowns_to_conclude = policy.unknowns_to_conclude.max(1);
     let mut unknowns = 0;
     for attempt in 0..policy.attempts {
@@ -181,35 +298,36 @@ where
             .unwrap_or(Err(UnindexedClientError::Connectivity(
                 ConnectivityError::Timeout,
             )));
-        match status {
-            Ok(VenueOrderStatus::Unknown) if sent.elapsed() >= policy.grace => {
+        match status.map(&step) {
+            Ok(Step::Found(found)) => return Lookup::Found(found),
+            Ok(Step::Unknown) if sent.elapsed() >= policy.grace => {
                 unknowns += 1;
                 debug!(
                     instrument = %key.instrument,
                     cid = %key.cid,
+                    request,
                     unknowns,
-                    "ExecutionManager looked up an order whose open outcome is unknown: the venue does not know it"
+                    "ExecutionManager looked up an order whose request's outcome is unknown: the venue does not show it"
                 );
                 if unknowns >= unknowns_to_conclude {
-                    return LookupOutcome::NeverPlaced;
+                    return Lookup::Concluded;
                 }
             }
-            // Too soon after the send to count: the venue may not list an order it just accepted.
-            Ok(VenueOrderStatus::Unknown) => {}
-            Ok(VenueOrderStatus::Live(order)) => return LookupOutcome::Live(order),
-            Ok(VenueOrderStatus::Ended(order)) => return LookupOutcome::Ended(order),
+            // Too soon after the send to count: the venue may not show what it just accepted.
+            Ok(Step::Unknown | Step::Retry) => {}
             Err(error) => {
                 warn!(
                     instrument = %key.instrument,
                     cid = %key.cid,
+                    request,
                     ?error,
-                    "ExecutionManager could not look up an order whose open outcome is unknown"
+                    "ExecutionManager could not look up an order whose request's outcome is unknown"
                 );
                 unknowns = 0;
             }
         }
     }
-    LookupOutcome::Exhausted
+    Lookup::Exhausted
 }
 
 #[cfg(test)]

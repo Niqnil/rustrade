@@ -2,13 +2,14 @@ use crate::{
     engine::{
         Engine,
         action::send_requests::{
-            SendCancelThenOpensOutput, SendCancelsAndOpensOutput, SendRequestsOutput,
+            SendAmendsOutput, SendCancelThenOpensOutput, SendCancelsAndOpensOutput,
+            SendRequestsOutput,
         },
         clock::EngineClock,
-        error::UnrecoverableEngineError,
+        error::{EngineError, RecoverableEngineError, UnrecoverableEngineError},
         execution_tx::ExecutionTxMap,
         state::{
-            MarketSnapshotSource, TracksInstrument, TracksOrder,
+            MarketSnapshotSource, PreparesAmend, TracksInstrument, TracksOrder,
             order::in_flight_recorder::InFlightRequestRecorder,
         },
     },
@@ -16,7 +17,8 @@ use crate::{
     strategy::algo::AlgoStrategy,
 };
 use rustrade_execution::order::request::{
-    CancelThenOpen, OrderRequestCancel, OrderRequestOpen, RequestCancel, RequestOpen,
+    CancelThenOpen, OrderAmend, OrderRequestAmend, OrderRequestCancel, OrderRequestOpen,
+    RequestCancel, RequestOpen,
 };
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
 use rustrade_integration::collection::{none_one_or_many::NoneOneOrMany, one_or_many::OneOrMany};
@@ -36,6 +38,7 @@ pub trait GenerateAlgoOrders<ExchangeKey = ExchangeIndex, InstrumentKey = Instru
     /// - Generated cancel requests that were refused by the [`RiskManager`].
     /// - Generated open requests that were refused by the [`RiskManager`].
     /// - Generated [`CancelThenOpen`] groups, sent or refused.
+    /// - Generated amends, sent or refused.
     fn generate_algo_orders(&mut self) -> GenerateAlgoOrdersOutput<ExchangeKey, InstrumentKey>;
 }
 
@@ -47,7 +50,8 @@ where
     State: InFlightRequestRecorder<ExchangeKey, InstrumentKey>
         + MarketSnapshotSource<InstrumentKey>
         + TracksInstrument<InstrumentKey>
-        + TracksOrder<InstrumentKey>,
+        + TracksOrder<InstrumentKey>
+        + PreparesAmend<ExchangeKey, InstrumentKey>,
     ExecutionTxs: ExecutionTxMap<ExchangeKey, InstrumentKey>,
     Strategy: AlgoStrategy<ExchangeKey, InstrumentKey, State = State>,
     Risk: RiskManager<ExchangeKey, InstrumentKey, State = State>,
@@ -58,11 +62,37 @@ where
         // Generate orders
         let (cancels, opens) = self.strategy.generate_algo_orders(&self.state);
         let groups = self.strategy.generate_cancel_then_opens(&self.state);
+        let amends: Vec<_> = self
+            .strategy
+            .generate_amends(&self.state)
+            .into_iter()
+            .collect();
+
+        // Build each amend from the order it changes, for the risk manager to review: an amend
+        // the state refuses is reported without reaching it.
+        let mut amends_invalid = Vec::new();
+        let amends: Vec<_> = amends
+            .into_iter()
+            .filter_map(|amend| match self.state.prepare_amend(&amend) {
+                Ok(request) => Some(OrderRequestAmend {
+                    key: amend.key,
+                    state: request,
+                }),
+                Err(refusal) => {
+                    amends_invalid.push(Box::new((
+                        amend,
+                        EngineError::Recoverable(RecoverableEngineError::AmendRefused(refusal)),
+                    )));
+                    None
+                }
+            })
+            .collect();
 
         // RiskApprove & RiskRefuse order requests
         let (cancels, opens, refused_cancels, refused_opens) =
             self.risk.check(&self.state, cancels, opens);
         let (groups, refused_groups) = self.risk.check_cancel_then_opens(&self.state, groups);
+        let (amends, refused_amends) = self.risk.check_amends(&self.state, amends);
 
         // Collect every Iterator, since the strategy and risk manager may have borrowed the state
         // to build them, and sending records in-flight requests on it. An empty Vec does not
@@ -79,6 +109,14 @@ where
             .map(|RiskApproved(group)| group)
             .collect();
         let groups_refused: NoneOneOrMany<_> = refused_groups.into_iter().collect();
+        let amends: Vec<_> = amends
+            .into_iter()
+            .map(|RiskApproved(amend)| OrderAmend {
+                key: amend.key,
+                state: amend.state.patch,
+            })
+            .collect();
+        let amends_refused: NoneOneOrMany<_> = refused_amends.into_iter().collect();
 
         // Send risk approved order requests.
         //
@@ -90,9 +128,15 @@ where
         let cancels = self.send_cancel_requests(cancels);
         let opens = self.send_open_requests(opens);
         let groups = self.send_cancel_then_open_requests(groups);
+        // Amends go after everything else, so an amend of an order a cancel above has just
+        // claimed is refused, its order no longer `Open`. Each is built again from the order as
+        // it now stands.
+        let mut amends = self.send_amend_requests(amends);
+        amends.errors = NoneOneOrMany::from_iter(amends_invalid).extend(amends.errors);
 
         GenerateAlgoOrdersOutput::new(cancels, opens, cancels_refused, opens_refused)
             .with_cancel_then_opens(CancelThenOpensOutput::new(groups, groups_refused))
+            .with_amends(AmendsOutput::new(amends, amends_refused))
     }
 }
 
@@ -129,6 +173,35 @@ pub struct GenerateAlgoOrdersOutput<ExchangeKey = ExchangeIndex, InstrumentKey =
     /// Boxed whole, and `None` rather than an empty output, so the common output without a group
     /// stays small and allocation-free: see the type's `# Size` note.
     pub cancel_then_opens: Option<Box<CancelThenOpensOutput<ExchangeKey, InstrumentKey>>>,
+    /// Generated amends, sent or refused; `None` when there were none.
+    ///
+    /// Boxed whole, and `None` rather than an empty output, as
+    /// [`cancel_then_opens`](Self::cancel_then_opens).
+    pub amends: Option<Box<AmendsOutput<ExchangeKey, InstrumentKey>>>,
+}
+
+/// The amends of one [`GenerateAlgoOrdersOutput`].
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+pub struct AmendsOutput<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> {
+    /// Amends sent, and amends the [`Engine`] refused or could not send.
+    pub sent: SendAmendsOutput<ExchangeKey, InstrumentKey>,
+    /// Amends refused by the [`RiskManager`].
+    pub refused: NoneOneOrMany<RiskRefused<OrderRequestAmend<ExchangeKey, InstrumentKey>>>,
+}
+
+impl<ExchangeKey, InstrumentKey> AmendsOutput<ExchangeKey, InstrumentKey> {
+    /// Construct a new [`AmendsOutput`].
+    pub fn new(
+        sent: SendAmendsOutput<ExchangeKey, InstrumentKey>,
+        refused: NoneOneOrMany<RiskRefused<OrderRequestAmend<ExchangeKey, InstrumentKey>>>,
+    ) -> Self {
+        Self { sent, refused }
+    }
+
+    /// Returns `true` if no amend was sent or refused.
+    pub fn is_empty(&self) -> bool {
+        self.sent.is_empty() && self.refused.is_none()
+    }
 }
 
 /// The [`CancelThenOpen`] groups of one [`GenerateAlgoOrdersOutput`].
@@ -172,6 +245,16 @@ impl<ExchangeKey, InstrumentKey> GenerateAlgoOrdersOutput<ExchangeKey, Instrumen
             cancels_refused,
             opens_refused,
             cancel_then_opens: None,
+            amends: None,
+        }
+    }
+
+    /// Set the amends, leaving [`amends`](Self::amends) `None` when `amends` is empty.
+    #[must_use]
+    pub fn with_amends(self, amends: AmendsOutput<ExchangeKey, InstrumentKey>) -> Self {
+        Self {
+            amends: (!amends.is_empty()).then(|| Box::new(amends)),
+            ..self
         }
     }
 
@@ -197,6 +280,7 @@ impl<ExchangeKey, InstrumentKey> GenerateAlgoOrdersOutput<ExchangeKey, Instrumen
                 .cancel_then_opens
                 .as_ref()
                 .is_none_or(|groups| groups.is_empty())
+            && self.amends.as_ref().is_none_or(|amends| amends.is_empty())
     }
 
     /// Returns any unrecoverable errors that occurred during order request generation & sending.
@@ -206,9 +290,15 @@ impl<ExchangeKey, InstrumentKey> GenerateAlgoOrdersOutput<ExchangeKey, Instrumen
             .as_ref()
             .map(|groups| groups.sent.unrecoverable_errors())
             .unwrap_or_default();
+        let amends = self
+            .amends
+            .as_ref()
+            .map(|amends| amends.sent.unrecoverable_errors())
+            .unwrap_or_default();
         self.cancels_and_opens
             .unrecoverable_errors()
             .extend(groups)
+            .extend(amends)
             .into_option()
     }
 }
@@ -220,6 +310,7 @@ impl<ExchangeKey, InstrumentKey> Default for GenerateAlgoOrdersOutput<ExchangeKe
             cancels_refused: NoneOneOrMany::None,
             opens_refused: NoneOneOrMany::None,
             cancel_then_opens: None,
+            amends: None,
         }
     }
 }

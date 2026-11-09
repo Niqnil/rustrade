@@ -446,6 +446,10 @@ impl<Clock, GlobalData, InstrumentData, ExecutionTxs, Strategy, Risk>
                 // Opens stamped like those of `SendOpenRequests`, for the same reason.
                 ActionOutput::CancelThenOpens(self.send_cancel_then_open_requests(groups.clone()))
             }
+            Command::SendAmendRequests(amends) => {
+                info!(?amends, "Engine actioning user Command::SendAmendRequests");
+                ActionOutput::Amends(self.send_amend_requests(amends.clone()))
+            }
             Command::ClosePositions(filter) => {
                 info!(?filter, "Engine actioning user Command::ClosePositions");
                 ActionOutput::ClosePositions(self.close_positions(filter))

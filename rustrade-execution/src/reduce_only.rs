@@ -310,6 +310,12 @@ impl ReduceOnlyBook {
             .map(booked)
     }
 
+    /// What the live order under `cid` was sent as, or `None` when the book holds no live order
+    /// under it.
+    pub fn sent_as(&self, cid: &ClientOrderId) -> Option<ReduceOnly> {
+        self.live.get(cid).map(|order| order.reduce_only)
+    }
+
     /// Whether `trade` is a fill of an order sent reduce-only, either way: [`lookup`](Self::lookup)
     /// with an order the book does not hold counted as not.
     pub fn is_reduce_only<AssetKey, InstrumentKey>(

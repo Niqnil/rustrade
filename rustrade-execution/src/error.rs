@@ -668,6 +668,11 @@ pub enum AmendRefusal {
     #[error("the order has a request in flight")]
     RequestInFlight,
 
+    /// The amend's answer was lost, and the venue went on listing the order as it was before the
+    /// amend: the engine's `ExecutionManager` concluded it was not made.
+    #[error("the venue still lists the order as it was")]
+    NotApplied,
+
     /// The venue refused the amend for the order's kind, time in force or instrument, for a
     /// reason the client cannot declare in advance. The message is the venue's or the client's.
     #[error("{0}")]

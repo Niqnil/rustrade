@@ -17,14 +17,15 @@ use futures::{Stream, stream::FusedStream};
 use rustrade_data::streams::consumer::MarketStreamEvent;
 use rustrade_execution::{
     AccountEvent, AccountEventKind, UnindexedAccountEvent,
+    error::OrderError,
     exchange::mock::{SimulatedVenue, VenueOutcome},
     indexer::AccountEventIndexer,
     market::MarketObservation,
     order::{
         Order, OrderEvent,
         request::{
-            CancelThenOpen, OnCancelFailure, OrderRequestCancel, OrderRequestOpen,
-            UnindexedOrderResponseCancel,
+            CancelThenOpen, OnCancelFailure, OrderRequestAmend, OrderRequestCancel,
+            OrderRequestOpen, UnindexedOrderResponseAmend, UnindexedOrderResponseCancel,
         },
         state::UnindexedOrderState,
     },
@@ -108,6 +109,8 @@ enum Deliverable {
     OpenResponse(Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>),
     /// The response to an [`ExecutionRequest::Cancel`].
     CancelResponse(UnindexedOrderResponseCancel),
+    /// The response to an [`ExecutionRequest::Amend`].
+    AmendResponse(UnindexedOrderResponseAmend),
 }
 
 /// Something a venue has yet to do: a request the `Engine` has issued, or a deadline of its own.
@@ -119,6 +122,7 @@ enum Deliverable {
 enum Action {
     Open(OrderRequestOpen<ExchangeId, InstrumentNameExchange>),
     Cancel(OrderRequestCancel<ExchangeId, InstrumentNameExchange>),
+    Amend(OrderRequestAmend<ExchangeId, InstrumentNameExchange>),
     /// Cancel, then open once the cancels' answers have reached the `Engine` side: see
     /// [`ExecutionRequest::CancelThenOpen`] and [`SimRunner`]'s `# A cancel-then-open group`.
     CancelThenOpen {
@@ -1323,6 +1327,9 @@ fn drain_requests(
                 ExecutionRequest::Cancel(request) => {
                     Action::Cancel(index_request(&slot.indexer, &request, "cancel")?)
                 }
+                ExecutionRequest::Amend(request) => {
+                    Action::Amend(index_request(&slot.indexer, &request, "amend")?)
+                }
                 ExecutionRequest::CancelThenOpen(group) => {
                     let CancelThenOpen {
                         cancels,
@@ -1456,6 +1463,28 @@ fn act(
             slot.venue.cancel_order(request),
             Deliverable::CancelResponse,
         ),
+        // Checked against what the venue declares first, as the `ExecutionManager` checks a
+        // live client's.
+        Action::Amend(request) => {
+            let outcome = match slot.venue.amend_support().permits(&request.state) {
+                Ok(()) => slot.venue.amend_order(request),
+                Err(refusal) => VenueOutcome {
+                    events: Vec::new(),
+                    response: UnindexedOrderResponseAmend {
+                        key: request.key,
+                        state: Err(OrderError::AmendRefused(refusal)),
+                    },
+                },
+            };
+            schedule(
+                pending,
+                seq,
+                exchange,
+                delivers,
+                outcome,
+                Deliverable::AmendResponse,
+            );
+        }
         Action::CancelThenOpen {
             cancels,
             opens,
@@ -1728,6 +1757,21 @@ fn step<MarketKind>(
             EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
                 exchange: response.key.exchange,
                 kind: AccountEventKind::OrderCancelled(response),
+            }))
+        }
+        Deliverable::AmendResponse(response) => {
+            let response = slot
+                .indexer
+                .order_response_amend(response)
+                .map_err(|error| {
+                    SimFault(format!(
+                        "venue returned an unindexable amend response: {error}"
+                    ))
+                })?;
+
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                exchange: response.key.exchange,
+                kind: AccountEventKind::OrderAmended(response),
             }))
         }
     }))

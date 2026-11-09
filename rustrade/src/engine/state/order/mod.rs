@@ -380,6 +380,9 @@ where
         self.0.values()
     }
 
+    // One match over the tracked and the incoming state, an arm per pair. The lint counts each
+    // arm's log macro expansion, and splitting the match would scatter the transition table.
+    #[allow(clippy::cognitive_complexity)]
     fn update_from_order_snapshot<AssetKey>(
         &mut self,
         snapshot: Snapshot<&Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>>,
@@ -2884,6 +2887,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
     mod amend {
         use super::*;
         use rustrade_execution::{

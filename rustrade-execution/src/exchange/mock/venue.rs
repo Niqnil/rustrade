@@ -6,7 +6,10 @@ use crate::{
     borrow_capacity::BorrowCapacity,
     cash_flow::{CashFlow, CashFlowId, CashFlowKind, CashFlowLoan, InterestTiming},
     client::mock::MockExecutionConfig,
-    error::{ApiError, BorrowReject, BorrowRejectReason, UnindexedApiError, UnindexedOrderError},
+    error::{
+        AmendField, AmendRefusal, ApiError, BorrowReject, BorrowRejectReason, OrderError,
+        UnindexedApiError, UnindexedOrderError,
+    },
     exchange::mock::{
         account::{AccountState, BalanceInsufficient, Committed, Credit, Debit, Delivery, Lending},
         orders::{AlreadyResting, OpenOrder, Reservation, RestingOrder},
@@ -20,8 +23,12 @@ use crate::{
     market::{MarketBar, MarketDepth, MarketObservation, MarketSnapshot},
     order::{
         Order, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrder, UnindexedOrderKey,
+        amend::AmendSupport,
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
-        request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
+        request::{
+            OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseAmend,
+            UnindexedOrderResponseCancel,
+        },
         state::{Cancelled, Expired, Filled, Open, OrderState, UnindexedOrderState},
     },
     position::{Position, PositionReport},
@@ -83,6 +90,9 @@ pub type OpenOutcome = VenueOutcome<Order<ExchangeId, InstrumentNameExchange, Un
 
 /// Response type of [`SimulatedVenue::cancel_order`].
 pub type CancelOutcome = VenueOutcome<UnindexedOrderResponseCancel>;
+
+/// Response type of [`SimulatedVenue::amend_order`].
+pub type AmendOutcome = VenueOutcome<UnindexedOrderResponseAmend>;
 
 /// A venue's view of one instrument: what it is worth, how much of it is left to take, and when
 /// that view was last replaced.
@@ -4000,6 +4010,38 @@ impl SimulatedVenue {
         self.report_debt_changes(&mut events);
 
         VenueOutcome { events, response }
+    }
+
+    /// What this venue can amend in place: see [`AmendSupport`].
+    ///
+    /// Nothing yet: every amend is refused.
+    pub fn amend_support(&self) -> AmendSupport {
+        AmendSupport::NONE
+    }
+
+    /// Amends a resting order in place.
+    ///
+    /// Refuses every amend, changing nothing, with [`AmendRefusal::Unsupported`] for the first
+    /// field it changes: see [`amend_support`](Self::amend_support).
+    pub fn amend_order(
+        &mut self,
+        request: OrderRequestAmend<ExchangeId, InstrumentNameExchange>,
+    ) -> AmendOutcome {
+        let field = request
+            .state
+            .patch
+            .fields()
+            .next()
+            .unwrap_or(AmendField::Price);
+        VenueOutcome {
+            events: Vec::new(),
+            response: UnindexedOrderResponseAmend {
+                key: request.key,
+                state: Err(OrderError::AmendRefused(AmendRefusal::Unsupported {
+                    field,
+                })),
+            },
+        }
     }
 
     /// Takes a resting order off the book, releasing whatever is held against it.

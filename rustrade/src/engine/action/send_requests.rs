@@ -5,7 +5,7 @@ use crate::{
         error::{EngineError, RecoverableEngineError, UnrecoverableEngineError},
         execution_tx::ExecutionTxMap,
         state::{
-            MarketSnapshotSource, TracksInstrument, TracksOrder,
+            MarketSnapshotSource, PreparesAmend, TracksInstrument, TracksOrder,
             order::in_flight_recorder::InFlightRequestRecorder,
         },
     },
@@ -13,10 +13,16 @@ use crate::{
 };
 use derive_more::Constructor;
 use itertools::Itertools;
-use rustrade_execution::order::{
-    OrderEvent,
-    id::ClientOrderId,
-    request::{CancelThenOpen, OrderRequestCancel, OrderRequestOpen, RequestCancel, RequestOpen},
+use rustrade_execution::{
+    error::AmendRefusal,
+    order::{
+        OrderEvent,
+        id::ClientOrderId,
+        request::{
+            CancelThenOpen, OrderAmend, OrderRequestAmend, OrderRequestCancel, OrderRequestOpen,
+            RequestCancel, RequestOpen,
+        },
+    },
 };
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
 use rustrade_integration::{
@@ -179,6 +185,80 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
 
     /// Check `group` can be sent, given the open ids `claimed` earlier in the same call, and stamp
     /// its opens with the market the state holds now. Returns the exchange the group is for.
+    /// Send amends, each built from the order the state tracks under its key
+    /// ([`PreparesAmend`]), and record those sent as in flight.
+    ///
+    /// An amend is refused, unsent, with [`RecoverableEngineError::AmendRefused`] when the state
+    /// refuses to prepare it, or when an earlier amend in the batch names the same order: one
+    /// request at a time per order.
+    pub(crate) fn send_amend_requests<ExchangeKey, InstrumentKey>(
+        &mut self,
+        amends: impl IntoIterator<Item = OrderAmend<ExchangeKey, InstrumentKey>>,
+    ) -> SendAmendsOutput<ExchangeKey, InstrumentKey>
+    where
+        Clock: EngineClock,
+        State: PreparesAmend<ExchangeKey, InstrumentKey>
+            + InFlightRequestRecorder<ExchangeKey, InstrumentKey>,
+        ExecutionTxs: ExecutionTxMap<ExchangeKey, InstrumentKey>,
+        ExchangeKey: Debug + Clone,
+        InstrumentKey: Debug + Clone + PartialEq,
+    {
+        // The orders this batch has already amended: the state records none until it is sent.
+        let mut claimed: Vec<(InstrumentKey, ClientOrderId)> = Vec::new();
+        let (sent, errors): (Vec<_>, Vec<_>) = amends
+            .into_iter()
+            .map(|amend| {
+                let (instrument, cid) = (&amend.key.instrument, &amend.key.cid);
+                let prepared = if claimed.iter().any(|(i, c)| i == instrument && c == cid) {
+                    Err(AmendRefusal::RequestInFlight)
+                } else {
+                    self.state.prepare_amend(&amend)
+                };
+                let request = match prepared {
+                    Ok(request) => request,
+                    Err(refusal) => {
+                        warn!(
+                            instrument = ?instrument,
+                            strategy = %amend.key.strategy,
+                            cid = %cid,
+                            %refusal,
+                            "amend refused by the Engine -- not sent"
+                        );
+                        return Err(Box::new((
+                            amend,
+                            EngineError::Recoverable(RecoverableEngineError::AmendRefused(refusal)),
+                        )));
+                    }
+                };
+                claimed.push((instrument.clone(), cid.clone()));
+                let request = OrderRequestAmend {
+                    key: amend.key.clone(),
+                    state: request,
+                };
+                match self.send_execution_request(
+                    &request.key.exchange,
+                    ExecutionRequest::Amend(request.clone()),
+                    &request,
+                ) {
+                    Ok(()) => Ok(Box::new(request)),
+                    Err(error) => Err(Box::new((amend, error))),
+                }
+            })
+            .partition_result();
+
+        let output =
+            SendAmendsOutput::new(sent.into_iter().collect(), errors.into_iter().collect());
+        if !output.sent.is_none() {
+            let time_sent = self.clock.time();
+            for request in output.sent_iter() {
+                self.state.record_in_flight_amend(request, time_sent);
+            }
+            let clock = &self.clock;
+            self.in_flight.on_sent(time_sent, || clock.instant());
+        }
+        output
+    }
+
     fn prepare_cancel_then_open<ExchangeKey, InstrumentKey>(
         &self,
         group: &mut CancelThenOpen<ExchangeKey, InstrumentKey>,
@@ -511,6 +591,54 @@ impl<ExchangeKey, InstrumentKey> SendCancelThenOpensOutput<ExchangeKey, Instrume
                 EngineError::Recoverable(_) => None,
             })
             .collect()
+    }
+}
+
+/// Summary of the amends sent by the [`Engine`] to the `ExecutionManager`.
+///
+/// Each amend is boxed inside its [`NoneOneOrMany`] field, as in [`SendRequestsOutput`].
+#[derive(
+    Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
+)]
+pub struct SendAmendsOutput<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> {
+    /// Amends sent for execution, as built from the orders they amend.
+    pub sent: NoneOneOrMany<Box<OrderRequestAmend<ExchangeKey, InstrumentKey>>>,
+    /// Amends not sent, as asked for, each paired with the [`EngineError`] that stopped it:
+    /// [`RecoverableEngineError::AmendRefused`] when the `Engine` refused it.
+    pub errors: NoneOneOrMany<Box<(OrderAmend<ExchangeKey, InstrumentKey>, EngineError)>>,
+}
+
+impl<ExchangeKey, InstrumentKey> SendAmendsOutput<ExchangeKey, InstrumentKey> {
+    /// Returns `true` if no amend was sent or refused.
+    pub fn is_empty(&self) -> bool {
+        self.sent.is_none() && self.errors.is_none()
+    }
+
+    /// Iterates the amends sent, dereferencing through the boxed payload.
+    pub fn sent_iter(
+        &self,
+    ) -> impl Iterator<Item = &OrderRequestAmend<ExchangeKey, InstrumentKey>> {
+        self.sent.iter().map(|amend| &**amend)
+    }
+
+    /// Returns any unrecoverable errors that occurred while sending the amends.
+    pub fn unrecoverable_errors(&self) -> NoneOneOrMany<UnrecoverableEngineError> {
+        self.errors
+            .iter()
+            .filter_map(|entry| match &entry.1 {
+                EngineError::Unrecoverable(error) => Some(error.clone()),
+                EngineError::Recoverable(_) => None,
+            })
+            .collect()
+    }
+}
+
+impl<ExchangeKey, InstrumentKey> Default for SendAmendsOutput<ExchangeKey, InstrumentKey> {
+    fn default() -> Self {
+        Self {
+            sent: NoneOneOrMany::default(),
+            errors: NoneOneOrMany::default(),
+        }
     }
 }
 

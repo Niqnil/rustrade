@@ -1,4 +1,6 @@
-use rustrade_execution::order::request::{CancelThenOpen, OrderRequestCancel, OrderRequestOpen};
+use rustrade_execution::order::request::{
+    CancelThenOpen, OrderAmend, OrderRequestCancel, OrderRequestOpen,
+};
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
 
 /// Strategy interface for generating algorithmic open and cancel order requests based on the
@@ -63,6 +65,31 @@ pub trait AlgoStrategy<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIn
         &self,
         state: &Self::State,
     ) -> impl IntoIterator<Item = CancelThenOpen<ExchangeKey, InstrumentKey>> {
+        let _ = state;
+        std::iter::empty()
+    }
+
+    /// Generate amends of working orders based on current system `State`: each names an order by
+    /// its key and says what to change (see
+    /// [`AmendPatch`](rustrade_execution::order::amend::AmendPatch)).
+    ///
+    /// The [`Engine`](crate::engine::Engine) calls this right after
+    /// [`generate_cancel_then_opens`](Self::generate_cancel_then_opens), with the same state. It
+    /// builds each amend from the order it tracks, refusing one it cannot send (see
+    /// [`PreparesAmend`](crate::engine::state::PreparesAmend)), passes the rest to
+    /// [`RiskManager::check_amends`](crate::risk::RiskManager::check_amends), and sends the
+    /// approved ones after every other request.
+    ///
+    /// An amend is refused at the `ExecutionManager` when the exchange's client cannot make it
+    /// ([`ExecutionClient::amend_support`](rustrade_execution::client::ExecutionClient::amend_support)).
+    /// The refusal arrives as the amend's answer, and the order is unchanged: send a
+    /// [`CancelThenOpen`] instead if a new order will do.
+    ///
+    /// The default generates none.
+    fn generate_amends(
+        &self,
+        state: &Self::State,
+    ) -> impl IntoIterator<Item = OrderAmend<ExchangeKey, InstrumentKey>> {
         let _ = state;
         std::iter::empty()
     }

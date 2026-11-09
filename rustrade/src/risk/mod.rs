@@ -1,5 +1,7 @@
 use derive_more::{Constructor, Display, From};
-use rustrade_execution::order::request::{CancelThenOpen, OrderRequestCancel, OrderRequestOpen};
+use rustrade_execution::order::request::{
+    CancelThenOpen, OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, RequestOpen,
+};
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, hash::Hash, marker::PhantomData};
@@ -128,6 +130,95 @@ pub trait RiskManager<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentInd
         }
         (approved, refused)
     }
+
+    /// Reviews the amends an [`AlgoStrategy`](super::strategy::algo::AlgoStrategy) generated,
+    /// approving or refusing each: approved amends, refused amends.
+    ///
+    /// The [`Engine`](crate::engine::Engine) calls it right after
+    /// [`check_cancel_then_opens`](Self::check_cancel_then_opens), on the same occasions, with the
+    /// amends from
+    /// [`generate_amends`](super::strategy::algo::AlgoStrategy::generate_amends) as it built them
+    /// from the orders it tracks: each carries the order as it stands
+    /// ([`RequestAmend::current`](rustrade_execution::order::amend::RequestAmend::current)) and
+    /// the quantity filled. The caller obligations of [`check`](Self::check) apply: return each
+    /// amend once, approved or refused; an approved amend is sent as returned.
+    ///
+    /// # Default
+    /// Approves an amend that only lowers the quantity, since it cannot add exposure. Every
+    /// other amend is passed through [`check`](Self::check) as the open it would leave resting:
+    /// the amended order, for the quantity left to fill. The amend is approved if `check` approves
+    /// that open unchanged, and refused otherwise, with `check`'s reason, or because `check`
+    /// adjusted it: an amend cannot be sent as adjusted.
+    ///
+    /// `check` sees the projected open on top of the state, which still holds the order before
+    /// the amend. A check that sums the exposure of resting orders therefore counts the order
+    /// twice. Override this to net it out.
+    fn check_amends(
+        &self,
+        state: &Self::State,
+        amends: impl IntoIterator<Item = OrderRequestAmend<ExchangeKey, InstrumentKey>>,
+    ) -> (
+        impl IntoIterator<Item = RiskApproved<OrderRequestAmend<ExchangeKey, InstrumentKey>>>,
+        impl IntoIterator<Item = RiskRefused<OrderRequestAmend<ExchangeKey, InstrumentKey>>>,
+    )
+    where
+        ExchangeKey: Debug + Clone,
+        InstrumentKey: Debug + Clone,
+    {
+        let mut approved = Vec::new();
+        let mut refused = Vec::new();
+        for amend in amends {
+            let request = &amend.state;
+            let amended = match request.amended() {
+                Ok(amended) => amended,
+                Err(refusal) => {
+                    refused.push(RiskRefused::new(amend, refusal.to_string()));
+                    continue;
+                }
+            };
+
+            let lowers_quantity_only = request.patch.price.is_none()
+                && request.patch.trigger_price.is_none()
+                && request
+                    .patch
+                    .quantity
+                    .is_some_and(|quantity| quantity < request.current.quantity);
+            if lowers_quantity_only {
+                approved.push(RiskApproved::new(amend));
+                continue;
+            }
+
+            let projected = RequestOpen::new(
+                amended.side,
+                amended.price,
+                amended.quantity - request.filled,
+                amended.kind,
+                amended.time_in_force,
+            )
+            .with_reduce_only(amended.reduce_only);
+            let open = OrderRequestOpen {
+                key: amend.key.clone(),
+                state: projected.clone(),
+            };
+            let (_, opens, _, refused_opens) = self.check(state, std::iter::empty(), [open]);
+            let opens: Vec<_> = opens.into_iter().map(RiskApproved::into_item).collect();
+            let reasons: Vec<String> = refused_opens
+                .into_iter()
+                .map(|refused| refused.reason)
+                .collect();
+            match (opens.as_slice(), reasons.is_empty()) {
+                ([open], true) if open.state == projected => {
+                    approved.push(RiskApproved::new(amend));
+                }
+                (_, false) => refused.push(RiskRefused::new(amend, reasons.join("; "))),
+                (opens, true) => refused.push(RiskRefused::new(
+                    amend,
+                    format!("the risk manager adjusted the order the amend leaves: {opens:?}"),
+                )),
+            }
+        }
+        (approved, refused)
+    }
 }
 
 /// New type that wraps order requests that have passed [`RiskManager`] checks.
@@ -227,8 +318,9 @@ mod tests {
     use rust_decimal_macros::dec;
     use rustrade_execution::order::{
         OrderKey, OrderKind, TimeInForce,
-        id::{ClientOrderId, StrategyId},
-        request::{OnCancelFailure, RequestCancel, RequestOpen},
+        amend::{AmendPatch, AmendTarget, RequestAmend},
+        id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
+        request::{OnCancelFailure, ReduceOnly, RequestCancel, RequestOpen},
     };
     use rustrade_instrument::Side;
 
@@ -323,5 +415,71 @@ mod tests {
             refusals[0].reason,
             format!("open {:?}: too large", key("large"))
         );
+    }
+
+    fn amend(
+        cid: &str,
+        quantity: Decimal,
+        filled: Decimal,
+        patch: AmendPatch,
+    ) -> OrderRequestAmend {
+        OrderRequestAmend {
+            key: key(cid),
+            state: RequestAmend::new(
+                VenueOrderId::Assigned(OrderId::new(cid)),
+                patch,
+                AmendTarget {
+                    side: Side::Buy,
+                    price: Some(dec!(100)),
+                    quantity,
+                    kind: OrderKind::Limit,
+                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                    reduce_only: ReduceOnly::No,
+                },
+                filled,
+            ),
+        }
+    }
+
+    /// By default an amend that only lowers the quantity is approved unchecked, and any other is
+    /// checked as the open it leaves resting: the amended order, for what is left to fill.
+    /// Approved only if `check` approves that open unchanged.
+    #[test]
+    fn the_default_amend_check_reviews_the_order_the_amend_leaves() {
+        let reprice = AmendPatch::default().with_price(dec!(99));
+        let small = amend("small", dec!(0.5), dec!(0), reprice);
+        let mostly_filled = amend("mostly_filled", dec!(5), dec!(4.5), reprice);
+        let cut = amend("cut", dec!(5), dec!(0), reprice);
+        let large = amend("large", dec!(20), dec!(0), reprice);
+        let lowered = amend(
+            "lowered",
+            dec!(20),
+            dec!(0),
+            AmendPatch::default().with_quantity(dec!(15)),
+        );
+
+        let (approved, refusals) = SizeCap.check_amends(
+            &(),
+            [
+                small.clone(),
+                mostly_filled.clone(),
+                cut.clone(),
+                large.clone(),
+                lowered.clone(),
+            ],
+        );
+        let approved: Vec<_> = approved.into_iter().map(RiskApproved::into_item).collect();
+        let refusals: Vec<_> = refusals.into_iter().collect();
+
+        assert_eq!(approved, vec![small, mostly_filled, lowered]);
+        assert_eq!(refusals.len(), 2, "{refusals:?}");
+        assert_eq!(refusals[0].item, cut);
+        assert!(
+            refusals[0].reason.starts_with("the risk manager adjusted"),
+            "{}",
+            refusals[0].reason
+        );
+        assert_eq!(refusals[1].item, large);
+        assert_eq!(refusals[1].reason, "too large");
     }
 }
