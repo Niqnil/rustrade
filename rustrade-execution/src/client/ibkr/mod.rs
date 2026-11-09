@@ -85,8 +85,8 @@
 //! - **Client order ids** travel as each order's IB order reference, so they are at most 128
 //!   ASCII characters
 //! - **No order modification.** This client never modifies an open order, though IB allows it.
-//!   An order modified outside it, such as by hand in TWS, is still reported with the price and
-//!   quantity it was placed with (see [`OrderContext`]).
+//!   An order modified outside it, such as by hand in TWS, is still reported with the price,
+//!   quantity and time in force it was placed with (see [`OrderContext`]).
 //!
 //! # Reconnection & Recovery
 //!

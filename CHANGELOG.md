@@ -181,7 +181,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   #888). IB allows an open order's price, size and time in force to be changed in place. This
   client never does so, which is why the order context it stores at placement stays fixed. The
   module's limitations now say so, along with the consequence: an order modified outside the client,
-  such as by hand in TWS, is still reported with the price and quantity it was placed with.
+  such as by hand in TWS, is still reported with the price, quantity and time in force it was
+  placed with.
 
 ## [0.21.0] - 2026-11-04
 

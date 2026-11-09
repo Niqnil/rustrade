@@ -92,8 +92,10 @@ pub struct BracketOrderResult {
 /// # Known limitation
 ///
 /// An order modified outside this client, such as by hand in TWS, keeps its placement context
-/// here. Its statuses, and the open-order listing that finds it tracked, then report the price and
-/// quantity it was placed with, not the modified ones.
+/// here. Its statuses, and the open- and ended-order listings that find it tracked, then report the
+/// price, quantity and time in force it was placed with, not the modified ones. A cancellation is
+/// also told apart from an expiry by the placement time in force, and a fill whose quantity IB
+/// leaves out is taken as the placement quantity.
 #[derive(Debug, Clone)]
 pub struct OrderContext {
     pub instrument: InstrumentNameExchange,
