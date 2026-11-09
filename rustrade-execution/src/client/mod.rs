@@ -59,13 +59,14 @@ use crate::{
     UnindexedAccountEvent, UnindexedAccountSnapshot,
     balance::AssetBalance,
     borrow_capacity::BorrowCapacity,
-    error::UnindexedClientError,
+    error::{AmendField, AmendRefusal, OrderError, UnindexedClientError},
     order::{
-        Order, UnindexedInactiveOrder, UnindexedOrderKey,
+        Order, OrderEvent, UnindexedInactiveOrder, UnindexedOrderKey,
+        amend::AmendSupport,
         bracket::{BracketOrderRequest, BracketOrderResult},
         request::{
-            CancelReplaceAnswer, OnCancelFailure, OrderRequestCancel, OrderRequestOpen,
-            UnindexedOrderResponseCancel,
+            CancelReplaceAnswer, OnCancelFailure, OrderRequestAmend, OrderRequestCancel,
+            OrderRequestOpen, UnindexedOrderResponseAmend, UnindexedOrderResponseCancel,
         },
         state::{Open, UnindexedOrderState},
     },
@@ -730,6 +731,72 @@ where
     ) -> Option<impl Future<Output = CancelReplaceAnswer> + Send> {
         let _ = (cancel, open, on_cancel_failure);
         None::<std::future::Ready<CancelReplaceAnswer>>
+    }
+
+    /// What this client can amend in place: see [`AmendSupport`].
+    ///
+    /// The engine's `ExecutionManager` checks each amend against it with
+    /// [`AmendSupport::permits`], and refuses one it does not permit without calling
+    /// [`amend_order`](Self::amend_order).
+    ///
+    /// The default is [`AmendSupport::NONE`]: nothing can be amended.
+    ///
+    /// # Wrapping clients
+    /// A client that wraps another must forward both this and [`amend_order`](Self::amend_order),
+    /// or neither. Forwarding only this one declares amends that the default `amend_order` then
+    /// refuses; forwarding only `amend_order` leaves it never called.
+    fn amend_support(&self) -> AmendSupport {
+        AmendSupport::NONE
+    }
+
+    /// Amend a working order in place: change its price, total quantity or trigger price.
+    ///
+    /// Called only with an amend that [`amend_support`](Self::amend_support) permits.
+    ///
+    /// # Implementation obligations
+    /// - **Never a substitute.** Send the amend as the venue's amend, or refuse it. Never serve it
+    ///   by cancelling the order and placing another: the caller chose an amend, and can send a
+    ///   [`CancelThenOpen`] itself.
+    /// - **Answer once, with what the venue did.** `Ok(Amended)` carries the order as the venue
+    ///   reports it after the amend, with [`Amended::previous_id`] set when the venue now
+    ///   addresses it by a different identifier. Where the venue's answer does not repeat a value
+    ///   the amend set, use the amend's value.
+    /// - **Refused means unchanged.** [`OrderError::AmendRefused`], or a venue rejection
+    ///   ([`OrderError::Rejected`]), says the order is as it was. Refuse with
+    ///   [`AmendRefusal::Venue`] what the venue cannot amend but `amend_support` cannot declare,
+    ///   such as an instrument or an order kind, without sending it.
+    /// - **Unknown stays unknown.** When the venue's answer is lost, answer
+    ///   [`OrderError::Connectivity`]. The manager then looks the order up and adopts what the
+    ///   venue reports.
+    /// - **The future must resolve.** The manager bounds it with its `request_timeout`, and a
+    ///   timeout counts as an unknown outcome.
+    ///
+    /// The default refuses every amend with [`AmendRefusal::Unsupported`] for the first field it
+    /// changes, without sending anything.
+    ///
+    /// [`CancelThenOpen`]: crate::order::request::CancelThenOpen
+    /// [`Amended::previous_id`]: crate::order::amend::Amended::previous_id
+    /// [`AmendRefusal::Unsupported`]: crate::error::AmendRefusal::Unsupported
+    /// [`AmendRefusal::Venue`]: crate::error::AmendRefusal::Venue
+    /// [`OrderError::AmendRefused`]: crate::error::OrderError::AmendRefused
+    /// [`OrderError::Rejected`]: crate::error::OrderError::Rejected
+    /// [`OrderError::Connectivity`]: crate::error::OrderError::Connectivity
+    fn amend_order(
+        &self,
+        request: OrderRequestAmend<ExchangeId, &InstrumentNameExchange>,
+    ) -> impl Future<Output = UnindexedOrderResponseAmend> + Send {
+        let field = request
+            .state
+            .patch
+            .fields()
+            .next()
+            .unwrap_or(AmendField::Price);
+        std::future::ready(OrderEvent {
+            key: request.key.into_owned_instrument(),
+            state: Err(OrderError::AmendRefused(AmendRefusal::Unsupported {
+                field,
+            })),
+        })
     }
 
     /// Fetch current balances for the specified assets.

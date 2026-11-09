@@ -46,7 +46,7 @@ use rustrade_execution::{
     cash_flow::CashFlow,
     order::{
         id::{ClientOrderId, StrategyId},
-        request::{OrderRequestCancel, OrderRequestOpen},
+        request::{OrderRequestAmend, OrderRequestCancel, OrderRequestOpen},
     },
     trade::Trade,
 };
@@ -339,6 +339,13 @@ impl InFlightRequestRecorder for MultiStrategyCustomInstrumentData {
     fn record_in_flight_open(
         &mut self,
         _: &OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
+        _: DateTime<Utc>,
+    ) {
+    }
+
+    fn record_in_flight_amend(
+        &mut self,
+        _: &OrderRequestAmend<ExchangeIndex, InstrumentIndex>,
         _: DateTime<Utc>,
     ) {
     }

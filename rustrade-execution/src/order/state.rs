@@ -1,6 +1,9 @@
 use crate::{
     error::OrderError,
-    order::id::{OrderId, VenueOrderId},
+    order::{
+        amend::AmendPatch,
+        id::{OrderId, VenueOrderId},
+    },
 };
 use chrono::{DateTime, Utc};
 use derive_more::{Constructor, From};
@@ -57,6 +60,7 @@ impl<AssetKey, InstrumentKey> OrderState<AssetKey, InstrumentKey> {
                 ActiveOrderState::CancelInFlight(state) => {
                     state.order.as_ref().map(|order| order.time_exchange)
                 }
+                ActiveOrderState::AmendInFlight(state) => Some(state.order.time_exchange),
             },
             Self::Inactive(inactive) => match inactive {
                 InactiveOrderState::Cancelled(state) => Some(state.time_exchange),
@@ -107,17 +111,19 @@ pub enum ActiveOrderState {
     OpenInFlight(OpenInFlight),
     Open(Open),
     CancelInFlight(CancelInFlight),
+    AmendInFlight(AmendInFlight),
 }
 
 impl ActiveOrderState {
     /// When the request this order awaits an answer to was sent: `Some` for
-    /// [`OpenInFlight`](Self::OpenInFlight) and [`CancelInFlight`](Self::CancelInFlight), `None`
-    /// for [`Open`](Self::Open).
+    /// [`OpenInFlight`](Self::OpenInFlight), [`CancelInFlight`](Self::CancelInFlight) and
+    /// [`AmendInFlight`](Self::AmendInFlight), `None` for [`Open`](Self::Open).
     pub fn time_sent(&self) -> Option<DateTime<Utc>> {
         match self {
             Self::OpenInFlight(open) => Some(open.time_sent),
             Self::Open(_) => None,
             Self::CancelInFlight(cancel) => Some(cancel.time_sent),
+            Self::AmendInFlight(amend) => Some(amend.time_sent),
         }
     }
 
@@ -126,6 +132,17 @@ impl ActiveOrderState {
             Self::OpenInFlight(_) => None,
             Self::Open(open) => Some(open),
             Self::CancelInFlight(cancel) => cancel.order.as_ref(),
+            Self::AmendInFlight(amend) => Some(&amend.order),
+        }
+    }
+
+    /// The working order's state as last reported, mutably: see [`Self::open_meta`].
+    pub fn open_meta_mut(&mut self) -> Option<&mut Open> {
+        match self {
+            Self::OpenInFlight(_) => None,
+            Self::Open(open) => Some(open),
+            Self::CancelInFlight(cancel) => cancel.order.as_mut(),
+            Self::AmendInFlight(amend) => Some(&mut amend.order),
         }
     }
 }
@@ -263,6 +280,22 @@ pub struct CancelInFlight {
     /// The order as last reported working, if it was before the cancel was sent.
     pub order: Option<Open>,
     /// When the cancel was sent, by the sender's clock, as [`OpenInFlight::time_sent`].
+    pub time_sent: DateTime<Utc>,
+}
+
+/// An amend sent to the exchange that it has not yet answered.
+///
+/// The order keeps working as last reported while it waits: fills advance
+/// [`order`](Self::order), and the amend's values are taken only from its answer.
+#[derive(
+    Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
+)]
+pub struct AmendInFlight {
+    /// The order as last reported working.
+    pub order: Open,
+    /// What the amend changes.
+    pub patch: AmendPatch,
+    /// When the amend was sent, by the sender's clock, as [`OpenInFlight::time_sent`].
     pub time_sent: DateTime<Utc>,
 }
 

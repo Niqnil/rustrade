@@ -4,6 +4,7 @@ use crate::{
     market::MarketSnapshot,
     order::{
         Order, OrderEvent, OrderKind, TimeInForce,
+        amend::{Amended, RequestAmend},
         id::{PositionId, VenueOrderId},
         state::{Cancelled, UnindexedOrderState},
     },
@@ -33,6 +34,20 @@ pub type OrderResponseCancel<
 
 pub type UnindexedOrderResponseCancel =
     OrderResponseCancel<ExchangeId, AssetNameExchange, InstrumentNameExchange>;
+
+/// An amend of a working order: see [`RequestAmend`].
+pub type OrderRequestAmend<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> =
+    OrderEvent<RequestAmend, ExchangeKey, InstrumentKey>;
+
+/// The answer to an amend: the order as amended, or why it was not.
+pub type OrderResponseAmend<
+    ExchangeKey = ExchangeIndex,
+    AssetKey = AssetIndex,
+    InstrumentKey = InstrumentIndex,
+> = OrderEvent<Result<Amended, OrderError<AssetKey, InstrumentKey>>, ExchangeKey, InstrumentKey>;
+
+pub type UnindexedOrderResponseAmend =
+    OrderResponseAmend<ExchangeId, AssetNameExchange, InstrumentNameExchange>;
 
 /// Parameters for opening a new order.
 ///

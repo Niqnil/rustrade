@@ -55,7 +55,7 @@ use rustrade_execution::{
     order::{
         OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, StrategyId},
-        request::{OrderRequestCancel, OrderRequestOpen, RequestOpen},
+        request::{OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, RequestOpen},
     },
 };
 use rustrade_instrument::{
@@ -920,6 +920,13 @@ impl InFlightRequestRecorder for LoseMoneyInstrumentData {
     fn record_in_flight_open(
         &mut self,
         _: &OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
+        _: DateTime<Utc>,
+    ) {
+    }
+
+    fn record_in_flight_amend(
+        &mut self,
+        _: &OrderRequestAmend<ExchangeIndex, InstrumentIndex>,
         _: DateTime<Utc>,
     ) {
     }

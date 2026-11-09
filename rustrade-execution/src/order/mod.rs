@@ -34,6 +34,10 @@ pub mod request;
 /// Bracket order types for the [`BracketOrderClient`](crate::client::BracketOrderClient) trait.
 pub mod bracket;
 
+/// Amending a working order in place: [`AmendPatch`](amend::AmendPatch),
+/// [`AmendSupport`](amend::AmendSupport) and [`Amended`](amend::Amended).
+pub mod amend;
+
 /// Convenient type alias for an [`Order`] keyed with [`ExchangeId`] and [`InstrumentNameExchange`].
 pub type UnindexedOrder = Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>;
 
@@ -363,12 +367,6 @@ pub enum OrderKind {
 impl OrderKind {
     /// Whether this is an [`OrderKind::ConditionalUnresolved`], which leaves open whether the
     /// order trails.
-    #[cfg(any(
-        feature = "alpaca",
-        feature = "binance",
-        feature = "hyperliquid",
-        feature = "ibkr"
-    ))]
     pub(crate) fn is_conditional_unresolved(&self) -> bool {
         matches!(self, Self::ConditionalUnresolved { .. })
     }

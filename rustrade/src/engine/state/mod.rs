@@ -564,6 +564,15 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                 instrument_state.data.process(event);
                 applied
             }
+            AccountEventKind::OrderAmended(response) => {
+                let instrument_state = self
+                    .instruments
+                    .instrument_index_mut(&response.key.instrument);
+
+                instrument_state.update_from_amend_response(response);
+                instrument_state.data.process(event);
+                FillsApplied::default()
+            }
             AccountEventKind::OrderCancelled(response) => {
                 let instrument_state = self
                     .instruments

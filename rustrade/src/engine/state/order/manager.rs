@@ -1,7 +1,7 @@
 use crate::engine::state::order::in_flight_recorder::InFlightRequestRecorder;
 use rustrade_execution::order::{
     Order,
-    request::OrderResponseCancel,
+    request::{OrderResponseAmend, OrderResponseCancel},
     state::{ActiveOrderState, OrderState},
 };
 use rustrade_integration::collection::snapshot::Snapshot;
@@ -64,6 +64,24 @@ where
     fn update_from_cancel_response<AssetKey>(
         &mut self,
         response: &OrderResponseCancel<ExchangeKey, AssetKey, InstrumentKey>,
+    ) where
+        AssetKey: Debug + Clone;
+
+    /// Apply the answer to an amend.
+    ///
+    /// # Contract
+    /// - `Ok(Amended)` commits the amended price, quantity and kind to the order, whatever its
+    ///   state: a late answer behind a cancel still says what the order was while it rested. An
+    ///   [`AmendInFlight`](rustrade_execution::order::state::AmendInFlight) order returns to
+    ///   `Open`, carrying the identifier the venue now addresses it by. An order the amend left
+    ///   with nothing to fill stops being tracked.
+    /// - A refusal or rejection returns an `AmendInFlight` order to `Open`, unchanged.
+    /// - An unknown outcome
+    ///   ([`OrderError::is_outcome_unknown`](rustrade_execution::error::OrderError::is_outcome_unknown))
+    ///   leaves the amend in flight: the `ExecutionManager` looks the order up and answers again.
+    fn update_from_amend_response<AssetKey>(
+        &mut self,
+        response: &OrderResponseAmend<ExchangeKey, AssetKey, InstrumentKey>,
     ) where
         AssetKey: Debug + Clone;
 }
