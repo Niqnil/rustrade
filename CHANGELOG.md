@@ -196,6 +196,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **Sequenced by the `ExecutionManager`, and by the backtest runner**, where the opens act one
     simulated round trip after the cancels: `2 × to_venue + from_venue` after the group is sent.
     A drain waits for held opens.
+- **A cancel and its open sent as one venue request, where the client offers one**
+  (`rustrade-execution`, `rustrade`, #891). That takes out the round trip in which a group leaves
+  nothing resting.
+  - **`ExecutionClient::cancel_replace`:** a default method that declines every pair. A client
+    overrides it where its venue can carry a `CancelThenOpen` group of one cancel and one open as
+    one request, with exactly the group's semantics. The `ExecutionManager` offers each such group
+    to it first, and sequences the group itself when the client declines.
+  - **One answer per leg, as if each were sent alone,** in the new `CancelReplaceAnswer`. When a
+    cancel fails under `DropOpens` and the venue does not attempt the open, the open is answered
+    as dropped, as when sequenced. A timeout fails the cancel and leaves the open's outcome
+    unknown, so the open is looked up like any other.
+  - **Binance Spot** sends such a group as `POST /api/v3/order/cancelReplace`:
+    - The mode is `STOP_ON_FAILURE` for `DropOpens` and `ALLOW_FAILURE` for `SendOpens`.
+    - The venue answers each leg separately. A cancel that went through beside a refused new
+      order, or a cancel that failed, each carries its own reason, read as a plain cancel or open
+      would read it.
+    - The client declines, and the group is sequenced instead, for a pair on two symbols, an
+      order kind or time in force the plain open refuses, a borrow, or a venue id that is not a
+      number.
+  - **Wrapping clients** keep the sequential path unless they forward `cancel_replace`.
 
 ### Changed
 

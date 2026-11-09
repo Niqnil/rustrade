@@ -882,6 +882,14 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A rate-limit refusal also carries its `Retry-After`, and a body that is not Binance's
+    /// error object is carried as the message, with no code.
+    #[test]
+    fn a_whole_refusal_carries_its_wait_or_its_raw_body() {
+        let refusal = |status| answer(status, json!({"code": -1013, "msg": "Filter failure"}));
+        let code = Some(-1013);
 
         let mut throttled = refusal(429);
         throttled
