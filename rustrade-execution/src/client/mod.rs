@@ -695,10 +695,18 @@ where
     ///   Under [`OnCancelFailure::DropOpens`] it must not place the open when the cancel fails.
     ///   Under [`OnCancelFailure::SendOpens`] it must attempt the open whatever the cancel's
     ///   answer.
-    /// - **Answer each leg as if sent alone.** [`CancelReplaceAnswer::cancel`] is what
-    ///   [`cancel_order`](Self::cancel_order) would answer. [`CancelReplaceAnswer::open`] is what
-    ///   [`open_order`](Self::open_order) would answer. It is `None` only when the cancel failed
-    ///   under `DropOpens` and the venue did not attempt the open.
+    /// - **Answer what the venue did with each leg,** in the form a leg sent alone is answered:
+    ///   [`CancelReplaceAnswer::cancel`] as [`cancel_order`](Self::cancel_order) answers, and
+    ///   [`CancelReplaceAnswer::open`] as [`open_order`](Self::open_order) answers. `open` is
+    ///   `None` only when the cancel failed under `DropOpens` and the venue did not attempt the
+    ///   open.
+    /// - **A request refused whole changed nothing.** A venue may check the request before it
+    ///   acts on either leg, and refuse it whole: for a filter, a limit, or a malformed or
+    ///   unauthorised request. The order to cancel then still rests, so the cancel is answered as
+    ///   failed with that refusal, and the open as not attempted under `DropOpens` or as refused
+    ///   with the same reason under `SendOpens`. Sent apart, the cancel might have gone through
+    ///   and only the open been refused. Under `DropOpens` that would leave nothing resting,
+    ///   where the refused request leaves the order to cancel in place.
     /// - **Unknown stays unknown.** When the venue's answer is lost, the cancel is an error, and
     ///   the open is `Some`, with an outcome that is unknown (see
     ///   [`OrderState::is_outcome_unknown`](crate::order::state::OrderState::is_outcome_unknown)).

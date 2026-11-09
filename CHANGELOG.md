@@ -203,10 +203,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     overrides it where its venue can carry a `CancelThenOpen` group of one cancel and one open as
     one request, with exactly the group's semantics. The `ExecutionManager` offers each such group
     to it first, and sequences the group itself when the client declines.
-  - **One answer per leg, as if each were sent alone,** in the new `CancelReplaceAnswer`. When a
-    cancel fails under `DropOpens` and the venue does not attempt the open, the open is answered
-    as dropped, as when sequenced. A timeout fails the cancel and leaves the open's outcome
-    unknown, so the open is looked up like any other.
+  - **One answer per leg, saying what the venue did with it,** in the new `CancelReplaceAnswer`.
+    When a cancel fails under `DropOpens` and the venue does not attempt the open, the open is
+    answered as dropped, as when sequenced. A timeout fails the cancel and leaves the open's
+    outcome unknown, so the open is looked up like any other.
+  - **A request the venue refuses whole changes nothing,** unlike a sequenced group. The venue
+    checks it before acting on either leg, for a filter, a limit, or a malformed request. The
+    order to cancel then still rests: the cancel is answered as failed with the venue's reason,
+    and the open as dropped under `DropOpens` or refused under `SendOpens`. Sequenced, the cancel
+    could have gone through with only the open refused, leaving nothing resting.
   - **Binance Spot** sends such a group as `POST /api/v3/order/cancelReplace`:
     - The mode is `STOP_ON_FAILURE` for `DropOpens` and `ALLOW_FAILURE` for `SendOpens`.
     - The venue answers each leg separately. A cancel that went through beside a refused new
