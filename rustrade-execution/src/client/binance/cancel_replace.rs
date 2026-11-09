@@ -855,12 +855,16 @@ mod tests {
     /// Only a success, a partial failure, or an error coded as a cancel-replace failure or
     /// carrying leg results, reports legs.
     #[test]
-    fn only_a_success_or_an_error_with_leg_results_reports_legs() {
+    fn reports_legs_for_a_success_a_409_a_leg_code_or_leg_data() {
         assert!(answer(200, json!({})).reports_legs());
         assert!(answer(409, json!({"code": -2021, "data": {}})).reports_legs());
+        // Any `data` is read leg by leg, whatever the code: a leg it does not report readably is
+        // then unknown, never refused.
         assert!(answer(400, json!({"code": -1013, "data": {}})).reports_legs());
         assert!(!answer(400, json!({"code": -1013, "msg": "Filter failure"})).reports_legs());
         assert!(!answer(400, json!({"code": -2011, "msg": "Unknown order sent."})).reports_legs());
+        // A throttle refuses the whole request, so it reaches the retry as an error.
+        assert!(!answer(429, json!({"code": -1003, "msg": "Too many requests."})).reports_legs());
         assert!(
             !RawAnswer {
                 body: "<html>".to_string(),
@@ -886,6 +890,10 @@ mod tests {
             ),
             answer(400, json!({"code": -2022, "data": "garbled"})),
             answer(400, json!({"code": -2021, "data": {"cancelResult": 7}})),
+            RawAnswer {
+                body: "<html>".to_string(),
+                ..answer(409, json!({}))
+            },
         ] {
             assert!(unreadable.reports_legs(), "{unreadable:?}");
             let (cancel, open) = read_legs(&unreadable, &btcusdt(), dec!(1));
