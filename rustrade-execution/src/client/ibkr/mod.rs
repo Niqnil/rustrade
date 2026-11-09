@@ -153,9 +153,10 @@
 //! of it.
 //!
 //! `account_snapshot` sends its request for the login's accounts only while the client is
-//! connected, since `ibapi` holds that request until a reconnect ends. A drop between that check
-//! and the request is the exception: the snapshot then returns only once `ibapi`'s reconnect has
-//! succeeded or been given up, which can take minutes.
+//! connected, so it fails at once while the connection is down. When the connection drops between
+//! that check and the request, `ibapi` holds the request while it reconnects, for at most the
+//! 30 seconds it gives that request: the snapshot then fails with [`ConnectivityError::Timeout`]
+//! if the reconnect has not ended by then.
 //!
 //! # Caller Responsibilities
 //!
@@ -631,8 +632,12 @@ fn read_error(what: &str, e: ibapi::Error) -> UnindexedClientError {
             ConnectivityError::Socket(format!("{what}: {e}")).into()
         }
         ibapi::Error::Timeout => {
-            // `Timeout` carries no context, so the request IB did not answer is named here.
-            warn!(what, "IB did not answer an IBKR account read in time");
+            // `Timeout` carries no context, so the request that timed out is named here.
+            warn!(
+                what,
+                "IBKR account read timed out: IB did not answer, or ibapi's reconnect outlasted \
+                 the request's deadline"
+            );
             ConnectivityError::Timeout.into()
         }
         e => UnindexedClientError::Internal(format!("{what}: {e}")),
@@ -2519,9 +2524,10 @@ impl ExecutionClient for IbkrClient {
     /// or if the request for the login's accounts yields none, as it does when the session ends
     /// during it.
     ///
-    /// While the connection is down this fails at once, as the other account reads do. It may
-    /// wait for `ibapi`'s reconnect to end, which can take minutes, when the connection drops just
-    /// as the snapshot starts: see [Account read errors](crate::client::ibkr#account-read-errors).
+    /// While the connection is down this fails at once, as the other account reads do. When the
+    /// connection drops just as the snapshot starts, it may wait for `ibapi`'s reconnect, up to
+    /// 30 seconds for the reconnect and IB's answer together: see
+    /// [Account read errors](crate::client::ibkr#account-read-errors).
     ///
     /// # Known Issue: ibapi Decode Errors
     ///
@@ -2559,11 +2565,12 @@ impl ExecutionClient for IbkrClient {
         let positions_filter = instruments_filter.clone();
         let positions_future = tokio::task::spawn_blocking(move || {
             let instruments_filter = positions_filter;
-            // `ibapi` holds a request for the login's accounts until a reconnect ends, so none is
-            // sent while the client is down. The balances read, refused at once when it runs after
-            // the drop, is checked first and then says why: transient while `ibapi` reconnects,
-            // `Internal` once it has given up. Had it finished just before the drop, this error is
-            // the snapshot's.
+            // While the client is down, `ibapi` would hold a request for the login's accounts
+            // until the reconnect ends or the request's 30 s deadline passes. So none is sent, and
+            // the snapshot fails at once rather than after a wait. The balances read, refused at
+            // once when it runs after the drop, is checked first and then says why: transient
+            // while `ibapi` reconnects, `Internal` once it has given up. Had it finished just
+            // before the drop, this error is the snapshot's.
             if !client.is_connected() {
                 return Err(ConnectivityError::Socket(
                     "managed accounts: not connected to TWS/Gateway".to_string(),

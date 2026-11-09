@@ -16,7 +16,7 @@
 # cannot land while leaving this record behind. CI cannot verify that the re-verification a
 # pinned entry mandates was actually performed — only that this file was not left untouched.
 
-ibapi=5.5.0  # 2026-11-03 | Financial protocol, community-maintained, no official SDK. Latest re-verification: the =5.5.0 record below (git 91fd3077f0eb24ee8e5ff7fc3ad754584a246755; standing properties 1-5 hold). The rest of this line is the 3.2.0->3.3.0 review: all four properties recorded at 3.2.0 re-verified and still hold: zero unsafe (also no transmute/from_raw/extern "C"/asm!; holds by inspection, not by lint — upstream has no #![forbid(unsafe_code)]), no build.rs, dependency tree byte-identical vs 3.2.0 (both Cargo.toml and Cargo.lock differ by the version line alone; 9 direct deps under our `default-features = false, features = ["sync"]` selection, unchanged), still only a caller-supplied TWS socket (reconnect reuses the caller's address — no fallback host, no telemetry) + the opt-in local recorder dir (IBAPI_RECORDING_DIR; recorder.rs byte-identical). Env set unchanged (IBAPI_RECORDING_DIR, IBAPI_TIMEZONE_ALIASES); no process spawn, no obfuscation; published from git b140b312d1136d240f3b5651a89f4778e01aa222.
+ibapi=5.7.0  # 2026-11-08 | Financial protocol, community-maintained, no official SDK. Latest re-verification: the =5.7.0 record below (git e33c5ce5ffa091aa4155e9b865304a2b28872220; standing properties 1-5 hold). The rest of this line is the 3.2.0->3.3.0 review: all four properties recorded at 3.2.0 re-verified and still hold: zero unsafe (also no transmute/from_raw/extern "C"/asm!; holds by inspection, not by lint — upstream has no #![forbid(unsafe_code)]), no build.rs, dependency tree byte-identical vs 3.2.0 (both Cargo.toml and Cargo.lock differ by the version line alone; 9 direct deps under our `default-features = false, features = ["sync"]` selection, unchanged), still only a caller-supplied TWS socket (reconnect reuses the caller's address — no fallback host, no telemetry) + the opt-in local recorder dir (IBAPI_RECORDING_DIR; recorder.rs byte-identical). Env set unchanged (IBAPI_RECORDING_DIR, IBAPI_TIMEZONE_ALIASES); no process spawn, no obfuscation; published from git b140b312d1136d240f3b5651a89f4778e01aa222.
 #   New in 3.3.0, reviewed: `src/config` — despite the name it reads NO local files and NO env vars. It wraps two TWS wire messages (ReqConfig=108/UpdateConfig=109) over the already-open socket, whose protobuf types already existed in 3.2.0. Version-gated, #[must_use] builder, not reachable during connect/handshake.
 #   NOTE (capability, not vulnerability): `update_config()` can write the gateway's own safety settings — read_only_api, the bypass_* order precautions, trusted_ips, allow_localhost_only, socket_port, master_client_id. rustrade does not call it and does not re-export it; keep it out of the wrapper surface unless there is a deliberate reason.
 #   Upstream BREAKING in a minor release: the `fundamental` module was removed (IBKR retired reqFundamentalData in TWS API 10.47). rustrade never used it — verified no reference to fundamental_data / FundamentalData / FundamentalReportType / TickType::FundamentalRatios.
@@ -537,6 +537,56 @@ ibapi=5.5.0  # 2026-11-03 | Financial protocol, community-maintained, no officia
 # to disconnect. Order status and position frames decoded without a Parse error under the stricter decoders.
 # Not exercised: a fill of this client's own order (outside regular hours), an automatic reconnect or a
 # reconnect that gives up, a cold-HMDS historical fetch, a liquidation.
+#
+# Re-verified against the =5.7.0 crates.io source on 2026-11-08 (5.5.0 -> 5.7.0, through 5.6.0).
+# Published 2026-11-06 by the same crates.io owner as every 5.x release, from git
+# e33c5ce5ffa091aa4155e9b865304a2b28872220 (5.6.0 was 04fe672f8adc37c20cb1936aaba8c77f2e7e98a3); crate sha256
+# 5aa41c8edb238cad9b66343b301c8ca06bfe793c60e92d7e080fedef94823556 (= Cargo.lock). Authors and repository unchanged.
+# Upstream cut it from its 5.x release branch, with the fix for its one-shot reconnect wait backported.
+#
+# Standing properties, all hold:
+#   1. ZERO unsafe -- no unsafe / transmute / extern "C" / asm! / #[no_mangle] / #[link] / dlopen in src/. The
+#      only `from_raw` is still the safe `RequestId::from_raw(i32)` (client/ids.rs:35). By inspection.
+#   2. NO build.rs (`build = false`), no proc macros, no include_bytes!/include_str!. `proto/mod.rs:5` still
+#      `include!`s the checked-in prost output.
+#   3. DEPENDENCY TREE -- Cargo.toml differs from 5.5.0 in the version line alone: `[dependencies.*]`,
+#      `[features]`, dev/build deps and rust-version 1.88 identical. Cargo.lock: ibapi's version and checksum
+#      only, zero packages added or removed.
+#   4. NETWORK SURFACE -- still only the caller's TWS socket (transport/sync.rs:1318; reconnect :1359 reuses the
+#      stored address). The one new I/O call is `shutdown(Both)` on that same socket (see #1179 below). URLs in
+#      src/ are doc links or error text. No process spawn, no telemetry, no obfuscation. Thread spawns
+#      unchanged (transport/sync.rs:649 dispatcher, :887 cleanup).
+#   5. ENV SURFACE unchanged: IBAPI_RAW_CAPTURE_DIR (transport/raw_capture.rs:92), IBAPI_RECORDING_DIR
+#      (transport/recorder.rs:40), IBAPI_TIMEZONE_ALIASES (common/timezone.rs:175). Filesystem sites unchanged.
+#   NEW NON-CODE FILES in the package: `.claude/skills/*/SKILL.md` and `docs/wire-facts/*.md`, upstream's
+#   own agent and protocol notes. Never compiled or read by cargo.
+#
+# ORDER WIRE FORMAT: `orders/common/encoders.rs` byte-identical to 5.5.0; `messages/` unchanged. The handshake
+# now offers max server version 227 (`COMBO_IMPLIED_BID_ASK`), which gates only the new combo implied
+# bid/ask ticks (TickType 112/113, generic tick 760). Minimum unchanged.
+#
+# NOTICE CLASSIFICATION: unchanged (`errors.rs` and `messages/` identical). `Error` still #[non_exhaustive],
+# no new variants.
+#
+# BEHAVIOUR CHANGES ON PATHS WE COMPILE:
+#   - ONE-SHOT DEADLINE (the fix #859 waited for): `retry_on_connection_reset` waits for the reconnect only
+#     until the call's deadline, then returns Error::Timeout (transport/sync/connection_signal.rs). Shared
+#     one-shots always carry one (`one_shot_timeout`, default 30 s): `managed_accounts`, which
+#     `account_snapshot` calls, is one; `read_error` already maps Timeout to ConnectivityError::Timeout.
+#     Request-id one-shots and historical `fetch` carry one ONLY when the client sets `one_shot_timeout`
+#     (builder default None), so rustrade-data's IbkrHistoricalData historical bars and option computations
+#     still wait without a limit (#883). Public `Client::wait_connected` unchanged.
+#   - RECONNECT WRITE GATE (upstream #1171): a write takes `try_read` on a session gate that the dispatcher
+#     holds from reset until the replayed handshake ends, so a request is written on the old socket or
+#     refused with ConnectionReset, never sent mid-handshake. Every IBKR path already treats ConnectionReset
+#     as transient.
+#   - DEAD-SOCKET SEVER (upstream #1179): on a reconnect the dead stream is shut down first, so a write
+#     blocked on a peer that stopped reading fails with ConnectionReset and the reconnect proceeds.
+#   - ADDITIVE API: `Execution::option_exercise_type` (`OptionExerciseType`, decoded from the protobuf
+#     execution with no server-version gate; codes follow IB's reference client, no semantics given),
+#     TickType::ComboImpliedBid/Ask (TickType is not #[non_exhaustive]; our matches have wildcards),
+#     blocking `is_terminated()` on subscriptions, `HistoricalScheduleBuilder::trading_hours`.
+#   rustrade compiles unchanged: `cargo check --locked --workspace --all-targets --all-features` is warning-free.
 binance-sdk=77.2.0  # 2026-10-30 | Exchange SDK, signing/IO. PINNED: margin user-data stream couples to 3 `binance_sdk::common` internals (lower-stability than the public per-market API). ANY bump MUST re-verify all 3 before merge:
 #   1. common::websocket::WebsocketApi::send_message      — signature + WebsocketMessageSendOptions signing fields (margin WS subscribe send)
 #   2. ws.common.events.subscribe (WebsocketEventEmitter) — receive/event-callback path (margin WS event delivery)
