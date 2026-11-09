@@ -53,8 +53,21 @@
 //! As IB documents it, interest accrues daily through the month in `AccruedCash` and is posted to
 //! cash at the month's end or in the first days of the next. Until then `total` leaves it out, so
 //! the cash the account will hold is `total + accrued`. Stock borrow fees accrue daily too; IB
-//! does not document whether they accrue in `AccruedCash` or when they post. Fills carry none of
-//! these charges, so PnL computed from them excludes them too.
+//! does not document whether they accrue in `AccruedCash` or when they post. On a paper account,
+//! a short stock position's borrow fee, charged for every calendar day from settlement, accrued in
+//! the `AccruedCash` of the stock's currency, was booked several days late, and posted to that
+//! currency's cash early in the next month as the month's "Net Short Stock Interest". So there,
+//! until it posted, `total` left it out and `total + accrued` included it; a live account may
+//! differ. For a short held from 12 October to 6 November 2026, in US Eastern dates:
+//!
+//! - The fees for 13–15 October first appeared on 16 October.
+//! - October's total posted to cash on 4 November, the third business day, as IB support had
+//!   said.
+//! - No fee for November had appeared when the position was closed at the open on 6 November. The
+//!   first part appeared by early 7 November, so a fee can still arrive after the position that
+//!   incurred it is gone.
+//!
+//! Fills carry none of these charges, so PnL computed from them excludes them too.
 //!
 //! # Fill fees
 //!
