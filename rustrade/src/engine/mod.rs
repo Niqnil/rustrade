@@ -2060,6 +2060,11 @@ pub enum EngineOutput<
 }
 
 /// A single resting order captured in an [`EngineOutput::OpenOrdersAtSplit`] observable.
+///
+/// An order with an amend in flight at the split is captured at the values it rested at before
+/// the amend. The amend's new values are on the pre-split scale, and its answer commits whatever
+/// the venue confirms, so wait for that answer, or cancel the order, before re-pricing it for the
+/// split.
 #[derive(
     Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
 )]

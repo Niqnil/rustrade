@@ -70,11 +70,16 @@ where
     /// Apply the answer to an amend.
     ///
     /// # Contract
-    /// - `Ok(Amended)` commits the amended price, quantity and kind to the order, whatever its
-    ///   state: a late answer behind a cancel still says what the order was while it rested. An
+    /// - `Ok(Amended)` commits the amended price, quantity and kind to an order with its amend in
+    ///   flight, or with a cancel sent since: a late answer behind a cancel still says what the
+    ///   order was while it rested. An
     ///   [`AmendInFlight`](rustrade_execution::order::state::AmendInFlight) order returns to
     ///   `Open`, carrying the identifier the venue now addresses it by. An order the amend left
     ///   with nothing to fill stops being tracked.
+    /// - `Ok(Amended)` is ignored for an `Open` order, which has no amend in flight, and for an
+    ///   answer about another venue order: one whose
+    ///   [`previous_id`](rustrade_execution::order::amend::Amended::previous_id), or else whose
+    ///   order's identifier, is not the identifier tracked.
     /// - A refusal or rejection returns an `AmendInFlight` order to `Open`, unchanged.
     /// - An unknown outcome
     ///   ([`OrderError::is_outcome_unknown`](rustrade_execution::error::OrderError::is_outcome_unknown))

@@ -348,6 +348,9 @@ impl AmendSupport {
     /// - [`AmendRefusal::Unsupported`] for the first field the request changes that cannot be
     ///   amended;
     /// - [`AmendRefusal::Increase`] for a field that can only be lowered and is raised;
+    /// - [`AmendRefusal::NotOnKind`] for a field that can only be lowered and the order's kind
+    ///   does not have. Other checks of the order's kind are
+    ///   [`RequestAmend::amended`](RequestAmend::amended)'s;
     /// - [`AmendRefusal::MultipleFields`] for a request changing more than one field where
     ///   [`multi_field`](Self::multi_field) is `false`.
     pub fn permits(&self, request: &RequestAmend) -> Result<(), AmendRefusal> {
@@ -374,11 +377,11 @@ impl AmendSupport {
             match allowed {
                 AmendAllowed::Unsupported => return Err(AmendRefusal::Unsupported { field }),
                 AmendAllowed::Any => {}
-                AmendAllowed::DecreaseOnly => {
-                    if old.is_none_or(|old| new > old) {
-                        return Err(AmendRefusal::Increase { field });
-                    }
-                }
+                AmendAllowed::DecreaseOnly => match old {
+                    None => return Err(AmendRefusal::NotOnKind { field }),
+                    Some(old) if new > old => return Err(AmendRefusal::Increase { field }),
+                    Some(_) => {}
+                },
             }
         }
 
@@ -610,6 +613,22 @@ mod tests {
             );
             assert_eq!(support.permits(&to(dec!(89))), Ok(()), "{kind:?}");
         }
+    }
+
+    /// A field that can only be lowered, on an order whose kind does not have it, is refused as
+    /// not on the kind: there is nothing to compare with.
+    #[test]
+    fn support_for_decreases_only_refuses_a_field_the_kind_lacks() {
+        let support = AmendSupport::NONE.with_trigger_price(AmendAllowed::DecreaseOnly);
+        assert_eq!(
+            support.permits(&request(
+                AmendPatch::default().with_trigger_price(dec!(1)),
+                limit()
+            )),
+            Err(AmendRefusal::NotOnKind {
+                field: AmendField::TriggerPrice
+            })
+        );
     }
 
     #[test]

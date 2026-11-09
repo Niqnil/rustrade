@@ -36,7 +36,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `ActiveOrderState::AmendInFlight`. It keeps working at its old values: fills advance it, and
     the amend's values are taken only from its answer. One request at a time per order: an amend
     of an order with an open, cancel or amend in flight is refused (`AmendRefusal::RequestInFlight`).
-    A cancel of such an order is still sent.
+    A cancel of such an order is still sent, including by `Command::CancelOrders` and at contract
+    expiry. While an amend raising the quantity is in flight, a fill beyond the old total retires
+    the order only once it reaches the new total.
   - **From a strategy:** `AlgoStrategy::generate_amends` and `RiskManager::check_amends`, both
     with defaults, so existing implementations are unaffected. The default check approves an
     amend that only lowers the quantity. It passes any other amend through `RiskManager::check`

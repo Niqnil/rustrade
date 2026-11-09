@@ -183,8 +183,6 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
         output
     }
 
-    /// Check `group` can be sent, given the open ids `claimed` earlier in the same call, and stamp
-    /// its opens with the market the state holds now. Returns the exchange the group is for.
     /// Send amends, each built from the order the state tracks under its key
     /// ([`PreparesAmend`]), and record those sent as in flight.
     ///
@@ -259,6 +257,8 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
         output
     }
 
+    /// Check `group` can be sent, given the open ids `claimed` earlier in the same call, and stamp
+    /// its opens with the market the state holds now. Returns the exchange the group is for.
     fn prepare_cancel_then_open<ExchangeKey, InstrumentKey>(
         &self,
         group: &mut CancelThenOpen<ExchangeKey, InstrumentKey>,

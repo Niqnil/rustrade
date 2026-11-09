@@ -320,11 +320,20 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
         let Some(order) = self.0.get_mut(cid) else {
             return false;
         };
-        let quantity = order.quantity;
-        let (ActiveOrderState::Open(open)
-        | ActiveOrderState::AmendInFlight(AmendInFlight { order: open, .. })) = &mut order.state
-        else {
-            return false;
+        // While an amend raising the quantity is in flight, the venue may already have made it and
+        // filled beyond the old total: such a fill retires the order only past the new total. A
+        // venue that refused the raise cannot have filled beyond the old one.
+        let (open, quantity) = match &mut order.state {
+            ActiveOrderState::Open(open) => (open, order.quantity),
+            ActiveOrderState::AmendInFlight(AmendInFlight {
+                order: open, patch, ..
+            }) => (
+                open,
+                patch
+                    .quantity
+                    .map_or(order.quantity, |amended| amended.max(order.quantity)),
+            ),
+            _ => return false,
         };
         // A `ClientOrderId` identifies the order this engine sent; the venue's own id identifies
         // what it filled. Requiring both to agree keeps a fill off an order that merely shares the
@@ -906,15 +915,45 @@ where
                 );
                 return;
             }
-            ActiveOrderState::Open(open)
-            | ActiveOrderState::AmendInFlight(AmendInFlight { order: open, .. }) => {
+            // No amend was recorded: a duplicate or stale answer, whose values may be older than
+            // what the order has since been reported as.
+            ActiveOrderState::Open(_) => {
+                warn!(
+                    exchange = ?response.key.exchange,
+                    instrument = ?response.key.instrument,
+                    strategy = %response.key.strategy,
+                    cid = %response.key.cid,
+                    update = ?response,
+                    "OrderManager received an amend for an order with no amend in flight - ignoring"
+                );
+                return;
+            }
+            ActiveOrderState::AmendInFlight(AmendInFlight { order: open, .. }) => {
                 Some(open.clone())
             }
             ActiveOrderState::CancelInFlight(cancel) => cancel.order.clone(),
         };
 
-        // The values the venue confirmed, whatever the state: a late answer behind a cancel still
-        // says what the order was while it rested.
+        // The answer must be for the venue order amended: under its previous identifier when the
+        // venue issued a new one.
+        if let Some(held) = &held {
+            let amended_id = amended.previous_id.as_ref().unwrap_or(&amended.open.id);
+            if *amended_id != held.id {
+                warn!(
+                    exchange = ?response.key.exchange,
+                    instrument = ?response.key.instrument,
+                    strategy = %response.key.strategy,
+                    cid = %response.key.cid,
+                    tracked_id = ?held.id,
+                    update = ?response,
+                    "OrderManager received an amend of another venue order - ignoring"
+                );
+                return;
+            }
+        }
+
+        // The values the venue confirmed, behind a cancel too: a late answer still says what the
+        // order was while it rested.
         order.price = amended.price;
         order.quantity = amended.quantity;
         order.kind = amended.kind;
@@ -3146,6 +3185,56 @@ mod tests {
             filled.filled_quantity = dec!(0.5);
             orders.update_from_amend_response(&answer(Ok(amended(filled, dec!(1), dec!(0.5)))));
             assert!(orders.0.is_empty());
+        }
+
+        /// A fill beyond the old total while an amend raising the quantity is in flight means the
+        /// venue made the raise: the order retires only past the new total. A lowering amend in
+        /// flight does not lower the total a fill is measured against.
+        #[test]
+        fn a_fill_beyond_the_old_total_waits_for_a_raise_in_flight() {
+            let amending = |patch: AmendPatch| {
+                let mut orders = resting();
+                orders.record_in_flight_amend(&request(patch), TIME_SENT);
+                orders
+            };
+
+            let mut raising = amending(AmendPatch::default().with_quantity(dec!(3)));
+            assert!(!raising.update_from_fill(&cid(), &OrderId::new("1"), dec!(2)));
+            let ActiveOrderState::AmendInFlight(amend) = &tracked_order(&raising).state else {
+                panic!("still AmendInFlight");
+            };
+            assert_eq!(amend.order.filled_quantity, dec!(2));
+            assert!(raising.update_from_fill(&cid(), &OrderId::new("1"), dec!(3)));
+            assert!(raising.0.is_empty());
+
+            let mut lowering = amending(AmendPatch::default().with_quantity(dec!(0.5)));
+            assert!(!lowering.update_from_fill(&cid(), &OrderId::new("1"), dec!(0.6)));
+            assert!(lowering.update_from_fill(&cid(), &OrderId::new("1"), dec!(1)));
+        }
+
+        /// An answer is applied only to the amend it answers: not to an order with no amend in
+        /// flight, nor to an amend of another venue order.
+        #[test]
+        fn an_amend_answer_is_ignored_without_its_amend() {
+            let made = || answer(Ok(amended(open_assigned("1", t(1)), dec!(2), dec!(3))));
+
+            let mut orders = resting();
+            let before = tracked_order(&orders).clone();
+            orders.update_from_amend_response(&made());
+            assert_eq!(*tracked_order(&orders), before, "no amend in flight");
+
+            for previous_id in [None, Some(VenueOrderId::Assigned(OrderId::new("9")))] {
+                let mut orders = in_flight();
+                let before = tracked_order(&orders).clone();
+                orders.update_from_amend_response(&answer(Ok(Amended::new(
+                    open_assigned("9", t(1)),
+                    Some(dec!(2)),
+                    dec!(3),
+                    OrderKind::Limit,
+                    previous_id,
+                ))));
+                assert_eq!(*tracked_order(&orders), before, "another venue order");
+            }
         }
     }
 }
