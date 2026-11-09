@@ -63,7 +63,10 @@ use crate::{
     order::{
         Order, UnindexedInactiveOrder, UnindexedOrderKey,
         bracket::{BracketOrderRequest, BracketOrderResult},
-        request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
+        request::{
+            CancelReplaceAnswer, OnCancelFailure, OrderRequestCancel, OrderRequestOpen,
+            UnindexedOrderResponseCancel,
+        },
         state::{Open, UnindexedOrderState},
     },
     shortability::Shortability,
@@ -219,7 +222,10 @@ impl<'a> ClientInstrument<'a> {
 ///     error::UnindexedClientError,
 ///     order::{
 ///         Order, UnindexedInactiveOrder, UnindexedOrderKey,
-///         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
+///         request::{
+///             CancelReplaceAnswer, OnCancelFailure, OrderRequestCancel, OrderRequestOpen,
+///             UnindexedOrderResponseCancel,
+///         },
 ///         state::{Open, UnindexedOrderState},
 ///     },
 ///     trade::{Trade, TradesRead},
@@ -354,6 +360,17 @@ impl<'a> ClientInstrument<'a> {
 ///     ) -> impl Stream<Item = Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> + Send
 ///     {
 ///         self.inner.open_orders(requests)
+///     }
+///
+///     // Forwarded so that the inner client's one-request cancel-replace is kept: left out, the
+///     // wrapper's groups would go the slower, sequential way.
+///     fn cancel_replace(
+///         &self,
+///         cancel: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
+///         open: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
+///         on_cancel_failure: OnCancelFailure,
+///     ) -> Option<impl Future<Output = CancelReplaceAnswer> + Send> {
+///         self.inner.cancel_replace(cancel, open, on_cancel_failure)
 ///     }
 ///
 ///     async fn fetch_balances(
@@ -658,6 +675,61 @@ where
         futures::stream::FuturesUnordered::from_iter(
             requests.into_iter().map(|request| self.open_order(request)),
         )
+    }
+
+    /// Send a cancel and the open that waits on it as one venue request, where the venue has one
+    /// that does exactly what a [`CancelThenOpen`] group of that cancel and that open asks.
+    ///
+    /// The engine's `ExecutionManager` offers each group of one cancel and one open here first.
+    /// When this returns `None` it sequences the group itself: it sends the cancel, and sends or
+    /// drops the open once the cancel is answered. A native request saves the open's round trip,
+    /// which is how long the group leaves nothing resting.
+    ///
+    /// The default returns `None` for every pair. Binance Spot overrides it.
+    ///
+    /// # Implementation obligations
+    /// - **Decline without sending.** Return `None`, having sent nothing, for a pair the venue's
+    ///   request cannot carry exactly as asked, including under `on_cancel_failure`. The
+    ///   sequential path then serves it.
+    /// - **Keep the group's order.** The venue must finish the cancel before it places the open.
+    ///   Under [`OnCancelFailure::DropOpens`] it must not place the open when the cancel fails.
+    ///   Under [`OnCancelFailure::SendOpens`] it must attempt the open whatever the cancel's
+    ///   answer, unless the venue refuses the whole request (below).
+    /// - **Answer what the venue did with each leg,** in the form a leg sent alone is answered:
+    ///   [`CancelReplaceAnswer::cancel`] as [`cancel_order`](Self::cancel_order) answers, and
+    ///   [`CancelReplaceAnswer::open`] as [`open_order`](Self::open_order) answers. `open` is
+    ///   `None` only when the cancel failed under `DropOpens` and the venue did not attempt the
+    ///   open.
+    /// - **A request refused whole changed nothing.** A venue may check the request before it
+    ///   acts on either leg, and refuse it whole: for a filter, a limit, or a malformed or
+    ///   unauthorised request. The order to cancel then still rests, so the cancel is answered as
+    ///   failed with that refusal, and the open as not attempted under `DropOpens` or as refused
+    ///   with the same reason under `SendOpens`. Sent apart, the cancel might have gone through
+    ///   and only the open been refused, leaving nothing resting, where the refused request
+    ///   leaves the order to cancel in place.
+    /// - **Unknown stays unknown.** When the venue's answer is lost, the cancel is an error, and
+    ///   the open is `Some`, with an outcome that is unknown (see
+    ///   [`OrderState::is_outcome_unknown`](crate::order::state::OrderState::is_outcome_unknown)).
+    ///   Then the manager looks the order up, as it does for an open sent alone.
+    /// - **Answer once.** The future must resolve. The manager bounds it with its
+    ///   `request_timeout`, and a timeout counts as the cancel failing and the open's outcome
+    ///   being unknown.
+    ///
+    /// # Wrapping clients
+    /// A client that wraps another and does not forward this method keeps the default, so its
+    /// groups go the sequential way. That is still correct, just slower.
+    ///
+    /// [`CancelThenOpen`]: crate::order::request::CancelThenOpen
+    /// [`OnCancelFailure::DropOpens`]: crate::order::request::OnCancelFailure::DropOpens
+    /// [`OnCancelFailure::SendOpens`]: crate::order::request::OnCancelFailure::SendOpens
+    fn cancel_replace(
+        &self,
+        cancel: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
+        open: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
+        on_cancel_failure: OnCancelFailure,
+    ) -> Option<impl Future<Output = CancelReplaceAnswer> + Send> {
+        let _ = (cancel, open, on_cancel_failure);
+        None::<std::future::Ready<CancelReplaceAnswer>>
     }
 
     /// Fetch current balances for the specified assets.
