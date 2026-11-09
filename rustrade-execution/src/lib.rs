@@ -86,6 +86,8 @@ pub use cash_flow::{
 pub mod client;
 pub mod error;
 pub mod exchange;
+pub mod expiry;
+pub use expiry::LongOptionExpiry;
 pub mod fee;
 pub use fee::{
     FeeAssetConfig, FeeAssetConfigError, FeeModel, FeeModelConfig, Liquidity, PerContractFeeModel,
@@ -122,6 +124,8 @@ pub mod position;
 pub mod reduce_only;
 pub mod rules;
 pub use rules::{OrderRules, PreSendRules, ValueRule};
+pub mod short_option;
+pub use short_option::{Collateral, ShortPutCollateral};
 pub mod shortability;
 pub mod slippage;
 pub use shortability::{Shortability, ShortabilityProvider, ShortabilityTable};

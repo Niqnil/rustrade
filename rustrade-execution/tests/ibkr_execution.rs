@@ -48,6 +48,7 @@
 //! | `test_lenient_connect_reports_the_contracts_it_skips` | Lenient connect registers the rest and returns the skips |
 //! | `test_fetch_balances` | Fetch account balances |
 //! | `test_account_snapshot` | Fetch full account snapshot |
+//! | `test_account_snapshot_positions_match_ib` | The snapshot's positions match IB's own position listing |
 //! | `test_fetch_open_orders` | Fetch currently open orders |
 //! | `test_account_stream` | Stream account events |
 //! | `test_fetch_trades` | Fetch historical trades |
@@ -112,6 +113,7 @@ use rustrade_execution::{
         request::RequestOpen,
         state::{ActiveOrderState, InactiveOrderState, OrderState},
     },
+    position::PositionReport,
 };
 use rustrade_instrument::{
     Side, asset::name::AssetNameExchange, exchange::ExchangeId, ibkr::ContractRegistryError,
@@ -428,6 +430,92 @@ async fn test_account_snapshot() {
     println!("Instruments: {}", snapshot.instruments.len());
     for snap in &snapshot.instruments {
         println!("  {}: position {:?}", snap.instrument, snap.position);
+    }
+}
+
+/// `account_snapshot` reports each requested instrument's position as IB's own position listing
+/// does: open with IB's signed quantity when the account holds it, flat when it holds none.
+///
+/// Read against `positions()`, a different IB request from the one the client uses. AAPL and
+/// MSFT are requested; at least one must be flat. The open case is checked only while the
+/// account holds one of them, as after [`test_open_paper_short`].
+#[tokio::test]
+#[ignore]
+#[serial]
+async fn test_account_snapshot_positions_match_ib() {
+    init_logging();
+
+    let symbols = ["AAPL", "MSFT"];
+    let mut config = resolved_aapl_config(32);
+    let aapl = config.contracts[0].clone();
+    config.contracts.push(ContractConfig {
+        name: "MSFT".to_string(),
+        symbol: "MSFT".to_string(),
+        ..aapl
+    });
+    let address = format!("{}:{}", config.host, config.port);
+
+    // IB's listing, summed over the login's accounts as the snapshot is.
+    let held = tokio::task::spawn_blocking(move || {
+        let client = ibapi::client::blocking::Client::connect(&address, test_client_id_base() + 33)
+            .expect("connection failed");
+        let subscription = client.positions().expect("positions failed");
+        let mut held = std::collections::HashMap::<String, rust_decimal::Decimal>::new();
+        for update in subscription.timeout_iter_data(Duration::from_secs(10)) {
+            match update.expect("positions subscription failed") {
+                ibapi::accounts::PositionUpdate::Position(position) => {
+                    if position.contract.security_type == SecurityType::Stock
+                        && position.contract.currency == "USD"
+                    {
+                        let quantity = rust_decimal::Decimal::try_from(position.position)
+                            .expect("a finite position");
+                        *held
+                            .entry(position.contract.symbol.to_string())
+                            .or_default() += quantity;
+                    }
+                }
+                ibapi::accounts::PositionUpdate::PositionEnd => return held,
+            }
+        }
+        panic!("IB's position listing did not end");
+    })
+    .await
+    .expect("task join");
+
+    let client = connect_client(config).await.expect("connection failed");
+    let instruments: Vec<InstrumentNameExchange> =
+        symbols.iter().map(|symbol| (*symbol).into()).collect();
+    let snapshot = client
+        .account_snapshot(&[], &instruments)
+        .await
+        .expect("account_snapshot failed");
+
+    let mut flat_checked = false;
+    let mut open_checked = false;
+    for symbol in symbols {
+        let quantity = held.get(symbol).copied().unwrap_or_default();
+        let reported = &snapshot
+            .instruments
+            .iter()
+            .find(|entry| entry.instrument.name().as_str() == symbol)
+            .unwrap_or_else(|| panic!("{symbol} is not in the snapshot: {snapshot:?}"))
+            .position;
+        println!("{symbol}: IB holds {quantity}, the snapshot reports {reported:?}");
+        if quantity.is_zero() {
+            assert!(matches!(reported, PositionReport::Flat), "{symbol}");
+            flat_checked = true;
+        } else {
+            assert_eq!(
+                reported.open().map(|position| position.quantity),
+                Some(quantity),
+                "{symbol}"
+            );
+            open_checked = true;
+        }
+    }
+    assert!(flat_checked, "the account holds every requested instrument");
+    if !open_checked {
+        println!("No requested instrument is held: the open case was not checked");
     }
 }
 

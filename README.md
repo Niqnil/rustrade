@@ -72,6 +72,7 @@ types each execution client accepts.
 | **Massive** | Stocks, Crypto, Forex, Options, Futures | Historical + live streaming (Futures historical only) |
 | **Databento** | Equities, Futures, Options | Nanosecond precision, DBN format |
 | **London Strategic Edge** | FX, Crypto, Equities/ETFs, Options, Futures proxies, CFDs | Live ticks, historical candles, bulk export. ⚠️ Data is **not redistributable** |
+| **ThetaData** | US Options, Stocks, Indices, Interest rates | Historical quotes, bars, open interest and snapshots, through the local Theta Terminal. ⚠️ Data is **not redistributable** |
 
 > **⚠️ London Strategic Edge data is NOT redistributable.** This integration's *code* is MIT
 > like the rest of the repository; the *data* it retrieves is not. LSE permits use for your own
@@ -80,15 +81,20 @@ types each execution client accepts.
 > competing feed, download service or interface. Do not commit retrieved data, publish it as
 > fixtures or example datasets, or re-serve it. Terms: <https://londonstrategicedge.com/terms>
 
+> **⚠️ ThetaData data is NOT redistributable.** ThetaData's individual plans license the data for
+> personal, non-commercial use only, and its terms forbid reproducing, distributing or publishing
+> it. Do not commit retrieved data, publish it as fixtures or example datasets, or re-serve it.
+> Terms: <https://www.thetadata.net/terms-and-conditions>
+
 ## Quick Start
 
 Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-rustrade = "0.21"
-rustrade-data = { version = "0.21", features = ["hyperliquid"] }
-rustrade-execution = { version = "0.21", features = ["binance"] }
+rustrade = "0.22"
+rustrade-data = { version = "0.22", features = ["hyperliquid"] }
+rustrade-execution = { version = "0.22", features = ["binance"] }
 ```
 
 See the [examples](https://github.com/Niqnil/rustrade/tree/main/rustrade/examples) for complete working code.

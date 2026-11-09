@@ -120,6 +120,7 @@ impl From<InstrumentConfig> for Instrument<ExchangeId, Asset> {
                     settlement_asset: Asset::new_from_exchange(contract.settlement_asset),
                     kind: contract.kind,
                     exercise: contract.exercise,
+                    settlement: contract.settlement,
                     expiry: contract.expiry,
                     strike: contract.strike,
                 }),

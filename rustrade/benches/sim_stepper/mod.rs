@@ -118,6 +118,8 @@ fn session() -> Session {
             .unwrap(),
         ),
         fee_asset: None,
+        long_option_expiry: Default::default(),
+        short_put_collateral: Default::default(),
     };
     let interest = PeriodicMarginInterest::new(TimeDelta::hours(1), DayCount::Act365).with_rates(
         AssetNameExchange::new("btc"),

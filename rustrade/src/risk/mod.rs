@@ -1,5 +1,5 @@
 use derive_more::{Constructor, Display, From};
-use rustrade_execution::order::request::{OrderRequestCancel, OrderRequestOpen};
+use rustrade_execution::order::request::{CancelThenOpen, OrderRequestCancel, OrderRequestOpen};
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, hash::Hash, marker::PhantomData};
@@ -37,7 +37,9 @@ pub trait RiskManager<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentInd
     /// contract expiry or a corporate action, while trading is enabled and no drain is in
     /// progress, with the batch its strategy generated from `state`.
     /// It sends only the approved requests, cancels first, and reports the refused ones, with
-    /// their reasons, in [`GenerateAlgoOrdersOutput`]. Commands to close positions or cancel
+    /// their reasons, in [`GenerateAlgoOrdersOutput`]. The strategy's
+    /// [`CancelThenOpen`] groups are reviewed apart, by
+    /// [`check_cancel_then_opens`](Self::check_cancel_then_opens). Commands to close positions or cancel
     /// orders do not pass through it.
     ///
     /// # Caller obligations
@@ -65,6 +67,67 @@ pub trait RiskManager<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentInd
         impl IntoIterator<Item = RiskRefused<OrderRequestCancel<ExchangeKey, InstrumentKey>>>,
         impl IntoIterator<Item = RiskRefused<OrderRequestOpen<ExchangeKey, InstrumentKey>>>,
     );
+
+    /// Reviews the [`CancelThenOpen`] groups an
+    /// [`AlgoStrategy`](super::strategy::algo::AlgoStrategy) generated, approving or refusing
+    /// each group whole: approved groups, refused groups.
+    ///
+    /// The [`Engine`](crate::engine::Engine) calls it right after [`check`](Self::check), on the
+    /// same occasions, with the groups from
+    /// [`generate_cancel_then_opens`](super::strategy::algo::AlgoStrategy::generate_cancel_then_opens).
+    /// It sends the approved groups and reports the refused ones. The caller obligations of
+    /// [`check`](Self::check) apply to each group: return it once, approved or refused; an
+    /// approved group is sent as returned; a refusal is final for this batch.
+    ///
+    /// # Default
+    /// Passes each group's legs, alone, through [`check`](Self::check). A group is approved, with
+    /// the legs as `check` returned them, only if `check` refused none of them; otherwise it is
+    /// refused whole, as the strategy generated it, with the refused legs' reasons. So a risk manager written before groups
+    /// existed reviews their legs too. `check` sees each group as a batch of its own, so a check
+    /// that weighs a whole batch, such as total exposure, sees a group apart from the requests
+    /// that [`check`](Self::check) reviewed. Override this to review groups together with them.
+    fn check_cancel_then_opens(
+        &self,
+        state: &Self::State,
+        groups: impl IntoIterator<Item = CancelThenOpen<ExchangeKey, InstrumentKey>>,
+    ) -> (
+        impl IntoIterator<Item = RiskApproved<CancelThenOpen<ExchangeKey, InstrumentKey>>>,
+        impl IntoIterator<Item = RiskRefused<CancelThenOpen<ExchangeKey, InstrumentKey>>>,
+    )
+    where
+        ExchangeKey: Debug + Clone,
+        InstrumentKey: Debug + Clone,
+    {
+        let mut approved = Vec::new();
+        let mut refused = Vec::new();
+        for group in groups {
+            let on_cancel_failure = group.on_cancel_failure;
+            // Kept to report a refusal with: `check` takes the legs by value.
+            let generated = group.clone();
+            let CancelThenOpen { cancels, opens, .. } = group;
+            let (cancels, opens, refused_cancels, refused_opens) =
+                self.check(state, cancels, opens);
+            let cancels: Vec<_> = cancels.into_iter().map(RiskApproved::into_item).collect();
+            let opens: Vec<_> = opens.into_iter().map(RiskApproved::into_item).collect();
+            let reasons: Vec<String> = refused_cancels
+                .into_iter()
+                .map(|refused| format!("cancel {:?}: {}", refused.item.key, refused.reason))
+                .chain(
+                    refused_opens
+                        .into_iter()
+                        .map(|refused| format!("open {:?}: {}", refused.item.key, refused.reason)),
+                )
+                .collect();
+            if reasons.is_empty() {
+                approved.push(RiskApproved::new(
+                    CancelThenOpen::new(cancels, opens).with_on_cancel_failure(on_cancel_failure),
+                ));
+            } else {
+                refused.push(RiskRefused::new(generated, reasons.join("; ")));
+            }
+        }
+        (approved, refused)
+    }
 }
 
 /// New type that wraps order requests that have passed [`RiskManager`] checks.
@@ -154,5 +217,111 @@ impl<State, ExchangeKey, InstrumentKey> RiskManager<ExchangeKey, InstrumentKey>
             std::iter::empty(),
             std::iter::empty(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+    use rustrade_execution::order::{
+        OrderKey, OrderKind, TimeInForce,
+        id::{ClientOrderId, StrategyId},
+        request::{OnCancelFailure, RequestCancel, RequestOpen},
+    };
+    use rustrade_instrument::Side;
+
+    /// Refuses an open above 10, cuts one above 1 down to 1, and approves the rest.
+    struct SizeCap;
+
+    impl RiskManager for SizeCap {
+        type State = ();
+
+        fn check(
+            &self,
+            _: &Self::State,
+            cancels: impl IntoIterator<Item = OrderRequestCancel>,
+            opens: impl IntoIterator<Item = OrderRequestOpen>,
+        ) -> (
+            impl IntoIterator<Item = RiskApproved<OrderRequestCancel>>,
+            impl IntoIterator<Item = RiskApproved<OrderRequestOpen>>,
+            impl IntoIterator<Item = RiskRefused<OrderRequestCancel>>,
+            impl IntoIterator<Item = RiskRefused<OrderRequestOpen>>,
+        ) {
+            let (mut approved, mut refused) = (Vec::new(), Vec::new());
+            for mut open in opens {
+                if open.state.quantity > dec!(10) {
+                    refused.push(RiskRefused::new(open, "too large"));
+                } else {
+                    open.state.quantity = open.state.quantity.min(dec!(1));
+                    approved.push(RiskApproved::new(open));
+                }
+            }
+            (
+                cancels.into_iter().map(RiskApproved::new),
+                approved,
+                std::iter::empty(),
+                refused,
+            )
+        }
+    }
+
+    fn key(cid: &str) -> OrderKey {
+        OrderKey {
+            exchange: ExchangeIndex(0),
+            instrument: InstrumentIndex(0),
+            strategy: StrategyId::new("test"),
+            cid: ClientOrderId::new(cid),
+        }
+    }
+
+    fn open(cid: &str, quantity: Decimal) -> OrderRequestOpen {
+        OrderRequestOpen {
+            key: key(cid),
+            state: RequestOpen::new(
+                Side::Sell,
+                None,
+                quantity,
+                OrderKind::Market,
+                TimeInForce::ImmediateOrCancel,
+            ),
+        }
+    }
+
+    fn group(opens: Vec<OrderRequestOpen>) -> CancelThenOpen {
+        CancelThenOpen::new(
+            vec![OrderRequestCancel {
+                key: key("stop"),
+                state: RequestCancel { id: None },
+            }],
+            opens,
+        )
+    }
+
+    /// By default each group's legs pass through `check` alone: a group is approved with its legs
+    /// as `check` returned them and its failure policy kept, or refused whole, as generated, when
+    /// `check` refuses any leg.
+    #[test]
+    fn the_default_group_check_approves_or_refuses_each_group_whole() {
+        let untouched = group(vec![open("small", dec!(0.5))]);
+        let cut =
+            group(vec![open("medium", dec!(5))]).with_on_cancel_failure(OnCancelFailure::SendOpens);
+        let refused = group(vec![open("small", dec!(0.5)), open("large", dec!(20))]);
+
+        let (approved, refusals) =
+            SizeCap.check_cancel_then_opens(&(), [untouched.clone(), cut.clone(), refused.clone()]);
+        let approved: Vec<_> = approved.into_iter().map(RiskApproved::into_item).collect();
+        let refusals: Vec<_> = refusals.into_iter().collect();
+
+        let mut cut_down = cut;
+        cut_down.opens[0].state.quantity = dec!(1);
+        assert_eq!(approved, vec![untouched, cut_down]);
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        assert_eq!(refusals[0].item, refused, "refused as generated");
+        assert_eq!(
+            refusals[0].reason,
+            format!("open {:?}: too large", key("large"))
+        );
     }
 }

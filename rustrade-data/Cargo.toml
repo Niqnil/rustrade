@@ -1,6 +1,6 @@
 [package]
 name = "rustrade-data"
-version = "0.21.0"
+version = "0.22.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -41,6 +41,15 @@ lse = ["dep:sha2", "dep:hex", "reqwest/stream", "tokio/fs", "tokio/io-util"]
 # `.github/tier2-dependencies.txt`.
 lse-parquet = ["lse", "dep:parquet"]
 massive = ["dep:urlencoding", "serde_json/raw_value"]
+# ThetaData, through the REST API of the Theta Terminal the caller runs locally.
+#
+# ⚠️ The data this integration retrieves is NOT redistributable, whatever this crate's own licence
+# says. See `exchange::thetadata` and https://www.thetadata.net/terms-and-conditions
+#
+# `chrono-tz` converts ThetaData's New York wall-clock times to UTC (already in the workspace tree
+# via `rustrade-execution`). `serde_json/raw_value` reads each price's decimal text exactly, and
+# `reqwest/stream` decodes a response line by line instead of buffering it.
+thetadata = ["dep:chrono-tz", "serde_json/raw_value", "reqwest/stream"]
 
 [dev-dependencies]
 rustrade-instrument = { workspace = true, features = ["test-utils"] }
@@ -130,7 +139,7 @@ vecmap-rs = { workspace = true }
 fnv = { workspace = true }
 
 # IBKR (optional, behind "ibkr" feature)
-ibapi = { version = "=5.5.0", optional = true, default-features = false, features = ["sync"] }
+ibapi = { version = "=5.7.0", optional = true, default-features = false, features = ["sync"] }
 time = { version = "0.3", optional = true, features = ["macros"] }
 # XML parser for IBKR Flex Web Service statements (corporate-action reconciliation). New normal dep
 # (serde-xml-rs/xml-rs are only a build-dep of time-tz via ibapi, not reusable). Note for tier-2 review.
@@ -148,6 +157,7 @@ databento = { version = "0.64", optional = true, features = ["chrono"] }
 
 # Massive (optional, behind "massive" feature)
 urlencoding = { version = "2.1", optional = true }
+chrono-tz = { workspace = true, optional = true }
 
 # Integration tests whose contents are entirely feature-gated. Without `required-features`, the
 # target still builds with the feature off and libtest reports "0 passed" -- a green run that
@@ -253,6 +263,14 @@ required-features = ["massive"]
 name = "massive_ws_shared"
 required-features = ["massive"]
 
+[[test]]
+name = "thetadata_rest"
+required-features = ["thetadata"]
+
+[[test]]
+name = "thetadata_live"
+required-features = ["thetadata"]
+
 # Examples that depend on optional features. Without `required-features`,
 # `cargo check --all-targets` (default features) fails to compile them.
 
@@ -303,3 +321,7 @@ required-features = ["ibkr"]
 [[example]]
 name = "ibkr_flex_corporate_actions"
 required-features = ["ibkr"]
+
+[[example]]
+name = "thetadata_options"
+required-features = ["thetadata"]

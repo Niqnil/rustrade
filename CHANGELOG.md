@@ -7,6 +7,300 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-09
+
+### Added
+
+- **A ThetaData provider: US options, stocks, indices, interest rates and the market calendar**
+  (`rustrade-data`, new `thetadata` feature, #865). `ThetaDataClient` talks to the REST API (v3)
+  of a Theta Terminal, ThetaData's local application, which the caller runs logged in to their
+  account.
+  - **Options:** roots, expirations, strikes, and the contracts listed on a date with expired ones
+    included. History: NBBO quotes (every quote or one per interval), OHLC bars, open interest and
+    end-of-day reports. Snapshots: quotes, where one request covers a whole chain, plus OHLC and
+    open interest.
+  - **Stocks and indices:** symbols, dates, OHLC bars, NBBO quotes, index prices, end-of-day
+    reports and snapshots.
+  - **Interest rates and calendar:** daily SOFR and Treasury yields, and the market's schedule for
+    a day or a year's holidays.
+  - **Output types:** quotes and bars convert to `OrderBookL1` and `Candle`. An end-of-day report
+    carries its trading date and the day's `Candle`, closing at 00:00 UTC after that date, after
+    ThetaData generates the report, so a free account can drive a daily backtest. Option contracts
+    keep ThetaData's root (such as `SPXW`) and convert to `MarketDataOptionContract`.
+  - **Exchange ids:** `ExchangeId::ThetaDataStocks`, `ThetaDataOptions` and `ThetaDataIndices`
+    (`rustrade-instrument`), one per asset class, so a backtest can give stocks and options their
+    own mock fee model and expiry handling.
+  - **Example:** `engine_backtest_with_thetadata_candles` (`rustrade`, `thetadata` feature) runs a
+    backtest on daily candles from end-of-day reports, or on one-minute bars with
+    `--minute-bars` (value plan).
+  - **Prices are exact:** each is read from its decimal text. ThetaData's New York wall-clock
+    times are converted to UTC, with the daylight-saving transitions documented.
+  - **Ranges and concurrency:** date ranges are split into requests within ThetaData's per-request
+    caps and streamed back in order. The client keeps at most a caller-set number of requests in
+    flight, matching the account's concurrency limit. A stream holds its slot until it ends or is
+    dropped, so at a limit of 1, drain or drop one stream before polling the next.
+  - **Errors:** `ThetaDataError` tells apart an unreachable Terminal, a request the plan does not
+    include, a session taken over by another login, a full queue and other failures, and marks
+    the transient ones. A request with no data yields no rows, or `None` from the calendar's
+    single-day methods. Dates before the plan's history
+    starts are refused as an invalid request (HTTP 400), not as a permission error.
+  - **Securing the Terminal:** its API has no authentication, and the Terminal may listen on every
+    network interface whatever its configured host. Keep its port behind a firewall, or in a
+    container that does not publish it beyond `127.0.0.1` or a private network.
+
+  ⚠️ ThetaData's individual plans are for personal, non-commercial use, and its terms forbid
+  redistributing the data. Do not commit or publish what this integration retrieves. See
+  <https://www.thetadata.net/terms-and-conditions>.
+
+- **A market stream can be ended and reconnected when it stays silent** (`rustrade-data`, #862).
+  A WebSocket can stay open, and keep answering pings, while its subscriptions deliver nothing.
+  Such a stream never ended, so it never reconnected.
+  - `MarketStreamOptions::with_silence_timeout(threshold)` sets a per-connection timeout, off by
+    default. When the connection delivers no market event for `threshold`, its stream yields the
+    new `DataError::SilenceTimeout { threshold }`, then `Reconnecting`, and re-initialises with
+    its backoff, as after any other end. A zero threshold is refused
+    (`MarketStreamOptionsError::SilenceTimeoutZero`).
+  - Only the market events the stream delivers restart the timer: pings, pongs, a venue's
+    heartbeat and acknowledgement messages, an update the integration does not deliver (such as
+    a candle that has not closed) and the stream's errors do not. The timer starts once the
+    stream has initialised, including the venue acknowledging its subscriptions.
+  - `SilenceTimeout` is not terminal, and is yielded as an error so a caller can count it apart
+    from the stream's transport errors.
+  - New `StreamBuilder::subscribe_with_options` and `DynamicStreams::init_with_options` take the
+    options per `subscribe` call and per subscription batch. `subscribe`, `init` and `init_with`
+    use `MarketStreamOptions::default()`.
+  - `MarketStreamOptions` also carries the reconnect backoff (`with_reconnect`), which the
+    builders used to fix at `STREAM_RECONNECTION_POLICY`.
+  - The Binance USD-M futures rustdoc replaces its "caller obligation" to detect a silently dead
+    stream with how to set the timeout. It also notes that 1-second continuous klines are
+    delivered on the `/market` path only, and that `BinanceHistoricalClient::futures` returns
+    1-second candles from only about four months back, without an error for an earlier start.
+
+- **`Engine::attribute_cash_flow` is public** (`rustrade`). `Engine::process` asks the strategy's
+  `CashFlowAttributionStrategy` which position an account-level cash flow belongs to.
+  `Engine::update_from_account_stream` does not, so a caller driving the engine by hand left every
+  such flow on the account. That caller now calls `attribute_cash_flow` on each account event
+  before `update_from_account_stream`, and before recording the event in any audit it keeps.
+
+- **The engine can let long options lapse at expiry** (`rustrade`, #868).
+  `ExpiryHandling::Engine(LongOptionExpiry::Lapse)` settles every long option at zero, in the money
+  or not, matching a holder who instructs the venue not to exercise. Set it per exchange with
+  `expiry_handling`.
+  - Short options still settle at their intrinsic value, standing in for assignment, and futures at
+    their own last price.
+  - A lapsing long needs no underlying price. When any position that needs the price is open and
+    the price is missing, nothing is settled and the expiry stays retryable, as before.
+
+- **The simulated venue holds options, long or fully secured short, and settles them at expiry
+  itself** (`rustrade-execution`, #872). `SimulatedVenue` used to refuse every option order. Now:
+  - **Premium is paid in cash.** A buy pays `price × quantity × contract_size` and the fee in the
+    quote asset, and a sale receives it, less the fee, whether it opens or closes a position. The
+    venue keeps a net position per option and reports it in its account snapshot.
+  - **Orders.** A buy needs its premium and fee in free cash. Orders at or after expiry are
+    refused. A price that is not positive is no price, so a zero candle never fills an option. A
+    request-priced venue (`SimulatedVenue::new`, and so `MockExchange::new`) has no market feed to
+    price the underlying, so it refuses a buy opening a long unless `long_option_expiry` is
+    `Lapse`, and every sale opening a short.
+  - **Shorts are fully secured, as a cash account writes them.** A sale that opens or increases a
+    short holds collateral while the short is open, out of `free` and still in `total`: a put the
+    cash to buy the underlying at the strike, `strike × quantity × contract_size` of quote; a call
+    the shares it would deliver, `quantity × contract_size` of base. Covering shares cannot be
+    sold or used by another order, and collateral is never borrowed. A limit sale holds it while
+    it rests, measured, like every order, as if the orders already resting on its side filled
+    first; a buy-back releases its share as it fills. `SimulatedVenue::collateral_held` reports
+    it as a `Collateral`. A short whose collateral is not free is refused (`ApiError::BalanceInsufficient`), and a
+    short cash-settled call always is.
+  - **`MockExecutionConfig::short_put_collateral`** (`ShortPutCollateral`) decides whether a put's
+    premium counts towards its collateral: `Strike`, the default, holds the full strike before the
+    premium arrives, as Interactive Brokers does in a cash account; `StrikeLessPremium` lets the
+    premium count, as Alpaca does.
+  - **Not modelled:** naked shorts, margin against the underlying's price, credit for a long
+    option covering a short (spreads), and early assignment.
+  - **Expiry is settled by the venue.** When the clock passes a contract's expiry, the venue retires
+    the orders still working on it and settles the position against its own last price for the
+    underlying, at zero fee: out of the money at zero (`TradeOrigin::Expiry`); in the money,
+    exercised, by delivering the underlying at the strike or paying the intrinsic value, as the
+    contract's `settlement` says (`TradeOrigin::Exercise`). A short in the money is always
+    assigned (`TradeOrigin::Assignment`), whole, and pays out of the collateral it held: a put buys
+    the shares with its cash, a call delivers its shares for the strike, a cash-settled put pays its
+    intrinsic value and releases the rest. Out of the money, a short's collateral is released.
+    A long's delivery the account cannot cover is still made: on a cash account with a WARN, the
+    balance going negative; on a venue that lends, the shortfall is lent as a margin loan, past the
+    borrow cap if need be (with a WARN), owed, counted as debt, and charged interest.
+    `AccountState::lend` takes such a loan. Without an underlying price, settlement waits for one;
+    an option whose underlying no single spot instrument on the venue trades settles only by a long
+    lapsing. `MockExecutionConfig::long_option_expiry` makes every long lapse instead; it does not
+    apply to shorts.
+  - **Restore** refuses a snapshot holding a short cash-settled call
+    (`VenueRestoreError::OptionShortUnsecurable`), or whose balances do not hold its shorts'
+    collateral (`VenueRestoreError::OptionCollateralNotHeld`). The snapshot format is unchanged:
+    collateral is derived from the positions.
+  - **Leave expiry to the venue:** configure the engine with `ExpiryHandling::Venue` for that
+    exchange, or the position is closed twice.
+  - The `rustrade` execution builder now accepts option instruments for a mock exchange.
+  - A `SimStart` may hold an option position, seeded into the venue and the engine at its entry
+    price with its premium already paid or received. A short holds its collateral out of the listed
+    balances, which a spot position may supply for a covered call; one they do not cover is refused
+    (`SimStartError::OptionShortUncovered`), as is a short cash-settled call
+    (`SimStartError::OptionShortUnsecurable`). A venue's `initial_state` seeding a short holds its
+    collateral the same way, and panics if the seeded balances do not cover it.
+- **A simulated venue learns when its market feed goes down** (`rustrade-execution`, `rustrade`,
+  #876). Under `StaleMarketPolicy::Wait`, a venue could tell a dead feed from a quiet market only
+  by its age, so a `max_age` short enough to catch an outage also refused orders on a quiet book.
+  - `SimulatedVenue::mark_market_stale(instrument, time)` records that an instrument's feed is
+    down, in the new `VenueInstrumentMarket::stale_since`. Under `Wait`, a marked market is stale
+    however recently it was observed fresh, so an order waits for its next fresh observation, and
+    an immediate-or-cancel or fill-or-kill order is rejected with a reason naming the feed. The
+    next fresh observation clears the mark. Under `StaleMarketPolicy::Off` nothing changes.
+  - **Paper venues:** `PaperMarketFeed::tap` now passes a `Reconnecting` event on to the venues,
+    which mark every instrument they trade whose market data comes from that exchange
+    (`Instrument::data_exchange`). The end of the stream marks all of them. A reconnection names
+    only its exchange, so it also marks that exchange's instruments on connections still
+    delivering, until each one's next fresh observation.
+  - **Backtests:** `SimRunner` and `SimStepper` mark the same instruments on a `Reconnecting` event
+    in their source, as a paper venue does.
+  - **Custom drivers:** `MarketFeedEvent::Stale { instruments }` marks instruments on a
+    market-driven `MockExchange`, and the driver marks every instrument when its feed ends.
+  - `ExecutionInstrumentMap::own_instruments_priced_from(exchange)` lists an exchange's
+    instruments priced from another, or its own, exchange.
+  - A connection that stays open but delivers nothing reconnects only with
+    `MarketStreamOptions::with_silence_timeout` (#862); without it, such a feed is still noticed
+    only by its age.
+- **`OptionContract::settlement`: whether an exercised option delivers the underlying or pays cash**
+  (`rustrade-instrument`, #872). `OptionSettlement::{Physical, Cash}`, a contract term beside
+  `exercise`. A serialised contract without it loads as `Physical`.
+- **Cancel, then open: an open sent only once the cancels it depends on have been answered**
+  (`rustrade-execution`, `rustrade`, #887). Requests are otherwise sent concurrently and reach the
+  venue in no guaranteed order, so an exit could race the cancel of a resting stop that would block
+  or flip it, and a stop could not be moved without two resting at once.
+  - **`CancelThenOpen { cancels, opens, on_cancel_failure }`** (`rustrade_execution::order::request`):
+    cancels and opens on one exchange. The opens are sent once every cancel has been answered.
+    Requests outside the group, other groups included, stay concurrent.
+  - **When a cancel fails** (any error: already filled, cancelled or expired, not found, rejected,
+    or timed out), `OnCancelFailure::DropOpens`, the default, sends none of the opens and answers
+    each with an inactive order whose error is the new
+    `NotPlacedReason::CancelFailed { cancel }`, naming the first cancel that failed.
+    `OnCancelFailure::SendOpens` sends them anyway. Each cancel is answered as a cancel sent alone
+    would be.
+  - **Not atomic:** between the cancels' answers and the opens' arrival nothing in the group rests,
+    so a stop being moved leaves its position unprotected for one round trip to the venue.
+  - **From a strategy:** `AlgoStrategy::generate_cancel_then_opens` and
+    `RiskManager::check_cancel_then_opens`, both with defaults, so existing implementations are
+    unaffected. The default check passes each group's legs, alone, through `RiskManager::check`
+    and approves the group only if no leg is refused, otherwise refusing it whole. The groups
+    appear in `GenerateAlgoOrdersOutput::cancel_then_opens`.
+  - **From a command:** `Command::SendCancelThenOpenRequests`, reported in
+    `ActionOutput::CancelThenOpens`. Like the other commands, it skips the risk manager.
+  - **The engine** sends a group whole or not at all, refusing it when it is not valid (no cancel,
+    no open, or more than one exchange: `RecoverableEngineError::InvalidCancelThenOpen`), when a
+    leg names an untracked instrument, or when an open reuses a client order id. Every leg is
+    recorded in flight when the group is sent.
+  - **Sequenced by the `ExecutionManager`, and by the backtest runner**, where the opens act one
+    simulated round trip after the cancels: `2 × to_venue + from_venue` after the group is sent.
+    A drain waits for held opens.
+- **A cancel and its open sent as one venue request, where the client offers one**
+  (`rustrade-execution`, `rustrade`, #891). That takes out the round trip in which a group leaves
+  nothing resting.
+  - **`ExecutionClient::cancel_replace`:** a default method that declines every pair. A client
+    overrides it where its venue can carry a `CancelThenOpen` group of one cancel and one open as
+    one request, with exactly the group's semantics. The `ExecutionManager` offers each such group
+    to it first, and sequences the group itself when the client declines.
+  - **One answer per leg, saying what the venue did with it,** in the new `CancelReplaceAnswer`.
+    When a cancel fails under `DropOpens` and the venue does not attempt the open, the open is
+    answered as dropped, as when sequenced. A timeout fails the cancel and leaves the open's
+    outcome unknown, so the open is looked up like any other.
+  - **A request the venue refuses whole changes nothing,** unlike a sequenced group. The venue
+    refuses it before acting on either leg, for example on a filter, an order limit, or a
+    malformed or unauthorised request. The order to cancel then still rests: the cancel is
+    answered as failed with the venue's reason, and the open as dropped under `DropOpens` or
+    refused under `SendOpens`. Sequenced, the cancel could have gone through with only the open
+    refused, leaving nothing resting.
+  - **Binance Spot** sends such a group as `POST /api/v3/order/cancelReplace`:
+    - The mode is `STOP_ON_FAILURE` for `DropOpens` and `ALLOW_FAILURE` for `SendOpens`.
+    - The venue answers each leg separately. A cancel that went through beside a refused new
+      order, or a cancel that failed, each carries its own reason, read as a plain cancel or open
+      would read it.
+    - The client declines, and the group is sequenced instead, for a pair on two symbols, an
+      order kind or time in force the plain open refuses, a borrow, or a venue id that is not a
+      number.
+  - **Wrapping clients** keep the sequential path unless they forward `cancel_replace`.
+
+### Changed
+
+- **Breaking: `OptionContract` has a `settlement` field** (`rustrade-instrument`, #872). Struct
+  literals must set it; `OptionSettlement::Physical` is what every contract was taken to be before.
+- **Breaking: `MockExecutionConfig` has `long_option_expiry` and `short_put_collateral` fields**
+  (`rustrade-execution`, #872). Struct literals and `MockExecutionConfig::new` must set them;
+  `LongOptionExpiry::default()` keeps exercising in-the-money options, and
+  `ShortPutCollateral::default()` holds a short put's full strike. A serialised config without
+  them loads with the defaults.
+- **`LongOptionExpiry` moved to `rustrade_execution::expiry`** (#872), so the simulated venue settles
+  by the same choice as the engine. `rustrade::engine::state::instrument::LongOptionExpiry` still
+  names it.
+- **Breaking: `ExpiryHandling::Engine` carries a `LongOptionExpiry`** (`rustrade`, #868). Write
+  `ExpiryHandling::Engine(LongOptionExpiry::Exercise)`, or `ExpiryHandling::default()`, for the
+  old behaviour. In a human-readable format such as JSON, a serialised bare `"Engine"` still
+  deserialises, as that. `ExpiryHandling` and `LongOptionExpiry` are `#[non_exhaustive]`, so a
+  `match` on either outside `rustrade` needs a wildcard arm.
+
+- **Breaking: `VenueInstrumentMarket` is `#[non_exhaustive]` and has a `stale_since` field**
+  (`rustrade-execution`, #876). Outside the crate it can no longer be built with a struct literal;
+  start from `VenueInstrumentMarket::default()`.
+
+- **Breaking: `ExecutionRequest`, `Command`, `ActionOutput` and `GenerateAlgoOrdersOutput` grow
+  for `CancelThenOpen`** (`rustrade`, #887). New variants `ExecutionRequest::CancelThenOpen`,
+  `Command::SendCancelThenOpenRequests` and `ActionOutput::CancelThenOpens`, so an exhaustive
+  `match` needs an arm for each. A struct literal of `GenerateAlgoOrdersOutput` must set its new
+  field `cancel_then_opens` (`None` for no groups); `GenerateAlgoOrdersOutput::new` sets it. The
+  engine's `GenerateAlgoOrders` implementation also requires `ExchangeKey: PartialEq`, which every
+  key type in the library is.
+- **`InFlightDeadlines::deadline_for` adds one more `request_timeout`** (`rustrade`, #887): an open
+  held behind a cancel waits up to that long before it is sent. Deadlines derived by the
+  `ExecutionBuilder` grow by the same amount, so an order stranded in flight is flagged that much
+  later.
+
+- **Breaking: `init_market_stream` takes `MarketStreamOptions` in place of its
+  `ReconnectionBackoffPolicy`** (`rustrade-data`, #862). Pass
+  `MarketStreamOptions::default().with_reconnect(policy)` to keep the old behaviour.
+- **`ibapi` 5.5.0 → 5.7.0** (`rustrade-execution`, `rustrade-data`, `rustrade-instrument`, feature
+  `ibkr`, #859). The bytes sent for every order this crate builds are unchanged. The changes that
+  reach the compiled code:
+  - A one-shot request with a deadline no longer waits past it for a reconnect, and fails with a
+    timeout instead. So `IbkrClient::account_snapshot`, when the connection drops just as it
+    starts, now waits at most 30 seconds for the reconnect and then fails with the transient
+    `ConnectivityError::Timeout`. It used to return only once the reconnect ended, which can take
+    minutes. While the connection is down it still fails at once.
+  - A request sent while `ibapi` reconnects is either written on the old connection or refused with
+    a connection reset. It can no longer reach the new connection before its handshake has
+    finished. A write stuck on a gateway that stopped reading now fails with a connection reset,
+    and the reconnect goes ahead.
+  - The handshake offers server version 227. It changes only combo implied bid/ask ticks, which
+    this crate does not request.
+- The IBKR execution module rustdoc now records how a paper account handled a short stock
+  position's borrow fee: it accrued daily in that currency's `AccruedCash`, was booked several
+  days late (once after the position had closed), and posted to cash on the third business day of
+  the next month as interest, so until it posted `Balance::total` left it out and
+  `Balance::total + Balance::accrued` included it. IB still does not document this, and a live
+  account may differ (`rustrade-execution`).
+
+### Fixed
+
+- **A simulated market tick now moves the clock requests read** (`rustrade-execution`).
+  `SimulatedVenue::apply_market` advanced the venue's clock but not `time_exchange()`, which only
+  `advance_time` set. A request placed after a tick, with no `advance_time` in between, was stamped
+  earlier than the tick had already reported, and a `GoodTillDate` order whose deadline the tick
+  had reached was accepted and rested until the next input swept it. Now `time_exchange()` is the
+  latest instant either input reached, so such a request is stamped at the tick and such an order
+  expires on arrival. A snapshot written with the lagging clock restores it at the instant
+  reached. Drivers that call `advance_time` before each request, as `MockExchange` does, see no
+  change.
+- **The IBKR client's docs no longer say IB cannot modify an order in flight** (`rustrade-execution`,
+  #888). IB allows an open order's price, size and time in force to be changed in place. This
+  client never does so, which is why the order context it stores at placement stays fixed. The
+  module's limitations now say so, along with the consequence: an order modified outside the client,
+  such as by hand in TWS, is still reported with the price, quantity and time in force it was
+  placed with.
+
 ## [0.21.0] - 2026-11-04
 
 ### Added
@@ -2702,8 +2996,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Each client now says what its balances include and how fresh they are. Hyperliquid's
     standard-mode balances include funding, but position PnL does not. Binance margin debt and
     accrued interest are only as fresh as the last REST read. IBKR's `TotalCashValue`, as IB
-    documents it, leaves out interest and borrow fees accrued during the month until they are
-    posted. Alpaca reads only fill activities, and its trades report zero fees.
+    documents it, leaves out interest accrued during the month until it is posted; IB does not
+    document how stock borrow fees are treated. Alpaca reads only fill activities, and its
+    trades report zero fees.
   - `SimulatedVenue` charges no carry, lends no stock, and models no locate or short-sale
     restriction.
 

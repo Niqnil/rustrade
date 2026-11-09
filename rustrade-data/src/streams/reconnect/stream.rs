@@ -250,6 +250,45 @@ where
     })
 }
 
+/// Ends `stream` once it has yielded no `Ok` item for `threshold`, yielding `on_silence` first.
+///
+/// The timer starts when this is called and restarts at each `Ok` item. An `Err` item is passed
+/// on without restarting it, so a stream yielding only errors is silent. The deadline runs on
+/// tokio's clock, so a test can advance it with paused time.
+pub(crate) fn end_on_silence<St, T, E>(
+    stream: St,
+    threshold: Duration,
+    on_silence: E,
+    stream_key: StreamKey,
+) -> impl Stream<Item = Result<T, E>>
+where
+    St: Stream<Item = Result<T, E>> + Unpin,
+{
+    let deadline = tokio::time::Instant::now() + threshold;
+    stream::unfold(
+        Some((stream, deadline, on_silence)),
+        move |state| async move {
+            let (mut stream, deadline, on_silence) = state?;
+            match tokio::time::timeout_at(deadline, stream.next()).await {
+                Ok(Some(Ok(item))) => {
+                    let deadline = tokio::time::Instant::now() + threshold;
+                    Some((Ok(item), Some((stream, deadline, on_silence))))
+                }
+                Ok(Some(Err(error))) => Some((Err(error), Some((stream, deadline, on_silence)))),
+                Ok(None) => None,
+                Err(_elapsed) => {
+                    warn!(
+                        ?stream_key,
+                        ?threshold,
+                        "MarketStream delivered nothing within its silence timeout, reconnecting"
+                    );
+                    Some((Err(on_silence), None))
+                }
+            }
+        },
+    )
+}
+
 /// Maps every item of one initialised `stream` into an [`Event::Item`], followed by an
 /// [`Event::Reconnecting`] when it ends.
 pub(crate) fn with_trailing_reconnecting<St, Origin>(

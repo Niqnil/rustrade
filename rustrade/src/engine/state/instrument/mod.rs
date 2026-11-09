@@ -45,7 +45,10 @@ use rustrade_instrument::{
     },
 };
 use rustrade_integration::collection::{FnvIndexMap, snapshot::Snapshot};
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{IgnoredAny, MapAccess, Visitor},
+};
 use smol_str::SmolStr;
 use std::fmt::Debug;
 use tracing::{debug, error, info, warn};
@@ -550,18 +553,31 @@ impl<InstrumentData> InstrumentStates<InstrumentData> {
 pub const MAX_RETIRED_ROUTING: usize = 64;
 
 /// Who settles an expiring instrument's positions when the engine processes a
-/// [`ContractExpiry`](crate::EngineEvent::ContractExpiry).
+/// [`ContractExpiry`](crate::EngineEvent::ContractExpiry), and, when the engine does, how a long
+/// option settles.
 ///
 /// Set per instrument on [`InstrumentState::expiry_handling`], usually for every instrument of one
 /// exchange through
 /// [`EngineStateBuilder::expiry_handling`](crate::engine::state::builder::EngineStateBuilder::expiry_handling).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+///
+/// Defaults to `Engine(LongOptionExpiry::Exercise)`.
+///
+/// # Serialisation
+///
+/// `Engine` serialises with its [`LongOptionExpiry`], as `{"Engine": "Exercise"}` in JSON. In a
+/// human-readable format such as JSON, the bare `"Engine"` written before `Engine` carried one
+/// still deserialises, as `Engine(LongOptionExpiry::Exercise)`, the behaviour it named. A binary
+/// format reads only the current form.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum ExpiryHandling {
     /// The engine settles. It closes every open position with a trade it synthesises at the
-    /// settlement price, so expiry is cash-settled. The default, and the right choice for a
-    /// backtest, or for a venue that reports no trade at expiry.
-    #[default]
-    Engine,
+    /// settlement price, so expiry is cash-settled. The right choice for a backtest, or for a
+    /// venue that reports no trade at expiry.
+    ///
+    /// A future settles at its own last price. A short option settles at its intrinsic value,
+    /// standing in for assignment. A long option settles as the [`LongOptionExpiry`] says.
+    Engine(LongOptionExpiry),
     /// The venue settles. It reports its own trades for the expiry, exercise or assignment, and
     /// those trades move the positions. On `ContractExpiry` the engine cancels the instrument's
     /// orders and marks it processed, but synthesises no trade, so a position is not closed twice.
@@ -571,6 +587,87 @@ pub enum ExpiryHandling {
     /// The positions stay open until the venue's trades arrive. A caller that never feeds them to
     /// the engine is left holding positions on an expired instrument.
     Venue,
+}
+
+impl Default for ExpiryHandling {
+    fn default() -> Self {
+        Self::Engine(LongOptionExpiry::default())
+    }
+}
+
+/// How [`ExpiryHandling::Engine`] settles a long option position at expiry: in cash, at the
+/// intrinsic value when exercised. Defined in `rustrade-execution`, so that the simulated venue
+/// settles by the same choice.
+pub use rustrade_execution::expiry::LongOptionExpiry;
+
+/// [`ExpiryHandling`]'s own serialised form, read as derived by a binary format.
+#[derive(Deserialize)]
+#[serde(rename = "ExpiryHandling")]
+enum ExpiryHandlingVariant {
+    Engine(LongOptionExpiry),
+    Venue,
+}
+
+impl From<ExpiryHandlingVariant> for ExpiryHandling {
+    fn from(variant: ExpiryHandlingVariant) -> Self {
+        match variant {
+            ExpiryHandlingVariant::Engine(long_options) => Self::Engine(long_options),
+            ExpiryHandlingVariant::Venue => Self::Venue,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ExpiryHandling {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const VARIANTS: &[&str] = &["Engine", "Venue"];
+
+        struct ExpiryHandlingVisitor;
+
+        impl<'de> Visitor<'de> for ExpiryHandlingVisitor {
+            type Value = ExpiryHandling;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(r#"{"Engine": <LongOptionExpiry>}, "Venue", or "Engine""#)
+            }
+
+            // The bare `"Engine"`, written before `Engine` carried a `LongOptionExpiry`, and the
+            // unit `"Venue"`.
+            fn visit_str<E: serde::de::Error>(self, name: &str) -> Result<Self::Value, E> {
+                match name {
+                    "Engine" => Ok(ExpiryHandling::Engine(LongOptionExpiry::Exercise)),
+                    "Venue" => Ok(ExpiryHandling::Venue),
+                    _ => Err(E::unknown_variant(name, VARIANTS)),
+                }
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let Some(name) = map.next_key::<String>()? else {
+                    return Err(serde::de::Error::invalid_length(0, &self));
+                };
+                let handling = match name.as_str() {
+                    "Engine" => ExpiryHandling::Engine(map.next_value()?),
+                    "Venue" => {
+                        map.next_value::<()>()?;
+                        ExpiryHandling::Venue
+                    }
+                    _ => return Err(serde::de::Error::unknown_variant(&name, VARIANTS)),
+                };
+                if map.next_key::<IgnoredAny>()?.is_some() {
+                    return Err(serde::de::Error::invalid_length(2, &self));
+                }
+                Ok(handling)
+            }
+        }
+
+        // Only a self-describing format can say whether it holds a bare name or a variant with
+        // its value. A binary format reads the derived form, which is all it was ever written in
+        // since `Engine` carried a `LongOptionExpiry`.
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_any(ExpiryHandlingVisitor)
+        } else {
+            ExpiryHandlingVariant::deserialize(deserializer).map(Self::from)
+        }
+    }
 }
 
 /// A reduce-only order's fill the engine cut so it would not grow or flip the position it
@@ -720,7 +817,7 @@ pub struct InstrumentState<
     pub fee_model: FeeModelConfig,
 
     /// Who settles this instrument's positions at expiry. See [`ExpiryHandling`]. Defaults to
-    /// [`ExpiryHandling::Engine`].
+    /// [`ExpiryHandling::Engine`] with [`LongOptionExpiry::Exercise`].
     #[serde(default)]
     pub expiry_handling: ExpiryHandling,
 
@@ -3655,13 +3752,14 @@ mod tests {
         mut state: InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex>,
     ) -> InstrumentState<(), ExchangeIndex, AssetIndex, InstrumentIndex> {
         use rustrade_instrument::instrument::kind::option::{
-            OptionContract, OptionExercise, OptionKind,
+            OptionContract, OptionExercise, OptionKind, OptionSettlement,
         };
         state.instrument.kind = InstrumentKind::Option(OptionContract {
             contract_size: Decimal::ONE,
             settlement_asset: state.instrument.underlying.quote,
             kind: OptionKind::Call,
             exercise: OptionExercise::American,
+            settlement: OptionSettlement::Physical,
             expiry: TIME,
             strike: dec!(100),
         });
@@ -6766,5 +6864,121 @@ mod tests {
         state.clear_order_routing();
 
         assert!(state.reduce_only.is_empty());
+    }
+
+    /// `ExpiryHandling` round-trips in its own form, and the bare `"Engine"` written before
+    /// `Engine` carried a `LongOptionExpiry` still loads, as the exercise it named.
+    #[test]
+    fn expiry_handling_serde_round_trips_and_reads_the_bare_engine() {
+        for handling in [
+            ExpiryHandling::Engine(LongOptionExpiry::Exercise),
+            ExpiryHandling::Engine(LongOptionExpiry::Lapse),
+            ExpiryHandling::Venue,
+        ] {
+            let json = serde_json::to_string(&handling).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ExpiryHandling>(&json).unwrap(),
+                handling
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&ExpiryHandling::Engine(LongOptionExpiry::Lapse)).unwrap(),
+            r#"{"Engine":"Lapse"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ExpiryHandling>(r#""Engine""#).unwrap(),
+            ExpiryHandling::Engine(LongOptionExpiry::Exercise)
+        );
+        assert_eq!(
+            serde_json::from_str::<ExpiryHandling>(r#""Venue""#).unwrap(),
+            ExpiryHandling::Venue
+        );
+        assert_eq!(
+            serde_json::from_str::<ExpiryHandling>(r#"{"Venue":null}"#).unwrap(),
+            ExpiryHandling::Venue
+        );
+
+        // A bad value is named in the error.
+        for (json, named) in [
+            (r#""Lapse""#, "Lapse"),
+            (r#"{"Engine":"Never"}"#, "Never"),
+            (r#"{"Elsewhere":"Exercise"}"#, "Elsewhere"),
+        ] {
+            let error = serde_json::from_str::<ExpiryHandling>(json).unwrap_err();
+            assert!(error.to_string().contains(named), "{json}: {error}");
+        }
+        // A map must hold exactly one variant.
+        assert!(serde_json::from_str::<ExpiryHandling>("{}").is_err());
+        assert!(
+            serde_json::from_str::<ExpiryHandling>(r#"{"Engine":"Lapse","Venue":null}"#).is_err()
+        );
+        // Neither a name nor a map: the error says what would have been read.
+        let error = serde_json::from_str::<ExpiryHandling>("1").unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(r#"{"Engine": <LongOptionExpiry>}, "Venue", or "Engine""#),
+            "{error}"
+        );
+    }
+
+    /// A deserializer that reads its inner one as a binary format would: not human-readable, so
+    /// it reads a value by the shape asked for, as an enum.
+    struct NotHumanReadable<D>(D);
+
+    impl<'de, D: Deserializer<'de>> Deserializer<'de> for NotHumanReadable<D> {
+        type Error = D::Error;
+
+        fn deserialize_any<V: Visitor<'de>>(self, _: V) -> Result<V::Value, Self::Error> {
+            Err(serde::de::Error::custom(
+                "a binary format cannot deserialize_any",
+            ))
+        }
+
+        fn deserialize_enum<V: Visitor<'de>>(
+            self,
+            name: &'static str,
+            variants: &'static [&'static str],
+            visitor: V,
+        ) -> Result<V::Value, Self::Error> {
+            self.0.deserialize_enum(name, variants, visitor)
+        }
+
+        fn is_human_readable(&self) -> bool {
+            false
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf
+            option unit unit_struct newtype_struct seq tuple tuple_struct map struct identifier
+            ignored_any
+        }
+    }
+
+    /// A binary format reads `ExpiryHandling` in its derived form, as a variant, and so cannot
+    /// read the bare `"Engine"`, which only a human-readable format was ever written with.
+    #[test]
+    fn expiry_handling_binary_format_reads_the_derived_form() {
+        for handling in [
+            ExpiryHandling::Engine(LongOptionExpiry::Exercise),
+            ExpiryHandling::Engine(LongOptionExpiry::Lapse),
+            ExpiryHandling::Venue,
+        ] {
+            let written = serde_json::to_value(handling).unwrap();
+            assert_eq!(
+                ExpiryHandling::deserialize(NotHumanReadable(&written)).unwrap(),
+                handling
+            );
+        }
+        let bare_engine = serde_json::Value::String("Engine".to_owned());
+        assert!(ExpiryHandling::deserialize(NotHumanReadable(&bare_engine)).is_err());
+    }
+
+    #[test]
+    fn expiry_handling_defaults_to_the_engine_exercising() {
+        assert_eq!(
+            ExpiryHandling::default(),
+            ExpiryHandling::Engine(LongOptionExpiry::Exercise)
+        );
     }
 }

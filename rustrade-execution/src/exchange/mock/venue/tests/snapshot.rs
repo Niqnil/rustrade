@@ -276,6 +276,25 @@ fn a_restored_venue_holds_no_market_until_it_observes_one() {
     ));
 }
 
+/// A snapshot whose request clock lags the instant the venue reached, as one written before a
+/// market tick moved that clock could, restores with the request clock at the instant reached.
+#[test]
+fn a_snapshot_with_a_lagging_request_clock_restores_it_at_the_instant_reached() {
+    let original = venue_mid_run();
+    let reached = original.accrued_through.expect("the venue has moved");
+    let mut json = serde_json::to_value(original.snapshot()).unwrap();
+    json["time_exchange"] = serde_json::to_value(reached - TimeDelta::seconds(30)).unwrap();
+
+    let restored = SimulatedVenue::from_snapshot(
+        &margin_window_config(),
+        spot_instruments(),
+        serde_json::from_value(json).unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(restored.time_exchange(), reached);
+}
+
 #[test]
 fn a_snapshot_of_another_version_is_refused() {
     let mut json = serde_json::to_value(venue_mid_run().snapshot()).unwrap();

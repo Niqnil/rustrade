@@ -65,6 +65,10 @@ pub mod massive;
 #[cfg(feature = "lse")]
 pub mod lse;
 
+// No `///` here, for the reason given on `lse` above.
+#[cfg(feature = "thetadata")]
+pub mod thetadata;
+
 /// OSI option contract symbols, shared by the providers that spell contracts that way.
 #[cfg(any(feature = "lse", feature = "massive"))]
 pub(crate) mod osi;

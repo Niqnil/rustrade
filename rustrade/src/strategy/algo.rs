@@ -1,4 +1,4 @@
-use rustrade_execution::order::request::{OrderRequestCancel, OrderRequestOpen};
+use rustrade_execution::order::request::{CancelThenOpen, OrderRequestCancel, OrderRequestOpen};
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
 
 /// Strategy interface for generating algorithmic open and cancel order requests based on the
@@ -45,4 +45,25 @@ pub trait AlgoStrategy<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIn
         impl IntoIterator<Item = OrderRequestCancel<ExchangeKey, InstrumentKey>>,
         impl IntoIterator<Item = OrderRequestOpen<ExchangeKey, InstrumentKey>>,
     );
+
+    /// Generate [`CancelThenOpen`] groups based on current system `State`: opens to send only
+    /// once the cancels they depend on have been answered.
+    ///
+    /// For a pair that must not race, such as an exit behind the cancel of a resting stop, or a
+    /// stop moved to a new trigger. The requests [`generate_algo_orders`](Self::generate_algo_orders)
+    /// returns are sent concurrently, in no guaranteed order, and are not ordered against these
+    /// groups.
+    ///
+    /// The [`Engine`](crate::engine::Engine) calls this right after
+    /// [`generate_algo_orders`](Self::generate_algo_orders), with the same state, and passes the
+    /// groups to [`RiskManager::check_cancel_then_opens`](crate::risk::RiskManager::check_cancel_then_opens).
+    ///
+    /// The default generates none.
+    fn generate_cancel_then_opens(
+        &self,
+        state: &Self::State,
+    ) -> impl IntoIterator<Item = CancelThenOpen<ExchangeKey, InstrumentKey>> {
+        let _ = state;
+        std::iter::empty()
+    }
 }

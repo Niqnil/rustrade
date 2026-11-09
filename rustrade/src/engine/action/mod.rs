@@ -1,5 +1,7 @@
 use crate::engine::{
-    action::send_requests::{SendCancelsAndOpensOutput, SendRequestsOutput},
+    action::send_requests::{
+        SendCancelThenOpensOutput, SendCancelsAndOpensOutput, SendRequestsOutput,
+    },
     error::UnrecoverableEngineError,
 };
 use derive_more::From;
@@ -31,6 +33,9 @@ pub enum ActionOutput<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentInd
     CancelOrders(SendRequestsOutput<RequestCancel, ExchangeKey, InstrumentKey>),
     OpenOrders(SendRequestsOutput<RequestOpen, ExchangeKey, InstrumentKey>),
     ClosePositions(SendCancelsAndOpensOutput<ExchangeKey, InstrumentKey>),
+    /// The [`CancelThenOpen`](rustrade_execution::order::request::CancelThenOpen) groups of a
+    /// [`Command::SendCancelThenOpenRequests`](super::command::Command::SendCancelThenOpenRequests).
+    CancelThenOpens(SendCancelThenOpensOutput<ExchangeKey, InstrumentKey>),
 }
 
 impl<ExchangeKey, InstrumentKey> ActionOutput<ExchangeKey, InstrumentKey> {
@@ -40,8 +45,65 @@ impl<ExchangeKey, InstrumentKey> ActionOutput<ExchangeKey, InstrumentKey> {
             ActionOutput::CancelOrders(cancels) => cancels.unrecoverable_errors(),
             ActionOutput::OpenOrders(opens) => opens.unrecoverable_errors(),
             ActionOutput::ClosePositions(requests) => requests.unrecoverable_errors(),
+            ActionOutput::CancelThenOpens(groups) => groups.unrecoverable_errors(),
         }
         .into_option()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::error::EngineError;
+    use rustrade_execution::order::{
+        OrderKey, OrderKind, TimeInForce,
+        id::{ClientOrderId, StrategyId},
+        request::{CancelThenOpen, OrderRequestCancel, OrderRequestOpen},
+    };
+    use rustrade_instrument::Side;
+    use rustrade_integration::collection::none_one_or_many::NoneOneOrMany;
+
+    /// A group that failed to send for a terminated channel makes the command's output
+    /// unrecoverable.
+    #[test]
+    fn a_commanded_groups_unrecoverable_error_is_reported() {
+        let key = |cid: &str| OrderKey {
+            exchange: ExchangeIndex(0),
+            instrument: InstrumentIndex(0),
+            strategy: StrategyId::new("test"),
+            cid: ClientOrderId::new(cid),
+        };
+        let group = CancelThenOpen::new(
+            vec![OrderRequestCancel {
+                key: key("stop"),
+                state: RequestCancel { id: None },
+            }],
+            vec![OrderRequestOpen {
+                key: key("exit"),
+                state: RequestOpen::new(
+                    Side::Sell,
+                    None,
+                    rust_decimal::Decimal::ONE,
+                    OrderKind::Market,
+                    TimeInForce::ImmediateOrCancel,
+                ),
+            }],
+        );
+        let terminated = UnrecoverableEngineError::ExecutionChannelTerminated("gone".to_string());
+        let output: ActionOutput = ActionOutput::CancelThenOpens(SendCancelThenOpensOutput::new(
+            NoneOneOrMany::None,
+            NoneOneOrMany::One(Box::new((
+                group,
+                EngineError::Unrecoverable(terminated.clone()),
+            ))),
+        ));
+        assert_eq!(
+            output.unrecoverable_errors(),
+            Some(OneOrMany::One(terminated))
+        );
+        let fine: ActionOutput =
+            ActionOutput::CancelThenOpens(SendCancelThenOpensOutput::default());
+        assert_eq!(fine.unrecoverable_errors(), None);
     }
 }
 

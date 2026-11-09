@@ -51,7 +51,10 @@ use crate::client::reconnect_budget::ReconnectBudget;
 use crate::client::venue_clock::{HostMoment, VenueClock};
 use binance_sdk::common::{
     errors::{ConnectorError, WebsocketError},
-    models::{Interval, ParamBuildError, RateLimitType, RestApiResponse, WebsocketApiRateLimit},
+    models::{
+        Interval, ParamBuildError, RateLimitType, RestApiRateLimit, RestApiResponse,
+        WebsocketApiRateLimit,
+    },
     websocket::Subscription,
 };
 use chrono::{DateTime, TimeDelta, TimeZone, Utc};
@@ -67,6 +70,7 @@ use serde::{
 };
 use smol_str::format_smolstr;
 use std::{
+    collections::HashMap,
     fmt,
     pin::Pin,
     str::FromStr,
@@ -1156,13 +1160,12 @@ impl RateLimitTracker {
     /// `sent_ms` (from [`unix_ms`]).
     ///
     /// Reads the header of this tracker's [`WeightPool`]; a response without it changes nothing.
-    pub(crate) fn observe_rest<D>(&self, response: &RestApiResponse<D>, sent_ms: u128) {
+    pub(crate) fn observe_rest(&self, response: &impl RestAnswer, sent_ms: u128) {
         let used = match self.pool {
             // The SDK has already parsed `x-mbx-used-weight-1m` into `rate_limits`.
             WeightPool::Spot => response
-                .rate_limits
+                .rate_limits()
                 .iter()
-                .flatten()
                 .find(|limit| {
                     is_weight_per_minute(
                         &limit.rate_limit_type,
@@ -1173,7 +1176,7 @@ impl RateLimitTracker {
                 .map(|limit| limit.count),
             // The SDK parses only `x-mbx-*` headers. reqwest names headers in lowercase.
             WeightPool::Sapi => response
-                .headers
+                .headers()
                 .get("x-sapi-used-ip-weight-1m")
                 .and_then(|used| used.parse().ok()),
         };
@@ -3673,22 +3676,42 @@ pub(crate) fn optional_decimal(
 /// (`binance_sdk::margin_trading::rest_api::RestApi`) clients — the helper never touches
 /// `R` itself, it only hands an `Arc<R>` clone to the per-attempt closure. Also usable
 /// from concurrent per-instrument futures that hold only `Arc<R>` + `Arc<RateLimitTracker>`.
-pub(crate) async fn rest_call_with_retry<R, D>(
+pub(crate) async fn rest_call_with_retry<R, A>(
     rest: &Arc<R>,
     rate_limiter: &RateLimitTracker,
     kind: RequestKind,
     make_call: impl FnMut(
         Arc<R>,
-    ) -> Pin<
-        Box<dyn std::future::Future<Output = anyhow::Result<RestApiResponse<D>>> + Send>,
-    >,
-) -> anyhow::Result<RestApiResponse<D>>
+    ) -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<A>> + Send>>,
+) -> anyhow::Result<A>
 where
     R: Send + Sync,
+    A: RestAnswer,
 {
     rest_read_with_retry(rest, rate_limiter, kind, make_call)
         .await
         .map(|(response, _)| response)
+}
+
+/// A REST answer, as far as the weight tracker reads one ([`RateLimitTracker::observe_rest`]).
+///
+/// The SDK's [`RestApiResponse`], and the raw answer of a request sent past the SDK, whose error
+/// bodies the SDK would not keep.
+pub(crate) trait RestAnswer {
+    /// The rate limits Binance reported in the answer's `x-mbx-*` headers.
+    fn rate_limits(&self) -> &[RestApiRateLimit];
+    /// The answer's headers, named in lowercase.
+    fn headers(&self) -> &HashMap<String, String>;
+}
+
+impl<D> RestAnswer for RestApiResponse<D> {
+    fn rate_limits(&self) -> &[RestApiRateLimit] {
+        self.rate_limits.as_deref().unwrap_or_default()
+    }
+
+    fn headers(&self) -> &HashMap<String, String> {
+        &self.headers
+    }
 }
 
 /// How far Binance's REST account view can trail its account stream, as the allowance a balance
@@ -3712,21 +3735,21 @@ pub(crate) fn balance_read_time(sent: HostMoment, venue: &VenueClock) -> DateTim
 
 /// [`rest_call_with_retry`], also returning when the request that succeeded was sent, on this
 /// host's wall and monotonic clocks: a read describes the venue's state no earlier than that.
-pub(crate) async fn rest_read_with_retry<R, D>(
+pub(crate) async fn rest_read_with_retry<R, A>(
     rest: &Arc<R>,
     rate_limiter: &RateLimitTracker,
     kind: RequestKind,
     mut make_call: impl FnMut(
         Arc<R>,
-    ) -> Pin<
-        Box<dyn std::future::Future<Output = anyhow::Result<RestApiResponse<D>>> + Send>,
-    >,
-) -> anyhow::Result<(RestApiResponse<D>, HostMoment)>
+    )
+        -> Pin<Box<dyn std::future::Future<Output = anyhow::Result<A>> + Send>>,
+) -> anyhow::Result<(A, HostMoment)>
 where
     // `Arc<R>` is moved into the `+ Send` future, which requires `R: Send + Sync`. Both SDK
     // RestApi types satisfy this; stating it here surfaces the constraint at the definition
     // rather than as a confusing error at the call sites' `Box::pin(async move ...)`.
     R: Send + Sync,
+    A: RestAnswer,
 {
     // On the last iteration (attempt == MAX_RATE_LIMIT_RETRIES) a rate-limit error is not
     // retried, so every match arm returns. The post-loop unreachable!() is a runtime safety
@@ -4296,6 +4319,16 @@ fn ws_response_failure(e: &anyhow::Error) -> Option<RequestFailure> {
         )),
         _ => None,
     }
+}
+
+/// The error a Binance rejection of an order or cancel reads as when it arrives as data, Binance's
+/// `code` and `msg`, rather than as a failed request: a leg of a cancel-replace answer.
+pub(crate) fn order_rejection(
+    code: Option<i64>,
+    msg: &str,
+    instrument: &InstrumentNameExchange,
+) -> UnindexedOrderError {
+    order_error_from(RequestFailure::Rejected(with_code(msg, code)), instrument)
 }
 
 /// Map a [`RequestFailure`] of an order or cancel request to an [`OrderError`].
@@ -7115,8 +7148,11 @@ mod tests {
         let tracker = RateLimitTracker::new(WeightPool::Spot);
         let started = tokio::time::Instant::now();
         let mut calls = 0_u32;
-        let result =
-            rest_call_with_retry::<(), ()>(&Arc::new(()), &tracker, RequestKind::Query, |_| {
+        let result = rest_call_with_retry::<(), RestApiResponse<()>>(
+            &Arc::new(()),
+            &tracker,
+            RequestKind::Query,
+            |_| {
                 calls += 1;
                 Box::pin(async {
                     Err(anyhow::Error::new(ConnectorError::TooManyRequestsError {
@@ -7125,8 +7161,9 @@ mod tests {
                         retry_after: None,
                     }))
                 })
-            })
-            .await;
+            },
+        )
+        .await;
 
         assert_eq!(calls, MAX_RATE_LIMIT_RETRIES + 1);
         let error = result.err().expect("every attempt was refused");

@@ -27,7 +27,7 @@ use rustrade::{
             connectivity::{ConnectivityDimension, Health, UntrackedExchange},
             global::DefaultGlobalData,
             instrument::{
-                ExpiryHandling,
+                ExpiryHandling, LongOptionExpiry,
                 data::{DefaultInstrumentMarketData, InstrumentDataState},
                 filter::InstrumentFilter,
             },
@@ -60,8 +60,8 @@ use rustrade_execution::{
         Order, OrderKey, OrderKind, TimeInForce,
         id::{ClientOrderId, OrderId, PositionId, StrategyId, VenueOrderId},
         request::{
-            OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, ReduceOnly, RequestCancel,
-            RequestOpen,
+            CancelThenOpen, CancelThenOpenError, OrderRequestCancel, OrderRequestOpen,
+            OrderResponseCancel, ReduceOnly, RequestCancel, RequestOpen,
         },
         state::{ActiveOrderState, Cancelled, Filled, Open, OrderState},
     },
@@ -80,7 +80,7 @@ use rustrade_instrument::{
             InstrumentKind,
             cfd::CfdContract,
             future::FutureContract,
-            option::{OptionContract, OptionExercise, OptionKind},
+            option::{OptionContract, OptionExercise, OptionKind, OptionSettlement},
             perpetual::PerpetualContract,
         },
         spec::{
@@ -1372,6 +1372,7 @@ fn build_option_engine_with_strategy<Strategy>(
                 settlement_asset: "usd".into(),
                 kind: OptionKind::Call,
                 exercise: OptionExercise::European,
+                settlement: OptionSettlement::Physical,
                 expiry,
                 strike: dec!(50_000),
             }),
@@ -2210,7 +2211,10 @@ fn test_contract_expiry_engine_handling_is_the_default() {
         .instruments
         .instruments(&InstrumentFilter::None)
     {
-        assert_eq!(state.expiry_handling, ExpiryHandling::Engine);
+        assert_eq!(
+            state.expiry_handling,
+            ExpiryHandling::Engine(LongOptionExpiry::Exercise)
+        );
     }
 }
 
@@ -2599,6 +2603,248 @@ fn test_command_send_open_requests_duplicate_cid_rejected_before_send() {
             .contains_key(&ClientOrderId::new("dup")),
         "the refused request's position routing is not recorded"
     );
+}
+
+/// A `CancelThenOpen` group is sent whole, as one request, or refused whole, unsent and
+/// unrecorded: when it is not valid, when a leg names an unknown instrument, or when an open's
+/// client order id is tracked already, claimed by an earlier group in the call, or repeated in the
+/// group. A sent group's opens are stamped, and every leg is recorded in flight.
+#[test]
+fn test_command_send_cancel_then_open_requests_sends_each_group_whole_or_not_at_all() {
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    send_spot_price(&mut engine, 1, dec!(45_000));
+    // The fixture has three instruments (indices 0..=2), so index 3 is unknown.
+    let (known, unknown) = (InstrumentIndex(1), InstrumentIndex(3));
+
+    // The resting order the groups cancel, tracked by an earlier action.
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(open_request(
+            known, "stop",
+        )))),
+    );
+    assert!(matches!(
+        execution_rx.rx.try_recv(),
+        Ok(ExecutionRequest::Open(_))
+    ));
+
+    let group = |opens: &[(InstrumentIndex, &str)]| {
+        CancelThenOpen::new(
+            vec![cancel_request(known, "stop")],
+            opens
+                .iter()
+                .map(|(instrument, cid)| open_request(*instrument, cid))
+                .collect(),
+        )
+    };
+    // Two opens on one instrument under different ids are not duplicates.
+    let valid = group(&[(known, "exit"), (known, "exit-2")]);
+    let no_cancels = CancelThenOpen::new(vec![], vec![open_request(known, "no-cancels")]);
+    let untracked = group(&[(known, "sibling"), (unknown, "untracked")]);
+    let tracked_id = group(&[(known, "stop")]);
+    let claimed = group(&[(known, "exit")]);
+    // Nor is an open under a fresh id on the instrument whose ids an earlier group claimed.
+    let fresh = group(&[(known, "fresh")]);
+    let repeated = group(&[(known, "twice"), (known, "twice")]);
+
+    let audit = process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendCancelThenOpenRequests(OneOrMany::Many(vec![
+            valid.clone(),
+            no_cancels.clone(),
+            untracked.clone(),
+            tracked_id.clone(),
+            claimed.clone(),
+            fresh.clone(),
+            repeated.clone(),
+        ]))),
+    );
+    let EngineAudit::Process(audit) = audit.event else {
+        panic!("expected EngineAudit::Process");
+    };
+    assert!(
+        audit.errors.is_empty(),
+        "a refused group must not stop the engine"
+    );
+    let NoneOneOrMany::One(EngineOutput::Commanded(ActionOutput::CancelThenOpens(output))) =
+        audit.outputs
+    else {
+        panic!(
+            "expected one CancelThenOpens output, got {:?}",
+            audit.outputs
+        );
+    };
+
+    let sent: Vec<_> = output.sent_iter().cloned().collect();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    for (sent, expected) in sent.iter().zip([&valid, &fresh]) {
+        assert_eq!(sent.cancels, expected.cancels);
+        let sent_keys: Vec<_> = sent.opens.iter().map(|open| &open.key).collect();
+        assert_eq!(
+            sent_keys,
+            expected
+                .opens
+                .iter()
+                .map(|open| &open.key)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            sent.opens.iter().all(|open| open.state.market.is_some()),
+            "a sent open is stamped with the market"
+        );
+    }
+    let errors: Vec<_> = output
+        .errors
+        .iter()
+        .map(|error| (**error).clone())
+        .collect();
+    assert_eq!(
+        errors,
+        vec![
+            (
+                no_cancels,
+                EngineError::Recoverable(RecoverableEngineError::InvalidCancelThenOpen(
+                    CancelThenOpenError::NoCancels
+                ))
+            ),
+            (untracked, unknown_instrument_error(unknown)),
+            (tracked_id, duplicate_cid_error("stop")),
+            (claimed, duplicate_cid_error("exit")),
+            (repeated, duplicate_cid_error("twice")),
+        ]
+    );
+
+    for sent in &sent {
+        match execution_rx.rx.try_recv() {
+            Ok(ExecutionRequest::CancelThenOpen(request)) => assert_eq!(&request, sent),
+            other => panic!("expected each valid group to be sent as one request, got {other:?}"),
+        }
+    }
+    assert!(
+        execution_rx.rx.try_recv().is_err(),
+        "no refused group may be sent"
+    );
+
+    let orders = &engine.state.instruments.instrument_index(&known).orders.0;
+    assert!(matches!(
+        orders[&ClientOrderId::new("stop")].state,
+        ActiveOrderState::CancelInFlight(_)
+    ));
+    for open in ["exit", "fresh"] {
+        assert!(matches!(
+            orders[&ClientOrderId::new(open)].state,
+            ActiveOrderState::OpenInFlight(_)
+        ));
+    }
+    for refused in ["no-cancels", "sibling", "twice"] {
+        assert!(
+            !orders.contains_key(&ClientOrderId::new(refused)),
+            "{refused} must not be recorded"
+        );
+    }
+}
+
+/// Emits one plain open, and two groups from the strategy's `CancelThenOpen` hook: one valid, one
+/// reusing the plain open's client order id.
+struct CancelThenOpenStrategy;
+
+impl AlgoStrategy for CancelThenOpenStrategy {
+    type State = EngineState<DefaultGlobalData, DefaultInstrumentMarketData>;
+
+    fn generate_algo_orders(
+        &self,
+        _: &Self::State,
+    ) -> (
+        impl IntoIterator<Item = OrderRequestCancel<ExchangeIndex, InstrumentIndex>>,
+        impl IntoIterator<Item = OrderRequestOpen<ExchangeIndex, InstrumentIndex>>,
+    ) {
+        (
+            std::iter::empty(),
+            [open_request(InstrumentIndex(1), "plain")],
+        )
+    }
+
+    fn generate_cancel_then_opens(
+        &self,
+        _: &Self::State,
+    ) -> impl IntoIterator<Item = CancelThenOpen<ExchangeIndex, InstrumentIndex>> {
+        let known = InstrumentIndex(1);
+        [
+            CancelThenOpen::new(
+                vec![cancel_request(known, "stop")],
+                vec![open_request(known, "exit")],
+            ),
+            CancelThenOpen::new(
+                vec![cancel_request(known, "stop")],
+                vec![open_request(known, "plain")],
+            ),
+        ]
+    }
+}
+
+/// A strategy's groups pass the risk manager and are sent after its plain requests, so a group
+/// reusing a plain open's id is refused as a duplicate. They are reported in the algo output's
+/// `cancel_then_opens`, which an output without a group leaves `None`.
+#[test]
+fn test_strategy_cancel_then_open_groups_are_sent_after_plain_requests() {
+    use rustrade::engine::action::generate_algo_orders::GenerateAlgoOrders;
+
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine_with_strategy(
+        TradingState::Enabled,
+        execution_tx,
+        OmsMode::Netting,
+        CancelThenOpenStrategy,
+    );
+
+    let output = engine.generate_algo_orders();
+    let groups = output
+        .cancel_then_opens
+        .as_deref()
+        .expect("the strategy generated groups");
+    assert!(
+        groups.refused.is_none(),
+        "the default risk manager approves"
+    );
+    let sent: Vec<_> = groups
+        .sent
+        .sent_iter()
+        .map(|group| group.opens[0].key.cid.clone())
+        .collect();
+    assert_eq!(sent, [ClientOrderId::new("exit")]);
+    let errors: Vec<_> = groups
+        .sent
+        .errors
+        .iter()
+        .map(|error| (error.0.opens[0].key.cid.clone(), error.1.clone()))
+        .collect();
+    assert_eq!(
+        errors,
+        [(ClientOrderId::new("plain"), duplicate_cid_error("plain"))]
+    );
+
+    assert!(matches!(
+        execution_rx.rx.try_recv(),
+        Ok(ExecutionRequest::Open(open)) if open.key.cid == ClientOrderId::new("plain")
+    ));
+    assert!(matches!(
+        execution_rx.rx.try_recv(),
+        Ok(ExecutionRequest::CancelThenOpen(group)) if group.opens[0].key.cid == ClientOrderId::new("exit")
+    ));
+    assert!(execution_rx.rx.try_recv().is_err());
+
+    // A strategy without groups leaves the field `None`.
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine_with_strategy(
+        TradingState::Enabled,
+        execution_tx,
+        OmsMode::Netting,
+        FixedInstrumentStrategy {
+            instrument: InstrumentIndex(1),
+        },
+    );
+    assert!(engine.generate_algo_orders().cancel_then_opens.is_none());
 }
 
 /// Emits one cancel and one open for a fixed instrument, from both the algo and the
@@ -4386,6 +4632,7 @@ fn build_two_option_engine(
                 settlement_asset: "usd".into(),
                 kind: OptionKind::Call,
                 exercise: OptionExercise::European,
+                settlement: OptionSettlement::Physical,
                 expiry,
                 strike: dec!(50_000),
             }),
@@ -4403,6 +4650,7 @@ fn build_two_option_engine(
                 settlement_asset: "usd".into(),
                 kind: OptionKind::Call,
                 exercise: OptionExercise::European,
+                settlement: OptionSettlement::Physical,
                 expiry,
                 strike: dec!(33_333),
             }),
@@ -4686,6 +4934,7 @@ fn build_put_option_engine(
                 settlement_asset: "usd".into(),
                 kind: OptionKind::Put,
                 exercise: OptionExercise::European,
+                settlement: OptionSettlement::Physical,
                 expiry,
                 strike: dec!(50_000),
             }),
@@ -4876,6 +5125,7 @@ fn build_option_spot_engine_with_oms(
                 settlement_asset: "usd".into(),
                 kind: OptionKind::Call,
                 exercise: OptionExercise::European,
+                settlement: OptionSettlement::Physical,
                 expiry,
                 strike: dec!(50_000),
             }),
@@ -6490,6 +6740,7 @@ fn build_ambiguous_underlying_engine(
                 settlement_asset: "usd".into(),
                 kind: OptionKind::Call,
                 exercise: OptionExercise::European,
+                settlement: OptionSettlement::Physical,
                 expiry,
                 strike: dec!(50_000),
             }),
@@ -7923,6 +8174,8 @@ fn test_venue_checkpoint_is_answered_with_the_engine_positions() {
         Default::default(),
         None,
         None,
+        Default::default(),
+        Default::default(),
     );
     let venue_checkpoint = SimulatedVenue::new(&config, FnvHashMap::default()).checkpoint();
     let before = engine.state.clone();
@@ -8651,4 +8904,274 @@ fn test_hedging_pending_fill_keeps_the_fee_value_it_arrived_with() {
         .position
         .positions[&position_id];
     assert_eq!(position.fees_enter.fees_quote, Some(dec!(0.0002)));
+}
+
+// ---------------------------------------------------------------------------
+// ExpiryHandling::Engine(LongOptionExpiry::Lapse)
+// ---------------------------------------------------------------------------
+
+/// Make the engine settle instrument index 0 with long options lapsing.
+fn lapse_long_options<Strategy>(engine: &mut TestEngine<Strategy>) {
+    engine
+        .state
+        .instruments
+        .instrument_index_mut(&InstrumentIndex(0))
+        .expiry_handling = ExpiryHandling::Engine(LongOptionExpiry::Lapse);
+}
+
+/// Open a position with its own `position_id` in a Hedging engine, filled at `price`.
+fn open_hedged_option_position(engine: &mut TestEngine, leg: &str, side: Side, price: Decimal) {
+    let cid = ClientOrderId::new(format!("cid-{leg}"));
+    let exchange_order_id = OrderId::new(format!("exch-{leg}"));
+    send_open_order_with_position_id(
+        engine,
+        cid.clone(),
+        PositionId::new(leg),
+        side,
+        price,
+        ReduceOnly::No,
+    );
+    send_order_ack(engine, cid, exchange_order_id.clone(), side);
+    send_fill(engine, exchange_order_id, side, price);
+}
+
+/// A long call in the money lapses: it settles at zero, not at its intrinsic value, losing the
+/// premium paid.
+#[test]
+fn test_contract_expiry_lapse_long_itm_call_settles_at_zero() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    lapse_long_options(&mut engine);
+    // Intrinsic would be 55_000 - 50_000 = 5_000.
+    send_spot_price(&mut engine, 1, dec!(55_000));
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
+
+    assert_eq!(exited.len(), 1);
+    assert_eq!(exited[0].side, Side::Buy);
+    assert_eq!(exited[0].price_exit, Some(Decimal::ZERO));
+    assert_eq!(exited[0].pnl_realised, dec!(-2_000));
+    let state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert!(state.position.positions.is_empty());
+    assert!(state.expiration_processed);
+}
+
+/// A lapsing long needs no underlying price, so it settles even when none has arrived.
+#[test]
+fn test_contract_expiry_lapse_long_needs_no_underlying_price() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    lapse_long_options(&mut engine);
+    // No spot price is sent.
+    open_option_position(&mut engine, dec!(1), dec!(1_000));
+
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
+
+    assert_eq!(exited.len(), 1);
+    assert_eq!(exited[0].price_exit, Some(Decimal::ZERO));
+    assert_eq!(exited[0].pnl_realised, dec!(-1_000));
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .expiration_processed
+    );
+}
+
+/// A short call in the money still settles at its intrinsic value when longs lapse: the short
+/// stands in for assignment.
+#[test]
+fn test_contract_expiry_lapse_short_itm_call_settles_at_intrinsic() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    lapse_long_options(&mut engine);
+    send_spot_price(&mut engine, 1, dec!(55_000));
+    open_option_position_side(&mut engine, Side::Sell, dec!(1), dec!(2_000));
+
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
+
+    assert_eq!(exited.len(), 1);
+    assert_eq!(exited[0].side, Side::Sell);
+    assert_eq!(exited[0].price_exit, Some(dec!(5_000)));
+    // Sold at 2_000, bought back at the 5_000 intrinsic.
+    assert_eq!(exited[0].pnl_realised, dec!(-3_000));
+}
+
+/// A short still needs the underlying price when longs lapse. Without it nothing settles, and the
+/// expiry stays retryable.
+#[test]
+fn test_contract_expiry_lapse_short_without_price_is_not_settled() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    lapse_long_options(&mut engine);
+    open_option_position_side(&mut engine, Side::Sell, dec!(1), dec!(2_000));
+
+    let outputs: Vec<EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>> =
+        engine.process_contract_expiry(&InstrumentIndex(0));
+
+    assert_eq!(
+        outputs,
+        vec![EngineOutput::ContractExpiryNotSettled {
+            instrument: InstrumentIndex(0),
+            reason: ContractExpiryNotSettledReason::SettlementPriceUnavailable,
+        }]
+    );
+    let state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert_eq!(state.position.positions.len(), 1);
+    assert!(!state.expiration_processed);
+}
+
+/// In Hedging mode each position settles by its own side: the long lapses at zero and the short
+/// settles at intrinsic.
+#[test]
+fn test_contract_expiry_lapse_hedging_long_and_short() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_hedging_option_engine(TradingState::Disabled, execution_tx);
+    lapse_long_options(&mut engine);
+    send_spot_price(&mut engine, 1, dec!(55_000));
+    open_hedged_option_position(&mut engine, "long-leg", Side::Buy, dec!(2_000));
+    open_hedged_option_position(&mut engine, "short-leg", Side::Sell, dec!(3_000));
+
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
+
+    assert_eq!(exited.len(), 2);
+    let exit = |leg: &str| {
+        exited
+            .iter()
+            .find(|exit| exit.position_id == PositionId::new(leg))
+            .unwrap()
+    };
+    assert_eq!(exit("long-leg").price_exit, Some(Decimal::ZERO));
+    assert_eq!(exit("long-leg").pnl_realised, dec!(-2_000));
+    assert_eq!(exit("short-leg").price_exit, Some(dec!(5_000)));
+    assert_eq!(exit("short-leg").pnl_realised, dec!(-2_000));
+    let state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert!(state.position.positions.is_empty());
+    assert!(state.expiration_processed);
+}
+
+/// With a long and a short open and no underlying price, neither settles: the expiry is not
+/// settled in part.
+#[test]
+fn test_contract_expiry_lapse_hedging_without_price_settles_nothing() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_hedging_option_engine(TradingState::Disabled, execution_tx);
+    lapse_long_options(&mut engine);
+    open_hedged_option_position(&mut engine, "long-leg", Side::Buy, dec!(2_000));
+    open_hedged_option_position(&mut engine, "short-leg", Side::Sell, dec!(3_000));
+
+    let outputs: Vec<EngineOutput<OnTradingDisabledOutput, OnDisconnectOutput>> =
+        engine.process_contract_expiry(&InstrumentIndex(0));
+
+    assert_eq!(
+        outputs,
+        vec![EngineOutput::ContractExpiryNotSettled {
+            instrument: InstrumentIndex(0),
+            reason: ContractExpiryNotSettledReason::SettlementPriceUnavailable,
+        }]
+    );
+    let state = engine
+        .state
+        .instruments
+        .instrument_index(&InstrumentIndex(0));
+    assert_eq!(state.position.positions.len(), 2);
+    assert!(!state.expiration_processed);
+}
+
+/// `Lapse` concerns options only: a long future still settles at its own last price.
+#[test]
+fn test_contract_expiry_lapse_leaves_a_future_at_its_last_price() {
+    let expiry = chrono::DateTime::parse_from_rfc3339("2030-01-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_single_kind_engine(
+        InstrumentKind::Future(FutureContract {
+            contract_size: dec!(1),
+            settlement_asset: Asset::from("usd"),
+            expiry,
+        }),
+        execution_tx,
+    );
+    lapse_long_options(&mut engine);
+    open_option_position(&mut engine, dec!(2), dec!(1_000));
+    send_spot_price(&mut engine, 0, dec!(1_100));
+
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
+
+    assert_eq!(exited.len(), 1);
+    assert_eq!(exited[0].price_exit, Some(dec!(1_100)));
+    assert_eq!(exited[0].pnl_realised, dec!(200));
+}
+
+/// The audit replica follows a lapse settled with no underlying price: the position is removed
+/// and the instrument marked processed on both sides.
+#[test]
+fn test_contract_expiry_replica_parity_lapse_without_price() {
+    use rustrade::engine::audit::{context::EngineContext, state_replica::StateReplicaManager};
+
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    lapse_long_options(&mut engine);
+    open_option_position(&mut engine, dec!(1), dec!(1_000));
+
+    let seed_tick: AuditTick<_, EngineContext> = AuditTick {
+        event: engine.state.clone(),
+        context: EngineContext {
+            time: STARTING_TIMESTAMP,
+            sequence: Sequence(0),
+        },
+    };
+    let dummy_updates: DummyAuditUpdates = std::iter::empty();
+    let mut replica = StateReplicaManager::new(seed_tick, dummy_updates);
+    let option = InstrumentIndex(0);
+
+    process_live_and_replica!(&mut engine, replica, EngineEvent::ContractExpiry(option));
+
+    let live = engine.state.instruments.instrument_index(&option);
+    assert!(live.position.positions.is_empty());
+    assert!(live.expiration_processed);
+    assert_eq!(
+        replica
+            .replica_engine_state()
+            .instruments
+            .instrument_index(&option),
+        live
+    );
+}
+
+/// Lapsing longs need no underlying price, so an ambiguous underlying does not stop them settling.
+/// A short on the same underlying would still be refused as `AmbiguousUnderlying`.
+#[test]
+fn test_contract_expiry_lapse_long_ignores_an_ambiguous_underlying() {
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_ambiguous_underlying_engine(TradingState::Disabled, execution_tx);
+    lapse_long_options(&mut engine);
+    engine.process(market_event_trade(1, 0, dec!(1200)));
+    engine.process(market_event_trade(1, 1, dec!(60_000)));
+    engine.process(market_event_trade(1, 2, dec!(55_000)));
+    open_position_on(&mut engine, 0, Side::Buy, dec!(1_000), dec!(2), "opt-open");
+
+    let exited = expiry_exits(engine.process_contract_expiry(&InstrumentIndex(0)));
+
+    assert_eq!(exited.len(), 1);
+    assert_eq!(exited[0].price_exit, Some(Decimal::ZERO));
+    assert!(
+        engine
+            .state
+            .instruments
+            .instrument_index(&InstrumentIndex(0))
+            .expiration_processed
+    );
 }

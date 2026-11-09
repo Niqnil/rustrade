@@ -143,6 +143,15 @@ pub enum ExchangeId {
     MassiveForex,
     /// Massive US equity options WebSocket market data (`wss://socket.massive.com/options`)
     MassiveOptions,
+    /// ThetaData US stocks, through a Theta Terminal (consolidated SIP data)
+    #[serde(rename = "thetadata_stocks")]
+    ThetaDataStocks,
+    /// ThetaData US equity and index options, through a Theta Terminal (consolidated OPRA data)
+    #[serde(rename = "thetadata_options")]
+    ThetaDataOptions,
+    /// ThetaData US indices, through a Theta Terminal
+    #[serde(rename = "thetadata_indices")]
+    ThetaDataIndices,
     // ---------------------------------------------------------------------------------------
     // NOTE: append new variants HERE, at the end. See `# Index stability` on this enum.
     // ---------------------------------------------------------------------------------------
@@ -218,6 +227,9 @@ impl ExchangeId {
             ExchangeId::MassiveCrypto => "massive_crypto",
             ExchangeId::MassiveForex => "massive_forex",
             ExchangeId::MassiveOptions => "massive_options",
+            ExchangeId::ThetaDataStocks => "thetadata_stocks",
+            ExchangeId::ThetaDataOptions => "thetadata_options",
+            ExchangeId::ThetaDataIndices => "thetadata_indices",
         }
     }
 }
@@ -287,6 +299,26 @@ mod tests {
     }
 
     #[test]
+    fn test_serde_thetadata_variants() {
+        // See `test_serde_lse_variants`: `as_str` and the serde string must agree.
+        for (exchange, expected) in [
+            (ExchangeId::ThetaDataStocks, "thetadata_stocks"),
+            (ExchangeId::ThetaDataOptions, "thetadata_options"),
+            (ExchangeId::ThetaDataIndices, "thetadata_indices"),
+        ] {
+            assert_eq!(exchange.as_str(), expected);
+            assert_eq!(
+                serde_json::to_string(&exchange).unwrap(),
+                format!(r#""{expected}""#)
+            );
+            assert_eq!(
+                serde_json::from_str::<ExchangeId>(&format!(r#""{expected}""#)).unwrap(),
+                exchange
+            );
+        }
+    }
+
+    #[test]
     fn test_lse_variants_are_appended_last() {
         // `ExchangeId` derives `Ord` from declaration order, and that ordering determines
         // `ExchangeIndex`/`InstrumentIndex` assignment in `IndexedInstrumentsBuilder::build`.
@@ -308,6 +340,9 @@ mod tests {
             ExchangeId::MassiveCrypto,
             ExchangeId::MassiveForex,
             ExchangeId::MassiveOptions,
+            ExchangeId::ThetaDataStocks,
+            ExchangeId::ThetaDataOptions,
+            ExchangeId::ThetaDataIndices,
         ];
 
         for pair in tail.windows(2) {

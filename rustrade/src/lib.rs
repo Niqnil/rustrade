@@ -167,7 +167,8 @@ pub enum EngineEvent<
     /// Signal that an option or future contract has expired and settlement should be computed.
     ///
     /// The library handles: cancelling open orders, computing the settlement price (intrinsic
-    /// value for an option, the last price for a future), synthesising a closing fill, and setting
+    /// value for an option, or zero for a long option set to lapse, the last price for a future),
+    /// synthesising a closing fill, and setting
     /// the `expiration_processed` flag. For an instrument whose
     /// [`ExpiryHandling`](engine::state::instrument::ExpiryHandling) is `Venue`, it synthesises no
     /// fill: the venue's own trades close the positions.

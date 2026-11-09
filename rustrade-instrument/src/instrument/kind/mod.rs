@@ -242,7 +242,7 @@ impl<AssetKey> From<&InstrumentKind<AssetKey>> for MarketDataInstrumentKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::instrument::kind::option::{OptionExercise, OptionKind};
+    use crate::instrument::kind::option::{OptionExercise, OptionKind, OptionSettlement};
     use chrono::TimeZone;
 
     fn expiry(day: u32) -> DateTime<Utc> {
@@ -282,6 +282,7 @@ mod tests {
             settlement_asset: "usdt",
             kind: OptionKind::Call,
             exercise: OptionExercise::European,
+            settlement: OptionSettlement::Physical,
             expiry: expiry(day),
             strike,
         })
