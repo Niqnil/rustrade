@@ -25,7 +25,7 @@ use rustrade_execution::{
     order::{
         Order, OrderKey,
         id::{ClientOrderId, OrderId, PositionId, VenueOrderId},
-        request::{OrderResponseCancel, ReduceOnly},
+        request::{OrderResponseAmend, OrderResponseCancel, ReduceOnly},
         state::{ActiveOrderState, InactiveOrderState, OrderState},
     },
     position::PositionReport,
@@ -1671,6 +1671,22 @@ impl<InstrumentData, ExchangeKey, AssetKey, InstrumentKey>
                 self.pending_fills.clear();
             }
         }
+    }
+
+    /// Updates the instrument state from the answer to an
+    /// [`OrderRequestAmend`](rustrade_execution::order::request::OrderRequestAmend): see
+    /// [`OrderManager::update_from_amend_response`].
+    pub fn update_from_amend_response(
+        &mut self,
+        response: &OrderResponseAmend<ExchangeKey, AssetKey, InstrumentKey>,
+    ) where
+        ExchangeKey: Debug + Clone,
+        AssetKey: Debug + Clone,
+        InstrumentKey: Debug + Clone,
+    {
+        self.orders.update_from_amend_response::<AssetKey>(response);
+        // An amend that left nothing to fill retires the order.
+        self.cleanup_routing_tables();
     }
 
     /// Add a cash flow the venue attributed to this instrument, such as a funding payment, to the

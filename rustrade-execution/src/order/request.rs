@@ -4,6 +4,7 @@ use crate::{
     market::MarketSnapshot,
     order::{
         Order, OrderEvent, OrderKind, TimeInForce,
+        amend::{AmendPatch, Amended, RequestAmend},
         id::{PositionId, VenueOrderId},
         state::{Cancelled, UnindexedOrderState},
     },
@@ -33,6 +34,26 @@ pub type OrderResponseCancel<
 
 pub type UnindexedOrderResponseCancel =
     OrderResponseCancel<ExchangeId, AssetNameExchange, InstrumentNameExchange>;
+
+/// An amend as a strategy or a command asks for it: the order to amend, named by its key, and
+/// what to change. The engine builds the [`OrderRequestAmend`] it sends from the order it tracks
+/// under that key.
+pub type OrderAmend<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> =
+    OrderEvent<AmendPatch, ExchangeKey, InstrumentKey>;
+
+/// An amend of a working order: see [`RequestAmend`].
+pub type OrderRequestAmend<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> =
+    OrderEvent<RequestAmend, ExchangeKey, InstrumentKey>;
+
+/// The answer to an amend: the order as amended, or why it was not.
+pub type OrderResponseAmend<
+    ExchangeKey = ExchangeIndex,
+    AssetKey = AssetIndex,
+    InstrumentKey = InstrumentIndex,
+> = OrderEvent<Result<Amended, OrderError<AssetKey, InstrumentKey>>, ExchangeKey, InstrumentKey>;
+
+pub type UnindexedOrderResponseAmend =
+    OrderResponseAmend<ExchangeId, AssetNameExchange, InstrumentNameExchange>;
 
 /// Parameters for opening a new order.
 ///

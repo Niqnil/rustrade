@@ -396,6 +396,11 @@ impl<MarketEventKind: Debug> TimeExchange for EngineEvent<MarketEventKind> {
                     Some(snapshot.balance.time_exchange)
                 }
                 AccountEventKind::OrderSnapshot(order) => order.0.state.time_exchange(),
+                AccountEventKind::OrderAmended(response) => response
+                    .state
+                    .as_ref()
+                    .map(|amended| amended.open.time_exchange)
+                    .ok(),
                 AccountEventKind::OrderCancelled(response) => response
                     .state
                     .as_ref()
@@ -894,6 +899,49 @@ mod tests {
                     time,
                     None,
                 )),
+            )));
+
+        assert_eq!(event.time_exchange(), Some(time));
+    }
+
+    /// An amend's answer is stamped with the time the venue reports the amended order at, so a
+    /// historical clock advances on one as it does on a cancel's answer.
+    #[test]
+    fn an_amend_answer_reports_its_time_exchange() {
+        use rustrade_execution::{
+            AccountEvent, AccountEventKind,
+            order::{
+                OrderKey, OrderKind,
+                amend::Amended,
+                id::{ClientOrderId, OrderId, StrategyId},
+                request::OrderResponseAmend,
+                state::Open,
+            },
+        };
+        use rustrade_instrument::{asset::AssetIndex, exchange::ExchangeIndex};
+
+        let time = DateTime::<Utc>::MIN_UTC + TimeDelta::hours(1);
+        let open = Open::new(OrderId::new("1").into(), time, Decimal::ZERO);
+        let event: EngineEvent<()> =
+            EngineEvent::Account(AccountStreamEvent::Item(AccountEvent::new(
+                ExchangeIndex(0),
+                AccountEventKind::<ExchangeIndex, AssetIndex, InstrumentIndex>::OrderAmended(
+                    OrderResponseAmend {
+                        key: OrderKey::new(
+                            ExchangeIndex(0),
+                            InstrumentIndex::new(0),
+                            StrategyId::new("s"),
+                            ClientOrderId::new("c"),
+                        ),
+                        state: Ok(Amended::new(
+                            open,
+                            Some(Decimal::ONE),
+                            Decimal::ONE,
+                            OrderKind::Limit,
+                            None,
+                        )),
+                    },
+                ),
             )));
 
         assert_eq!(event.time_exchange(), Some(time));

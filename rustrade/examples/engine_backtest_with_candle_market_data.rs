@@ -51,7 +51,7 @@ use rustrade_data::{
 };
 use rustrade_execution::{
     AccountEvent,
-    order::request::{OrderRequestCancel, OrderRequestOpen},
+    order::request::{OrderRequestAmend, OrderRequestCancel, OrderRequestOpen},
 };
 use rustrade_instrument::{
     exchange::ExchangeId, index::IndexedInstruments, instrument::InstrumentIndex,
@@ -226,6 +226,13 @@ impl<ExchangeKey, InstrumentKey> InFlightRequestRecorder<ExchangeKey, Instrument
     fn record_in_flight_open(
         &mut self,
         _: &OrderRequestOpen<ExchangeKey, InstrumentKey>,
+        _: DateTime<Utc>,
+    ) {
+    }
+
+    fn record_in_flight_amend(
+        &mut self,
+        _: &OrderRequestAmend<ExchangeKey, InstrumentKey>,
         _: DateTime<Utc>,
     ) {
     }

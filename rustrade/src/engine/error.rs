@@ -48,6 +48,11 @@ pub enum RecoverableEngineError {
     /// valid, so none of it was sent.
     #[error("invalid CancelThenOpen group: {0}")]
     InvalidCancelThenOpen(rustrade_execution::order::request::CancelThenOpenError),
+
+    /// An amend the `Engine` refused from its own record of the order, so it was not sent: see
+    /// [`PreparesAmend`](crate::engine::state::PreparesAmend).
+    #[error("amend refused: {0}")]
+    AmendRefused(rustrade_execution::error::AmendRefusal),
 }
 
 /// Represents fatal error conditions that the [`Engine`](super::Engine) cannot recover from.

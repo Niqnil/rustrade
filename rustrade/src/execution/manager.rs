@@ -3,7 +3,10 @@ use crate::execution::{
     backfill::{FillRecoveryConfig, Watermark, backfill},
     error::ExecutionError,
     request::{ExecutionRequest, RequestFuture, dropped_open},
-    unknown_outcome::{LookupOutcome, UnknownOutcomeLookup, look_up_unknown_outcome},
+    unknown_outcome::{
+        AmendLookupOutcome, LookupOutcome, UnknownOutcomeLookup, look_up_unknown_amend,
+        look_up_unknown_outcome,
+    },
 };
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
@@ -23,17 +26,19 @@ use rustrade_execution::{
     AccountEvent, AccountEventKind, UnindexedAccountEvent, UnindexedAccountSnapshot,
     client::{ExecutionClient, OrderStatusClient, dedup::AccountEventDeduper},
     error::{
-        AccountReinitFailure, AccountStreamInitError, ConnectivityError, NotPlacedReason,
-        OrderError,
+        AccountReinitFailure, AccountStreamInitError, AmendRefusal, ConnectivityError,
+        NotPlacedReason, OrderError,
     },
     indexer::{AccountEventIndexer, AccountIndexError},
     map::ExecutionInstrumentMap,
     order::{
         Order, OrderEvent, OrderKey, UnindexedOrderKey,
+        amend::Amended,
         id::ClientOrderId,
         request::{
-            CancelReplaceAnswer, CancelThenOpen, OnCancelFailure, OrderRequestCancel,
-            OrderRequestOpen, OrderResponseCancel, UnindexedOrderResponseCancel,
+            CancelReplaceAnswer, CancelThenOpen, OnCancelFailure, OrderRequestAmend,
+            OrderRequestCancel, OrderRequestOpen, OrderResponseAmend, OrderResponseCancel,
+            UnindexedOrderResponseAmend, UnindexedOrderResponseCancel,
         },
         state::{OrderState, UnindexedOrderState},
     },
@@ -662,6 +667,9 @@ where
         let mut held_opens = HeldGroups::default();
         // The `CancelThenOpen` groups sent as one venue request each.
         let mut in_flight_cancel_replaces = FuturesUnordered::new();
+        let mut in_flight_amends = FuturesUnordered::new();
+        // Lookups of the orders whose amend came back with its outcome unknown.
+        let mut in_flight_amend_lookups = FuturesUnordered::new();
 
         // Set once a Shutdown (or a closed request Stream) has been observed. New requests are no
         // longer accepted, but the loop keeps running until nothing is outstanding.
@@ -677,6 +685,8 @@ where
                 && in_flight_opens.is_empty()
                 && in_flight_cancel_replaces.is_empty()
                 && in_flight_lookups.is_empty()
+                && in_flight_amends.is_empty()
+                && in_flight_amend_lookups.is_empty()
             {
                 // A group is held only while one of its cancels is in flight: its cancels are sent
                 // when it is held, and the answer to its last one releases it. So no in-flight
@@ -725,6 +735,18 @@ where
                 Either::Right(in_flight_lookups.select_next_some())
             };
 
+            let next_amend_response = if in_flight_amends.is_empty() {
+                Either::Left(std::future::pending())
+            } else {
+                Either::Right(in_flight_amends.select_next_some())
+            };
+
+            let next_amend_lookup = if in_flight_amend_lookups.is_empty() {
+                Either::Left(std::future::pending())
+            } else {
+                Either::Right(in_flight_amend_lookups.select_next_some())
+            };
+
             tokio::select! {
                 // Process exchange AccountStream events (balances, trades, order updates)
                 event = self.account_stream.next(), if !account_stream_done => match event {
@@ -759,6 +781,19 @@ where
                         in_flight_opens.push(Self::send_open(
                             &self.client, &self.indexer, self.request_timeout, request,
                         ));
+                    }
+                    Some(ExecutionRequest::Amend(request)) => {
+                        match Self::send_amend(
+                            &self.client, &self.indexer, self.request_timeout, request,
+                        ) {
+                            Ok(amend) => in_flight_amends.push(amend),
+                            // Refused here, unsent: the client does not declare it.
+                            Err(refused) => {
+                                if self.response_tx.send(*refused).is_err() {
+                                    break;
+                                }
+                            }
+                        }
                     }
                     Some(ExecutionRequest::CancelThenOpen(group)) => {
                         // Index every open now, so a misconfigured key panics on the request that
@@ -855,6 +890,26 @@ where
                 // Process the next lookup of an order whose open outcome was unknown
                 (request, outcome) = next_lookup => {
                     if let Some(event) = self.process_lookup_outcome(request, outcome)
+                        && self.response_tx.send(event).is_err()
+                    {
+                        break;
+                    }
+                }
+
+                // Process next ExecutionRequest::Amend response
+                ((request, sent), response) = next_amend_response => {
+                    let (event, lookup) = self.process_amend_answer(request, sent, response);
+
+                    if self.response_tx.send(event).is_err() {
+                        break;
+                    }
+
+                    in_flight_amend_lookups.extend(lookup);
+                }
+
+                // Process the next lookup of an order whose amend outcome was unknown
+                (request, outcome) = next_amend_lookup => {
+                    if let Some(event) = self.process_amend_lookup_outcome(request, outcome)
                         && self.response_tx.send(event).is_err()
                     {
                         break;
@@ -1289,10 +1344,13 @@ where
     ///
     /// The request was indexed when it was sent, so this does not fail in practice; if it did, the
     /// order is not looked up and the engine's in-flight deadline flags it.
-    fn lookup_key(
+    fn lookup_key<Kind>(
         &self,
-        request: &OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
-    ) -> Option<UnindexedOrderKey> {
+        request: &OrderEvent<Kind, ExchangeIndex, InstrumentIndex>,
+    ) -> Option<UnindexedOrderKey>
+    where
+        Kind: Clone + Debug,
+    {
         match self.indexer.order_request(request) {
             Ok(request) => Some(UnindexedOrderKey {
                 exchange: request.key.exchange,
@@ -1305,7 +1363,7 @@ where
                     exchange = %self.indexer.map.exchange.value,
                     ?request,
                     %error,
-                    "ExecutionManager cannot look up an order whose open outcome is unknown: its key does not index"
+                    "ExecutionManager cannot look up an order whose request's outcome is unknown: its key does not index"
                 );
                 None
             }
@@ -1414,6 +1472,211 @@ where
             exchange: order.key.exchange,
             kind: AccountEventKind::OrderSnapshot(Snapshot(order)),
         }))
+    }
+
+    /// Send the amend `request` to the client, bounded by `timeout`, with the instant it was
+    /// sent; or, when the client does not declare it ([`ExecutionClient::amend_support`]), the
+    /// answer refusing it, unsent.
+    ///
+    /// # Panics
+    /// See [`index_request`](Self::index_request).
+    fn send_amend<'a>(
+        client: &'a Client,
+        indexer: &'a AccountEventIndexer,
+        timeout: std::time::Duration,
+        request: OrderRequestAmend<ExchangeIndex, InstrumentIndex>,
+    ) -> Result<
+        RequestFuture<
+            (OrderRequestAmend<ExchangeIndex, InstrumentIndex>, Instant),
+            impl Future<Output = UnindexedOrderResponseAmend> + 'a,
+        >,
+        Box<AccountStreamEvent>,
+    > {
+        let client_request = Self::index_request(indexer, &request, "amend");
+        if let Err(refusal) = client.amend_support().permits(&client_request.state) {
+            debug!(
+                exchange = %indexer.map.exchange.value,
+                instrument = ?request.key.instrument,
+                cid = %request.key.cid,
+                %refusal,
+                "ExecutionManager refused an amend the client does not declare - not sent"
+            );
+            return Err(Box::new(Self::amend_event(
+                request.key,
+                Err(OrderError::AmendRefused(refusal)),
+            )));
+        }
+        Ok(RequestFuture::new(
+            client.amend_order(client_request),
+            timeout,
+            (request, Instant::now()),
+        ))
+    }
+
+    /// The `OrderAmended` event answering an amend of the order under `key`.
+    fn amend_event(
+        key: OrderKey<ExchangeIndex, InstrumentIndex>,
+        state: Result<Amended, OrderError<AssetIndex, InstrumentIndex>>,
+    ) -> AccountStreamEvent {
+        AccountStreamEvent::Item(AccountEvent {
+            exchange: key.exchange,
+            kind: AccountEventKind::OrderAmended(OrderResponseAmend { key, state }),
+        })
+    }
+
+    /// The event that answers the amend `request`, sent at `sent`, from the client's `response`
+    /// or its timeout; and, when that answer leaves the outcome unknown, the lookup of the order
+    /// to start, as [`process_open_answer`](Self::process_open_answer) does for an open.
+    fn process_amend_answer(
+        &self,
+        request: OrderRequestAmend<ExchangeIndex, InstrumentIndex>,
+        sent: Instant,
+        response: Result<UnindexedOrderResponseAmend, tokio::time::error::Elapsed>,
+    ) -> (
+        AccountStreamEvent,
+        Option<
+            impl Future<
+                Output = (
+                    OrderRequestAmend<ExchangeIndex, InstrumentIndex>,
+                    AmendLookupOutcome,
+                ),
+            > + use<RequestStream, Client>,
+        >,
+    ) {
+        let state = match response {
+            Ok(OrderResponseAmend { key, state }) => {
+                self.check_response_key(&request.key, key, "amend");
+                state.map_err(|error| self.indexer.order_error(error))
+            }
+            Err(_elapsed) => Err(OrderError::Connectivity(ConnectivityError::Timeout)),
+        };
+        let unknown = matches!(&state, Err(error) if error.is_outcome_unknown());
+        let event = Self::amend_event(request.key.clone(), state);
+
+        let lookup = unknown.then_some(request).and_then(|request| {
+            let key = self.lookup_key(&request)?;
+            if self.unknown_outcome.attempts == 0 {
+                warn!(
+                    exchange = %key.exchange,
+                    instrument = %key.instrument,
+                    cid = %key.cid,
+                    "ExecutionManager received an amend whose outcome is unknown - lookups are off, so it stays in flight"
+                );
+                return None;
+            }
+            warn!(
+                exchange = %key.exchange,
+                instrument = %key.instrument,
+                cid = %key.cid,
+                "ExecutionManager received an amend whose outcome is unknown - looking the order up at the venue"
+            );
+            Some(Self::look_up_amend(
+                Arc::clone(&self.client),
+                key,
+                request,
+                sent,
+                self.unknown_outcome,
+                self.request_timeout,
+            ))
+        });
+
+        (event, lookup)
+    }
+
+    /// Look up at the venue the order an amend whose outcome came back unknown was for.
+    ///
+    /// Owns what it uses, as [`look_up`](Self::look_up) does.
+    async fn look_up_amend(
+        client: Arc<Client>,
+        key: UnindexedOrderKey,
+        request: OrderRequestAmend<ExchangeIndex, InstrumentIndex>,
+        sent: Instant,
+        policy: UnknownOutcomeLookup,
+        lookup_timeout: std::time::Duration,
+    ) -> (
+        OrderRequestAmend<ExchangeIndex, InstrumentIndex>,
+        AmendLookupOutcome,
+    ) {
+        let outcome = look_up_unknown_amend(
+            client.as_ref(),
+            &key,
+            &request.state.current,
+            sent,
+            policy,
+            lookup_timeout,
+        )
+        .await;
+        (request, outcome)
+    }
+
+    /// The event that reports what the lookup of an amended order found: the order as the venue
+    /// lists it, as the amend's answer; its end, as an order snapshot; or the amend not applied.
+    /// `None` if the lookups ran out, leaving the amend in flight.
+    fn process_amend_lookup_outcome(
+        &self,
+        request: OrderRequestAmend<ExchangeIndex, InstrumentIndex>,
+        outcome: AmendLookupOutcome,
+    ) -> Option<AccountStreamEvent> {
+        let OrderRequestAmend { key, state: amend } = request;
+        let event = match outcome {
+            AmendLookupOutcome::Live(order) => {
+                let Order {
+                    price,
+                    quantity,
+                    kind,
+                    state: open,
+                    ..
+                } = *order;
+                let previous_id = open.id.contradicts(&amend.id).then_some(amend.id);
+                Self::amend_event(
+                    key,
+                    Ok(Amended::new(open, price, quantity, kind, previous_id)),
+                )
+            }
+            AmendLookupOutcome::Ended(order) => {
+                let Order {
+                    side,
+                    price,
+                    quantity,
+                    kind,
+                    time_in_force,
+                    state: ended,
+                    ..
+                } = *order;
+                AccountStreamEvent::Item(AccountEvent {
+                    exchange: key.exchange,
+                    kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+                        key,
+                        side,
+                        price,
+                        quantity,
+                        kind,
+                        time_in_force,
+                        state: self
+                            .indexer
+                            .order_state(UnindexedOrderState::Inactive(ended)),
+                    })),
+                })
+            }
+            AmendLookupOutcome::NotApplied => {
+                Self::amend_event(key, Err(OrderError::AmendRefused(AmendRefusal::NotApplied)))
+            }
+            AmendLookupOutcome::Exhausted => {
+                warn!(
+                    exchange = %self.indexer.map.exchange.value,
+                    instrument = ?key.instrument,
+                    cid = %key.cid,
+                    "ExecutionManager could not settle an amend whose outcome is unknown - it stays in flight"
+                );
+                return None;
+            }
+        };
+
+        info!(
+            exchange = %self.indexer.map.exchange.value,
+            "ExecutionManager settled an amend whose outcome was unknown"
+        );
+        Some(event)
     }
 
     fn process_open_timeout(
@@ -1559,10 +1822,11 @@ mod tests {
         AccountSnapshot, FillRecoveryFailure, FillRecoveryGap, FillRecoveryScope,
         UnindexedAccountEvent, UnindexedAccountSnapshot,
         balance::AssetBalance,
-        error::{ApiError, ClientError, UnindexedClientError, UnindexedOrderError},
+        error::{AmendField, ApiError, ClientError, UnindexedClientError, UnindexedOrderError},
         map::generate_execution_instrument_map,
         order::{
             OrderKey, OrderKind, TimeInForce, UnindexedInactiveOrder,
+            amend::{AmendAllowed, AmendPatch, AmendSupport, AmendTarget, RequestAmend},
             id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
             request::{RequestCancel, RequestOpen},
             state::{ActiveOrderState, Cancelled, InactiveOrderState, Open},
@@ -3092,6 +3356,8 @@ mod tests {
         Live(rust_decimal::Decimal),
         /// The ended-order read finds the order cancelled.
         Cancelled,
+        /// The open-order listing holds the order at this limit price, nothing filled.
+        LiveAt(rust_decimal::Decimal),
     }
 
     /// Answers every open with `open_answer`, or never, and each lookup of the order with the next
@@ -3102,6 +3368,10 @@ mod tests {
         /// `None` never answers an open, so the manager times it out.
         open_answer: Option<UnindexedOrderError>,
         lookups: Arc<std::sync::Mutex<std::collections::VecDeque<Lookup>>>,
+        amend_support: AmendSupport,
+        /// `None` never answers an amend, so the manager times it out.
+        amend_answer: Option<Result<Amended, UnindexedOrderError>>,
+        amends_sent: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl LookupClient {
@@ -3109,7 +3379,26 @@ mod tests {
             Self {
                 open_answer,
                 lookups: Arc::new(std::sync::Mutex::new(lookups.into())),
+                amend_support: AmendSupport::NONE,
+                amend_answer: None,
+                amends_sent: Arc::default(),
             }
+        }
+
+        fn with_amends(
+            self,
+            support: AmendSupport,
+            answer: Option<Result<Amended, UnindexedOrderError>>,
+        ) -> Self {
+            Self {
+                amend_support: support,
+                amend_answer: answer,
+                ..self
+            }
+        }
+
+        fn amends_sent(&self) -> usize {
+            self.amends_sent.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn lookups_left(&self) -> usize {
@@ -3189,6 +3478,24 @@ mod tests {
         {
             let lookup = self.lookups.lock().unwrap().pop_front();
             Ok(match lookup {
+                Some(Lookup::LiveAt(price)) => vec![Order {
+                    key: OrderKey {
+                        exchange: EXCHANGE,
+                        instrument: instruments[0].clone(),
+                        strategy: StrategyId::unknown(),
+                        cid: ClientOrderId::new(LOOKUP_CID),
+                    },
+                    side: Side::Buy,
+                    price: Some(price),
+                    quantity: dec!(1),
+                    kind: OrderKind::Limit,
+                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                    state: Open::new(
+                        VenueOrderId::Assigned(OrderId::new("venue-id")),
+                        DateTime::<Utc>::MIN_UTC,
+                        dec!(0),
+                    ),
+                }],
                 Some(Lookup::Live(filled_quantity)) => vec![Order {
                     key: OrderKey {
                         exchange: EXCHANGE,
@@ -3219,6 +3526,25 @@ mod tests {
         ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError>
         {
             unreachable!("ExecutionManager::run does not fetch trades")
+        }
+
+        fn amend_support(&self) -> AmendSupport {
+            self.amend_support
+        }
+
+        async fn amend_order(
+            &self,
+            request: OrderRequestAmend<ExchangeId, &InstrumentNameExchange>,
+        ) -> UnindexedOrderResponseAmend {
+            self.amends_sent
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let Some(answer) = self.amend_answer.clone() else {
+                return std::future::pending().await;
+            };
+            OrderResponseAmend {
+                key: request.key.into_owned_instrument(),
+                state: answer,
+            }
         }
     }
 
@@ -3313,6 +3639,209 @@ mod tests {
             })
             .collect()
             .await
+    }
+
+    /// The order the amend tests amend: a limit buy of 1 at 100, as [`LookupClient`] lists it.
+    fn amend_target() -> AmendTarget {
+        AmendTarget {
+            side: Side::Buy,
+            price: Some(dec!(100)),
+            quantity: dec!(1),
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+            reduce_only: Some(rustrade_execution::order::request::ReduceOnly::No),
+        }
+    }
+
+    /// Send one amend, repricing the order to 99, through a manager over `client`, with `policy`,
+    /// and collect the amend answers and order snapshots it forwards once it drains.
+    async fn run_amend_with_lookups(
+        client: LookupClient,
+        policy: UnknownOutcomeLookup,
+    ) -> Vec<AccountEventKind<ExchangeIndex, AssetIndex, InstrumentIndex>> {
+        let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
+        let Ok(map) = generate_execution_instrument_map(&instruments, EXCHANGE) else {
+            panic!("the instrument map should build");
+        };
+        let indexer = AccountEventIndexer::new(Arc::new(map));
+        let requests = futures::stream::iter([ExecutionRequest::Amend(OrderRequestAmend {
+            key: OrderKey {
+                exchange: indexer.map.exchange.key,
+                instrument: InstrumentIndex(0),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new(LOOKUP_CID),
+            },
+            state: RequestAmend::new(
+                VenueOrderId::Assigned(OrderId::new("venue-id")),
+                AmendPatch::default().with_price(dec!(99)),
+                amend_target(),
+                dec!(0),
+            ),
+        })]);
+        let (response_tx, response_rx) = mpsc_unbounded();
+
+        ExecutionManager {
+            request_stream: requests,
+            request_timeout: std::time::Duration::from_secs(5),
+            unknown_outcome: policy,
+            response_tx,
+            client: Arc::new(client),
+            indexer,
+            account_stream: futures::stream::empty().boxed(),
+        }
+        .run()
+        .await;
+
+        response_rx
+            .into_stream()
+            .filter_map(|event| async move {
+                match event {
+                    rustrade_data::streams::reconnect::Event::Item(AccountEvent {
+                        kind, ..
+                    }) => Some(kind),
+                    _ => None,
+                }
+            })
+            .collect()
+            .await
+    }
+
+    fn amended_at(price: rust_decimal::Decimal) -> Amended {
+        Amended::new(
+            Open::new(
+                VenueOrderId::Assigned(OrderId::new("venue-id")),
+                DateTime::<Utc>::MIN_UTC,
+                dec!(0),
+            ),
+            Some(price),
+            dec!(1),
+            OrderKind::Limit,
+            None,
+        )
+    }
+
+    fn amend_answer(
+        event: &AccountEventKind<ExchangeIndex, AssetIndex, InstrumentIndex>,
+    ) -> &Result<Amended, OrderError<AssetIndex, InstrumentIndex>> {
+        match event {
+            AccountEventKind::OrderAmended(response) => {
+                assert_eq!(
+                    response.key.strategy,
+                    StrategyId::new("test"),
+                    "the request's key"
+                );
+                &response.state
+            }
+            other => panic!("expected an amend's answer, got {other:?}"),
+        }
+    }
+
+    /// An amend the client does not declare is answered as refused, without reaching it.
+    #[tokio::test(start_paused = true)]
+    async fn an_amend_the_client_does_not_declare_is_refused_unsent() {
+        let client = LookupClient::new(None, vec![]).with_amends(
+            AmendSupport::ALL.with_price(AmendAllowed::Unsupported),
+            Some(Ok(amended_at(dec!(99)))),
+        );
+
+        let events = run_amend_with_lookups(client.clone(), UnknownOutcomeLookup::default()).await;
+
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert_eq!(
+            amend_answer(&events[0]),
+            &Err(OrderError::AmendRefused(AmendRefusal::Unsupported {
+                field: AmendField::Price
+            }))
+        );
+        assert_eq!(client.amends_sent(), 0);
+    }
+
+    /// A declared amend is sent, and its answer forwarded under the request's key.
+    #[tokio::test(start_paused = true)]
+    async fn a_declared_amend_is_sent_and_answered() {
+        let client = LookupClient::new(None, vec![])
+            .with_amends(AmendSupport::ALL, Some(Ok(amended_at(dec!(99)))));
+
+        let events = run_amend_with_lookups(client.clone(), UnknownOutcomeLookup::default()).await;
+
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert_eq!(amend_answer(&events[0]), &Ok(amended_at(dec!(99))));
+        assert_eq!(client.amends_sent(), 1);
+    }
+
+    /// An amend that times out is answered as unknown, then the order is looked up: listed as it
+    /// was, it is asked about again; listed amended, its terms are the amend's answer.
+    #[tokio::test(start_paused = true)]
+    async fn an_amend_that_times_out_is_settled_by_the_order_the_venue_lists() {
+        let client = LookupClient::new(
+            None,
+            vec![Lookup::LiveAt(dec!(100)), Lookup::LiveAt(dec!(99))],
+        )
+        .with_amends(AmendSupport::ALL, None);
+
+        let events = run_amend_with_lookups(
+            client.clone(),
+            UnknownOutcomeLookup::default()
+                .with_grace(std::time::Duration::ZERO)
+                .with_unknowns_to_conclude(2),
+        )
+        .await;
+
+        assert_eq!(events.len(), 2, "{events:#?}");
+        assert!(
+            matches!(amend_answer(&events[0]), Err(error) if error.is_outcome_unknown()),
+            "{:?}",
+            events[0]
+        );
+        assert_eq!(amend_answer(&events[1]), &Ok(amended_at(dec!(99))));
+        assert_eq!(client.lookups_left(), 0);
+    }
+
+    /// Listed as it was before the amend as many times as the policy asks, the amend is concluded
+    /// not made.
+    #[tokio::test(start_paused = true)]
+    async fn an_amend_the_venue_never_shows_is_concluded_not_applied() {
+        let client = LookupClient::new(
+            None,
+            vec![
+                Lookup::LiveAt(dec!(100)),
+                Lookup::Unknown,
+                Lookup::LiveAt(dec!(100)),
+            ],
+        )
+        .with_amends(AmendSupport::ALL, None);
+
+        let events = run_amend_with_lookups(
+            client.clone(),
+            UnknownOutcomeLookup::default()
+                .with_grace(std::time::Duration::ZERO)
+                .with_unknowns_to_conclude(2),
+        )
+        .await;
+
+        assert_eq!(events.len(), 2, "{events:#?}");
+        assert_eq!(
+            amend_answer(&events[1]),
+            &Err(OrderError::AmendRefused(AmendRefusal::NotApplied)),
+            "a venue that does not know the order breaks no run"
+        );
+        assert_eq!(client.lookups_left(), 0);
+    }
+
+    /// Found ended, the order's end is forwarded as its snapshot.
+    #[tokio::test(start_paused = true)]
+    async fn an_amended_order_found_ended_is_reported_ended() {
+        let client =
+            LookupClient::new(None, vec![Lookup::Cancelled]).with_amends(AmendSupport::ALL, None);
+
+        let events = run_amend_with_lookups(client, UnknownOutcomeLookup::default()).await;
+
+        assert_eq!(events.len(), 2, "{events:#?}");
+        assert!(matches!(
+            &events[1],
+            AccountEventKind::OrderSnapshot(Snapshot(order))
+                if matches!(order.state, OrderState::Inactive(InactiveOrderState::Cancelled(_)))
+        ));
     }
 
     fn is_unknown_outcome(

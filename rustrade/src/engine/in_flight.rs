@@ -181,6 +181,9 @@ pub enum InFlightRequest {
     /// A cancel request: the order is
     /// [`CancelInFlight`](rustrade_execution::order::state::CancelInFlight).
     Cancel,
+    /// An amend: the order is
+    /// [`AmendInFlight`](rustrade_execution::order::state::AmendInFlight).
+    Amend,
 }
 
 /// An order whose request has been in flight longer than its exchange's deadline.
@@ -346,6 +349,7 @@ impl InFlightWatch {
                 let request = match &order.state {
                     ActiveOrderState::OpenInFlight(_) => InFlightRequest::Open,
                     ActiveOrderState::CancelInFlight(_) => InFlightRequest::Cancel,
+                    ActiveOrderState::AmendInFlight(_) => InFlightRequest::Amend,
                     ActiveOrderState::Open(_) => continue,
                 };
                 let (Some(time_sent), Some(deadline)) = (

@@ -12,7 +12,7 @@ use rustrade_data::{
 use rustrade_execution::{
     AccountEvent,
     market::MarketSnapshot,
-    order::request::{OrderRequestCancel, OrderRequestOpen},
+    order::request::{OrderRequestAmend, OrderRequestCancel, OrderRequestOpen},
 };
 use rustrade_instrument::{
     asset::AssetIndex, exchange::ExchangeIndex, instrument::InstrumentIndex,
@@ -431,6 +431,13 @@ impl<ExchangeKey, InstrumentKey> InFlightRequestRecorder<ExchangeKey, Instrument
         _: DateTime<Utc>,
     ) {
     }
+
+    fn record_in_flight_amend(
+        &mut self,
+        _: &OrderRequestAmend<ExchangeKey, InstrumentKey>,
+        _: DateTime<Utc>,
+    ) {
+    }
 }
 
 /// [`InstrumentDataState`] for an option contract: everything [`DefaultInstrumentMarketData`]
@@ -535,6 +542,14 @@ impl<ExchangeKey, InstrumentKey> InFlightRequestRecorder<ExchangeKey, Instrument
         time_sent: DateTime<Utc>,
     ) {
         self.market.record_in_flight_open(request, time_sent);
+    }
+
+    fn record_in_flight_amend(
+        &mut self,
+        request: &OrderRequestAmend<ExchangeKey, InstrumentKey>,
+        time_sent: DateTime<Utc>,
+    ) {
+        self.market.record_in_flight_amend(request, time_sent);
     }
 }
 

@@ -19,8 +19,14 @@ use rustrade_data::event::MarketEvent;
 use rustrade_execution::{
     AccountEvent, AccountEventKind, AccountSnapshot, UnindexedAccountSnapshot,
     balance::AssetBalance,
+    error::AmendRefusal,
     market::MarketSnapshot,
-    order::{id::ClientOrderId, request::ReduceOnly},
+    order::{
+        amend::{AmendTarget, RequestAmend},
+        id::ClientOrderId,
+        request::{OrderAmend, ReduceOnly},
+        state::ActiveOrderState,
+    },
     trade::TradeId,
 };
 use rustrade_instrument::{
@@ -186,6 +192,62 @@ impl<GlobalData, InstrumentData> TracksOrder<InstrumentIndex>
         self.instruments
             .get_index(instrument)
             .is_some_and(|state| state.orders.0.contains_key(cid))
+    }
+}
+
+/// Builds the amend the `Engine` sends from the order a `State` tracks.
+///
+/// An amend names its order by key and says what to change ([`OrderAmend`]). The order it
+/// changes is the one the `Engine` tracks, so the `Engine` asks this for the
+/// [`RequestAmend`] to send: the venue's identifier for the order, the order as it stands, and the
+/// quantity filled.
+///
+/// # Implementing this
+/// Refuse, with an [`AmendRefusal`]:
+/// - [`Untracked`](AmendRefusal::Untracked) for an order this state does not track;
+/// - [`RequestInFlight`](AmendRefusal::RequestInFlight) for one not `Open`: its open, its cancel
+///   or another amend is in flight;
+/// - whatever [`AmendPatch::apply`](rustrade_execution::order::amend::AmendPatch::apply) refuses
+///   for the order as it stands.
+pub trait PreparesAmend<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> {
+    /// The amend to send for `amend`, or why there is none.
+    fn prepare_amend(
+        &self,
+        amend: &OrderAmend<ExchangeKey, InstrumentKey>,
+    ) -> Result<RequestAmend, AmendRefusal>;
+}
+
+impl<GlobalData, InstrumentData> PreparesAmend<ExchangeIndex, InstrumentIndex>
+    for EngineState<GlobalData, InstrumentData>
+{
+    fn prepare_amend(
+        &self,
+        amend: &OrderAmend<ExchangeIndex, InstrumentIndex>,
+    ) -> Result<RequestAmend, AmendRefusal> {
+        let instrument = self
+            .instruments
+            .get_index(&amend.key.instrument)
+            .ok_or(AmendRefusal::Untracked)?;
+        let order = instrument
+            .orders
+            .0
+            .get(&amend.key.cid)
+            .ok_or(AmendRefusal::Untracked)?;
+        let ActiveOrderState::Open(open) = &order.state else {
+            return Err(AmendRefusal::RequestInFlight);
+        };
+        let current = AmendTarget {
+            side: order.side,
+            price: order.price,
+            quantity: order.quantity,
+            kind: order.kind,
+            time_in_force: order.time_in_force,
+            reduce_only: instrument.reduce_only.sent_as(&amend.key.cid),
+        };
+        let request =
+            RequestAmend::new(open.id.clone(), amend.state, current, open.filled_quantity);
+        request.amended()?;
+        Ok(request)
     }
 }
 
@@ -563,6 +625,15 @@ impl<GlobalData, InstrumentData> EngineState<GlobalData, InstrumentData> {
                     instrument_state.replay_order_snapshot(order.as_ref(), reduce_only_fills);
                 instrument_state.data.process(event);
                 applied
+            }
+            AccountEventKind::OrderAmended(response) => {
+                let instrument_state = self
+                    .instruments
+                    .instrument_index_mut(&response.key.instrument);
+
+                instrument_state.update_from_amend_response(response);
+                instrument_state.data.process(event);
+                FillsApplied::default()
             }
             AccountEventKind::OrderCancelled(response) => {
                 let instrument_state = self

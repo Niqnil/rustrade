@@ -1,7 +1,7 @@
 use crate::engine::state::order::in_flight_recorder::InFlightRequestRecorder;
 use rustrade_execution::order::{
     Order,
-    request::OrderResponseCancel,
+    request::{OrderResponseAmend, OrderResponseCancel},
     state::{ActiveOrderState, OrderState},
 };
 use rustrade_integration::collection::snapshot::Snapshot;
@@ -64,6 +64,31 @@ where
     fn update_from_cancel_response<AssetKey>(
         &mut self,
         response: &OrderResponseCancel<ExchangeKey, AssetKey, InstrumentKey>,
+    ) where
+        AssetKey: Debug + Clone;
+
+    /// Apply the answer to an amend.
+    ///
+    /// # Contract
+    /// - `Ok(Amended)` commits the amended price, quantity and kind to an order with its amend in
+    ///   flight, or with a cancel sent since: a late answer behind a cancel still says what the
+    ///   order was while it rested. An
+    ///   [`AmendInFlight`](rustrade_execution::order::state::AmendInFlight) order returns to
+    ///   `Open`, carrying the identifier the venue now addresses it by. An order the amend left
+    ///   with nothing to fill stops being tracked.
+    /// - `Ok(Amended)` is ignored for an `Open` order, which has no amend in flight, and for an
+    ///   answer about another venue order: one whose
+    ///   [`previous_id`](rustrade_execution::order::amend::Amended::previous_id), or else whose
+    ///   order's identifier, contradicts the identifier tracked
+    ///   ([`VenueOrderId::contradicts`](rustrade_execution::order::id::VenueOrderId::contradicts)).
+    /// - A refusal or rejection returns an `AmendInFlight` order to `Open`, unchanged, or stops
+    ///   tracking it when fills while the amend was in flight left it nothing to fill.
+    /// - An unknown outcome
+    ///   ([`OrderError::is_outcome_unknown`](rustrade_execution::error::OrderError::is_outcome_unknown))
+    ///   leaves the amend in flight: the `ExecutionManager` looks the order up and answers again.
+    fn update_from_amend_response<AssetKey>(
+        &mut self,
+        response: &OrderResponseAmend<ExchangeKey, AssetKey, InstrumentKey>,
     ) where
         AssetKey: Debug + Clone;
 }

@@ -138,7 +138,9 @@ impl MarginPlacement {
                 (expired.id.clone(), expired.time_exchange)
             }
             OrderState::Active(
-                ActiveOrderState::OpenInFlight(_) | ActiveOrderState::CancelInFlight(_),
+                ActiveOrderState::OpenInFlight(_)
+                | ActiveOrderState::CancelInFlight(_)
+                | ActiveOrderState::AmendInFlight(_),
             )
             | OrderState::Inactive(InactiveOrderState::OpenFailed(_)) => return None,
         };

@@ -310,6 +310,12 @@ impl ReduceOnlyBook {
             .map(booked)
     }
 
+    /// What the live order under `cid` was sent as, or `None` when the book holds no live order
+    /// under it.
+    pub fn sent_as(&self, cid: &ClientOrderId) -> Option<ReduceOnly> {
+        self.live.get(cid).map(|order| order.reduce_only)
+    }
+
     /// Whether `trade` is a fill of an order sent reduce-only, either way: [`lookup`](Self::lookup)
     /// with an order the book does not hold counted as not.
     pub fn is_reduce_only<AssetKey, InstrumentKey>(
@@ -356,6 +362,21 @@ mod tests {
 
     fn cid(id: &str) -> ClientOrderId {
         ClientOrderId::new(id)
+    }
+
+    /// What a live order was sent as, either way; nothing for an order that ended, even a
+    /// reduce-only one kept retired, or one never registered.
+    #[test]
+    fn sent_as_reads_live_orders_only() {
+        let mut book = ReduceOnlyBook::new();
+        book.register(&cid("reduce"), Position);
+        book.register(&cid("plain"), No);
+        assert_eq!(book.sent_as(&cid("reduce")), Some(Position));
+        assert_eq!(book.sent_as(&cid("plain")), Some(No));
+
+        book.retire(&cid("reduce"));
+        assert_eq!(book.sent_as(&cid("reduce")), None);
+        assert_eq!(book.sent_as(&cid("never")), None);
     }
 
     fn venue(id: &str) -> OrderId {

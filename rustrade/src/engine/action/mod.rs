@@ -1,6 +1,6 @@
 use crate::engine::{
     action::send_requests::{
-        SendCancelThenOpensOutput, SendCancelsAndOpensOutput, SendRequestsOutput,
+        SendAmendsOutput, SendCancelThenOpensOutput, SendCancelsAndOpensOutput, SendRequestsOutput,
     },
     error::UnrecoverableEngineError,
 };
@@ -36,6 +36,9 @@ pub enum ActionOutput<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentInd
     /// The [`CancelThenOpen`](rustrade_execution::order::request::CancelThenOpen) groups of a
     /// [`Command::SendCancelThenOpenRequests`](super::command::Command::SendCancelThenOpenRequests).
     CancelThenOpens(SendCancelThenOpensOutput<ExchangeKey, InstrumentKey>),
+    /// The amends of a
+    /// [`Command::SendAmendRequests`](super::command::Command::SendAmendRequests).
+    Amends(SendAmendsOutput<ExchangeKey, InstrumentKey>),
 }
 
 impl<ExchangeKey, InstrumentKey> ActionOutput<ExchangeKey, InstrumentKey> {
@@ -46,6 +49,7 @@ impl<ExchangeKey, InstrumentKey> ActionOutput<ExchangeKey, InstrumentKey> {
             ActionOutput::OpenOrders(opens) => opens.unrecoverable_errors(),
             ActionOutput::ClosePositions(requests) => requests.unrecoverable_errors(),
             ActionOutput::CancelThenOpens(groups) => groups.unrecoverable_errors(),
+            ActionOutput::Amends(amends) => amends.unrecoverable_errors(),
         }
         .into_option()
     }

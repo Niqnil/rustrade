@@ -1,6 +1,6 @@
 use crate::engine::state::EngineState;
 use chrono::{DateTime, Utc};
-use rustrade_execution::order::request::{OrderRequestCancel, OrderRequestOpen};
+use rustrade_execution::order::request::{OrderRequestAmend, OrderRequestCancel, OrderRequestOpen};
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
 use tracing::error;
 
@@ -54,6 +54,17 @@ pub trait InFlightRequestRecorder<ExchangeKey = ExchangeIndex, InstrumentKey = I
     fn record_in_flight_open(
         &mut self,
         request: &OrderRequestOpen<ExchangeKey, InstrumentKey>,
+        time_sent: DateTime<Utc>,
+    );
+
+    /// Record `request` as an amend in flight for the order it names.
+    ///
+    /// The `Engine` records an amend only for an order it tracks as `Open`, having refused any
+    /// other before sending it. The amend's values are not the order's until its answer confirms
+    /// them, so an implementation tracking exposure keeps counting the order as it was.
+    fn record_in_flight_amend(
+        &mut self,
+        request: &OrderRequestAmend<ExchangeKey, InstrumentKey>,
         time_sent: DateTime<Utc>,
     );
 }
@@ -130,5 +141,21 @@ where
         instrument_state
             .reduce_only
             .register(&request.key.cid, request.state.reduce_only);
+    }
+
+    fn record_in_flight_amend(
+        &mut self,
+        request: &OrderRequestAmend<ExchangeIndex, InstrumentIndex>,
+        time_sent: DateTime<Utc>,
+    ) {
+        let instrument_state = self
+            .instruments
+            .instrument_index_mut(&request.key.instrument);
+        instrument_state
+            .orders
+            .record_in_flight_amend(request, time_sent);
+        instrument_state
+            .data
+            .record_in_flight_amend(request, time_sent);
     }
 }

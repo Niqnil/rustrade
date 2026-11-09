@@ -15,7 +15,8 @@ use rustrade_instrument::{
 };
 use serde::{Deserialize, Serialize};
 use state::{
-    ActiveOrderState, Cancelled, Expired, InactiveOrderState, Open, OpenInFlight, OrderState,
+    ActiveOrderState, AmendInFlight, Cancelled, Expired, InactiveOrderState, Open, OpenInFlight,
+    OrderState,
 };
 
 /// `Order` related identifiers.
@@ -33,6 +34,10 @@ pub mod request;
 
 /// Bracket order types for the [`BracketOrderClient`](crate::client::BracketOrderClient) trait.
 pub mod bracket;
+
+/// Amending a working order in place: [`AmendPatch`](amend::AmendPatch),
+/// [`AmendSupport`](amend::AmendSupport) and [`Amended`](amend::Amended).
+pub mod amend;
 
 /// Convenient type alias for an [`Order`] keyed with [`ExchangeId`] and [`InstrumentNameExchange`].
 pub type UnindexedOrder = Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>;
@@ -220,15 +225,21 @@ where
     ExchangeKey: Clone,
     InstrumentKey: Clone,
 {
+    /// A cancel of this order, or `None` when a cancel is already in flight.
+    ///
+    /// An order with an amend in flight is still working at the venue, so it is cancelled by the
+    /// identifier it was last reported under. A venue that issues a new identifier on amend may
+    /// not know that one once the amend is made.
     pub fn to_request_cancel(&self) -> Option<OrderRequestCancel<ExchangeKey, InstrumentKey>> {
         let Order { key, state, .. } = self;
 
         let request_cancel = match state {
             ActiveOrderState::OpenInFlight(_) => RequestCancel { id: None },
-            ActiveOrderState::Open(open) => RequestCancel {
+            ActiveOrderState::Open(open)
+            | ActiveOrderState::AmendInFlight(AmendInFlight { order: open, .. }) => RequestCancel {
                 id: Some(open.id.clone()),
             },
-            _ => return None,
+            ActiveOrderState::CancelInFlight(_) => return None,
         };
 
         Some(OrderRequestCancel {
@@ -363,12 +374,6 @@ pub enum OrderKind {
 impl OrderKind {
     /// Whether this is an [`OrderKind::ConditionalUnresolved`], which leaves open whether the
     /// order trails.
-    #[cfg(any(
-        feature = "alpaca",
-        feature = "binance",
-        feature = "hyperliquid",
-        feature = "ibkr"
-    ))]
     pub(crate) fn is_conditional_unresolved(&self) -> bool {
         matches!(self, Self::ConditionalUnresolved { .. })
     }
@@ -577,5 +582,48 @@ mod tests {
             .to_string(),
             "TrailingStop(1, Percentage, activation: Some(105))"
         );
+    }
+
+    /// An order with an amend in flight is still working, so a cancel names it by the identifier
+    /// it was last reported under; one with a cancel in flight gets no second cancel.
+    #[test]
+    fn an_order_with_an_amend_in_flight_can_be_cancelled() {
+        use crate::order::{amend::AmendPatch, id::OrderId, state::CancelInFlight};
+
+        let open = Open::new(
+            id::VenueOrderId::Assigned(OrderId::new("venue-1")),
+            DateTime::UNIX_EPOCH,
+            dec!(0),
+        );
+        let order = |state| Order {
+            key: OrderKey {
+                exchange: (),
+                instrument: (),
+                strategy: id::StrategyId::new("s"),
+                cid: ClientOrderId::new("cid"),
+            },
+            side: Side::Buy,
+            price: Some(dec!(100)),
+            quantity: dec!(1),
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+            state,
+        };
+
+        let amending = order(ActiveOrderState::AmendInFlight(AmendInFlight::new(
+            open.clone(),
+            AmendPatch::default().with_price(dec!(101)),
+            DateTime::UNIX_EPOCH,
+        )));
+        assert_eq!(
+            amending.to_request_cancel().map(|cancel| cancel.state.id),
+            Some(Some(open.id.clone()))
+        );
+
+        let cancelling = order(ActiveOrderState::CancelInFlight(CancelInFlight::new(
+            Some(open),
+            DateTime::UNIX_EPOCH,
+        )));
+        assert_eq!(cancelling.to_request_cancel(), None);
     }
 }

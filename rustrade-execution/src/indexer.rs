@@ -15,7 +15,7 @@ use crate::{
     notice::AccountNotice,
     order::{
         Order, OrderEvent, OrderKey, OrderSnapshot, UnindexedOrderKey, UnindexedOrderSnapshot,
-        request::OrderResponseCancel,
+        request::{OrderResponseAmend, OrderResponseCancel},
         state::{InactiveOrderState, OrderState, UnindexedOrderState},
     },
     trade::{AssetFees, Trade, TradeAmendment, TradeAmendmentKind},
@@ -117,6 +117,9 @@ impl AccountEventIndexer {
             }
             AccountEventKind::OrderSnapshot(snapshot) => {
                 AccountEventKind::OrderSnapshot(self.order_snapshot(snapshot.0).map(Snapshot)?)
+            }
+            AccountEventKind::OrderAmended(response) => {
+                AccountEventKind::OrderAmended(self.order_response_amend(response)?)
             }
             AccountEventKind::OrderCancelled(response) => {
                 AccountEventKind::OrderCancelled(self.order_response_cancel(response)?)
@@ -547,6 +550,19 @@ impl AccountEventIndexer {
         })
     }
 
+    /// Index an amend's answer, as [`Self::order_response_cancel`] does a cancel's.
+    pub fn order_response_amend(
+        &self,
+        response: OrderResponseAmend<ExchangeId, AssetNameExchange, InstrumentNameExchange>,
+    ) -> Result<OrderResponseAmend, IndexError> {
+        let OrderResponseAmend { key, state } = response;
+
+        Ok(OrderResponseAmend {
+            key: self.order_key(key)?,
+            state: state.map_err(|error| self.order_error(error)),
+        })
+    }
+
     pub fn order_key(&self, key: UnindexedOrderKey) -> Result<OrderKey, IndexError> {
         let UnindexedOrderKey {
             exchange,
@@ -737,6 +753,7 @@ impl AccountEventIndexer {
             UnindexedOrderError::UnsupportedMarginEffect(effect) => {
                 OrderError::UnsupportedMarginEffect(effect)
             }
+            UnindexedOrderError::AmendRefused(refusal) => OrderError::AmendRefused(refusal),
         }
     }
 

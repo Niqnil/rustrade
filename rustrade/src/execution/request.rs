@@ -4,7 +4,7 @@ use rustrade_execution::{
     order::{
         Order,
         id::ClientOrderId,
-        request::{CancelThenOpen, OrderRequestCancel, OrderRequestOpen},
+        request::{CancelThenOpen, OrderRequestAmend, OrderRequestCancel, OrderRequestOpen},
         state::OrderState,
     },
 };
@@ -59,6 +59,9 @@ pub enum ExecutionRequest<ExchangeKey = ExchangeIndex, InstrumentKey = Instrumen
     /// open instead with the order as requested, inactive with
     /// [`NotPlacedReason::CancelFailed`].
     CancelThenOpen(CancelThenOpen<ExchangeKey, InstrumentKey>),
+
+    /// Amend a working order in place, as the `Engine` built it from the order it tracks.
+    Amend(OrderRequestAmend<ExchangeKey, InstrumentKey>),
 }
 
 /// The answer to an open of a [`CancelThenOpen`] group that is dropped because the cancel `cancel`

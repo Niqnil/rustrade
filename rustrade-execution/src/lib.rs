@@ -51,7 +51,10 @@ use wiremock as _;
 use crate::{
     balance::{AssetBalance, AssetBalanceUpdate},
     error::StreamTerminationReason,
-    order::{Order, OrderSnapshot, request::OrderResponseCancel},
+    order::{
+        Order, OrderSnapshot,
+        request::{OrderResponseAmend, OrderResponseCancel},
+    },
     position::PositionReport,
     trade::Trade,
 };
@@ -282,6 +285,14 @@ pub enum AccountEventKind<ExchangeKey, AssetKey, InstrumentKey> {
 
     /// Response to an [`OrderRequestCancel<ExchangeKey, InstrumentKey>`](order::request::OrderRequestOpen).
     OrderCancelled(OrderResponseCancel<ExchangeKey, AssetKey, InstrumentKey>),
+
+    /// Answer to an [`OrderRequestAmend`](order::request::OrderRequestAmend): the order as the
+    /// venue amended it, or why it was not amended.
+    ///
+    /// The engine's `ExecutionManager` emits it once per amend it sends. The account stream may
+    /// also report the amended order as an [`OrderSnapshot`](Self::OrderSnapshot); that does not
+    /// stand in for this answer.
+    OrderAmended(OrderResponseAmend<ExchangeKey, AssetKey, InstrumentKey>),
 
     /// [`Order<ExchangeKey, InstrumentKey, Open>`] partial or full-fill.
     ///

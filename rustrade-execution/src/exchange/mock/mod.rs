@@ -30,7 +30,9 @@ pub mod orders;
 pub mod request;
 pub mod venue;
 
-pub use venue::{CancelOutcome, OpenOutcome, SimulatedVenue, VenueInstrumentMarket, VenueOutcome};
+pub use venue::{
+    AmendOutcome, CancelOutcome, OpenOutcome, SimulatedVenue, VenueInstrumentMarket, VenueOutcome,
+};
 
 /// The clock a [`market-driven`](MockExchange::new_market_driven) [`MockExchange`] stamps
 /// everything with.

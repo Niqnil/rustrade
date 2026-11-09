@@ -7,6 +7,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Amend in place: change a working order's price, total quantity or trigger price without
+  cancelling it** (`rustrade-execution`, `rustrade`, #892). Where the venue allows it, the order
+  keeps its identity, and often its place in the queue, instead of being replaced.
+  - **The request:** an `OrderAmend` names the order by its key and carries an `AmendPatch` (new
+    in `rustrade_execution::order::amend`), built from `AmendPatch::default()` and its `with_*`
+    methods. `quantity` is the new total, filled part included, and must stay above the quantity
+    filled. The engine builds the `RequestAmend` the client receives from the order it tracks:
+    the venue id, the order as it stands (`AmendTarget`) and the quantity filled.
+    `AmendTarget::reduce_only` is `None` when the engine did not send the order, such as one
+    adopted from the venue's listing of open orders. A client that sends the whole order again
+    reads it with `AmendTarget::known_reduce_only`, which refuses the amend
+    (`AmendRefusal::ReduceOnlyUnknown`) rather than guess the flag.
+  - **What a client can amend:** `ExecutionClient::amend_support` returns an `AmendSupport`: per
+    field, `AmendAllowed::{Unsupported, Any, DecreaseOnly}`, plus whether several fields can
+    change at once, whether the order keeps its venue id, and the queue priority after an amend
+    (`AmendPriority`). The `ExecutionManager` refuses an amend the client does not permit without
+    sending it. `ExecutionClient::amend_order` sends the amend. Both are default methods
+    (`AmendSupport::NONE`, and a refusal), so existing clients are unaffected and refuse every
+    amend. A wrapping client must forward both or neither.
+  - **The answer:** `AccountEventKind::OrderAmended`, once per amend. `Ok(Amended)` is the order
+    as the venue amended it, with `previous_id` set when the venue now addresses it by another id.
+    A refusal is the new `OrderError::AmendRefused(AmendRefusal)`, and leaves the order unchanged.
+  - **A lost answer** (a connectivity error or a timeout) is resolved by looking the order up, as
+    for an open or a cancel. The new values listed mean the amend was made. The old values listed
+    are not conclusive, since the venue may not have caught up: the manager keeps looking, and
+    when it runs out of attempts answers `AmendRefusal::NotApplied`.
+  - **Engine state:** while an amend is in flight the order is
+    `ActiveOrderState::AmendInFlight`. It keeps working at its old values: fills advance it, and
+    the amend's values are taken only from its answer. One request at a time per order: an amend
+    of an order with an open, cancel or amend in flight is refused (`AmendRefusal::RequestInFlight`).
+    A cancel of such an order is still sent, including by `Command::CancelOrders` and at contract
+    expiry. While an amend raising the quantity is in flight, a fill beyond the old total retires
+    the order only once it reaches the new total. An `Ok(Amended)` is applied only to the amend it
+    answers: one for an order with no amend in flight, or naming another venue order, is ignored.
+  - **From a strategy:** `AlgoStrategy::generate_amends` and `RiskManager::check_amends`, both
+    with defaults, so existing implementations are unaffected. The default check approves an
+    amend that only lowers the quantity. It passes any other amend through `RiskManager::check`
+    as the open the amended order would leave resting, and refuses it if `check` refuses or
+    adjusts that open. An order whose reduce-only flag is not known is checked as one that may
+    add exposure. The amends appear in `GenerateAlgoOrdersOutput::amends`.
+  - **From a command:** `Command::SendAmendRequests`, reported in `ActionOutput::Amends`. Like the
+    other commands, it skips the risk manager.
+  - **The engine** refuses an amend unsent, as `RecoverableEngineError::AmendRefused`, when it
+    does not track the order, when the amend changes nothing, raises a quantity to or below the
+    quantity filled, or names a field the order's kind does not have, or when the order has a
+    request in flight. Amends are sent after every other request in the same batch, so an amend
+    of an order that a cancel in that batch has claimed is refused.
+  - **No venue amends yet.** Every client in the library, and the simulated venue used by
+    `MockExecution` and the backtest runner, declares `AmendSupport::NONE`, so an amend is
+    answered as refused there, never silently dropped.
+
+### Changed
+
+- **Breaking: amend in place grows the engine's enums, output and order-tracking traits**
+  (`rustrade-execution`, `rustrade`, #892).
+  - **New variants:** `ActiveOrderState::AmendInFlight`, `ExecutionRequest::Amend`,
+    `InFlightRequest::Amend`, `Command::SendAmendRequests` and `ActionOutput::Amends`. An
+    exhaustive `match` on any of them needs an arm for each.
+  - **`GenerateAlgoOrdersOutput` has an `amends` field.** A struct literal must set it (`None`
+    for no amends); `GenerateAlgoOrdersOutput::new` sets it.
+  - **New required trait methods:** `InFlightRequestRecorder::record_in_flight_amend` and
+    `OrderManager::update_from_amend_response`. A custom `InstrumentDataState` implements
+    `record_in_flight_amend`; one that tracks no orders can leave its body empty.
+  - **The engine's `GenerateAlgoOrders` implementation requires `State: PreparesAmend`.**
+    `EngineState` implements it; a custom engine state must implement it too.
+
 ## [0.22.0] - 2026-11-09
 
 ### Added

@@ -56,12 +56,14 @@ use rustrade_execution::{
     MarketSnapshot, PerContractFeeModel,
     balance::{AssetBalance, AssetBalanceUpdate, Balance, BalanceUpdate},
     cash_flow::CashFlow,
+    error::AmendRefusal,
     order::{
         Order, OrderKey, OrderKind, TimeInForce,
+        amend::{AmendPatch, AmendTarget, Amended},
         id::{ClientOrderId, OrderId, PositionId, StrategyId, VenueOrderId},
         request::{
-            CancelThenOpen, CancelThenOpenError, OrderRequestCancel, OrderRequestOpen,
-            OrderResponseCancel, ReduceOnly, RequestCancel, RequestOpen,
+            CancelThenOpen, CancelThenOpenError, OrderAmend, OrderRequestCancel, OrderRequestOpen,
+            OrderResponseAmend, OrderResponseCancel, ReduceOnly, RequestCancel, RequestOpen,
         },
         state::{ActiveOrderState, Cancelled, Filled, Open, OrderState},
     },
@@ -2605,6 +2607,201 @@ fn test_command_send_open_requests_duplicate_cid_rejected_before_send() {
     );
 }
 
+/// An amend is built from the order the engine tracks, sent, and recorded in flight; one the
+/// engine cannot send is refused unsent: an order it does not track, an amend that changes
+/// nothing, or a second amend of one order in a batch. The answer commits the amend's values.
+#[test]
+fn test_command_send_amend_requests_builds_each_from_the_tracked_order() {
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    send_spot_price(&mut engine, 1, dec!(45_000));
+    let known = InstrumentIndex(1);
+    let cid = ClientOrderId::new("rest");
+
+    // The resting order the amends change: opened, then acknowledged by the venue.
+    let open = open_request(known, "rest");
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendOpenRequests(OneOrMany::One(open.clone()))),
+    );
+    assert!(matches!(
+        execution_rx.rx.try_recv(),
+        Ok(ExecutionRequest::Open(_))
+    ));
+    let venue_open = Open {
+        id: VenueOrderId::Assigned(OrderId::new("venue-1")),
+        time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
+        filled_quantity: dec!(0.25),
+    };
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+            exchange: ExchangeIndex(0),
+            kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+                key: open.key.clone(),
+                side: open.state.side,
+                price: open.state.price,
+                quantity: open.state.quantity,
+                kind: open.state.kind,
+                time_in_force: open.state.time_in_force,
+                state: OrderState::active(venue_open.clone()),
+            })),
+        })),
+    );
+
+    let amend = |cid: &str, patch: AmendPatch| OrderAmend {
+        key: OrderKey {
+            cid: ClientOrderId::new(cid),
+            ..open.key.clone()
+        },
+        state: patch,
+    };
+    let unchanged = amend("rest", AmendPatch::default().with_price(dec!(45_000)));
+    let valid = amend("rest", AmendPatch::default().with_price(dec!(44_000)));
+    let again = amend("rest", AmendPatch::default().with_quantity(dec!(2)));
+    let untracked = amend("nothing", AmendPatch::default().with_price(dec!(44_000)));
+
+    let audit = process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendAmendRequests(OneOrMany::Many(vec![
+            unchanged.clone(),
+            valid.clone(),
+            again.clone(),
+            untracked.clone(),
+        ]))),
+    );
+    let EngineAudit::Process(audit) = audit.event else {
+        panic!("expected EngineAudit::Process");
+    };
+    assert!(
+        audit.errors.is_empty(),
+        "a refused amend must not stop the engine"
+    );
+    let NoneOneOrMany::One(EngineOutput::Commanded(ActionOutput::Amends(output))) = audit.outputs
+    else {
+        panic!("expected one Amends output, got {:?}", audit.outputs);
+    };
+
+    let refused = |refusal| EngineError::Recoverable(RecoverableEngineError::AmendRefused(refusal));
+    let errors: Vec<_> = output
+        .errors
+        .iter()
+        .map(|error| (**error).clone())
+        .collect();
+    assert_eq!(
+        errors,
+        vec![
+            (unchanged, refused(AmendRefusal::NoChange)),
+            (again, refused(AmendRefusal::RequestInFlight)),
+            (untracked, refused(AmendRefusal::Untracked)),
+        ]
+    );
+
+    let sent: Vec<_> = output.sent_iter().cloned().collect();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    let request = &sent[0];
+    assert_eq!(request.key, valid.key);
+    assert_eq!(request.state.id, venue_open.id);
+    assert_eq!(request.state.patch, valid.state);
+    assert_eq!(
+        request.state.current,
+        AmendTarget {
+            side: Side::Buy,
+            price: Some(dec!(45_000)),
+            quantity: dec!(1),
+            kind: OrderKind::Limit,
+            time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+            reduce_only: Some(ReduceOnly::No),
+        }
+    );
+    assert_eq!(request.state.filled, dec!(0.25));
+    match execution_rx.rx.try_recv() {
+        Ok(ExecutionRequest::Amend(sent)) => assert_eq!(&sent, request),
+        other => panic!("expected the amend to be sent, got {other:?}"),
+    }
+    assert!(
+        execution_rx.rx.try_recv().is_err(),
+        "no refused amend may be sent"
+    );
+
+    let order = |engine: &TestEngine| {
+        engine.state.instruments.instrument_index(&known).orders.0[&cid].clone()
+    };
+    assert!(matches!(
+        order(&engine).state,
+        ActiveOrderState::AmendInFlight(_)
+    ));
+
+    // The venue's answer commits the new price.
+    let amended = Open {
+        time_exchange: time_plus_days(STARTING_TIMESTAMP, 2),
+        ..venue_open
+    };
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+            exchange: ExchangeIndex(0),
+            kind: AccountEventKind::OrderAmended(OrderResponseAmend {
+                key: valid.key.clone(),
+                state: Ok(Amended::new(
+                    amended.clone(),
+                    Some(dec!(44_000)),
+                    dec!(1),
+                    OrderKind::Limit,
+                    None,
+                )),
+            }),
+        })),
+    );
+    let order = order(&engine);
+    assert_eq!(order.price, Some(dec!(44_000)));
+    assert_eq!(order.state, ActiveOrderState::Open(amended));
+}
+
+/// An order the engine did not send, adopted from the venue's listing, is amended with its
+/// reduce-only flag reported as not known, rather than guessed.
+#[test]
+fn test_an_adopted_order_is_amended_with_its_reduce_only_unknown() {
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine(TradingState::Disabled, execution_tx);
+    send_spot_price(&mut engine, 1, dec!(45_000));
+    let adopted = open_request(InstrumentIndex(1), "adopted");
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+            exchange: ExchangeIndex(0),
+            kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+                key: adopted.key.clone(),
+                side: adopted.state.side,
+                price: adopted.state.price,
+                quantity: adopted.state.quantity,
+                kind: adopted.state.kind,
+                time_in_force: adopted.state.time_in_force,
+                state: OrderState::active(Open {
+                    id: VenueOrderId::Assigned(OrderId::new("venue-adopted")),
+                    time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
+                    filled_quantity: dec!(0),
+                }),
+            })),
+        })),
+    );
+
+    process_with_audit(
+        &mut engine,
+        EngineEvent::Command(Command::SendAmendRequests(OneOrMany::One(OrderAmend {
+            key: adopted.key.clone(),
+            state: AmendPatch::default().with_price(dec!(44_000)),
+        }))),
+    );
+    match execution_rx.rx.try_recv() {
+        Ok(ExecutionRequest::Amend(sent)) => {
+            assert_eq!(sent.key, adopted.key);
+            assert_eq!(sent.state.current.reduce_only, None);
+        }
+        other => panic!("expected the amend to be sent, got {other:?}"),
+    }
+}
+
 /// A `CancelThenOpen` group is sent whole, as one request, or refused whole, unsent and
 /// unrecorded: when it is not valid, when a leg names an unknown instrument, or when an open's
 /// client order id is tracked already, claimed by an earlier group in the call, or repeated in the
@@ -2845,6 +3042,140 @@ fn test_strategy_cancel_then_open_groups_are_sent_after_plain_requests() {
         },
     );
     assert!(engine.generate_algo_orders().cancel_then_opens.is_none());
+}
+
+/// Cancels its resting order "cancelled", and amends the price of it, of the resting order "rest"
+/// and of an order it does not track.
+struct AmendStrategy;
+
+impl AlgoStrategy for AmendStrategy {
+    type State = EngineState<DefaultGlobalData, DefaultInstrumentMarketData>;
+
+    fn generate_algo_orders(
+        &self,
+        _: &Self::State,
+    ) -> (
+        impl IntoIterator<Item = OrderRequestCancel<ExchangeIndex, InstrumentIndex>>,
+        impl IntoIterator<Item = OrderRequestOpen<ExchangeIndex, InstrumentIndex>>,
+    ) {
+        (
+            [cancel_request(InstrumentIndex(1), "cancelled")],
+            std::iter::empty(),
+        )
+    }
+
+    fn generate_amends(
+        &self,
+        _: &Self::State,
+    ) -> impl IntoIterator<Item = OrderAmend<ExchangeIndex, InstrumentIndex>> {
+        ["rest", "cancelled", "nothing"].map(|cid| OrderAmend {
+            key: cancel_request(InstrumentIndex(1), cid).key,
+            state: AmendPatch::default().with_price(dec!(44_000)),
+        })
+    }
+}
+
+/// A strategy's amends are built from the orders the engine tracks, pass the risk manager, and are
+/// sent after its cancels, each built again from its order as it then stands: an amend of an
+/// order the strategy also cancels is refused unsent, as is one of an order the engine does not
+/// track. They are reported in the algo output's `amends`, which an output without an amend leaves
+/// `None`.
+#[test]
+fn test_strategy_amends_are_sent_after_cancels() {
+    use rustrade::engine::action::generate_algo_orders::GenerateAlgoOrders;
+    use rustrade::engine::state::order::in_flight_recorder::InFlightRequestRecorder;
+
+    let (execution_tx, mut execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine_with_strategy(
+        TradingState::Enabled,
+        execution_tx,
+        OmsMode::Netting,
+        AmendStrategy,
+    );
+    let known = InstrumentIndex(1);
+
+    // The two resting orders: opened, then acknowledged by the venue.
+    for cid in ["rest", "cancelled"] {
+        let open = open_request(known, cid);
+        engine
+            .state
+            .record_in_flight_open(&open, STARTING_TIMESTAMP);
+        engine.state.update_from_account(&AccountEvent {
+            exchange: ExchangeIndex(0),
+            kind: AccountEventKind::OrderSnapshot(Snapshot(Order {
+                key: open.key.clone(),
+                side: open.state.side,
+                price: open.state.price,
+                quantity: open.state.quantity,
+                kind: open.state.kind,
+                time_in_force: open.state.time_in_force,
+                state: OrderState::active(Open {
+                    id: VenueOrderId::Assigned(OrderId::new(format!("venue-{cid}"))),
+                    time_exchange: time_plus_days(STARTING_TIMESTAMP, 1),
+                    filled_quantity: dec!(0),
+                }),
+            })),
+        });
+    }
+
+    let output = engine.generate_algo_orders();
+    let amends = output
+        .amends
+        .as_deref()
+        .expect("the strategy generated amends");
+    assert!(
+        amends.refused.is_none(),
+        "the default risk manager approves"
+    );
+    let sent: Vec<_> = amends
+        .sent
+        .sent_iter()
+        .map(|amend| amend.key.cid.clone())
+        .collect();
+    assert_eq!(sent, [ClientOrderId::new("rest")]);
+    let errors: Vec<_> = amends
+        .sent
+        .errors
+        .iter()
+        .map(|error| (error.0.key.cid.clone(), error.1.clone()))
+        .collect();
+    let refused = |refusal| EngineError::Recoverable(RecoverableEngineError::AmendRefused(refusal));
+    assert_eq!(
+        errors,
+        [
+            (
+                ClientOrderId::new("nothing"),
+                refused(AmendRefusal::Untracked)
+            ),
+            (
+                ClientOrderId::new("cancelled"),
+                refused(AmendRefusal::RequestInFlight)
+            ),
+        ]
+    );
+
+    assert!(matches!(
+        execution_rx.rx.try_recv(),
+        Ok(ExecutionRequest::Cancel(cancel)) if cancel.key.cid == ClientOrderId::new("cancelled")
+    ));
+    assert!(matches!(
+        execution_rx.rx.try_recv(),
+        Ok(ExecutionRequest::Amend(amend))
+            if amend.key.cid == ClientOrderId::new("rest") && amend.state.patch.price == Some(dec!(44_000))
+    ));
+    assert!(execution_rx.rx.try_recv().is_err());
+
+    // A strategy without amends leaves the field `None`.
+    let (execution_tx, _execution_rx) = mpsc_unbounded();
+    let mut engine = build_option_engine_with_strategy(
+        TradingState::Enabled,
+        execution_tx,
+        OmsMode::Netting,
+        FixedInstrumentStrategy {
+            instrument: InstrumentIndex(1),
+        },
+    );
+    assert!(engine.generate_algo_orders().amends.is_none());
 }
 
 /// Emits one cancel and one open for a fixed instrument, from both the algo and the

@@ -9,8 +9,13 @@ use rustrade_execution::{
     order::{
         Order,
         id::{ClientOrderId, OrderId, VenueOrderId},
-        request::{OrderRequestCancel, OrderRequestOpen, OrderResponseCancel},
-        state::{ActiveOrderState, CancelInFlight, InactiveOrderState, OrderState},
+        request::{
+            OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, OrderResponseAmend,
+            OrderResponseCancel,
+        },
+        state::{
+            ActiveOrderState, AmendInFlight, CancelInFlight, InactiveOrderState, Open, OrderState,
+        },
     },
 };
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
@@ -169,22 +174,25 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
 
     /// Whether any tracked order is awaiting a response from the exchange.
     ///
-    /// True for [`ActiveOrderState::OpenInFlight`] and [`ActiveOrderState::CancelInFlight`] — a
-    /// request has been sent and its outcome is not yet known. An order merely *resting* at the
+    /// True for [`ActiveOrderState::OpenInFlight`], [`ActiveOrderState::CancelInFlight`] and
+    /// [`ActiveOrderState::AmendInFlight`] — a request has been sent and its outcome is not yet
+    /// known. An order merely *resting* at the
     /// exchange ([`ActiveOrderState::Open`]) is **not** in flight: nothing is owed in reply, and a
     /// limit order that never fills must not hold up a drain.
     pub fn has_request_in_flight(&self) -> bool {
         self.0.values().any(|order| {
             matches!(
                 order.state,
-                ActiveOrderState::OpenInFlight(_) | ActiveOrderState::CancelInFlight(_)
+                ActiveOrderState::OpenInFlight(_)
+                    | ActiveOrderState::CancelInFlight(_)
+                    | ActiveOrderState::AmendInFlight(_)
             )
         })
     }
 
     /// Whether `snapshot` reports that its order was never placed
     /// ([`OrderError::NotPlaced`]) while the order is tracked as one the venue has reported
-    /// working: `Open`, or `CancelInFlight` after it was. The venue's own report outweighs the
+    /// working: `Open` or `AmendInFlight`, or `CancelInFlight` after it was. The venue's own report outweighs the
     /// conclusion, so [`update_from_order_snapshot`](OrderManager::update_from_order_snapshot)
     /// ignores such a snapshot.
     pub(crate) fn is_contradicted_never_placed<AssetKey>(
@@ -200,7 +208,7 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
             .get(&snapshot.key.cid)
             .is_some_and(|order| match &order.state {
                 ActiveOrderState::OpenInFlight(_) => false,
-                ActiveOrderState::Open(_) => true,
+                ActiveOrderState::Open(_) | ActiveOrderState::AmendInFlight(_) => true,
                 ActiveOrderState::CancelInFlight(cancel) => cancel.order.is_some(),
             })
     }
@@ -247,10 +255,11 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
         false
     }
 
-    /// Stop tracking the order under `cid` if it is `Open` as the venue order `id`, returning it.
+    /// Stop tracking the order under `cid` if it is working as the venue order `id`, `Open` or
+    /// with an amend in flight, returning it.
     ///
     /// Kept, with `None` returned, when:
-    /// - the order is in flight, because its request is still being answered;
+    /// - its open or cancel is in flight, because that request is still being answered;
     /// - it cannot be shown to be the venue order `id` ([`VenueOrderId::is_same_order_as`]). The
     ///   client id may have been reused for a new order that `id` does not describe, and without
     ///   a venue identifier on both sides nothing tells the two apart, so an order the venue never
@@ -263,7 +272,10 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
         id: &VenueOrderId,
     ) -> Option<Order<ExchangeKey, InstrumentKey, ActiveOrderState>> {
         match &self.0.get(cid)?.state {
-            ActiveOrderState::Open(open) if open.id.is_same_order_as(id) => {
+            ActiveOrderState::Open(open)
+            | ActiveOrderState::AmendInFlight(AmendInFlight { order: open, .. })
+                if open.id.is_same_order_as(id) =>
+            {
                 self.1.insert(cid.clone());
                 self.0.remove(cid)
             }
@@ -287,8 +299,8 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
     ///
     /// # What it will not do
     ///
-    /// Nothing happens unless the order is already tracked and `Open` under this exact venue
-    /// [`OrderId`]. A fill for an untracked order cannot insert one, so this cannot resurrect an
+    /// Nothing happens unless the order is already tracked and working, `Open` or with an amend
+    /// in flight, under this exact venue [`OrderId`]. A fill for an untracked order cannot insert one, so this cannot resurrect an
     /// order that has retired -- unlike an order snapshot, which reaches a vacant-entry arm that
     /// inserts. A fill arriving after its order retired is therefore safe to apply here, and is
     /// simply ignored.
@@ -308,9 +320,20 @@ impl<ExchangeKey, InstrumentKey> Orders<ExchangeKey, InstrumentKey> {
         let Some(order) = self.0.get_mut(cid) else {
             return false;
         };
-        let quantity = order.quantity;
-        let ActiveOrderState::Open(open) = &mut order.state else {
-            return false;
+        // While an amend raising the quantity is in flight, the venue may already have made it and
+        // filled beyond the old total: such a fill retires the order only past the new total. A
+        // venue that refused the raise cannot have filled beyond the old one.
+        let (open, quantity) = match &mut order.state {
+            ActiveOrderState::Open(open) => (open, order.quantity),
+            ActiveOrderState::AmendInFlight(AmendInFlight {
+                order: open, patch, ..
+            }) => (
+                open,
+                patch
+                    .quantity
+                    .map_or(order.quantity, |amended| amended.max(order.quantity)),
+            ),
+            _ => return false,
         };
         // A `ClientOrderId` identifies the order this engine sent; the venue's own id identifies
         // what it filled. Requiring both to agree keeps a fill off an order that merely shares the
@@ -366,6 +389,9 @@ where
         self.0.values()
     }
 
+    // One match over the tracked and the incoming state, an arm per pair. The lint counts each
+    // arm's log macro expansion, and splitting the match would scatter the transition table.
+    #[allow(clippy::cognitive_complexity)]
     fn update_from_order_snapshot<AssetKey>(
         &mut self,
         snapshot: Snapshot<&Order<ExchangeKey, InstrumentKey, OrderState<AssetKey, InstrumentKey>>>,
@@ -629,6 +655,96 @@ where
                     "OrderManager received a duplicate CancelInFlight recording - ignoring"
                 );
             }
+            (ActiveOrderState::AmendInFlight(_), ActiveOrderState::OpenInFlight(_)) => {
+                warn!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager received an OpenInFlight recording for an AmendInFlight order - ignoring"
+                );
+            }
+            // The order keeps working while its amend is in flight: a later report of it advances
+            // the state the amend carries, and only the amend's own answer ends the amend.
+            (ActiveOrderState::AmendInFlight(current), ActiveOrderState::Open(open)) => {
+                if current.order.id.contradicts(&open.id) {
+                    error!(
+                        exchange = ?snapshot.key.exchange,
+                        instrument = ?snapshot.key.instrument,
+                        strategy = %snapshot.key.strategy,
+                        cid = %snapshot.key.cid,
+                        tracked_id = %current.order.id,
+                        update_id = %open.id,
+                        "OrderManager received an Open snapshot naming a different exchange order than the tracked AmendInFlight - ignoring"
+                    );
+                    return;
+                }
+                if !current.order.is_superseded_by(&open) {
+                    debug!(
+                        exchange = ?snapshot.key.exchange,
+                        instrument = ?snapshot.key.instrument,
+                        strategy = %snapshot.key.strategy,
+                        cid = %snapshot.key.cid,
+                        update = ?snapshot,
+                        "OrderManager received an out of sequence Open order snapshot for an AmendInFlight - ignoring"
+                    );
+                    return;
+                }
+                if open.quantity_remaining(update.quantity) <= Decimal::ZERO {
+                    debug!(
+                        exchange = ?snapshot.key.exchange,
+                        instrument = ?snapshot.key.instrument,
+                        strategy = %snapshot.key.strategy,
+                        cid = %snapshot.key.cid,
+                        update = ?snapshot,
+                        "OrderManager removing an AmendInFlight order a more recent snapshot reports as fully filled"
+                    );
+                    self.1.insert(current_entry.remove().key.cid);
+                    return;
+                }
+                if let ActiveOrderState::AmendInFlight(amend) = &mut current_entry.get_mut().state {
+                    amend.order = open;
+                }
+            }
+            // A cancel supersedes the amend: the order is cancelled whatever the amend's answer.
+            (
+                ActiveOrderState::AmendInFlight(current),
+                ActiveOrderState::CancelInFlight(mut update),
+            ) => {
+                debug!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager transitioned an AmendInFlight order to CancelInFlight"
+                );
+                let current = &current.order;
+                let latest_open = update
+                    .order
+                    .take()
+                    .filter(|update| {
+                        !current.id.contradicts(&update.id) && current.is_superseded_by(update)
+                    })
+                    .unwrap_or_else(|| current.clone());
+
+                current_entry.get_mut().state = ActiveOrderState::CancelInFlight(CancelInFlight {
+                    order: Some(latest_open),
+                    time_sent: update.time_sent,
+                })
+            }
+            // An amend is recorded only by `record_in_flight_amend`, never by a snapshot.
+            (_, ActiveOrderState::AmendInFlight(_)) => {
+                warn!(
+                    exchange = ?snapshot.key.exchange,
+                    instrument = ?snapshot.key.instrument,
+                    strategy = %snapshot.key.strategy,
+                    cid = %snapshot.key.cid,
+                    update = ?snapshot,
+                    "OrderManager received an AmendInFlight snapshot - ignoring"
+                );
+            }
         }
     }
 
@@ -651,7 +767,12 @@ where
         };
 
         match (&order.get().state, &response.state) {
-            (ActiveOrderState::OpenInFlight(_) | ActiveOrderState::Open(_), Ok(_)) => {
+            (
+                ActiveOrderState::OpenInFlight(_)
+                | ActiveOrderState::Open(_)
+                | ActiveOrderState::AmendInFlight(_),
+                Ok(_),
+            ) => {
                 warn!(
                     exchange = ?response.key.exchange,
                     instrument = ?response.key.instrument,
@@ -673,7 +794,12 @@ where
                 );
                 self.1.insert(order.remove().key.cid);
             }
-            (ActiveOrderState::OpenInFlight(_) | ActiveOrderState::Open(_), Err(error)) => {
+            (
+                ActiveOrderState::OpenInFlight(_)
+                | ActiveOrderState::Open(_)
+                | ActiveOrderState::AmendInFlight(_),
+                Err(error),
+            ) => {
                 warn!(
                     exchange = ?response.key.exchange,
                     instrument = ?response.key.instrument,
@@ -713,6 +839,173 @@ where
                     order.remove();
                 }
             }
+        }
+    }
+
+    fn update_from_amend_response<AssetKey>(
+        &mut self,
+        response: &OrderResponseAmend<ExchangeKey, AssetKey, InstrumentKey>,
+    ) where
+        AssetKey: Debug + Clone,
+    {
+        let Entry::Occupied(mut entry) = self.0.entry(response.key.cid.clone()) else {
+            debug!(
+                exchange = ?response.key.exchange,
+                instrument = ?response.key.instrument,
+                strategy = %response.key.strategy,
+                cid = %response.key.cid,
+                update = ?response,
+                "OrderManager received an OrderResponseAmend for an untracked order - ignoring"
+            );
+            return;
+        };
+
+        let amended = match &response.state {
+            Ok(amended) => amended,
+            // Unknown: the amend may yet be made. The `ExecutionManager` looks the order up and
+            // answers again with what the venue lists.
+            Err(error) if error.is_outcome_unknown() => {
+                debug!(
+                    exchange = ?response.key.exchange,
+                    instrument = ?response.key.instrument,
+                    strategy = %response.key.strategy,
+                    cid = %response.key.cid,
+                    ?error,
+                    "OrderManager received an amend whose outcome is unknown - leaving it in flight"
+                );
+                return;
+            }
+            Err(error) => {
+                if let ActiveOrderState::AmendInFlight(amend) = &entry.get().state {
+                    debug!(
+                        exchange = ?response.key.exchange,
+                        instrument = ?response.key.instrument,
+                        strategy = %response.key.strategy,
+                        cid = %response.key.cid,
+                        ?error,
+                        "OrderManager received a refused amend - the order is unchanged"
+                    );
+                    let open = amend.order.clone();
+                    // A fill can reach the old total while a raise is in flight: refused, the
+                    // raise leaves the order with nothing to fill.
+                    if open.quantity_remaining(entry.get().quantity) <= Decimal::ZERO {
+                        debug!(
+                            exchange = ?response.key.exchange,
+                            instrument = ?response.key.instrument,
+                            strategy = %response.key.strategy,
+                            cid = %response.key.cid,
+                            "OrderManager removing an order filled while its refused amend was in flight"
+                        );
+                        self.1.insert(entry.remove().key.cid);
+                        return;
+                    }
+                    entry.get_mut().state = ActiveOrderState::Open(open);
+                } else {
+                    debug!(
+                        exchange = ?response.key.exchange,
+                        instrument = ?response.key.instrument,
+                        strategy = %response.key.strategy,
+                        cid = %response.key.cid,
+                        ?error,
+                        state = ?entry.get().state,
+                        "OrderManager received a refused amend for an order not AmendInFlight - ignoring"
+                    );
+                }
+                return;
+            }
+        };
+
+        let order = entry.get_mut();
+        let held = match &mut order.state {
+            ActiveOrderState::OpenInFlight(_) => {
+                warn!(
+                    exchange = ?response.key.exchange,
+                    instrument = ?response.key.instrument,
+                    strategy = %response.key.strategy,
+                    cid = %response.key.cid,
+                    update = ?response,
+                    "OrderManager received an amend for an OpenInFlight order - ignoring"
+                );
+                return;
+            }
+            // No amend was recorded: a duplicate or stale answer, whose values may be older than
+            // what the order has since been reported as.
+            ActiveOrderState::Open(_) => {
+                warn!(
+                    exchange = ?response.key.exchange,
+                    instrument = ?response.key.instrument,
+                    strategy = %response.key.strategy,
+                    cid = %response.key.cid,
+                    update = ?response,
+                    "OrderManager received an amend for an order with no amend in flight - ignoring"
+                );
+                return;
+            }
+            ActiveOrderState::AmendInFlight(AmendInFlight { order: open, .. }) => {
+                Some(open.clone())
+            }
+            ActiveOrderState::CancelInFlight(cancel) => cancel.order.clone(),
+        };
+
+        // The answer must be for the venue order amended: under its previous identifier when the
+        // venue issued a new one. Only two different assigned identifiers say it is not, as for
+        // snapshots: an order the venue had not named may be named in the answer.
+        if let Some(held) = &held {
+            let amended_id = amended.previous_id.as_ref().unwrap_or(&amended.open.id);
+            if held.id.contradicts(amended_id) {
+                warn!(
+                    exchange = ?response.key.exchange,
+                    instrument = ?response.key.instrument,
+                    strategy = %response.key.strategy,
+                    cid = %response.key.cid,
+                    tracked_id = ?held.id,
+                    update = ?response,
+                    "OrderManager received an amend of another venue order - ignoring"
+                );
+                return;
+            }
+        }
+
+        // The values the venue confirmed, behind a cancel too: a late answer still says what the
+        // order was while it rested.
+        order.price = amended.price;
+        order.quantity = amended.quantity;
+        order.kind = amended.kind;
+
+        // The venue's state after the amend, unless a later report already advanced the held one.
+        // The identifier is the amend's either way: the venue may have issued a new one.
+        let open = match held {
+            Some(held) if !held.is_superseded_by(&amended.open) => Open {
+                id: amended.open.id.clone(),
+                ..held
+            },
+            _ => amended.open.clone(),
+        };
+
+        if open.quantity_remaining(order.quantity) <= Decimal::ZERO {
+            debug!(
+                exchange = ?response.key.exchange,
+                instrument = ?response.key.instrument,
+                strategy = %response.key.strategy,
+                cid = %response.key.cid,
+                update = ?response,
+                "OrderManager removing an order its amend left with nothing to fill"
+            );
+            self.1.insert(entry.remove().key.cid);
+            return;
+        }
+
+        debug!(
+            exchange = ?response.key.exchange,
+            instrument = ?response.key.instrument,
+            strategy = %response.key.strategy,
+            cid = %response.key.cid,
+            update = ?response,
+            "OrderManager applied an amend"
+        );
+        match &mut order.state {
+            ActiveOrderState::CancelInFlight(cancel) => cancel.order = Some(open),
+            state => *state = ActiveOrderState::Open(open),
         }
     }
 }
@@ -882,6 +1175,39 @@ where
                 entry.insert(Order::open_in_flight(request, time_sent));
             }
         }
+    }
+
+    fn record_in_flight_amend(
+        &mut self,
+        request: &OrderRequestAmend<ExchangeKey, InstrumentKey>,
+        time_sent: DateTime<Utc>,
+    ) {
+        let Some(order) = self.0.get_mut(&request.key.cid) else {
+            error!(
+                cid = %request.key.cid,
+                event = ?request,
+                "OrderManager cannot mark AmendInFlight for an untracked order - ignoring"
+            );
+            return;
+        };
+
+        // The `Engine` sends an amend only for an `Open` order, so anything else is a caller
+        // recording one it should have refused.
+        let ActiveOrderState::Open(open) = &order.state else {
+            error!(
+                cid = %request.key.cid,
+                state = ?order.state,
+                event = ?request,
+                "OrderManager cannot mark AmendInFlight for an order not Open - ignoring"
+            );
+            return;
+        };
+
+        order.state = ActiveOrderState::AmendInFlight(AmendInFlight {
+            order: open.clone(),
+            patch: request.state.patch,
+            time_sent,
+        });
     }
 }
 
@@ -2611,6 +2937,369 @@ mod tests {
         for cid in [&cancel_failed, &complete] {
             state.update_from_order_snapshot(order_snapshot_open(cid.clone(), time).as_ref());
             assert!(!state.0.contains_key(cid), "{cid}: stays retired");
+        }
+    }
+
+    #[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
+    mod amend {
+        use super::*;
+        use rustrade_execution::{
+            error::{AmendRefusal, ConnectivityError, OrderError},
+            order::{
+                amend::{AmendPatch, AmendTarget, Amended, RequestAmend},
+                request::{OrderRequestAmend, OrderResponseAmend, ReduceOnly},
+                state::AmendInFlight,
+            },
+        };
+
+        fn t(secs: i64) -> DateTime<Utc> {
+            time_plus_secs(DateTime::<Utc>::MIN_UTC, secs)
+        }
+
+        fn cid() -> ClientOrderId {
+            ClientOrderId::new("amended")
+        }
+
+        fn tracked(state: ActiveOrderState) -> Orders<ExchangeId, u64> {
+            orders([order(cid(), state)])
+        }
+
+        fn resting() -> Orders<ExchangeId, u64> {
+            tracked(ActiveOrderState::Open(open_assigned("1", t(0))))
+        }
+
+        fn request(patch: AmendPatch) -> OrderRequestAmend<ExchangeId, u64> {
+            let order = order(cid(), ());
+            OrderRequestAmend {
+                key: order.key,
+                state: RequestAmend::new(
+                    VenueOrderId::Assigned(OrderId::new("1")),
+                    patch,
+                    AmendTarget {
+                        side: order.side,
+                        price: order.price,
+                        quantity: order.quantity,
+                        kind: order.kind,
+                        time_in_force: order.time_in_force,
+                        reduce_only: Some(ReduceOnly::No),
+                    },
+                    Decimal::ZERO,
+                ),
+            }
+        }
+
+        fn in_flight() -> Orders<ExchangeId, u64> {
+            let mut orders = resting();
+            orders.record_in_flight_amend(
+                &request(AmendPatch::default().with_price(dec!(2))),
+                TIME_SENT,
+            );
+            orders
+        }
+
+        fn answer(
+            state: Result<Amended, OrderError<u64, u64>>,
+        ) -> OrderResponseAmend<ExchangeId, u64, u64> {
+            OrderResponseAmend {
+                key: order(cid(), ()).key,
+                state,
+            }
+        }
+
+        fn amended(open: Open, price: Decimal, quantity: Decimal) -> Amended {
+            Amended::new(open, Some(price), quantity, OrderKind::Limit, None)
+        }
+
+        fn tracked_order(
+            orders: &Orders<ExchangeId, u64>,
+        ) -> &Order<ExchangeId, u64, ActiveOrderState> {
+            orders.0.get(&cid()).expect("tracked")
+        }
+
+        #[test]
+        fn an_amend_is_recorded_only_for_an_open_order() {
+            let orders = in_flight();
+            assert_eq!(
+                tracked_order(&orders).state,
+                ActiveOrderState::AmendInFlight(AmendInFlight {
+                    order: open_assigned("1", t(0)),
+                    patch: AmendPatch::default().with_price(dec!(2)),
+                    time_sent: TIME_SENT,
+                })
+            );
+            assert!(orders.has_request_in_flight());
+
+            for state in [
+                ActiveOrderState::OpenInFlight(OpenInFlight::new(TIME_SENT)),
+                ActiveOrderState::CancelInFlight(CancelInFlight::new(None, TIME_SENT)),
+            ] {
+                let mut orders = tracked(state.clone());
+                orders.record_in_flight_amend(
+                    &request(AmendPatch::default().with_price(dec!(2))),
+                    TIME_SENT,
+                );
+                assert_eq!(tracked_order(&orders).state, state);
+            }
+        }
+
+        #[test]
+        fn an_amend_the_venue_made_commits_its_values() {
+            let mut orders = in_flight();
+            orders.update_from_amend_response(&answer(Ok(amended(
+                open_assigned("1", t(1)),
+                dec!(2),
+                dec!(3),
+            ))));
+            let order = tracked_order(&orders);
+            assert_eq!(order.price, Some(dec!(2)));
+            assert_eq!(order.quantity, dec!(3));
+            assert_eq!(
+                order.state,
+                ActiveOrderState::Open(open_assigned("1", t(1)))
+            );
+            assert!(!orders.has_request_in_flight());
+        }
+
+        #[test]
+        fn an_amend_keeps_a_later_fill_and_takes_the_new_venue_id() {
+            let mut orders = in_flight();
+            // A fill reported after the venue answered, but applied first.
+            assert!(!orders.update_from_fill(&cid(), &OrderId::new("1"), dec!(0.4)));
+            orders.update_from_amend_response(&answer(Ok(Amended::new(
+                open_assigned("2", t(0)),
+                Some(dec!(2)),
+                dec!(1),
+                OrderKind::Limit,
+                Some(VenueOrderId::Assigned(OrderId::new("1"))),
+            ))));
+            let ActiveOrderState::Open(open) = &tracked_order(&orders).state else {
+                panic!("Open");
+            };
+            assert_eq!(open.id, VenueOrderId::Assigned(OrderId::new("2")));
+            assert_eq!(open.filled_quantity, dec!(0.4));
+        }
+
+        #[test]
+        fn a_refused_amend_leaves_the_order_as_it_was() {
+            for error in [
+                OrderError::AmendRefused(AmendRefusal::NoChange),
+                OrderError::Rejected(ApiError::OrderRejected("no".into())),
+            ] {
+                let mut orders = in_flight();
+                orders.update_from_amend_response(&answer(Err(error)));
+                let order = tracked_order(&orders);
+                assert_eq!(order.price, Some(dec!(1)));
+                assert_eq!(
+                    order.state,
+                    ActiveOrderState::Open(open_assigned("1", t(0)))
+                );
+            }
+        }
+
+        #[test]
+        fn an_unknown_outcome_leaves_the_amend_in_flight() {
+            let mut orders = in_flight();
+            let before = tracked_order(&orders).clone();
+            orders.update_from_amend_response(&answer(Err(OrderError::Connectivity(
+                ConnectivityError::Timeout,
+            ))));
+            assert_eq!(*tracked_order(&orders), before);
+        }
+
+        #[test]
+        fn the_order_keeps_working_while_its_amend_is_in_flight() {
+            let mut orders = in_flight();
+            orders.update_from_order_snapshot(Snapshot(&order(
+                cid(),
+                OrderState::<u64, u64>::active(open_assigned("1", t(2))),
+            )));
+            let ActiveOrderState::AmendInFlight(amend) = &tracked_order(&orders).state else {
+                panic!("still AmendInFlight");
+            };
+            assert_eq!(amend.order.time_exchange, t(2));
+
+            assert!(orders.update_from_fill(&cid(), &OrderId::new("1"), dec!(1)));
+            assert!(orders.0.is_empty(), "a fill of the whole order retires it");
+        }
+
+        #[test]
+        fn a_cancel_supersedes_the_amend_and_a_late_amend_still_commits_its_values() {
+            let mut orders = in_flight();
+            orders.record_in_flight_cancel(&request_cancel(cid()), t(3));
+            assert_eq!(
+                tracked_order(&orders).state,
+                ActiveOrderState::CancelInFlight(CancelInFlight::new(
+                    Some(open_assigned("1", t(0))),
+                    t(3),
+                ))
+            );
+
+            orders.update_from_amend_response(&answer(Ok(amended(
+                open_assigned("1", t(1)),
+                dec!(2),
+                dec!(1),
+            ))));
+            let order = tracked_order(&orders);
+            assert_eq!(order.price, Some(dec!(2)));
+            assert!(matches!(
+                order.state,
+                ActiveOrderState::CancelInFlight(CancelInFlight { order: Some(_), .. })
+            ));
+        }
+
+        /// A cancel's snapshot carrying the order replaces the amend's order only with a later
+        /// report of the same venue order: one of another venue order, or an older one, leaves
+        /// the order as last reported.
+        #[test]
+        fn a_cancel_snapshot_takes_only_a_later_report_of_the_amended_order() {
+            let cancelled_with = |reported: Open| {
+                let mut orders = tracked(ActiveOrderState::Open(open_assigned("1", t(2))));
+                orders.record_in_flight_amend(
+                    &request(AmendPatch::default().with_price(dec!(2))),
+                    TIME_SENT,
+                );
+                orders.update_from_order_snapshot(Snapshot(&order(
+                    cid(),
+                    OrderState::<u64, u64>::Active(ActiveOrderState::CancelInFlight(
+                        CancelInFlight::new(Some(reported), t(5)),
+                    )),
+                )));
+                tracked_order(&orders).state.clone()
+            };
+            let cancel = |order: Open| {
+                ActiveOrderState::CancelInFlight(CancelInFlight::new(Some(order), t(5)))
+            };
+
+            assert_eq!(
+                cancelled_with(open_assigned("1", t(3))),
+                cancel(open_assigned("1", t(3)))
+            );
+            assert_eq!(
+                cancelled_with(open_assigned("2", t(3))),
+                cancel(open_assigned("1", t(2))),
+                "another venue order"
+            );
+            assert_eq!(
+                cancelled_with(open_assigned("1", t(1))),
+                cancel(open_assigned("1", t(2))),
+                "an older report"
+            );
+        }
+
+        #[test]
+        fn an_amend_leaving_nothing_to_fill_retires_the_order() {
+            let mut part_filled = open_assigned("1", t(1));
+            part_filled.filled_quantity = dec!(0.5);
+            let mut orders = tracked(ActiveOrderState::Open(part_filled));
+            orders.record_in_flight_amend(
+                &request(AmendPatch::default().with_quantity(dec!(0.6))),
+                TIME_SENT,
+            );
+            let mut filled = open_assigned("1", t(2));
+            filled.filled_quantity = dec!(0.5);
+            orders.update_from_amend_response(&answer(Ok(amended(filled, dec!(1), dec!(0.5)))));
+            assert!(orders.0.is_empty());
+        }
+
+        /// A fill beyond the old total while an amend raising the quantity is in flight means the
+        /// venue made the raise: the order retires only past the new total. A lowering amend in
+        /// flight does not lower the total a fill is measured against.
+        #[test]
+        fn a_fill_beyond_the_old_total_waits_for_a_raise_in_flight() {
+            let amending = |patch: AmendPatch| {
+                let mut orders = resting();
+                orders.record_in_flight_amend(&request(patch), TIME_SENT);
+                orders
+            };
+
+            let mut raising = amending(AmendPatch::default().with_quantity(dec!(3)));
+            assert!(!raising.update_from_fill(&cid(), &OrderId::new("1"), dec!(2)));
+            let ActiveOrderState::AmendInFlight(amend) = &tracked_order(&raising).state else {
+                panic!("still AmendInFlight");
+            };
+            assert_eq!(amend.order.filled_quantity, dec!(2));
+            assert!(raising.update_from_fill(&cid(), &OrderId::new("1"), dec!(3)));
+            assert!(raising.0.is_empty());
+
+            let mut lowering = amending(AmendPatch::default().with_quantity(dec!(0.5)));
+            assert!(!lowering.update_from_fill(&cid(), &OrderId::new("1"), dec!(0.6)));
+            assert!(lowering.update_from_fill(&cid(), &OrderId::new("1"), dec!(1)));
+        }
+
+        /// An answer is applied only to the amend it answers: not to an order with no amend in
+        /// flight, nor to an amend of another venue order.
+        #[test]
+        fn an_amend_answer_is_ignored_without_its_amend() {
+            let made = || answer(Ok(amended(open_assigned("1", t(1)), dec!(2), dec!(3))));
+
+            let mut orders = resting();
+            let before = tracked_order(&orders).clone();
+            orders.update_from_amend_response(&made());
+            assert_eq!(*tracked_order(&orders), before, "no amend in flight");
+
+            for previous_id in [None, Some(VenueOrderId::Assigned(OrderId::new("9")))] {
+                let mut orders = in_flight();
+                let before = tracked_order(&orders).clone();
+                orders.update_from_amend_response(&answer(Ok(Amended::new(
+                    open_assigned("9", t(1)),
+                    Some(dec!(2)),
+                    dec!(3),
+                    OrderKind::Limit,
+                    previous_id,
+                ))));
+                assert_eq!(*tracked_order(&orders), before, "another venue order");
+            }
+
+            let mut cancelling = in_flight();
+            cancelling.record_in_flight_cancel(&request_cancel(cid()), t(3));
+            let before = tracked_order(&cancelling).clone();
+            cancelling.update_from_amend_response(&answer(Ok(amended(
+                open_assigned("9", t(1)),
+                dec!(2),
+                dec!(3),
+            ))));
+            assert_eq!(
+                *tracked_order(&cancelling),
+                before,
+                "another venue order, behind a cancel"
+            );
+        }
+
+        /// An order the venue had not named when the amend was sent may be named in the answer.
+        #[test]
+        fn an_amend_answer_may_name_an_order_the_venue_had_not() {
+            let mut orders = tracked(ActiveOrderState::Open(open_client_assigned(t(0))));
+            orders.record_in_flight_amend(
+                &request(AmendPatch::default().with_price(dec!(2))),
+                TIME_SENT,
+            );
+            orders.update_from_amend_response(&answer(Ok(amended(
+                open_assigned("7", t(1)),
+                dec!(2),
+                dec!(1),
+            ))));
+            let order = tracked_order(&orders);
+            assert_eq!(order.price, Some(dec!(2)));
+            assert_eq!(
+                order.state,
+                ActiveOrderState::Open(open_assigned("7", t(1)))
+            );
+        }
+
+        /// A fill that reached the old total while a raise was in flight leaves nothing to fill
+        /// once the raise is refused.
+        #[test]
+        fn a_refused_raise_retires_an_order_filled_meanwhile() {
+            let mut orders = resting();
+            orders.record_in_flight_amend(
+                &request(AmendPatch::default().with_quantity(dec!(3))),
+                TIME_SENT,
+            );
+            assert!(!orders.update_from_fill(&cid(), &OrderId::new("1"), dec!(1)));
+            orders.update_from_amend_response(&answer(Err(OrderError::AmendRefused(
+                AmendRefusal::Venue("filled".into()),
+            ))));
+            assert!(orders.0.is_empty());
         }
     }
 }

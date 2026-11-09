@@ -12,7 +12,7 @@
 //! evolve while `is_transient()` semantics remain stable.
 
 use crate::{margin::MarginEffect, order::id::ClientOrderId};
-use derive_more::Constructor;
+use derive_more::{Constructor, Display};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     asset::{AssetIndex, name::AssetNameExchange},
@@ -604,6 +604,84 @@ pub enum OrderError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     /// with account-level margin takes none.
     #[error("unsupported margin effect: {0:?}")]
     UnsupportedMarginEffect(MarginEffect),
+
+    /// An amend refused without being sent, or by the venue for a reason given in
+    /// [`AmendRefusal`]: the order is unchanged.
+    ///
+    /// Non-transient — change the amend, or cancel the order and place a new one.
+    #[error("amend refused: {0}")]
+    AmendRefused(AmendRefusal),
+}
+
+/// One field an amend can change: see [`AmendPatch`](crate::order::amend::AmendPatch).
+#[derive(
+    Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Display,
+)]
+pub enum AmendField {
+    #[display("price")]
+    Price,
+    #[display("quantity")]
+    Quantity,
+    #[display("trigger price")]
+    TriggerPrice,
+}
+
+/// Why an amend was refused, leaving the order unchanged.
+///
+/// Carried by [`OrderError::AmendRefused`], and by the engine's refusal of an amend it does not
+/// send.
+#[non_exhaustive]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Error)]
+pub enum AmendRefusal {
+    /// The client cannot amend this field: see
+    /// [`AmendSupport`](crate::order::amend::AmendSupport).
+    #[error("the {field} cannot be amended")]
+    Unsupported { field: AmendField },
+
+    /// The client can only lower this field, and the amend raises it.
+    #[error("the {field} can only be lowered")]
+    Increase { field: AmendField },
+
+    /// The client amends one field at a time, and the amend changes more.
+    #[error("only one field can be amended at a time")]
+    MultipleFields,
+
+    /// The amend changes nothing.
+    #[error("the amend changes nothing")]
+    NoChange,
+
+    /// The order has no such field: a price on an order without a limit price, or a trigger on
+    /// a kind without an amendable trigger.
+    #[error("the order has no {field} to amend")]
+    NotOnKind { field: AmendField },
+
+    /// The new total quantity is not above the quantity already filled.
+    #[error("the quantity must be above the {filled} already filled")]
+    QuantityNotAboveFilled { filled: Decimal },
+
+    /// The client sends the whole order again to amend it, and the order's reduce-only flag is
+    /// not known: see [`AmendTarget::reduce_only`](crate::order::amend::AmendTarget::reduce_only).
+    #[error("the order's reduce-only flag is not known, and the amend would have to send it")]
+    ReduceOnlyUnknown,
+
+    /// The order is not tracked as working: unknown, or ended.
+    #[error("the order is not tracked")]
+    Untracked,
+
+    /// The order is not resting with nothing in flight: its open, its cancel or another amend
+    /// has not been answered yet. One request at a time per order.
+    #[error("the order has a request in flight")]
+    RequestInFlight,
+
+    /// The amend's answer was lost, and the venue went on listing the order as it was before the
+    /// amend: the engine's `ExecutionManager` concluded it was not made.
+    #[error("the venue still lists the order as it was")]
+    NotApplied,
+
+    /// The venue refused the amend for the order's kind, time in force or instrument, for a
+    /// reason the client cannot declare in advance. The message is the venue's or the client's.
+    #[error("{0}")]
+    Venue(String),
 }
 
 /// How an order is known not to have been placed.
@@ -821,8 +899,9 @@ impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
     ///   refused borrow, etc.)
     /// - [`UnsupportedOrderType`](Self::UnsupportedOrderType),
     ///   [`InvalidPrecision`](Self::InvalidPrecision),
-    ///   [`OutOfBounds`](Self::OutOfBounds) and
-    ///   [`UnsupportedMarginEffect`](Self::UnsupportedMarginEffect)
+    ///   [`OutOfBounds`](Self::OutOfBounds),
+    ///   [`UnsupportedMarginEffect`](Self::UnsupportedMarginEffect) and
+    ///   [`AmendRefused`](Self::AmendRefused)
     ///
     /// [`NotPlaced`](Self::NotPlaced) is transient when the request was not sent for a connection
     /// failure, since a later send may get through. It is not when the venue does not know the
@@ -840,7 +919,8 @@ impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
             Self::UnsupportedOrderType(_)
             | Self::InvalidPrecision(_)
             | Self::OutOfBounds(_)
-            | Self::UnsupportedMarginEffect(_) => false,
+            | Self::UnsupportedMarginEffect(_)
+            | Self::AmendRefused(_) => false,
         }
     }
 
