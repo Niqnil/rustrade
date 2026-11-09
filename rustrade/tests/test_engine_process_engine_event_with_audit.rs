@@ -2638,7 +2638,8 @@ fn test_command_send_cancel_then_open_requests_sends_each_group_whole_or_not_at_
                 .collect(),
         )
     };
-    let valid = group(&[(known, "exit")]);
+    // Two opens on one instrument under different ids are not duplicates.
+    let valid = group(&[(known, "exit"), (known, "exit-2")]);
     let no_cancels = CancelThenOpen::new(vec![], vec![open_request(known, "no-cancels")]);
     let untracked = group(&[(known, "sibling"), (unknown, "untracked")]);
     let tracked_id = group(&[(known, "stop")]);
@@ -2675,9 +2676,13 @@ fn test_command_send_cancel_then_open_requests_sends_each_group_whole_or_not_at_
     let sent: Vec<_> = output.sent_iter().cloned().collect();
     assert_eq!(sent.len(), 1, "{sent:?}");
     assert_eq!(sent[0].cancels, valid.cancels);
-    assert_eq!(sent[0].opens[0].key, valid.opens[0].key);
+    let sent_keys: Vec<_> = sent[0].opens.iter().map(|open| &open.key).collect();
+    assert_eq!(
+        sent_keys,
+        valid.opens.iter().map(|open| &open.key).collect::<Vec<_>>()
+    );
     assert!(
-        sent[0].opens[0].state.market.is_some(),
+        sent[0].opens.iter().all(|open| open.state.market.is_some()),
         "a sent open is stamped with the market"
     );
     let errors: Vec<_> = output

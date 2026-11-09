@@ -3162,7 +3162,7 @@ mod tests {
     }
 
     /// A group whose cancel fails never reaches the venue with its opens. Each is answered dropped,
-    /// with the cancel's answer, one round trip after the group was sent.
+    /// in the group's order, with the cancel's answer, one round trip after the group was sent.
     #[tokio::test]
     async fn a_groups_failed_cancel_drops_its_opens_unsent() {
         let mut harness = Harness::new(
@@ -3180,11 +3180,15 @@ mod tests {
 
         harness.clock.advance_to(at(10));
         let unknown = ClientOrderId::random();
-        let (first, second) = (ClientOrderId::random(), ClientOrderId::random());
+        let (first, second, third) = (
+            ClientOrderId::random(),
+            ClientOrderId::random(),
+            ClientOrderId::random(),
+        );
         harness.send(cancel_then_open(
             harness.exchange,
             &[&unknown],
-            &[&first, &second],
+            &[&first, &second, &third],
         ));
 
         let events = harness.rest_events().await;
@@ -3195,6 +3199,7 @@ mod tests {
                 "cancelled", // 210: no such order
                 "order",     // 210: first, dropped
                 "order",     // 210: second, dropped
+                "order",     // 210: third, dropped
                 "market",    // 215
                 "market",    // 505: nothing more from the venue
                 "after_drain"
@@ -3214,7 +3219,15 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(orders, vec![(first, dropped.clone()), (second, dropped)]);
+        assert_eq!(
+            orders,
+            vec![
+                (first, dropped.clone()),
+                (second, dropped.clone()),
+                (third, dropped)
+            ],
+            "in the group's order"
+        );
         let venue = &harness.runner.venues()[&harness.exchange].venue;
         assert!(
             venue.orders_open(&[]).is_empty(),
