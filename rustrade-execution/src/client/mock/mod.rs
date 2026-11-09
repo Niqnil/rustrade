@@ -17,6 +17,7 @@ use crate::{
         request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
         state::{Open, OrderState, UnindexedOrderState},
     },
+    short_option::ShortPutCollateral,
     slippage::SlippageConfig,
     trade::TradesRead,
 };
@@ -111,6 +112,10 @@ pub struct MockExecutionConfig {
     /// [`LongOptionExpiry::Lapse`].
     #[serde(default)]
     pub long_option_expiry: LongOptionExpiry,
+    /// How much quote a short put holds on the venue: the full strike, the default, or the
+    /// strike less the premium the sale receives. See [`ShortPutCollateral`].
+    #[serde(default)]
+    pub short_put_collateral: ShortPutCollateral,
 }
 
 #[derive(Debug, Constructor)]

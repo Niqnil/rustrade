@@ -5,7 +5,10 @@ use crate::{
         state::position::PositionSeed,
     },
     error::BarterError,
-    execution::{AccountStreamEvent, request::ExecutionRequest},
+    execution::{
+        AccountStreamEvent,
+        request::{ExecutionRequest, dropped_open},
+    },
     shutdown::Shutdown,
 };
 use chrono::{DateTime, TimeDelta, Utc};
@@ -18,8 +21,11 @@ use rustrade_execution::{
     indexer::AccountEventIndexer,
     market::MarketObservation,
     order::{
-        Order,
-        request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
+        Order, OrderEvent,
+        request::{
+            CancelThenOpen, OnCancelFailure, OrderRequestCancel, OrderRequestOpen,
+            UnindexedOrderResponseCancel,
+        },
         state::UnindexedOrderState,
     },
 };
@@ -113,6 +119,13 @@ enum Deliverable {
 enum Action {
     Open(OrderRequestOpen<ExchangeId, InstrumentNameExchange>),
     Cancel(OrderRequestCancel<ExchangeId, InstrumentNameExchange>),
+    /// Cancel, then open once the cancels' answers have reached the `Engine` side: see
+    /// [`ExecutionRequest::CancelThenOpen`] and [`SimRunner`]'s `# A cancel-then-open group`.
+    CancelThenOpen {
+        cancels: Vec<OrderRequestCancel<ExchangeId, InstrumentNameExchange>>,
+        opens: Vec<OrderRequestOpen<ExchangeId, InstrumentNameExchange>>,
+        on_cancel_failure: OnCancelFailure,
+    },
     /// Move the venue's clock to its own next deadline, an order's expiry or a holding-cost
     /// boundary. See [`SimRunner`]'s `# A venue's own deadlines`.
     Wake,
@@ -175,14 +188,14 @@ impl Wakeups {
         }
         self.queued.insert(exchange, deadline);
 
-        pending.push(Reverse(ScheduledEvent {
-            time: deadline,
-            class: CLASS_ACTION,
-            seq: *seq,
+        push(
+            pending,
+            seq,
+            deadline,
+            CLASS_ACTION,
             exchange,
-            payload: Payload::Act(Action::Wake),
-        }));
-        *seq += 1;
+            Payload::Act(Action::Wake),
+        );
     }
 
     /// Whether a wake-up for `exchange` popped at `time` is the earliest one queued for it,
@@ -354,6 +367,14 @@ fn source_class<MarketKind>(event: &EngineEvent<MarketKind>) -> u8 {
 ///
 /// At `latency_ms: 0` the two instants coincide on every request, so none of this moves a result
 /// that a zero-latency run already produced.
+///
+/// # A cancel-then-open group
+/// An [`ExecutionRequest::CancelThenOpen`] issued at `T` reaches the venue at `T + to_venue`, where
+/// its cancels act together. Their answers reach the `Engine` side at `T + to_venue + from_venue`,
+/// which is where a live `ExecutionManager` waits for them. Its opens are then sent, and act at
+/// `T + 2·to_venue + from_venue`: one simulated round trip after the cancels, the gap a live run
+/// has too. When a cancel failed and the group drops its opens, each open's answer is delivered
+/// with the cancels' answers instead, and the venue never sees it.
 ///
 /// # Ordering contract
 /// Queue entries and source events are merged on `(time, class)`, where `class` breaks a tie within
@@ -1013,6 +1034,7 @@ where
             &mut self.pending,
             &mut self.seq,
             &mut self.wakeups,
+            time,
             &event,
         )?;
 
@@ -1092,10 +1114,16 @@ where
 /// Folds one source event into per-instrument market state, hands it to every venue trading it,
 /// and schedules whatever resting orders it filled.
 ///
-/// Anything that is not a market data item is ignored: an account event, a command or a reconnect
-/// carries no price. A reconnect in particular is deliberately *not* treated as clearing the
-/// market — a gap in a feed does not mean the instrument stopped having a price, and a venue that
-/// forgot its market on every reconnect would refuse to match orders it should have matched.
+/// Anything that is not a market data item is ignored, an account event or a command, except a
+/// reconnect. A reconnect carries no price, and is deliberately *not* treated as clearing the
+/// market: a gap in a feed does not mean the instrument stopped having a price, and a venue that
+/// forgot its market on every reconnect would refuse to match orders it should have matched. It
+/// does say that nothing more is arriving from its exchange, so each venue marks the instruments
+/// it trades whose market data comes from that exchange with
+/// [`SimulatedVenue::mark_market_stale`] at `time`, the instant the source carried it at. Only
+/// [`StaleMarketPolicy::Wait`](rustrade_execution::fill::StaleMarketPolicy::Wait) reads the mark.
+/// The end of the data needs no mark: nothing arrives after it, and
+/// [`expire_held`](SimCore::expire_held) retires what is still held.
 ///
 /// A venue whose exchange does not list the instrument is skipped, so a runner driving several
 /// venues never leaks one exchange's prices into another's view, even when both list the same
@@ -1121,13 +1149,23 @@ fn route_market<MarketKind>(
     pending: &mut BinaryHeap<Reverse<ScheduledEvent>>,
     seq: &mut u64,
     wakeups: &mut Wakeups,
+    time: DateTime<Utc>,
     event: &EngineEvent<MarketKind>,
 ) -> Result<Routed, SimFault>
 where
     MarketKind: VenueMarketUpdate,
 {
-    let EngineEvent::Market(MarketStreamEvent::Item(event)) = event else {
-        return Ok(Routed::Now);
+    let event = match event {
+        EngineEvent::Market(MarketStreamEvent::Item(event)) => event,
+        EngineEvent::Market(MarketStreamEvent::Reconnecting(data_exchange)) => {
+            for slot in venues.values_mut() {
+                for name in slot.indexer.map.own_instruments_priced_from(*data_exchange) {
+                    slot.venue.mark_market_stale(name, time);
+                }
+            }
+            return Ok(Routed::Now);
+        }
+        _ => return Ok(Routed::Now),
     };
 
     let state = market.entry(event.instrument).or_default();
@@ -1279,40 +1317,67 @@ fn drain_requests(
                     drain = RequestDrain::Abandon;
                     continue;
                 }
-                ExecutionRequest::Open(request) => Action::Open(
-                    slot.indexer
-                        .order_request(&request)
-                        .map_err(|error| {
-                            SimFault(format!(
-                                "received open request for non-configured key: {error}"
-                            ))
-                        })?
-                        .into_owned_instrument(),
-                ),
-                ExecutionRequest::Cancel(request) => Action::Cancel(
-                    slot.indexer
-                        .order_request(&request)
-                        .map_err(|error| {
-                            SimFault(format!(
-                                "received cancel request for non-configured key: {error}"
-                            ))
-                        })?
-                        .into_owned_instrument(),
-                ),
+                ExecutionRequest::Open(request) => {
+                    Action::Open(index_request(&slot.indexer, &request, "open")?)
+                }
+                ExecutionRequest::Cancel(request) => {
+                    Action::Cancel(index_request(&slot.indexer, &request, "cancel")?)
+                }
+                ExecutionRequest::CancelThenOpen(group) => {
+                    let CancelThenOpen {
+                        cancels,
+                        opens,
+                        on_cancel_failure,
+                        ..
+                    } = group;
+                    Action::CancelThenOpen {
+                        cancels: cancels
+                            .iter()
+                            .map(|cancel| index_request(&slot.indexer, cancel, "cancel"))
+                            .collect::<Result<_, _>>()?,
+                        opens: opens
+                            .iter()
+                            .map(|open| index_request(&slot.indexer, open, "open"))
+                            .collect::<Result<_, _>>()?,
+                        on_cancel_failure,
+                    }
+                }
             };
 
-            pending.push(Reverse(ScheduledEvent {
-                time: arrives,
-                class: CLASS_ACTION,
-                seq: *seq,
-                exchange: *exchange,
-                payload: Payload::Act(action),
-            }));
-            *seq += 1;
+            push(
+                pending,
+                seq,
+                arrives,
+                CLASS_ACTION,
+                *exchange,
+                Payload::Act(action),
+            );
         }
     }
 
     Ok(drain)
+}
+
+/// Index one request the `Engine` sent, owning its instrument name.
+///
+/// # Errors
+/// A [`SimFault`] if its key is not configured for the venue.
+fn index_request<Kind>(
+    indexer: &AccountEventIndexer,
+    request: &OrderEvent<Kind, ExchangeIndex, InstrumentIndex>,
+    kind: &str,
+) -> Result<OrderEvent<Kind, ExchangeId, InstrumentNameExchange>, SimFault>
+where
+    Kind: Clone,
+{
+    indexer
+        .order_request(request)
+        .map(OrderEvent::into_owned_instrument)
+        .map_err(|error| {
+            SimFault(format!(
+                "received {kind} request for non-configured key: {error}"
+            ))
+        })
 }
 
 /// Run one request against its venue, scheduling everything that comes back.
@@ -1391,12 +1456,94 @@ fn act(
             slot.venue.cancel_order(request),
             Deliverable::CancelResponse,
         ),
+        Action::CancelThenOpen {
+            cancels,
+            opens,
+            on_cancel_failure,
+        } => {
+            // Any error fails the cancel: see `OnCancelFailure`.
+            let mut failed = None;
+            for cancel in cancels {
+                let cid = cancel.key.cid.clone();
+                let outcome = slot.venue.cancel_order(cancel);
+                if failed.is_none() && outcome.response.state.is_err() {
+                    failed = Some(cid);
+                }
+                schedule(
+                    pending,
+                    seq,
+                    exchange,
+                    delivers,
+                    outcome,
+                    Deliverable::CancelResponse,
+                );
+            }
+
+            match (failed, on_cancel_failure) {
+                (Some(cancel), OnCancelFailure::DropOpens) => {
+                    for open in opens {
+                        push(
+                            pending,
+                            seq,
+                            delivers,
+                            CLASS_ACCOUNT,
+                            exchange,
+                            Payload::Deliver(Deliverable::OpenResponse(dropped_open(
+                                open,
+                                cancel.clone(),
+                            ))),
+                        );
+                    }
+                }
+                (None, _) | (Some(_), OnCancelFailure::SendOpens) => {
+                    // Sent once the last cancel's answer is back, so each open arrives one more
+                    // trip to the venue after that.
+                    let arrives = checked_offset(
+                        delivers,
+                        slot.to_venue,
+                        "an open held behind a cancel arriving at the venue",
+                    )?;
+                    for open in opens {
+                        push(
+                            pending,
+                            seq,
+                            arrives,
+                            CLASS_ACTION,
+                            exchange,
+                            Payload::Act(Action::Open(open)),
+                        );
+                    }
+                }
+            }
+        }
         // The clock is all a wake-up moves, and it has moved.
         Action::Wake => {}
     }
 
     wakeups.arm(pending, seq, exchange, &slot.venue);
     Ok(woken)
+}
+
+/// Queue `payload`, owed to or by `exchange`, at `time` in `class`, under the next `seq`.
+///
+/// Every entry goes through here, so no two share a `seq` and entries at one instant and class pop
+/// in the order they were queued.
+fn push(
+    pending: &mut BinaryHeap<Reverse<ScheduledEvent>>,
+    seq: &mut u64,
+    time: DateTime<Utc>,
+    class: u8,
+    exchange: ExchangeIndex,
+    payload: Payload,
+) {
+    pending.push(Reverse(ScheduledEvent {
+        time,
+        class,
+        seq: *seq,
+        exchange,
+        payload,
+    }));
+    *seq += 1;
 }
 
 /// Apply a simulated latency offset, refusing to schedule an event before its own cause.
@@ -1436,14 +1583,14 @@ fn schedule<Response>(
 
     schedule_events(pending, seq, exchange, time, events);
 
-    pending.push(Reverse(ScheduledEvent {
+    push(
+        pending,
+        seq,
         time,
-        class: CLASS_ACCOUNT,
-        seq: *seq,
+        CLASS_ACCOUNT,
         exchange,
-        payload: Payload::Deliver(wrap(response)),
-    }));
-    *seq += 1;
+        Payload::Deliver(wrap(response)),
+    );
 }
 
 /// Push account events onto the queue, in the order the venue gave them.
@@ -1459,14 +1606,14 @@ fn schedule_events(
     events: Vec<UnindexedAccountEvent>,
 ) {
     for event in events {
-        pending.push(Reverse(ScheduledEvent {
+        push(
+            pending,
+            seq,
             time,
-            class: CLASS_ACCOUNT,
-            seq: *seq,
+            CLASS_ACCOUNT,
             exchange,
-            payload: Payload::Deliver(Deliverable::Account(event)),
-        }));
-        *seq += 1;
+            Payload::Deliver(Deliverable::Account(event)),
+        );
     }
 }
 
@@ -1697,6 +1844,7 @@ mod tests {
             spot_margin: None,
             fee_asset: None,
             long_option_expiry: Default::default(),
+            short_put_collateral: Default::default(),
         }
     }
 
@@ -2937,6 +3085,284 @@ mod tests {
         assert_eq!(
             harness.rest().await,
             vec!["balance", "order", "market", "after_drain"],
+        );
+    }
+
+    /// The legs of a [`CancelThenOpen`] group, all for the fixture instrument: cancels of
+    /// `cancels`, then a resting buy limit at 1 under each of `opens`.
+    fn cancel_then_open(
+        exchange: ExchangeIndex,
+        cancels: &[&ClientOrderId],
+        opens: &[&ClientOrderId],
+    ) -> ExecutionRequest {
+        let key = |cid: &ClientOrderId| OrderKey {
+            exchange,
+            instrument: instrument_key(),
+            strategy: StrategyId::new("test"),
+            cid: cid.clone(),
+        };
+        ExecutionRequest::CancelThenOpen(CancelThenOpen::new(
+            cancels
+                .iter()
+                .map(|cid| OrderRequestCancel {
+                    key: key(cid),
+                    state: RequestCancel { id: None },
+                })
+                .collect(),
+            opens
+                .iter()
+                .map(|cid| OrderRequestOpen {
+                    key: key(cid),
+                    state: RequestOpen::new(
+                        Side::Buy,
+                        Some(dec!(1)),
+                        dec!(0.01),
+                        OrderKind::Limit,
+                        TimeInForce::GoodUntilCancelled { post_only: false },
+                    ),
+                })
+                .collect(),
+        ))
+    }
+
+    /// A group's cancel acts one trip after it is sent, and its opens one round trip after that, in
+    /// the group's order: the cancel's answer back to the sender, and the opens out to the venue.
+    ///
+    /// Each leg is 100 ms. Sent at 210, the cancel acts at 310 and is answered at 410; the open
+    /// then acts at 510 and is answered at 610, between the ticks at 605 and 705. An open acting
+    /// with its cancel would be answered at 410, before the tick at 505.
+    #[tokio::test]
+    async fn a_groups_open_acts_one_round_trip_after_its_cancel() {
+        let mut harness = Harness::new(
+            200,
+            vec![
+                market(10, dec!(200)),
+                market(405, dec!(200)),
+                market(505, dec!(200)),
+                market(605, dec!(200)),
+                market(705, dec!(200)),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        let resting = harness.send_limit(dec!(1));
+        assert_eq!(harness.next().await, Some("balance"));
+        assert_eq!(harness.next().await, Some("order"));
+
+        harness.clock.advance_to(at(210));
+        let replacements: Vec<_> = (0..3).map(|_| ClientOrderId::random()).collect();
+        harness.send(cancel_then_open(
+            harness.exchange,
+            &[&resting],
+            &replacements.iter().collect::<Vec<_>>(),
+        ));
+
+        let events = harness.rest_events().await;
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec![
+                "market",    // 405
+                "balance",   // 410: the cancel releases the resting order's hold
+                "cancelled", // 410
+                "market",    // 505
+                "market",    // 605
+                "balance",   // 610: each open, acted at 510
+                "order",     // 610
+                "balance",   // 610
+                "order",     // 610
+                "balance",   // 610
+                "order",     // 610
+                "market",    // 705
+                "after_drain"
+            ]
+        );
+        assert_eq!(cancel_outcomes(&events), vec![Ok(())]);
+        let opened: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                    kind: AccountEventKind::OrderSnapshot(Snapshot(order)),
+                    ..
+                })) => Some((
+                    order.key.cid.clone(),
+                    matches!(order.state, OrderState::Active(_)),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            opened,
+            replacements
+                .into_iter()
+                .map(|cid| (cid, true))
+                .collect::<Vec<_>>(),
+            "each open rests, acted on in the group's order"
+        );
+    }
+
+    /// A group whose cancel fails never reaches the venue with its opens. Each is answered dropped,
+    /// in the group's order, with the cancel's answer, one round trip after the group was sent.
+    #[tokio::test]
+    async fn a_groups_failed_cancel_drops_its_opens_unsent() {
+        let mut harness = Harness::new(
+            200,
+            vec![
+                market(10, dec!(200)),
+                market(205, dec!(200)),
+                market(215, dec!(200)),
+                market(505, dec!(200)),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        let unknown = ClientOrderId::random();
+        let (first, second, third) = (
+            ClientOrderId::random(),
+            ClientOrderId::random(),
+            ClientOrderId::random(),
+        );
+        harness.send(cancel_then_open(
+            harness.exchange,
+            &[&unknown],
+            &[&first, &second, &third],
+        ));
+
+        let events = harness.rest_events().await;
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec![
+                "market",    // 205
+                "cancelled", // 210: no such order
+                "order",     // 210: first, dropped
+                "order",     // 210: second, dropped
+                "order",     // 210: third, dropped
+                "market",    // 215
+                "market",    // 505: nothing more from the venue
+                "after_drain"
+            ]
+        );
+        assert!(cancel_outcomes(&events)[0].is_err(), "{events:?}");
+        let dropped = OrderState::inactive(rustrade_execution::error::OrderError::NotPlaced(
+            rustrade_execution::error::NotPlacedReason::CancelFailed { cancel: unknown },
+        ));
+        let orders: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                    kind: AccountEventKind::OrderSnapshot(Snapshot(order)),
+                    ..
+                })) => Some((order.key.cid.clone(), order.state.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            orders,
+            vec![
+                (first, dropped.clone()),
+                (second, dropped.clone()),
+                (third, dropped)
+            ],
+            "in the group's order"
+        );
+        let venue = &harness.runner.venues()[&harness.exchange].venue;
+        assert!(
+            venue.orders_open(&[]).is_empty(),
+            "the venue never saw the opens"
+        );
+    }
+
+    /// `SendOpens` sends a group's opens after a failed cancel, one round trip after the cancel
+    /// acted, as after a cancel that succeeded.
+    #[tokio::test]
+    async fn send_opens_sends_a_groups_opens_after_a_failed_cancel() {
+        let mut harness = Harness::new(
+            200,
+            vec![
+                market(10, dec!(200)),
+                market(205, dec!(200)),
+                market(305, dec!(200)),
+                market(405, dec!(200)),
+                market(415, dec!(200)),
+            ],
+        );
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        let (unknown, open) = (ClientOrderId::random(), ClientOrderId::random());
+        let ExecutionRequest::CancelThenOpen(group) =
+            cancel_then_open(harness.exchange, &[&unknown], &[&open])
+        else {
+            unreachable!("the helper builds a group");
+        };
+        harness.send(ExecutionRequest::CancelThenOpen(
+            group.with_on_cancel_failure(OnCancelFailure::SendOpens),
+        ));
+
+        let events = harness.rest_events().await;
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec![
+                "market",    // 205
+                "cancelled", // 210: no such order
+                "market",    // 305
+                "market",    // 405
+                "balance",   // 410: the open, acted at 310
+                "order",     // 410
+                "market",    // 415
+                "after_drain"
+            ]
+        );
+        assert!(cancel_outcomes(&events)[0].is_err(), "{events:?}");
+        assert!(
+            matches!(last_order_state(&events), OrderState::Active(_)),
+            "{:?}",
+            last_order_state(&events)
+        );
+    }
+
+    /// With several cancels, a dropped open names the first that failed, even after one that
+    /// succeeded.
+    #[tokio::test]
+    async fn a_dropped_open_names_the_groups_first_failed_cancel() {
+        let mut harness = Harness::new(0, vec![market(10, dec!(200)), market(20, dec!(200))]);
+
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(10));
+        let resting = harness.send_limit(dec!(1));
+        assert_eq!(harness.next().await, Some("balance"));
+        assert_eq!(harness.next().await, Some("order"));
+
+        let (first_unknown, second_unknown, open) = (
+            ClientOrderId::random(),
+            ClientOrderId::random(),
+            ClientOrderId::random(),
+        );
+        harness.send(cancel_then_open(
+            harness.exchange,
+            &[&resting, &first_unknown, &second_unknown],
+            &[&open],
+        ));
+
+        let events = harness.rest_events().await;
+        let outcomes: Vec<_> = cancel_outcomes(&events).iter().map(Result::is_ok).collect();
+        assert_eq!(outcomes, vec![true, false, false]);
+        assert_eq!(
+            last_order_state(&events),
+            &OrderState::inactive(rustrade_execution::error::OrderError::NotPlaced(
+                rustrade_execution::error::NotPlacedReason::CancelFailed {
+                    cancel: first_unknown,
+                },
+            ))
         );
     }
 

@@ -560,6 +560,30 @@ impl AccountState {
         balance
     }
 
+    /// Lends `amount` of `asset` whatever any limit says, and returns the restated balance:
+    /// `total`, `free` and the loan rise by it.
+    ///
+    /// For a delivery the account cannot refuse, such as the underlying an exercised option
+    /// delivers; the caller decides how much and reports any limit passed. An asset the account
+    /// has never held is opened at zero first.
+    ///
+    /// # Panics
+    /// The caller must call it only on a margin account (see
+    /// [`enable_margin`](Self::enable_margin)): debug builds assert it, and a cash account would
+    /// otherwise be given a loan it cannot report.
+    pub fn lend(
+        &mut self,
+        asset: &AssetNameExchange,
+        amount: Decimal,
+        time_exchange: DateTime<Utc>,
+    ) -> AssetBalance<AssetNameExchange> {
+        debug_assert!(self.margin, "AccountState::lend on a cash account");
+        self.borrow(asset, amount, time_exchange);
+        let balance = self.balance_expect(asset);
+        balance.time_exchange = time_exchange;
+        balance.clone()
+    }
+
     /// Lends `amount` of `asset`: `total` and `free` rise by it, and so does the loan. An asset the
     /// account has never held is opened at zero first, as a delivery opens one.
     fn borrow(&mut self, asset: &AssetNameExchange, amount: Decimal, time_exchange: DateTime<Utc>) {

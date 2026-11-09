@@ -11,7 +11,7 @@
 //! it over pattern matching on specific variants, as the internal taxonomy may
 //! evolve while `is_transient()` semantics remain stable.
 
-use crate::margin::MarginEffect;
+use crate::{margin::MarginEffect, order::id::ClientOrderId};
 use derive_more::Constructor;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
@@ -626,6 +626,20 @@ pub enum NotPlacedReason {
     /// The engine's `ExecutionManager` reports this, after the lookups its policy sets out.
     #[error("unknown to the venue")]
     UnknownToVenue,
+
+    /// The open was held back behind the cancels of its
+    /// [`CancelThenOpen`](crate::order::request::CancelThenOpen) group, and was never sent because
+    /// one of them failed.
+    ///
+    /// `cancel` is the client order id of the first cancel in the group whose answer was an error,
+    /// a timeout included. That cancel's own answer says why it failed. Only a group whose
+    /// [`OnCancelFailure`](crate::order::request::OnCancelFailure) is
+    /// [`DropOpens`](crate::order::request::OnCancelFailure::DropOpens) drops its opens.
+    #[error("not sent: the preceding cancel of {cancel} failed")]
+    CancelFailed {
+        /// The client order id of the first cancel in the group that failed.
+        cancel: ClientOrderId,
+    },
 }
 
 /// A value in an order request with more precision than the venue accepts, or that is not
@@ -810,14 +824,17 @@ impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
     ///   [`OutOfBounds`](Self::OutOfBounds) and
     ///   [`UnsupportedMarginEffect`](Self::UnsupportedMarginEffect)
     ///
-    /// [`NotPlaced`](Self::NotPlaced) is transient when the request was not sent, since a later
-    /// send may get through, and not when the venue does not know the order.
+    /// [`NotPlaced`](Self::NotPlaced) is transient when the request was not sent for a connection
+    /// failure, since a later send may get through. It is not when the venue does not know the
+    /// order, or when the open was dropped because a cancel it waited on failed.
     pub fn is_transient(&self) -> bool {
         match self {
             Self::Connectivity(e) | Self::NotPlaced(NotPlacedReason::NotSent(e)) => {
                 e.is_transient()
             }
-            Self::NotPlaced(NotPlacedReason::UnknownToVenue) => false,
+            Self::NotPlaced(
+                NotPlacedReason::UnknownToVenue | NotPlacedReason::CancelFailed { .. },
+            ) => false,
             Self::Rejected(ApiError::RateLimit { .. }) => true,
             Self::Rejected(_) => false,
             Self::UnsupportedOrderType(_)
@@ -1215,6 +1232,15 @@ mod tests {
         let unknown: UnindexedOrderError = OrderError::NotPlaced(NotPlacedReason::UnknownToVenue);
         assert!(!unknown.is_transient());
         assert!(!unknown.is_outcome_unknown());
+
+        let dropped: UnindexedOrderError = OrderError::NotPlaced(NotPlacedReason::CancelFailed {
+            cancel: ClientOrderId::new("stop"),
+        });
+        assert!(
+            !dropped.is_transient(),
+            "resending cannot help: the cancel it waited on failed"
+        );
+        assert!(!dropped.is_outcome_unknown(), "it was never sent");
     }
 
     /// Only a connectivity error leaves an open's outcome unknown, and only as an open's answer

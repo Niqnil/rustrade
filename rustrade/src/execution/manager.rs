@@ -2,12 +2,12 @@ use crate::execution::{
     AccountStreamEvent,
     backfill::{FillRecoveryConfig, Watermark, backfill},
     error::ExecutionError,
-    request::{ExecutionRequest, RequestFuture},
+    request::{ExecutionRequest, RequestFuture, dropped_open},
     unknown_outcome::{LookupOutcome, UnknownOutcomeLookup, look_up_unknown_outcome},
 };
 use chrono::{DateTime, Utc};
 use derive_more::Constructor;
-use fnv::FnvHashSet;
+use fnv::{FnvHashMap, FnvHashSet};
 use futures::{
     FutureExt, Stream, StreamExt,
     future::Either,
@@ -29,9 +29,11 @@ use rustrade_execution::{
     indexer::{AccountEventIndexer, AccountIndexError},
     map::ExecutionInstrumentMap,
     order::{
-        Order, OrderKey, UnindexedOrderKey,
+        Order, OrderEvent, OrderKey, UnindexedOrderKey,
+        id::ClientOrderId,
         request::{
-            OrderRequestCancel, OrderRequestOpen, OrderResponseCancel, UnindexedOrderResponseCancel,
+            CancelReplaceAnswer, CancelThenOpen, OnCancelFailure, OrderRequestCancel,
+            OrderRequestOpen, OrderResponseCancel, UnindexedOrderResponseCancel,
         },
         state::{OrderState, UnindexedOrderState},
     },
@@ -164,6 +166,11 @@ impl Debug for Clock {
 /// - Answers every request exactly once, keyed by the request: with the client's response, or with
 ///   a timeout once `request_timeout` elapses. Only [`ExecutionRequest::Shutdown`] abandons
 ///   requests in flight.
+/// - Sequences each [`ExecutionRequest::CancelThenOpen`] group: sends its cancels, holds its opens
+///   until every cancel has been answered, then sends them, or answers each as dropped when a
+///   cancel failed and the group says so. A group of one cancel and one open goes instead as one
+///   venue request when the client offers one for it ([`ExecutionClient::cancel_replace`]), and
+///   each leg is answered from it. Every other request is sent as it arrives, concurrently.
 /// - Settles an open whose answer leaves its outcome unknown (a timeout, or a connectivity error:
 ///   see [`OrderError::is_outcome_unknown`]) by looking the order up at the venue with
 ///   [`OrderStatusClient::fetch_order_status`], as its
@@ -635,18 +642,26 @@ where
     /// 1. every already in-flight open and cancel is awaited to completion, each response
     ///    forwarded — these are bounded by `request_timeout` — and so is every lookup of an open
     ///    whose outcome came back unknown, which its `UnknownOutcomeLookup` bounds, so this cannot
-    ///    hang;
+    ///    hang. An open held behind the cancels of a `CancelThenOpen` group is sent, or dropped,
+    ///    once they are answered, and then awaited like the rest;
     /// 2. the account tail — every event the exchange has already made available — is drained;
     /// 3. only then does the loop end, dropping `response_tx` and ending the `Stream` returned by
     ///    [`init`](Self::init).
     ///
     /// That last drop is what a caller observes as "this manager is finished", so performing it
     /// after the drain rather than before is what stops a shutdown from truncating the ledgers.
+    // One `select!` over independent arms, each handing its work to a method. The lint counts
+    // the macro's expansion, so splitting the loop further would only scatter its control flow.
+    #[allow(clippy::cognitive_complexity)]
     pub async fn run(mut self) {
         let mut in_flight_cancels = FuturesUnordered::new();
         let mut in_flight_opens = FuturesUnordered::new();
         // Lookups of the orders whose open came back with its outcome unknown.
         let mut in_flight_lookups = FuturesUnordered::new();
+        // The opens of each `CancelThenOpen` group whose cancels are not all answered yet.
+        let mut held_opens = HeldGroups::default();
+        // The `CancelThenOpen` groups sent as one venue request each.
+        let mut in_flight_cancel_replaces = FuturesUnordered::new();
 
         // Set once a Shutdown (or a closed request Stream) has been observed. New requests are no
         // longer accepted, but the loop keeps running until nothing is outstanding.
@@ -660,8 +675,16 @@ where
             if draining
                 && in_flight_cancels.is_empty()
                 && in_flight_opens.is_empty()
+                && in_flight_cancel_replaces.is_empty()
                 && in_flight_lookups.is_empty()
             {
+                // A group is held only while one of its cancels is in flight: its cancels are sent
+                // when it is held, and the answer to its last one releases it. So no in-flight
+                // cancel means no held group, and waiting on one here could only hang.
+                debug_assert!(
+                    held_opens.held.is_empty(),
+                    "a CancelThenOpen group is held with none of its cancels in flight: {held_opens:?}"
+                );
                 // Every response this manager owed has been forwarded. Anything the exchange sent
                 // alongside those responses is already queued on the account side, so take it
                 // before the channel closes.
@@ -688,6 +711,12 @@ where
                 Either::Left(std::future::pending())
             } else {
                 Either::Right(in_flight_opens.select_next_some())
+            };
+
+            let next_cancel_replace = if in_flight_cancel_replaces.is_empty() {
+                Either::Left(std::future::pending())
+            } else {
+                Either::Right(in_flight_cancel_replaces.select_next_some())
             };
 
             let next_lookup = if in_flight_lookups.is_empty() {
@@ -722,41 +751,58 @@ where
                         draining = true;
                     }
                     Some(ExecutionRequest::Cancel(request)) => {
-                        // Panic since the system is set up incorrectly, so it's foolish to continue
-                        let client_request = self
-                            .indexer
-                            .order_request(&request)
-                            .unwrap_or_else(|error| panic!(
-                                "ExecutionManager received cancel request for non-configured key: {error}"
-                            ));
-
-                        in_flight_cancels.push(RequestFuture::new(
-                            self.client.cancel_order(client_request),
-                            self.request_timeout,
-                            request,
-                        ))
+                        in_flight_cancels.push(Self::send_cancel(
+                            &self.client, &self.indexer, self.request_timeout, request, None,
+                        ));
                     },
                     Some(ExecutionRequest::Open(request)) => {
-                        // Panic since the system is set up incorrectly, so it's foolish to continue
-                        let client_request = self
-                            .indexer
-                            .order_request(&request)
-                            .unwrap_or_else(|error| panic!(
-                                "ExecutionManager received open request for non-configured key: {error}"
-                            ));
-
-                        // The send time travels with the request, for the lookup an unknown outcome
-                        // starts.
-                        in_flight_opens.push(RequestFuture::new(
-                            self.client.open_order(client_request),
-                            self.request_timeout,
-                            (request, Instant::now()),
-                        ))
+                        in_flight_opens.push(Self::send_open(
+                            &self.client, &self.indexer, self.request_timeout, request,
+                        ));
+                    }
+                    Some(ExecutionRequest::CancelThenOpen(group)) => {
+                        // Index every open now, so a misconfigured key panics on the request that
+                        // carried it rather than once its cancels are answered.
+                        group.opens.iter().for_each(|open| {
+                            Self::index_request(&self.indexer, open, "open");
+                        });
+                        let group = match Self::send_cancel_replace(
+                            &self.client, &self.indexer, self.request_timeout, group,
+                        ) {
+                            Ok(cancel_replace) => {
+                                in_flight_cancel_replaces.push(cancel_replace);
+                                continue;
+                            }
+                            Err(group) => group,
+                        };
+                        match held_opens.hold(group) {
+                            Hold::Cancels { group, cancels } => {
+                                in_flight_cancels.extend(cancels.into_iter().map(|cancel| {
+                                    Self::send_cancel(
+                                        &self.client,
+                                        &self.indexer,
+                                        self.request_timeout,
+                                        cancel,
+                                        Some(group),
+                                    )
+                                }));
+                            }
+                            Hold::Opens(opens) => {
+                                in_flight_opens.extend(opens.into_iter().map(|open| {
+                                    Self::send_open(
+                                        &self.client, &self.indexer, self.request_timeout, open,
+                                    )
+                                }));
+                            }
+                        }
                     }
                 },
 
                 // Process next ExecutionRequest::Cancel response
-                (request, response) = next_cancel_response => {
+                ((request, group), response) = next_cancel_response => {
+                    // Any error fails the cancel, a timeout included: see `OnCancelFailure`.
+                    let failed = !matches!(&response, Ok(response) if response.state.is_ok());
+                    let cid = request.key.cid.clone();
                     let event = match response {
                         Ok(response) => self.process_cancel_response(request, response),
                         Err(_elapsed) => Self::process_cancel_timeout(request),
@@ -765,7 +811,35 @@ where
                     if self.response_tx.send(event).is_err() {
                         break;
                     }
+
+                    // The cancel's answer goes first, so the opens it released, or the reports of
+                    // the opens it dropped, follow it.
+                    let Some(group) = group else { continue };
+                    let Some(opens) = self.release(held_opens.answer(group, cid, failed)) else {
+                        break;
+                    };
+                    in_flight_opens.extend(opens.into_iter().map(|open| {
+                        Self::send_open(&self.client, &self.indexer, self.request_timeout, open)
+                    }));
                 },
+
+                // Process the answer to a group sent as one venue request
+                ((cancel, open, sent), answer) = next_cancel_replace => {
+                    let (cancel_event, open_answer) =
+                        self.process_cancel_replace_answer(cancel, open, answer);
+                    let (open_event, lookup) = match open_answer {
+                        NativeOpen::Answered(open, response) => {
+                            self.process_open_answer(open, sent, response)
+                        }
+                        NativeOpen::Dropped(dropped) => (dropped, None),
+                    };
+                    // The cancel's answer goes first, as when the group is sequenced here.
+                    let mut events = [cancel_event, open_event].into_iter();
+                    if events.any(|event| self.response_tx.send(event).is_err()) {
+                        break;
+                    }
+                    in_flight_lookups.extend(lookup);
+                }
 
                 // Process next ExecutionRequest::Open response
                 ((request, sent), response) = next_open_response => {
@@ -775,9 +849,7 @@ where
                         break;
                     }
 
-                    if let Some(lookup) = lookup {
-                        in_flight_lookups.push(lookup);
-                    }
+                    in_flight_lookups.extend(lookup);
                 }
 
                 // Process the next lookup of an order whose open outcome was unknown
@@ -847,6 +919,219 @@ where
         }
 
         drained
+    }
+
+    /// Index `request` for the client.
+    ///
+    /// # Panics
+    /// If its key is not configured for this manager: the system is set up incorrectly, so it is
+    /// foolish to continue.
+    ///
+    /// Takes the indexer rather than `&self`, as do [`send_cancel`](Self::send_cancel) and
+    /// [`send_open`](Self::send_open), so the futures they return borrow only the fields they use
+    /// while [`run`](Self::run) polls the streams the others hold.
+    fn index_request<'a, Kind>(
+        indexer: &'a AccountEventIndexer,
+        request: &OrderEvent<Kind, ExchangeIndex, InstrumentIndex>,
+        kind: &'static str,
+    ) -> OrderEvent<Kind, ExchangeId, &'a InstrumentNameExchange>
+    where
+        Kind: Clone,
+    {
+        indexer.order_request(request).unwrap_or_else(|error| {
+            panic!("ExecutionManager received {kind} request for non-configured key: {error}")
+        })
+    }
+
+    /// Send `request` to the client, bounded by `request_timeout`, tagged with the
+    /// `CancelThenOpen` group it belongs to, if any.
+    ///
+    /// # Panics
+    /// See [`index_request`](Self::index_request).
+    fn send_cancel<'a>(
+        client: &'a Client,
+        indexer: &'a AccountEventIndexer,
+        timeout: std::time::Duration,
+        request: OrderRequestCancel<ExchangeIndex, InstrumentIndex>,
+        group: Option<u64>,
+    ) -> RequestFuture<
+        (
+            OrderRequestCancel<ExchangeIndex, InstrumentIndex>,
+            Option<u64>,
+        ),
+        impl Future<Output = UnindexedOrderResponseCancel> + 'a,
+    > {
+        let client_request = Self::index_request(indexer, &request, "cancel");
+        RequestFuture::new(
+            client.cancel_order(client_request),
+            timeout,
+            (request, group),
+        )
+    }
+
+    /// Send `request` to the client, bounded by `request_timeout`, with the instant it was sent,
+    /// for the lookup an unknown outcome starts.
+    ///
+    /// # Panics
+    /// See [`index_request`](Self::index_request).
+    fn send_open<'a>(
+        client: &'a Client,
+        indexer: &'a AccountEventIndexer,
+        timeout: std::time::Duration,
+        request: OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
+    ) -> RequestFuture<
+        (OrderRequestOpen<ExchangeIndex, InstrumentIndex>, Instant),
+        impl Future<Output = Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>> + 'a,
+    > {
+        let client_request = Self::index_request(indexer, &request, "open");
+        RequestFuture::new(
+            client.open_order(client_request),
+            timeout,
+            (request, Instant::now()),
+        )
+    }
+
+    /// Send `group` as one venue request, bounded by `timeout`, when it is one cancel and one
+    /// open and the client offers a request for them ([`ExecutionClient::cancel_replace`]); hand
+    /// it back to be sequenced here otherwise. Carries both requests, and the instant they were
+    /// sent, for the lookup an unknown outcome of the open starts.
+    ///
+    /// # Panics
+    /// See [`index_request`](Self::index_request).
+    #[allow(clippy::type_complexity)] // The tuple names what the answer arm needs; an alias would only hide it.
+    fn send_cancel_replace<'a>(
+        client: &'a Client,
+        indexer: &'a AccountEventIndexer,
+        timeout: std::time::Duration,
+        group: CancelThenOpen<ExchangeIndex, InstrumentIndex>,
+    ) -> Result<
+        RequestFuture<
+            (
+                OrderRequestCancel<ExchangeIndex, InstrumentIndex>,
+                OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
+                Instant,
+            ),
+            impl Future<Output = CancelReplaceAnswer> + 'a,
+        >,
+        CancelThenOpen<ExchangeIndex, InstrumentIndex>,
+    > {
+        let ([cancel], [open]) = (group.cancels.as_slice(), group.opens.as_slice()) else {
+            return Err(group);
+        };
+        let Some(answer) = client.cancel_replace(
+            Self::index_request(indexer, cancel, "cancel"),
+            Self::index_request(indexer, open, "open"),
+            group.on_cancel_failure,
+        ) else {
+            return Err(group);
+        };
+        let CancelThenOpen {
+            mut cancels,
+            mut opens,
+            ..
+        } = group;
+        let (Some(cancel), Some(open)) = (cancels.pop(), opens.pop()) else {
+            unreachable!("a group of exactly one cancel and one open was matched above");
+        };
+        Ok(RequestFuture::new(
+            answer,
+            timeout,
+            (cancel, open, Instant::now()),
+        ))
+    }
+
+    /// The opens to send now that a group's cancel has been answered: those `release` sends, and
+    /// none before the group's last answer. Each open it drops is answered as dropped first.
+    ///
+    /// `None` if the channel to the Engine closed while answering a dropped open.
+    fn release(
+        &self,
+        release: Option<Release>,
+    ) -> Option<Vec<OrderRequestOpen<ExchangeIndex, InstrumentIndex>>> {
+        match release {
+            None => Some(Vec::new()),
+            Some(Release::Send(opens)) => Some(opens),
+            Some(Release::Drop { opens, cancel }) => {
+                self.forward_dropped(opens, &cancel).then(Vec::new)
+            }
+        }
+    }
+
+    /// Answer each of `opens` as dropped, because the cancel `cancel` of their group failed.
+    ///
+    /// Returns `false` if the channel to the Engine has closed.
+    fn forward_dropped(
+        &self,
+        opens: Vec<OrderRequestOpen<ExchangeIndex, InstrumentIndex>>,
+        cancel: &ClientOrderId,
+    ) -> bool {
+        opens
+            .into_iter()
+            .all(|open| self.response_tx.send(self.dropped(open, cancel)).is_ok())
+    }
+
+    /// The answer to `open` as dropped, because the cancel `cancel` of its group failed.
+    fn dropped(
+        &self,
+        open: OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
+        cancel: &ClientOrderId,
+    ) -> AccountStreamEvent {
+        warn!(
+            exchange = %self.indexer.map.exchange.value,
+            instrument = ?open.key.instrument,
+            cid = %open.key.cid,
+            %cancel,
+            "ExecutionManager dropped an open held behind a cancel that failed"
+        );
+        AccountStreamEvent::Item(AccountEvent {
+            exchange: open.key.exchange,
+            kind: AccountEventKind::OrderSnapshot(Snapshot(dropped_open(open, cancel.clone()))),
+        })
+    }
+
+    /// The event that answers the cancel of a group sent as one venue request, from the client's
+    /// `answer` or its timeout; and the open's answer, to process as an open sent alone, or the
+    /// event that answers it as dropped when the venue did not attempt it.
+    ///
+    /// A timeout fails the cancel and leaves the open's outcome unknown.
+    fn process_cancel_replace_answer(
+        &self,
+        cancel: OrderRequestCancel<ExchangeIndex, InstrumentIndex>,
+        open: OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
+        answer: Result<CancelReplaceAnswer, tokio::time::error::Elapsed>,
+    ) -> (AccountStreamEvent, NativeOpen) {
+        match answer {
+            Ok(CancelReplaceAnswer {
+                cancel: response,
+                open: None,
+            }) => {
+                let failed = response.state.is_err();
+                let cid = cancel.key.cid.clone();
+                let cancel_event = self.process_cancel_response(cancel, response);
+                if !failed {
+                    // The client broke `cancel_replace`'s contract. By its word the venue placed
+                    // nothing, so the open is still answered as not placed.
+                    error!(
+                        exchange = %self.indexer.map.exchange.value,
+                        cid = %open.key.cid,
+                        cancel = %cid,
+                        "ExecutionManager received a cancel-replace that did not attempt its open although its cancel succeeded - answering the open as dropped"
+                    );
+                }
+                (cancel_event, NativeOpen::Dropped(self.dropped(open, &cid)))
+            }
+            Ok(CancelReplaceAnswer {
+                cancel: response,
+                open: Some(opened),
+            }) => (
+                self.process_cancel_response(cancel, response),
+                NativeOpen::Answered(open, Ok(opened)),
+            ),
+            Err(elapsed) => (
+                Self::process_cancel_timeout(cancel),
+                NativeOpen::Answered(open, Err(elapsed)),
+            ),
+        }
     }
 
     /// Index a cancel response under the key of the request it answers.
@@ -1147,6 +1432,118 @@ where
                 time_in_force: state.time_in_force,
                 state: OrderState::inactive(OrderError::Connectivity(ConnectivityError::Timeout)),
             })),
+        })
+    }
+}
+
+/// The opens of each [`ExecutionRequest::CancelThenOpen`] group whose cancels are not all answered
+/// yet, keyed by the group id its cancels carry while in flight.
+#[derive(Debug, Default)]
+struct HeldGroups {
+    held: FnvHashMap<u64, HeldOpens>,
+    next: u64,
+}
+
+/// The opens of one group, held until every cancel of the group has been answered.
+#[derive(Debug)]
+struct HeldOpens {
+    /// How many of the group's cancels are still unanswered.
+    unanswered: usize,
+    /// The first of the group's cancels whose answer was an error, if any has been.
+    failed: Option<ClientOrderId>,
+    opens: Vec<OrderRequestOpen<ExchangeIndex, InstrumentIndex>>,
+    on_cancel_failure: OnCancelFailure,
+}
+
+/// What to send of a group just received.
+#[derive(Debug)]
+enum Hold {
+    /// Its cancels, tagged with `group`; its opens are held.
+    Cancels {
+        group: u64,
+        cancels: Vec<OrderRequestCancel<ExchangeIndex, InstrumentIndex>>,
+    },
+    /// Its opens, at once: it has no cancel to wait on. The Engine refuses such a group, so this
+    /// is a caller sending its own requests.
+    Opens(Vec<OrderRequestOpen<ExchangeIndex, InstrumentIndex>>),
+}
+
+/// What to do with a group's opens once its last cancel has been answered.
+#[derive(Debug, PartialEq)]
+enum Release {
+    /// Send them.
+    Send(Vec<OrderRequestOpen<ExchangeIndex, InstrumentIndex>>),
+    /// Answer each as dropped, because `cancel` failed.
+    Drop {
+        opens: Vec<OrderRequestOpen<ExchangeIndex, InstrumentIndex>>,
+        cancel: ClientOrderId,
+    },
+}
+
+/// The open of a group sent as one venue request, as the request's answer leaves it.
+// Returned and matched at once, never stored, so the variants' size difference costs nothing,
+// where boxing would allocate on every answer.
+#[allow(clippy::large_enum_variant)]
+enum NativeOpen {
+    /// Answered, or timed out with its group: processed as an open sent alone.
+    Answered(
+        OrderRequestOpen<ExchangeIndex, InstrumentIndex>,
+        Result<
+            Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
+            tokio::time::error::Elapsed,
+        >,
+    ),
+    /// Not attempted by the venue: the event that answers it as dropped.
+    Dropped(AccountStreamEvent),
+}
+
+impl HeldGroups {
+    /// Hold `group`'s opens until its cancels are answered, returning the cancels to send.
+    fn hold(&mut self, group: CancelThenOpen<ExchangeIndex, InstrumentIndex>) -> Hold {
+        let CancelThenOpen {
+            cancels,
+            opens,
+            on_cancel_failure,
+            ..
+        } = group;
+        if cancels.is_empty() {
+            return Hold::Opens(opens);
+        }
+        let id = self.next;
+        self.next = self.next.wrapping_add(1);
+        self.held.insert(
+            id,
+            HeldOpens {
+                unanswered: cancels.len(),
+                failed: None,
+                opens,
+                on_cancel_failure,
+            },
+        );
+        Hold::Cancels { group: id, cancels }
+    }
+
+    /// Record that a cancel of `group`, `cid`, has been answered, `failed` or not. Returns what to
+    /// do with the group's opens once that was its last cancel, releasing the group, and `None`
+    /// before then.
+    fn answer(&mut self, group: u64, cid: ClientOrderId, failed: bool) -> Option<Release> {
+        let entry = self.held.get_mut(&group)?;
+        if failed && entry.failed.is_none() {
+            entry.failed = Some(cid);
+        }
+        entry.unanswered = entry.unanswered.saturating_sub(1);
+        if entry.unanswered > 0 {
+            return None;
+        }
+        let HeldOpens {
+            failed,
+            opens,
+            on_cancel_failure,
+            ..
+        } = self.held.remove(&group)?;
+        Some(match (failed, on_cancel_failure) {
+            (Some(cancel), OnCancelFailure::DropOpens) => Release::Drop { opens, cancel },
+            (None, _) | (Some(_), OnCancelFailure::SendOpens) => Release::Send(opens),
         })
     }
 }
@@ -3153,5 +3550,776 @@ mod tests {
 
         assert_eq!(orders.len(), 1, "{orders:#?}");
         assert_eq!(client.lookups_left(), 1, "never asked");
+    }
+
+    /// [`ExecutionRequest::CancelThenOpen`]: the opens wait for every cancel's answer, and are
+    /// sent or dropped as the group says.
+    mod cancel_then_open {
+        use super::*;
+        use rustrade_execution::client::VenueOrderStatus;
+        use std::sync::Mutex;
+
+        /// How the scripted client answers a cancel, after its delay.
+        #[derive(Debug, Clone, Copy)]
+        enum Answer {
+            Cancelled,
+            AlreadyFilled,
+            /// Never answers, so the manager's timeout does.
+            Hangs,
+        }
+
+        /// How the scripted client answers a group it sends as one venue request, a second after
+        /// it was sent.
+        #[derive(Debug, Clone, Copy)]
+        enum Native {
+            /// The cancel succeeded and the open rests.
+            Both,
+            /// The cancel failed, the order having filled, and the open was not attempted.
+            CancelFailed,
+            /// The cancel succeeded and the open was rejected.
+            OpenRejected,
+            /// The answer was lost: the cancel's is a connectivity error, the open's unknown.
+            Lost,
+            /// Never answers, so the manager's timeout does.
+            Hangs,
+            /// Breaks the contract: the cancel succeeded, yet the open is said not attempted.
+            OpenSkipped,
+        }
+
+        /// Answers each cancel as scripted by its client order id, and accepts every open. Logs
+        /// each call as it starts and each cancel as it answers, in order. With a `native`
+        /// script, it also sends every group of one cancel and one open as one venue request,
+        /// and finds every order it is asked to look up live.
+        #[derive(Debug, Clone, Default)]
+        struct ScriptedClient {
+            script: Vec<(&'static str, u64, Answer)>,
+            native: Option<Native>,
+            log: Arc<Mutex<Vec<String>>>,
+        }
+
+        impl ScriptedClient {
+            fn new(script: Vec<(&'static str, u64, Answer)>) -> Self {
+                Self {
+                    script,
+                    native: None,
+                    log: Arc::default(),
+                }
+            }
+
+            fn native(native: Native) -> Self {
+                Self {
+                    native: Some(native),
+                    ..Self::new(vec![])
+                }
+            }
+
+            fn log(&self, entry: String) {
+                self.log.lock().unwrap().push(entry);
+            }
+
+            fn logged(&self) -> Vec<String> {
+                self.log.lock().unwrap().clone()
+            }
+        }
+
+        impl ExecutionClient for ScriptedClient {
+            const EXCHANGE: ExchangeId = EXCHANGE;
+            const SUPPORTED_KINDS: &'static [InstrumentKindDiscriminant] = &[];
+            type Config = ();
+            type AccountStream = futures::stream::Empty<UnindexedAccountEvent>;
+
+            fn new(_: Self::Config) -> Self {
+                Self::default()
+            }
+
+            async fn account_snapshot(
+                &self,
+                _: &[AssetNameExchange],
+                _: &[InstrumentNameExchange],
+            ) -> Result<UnindexedAccountSnapshot, UnindexedClientError> {
+                unreachable!("ExecutionManager::run does not fetch account snapshots")
+            }
+
+            async fn account_stream(
+                &self,
+                _: &[AssetNameExchange],
+                _: &[InstrumentNameExchange],
+            ) -> Result<Self::AccountStream, UnindexedClientError> {
+                unreachable!("ExecutionManager::run does not open account streams")
+            }
+
+            async fn cancel_order(
+                &self,
+                request: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
+            ) -> UnindexedOrderResponseCancel {
+                let cid = request.key.cid.to_string();
+                self.log(format!("cancel {cid}"));
+                let (_, delay, answer) = *self
+                    .script
+                    .iter()
+                    .find(|(scripted, _, _)| *scripted == cid)
+                    .expect("every cancel is scripted");
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                let state = match answer {
+                    Answer::Cancelled => Ok(Cancelled::new(
+                        OrderId::new("venue-id"),
+                        DateTime::<Utc>::MIN_UTC,
+                        Some(dec!(0)),
+                    )),
+                    Answer::AlreadyFilled => {
+                        Err(OrderError::Rejected(ApiError::OrderAlreadyFullyFilled))
+                    }
+                    Answer::Hangs => std::future::pending().await,
+                };
+                self.log(format!("cancel {cid} answered"));
+                OrderResponseCancel {
+                    key: request.key.into_owned_instrument(),
+                    state,
+                }
+            }
+
+            async fn open_order(
+                &self,
+                request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
+            ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+                self.log(format!("open {}", request.key.cid));
+                answered(request, OrderState::active(resting()))
+            }
+
+            fn cancel_replace(
+                &self,
+                cancel: OrderRequestCancel<ExchangeId, &InstrumentNameExchange>,
+                open: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
+                on_cancel_failure: OnCancelFailure,
+            ) -> Option<impl Future<Output = CancelReplaceAnswer> + Send> {
+                let native = self.native?;
+                self.log(format!(
+                    "cancel-replace {} {} {on_cancel_failure:?}",
+                    cancel.key.cid, open.key.cid
+                ));
+                Some(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let cancelled = Ok(Cancelled::new(
+                        OrderId::new("venue-id"),
+                        DateTime::<Utc>::MIN_UTC,
+                        Some(dec!(0)),
+                    ));
+                    let (cancel_state, open_state) = match native {
+                        Native::Both => (cancelled, Some(OrderState::active(resting()))),
+                        Native::CancelFailed => (
+                            Err(OrderError::Rejected(ApiError::OrderAlreadyFullyFilled)),
+                            None,
+                        ),
+                        Native::OpenRejected => (
+                            cancelled,
+                            Some(OrderState::inactive(OrderError::Rejected(
+                                ApiError::OrderRejected("insufficient balance".to_string()),
+                            ))),
+                        ),
+                        Native::Lost => (
+                            Err(OrderError::Connectivity(ConnectivityError::Socket(
+                                "dropped".to_string(),
+                            ))),
+                            Some(OrderState::inactive(OrderError::Connectivity(
+                                ConnectivityError::Socket("dropped".to_string()),
+                            ))),
+                        ),
+                        Native::Hangs => std::future::pending().await,
+                        Native::OpenSkipped => (cancelled, None),
+                    };
+                    CancelReplaceAnswer {
+                        cancel: OrderResponseCancel {
+                            key: cancel.key.into_owned_instrument(),
+                            state: cancel_state,
+                        },
+                        open: open_state.map(|state| answered(open, state)),
+                    }
+                })
+            }
+
+            async fn fetch_balances(
+                &self,
+                _: &[AssetNameExchange],
+            ) -> Result<Vec<AssetBalance<AssetNameExchange>>, UnindexedClientError> {
+                unreachable!("ExecutionManager::run does not fetch balances")
+            }
+
+            async fn fetch_open_orders(
+                &self,
+                _: &[InstrumentNameExchange],
+            ) -> Result<Vec<Order<ExchangeId, InstrumentNameExchange, Open>>, UnindexedClientError>
+            {
+                unreachable!("ExecutionManager::run does not fetch open orders")
+            }
+
+            async fn fetch_trades(
+                &self,
+                _: DateTime<Utc>,
+                _: DateTime<Utc>,
+                _: &[InstrumentNameExchange],
+            ) -> Result<TradesRead<AssetNameExchange, InstrumentNameExchange>, UnindexedClientError>
+            {
+                unreachable!("ExecutionManager::run does not fetch trades")
+            }
+        }
+
+        impl OrderStatusClient for ScriptedClient {
+            async fn fetch_ended_orders(
+                &self,
+                _: &[UnindexedOrderKey],
+            ) -> Result<Vec<UnindexedInactiveOrder>, UnindexedClientError> {
+                unreachable!("lookups go through fetch_order_status")
+            }
+
+            async fn fetch_order_status(
+                &self,
+                key: &UnindexedOrderKey,
+            ) -> Result<VenueOrderStatus, UnindexedClientError> {
+                self.log(format!("lookup {}", key.cid));
+                Ok(VenueOrderStatus::Live(Box::new(Order {
+                    key: key.clone(),
+                    side: Side::Sell,
+                    price: None,
+                    quantity: dec!(1),
+                    kind: OrderKind::Market,
+                    time_in_force: TimeInForce::ImmediateOrCancel,
+                    state: resting(),
+                })))
+            }
+        }
+
+        /// A resting order's state as the scripted venue reports it.
+        fn resting() -> Open {
+            Open::new(
+                VenueOrderId::Assigned(OrderId::new("venue-id")),
+                DateTime::<Utc>::MIN_UTC,
+                dec!(0),
+            )
+        }
+
+        /// The answer to the open `request`, in `state`.
+        fn answered(
+            request: OrderRequestOpen<ExchangeId, &InstrumentNameExchange>,
+            state: UnindexedOrderState,
+        ) -> Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState> {
+            let OrderRequestOpen { key, state: open } = request;
+            Order {
+                key: key.into_owned_instrument(),
+                side: open.side,
+                price: open.price,
+                quantity: open.quantity,
+                kind: open.kind,
+                time_in_force: open.time_in_force,
+                state,
+            }
+        }
+
+        fn key(cid: &str) -> OrderKey {
+            OrderKey {
+                exchange: ExchangeIndex(0),
+                instrument: InstrumentIndex(0),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new(cid),
+            }
+        }
+
+        fn cancel(cid: &str) -> OrderRequestCancel {
+            OrderRequestCancel {
+                key: key(cid),
+                state: RequestCancel {
+                    id: Some(VenueOrderId::Assigned(OrderId::new("venue-id"))),
+                },
+            }
+        }
+
+        fn open(cid: &str) -> OrderRequestOpen {
+            OrderRequestOpen {
+                key: key(cid),
+                state: RequestOpen::new(
+                    Side::Sell,
+                    None,
+                    dec!(1),
+                    OrderKind::Market,
+                    TimeInForce::ImmediateOrCancel,
+                ),
+            }
+        }
+
+        fn group(cancels: &[&str], opens: &[&str]) -> CancelThenOpen {
+            CancelThenOpen::new(
+                cancels.iter().map(|cid| cancel(cid)).collect(),
+                opens.iter().map(|cid| open(cid)).collect(),
+            )
+        }
+
+        /// Run `requests` through a manager over `client`, with a 5 s request timeout, and
+        /// describe everything it forwards once the request stream ends and it drains.
+        async fn run(client: &ScriptedClient, requests: Vec<ExecutionRequest>) -> Vec<String> {
+            let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
+            let Ok(map) = generate_execution_instrument_map(&instruments, EXCHANGE) else {
+                panic!("the instrument map should build");
+            };
+            let (response_tx, response_rx) = mpsc_unbounded();
+
+            ExecutionManager {
+                request_stream: futures::stream::iter(requests),
+                request_timeout: std::time::Duration::from_secs(5),
+                unknown_outcome: UnknownOutcomeLookup::default(),
+                response_tx,
+                client: Arc::new(client.clone()),
+                indexer: AccountEventIndexer::new(Arc::new(map)),
+                account_stream: futures::stream::empty().boxed(),
+            }
+            .run()
+            .await;
+
+            response_rx
+                .into_stream()
+                .map(|event| match event {
+                    AccountStreamEvent::Item(AccountEvent {
+                        kind: AccountEventKind::OrderCancelled(response),
+                        ..
+                    }) => format!(
+                        "cancelled {} {}",
+                        response.key.cid,
+                        match response.state {
+                            Ok(_) => "ok".to_string(),
+                            Err(error) => format!("{error:?}"),
+                        }
+                    ),
+                    AccountStreamEvent::Item(AccountEvent {
+                        kind: AccountEventKind::OrderSnapshot(Snapshot(order)),
+                        ..
+                    }) => format!(
+                        "snapshot {} {}",
+                        order.key.cid,
+                        match order.state {
+                            OrderState::Active(_) => "active".to_string(),
+                            OrderState::Inactive(state) => format!("{state:?}"),
+                        }
+                    ),
+                    other => panic!("unexpected event: {other:?}"),
+                })
+                .collect()
+                .await
+        }
+
+        fn dropped(cancel: &str) -> String {
+            format!(
+                "{:?}",
+                InactiveOrderState::<AssetIndex, InstrumentIndex>::OpenFailed(
+                    OrderError::NotPlaced(NotPlacedReason::CancelFailed {
+                        cancel: ClientOrderId::new(cancel),
+                    })
+                )
+            )
+        }
+
+        /// The open leaves only once the cancel has answered, and the cancel's answer is forwarded
+        /// first. A plain open sent after the group is not held behind it. The request stream ends
+        /// at once, so this also shows a drain waits for the held open.
+        #[tokio::test(start_paused = true)]
+        async fn the_opens_leave_only_after_the_cancel_has_answered() {
+            let client = ScriptedClient::new(vec![("stop", 1, Answer::Cancelled)]);
+            let events = run(
+                &client,
+                vec![
+                    ExecutionRequest::CancelThenOpen(group(&["stop"], &["exit"])),
+                    ExecutionRequest::Open(open("other")),
+                ],
+            )
+            .await;
+
+            // Which of the first two calls starts first is up to the manager's `select!`, which
+            // polls its branches in a random order. Both start before the cancel answers.
+            let logged = client.logged();
+            let (first_two, rest) = logged.split_at(2);
+            let mut first_two = first_two.to_vec();
+            first_two.sort();
+            assert_eq!(first_two, ["cancel stop", "open other"], "{logged:?}");
+            assert_eq!(rest, ["cancel stop answered", "open exit"], "{logged:?}");
+            assert_eq!(
+                events,
+                [
+                    "snapshot other active",
+                    "cancelled stop ok",
+                    "snapshot exit active"
+                ]
+            );
+        }
+
+        /// With several cancels, the opens wait for the last answer. When cancels fail, none of
+        /// the opens is sent, and each is reported dropped, naming the first cancel that failed,
+        /// after every cancel's own answer.
+        #[tokio::test(start_paused = true)]
+        async fn a_failed_cancel_drops_every_open_naming_the_first_failure() {
+            let client = ScriptedClient::new(vec![
+                ("ok", 0, Answer::Cancelled),
+                ("filled", 1, Answer::AlreadyFilled),
+                ("filled-too", 2, Answer::AlreadyFilled),
+            ]);
+            let events = run(
+                &client,
+                vec![ExecutionRequest::CancelThenOpen(group(
+                    &["ok", "filled", "filled-too"],
+                    &["exit", "stop"],
+                ))],
+            )
+            .await;
+
+            assert!(
+                !client.logged().iter().any(|call| call.starts_with("open")),
+                "no open sent: {:?}",
+                client.logged()
+            );
+            let failure = format!(
+                "{:?}",
+                OrderError::<AssetIndex, InstrumentIndex>::Rejected(
+                    ApiError::OrderAlreadyFullyFilled
+                )
+            );
+            assert_eq!(
+                events,
+                [
+                    "cancelled ok ok".to_string(),
+                    format!("cancelled filled {failure}"),
+                    format!("cancelled filled-too {failure}"),
+                    format!("snapshot exit {}", dropped("filled")),
+                    format!("snapshot stop {}", dropped("filled")),
+                ]
+            );
+        }
+
+        /// A cancel the venue never answers times out, and the timeout fails the group.
+        #[tokio::test(start_paused = true)]
+        async fn a_timed_out_cancel_drops_the_opens() {
+            let client = ScriptedClient::new(vec![("stop", 0, Answer::Hangs)]);
+            let events = run(
+                &client,
+                vec![ExecutionRequest::CancelThenOpen(group(
+                    &["stop"],
+                    &["exit"],
+                ))],
+            )
+            .await;
+
+            assert_eq!(client.logged(), ["cancel stop"]);
+            assert_eq!(
+                events,
+                [
+                    format!(
+                        "cancelled stop {:?}",
+                        OrderError::<AssetIndex, InstrumentIndex>::Connectivity(
+                            ConnectivityError::Timeout
+                        )
+                    ),
+                    format!("snapshot exit {}", dropped("stop")),
+                ]
+            );
+        }
+
+        /// `SendOpens` sends the opens once every cancel has answered, failed or not.
+        #[tokio::test(start_paused = true)]
+        async fn send_opens_sends_the_opens_after_a_failed_cancel() {
+            let client = ScriptedClient::new(vec![("stop", 1, Answer::AlreadyFilled)]);
+            let events = run(
+                &client,
+                vec![ExecutionRequest::CancelThenOpen(
+                    group(&["stop"], &["exit"]).with_on_cancel_failure(OnCancelFailure::SendOpens),
+                )],
+            )
+            .await;
+
+            assert_eq!(
+                client.logged(),
+                ["cancel stop", "cancel stop answered", "open exit"]
+            );
+            assert_eq!(events.len(), 2, "{events:?}");
+            assert_eq!(events[1], "snapshot exit active");
+        }
+
+        /// A group with no cancel has nothing to wait on: its opens go out at once. The Engine
+        /// refuses such a group, so this is a caller sending its own requests.
+        #[tokio::test(start_paused = true)]
+        async fn a_group_without_cancels_sends_its_opens_at_once() {
+            let client = ScriptedClient::new(vec![]);
+            let events = run(
+                &client,
+                vec![ExecutionRequest::CancelThenOpen(group(&[], &["exit"]))],
+            )
+            .await;
+
+            assert_eq!(client.logged(), ["open exit"]);
+            assert_eq!(events, ["snapshot exit active"]);
+        }
+
+        /// `Shutdown` abandons a held open with everything else in flight: it is never sent, and
+        /// nothing more is forwarded.
+        #[tokio::test(start_paused = true)]
+        async fn shutdown_abandons_held_opens() {
+            let client = ScriptedClient::new(vec![("stop", 1, Answer::Cancelled)]);
+            let events = run(
+                &client,
+                vec![
+                    ExecutionRequest::CancelThenOpen(group(&["stop"], &["exit"])),
+                    ExecutionRequest::Shutdown,
+                ],
+            )
+            .await;
+
+            assert!(
+                !client.logged().iter().any(|call| call.starts_with("open")),
+                "{:?}",
+                client.logged()
+            );
+            assert!(events.is_empty(), "{events:?}");
+        }
+
+        /// Two groups are sequenced apart: one's failure drops only its own opens.
+        #[tokio::test(start_paused = true)]
+        async fn groups_are_sequenced_apart() {
+            let client = ScriptedClient::new(vec![
+                ("filled", 1, Answer::AlreadyFilled),
+                ("ok", 2, Answer::Cancelled),
+            ]);
+            let events = run(
+                &client,
+                vec![
+                    ExecutionRequest::CancelThenOpen(group(&["filled"], &["dropped"])),
+                    ExecutionRequest::CancelThenOpen(group(&["ok"], &["sent"])),
+                ],
+            )
+            .await;
+
+            assert_eq!(
+                client.logged(),
+                [
+                    "cancel filled",
+                    "cancel ok",
+                    "cancel filled answered",
+                    "cancel ok answered",
+                    "open sent"
+                ]
+            );
+            assert_eq!(events[1], format!("snapshot dropped {}", dropped("filled")));
+            assert_eq!(events[3], "snapshot sent active");
+        }
+
+        /// The answer to `cid`'s open as a connectivity error leaves it: in flight, unknown.
+        fn unknown(cid: &str, error: ConnectivityError) -> String {
+            format!(
+                "snapshot {cid} {:?}",
+                InactiveOrderState::<AssetIndex, InstrumentIndex>::OpenFailed(
+                    OrderError::Connectivity(error)
+                )
+            )
+        }
+
+        /// A group of one cancel and one open goes as one venue request when the client offers
+        /// one, carrying the group's policy. Each leg is answered from it, the cancel first, and a
+        /// drain waits for the answer.
+        #[tokio::test(start_paused = true)]
+        async fn a_native_cancel_replace_answers_each_leg_from_one_request() {
+            let client = ScriptedClient::native(Native::Both);
+            let events = run(
+                &client,
+                vec![ExecutionRequest::CancelThenOpen(group(
+                    &["stop"],
+                    &["exit"],
+                ))],
+            )
+            .await;
+
+            assert_eq!(client.logged(), ["cancel-replace stop exit DropOpens"]);
+            assert_eq!(events, ["cancelled stop ok", "snapshot exit active"]);
+        }
+
+        /// A group's `SendOpens` reaches the client.
+        #[tokio::test(start_paused = true)]
+        async fn a_native_cancel_replace_carries_send_opens() {
+            let client = ScriptedClient::native(Native::Both);
+            run(
+                &client,
+                vec![ExecutionRequest::CancelThenOpen(
+                    group(&["stop"], &["exit"]).with_on_cancel_failure(OnCancelFailure::SendOpens),
+                )],
+            )
+            .await;
+
+            assert_eq!(client.logged(), ["cancel-replace stop exit SendOpens"]);
+        }
+
+        /// A group of more than one cancel, or more than one open, is never offered: the manager
+        /// sequences it.
+        #[tokio::test(start_paused = true)]
+        async fn only_a_group_of_one_cancel_and_one_open_goes_native() {
+            let client = ScriptedClient {
+                script: vec![("a", 0, Answer::Cancelled), ("b", 0, Answer::Cancelled)],
+                ..ScriptedClient::native(Native::Both)
+            };
+            run(
+                &client,
+                vec![
+                    ExecutionRequest::CancelThenOpen(group(&["a", "b"], &["exit"])),
+                    ExecutionRequest::CancelThenOpen(group(&["a"], &["one", "two"])),
+                ],
+            )
+            .await;
+
+            assert!(
+                !client
+                    .logged()
+                    .iter()
+                    .any(|call| call.starts_with("cancel-replace")),
+                "{:?}",
+                client.logged()
+            );
+        }
+
+        /// A failed cancel whose venue did not attempt the open: the open is answered as dropped,
+        /// naming the cancel, after the cancel's own answer.
+        #[tokio::test(start_paused = true)]
+        async fn a_native_cancel_failure_answers_the_open_as_dropped() {
+            let client = ScriptedClient::native(Native::CancelFailed);
+            let events = run(
+                &client,
+                vec![ExecutionRequest::CancelThenOpen(group(
+                    &["stop"],
+                    &["exit"],
+                ))],
+            )
+            .await;
+
+            assert_eq!(
+                events,
+                [
+                    format!(
+                        "cancelled stop {:?}",
+                        OrderError::<AssetIndex, InstrumentIndex>::Rejected(
+                            ApiError::OrderAlreadyFullyFilled
+                        )
+                    ),
+                    format!("snapshot exit {}", dropped("stop")),
+                ]
+            );
+        }
+
+        /// A cancel that succeeded with an open the venue rejected: each leg has its own answer.
+        #[tokio::test(start_paused = true)]
+        async fn a_native_open_rejection_is_the_opens_own_answer() {
+            let client = ScriptedClient::native(Native::OpenRejected);
+            let events = run(
+                &client,
+                vec![ExecutionRequest::CancelThenOpen(group(
+                    &["stop"],
+                    &["exit"],
+                ))],
+            )
+            .await;
+
+            assert_eq!(
+                events,
+                [
+                    "cancelled stop ok".to_string(),
+                    format!(
+                        "snapshot exit {:?}",
+                        InactiveOrderState::<AssetIndex, InstrumentIndex>::OpenFailed(
+                            OrderError::Rejected(ApiError::OrderRejected(
+                                "insufficient balance".to_string()
+                            ))
+                        )
+                    ),
+                ]
+            );
+        }
+
+        /// A lost answer leaves the open's outcome unknown, so the open is looked up, as one sent
+        /// alone would be, and what the lookup finds follows.
+        #[tokio::test(start_paused = true)]
+        async fn a_lost_native_answer_looks_the_open_up() {
+            let client = ScriptedClient::native(Native::Lost);
+            let events = run(
+                &client,
+                vec![ExecutionRequest::CancelThenOpen(group(
+                    &["stop"],
+                    &["exit"],
+                ))],
+            )
+            .await;
+
+            assert_eq!(
+                client.logged(),
+                ["cancel-replace stop exit DropOpens", "lookup exit"]
+            );
+            let socket = || ConnectivityError::Socket("dropped".to_string());
+            assert_eq!(
+                events,
+                [
+                    format!(
+                        "cancelled stop {:?}",
+                        OrderError::<AssetIndex, InstrumentIndex>::Connectivity(socket())
+                    ),
+                    unknown("exit", socket()),
+                    "snapshot exit active".to_string(),
+                ]
+            );
+        }
+
+        /// A request the venue never answers times out: the cancel fails, and the open's outcome
+        /// is unknown, so it is looked up.
+        #[tokio::test(start_paused = true)]
+        async fn a_timed_out_native_request_fails_the_cancel_and_looks_the_open_up() {
+            let client = ScriptedClient::native(Native::Hangs);
+            let events = run(
+                &client,
+                vec![ExecutionRequest::CancelThenOpen(group(
+                    &["stop"],
+                    &["exit"],
+                ))],
+            )
+            .await;
+
+            assert_eq!(
+                client.logged(),
+                ["cancel-replace stop exit DropOpens", "lookup exit"]
+            );
+            assert_eq!(
+                events,
+                [
+                    format!(
+                        "cancelled stop {:?}",
+                        OrderError::<AssetIndex, InstrumentIndex>::Connectivity(
+                            ConnectivityError::Timeout
+                        )
+                    ),
+                    unknown("exit", ConnectivityError::Timeout),
+                    "snapshot exit active".to_string(),
+                ]
+            );
+        }
+
+        /// A client that says it did not attempt the open although its cancel succeeded breaks
+        /// its contract. Nothing was placed by its word, so the open is still answered, as
+        /// dropped.
+        #[tokio::test(start_paused = true)]
+        async fn an_open_skipped_after_a_good_cancel_is_still_answered() {
+            let client = ScriptedClient::native(Native::OpenSkipped);
+            let events = run(
+                &client,
+                vec![ExecutionRequest::CancelThenOpen(group(
+                    &["stop"],
+                    &["exit"],
+                ))],
+            )
+            .await;
+
+            assert_eq!(
+                events,
+                [
+                    "cancelled stop ok".to_string(),
+                    format!("snapshot exit {}", dropped("stop")),
+                ]
+            );
+        }
     }
 }

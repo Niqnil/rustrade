@@ -46,6 +46,12 @@ pub enum MarketFeedEvent {
         instrument: InstrumentNameExchange,
         observation: MarketObservation,
     },
+    /// The feed stopped delivering `instruments`, because the stream carrying them is reconnecting
+    /// or has ended. Each is marked with [`SimulatedVenue::mark_market_stale`] until its next
+    /// fresh observation.
+    Stale {
+        instruments: Vec<InstrumentNameExchange>,
+    },
     /// The feed fell behind and dropped `missed` observations before this point.
     ///
     /// The venue never sees what they showed, so a price that crossed a resting order only in one
@@ -143,6 +149,9 @@ impl MockExchange {
     /// arrives, ahead of a request that is due at the same moment. An instrument the feed has not
     /// yet observed refuses a market order, while a limit order on it rests.
     ///
+    /// Each instrument a [`MarketFeedEvent::Stale`] names is marked with
+    /// [`SimulatedVenue::mark_market_stale`] at the clock's instant.
+    ///
     /// When the feed reports [`MarketFeedEvent::Lagged`], the driver logs an error and emits a
     /// [`StreamTerminated`](crate::AccountEventKind::StreamTerminated) after everything queued
     /// before it, which ends the account stream of a [`MockExecution`](crate::client::mock::MockExecution)
@@ -150,8 +159,8 @@ impl MockExchange {
     /// stream can read its fills back. What the dropped observations showed is lost, so a resting
     /// order may have missed a fill. Fill recovery cannot repair that.
     ///
-    /// When the feed ends, the driver logs a warning and serves requests on the last market it
-    /// saw. Deadlines keep falling.
+    /// When the feed ends, the driver logs a warning, marks every instrument stale as above, and
+    /// serves requests on the last market it saw. Deadlines keep falling.
     ///
     /// The feed is served ahead of requests, so while it has a backlog a request is read, and its
     /// wait for the venue begins, only after that backlog is applied. The latency above is a lower
@@ -282,6 +291,12 @@ impl MockExchange {
                         let events = self.venue.apply_market(&instrument, observation, clock.now());
                         emit.queue(events, None);
                     }
+                    Some(MarketFeedEvent::Stale { instruments }) => {
+                        let now = clock.now();
+                        for instrument in &instruments {
+                            self.venue.mark_market_stale(instrument, now);
+                        }
+                    }
                     Some(MarketFeedEvent::Lagged { missed }) => {
                         error!(
                             %exchange,
@@ -304,8 +319,15 @@ impl MockExchange {
                         feed_open = false;
                         warn!(
                             %exchange,
-                            "MockExchange market feed ended: serving requests on the last market seen"
+                            "MockExchange market feed ended: serving requests on the last market \
+                             seen, marked stale"
                         );
+                        let now = clock.now();
+                        let instruments =
+                            self.venue.instruments().keys().cloned().collect::<Vec<_>>();
+                        for instrument in &instruments {
+                            self.venue.mark_market_stale(instrument, now);
+                        }
                     }
                 },
 
@@ -741,6 +763,7 @@ pub(crate) mod fixtures {
             None,
             None,
             Default::default(),
+            Default::default(),
         )
     }
 
@@ -777,6 +800,7 @@ pub(crate) mod fixtures {
             crate::fill::StaleMarketPolicy::default(),
             None,
             None,
+            Default::default(),
             Default::default(),
         )
     }
@@ -1519,6 +1543,59 @@ mod tests {
 
     fn priced(price: &str) -> MarketSnapshot {
         market_prices(price).unwrap()
+    }
+
+    /// A [`MarketFeedEvent::Stale`] naming the instrument, and the feed ending, each reach the
+    /// venue: under `Wait`, an immediate-or-cancel order on a market observed fresh a moment ago
+    /// is then refused, naming the feed.
+    #[tokio::test(start_paused = true)]
+    async fn a_paper_venue_refuses_an_immediate_order_once_its_feed_is_reported_down() {
+        let ioc = |cid: &str| {
+            let mut request = request(instrument_name(), Side::Buy, "1", None);
+            request.key.cid = ClientOrderId::new(cid);
+            request.state.time_in_force = crate::order::TimeInForce::ImmediateOrCancel;
+            request
+        };
+        let refused = |state: &crate::order::state::UnindexedOrderState| {
+            matches!(
+                state,
+                OrderState::Inactive(InactiveOrderState::OpenFailed(
+                    crate::error::OrderError::Rejected(crate::error::ApiError::OrderRejected(reason))
+                )) if reason.contains("feed was reported down")
+            )
+        };
+
+        for end_feed in [false, true] {
+            let mut config = spot_config("0", "100000", FeeModelConfig::default());
+            config.stale_market = crate::fill::StaleMarketPolicy::Wait {
+                max_age: std::time::Duration::from_secs(3600),
+            };
+            let mut paper = Paper::start(config);
+            paper.observe(priced("50000"));
+
+            let before = paper.open(ioc("before")).await;
+            assert!(!refused(&before.state), "{:?}", before.state);
+
+            if end_feed {
+                // Replacing the only sender ends the feed.
+                paper.market_tx = mpsc::unbounded_channel().0;
+            } else {
+                paper
+                    .market_tx
+                    .send(MarketFeedEvent::Stale {
+                        instruments: vec![instrument_name()],
+                    })
+                    .unwrap();
+            }
+
+            let after = paper.open(ioc("after")).await;
+            assert!(
+                refused(&after.state),
+                "end_feed {end_feed}: {:?}",
+                after.state
+            );
+            paper.stop().await;
+        }
     }
 
     /// A limit order rests on a market-driven driver, and fills when a later observation crosses

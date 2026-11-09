@@ -16,7 +16,7 @@ use itertools::Itertools;
 use rustrade_execution::order::{
     OrderEvent,
     id::ClientOrderId,
-    request::{OrderRequestCancel, OrderRequestOpen, RequestCancel, RequestOpen},
+    request::{CancelThenOpen, OrderRequestCancel, OrderRequestOpen, RequestCancel, RequestOpen},
 };
 use rustrade_instrument::{exchange::ExchangeIndex, instrument::InstrumentIndex};
 use rustrade_integration::{
@@ -106,6 +106,148 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
         output
     }
 
+    /// Send [`CancelThenOpen`] groups on behalf of an `Engine` action, each whole or not at all.
+    ///
+    /// A group is refused unsent if it is not valid (see [`CancelThenOpen::exchange`]), if a leg
+    /// names an instrument the state does not track, or if an open names a client order id already
+    /// in use, by an order the state tracks or by an open earlier in this call (see
+    /// [`TracksOrder`]). Each open of the rest is stamped with the market the state holds now (see
+    /// [`MarketSnapshotSource`]), and the group is sent to its exchange as one
+    /// [`ExecutionRequest::CancelThenOpen`]. Every leg of a sent group is recorded as in flight
+    /// now, its opens included, though they leave only once the cancels are answered: the
+    /// in-flight deadline allows for that wait (see
+    /// [`InFlightDeadlines::deadline_for`](crate::engine::in_flight::InFlightDeadlines::deadline_for)).
+    pub(crate) fn send_cancel_then_open_requests<ExchangeKey, InstrumentKey>(
+        &mut self,
+        groups: impl IntoIterator<Item = CancelThenOpen<ExchangeKey, InstrumentKey>>,
+    ) -> SendCancelThenOpensOutput<ExchangeKey, InstrumentKey>
+    where
+        Clock: EngineClock,
+        State: TracksInstrument<InstrumentKey>
+            + TracksOrder<InstrumentKey>
+            + MarketSnapshotSource<InstrumentKey>
+            + InFlightRequestRecorder<ExchangeKey, InstrumentKey>,
+        ExecutionTxs: ExecutionTxMap<ExchangeKey, InstrumentKey>,
+        ExchangeKey: Debug + Clone + PartialEq,
+        InstrumentKey: Debug + Clone + PartialEq,
+    {
+        // As in `send_open_requests`: the ids the groups sent so far have claimed.
+        let mut claimed: Vec<(InstrumentKey, ClientOrderId)> = Vec::new();
+        let (sent, errors): (Vec<_>, Vec<_>) = groups
+            .into_iter()
+            .map(|mut group| {
+                let exchange = match self.prepare_cancel_then_open(&mut group, &claimed) {
+                    Ok(exchange) => exchange,
+                    Err(error) => return Err(Box::new((group, error))),
+                };
+                claimed.extend(
+                    group
+                        .opens
+                        .iter()
+                        .map(|open| (open.key.instrument.clone(), open.key.cid.clone())),
+                );
+                match self.send_execution_request(
+                    &exchange,
+                    ExecutionRequest::CancelThenOpen(group.clone()),
+                    &group,
+                ) {
+                    Ok(()) => Ok(Box::new(group)),
+                    Err(error) => Err(Box::new((group, error))),
+                }
+            })
+            .partition_result();
+        let output = SendCancelThenOpensOutput::new(
+            sent.into_iter().collect(),
+            errors.into_iter().collect(),
+        );
+
+        if !output.sent.is_none() {
+            let time_sent = self.clock.time();
+            self.state.record_in_flight_cancels(
+                output.sent_iter().flat_map(|group| group.cancels.iter()),
+                time_sent,
+            );
+            self.state.record_in_flight_opens(
+                output.sent_iter().flat_map(|group| group.opens.iter()),
+                time_sent,
+            );
+            let clock = &self.clock;
+            self.in_flight.on_sent(time_sent, || clock.instant());
+        }
+        output
+    }
+
+    /// Check `group` can be sent, given the open ids `claimed` earlier in the same call, and stamp
+    /// its opens with the market the state holds now. Returns the exchange the group is for.
+    fn prepare_cancel_then_open<ExchangeKey, InstrumentKey>(
+        &self,
+        group: &mut CancelThenOpen<ExchangeKey, InstrumentKey>,
+        claimed: &[(InstrumentKey, ClientOrderId)],
+    ) -> Result<ExchangeKey, EngineError>
+    where
+        State: TracksInstrument<InstrumentKey>
+            + TracksOrder<InstrumentKey>
+            + MarketSnapshotSource<InstrumentKey>,
+        ExchangeKey: Debug + Clone + PartialEq,
+        InstrumentKey: Debug + Clone + PartialEq,
+    {
+        let exchange = group.exchange().cloned().map_err(|error| {
+            warn!(
+                ?error,
+                ?group,
+                "invalid CancelThenOpen group -- rejected, not sent"
+            );
+            EngineError::Recoverable(RecoverableEngineError::InvalidCancelThenOpen(error))
+        })?;
+
+        let keys = group
+            .cancels
+            .iter()
+            .map(|cancel| &cancel.key)
+            .chain(group.opens.iter().map(|open| &open.key));
+        for key in keys {
+            if !self.state.tracks_instrument(&key.instrument) {
+                warn!(
+                    instrument = ?key.instrument,
+                    strategy = %key.strategy,
+                    cid = %key.cid,
+                    "CancelThenOpen group with a leg for an instrument the Engine does not track \
+                     -- rejected, not sent"
+                );
+                return Err(EngineError::Recoverable(
+                    RecoverableEngineError::UnknownInstrument(format!("{:?}", key.instrument)),
+                ));
+            }
+        }
+
+        for (index, open) in group.opens.iter().enumerate() {
+            let (instrument, cid) = (&open.key.instrument, &open.key.cid);
+            let earlier_in_group = group.opens[..index]
+                .iter()
+                .any(|other| other.key.instrument == *instrument && other.key.cid == *cid);
+            if self.state.tracks_order(instrument, cid)
+                || earlier_in_group
+                || claimed.iter().any(|(i, c)| i == instrument && c == cid)
+            {
+                warn!(
+                    instrument = ?instrument,
+                    strategy = %open.key.strategy,
+                    cid = %cid,
+                    "CancelThenOpen group with an open under a client order id the Engine already \
+                     tracks an order under -- rejected, not sent"
+                );
+                return Err(EngineError::Recoverable(
+                    RecoverableEngineError::DuplicateClientOrderId(cid.to_string()),
+                ));
+            }
+        }
+
+        for open in &mut group.opens {
+            open.state.market = self.state.market_snapshot(&open.key.instrument);
+        }
+        Ok(exchange)
+    }
+
     /// Send each request whose instrument the state tracks and that `prepare` accepts, after
     /// `prepare` has adjusted it. Reject the others unsent: one for an untracked instrument as
     /// [`RecoverableEngineError::UnknownInstrument`], before `prepare` sees it, and one `prepare`
@@ -177,37 +319,53 @@ impl<Clock, State, ExecutionTxs, Strategy, Risk>
         ExecutionRequest<ExchangeKey, InstrumentKey>:
             From<OrderEvent<Kind, ExchangeKey, InstrumentKey>>,
     {
-        match self
-            .execution_txs
-            .find(&request.key.exchange)?
-            .send(ExecutionRequest::from(request.clone()))
-        {
+        self.send_execution_request(
+            &request.key.exchange,
+            ExecutionRequest::from(request.clone()),
+            request,
+        )
+    }
+
+    /// Send `request` down the execution channel of `exchange`, exactly as given, logging
+    /// `original`, what it was built from, if the send fails.
+    ///
+    /// Private, for the same reason as [`Self::send_request`]: its callers check and record.
+    fn send_execution_request<ExchangeKey, InstrumentKey>(
+        &self,
+        exchange: &ExchangeKey,
+        request: ExecutionRequest<ExchangeKey, InstrumentKey>,
+        original: &dyn Debug,
+    ) -> Result<(), EngineError>
+    where
+        ExecutionTxs: ExecutionTxMap<ExchangeKey, InstrumentKey>,
+        ExchangeKey: Debug + Clone,
+        InstrumentKey: Debug + Clone,
+    {
+        match self.execution_txs.find(exchange)?.send(request) {
             Ok(()) => Ok(()),
             Err(error) if error.is_unrecoverable() => {
                 error!(
-                    exchange = ?request.key.exchange,
-                    ?request,
+                    ?exchange,
+                    request = ?original,
                     ?error,
                     "failed to send ExecutionRequest due to terminated channel"
                 );
                 Err(EngineError::Unrecoverable(
                     UnrecoverableEngineError::ExecutionChannelTerminated(format!(
-                        "{:?} execution channel terminated: {:?}",
-                        request.key.exchange, error
+                        "{exchange:?} execution channel terminated: {error:?}"
                     )),
                 ))
             }
             Err(error) => {
                 error!(
-                    exchange = ?request.key.exchange,
-                    ?request,
+                    ?exchange,
+                    request = ?original,
                     ?error,
                     "failed to send ExecutionRequest due to unhealthy channel"
                 );
                 Err(EngineError::Recoverable(
                     RecoverableEngineError::ExecutionChannelUnhealthy(format!(
-                        "{:?} execution channel unhealthy: {:?}",
-                        request.key.exchange, error
+                        "{exchange:?} execution channel unhealthy: {error:?}"
                     )),
                 ))
             }
@@ -310,6 +468,53 @@ impl<Kind, ExchangeKey, InstrumentKey> SendRequestsOutput<Kind, ExchangeKey, Ins
 impl<Kind, ExchangeKey, InstrumentKey> Default
     for SendRequestsOutput<Kind, ExchangeKey, InstrumentKey>
 {
+    fn default() -> Self {
+        Self {
+            sent: NoneOneOrMany::default(),
+            errors: NoneOneOrMany::default(),
+        }
+    }
+}
+
+/// Summary of the [`CancelThenOpen`] groups the [`Engine`] sent to the `ExecutionManager`, or
+/// refused unsent.
+///
+/// Each group is boxed inside its [`NoneOneOrMany`] field, as in [`SendRequestsOutput`].
+#[derive(
+    Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Constructor,
+)]
+pub struct SendCancelThenOpensOutput<ExchangeKey = ExchangeIndex, InstrumentKey = InstrumentIndex> {
+    /// Groups sent for execution, whole.
+    pub sent: NoneOneOrMany<Box<CancelThenOpen<ExchangeKey, InstrumentKey>>>,
+    /// Groups not sent, none of their legs included, each paired with the [`EngineError`] that
+    /// stopped it.
+    pub errors: NoneOneOrMany<Box<(CancelThenOpen<ExchangeKey, InstrumentKey>, EngineError)>>,
+}
+
+impl<ExchangeKey, InstrumentKey> SendCancelThenOpensOutput<ExchangeKey, InstrumentKey> {
+    /// Returns `true` if no group was sent or refused.
+    pub fn is_empty(&self) -> bool {
+        self.sent.is_none() && self.errors.is_none()
+    }
+
+    /// Iterates the groups sent, dereferencing through the boxed payload.
+    pub fn sent_iter(&self) -> impl Iterator<Item = &CancelThenOpen<ExchangeKey, InstrumentKey>> {
+        self.sent.iter().map(|group| &**group)
+    }
+
+    /// Returns any unrecoverable errors that occurred while sending the groups.
+    pub fn unrecoverable_errors(&self) -> NoneOneOrMany<UnrecoverableEngineError> {
+        self.errors
+            .iter()
+            .filter_map(|entry| match &entry.1 {
+                EngineError::Unrecoverable(error) => Some(error.clone()),
+                EngineError::Recoverable(_) => None,
+            })
+            .collect()
+    }
+}
+
+impl<ExchangeKey, InstrumentKey> Default for SendCancelThenOpensOutput<ExchangeKey, InstrumentKey> {
     fn default() -> Self {
         Self {
             sent: NoneOneOrMany::default(),

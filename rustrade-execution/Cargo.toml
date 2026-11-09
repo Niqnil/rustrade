@@ -31,9 +31,11 @@ binance = [
     "dep:serde_json",
     "serde_json/raw_value", # RawValue borrow for zero-copy WS user-data frame parsing
     "dep:anyhow",
-    # Only to name `reqwest::Method` for the margin new-order and cancel requests, which go
-    # through the SDK's `common::utils::send_request` (and its own reqwest client). No new crate
-    # enters the graph — reqwest is already a workspace dep and a binance-sdk transitive dep.
+    # To name `reqwest::Method` for the margin new-order and cancel requests, which go through
+    # the SDK's `common::utils::send_request` (and its own reqwest client); and to send the spot
+    # cancel-replace, whose error answers the SDK cannot return whole, with our own client. No
+    # new crate enters the graph — reqwest is already a workspace dep and a binance-sdk
+    # transitive dep.
     "dep:reqwest",
 ]
 ibkr = [

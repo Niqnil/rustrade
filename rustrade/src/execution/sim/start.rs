@@ -17,7 +17,10 @@ use rustrade_instrument::{
     exchange::ExchangeId,
     instrument::{
         Instrument,
-        kind::InstrumentKind,
+        kind::{
+            InstrumentKind,
+            option::{OptionKind, OptionSettlement},
+        },
         name::{InstrumentNameExchange, InstrumentNameInternal},
     },
 };
@@ -37,8 +40,11 @@ use thiserror::Error;
 ///     borrowed, so the asset opens owing the net quantity and holding none of it;
 ///   - a CFD position is held as a position, at its entry price, which the venue's ledger closes
 ///     against;
-///   - a long option position is held as a position too, its premium already paid. A short option
-///     is refused: the venue holds no short option yet.
+///   - an option position is held as a position too, its premium already paid or received. A
+///     short holds its collateral out of the listed balances, as the venue holds it for a short
+///     it opens: a put `strike × quantity × contract_size` of quote, a call `quantity ×
+///     contract_size` of base, which a spot position may supply. A short whose collateral the
+///     listed balances do not cover, and a short cash-settled call, are refused.
 /// - **The `Engine`'s opening positions.** The [`positions`](Self::positions) themselves, returned
 ///   by [`SimExecutionBuild::position_seeds`] for [`EngineStateBuilder::positions`]. The entry
 ///   price exists only here: a spot venue holds an asset balance, which has none.
@@ -88,8 +94,9 @@ pub struct SimStart {
     /// net short. Listing it is how a start owes more than the net, or owes interest already.
     ///
     /// A CFD position's margin is not listed here: the venue holds it in the position, as the full
-    /// notional at entry, and closing the position pays it back with the realised PnL. Nor is a
-    /// long option's premium: it was paid before the start, and the cash listed is what is left.
+    /// notional at entry, and closing the position pays it back with the realised PnL. Nor is an
+    /// option's premium: it was paid or received before the start, and the cash listed is what
+    /// the account holds. A short option's collateral is part of it: the venue sets it aside.
     pub balances: Vec<StartBalance>,
     /// Positions held at the start, each naming its instrument as the `Engine` does. At most one
     /// per instrument, since the venue nets.
@@ -207,12 +214,25 @@ pub enum SimStartError {
          lend its base asset"
     )]
     SpotShort { instrument: InstrumentNameInternal },
-    /// An option position is short, which the simulated venue cannot hold: it holds long options
-    /// only.
+    /// An option position is a short cash-settled call, which nothing in a cash account secures,
+    /// so the simulated venue never holds one.
     #[error(
-        "SimStart position in {instrument} is a short option; the venue holds long options only"
+        "SimStart position in {instrument} is a short cash-settled call, which the venue never \
+         holds"
     )]
-    OptionShort { instrument: InstrumentNameInternal },
+    OptionShortUnsecurable { instrument: InstrumentNameInternal },
+    /// A short option's collateral, `required` of `asset` with every earlier short's in that asset,
+    /// is more than the start's balance of it, `total`.
+    #[error(
+        "SimStart position in {instrument} is a short option securing {required} {asset} with \
+         the shorts before it, but the start holds {total} {asset}"
+    )]
+    OptionShortUncovered {
+        instrument: InstrumentNameInternal,
+        asset: AssetNameExchange,
+        required: Decimal,
+        total: Decimal,
+    },
     /// More than one position names one instrument, but the venue holds one net position each.
     #[error("SimStart holds more than one position in {instrument}; the venue nets them")]
     DuplicatePosition { instrument: InstrumentNameInternal },
@@ -305,6 +325,8 @@ impl SimStart {
         let mut prices = Vec::<StartPrice<'_>>::new();
         // CFD and option positions, which the venue holds as positions rather than balances.
         let mut held = Vec::new();
+        // Short options, with the collateral each holds, checked once every balance is known.
+        let mut secured = Vec::<(&InstrumentNameInternal, AssetNameExchange, Decimal)>::new();
         let mut seen = FnvHashMap::<&InstrumentNameInternal, ()>::default();
 
         for seed in &self.positions {
@@ -343,12 +365,26 @@ impl SimStart {
                         prices.push((name, &instrument.underlying, seed.price_entry_average));
                     }
                 }
-                InstrumentKind::Option(_) if seed.side == Side::Sell => {
-                    return Err(SimStartError::OptionShort {
-                        instrument: seed.instrument.clone(),
-                    });
-                }
                 InstrumentKind::Cfd(_) | InstrumentKind::Option(_) => {
+                    if let InstrumentKind::Option(contract) = &instrument.kind
+                        && seed.side == Side::Sell
+                    {
+                        let units = seed.quantity_abs * contract.contract_size;
+                        let collateral = match (contract.kind, contract.settlement) {
+                            (OptionKind::Call, OptionSettlement::Cash) => {
+                                return Err(SimStartError::OptionShortUnsecurable {
+                                    instrument: seed.instrument.clone(),
+                                });
+                            }
+                            (OptionKind::Call, OptionSettlement::Physical) => {
+                                (instrument.underlying.base.clone(), units)
+                            }
+                            (OptionKind::Put, _) => {
+                                (instrument.underlying.quote.clone(), contract.strike * units)
+                            }
+                        };
+                        secured.push((&seed.instrument, collateral.0, collateral.1));
+                    }
                     held.push(InstrumentAccountSnapshot {
                         instrument: (*name).clone(),
                         orders: Vec::new(),
@@ -391,6 +427,25 @@ impl SimStart {
                     };
                     balances.insert(asset, opening);
                 }
+            }
+        }
+
+        // What each short option holds comes out of the balance the venue opens with, so together
+        // they may not exceed it.
+        let mut required = FnvHashMap::<&AssetNameExchange, Decimal>::default();
+        for (instrument, asset, collateral) in &secured {
+            let required = required.entry(asset).or_default();
+            *required += collateral;
+            let total = balances
+                .get(asset)
+                .map_or(Decimal::ZERO, |(total, _)| *total);
+            if *required > total {
+                return Err(SimStartError::OptionShortUncovered {
+                    instrument: (*instrument).clone(),
+                    asset: asset.clone(),
+                    required: *required,
+                    total,
+                });
             }
         }
 
@@ -726,21 +781,97 @@ mod tests {
         assert_eq!(seeds, start.positions);
     }
 
+    fn option_venue_of(
+        kind: OptionKind,
+        settlement: OptionSettlement,
+    ) -> FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>> {
+        let mut instruments = option_venue();
+        for instrument in instruments.values_mut() {
+            if let InstrumentKind::Option(contract) = &mut instrument.kind {
+                contract.kind = kind;
+                contract.settlement = settlement;
+            }
+        }
+        instruments
+    }
+
+    fn short_option(quantity: Decimal) -> PositionSeed {
+        seed("binance_spot-spy_usdt", Side::Sell, quantity, dec!(1.5))
+    }
+
     #[test]
-    fn a_short_option_is_refused() {
+    fn a_covered_short_call_is_seeded_holding_the_base_it_would_deliver() {
         let start = SimStart::new(
-            vec![usdt(dec!(1000))],
-            vec![seed(
-                "binance_spot-spy_usdt",
-                Side::Sell,
-                dec!(1),
-                dec!(1.5),
-            )],
+            vec![
+                usdt(dec!(1000)),
+                StartBalance::new(AssetNameExchange::new("spy"), dec!(200)),
+            ],
+            vec![short_option(dec!(2))],
+        );
+
+        let (snapshot, _) = start.resolve(EXCHANGE, &option_venue(), None).unwrap();
+
+        let position = snapshot.instruments[0].position.open().unwrap();
+        assert_eq!(position.quantity, dec!(-2));
+        assert_eq!(
+            balance(&snapshot, "spy"),
+            Some(dec!(200)),
+            "the venue holds the collateral out of the balance listed"
+        );
+    }
+
+    #[test]
+    fn a_short_call_the_base_listed_does_not_cover_is_refused() {
+        let start = SimStart::new(
+            vec![
+                usdt(dec!(1000000)),
+                StartBalance::new(AssetNameExchange::new("spy"), dec!(199)),
+            ],
+            vec![short_option(dec!(2))],
         );
 
         assert_eq!(
             start.resolve(EXCHANGE, &option_venue(), None).unwrap_err(),
-            SimStartError::OptionShort {
+            SimStartError::OptionShortUncovered {
+                instrument: InstrumentNameInternal::new("binance_spot-spy_usdt"),
+                asset: AssetNameExchange::new("spy"),
+                required: dec!(200),
+                total: dec!(199),
+            }
+        );
+    }
+
+    #[test]
+    fn a_short_put_holds_its_strike_in_quote() {
+        let instruments = option_venue_of(OptionKind::Put, OptionSettlement::Physical);
+        let covered = SimStart::new(vec![usdt(dec!(10000))], vec![short_option(dec!(1))]);
+        assert!(covered.resolve(EXCHANGE, &instruments, None).is_ok());
+
+        let uncovered = SimStart::new(vec![usdt(dec!(9999))], vec![short_option(dec!(1))]);
+        assert_eq!(
+            uncovered.resolve(EXCHANGE, &instruments, None).unwrap_err(),
+            SimStartError::OptionShortUncovered {
+                instrument: InstrumentNameInternal::new("binance_spot-spy_usdt"),
+                asset: AssetNameExchange::new("usdt"),
+                required: dec!(10000),
+                total: dec!(9999),
+            }
+        );
+    }
+
+    #[test]
+    fn a_short_cash_settled_call_is_refused() {
+        let start = SimStart::new(vec![usdt(dec!(1000000))], vec![short_option(dec!(1))]);
+
+        assert_eq!(
+            start
+                .resolve(
+                    EXCHANGE,
+                    &option_venue_of(OptionKind::Call, OptionSettlement::Cash),
+                    None
+                )
+                .unwrap_err(),
+            SimStartError::OptionShortUnsecurable {
                 instrument: InstrumentNameInternal::new("binance_spot-spy_usdt"),
             }
         );

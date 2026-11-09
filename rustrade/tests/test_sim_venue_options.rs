@@ -133,6 +133,7 @@ fn mock_config(balances: Vec<AssetBalance<AssetNameExchange>>) -> MockExecutionC
         spot_margin: None,
         fee_asset: None,
         long_option_expiry: Default::default(),
+        short_put_collateral: Default::default(),
     }
 }
 
@@ -141,9 +142,11 @@ type BacktestTxMap = rustrade::engine::execution_tx::MultiExchangeTxMap<
     rustrade_integration::channel::UnboundedTx<ExecutionRequest>,
 >;
 
-/// Buys one option contract at the first option price it sees, and does nothing else.
+/// Buys one option contract at the first option price it sees, or sells one when `sell`, and
+/// does nothing else.
 #[derive(Debug, Default)]
 struct BuyOneOption {
+    sell: bool,
     sent: AtomicUsize,
 }
 
@@ -176,7 +179,7 @@ impl AlgoStrategy for BuyOneOption {
                 cid: ClientOrderId::random(),
             },
             state: RequestOpen::new(
-                Side::Buy,
+                if self.sell { Side::Sell } else { Side::Buy },
                 None,
                 dec!(1),
                 OrderKind::Market,
@@ -267,6 +270,12 @@ impl
 
 /// SPY and a 100-share SPY call struck at 100, expiring at [`expiry`], settled as `settlement`.
 fn instruments(settlement: OptionSettlement) -> IndexedInstruments {
+    instruments_of(OptionKind::Call, settlement)
+}
+
+/// SPY and a 100-share SPY option of `kind` struck at 100, expiring at [`expiry`], settled as
+/// `settlement`. Named as [`instruments`]'s call is, whatever its kind.
+fn instruments_of(kind: OptionKind, settlement: OptionSettlement) -> IndexedInstruments {
     let spy = Instrument::spot(
         EXCHANGE,
         "simulated_spy_usd",
@@ -283,7 +292,7 @@ fn instruments(settlement: OptionSettlement) -> IndexedInstruments {
         InstrumentKind::Option(OptionContract {
             contract_size: dec!(100),
             settlement_asset: "usd".into(),
-            kind: OptionKind::Call,
+            kind,
             exercise: OptionExercise::American,
             settlement,
             expiry: expiry(),
@@ -331,14 +340,25 @@ fn trade(
 /// for 150. SPY trades at 110 an hour before the call expires at 20:00, and again an hour after,
 /// so the run's clock passes the expiry with the underlying priced at 110.
 async fn run(settlement: OptionSettlement) -> BacktestResult<Daily, BacktestState> {
-    let instruments = instruments(settlement);
+    run_with(OptionKind::Call, settlement, false, dec!(110)).await
+}
+
+/// A run as [`run`]'s, of an option of `kind`, which the strategy sells when `sell`, with SPY at
+/// `spy_at_expiry` around the expiry.
+async fn run_with(
+    kind: OptionKind,
+    settlement: OptionSettlement,
+    sell: bool,
+    spy_at_expiry: Decimal,
+) -> BacktestResult<Daily, BacktestState> {
+    let instruments = instruments_of(kind, settlement);
     let (spy, call) = (key(&instruments, "SPY"), key(&instruments, "SPY_C100"));
 
     let market_events = vec![
         trade("2025-03-24T22:00:00Z", spy, dec!(100)),
         trade("2025-03-24T22:01:00Z", call, dec!(1.5)),
-        trade("2025-03-25T19:00:00Z", spy, dec!(110)),
-        trade("2025-03-25T21:00:00Z", spy, dec!(110)),
+        trade("2025-03-25T19:00:00Z", spy, spy_at_expiry),
+        trade("2025-03-25T21:00:00Z", spy, spy_at_expiry),
     ];
 
     let engine_state = EngineStateBuilder::new(&instruments, DefaultGlobalData, |_| {
@@ -367,7 +387,10 @@ async fn run(settlement: OptionSettlement) -> BacktestResult<Daily, BacktestStat
         BacktestArgsDynamic {
             id: "option-expiry".into(),
             risk_free_return: Decimal::ZERO,
-            strategy: BuyOneOption::default(),
+            strategy: BuyOneOption {
+                sell,
+                ..BuyOneOption::default()
+            },
             risk: DefaultRiskManager::default(),
         },
     )
@@ -557,4 +580,141 @@ fn a_start_holding_a_long_call_holds_it_on_both_sides_until_the_venue_settles_it
         .unwrap();
     assert_eq!(held(&engine), []);
     assert_eq!(usd(&engine), Some(FUNDING + dec!(1_000)));
+}
+
+/// A cash-secured put, sold for 1.50, is 10 in the money at expiry, so the venue assigns it: it
+/// closes the option at 0 and buys 100 SPY at the strike with the cash the put held. The engine
+/// ends holding the shares, and the option's PnL is the premium kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backtest_assigned_short_put_ends_holding_the_shares_bought_at_the_strike() {
+    let result = run_with(OptionKind::Put, OptionSettlement::Physical, true, dec!(90)).await;
+
+    assert_eq!(
+        open_positions(&result),
+        [("SPY".to_string(), dec!(100), dec!(100))]
+    );
+    assert_eq!(option_pnl(&result), dec!(150));
+    let usd = balance_end(&result, "usd");
+    assert_eq!(
+        (usd.total, usd.free),
+        (
+            FUNDING + dec!(150) - dec!(10_000),
+            FUNDING + dec!(150) - dec!(10_000)
+        )
+    );
+    assert_eq!(balance_end(&result, "spy").total, dec!(100));
+}
+
+/// Out of the money at expiry, the same put expires: the run ends flat, keeping the premium, and
+/// the cash it held is free again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_backtest_short_put_expiring_out_of_the_money_keeps_the_premium() {
+    let result = run_with(OptionKind::Put, OptionSettlement::Physical, true, dec!(110)).await;
+
+    assert_eq!(open_positions(&result), []);
+    assert_eq!(option_pnl(&result), dec!(150));
+    let usd = balance_end(&result, "usd");
+    assert_eq!(
+        (usd.total, usd.free),
+        (FUNDING + dec!(150), FUNDING + dec!(150))
+    );
+}
+
+/// A stepped session starting from a `SimStart` that holds 100 SPY and one call written against
+/// them. The call is 10 in the money at expiry, so the venue assigns it and delivers the shares at
+/// the strike: the `Engine` closes both positions on the venue's trades, and the account holds the
+/// strike's cash.
+#[test]
+fn a_start_holding_a_covered_call_ends_flat_once_the_shares_are_delivered() {
+    type State = EngineState<DefaultGlobalData, DefaultInstrumentMarketData>;
+
+    let instruments = instruments(OptionSettlement::Physical);
+    let spy = key(&instruments, "SPY");
+    let start_time = ts("2025-03-24T22:00:00Z");
+    let start = SimStart::new(
+        vec![StartBalance::new(AssetNameExchange::new("usd"), FUNDING)],
+        vec![
+            PositionSeed::new(
+                "simulated_spy_usd",
+                Side::Buy,
+                dec!(100),
+                dec!(95),
+                start_time,
+            ),
+            PositionSeed::new(CALL, Side::Sell, dec!(1), dec!(1.5), start_time),
+        ],
+    );
+    let build = SimExecutionBuilder::new(&instruments)
+        .add_venue_with_start(mock_config(vec![]), SimVenueOptions::default(), start)
+        .unwrap()
+        .build();
+    let seeds = build.position_seeds();
+    let SimExecutionBuild {
+        execution_tx_map,
+        venues,
+    } = build;
+
+    let clock = HistoricalClock::new(start_time);
+    let state = EngineStateBuilder::new(&instruments, DefaultGlobalData, |_| {
+        DefaultInstrumentMarketData::default()
+    })
+    .time_engine_start(start_time)
+    .trading_state(TradingState::Enabled)
+    .expiry_handling(EXCHANGE, ExpiryHandling::Venue)
+    .positions(seeds)
+    .build();
+    let mut engine: SimEngine<
+        DefaultGlobalData,
+        DefaultInstrumentMarketData,
+        DefaultStrategy<State>,
+        DefaultRiskManager<State>,
+    > = Engine::new(
+        clock.clone(),
+        state,
+        execution_tx_map,
+        InFlightDeadlines::default(),
+        DefaultStrategy::default(),
+        DefaultRiskManager::default(),
+    );
+    let mut stepper = SimStepper::new(venues, clock).unwrap();
+
+    let open = |engine: &SimEngine<_, _, _, _>| {
+        engine
+            .state
+            .instruments
+            .instruments(&InstrumentFilter::None)
+            .map(|instrument| instrument.position.positions.len())
+            .sum::<usize>()
+    };
+    let asset = |engine: &SimEngine<_, _, _, _>, name: &str| {
+        engine
+            .state
+            .assets
+            .assets()
+            .find(|state| state.asset.name_internal.as_ref() == name)
+            .and_then(|state| state.balance.as_ref())
+            .map(|balance| balance.value.total)
+    };
+
+    let before = "2025-03-25T19:00:00Z";
+    stepper
+        .step(
+            &mut engine,
+            ts(before),
+            [EngineEvent::Market(trade(before, spy, dec!(110)))],
+        )
+        .unwrap();
+    assert_eq!(open(&engine), 2, "the shares and the call");
+
+    let after = "2025-03-25T21:00:00Z";
+    stepper
+        .step(
+            &mut engine,
+            ts(after),
+            [EngineEvent::Market(trade(after, spy, dec!(110)))],
+        )
+        .unwrap();
+    assert_eq!(open(&engine), 0);
+    assert_eq!(asset(&engine, "usd"), Some(FUNDING + dec!(10_000)));
+    assert_eq!(asset(&engine, "spy"), Some(Decimal::ZERO));
 }
