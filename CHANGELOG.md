@@ -177,6 +177,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expires on arrival. A snapshot written with the lagging clock restores it at the instant
   reached. Drivers that call `advance_time` before each request, as `MockExchange` does, see no
   change.
+- **The IBKR client's docs no longer say IB cannot modify an order in flight** (`rustrade-execution`,
+  #888). IB allows an open order's price, size and time in force to be changed in place. This
+  client never does so, which is why the order context it stores at placement stays fixed. The
+  module's limitations now say so, along with the consequence: an order modified outside the client,
+  such as by hand in TWS, is still reported with the price and quantity it was placed with.
 
 ## [0.21.0] - 2026-11-04
 

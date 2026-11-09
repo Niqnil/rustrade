@@ -84,8 +84,16 @@ pub struct BracketOrderResult {
 ///
 /// # Invariant
 ///
-/// This data is immutable after order placement. IB doesn't support in-flight
-/// order modification — amendments are cancel+replace (new order ID, new entry).
+/// This data is immutable after order placement, because this client never modifies an order it
+/// placed: the [`ExecutionClient`](crate::client::ExecutionClient) trait has no modify operation,
+/// so a change is a cancel and a new order (new order ID, new entry). IB itself does allow an open
+/// order's price, size and time in force to be modified in place, under the same order ID.
+///
+/// # Known limitation
+///
+/// An order modified outside this client, such as by hand in TWS, keeps its placement context
+/// here. Its statuses, and the open-order listing that finds it tracked, then report the price and
+/// quantity it was placed with, not the modified ones.
 #[derive(Debug, Clone)]
 pub struct OrderContext {
     pub instrument: InstrumentNameExchange,
