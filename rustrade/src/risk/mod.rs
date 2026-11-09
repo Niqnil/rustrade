@@ -482,4 +482,30 @@ mod tests {
         assert_eq!(refusals[1].item, large);
         assert_eq!(refusals[1].reason, "too large");
     }
+
+    /// Only an amend that changes the quantity alone, lowering it, skips `check`: a quantity
+    /// raised, or lowered beside a new price or trigger, is checked as the open it leaves.
+    #[test]
+    fn the_default_amend_check_skips_only_a_quantity_lowered_alone() {
+        let raised = amend(
+            "raised",
+            dec!(5),
+            dec!(0),
+            AmendPatch::default().with_quantity(dec!(20)),
+        );
+        let lowered_and_repriced = amend(
+            "lowered_and_repriced",
+            dec!(30),
+            dec!(0),
+            AmendPatch::default()
+                .with_quantity(dec!(20))
+                .with_price(dec!(99)),
+        );
+
+        let (approved, refusals) =
+            SizeCap.check_amends(&(), [raised.clone(), lowered_and_repriced.clone()]);
+        assert_eq!(approved.into_iter().count(), 0);
+        let refused: Vec<_> = refusals.into_iter().map(|refusal| refusal.item).collect();
+        assert_eq!(refused, vec![raised, lowered_and_repriced]);
+    }
 }

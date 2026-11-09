@@ -259,10 +259,10 @@ pub enum AmendPriority {
 ///
 /// `#[non_exhaustive]`, so a field can be added without breaking a caller. Outside this crate,
 /// start from [`AmendSupport::NONE`] and the `with_*` methods.
+///
+/// The [`Default`] is [`AmendSupport::NONE`].
 #[non_exhaustive]
-#[derive(
-    Debug, Copy, Clone, Default, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize,
-)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 pub struct AmendSupport {
     pub price: AmendAllowed,
     pub quantity: AmendAllowed,
@@ -274,6 +274,13 @@ pub struct AmendSupport {
     pub keeps_id: bool,
     /// What an amend does to the order's queue position.
     pub priority: AmendPriority,
+}
+
+impl Default for AmendSupport {
+    /// [`AmendSupport::NONE`]: nothing can be amended.
+    fn default() -> Self {
+        Self::NONE
+    }
 }
 
 impl AmendSupport {
@@ -486,6 +493,31 @@ mod tests {
         );
     }
 
+    /// Each kind with a trigger: a `Stop`, `StopLimit`, `TakeProfit` and `TakeProfitLimit` at
+    /// `trigger_price`.
+    fn triggered_kinds(trigger_price: Decimal) -> [OrderKind; 4] {
+        [
+            OrderKind::Stop { trigger_price },
+            OrderKind::StopLimit { trigger_price },
+            OrderKind::TakeProfit { trigger_price },
+            OrderKind::TakeProfitLimit { trigger_price },
+        ]
+    }
+
+    #[test]
+    fn a_trigger_moves_the_trigger_of_every_kind_with_one() {
+        for (kind, moved) in triggered_kinds(dec!(90))
+            .into_iter()
+            .zip(triggered_kinds(dec!(92)))
+        {
+            let amended = AmendPatch::default()
+                .with_trigger_price(dec!(92))
+                .apply(&target(kind, None), dec!(0))
+                .unwrap();
+            assert_eq!(amended.kind, moved);
+        }
+    }
+
     #[test]
     fn a_trigger_moves_the_trigger_of_its_kind() {
         let stop_limit = target(
@@ -554,6 +586,53 @@ mod tests {
             )),
             Ok(())
         );
+    }
+
+    /// A trigger that can only be lowered is compared with the order's own trigger, whatever
+    /// its kind.
+    #[test]
+    fn support_for_trigger_decreases_reads_the_current_trigger() {
+        let support = AmendSupport::NONE.with_trigger_price(AmendAllowed::DecreaseOnly);
+        for kind in triggered_kinds(dec!(90)) {
+            let order = target(kind, None);
+            let to = |trigger| {
+                request(
+                    AmendPatch::default().with_trigger_price(trigger),
+                    order.clone(),
+                )
+            };
+            assert_eq!(
+                support.permits(&to(dec!(91))),
+                Err(AmendRefusal::Increase {
+                    field: AmendField::TriggerPrice
+                }),
+                "{kind:?}"
+            );
+            assert_eq!(support.permits(&to(dec!(89))), Ok(()), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn support_builders_set_their_field_only() {
+        let support = AmendSupport::NONE
+            .with_price(AmendAllowed::Any)
+            .with_quantity(AmendAllowed::DecreaseOnly)
+            .with_trigger_price(AmendAllowed::Any)
+            .with_multi_field(true)
+            .with_keeps_id(false)
+            .with_priority(AmendPriority::KeptOnQuantityDecrease);
+        assert_eq!(
+            support,
+            AmendSupport {
+                price: AmendAllowed::Any,
+                quantity: AmendAllowed::DecreaseOnly,
+                trigger_price: AmendAllowed::Any,
+                multi_field: true,
+                keeps_id: false,
+                priority: AmendPriority::KeptOnQuantityDecrease,
+            }
+        );
+        assert_eq!(AmendSupport::default(), AmendSupport::NONE);
     }
 
     #[test]

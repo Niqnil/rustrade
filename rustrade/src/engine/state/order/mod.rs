@@ -3094,6 +3094,45 @@ mod tests {
             ));
         }
 
+        /// A cancel's snapshot carrying the order replaces the amend's order only with a later
+        /// report of the same venue order: one of another venue order, or an older one, leaves
+        /// the order as last reported.
+        #[test]
+        fn a_cancel_snapshot_takes_only_a_later_report_of_the_amended_order() {
+            let cancelled_with = |reported: Open| {
+                let mut orders = tracked(ActiveOrderState::Open(open_assigned("1", t(2))));
+                orders.record_in_flight_amend(
+                    &request(AmendPatch::default().with_price(dec!(2))),
+                    TIME_SENT,
+                );
+                orders.update_from_order_snapshot(Snapshot(&order(
+                    cid(),
+                    OrderState::<u64, u64>::Active(ActiveOrderState::CancelInFlight(
+                        CancelInFlight::new(Some(reported), t(5)),
+                    )),
+                )));
+                tracked_order(&orders).state.clone()
+            };
+            let cancel = |order: Open| {
+                ActiveOrderState::CancelInFlight(CancelInFlight::new(Some(order), t(5)))
+            };
+
+            assert_eq!(
+                cancelled_with(open_assigned("1", t(3))),
+                cancel(open_assigned("1", t(3)))
+            );
+            assert_eq!(
+                cancelled_with(open_assigned("2", t(3))),
+                cancel(open_assigned("1", t(2))),
+                "another venue order"
+            );
+            assert_eq!(
+                cancelled_with(open_assigned("1", t(1))),
+                cancel(open_assigned("1", t(2))),
+                "an older report"
+            );
+        }
+
         #[test]
         fn an_amend_leaving_nothing_to_fill_retires_the_order() {
             let mut part_filled = open_assigned("1", t(1));

@@ -388,6 +388,70 @@ mod tests {
         assert!(by_hand.is_empty());
     }
 
+    /// Amends alone, sent or refused by the engine, make an output that is not empty.
+    #[test]
+    fn amends_alone_make_an_output_that_is_not_empty() {
+        use crate::engine::action::send_requests::SendAmendsOutput;
+        use rustrade_execution::{
+            error::AmendRefusal,
+            order::{
+                amend::{AmendPatch, AmendTarget, RequestAmend},
+                id::{OrderId, VenueOrderId},
+                request::ReduceOnly,
+            },
+        };
+
+        let open = &group().opens[0];
+        let patch = AmendPatch::default().with_price(rust_decimal::Decimal::TWO);
+        let request = OrderRequestAmend {
+            key: open.key.clone(),
+            state: RequestAmend::new(
+                VenueOrderId::Assigned(OrderId::new("1")),
+                patch,
+                AmendTarget {
+                    side: open.state.side,
+                    price: Some(rust_decimal::Decimal::ONE),
+                    quantity: open.state.quantity,
+                    kind: OrderKind::Limit,
+                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                    reduce_only: ReduceOnly::No,
+                },
+                rust_decimal::Decimal::ZERO,
+            ),
+        };
+        let amend = OrderAmend {
+            key: open.key.clone(),
+            state: patch,
+        };
+        let refused =
+            EngineError::Recoverable(RecoverableEngineError::AmendRefused(AmendRefusal::NoChange));
+
+        let with = |sent| {
+            GenerateAlgoOrdersOutput::<ExchangeIndex, InstrumentIndex>::default()
+                .with_amends(AmendsOutput::new(sent, NoneOneOrMany::None))
+        };
+        let only_sent = with(SendAmendsOutput::new(
+            NoneOneOrMany::One(Box::new(request)),
+            NoneOneOrMany::None,
+        ));
+        assert!(only_sent.amends.is_some());
+        assert!(!only_sent.is_empty());
+        let only_errors = with(SendAmendsOutput::new(
+            NoneOneOrMany::None,
+            NoneOneOrMany::One(Box::new((amend, refused))),
+        ));
+        assert!(only_errors.amends.is_some());
+        assert!(!only_errors.is_empty());
+        assert!(
+            with(SendAmendsOutput::new(
+                NoneOneOrMany::None,
+                NoneOneOrMany::None
+            ))
+            .amends
+            .is_none()
+        );
+    }
+
     /// A group that failed to send for a terminated channel is an unrecoverable error of the whole
     /// output; one refused for a recoverable reason is not.
     #[test]

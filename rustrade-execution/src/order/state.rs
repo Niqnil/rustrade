@@ -369,6 +369,33 @@ mod tests {
         }
     }
 
+    /// An order with an amend in flight keeps working as last reported: its time and fill are
+    /// the order's, and the time sent is the amend's.
+    #[test]
+    fn an_amend_in_flight_keeps_the_order_as_last_reported() {
+        let order = open(5, dec!(1));
+        let sent = DateTime::<Utc>::MIN_UTC + TimeDelta::seconds(7);
+        let mut state = ActiveOrderState::AmendInFlight(AmendInFlight::new(
+            order.clone(),
+            AmendPatch::default().with_price(dec!(1)),
+            sent,
+        ));
+        assert_eq!(state.time_sent(), Some(sent));
+        assert_eq!(state.open_meta(), Some(&order));
+
+        state
+            .open_meta_mut()
+            .expect("an amend in flight has a working order")
+            .filled_quantity = dec!(2);
+        assert_eq!(
+            state.open_meta().map(|open| open.filled_quantity),
+            Some(dec!(2))
+        );
+
+        let state: OrderState = OrderState::Active(state);
+        assert_eq!(state.time_exchange(), Some(order.time_exchange));
+    }
+
     #[test]
     fn a_later_stamp_supersedes() {
         assert!(open(0, dec!(0)).is_superseded_by(&open(1, dec!(0))));

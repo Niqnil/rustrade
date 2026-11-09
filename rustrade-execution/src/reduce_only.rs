@@ -364,6 +364,21 @@ mod tests {
         ClientOrderId::new(id)
     }
 
+    /// What a live order was sent as, either way; nothing for an order that ended, even a
+    /// reduce-only one kept retired, or one never registered.
+    #[test]
+    fn sent_as_reads_live_orders_only() {
+        let mut book = ReduceOnlyBook::new();
+        book.register(&cid("reduce"), Position);
+        book.register(&cid("plain"), No);
+        assert_eq!(book.sent_as(&cid("reduce")), Some(Position));
+        assert_eq!(book.sent_as(&cid("plain")), Some(No));
+
+        book.retire(&cid("reduce"));
+        assert_eq!(book.sent_as(&cid("reduce")), None);
+        assert_eq!(book.sent_as(&cid("never")), None);
+    }
+
     fn venue(id: &str) -> OrderId {
         OrderId::new(id)
     }
