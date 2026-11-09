@@ -38,7 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     of an order with an open, cancel or amend in flight is refused (`AmendRefusal::RequestInFlight`).
     A cancel of such an order is still sent, including by `Command::CancelOrders` and at contract
     expiry. While an amend raising the quantity is in flight, a fill beyond the old total retires
-    the order only once it reaches the new total.
+    the order only once it reaches the new total. An `Ok(Amended)` is applied only to the amend it
+    answers: one for an order with no amend in flight, or naming another venue order, is ignored.
   - **From a strategy:** `AlgoStrategy::generate_amends` and `RiskManager::check_amends`, both
     with defaults, so existing implementations are unaffected. The default check approves an
     amend that only lowers the quantity. It passes any other amend through `RiskManager::check`

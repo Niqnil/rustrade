@@ -886,6 +886,19 @@ where
                         "OrderManager received a refused amend - the order is unchanged"
                     );
                     let open = amend.order.clone();
+                    // A fill can reach the old total while a raise is in flight: refused, the
+                    // raise leaves the order with nothing to fill.
+                    if open.quantity_remaining(entry.get().quantity) <= Decimal::ZERO {
+                        debug!(
+                            exchange = ?response.key.exchange,
+                            instrument = ?response.key.instrument,
+                            strategy = %response.key.strategy,
+                            cid = %response.key.cid,
+                            "OrderManager removing an order filled while its refused amend was in flight"
+                        );
+                        self.1.insert(entry.remove().key.cid);
+                        return;
+                    }
                     entry.get_mut().state = ActiveOrderState::Open(open);
                 } else {
                     debug!(
@@ -935,10 +948,11 @@ where
         };
 
         // The answer must be for the venue order amended: under its previous identifier when the
-        // venue issued a new one.
+        // venue issued a new one. Only two different assigned identifiers say it is not, as for
+        // snapshots: an order the venue had not named may be named in the answer.
         if let Some(held) = &held {
             let amended_id = amended.previous_id.as_ref().unwrap_or(&amended.open.id);
-            if *amended_id != held.id {
+            if held.id.contradicts(amended_id) {
                 warn!(
                     exchange = ?response.key.exchange,
                     instrument = ?response.key.instrument,
@@ -3235,6 +3249,57 @@ mod tests {
                 ))));
                 assert_eq!(*tracked_order(&orders), before, "another venue order");
             }
+
+            let mut cancelling = in_flight();
+            cancelling.record_in_flight_cancel(&request_cancel(cid()), t(3));
+            let before = tracked_order(&cancelling).clone();
+            cancelling.update_from_amend_response(&answer(Ok(amended(
+                open_assigned("9", t(1)),
+                dec!(2),
+                dec!(3),
+            ))));
+            assert_eq!(
+                *tracked_order(&cancelling),
+                before,
+                "another venue order, behind a cancel"
+            );
+        }
+
+        /// An order the venue had not named when the amend was sent may be named in the answer.
+        #[test]
+        fn an_amend_answer_may_name_an_order_the_venue_had_not() {
+            let mut orders = tracked(ActiveOrderState::Open(open_client_assigned(t(0))));
+            orders.record_in_flight_amend(
+                &request(AmendPatch::default().with_price(dec!(2))),
+                TIME_SENT,
+            );
+            orders.update_from_amend_response(&answer(Ok(amended(
+                open_assigned("7", t(1)),
+                dec!(2),
+                dec!(1),
+            ))));
+            let order = tracked_order(&orders);
+            assert_eq!(order.price, Some(dec!(2)));
+            assert_eq!(
+                order.state,
+                ActiveOrderState::Open(open_assigned("7", t(1)))
+            );
+        }
+
+        /// A fill that reached the old total while a raise was in flight leaves nothing to fill
+        /// once the raise is refused.
+        #[test]
+        fn a_refused_raise_retires_an_order_filled_meanwhile() {
+            let mut orders = resting();
+            orders.record_in_flight_amend(
+                &request(AmendPatch::default().with_quantity(dec!(3))),
+                TIME_SENT,
+            );
+            assert!(!orders.update_from_fill(&cid(), &OrderId::new("1"), dec!(1)));
+            orders.update_from_amend_response(&answer(Err(OrderError::AmendRefused(
+                AmendRefusal::Venue("filled".into()),
+            ))));
+            assert!(orders.0.is_empty());
         }
     }
 }

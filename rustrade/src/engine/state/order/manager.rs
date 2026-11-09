@@ -79,8 +79,10 @@ where
     /// - `Ok(Amended)` is ignored for an `Open` order, which has no amend in flight, and for an
     ///   answer about another venue order: one whose
     ///   [`previous_id`](rustrade_execution::order::amend::Amended::previous_id), or else whose
-    ///   order's identifier, is not the identifier tracked.
-    /// - A refusal or rejection returns an `AmendInFlight` order to `Open`, unchanged.
+    ///   order's identifier, contradicts the identifier tracked
+    ///   ([`VenueOrderId::contradicts`](rustrade_execution::order::id::VenueOrderId::contradicts)).
+    /// - A refusal or rejection returns an `AmendInFlight` order to `Open`, unchanged, or stops
+    ///   tracking it when fills while the amend was in flight left it nothing to fill.
     /// - An unknown outcome
     ///   ([`OrderError::is_outcome_unknown`](rustrade_execution::error::OrderError::is_outcome_unknown))
     ///   leaves the amend in flight: the `ExecutionManager` looks the order up and answers again.
