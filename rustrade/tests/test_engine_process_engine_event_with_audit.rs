@@ -2644,6 +2644,8 @@ fn test_command_send_cancel_then_open_requests_sends_each_group_whole_or_not_at_
     let untracked = group(&[(known, "sibling"), (unknown, "untracked")]);
     let tracked_id = group(&[(known, "stop")]);
     let claimed = group(&[(known, "exit")]);
+    // Nor is an open under a fresh id on the instrument whose ids an earlier group claimed.
+    let fresh = group(&[(known, "fresh")]);
     let repeated = group(&[(known, "twice"), (known, "twice")]);
 
     let audit = process_with_audit(
@@ -2654,6 +2656,7 @@ fn test_command_send_cancel_then_open_requests_sends_each_group_whole_or_not_at_
             untracked.clone(),
             tracked_id.clone(),
             claimed.clone(),
+            fresh.clone(),
             repeated.clone(),
         ]))),
     );
@@ -2674,17 +2677,23 @@ fn test_command_send_cancel_then_open_requests_sends_each_group_whole_or_not_at_
     };
 
     let sent: Vec<_> = output.sent_iter().cloned().collect();
-    assert_eq!(sent.len(), 1, "{sent:?}");
-    assert_eq!(sent[0].cancels, valid.cancels);
-    let sent_keys: Vec<_> = sent[0].opens.iter().map(|open| &open.key).collect();
-    assert_eq!(
-        sent_keys,
-        valid.opens.iter().map(|open| &open.key).collect::<Vec<_>>()
-    );
-    assert!(
-        sent[0].opens.iter().all(|open| open.state.market.is_some()),
-        "a sent open is stamped with the market"
-    );
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    for (sent, expected) in sent.iter().zip([&valid, &fresh]) {
+        assert_eq!(sent.cancels, expected.cancels);
+        let sent_keys: Vec<_> = sent.opens.iter().map(|open| &open.key).collect();
+        assert_eq!(
+            sent_keys,
+            expected
+                .opens
+                .iter()
+                .map(|open| &open.key)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            sent.opens.iter().all(|open| open.state.market.is_some()),
+            "a sent open is stamped with the market"
+        );
+    }
     let errors: Vec<_> = output
         .errors
         .iter()
@@ -2706,9 +2715,11 @@ fn test_command_send_cancel_then_open_requests_sends_each_group_whole_or_not_at_
         ]
     );
 
-    match execution_rx.rx.try_recv() {
-        Ok(ExecutionRequest::CancelThenOpen(request)) => assert_eq!(request, sent[0]),
-        other => panic!("expected the valid group to be sent as one request, got {other:?}"),
+    for sent in &sent {
+        match execution_rx.rx.try_recv() {
+            Ok(ExecutionRequest::CancelThenOpen(request)) => assert_eq!(&request, sent),
+            other => panic!("expected each valid group to be sent as one request, got {other:?}"),
+        }
     }
     assert!(
         execution_rx.rx.try_recv().is_err(),
@@ -2720,10 +2731,12 @@ fn test_command_send_cancel_then_open_requests_sends_each_group_whole_or_not_at_
         orders[&ClientOrderId::new("stop")].state,
         ActiveOrderState::CancelInFlight(_)
     ));
-    assert!(matches!(
-        orders[&ClientOrderId::new("exit")].state,
-        ActiveOrderState::OpenInFlight(_)
-    ));
+    for open in ["exit", "fresh"] {
+        assert!(matches!(
+            orders[&ClientOrderId::new(open)].state,
+            ActiveOrderState::OpenInFlight(_)
+        ));
+    }
     for refused in ["no-cancels", "sibling", "twice"] {
         assert!(
             !orders.contains_key(&ClientOrderId::new(refused)),

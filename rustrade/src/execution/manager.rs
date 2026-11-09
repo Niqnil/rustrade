@@ -669,8 +669,14 @@ where
                 && in_flight_cancels.is_empty()
                 && in_flight_opens.is_empty()
                 && in_flight_lookups.is_empty()
-                && held_opens.is_empty()
             {
+                // A group is held only while one of its cancels is in flight: its cancels are sent
+                // when it is held, and the answer to its last one releases it. So no in-flight
+                // cancel means no held group, and waiting on one here could only hang.
+                debug_assert!(
+                    held_opens.held.is_empty(),
+                    "a CancelThenOpen group is held with none of its cancels in flight: {held_opens:?}"
+                );
                 // Every response this manager owed has been forwarded. Anything the exchange sent
                 // alongside those responses is already queued on the account side, so take it
                 // before the channel closes.
@@ -1335,11 +1341,6 @@ enum Release {
 }
 
 impl HeldGroups {
-    /// Whether no group's opens are held.
-    fn is_empty(&self) -> bool {
-        self.held.is_empty()
-    }
-
     /// Hold `group`'s opens until its cancels are answered, returning the cancels to send.
     fn hold(&mut self, group: CancelThenOpen<ExchangeIndex, InstrumentIndex>) -> Hold {
         let CancelThenOpen {
