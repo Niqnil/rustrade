@@ -1891,6 +1891,7 @@ mod tests {
             short_put_collateral: Default::default(),
             amend: Default::default(),
             time_in_force: Default::default(),
+            session_close: None,
         }
     }
 
@@ -2667,6 +2668,142 @@ mod tests {
             SimExecutionBuilder::new(&instruments)
                 .add_venue_with_options(margin, options)
                 .is_ok()
+        );
+    }
+
+    /// A session calendar handed in through the options is the venue's: without it a day limit
+    /// order is refused, and with it the order rests.
+    #[test]
+    fn a_session_calendar_in_the_options_lets_the_venue_take_a_day_limit() {
+        use rustrade_instrument::calendar::{DailyClose, Tz};
+
+        let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
+        let day_limit = || OrderRequestOpen {
+            key: OrderKey {
+                exchange: EXCHANGE,
+                instrument: rustrade_instrument::instrument::name::InstrumentNameExchange::new(
+                    "btc_usdt",
+                ),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new("day"),
+            },
+            state: RequestOpen::new(
+                Side::Buy,
+                Some(dec!(100)),
+                dec!(1),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilEndOfDay,
+            ),
+        };
+
+        let mut plain = builder::market_driven_venue(
+            &config(0),
+            SimVenueOptions::default(),
+            &instruments,
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                plain.open_order(day_limit()).response.state,
+                OrderState::Inactive(InactiveOrderState::OpenFailed(_))
+            ),
+            "no calendar, no day limit"
+        );
+
+        let close = DailyClose::new(
+            chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+            "America/New_York".parse::<Tz>().unwrap(),
+        );
+        let options = SimVenueOptions::default().with_session_calendar(Arc::new(close));
+        let mut venue =
+            builder::market_driven_venue(&config(0), options, &instruments, None).unwrap();
+        let rested = venue.open_order(day_limit());
+        assert!(
+            matches!(rested.response.state, OrderState::Active(_)),
+            "{:?}",
+            rested.response.state
+        );
+    }
+
+    /// A calendar in the options replaces the configured close entirely: a seeded day order is
+    /// placed by it, not first by the configured close (which it would then keep). Without one,
+    /// the configured close places it.
+    #[test]
+    fn a_session_calendar_in_the_options_places_seeded_day_orders_over_the_configured_close() {
+        use chrono::{NaiveTime, TimeZone, Utc};
+        use rustrade_execution::{
+            InstrumentAccountSnapshot,
+            client::mock::SessionCalendarConfig,
+            order::{
+                Order,
+                id::{OrderId, VenueOrderId},
+                state::Open,
+            },
+            position::PositionReport,
+        };
+        use rustrade_instrument::{
+            calendar::{DailyClose, Tz},
+            instrument::name::InstrumentNameExchange,
+        };
+
+        let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
+        // Accepted Monday 2026-11-09 at 15:00 UTC.
+        let accepted = Utc.with_ymd_and_hms(2026, 11, 9, 15, 0, 0).unwrap();
+        let mut config = config(0);
+        // 16:00 New York would place it at Monday 21:00 UTC.
+        config.session_close = Some(SessionCalendarConfig::Daily(DailyClose::new(
+            NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+            "America/New_York".parse::<Tz>().unwrap(),
+        )));
+        config.initial_state.instruments = vec![InstrumentAccountSnapshot {
+            instrument: InstrumentNameExchange::new("btc_usdt"),
+            orders: vec![Order {
+                key: OrderKey {
+                    exchange: EXCHANGE,
+                    instrument: InstrumentNameExchange::new("btc_usdt"),
+                    strategy: StrategyId::new("test"),
+                    cid: ClientOrderId::new("seeded"),
+                },
+                side: Side::Buy,
+                price: Some(dec!(100)),
+                quantity: dec!(1),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilEndOfDay,
+                state: OrderState::active(Open::new(
+                    VenueOrderId::Assigned(OrderId::new("seeded")),
+                    accepted,
+                    Decimal::ZERO,
+                )),
+            }],
+            orders_complete: true,
+            position: PositionReport::Unreported,
+            isolated: None,
+        }];
+
+        // With no calendar in the options, the configured close places it.
+        let configured =
+            builder::market_driven_venue(&config, SimVenueOptions::default(), &instruments, None)
+                .unwrap();
+        assert_eq!(
+            configured.next_deadline(),
+            Some(
+                Utc.with_ymd_and_hms(2026, 11, 9, 21, 0, 0).unwrap()
+                    + chrono::TimeDelta::nanoseconds(1)
+            )
+        );
+
+        // 12:00 UTC places it at Tuesday noon, the first close after 15:00 Monday.
+        let noon = DailyClose::new(NaiveTime::from_hms_opt(12, 0, 0).unwrap(), Tz::UTC);
+        let options = SimVenueOptions::default().with_session_calendar(Arc::new(noon));
+        let venue = builder::market_driven_venue(&config, options, &instruments, None).unwrap();
+
+        assert_eq!(
+            venue.next_deadline(),
+            Some(
+                Utc.with_ymd_and_hms(2026, 11, 10, 12, 0, 0).unwrap()
+                    + chrono::TimeDelta::nanoseconds(1)
+            )
         );
     }
 

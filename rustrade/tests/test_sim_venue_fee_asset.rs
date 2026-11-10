@@ -116,6 +116,7 @@ fn venue() -> SimulatedVenue {
         short_put_collateral: Default::default(),
         amend: Default::default(),
         time_in_force: Default::default(),
+        session_close: None,
     };
     let mut venue = SimulatedVenue::new_market_driven(
         &config,

@@ -16,6 +16,7 @@ use itertools::Itertools;
 use rust_decimal::Decimal;
 use rustrade_instrument::{
     asset::name::AssetNameExchange,
+    calendar::CalendarError,
     exchange::ExchangeId,
     instrument::{
         Instrument,
@@ -52,8 +53,10 @@ use thiserror::Error;
 ///
 /// # What it does not hold
 /// - **The configuration**, and the models set by builder methods (holding costs, margin interest,
-///   a fill model, shortability): code, not data. Restore with the configuration and models the
-///   venue ran with. A changed fee model or interest model applies from the restore on.
+///   a fill model, shortability, a session calendar): code, not data. Restore with the
+///   configuration and models the venue ran with. A changed fee model or interest model applies
+///   from the restore on. A changed session calendar applies to day orders accepted after the
+///   restore: one the snapshot holds keeps the deadline it was given, which the snapshot records.
 /// - **The market**: what the venue last observed is stale by the time it is restored. A restored
 ///   venue holds no market until its driver feeds one, so it values and matches nothing before
 ///   then, as a fresh venue does not.
@@ -232,6 +235,12 @@ pub enum VenueRestoreError {
         required: Decimal,
         held: Decimal,
     },
+
+    /// The configuration's [`session_close`](MockExecutionConfig::session_close) cannot place
+    /// the close of a day limit order the snapshot holds with no deadline of its own: one seeded
+    /// through a configured `initial_state` rather than accepted by the venue.
+    #[error("venue snapshot holds a day order whose session close cannot be placed: {0}")]
+    SessionCalendar(#[source] CalendarError),
 }
 
 impl FormatVersion for SimulatedVenueSnapshot {
@@ -391,6 +400,8 @@ impl SimulatedVenue {
     /// - [`VenueRestoreError::OptionShortUnsecurable`] if it holds a short cash-settled call.
     /// - [`VenueRestoreError::OptionCollateralNotHeld`] if its balances do not hold the collateral
     ///   its short options secure.
+    /// - [`VenueRestoreError::SessionCalendar`] if `config`'s session close cannot place the
+    ///   close of a day limit order the snapshot holds with no deadline of its own.
     ///
     /// # Cost
     /// The slippage stream is resumed by drawing again every value the snapshot's venue drew, one
@@ -524,6 +535,9 @@ impl SimulatedVenue {
             );
         }
         venue.check_collateral_held()?;
+        venue
+            .resolve_seeded_deadlines()
+            .map_err(VenueRestoreError::SessionCalendar)?;
         venue.slippage = Slippage::resumed(config.slippage, slippage_draws);
         venue.checkpoint_sequence = checkpoint_sequence;
         venue.refresh_next_charge();

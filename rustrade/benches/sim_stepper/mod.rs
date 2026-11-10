@@ -122,6 +122,7 @@ fn session() -> Session {
         short_put_collateral: Default::default(),
         amend: Default::default(),
         time_in_force: Default::default(),
+        session_close: None,
     };
     let interest = PeriodicMarginInterest::new(TimeDelta::hours(1), DayCount::Act365).with_rates(
         AssetNameExchange::new("btc"),

@@ -123,6 +123,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **New `TimeInForceKind` and `TimeInForce::kind`:** the payload-free spelling of a time in
     force, with post-only as its own kind.
 
+- **The simulated venue takes a day limit order, expiring it when the session closes**
+  (`rustrade-execution`, `rustrade-instrument`, `rustrade`, #905).
+  - **New `MockExecutionConfig::session_close: Option<SessionCalendarConfig>`**, opt-in. Its one
+    variant, `SessionCalendarConfig::Daily(DailyClose)`, is a close time in an IANA time zone,
+    every weekday. Without it, a `GoodUntilEndOfDay` limit order is still refused.
+  - **With it, the venue accepts a day limit order and expires it at the first instant after the
+    next session close.** The deadline is fixed when the order is accepted. An amend does not move
+    it, a snapshot keeps it, and it is kept while the order is held for a fresh market. Something
+    trading at the close itself can still fill the order. An order sent after the close, on a
+    weekend, or before the open expires at the next close. The order keeps reporting
+    `GoodUntilEndOfDay`, and a cancel after expiry is answered `OrderAlreadyExpired`. A marketable
+    day limit that fills in part rests its remainder.
+  - **Known limitations:** no holidays or early closes; no open time, so an order sent after the
+    close can fill on after-hours data; one close for the whole venue.
+  - **New `rustrade_instrument::calendar`:** the `SessionCalendar` trait (`next_close_after`,
+    strictly after, UTC in and out), `CalendarError`, `DailyClose`, `instant_at_local` (local time
+    to UTC, with the daylight-saving rule `DailyAccrual` already used), and a re-export of
+    `chrono_tz::Tz`.
+  - **A calendar of your own:** `SimulatedVenue::with_session_calendar` and
+    `SimVenueOptions::session_calendar` override the configured close. A day order seeded in
+    `initial_state` expires at the close after the instant the live venue accepted it, placed
+    by the options' calendar when one is given.
+  - **New `VenueRestoreError::SessionCalendar`:** a restored snapshot holds a seeded day order whose
+    close the configured calendar cannot place.
+
 ### Changed
 
 - **Breaking: amend in place grows the engine's enums, output and order-tracking traits**
@@ -155,6 +180,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `MockExecutionConfig` has a `time_in_force` field. A struct literal must set it
     (`Default::default()` for no rules), and `MockExecutionConfig::new` takes it as a last
     argument.
+
+- **Breaking: day limit orders on the simulated venue** (`rustrade-execution`,
+  `rustrade-instrument`, #905).
+  - `MockExecutionConfig` has a `session_close` field. A struct literal must set it (`None` for
+    none), and `MockExecutionConfig::new` takes it as a last argument.
+  - `RestingOrder` has a `deadline` field and is `#[non_exhaustive]`: build one with
+    `RestingOrder::new`. `OpenOrders::insert` and `OpenOrders::hold`, and `AccountState::book`
+    and `AccountState::hold`, take a `RestingOrder` instead of an order and its reservation.
+  - `rustrade-instrument` depends on `chrono-tz`.
 
 ### Fixed
 

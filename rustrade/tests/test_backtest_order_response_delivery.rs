@@ -361,6 +361,7 @@ fn args_constant()
             short_put_collateral: Default::default(),
             amend: Default::default(),
             time_in_force: Default::default(),
+            session_close: None,
         })],
         market_data: MarketDataInMemory::new(Arc::new(market_events)),
         summary_interval: Daily,
