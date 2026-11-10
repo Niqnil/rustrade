@@ -1457,6 +1457,29 @@ mod tests {
         assert_eq!(credited.balance, Balance::new(dec!(65), dec!(5)));
     }
 
+    #[test]
+    fn restoring_a_hold_undoes_its_release_even_with_free_below_zero() {
+        let mut account = account_with_usd(dec!(100));
+        account
+            .reserve(&usd(), dec!(60), DateTime::<Utc>::MIN_UTC)
+            .unwrap();
+        let _ = account.charge(&usd(), dec!(-50), DateTime::<Utc>::MIN_UTC);
+        assert_eq!(usd_balance(&account), Balance::new(dec!(50), dec!(-10)));
+
+        let released = account.release(&usd(), dec!(60), DateTime::<Utc>::MIN_UTC);
+        assert_eq!(released.balance, Balance::new(dec!(50), dec!(50)));
+
+        let later = DateTime::<Utc>::MIN_UTC + chrono::TimeDelta::seconds(1);
+        let restored = account.restore_hold(&usd(), dec!(60), later);
+        assert_eq!(
+            restored.balance,
+            Balance::new(dec!(50), dec!(-10)),
+            "held again although free is below the hold"
+        );
+        assert_eq!(restored.time_exchange, later);
+        assert_eq!(usd_balance(&account), Balance::new(dec!(50), dec!(-10)));
+    }
+
     /// A snapshot holding `orders`, as a configured `initial_state` would.
     fn snapshot_of(orders: impl IntoIterator<Item = UnindexedOrder>) -> UnindexedAccountSnapshot {
         let mut orders = orders.into_iter();
