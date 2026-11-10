@@ -2727,7 +2727,8 @@ mod tests {
     }
 
     /// A calendar in the options replaces the configured close entirely: a seeded day order is
-    /// placed by it, not first by the configured close (which it would then keep).
+    /// placed by it, not first by the configured close (which it would then keep). Without one,
+    /// the configured close places it.
     #[test]
     fn a_session_calendar_in_the_options_places_seeded_day_orders_over_the_configured_close() {
         use chrono::{NaiveTime, TimeZone, Utc};
@@ -2779,6 +2780,18 @@ mod tests {
             position: PositionReport::Unreported,
             isolated: None,
         }];
+
+        // With no calendar in the options, the configured close places it.
+        let configured =
+            builder::market_driven_venue(&config, SimVenueOptions::default(), &instruments, None)
+                .unwrap();
+        assert_eq!(
+            configured.next_deadline(),
+            Some(
+                Utc.with_ymd_and_hms(2026, 11, 9, 21, 0, 0).unwrap()
+                    + chrono::TimeDelta::nanoseconds(1)
+            )
+        );
 
         // 12:00 UTC places it at Tuesday noon, the first close after 15:00 Monday.
         let noon = DailyClose::new(NaiveTime::from_hms_opt(12, 0, 0).unwrap(), Tz::UTC);
