@@ -429,6 +429,49 @@ pub enum TimeInForce {
     AtClose,
 }
 
+impl TimeInForce {
+    /// Which kind of time in force this is, without its payload.
+    pub fn kind(&self) -> TimeInForceKind {
+        match self {
+            Self::GoodUntilCancelled { post_only: false } => TimeInForceKind::GoodUntilCancelled,
+            Self::GoodUntilCancelled { post_only: true } => TimeInForceKind::PostOnly,
+            Self::GoodUntilEndOfDay => TimeInForceKind::GoodUntilEndOfDay,
+            Self::FillOrKill => TimeInForceKind::FillOrKill,
+            Self::ImmediateOrCancel => TimeInForceKind::ImmediateOrCancel,
+            Self::GoodTillDate { .. } => TimeInForceKind::GoodTillDate,
+            Self::AtOpen => TimeInForceKind::AtOpen,
+            Self::AtClose => TimeInForceKind::AtClose,
+        }
+    }
+}
+
+/// Which [`TimeInForce`] an order carries, without its payload: the payload-free spelling a venue
+/// uses to declare which ones it takes.
+///
+/// [`TimeInForce::GoodUntilCancelled`] is two kinds here, because a venue that takes a
+/// good-until-cancelled order does not always take a post-only one.
+#[derive(
+    Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize, Display,
+)]
+pub enum TimeInForceKind {
+    /// [`TimeInForce::GoodUntilCancelled`] without `post_only`.
+    GoodUntilCancelled,
+    /// [`TimeInForce::GoodUntilCancelled`] with `post_only`.
+    PostOnly,
+    /// [`TimeInForce::GoodUntilEndOfDay`].
+    GoodUntilEndOfDay,
+    /// [`TimeInForce::FillOrKill`].
+    FillOrKill,
+    /// [`TimeInForce::ImmediateOrCancel`].
+    ImmediateOrCancel,
+    /// [`TimeInForce::GoodTillDate`], whatever its expiry.
+    GoodTillDate,
+    /// [`TimeInForce::AtOpen`].
+    AtOpen,
+    /// [`TimeInForce::AtClose`].
+    AtClose,
+}
+
 impl<ExchangeKey, InstrumentKey> Order<ExchangeKey, InstrumentKey, ActiveOrderState>
 where
     ExchangeKey: Clone,
@@ -504,6 +547,40 @@ impl<ExchangeKey, AssetKey, InstrumentKey> From<Order<ExchangeKey, InstrumentKey
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+
+    #[test]
+    fn a_time_in_force_names_its_kind_and_post_only_is_its_own() {
+        let cases = [
+            (
+                TimeInForce::GoodUntilCancelled { post_only: false },
+                TimeInForceKind::GoodUntilCancelled,
+            ),
+            (
+                TimeInForce::GoodUntilCancelled { post_only: true },
+                TimeInForceKind::PostOnly,
+            ),
+            (
+                TimeInForce::GoodUntilEndOfDay,
+                TimeInForceKind::GoodUntilEndOfDay,
+            ),
+            (TimeInForce::FillOrKill, TimeInForceKind::FillOrKill),
+            (
+                TimeInForce::ImmediateOrCancel,
+                TimeInForceKind::ImmediateOrCancel,
+            ),
+            (
+                TimeInForce::GoodTillDate {
+                    expiry: DateTime::<Utc>::MIN_UTC,
+                },
+                TimeInForceKind::GoodTillDate,
+            ),
+            (TimeInForce::AtOpen, TimeInForceKind::AtOpen),
+            (TimeInForce::AtClose, TimeInForceKind::AtClose),
+        ];
+        for (time_in_force, kind) in cases {
+            assert_eq!(time_in_force.kind(), kind, "{time_in_force}");
+        }
+    }
 
     #[test]
     fn order_kind_display_take_profit() {

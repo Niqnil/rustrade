@@ -135,6 +135,7 @@ fn mock_config(balances: Vec<AssetBalance<AssetNameExchange>>) -> MockExecutionC
         long_option_expiry: Default::default(),
         short_put_collateral: Default::default(),
         amend: Default::default(),
+        time_in_force: Default::default(),
     }
 }
 

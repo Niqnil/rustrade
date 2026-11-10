@@ -5,7 +5,7 @@ use crate::{
     balance::{AssetBalance, MarginDetails},
     borrow_capacity::BorrowCapacity,
     cash_flow::{CashFlow, CashFlowId, CashFlowKind, CashFlowLoan, InterestTiming},
-    client::mock::{AmendConfig, MockExecutionConfig},
+    client::mock::{AmendConfig, MockExecutionConfig, TimeInForceRules},
     error::{
         AmendRefusal, ApiError, BorrowReject, BorrowRejectReason, OrderError, UnindexedApiError,
         UnindexedOrderError,
@@ -595,6 +595,13 @@ pub enum VenueRegime {
 /// | `GoodUntilEndOfDay` | **rejected** | fills |
 /// | `AtOpen` / `AtClose` | **rejected** | **rejected** |
 ///
+/// Every rejection here is [`OrderError::UnsupportedTimeInForce`].
+/// [`MockExecutionConfig::time_in_force`] narrows the table per instrument kind, so the venue also
+/// refuses what the live venue it stands in for refuses: a venue configured as Alpaca takes an
+/// option order only as `GoodUntilEndOfDay` or `GoodUntilCancelled`. A rule cannot widen it:
+/// a `GoodUntilEndOfDay` limit order stays rejected, for want of a session calendar, even where
+/// the live venue takes one.
+///
 /// A market order works only on arrival, which honours every time in force that bounds *how long*
 /// an order works — so most of the table is moot for one. (It fills in full wherever the book has
 /// the size; what it cannot fill is cancelled, since it has no limit price to rest at.) The two
@@ -828,6 +835,9 @@ pub struct SimulatedVenue {
     /// What this venue amends in place. Fixed at construction from
     /// [`MockExecutionConfig::amend`].
     amend: AmendConfig,
+    /// Which time in force each kind of instrument takes. Fixed at construction from
+    /// [`MockExecutionConfig::time_in_force`].
+    time_in_force: TimeInForceRules,
     /// The expiry of every option this venue lists, earliest first. Instruments are fixed at
     /// construction, so this never changes.
     option_expiries: Vec<(DateTime<Utc>, InstrumentNameExchange)>,
@@ -971,6 +981,7 @@ impl SimulatedVenue {
             long_option_expiry: config.long_option_expiry,
             short_put_collateral: config.short_put_collateral,
             amend: config.amend,
+            time_in_force: config.time_in_force.clone(),
             option_expiries,
             next_option_expiry: None,
             option_spots,
@@ -4741,6 +4752,10 @@ impl SimulatedVenue {
             return (build_open_order_err_response(request, error), None);
         }
 
+        if let Err(error) = self.check_time_in_force_rule(&request) {
+            return (build_open_order_err_response(request, error), None);
+        }
+
         // An order for nothing, or for less than nothing, is refused as a venue refuses it. Every
         // path below takes the quantity as positive: a held order, for one, is released only to
         // trade or rest some of it.
@@ -6519,6 +6534,39 @@ impl SimulatedVenue {
     }
 
     /// Whether `instrument` is an option this venue knows.
+    /// Refuses an order whose time in force its instrument's kind does not take under
+    /// [`MockExecutionConfig::time_in_force`], as the live venue would.
+    fn check_time_in_force_rule(
+        &self,
+        request: &OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
+    ) -> Result<(), UnindexedOrderError> {
+        let time_in_force = request.state.time_in_force;
+        let Some(kind) = self
+            .instruments
+            .get(&request.key.instrument)
+            .map(|instrument| instrument.kind.discriminant())
+        else {
+            return Ok(());
+        };
+        match self.time_in_force.accepted(kind) {
+            Some(accepted) if !accepted.contains(&time_in_force.kind()) => {
+                let accepted = accepted
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(UnindexedOrderError::unsupported_time_in_force(
+                    time_in_force,
+                    format!(
+                        "{} takes only {accepted} for {kind} orders",
+                        request.key.exchange
+                    ),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn is_option(&self, instrument: &InstrumentNameExchange) -> bool {
         self.instruments
             .get(instrument)
@@ -6958,10 +7006,10 @@ fn clamp_to_limit(side: Side, price: Decimal, limit: Decimal) -> Decimal {
 /// a promise never to take liquidity is one a market order cannot keep.
 ///
 /// # Errors
-/// Returns [`ApiError::OrderRejected`] naming what it would take to honour the pair. Rejecting is
-/// the point: treating an unsupported time in force as `GoodUntilCancelled` would silently leave an
-/// order working that its sender asked to have cancelled, and treating an unsupported one as
-/// "fill now" answers a question the sender did not ask.
+/// Returns [`OrderError::UnsupportedTimeInForce`] naming what it would take to honour the pair.
+/// Rejecting is the point: treating an unsupported time in force as `GoodUntilCancelled` would
+/// silently leave an order working that its sender asked to have cancelled, and treating an
+/// unsupported one as "fill now" answers a question the sender did not ask.
 fn validate_time_in_force_supported(
     order_kind: OrderKind,
     time_in_force: TimeInForce,
@@ -6996,12 +7044,13 @@ fn validate_time_in_force_supported(
         (_, _) => return Ok(()),
     };
 
-    Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+    Err(UnindexedOrderError::unsupported_time_in_force(
+        time_in_force,
         format!(
-            "SimulatedVenue does not support TimeInForce::{time_in_force} on \
-             OrderKind::{order_kind:?}: it does not model {missing}"
+            "SimulatedVenue cannot honour it on OrderKind::{order_kind:?}: it does not model \
+             {missing}"
         ),
-    )))
+    ))
 }
 
 /// What a supported time in force makes one arriving order do.
@@ -8588,6 +8637,7 @@ mod tests {
             Default::default(),
             Default::default(),
             Default::default(),
+            Default::default(),
         );
         let mut venue = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
         assert_eq!(cfd_position(&venue), Some((d("-1"), Some(d("5000")))));
@@ -8631,6 +8681,7 @@ mod tests {
             crate::fill::StaleMarketPolicy::default(),
             None,
             None,
+            Default::default(),
             Default::default(),
             Default::default(),
             Default::default(),
@@ -11414,13 +11465,20 @@ mod tests {
                 "{time_in_force} must not rest"
             );
             match outcome.response.state {
-                OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
-                    ApiError::OrderRejected(ref reason),
-                ))) => assert!(
-                    reason.contains("does not model"),
-                    "the rejection must say what is missing, got: {reason}"
-                ),
-                ref other => panic!("{time_in_force} must be rejected, got: {other:?}"),
+                OrderState::Inactive(InactiveOrderState::OpenFailed(
+                    OrderError::UnsupportedTimeInForce {
+                        time_in_force: refused,
+                        ref reason,
+                        ..
+                    },
+                )) => {
+                    assert_eq!(refused, time_in_force);
+                    assert!(
+                        reason.contains("does not model"),
+                        "the refusal must say what is missing, got: {reason}"
+                    );
+                }
+                ref other => panic!("{time_in_force} must be refused, got: {other:?}"),
             }
         }
     }
@@ -11479,13 +11537,20 @@ mod tests {
                 "{time_in_force} must move no balance"
             );
             match outcome.response.state {
-                OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
-                    ApiError::OrderRejected(ref reason),
-                ))) => assert!(
-                    reason.contains("does not model"),
-                    "the rejection must say what is missing, got: {reason}"
-                ),
-                ref other => panic!("{time_in_force} must be rejected, got: {other:?}"),
+                OrderState::Inactive(InactiveOrderState::OpenFailed(
+                    OrderError::UnsupportedTimeInForce {
+                        time_in_force: refused,
+                        ref reason,
+                        ..
+                    },
+                )) => {
+                    assert_eq!(refused, time_in_force);
+                    assert!(
+                        reason.contains("does not model"),
+                        "the refusal must say what is missing, got: {reason}"
+                    );
+                }
+                ref other => panic!("{time_in_force} must be refused, got: {other:?}"),
             }
         }
     }

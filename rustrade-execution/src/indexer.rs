@@ -753,6 +753,13 @@ impl AccountEventIndexer {
             UnindexedOrderError::UnsupportedMarginEffect(effect) => {
                 OrderError::UnsupportedMarginEffect(effect)
             }
+            UnindexedOrderError::UnsupportedTimeInForce {
+                time_in_force,
+                reason,
+            } => OrderError::UnsupportedTimeInForce {
+                time_in_force,
+                reason,
+            },
             UnindexedOrderError::AmendRefused(refusal) => OrderError::AmendRefused(refusal),
         }
     }

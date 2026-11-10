@@ -11,7 +11,10 @@
 //! it over pattern matching on specific variants, as the internal taxonomy may
 //! evolve while `is_transient()` semantics remain stable.
 
-use crate::{margin::MarginEffect, order::id::ClientOrderId};
+use crate::{
+    margin::MarginEffect,
+    order::{TimeInForce, id::ClientOrderId},
+};
 use derive_more::{Constructor, Display};
 use rust_decimal::Decimal;
 use rustrade_instrument::{
@@ -605,6 +608,21 @@ pub enum OrderError<AssetKey = AssetIndex, InstrumentKey = InstrumentIndex> {
     #[error("unsupported margin effect: {0:?}")]
     UnsupportedMarginEffect(MarginEffect),
 
+    /// The order's [`TimeInForce`] is one this client or venue does not take for it, so the order
+    /// was refused without being sent.
+    ///
+    /// Non-transient — place the order with a time in force that is taken. `reason` says which
+    /// ones are, or what honouring this one would need. A client refuses rather than sending a
+    /// nearer time in force in its place, which would leave the order working longer, or shorter,
+    /// than its sender asked. Built with
+    /// [`OrderError::unsupported_time_in_force`].
+    #[error("unsupported time in force {time_in_force}: {reason}")]
+    #[non_exhaustive]
+    UnsupportedTimeInForce {
+        time_in_force: TimeInForce,
+        reason: String,
+    },
+
     /// An amend refused without being sent, or by the venue for a reason given in
     /// [`AmendRefusal`]: the order is unchanged.
     ///
@@ -925,7 +943,20 @@ impl<AssetKey, InstrumentKey> OrderError<AssetKey, InstrumentKey> {
             | Self::InvalidPrecision(_)
             | Self::OutOfBounds(_)
             | Self::UnsupportedMarginEffect(_)
+            | Self::UnsupportedTimeInForce { .. }
             | Self::AmendRefused(_) => false,
+        }
+    }
+
+    /// [`UnsupportedTimeInForce`](Self::UnsupportedTimeInForce): `time_in_force` is not taken, for
+    /// the `reason` given.
+    pub fn unsupported_time_in_force(
+        time_in_force: TimeInForce,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::UnsupportedTimeInForce {
+            time_in_force,
+            reason: reason.into(),
         }
     }
 

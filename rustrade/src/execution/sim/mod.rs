@@ -1890,6 +1890,7 @@ mod tests {
             long_option_expiry: Default::default(),
             short_put_collateral: Default::default(),
             amend: Default::default(),
+            time_in_force: Default::default(),
         }
     }
 
@@ -3498,6 +3499,7 @@ mod tests {
         let mut harness = Harness::with_config(
             MockExecutionConfig {
                 amend: rustrade_execution::client::mock::AmendConfig::NONE,
+                time_in_force: Default::default(),
                 ..config(0)
             },
             vec![
