@@ -240,7 +240,7 @@ pub enum VenueRestoreError {
     /// the close of a day limit order the snapshot holds with no deadline of its own: one seeded
     /// through a configured `initial_state` rather than accepted by the venue.
     #[error("venue snapshot holds a day order whose session close cannot be placed: {0}")]
-    SessionCalendar(CalendarError),
+    SessionCalendar(#[source] CalendarError),
 }
 
 impl FormatVersion for SimulatedVenueSnapshot {

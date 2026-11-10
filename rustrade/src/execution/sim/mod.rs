@@ -2726,6 +2726,74 @@ mod tests {
         );
     }
 
+    /// A calendar in the options replaces the configured close entirely: a seeded day order is
+    /// placed by it, not first by the configured close (which it would then keep).
+    #[test]
+    fn a_session_calendar_in_the_options_places_seeded_day_orders_over_the_configured_close() {
+        use chrono::{NaiveTime, TimeZone, Utc};
+        use rustrade_execution::{
+            InstrumentAccountSnapshot,
+            client::mock::SessionCalendarConfig,
+            order::{
+                Order,
+                id::{OrderId, VenueOrderId},
+                state::Open,
+            },
+            position::PositionReport,
+        };
+        use rustrade_instrument::{
+            calendar::{DailyClose, Tz},
+            instrument::name::InstrumentNameExchange,
+        };
+
+        let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
+        // Accepted Monday 2026-11-09 at 15:00 UTC.
+        let accepted = Utc.with_ymd_and_hms(2026, 11, 9, 15, 0, 0).unwrap();
+        let mut config = config(0);
+        // 16:00 New York would place it at Monday 21:00 UTC.
+        config.session_close = Some(SessionCalendarConfig::Daily(DailyClose::new(
+            NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+            "America/New_York".parse::<Tz>().unwrap(),
+        )));
+        config.initial_state.instruments = vec![InstrumentAccountSnapshot {
+            instrument: InstrumentNameExchange::new("btc_usdt"),
+            orders: vec![Order {
+                key: OrderKey {
+                    exchange: EXCHANGE,
+                    instrument: InstrumentNameExchange::new("btc_usdt"),
+                    strategy: StrategyId::new("test"),
+                    cid: ClientOrderId::new("seeded"),
+                },
+                side: Side::Buy,
+                price: Some(dec!(100)),
+                quantity: dec!(1),
+                kind: OrderKind::Limit,
+                time_in_force: TimeInForce::GoodUntilEndOfDay,
+                state: OrderState::active(Open::new(
+                    VenueOrderId::Assigned(OrderId::new("seeded")),
+                    accepted,
+                    Decimal::ZERO,
+                )),
+            }],
+            orders_complete: true,
+            position: PositionReport::Unreported,
+            isolated: None,
+        }];
+
+        // 12:00 UTC places it at Tuesday noon, the first close after 15:00 Monday.
+        let noon = DailyClose::new(NaiveTime::from_hms_opt(12, 0, 0).unwrap(), Tz::UTC);
+        let options = SimVenueOptions::default().with_session_calendar(Arc::new(noon));
+        let venue = builder::market_driven_venue(&config, options, &instruments, None).unwrap();
+
+        assert_eq!(
+            venue.next_deadline(),
+            Some(
+                Utc.with_ymd_and_hms(2026, 11, 10, 12, 0, 0).unwrap()
+                    + chrono::TimeDelta::nanoseconds(1)
+            )
+        );
+    }
+
     /// A configured opening balance stamped before the session start must not arrive behind the
     /// clock.
     ///

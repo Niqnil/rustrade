@@ -617,7 +617,9 @@ pub enum VenueRegime {
 ///   after Friday's close expires at Monday's. The venue knows no open time, so such an order works
 ///   at once and can fill on after-hours data that a live venue would hold until the next open.
 /// - **A seeded day order** (one in `initial_state`) expires at the close after the instant the
-///   live venue accepted it, its [`Open::time_exchange`], which may already have passed.
+///   live venue accepted it, its [`Open::time_exchange`], which may already have passed. The
+///   venue does not refuse one when it has no calendar, since the live venue already accepted
+///   it, but then it has no deadline and works until cancelled.
 /// - The configured [`DailyClose`](rustrade_instrument::calendar::DailyClose) knows no holidays
 ///   or early closes, and there is one calendar for the whole venue: see
 ///   [`SessionCalendarConfig`]'s known limitations.
@@ -1095,7 +1097,9 @@ impl SimulatedVenue {
     ///
     /// A day limit order seeded through `initial_state` is given the close after the instant the
     /// live venue accepted it (its [`Open::time_exchange`]), unless it already has one. An order
-    /// already given a deadline keeps it: a deadline is fixed when it is resolved.
+    /// already given a deadline keeps it, since a deadline is fixed when it is resolved, so one the
+    /// configured `session_close` already placed keeps that close. To have `calendar` place every
+    /// seeded order, build the venue from a configuration with no `session_close`.
     ///
     /// # Errors
     /// The [`CalendarError`] of the first seeded day order, by client order id, that `calendar`
@@ -1246,11 +1250,12 @@ impl SimulatedVenue {
     ///
     /// # Deadlines are swept from here and from [`apply_market`](Self::apply_market), never on a
     /// clock of their own
-    /// A [`TimeInForce::GoodTillDate`] order must stop working at the instant it says, not at
-    /// whenever the next market tick happens to arrive -- otherwise a cancel sent after the
-    /// nominal deadline would succeed against an order that should already have been retired, and
-    /// an instrument that stops ticking would hold its expired orders open indefinitely. So both
-    /// of this venue's inputs sweep.
+    /// A [`TimeInForce::GoodTillDate`] order, or a day order (see the type's "A day order lives
+    /// until the session closes"), must stop working at its deadline, not at whenever the next
+    /// market tick happens to arrive -- otherwise a cancel sent after the nominal deadline would
+    /// succeed against an order that should already have been retired, and an instrument that
+    /// stops ticking would hold its expired orders open indefinitely. So both of this venue's
+    /// inputs sweep.
     ///
     /// The sweep is **not** scoped to any instrument: a deadline is a property of the clock, not of
     /// a book. An order on a quiet instrument is retired by activity anywhere on the venue.
@@ -2468,7 +2473,8 @@ impl SimulatedVenue {
     ///
     /// A request placed after a market tick, without an `advance_time` in between, is therefore
     /// stamped at that tick, and an order whose [`GoodTillDate`](TimeInForce::GoodTillDate)
-    /// deadline the tick reached expires on arrival rather than resting.
+    /// deadline the tick reached expires on arrival rather than resting. The clock also judges a
+    /// resting day order's deadline.
     pub fn time_exchange(&self) -> DateTime<Utc> {
         self.time_exchange_latest
     }
@@ -4288,8 +4294,9 @@ impl SimulatedVenue {
     ///   balance is restamped.
     /// - For an order the venue no longer holds, the reason a cancel would give: see
     ///   [`cancel_order`](Self::cancel_order). An order whose
-    ///   [`GoodTillDate`](TimeInForce::GoodTillDate) deadline the venue has reached was retired
-    ///   when the clock reached it, so its amend is answered [`ApiError::OrderAlreadyExpired`].
+    ///   [`GoodTillDate`](TimeInForce::GoodTillDate) or day deadline the venue has reached was
+    ///   retired when the clock reached it, so its amend is answered
+    ///   [`ApiError::OrderAlreadyExpired`].
     ///
     /// # Panics
     /// If the configured [`MarginInterestModel`] breaks its contract with a boundary not after

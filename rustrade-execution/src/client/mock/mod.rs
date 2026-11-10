@@ -172,9 +172,11 @@ pub struct MockExecutionConfig {
 ///   an instrument that trades around the clock gets the same close. Refuse a day order where the
 ///   live venue refuses one with [`MockExecutionConfig::time_in_force`].
 ///
-/// `#[non_exhaustive]`, so other sources of a close can be added without breaking a caller.
+/// `#[non_exhaustive]`, so other sources of a close can be added without breaking a caller. Not
+/// `Copy`, so that such a source may hold a list of dates; `Ord` and `Hash` are what
+/// [`MockExecutionConfig`] requires.
 #[non_exhaustive]
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionCalendarConfig {
     /// One close time in a time zone, every weekday: see [`DailyClose`].

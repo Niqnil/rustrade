@@ -67,8 +67,10 @@ pub struct SimVenueOptions {
     pub margin_interest: Option<Arc<dyn MarginInterestModel>>,
     /// When the venue's trading sessions close, in place of the configuration's
     /// [`session_close`](MockExecutionConfig::session_close) — see
-    /// [`SimulatedVenue::with_session_calendar`]. `None` uses the configured one, if any. With
-    /// neither, the venue refuses a day limit order.
+    /// [`SimulatedVenue::with_session_calendar`]. It replaces the configured close entirely: a day
+    /// order seeded in the configuration or held in a restored snapshot is placed by it, and the
+    /// configured close is never asked. `None` uses the configured one, if any. With neither, the
+    /// venue refuses a day limit order.
     pub session_calendar: Option<Arc<dyn SessionCalendar>>,
 }
 
@@ -152,6 +154,20 @@ pub(crate) fn market_driven_venue(
              account takes no loans to charge"
         )));
     }
+
+    // A calendar in the options replaces the configured close, so the venue is built without the
+    // latter: otherwise it would already have placed the seeded day orders, which keep the
+    // deadline they are first given.
+    let without_close;
+    let config = if session_calendar.is_some() && config.session_close.is_some() {
+        without_close = MockExecutionConfig {
+            session_close: None,
+            ..config.clone()
+        };
+        &without_close
+    } else {
+        config
+    };
 
     let venue_instruments = generate_mock_exchange_instruments(instruments, exchange);
     let venue = match restore {

@@ -143,7 +143,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `chrono_tz::Tz`.
   - **A calendar of your own:** `SimulatedVenue::with_session_calendar` and
     `SimVenueOptions::session_calendar` override the configured close. A day order seeded in
-    `initial_state` expires at the close after the instant the live venue accepted it.
+    `initial_state` expires at the close after the instant the live venue accepted it, placed
+    by the options' calendar when one is given.
   - **New `VenueRestoreError::SessionCalendar`:** a restored snapshot holds a seeded day order whose
     close the configured calendar cannot place.
 
@@ -184,9 +185,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rustrade-instrument`, #905).
   - `MockExecutionConfig` has a `session_close` field. A struct literal must set it (`None` for
     none), and `MockExecutionConfig::new` takes it as a last argument.
-  - `RestingOrder` has a `deadline` field. `OpenOrders::insert` and `OpenOrders::hold`, and
-    `AccountState::book` and `AccountState::hold`, take a `RestingOrder` (build one with
-    `RestingOrder::new`) instead of an order and its reservation.
+  - `RestingOrder` has a `deadline` field and is `#[non_exhaustive]`: build one with
+    `RestingOrder::new`. `OpenOrders::insert` and `OpenOrders::hold`, and `AccountState::book`
+    and `AccountState::hold`, take a `RestingOrder` instead of an order and its reservation.
   - `rustrade-instrument` depends on `chrono-tz`.
 
 ### Fixed

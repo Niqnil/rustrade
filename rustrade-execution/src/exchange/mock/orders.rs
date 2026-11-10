@@ -79,6 +79,10 @@ impl Reservation {
 /// The two are one value rather than two collections because they have exactly one lifetime: an
 /// order that leaves the book takes its reservation with it, and a reservation that outlives its
 /// order is held against nothing.
+///
+/// `#[non_exhaustive]`, so what the venue keeps about a resting order can grow without breaking
+/// a caller: build one with [`new`](Self::new).
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct RestingOrder {
     pub order: OpenOrder,
@@ -1480,5 +1484,23 @@ mod tests {
 
         assert_eq!(result, Err("a"));
         assert_eq!(open.next_expiry(), None, "b is never asked");
+    }
+
+    /// A resting order written before it had a deadline of its own reads back with none, and
+    /// one with no deadline is written without the field, so a snapshot holding no day order
+    /// keeps its earlier shape.
+    #[test]
+    fn a_resting_order_without_a_deadline_field_reads_back_with_none() {
+        let plain = RestingOrder::new(order("a", Side::Buy, Some(dec!(97)), 1_000), None);
+        let json = serde_json::to_value(&plain).unwrap();
+        assert_eq!(
+            json.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["order", "reservation"]
+        );
+        assert_eq!(serde_json::from_value::<RestingOrder>(json).unwrap(), plain);
+
+        let dated = plain.with_deadline(Some(at(3_000)));
+        let json = serde_json::to_string(&dated).unwrap();
+        assert_eq!(serde_json::from_str::<RestingOrder>(&json).unwrap(), dated);
     }
 }
