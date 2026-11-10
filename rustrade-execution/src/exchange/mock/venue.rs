@@ -16012,6 +16012,53 @@ mod tests {
         );
     }
 
+    /// A held limit order released in part pays a ticket and a minimum per order on its fill, and
+    /// its remainder holds, and is charged, only what the whole order adds to them.
+    #[test]
+    fn a_held_limit_order_filled_in_part_pays_a_per_order_fee_once() {
+        let config = MockExecutionConfig {
+            stale_market: StaleMarketPolicy::Wait { max_age: MAX_AGE },
+            fee_model: FeeModelConfig::Composite(
+                CompositeFeeModel::new(vec![
+                    FeeComponent::new(FeeBasis::PerOrder(d("5"))),
+                    FeeComponent::new(FeeBasis::PerContract(d("1"))).with_min_per_order(d("2")),
+                ])
+                .unwrap(),
+            ),
+            ..margin_config("0", "1000", "2")
+        };
+        let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+        advance(&mut venue, time(1));
+        assert!(observe(&mut venue, 1, traded("100")).is_empty());
+        advance(&mut venue, time(12));
+        let _ = venue.open_order(gtc_limit("waiting", Side::Buy, "1.5", "100"));
+
+        // 0.5 fills at 80 for 40 and a fee of 7; the remaining 1 rests at 100, holding no fee.
+        let events = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("79", "80"))
+                .with_depth(MarketDepth::new(Some(d("1")), Some(d("0.5")))),
+            time(20),
+        );
+        let fill = trade_of(sans_debt(&events)[2]);
+        assert_eq!((fill.quantity, fill.fees.fees), (d("0.5"), d("7")));
+        let quote_now = venue.balances(&[quote()])[0].balance;
+        assert_eq!(
+            (quote_now.total, quote_now.free),
+            (d("953"), d("853")),
+            "the remainder holds its 100 and no second ticket or minimum"
+        );
+
+        let events = venue.apply_market(
+            &instrument_name(),
+            MarketObservation::new(book("100", "100")),
+            time(21),
+        );
+        assert_eq!(trades_in(&events)[0].fees.fees, Decimal::ZERO);
+        let quote_now = venue.balances(&[quote()])[0].balance;
+        assert_eq!((quote_now.total, quote_now.free), (d("853"), d("853")));
+    }
+
     #[test]
     fn cancelling_a_released_remainder_repays_only_its_own_loan_and_not_one_already_owed() {
         // Owing 20 USDT already, the account has 100 of its own and 120 to spend.
