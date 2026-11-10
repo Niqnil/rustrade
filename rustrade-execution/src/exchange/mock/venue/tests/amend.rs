@@ -825,6 +825,37 @@ fn on_a_stale_market_a_price_amend_is_refused_and_a_quantity_amend_is_made() {
 }
 
 #[test]
+fn on_a_stale_market_an_amend_of_an_order_the_market_crosses_is_refused() {
+    let mut venue = SimulatedVenue::new_market_driven(&stale_config(MAX_AGE), spot_instruments());
+    advance(&mut venue, time(1));
+    // Only 0.4 offered at 100: a buy of 1 at 101 takes it, and the rest stays crossing the book.
+    assert!(
+        venue
+            .apply_market(
+                &instrument_name(),
+                MarketObservation::new(book("90", "100"))
+                    .with_depth(MarketDepth::new(None, Some(d("0.4")))),
+                time(1),
+            )
+            .is_empty()
+    );
+    let rested = venue.open_order(limit_request("crossing", Side::Buy, "1", "101", gtc()));
+    assert_eq!(rested_open(&rested).filled_quantity, d("0.4"));
+    advance(&mut venue, time(12));
+    let before = resting(&venue, "crossing");
+    let free = free_quote(&venue);
+
+    // Either would trade against a market the venue no longer trusts.
+    for patch in [quantity("2"), quantity("0.8")] {
+        let outcome = amend(&mut venue, "crossing", patch);
+        assert_venue_refusal(&outcome);
+        assert!(outcome.events.is_empty(), "{:?}", outcome.events);
+    }
+    assert_eq!(resting(&venue, "crossing"), before);
+    assert_eq!(free_quote(&venue), free);
+}
+
+#[test]
 fn a_market_order_held_for_its_next_bar_is_not_amended() {
     let config = MockExecutionConfig {
         market_order_timing: MarketOrderTiming::NextBar(NextBarPrice::Open),

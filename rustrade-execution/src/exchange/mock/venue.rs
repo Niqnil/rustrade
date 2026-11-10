@@ -4139,8 +4139,9 @@ impl SimulatedVenue {
     ///   post-only order whose new price the market crosses.
     /// - [`AmendRefusal::Venue`] for an order the venue holds for a later bar or a fresh market,
     ///   one seeded through [`MockExecutionConfig::initial_state`] (the venue took nothing for it
-    ///   to recommit), an option order, and a price amend on a market that is stale under
-    ///   [`StaleMarketPolicy::Wait`]. A quantity-only amend on a stale market is made.
+    ///   to recommit), an option order, and, on a market that is stale under
+    ///   [`StaleMarketPolicy::Wait`], a price amend or an amend of an order the market crosses.
+    ///   A quantity-only amend of an order the stale market does not reach is made.
     /// - The shortability check an arriving CFD sell gets, for an amend that raises a sell's
     ///   quantity or reprices it to cross the market.
     /// - [`ApiError::BalanceInsufficient`], or a borrow limit, as for an arriving order, when the
@@ -4252,23 +4253,26 @@ impl SimulatedVenue {
         let repriced = amended.price != order.price;
         let raised = amended.quantity > order.quantity;
 
-        // A price amend is decided against the market, which a stale one cannot be trusted to
-        // show. A quantity-only amend leaves the order where it was decided.
-        if repriced
-            && let StaleMarketPolicy::Wait { max_age } = self.stale_market
-            && let MarketAge::Stale(_) = self.market_age(instrument, max_age, time_exchange)
-        {
-            return Err(refuse(format!(
-                "{instrument}'s market is stale under StaleMarketPolicy::Wait, and a price amend \
-                 is decided against it"
-            )));
-        }
-
         let market = self
             .market(instrument)
             .map(|market| market.snapshot)
             .unwrap_or_default();
         let marketable = crosses(order.side, limit, &market);
+
+        // A price amend, and any amend of an order the market crosses, is decided against the
+        // market, which a stale one cannot be trusted to show: an arriving order is held instead.
+        // A quantity-only amend of an order the market does not reach trades nothing, so it is
+        // made.
+        if (repriced || marketable)
+            && let StaleMarketPolicy::Wait { max_age } = self.stale_market
+            && let MarketAge::Stale(_) = self.market_age(instrument, max_age, time_exchange)
+        {
+            return Err(refuse(format!(
+                "{instrument}'s market is stale under StaleMarketPolicy::Wait, and an amend that \
+                 reprices or trades is decided against it"
+            )));
+        }
+
         let post_only = matches!(
             order.time_in_force,
             TimeInForce::GoodUntilCancelled { post_only: true }

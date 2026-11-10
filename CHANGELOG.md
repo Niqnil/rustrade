@@ -82,8 +82,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     - a post-only order whose new price would cross the market: the new
       `AmendRefusal::WouldTakeLiquidity`;
     - with `AmendRefusal::Venue`: an order held for a later bar or a fresh market, an order seeded
-      through `initial_state`, an option order, and a price amend on a market that is stale under
-      `StaleMarketPolicy::Wait` (a quantity-only amend is made);
+      through `initial_state`, an option order, and, on a market that is stale under
+      `StaleMarketPolicy::Wait`, an amend that reprices the order or would trade (a quantity-only
+      amend of an order the market does not reach is made);
     - an amend raising a CFD sell, or repricing it through the market, that the configured
       shortability does not allow, measured with the order's own old quantity left out.
     - The venue checks an amend against the order as it holds it, not the order its sender
