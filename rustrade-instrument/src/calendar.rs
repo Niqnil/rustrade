@@ -150,9 +150,10 @@ impl SessionCalendar for DailyClose {
 
 /// The instant at local `time` on local `date` in `zone`.
 ///
-/// A local time that falls in a daylight-saving gap does not exist, so it is taken at the first
-/// local time after the gap, to the minute. One that falls in an overlap exists twice, so it is
-/// taken the first time. `None` only if the instant is out of range.
+/// A local time that falls in a gap (a daylight-saving change, or a zone skipping a day) does
+/// not exist, so it is taken at the first local time after the gap, to the minute. One that falls
+/// in an overlap exists twice, so it is taken the first time. `None` only if the instant is out
+/// of range.
 pub fn instant_at_local<Z: TimeZone>(
     zone: &Z,
     date: NaiveDate,
@@ -160,7 +161,8 @@ pub fn instant_at_local<Z: TimeZone>(
 ) -> Option<DateTime<Utc>> {
     let local = date.and_time(time);
 
-    // A daylight-saving gap is at most a few hours wide; step past it a minute at a time.
+    // A gap is at most a day wide (a daylight-saving change is an hour or so; a zone that moved
+    // across the date line skipped a whole day); step past it a minute at a time.
     (0..=24 * 60).find_map(|minutes| {
         zone.from_local_datetime(&local.checked_add_signed(TimeDelta::minutes(minutes))?)
             .earliest()
@@ -169,6 +171,7 @@ pub fn instant_at_local<Z: TimeZone>(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)] // Test code: panics on bad input are acceptable
 mod tests {
     use super::*;
     use chrono_tz::{America::New_York, Europe::London};
@@ -289,6 +292,15 @@ mod tests {
             instant_at_local(&London, overlap, at(16, 30)),
             Some(utc(2026, 10, 25, 16, 30, 0))
         );
+        // Samoa moved across the date line by skipping Friday 2011-12-30 whole: from midnight
+        // that day, the first local time that exists is a full day later, 00:00 +14:00 on the
+        // 31st.
+        let skipped = NaiveDate::from_ymd_opt(2011, 12, 30).unwrap();
+        assert_eq!(
+            instant_at_local(&chrono_tz::Pacific::Apia, skipped, at(0, 0)),
+            Some(utc(2011, 12, 30, 10, 0, 0)),
+            "a gap a whole day wide is still stepped past"
+        );
     }
 
     #[test]
@@ -340,5 +352,6 @@ mod tests {
         assert!(london > close, "Europe/London sorts after America/New_York");
         assert!(DailyClose::new(at(15, 0), London) < close);
         assert_eq!(close.cmp(&close), Ordering::Equal);
+        assert_eq!((london.close(), london.zone()), (at(16, 0), London));
     }
 }

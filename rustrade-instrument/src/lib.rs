@@ -52,8 +52,8 @@ pub mod instrument;
 /// indexing non-indexed collections.
 pub mod index;
 
-/// When a market's trading sessions close: [`SessionCalendar`](calendar::SessionCalendar) and
-/// the fixed weekday rule [`DailyClose`](calendar::DailyClose).
+// Documented in the module itself: an outer doc comment here would resolve its intra-doc links
+// from the crate root.
 pub mod calendar;
 
 /// Corporate-action market facts (e.g. stock splits) and date-resolution helpers.
