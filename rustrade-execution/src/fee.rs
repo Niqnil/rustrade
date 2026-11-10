@@ -88,7 +88,8 @@ impl FeeInput {
 /// the fee of `q1` after `p` filled plus the fee of `q2` after `p + q1` filled must equal the fee
 /// of `q1 + q2` after `p` filled. The simulated venue relies on this. It reserves an order's
 /// remaining fee in one amount when the order rests, and charges it fill by fill. Every model in
-/// this module meets it.
+/// this module meets it at one price. A bounded [`Notional`](FeeBasis::Notional) component, with
+/// an order that fills at several prices, only approximates it (see [`FeeComponent`]).
 pub trait FeeModel {
     /// The fee of the fill `input` describes. Negative is a rebate.
     fn compute_fee(&self, input: &FeeInput) -> Decimal;
@@ -111,7 +112,7 @@ impl FeeModel for ZeroFeeModel {
 /// `total_fee = commission_per_contract * quantity.abs()`
 ///
 /// This matches the typical Alpaca/IBKR per-contract options pricing.
-/// `contract_size` is accepted but not used; the fee is per contract unit,
+/// The input's `contract_size` is not used; the fee is per contract unit,
 /// not per underlying share.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct PerContractFeeModel {
@@ -120,8 +121,9 @@ pub struct PerContractFeeModel {
 }
 
 impl FeeModel for PerContractFeeModel {
-    /// `liquidity` is ignored: a per-contract commission is a flat brokerage charge, and the
-    /// brokers this models (Alpaca, IBKR options) do not vary it by who supplied liquidity.
+    /// The input's `liquidity` is ignored: a per-contract commission is a flat brokerage charge,
+    /// and the brokers this models (Alpaca, IBKR options) do not vary it by who supplied
+    /// liquidity.
     fn compute_fee(&self, input: &FeeInput) -> Decimal {
         self.commission_per_contract * input.quantity.abs()
     }
@@ -232,7 +234,8 @@ pub enum FeeBasis {
 impl FeeBasis {
     /// The charge for an order that has filled `filled` contracts in total, at `input`'s price.
     ///
-    /// `filled` is above zero: [`FeeComponent::bounded`] charges an order that has filled nothing
+    /// For a [`PerOrder`](Self::PerOrder) basis, `filled` is above zero: such a component is
+    /// charged through [`FeeComponent::bounded`], which charges an order that has filled nothing
     /// nothing, without asking the basis.
     fn charge(&self, input: &FeeInput, filled: Decimal) -> Decimal {
         match *self {
@@ -264,7 +267,14 @@ impl FeeBasis {
 /// - What had filled before is valued at this fill's price, which matters only for a
 ///   [`Notional`](FeeBasis::Notional) basis with bounds, when an order fills at several prices.
 /// - The bounds count the order's whole filled quantity, including fills a side or liquidity
-///   filter excludes.
+///   filter excludes. So a [`PerOrder`](FeeBasis::PerOrder) charge, or a minimum, limited to one
+///   side or liquidity is charged only if the order's first fill is on it: a ticket on maker fills
+///   is never charged to an order whose first fill took liquidity. The engine prices every fill
+///   as taker.
+///
+/// # Validation
+/// A component charges only as part of a [`CompositeFeeModel`], which refuses one whose minimum
+/// exceeds its maximum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 pub struct FeeComponent {
     basis: FeeBasis,
@@ -359,6 +369,14 @@ impl FeeComponent {
         self.max_per_order
     }
 
+    /// Whether the component charges a fill its quantity times one contract's charge, whatever
+    /// its order filled before: neither per order nor bounded per order.
+    fn is_linear(&self) -> bool {
+        !matches!(self.basis, FeeBasis::PerOrder(_))
+            && self.min_per_order.is_none()
+            && self.max_per_order.is_none()
+    }
+
     /// The bounded charge for an order that has filled `filled` contracts in total.
     fn bounded(&self, input: &FeeInput, filled: Decimal) -> Decimal {
         if filled.is_zero() {
@@ -368,9 +386,9 @@ impl FeeComponent {
         let charge = self.min_per_order.map_or(charge, |min| charge.max(min));
         self.max_per_order.map_or(charge, |max| charge.min(max))
     }
-}
 
-impl FeeModel for FeeComponent {
+    /// The component's charge for the fill `input` describes. Not a [`FeeModel`] of its own, so
+    /// that it charges only inside a [`CompositeFeeModel`], which validates its bounds.
     fn compute_fee(&self, input: &FeeInput) -> Decimal {
         if self.side.is_some_and(|side| side != input.side)
             || self
@@ -378,6 +396,9 @@ impl FeeModel for FeeComponent {
                 .is_some_and(|liquidity| liquidity != input.liquidity)
         {
             return Decimal::ZERO;
+        }
+        if self.is_linear() {
+            return self.basis.charge(input, input.quantity.abs());
         }
         let prior = input.prior_filled.abs();
         let filled = prior + input.quantity.abs();
@@ -537,11 +558,7 @@ impl FeeModelConfig {
     pub(crate) fn is_linear(&self) -> bool {
         match self {
             Self::Zero(_) | Self::PerContract(_) | Self::Percentage(_) => true,
-            Self::Composite(model) => model.0.iter().all(|component| {
-                !matches!(component.basis, FeeBasis::PerOrder(_))
-                    && component.min_per_order.is_none()
-                    && component.max_per_order.is_none()
-            }),
+            Self::Composite(model) => model.0.iter().all(FeeComponent::is_linear),
         }
     }
 }
@@ -1059,6 +1076,26 @@ mod tests {
         assert_eq!(
             maker.compute_fee(&fill.with_liquidity(Liquidity::Maker)),
             d("1")
+        );
+    }
+
+    /// A ticket limited to maker fills is charged on the order's first fill only, so an order
+    /// whose first fill took liquidity never pays it.
+    #[test]
+    fn a_ticket_on_one_liquidity_is_charged_only_if_the_first_fill_is_on_it() {
+        let ticket = FeeComponent::new(FeeBasis::PerOrder(d("5"))).on_liquidity(Liquidity::Maker);
+        let maker = buy("1", "2", "1").with_liquidity(Liquidity::Maker);
+
+        assert_eq!(ticket.compute_fee(&maker), d("5"), "a maker first fill");
+        assert_eq!(
+            ticket.compute_fee(&buy("1", "2", "1")),
+            Decimal::ZERO,
+            "a taker first fill"
+        );
+        assert_eq!(
+            ticket.compute_fee(&maker.with_prior_filled(d("2"))),
+            Decimal::ZERO,
+            "a maker fill after a taker first fill"
         );
     }
 
