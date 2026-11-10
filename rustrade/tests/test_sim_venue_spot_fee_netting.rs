@@ -140,6 +140,7 @@ fn venue(fee_model: FeeModelConfig, spot_fee_asset: SpotFeeAsset) -> SimulatedVe
         short_put_collateral: Default::default(),
         amend: Default::default(),
         time_in_force: Default::default(),
+        session_close: None,
     };
     let spot = Instrument {
         exchange: EXCHANGE,

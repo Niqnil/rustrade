@@ -5,7 +5,7 @@ use crate::{
     balance::{AssetBalance, MarginDetails},
     borrow_capacity::BorrowCapacity,
     cash_flow::{CashFlow, CashFlowId, CashFlowKind, CashFlowLoan, InterestTiming},
-    client::mock::{AmendConfig, MockExecutionConfig, TimeInForceRules},
+    client::mock::{AmendConfig, MockExecutionConfig, SessionCalendarConfig, TimeInForceRules},
     error::{
         AmendRefusal, ApiError, BorrowReject, BorrowRejectReason, OrderError, UnindexedApiError,
         UnindexedOrderError,
@@ -44,6 +44,7 @@ use rust_decimal::Decimal;
 use rustrade_instrument::{
     Side, Underlying,
     asset::name::AssetNameExchange,
+    calendar::{CalendarError, SessionCalendar},
     exchange::ExchangeId,
     instrument::{
         Instrument,
@@ -592,15 +593,34 @@ pub enum VenueRegime {
 /// | `GoodUntilCancelled { post_only: true }` | rests, or **cancels** if marketable | **rejected** |
 /// | `ImmediateOrCancel` / `FillOrKill` | fills if marketable, else **cancels** | fills |
 /// | `GoodTillDate { expiry }` | rests until `expiry`, then **expires** | fills |
-/// | `GoodUntilEndOfDay` | **rejected** | fills |
+/// | `GoodUntilEndOfDay` with a session calendar | rests until the close, then **expires** | fills |
+/// | `GoodUntilEndOfDay` without one | **rejected** | fills |
 /// | `AtOpen` / `AtClose` | **rejected** | **rejected** |
 ///
 /// Every rejection here is [`OrderError::UnsupportedTimeInForce`].
 /// [`MockExecutionConfig::time_in_force`] narrows the table per instrument kind, so the venue also
 /// refuses what the live venue it stands in for refuses: a venue configured as Alpaca takes an
-/// option order only as `GoodUntilEndOfDay` or `GoodUntilCancelled`. A rule cannot widen it:
-/// a `GoodUntilEndOfDay` limit order stays rejected, for want of a session calendar, even where
-/// the live venue takes one.
+/// option order only as `GoodUntilEndOfDay` or `GoodUntilCancelled`. A rule cannot widen it.
+///
+/// ## A day order lives until the session closes
+/// A venue knows when its sessions close from [`MockExecutionConfig::session_close`], or from a
+/// calendar attached with [`with_session_calendar`](Self::with_session_calendar). Without either it
+/// refuses a `GoodUntilEndOfDay` limit order. With one, it resolves the order's deadline once, when
+/// it accepts the order: the first instant after the next session close. The order then rests,
+/// held or on the book, and expires at that deadline like a `GoodTillDate` order (see below), and
+/// it keeps reporting `GoodUntilEndOfDay`. An amend does not move the deadline, and a snapshot
+/// keeps it.
+/// - **What trades at the close itself can still fill it.** The deadline is one nanosecond after
+///   the close, so a tick or a bar stamped exactly at the close is matched before the order
+///   expires.
+/// - **An order sent outside the session is accepted** and expires at the next close: one sent
+///   after Friday's close expires at Monday's. The venue knows no open time, so such an order works
+///   at once and can fill on after-hours data that a live venue would hold until the next open.
+/// - **A seeded day order** (one in `initial_state`) expires at the close after the instant the
+///   live venue accepted it, its [`Open::time_exchange`], which may already have passed.
+/// - The configured [`DailyClose`](rustrade_instrument::calendar::DailyClose) knows no holidays
+///   or early closes, and there is one calendar for the whole venue: see
+///   [`SessionCalendarConfig`]'s known limitations.
 ///
 /// A market order works only on arrival, which honours every time in force that bounds *how long*
 /// an order works — so most of the table is moot for one. (It fills in full wherever the book has
@@ -612,10 +632,11 @@ pub enum VenueRegime {
 /// a wrong fill rather than an ignored flag.
 ///
 /// ## A deadline is swept, not scheduled
-/// This venue has no timer. A [`GoodTillDate`](TimeInForce::GoodTillDate) order is retired when a
-/// driver next calls [`advance_time`](Self::advance_time) or [`apply_market`](Self::apply_market),
-/// whichever comes first, and the sweep spans every instrument rather than only the one that
-/// ticked. A deadline falling after the last such call is never reached at all — see
+/// This venue has no timer. A [`GoodTillDate`](TimeInForce::GoodTillDate) order, or a day order,
+/// is retired at its deadline when a driver next calls [`advance_time`](Self::advance_time) or
+/// [`apply_market`](Self::apply_market), whichever comes first, and the sweep spans every
+/// instrument rather than only the one that ticked. A deadline falling after the last such call
+/// is never reached at all — see
 /// [`advance_time`](Self::advance_time) for what that means for a caller. A driver that keeps a
 /// timeline of its own can advance the clock to each [`next_deadline`](Self::next_deadline) as it
 /// falls, as `SimRunner` does, so that a deadline is reached at its own instant.
@@ -838,6 +859,10 @@ pub struct SimulatedVenue {
     /// Which time in force each kind of instrument takes. Fixed at construction from
     /// [`MockExecutionConfig::time_in_force`].
     time_in_force: TimeInForceRules,
+    /// When this venue's sessions close, which is when a day limit order expires, or `None` if it
+    /// has no calendar and so refuses one. From [`MockExecutionConfig::session_close`], or
+    /// [`with_session_calendar`](Self::with_session_calendar).
+    session_calendar: Option<Arc<dyn SessionCalendar>>,
     /// The expiry of every option this venue lists, earliest first. Instruments are fixed at
     /// construction, so this never changes.
     option_expiries: Vec<(DateTime<Utc>, InstrumentNameExchange)>,
@@ -869,6 +894,8 @@ impl SimulatedVenue {
     /// - If `initial_state` holds a short option position that its seeded free balances do not
     ///   cover, whose collateral asset it holds no balance of, or that is a cash-settled call: see
     ///   `# How an option is accounted` on [`SimulatedVenue`].
+    /// - If [`MockExecutionConfig::session_close`] cannot place the close of a day limit order
+    ///   seeded in `initial_state`.
     pub fn new(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
@@ -893,6 +920,8 @@ impl SimulatedVenue {
     /// - If `initial_state` holds a short option position that its seeded free balances do not
     ///   cover, whose collateral asset it holds no balance of, or that is a cash-settled call: see
     ///   `# How an option is accounted` on [`SimulatedVenue`].
+    /// - If [`MockExecutionConfig::session_close`] cannot place the close of a day limit order
+    ///   seeded in `initial_state`.
     pub fn new_market_driven(
         config: &MockExecutionConfig,
         instruments: FnvHashMap<InstrumentNameExchange, Instrument<ExchangeId, AssetNameExchange>>,
@@ -920,7 +949,7 @@ impl SimulatedVenue {
             .filter_map(|balance| Some((balance.asset.clone(), balance.balance.margin?)))
             .collect();
 
-        Self::assemble(
+        let mut venue = Self::assemble(
             config,
             instruments,
             regime,
@@ -928,7 +957,14 @@ impl SimulatedVenue {
             positions,
             order_id_start,
             reported_debt,
-        )
+        );
+        if let Err(error) = venue.resolve_seeded_deadlines() {
+            panic!(
+                "MockExecutionConfig::session_close cannot place a seeded day order's close: \
+                 {error}"
+            );
+        }
+        venue
     }
 
     /// A venue configured by `config`, holding `account`, `positions` and `reported_debt`, whose
@@ -982,6 +1018,10 @@ impl SimulatedVenue {
             short_put_collateral: config.short_put_collateral,
             amend: config.amend,
             time_in_force: config.time_in_force.clone(),
+            session_calendar: config
+                .session_close
+                .as_ref()
+                .map(SessionCalendarConfig::calendar),
             option_expiries,
             next_option_expiry: None,
             option_spots,
@@ -1042,6 +1082,78 @@ impl SimulatedVenue {
     pub fn with_fill_model(mut self, model: Arc<dyn FillModel>) -> Self {
         self.fill_model = model;
         self
+    }
+
+    /// This venue, closing its sessions as `calendar` says rather than as the configured
+    /// [`session_close`](MockExecutionConfig::session_close), so it accepts a
+    /// [`TimeInForce::GoodUntilEndOfDay`] limit order and expires it at the first instant after
+    /// the next close: see the type's "Which `TimeInForce` this venue honours".
+    ///
+    /// The way to plug in a calendar of your own, such as one with a market's holidays and early
+    /// closes. Like [`with_fill_model`](Self::with_fill_model), it is not part of the
+    /// configuration, so a serialised configuration no longer says when sessions close.
+    ///
+    /// A day limit order seeded through `initial_state` is given the close after the instant the
+    /// live venue accepted it (its [`Open::time_exchange`]), unless it already has one. An order
+    /// already given a deadline keeps it: a deadline is fixed when it is resolved.
+    ///
+    /// # Errors
+    /// The [`CalendarError`] of the first seeded day order, by client order id, that `calendar`
+    /// cannot answer for.
+    ///
+    /// # Panics
+    /// If `calendar` answers a close not after the instant it was asked from, breaking the
+    /// [`SessionCalendar`] contract.
+    pub fn with_session_calendar(
+        mut self,
+        calendar: Arc<dyn SessionCalendar>,
+    ) -> Result<Self, CalendarError> {
+        self.session_calendar = Some(calendar);
+        self.resolve_seeded_deadlines()?;
+        Ok(self)
+    }
+
+    /// Gives each open day limit order with no deadline of its own the close after the instant it
+    /// was accepted, if this venue has a session calendar. Only a seeded order can lack one: the
+    /// venue resolves the deadline of every day order it accepts itself.
+    fn resolve_seeded_deadlines(&mut self) -> Result<(), CalendarError> {
+        let Some(calendar) = self.session_calendar.clone() else {
+            return Ok(());
+        };
+        self.account.resolve_deadlines(|order| {
+            if is_day_limit(order.kind, order.time_in_force) {
+                deadline_after_close(calendar.as_ref(), order.state.time_exchange).map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    /// The deadline of a [`TimeInForce::GoodUntilEndOfDay`] limit order arriving at `now`: the
+    /// first instant after this venue's next session close. `None` for any other order.
+    ///
+    /// # Errors
+    /// [`OrderError::UnsupportedTimeInForce`] if the calendar cannot answer for `now`. A venue with
+    /// no calendar has already refused the order in [`validate_time_in_force_supported`].
+    fn day_deadline(
+        &self,
+        request: &OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DateTime<Utc>>, UnindexedOrderError> {
+        if !is_day_limit(request.state.kind, request.state.time_in_force) {
+            return Ok(None);
+        }
+        let Some(calendar) = &self.session_calendar else {
+            unreachable!("validate_time_in_force_supported refuses a day limit with no calendar");
+        };
+        deadline_after_close(calendar.as_ref(), now)
+            .map(Some)
+            .map_err(|error| {
+                UnindexedOrderError::unsupported_time_in_force(
+                    request.state.time_in_force,
+                    format!("SimulatedVenue cannot place the session close that ends it: {error}"),
+                )
+            })
     }
 
     /// This venue, refusing a CFD short that `provider` does not allow.
@@ -2309,7 +2421,9 @@ impl SimulatedVenue {
     /// order]`: it never traded, so this is the last chance to report it.
     fn retire_expired(
         &mut self,
-        RestingOrder { order, reservation }: RestingOrder,
+        RestingOrder {
+            order, reservation, ..
+        }: RestingOrder,
         time_exchange: DateTime<Utc>,
     ) -> Vec<UnindexedAccountEvent> {
         let flows = reservation
@@ -2708,7 +2822,10 @@ impl SimulatedVenue {
 
         for (cid, limit) in crossing {
             // Collected from this same book with nothing in between, so this always finds it.
-            let Some(RestingOrder { order, reservation }) = self.account.remove_order(&cid) else {
+            let Some(RestingOrder {
+                order, reservation, ..
+            }) = self.account.remove_order(&cid)
+            else {
                 continue;
             };
 
@@ -2879,7 +2996,10 @@ impl SimulatedVenue {
         let mut events = Vec::with_capacity(immediate.len() * 2);
         for cid in immediate {
             // Collected from this same index with nothing in between, so this always finds it.
-            if let Some(RestingOrder { order, reservation }) = self.account.remove_order(&cid) {
+            if let Some(RestingOrder {
+                order, reservation, ..
+            }) = self.account.remove_order(&cid)
+            {
                 let released = reservation
                     .map(|reservation| self.release_reservation(reservation, time_exchange));
                 events.extend(self.cancel_unfilled(order, released, time_exchange));
@@ -2898,7 +3018,9 @@ impl SimulatedVenue {
     /// [`settle_resting`](Self::settle_resting). So is one the release's market cannot price.
     fn fill_held(
         &mut self,
-        RestingOrder { order, reservation }: RestingOrder,
+        RestingOrder {
+            order, reservation, ..
+        }: RestingOrder,
         release: Release<'_>,
         terms: &InstrumentTerms,
         time_exchange: DateTime<Utc>,
@@ -3051,7 +3173,11 @@ impl SimulatedVenue {
     /// Whatever joins the book is stamped `time_exchange`, which is when it joined the queue.
     fn release_held_limit(
         &mut self,
-        RestingOrder { order, reservation }: RestingOrder,
+        RestingOrder {
+            order,
+            reservation,
+            deadline,
+        }: RestingOrder,
         limit: Decimal,
         release: Release<'_>,
         terms: &InstrumentTerms,
@@ -3087,7 +3213,9 @@ impl SimulatedVenue {
                     time_in_force: order.time_in_force,
                     state: open,
                 };
-                self.book_rested(rested.clone(), reservation);
+                // The deadline it was given on arrival, not one from the release: a day order
+                // expires at the close after it arrived, however long it was held.
+                self.book_rested(rested.clone(), reservation, deadline);
                 rested.map_state(OrderState::active)
             }
             // Filled outright by this one trade, which carries the order's id: a held order has
@@ -4200,7 +4328,9 @@ impl SimulatedVenue {
         // until the amend succeeds: a refusal leaves it, its queue position and its hold exactly
         // as they were.
         let (order, reservation) = match self.account.orders().resting_order(cid) {
-            Some(RestingOrder { order, reservation }) => (order.clone(), reservation.clone()),
+            Some(RestingOrder {
+                order, reservation, ..
+            }) => (order.clone(), reservation.clone()),
             None => return Err(self.cancel_missing_reason(cid)),
         };
 
@@ -4446,7 +4576,9 @@ impl SimulatedVenue {
     ) -> CancelOutcome {
         let time_exchange = self.time_exchange();
 
-        let Some(RestingOrder { order, reservation }) = self.account.remove_order(&request.key.cid)
+        let Some(RestingOrder {
+            order, reservation, ..
+        }) = self.account.remove_order(&request.key.cid)
         else {
             return VenueOutcome {
                 events: Vec::new(),
@@ -4746,9 +4878,11 @@ impl SimulatedVenue {
             return (build_open_order_err_response(request, error), None);
         }
 
-        if let Err(error) =
-            validate_time_in_force_supported(request.state.kind, request.state.time_in_force)
-        {
+        if let Err(error) = validate_time_in_force_supported(
+            request.state.kind,
+            request.state.time_in_force,
+            self.session_calendar.is_some(),
+        ) {
             return (build_open_order_err_response(request, error), None);
         }
 
@@ -4840,6 +4974,14 @@ impl SimulatedVenue {
             _ => None,
         };
 
+        // Resolved once, now, and carried with the order wherever it goes: held, rested, or
+        // released later, a day order expires at the close after it arrived. Before the ledger is
+        // touched, so a calendar that cannot answer leaves no trace on it.
+        let deadline = match self.day_deadline(&request, now) {
+            Ok(deadline) => deadline,
+            Err(error) => return (build_open_order_err_response(request, error), None),
+        };
+
         // Under `StaleMarketPolicy::Wait`, an order arriving on a stale market is handled as if it
         // arrived just after the instrument's next fresh observation: held until then, or refused
         // if its time in force will not wait. An order already past its own deadline is not asked,
@@ -4896,7 +5038,7 @@ impl SimulatedVenue {
                             None,
                         );
                     }
-                    return self.hold_on_arrival(request, market, &terms);
+                    return self.hold_on_arrival(request, market, &terms, deadline);
                 }
                 MarketAge::Fresh | MarketAge::Unpriced => {}
             }
@@ -4922,7 +5064,7 @@ impl SimulatedVenue {
                 Disposition::FillAndCancel | Disposition::FillOrNothing
                     if matches!(self.market_order_timing, MarketOrderTiming::NextBar(_)) =>
                 {
-                    self.hold_on_arrival(request, market, &terms)
+                    self.hold_on_arrival(request, market, &terms, deadline)
                 }
                 Disposition::FillAndCancel => {
                     self.fill_on_arrival(request, market, &terms, Remainder::Cancel)
@@ -4952,7 +5094,7 @@ impl SimulatedVenue {
             // The three differ only in what becomes of a remainder the book could not fill, which
             // is exactly what they are asked here -- see `Remainder`.
             Disposition::FillAndRest => {
-                self.fill_on_arrival(request, market, &terms, Remainder::Rest { limit })
+                self.fill_on_arrival(request, market, &terms, Remainder::Rest { limit, deadline })
             }
             Disposition::FillAndCancel => {
                 self.fill_on_arrival(request, market, &terms, Remainder::Cancel)
@@ -4961,7 +5103,7 @@ impl SimulatedVenue {
                 self.fill_on_arrival(request, market, &terms, Remainder::Kill)
             }
             // Nothing has traded, so the whole quantity is what rests.
-            Disposition::Rest => self.rest_order(request, limit, &terms, Decimal::ZERO),
+            Disposition::Rest => self.rest_order(request, limit, &terms, Decimal::ZERO, deadline),
             Disposition::CancelUnfilled => self.cancel_on_arrival(request, now),
             Disposition::Expire => self.expire_on_arrival(request, now),
         }
@@ -5015,11 +5157,16 @@ impl SimulatedVenue {
     /// market prices nothing for a market order, and when the account cannot cover the hold. The
     /// last two are what an arriving order would be refused for too, so a strategy is refused the
     /// same orders whether or not they wait.
+    ///
+    /// `deadline` is when the order expires if it has a deadline of its own (see
+    /// [`RestingOrder::deadline`]): a held order is swept at its deadline like a resting one, and
+    /// keeps it when released.
     fn hold_on_arrival(
         &mut self,
         request: OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
         market: Option<MarketSnapshot>,
         terms: &InstrumentTerms,
+        deadline: Option<DateTime<Utc>>,
     ) -> (
         Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
         Option<OpenOrderNotifications>,
@@ -5158,7 +5305,8 @@ impl SimulatedVenue {
             effect,
             unreported_interest: interest.map(|flow| vec![*flow]).unwrap_or_default(),
         };
-        if let Err(AlreadyResting(refused)) = self.account.hold(order.clone(), Some(reservation)) {
+        let held = RestingOrder::new(order.clone(), Some(reservation)).with_deadline(deadline);
+        if let Err(AlreadyResting(refused)) = self.account.hold(held) {
             unreachable!(
                 "SimulatedVenue held {} over a resting order: open_order_inner checks first",
                 refused.order.key.cid
@@ -5618,7 +5766,9 @@ impl SimulatedVenue {
         if filled_quantity <= Decimal::ZERO || (unfilled > Decimal::ZERO && remainder.is_kill()) {
             return match remainder {
                 // Nothing has traded, so the whole quantity is what rests.
-                Remainder::Rest { limit } => self.rest_order(request, limit, terms, Decimal::ZERO),
+                Remainder::Rest { limit, deadline } => {
+                    self.rest_order(request, limit, terms, Decimal::ZERO, deadline)
+                }
                 Remainder::Cancel | Remainder::Kill => {
                     self.cancel_on_arrival(request, time_exchange)
                 }
@@ -5657,7 +5807,7 @@ impl SimulatedVenue {
         // this fill leaves. Computed before anything moves, so both legs are asked of the ledger as
         // one requirement.
         let held = match remainder {
-            Remainder::Rest { limit } if unfilled > Decimal::ZERO => Some(self.settlement(
+            Remainder::Rest { limit, .. } if unfilled > Decimal::ZERO => Some(self.settlement(
                 terms,
                 self.behind_resting(
                     terms,
@@ -5765,6 +5915,7 @@ impl SimulatedVenue {
                 price: fill_price,
             },
             held,
+            remainder.deadline(),
             &commitment.committed,
             time_exchange,
         );
@@ -5787,13 +5938,15 @@ impl SimulatedVenue {
     ///
     /// The three outcomes are the three things a taker fill can leave behind: nothing, a remainder
     /// with nowhere to wait, or a remainder on the book. `committed` says what a margin account
-    /// lent the arrival, part of which a remainder on the book holds.
+    /// lent the arrival, part of which a remainder on the book holds, and `deadline` is when that
+    /// remainder expires, if its order has a deadline of its own (see [`RestingOrder::deadline`]).
     fn retire_filled(
         &mut self,
         request: &OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
         order_id: OrderId,
         fill: Fill,
         held: Option<Settlement>,
+        deadline: Option<DateTime<Utc>>,
         committed: &Committed,
         time_exchange: DateTime<Utc>,
     ) -> UnindexedOrderState {
@@ -5831,6 +5984,7 @@ impl SimulatedVenue {
                         // after that trade, the remainder's share with it.
                         unreported_interest: Vec::new(),
                     },
+                    deadline,
                 );
 
                 OrderState::active(open)
@@ -5902,15 +6056,22 @@ impl SimulatedVenue {
         }
     }
 
-    /// Puts `order` on the book holding `reservation`.
+    /// Puts `order` on the book holding `reservation`, expiring at `deadline` if it has one of its
+    /// own (see [`RestingOrder::deadline`]).
     ///
     /// # Panics
     /// If an order is already resting under its id. `open_order_inner` refuses such an open before
     /// anything touches the ledger, under the same `&mut self`, so the book is vacant under this id
     /// by construction, and a refusal here would be a bug in this venue with no correct reply left
     /// to give.
-    fn book_rested(&mut self, order: OpenOrder, reservation: Reservation) {
-        if let Err(AlreadyResting(refused)) = self.account.book(order, Some(reservation)) {
+    fn book_rested(
+        &mut self,
+        order: OpenOrder,
+        reservation: Reservation,
+        deadline: Option<DateTime<Utc>>,
+    ) {
+        let resting = RestingOrder::new(order, Some(reservation)).with_deadline(deadline);
+        if let Err(AlreadyResting(refused)) = self.account.book(resting) {
             unreachable!(
                 "SimulatedVenue booked {} over a resting order: open_order_inner checks first",
                 refused.order.key.cid
@@ -5942,6 +6103,7 @@ impl SimulatedVenue {
         limit: Decimal,
         terms: &InstrumentTerms,
         filled_quantity: Decimal,
+        deadline: Option<DateTime<Utc>>,
     ) -> (
         Order<ExchangeId, InstrumentNameExchange, UnindexedOrderState>,
         Option<OpenOrderNotifications>,
@@ -6014,6 +6176,7 @@ impl SimulatedVenue {
                 // Nothing traded: the interest waits for a position to belong to.
                 unreported_interest: interest.map(|flow| vec![*flow]).unwrap_or_default(),
             },
+            deadline,
         );
 
         let order_response = Order {
@@ -7014,12 +7177,11 @@ fn clamp_to_limit(side: Side, price: Decimal, limit: Decimal) -> Decimal {
 fn validate_time_in_force_supported(
     order_kind: OrderKind,
     time_in_force: TimeInForce,
+    session_close: bool,
 ) -> Result<(), UnindexedOrderError> {
-    const NO_CALENDAR: &str = "a session calendar, which this venue does not have";
-
     let missing = match (order_kind, time_in_force) {
         // Governs *when* an order executes, not how long it works, whatever the kind.
-        (_, TimeInForce::AtOpen | TimeInForce::AtClose) => NO_CALENDAR,
+        (_, TimeInForce::AtOpen | TimeInForce::AtClose) => "an opening or closing auction",
 
         // A market order takes liquidity by definition, so it cannot promise not to.
         (OrderKind::Market, TimeInForce::GoodUntilCancelled { post_only: true }) => {
@@ -7030,12 +7192,17 @@ fn validate_time_in_force_supported(
         // fills in full on arrival.
         (OrderKind::Market, _) => return Ok(()),
 
-        (OrderKind::Limit, TimeInForce::GoodUntilEndOfDay) => NO_CALENDAR,
+        // Works until the session closes, so the venue must know when that is.
+        (OrderKind::Limit, TimeInForce::GoodUntilEndOfDay) if !session_close => {
+            "a session close (set MockExecutionConfig::session_close, or attach a calendar with \
+             SimulatedVenue::with_session_calendar)"
+        }
 
         // Honoured -- what each one then does is `Disposition`'s decision, not this one.
         (
             OrderKind::Limit,
             TimeInForce::GoodUntilCancelled { .. }
+            | TimeInForce::GoodUntilEndOfDay
             | TimeInForce::ImmediateOrCancel
             | TimeInForce::FillOrKill
             | TimeInForce::GoodTillDate { .. },
@@ -7052,6 +7219,41 @@ fn validate_time_in_force_supported(
              {missing}"
         ),
     ))
+}
+
+/// Whether an order of `order_kind` with `time_in_force` is a day limit order: the one kind of
+/// order whose deadline comes from a session calendar.
+fn is_day_limit(order_kind: OrderKind, time_in_force: TimeInForce) -> bool {
+    matches!(
+        (order_kind, time_in_force),
+        (OrderKind::Limit, TimeInForce::GoodUntilEndOfDay)
+    )
+}
+
+/// The deadline of a day order accepted at `after`: the first instant after `calendar`'s next
+/// session close, one nanosecond after it (the clock's resolution), so that a deadline, which is
+/// an inclusive cutoff, still lets what trades at the close itself fill the order.
+///
+/// # Errors
+/// The calendar's [`CalendarError`], or [`CalendarError::OutOfRange`] if the close is the last
+/// representable instant.
+///
+/// # Panics
+/// If `calendar` answers a close not after `after`, breaking the [`SessionCalendar`] contract: a
+/// deadline at or before the order's acceptance would expire it on arrival for no reason the
+/// order gave.
+fn deadline_after_close(
+    calendar: &dyn SessionCalendar,
+    after: DateTime<Utc>,
+) -> Result<DateTime<Utc>, CalendarError> {
+    let close = calendar.next_close_after(after)?;
+    assert!(
+        close > after,
+        "SessionCalendar {calendar:?} answered a close at {close}, not after {after}"
+    );
+    close
+        .checked_add_signed(chrono::TimeDelta::nanoseconds(1))
+        .ok_or(CalendarError::out_of_range(after))
 }
 
 /// What a supported time in force makes one arriving order do.
@@ -7131,7 +7333,9 @@ fn disposition(
         _ if marketable => match (order_kind, time_in_force) {
             (
                 OrderKind::Limit,
-                TimeInForce::GoodUntilCancelled { .. } | TimeInForce::GoodTillDate { .. },
+                TimeInForce::GoodUntilCancelled { .. }
+                | TimeInForce::GoodUntilEndOfDay
+                | TimeInForce::GoodTillDate { .. },
             ) => Disposition::FillAndRest,
             _ => Disposition::FillAndCancel,
         },
@@ -7191,7 +7395,12 @@ enum Release<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Remainder {
     /// Joins the book at this limit and waits to be crossed.
-    Rest { limit: Decimal },
+    Rest {
+        limit: Decimal,
+        /// When what rests expires, if the order has a deadline of its own: see
+        /// [`RestingOrder::deadline`].
+        deadline: Option<DateTime<Utc>>,
+    },
     /// Retires as [`Cancelled`], carrying whatever did trade.
     Cancel,
     /// Nothing trades at all. An order that cannot be filled in full would rather be filled not at
@@ -7205,6 +7414,15 @@ impl Remainder {
     /// [`TimeInForce::FillOrKill`] differ from [`TimeInForce::ImmediateOrCancel`].
     fn is_kill(self) -> bool {
         matches!(self, Self::Kill)
+    }
+
+    /// When a remainder that rests expires, if it has a deadline of its own. `None` for one that
+    /// does not rest.
+    fn deadline(self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Rest { deadline, .. } => deadline,
+            Self::Cancel | Self::Kill => None,
+        }
     }
 }
 
@@ -8163,7 +8381,7 @@ mod tests {
                 .collect(),
             {
                 let mut book = OpenOrders::default();
-                book.insert(
+                book.insert(RestingOrder::new(
                     Order {
                         key: OrderKey {
                             exchange: EXCHANGE,
@@ -8183,7 +8401,7 @@ mod tests {
                         },
                     },
                     None,
-                )
+                ))
                 .unwrap();
                 book
             },
@@ -8639,6 +8857,7 @@ mod tests {
             Default::default(),
             Default::default(),
             Default::default(),
+            None,
         );
         let mut venue = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
         assert_eq!(cfd_position(&venue), Some((d("-1"), Some(d("5000")))));
@@ -8686,6 +8905,7 @@ mod tests {
             Default::default(),
             Default::default(),
             Default::default(),
+            None,
         );
         let _ = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
     }
@@ -10370,7 +10590,7 @@ mod tests {
         let mut seeded = seeded_part_filled("48000", "1", "0");
         seeded.state.id = VenueOrderId::Assigned(OrderId::new(u64::MAX.to_string()));
         assert!(
-            account.book(seeded, None).is_ok(),
+            account.book(RestingOrder::new(seeded, None)).is_ok(),
             "the book is vacant under this id"
         );
 
@@ -10689,7 +10909,10 @@ mod tests {
         assert!(
             venue
                 .account
-                .book(seeded_part_filled("48000", "1", "0"), None)
+                .book(RestingOrder::new(
+                    seeded_part_filled("48000", "1", "0"),
+                    None
+                ))
                 .is_ok()
         );
 
@@ -10715,11 +10938,11 @@ mod tests {
         assert!(
             venue
                 .account
-                .book(
+                .book(RestingOrder::new(
                     seeded_part_filled("48000", "1", "0.4"),
                     // As `initial_state` seeds one: the venue never took anything for it.
-                    None,
-                )
+                    None
+                ),)
                 .is_ok(),
             "the book is vacant under this id"
         );
@@ -10778,7 +11001,10 @@ mod tests {
         assert!(
             venue
                 .account
-                .book(seeded_part_filled("48000", "1", "0.4"), None)
+                .book(RestingOrder::new(
+                    seeded_part_filled("48000", "1", "0.4"),
+                    None
+                ))
                 .is_ok(),
             "the book is vacant under this id"
         );
@@ -10828,6 +11054,7 @@ mod tests {
             d("48000"),
             &terms,
             d("0.4"),
+            None,
         );
 
         match &response.state {
@@ -12105,11 +12332,11 @@ mod tests {
         assert!(
             venue
                 .account
-                .book(
+                .book(RestingOrder::new(
                     as_open(seeded).expect("the seeded order is Open"),
                     // As `initial_state` seeds one: the venue never took anything for it.
-                    None,
-                )
+                    None
+                ),)
                 .is_ok(),
             "the book is vacant under this id"
         );
@@ -12888,7 +13115,10 @@ mod tests {
         assert!(
             venue
                 .account
-                .book(seeded_part_filled("48000", "1", "0.4"), None)
+                .book(RestingOrder::new(
+                    seeded_part_filled("48000", "1", "0.4"),
+                    None
+                ))
                 .is_ok(),
             "the book is vacant under this id"
         );
@@ -19165,5 +19395,6 @@ mod tests {
     mod collateral_ratio;
     mod liquidation;
     mod options;
+    mod session_close;
     mod snapshot;
 }

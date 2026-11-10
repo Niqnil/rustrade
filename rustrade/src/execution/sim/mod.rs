@@ -1891,6 +1891,7 @@ mod tests {
             short_put_collateral: Default::default(),
             amend: Default::default(),
             time_in_force: Default::default(),
+            session_close: None,
         }
     }
 
@@ -2667,6 +2668,61 @@ mod tests {
             SimExecutionBuilder::new(&instruments)
                 .add_venue_with_options(margin, options)
                 .is_ok()
+        );
+    }
+
+    /// A session calendar handed in through the options is the venue's: without it a day limit
+    /// order is refused, and with it the order rests.
+    #[test]
+    fn a_session_calendar_in_the_options_lets_the_venue_take_a_day_limit() {
+        use rustrade_instrument::calendar::{DailyClose, Tz};
+
+        let instruments = IndexedInstruments::new([instrument(EXCHANGE, "btc", "usdt")]);
+        let day_limit = || OrderRequestOpen {
+            key: OrderKey {
+                exchange: EXCHANGE,
+                instrument: rustrade_instrument::instrument::name::InstrumentNameExchange::new(
+                    "btc_usdt",
+                ),
+                strategy: StrategyId::new("test"),
+                cid: ClientOrderId::new("day"),
+            },
+            state: RequestOpen::new(
+                Side::Buy,
+                Some(dec!(100)),
+                dec!(1),
+                OrderKind::Limit,
+                TimeInForce::GoodUntilEndOfDay,
+            ),
+        };
+
+        let mut plain = builder::market_driven_venue(
+            &config(0),
+            SimVenueOptions::default(),
+            &instruments,
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                plain.open_order(day_limit()).response.state,
+                OrderState::Inactive(InactiveOrderState::OpenFailed(_))
+            ),
+            "no calendar, no day limit"
+        );
+
+        let close = DailyClose::new(
+            chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap(),
+            "America/New_York".parse::<Tz>().unwrap(),
+        );
+        let options = SimVenueOptions::default().with_session_calendar(Arc::new(close));
+        let mut venue =
+            builder::market_driven_venue(&config(0), options, &instruments, None).unwrap();
+        let rested = venue.open_order(day_limit());
+        assert!(
+            matches!(rested.response.state, OrderState::Active(_)),
+            "{:?}",
+            rested.response.state
         );
     }
 

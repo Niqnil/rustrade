@@ -139,6 +139,7 @@ fn config(latency_ms: u64) -> MockExecutionConfig {
         short_put_collateral: Default::default(),
         amend: Default::default(),
         time_in_force: Default::default(),
+        session_close: None,
     }
 }
 

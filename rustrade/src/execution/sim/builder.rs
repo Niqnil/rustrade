@@ -26,6 +26,7 @@ use rustrade_execution::{
     shortability::ShortabilityProvider,
 };
 use rustrade_instrument::{
+    calendar::SessionCalendar,
     exchange::{ExchangeId, ExchangeIndex},
     index::IndexedInstruments,
 };
@@ -64,6 +65,11 @@ pub struct SimVenueOptions {
     /// [`MockExecutionConfig::spot_margin`]: without it the venue takes no loans, and adding the
     /// venue is refused.
     pub margin_interest: Option<Arc<dyn MarginInterestModel>>,
+    /// When the venue's trading sessions close, in place of the configuration's
+    /// [`session_close`](MockExecutionConfig::session_close) — see
+    /// [`SimulatedVenue::with_session_calendar`]. `None` uses the configured one, if any. With
+    /// neither, the venue refuses a day limit order.
+    pub session_calendar: Option<Arc<dyn SessionCalendar>>,
 }
 
 impl SimVenueOptions {
@@ -96,6 +102,14 @@ impl SimVenueOptions {
         self.margin_interest = Some(model);
         self
     }
+
+    /// These options, closing the venue's trading sessions as `calendar` says, which is when a
+    /// day limit order expires — see [`SessionCalendar`].
+    #[must_use]
+    pub fn with_session_calendar(mut self, calendar: Arc<dyn SessionCalendar>) -> Self {
+        self.session_calendar = Some(calendar);
+        self
+    }
 }
 
 /// The market-driven [`SimulatedVenue`] `config` describes, modelling what `options` add to it,
@@ -109,7 +123,9 @@ impl SimVenueOptions {
 /// - `options` carries a [`margin_interest`](SimVenueOptions::margin_interest) model while
 ///   `config` has no [`spot_margin`](MockExecutionConfig::spot_margin);
 /// - `restore` is refused by [`SimulatedVenue::from_snapshot`], or is of a venue that was not
-///   market-driven.
+///   market-driven;
+/// - `options` carries a [`session_calendar`](SimVenueOptions::session_calendar) that cannot
+///   place the close of a day order seeded in `config` or held in `restore`.
 ///
 /// # Panics
 /// If an instrument executed on the venue has a kind the venue cannot model: callers check
@@ -125,6 +141,7 @@ pub(crate) fn market_driven_venue(
         shortability,
         fill_model,
         margin_interest,
+        session_calendar,
     } = options;
 
     let exchange = config.mocked_exchange;
@@ -162,6 +179,14 @@ pub(crate) fn market_driven_venue(
     }
     if let Some(model) = margin_interest {
         venue = venue.with_margin_interest(model);
+    }
+    if let Some(calendar) = session_calendar {
+        venue = venue.with_session_calendar(calendar).map_err(|error| {
+            BarterError::ExecutionBuilder(format!(
+                "simulated venue {exchange} cannot place a seeded day order's session close: \
+                 {error}"
+            ))
+        })?;
     }
     Ok(venue)
 }
