@@ -1461,6 +1461,51 @@ fn a_buyback_the_account_cannot_pay_for_keeps_the_collateral_held() {
     assert_eq!(option_position(&venue), Some(d("-1")));
 }
 
+/// As above, but with `free` charged below zero while the short is open, as a holding cost the
+/// account cannot cover leaves it. Holding the collateral again after the refused buyback must not
+/// be refused for the shortfall: the buyback is refused and the collateral stays held.
+#[test]
+fn a_refused_buyback_with_free_below_zero_keeps_the_collateral_held() {
+    let mut venue = driven_venue(OptionKind::Put, OptionSettlement::Physical, |_| {});
+    feed(&mut venue, "100", "1.5", time(2));
+    sell(&mut venue, "1");
+    assert_eq!(totals(&venue, usd()), (d("10150"), d("150")));
+
+    let _ = venue
+        .account
+        .charge(&usd(), d("-10100"), DateTime::<Utc>::MIN_UTC);
+    assert_eq!(
+        totals(&venue, usd()),
+        (d("50"), d("-9950")),
+        "the charge overdraws free"
+    );
+    feed(&mut venue, "100", "1", time(3));
+
+    let outcome = venue.open_order(option_request(Side::Buy, "1", None));
+
+    assert!(
+        matches!(
+            &outcome.response.state,
+            OrderState::Inactive(InactiveOrderState::OpenFailed(OrderError::Rejected(
+                ApiError::BalanceInsufficient(Some(asset), _)
+            ))) if *asset == usd()
+        ),
+        "100 to pay, 50 in the account: {:?}",
+        outcome.response.state
+    );
+    assert!(outcome.events.is_empty(), "{:?}", outcome.events);
+    assert_eq!(
+        totals(&venue, usd()),
+        (d("50"), d("-9950")),
+        "the collateral is held again on top of the overdrawn free"
+    );
+    assert_eq!(
+        venue.collateral_held(&option_name()),
+        collateral(usd(), "10000")
+    );
+    assert_eq!(option_position(&venue), Some(d("-1")));
+}
+
 #[test]
 fn a_resting_sale_to_open_reserves_its_collateral_until_it_fills() {
     let mut venue = driven_venue(OptionKind::Put, OptionSettlement::Physical, |_| {});
