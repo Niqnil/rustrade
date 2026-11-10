@@ -3120,11 +3120,14 @@ impl SimulatedVenue {
     /// stands, and committed in place of the hold through
     /// [`commit_afresh`](Self::commit_afresh). An order the account cannot afford is refused.
     ///
-    /// A refusal changes nothing, the slippage included, and hands `reservation` back. Only
-    /// balance timestamps move, to `time_exchange`: those of the order's hold and of any collateral
-    /// the fill would have released, which are released and restored. No event reports them. A commit prints the fill, if any, under the order's own id, but
-    /// leaves the order where it was: the caller puts what is left on the book, or retires an
-    /// order filled outright, and reports the order.
+    /// A refusal changes nothing, the slippage included, and hands `reservation` back. A refused
+    /// post-only order touches no balance. One the account cannot afford moves only balance
+    /// timestamps, to `time_exchange`: those of the order's hold and of any collateral the fill
+    /// would have released, which its recommit released and restored. No event reports them.
+    ///
+    /// A commit prints the fill, if any, under the order's own id, but leaves the order where it
+    /// was: the caller puts what is left on the book, or retires an order filled outright, and
+    /// reports the order.
     ///
     /// `order` must not be among the resting orders the costing reads: the remainder's
     /// requirement is priced against the position with what else rests on its side behind it, so
