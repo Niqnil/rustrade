@@ -155,6 +155,7 @@ impl<'a> ExecutionBuilder<'a> {
             clock: move || clock.time(),
             request_tx,
             event_rx,
+            amend_support: config.amend.support(),
         };
 
         // `add_execution` runs first so its supported-kind check rejects an unbacktestable
@@ -294,6 +295,7 @@ impl<'a> ExecutionBuilder<'a> {
             clock: move || clock.time(),
             request_tx,
             event_rx,
+            amend_support: config.amend.support(),
         };
 
         // As in `add_mock`: the supported-kind check runs before the venue projects the
@@ -1064,6 +1066,7 @@ mod tests {
             fee_asset: None,
             long_option_expiry: Default::default(),
             short_put_collateral: Default::default(),
+            amend: Default::default(),
         }
     }
 

@@ -443,6 +443,14 @@ impl MockExchange {
                 let outcome = self.venue.cancel_order(request);
                 emit.respond(outcome.events, response_tx, outcome.response);
             }
+            MockExchangeRequestKind::AmendOrder {
+                response_tx,
+                request,
+            } => {
+                // As a cancel's: what the amend moved is restated before its answer.
+                let outcome = self.venue.amend_order(request);
+                emit.respond(outcome.events, response_tx, outcome.response);
+            }
             MockExchangeRequestKind::OpenOrder {
                 response_tx,
                 request,
@@ -766,6 +774,7 @@ pub(crate) mod fixtures {
             None,
             Default::default(),
             Default::default(),
+            Default::default(),
         )
     }
 
@@ -802,6 +811,7 @@ pub(crate) mod fixtures {
             crate::fill::StaleMarketPolicy::default(),
             None,
             None,
+            Default::default(),
             Default::default(),
             Default::default(),
         )
@@ -1005,6 +1015,7 @@ pub(crate) mod fixtures {
 mod tests {
     use super::{fixtures::*, *};
     use crate::market::MarketSnapshot;
+    use crate::order::amend::AmendSupport;
     use crate::{
         AccountEventKind,
         fee::FeeModelConfig,
@@ -1281,6 +1292,7 @@ mod tests {
             clock: Utc::now,
             request_tx: request_tx.clone(),
             event_rx,
+            amend_support: AmendSupport::NONE,
         };
         let unknown = OrderKey {
             cid: ClientOrderId::new("never-opened"),
@@ -1320,6 +1332,7 @@ mod tests {
             clock: Utc::now,
             request_tx,
             event_rx,
+            amend_support: AmendSupport::NONE,
         };
         let capacity = client.fetch_borrow_capacity(&instrument_name(), side).await;
 
@@ -1896,6 +1909,141 @@ mod tests {
         let cancelled = response_rx.await.expect("the cancel is answered");
         assert!(cancelled.state.is_ok(), "{cancelled:?}");
         paper.stop().await;
+    }
+
+    /// A client of a market-driven driver declares the amends its venue's config allows, and an
+    /// amend it sends is booked a half latency later and answered a whole one later, after the
+    /// balance it restated.
+    #[tokio::test(start_paused = true)]
+    async fn a_paper_venue_amends_a_resting_order_its_client_sends() {
+        use crate::{
+            client::{ExecutionClient, mock::MockExecution},
+            order::{
+                OrderKey,
+                amend::{AmendPatch, AmendTarget, RequestAmend},
+                state::ActiveOrderState,
+            },
+        };
+
+        let mut config = spot_config("0", "100000", FeeModelConfig::default());
+        config.latency_ms = 100;
+        let support = config.amend.support();
+        let mut paper = Paper::start(config);
+        paper.observe(priced("50000"));
+        let rest = limit_request("rest", Side::Buy, "1", "49000", gtc());
+        let resting = paper.open(rest.clone()).await;
+        let OrderState::Active(ActiveOrderState::Open(open)) = resting.state else {
+            panic!("a limit below the market rests: {resting:?}");
+        };
+        let rested = paper.next_event().await;
+        assert!(matches!(rested.kind, AccountEventKind::BalanceSnapshot(_)));
+
+        let client = MockExecution {
+            mocked_exchange: EXCHANGE,
+            clock: Utc::now,
+            request_tx: paper.request_tx.clone(),
+            event_rx: paper.events.resubscribe(),
+            amend_support: support,
+        };
+        assert_eq!(client.amend_support(), support);
+        let instrument = instrument_name();
+        let request = OrderEvent {
+            key: OrderKey {
+                exchange: rest.key.exchange,
+                instrument: &instrument,
+                strategy: rest.key.strategy.clone(),
+                cid: rest.key.cid.clone(),
+            },
+            state: RequestAmend::new(
+                open.id.clone(),
+                AmendPatch::default().with_price(d("48000")),
+                AmendTarget {
+                    side: Side::Buy,
+                    price: Some(d("49000")),
+                    quantity: d("1"),
+                    kind: crate::order::OrderKind::Limit,
+                    time_in_force: gtc(),
+                    reduce_only: None,
+                },
+                Decimal::ZERO,
+            ),
+        };
+
+        let sent = tokio::time::Instant::now();
+        let answer = client.amend_order(request).await;
+
+        assert_eq!(sent.elapsed(), std::time::Duration::from_millis(100));
+        let amended = answer.state.expect("the amend is made");
+        assert_eq!(amended.price, Some(d("48000")));
+        assert_eq!(amended.open.id, open.id);
+        assert_eq!(answer.key, rest.key);
+        let AccountEventKind::BalanceSnapshot(restated) = paper.next_event().await.kind else {
+            panic!("the amend restates the hold it moved");
+        };
+        assert_eq!(restated.0.balance.free, d("52000"));
+
+        drop(client);
+        paper.stop().await;
+    }
+
+    /// A client whose venue has stopped answers an amend as a lost connection, which its manager
+    /// settles by looking the order up.
+    #[tokio::test]
+    async fn an_amend_to_a_stopped_venue_is_answered_as_offline() {
+        use crate::{
+            client::{ExecutionClient, mock::MockExecution},
+            error::ConnectivityError,
+            order::{
+                OrderKey, OrderKind,
+                amend::{AmendPatch, AmendTarget, RequestAmend},
+                id::{StrategyId, VenueOrderId},
+            },
+        };
+
+        let (request_tx, request_rx) = mpsc::unbounded_channel();
+        let (_event_tx, event_rx) = broadcast::channel(1);
+        drop(request_rx);
+        let client = MockExecution {
+            mocked_exchange: EXCHANGE,
+            clock: Utc::now,
+            request_tx,
+            event_rx,
+            amend_support: crate::client::mock::AmendConfig::FULL.support(),
+        };
+        let instrument = instrument_name();
+        let key = OrderKey {
+            exchange: EXCHANGE,
+            instrument: &instrument,
+            strategy: StrategyId::new("test"),
+            cid: ClientOrderId::new("rest"),
+        };
+
+        let answer = client
+            .amend_order(OrderEvent {
+                key: key.clone(),
+                state: RequestAmend::new(
+                    VenueOrderId::ClientAssigned,
+                    AmendPatch::default().with_quantity(d("2")),
+                    AmendTarget {
+                        side: Side::Buy,
+                        price: Some(d("49000")),
+                        quantity: d("1"),
+                        kind: OrderKind::Limit,
+                        time_in_force: gtc(),
+                        reduce_only: None,
+                    },
+                    Decimal::ZERO,
+                ),
+            })
+            .await;
+
+        assert_eq!(answer.key, key.into_owned_instrument());
+        assert!(matches!(
+            answer.state,
+            Err(crate::error::OrderError::Connectivity(
+                ConnectivityError::ExchangeOffline(EXCHANGE)
+            ))
+        ));
     }
 
     /// A deadline further out than a tokio timer can wait is retired at its own instant, not early.

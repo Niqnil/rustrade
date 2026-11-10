@@ -14,7 +14,11 @@ use crate::{
     margin::SpotMarginConfig,
     order::{
         Order, OrderKey, UnindexedInactiveOrder, UnindexedOrderKey,
-        request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
+        amend::{AmendAllowed, AmendPriority, AmendSupport},
+        request::{
+            OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseAmend,
+            UnindexedOrderResponseCancel,
+        },
         state::{Open, OrderState, UnindexedOrderState},
     },
     short_option::ShortPutCollateral,
@@ -116,6 +120,108 @@ pub struct MockExecutionConfig {
     /// strike less the premium the sale receives. See [`ShortPutCollateral`].
     #[serde(default)]
     pub short_put_collateral: ShortPutCollateral,
+    /// What the mock exchange amends in place, and whether an amended order keeps its venue
+    /// order id. See [`AmendConfig`].
+    ///
+    /// Defaults to [`AmendConfig::FULL`]: a resting order's price and quantity can be amended,
+    /// together or alone, and the order keeps its id.
+    #[serde(default)]
+    pub amend: AmendConfig,
+}
+
+/// What the mock exchange amends in place: see
+/// [`ExecutionClient::amend_order`].
+///
+/// The simulated venue amends a resting limit order's price and total quantity. It has no
+/// conditional orders, so it never amends a trigger price.
+///
+/// - **Priority.** An order keeps its place in the queue only when its quantity is lowered and
+///   its price is left alone. Any other amend sends it to the back of the queue at its price, as
+///   if it had arrived when the amend did.
+/// - **Crossing the market.** An amend whose new price crosses the market trades as a taker, as an
+///   arriving limit order does, and what is left rests at the new price. A post-only order's
+///   amend that would cross is refused instead.
+/// - **Refused** with [`AmendRefusal::Venue`](crate::error::AmendRefusal::Venue): an order the
+///   venue is holding for a later bar or a fresh market, an order seeded through
+///   [`MockExecutionConfig::initial_state`], and an option order.
+///
+/// `#[non_exhaustive]`, so a field can be added without breaking a caller. Outside this crate,
+/// start from [`AmendConfig::FULL`] or [`AmendConfig::NONE`] and the `with_*` methods. A field
+/// missing from a serialized config takes its value from `FULL`.
+#[non_exhaustive]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)]
+#[serde(default)]
+pub struct AmendConfig {
+    /// Whether an amend may change the limit price.
+    pub price: AmendAllowed,
+    /// Whether an amend may change the total quantity.
+    pub quantity: AmendAllowed,
+    /// Whether one amend may change both.
+    pub multi_field: bool,
+    /// Whether an amended order is given a new venue order id, as a venue that amends by
+    /// replacing the order does. The answer's
+    /// [`Amended::previous_id`](crate::order::amend::Amended::previous_id) then names the old
+    /// one. A fill the amend itself makes is reported under the old id.
+    pub reassign_id: bool,
+}
+
+impl Default for AmendConfig {
+    /// [`AmendConfig::FULL`].
+    fn default() -> Self {
+        Self::FULL
+    }
+}
+
+impl AmendConfig {
+    /// Price and quantity can each be amended to any value, together or alone, and the order
+    /// keeps its id.
+    pub const FULL: Self = Self {
+        price: AmendAllowed::Any,
+        quantity: AmendAllowed::Any,
+        multi_field: true,
+        reassign_id: false,
+    };
+
+    /// Nothing can be amended: every amend is refused, as a venue without amends refuses it.
+    pub const NONE: Self = Self {
+        price: AmendAllowed::Unsupported,
+        quantity: AmendAllowed::Unsupported,
+        multi_field: false,
+        reassign_id: false,
+    };
+
+    pub fn with_price(self, price: AmendAllowed) -> Self {
+        Self { price, ..self }
+    }
+
+    pub fn with_quantity(self, quantity: AmendAllowed) -> Self {
+        Self { quantity, ..self }
+    }
+
+    pub fn with_multi_field(self, multi_field: bool) -> Self {
+        Self {
+            multi_field,
+            ..self
+        }
+    }
+
+    pub fn with_reassign_id(self, reassign_id: bool) -> Self {
+        Self {
+            reassign_id,
+            ..self
+        }
+    }
+
+    /// What a client of a venue configured this way declares: no trigger price, since the venue
+    /// has no conditional orders, and priority kept only on a quantity decrease.
+    pub fn support(&self) -> AmendSupport {
+        AmendSupport::NONE
+            .with_price(self.price)
+            .with_quantity(self.quantity)
+            .with_multi_field(self.multi_field)
+            .with_keeps_id(!self.reassign_id)
+            .with_priority(AmendPriority::KeptOnQuantityDecrease)
+    }
 }
 
 #[derive(Debug, Constructor)]
@@ -124,6 +230,10 @@ pub struct MockExecutionClientConfig<FnTime> {
     pub clock: FnTime,
     pub request_tx: mpsc::UnboundedSender<MockExchangeRequest>,
     pub event_rx: broadcast::Receiver<UnindexedAccountEvent>,
+    /// What the client declares it can amend: the venue's
+    /// [`AmendConfig::support`], read from the same [`MockExecutionConfig::amend`] the venue was
+    /// built with, so the two cannot disagree.
+    pub amend_support: AmendSupport,
 }
 
 impl<FnTime> Clone for MockExecutionClientConfig<FnTime>
@@ -136,6 +246,7 @@ where
             clock: self.clock.clone(),
             request_tx: self.request_tx.clone(),
             event_rx: self.event_rx.resubscribe(),
+            amend_support: self.amend_support,
         }
     }
 }
@@ -146,6 +257,9 @@ pub struct MockExecution<FnTime> {
     pub clock: FnTime,
     pub request_tx: mpsc::UnboundedSender<MockExchangeRequest>,
     pub event_rx: broadcast::Receiver<UnindexedAccountEvent>,
+    /// What [`amend_support`](ExecutionClient::amend_support) declares: see
+    /// [`MockExecutionClientConfig::amend_support`].
+    pub amend_support: AmendSupport,
 }
 
 impl<FnTime> Clone for MockExecution<FnTime>
@@ -158,6 +272,7 @@ where
             clock: self.clock.clone(),
             request_tx: self.request_tx.clone(),
             event_rx: self.event_rx.resubscribe(),
+            amend_support: self.amend_support,
         }
     }
 }
@@ -195,6 +310,7 @@ where
             clock: config.clock,
             request_tx: config.request_tx,
             event_rx: config.event_rx,
+            amend_support: config.amend_support,
         }
     }
 
@@ -351,6 +467,46 @@ where
                 )),
             },
         }
+    }
+
+    fn amend_support(&self) -> AmendSupport {
+        self.amend_support
+    }
+
+    async fn amend_order(
+        &self,
+        request: OrderRequestAmend<ExchangeId, &InstrumentNameExchange>,
+    ) -> UnindexedOrderResponseAmend {
+        let (response_tx, response_rx) = oneshot::channel();
+
+        let request = request.into_owned_instrument();
+        let key = request.key.clone();
+        let offline =
+            || OrderError::Connectivity(ConnectivityError::ExchangeOffline(self.mocked_exchange));
+
+        if self
+            .request_tx
+            .send(MockExchangeRequest::amend_order(
+                self.time_request(),
+                response_tx,
+                request,
+            ))
+            .is_err()
+        {
+            // The venue's channel is closed. Answered as a cancel's is, as a lost connection,
+            // which the manager settles by looking the order up.
+            return UnindexedOrderResponseAmend {
+                key,
+                state: Err(offline()),
+            };
+        }
+
+        response_rx
+            .await
+            .unwrap_or_else(|_| UnindexedOrderResponseAmend {
+                key,
+                state: Err(offline()),
+            })
     }
 
     async fn fetch_balances(
@@ -572,6 +728,63 @@ mod tests {
     use rust_decimal::Decimal;
     use rustrade_integration::collection::snapshot::Snapshot;
 
+    #[test]
+    fn an_amend_config_declares_what_it_allows_and_never_a_trigger() {
+        let full = AmendConfig::FULL.support();
+        assert_eq!(
+            full,
+            AmendSupport::NONE
+                .with_price(AmendAllowed::Any)
+                .with_quantity(AmendAllowed::Any)
+                .with_multi_field(true)
+                .with_keeps_id(true)
+                .with_priority(AmendPriority::KeptOnQuantityDecrease)
+        );
+
+        let narrow = AmendConfig::NONE
+            .with_quantity(AmendAllowed::DecreaseOnly)
+            .with_reassign_id(true)
+            .support();
+        assert_eq!(narrow.price, AmendAllowed::Unsupported);
+        assert_eq!(narrow.quantity, AmendAllowed::DecreaseOnly);
+        assert_eq!(narrow.trigger_price, AmendAllowed::Unsupported);
+        assert!(!narrow.multi_field);
+        assert!(!narrow.keeps_id);
+        assert!(AmendConfig::NONE.support().is_none());
+        assert_eq!(AmendConfig::default(), AmendConfig::FULL);
+    }
+
+    #[test]
+    fn an_amend_config_missing_from_a_serialized_config_is_full() {
+        let config = MockExecutionConfig {
+            mocked_exchange: ExchangeId::Mock,
+            initial_state: UnindexedAccountSnapshot {
+                exchange: ExchangeId::Mock,
+                balances: Vec::new(),
+                instruments: Vec::new(),
+            },
+            latency_ms: 0,
+            fee_model: Default::default(),
+            fill_model: Default::default(),
+            spot_fee_asset: Default::default(),
+            slippage: Default::default(),
+            market_order_timing: Default::default(),
+            stale_market: Default::default(),
+            spot_margin: None,
+            fee_asset: None,
+            long_option_expiry: Default::default(),
+            short_put_collateral: Default::default(),
+            amend: AmendConfig::NONE,
+        };
+        let mut json = serde_json::to_value(&config).unwrap();
+        json.as_object_mut().unwrap().remove("amend");
+        let read: MockExecutionConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(read.amend, AmendConfig::FULL);
+
+        let partial: AmendConfig = serde_json::from_str(r#"{"reassign_id": true}"#).unwrap();
+        assert_eq!(partial, AmendConfig::FULL.with_reassign_id(true));
+    }
+
     fn filler_event() -> UnindexedAccountEvent {
         // Content is irrelevant — these events are overwritten by the lag before they can be
         // delivered; they exist only to overflow the broadcast buffer.
@@ -597,7 +810,13 @@ mod tests {
 
         let (_event_tx, event_rx) = broadcast::channel::<UnindexedAccountEvent>(1);
         let (request_tx, mut request_rx) = mpsc::unbounded_channel();
-        let client = MockExecution::new(ExchangeId::Mock, Utc::now, request_tx, event_rx);
+        let client = MockExecution::new(
+            ExchangeId::Mock,
+            Utc::now,
+            request_tx,
+            event_rx,
+            AmendSupport::NONE,
+        );
         let start = Utc::now() - chrono::TimeDelta::hours(1);
         let end = Utc::now();
 
@@ -677,7 +896,13 @@ mod tests {
         let (request_tx, _request_rx) = mpsc::unbounded_channel();
         // `MockExecution` derives `Constructor`, so its inherent `new` takes the four fields
         // directly (the `ExecutionClient::new(config)` trait method is shadowed here).
-        let client = MockExecution::new(ExchangeId::Mock, Utc::now, request_tx, event_rx);
+        let client = MockExecution::new(
+            ExchangeId::Mock,
+            Utc::now,
+            request_tx,
+            event_rx,
+            AmendSupport::NONE,
+        );
 
         let mut stream = client.account_stream(&[], &[]).await.unwrap();
 
@@ -712,7 +937,13 @@ mod tests {
     async fn account_stream_ends_right_after_a_terminal_event_from_the_venue() {
         let (event_tx, event_rx) = broadcast::channel::<UnindexedAccountEvent>(16);
         let (request_tx, _request_rx) = mpsc::unbounded_channel();
-        let client = MockExecution::new(ExchangeId::Mock, Utc::now, request_tx, event_rx);
+        let client = MockExecution::new(
+            ExchangeId::Mock,
+            Utc::now,
+            request_tx,
+            event_rx,
+            AmendSupport::NONE,
+        );
         let mut stream = client.account_stream(&[], &[]).await.unwrap();
 
         event_tx.send(filler_event()).unwrap();

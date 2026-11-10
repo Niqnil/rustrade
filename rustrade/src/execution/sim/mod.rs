@@ -1889,6 +1889,7 @@ mod tests {
             fee_asset: None,
             long_option_expiry: Default::default(),
             short_put_collateral: Default::default(),
+            amend: Default::default(),
         }
     }
 
@@ -3407,6 +3408,124 @@ mod tests {
                     cancel: first_unknown,
                 },
             ))
+        );
+    }
+
+    /// An amend of the resting buy under `cid`, moving its price to `price`.
+    fn amend_to(exchange: ExchangeIndex, cid: ClientOrderId, price: Decimal) -> ExecutionRequest {
+        use rustrade_execution::order::{
+            amend::{AmendPatch, AmendTarget, RequestAmend},
+            id::VenueOrderId,
+            request::OrderRequestAmend,
+        };
+        ExecutionRequest::Amend(OrderRequestAmend {
+            key: OrderKey {
+                exchange,
+                instrument: instrument_key(),
+                strategy: StrategyId::new("test"),
+                cid,
+            },
+            state: RequestAmend::new(
+                VenueOrderId::ClientAssigned,
+                AmendPatch::default().with_price(price),
+                AmendTarget {
+                    side: Side::Buy,
+                    price: Some(dec!(1)),
+                    quantity: dec!(0.01),
+                    kind: OrderKind::Limit,
+                    time_in_force: TimeInForce::GoodUntilCancelled { post_only: false },
+                    reduce_only: None,
+                },
+                Decimal::ZERO,
+            ),
+        })
+    }
+
+    /// Every amend response in a run: the price it set, or the error it was refused with.
+    fn amend_outcomes(events: &[EngineEvent<DataKind>]) -> Vec<Result<Option<Decimal>, String>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                EngineEvent::Account(AccountStreamEvent::Item(AccountEvent {
+                    kind: AccountEventKind::OrderAmended(response),
+                    ..
+                })) => Some(
+                    response
+                        .state
+                        .as_ref()
+                        .map(|amended| amended.price)
+                        .map_err(|error| error.to_string()),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// An amend reaches the venue, which moves the order and restates its hold before answering.
+    #[tokio::test]
+    async fn an_amend_moves_a_resting_order_and_restates_its_hold_first() {
+        let mut harness = Harness::new(
+            0,
+            vec![
+                market(10, dec!(200)),
+                market(100, dec!(200)),
+                market(700, dec!(200)),
+            ],
+        );
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+        harness.clock.advance_to(at(10));
+        let cid = harness.send_limit(dec!(1));
+        assert_eq!(harness.next().await, Some("balance"));
+        assert_eq!(harness.next().await, Some("order"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(100));
+        harness.send(amend_to(harness.exchange, cid, dec!(2)));
+
+        let events = harness.rest_events().await;
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec!["balance", "account_other", "market", "after_drain"]
+        );
+        assert_eq!(amend_outcomes(&events), vec![Ok(Some(dec!(2)))]);
+    }
+
+    /// An amend the venue's config does not allow is refused without reaching the venue, as the
+    /// `ExecutionManager` refuses one a live client does not declare.
+    #[tokio::test]
+    async fn an_amend_the_venue_does_not_declare_is_refused_unsent() {
+        let mut harness = Harness::with_config(
+            MockExecutionConfig {
+                amend: rustrade_execution::client::mock::AmendConfig::NONE,
+                ..config(0)
+            },
+            vec![
+                market(10, dec!(200)),
+                market(100, dec!(200)),
+                market(700, dec!(200)),
+            ],
+        );
+        assert_eq!(harness.next().await, Some("snapshot"));
+        assert_eq!(harness.next().await, Some("market"));
+        harness.clock.advance_to(at(10));
+        let cid = harness.send_limit(dec!(1));
+        assert_eq!(harness.next().await, Some("balance"));
+        assert_eq!(harness.next().await, Some("order"));
+        assert_eq!(harness.next().await, Some("market"));
+
+        harness.clock.advance_to(at(100));
+        harness.send(amend_to(harness.exchange, cid, dec!(2)));
+
+        let events = harness.rest_events().await;
+        assert_eq!(
+            events.iter().map(label).collect::<Vec<_>>(),
+            vec!["account_other", "market", "after_drain"],
+            "refused with nothing restated"
+        );
+        assert_eq!(
+            amend_outcomes(&events),
+            vec![Err("amend refused: the price cannot be amended".to_owned())]
         );
     }
 

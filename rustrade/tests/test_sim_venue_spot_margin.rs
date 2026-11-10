@@ -139,6 +139,7 @@ fn venue(spot_fee_asset: SpotFeeAsset) -> SimulatedVenue {
         fee_asset: None,
         long_option_expiry: Default::default(),
         short_put_collateral: Default::default(),
+        amend: Default::default(),
     };
     let spot = Instrument {
         exchange: EXCHANGE,
@@ -444,6 +445,7 @@ fn a_liquidation_flattens_the_engine_position_and_leaves_its_balances_the_venues
         fee_asset: None,
         long_option_expiry: Default::default(),
         short_put_collateral: Default::default(),
+        amend: Default::default(),
     };
     let mut venue = SimulatedVenue::new_market_driven(&config, template.instruments().clone());
     let traded = |price| {

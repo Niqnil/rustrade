@@ -5,7 +5,10 @@ use crate::{
     error::UnindexedApiError,
     order::{
         Order, UnindexedInactiveOrder, UnindexedOrderKey,
-        request::{OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseCancel},
+        request::{
+            OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseAmend,
+            UnindexedOrderResponseCancel,
+        },
         state::{Open, UnindexedOrderState},
     },
     trade::Trade,
@@ -133,6 +136,20 @@ impl MockExchangeRequest {
         )
     }
 
+    pub fn amend_order(
+        time_request: DateTime<Utc>,
+        response_tx: oneshot::Sender<UnindexedOrderResponseAmend>,
+        request: OrderRequestAmend<ExchangeId, InstrumentNameExchange>,
+    ) -> Self {
+        Self::new(
+            time_request,
+            MockExchangeRequestKind::AmendOrder {
+                response_tx,
+                request,
+            },
+        )
+    }
+
     pub fn open_order(
         time_request: DateTime<Utc>,
         response_tx: oneshot::Sender<
@@ -190,6 +207,12 @@ pub enum MockExchangeRequestKind {
     CancelOrder {
         response_tx: oneshot::Sender<UnindexedOrderResponseCancel>,
         request: OrderRequestCancel<ExchangeId, InstrumentNameExchange>,
+    },
+    /// Amend a resting order in place: see
+    /// [`SimulatedVenue::amend_order`](crate::exchange::mock::SimulatedVenue::amend_order).
+    AmendOrder {
+        response_tx: oneshot::Sender<UnindexedOrderResponseAmend>,
+        request: OrderRequestAmend<ExchangeId, InstrumentNameExchange>,
     },
     OpenOrder {
         response_tx:

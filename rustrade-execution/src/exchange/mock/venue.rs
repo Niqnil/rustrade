@@ -5,14 +5,14 @@ use crate::{
     balance::{AssetBalance, MarginDetails},
     borrow_capacity::BorrowCapacity,
     cash_flow::{CashFlow, CashFlowId, CashFlowKind, CashFlowLoan, InterestTiming},
-    client::mock::MockExecutionConfig,
+    client::mock::{AmendConfig, MockExecutionConfig},
     error::{
-        AmendField, AmendRefusal, ApiError, BorrowReject, BorrowRejectReason, OrderError,
-        UnindexedApiError, UnindexedOrderError,
+        AmendRefusal, ApiError, BorrowReject, BorrowRejectReason, OrderError, UnindexedApiError,
+        UnindexedOrderError,
     },
     exchange::mock::{
         account::{AccountState, BalanceInsufficient, Committed, Credit, Debit, Delivery, Lending},
-        orders::{AlreadyResting, OpenOrder, Reservation, RestingOrder},
+        orders::{AlreadyResting, NotQueued, OpenOrder, Rank, Reservation, RestingOrder},
     },
     expiry::LongOptionExpiry,
     fee::{FeeAssetConfig, FeeModel, FeeModelConfig, Liquidity, SpotFeeAsset},
@@ -23,7 +23,7 @@ use crate::{
     market::{MarketBar, MarketDepth, MarketObservation, MarketSnapshot},
     order::{
         Order, OrderKind, TimeInForce, UnindexedInactiveOrder, UnindexedOrder, UnindexedOrderKey,
-        amend::AmendSupport,
+        amend::{AmendSupport, AmendTarget, Amended, RequestAmend},
         id::{ClientOrderId, OrderId, StrategyId, VenueOrderId},
         request::{
             OrderRequestAmend, OrderRequestCancel, OrderRequestOpen, UnindexedOrderResponseAmend,
@@ -825,6 +825,9 @@ pub struct SimulatedVenue {
     /// How much quote a short put holds. Fixed at construction from
     /// [`MockExecutionConfig::short_put_collateral`].
     short_put_collateral: ShortPutCollateral,
+    /// What this venue amends in place. Fixed at construction from
+    /// [`MockExecutionConfig::amend`].
+    amend: AmendConfig,
     /// The expiry of every option this venue lists, earliest first. Instruments are fixed at
     /// construction, so this never changes.
     option_expiries: Vec<(DateTime<Utc>, InstrumentNameExchange)>,
@@ -967,6 +970,7 @@ impl SimulatedVenue {
             checkpoint_sequence: 0,
             long_option_expiry: config.long_option_expiry,
             short_put_collateral: config.short_put_collateral,
+            amend: config.amend,
             option_expiries,
             next_option_expiry: None,
             option_spots,
@@ -3044,7 +3048,7 @@ impl SimulatedVenue {
     ) -> Vec<UnindexedAccountEvent> {
         let (committed, trade, remainder) =
             match self.reenter(&order, reservation, limit, release, terms, time_exchange) {
-                Reentry::Refused { reservation } => {
+                Reentry::Refused { reservation, .. } => {
                     let released = reservation
                         .map(|reservation| self.release_reservation(reservation, time_exchange));
                     return self.cancel_unfilled(order, released, time_exchange);
@@ -3120,19 +3124,21 @@ impl SimulatedVenue {
     /// stands, and committed in place of the hold through
     /// [`commit_afresh`](Self::commit_afresh). An order the account cannot afford is refused.
     ///
-    /// A refusal changes nothing, the slippage included, and hands `reservation` back. A refused
-    /// post-only order touches no balance. One the account cannot afford moves only balance
-    /// timestamps, to `time_exchange`: those of the order's hold and of any collateral the fill
-    /// would have released, which its recommit released and restored. No event reports them.
+    /// A refusal changes nothing, the slippage included, hands `reservation` back, and says why.
+    /// A refused post-only order touches no balance. One the account cannot afford moves only
+    /// balance timestamps, to `time_exchange`: those of the order's hold and of any collateral
+    /// the fill would have released, which its recommit released and restored. No event reports
+    /// them.
     ///
     /// A commit prints the fill, if any, under the order's own id, but leaves the order where it
     /// was: the caller puts what is left on the book, or retires an order filled outright, and
-    /// reports the order.
+    /// reports the order. The interest a commit charges, and any its hold carried, waits in the
+    /// remainder's reservation only while the order has traded nothing, before this or now:
+    /// otherwise the commit reports it, after its trade if it has one.
     ///
-    /// `order` must not be among the resting orders the costing reads: the remainder's
-    /// requirement is priced against the position with what else rests on its side behind it, so
-    /// an order still on the book would count itself twice. A caller that leaves it on the book
-    /// excludes it from that sum.
+    /// `order` may still be on the book, under its own client order id: the remainder is priced
+    /// against the position with what else rests on its side behind it, and that sum leaves the
+    /// order's own id out, so it never counts itself.
     fn reenter(
         &mut self,
         order: &OpenOrder,
@@ -3162,7 +3168,10 @@ impl SimulatedVenue {
             TimeInForce::GoodUntilCancelled { post_only: true }
         );
         if marketable && post_only {
-            return Reentry::Refused { reservation };
+            return Reentry::Refused {
+                reservation,
+                cause: Refusal::PostOnly,
+            };
         }
 
         // What the market has to give this order: nothing if it does not cross, and all of it
@@ -3205,7 +3214,13 @@ impl SimulatedVenue {
                 Some((price, _)) => position.after(side, filled_quantity, *price),
                 None => position,
             };
-            let position = self.behind_resting(terms, &order.key.instrument, side, position);
+            let position = self.behind_resting(
+                terms,
+                &order.key.instrument,
+                side,
+                position,
+                Some(&order.key.cid),
+            );
             self.settlement(terms, position, side, unfilled, limit, Liquidity::Maker)
         });
         // One order pays with one asset, which a call sale whose fill only closes a long, while its
@@ -3247,9 +3262,15 @@ impl SimulatedVenue {
                 loan,
                 excess_borrowed,
             } => (commitment, loan, excess_borrowed),
-            Recommitted::Unaffordable { reservation } => {
+            Recommitted::Unaffordable {
+                reservation,
+                insufficient,
+            } => {
                 self.slippage = slippage_before;
-                return Reentry::Refused { reservation };
+                return Reentry::Refused {
+                    reservation,
+                    cause: Refusal::Unaffordable(insufficient),
+                };
             }
         };
 
@@ -3263,17 +3284,17 @@ impl SimulatedVenue {
             self.print_fill(terms, order, fill, settlement.fees, time_exchange)
         });
 
-        // What is left holds the loan this commit left the order with. A re-entry that traded
-        // reports every charge after its trade. One that did not leaves them with no position to
-        // belong to, so they wait with the remainder, as on arrival.
+        // What is left holds the loan this commit left the order with. An order that has traded,
+        // before or by this commit, has a position for its charges to belong to, so the commit
+        // reports them. One that has not leaves them nothing to belong to, so they wait with the
+        // remainder, as on arrival.
         let remainder = held.map(|held| {
-            let unreported_interest = match trade {
-                Some(_) => Vec::new(),
-                None => {
-                    let mut held = std::mem::take(&mut committed.held_interest);
-                    held.extend(committed.interest.take().map(|flow| *flow));
-                    held
-                }
+            let unreported_interest = if trade.is_none() && order.state.filled_quantity.is_zero() {
+                let mut held = std::mem::take(&mut committed.held_interest);
+                held.extend(committed.interest.take().map(|flow| *flow));
+                held
+            } else {
+                Vec::new()
             };
             Reservation {
                 borrowed: loan.min(held.requirement()),
@@ -3475,7 +3496,7 @@ impl SimulatedVenue {
             time_exchange,
         ) {
             Recommitted::Committed { commitment, .. } => RestingSettlement::Settled(commitment),
-            Recommitted::Unaffordable { reservation } => RestingSettlement::Unaffordable {
+            Recommitted::Unaffordable { reservation, .. } => RestingSettlement::Unaffordable {
                 released: reservation
                     .map(|reservation| self.release_reservation(reservation, time_exchange)),
             },
@@ -3558,7 +3579,8 @@ impl SimulatedVenue {
                     excess_borrowed,
                 }
             }
-            Err(_) => Recommitted::Unaffordable {
+            Err(insufficient) => Recommitted::Unaffordable {
+                insufficient,
                 reservation: released.map(|(mut reservation, _)| {
                     // A refused commit moves nothing, so this undoes the release exactly, even
                     // where a charge has left `free` below zero.
@@ -4074,36 +4096,312 @@ impl SimulatedVenue {
         VenueOutcome { events, response }
     }
 
-    /// What this venue can amend in place: see [`AmendSupport`].
-    ///
-    /// Nothing yet: every amend is refused.
+    /// What this venue can amend in place: [`MockExecutionConfig::amend`]'s
+    /// [`support`](AmendConfig::support).
     pub fn amend_support(&self) -> AmendSupport {
-        AmendSupport::NONE
+        self.amend.support()
     }
 
-    /// Amends a resting order in place.
+    /// Amends a resting limit order's price or total quantity in place, as
+    /// [`AmendConfig`] describes, and answers with the order as amended.
     ///
-    /// Refuses every amend, changing nothing, with [`AmendRefusal::Unsupported`] for the first
-    /// field it changes: see [`amend_support`](Self::amend_support).
+    /// The amend is checked against the order as this venue holds it, not against the
+    /// [`current`](crate::order::amend::RequestAmend::current) its sender tracked: by
+    /// [`AmendPatch::apply`](crate::order::amend::AmendPatch::apply), then by
+    /// [`amend_support`](Self::amend_support). An amend whose
+    /// [`id`](crate::order::amend::RequestAmend::id) names another venue order id than the order
+    /// now has is rejected, as an amend of an order the venue no longer addresses that way.
+    ///
+    /// # What an amend does
+    /// The order's hold is released and what the amended order needs held, or fills, is costed
+    /// afresh against the venue's current market, as a held limit order is when the venue
+    /// releases it:
+    /// - one whose new price the market crosses trades as a taker, up to the size the market has,
+    ///   and what is left rests at the new price; a fill it makes is reported under the order's
+    ///   id before the amend;
+    /// - otherwise it rests whole at its new price and quantity.
+    ///
+    /// The order keeps its place in the queue only when its quantity is lowered and its price is
+    /// left alone. Any other amend files it behind every order at its new price, and stamps its
+    /// [`Open::time_exchange`] with the amend's instant.
+    ///
+    /// A margin order keeps its loan, borrowing more only for what the amend adds; what it no
+    /// longer needs is repaid only on a venue that repays when an order is cancelled, as when a
+    /// fill costs less than was held. Interest the amend's borrow is charged waits for a trade,
+    /// as an arriving order's does, only while the order has traded nothing.
+    ///
+    /// Returns the balances the amend restated, then the fill and interest it reported, then,
+    /// for an order the amend filled outright, the order's terminal snapshot.
+    ///
+    /// # Refused, changing nothing
+    /// - [`AmendRefusal`] from the checks above, or [`AmendRefusal::WouldTakeLiquidity`] for a
+    ///   post-only order whose new price the market crosses.
+    /// - [`AmendRefusal::Venue`] for an order the venue holds for a later bar or a fresh market,
+    ///   one seeded through [`MockExecutionConfig::initial_state`] (the venue took nothing for it
+    ///   to recommit), an option order, and a price amend on a market that is stale under
+    ///   [`StaleMarketPolicy::Wait`]. A quantity-only amend on a stale market is made.
+    /// - The shortability check an arriving CFD sell gets, for an amend that raises a sell's
+    ///   quantity or reprices it to cross the market.
+    /// - [`ApiError::BalanceInsufficient`], or a borrow limit, as for an arriving order, when the
+    ///   account cannot afford the amended order. No event is reported, though the order's
+    ///   balance is restamped.
+    /// - For an order the venue no longer holds, the reason a cancel would give: see
+    ///   [`cancel_order`](Self::cancel_order). An order whose
+    ///   [`GoodTillDate`](TimeInForce::GoodTillDate) deadline the venue has reached was retired
+    ///   when the clock reached it, so its amend is answered [`ApiError::OrderAlreadyExpired`].
+    ///
+    /// # Panics
+    /// If the configured [`MarginInterestModel`] breaks its contract with a boundary not after
+    /// the instant it was asked from, when the venue next looks for one after a loan changes.
     pub fn amend_order(
         &mut self,
         request: OrderRequestAmend<ExchangeId, InstrumentNameExchange>,
     ) -> AmendOutcome {
-        let field = request
-            .state
-            .patch
-            .fields()
-            .next()
-            .unwrap_or(AmendField::Price);
+        let mut events = Vec::new();
+        let state = self.amend_resting(&request, &mut events);
+        if state.is_ok() {
+            self.refresh_next_interest_if_loans_changed();
+            self.report_debt_changes(&mut events);
+        }
         VenueOutcome {
-            events: Vec::new(),
+            events,
             response: UnindexedOrderResponseAmend {
                 key: request.key,
-                state: Err(OrderError::AmendRefused(AmendRefusal::Unsupported {
-                    field,
-                })),
+                state,
             },
         }
+    }
+
+    /// [`amend_order`](Self::amend_order)'s work, pushing what the amend reports onto `events`.
+    fn amend_resting(
+        &mut self,
+        request: &OrderRequestAmend<ExchangeId, InstrumentNameExchange>,
+        events: &mut Vec<UnindexedAccountEvent>,
+    ) -> Result<Amended, UnindexedOrderError> {
+        let cid = &request.key.cid;
+        let instrument = &request.key.instrument;
+        let time_exchange = self.time_exchange();
+        let refuse = |reason: String| OrderError::AmendRefused(AmendRefusal::Venue(reason));
+
+        // Cloned out, so the ledger can be borrowed mutably below. The order stays on the book
+        // until the amend succeeds: a refusal leaves it, its queue position and its hold exactly
+        // as they were.
+        let (order, reservation) = match self.account.orders().resting_order(cid) {
+            Some(RestingOrder { order, reservation }) => (order.clone(), reservation.clone()),
+            None => return Err(self.cancel_missing_reason(cid)),
+        };
+
+        if request.state.id.contradicts(&order.state.id) {
+            return Err(UnindexedOrderError::Rejected(ApiError::OrderRejected(
+                format!(
+                    "SimulatedVenue holds {cid} as {:?}, not as {:?}",
+                    order.state.id, request.state.id
+                ),
+            )));
+        }
+        let Some(reservation) = reservation else {
+            return Err(refuse(format!(
+                "{cid} was seeded through initial_state, so SimulatedVenue holds nothing against \
+                 it to recommit"
+            )));
+        };
+        // Only a limit order the venue booked on the book is queued: a held order waits for a
+        // bar or a fresh market, and an order with no price never rests. An immediate order
+        // never rests either, so every order past this check works until cancelled or a date.
+        if !self.account.orders().is_queued(cid) {
+            return Err(refuse(format!(
+                "{cid} is held for its instrument's next bar or fresh market, not resting on the \
+                 book"
+            )));
+        }
+        if self.is_option(instrument) {
+            return Err(refuse(format!(
+                "SimulatedVenue does not amend an option order: {instrument}"
+            )));
+        }
+
+        // Checked against the order as this venue holds it.
+        let filled = order.state.filled_quantity;
+        let current = AmendTarget {
+            side: order.side,
+            price: order.price,
+            quantity: order.quantity,
+            kind: order.kind,
+            time_in_force: order.time_in_force,
+            reduce_only: request.state.current.reduce_only,
+        };
+        let amended = request
+            .state
+            .patch
+            .apply(&current, filled)
+            .map_err(OrderError::AmendRefused)?;
+        self.amend
+            .support()
+            .permits(&RequestAmend::new(
+                order.state.id.clone(),
+                request.state.patch,
+                current,
+                filled,
+            ))
+            .map_err(OrderError::AmendRefused)?;
+        let Some(limit) = amended.price else {
+            unreachable!("SimulatedVenue queued {cid} without a limit price");
+        };
+        let repriced = amended.price != order.price;
+        let raised = amended.quantity > order.quantity;
+
+        // A price amend is decided against the market, which a stale one cannot be trusted to
+        // show. A quantity-only amend leaves the order where it was decided.
+        if repriced
+            && let StaleMarketPolicy::Wait { max_age } = self.stale_market
+            && let MarketAge::Stale(_) = self.market_age(instrument, max_age, time_exchange)
+        {
+            return Err(refuse(format!(
+                "{instrument}'s market is stale under StaleMarketPolicy::Wait, and a price amend \
+                 is decided against it"
+            )));
+        }
+
+        let market = self
+            .market(instrument)
+            .map(|market| market.snapshot)
+            .unwrap_or_default();
+        let marketable = crosses(order.side, limit, &market);
+        let post_only = matches!(
+            order.time_in_force,
+            TimeInForce::GoodUntilCancelled { post_only: true }
+        );
+        if post_only && marketable {
+            return Err(OrderError::AmendRefused(AmendRefusal::WouldTakeLiquidity));
+        }
+
+        let terms = self
+            .instrument_terms(instrument)
+            .map_err(UnindexedOrderError::Rejected)?;
+        // A lowered or unmoved sell asks for no more short than the venue already accepted.
+        if raised || (repriced && marketable) {
+            let sale = ShortSale {
+                instrument,
+                exchange: request.key.exchange,
+                side: order.side,
+                kind: order.kind,
+                price: amended.price,
+                quantity: amended.quantity - filled,
+                replacing: Some(cid),
+            };
+            self.check_shortability(&sale, &terms, Some(&market))
+                .map_err(UnindexedOrderError::Rejected)?;
+        }
+
+        let candidate = Order {
+            price: amended.price,
+            quantity: amended.quantity,
+            ..order.clone()
+        };
+        let (committed, trade, remainder) = match self.reenter(
+            &candidate,
+            Some(reservation),
+            limit,
+            Release::Market(&market),
+            &terms,
+            time_exchange,
+        ) {
+            Reentry::Entered {
+                committed,
+                trade,
+                remainder,
+            } => (committed, trade, remainder),
+            // Checked above against the same market, so not reached; answered as that check
+            // answers it rather than asserted.
+            Reentry::Refused {
+                cause: Refusal::PostOnly,
+                ..
+            } => return Err(OrderError::AmendRefused(AmendRefusal::WouldTakeLiquidity)),
+            Reentry::Refused {
+                cause: Refusal::Unaffordable(insufficient),
+                ..
+            } => {
+                return Err(UnindexedOrderError::Rejected(
+                    self.insufficient_error(insufficient, order.side),
+                ));
+            }
+        };
+
+        let traded = trade
+            .as_ref()
+            .map(|trade| (trade.order_id.clone(), trade.price));
+        let filled_total = filled + trade.as_ref().map_or(Decimal::ZERO, |trade| trade.quantity);
+        self.push_committed(events, committed, trade);
+
+        let Some(reservation) = remainder else {
+            // Filled outright by the amend's own trade.
+            let Some((order_id, price)) = traded else {
+                unreachable!("an amended order with nothing left to rest has traded");
+            };
+            let _ = self.account.remove_order(cid);
+            let ended = Order {
+                key: candidate.key.clone(),
+                side: candidate.side,
+                price: candidate.price,
+                quantity: candidate.quantity,
+                kind: candidate.kind,
+                time_in_force: candidate.time_in_force,
+                state: Filled::new(
+                    order_id,
+                    time_exchange,
+                    candidate.quantity,
+                    // As `match_resting` reports it: an average only of fills this one trade is.
+                    filled.is_zero().then_some(price),
+                ),
+            };
+            self.account.ack_filled(ended.clone());
+            events.push(
+                self.build_account_event(Snapshot(ended.map_state(OrderState::fully_filled))),
+            );
+            return Ok(Amended::new(
+                Open::new(order.state.id, time_exchange, candidate.quantity),
+                candidate.price,
+                candidate.quantity,
+                candidate.kind,
+                None,
+            ));
+        };
+
+        let rank = if !repriced && amended.quantity < order.quantity {
+            Rank::Kept
+        } else {
+            Rank::Lost
+        };
+        let opened_at = match rank {
+            Rank::Kept => order.state.time_exchange,
+            Rank::Lost => time_exchange,
+        };
+        // Minted only now the amend has succeeded, so a refused amend uses up no id.
+        let (id, previous_id) = if self.amend.reassign_id {
+            let id = VenueOrderId::Assigned(self.order_id_sequence_fetch_add());
+            (id, Some(order.state.id))
+        } else {
+            (order.state.id, None)
+        };
+        let open = Open::new(id, opened_at, filled_total);
+        let booked = Order {
+            state: open.clone(),
+            ..candidate
+        };
+        let answer = Amended::new(
+            open,
+            booked.price,
+            booked.quantity,
+            booked.kind,
+            previous_id,
+        );
+        if let Err(NotQueued(refused)) = self.account.amend_order(booked, Some(reservation), rank) {
+            unreachable!(
+                "SimulatedVenue amended {} off the book: amend_resting checks it is queued",
+                refused.order.key.cid
+            );
+        }
+        Ok(answer)
     }
 
     /// Takes a resting order off the book, releasing whatever is held against it.
@@ -4490,7 +4788,9 @@ impl SimulatedVenue {
         }
 
         // Before anything touches the ledger: a refused short leaves no trace on it.
-        if let Err(error) = self.check_shortability(&request, &terms, market.as_ref()) {
+        if let Err(error) =
+            self.check_shortability(&ShortSale::opening(&request), &terms, market.as_ref())
+        {
             return (build_open_order_err_response(request, error), None);
         }
 
@@ -4989,11 +5289,13 @@ impl SimulatedVenue {
     /// The short an order opens is measured as if every resting sell on the instrument filled
     /// first, so that a short this venue has already accepted on the book counts against what is
     /// left to lend, and an order whose short part is nothing — a buy, or a sell that only reduces
-    /// a long — passes untouched. `market` is the snapshot the order will be priced from, so
-    /// whether it is marketable is judged against the book it would fill on.
+    /// a long — passes untouched. An amended order already resting is left out of the resting
+    /// sells, and measured at what it would have left to fill once amended. `market` is the
+    /// snapshot the order will be priced from, so whether it is marketable is judged against the
+    /// book it would fill on.
     fn check_shortability(
         &self,
-        request: &OrderRequestOpen<ExchangeId, InstrumentNameExchange>,
+        sale: &ShortSale<'_>,
         terms: &InstrumentTerms,
         market: Option<&MarketSnapshot>,
     ) -> Result<(), UnindexedApiError> {
@@ -5002,27 +5304,31 @@ impl SimulatedVenue {
         };
         // A CFD short borrows nothing, but a venue may still refuse one on a stock it cannot
         // borrow. An option short is secured instead, in `check_option_order`.
-        if !matches!(terms.settles, Settles::Cfd) || request.state.side != Side::Sell {
+        if !matches!(terms.settles, Settles::Cfd) || sale.side != Side::Sell {
             return Ok(());
         }
 
-        let instrument = &request.key.instrument;
+        let instrument = sale.instrument;
         let resting_sells: Decimal = self
             .account
             .orders_open()
-            .filter(|order| order.key.instrument == *instrument && order.side == Side::Sell)
+            .filter(|order| {
+                order.key.instrument == *instrument
+                    && order.side == Side::Sell
+                    && Some(&order.key.cid) != sale.replacing
+            })
             .map(|order| order.state.quantity_remaining(order.quantity))
             .sum();
         // The position left if every resting sell fills, before and after this order does too.
         let committed = self.net_position(terms, instrument).quantity - resting_sells;
         let short_before = (-committed).max(Decimal::ZERO);
-        let short_after = (request.state.quantity - committed).max(Decimal::ZERO);
+        let short_after = (sale.quantity - committed).max(Decimal::ZERO);
         if short_after <= short_before {
             return Ok(());
         }
 
         let now = self.time_exchange();
-        let exchange = request.key.exchange;
+        let exchange = sale.exchange;
         let shortability = provider.shortability(instrument, now);
 
         if let Some(delisting_at) = shortability.delisting_at
@@ -5051,7 +5357,7 @@ impl SimulatedVenue {
             let message = format!(
                 "selling {} {instrument} on {exchange} would take its short, resting sells \
                  included, to {short_after}, past the {available} there is to borrow at {now}",
-                request.state.quantity
+                sale.quantity
             );
             let left = (available - short_before).max(Decimal::ZERO);
             return Err(ApiError::BorrowRejected(
@@ -5066,18 +5372,13 @@ impl SimulatedVenue {
         // that would take from the book is refused as unpriceable instead, which names the real
         // cause.
         let marketable = || {
-            market.is_some_and(|market| match request.state.kind {
-                OrderKind::Limit => request
-                    .state
+            market.is_some_and(|market| match sale.kind {
+                OrderKind::Limit => sale
                     .price
                     .is_some_and(|limit| crosses(Side::Sell, limit, market)),
                 _ => self
                     .fill_model
-                    .fill_price(&FillContext::new(
-                        Side::Sell,
-                        request.state.quantity,
-                        market,
-                    ))
+                    .fill_price(&FillContext::new(Side::Sell, sale.quantity, market))
                     .is_some(),
             })
         };
@@ -5342,6 +5643,7 @@ impl SimulatedVenue {
                     &request.key.instrument,
                     side,
                     position.after(side, filled_quantity, fill_price),
+                    None,
                 ),
                 side,
                 unfilled,
@@ -5749,18 +6051,23 @@ impl SimulatedVenue {
             instrument,
             side,
             self.net_position(terms, instrument),
+            None,
         )
     }
 
     /// `position` moved by every order resting on `side` of the option `instrument`, as
     /// [`position_behind_resting`](Self::position_behind_resting) explains. Only a position that
     /// opposes `side` moves: resting orders that only add to it change nothing an order closes.
+    ///
+    /// `excluding` names an order left out of the sum: the order being costed, when it is still
+    /// on the book, so it does not count itself.
     fn behind_resting(
         &self,
         terms: &InstrumentTerms,
         instrument: &InstrumentNameExchange,
         side: Side,
         position: NetPosition,
+        excluding: Option<&ClientOrderId>,
     ) -> NetPosition {
         if !matches!(terms.settles, Settles::Option { .. }) || !position.opposes(side) {
             return position;
@@ -5768,7 +6075,11 @@ impl SimulatedVenue {
         let resting: Decimal = self
             .account
             .orders_open()
-            .filter(|order| order.key.instrument == *instrument && order.side == side)
+            .filter(|order| {
+                order.key.instrument == *instrument
+                    && order.side == side
+                    && Some(&order.key.cid) != excluding
+            })
             .map(|order| order.state.quantity_remaining(order.quantity))
             .sum();
         // The entry price is no part of what an option settlement reads.
@@ -7094,11 +7405,14 @@ enum Recommitted {
         loan: Decimal,
         excess_borrowed: Decimal,
     },
-    /// The account cannot cover it. The ledger's amounts are as they were, only the timestamps of
-    /// the balances released and restored moving (the order's hold, and any collateral the fill
-    /// would have released): the order still holds its reservation, handed back here whole, if it
-    /// held anything.
-    Unaffordable { reservation: Option<Reservation> },
+    /// The account cannot cover it, as `insufficient` says. The ledger's amounts are as they
+    /// were, only the timestamps of the balances released and restored moving (the order's hold,
+    /// and any collateral the fill would have released): the order still holds its reservation,
+    /// handed back here whole, if it held anything.
+    Unaffordable {
+        reservation: Option<Reservation>,
+        insufficient: BalanceInsufficient,
+    },
 }
 
 /// What deciding an order the venue already holds at a market came to — see
@@ -7106,9 +7420,12 @@ enum Recommitted {
 // `large_enum_variant`: as for `Recommitted`, which this carries the commitment of.
 #[allow(clippy::large_enum_variant)]
 enum Reentry {
-    /// Refused, changing nothing: a post-only order the market crosses, or one the account cannot
-    /// afford. The order still holds its reservation, handed back here whole, if it held anything.
-    Refused { reservation: Option<Reservation> },
+    /// Refused for `cause`, changing nothing. The order still holds its reservation, handed back
+    /// here whole, if it held anything.
+    Refused {
+        reservation: Option<Reservation>,
+        cause: Refusal,
+    },
     /// Committed in place of the order's hold, restating these balances, having printed `trade`
     /// if the order traded. `remainder` is what the venue now holds against what is left of the
     /// order, or `None` if the trade filled it.
@@ -7117,6 +7434,42 @@ enum Reentry {
         trade: Option<Trade<AssetNameExchange, InstrumentNameExchange>>,
         remainder: Option<Reservation>,
     },
+}
+
+/// A sale [`check_shortability`](SimulatedVenue::check_shortability) judges: an arriving
+/// order, or a resting one as an amend would leave it.
+struct ShortSale<'a> {
+    instrument: &'a InstrumentNameExchange,
+    exchange: ExchangeId,
+    side: Side,
+    kind: OrderKind,
+    price: Option<Decimal>,
+    /// What the order has left to fill.
+    quantity: Decimal,
+    /// The resting order this sale amends, left out of the resting sells it is measured behind.
+    replacing: Option<&'a ClientOrderId>,
+}
+
+impl<'a> ShortSale<'a> {
+    fn opening(request: &'a OrderRequestOpen<ExchangeId, InstrumentNameExchange>) -> Self {
+        Self {
+            instrument: &request.key.instrument,
+            exchange: request.key.exchange,
+            side: request.state.side,
+            kind: request.state.kind,
+            price: request.state.price,
+            quantity: request.state.quantity,
+            replacing: None,
+        }
+    }
+}
+
+/// Why [`Reentry::Refused`] refused an order.
+enum Refusal {
+    /// It is post-only, and the market crosses it.
+    PostOnly,
+    /// The account cannot afford it, as this says.
+    Unaffordable(BalanceInsufficient),
 }
 
 /// How much of an arriving order traded, and at what price.
@@ -8228,6 +8581,7 @@ mod tests {
             None,
             Default::default(),
             Default::default(),
+            Default::default(),
         );
         let mut venue = SimulatedVenue::new(&config, instruments_of(cfd_instrument()));
         assert_eq!(cfd_position(&venue), Some((d("-1"), Some(d("5000")))));
@@ -8271,6 +8625,7 @@ mod tests {
             crate::fill::StaleMarketPolicy::default(),
             None,
             None,
+            Default::default(),
             Default::default(),
             Default::default(),
         );
@@ -18732,6 +19087,7 @@ mod tests {
         instruments
     }
 
+    mod amend;
     mod borrow_capacity;
     mod borrow_price_window;
     mod collateral_ratio;

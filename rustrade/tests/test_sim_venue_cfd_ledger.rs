@@ -133,6 +133,7 @@ fn mock_config(usd_balance: Decimal, fee_model: FeeModelConfig) -> MockExecution
         fee_asset: None,
         long_option_expiry: Default::default(),
         short_put_collateral: Default::default(),
+        amend: Default::default(),
     }
 }
 

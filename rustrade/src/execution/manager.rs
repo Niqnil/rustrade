@@ -3037,7 +3037,13 @@ mod tests {
         // Capacity 1, so three events sent while the stream is not read lag it.
         let (event_tx, event_rx) = tokio::sync::broadcast::channel(1);
         let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
-        let client = MockExecution::new(ExchangeId::Mock, sim_now.clone(), request_tx, event_rx);
+        let client = MockExecution::new(
+            ExchangeId::Mock,
+            sim_now.clone(),
+            request_tx,
+            event_rx,
+            AmendSupport::NONE,
+        );
 
         // The venue: an empty snapshot, and its one fill when a read's span holds its time.
         let fill = missed_trade("a", 10);

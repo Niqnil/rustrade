@@ -1228,7 +1228,13 @@ mod tests {
 
         let (_event_tx, event_rx) = tokio::sync::broadcast::channel(1);
         let (request_tx, _request_rx) = tokio::sync::mpsc::unbounded_channel();
-        let client = MockExecution::new(ExchangeId::Mock, Utc::now, request_tx, event_rx);
+        let client = MockExecution::new(
+            ExchangeId::Mock,
+            Utc::now,
+            request_tx,
+            event_rx,
+            AmendSupport::NONE,
+        );
         let terminated = |secs| UnindexedAccountEvent {
             exchange: ExchangeId::Mock,
             kind: AccountEventKind::StreamTerminated(StreamTerminationReason::RateLimited {

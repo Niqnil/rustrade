@@ -137,6 +137,7 @@ fn config(latency_ms: u64) -> MockExecutionConfig {
         fee_asset: None,
         long_option_expiry: Default::default(),
         short_put_collateral: Default::default(),
+        amend: Default::default(),
     }
 }
 
