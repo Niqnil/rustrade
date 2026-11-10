@@ -190,6 +190,7 @@ fn config() -> MockExecutionConfig {
         amend: Default::default(),
         time_in_force: Default::default(),
         session_close: None,
+        fee_model_by_kind: Default::default(),
     }
 }
 

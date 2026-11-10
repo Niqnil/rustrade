@@ -150,6 +150,7 @@ fn venue(instruments: usize, held: usize, liquidation: bool) -> SimulatedVenue {
         amend: Default::default(),
         time_in_force: Default::default(),
         session_close: None,
+        fee_model_by_kind: Default::default(),
     };
     let map: FnvHashMap<_, _> = (0..instruments).map(|i| (name(i), spot(i))).collect();
     let mut venue = SimulatedVenue::new_market_driven(&config, map);

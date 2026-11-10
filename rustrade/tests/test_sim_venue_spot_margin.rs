@@ -142,6 +142,7 @@ fn venue(spot_fee_asset: SpotFeeAsset) -> SimulatedVenue {
         amend: Default::default(),
         time_in_force: Default::default(),
         session_close: None,
+        fee_model_by_kind: Default::default(),
     };
     let spot = Instrument {
         exchange: EXCHANGE,
@@ -432,7 +433,7 @@ fn a_liquidation_flattens_the_engine_position_and_leaves_its_balances_the_venues
             instruments: vec![],
         },
         latency_ms: 0,
-        fee_model: template.fee_model,
+        fee_model: template.fee_model.clone(),
         fill_model: SimFillConfig::default(),
         spot_fee_asset: SpotFeeAsset::Received,
         slippage: Default::default(),
@@ -450,6 +451,7 @@ fn a_liquidation_flattens_the_engine_position_and_leaves_its_balances_the_venues
         amend: Default::default(),
         time_in_force: Default::default(),
         session_close: None,
+        fee_model_by_kind: Default::default(),
     };
     let mut venue = SimulatedVenue::new_market_driven(&config, template.instruments().clone());
     let traded = |price| {

@@ -1246,3 +1246,90 @@ fn an_order_a_liquidation_cancels_reports_the_interest_its_loan_was_charged_when
     );
     assert_cancelled(order_named(&events, "resting"));
 }
+
+/// A venue like [`short_one_btc`]'s, whose fills each pay a ticket of 10 USDT per order, and which
+/// takes a fill's fee in quote, or, under `Received`, a buy's in the base it receives.
+fn short_one_btc_paying_a_ticket(spot_fee_asset: SpotFeeAsset) -> SimulatedVenue {
+    let config = MockExecutionConfig {
+        fee_model: FeeModelConfig::Composite(
+            CompositeFeeModel::new(vec![FeeComponent::new(FeeBasis::PerOrder(d("10")))]).unwrap(),
+        ),
+        spot_fee_asset,
+        ..liquidating_config(
+            vec![funded(base(), Decimal::ZERO), funded(quote(), d("10000"))],
+            liquidation("1.1", "0.02"),
+        )
+    };
+    let mut venue = SimulatedVenue::new_market_driven(&config, spot_instruments());
+    advance(&mut venue, time(1));
+    assert!(tick(&mut venue, "10000", 1).is_empty());
+    let outcome = venue.open_order(sell_request("1", None));
+    assert_eq!(filled_trade(&outcome).fees.fees, d("10"));
+    venue
+}
+
+/// A fee that is not a multiple of the quantity, here a ticket per order, still buys back exactly
+/// what is owed: the quantity is searched on the settlement, not scaled from one unit's.
+#[test]
+fn a_ticket_per_order_buys_back_exactly_the_debt() {
+    let mut venue = short_one_btc_paying_a_ticket(SpotFeeAsset::Quote);
+
+    // 19,990 left of the sale against 18,200 owed: a margin level of 1.098.
+    let events = tick(&mut venue, "18200", 2);
+
+    let bought = trades(&events);
+    assert_eq!(bought.len(), 1, "{:?}", shape(&events));
+    assert_eq!(
+        (bought[0].quantity, bought[0].fees.fees),
+        (d("1"), d("10")),
+        "the debt, and not the 1.0005 one unit's price including the ticket would scale to"
+    );
+    assert_eq!(
+        balance_now(&venue, base()),
+        Balance::new_margin(Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO)
+    );
+    // 19,990 less the 18,200 buy, its ticket and the 364 liquidation fee.
+    assert_eq!(balance_now(&venue, quote()).free, d("1416"));
+}
+
+/// A ticket taken from the base a buy receives grosses the buy up by the ticket, not by a share.
+#[test]
+fn a_ticket_taken_in_base_grosses_the_buy_back_up_by_the_ticket() {
+    let mut venue = short_one_btc_paying_a_ticket(SpotFeeAsset::Received);
+
+    let events = tick(&mut venue, "18200", 2);
+
+    let bought = trades(&events)[0];
+    assert_eq!(bought.fees.asset, base());
+    let ticket_in_btc = d("10") / d("18200");
+    assert!(
+        bought.quantity >= d("1") + ticket_in_btc
+            && bought.quantity < d("1") + ticket_in_btc + d("0.000000000000000000001"),
+        "{}",
+        bought.quantity
+    );
+    let btc = balance_now(&venue, base());
+    assert_eq!(btc.margin.unwrap(), MarginDetails::default());
+    assert!(
+        btc.free >= Decimal::ZERO && btc.free < d("0.000000000000000000001"),
+        "{btc:?}"
+    );
+}
+
+/// What the account can pay for, ticket included, is all it buys back when that is short of the
+/// debt.
+#[test]
+fn a_ticket_per_order_leaves_the_budget_for_the_buy_back_it_cannot_cover() {
+    let mut venue = short_one_btc_paying_a_ticket(SpotFeeAsset::Quote);
+
+    // 19,990 pays the ticket and 19,980 of BTC at 25,000: 0.7992 of the 1 owed.
+    let (events, _) = warnings(|| tick(&mut venue, "25000", 2));
+
+    let bought = trades(&events);
+    assert_eq!(bought.len(), 1, "{:?}", shape(&events));
+    assert_eq!(bought[0].quantity, d("0.7992"));
+    assert_eq!(
+        balance_now(&venue, base()).margin.unwrap().borrowed,
+        d("0.2008")
+    );
+}
