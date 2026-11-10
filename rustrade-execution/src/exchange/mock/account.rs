@@ -455,6 +455,30 @@ impl AccountState {
         balance.clone()
     }
 
+    /// Takes back `amount` of `asset` that a [`release`](Self::release) just gave to `free`,
+    /// whatever `free` holds now: the exact inverse of `release`.
+    ///
+    /// For a caller that released a hold to try something in its place and must put the hold back
+    /// when that is refused. Unlike [`reserve`](Self::reserve) it is never refused: a
+    /// [`charge`](Self::charge) may have taken `free` below zero while the hold was out of it, and
+    /// undoing the release must leave `free` there, not refuse to restore the hold.
+    ///
+    /// # Panics
+    /// Panics if `asset` has no balance — see [`reserve`](Self::reserve).
+    pub fn restore_hold(
+        &mut self,
+        asset: &AssetNameExchange,
+        amount: Decimal,
+        time_exchange: DateTime<Utc>,
+    ) -> AssetBalance<AssetNameExchange> {
+        let balance = self.balance_expect(asset);
+
+        balance.balance.free -= amount;
+        balance.time_exchange = time_exchange;
+
+        balance.clone()
+    }
+
     /// Moves `amount` of `asset` into the account, or out of it when negative, whatever `free`
     /// holds.
     ///
