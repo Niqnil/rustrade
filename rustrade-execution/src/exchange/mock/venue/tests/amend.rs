@@ -430,6 +430,41 @@ fn a_raised_cfd_sell_is_measured_without_its_own_old_quantity() {
     assert_eq!(resting_cfd_quantity(&venue, "short"), d("3"));
 }
 
+#[test]
+fn a_partly_filled_cfd_sells_raise_is_measured_by_what_it_has_left_to_sell() {
+    let mut venue = make_cfd_venue_lending(lending(Shortability::new().with_available(d("3"))));
+    // One bid at 4,990: a sell of 2 at 4,980 trades 1 and rests the other.
+    assert!(
+        venue
+            .apply_market(
+                &cfd_instrument_name(),
+                MarketObservation::new(book("4990", "5000"))
+                    .with_depth(MarketDepth::new(Some(d("1")), None)),
+                time(1),
+            )
+            .is_empty()
+    );
+    let rested = venue.open_order(cfd_limit("short", Side::Sell, "2", "4980"));
+    assert_eq!(rested_open(&rested).filled_quantity, d("1"));
+    advance(&mut venue, time(2));
+    assert!(cfd_market(&mut venue, "4970", "5000", "5000").is_empty());
+
+    // Short 1 already, and a total of 3 leaves 2 to sell: a short of 3, within what there is.
+    assert!(
+        amend_cfd(&mut venue, "short", quantity("3"))
+            .response
+            .state
+            .is_ok()
+    );
+
+    let past = amend_cfd(&mut venue, "short", quantity("4"));
+    assert_eq!(
+        borrow_refusal(&past),
+        BorrowRejectReason::InventoryUnavailable
+    );
+    assert_eq!(resting_cfd_quantity(&venue, "short"), d("3"));
+}
+
 fn resting_cfd_quantity(venue: &SimulatedVenue, name: &str) -> Decimal {
     venue.account.orders().get(&cid(name)).unwrap().quantity
 }
