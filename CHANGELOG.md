@@ -109,7 +109,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **`AlpacaClient` refuses an options order whose time in force Alpaca does not take**, before
     sending it. Alpaca takes an options order only as `day` (`GoodUntilEndOfDay`) or `gtc`
     (`GoodUntilCancelled` without post-only), and rejects any other with HTTP 422. The set is
-    `AlpacaClient::OPTION_TIME_IN_FORCE`. Equity and crypto orders map as before.
+    `AlpacaClient::OPTION_TIME_IN_FORCE`. Equity orders map as before.
+  - **`AlpacaClient` refuses a crypto order whose time in force Alpaca does not take**, before
+    sending it. Alpaca takes a crypto order (a `BASE/QUOTE` symbol) only as `gtc` (without
+    post-only) or `ioc`, and rejects `day`, `fok`, `opg` and `cls`. The set is
+    `AlpacaClient::CRYPTO_TIME_IN_FORCE`. A simulated venue standing in for Alpaca crypto alone
+    can take it as its `Spot` rule. One that also trades equities cannot, because both are `Spot`.
   - **New `MockExecutionConfig::time_in_force: TimeInForceRules`:** which time in force the
     simulated venue takes for each kind of instrument, so a backtest refuses what the live venue
     refuses. `TimeInForceRules::with_accepted` with `InstrumentKindDiscriminant::Option` and
