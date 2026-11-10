@@ -1905,8 +1905,8 @@ impl ExecutionClient for AlpacaClient {
     /// other is refused with [`OrderError::UnsupportedTimeInForce`] without a request.
     ///
     /// Crypto is told apart by the `/` in its symbol. An order for a crypto symbol spelt without
-    /// one, such as `BTCUSD`, is taken for an equity: its time in force is not checked as crypto,
-    /// and Alpaca rejects it.
+    /// one, such as `BTCUSD`, is taken for an equity, so its time in force is not checked as
+    /// crypto. Pass a crypto symbol as `BASE/QUOTE`.
     ///
     /// # Market order price
     ///
