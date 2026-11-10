@@ -398,9 +398,11 @@ impl FeeModel for FeeComponent {
 ///
 /// # Example: Alpaca's US option fees
 /// Alpaca charges no commission on retail option trades, and passes regulatory and clearing fees
-/// through. This schedule follows its fee schedule of 2026-10-12. The rates change, so check the
-/// venue's current schedule before relying on them. Alpaca rounds each fee type's daily total up
-/// to the cent, which this does not model (see `# Rounding`).
+/// through. This schedule follows its fee schedule of 2026-10-12, for equity options. The rates
+/// change, so check the venue's current schedule before relying on them. Alpaca rounds each fee
+/// type's daily total up to the cent, which this does not model (see `# Rounding`). Index options
+/// also pay a commission per contract and exchange fees that vary by symbol and premium, which
+/// this model cannot yet express.
 ///
 /// ```
 /// use rust_decimal_macros::dec;
